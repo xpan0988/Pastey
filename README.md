@@ -107,9 +107,38 @@ npm run tauri dev
 
 ## Build
 
+Frontend only:
+
 ```bash
-npm run tauri build
+npm run build
 ```
+
+Packaged desktop app:
+
+```bash
+npm run tauri:build
+```
+
+Packaged desktop app with artifact audit:
+
+```bash
+npm run build:checked
+```
+
+## Release size expectations
+
+- `src-tauri/target/` can grow to several GB during development. That is normal Rust/Tauri build cache and should not be treated as the shipped app size.
+- Final packaged artifacts should stay small because `pastey` only bundles the compiled desktop app plus the built frontend from `dist/`.
+- Use the checked release build before shipping.
+
+- The size audit prints packaged artifact sizes for `.app`, `.dmg`, `.msi`, `.exe`, and other generated bundle outputs under `src-tauri/target/release/bundle/`.
+- The audit fails if default size thresholds are exceeded:
+  - macOS `.dmg`: 100MB
+  - macOS `.app`: 200MB
+  - Windows `.msi`: 150MB
+  - Windows `.exe`: 150MB
+- The audit also fails if a final app bundle appears to contain development or local-data artifacts such as `node_modules`, `target`, `.git`, `src-tauri`, `src`, `outbox`, `inbox`, `temp`, or `db.sqlite`.
+- If the size check fails, inspect the bundle contents first. A large final artifact usually means build caches, source files, or local app data were accidentally included.
 
 ## Platform notes
 

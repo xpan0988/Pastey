@@ -1,6 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { AppConfig, RoomInfo, RoomItem } from "./types";
 
+interface SendFileOptions {
+  displayName?: string;
+  mimeType?: string | null;
+}
+
 export async function createRoom(expiryMinutes: number): Promise<RoomInfo> {
   return invoke("create_room", { expiryMinutes });
 }
@@ -25,8 +30,17 @@ export async function sendTextToRoom(roomId: string, text: string): Promise<Room
   return invoke("send_text_to_room", { roomId, text });
 }
 
-export async function sendFileToRoom(roomId: string, path: string): Promise<RoomItem> {
-  return invoke("send_file_to_room", { roomId, path });
+export async function sendFileToRoom(roomId: string, path: string, options?: SendFileOptions): Promise<RoomItem> {
+  return invoke("send_file_to_room", {
+    roomId,
+    path,
+    displayName: options?.displayName ?? null,
+    mimeType: options?.mimeType ?? null
+  });
+}
+
+export async function writeTempFile(fileName: string, bytes: number[]): Promise<string> {
+  return invoke("write_temp_file", { fileName, bytes });
 }
 
 export async function burnRoom(roomId: string): Promise<boolean> {

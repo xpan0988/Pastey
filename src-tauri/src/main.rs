@@ -20,8 +20,9 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 
 use crate::{
     commands::{
-        burn_room, copy_text_to_clipboard, create_room, get_config, get_room, join_room, leave_room,
-        list_room_items, list_rooms, reveal_in_folder, send_file_to_room, send_text_to_room, update_config,
+        burn_room, copy_text_to_clipboard, create_room, get_config, get_room, join_room,
+        leave_room, list_room_items, list_rooms, reveal_in_folder, send_file_to_room,
+        send_text_to_room, update_config, write_temp_file,
     },
     config::StoredConfig,
     error::{AppError, AppResult},
@@ -93,6 +94,7 @@ fn main() {
             list_room_items,
             send_text_to_room,
             send_file_to_room,
+            write_temp_file,
             burn_room,
             leave_room,
             get_config,
@@ -119,11 +121,15 @@ fn install_global_shortcut(app: &AppHandle) -> AppResult<()> {
             })
             .build(),
     )
-    .map_err(|error| AppError::InvalidInput(format!("failed to initialize global shortcut plugin: {error}")))?;
+    .map_err(|error| {
+        AppError::InvalidInput(format!(
+            "failed to initialize global shortcut plugin: {error}"
+        ))
+    })?;
 
-    app.global_shortcut()
-        .register(shortcut)
-        .map_err(|error| AppError::InvalidInput(format!("failed to register global shortcut: {error}")))?;
+    app.global_shortcut().register(shortcut).map_err(|error| {
+        AppError::InvalidInput(format!("failed to register global shortcut: {error}"))
+    })?;
 
     Ok(())
 }
@@ -174,9 +180,9 @@ fn toggle_main_window(app: &AppHandle, target: &str) -> AppResult<()> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| AppError::NotFound("main window not found".into()))?;
-    let is_visible = window
-        .is_visible()
-        .map_err(|error| AppError::InvalidInput(format!("failed to read window visibility: {error}")))?;
+    let is_visible = window.is_visible().map_err(|error| {
+        AppError::InvalidInput(format!("failed to read window visibility: {error}"))
+    })?;
 
     if is_visible {
         window

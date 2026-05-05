@@ -56,18 +56,21 @@ function App() {
   }, []);
 
   const activeCount = useMemo(
-    () => rooms.filter((room) => room.status === "connected" || room.status === "waiting").length,
+    () => rooms.length,
     [rooms]
   );
 
-  async function refreshRooms(selectedRoomId?: string) {
+  async function refreshRooms(selectedRoomId?: string): Promise<RoomInfo | null> {
     const nextRooms = await listRooms();
     setRooms(nextRooms);
 
     if (selectedRoomId) {
       const match = nextRooms.find((room) => room.id === selectedRoomId) ?? null;
       setCurrentRoom(match);
+      return match;
     }
+
+    return null;
   }
 
   async function openRoom(room: RoomInfo) {
@@ -88,7 +91,11 @@ function App() {
       const [nextRoom, nextItems] = await Promise.all([getRoom(view.roomId), listRoomItems(view.roomId)]);
       setCurrentRoom(nextRoom);
       setRoomItems(nextItems);
-      await refreshRooms(view.roomId);
+      const visibleRoom = await refreshRooms(view.roomId);
+      if (!visibleRoom) {
+        setView({ screen: "home" });
+        setRoomItems([]);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }

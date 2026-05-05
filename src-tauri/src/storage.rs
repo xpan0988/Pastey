@@ -14,10 +14,13 @@ use crate::{
     crypto,
     error::{AppError, AppResult},
     models::{
-        LocalRole, PayloadType, RoomInfo, RoomItem, RoomItemDirection, RoomItemStatus, RoomStatus, StoredRoom,
-        StoredRoomItem,
+        LocalRole, PayloadType, RoomInfo, RoomItem, RoomItemDirection, RoomItemStatus, RoomStatus,
+        StoredRoom, StoredRoomItem,
     },
 };
+
+pub const MAX_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_FILE_SIZE_MESSAGE: &str = "File too large. Max supported size: 512MB (MVP limit).";
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -30,10 +33,9 @@ pub struct AppPaths {
 }
 
 pub fn init_app_paths(app: &AppHandle) -> AppResult<AppPaths> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| AppError::InvalidInput(format!("unable to resolve app data directory: {error}")))?;
+    let app_data_dir = app.path().app_data_dir().map_err(|error| {
+        AppError::InvalidInput(format!("unable to resolve app data directory: {error}"))
+    })?;
     let payloads_dir = app_data_dir.join("payloads");
     let inbox_dir = app_data_dir.join("inbox");
     let temp_dir = app_data_dir.join("temp");
@@ -70,7 +72,9 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             code_nonce TEXT NOT NULL,
             peer_host TEXT,
             peer_port INTEGER,
-            peer_transport_public_key TEXT
+            peer_transport_public_key TEXT,
+            local_burned_at INTEGER,
+            peer_burned_at INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS room_items (
@@ -96,6 +100,8 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
         CREATE INDEX IF NOT EXISTS idx_room_items_room_id ON room_items(room_id, created_at);
         "#,
     )?;
+    ensure_room_schema(&conn)?;
+    migrate_room_statuses(&conn)?;
     Ok(())
 }
 
@@ -117,7 +123,7 @@ pub fn create_room(
         room_code_hash: crypto::hash_code(code),
         created_at: now,
         expires_at,
-        status: RoomStatus::Waiting,
+        status: RoomStatus::Active,
         local_role,
         peer_device_name: None,
         auto_burn_after_expiry: true,
@@ -126,6 +132,8 @@ pub fn create_room(
         peer_host: None,
         peer_port: None,
         peer_transport_public_key: None,
+        local_burned_at: None,
+        peer_burned_at: None,
     };
 
     let conn = connection(paths)?;
@@ -144,15 +152,19 @@ pub fn create_room(
             code_nonce,
             peer_host,
             peer_port,
-            peer_transport_public_key
+            peer_transport_public_key,
+            local_burned_at,
+            peer_burned_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         ON CONFLICT(id) DO UPDATE SET
             room_code_hash = excluded.room_code_hash,
             expires_at = excluded.expires_at,
             local_role = excluded.local_role,
             wrapped_room_code = excluded.wrapped_room_code,
-            code_nonce = excluded.code_nonce
+            code_nonce = excluded.code_nonce,
+            local_burned_at = excluded.local_burned_at,
+            peer_burned_at = excluded.peer_burned_at
         "#,
         params![
             room.id,
@@ -167,7 +179,9 @@ pub fn create_room(
             room.code_nonce,
             room.peer_host,
             room.peer_port.map(i64::from),
-            room.peer_transport_public_key
+            room.peer_transport_public_key,
+            room.local_burned_at,
+            room.peer_burned_at
         ],
     )?;
 
@@ -201,8 +215,11 @@ pub fn list_rooms(paths: &AppPaths) -> AppResult<Vec<StoredRoom>> {
             code_nonce,
             peer_host,
             peer_port,
-            peer_transport_public_key
+            peer_transport_public_key,
+            local_burned_at,
+            peer_burned_at
         FROM rooms
+        WHERE status NOT IN ('burned', 'expired')
         ORDER BY created_at DESC
         "#,
     )?;
@@ -228,7 +245,9 @@ pub fn get_room_by_id(paths: &AppPaths, room_id: &str) -> AppResult<StoredRoom> 
             code_nonce,
             peer_host,
             peer_port,
-            peer_transport_public_key
+            peer_transport_public_key,
+            local_burned_at,
+            peer_burned_at
         FROM rooms
         WHERE id = ?1
         "#,
@@ -255,7 +274,8 @@ pub fn update_room_peer(
             peer_port = ?2,
             peer_device_name = ?3,
             peer_transport_public_key = ?4,
-            status = ?5
+            status = ?5,
+            peer_burned_at = NULL
         WHERE id = ?6
         "#,
         params![
@@ -270,8 +290,37 @@ pub fn update_room_peer(
     Ok(())
 }
 
-pub fn clear_room_peer(paths: &AppPaths, room_id: &str, status: RoomStatus) -> AppResult<()> {
-    update_room_peer(paths, room_id, None, None, None, None, status)
+pub fn mark_peer_left(paths: &AppPaths, room_id: &str) -> AppResult<()> {
+    let conn = connection(paths)?;
+    conn.execute(
+        r#"
+        UPDATE rooms
+        SET peer_host = NULL,
+            peer_port = NULL,
+            peer_transport_public_key = NULL,
+            status = ?1
+        WHERE id = ?2 AND status NOT IN ('burned', 'expired')
+        "#,
+        params![RoomStatus::PeerLeft.as_str(), room_id],
+    )?;
+    Ok(())
+}
+
+pub fn mark_peer_burned(paths: &AppPaths, room_id: &str) -> AppResult<()> {
+    let conn = connection(paths)?;
+    conn.execute(
+        r#"
+        UPDATE rooms
+        SET peer_host = NULL,
+            peer_port = NULL,
+            peer_transport_public_key = NULL,
+            status = ?1,
+            peer_burned_at = ?2
+        WHERE id = ?3 AND status NOT IN ('burned', 'expired')
+        "#,
+        params![RoomStatus::PeerLeft.as_str(), now_ts(), room_id],
+    )?;
+    Ok(())
 }
 
 pub fn set_room_status(paths: &AppPaths, room_id: &str, status: RoomStatus) -> AppResult<()> {
@@ -375,22 +424,33 @@ pub fn create_outgoing_text_item(
     )
 }
 
-pub fn create_outgoing_file_item(
+pub fn create_outgoing_file_item_with_metadata(
     paths: &AppPaths,
     master_key: &[u8; 32],
     room_id: &str,
     file_path: &Path,
+    display_name: Option<String>,
+    mime_type: Option<String>,
 ) -> AppResult<StoredRoomItem> {
+    validate_file_size(fs::metadata(file_path)?.len())?;
     let bytes = fs::read(file_path)?;
-    let file_name = file_path
-        .file_name()
-        .and_then(|value| value.to_str())
+    validate_file_size(bytes.len() as u64)?;
+    let file_name = display_name
         .map(sanitize)
-        .filter(|value| !value.is_empty());
-    let mime_type = MimeGuess::from_path(file_path)
-        .first_raw()
-        .map(ToString::to_string)
-        .or_else(|| Some("application/octet-stream".to_string()));
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            file_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(sanitize)
+                .filter(|value| !value.is_empty())
+        });
+    let resolved_mime_type = mime_type.or_else(|| {
+        MimeGuess::from_path(file_path)
+            .first_raw()
+            .map(ToString::to_string)
+            .or_else(|| Some("application/octet-stream".to_string()))
+    });
 
     persist_room_item(
         paths,
@@ -400,11 +460,35 @@ pub fn create_outgoing_file_item(
         RoomItemDirection::Outgoing,
         &bytes,
         file_name,
-        mime_type,
+        resolved_mime_type,
         RoomItemStatus::Created,
         None,
         None,
     )
+}
+
+pub fn validate_file_size(size_bytes: u64) -> AppResult<()> {
+    if size_bytes > MAX_FILE_SIZE_BYTES {
+        return Err(AppError::InvalidInput(MAX_FILE_SIZE_MESSAGE.to_string()));
+    }
+
+    Ok(())
+}
+
+pub fn write_temp_file(paths: &AppPaths, file_name: &str, bytes: &[u8]) -> AppResult<PathBuf> {
+    validate_file_size(bytes.len() as u64)?;
+
+    let sanitized_name = sanitize(file_name);
+    let fallback_name = if sanitized_name.is_empty() {
+        "clipboard_image.png".to_string()
+    } else {
+        sanitized_name
+    };
+    let temp_path = paths
+        .temp_dir
+        .join(format!("{}_{}", Uuid::new_v4(), fallback_name));
+    fs::write(&temp_path, bytes)?;
+    Ok(temp_path)
 }
 
 pub fn persist_incoming_item(
@@ -434,7 +518,11 @@ pub fn persist_incoming_item(
     )
 }
 
-pub fn set_room_item_status(paths: &AppPaths, item_id: &str, status: RoomItemStatus) -> AppResult<()> {
+pub fn set_room_item_status(
+    paths: &AppPaths,
+    item_id: &str,
+    status: RoomItemStatus,
+) -> AppResult<()> {
     let conn = connection(paths)?;
     conn.execute(
         "UPDATE room_items SET status = ?1 WHERE id = ?2",
@@ -453,8 +541,8 @@ pub fn burn_room(paths: &AppPaths, room_id: &str) -> AppResult<Option<StoredRoom
     let conn = connection(paths)?;
     conn.execute("DELETE FROM room_items WHERE room_id = ?1", [room_id])?;
     conn.execute(
-        "UPDATE rooms SET status = 'burned', peer_host = NULL, peer_port = NULL, peer_device_name = NULL, peer_transport_public_key = NULL WHERE id = ?1",
-        [room_id],
+        "UPDATE rooms SET status = 'burned', peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL, local_burned_at = ?1 WHERE id = ?2",
+        params![now_ts(), room_id],
     )?;
     Ok(room)
 }
@@ -465,7 +553,7 @@ pub fn leave_room(paths: &AppPaths, room_id: &str) -> AppResult<Option<StoredRoo
         return Ok(None);
     }
 
-    clear_room_peer(paths, room_id, RoomStatus::Left)?;
+    mark_peer_left(paths, room_id)?;
     Ok(room)
 }
 
@@ -482,7 +570,7 @@ pub fn cleanup_expired_rooms(paths: &AppPaths) -> AppResult<Vec<String>> {
         delete_room_payloads(paths, room_id)?;
         conn.execute("DELETE FROM room_items WHERE room_id = ?1", [room_id])?;
         conn.execute(
-            "UPDATE rooms SET status = 'expired', peer_host = NULL, peer_port = NULL, peer_device_name = NULL, peer_transport_public_key = NULL WHERE id = ?1",
+            "UPDATE rooms SET status = 'expired', peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL WHERE id = ?1",
             [room_id],
         )?;
     }
@@ -493,7 +581,7 @@ pub fn cleanup_expired_rooms(paths: &AppPaths) -> AppResult<Vec<String>> {
 pub fn mark_rooms_left_on_startup(paths: &AppPaths) -> AppResult<()> {
     let conn = connection(paths)?;
     conn.execute(
-        "UPDATE rooms SET status = 'left', peer_host = NULL, peer_port = NULL, peer_device_name = NULL, peer_transport_public_key = NULL WHERE status IN ('waiting', 'connected')",
+        "UPDATE rooms SET status = 'peer_left', peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL WHERE status IN ('active', 'peer_left', 'waiting', 'connected', 'left') AND peer_host IS NOT NULL",
         [],
     )?;
     Ok(())
@@ -510,7 +598,8 @@ pub fn read_room_code(room: &StoredRoom, master_key: &[u8; 32]) -> AppResult<Str
 
 pub fn read_room_item_key(item: &StoredRoomItem, master_key: &[u8; 32]) -> AppResult<[u8; 32]> {
     let bytes = crypto::unwrap_bytes(&item.wrapped_key, &item.key_nonce, master_key)?;
-    bytes.try_into()
+    bytes
+        .try_into()
         .map_err(|_| AppError::Crypto("payload key had invalid length".into()))
 }
 
@@ -519,7 +608,7 @@ pub fn room_to_info(room: StoredRoom, master_key: &[u8; 32]) -> AppResult<RoomIn
     let peer_connected = room.peer_host.is_some()
         && room.peer_port.is_some()
         && room.peer_transport_public_key.is_some()
-        && room.status == RoomStatus::Connected;
+        && room.status == RoomStatus::Active;
 
     Ok(RoomInfo {
         id: room.id,
@@ -532,6 +621,8 @@ pub fn room_to_info(room: StoredRoom, master_key: &[u8; 32]) -> AppResult<RoomIn
         peer_device_name: room.peer_device_name,
         auto_burn_after_expiry: room.auto_burn_after_expiry,
         peer_connected,
+        local_burned_at: room.local_burned_at,
+        peer_burned_at: room.peer_burned_at,
     })
 }
 
@@ -585,7 +676,10 @@ pub fn next_inbox_path(base_dir: &Path, display_name: Option<&str>) -> AppResult
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("pastey_file");
-    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
 
     for index in 1..1000 {
         let file_name = if ext.is_empty() {
@@ -599,7 +693,9 @@ pub fn next_inbox_path(base_dir: &Path, display_name: Option<&str>) -> AppResult
         }
     }
 
-    Err(AppError::InvalidInput("unable to allocate inbox file name".into()))
+    Err(AppError::InvalidInput(
+        "unable to allocate inbox file name".into(),
+    ))
 }
 
 pub fn now_ts() -> i64 {
@@ -633,8 +729,7 @@ fn persist_room_item(
     let (ciphertext, payload_nonce) = crypto::encrypt_bytes(plaintext, &payload_key)?;
     fs::write(&absolute_path, ciphertext)?;
     let (wrapped_key, key_nonce) = crypto::wrap_bytes(&payload_key, master_key)?;
-    let (created_at, saved_path) =
-        created_saved_override.unwrap_or_else(|| (now_ts(), None));
+    let (created_at, saved_path) = created_saved_override.unwrap_or_else(|| (now_ts(), None));
 
     let item = StoredRoomItem {
         id,
@@ -709,6 +804,35 @@ fn connection(paths: &AppPaths) -> AppResult<Connection> {
     Ok(conn)
 }
 
+fn ensure_room_schema(conn: &Connection) -> AppResult<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(rooms)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if !columns.iter().any(|column| column == "local_burned_at") {
+        conn.execute("ALTER TABLE rooms ADD COLUMN local_burned_at INTEGER", [])?;
+    }
+
+    if !columns.iter().any(|column| column == "peer_burned_at") {
+        conn.execute("ALTER TABLE rooms ADD COLUMN peer_burned_at INTEGER", [])?;
+    }
+
+    Ok(())
+}
+
+fn migrate_room_statuses(conn: &Connection) -> AppResult<()> {
+    conn.execute(
+        "UPDATE rooms SET status = 'active' WHERE status IN ('waiting', 'connected')",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE rooms SET status = 'peer_left' WHERE status = 'left'",
+        [],
+    )?;
+    Ok(())
+}
+
 fn delete_payload_file(paths: &AppPaths, relative_path: &str) -> AppResult<()> {
     let absolute = encrypted_file_path(paths, relative_path);
     if absolute.exists() {
@@ -727,7 +851,7 @@ fn row_to_room(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRoom> {
         room_code_hash: row.get(1)?,
         created_at: row.get(2)?,
         expires_at: row.get(3)?,
-        status: RoomStatus::from_db(&status).unwrap_or(RoomStatus::Left),
+        status: RoomStatus::from_db(&status).unwrap_or(RoomStatus::PeerLeft),
         local_role: LocalRole::from_db(&local_role).unwrap_or(LocalRole::Joined),
         peer_device_name: row.get(6)?,
         auto_burn_after_expiry: row.get::<_, i64>(7)? != 0,
@@ -736,6 +860,8 @@ fn row_to_room(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRoom> {
         peer_host: row.get(10)?,
         peer_port,
         peer_transport_public_key: row.get(12)?,
+        local_burned_at: row.get(13)?,
+        peer_burned_at: row.get(14)?,
     })
 }
 

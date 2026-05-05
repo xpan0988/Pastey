@@ -66,7 +66,7 @@ export function DropZone({ onPick }: DropZoneProps) {
     <div className={`drop-zone ${isHovering ? "hover" : ""}`}>
       <div className="subtle-stack">
         <strong>{busy ? "Encrypting..." : "Drop a file or image here"}</strong>
-        <p className="muted">Files are encrypted locally before they are sent into the room.</p>
+        <p className="muted">Files are encrypted locally before they are sent into the room. Max 512MB (MVP limit).</p>
       </div>
       <button className="ghost-button" onClick={handleBrowse} disabled={busy}>
         Choose file

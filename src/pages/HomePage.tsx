@@ -64,6 +64,13 @@ export function HomePage({
     }
   }
 
+  function roomPillLabel(room: RoomInfo): string {
+    if (room.peer_connected) return "Connected";
+    if (room.peer_burned_at) return "Peer burned";
+    if (room.status === "peer_left") return "Peer left";
+    return "Waiting";
+  }
+
   return (
     <div className="stack">
       <section className="panel hero-panel">
@@ -144,7 +151,7 @@ export function HomePage({
                 <div className="row spread">
                   <strong>{formatCode(room.room_code_display ?? room.room_code)}</strong>
                   <span className={`pill ${room.peer_connected ? "connected" : "waiting"}`}>
-                    {room.peer_connected ? "Connected" : room.status}
+                    {roomPillLabel(room)}
                   </span>
                 </div>
                 <div className="row spread wrap">

@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "tauri:build": "npm run tauri -- build",
+    "build:checked": "npm run tauri:build && node scripts/check-build-size.mjs",
     "preview": "vite preview",
     "tauri": "cross-env CI=true tauri"
   },

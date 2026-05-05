@@ -25,7 +25,9 @@ pub fn display_code(code: &str) -> String {
 }
 
 pub fn hash_code(code: &str) -> String {
-    blake3::hash(format!("pastey:code:v1:{code}").as_bytes()).to_hex().to_string()
+    blake3::hash(format!("pastey:code:v1:{code}").as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 pub fn random_key() -> [u8; 32] {
@@ -61,7 +63,11 @@ pub fn wrap_bytes(value: &[u8], master_key: &[u8; 32]) -> AppResult<(String, Str
     Ok((STANDARD.encode(ciphertext), STANDARD.encode(nonce)))
 }
 
-pub fn unwrap_bytes(encoded: &str, encoded_nonce: &str, master_key: &[u8; 32]) -> AppResult<Vec<u8>> {
+pub fn unwrap_bytes(
+    encoded: &str,
+    encoded_nonce: &str,
+    master_key: &[u8; 32],
+) -> AppResult<Vec<u8>> {
     let ciphertext = STANDARD.decode(encoded)?;
     let nonce_vec = STANDARD.decode(encoded_nonce)?;
     let nonce = nonce_from_slice(&nonce_vec)?;

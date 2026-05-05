@@ -2,12 +2,7 @@ use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    crypto,
-    error::AppResult,
-    models::AppConfig,
-    storage::AppPaths,
-};
+use crate::{crypto, error::AppResult, models::AppConfig, storage::AppPaths};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredConfig {
@@ -55,7 +50,11 @@ pub fn public_config(paths: &AppPaths, config: &StoredConfig) -> AppConfig {
     }
 }
 
-pub fn update(paths: &AppPaths, current: &mut StoredConfig, incoming: AppConfig) -> AppResult<AppConfig> {
+pub fn update(
+    paths: &AppPaths,
+    current: &mut StoredConfig,
+    incoming: AppConfig,
+) -> AppResult<AppConfig> {
     current.default_expiry_minutes = clamp_expiry(incoming.default_expiry_minutes);
     current.auto_burn_after_download = incoming.auto_burn_after_download;
     current.inbox_dir = normalize_inbox_dir(paths, incoming.inbox_dir.as_deref());

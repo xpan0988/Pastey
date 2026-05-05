@@ -5,9 +5,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::{
-    config,
-    crypto,
-    discovery,
+    config, crypto, discovery,
     error::{AppError, AppResult},
     models::{AppConfig, LocalRole, RoomInfo, RoomItem},
     storage, transfer, AppState,
@@ -76,7 +74,7 @@ pub async fn join_room(code: String, state: State<'_, Arc<AppState>>) -> Result<
             Some(discovered.port),
             Some(&response.device_name),
             Some(&discovered.transport_public_key),
-            crate::models::RoomStatus::Connected,
+            crate::models::RoomStatus::Active,
         )?;
 
         let updated = storage::get_room_by_id(&state.paths, &room.id)?;
@@ -94,13 +92,19 @@ pub async fn list_rooms(state: State<'_, Arc<AppState>>) -> Result<Vec<RoomInfo>
             config::master_key(&config)?
         };
         let rooms = storage::list_rooms(&state.paths)?;
-        rooms.into_iter().map(|room| storage::room_to_info(room, &master_key)).collect()
+        rooms
+            .into_iter()
+            .map(|room| storage::room_to_info(room, &master_key))
+            .collect()
     })
     .await
 }
 
 #[tauri::command]
-pub async fn get_room(room_id: String, state: State<'_, Arc<AppState>>) -> Result<RoomInfo, String> {
+pub async fn get_room(
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomInfo, String> {
     run_async(async move {
         let master_key = {
             let config = state.config.read();
@@ -154,6 +158,8 @@ pub async fn send_text_to_room(
 pub async fn send_file_to_room(
     room_id: String,
     path: String,
+    display_name: Option<String>,
+    mime_type: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<RoomItem, String> {
     run_async(async move {
@@ -166,7 +172,14 @@ pub async fn send_file_to_room(
             let config = state.config.read();
             config::master_key(&config)?
         };
-        let item = storage::create_outgoing_file_item(&state.paths, &master_key, &room_id, &file_path)?;
+        let item = storage::create_outgoing_file_item_with_metadata(
+            &state.paths,
+            &master_key,
+            &room_id,
+            &file_path,
+            display_name,
+            mime_type,
+        )?;
         transfer::send_room_item(state.inner().clone(), &room_id, &item.id).await?;
         let stored = storage::get_room_item_by_id(&state.paths, &item.id)?;
         storage::room_item_to_info(&state.paths, &master_key, stored)
@@ -175,11 +188,27 @@ pub async fn send_file_to_room(
 }
 
 #[tauri::command]
+pub fn write_temp_file(
+    file_name: String,
+    bytes: Vec<u8>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    let path = storage::write_temp_file(&state.paths, &file_name, &bytes)
+        .map_err(|error| error.message())?;
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
 pub async fn burn_room(room_id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
     run_async(async move {
-        transfer::notify_room_burn(state.inner().clone(), &room_id).await;
+        let peer = storage::get_room_by_id(&state.paths, &room_id)
+            .ok()
+            .and_then(|room| room.peer_host.zip(room.peer_port));
         let removed = storage::burn_room(&state.paths, &room_id)?.is_some();
         let _ = transfer::stop_room_server(state.inner().clone(), &room_id).await;
+        if let Some((peer_host, peer_port)) = peer {
+            transfer::notify_room_burn_with_peer(&peer_host, peer_port, &room_id).await;
+        }
         Ok(removed)
     })
     .await
@@ -203,7 +232,10 @@ pub fn get_config(state: State<'_, Arc<AppState>>) -> Result<AppConfig, String> 
 }
 
 #[tauri::command]
-pub fn update_config(config_value: AppConfig, state: State<'_, Arc<AppState>>) -> Result<AppConfig, String> {
+pub fn update_config(
+    config_value: AppConfig,
+    state: State<'_, Arc<AppState>>,
+) -> Result<AppConfig, String> {
     let mut guard = state.config.write();
     config::update(&state.paths, &mut guard, config_value).map_err(|error| error.message())
 }
@@ -223,7 +255,9 @@ pub fn copy_text_to_clipboard(text: String, app: AppHandle) -> Result<(), String
         .map_err(|error| error.to_string())
 }
 
-async fn run_async<T>(future: impl std::future::Future<Output = AppResult<T>>) -> Result<T, String> {
+async fn run_async<T>(
+    future: impl std::future::Future<Output = AppResult<T>>,
+) -> Result<T, String> {
     future.await.map_err(|error| error.message())
 }
 
@@ -235,7 +269,9 @@ fn unique_room_code(paths: &storage::AppPaths) -> AppResult<String> {
         }
     }
 
-    Err(AppError::InvalidInput("unable to allocate a unique room code".into()))
+    Err(AppError::InvalidInput(
+        "unable to allocate a unique room code".into(),
+    ))
 }
 
 fn normalize_code(code: &str) -> AppResult<String> {

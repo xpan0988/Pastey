@@ -1,9 +1,12 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { copyTextToClipboard, revealInFolder, sendFileToRoom, sendTextToRoom } from "../lib/tauri";
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent } from "react";
+import { copyTextToClipboard, revealInFolder, sendFileToRoom, sendTextToRoom, writeTempFile } from "../lib/tauri";
 import { formatBytes, formatRelativeExpiry, formatTimestamp } from "../lib/format";
 import type { RoomInfo, RoomItem } from "../lib/types";
 import { DropZone } from "../components/DropZone";
+
+const MAX_FILE_SIZE = 512 * 1024 * 1024;
+const FILE_TOO_LARGE_MESSAGE = "File too large. Max supported size: 512MB (MVP limit).";
 
 interface RoomPageProps {
   room: RoomInfo;
@@ -62,17 +65,81 @@ export function RoomPage({
   }
 
   async function handleSendFile(path: string) {
+    await sendFileMessage({ path });
+  }
+
+  async function sendFileMessage({
+    path,
+    displayName,
+    mimeType
+  }: {
+    path: string;
+    displayName?: string;
+    mimeType?: string | null;
+  }) {
     setBusy("file");
     setError(null);
 
     try {
-      await sendFileToRoom(room.id, path);
+      await sendFileToRoom(room.id, path, { displayName, mimeType });
       await onRefresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(null);
     }
+  }
+
+  async function handleSendPastedImage(file: File) {
+    if (file.size > MAX_FILE_SIZE) {
+      setError(FILE_TOO_LARGE_MESSAGE);
+      return;
+    }
+
+    setBusy("file");
+    setError(null);
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const tempPath = await writeTempFile(file.name, Array.from(new Uint8Array(buffer)));
+      await sendFileToRoom(room.id, tempPath, {
+        displayName: file.name,
+        mimeType: file.type || "image/png"
+      });
+      await onRefresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleComposerPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const imageItem = Array.from(event.clipboardData.items).find((item) => item.type.startsWith("image/"));
+    if (!imageItem) {
+      return;
+    }
+
+    event.preventDefault();
+
+    if (!room.peer_connected || busy !== null) {
+      return;
+    }
+
+    const clipboardFile = imageItem.getAsFile();
+    if (!clipboardFile) {
+      setError("Unable to read image from clipboard.");
+      return;
+    }
+
+    const mimeType = imageItem.type || clipboardFile.type || "image/png";
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const screenshotFile = new File([clipboardFile], `screenshot_${timestamp}.png`, {
+      type: mimeType,
+      lastModified: Date.now()
+    });
+
+    await handleSendPastedImage(screenshotFile);
   }
 
   async function handleCopyCode() {
@@ -99,7 +166,19 @@ export function RoomPage({
     }
   }
 
-  const headerStatus = room.peer_connected ? "Connected" : room.status === "waiting" ? "Waiting for peer" : room.status;
+  const peerStateMessage = room.peer_burned_at
+    ? "Peer burned room. Your local items stay here until you burn this room or it expires."
+    : room.status === "peer_left"
+      ? "Peer left this room. Sending is disabled until a new connection exists."
+      : null;
+
+  const headerStatus = room.peer_connected
+    ? "Connected"
+    : room.peer_burned_at
+      ? "Peer burned room"
+      : room.status === "peer_left"
+        ? "Peer left"
+        : "Waiting for peer";
 
   return (
     <div className="stack room-shell">
@@ -143,6 +222,8 @@ export function RoomPage({
             <span className="muted">Encrypted room cleanup stays local.</span>
           </div>
         </div>
+
+        {peerStateMessage ? <div className="error-box">{peerStateMessage}</div> : null}
       </section>
 
       <section className="panel chat-panel">
@@ -160,10 +241,21 @@ export function RoomPage({
           <textarea
             ref={composerRef}
             rows={3}
-            placeholder={room.peer_connected ? "Type a message and press Enter to send." : "Waiting for the other device to join this room."}
+            placeholder={
+              room.peer_connected
+                ? "Type a message and press Enter to send."
+                : room.peer_burned_at
+                  ? "Peer burned this room. Burn locally when you're done."
+                  : room.status === "peer_left"
+                    ? "Peer left this room."
+                    : "Waiting for the other device to join this room."
+            }
             value={text}
             disabled={!room.peer_connected || busy !== null}
             onChange={(event) => setText(event.target.value)}
+            onPaste={(event) => {
+              void handleComposerPaste(event);
+            }}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
@@ -181,7 +273,7 @@ export function RoomPage({
           >
             {busy === "text" ? "Sending..." : "Send"}
           </button>
-          <span className="muted">Press Enter to send. Use Shift + Enter for a new line.</span>
+          <span className="muted">Press Enter to send. Use Shift + Enter for a new line. Paste screenshots with Ctrl+V.</span>
         </div>
 
         <DropZone onPick={handleSendFile} />

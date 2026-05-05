@@ -75,7 +75,9 @@ pub async fn ensure_service(state: Arc<AppState>) -> AppResult<()> {
 
     let mut handle = state.discovery_handle.lock();
     if handle.is_none() {
-        *handle = Some(crate::DiscoveryHandle { shutdown: shutdown_tx });
+        *handle = Some(crate::DiscoveryHandle {
+            shutdown: shutdown_tx,
+        });
     }
     Ok(())
 }
@@ -94,9 +96,9 @@ pub async fn discover_room(room_code_hash: String) -> AppResult<(SocketAddr, Dis
     let socket = UdpSocket::bind(("0.0.0.0", 0))
         .await
         .map_err(|error| AppError::Network(format!("unable to open discovery socket: {error}")))?;
-    socket
-        .set_broadcast(true)
-        .map_err(|error| AppError::Network(format!("unable to enable discovery broadcast: {error}")))?;
+    socket.set_broadcast(true).map_err(|error| {
+        AppError::Network(format!("unable to enable discovery broadcast: {error}"))
+    })?;
 
     let request = DiscoveryRequest {
         kind: "discover_room".to_string(),
@@ -110,7 +112,9 @@ pub async fn discover_room(room_code_hash: String) -> AppResult<(SocketAddr, Dis
         socket
             .send_to(&payload, ("255.255.255.255", DISCOVERY_PORT))
             .await
-            .map_err(|error| AppError::Network(format!("unable to broadcast discovery: {error}")))?;
+            .map_err(|error| {
+                AppError::Network(format!("unable to broadcast discovery: {error}"))
+            })?;
         sleep(Duration::from_millis(150)).await;
     }
 

@@ -27,9 +27,8 @@ impl PayloadType {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RoomStatus {
-    Waiting,
-    Connected,
-    Left,
+    Active,
+    PeerLeft,
     Expired,
     Burned,
 }
@@ -37,9 +36,8 @@ pub enum RoomStatus {
 impl RoomStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Waiting => "waiting",
-            Self::Connected => "connected",
-            Self::Left => "left",
+            Self::Active => "active",
+            Self::PeerLeft => "peer_left",
             Self::Expired => "expired",
             Self::Burned => "burned",
         }
@@ -47,9 +45,11 @@ impl RoomStatus {
 
     pub fn from_db(value: &str) -> Option<Self> {
         match value {
-            "waiting" => Some(Self::Waiting),
-            "connected" => Some(Self::Connected),
-            "left" => Some(Self::Left),
+            "active" => Some(Self::Active),
+            "peer_left" => Some(Self::PeerLeft),
+            "waiting" => Some(Self::Active),
+            "connected" => Some(Self::Active),
+            "left" => Some(Self::PeerLeft),
             "expired" => Some(Self::Expired),
             "burned" => Some(Self::Burned),
             _ => None,
@@ -156,6 +156,8 @@ pub struct RoomInfo {
     pub peer_device_name: Option<String>,
     pub auto_burn_after_expiry: bool,
     pub peer_connected: bool,
+    pub local_burned_at: Option<i64>,
+    pub peer_burned_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -188,6 +190,8 @@ pub struct StoredRoom {
     pub peer_host: Option<String>,
     pub peer_port: Option<u16>,
     pub peer_transport_public_key: Option<String>,
+    pub local_burned_at: Option<i64>,
+    pub peer_burned_at: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -253,4 +257,11 @@ pub struct RoomItemUpload {
     pub transport_nonce: String,
     pub sender_public_key: String,
     pub encrypted_payload: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TransferErrorResponse {
+    pub code: String,
+    pub message: String,
+    pub max_size_bytes: Option<u64>,
 }

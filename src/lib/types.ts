@@ -1,6 +1,6 @@
 export type PayloadType = "text" | "file";
 
-export type RoomStatus = "waiting" | "connected" | "left" | "expired" | "burned";
+export type RoomStatus = "active" | "peer_left" | "burned" | "expired";
 
 export type LocalRole = "creator" | "joined";
 
@@ -19,6 +19,8 @@ export interface RoomInfo {
   peer_device_name?: string | null;
   auto_burn_after_expiry: boolean;
   peer_connected: boolean;
+  local_burned_at?: number | null;
+  peer_burned_at?: number | null;
 }
 
 export interface RoomItem {

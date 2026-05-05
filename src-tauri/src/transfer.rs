@@ -3,6 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{
     extract::{ConnectInfo, Path, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
@@ -10,13 +11,13 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
-    config,
-    crypto,
-    discovery,
+    config, crypto, discovery,
     error::{AppError, AppResult},
-    models::{JoinRoomRequest, JoinRoomResponse, RoomItemStatus, RoomItemUpload, RoomStatus},
-    storage,
-    ActiveRoomServer, AppState,
+    models::{
+        JoinRoomRequest, JoinRoomResponse, RoomItemStatus, RoomItemUpload, RoomStatus,
+        TransferErrorResponse,
+    },
+    storage, ActiveRoomServer, AppState,
 };
 
 #[derive(Clone)]
@@ -91,12 +92,7 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
     );
 
     if room.status != RoomStatus::Burned && room.status != RoomStatus::Expired {
-        let next_status = if room.peer_host.is_some() && room.peer_port.is_some() {
-            RoomStatus::Connected
-        } else {
-            RoomStatus::Waiting
-        };
-        storage::set_room_status(&state.paths, room_id, next_status)?;
+        storage::set_room_status(&state.paths, room_id, RoomStatus::Active)?;
     }
 
     discovery::ensure_service(state).await?;
@@ -125,7 +121,9 @@ pub async fn announce_join(
     let snapshot = room_server_snapshot(&state, room_id)?;
     let client = reqwest::Client::new();
     let response = client
-        .post(format!("http://{peer_host}:{peer_port}/rooms/{room_id}/join"))
+        .post(format!(
+            "http://{peer_host}:{peer_port}/rooms/{room_id}/join"
+        ))
         .json(&JoinRoomRequest {
             port: snapshot.port,
             device_name: device_name(),
@@ -167,9 +165,16 @@ pub async fn send_room_item(state: Arc<AppState>, room_id: &str, item_id: &str) 
     let snapshot = room_server_snapshot(&state, room_id)?;
     let receiver_public_key = crypto::decode_key(&peer_transport_public_key)?;
     let (wrapped_session_key, transport_nonce, sender_public_key) =
-        crypto::wrap_session_for_receiver(&payload_key, &snapshot.transport_secret, &receiver_public_key)?;
-    let encrypted_payload =
-        tokio::fs::read(storage::encrypted_file_path(&state.paths, &item.encrypted_path)).await?;
+        crypto::wrap_session_for_receiver(
+            &payload_key,
+            &snapshot.transport_secret,
+            &receiver_public_key,
+        )?;
+    let encrypted_payload = tokio::fs::read(storage::encrypted_file_path(
+        &state.paths,
+        &item.encrypted_path,
+    ))
+    .await?;
 
     let upload = RoomItemUpload {
         item_id: item.id.clone(),
@@ -190,7 +195,9 @@ pub async fn send_room_item(state: Arc<AppState>, room_id: &str, item_id: &str) 
         .build()
         .map_err(|error| AppError::Network(format!("unable to build HTTP client: {error}")))?;
     let response = client
-        .post(format!("http://{peer_host}:{peer_port}/rooms/{room_id}/items"))
+        .post(format!(
+            "http://{peer_host}:{peer_port}/rooms/{room_id}/items"
+        ))
         .json(&upload)
         .send()
         .await;
@@ -202,10 +209,14 @@ pub async fn send_room_item(state: Arc<AppState>, room_id: &str, item_id: &str) 
         }
         Ok(response) => {
             storage::set_room_item_status(&state.paths, item_id, RoomItemStatus::Failed)?;
-            Err(AppError::Network(format!(
-                "peer rejected room item ({})",
-                response.status()
-            )))
+            let status = response.status();
+            let message = response
+                .json::<TransferErrorResponse>()
+                .await
+                .ok()
+                .map(|error| error.message)
+                .unwrap_or_else(|| format!("peer rejected room item ({status})"));
+            Err(AppError::Network(message))
         }
         Err(error) => {
             storage::set_room_item_status(&state.paths, item_id, RoomItemStatus::Failed)?;
@@ -214,18 +225,8 @@ pub async fn send_room_item(state: Arc<AppState>, room_id: &str, item_id: &str) 
     }
 }
 
-pub async fn notify_room_burn(state: Arc<AppState>, room_id: &str) {
-    let Ok(room) = storage::get_room_by_id(&state.paths, room_id) else {
-        return;
-    };
-    let (Some(peer_host), Some(peer_port)) = (room.peer_host, room.peer_port) else {
-        return;
-    };
-
-    let _ = reqwest::Client::new()
-        .post(format!("http://{peer_host}:{peer_port}/rooms/{room_id}/burn"))
-        .send()
-        .await;
+pub async fn notify_room_burn_with_peer(peer_host: &str, peer_port: u16, room_id: &str) {
+    notify_room_event(peer_host, peer_port, room_id, "burn").await;
 }
 
 pub async fn notify_room_leave(state: Arc<AppState>, room_id: &str) {
@@ -236,8 +237,14 @@ pub async fn notify_room_leave(state: Arc<AppState>, room_id: &str) {
         return;
     };
 
+    notify_room_event(&peer_host, peer_port, room_id, "leave").await;
+}
+
+async fn notify_room_event(peer_host: &str, peer_port: u16, room_id: &str, action: &str) {
     let _ = reqwest::Client::new()
-        .post(format!("http://{peer_host}:{peer_port}/rooms/{room_id}/leave"))
+        .post(format!(
+            "http://{peer_host}:{peer_port}/rooms/{room_id}/{action}"
+        ))
         .send()
         .await;
 }
@@ -271,12 +278,16 @@ async fn join_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let room = storage::get_room_by_id(&ctx.state.paths, &room_id).map_err(|_| StatusCode::NOT_FOUND)?;
-    if room.expires_at <= storage::now_ts() || matches!(room.status, RoomStatus::Burned | RoomStatus::Expired) {
+    let room =
+        storage::get_room_by_id(&ctx.state.paths, &room_id).map_err(|_| StatusCode::NOT_FOUND)?;
+    if room.expires_at <= storage::now_ts()
+        || matches!(room.status, RoomStatus::Burned | RoomStatus::Expired)
+    {
         return Err(StatusCode::GONE);
     }
 
-    let snapshot = room_server_snapshot(&ctx.state, &room_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let snapshot = room_server_snapshot(&ctx.state, &room_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     storage::update_room_peer(
         &ctx.state.paths,
         &room_id,
@@ -284,7 +295,7 @@ async fn join_handler(
         Some(request.port),
         Some(&request.device_name),
         Some(&request.transport_public_key),
-        RoomStatus::Connected,
+        RoomStatus::Active,
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -299,48 +310,88 @@ async fn receive_item_handler(
     Path(room_id): Path<String>,
     State(ctx): State<RoomServerContext>,
     Json(upload): Json<RoomItemUpload>,
-) -> Result<StatusCode, StatusCode> {
+) -> Response {
     if room_id != ctx.room_id {
-        return Err(StatusCode::NOT_FOUND);
+        return StatusCode::NOT_FOUND.into_response();
     }
 
-    let room = storage::get_room_by_id(&ctx.state.paths, &room_id).map_err(|_| StatusCode::NOT_FOUND)?;
-    if room.expires_at <= storage::now_ts() || matches!(room.status, RoomStatus::Burned | RoomStatus::Expired) {
-        return Err(StatusCode::GONE);
+    let room = match storage::get_room_by_id(&ctx.state.paths, &room_id) {
+        Ok(room) => room,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if room.expires_at <= storage::now_ts()
+        || matches!(room.status, RoomStatus::Burned | RoomStatus::Expired)
+    {
+        return StatusCode::GONE.into_response();
     }
 
-    if storage::room_item_exists(&ctx.state.paths, &upload.item_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
-        return Ok(StatusCode::OK);
+    if let Err(error) = storage::validate_file_size(upload.size_bytes) {
+        return transfer_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file_too_large",
+            error.message(),
+        );
     }
 
-    let snapshot = room_server_snapshot(&ctx.state, &room_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let session_key = crypto::unwrap_session_from_sender(
+    match storage::room_item_exists(&ctx.state.paths, &upload.item_id) {
+        Ok(true) => return StatusCode::OK.into_response(),
+        Ok(false) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+
+    let snapshot = match room_server_snapshot(&ctx.state, &room_id) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let session_key = match crypto::unwrap_session_from_sender(
         &upload.wrapped_session_key,
         &upload.transport_nonce,
         &upload.sender_public_key,
         &snapshot.transport_secret,
-    )
-    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    ) {
+        Ok(session_key) => session_key,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
     let encrypted_payload = STANDARD
         .decode(&upload.encrypted_payload)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let payload_nonce = crypto::decode_nonce(&upload.payload_nonce).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let plaintext =
-        crypto::decrypt_bytes(&encrypted_payload, &session_key, &payload_nonce).map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|_| StatusCode::BAD_REQUEST);
+    let encrypted_payload = match encrypted_payload {
+        Ok(encrypted_payload) => encrypted_payload,
+        Err(status) => return status.into_response(),
+    };
+    let payload_nonce = match crypto::decode_nonce(&upload.payload_nonce) {
+        Ok(payload_nonce) => payload_nonce,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let plaintext = match crypto::decrypt_bytes(&encrypted_payload, &session_key, &payload_nonce) {
+        Ok(plaintext) => plaintext,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    if plaintext.len() as u64 > storage::MAX_FILE_SIZE_BYTES {
+        return transfer_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file_too_large",
+            storage::MAX_FILE_SIZE_MESSAGE.to_string(),
+        );
+    }
 
     let saved_path = if upload.payload_type == crate::models::PayloadType::File {
         let inbox_dir = {
             let config = ctx.state.config.read();
             config::effective_inbox_dir(&ctx.state.paths, &config)
         };
-        let output_path =
-            storage::next_inbox_path(&inbox_dir, upload.display_name.as_deref()).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        tokio::fs::create_dir_all(&inbox_dir)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        tokio::fs::write(&output_path, &plaintext)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let output_path = match storage::next_inbox_path(&inbox_dir, upload.display_name.as_deref())
+        {
+            Ok(path) => path,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        if tokio::fs::create_dir_all(&inbox_dir).await.is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        if tokio::fs::write(&output_path, &plaintext).await.is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         Some(output_path.display().to_string())
     } else {
         None
@@ -348,9 +399,12 @@ async fn receive_item_handler(
 
     let master_key = {
         let config = ctx.state.config.read();
-        config::master_key(&config).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        match config::master_key(&config) {
+            Ok(key) => key,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
     };
-    storage::persist_incoming_item(
+    if storage::persist_incoming_item(
         &ctx.state.paths,
         &master_key,
         &room_id,
@@ -362,11 +416,15 @@ async fn receive_item_handler(
         upload.created_at,
         saved_path,
     )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    storage::set_room_status(&ctx.state.paths, &room_id, RoomStatus::Connected)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if storage::set_room_status(&ctx.state.paths, &room_id, RoomStatus::Active).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
-    Ok(StatusCode::OK)
+    StatusCode::OK.into_response()
 }
 
 async fn remote_burn_handler(
@@ -377,12 +435,25 @@ async fn remote_burn_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    storage::burn_room(&ctx.state.paths, &room_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    storage::mark_peer_burned(&ctx.state.paths, &room_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let state = ctx.state.clone();
     tokio::spawn(async move {
         let _ = stop_room_server(state, &room_id).await;
     });
     Ok(StatusCode::OK)
+}
+
+fn transfer_error(status: StatusCode, code: &str, message: String) -> Response {
+    (
+        status,
+        Json(TransferErrorResponse {
+            code: code.to_string(),
+            message,
+            max_size_bytes: Some(storage::MAX_FILE_SIZE_BYTES),
+        }),
+    )
+        .into_response()
 }
 
 async fn remote_leave_handler(
@@ -393,7 +464,11 @@ async fn remote_leave_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    storage::clear_room_peer(&ctx.state.paths, &room_id, RoomStatus::Waiting)
+    storage::mark_peer_left(&ctx.state.paths, &room_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let state = ctx.state.clone();
+    tokio::spawn(async move {
+        let _ = stop_room_server(state, &room_id).await;
+    });
     Ok(StatusCode::OK)
 }
