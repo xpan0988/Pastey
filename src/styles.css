@@ -1,0 +1,504 @@
+:root {
+  color-scheme: light;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  line-height: 1.4;
+  font-weight: 400;
+  color: #162218;
+  background:
+    radial-gradient(circle at top left, rgba(118, 175, 133, 0.22), transparent 30%),
+    radial-gradient(circle at bottom right, rgba(209, 159, 96, 0.18), transparent 28%),
+    linear-gradient(180deg, #f7f2e9 0%, #ece6d8 100%);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --panel: rgba(255, 251, 245, 0.84);
+  --panel-strong: #fffdf7;
+  --ink: #162218;
+  --muted: #5a685d;
+  --line: rgba(22, 34, 24, 0.1);
+  --primary: #1f6a46;
+  --primary-strong: #164b31;
+  --accent: #dcae62;
+  --danger: #a1452b;
+  --shadow: 0 24px 60px rgba(57, 56, 44, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  min-height: 100vh;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+.app-shell {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+.center-panel {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+}
+
+.app-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 18px;
+}
+
+.brand {
+  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  font-size: 1.9rem;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+}
+
+.tagline {
+  margin: 6px 0 0;
+  color: var(--muted);
+}
+
+.stack,
+.subtle-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  border-radius: 22px;
+  padding: 20px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(16px);
+}
+
+.hero-panel {
+  background:
+    linear-gradient(135deg, rgba(255, 253, 248, 0.88), rgba(247, 255, 250, 0.82)),
+    var(--panel);
+}
+
+.home-grid {
+  display: grid;
+  grid-template-columns: 1.5fr minmax(280px, 0.9fr);
+  gap: 18px;
+  align-items: stretch;
+}
+
+.join-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--line);
+}
+
+.eyebrow {
+  display: inline-flex;
+  width: fit-content;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(31, 106, 70, 0.08);
+  color: var(--primary);
+  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+}
+
+.spread {
+  justify-content: space-between;
+}
+
+.gap {
+  gap: 10px;
+}
+
+.wrap {
+  flex-wrap: wrap;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.inline-field {
+  min-width: 140px;
+}
+
+.field span,
+label {
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+textarea,
+input,
+select,
+.path-box {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 12px 14px;
+  background: rgba(255, 255, 255, 0.76);
+  color: var(--ink);
+}
+
+textarea {
+  resize: vertical;
+}
+
+.path-box {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.primary-button,
+.ghost-button {
+  border-radius: 14px;
+  padding: 11px 15px;
+  border: 1px solid transparent;
+}
+
+.primary-button {
+  background: var(--primary);
+  color: white;
+}
+
+.primary-button:hover {
+  background: var(--primary-strong);
+}
+
+.ghost-button {
+  background: rgba(255, 255, 255, 0.68);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.strong-ghost {
+  background: rgba(31, 106, 70, 0.08);
+  border-color: rgba(31, 106, 70, 0.18);
+  color: var(--primary-strong);
+}
+
+.ghost-button.danger {
+  color: var(--danger);
+}
+
+.text-button {
+  border: 0;
+  background: transparent;
+  color: var(--primary-strong);
+  padding: 0;
+  text-align: left;
+}
+
+.back-button {
+  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  font-size: 0.88rem;
+}
+
+.settings-back {
+  width: fit-content;
+}
+
+.drop-zone {
+  border: 1.5px dashed rgba(31, 106, 70, 0.35);
+  border-radius: 18px;
+  padding: 20px 18px;
+  background: linear-gradient(180deg, rgba(245, 255, 248, 0.82), rgba(255, 255, 255, 0.42));
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+}
+
+.drop-zone.hover {
+  border-color: var(--primary);
+  transform: translateY(-1px);
+}
+
+.status-chip {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.62);
+  border: 1px solid var(--line);
+  padding: 8px 12px;
+  border-radius: 999px;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: #9ca69e;
+}
+
+.status-dot.active {
+  background: #238a56;
+}
+
+.muted {
+  color: var(--muted);
+  margin: 0;
+}
+
+h2,
+h3 {
+  margin: 0;
+}
+
+.error-box {
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(161, 69, 43, 0.1);
+  color: #7e2f19;
+  border: 1px solid rgba(161, 69, 43, 0.2);
+}
+
+.toggle-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.room-list {
+  display: grid;
+  gap: 12px;
+}
+
+.room-list-item {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 16px;
+  background: rgba(255, 255, 255, 0.7);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 0.82rem;
+  text-transform: capitalize;
+  border: 1px solid var(--line);
+}
+
+.pill.connected {
+  color: var(--primary-strong);
+  background: rgba(31, 106, 70, 0.08);
+  border-color: rgba(31, 106, 70, 0.18);
+}
+
+.pill.waiting {
+  color: #7a5e25;
+  background: rgba(220, 174, 98, 0.14);
+  border-color: rgba(220, 174, 98, 0.25);
+}
+
+.empty-state {
+  padding: 18px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.56);
+  border: 1px dashed rgba(22, 34, 24, 0.12);
+  color: var(--muted);
+}
+
+.room-shell {
+  min-height: calc(100vh - 140px);
+}
+
+.room-header {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.header-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.room-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.meta-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.68);
+  border: 1px solid var(--line);
+}
+
+.meta-label {
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.chat-panel {
+  flex: 1;
+  min-height: 340px;
+}
+
+.message-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 300px;
+  max-height: 52vh;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.message-row {
+  display: flex;
+}
+
+.message-row.outgoing {
+  justify-content: flex-end;
+}
+
+.message-row.incoming {
+  justify-content: flex-start;
+}
+
+.message-bubble,
+.file-card {
+  max-width: min(82%, 540px);
+  border-radius: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+}
+
+.message-row.outgoing .message-bubble,
+.message-row.outgoing .file-card {
+  background: linear-gradient(180deg, rgba(31, 106, 70, 0.9), rgba(27, 89, 59, 0.92));
+  color: white;
+  border-color: transparent;
+}
+
+.message-row.incoming .message-bubble,
+.message-row.incoming .file-card {
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.message-topline {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.8rem;
+  opacity: 0.78;
+  margin-bottom: 10px;
+}
+
+.message-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.inline-action,
+.inline-ghost {
+  margin-top: 10px;
+}
+
+.message-row.outgoing .text-button {
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.chat-image {
+  margin-top: 4px;
+}
+
+.image-preview {
+  width: 100%;
+  max-height: 280px;
+  object-fit: contain;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: white;
+}
+
+.composer-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.room-list-header {
+  margin-bottom: 4px;
+}
+
+@media (max-width: 720px) {
+  .app-shell {
+    padding: 14px;
+  }
+
+  .app-header,
+  .drop-zone,
+  .toggle-row,
+  .row.spread {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .home-grid,
+  .room-meta-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .message-bubble,
+  .file-card {
+    max-width: 100%;
+  }
+}

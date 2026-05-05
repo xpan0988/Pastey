@@ -1,0 +1,43 @@
+[package]
+name = "pastey"
+version = "0.1.0"
+description = "Local-first encrypted paste and file transfer utility"
+authors = ["OpenAI"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+axum = { version = "0.7", features = ["json"] }
+base64 = "0.22"
+blake3 = "1.5"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+futures-util = "0.3"
+hex = "0.4"
+hkdf = "0.12"
+http = "1"
+mime_guess = "2.0"
+parking_lot = "0.12"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sanitize-filename = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-opener = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+url = "2.5"
+uuid = { version = "1", features = ["serde", "v4"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

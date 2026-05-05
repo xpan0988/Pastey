@@ -1,0 +1,256 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PayloadType {
+    Text,
+    File,
+}
+
+impl PayloadType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::File => "file",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "text" => Some(Self::Text),
+            "file" => Some(Self::File),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RoomStatus {
+    Waiting,
+    Connected,
+    Left,
+    Expired,
+    Burned,
+}
+
+impl RoomStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Connected => "connected",
+            Self::Left => "left",
+            Self::Expired => "expired",
+            Self::Burned => "burned",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "waiting" => Some(Self::Waiting),
+            "connected" => Some(Self::Connected),
+            "left" => Some(Self::Left),
+            "expired" => Some(Self::Expired),
+            "burned" => Some(Self::Burned),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalRole {
+    Creator,
+    Joined,
+}
+
+impl LocalRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Creator => "creator",
+            Self::Joined => "joined",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "creator" => Some(Self::Creator),
+            "joined" => Some(Self::Joined),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RoomItemDirection {
+    Outgoing,
+    Incoming,
+}
+
+impl RoomItemDirection {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Outgoing => "outgoing",
+            Self::Incoming => "incoming",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "outgoing" => Some(Self::Outgoing),
+            "incoming" => Some(Self::Incoming),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RoomItemStatus {
+    Created,
+    Sent,
+    Received,
+    Failed,
+}
+
+impl RoomItemStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Sent => "sent",
+            Self::Received => "received",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "created" => Some(Self::Created),
+            "sent" => Some(Self::Sent),
+            "received" => Some(Self::Received),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub default_expiry_minutes: u64,
+    pub inbox_dir: Option<String>,
+    pub auto_burn_after_download: bool,
+    pub shortcut: String,
+    pub app_data_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoomInfo {
+    pub id: String,
+    pub room_code: Option<String>,
+    pub room_code_display: Option<String>,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub status: RoomStatus,
+    pub local_role: LocalRole,
+    pub peer_device_name: Option<String>,
+    pub auto_burn_after_expiry: bool,
+    pub peer_connected: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoomItem {
+    pub id: String,
+    pub room_id: String,
+    pub direction: RoomItemDirection,
+    pub payload_type: PayloadType,
+    pub display_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub size_bytes: u64,
+    pub created_at: i64,
+    pub status: RoomItemStatus,
+    pub text: Option<String>,
+    pub saved_path: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredRoom {
+    pub id: String,
+    pub room_code_hash: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub status: RoomStatus,
+    pub local_role: LocalRole,
+    pub peer_device_name: Option<String>,
+    pub auto_burn_after_expiry: bool,
+    pub wrapped_room_code: String,
+    pub code_nonce: String,
+    pub peer_host: Option<String>,
+    pub peer_port: Option<u16>,
+    pub peer_transport_public_key: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredRoomItem {
+    pub id: String,
+    pub room_id: String,
+    pub direction: RoomItemDirection,
+    pub payload_type: PayloadType,
+    pub encrypted_path: String,
+    pub display_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub size_bytes: u64,
+    pub created_at: i64,
+    pub status: RoomItemStatus,
+    pub nonce: String,
+    pub wrapped_key: String,
+    pub key_nonce: String,
+    pub saved_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscoveryRequest {
+    pub kind: String,
+    pub request_id: String,
+    pub room_code_hash: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscoveryResponse {
+    pub kind: String,
+    pub request_id: String,
+    pub room_id: String,
+    pub port: u16,
+    pub expires_at: i64,
+    pub transport_public_key: String,
+    pub device_name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JoinRoomRequest {
+    pub port: u16,
+    pub device_name: String,
+    pub transport_public_key: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JoinRoomResponse {
+    pub device_name: String,
+    pub expires_at: i64,
+    pub transport_public_key: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoomItemUpload {
+    pub item_id: String,
+    pub payload_type: PayloadType,
+    pub display_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub size_bytes: u64,
+    pub created_at: i64,
+    pub payload_nonce: String,
+    pub wrapped_session_key: String,
+    pub transport_nonce: String,
+    pub sender_public_key: String,
+    pub encrypted_payload: String,
+}
