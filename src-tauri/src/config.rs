@@ -10,6 +10,8 @@ pub struct StoredConfig {
     pub default_expiry_minutes: u64,
     pub inbox_dir: Option<String>,
     pub auto_burn_after_download: bool,
+    #[serde(default)]
+    pub speed_limit_mbps: Option<f64>,
     pub shortcut: String,
     pub app_secret: String,
 }
@@ -17,15 +19,17 @@ pub struct StoredConfig {
 pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfig> {
     if paths.config_path.exists() {
         let content = fs::read_to_string(&paths.config_path)?;
-        let stored: StoredConfig = serde_json::from_str(&content)?;
+        let mut stored: StoredConfig = serde_json::from_str(&content)?;
+        stored.version = stored.version.max(2);
         return Ok(stored);
     }
 
     let stored = StoredConfig {
-        version: 1,
+        version: 2,
         default_expiry_minutes: 15,
         inbox_dir: None,
         auto_burn_after_download: false,
+        speed_limit_mbps: None,
         shortcut: shortcut.to_string(),
         app_secret: crypto::encode_key(&crypto::random_key()),
     };
@@ -45,8 +49,10 @@ pub fn public_config(paths: &AppPaths, config: &StoredConfig) -> AppConfig {
         default_expiry_minutes: clamp_expiry(config.default_expiry_minutes),
         inbox_dir: Some(effective_inbox_dir(paths, config).display().to_string()),
         auto_burn_after_download: config.auto_burn_after_download,
+        speed_limit_mbps: normalize_speed_limit(config.speed_limit_mbps),
         shortcut: config.shortcut.clone(),
         app_data_path: paths.app_data_dir.display().to_string(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
     }
 }
 
@@ -58,6 +64,8 @@ pub fn update(
     current.default_expiry_minutes = clamp_expiry(incoming.default_expiry_minutes);
     current.auto_burn_after_download = incoming.auto_burn_after_download;
     current.inbox_dir = normalize_inbox_dir(paths, incoming.inbox_dir.as_deref());
+    current.speed_limit_mbps = normalize_speed_limit(incoming.speed_limit_mbps);
+    current.version = 2;
     save(paths, current)?;
     Ok(public_config(paths, current))
 }
@@ -90,5 +98,14 @@ fn normalize_inbox_dir(paths: &AppPaths, value: Option<&str>) -> Option<String> 
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+fn normalize_speed_limit(value: Option<f64>) -> Option<f64> {
+    let value = value?;
+    if !value.is_finite() || value <= 0.0 {
+        None
+    } else {
+        Some(value.clamp(1.0, 10_000.0))
     }
 }

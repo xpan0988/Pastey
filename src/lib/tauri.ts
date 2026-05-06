@@ -6,6 +6,13 @@ interface SendFileOptions {
   mimeType?: string | null;
 }
 
+export interface FileTransferMetadata {
+  path: string;
+  display_name: string;
+  mime_type?: string | null;
+  size_bytes: number;
+}
+
 export async function createRoom(expiryMinutes: number): Promise<RoomInfo> {
   return invoke("create_room", { expiryMinutes });
 }
@@ -39,8 +46,20 @@ export async function sendFileToRoom(roomId: string, path: string, options?: Sen
   });
 }
 
+export async function cancelTransfer(transferId: string): Promise<boolean> {
+  return invoke("cancel_transfer", { transferId });
+}
+
 export async function writeTempFile(fileName: string, bytes: number[]): Promise<string> {
   return invoke("write_temp_file", { fileName, bytes });
+}
+
+export async function getFileTransferMetadata(path: string): Promise<FileTransferMetadata> {
+  return invoke("get_file_transfer_metadata", { path });
+}
+
+export async function deleteTempFile(path: string): Promise<boolean> {
+  return invoke("delete_temp_file", { path });
 }
 
 export async function burnRoom(roomId: string): Promise<boolean> {

@@ -1,27 +1,24 @@
 :root {
-  color-scheme: light;
+  color-scheme: dark;
   font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
   line-height: 1.4;
   font-weight: 400;
-  color: #162218;
-  background:
-    radial-gradient(circle at top left, rgba(118, 175, 133, 0.22), transparent 30%),
-    radial-gradient(circle at bottom right, rgba(209, 159, 96, 0.18), transparent 28%),
-    linear-gradient(180deg, #f7f2e9 0%, #ece6d8 100%);
+  color: #f6f4ec;
+  background: linear-gradient(145deg, #101316 0%, #1c211e 46%, #28241f 100%);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  --panel: rgba(255, 251, 245, 0.84);
-  --panel-strong: #fffdf7;
-  --ink: #162218;
-  --muted: #5a685d;
-  --line: rgba(22, 34, 24, 0.1);
-  --primary: #1f6a46;
-  --primary-strong: #164b31;
-  --accent: #dcae62;
-  --danger: #a1452b;
-  --shadow: 0 24px 60px rgba(57, 56, 44, 0.12);
+  --panel: rgba(255, 255, 255, 0.11);
+  --panel-strong: rgba(255, 255, 255, 0.17);
+  --ink: #f6f4ec;
+  --muted: #b9c1b8;
+  --line: rgba(255, 255, 255, 0.14);
+  --primary: #7bdcb5;
+  --primary-strong: #a9f3d4;
+  --accent: #f1c46d;
+  --danger: #ff8d78;
+  --shadow: 0 22px 70px rgba(0, 0, 0, 0.28);
 }
 
 * {
@@ -91,17 +88,15 @@ button {
 
 .panel {
   background: var(--panel);
-  border: 1px solid rgba(255, 255, 255, 0.55);
-  border-radius: 22px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
   padding: 20px;
   box-shadow: var(--shadow);
-  backdrop-filter: blur(16px);
+  backdrop-filter: blur(22px) saturate(1.25);
 }
 
 .hero-panel {
-  background:
-    linear-gradient(135deg, rgba(255, 253, 248, 0.88), rgba(247, 255, 250, 0.82)),
-    var(--panel);
+  background: rgba(255, 255, 255, 0.13);
 }
 
 .home-grid {
@@ -116,8 +111,8 @@ button {
   flex-direction: column;
   gap: 14px;
   padding: 18px;
-  border-radius: 20px;
-  background: rgba(255, 255, 255, 0.72);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.08);
   border: 1px solid var(--line);
 }
 
@@ -126,7 +121,7 @@ button {
   width: fit-content;
   padding: 6px 10px;
   border-radius: 999px;
-  background: rgba(31, 106, 70, 0.08);
+  background: rgba(123, 220, 181, 0.12);
   color: var(--primary);
   font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
   font-size: 0.78rem;
@@ -173,9 +168,9 @@ select,
 .path-box {
   width: 100%;
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 12px;
   padding: 12px 14px;
-  background: rgba(255, 255, 255, 0.76);
+  background: rgba(255, 255, 255, 0.1);
   color: var(--ink);
 }
 
@@ -191,29 +186,29 @@ textarea {
 
 .primary-button,
 .ghost-button {
-  border-radius: 14px;
+  border-radius: 12px;
   padding: 11px 15px;
   border: 1px solid transparent;
 }
 
 .primary-button {
-  background: var(--primary);
-  color: white;
+  background: #e9f8ee;
+  color: #162218;
 }
 
 .primary-button:hover {
-  background: var(--primary-strong);
+  background: white;
 }
 
 .ghost-button {
-  background: rgba(255, 255, 255, 0.68);
+  background: rgba(255, 255, 255, 0.1);
   border-color: var(--line);
   color: var(--ink);
 }
 
 .strong-ghost {
-  background: rgba(31, 106, 70, 0.08);
-  border-color: rgba(31, 106, 70, 0.18);
+  background: rgba(123, 220, 181, 0.14);
+  border-color: rgba(123, 220, 181, 0.25);
   color: var(--primary-strong);
 }
 
@@ -239,10 +234,10 @@ textarea {
 }
 
 .drop-zone {
-  border: 1.5px dashed rgba(31, 106, 70, 0.35);
-  border-radius: 18px;
+  border: 1.5px dashed rgba(123, 220, 181, 0.42);
+  border-radius: 16px;
   padding: 20px 18px;
-  background: linear-gradient(180deg, rgba(245, 255, 248, 0.82), rgba(255, 255, 255, 0.42));
+  background: rgba(255, 255, 255, 0.07);
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -258,7 +253,7 @@ textarea {
   display: inline-flex;
   gap: 8px;
   align-items: center;
-  background: rgba(255, 255, 255, 0.62);
+  background: rgba(255, 255, 255, 0.1);
   border: 1px solid var(--line);
   padding: 8px 12px;
   border-radius: 999px;
@@ -287,10 +282,10 @@ h3 {
 
 .error-box {
   padding: 12px 14px;
-  border-radius: 14px;
-  background: rgba(161, 69, 43, 0.1);
-  color: #7e2f19;
-  border: 1px solid rgba(161, 69, 43, 0.2);
+  border-radius: 12px;
+  background: rgba(255, 141, 120, 0.12);
+  color: #ffd4cc;
+  border: 1px solid rgba(255, 141, 120, 0.28);
 }
 
 .toggle-row {
@@ -312,7 +307,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: 18px;
   padding: 16px;
-  background: rgba(255, 255, 255, 0.7);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .pill {
@@ -328,21 +323,30 @@ h3 {
 
 .pill.connected {
   color: var(--primary-strong);
-  background: rgba(31, 106, 70, 0.08);
-  border-color: rgba(31, 106, 70, 0.18);
+  background: rgba(123, 220, 181, 0.12);
+  border-color: rgba(123, 220, 181, 0.24);
 }
 
 .pill.waiting {
-  color: #7a5e25;
-  background: rgba(220, 174, 98, 0.14);
-  border-color: rgba(220, 174, 98, 0.25);
+  color: #ffe0a2;
+  background: rgba(241, 196, 109, 0.14);
+  border-color: rgba(241, 196, 109, 0.24);
+}
+
+.pill.completed {
+  color: var(--primary-strong);
+}
+
+.pill.failed,
+.pill.cancelled {
+  color: var(--danger);
 }
 
 .empty-state {
   padding: 18px;
   border-radius: 16px;
-  background: rgba(255, 255, 255, 0.56);
-  border: 1px dashed rgba(22, 34, 24, 0.12);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px dashed rgba(255, 255, 255, 0.14);
   color: var(--muted);
 }
 
@@ -375,7 +379,7 @@ h3 {
   gap: 6px;
   padding: 14px;
   border-radius: 18px;
-  background: rgba(255, 255, 255, 0.68);
+  background: rgba(255, 255, 255, 0.08);
   border: 1px solid var(--line);
 }
 
@@ -423,14 +427,14 @@ h3 {
 
 .message-row.outgoing .message-bubble,
 .message-row.outgoing .file-card {
-  background: linear-gradient(180deg, rgba(31, 106, 70, 0.9), rgba(27, 89, 59, 0.92));
-  color: white;
+  background: rgba(123, 220, 181, 0.18);
+  color: var(--ink);
   border-color: transparent;
 }
 
 .message-row.incoming .message-bubble,
 .message-row.incoming .file-card {
-  background: rgba(255, 255, 255, 0.82);
+  background: rgba(255, 255, 255, 0.1);
 }
 
 .message-topline {
@@ -467,6 +471,65 @@ h3 {
   border-radius: 14px;
   border: 1px solid var(--line);
   background: white;
+}
+
+.settings-grid,
+.transfer-list {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.tight {
+  gap: 4px;
+}
+
+.compact-button {
+  padding: 8px 11px;
+}
+
+.transfer-list {
+  margin-bottom: 14px;
+}
+
+.transfer-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.progress-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #7bdcb5, #f1c46d);
+  transition: width 160ms ease;
+}
+
+.transfer-stats {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.transfer-error {
+  color: #ffd4cc;
+  font-size: 0.9rem;
 }
 
 .composer-panel {

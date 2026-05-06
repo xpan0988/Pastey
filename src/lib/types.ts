@@ -6,7 +6,9 @@ export type LocalRole = "creator" | "joined";
 
 export type RoomItemDirection = "outgoing" | "incoming";
 
-export type RoomItemStatus = "created" | "sent" | "received" | "failed";
+export type RoomItemStatus = "created" | "sent" | "received" | "failed" | "cancelled";
+
+export type TransferStatus = "pending" | "transferring" | "completed" | "failed" | "cancelled";
 
 export interface RoomInfo {
   id: string;
@@ -41,6 +43,25 @@ export interface AppConfig {
   default_expiry_minutes: number;
   inbox_dir?: string | null;
   auto_burn_after_download: boolean;
+  speed_limit_mbps?: number | null;
   shortcut: string;
   app_data_path: string;
+  app_version: string;
+}
+
+export interface FileTransferProgressEvent {
+  transfer_id: string;
+  room_id: string;
+  item_id: string;
+  direction: RoomItemDirection;
+  file_name: string;
+  file_size: number;
+  chunk_size: number;
+  total_chunks: number;
+  transferred_bytes: number;
+  status: TransferStatus;
+  current_speed_bps: number;
+  average_speed_bps: number;
+  eta_seconds?: number | null;
+  error_message?: string | null;
 }

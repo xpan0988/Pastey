@@ -1,5 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
+use serde::Serialize;
 use tauri::{AppHandle, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
@@ -10,6 +11,14 @@ use crate::{
     models::{AppConfig, LocalRole, RoomInfo, RoomItem},
     storage, transfer, AppState,
 };
+
+#[derive(Serialize)]
+pub struct FileTransferMetadata {
+    path: String,
+    display_name: String,
+    mime_type: Option<String>,
+    size_bytes: u64,
+}
 
 #[tauri::command]
 pub async fn create_room(
@@ -127,10 +136,15 @@ pub async fn list_room_items(
             config::master_key(&config)?
         };
         let items = storage::list_room_items(&state.paths, &room_id)?;
-        items
-            .into_iter()
-            .map(|item| storage::room_item_to_info(&state.paths, &master_key, item))
-            .collect()
+        let mut result = Vec::with_capacity(items.len());
+        for item in items {
+            match storage::room_item_to_info(&state.paths, &master_key, item) {
+                Ok(item) => result.push(item),
+                Err(AppError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(result)
     })
     .await
 }
@@ -180,7 +194,12 @@ pub async fn send_file_to_room(
             display_name,
             mime_type,
         )?;
-        transfer::send_room_item(state.inner().clone(), &room_id, &item.id).await?;
+        if let Err(error) =
+            transfer::send_room_file(state.inner().clone(), &room_id, &item.id, &file_path).await
+        {
+            let _ = storage::delete_room_item(&state.paths, &item.id);
+            return Err(error);
+        }
         let stored = storage::get_room_item_by_id(&state.paths, &item.id)?;
         storage::room_item_to_info(&state.paths, &master_key, stored)
     })
@@ -199,11 +218,41 @@ pub fn write_temp_file(
 }
 
 #[tauri::command]
+pub fn get_file_transfer_metadata(path: String) -> Result<FileTransferMetadata, String> {
+    let file_path = resolve_user_path(&path).map_err(|error| error.message())?;
+    if !file_path.is_file() {
+        return Err(AppError::InvalidInput("selected path is not a file".into()).message());
+    }
+
+    let (display_name, mime_type, size_bytes) =
+        storage::file_transfer_metadata(&file_path).map_err(|error| error.message())?;
+    Ok(FileTransferMetadata {
+        path,
+        display_name,
+        mime_type,
+        size_bytes,
+    })
+}
+
+#[tauri::command]
+pub fn delete_temp_file(path: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
+    let file_path = resolve_user_path(&path).map_err(|error| error.message())?;
+    storage::delete_temp_file(&state.paths, &file_path).map_err(|error| error.message())
+}
+
+#[tauri::command]
 pub async fn burn_room(room_id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
     run_async(async move {
         let peer = storage::get_room_by_id(&state.paths, &room_id)
             .ok()
             .and_then(|room| room.peer_host.zip(room.peer_port));
+        transfer::cancel_room_transfers(
+            state.inner().clone(),
+            &room_id,
+            "Transfer cancelled.",
+            true,
+        )
+        .await;
         let removed = storage::burn_room(&state.paths, &room_id)?.is_some();
         let _ = transfer::stop_room_server(state.inner().clone(), &room_id).await;
         if let Some((peer_host, peer_port)) = peer {
@@ -217,12 +266,28 @@ pub async fn burn_room(room_id: String, state: State<'_, Arc<AppState>>) -> Resu
 #[tauri::command]
 pub async fn leave_room(room_id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
     run_async(async move {
+        transfer::cancel_room_transfers(
+            state.inner().clone(),
+            &room_id,
+            "Transfer cancelled.",
+            true,
+        )
+        .await;
         transfer::notify_room_leave(state.inner().clone(), &room_id).await;
         let removed = storage::leave_room(&state.paths, &room_id)?.is_some();
         let _ = transfer::stop_room_server(state.inner().clone(), &room_id).await;
         Ok(removed)
     })
     .await
+}
+
+#[tauri::command]
+pub async fn cancel_transfer(
+    transfer_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    run_async(async move { transfer::cancel_transfer(state.inner().clone(), &transfer_id).await })
+        .await
 }
 
 #[tauri::command]

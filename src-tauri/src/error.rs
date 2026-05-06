@@ -32,6 +32,30 @@ pub enum AppError {
 
 impl AppError {
     pub fn message(&self) -> String {
-        self.to_string()
+        match self {
+            Self::InvalidInput(message)
+            | Self::NotFound(message)
+            | Self::Timeout(message)
+            | Self::Network(message)
+            | Self::Crypto(message) => message.clone(),
+            Self::Io(error) => match error.kind() {
+                std::io::ErrorKind::NotFound => "File is no longer available.".to_string(),
+                std::io::ErrorKind::PermissionDenied => {
+                    "Could not read or write that file. Check folder permissions.".to_string()
+                }
+                std::io::ErrorKind::WriteZero => {
+                    "Could not write to destination folder.".to_string()
+                }
+                _ => "File transfer failed because the file could not be read or written."
+                    .to_string(),
+            },
+            Self::Sql(_) | Self::Json(_) => "Could not update local pastey storage.".to_string(),
+            Self::Http(error) if error.is_timeout() => "Network connection lost.".to_string(),
+            Self::Http(error) if error.is_connect() => "Peer left the room.".to_string(),
+            Self::Http(_) => "Network connection lost.".to_string(),
+            Self::Url(_) => "Selected file path is invalid.".to_string(),
+            Self::Utf8(_) => "Received text was not valid UTF-8.".to_string(),
+            Self::Base64(_) => "Received payload was not valid.".to_string(),
+        }
     }
 }

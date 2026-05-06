@@ -20,9 +20,10 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 
 use crate::{
     commands::{
-        burn_room, copy_text_to_clipboard, create_room, get_config, get_room, join_room,
-        leave_room, list_room_items, list_rooms, reveal_in_folder, send_file_to_room,
-        send_text_to_room, update_config, write_temp_file,
+        burn_room, cancel_transfer, copy_text_to_clipboard, create_room, delete_temp_file,
+        get_config, get_file_transfer_metadata, get_room, join_room, leave_room, list_room_items,
+        list_rooms, reveal_in_folder, send_file_to_room, send_text_to_room, update_config,
+        write_temp_file,
     },
     config::StoredConfig,
     error::{AppError, AppResult},
@@ -30,9 +31,11 @@ use crate::{
 };
 
 pub struct AppState {
+    pub app_handle: AppHandle,
     pub paths: AppPaths,
     pub config: RwLock<StoredConfig>,
     pub active_servers: Mutex<HashMap<String, ActiveRoomServer>>,
+    pub active_file_transfers: Mutex<HashMap<String, transfer::ActiveFileTransfer>>,
     pub discovery_handle: Mutex<Option<DiscoveryHandle>>,
 }
 
@@ -66,11 +69,14 @@ fn main() {
             let paths = storage::init_app_paths(&app.handle())?;
             storage::init_database(&paths)?;
             storage::mark_rooms_left_on_startup(&paths)?;
+            storage::cleanup_stale_part_files(&paths)?;
             let config = config::load_or_create(&paths, shortcut_label)?;
             let state = Arc::new(AppState {
+                app_handle: app.handle().clone(),
                 paths,
                 config: RwLock::new(config),
                 active_servers: Mutex::new(HashMap::new()),
+                active_file_transfers: Mutex::new(HashMap::new()),
                 discovery_handle: Mutex::new(None),
             });
 
@@ -94,7 +100,10 @@ fn main() {
             list_room_items,
             send_text_to_room,
             send_file_to_room,
+            cancel_transfer,
             write_temp_file,
+            get_file_transfer_metadata,
+            delete_temp_file,
             burn_room,
             leave_room,
             get_config,

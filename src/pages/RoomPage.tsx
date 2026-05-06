@@ -1,16 +1,24 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent } from "react";
-import { copyTextToClipboard, revealInFolder, sendFileToRoom, sendTextToRoom, writeTempFile } from "../lib/tauri";
-import { formatBytes, formatRelativeExpiry, formatTimestamp } from "../lib/format";
-import type { RoomInfo, RoomItem } from "../lib/types";
+import {
+  cancelTransfer,
+  copyTextToClipboard,
+  deleteTempFile,
+  getFileTransferMetadata,
+  revealInFolder,
+  sendFileToRoom,
+  sendTextToRoom,
+  writeTempFile
+} from "../lib/tauri";
+import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
+import { fileTypeLabel, formatBytes, formatDuration, formatRelativeExpiry, formatSpeed, formatTimestamp } from "../lib/format";
+import type { FileTransferProgressEvent, RoomInfo, RoomItem } from "../lib/types";
 import { DropZone } from "../components/DropZone";
-
-const MAX_FILE_SIZE = 512 * 1024 * 1024;
-const FILE_TOO_LARGE_MESSAGE = "File too large. Max supported size: 512MB (MVP limit).";
 
 interface RoomPageProps {
   room: RoomInfo;
   items: RoomItem[];
+  transfers: FileTransferProgressEvent[];
   onBack: () => void;
   onRefresh: () => Promise<void>;
   onBurn: (roomId: string) => Promise<void>;
@@ -20,6 +28,7 @@ interface RoomPageProps {
 export function RoomPage({
   room,
   items,
+  transfers,
   onBack,
   onRefresh,
   onBurn,
@@ -28,6 +37,8 @@ export function RoomPage({
   const [text, setText] = useState("");
   const [busy, setBusy] = useState<"text" | "file" | "burn" | "leave" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [activeFileKey, setActiveFileKey] = useState<string | null>(null);
+  const [cancellingTransferId, setCancellingTransferId] = useState<string | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
@@ -35,6 +46,10 @@ export function RoomPage({
   }, [room.id]);
 
   useEffect(() => {
+    if (busy === "burn" || room.status === "burned" || room.status === "expired") {
+      return;
+    }
+
     let cancelled = false;
     const interval = window.setInterval(() => {
       if (!cancelled) {
@@ -46,12 +61,13 @@ export function RoomPage({
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [onRefresh, room.id]);
+  }, [busy, onRefresh, room.id, room.status]);
 
   async function handleSendText() {
     if (!text.trim()) return;
     setBusy("text");
     setError(null);
+    setCancellingTransferId(null);
 
     try {
       await sendTextToRoom(room.id, text);
@@ -65,20 +81,42 @@ export function RoomPage({
   }
 
   async function handleSendFile(path: string) {
-    await sendFileMessage({ path });
+    try {
+      const metadata = await getFileTransferMetadata(path);
+      if (metadata.size_bytes > MAX_FILE_SIZE_BYTES) {
+        setError(FILE_TOO_LARGE_MESSAGE);
+        return;
+      }
+
+      await sendFileMessage({
+        path,
+        displayName: metadata.display_name,
+        mimeType: metadata.mime_type,
+        fileKey: `${metadata.path}:${metadata.size_bytes}`
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   async function sendFileMessage({
     path,
     displayName,
-    mimeType
+    mimeType,
+    fileKey
   }: {
     path: string;
     displayName?: string;
     mimeType?: string | null;
+    fileKey?: string;
   }) {
+    if (fileKey && activeFileKey === fileKey) {
+      return;
+    }
+
     setBusy("file");
     setError(null);
+    setActiveFileKey(fileKey ?? null);
 
     try {
       await sendFileToRoom(room.id, path, { displayName, mimeType });
@@ -86,31 +124,36 @@ export function RoomPage({
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
+      setActiveFileKey(null);
       setBusy(null);
     }
   }
 
   async function handleSendPastedImage(file: File) {
-    if (file.size > MAX_FILE_SIZE) {
+    if (file.size > MAX_FILE_SIZE_BYTES) {
       setError(FILE_TOO_LARGE_MESSAGE);
       return;
     }
 
-    setBusy("file");
-    setError(null);
+    const fileKey = `${file.name}:${file.size}:${file.lastModified}`;
+    if (activeFileKey === fileKey) {
+      return;
+    }
 
+    let tempPath: string | null = null;
     try {
       const buffer = await file.arrayBuffer();
-      const tempPath = await writeTempFile(file.name, Array.from(new Uint8Array(buffer)));
-      await sendFileToRoom(room.id, tempPath, {
+      tempPath = await writeTempFile(file.name, Array.from(new Uint8Array(buffer)));
+      await sendFileMessage({
+        path: tempPath,
         displayName: file.name,
-        mimeType: file.type || "image/png"
+        mimeType: file.type || "image/png",
+        fileKey
       });
-      await onRefresh();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy(null);
+      if (tempPath) {
+        void deleteTempFile(tempPath);
+      }
     }
   }
 
@@ -149,6 +192,7 @@ export function RoomPage({
   }
 
   async function handleBurnRoom() {
+    setError(null);
     setBusy("burn");
     try {
       await onBurn(room.id);
@@ -158,11 +202,25 @@ export function RoomPage({
   }
 
   async function handleLeaveRoom() {
+    setError(null);
     setBusy("leave");
     try {
       await onLeave(room.id);
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function handleCancelTransfer(transferId: string) {
+    setCancellingTransferId(transferId);
+    setError(null);
+    try {
+      await cancelTransfer(transferId);
+      await onRefresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCancellingTransferId(null);
     }
   }
 
@@ -190,7 +248,7 @@ export function RoomPage({
             </button>
             <h2>{room.room_code_display ?? room.room_code ?? "Room"}</h2>
             <p className="muted">
-              {room.local_role === "creator" ? "Share this code once, then keep chatting." : "Joined transfer room."}
+              {room.local_role === "creator" ? "Share this code once, then transfer." : "Joined transfer room."}
             </p>
           </div>
 
@@ -227,6 +285,19 @@ export function RoomPage({
       </section>
 
       <section className="panel chat-panel">
+        {transfers.length > 0 ? (
+          <div className="transfer-list">
+            {transfers.map((transfer) => (
+              <TransferCard
+                key={transfer.transfer_id}
+                transfer={transfer}
+                cancelling={cancellingTransferId === transfer.transfer_id}
+                onCancel={handleCancelTransfer}
+              />
+            ))}
+          </div>
+        ) : null}
+
         <div className="message-list">
           {items.length === 0 ? <div className="empty-state">No messages yet. Send text, a file, or an image.</div> : null}
           {items.map((item) => (
@@ -276,10 +347,53 @@ export function RoomPage({
           <span className="muted">Press Enter to send. Use Shift + Enter for a new line. Paste screenshots with Ctrl+V.</span>
         </div>
 
-        <DropZone onPick={handleSendFile} />
+        <DropZone onPick={handleSendFile} disabled={busy !== null || !room.peer_connected} />
 
         {error ? <div className="error-box">{error}</div> : null}
       </section>
+    </div>
+  );
+}
+
+interface TransferCardProps {
+  transfer: FileTransferProgressEvent;
+  cancelling: boolean;
+  onCancel: (transferId: string) => Promise<void>;
+}
+
+function TransferCard({ transfer, cancelling, onCancel }: TransferCardProps) {
+  const percent = transfer.file_size > 0 ? Math.min(100, (transfer.transferred_bytes / transfer.file_size) * 100) : 0;
+  const canCancel = transfer.status === "pending" || transfer.status === "transferring";
+  const statusLabel = transfer.status === "transferring" ? "Transferring" : transfer.status;
+
+  return (
+    <div className={`transfer-card ${transfer.status}`}>
+      <div className="row spread gap">
+        <div className="subtle-stack tight">
+          <strong>{transfer.file_name}</strong>
+          <span className="muted">
+            {formatBytes(transfer.transferred_bytes)} / {formatBytes(transfer.file_size)}
+            {" • "}
+            {Math.round(percent)}%
+          </span>
+        </div>
+        {canCancel ? (
+          <button className="ghost-button danger compact-button" onClick={() => void onCancel(transfer.transfer_id)} disabled={cancelling}>
+            {cancelling ? "Cancelling..." : "Cancel"}
+          </button>
+        ) : (
+          <span className={`pill ${transfer.status}`}>{statusLabel}</span>
+        )}
+      </div>
+      <div className="progress-track">
+        <div className="progress-fill" style={{ width: `${percent}%` }} />
+      </div>
+      <div className="transfer-stats">
+        <span>{formatSpeed(transfer.current_speed_bps)}</span>
+        <span>Avg {formatSpeed(transfer.average_speed_bps)}</span>
+        <span>ETA {formatDuration(transfer.eta_seconds)}</span>
+      </div>
+      {transfer.error_message ? <div className="transfer-error">{transfer.error_message}</div> : null}
     </div>
   );
 }
@@ -319,7 +433,10 @@ function MessageRow({ item, onCopyText, onReveal }: MessageRowProps) {
             <strong>{item.display_name ?? "file"}</strong>
             <span className="muted">
               {formatBytes(item.size_bytes)}
-              {item.mime_type ? ` • ${item.mime_type}` : ""}
+              {" • "}
+              {fileTypeLabel(item.display_name, item.mime_type)}
+              {item.status === "cancelled" ? " • cancelled" : ""}
+              {item.status === "failed" ? " • failed" : ""}
             </span>
             {imagePreview ? <img className="image-preview chat-image" src={imagePreview} alt={item.display_name ?? "Preview"} /> : null}
             {item.saved_path ? (

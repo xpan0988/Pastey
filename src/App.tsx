@@ -5,7 +5,7 @@ import { RoomPage } from "./pages/RoomPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { TrayStatus } from "./components/TrayStatus";
 import { burnRoom, getConfig, getRoom, leaveRoom, listRoomItems, listRooms } from "./lib/tauri";
-import type { AppConfig, RoomInfo, RoomItem } from "./lib/types";
+import type { AppConfig, FileTransferProgressEvent, RoomInfo, RoomItem } from "./lib/types";
 
 type View =
   | { screen: "home" }
@@ -22,6 +22,7 @@ function App() {
   const [rooms, setRooms] = useState<RoomInfo[]>([]);
   const [currentRoom, setCurrentRoom] = useState<RoomInfo | null>(null);
   const [roomItems, setRoomItems] = useState<RoomItem[]>([]);
+  const [transfers, setTransfers] = useState<Record<string, FileTransferProgressEvent>>({});
   const [focusToken, setFocusToken] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
@@ -41,6 +42,7 @@ function App() {
 
   useEffect(() => {
     let unlistenFocus: (() => void) | undefined;
+    let unlistenTransfer: (() => void) | undefined;
 
     void listen<FocusPayload>("pastey://focus", (event) => {
       const target = event.payload.target ?? "home";
@@ -50,10 +52,23 @@ function App() {
       unlistenFocus = fn;
     });
 
+    void listen<FileTransferProgressEvent>("pastey://transfer-progress", (event) => {
+      setTransfers((current) => ({
+        ...current,
+        [event.payload.transfer_id]: event.payload
+      }));
+      if (event.payload.status === "completed") {
+        void refreshCurrentRoom();
+      }
+    }).then((fn) => {
+      unlistenTransfer = fn;
+    });
+
     return () => {
       if (unlistenFocus) unlistenFocus();
+      if (unlistenTransfer) unlistenTransfer();
     };
-  }, []);
+  }, [view]);
 
   const activeCount = useMemo(
     () => rooms.length,
@@ -97,7 +112,21 @@ function App() {
         setRoomItems([]);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      if (
+        message === "room not found" ||
+        message === "File is no longer available" ||
+        message === "File is no longer available." ||
+        message === "Peer left the room" ||
+        message === "Peer left the room."
+      ) {
+        setView({ screen: "home" });
+        setCurrentRoom(null);
+        setRoomItems([]);
+        return;
+      }
+
+      setError(message);
     }
   }
 
@@ -106,6 +135,7 @@ function App() {
     setView({ screen: "home" });
     setCurrentRoom(null);
     setRoomItems([]);
+    setTransfers((current) => Object.fromEntries(Object.entries(current).filter(([, transfer]) => transfer.room_id !== roomId)));
     await refreshRooms();
   }
 
@@ -114,6 +144,7 @@ function App() {
     setView({ screen: "home" });
     setCurrentRoom(null);
     setRoomItems([]);
+    setTransfers((current) => Object.fromEntries(Object.entries(current).filter(([, transfer]) => transfer.room_id !== roomId)));
     await refreshRooms();
   }
 
@@ -152,6 +183,7 @@ function App() {
           <RoomPage
             room={currentRoom}
             items={roomItems}
+            transfers={Object.values(transfers).filter((transfer) => transfer.room_id === currentRoom.id)}
             onBack={() => {
               setView({ screen: "home" });
               void refreshRooms();

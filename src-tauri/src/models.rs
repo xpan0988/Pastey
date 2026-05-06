@@ -112,6 +112,7 @@ pub enum RoomItemStatus {
     Sent,
     Received,
     Failed,
+    Cancelled,
 }
 
 impl RoomItemStatus {
@@ -121,6 +122,7 @@ impl RoomItemStatus {
             Self::Sent => "sent",
             Self::Received => "received",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -130,6 +132,7 @@ impl RoomItemStatus {
             "sent" => Some(Self::Sent),
             "received" => Some(Self::Received),
             "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -140,8 +143,10 @@ pub struct AppConfig {
     pub default_expiry_minutes: u64,
     pub inbox_dir: Option<String>,
     pub auto_burn_after_download: bool,
+    pub speed_limit_mbps: Option<f64>,
     pub shortcut: String,
     pub app_data_path: String,
+    pub app_version: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -257,6 +262,44 @@ pub struct RoomItemUpload {
     pub transport_nonce: String,
     pub sender_public_key: String,
     pub encrypted_payload: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileTransferStartRequest {
+    pub transfer_id: String,
+    pub item_id: String,
+    pub display_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub size_bytes: u64,
+    pub chunk_size: u64,
+    pub total_chunks: u64,
+    pub created_at: i64,
+    pub wrapped_session_key: String,
+    pub transport_nonce: String,
+    pub sender_public_key: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileTransferFinishRequest {
+    pub item_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileTransferProgressEvent {
+    pub transfer_id: String,
+    pub room_id: String,
+    pub item_id: String,
+    pub direction: String,
+    pub file_name: String,
+    pub file_size: u64,
+    pub chunk_size: u64,
+    pub total_chunks: u64,
+    pub transferred_bytes: u64,
+    pub status: String,
+    pub current_speed_bps: f64,
+    pub average_speed_bps: f64,
+    pub eta_seconds: Option<f64>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

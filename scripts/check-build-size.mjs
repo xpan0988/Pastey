@@ -184,11 +184,17 @@ async function walkArtifacts(currentPath, artifacts, seen) {
   const parentDir = path.dirname(currentPath);
   const isBundleLikeFile =
     parentDir.includes(`${path.sep}bundle${path.sep}`) &&
+    !currentPath.includes(`${path.sep}share${path.sep}`) &&
     !currentPath.endsWith(".sig") &&
     !currentPath.endsWith(".json") &&
     !currentPath.endsWith(".yml") &&
     !currentPath.endsWith(".yaml") &&
-    !currentPath.endsWith(".txt");
+    !currentPath.endsWith(".txt") &&
+    !currentPath.endsWith(".sh") &&
+    !currentPath.endsWith(".icns") &&
+    !currentPath.endsWith(".xml") &&
+    !currentPath.endsWith(".applescript") &&
+    path.basename(currentPath) !== ".DS_Store";
 
   if (isBundleLikeFile && !seen.has(currentPath)) {
     seen.add(currentPath);

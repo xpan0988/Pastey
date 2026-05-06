@@ -19,8 +19,9 @@ use crate::{
     },
 };
 
-pub const MAX_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
-pub const MAX_FILE_SIZE_MESSAGE: &str = "File too large. Max supported size: 512MB (MVP limit).";
+pub const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub const MAX_FILE_SIZE_MESSAGE: &str = "File too large. Max supported size: 10GB.";
+const STALE_PART_FILE_AGE_SECS: i64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -432,9 +433,8 @@ pub fn create_outgoing_file_item_with_metadata(
     display_name: Option<String>,
     mime_type: Option<String>,
 ) -> AppResult<StoredRoomItem> {
-    validate_file_size(fs::metadata(file_path)?.len())?;
-    let bytes = fs::read(file_path)?;
-    validate_file_size(bytes.len() as u64)?;
+    let size_bytes = fs::metadata(file_path)?.len();
+    validate_file_size(size_bytes)?;
     let file_name = display_name
         .map(sanitize)
         .filter(|value| !value.is_empty())
@@ -452,19 +452,37 @@ pub fn create_outgoing_file_item_with_metadata(
             .or_else(|| Some("application/octet-stream".to_string()))
     });
 
-    persist_room_item(
+    persist_room_item_with_size(
         paths,
         master_key,
         room_id,
         PayloadType::File,
         RoomItemDirection::Outgoing,
-        &bytes,
+        &[],
+        size_bytes,
         file_name,
         resolved_mime_type,
         RoomItemStatus::Created,
         None,
         None,
     )
+}
+
+pub fn file_transfer_metadata(file_path: &Path) -> AppResult<(String, Option<String>, u64)> {
+    let metadata = fs::metadata(file_path)?;
+    validate_file_size(metadata.len())?;
+    let display_name = file_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(sanitize)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("selected path is not a file".into()))?;
+    let mime_type = MimeGuess::from_path(file_path)
+        .first_raw()
+        .map(ToString::to_string)
+        .or_else(|| Some("application/octet-stream".to_string()));
+
+    Ok((display_name, mime_type, metadata.len()))
 }
 
 pub fn validate_file_size(size_bytes: u64) -> AppResult<()> {
@@ -489,6 +507,16 @@ pub fn write_temp_file(paths: &AppPaths, file_name: &str, bytes: &[u8]) -> AppRe
         .join(format!("{}_{}", Uuid::new_v4(), fallback_name));
     fs::write(&temp_path, bytes)?;
     Ok(temp_path)
+}
+
+pub fn delete_temp_file(paths: &AppPaths, file_path: &Path) -> AppResult<bool> {
+    if !file_path.starts_with(&paths.temp_dir) {
+        return Err(AppError::InvalidInput(
+            "temp file path is outside pastey temp storage".into(),
+        ));
+    }
+
+    remove_file_if_exists(file_path)
 }
 
 pub fn persist_incoming_item(
@@ -518,6 +546,33 @@ pub fn persist_incoming_item(
     )
 }
 
+pub fn persist_incoming_file_item_metadata(
+    paths: &AppPaths,
+    master_key: &[u8; 32],
+    room_id: &str,
+    item_id: &str,
+    size_bytes: u64,
+    display_name: Option<String>,
+    mime_type: Option<String>,
+    created_at: i64,
+    saved_path: Option<String>,
+) -> AppResult<StoredRoomItem> {
+    persist_room_item_with_size(
+        paths,
+        master_key,
+        room_id,
+        PayloadType::File,
+        RoomItemDirection::Incoming,
+        &[],
+        size_bytes,
+        display_name,
+        mime_type,
+        RoomItemStatus::Received,
+        Some(item_id.to_string()),
+        Some((created_at, saved_path)),
+    )
+}
+
 pub fn set_room_item_status(
     paths: &AppPaths,
     item_id: &str,
@@ -537,13 +592,13 @@ pub fn burn_room(paths: &AppPaths, room_id: &str) -> AppResult<Option<StoredRoom
         return Ok(None);
     }
 
-    delete_room_payloads(paths, room_id)?;
     let conn = connection(paths)?;
-    conn.execute("DELETE FROM room_items WHERE room_id = ?1", [room_id])?;
     conn.execute(
         "UPDATE rooms SET status = 'burned', peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL, local_burned_at = ?1 WHERE id = ?2",
         params![now_ts(), room_id],
     )?;
+    delete_room_payloads(paths, room_id)?;
+    conn.execute("DELETE FROM room_items WHERE room_id = ?1", [room_id])?;
     Ok(room)
 }
 
@@ -576,6 +631,12 @@ pub fn cleanup_expired_rooms(paths: &AppPaths) -> AppResult<Vec<String>> {
     }
 
     Ok(room_ids)
+}
+
+pub fn cleanup_stale_part_files(paths: &AppPaths) -> AppResult<()> {
+    cleanup_stale_part_files_in_dir(&paths.inbox_dir)?;
+    cleanup_stale_part_files_in_dir(&paths.temp_dir)?;
+    Ok(())
 }
 
 pub fn mark_rooms_left_on_startup(paths: &AppPaths) -> AppResult<()> {
@@ -634,7 +695,8 @@ pub fn room_item_to_info(
     let text = if item.payload_type == PayloadType::Text {
         let key = read_room_item_key(&item, master_key)?;
         let nonce = crypto::decode_nonce(&item.nonce)?;
-        let encrypted = fs::read(encrypted_file_path(paths, &item.encrypted_path))?;
+        let encrypted = fs::read(encrypted_file_path(paths, &item.encrypted_path))
+            .map_err(map_missing_payload_error)?;
         let plaintext = crypto::decrypt_bytes(&encrypted, &key, &nonce)?;
         Some(String::from_utf8(plaintext)?)
     } else {
@@ -667,7 +729,7 @@ pub fn next_inbox_path(base_dir: &Path, display_name: Option<&str>) -> AppResult
     };
 
     let candidate = base_dir.join(&fallback);
-    if !candidate.exists() {
+    if !candidate.exists() && !part_path_for(&candidate).exists() {
         return Ok(candidate);
     }
 
@@ -683,12 +745,12 @@ pub fn next_inbox_path(base_dir: &Path, display_name: Option<&str>) -> AppResult
 
     for index in 1..1000 {
         let file_name = if ext.is_empty() {
-            format!("{stem}_{index}")
+            format!("{stem} ({index})")
         } else {
-            format!("{stem}_{index}.{ext}")
+            format!("{stem} ({index}).{ext}")
         };
         let next = base_dir.join(file_name);
-        if !next.exists() {
+        if !next.exists() && !part_path_for(&next).exists() {
             return Ok(next);
         }
     }
@@ -696,6 +758,14 @@ pub fn next_inbox_path(base_dir: &Path, display_name: Option<&str>) -> AppResult
     Err(AppError::InvalidInput(
         "unable to allocate inbox file name".into(),
     ))
+}
+
+pub fn part_path_for(final_path: &Path) -> PathBuf {
+    let file_name = final_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("pastey_file");
+    final_path.with_file_name(format!("{file_name}.part"))
 }
 
 pub fn now_ts() -> i64 {
@@ -712,6 +782,36 @@ fn persist_room_item(
     payload_type: PayloadType,
     direction: RoomItemDirection,
     plaintext: &[u8],
+    display_name: Option<String>,
+    mime_type: Option<String>,
+    status: RoomItemStatus,
+    item_id_override: Option<String>,
+    created_saved_override: Option<(i64, Option<String>)>,
+) -> AppResult<StoredRoomItem> {
+    persist_room_item_with_size(
+        paths,
+        master_key,
+        room_id,
+        payload_type,
+        direction,
+        plaintext,
+        plaintext.len() as u64,
+        display_name,
+        mime_type,
+        status,
+        item_id_override,
+        created_saved_override,
+    )
+}
+
+fn persist_room_item_with_size(
+    paths: &AppPaths,
+    master_key: &[u8; 32],
+    room_id: &str,
+    payload_type: PayloadType,
+    direction: RoomItemDirection,
+    plaintext: &[u8],
+    size_bytes: u64,
     display_name: Option<String>,
     mime_type: Option<String>,
     status: RoomItemStatus,
@@ -739,7 +839,7 @@ fn persist_room_item(
         encrypted_path: relative_path,
         display_name,
         mime_type,
-        size_bytes: plaintext.len() as u64,
+        size_bytes,
         created_at,
         status,
         nonce: crypto::encode_nonce(&payload_nonce),
@@ -749,7 +849,7 @@ fn persist_room_item(
     };
 
     let conn = connection(paths)?;
-    conn.execute(
+    if let Err(error) = conn.execute(
         r#"
         INSERT INTO room_items (
             id,
@@ -785,9 +885,59 @@ fn persist_room_item(
             item.key_nonce,
             item.saved_path
         ],
-    )?;
+    ) {
+        let _ = remove_file_if_exists(&absolute_path);
+        return Err(error.into());
+    }
 
     Ok(item)
+}
+
+fn cleanup_stale_part_files_in_dir(dir: &Path) -> AppResult<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".part") {
+            continue;
+        }
+
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        if now_ts().saturating_sub(modified) >= STALE_PART_FILE_AGE_SECS {
+            let _ = remove_file_if_exists(&path);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn delete_room_item(paths: &AppPaths, item_id: &str) -> AppResult<bool> {
+    let item = match get_room_item_by_id(paths, item_id) {
+        Ok(item) => item,
+        Err(AppError::NotFound(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+
+    delete_payload_file(paths, &item.encrypted_path)?;
+    let conn = connection(paths)?;
+    conn.execute("DELETE FROM room_items WHERE id = ?1", [item_id])?;
+    Ok(true)
 }
 
 fn delete_room_payloads(paths: &AppPaths, room_id: &str) -> AppResult<()> {
@@ -835,10 +985,23 @@ fn migrate_room_statuses(conn: &Connection) -> AppResult<()> {
 
 fn delete_payload_file(paths: &AppPaths, relative_path: &str) -> AppResult<()> {
     let absolute = encrypted_file_path(paths, relative_path);
-    if absolute.exists() {
-        fs::remove_file(absolute)?;
+    remove_file_if_exists(&absolute).map(|_| ())
+}
+
+fn remove_file_if_exists(path: &Path) -> AppResult<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
-    Ok(())
+}
+
+fn map_missing_payload_error(error: std::io::Error) -> AppError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        AppError::NotFound("File is no longer available".into())
+    } else {
+        error.into()
+    }
 }
 
 fn row_to_room(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRoom> {
@@ -886,4 +1049,29 @@ fn row_to_room_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRoomItem>
         key_nonce: row.get(12)?,
         saved_path: row.get(13)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn unknown_extension_metadata_remains_generic_and_transferable() {
+        let dir = std::env::temp_dir().join(format!("pastey_unknown_ext_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("payload.not-a-known-extension");
+        fs::write(&path, [0_u8, 1, 2, 3, 4, 5]).unwrap();
+
+        let (display_name, mime_type, size_bytes) = file_transfer_metadata(&path).unwrap();
+
+        assert_eq!(display_name, "payload.not-a-known-extension");
+        assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
+        assert_eq!(size_bytes, 6);
+        validate_file_size(size_bytes).unwrap();
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir(dir);
+    }
 }

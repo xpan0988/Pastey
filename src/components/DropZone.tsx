@@ -4,9 +4,10 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 interface DropZoneProps {
   onPick: (path: string) => Promise<void>;
+  disabled?: boolean;
 }
 
-export function DropZone({ onPick }: DropZoneProps) {
+export function DropZone({ onPick, disabled = false }: DropZoneProps) {
   const [isHovering, setIsHovering] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -22,6 +23,7 @@ export function DropZone({ onPick }: DropZoneProps) {
 
         if (event.payload.type === "drop") {
           setIsHovering(false);
+          if (disabled || busy) return;
           const [firstPath] = event.payload.paths;
           if (!firstPath) return;
           setBusy(true);
@@ -44,9 +46,10 @@ export function DropZone({ onPick }: DropZoneProps) {
         unlisten();
       }
     };
-  }, [onPick]);
+  }, [busy, disabled, onPick]);
 
   async function handleBrowse() {
+    if (disabled || busy) return;
     const selected = await open({
       multiple: false,
       directory: false
@@ -65,10 +68,10 @@ export function DropZone({ onPick }: DropZoneProps) {
   return (
     <div className={`drop-zone ${isHovering ? "hover" : ""}`}>
       <div className="subtle-stack">
-        <strong>{busy ? "Encrypting..." : "Drop a file or image here"}</strong>
-        <p className="muted">Files are encrypted locally before they are sent into the room. Max 512MB (MVP limit).</p>
+        <strong>{busy ? "Transferring..." : "Drop a file or image here"}</strong>
+        <p className="muted">Files stream in encrypted chunks over the local room. Max file size: 10GB.</p>
       </div>
-      <button className="ghost-button" onClick={handleBrowse} disabled={busy}>
+      <button className="ghost-button" onClick={handleBrowse} disabled={busy || disabled}>
         Choose file
       </button>
     </div>
