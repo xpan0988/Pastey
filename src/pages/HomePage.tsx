@@ -75,11 +75,17 @@ export function HomePage({
     <div className="stack">
       <section className="panel hero-panel">
         <div className="home-grid">
-          <div className="subtle-stack">
-            <h2>Transfer room</h2>
-            <p className="muted">Create a temporary room or join one with an 8-digit code.</p>
+          <div className="create-room-block">
+            <div className="subtle-stack compact-copy">
+              <h2>Transfer room</h2>
+              <p className="muted">Temporary local transfer room.</p>
+            </div>
 
-            <div className="row gap wrap">
+            <div className="create-controls">
+              <button className="primary-button create-button" onClick={handleCreateRoom} disabled={busy !== null}>
+                {busy === "create" ? "Creating..." : "Create Room"}
+              </button>
+
               <label className="field inline-field">
                 <span>Expiry</span>
                 <select value={expiryMinutes} onChange={(event) => setExpiryMinutes(Number(event.target.value))}>
@@ -89,11 +95,9 @@ export function HomePage({
                   <option value={1440}>24 hours</option>
                 </select>
               </label>
-
-              <button className="primary-button" onClick={handleCreateRoom} disabled={busy !== null}>
-                {busy === "create" ? "Creating..." : "Create Room"}
-              </button>
             </div>
+
+            <div className="home-status-line">Ready for local transfer</div>
           </div>
 
           <div className="join-card">

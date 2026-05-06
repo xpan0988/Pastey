@@ -76,20 +76,63 @@ button {
 
 .hero-panel {
   background: var(--panel);
+  padding: 18px;
 }
 
 .home-grid {
   display: grid;
-  grid-template-columns: 1.5fr minmax(280px, 0.9fr);
-  gap: 18px;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 0.82fr);
+  gap: 14px;
   align-items: stretch;
+}
+
+.create-room-block {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 12px;
+  min-height: 154px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.05);
+  transform: translateY(-3px);
+}
+
+.compact-copy {
+  gap: 4px;
+}
+
+.create-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.create-button {
+  min-height: 44px;
+  min-width: 140px;
+  padding-inline: 18px;
+  font-weight: 700;
+}
+
+.home-status-line {
+  width: fit-content;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 10px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.84rem;
 }
 
 .join-card {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 18px;
+  justify-content: center;
+  gap: 12px;
+  padding: 16px;
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid var(--line);
@@ -247,17 +290,17 @@ h3 {
 
 .room-list {
   display: grid;
-  gap: 12px;
+  gap: 8px;
 }
 
 .room-list-item {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 7px;
   text-align: left;
   border: 1px solid var(--line);
-  border-radius: 18px;
-  padding: 16px;
+  border-radius: 14px;
+  padding: 12px;
   background: rgba(255, 255, 255, 0.08);
 }
 
@@ -294,8 +337,8 @@ h3 {
 }
 
 .empty-state {
-  padding: 18px;
-  border-radius: 16px;
+  padding: 12px;
+  border-radius: 14px;
   background: rgba(255, 255, 255, 0.07);
   border: 1px dashed rgba(255, 255, 255, 0.14);
   color: var(--muted);
@@ -541,7 +584,7 @@ input:disabled {
 }
 
 .room-list-header {
-  margin-bottom: 4px;
+  margin-bottom: -2px;
 }
 
 @media (max-width: 720px) {
@@ -558,6 +601,15 @@ input:disabled {
   .home-grid,
   .room-meta-grid {
     grid-template-columns: 1fr;
+  }
+
+  .create-room-block {
+    min-height: 0;
+    transform: none;
+  }
+
+  .create-controls {
+    align-items: stretch;
   }
 
   .composer-row {

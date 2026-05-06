@@ -1,6 +1,6 @@
 # pastey
 
-`pastey` is a lightweight local-first desktop utility for moving text, files, and images directly between your own Windows 11 desktop and macOS laptop on the same LAN.
+`pastey` is a lightweight local-first desktop utility for moving text, files, and images directly between your own Windows and macOS devices on the same LAN.
 
 It is built with:
 
@@ -12,16 +12,23 @@ It is built with:
 - Temporary local HTTP transfer endpoints
 - UDP LAN discovery
 
+## 1.2.0
+
+- Refined home screen layout.
+- Matched Transfer room and Join room panels visually.
+- Preserved compact monochrome utility style.
+- No transfer protocol changes.
+
 ## What pastey does
 
-`pastey` lets one device stage a short-lived encrypted payload, show an 8-digit code, and wait for another device on the same LAN to request it.
+`pastey` lets one device open a short-lived encrypted transfer room, show an 8-digit code, and wait for another device on the same LAN to join it.
 
 The receiver:
 
 1. Opens `pastey`
 2. Enters the code
 3. Discovers the sender on the LAN
-4. Downloads the encrypted payload directly from the sender
+4. Receives encrypted text or file data directly over the local network
 5. Decrypts locally
 6. Displays text or saves files into the local inbox
 
@@ -31,23 +38,24 @@ There is no account system, no cloud relay, no telemetry, and no remote database
 
 - Payloads live on the sender until the receiver explicitly requests them.
 - SQLite stores metadata only.
-- Text is converted to bytes, encrypted, and stored as a `.bin` file in the outbox.
-- Files and images are encrypted as raw bytes and stored as generated `.bin` files in the outbox.
+- Text is converted to bytes, encrypted, and stored locally.
+- Files and images are transferred as generic encrypted binary data.
+- Large files are streamed in encrypted chunks up to 10GB.
 - The transfer server only runs during an active session.
 - LAN discovery only runs while there are active send sessions or a receive attempt is in progress.
 
 ## Security model
 
 - User content is never stored in plaintext in SQLite.
-- Outbox payloads are encrypted before they are written to disk.
+- Local payloads are encrypted before they are written to disk.
 - Payload encryption uses ChaCha20-Poly1305 authenticated encryption.
 - Each payload gets its own random session key and random nonce.
 - The 8-digit code is only the human access code.
 - Receiver-side decryption happens locally after download.
 - Original source file paths are never stored in the database.
-- Outbox file names use generated UUID-based identifiers only.
+- Local payload file names use generated UUID-based identifiers only.
 
-For the MVP, the app also keeps a local app secret in `config.json` so it can re-open short-lived encrypted sessions after an app restart without storing plaintext payloads in the database.
+The app keeps a local app secret in `config.json` so it can re-open short-lived encrypted sessions after an app restart without storing plaintext payloads in the database.
 
 ## What is stored locally
 
@@ -55,7 +63,7 @@ App data directory contents:
 
 - `db.sqlite`
 - `config.json`
-- `outbox/`
+- `payloads/`
 - `inbox/`
 - `temp/`
 
@@ -87,14 +95,14 @@ SQLite metadata includes:
 
 1. UTF-8 text is converted to bytes
 2. Encrypted in Rust
-3. Written to `outbox/payload_<uuid>.bin`
+3. Written to local encrypted payload storage
 4. Only metadata is stored in SQLite
 
 ### Files and images
 
 1. File bytes are read as-is
-2. Encrypted in Rust
-3. Written to `outbox/payload_<uuid>.bin`
+2. Large files are streamed in chunks instead of loaded fully into memory
+3. Chunks are encrypted in Rust
 4. Images are treated exactly like files
 5. No decode, resize, recompress, or transform step is applied
 
@@ -146,13 +154,11 @@ npm run build:checked
 - Windows Defender Firewall may prompt for local network access when the temporary transfer server starts.
 - Global shortcut defaults to `Ctrl+Shift+V` on Windows and `Cmd+Shift+V` on macOS.
 
-## Current MVP limitations
+## Current limitations
 
 - LAN-only
 - Sender must be online during the transfer
 - No cloud relay
-- No mobile client yet
 - No WebRTC yet
 - No TURN fallback yet
-- UDP discovery is simple broadcast-based discovery for the MVP
-- The receive flow is optimized for correctness and simplicity over very large file performance
+- UDP discovery is simple broadcast-based LAN discovery
