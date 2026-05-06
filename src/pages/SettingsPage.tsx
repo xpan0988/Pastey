@@ -1,5 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { prettifyShortcut } from "../lib/format";
 import { updateConfig } from "../lib/tauri";
 import type { AppConfig } from "../lib/types";
@@ -9,18 +9,47 @@ interface SettingsPageProps {
   onConfigChange: (config: AppConfig) => void;
 }
 
+const PRESET_SPEEDS = [10, 50, 100];
+
 export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
-  const presetSpeeds = [10, 50, 100];
-  const [customSpeed, setCustomSpeed] = useState(config.speed_limit_mbps && !presetSpeeds.includes(config.speed_limit_mbps) ? String(config.speed_limit_mbps) : "");
-  const speedValue = config.speed_limit_mbps
-    ? presetSpeeds.includes(config.speed_limit_mbps)
-      ? String(config.speed_limit_mbps)
-      : "custom"
-    : "unlimited";
+  const [speedValue, setSpeedValue] = useState(speedSelectionFromConfig(config.speed_limit_mbps, PRESET_SPEEDS));
+  const [customSpeed, setCustomSpeed] = useState(customSpeedFromConfig(config.speed_limit_mbps, PRESET_SPEEDS));
+
+  useEffect(() => {
+    setSpeedValue(speedSelectionFromConfig(config.speed_limit_mbps, PRESET_SPEEDS));
+    setCustomSpeed(customSpeedFromConfig(config.speed_limit_mbps, PRESET_SPEEDS));
+  }, [config.speed_limit_mbps]);
 
   async function save(next: AppConfig) {
     const saved = await updateConfig(next);
     onConfigChange(saved);
+  }
+
+  async function saveSpeedLimit(nextValue: string) {
+    setSpeedValue(nextValue);
+    if (nextValue === "custom") {
+      const currentCustom = validCustomSpeed(customSpeed) ?? 25;
+      setCustomSpeed(String(currentCustom));
+      await save({ ...config, speed_limit_mbps: currentCustom });
+      return;
+    }
+
+    await save({
+      ...config,
+      speed_limit_mbps: nextValue === "unlimited" ? null : Number(nextValue)
+    });
+  }
+
+  async function saveCustomSpeed() {
+    const nextCustom = validCustomSpeed(customSpeed);
+    if (!nextCustom) {
+      setCustomSpeed(customSpeedFromConfig(config.speed_limit_mbps, PRESET_SPEEDS) || "25");
+      return;
+    }
+
+    setCustomSpeed(String(nextCustom));
+    setSpeedValue("custom");
+    await save({ ...config, speed_limit_mbps: nextCustom });
   }
 
   async function chooseInbox() {
@@ -71,17 +100,7 @@ export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
           <span>Transfer speed limit</span>
           <select
             value={speedValue}
-            onChange={(event) =>
-              void save({
-                ...config,
-                speed_limit_mbps:
-                  event.target.value === "unlimited"
-                    ? null
-                    : event.target.value === "custom"
-                      ? Number(customSpeed) || 25
-                      : Number(event.target.value)
-              })
-            }
+            onChange={(event) => void saveSpeedLimit(event.target.value)}
           >
             <option value="unlimited">Unlimited</option>
             <option value="10">10 MB/s</option>
@@ -101,7 +120,12 @@ export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
               value={customSpeed}
               placeholder="25"
               onChange={(event) => setCustomSpeed(event.target.value)}
-              onBlur={() => void save({ ...config, speed_limit_mbps: Number(customSpeed) || 25 })}
+              onBlur={() => void saveCustomSpeed()}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.currentTarget.blur();
+                }
+              }}
             />
           </label>
         ) : null}
@@ -139,4 +163,20 @@ export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
       </div>
     </div>
   );
+}
+
+function speedSelectionFromConfig(value: number | null | undefined, presets: number[]): string {
+  if (!value || !Number.isFinite(value) || value <= 0) return "unlimited";
+  return presets.includes(value) ? String(value) : "custom";
+}
+
+function customSpeedFromConfig(value: number | null | undefined, presets: number[]): string {
+  if (!value || !Number.isFinite(value) || value <= 0 || presets.includes(value)) return "";
+  return String(value);
+}
+
+function validCustomSpeed(value: string): number | null {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.min(10_000, Math.max(1, parsed));
 }

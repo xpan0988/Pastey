@@ -3,22 +3,21 @@
   font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
   line-height: 1.4;
   font-weight: 400;
-  color: #f6f4ec;
-  background: linear-gradient(145deg, #101316 0%, #1c211e 46%, #28241f 100%);
+  color: #f4f5f7;
+  background: #07080a;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  --panel: rgba(255, 255, 255, 0.11);
-  --panel-strong: rgba(255, 255, 255, 0.17);
-  --ink: #f6f4ec;
-  --muted: #b9c1b8;
-  --line: rgba(255, 255, 255, 0.14);
-  --primary: #7bdcb5;
-  --primary-strong: #a9f3d4;
-  --accent: #f1c46d;
-  --danger: #ff8d78;
-  --shadow: 0 22px 70px rgba(0, 0, 0, 0.28);
+  --panel: rgba(26, 28, 33, 0.72);
+  --panel-strong: rgba(37, 40, 47, 0.82);
+  --ink: #f4f5f7;
+  --muted: #a8adb7;
+  --line: rgba(255, 255, 255, 0.12);
+  --control: rgba(255, 255, 255, 0.07);
+  --control-hover: rgba(255, 255, 255, 0.12);
+  --danger: #d86f61;
+  --shadow: 0 20px 52px rgba(0, 0, 0, 0.34);
 }
 
 * {
@@ -59,26 +58,6 @@ button {
   min-height: 100vh;
 }
 
-.app-header {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  align-items: flex-start;
-  margin-bottom: 18px;
-}
-
-.brand {
-  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
-  font-size: 1.9rem;
-  font-weight: 700;
-  letter-spacing: -0.04em;
-}
-
-.tagline {
-  margin: 6px 0 0;
-  color: var(--muted);
-}
-
 .stack,
 .subtle-stack {
   display: flex;
@@ -89,14 +68,14 @@ button {
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 18px;
+  border-radius: 20px;
   padding: 20px;
   box-shadow: var(--shadow);
   backdrop-filter: blur(22px) saturate(1.25);
 }
 
 .hero-panel {
-  background: rgba(255, 255, 255, 0.13);
+  background: var(--panel);
 }
 
 .home-grid {
@@ -111,22 +90,9 @@ button {
   flex-direction: column;
   gap: 14px;
   padding: 18px;
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.06);
   border: 1px solid var(--line);
-}
-
-.eyebrow {
-  display: inline-flex;
-  width: fit-content;
-  padding: 6px 10px;
-  border-radius: 999px;
-  background: rgba(123, 220, 181, 0.12);
-  color: var(--primary);
-  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
-  font-size: 0.78rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 
 .row {
@@ -170,7 +136,7 @@ select,
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 12px 14px;
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.07);
   color: var(--ink);
 }
 
@@ -188,65 +154,50 @@ textarea {
 .ghost-button {
   border-radius: 12px;
   padding: 11px 15px;
-  border: 1px solid transparent;
+  border: 1px solid var(--line);
 }
 
 .primary-button {
-  background: #e9f8ee;
-  color: #162218;
-}
-
-.primary-button:hover {
-  background: white;
-}
-
-.ghost-button {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: var(--line);
+  background: var(--control);
   color: var(--ink);
 }
 
-.strong-ghost {
-  background: rgba(123, 220, 181, 0.14);
-  border-color: rgba(123, 220, 181, 0.25);
-  color: var(--primary-strong);
+.primary-button:hover {
+  background: var(--control-hover);
+}
+
+.ghost-button {
+  background: var(--control);
+  color: var(--ink);
 }
 
 .ghost-button.danger {
+  background: rgba(216, 111, 97, 0.12);
+  border-color: rgba(216, 111, 97, 0.35);
   color: var(--danger);
 }
 
 .text-button {
   border: 0;
   background: transparent;
-  color: var(--primary-strong);
+  color: var(--ink);
   padding: 0;
   text-align: left;
 }
 
 .back-button {
   font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
-  font-size: 0.88rem;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.ghost-button.back-button {
+  min-width: 78px;
+  padding-inline: 16px;
 }
 
 .settings-back {
   width: fit-content;
-}
-
-.drop-zone {
-  border: 1.5px dashed rgba(123, 220, 181, 0.42);
-  border-radius: 16px;
-  padding: 20px 18px;
-  background: rgba(255, 255, 255, 0.07);
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 14px;
-}
-
-.drop-zone.hover {
-  border-color: var(--primary);
-  transform: translateY(-1px);
 }
 
 .status-chip {
@@ -263,11 +214,11 @@ textarea {
   width: 10px;
   height: 10px;
   border-radius: 999px;
-  background: #9ca69e;
+  background: var(--muted);
 }
 
 .status-dot.active {
-  background: #238a56;
+  background: var(--ink);
 }
 
 .muted {
@@ -283,9 +234,9 @@ h3 {
 .error-box {
   padding: 12px 14px;
   border-radius: 12px;
-  background: rgba(255, 141, 120, 0.12);
-  color: #ffd4cc;
-  border: 1px solid rgba(255, 141, 120, 0.28);
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--ink);
+  border: 1px solid var(--line);
 }
 
 .toggle-row {
@@ -322,24 +273,24 @@ h3 {
 }
 
 .pill.connected {
-  color: var(--primary-strong);
-  background: rgba(123, 220, 181, 0.12);
-  border-color: rgba(123, 220, 181, 0.24);
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.07);
+  border-color: var(--line);
 }
 
 .pill.waiting {
-  color: #ffe0a2;
-  background: rgba(241, 196, 109, 0.14);
-  border-color: rgba(241, 196, 109, 0.24);
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--line);
 }
 
 .pill.completed {
-  color: var(--primary-strong);
+  color: var(--ink);
 }
 
 .pill.failed,
 .pill.cancelled {
-  color: var(--danger);
+  color: var(--muted);
 }
 
 .empty-state {
@@ -427,9 +378,9 @@ h3 {
 
 .message-row.outgoing .message-bubble,
 .message-row.outgoing .file-card {
-  background: rgba(123, 220, 181, 0.18);
+  background: rgba(255, 255, 255, 0.12);
   color: var(--ink);
-  border-color: transparent;
+  border-color: var(--line);
 }
 
 .message-row.incoming .message-bubble,
@@ -515,7 +466,7 @@ h3 {
 .progress-fill {
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #7bdcb5, #f1c46d);
+  background: var(--ink);
   transition: width 160ms ease;
 }
 
@@ -528,14 +479,65 @@ h3 {
 }
 
 .transfer-error {
-  color: #ffd4cc;
+  color: var(--ink);
   font-size: 0.9rem;
 }
 
 .composer-panel {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
+  padding: 14px;
+}
+
+.composer-row {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.composer-row textarea {
+  min-height: 42px;
+  max-height: 150px;
+  resize: vertical;
+  padding: 11px 13px;
+  border-radius: 14px;
+}
+
+.composer-row.drop-active textarea {
+  border-color: rgba(255, 255, 255, 0.36);
+  background: rgba(255, 255, 255, 0.1);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.08);
+}
+
+.plus-button {
+  width: 42px;
+  height: 42px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--control);
+  color: var(--ink);
+  font-size: 1.35rem;
+  line-height: 1;
+}
+
+.plus-button:hover:not(:disabled),
+.ghost-button:hover:not(:disabled),
+.primary-button:hover:not(:disabled) {
+  background: var(--control-hover);
+}
+
+.ghost-button.danger:hover:not(:disabled) {
+  background: rgba(216, 111, 97, 0.18);
+}
+
+button:disabled,
+textarea:disabled,
+select:disabled,
+input:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 
 .room-list-header {
@@ -547,8 +549,6 @@ h3 {
     padding: 14px;
   }
 
-  .app-header,
-  .drop-zone,
   .toggle-row,
   .row.spread {
     flex-direction: column;
@@ -558,6 +558,14 @@ h3 {
   .home-grid,
   .room-meta-grid {
     grid-template-columns: 1fr;
+  }
+
+  .composer-row {
+    grid-template-columns: 42px minmax(0, 1fr);
+  }
+
+  .composer-row .primary-button {
+    grid-column: 1 / -1;
   }
 
   .message-bubble,

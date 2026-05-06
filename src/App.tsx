@@ -1,9 +1,8 @@
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { HomePage } from "./pages/HomePage";
 import { RoomPage } from "./pages/RoomPage";
 import { SettingsPage } from "./pages/SettingsPage";
-import { TrayStatus } from "./components/TrayStatus";
 import { burnRoom, getConfig, getRoom, leaveRoom, listRoomItems, listRooms } from "./lib/tauri";
 import type { AppConfig, FileTransferProgressEvent, RoomInfo, RoomItem } from "./lib/types";
 
@@ -69,11 +68,6 @@ function App() {
       if (unlistenTransfer) unlistenTransfer();
     };
   }, [view]);
-
-  const activeCount = useMemo(
-    () => rooms.length,
-    [rooms]
-  );
 
   async function refreshRooms(selectedRoomId?: string): Promise<RoomInfo | null> {
     const nextRooms = await listRooms();
@@ -158,14 +152,6 @@ function App() {
 
   return (
     <div className="app-shell">
-      <header className="app-header">
-        <div>
-          <div className="brand">pastey</div>
-          <p className="tagline">Encrypted room-based transfer for nearby devices you control.</p>
-        </div>
-        <TrayStatus activeCount={activeCount} />
-      </header>
-
       {error ? <div className="error-box">{error}</div> : null}
 
       <main>

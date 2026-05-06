@@ -76,11 +76,8 @@ export function HomePage({
       <section className="panel hero-panel">
         <div className="home-grid">
           <div className="subtle-stack">
-            <span className="eyebrow">Room-based transfer</span>
-            <h2>Open one room, keep sending inside it.</h2>
-            <p className="muted">
-              One 8-digit code per room. Multiple encrypted messages, files, and images after both devices join.
-            </p>
+            <h2>Transfer room</h2>
+            <p className="muted">Create a temporary room or join one with an 8-digit code.</p>
 
             <div className="row gap wrap">
               <label className="field inline-field">
@@ -118,7 +115,7 @@ export function HomePage({
             </label>
 
             <button
-              className="ghost-button strong-ghost"
+              className="ghost-button"
               onClick={handleJoinRoom}
               disabled={busy !== null || joinCode.length !== 8}
             >
@@ -138,7 +135,6 @@ export function HomePage({
         <div className="row spread room-list-header">
           <div>
             <h3>Recent rooms</h3>
-            <p className="muted">Re-open a room to check its state or continue transferring if it is still active.</p>
           </div>
         </div>
 

@@ -1,4 +1,6 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent } from "react";
 import {
   cancelTransfer,
@@ -13,7 +15,6 @@ import {
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
 import { fileTypeLabel, formatBytes, formatDuration, formatRelativeExpiry, formatSpeed, formatTimestamp } from "../lib/format";
 import type { FileTransferProgressEvent, RoomInfo, RoomItem } from "../lib/types";
-import { DropZone } from "../components/DropZone";
 
 interface RoomPageProps {
   room: RoomInfo;
@@ -39,6 +40,7 @@ export function RoomPage({
   const [error, setError] = useState<string | null>(null);
   const [activeFileKey, setActiveFileKey] = useState<string | null>(null);
   const [cancellingTransferId, setCancellingTransferId] = useState<string | null>(null);
+  const [composerDropActive, setComposerDropActive] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
@@ -62,6 +64,39 @@ export function RoomPage({
       window.clearInterval(interval);
     };
   }, [busy, onRefresh, room.id, room.status]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    void getCurrentWebview()
+      .onDragDropEvent(async (event) => {
+        if (event.payload.type === "over") {
+          setComposerDropActive(room.peer_connected && busy === null);
+          return;
+        }
+
+        if (event.payload.type === "drop") {
+          setComposerDropActive(false);
+          if (!room.peer_connected || busy !== null) return;
+          const [firstPath] = event.payload.paths;
+          if (firstPath) {
+            await handleSendFile(firstPath);
+          }
+          return;
+        }
+
+        setComposerDropActive(false);
+      })
+      .then((fn) => {
+        unlisten = fn;
+      });
+
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [busy, room.id, room.peer_connected]);
 
   async function handleSendText() {
     if (!text.trim()) return;
@@ -96,6 +131,18 @@ export function RoomPage({
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handlePickFile() {
+    if (!room.peer_connected || busy !== null) return;
+    const selected = await open({
+      multiple: false,
+      directory: false
+    });
+
+    if (typeof selected === "string") {
+      await handleSendFile(selected);
     }
   }
 
@@ -242,10 +289,7 @@ export function RoomPage({
     <div className="stack room-shell">
       <section className="panel room-header">
         <div className="row spread wrap">
-          <div className="subtle-stack">
-            <button className="text-button back-button" onClick={onBack}>
-              Back
-            </button>
+          <div className="subtle-stack room-title-block">
             <h2>{room.room_code_display ?? room.room_code ?? "Room"}</h2>
             <p className="muted">
               {room.local_role === "creator" ? "Share this code once, then transfer." : "Joined transfer room."}
@@ -253,6 +297,9 @@ export function RoomPage({
           </div>
 
           <div className="header-actions">
+            <button className="ghost-button back-button" onClick={onBack}>
+              Back
+            </button>
             <button className="ghost-button" onClick={handleCopyCode} disabled={!room.room_code}>
               Copy code
             </button>
@@ -307,14 +354,22 @@ export function RoomPage({
       </section>
 
       <section className="panel composer-panel">
-        <label className="field">
-          <span>Message</span>
+        <div className={`composer-row ${composerDropActive ? "drop-active" : ""}`}>
+          <button
+            className="plus-button"
+            onClick={() => void handlePickFile()}
+            disabled={!room.peer_connected || busy !== null}
+            title="Add file"
+            aria-label="Add file"
+          >
+            +
+          </button>
           <textarea
             ref={composerRef}
-            rows={3}
+            rows={1}
             placeholder={
               room.peer_connected
-                ? "Type a message and press Enter to send."
+                ? "Message"
                 : room.peer_burned_at
                   ? "Peer burned this room. Burn locally when you're done."
                   : room.status === "peer_left"
@@ -334,9 +389,6 @@ export function RoomPage({
               }
             }}
           />
-        </label>
-
-        <div className="row gap wrap">
           <button
             className="primary-button"
             onClick={handleSendText}
@@ -344,10 +396,7 @@ export function RoomPage({
           >
             {busy === "text" ? "Sending..." : "Send"}
           </button>
-          <span className="muted">Press Enter to send. Use Shift + Enter for a new line. Paste screenshots with Ctrl+V.</span>
         </div>
-
-        <DropZone onPick={handleSendFile} disabled={busy !== null || !room.peer_connected} />
 
         {error ? <div className="error-box">{error}</div> : null}
       </section>
@@ -378,7 +427,7 @@ function TransferCard({ transfer, cancelling, onCancel }: TransferCardProps) {
           </span>
         </div>
         {canCancel ? (
-          <button className="ghost-button danger compact-button" onClick={() => void onCancel(transfer.transfer_id)} disabled={cancelling}>
+          <button className="ghost-button compact-button" onClick={() => void onCancel(transfer.transfer_id)} disabled={cancelling}>
             {cancelling ? "Cancelling..." : "Cancel"}
           </button>
         ) : (

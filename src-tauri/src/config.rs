@@ -109,3 +109,24 @@ fn normalize_speed_limit(value: Option<f64>) -> Option<f64> {
         Some(value.clamp(1.0, 10_000.0))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speed_limit_normalization_treats_invalid_values_as_unlimited() {
+        assert_eq!(normalize_speed_limit(None), None);
+        assert_eq!(normalize_speed_limit(Some(0.0)), None);
+        assert_eq!(normalize_speed_limit(Some(-10.0)), None);
+        assert_eq!(normalize_speed_limit(Some(f64::NAN)), None);
+    }
+
+    #[test]
+    fn speed_limit_normalization_accepts_positive_values() {
+        assert_eq!(normalize_speed_limit(Some(10.0)), Some(10.0));
+        assert_eq!(normalize_speed_limit(Some(50.0)), Some(50.0));
+        assert_eq!(normalize_speed_limit(Some(100.0)), Some(100.0));
+        assert_eq!(normalize_speed_limit(Some(20_000.0)), Some(10_000.0));
+    }
+}
