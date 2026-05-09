@@ -921,14 +921,16 @@ fn cleanup_stale_part_files_in_dir(dir: &Path) -> AppResult<()> {
             continue;
         }
 
-        let modified = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let modified = metadata
+            .modified()
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
-        if now_ts().saturating_sub(modified) >= STALE_PART_FILE_AGE_SECS {
+        if metadata.len() == 0 || now_ts().saturating_sub(modified) >= STALE_PART_FILE_AGE_SECS {
             let _ = remove_file_if_exists(&path);
         }
     }

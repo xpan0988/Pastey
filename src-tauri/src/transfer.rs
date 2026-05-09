@@ -7,7 +7,7 @@ use std::{
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Path as AxumPath, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -35,11 +35,13 @@ use crate::{
     storage, ActiveRoomServer, AppState,
 };
 
-pub const DEFAULT_CHUNK_SIZE_BYTES: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_CHUNK_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const DISK_SPACE_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
 const TRANSFER_EVENT: &str = "pastey://transfer-progress";
 const TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_CHUNK_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CHUNK_PLAINTEXT_BYTES: u64 = MAX_CHUNK_BODY_BYTES as u64 - 1024;
 const CHUNK_RETRY_BACKOFFS: [Duration; 3] = [
     Duration::from_millis(300),
     Duration::from_millis(800),
@@ -108,6 +110,7 @@ struct ChunkSendFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChunkSendFailureKind {
     Cancelled,
+    ChunkTooLarge,
     HttpStatus,
     InvalidAck,
     PeerLeft,
@@ -119,6 +122,7 @@ impl ChunkSendFailureKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Cancelled => "cancelled",
+            Self::ChunkTooLarge => "chunk_too_large",
             Self::HttpStatus => "http_status",
             Self::InvalidAck => "invalid_ack",
             Self::PeerLeft => "peer_left",
@@ -163,6 +167,7 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
         )
         .route("/rooms/:room_id/burn", post(remote_burn_handler))
         .route("/rooms/:room_id/leave", post(remote_leave_handler))
+        .layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES))
         .with_state(RoomServerContext {
             state: state.clone(),
             room_id: room.id.clone(),
@@ -514,6 +519,7 @@ pub async fn send_room_file(
                     return Err(AppError::InvalidInput("Transfer cancelled.".into()));
                 }
 
+                notify_transfer_cancel(&client, &base_url, &transfer_id).await;
                 fail_transfer(&state, &transfer_id, item_id, error.message.clone());
                 return if error.kind == ChunkSendFailureKind::Timeout {
                     Err(AppError::Timeout(error.message))
@@ -666,6 +672,7 @@ async fn send_chunk_once(
     nonce: &[u8; 12],
     encrypted_bytes: &[u8],
 ) -> Result<ChunkAckResponse, ChunkSendFailure> {
+    let request_body_size = encrypted_bytes.len();
     let response = client
         .post(format!("{base_url}/transfers/{transfer_id}/chunks"))
         .timeout(CHUNK_REQUEST_TIMEOUT)
@@ -677,6 +684,14 @@ async fn send_chunk_once(
         .await
         .map_err(chunk_failure_from_reqwest)?;
 
+    let status = response.status();
+    dev_log_chunk_response(
+        transfer_id,
+        chunk_index,
+        plaintext_size,
+        request_body_size,
+        status,
+    );
     if !response.status().is_success() {
         return Err(chunk_failure_from_response(response).await);
     }
@@ -724,6 +739,13 @@ fn chunk_failure_from_reqwest(error: reqwest::Error) -> ChunkSendFailure {
 
 async fn chunk_failure_from_response(response: reqwest::Response) -> ChunkSendFailure {
     let status = response.status();
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        return ChunkSendFailure {
+            message: "Chunk too large for receiver.".into(),
+            kind: ChunkSendFailureKind::ChunkTooLarge,
+            retryable: false,
+        };
+    }
     if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
         return ChunkSendFailure {
             message: "Peer left the room.".into(),
@@ -744,6 +766,26 @@ async fn chunk_failure_from_response(response: reqwest::Response) -> ChunkSendFa
         };
     }
 
+    if error.as_ref().is_some_and(|error| {
+        matches!(
+            error.code.as_str(),
+            "integrity_failed"
+                | "invalid_chunk"
+                | "invalid_chunk_order"
+                | "invalid_payload"
+                | "invalid_transfer"
+                | "write_failed"
+        )
+    }) {
+        return ChunkSendFailure {
+            message: error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "File transfer failed.".to_string()),
+            kind: ChunkSendFailureKind::HttpStatus,
+            retryable: false,
+        };
+    }
+
     ChunkSendFailure {
         message: error
             .map(|error| error.message)
@@ -751,6 +793,83 @@ async fn chunk_failure_from_response(response: reqwest::Response) -> ChunkSendFa
         kind: ChunkSendFailureKind::HttpStatus,
         retryable: status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT,
     }
+}
+
+fn dev_log_chunk_response(
+    transfer_id: &str,
+    chunk_index: u64,
+    chunk_bytes: usize,
+    request_body_size: usize,
+    status: StatusCode,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "transfer chunk response transfer_id={transfer_id} chunk_index={chunk_index} chunk_bytes={chunk_bytes} request_body_size={request_body_size} response_status={status}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (
+        transfer_id,
+        chunk_index,
+        chunk_bytes,
+        request_body_size,
+        status,
+    );
+}
+
+fn dev_log_receiver_chunk_received(
+    transfer_id: &str,
+    chunk_index: u64,
+    chunk_bytes: u64,
+    request_body_size: usize,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "transfer receiver chunk received transfer_id={transfer_id} chunk_index={chunk_index} chunk_bytes={chunk_bytes} request_body_size={request_body_size}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, chunk_index, chunk_bytes, request_body_size);
+}
+
+fn dev_log_receiver_chunk_write_success(
+    transfer_id: &str,
+    chunk_index: u64,
+    chunk_bytes: u64,
+    request_body_size: usize,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "transfer receiver chunk write transfer_id={transfer_id} chunk_index={chunk_index} chunk_bytes={chunk_bytes} request_body_size={request_body_size} response_status={} result=success",
+        StatusCode::OK
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, chunk_index, chunk_bytes, request_body_size);
+}
+
+fn dev_log_receiver_chunk_failure(
+    transfer_id: &str,
+    chunk_index: u64,
+    chunk_bytes: u64,
+    request_body_size: usize,
+    response_status: StatusCode,
+    error_cause: &str,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "transfer receiver chunk failure transfer_id={transfer_id} chunk_index={chunk_index} chunk_bytes={chunk_bytes} request_body_size={request_body_size} response_status={response_status} error_cause={error_cause}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (
+        transfer_id,
+        chunk_index,
+        chunk_bytes,
+        request_body_size,
+        response_status,
+        error_cause,
+    );
 }
 
 fn dev_log_chunk_attempt(
@@ -1099,11 +1218,11 @@ async fn start_file_transfer_handler(
             error.message(),
         );
     }
-    if start.chunk_size == 0 || start.chunk_size > 64 * 1024 * 1024 {
+    if start.chunk_size == 0 || start.chunk_size > MAX_CHUNK_PLAINTEXT_BYTES {
         return transfer_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_chunk_size",
-            "Received payload was not valid.".into(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "chunk_too_large",
+            "Chunk too large for receiver.".into(),
         );
     }
     if start.total_chunks != start.size_bytes.div_ceil(start.chunk_size) {
@@ -1238,6 +1357,8 @@ async fn receive_file_chunk_handler(
             )
         }
     };
+    let request_body_size = body.len();
+    dev_log_receiver_chunk_received(&transfer_id, chunk_index, plaintext_size, request_body_size);
     let nonce = match headers
         .get("x-pastey-nonce")
         .and_then(|value| value.to_str().ok())
@@ -1315,6 +1436,14 @@ async fn receive_file_chunk_handler(
     let plaintext = match crypto::decrypt_bytes(&body, &session_key, &nonce) {
         Ok(plaintext) => plaintext,
         Err(_) => {
+            dev_log_receiver_chunk_failure(
+                &transfer_id,
+                chunk_index,
+                plaintext_size,
+                request_body_size,
+                StatusCode::BAD_REQUEST,
+                "integrity_failed",
+            );
             fail_receiver_transfer(
                 &ctx.state,
                 &transfer_id,
@@ -1329,6 +1458,14 @@ async fn receive_file_chunk_handler(
         }
     };
     if plaintext.len() as u64 != plaintext_size {
+        dev_log_receiver_chunk_failure(
+            &transfer_id,
+            chunk_index,
+            plaintext_size,
+            request_body_size,
+            StatusCode::BAD_REQUEST,
+            "plaintext_size_mismatch",
+        );
         fail_receiver_transfer(
             &ctx.state,
             &transfer_id,
@@ -1348,7 +1485,15 @@ async fn receive_file_chunk_handler(
         file.flush().await
     }
     .await;
-    if write_result.is_err() {
+    if let Err(error) = write_result {
+        dev_log_receiver_chunk_failure(
+            &transfer_id,
+            chunk_index,
+            plaintext_size,
+            request_body_size,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("write_failed: {error}"),
+        );
         fail_receiver_transfer(
             &ctx.state,
             &transfer_id,
@@ -1361,6 +1506,12 @@ async fn receive_file_chunk_handler(
             "Could not write to destination folder.".into(),
         );
     }
+    dev_log_receiver_chunk_write_success(
+        &transfer_id,
+        chunk_index,
+        plaintext_size,
+        request_body_size,
+    );
 
     let maybe_event = {
         let mut transfers = ctx.state.active_file_transfers.lock();
