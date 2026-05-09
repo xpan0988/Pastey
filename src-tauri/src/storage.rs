@@ -1085,4 +1085,17 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir(dir);
     }
+
+    #[test]
+    fn stale_part_cleanup_removes_empty_part_files_immediately() {
+        let dir = std::env::temp_dir().join(format!("pastey_empty_part_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let part_path = dir.join("payload.bin.part");
+        fs::write(&part_path, []).unwrap();
+
+        cleanup_stale_part_files_in_dir(&dir).unwrap();
+
+        assert!(!part_path.exists());
+        let _ = fs::remove_dir(dir);
+    }
 }

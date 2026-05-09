@@ -7,7 +7,7 @@ use std::{
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, State},
+    extract::{rejection::BytesRejection, ConnectInfo, DefaultBodyLimit, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -100,6 +100,19 @@ struct ChunkAckResponse {
     transferred_bytes: u64,
 }
 
+#[derive(Deserialize)]
+struct TransferCancelRequest {
+    status: Option<String>,
+    message: Option<String>,
+}
+
+struct ResponseErrorDetails {
+    status: StatusCode,
+    code: Option<String>,
+    message: String,
+    body_text: String,
+}
+
 #[derive(Debug)]
 struct ChunkSendFailure {
     message: String,
@@ -155,7 +168,7 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
         )
         .route(
             "/rooms/:room_id/transfers/:transfer_id/chunks",
-            post(receive_file_chunk_handler),
+            post(receive_file_chunk_handler).layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES)),
         )
         .route(
             "/rooms/:room_id/transfers/:transfer_id/finish",
@@ -167,7 +180,6 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
         )
         .route("/rooms/:room_id/burn", post(remote_burn_handler))
         .route("/rooms/:room_id/leave", post(remote_leave_handler))
-        .layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES))
         .with_state(RoomServerContext {
             state: state.clone(),
             room_id: room.id.clone(),
@@ -420,6 +432,18 @@ pub async fn send_room_file(
         .build()
         .map_err(|_| AppError::Network("Network connection lost.".into()))?;
     let base_url = format!("http://{peer_host}:{peer_port}/rooms/{room_id}");
+    let start_url = format!("{base_url}/transfers/start");
+    let chunk_url = format!("{base_url}/transfers/{transfer_id}/chunks");
+    dev_log_sender_transfer_start(
+        &transfer_id,
+        room_id,
+        &base_url,
+        &start_url,
+        &chunk_url,
+        chunk_size,
+        total_chunks,
+        file_size,
+    );
     let start = FileTransferStartRequest {
         transfer_id: transfer_id.clone(),
         item_id: item.id.clone(),
@@ -434,19 +458,32 @@ pub async fn send_room_file(
         sender_public_key,
     };
 
-    let start_response = client
-        .post(format!("{base_url}/transfers/start"))
-        .json(&start)
-        .send()
-        .await;
+    let start_response = client.post(&start_url).json(&start).send().await;
     let start_response = match start_response {
-        Ok(response) if response.status().is_success() => response,
+        Ok(response) if response.status().is_success() => {
+            dev_log_sender_transfer_start_response(&transfer_id, room_id, response.status(), "");
+            response
+        }
         Ok(response) => {
-            let message = response_error_message(response).await;
+            let details = response_error_details(response).await;
+            dev_log_sender_transfer_start_response(
+                &transfer_id,
+                room_id,
+                details.status,
+                &details.body_text,
+            );
+            let message = map_response_error_message(&details);
             fail_transfer(&state, &transfer_id, item_id, message.clone());
             return Err(AppError::Network(message));
         }
         Err(error) => {
+            dev_log_sender_final_error(
+                &transfer_id,
+                room_id,
+                None,
+                "start_failed",
+                &error.to_string(),
+            );
             fail_transfer(
                 &state,
                 &transfer_id,
@@ -492,6 +529,7 @@ pub async fn send_room_file(
         let ack = match send_chunk_with_retry(
             &client,
             &base_url,
+            room_id,
             &transfer_id,
             chunk_index,
             bytes_read,
@@ -519,7 +557,14 @@ pub async fn send_room_file(
                     return Err(AppError::InvalidInput("Transfer cancelled.".into()));
                 }
 
-                notify_transfer_cancel(&client, &base_url, &transfer_id).await;
+                notify_transfer_failed(&client, &base_url, &transfer_id, &error.message).await;
+                dev_log_sender_final_error(
+                    &transfer_id,
+                    room_id,
+                    Some(chunk_index),
+                    error.kind.as_str(),
+                    &error.message,
+                );
                 fail_transfer(&state, &transfer_id, item_id, error.message.clone());
                 return if error.kind == ChunkSendFailureKind::Timeout {
                     Err(AppError::Timeout(error.message))
@@ -568,11 +613,19 @@ pub async fn send_room_file(
             Ok(())
         }
         Ok(response) => {
-            let message = response_error_message(response).await;
+            let details = response_error_details(response).await;
+            let message = map_response_error_message(&details);
             fail_transfer(&state, &transfer_id, item_id, message.clone());
             Err(AppError::Network(message))
         }
         Err(error) => {
+            dev_log_sender_final_error(
+                &transfer_id,
+                room_id,
+                None,
+                "finish_failed",
+                &error.to_string(),
+            );
             fail_transfer(
                 &state,
                 &transfer_id,
@@ -599,6 +652,7 @@ fn update_sender_transfer_report(
 async fn send_chunk_with_retry(
     client: &reqwest::Client,
     base_url: &str,
+    room_id: &str,
     transfer_id: &str,
     chunk_index: u64,
     plaintext_size: usize,
@@ -619,6 +673,7 @@ async fn send_chunk_with_retry(
         let result = send_chunk_once(
             client,
             base_url,
+            room_id,
             transfer_id,
             chunk_index,
             plaintext_size,
@@ -630,12 +685,20 @@ async fn send_chunk_with_retry(
 
         match result {
             Ok(ack) => {
-                dev_log_chunk_attempt(transfer_id, chunk_index, retry_count, "ok", elapsed);
+                dev_log_sender_chunk_attempt(
+                    transfer_id,
+                    room_id,
+                    chunk_index,
+                    retry_count,
+                    "ok",
+                    elapsed,
+                );
                 return Ok(ack);
             }
             Err(error) => {
-                dev_log_chunk_attempt(
+                dev_log_sender_chunk_attempt(
                     transfer_id,
+                    room_id,
                     chunk_index,
                     retry_count,
                     error.kind.as_str(),
@@ -666,6 +729,7 @@ async fn send_chunk_with_retry(
 async fn send_chunk_once(
     client: &reqwest::Client,
     base_url: &str,
+    room_id: &str,
     transfer_id: &str,
     chunk_index: u64,
     plaintext_size: usize,
@@ -673,8 +737,18 @@ async fn send_chunk_once(
     encrypted_bytes: &[u8],
 ) -> Result<ChunkAckResponse, ChunkSendFailure> {
     let request_body_size = encrypted_bytes.len();
+    let chunk_url = format!("{base_url}/transfers/{transfer_id}/chunks");
+    dev_log_sender_chunk_request(
+        transfer_id,
+        room_id,
+        chunk_index,
+        &chunk_url,
+        "POST",
+        plaintext_size,
+        request_body_size,
+    );
     let response = client
-        .post(format!("{base_url}/transfers/{transfer_id}/chunks"))
+        .post(&chunk_url)
         .timeout(CHUNK_REQUEST_TIMEOUT)
         .header("x-pastey-chunk-index", chunk_index.to_string())
         .header("x-pastey-plaintext-size", plaintext_size.to_string())
@@ -685,28 +759,38 @@ async fn send_chunk_once(
         .map_err(chunk_failure_from_reqwest)?;
 
     let status = response.status();
-    dev_log_chunk_response(
+    if !response.status().is_success() {
+        return Err(chunk_failure_from_response(
+            response,
+            transfer_id,
+            room_id,
+            chunk_index,
+            plaintext_size,
+            request_body_size,
+        )
+        .await);
+    }
+    dev_log_sender_chunk_response(
         transfer_id,
+        room_id,
         chunk_index,
         plaintext_size,
         request_body_size,
         status,
+        "",
     );
-    if !response.status().is_success() {
-        return Err(chunk_failure_from_response(response).await);
-    }
 
     let ack = response
         .json::<ChunkAckResponse>()
         .await
         .map_err(|_| ChunkSendFailure {
-            message: "Network connection lost.".into(),
+            message: "Receiver returned an invalid chunk ack.".into(),
             kind: ChunkSendFailureKind::InvalidAck,
             retryable: true,
         })?;
     if !ack.ok || ack.chunk_index != chunk_index {
         return Err(ChunkSendFailure {
-            message: "Network connection lost.".into(),
+            message: "Receiver returned an invalid chunk ack.".into(),
             kind: ChunkSendFailureKind::InvalidAck,
             retryable: true,
         });
@@ -725,28 +809,60 @@ fn chunk_failure_from_reqwest(error: reqwest::Error) -> ChunkSendFailure {
     }
     if error.is_connect() {
         return ChunkSendFailure {
-            message: "Network connection lost.".into(),
+            message: "Connection lost.".into(),
             kind: ChunkSendFailureKind::Unreachable,
             retryable: true,
         };
     }
     ChunkSendFailure {
-        message: "Network connection lost.".into(),
+        message: "Connection lost.".into(),
         kind: ChunkSendFailureKind::Unreachable,
         retryable: true,
     }
 }
 
-async fn chunk_failure_from_response(response: reqwest::Response) -> ChunkSendFailure {
-    let status = response.status();
-    if status == StatusCode::PAYLOAD_TOO_LARGE {
+async fn chunk_failure_from_response(
+    response: reqwest::Response,
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: u64,
+    plaintext_size: usize,
+    request_body_size: usize,
+) -> ChunkSendFailure {
+    let details = response_error_details(response).await;
+    dev_log_sender_chunk_response(
+        transfer_id,
+        room_id,
+        chunk_index,
+        plaintext_size,
+        request_body_size,
+        details.status,
+        &details.body_text,
+    );
+    if details.status == StatusCode::PAYLOAD_TOO_LARGE
+        || details.code.as_deref() == Some("chunk_too_large")
+    {
         return ChunkSendFailure {
             message: "Chunk too large for receiver.".into(),
             kind: ChunkSendFailureKind::ChunkTooLarge,
             retryable: false,
         };
     }
-    if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
+    if details.code.as_deref() == Some("room_not_found") {
+        return ChunkSendFailure {
+            message: "Room not found on receiver.".into(),
+            kind: ChunkSendFailureKind::PeerLeft,
+            retryable: false,
+        };
+    }
+    if details.code.as_deref() == Some("transfer_missing") {
+        return ChunkSendFailure {
+            message: "Transfer session not found on receiver.".into(),
+            kind: ChunkSendFailureKind::HttpStatus,
+            retryable: false,
+        };
+    }
+    if details.status == StatusCode::GONE {
         return ChunkSendFailure {
             message: "Peer left the room.".into(),
             kind: ChunkSendFailureKind::PeerLeft,
@@ -754,11 +870,7 @@ async fn chunk_failure_from_response(response: reqwest::Response) -> ChunkSendFa
         };
     }
 
-    let error = response.json::<TransferErrorResponse>().await.ok();
-    if error
-        .as_ref()
-        .is_some_and(|error| error.code == "cancelled")
-    {
+    if details.code.as_deref() == Some("cancelled") {
         return ChunkSendFailure {
             message: "Transfer cancelled.".into(),
             kind: ChunkSendFailureKind::Cancelled,
@@ -766,9 +878,9 @@ async fn chunk_failure_from_response(response: reqwest::Response) -> ChunkSendFa
         };
     }
 
-    if error.as_ref().is_some_and(|error| {
+    if details.code.as_deref().is_some_and(|code| {
         matches!(
-            error.code.as_str(),
+            code,
             "integrity_failed"
                 | "invalid_chunk"
                 | "invalid_chunk_order"
@@ -778,102 +890,118 @@ async fn chunk_failure_from_response(response: reqwest::Response) -> ChunkSendFa
         )
     }) {
         return ChunkSendFailure {
-            message: error
-                .map(|error| error.message)
-                .unwrap_or_else(|| "File transfer failed.".to_string()),
+            message: map_response_error_message(&details),
             kind: ChunkSendFailureKind::HttpStatus,
             retryable: false,
         };
     }
 
     ChunkSendFailure {
-        message: error
-            .map(|error| error.message)
-            .unwrap_or_else(|| "Network connection lost.".to_string()),
+        message: map_response_error_message(&details),
         kind: ChunkSendFailureKind::HttpStatus,
-        retryable: status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT,
+        retryable: details.status.is_server_error()
+            || details.status == StatusCode::REQUEST_TIMEOUT,
     }
 }
 
-fn dev_log_chunk_response(
+fn dev_log_sender_transfer_start(
     transfer_id: &str,
-    chunk_index: u64,
-    chunk_bytes: usize,
-    request_body_size: usize,
+    room_id: &str,
+    peer_url: &str,
+    start_url: &str,
+    chunk_url: &str,
+    chunk_size: u64,
+    total_chunks: u64,
+    file_size: u64,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=start_request method=POST peer_url={peer_url} start_url={start_url} chunk_url={chunk_url} payload_format=binary encrypted_body_encoding=raw-bytes chunk_size={chunk_size} total_chunks={total_chunks} file_size={file_size}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (
+        transfer_id,
+        room_id,
+        peer_url,
+        start_url,
+        chunk_url,
+        chunk_size,
+        total_chunks,
+        file_size,
+    );
+}
+
+fn dev_log_sender_transfer_start_response(
+    transfer_id: &str,
+    room_id: &str,
     status: StatusCode,
+    body_text: &str,
 ) {
     #[cfg(debug_assertions)]
     eprintln!(
-        "transfer chunk response transfer_id={transfer_id} chunk_index={chunk_index} chunk_bytes={chunk_bytes} request_body_size={request_body_size} response_status={status}"
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=start_response response_status={status} response_body={body_text:?}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, room_id, status, body_text);
+}
+
+fn dev_log_sender_chunk_request(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: u64,
+    chunk_url: &str,
+    method: &str,
+    plaintext_bytes: usize,
+    encrypted_body_bytes: usize,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_request method={method} chunk_url={chunk_url} plaintext_bytes={plaintext_bytes} encrypted_body_bytes={encrypted_body_bytes} payload_format=binary encrypted_body_encoding=raw-bytes"
     );
 
     #[cfg(not(debug_assertions))]
     let _ = (
         transfer_id,
+        room_id,
         chunk_index,
-        chunk_bytes,
-        request_body_size,
+        chunk_url,
+        method,
+        plaintext_bytes,
+        encrypted_body_bytes,
+    );
+}
+
+fn dev_log_sender_chunk_response(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: u64,
+    plaintext_bytes: usize,
+    encrypted_body_bytes: usize,
+    status: StatusCode,
+    body_text: &str,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_response plaintext_bytes={plaintext_bytes} encrypted_body_bytes={encrypted_body_bytes} response_status={status} response_body={body_text:?}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (
+        transfer_id,
+        room_id,
+        chunk_index,
+        plaintext_bytes,
+        encrypted_body_bytes,
         status,
+        body_text,
     );
 }
 
-fn dev_log_receiver_chunk_received(
+fn dev_log_sender_chunk_attempt(
     transfer_id: &str,
-    chunk_index: u64,
-    chunk_bytes: u64,
-    request_body_size: usize,
-) {
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "transfer receiver chunk received transfer_id={transfer_id} chunk_index={chunk_index} chunk_bytes={chunk_bytes} request_body_size={request_body_size}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (transfer_id, chunk_index, chunk_bytes, request_body_size);
-}
-
-fn dev_log_receiver_chunk_write_success(
-    transfer_id: &str,
-    chunk_index: u64,
-    chunk_bytes: u64,
-    request_body_size: usize,
-) {
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "transfer receiver chunk write transfer_id={transfer_id} chunk_index={chunk_index} chunk_bytes={chunk_bytes} request_body_size={request_body_size} response_status={} result=success",
-        StatusCode::OK
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (transfer_id, chunk_index, chunk_bytes, request_body_size);
-}
-
-fn dev_log_receiver_chunk_failure(
-    transfer_id: &str,
-    chunk_index: u64,
-    chunk_bytes: u64,
-    request_body_size: usize,
-    response_status: StatusCode,
-    error_cause: &str,
-) {
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "transfer receiver chunk failure transfer_id={transfer_id} chunk_index={chunk_index} chunk_bytes={chunk_bytes} request_body_size={request_body_size} response_status={response_status} error_cause={error_cause}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (
-        transfer_id,
-        chunk_index,
-        chunk_bytes,
-        request_body_size,
-        response_status,
-        error_cause,
-    );
-}
-
-fn dev_log_chunk_attempt(
-    transfer_id: &str,
+    room_id: &str,
     chunk_index: u64,
     retry_count: usize,
     error_kind: &str,
@@ -881,12 +1009,188 @@ fn dev_log_chunk_attempt(
 ) {
     #[cfg(debug_assertions)]
     eprintln!(
-        "transfer chunk attempt transfer_id={transfer_id} chunk_index={chunk_index} retry_count={retry_count} error_kind={error_kind} elapsed_ms={}",
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_attempt retry_count={retry_count} result={error_kind} elapsed_ms={}",
         elapsed.as_millis()
     );
 
     #[cfg(not(debug_assertions))]
-    let _ = (transfer_id, chunk_index, retry_count, error_kind, elapsed);
+    let _ = (
+        transfer_id,
+        room_id,
+        chunk_index,
+        retry_count,
+        error_kind,
+        elapsed,
+    );
+}
+
+fn dev_log_sender_final_error(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: Option<u64>,
+    error_kind: &str,
+    message: &str,
+) {
+    #[cfg(debug_assertions)]
+    match chunk_index {
+        Some(chunk_index) => eprintln!(
+            "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=final_error error_kind={error_kind} message={message:?}"
+        ),
+        None => eprintln!(
+            "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=final_error error_kind={error_kind} message={message:?}"
+        ),
+    }
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, room_id, chunk_index, error_kind, message);
+}
+
+fn dev_log_receiver_start_route_hit(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_size: u64,
+    total_chunks: u64,
+    file_size: u64,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}] event=start_route_hit chunk_size={chunk_size} total_chunks={total_chunks} file_size={file_size}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, room_id, chunk_size, total_chunks, file_size);
+}
+
+fn dev_log_receiver_start_registered(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_size: u64,
+    total_chunks: u64,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}] event=start_registered chunk_size={chunk_size} total_chunks={total_chunks}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, room_id, chunk_size, total_chunks);
+}
+
+fn dev_log_receiver_start_failure(
+    transfer_id: &str,
+    room_id: &str,
+    response_status: StatusCode,
+    error_cause: &str,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}] event=start_failure response_status={response_status} error_cause={error_cause}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, room_id, response_status, error_cause);
+}
+
+fn dev_log_receiver_chunk_route_hit(transfer_id: &str, room_id: &str, chunk_index: Option<u64>) {
+    #[cfg(debug_assertions)]
+    match chunk_index {
+        Some(chunk_index) => eprintln!(
+            "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_route_hit"
+        ),
+        None => eprintln!(
+            "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk=unknown] event=chunk_route_hit"
+        ),
+    }
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, room_id, chunk_index);
+}
+
+fn dev_log_receiver_chunk_received(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: u64,
+    plaintext_bytes: u64,
+    request_body_size: usize,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_received plaintext_bytes={plaintext_bytes} request_body_size={request_body_size} payload_format=binary encrypted_body_encoding=raw-bytes"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (
+        transfer_id,
+        room_id,
+        chunk_index,
+        plaintext_bytes,
+        request_body_size,
+    );
+}
+
+fn dev_log_receiver_chunk_write_success(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: u64,
+    plaintext_bytes: u64,
+    request_body_size: usize,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_write plaintext_bytes={plaintext_bytes} request_body_size={request_body_size} response_status={} result=success",
+        StatusCode::OK
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (
+        transfer_id,
+        room_id,
+        chunk_index,
+        plaintext_bytes,
+        request_body_size,
+    );
+}
+
+fn dev_log_receiver_chunk_ack(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: u64,
+    transferred_bytes: u64,
+    result: &str,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_ack transferred_bytes={transferred_bytes} result={result}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, room_id, chunk_index, transferred_bytes, result);
+}
+
+fn dev_log_receiver_chunk_failure(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: u64,
+    plaintext_bytes: u64,
+    request_body_size: usize,
+    response_status: StatusCode,
+    error_cause: &str,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_failure plaintext_bytes={plaintext_bytes} request_body_size={request_body_size} response_status={response_status} error_cause={error_cause}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (
+        transfer_id,
+        room_id,
+        chunk_index,
+        plaintext_bytes,
+        request_body_size,
+        response_status,
+        error_cause,
+    );
 }
 
 pub async fn cancel_transfer(state: Arc<AppState>, transfer_id: &str) -> AppResult<bool> {
@@ -1205,8 +1509,19 @@ async fn start_file_transfer_handler(
     State(ctx): State<RoomServerContext>,
     Json(start): Json<FileTransferStartRequest>,
 ) -> Response {
+    dev_log_receiver_start_route_hit(
+        &start.transfer_id,
+        &room_id,
+        start.chunk_size,
+        start.total_chunks,
+        start.size_bytes,
+    );
     if room_id != ctx.room_id {
-        return StatusCode::NOT_FOUND.into_response();
+        return transfer_error(
+            StatusCode::NOT_FOUND,
+            "room_not_found",
+            "Room not found on receiver.".into(),
+        );
     }
     if let Some(response) = unavailable_room_response(&ctx.state, &room_id) {
         return response;
@@ -1250,11 +1565,17 @@ async fn start_file_transfer_handler(
     ) {
         Ok(session_key) => session_key,
         Err(_) => {
+            dev_log_receiver_start_failure(
+                &start.transfer_id,
+                &room_id,
+                StatusCode::BAD_REQUEST,
+                "invalid_payload",
+            );
             return transfer_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_payload",
-                "Received payload was not valid.".into(),
-            )
+                "Chunk integrity check failed.".into(),
+            );
         }
     };
     let inbox_dir = {
@@ -1282,10 +1603,16 @@ async fn start_file_transfer_handler(
     if tokio::fs::create_dir_all(&inbox_dir).await.is_err()
         || tokio::fs::File::create(&part_path).await.is_err()
     {
+        dev_log_receiver_start_failure(
+            &start.transfer_id,
+            &room_id,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "write_failed",
+        );
         return transfer_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "write_failed",
-            "Could not write to destination folder.".into(),
+            "Receiver failed to write chunk.".into(),
         );
     }
 
@@ -1318,10 +1645,17 @@ async fn start_file_transfer_handler(
         },
     };
     emit_event(&ctx.state, &transfer, "pending", 0, 0.0, 0.0, None, None);
+    let registered_transfer_id = start.transfer_id.clone();
     ctx.state
         .active_file_transfers
         .lock()
         .insert(start.transfer_id, transfer);
+    dev_log_receiver_start_registered(
+        &registered_transfer_id,
+        &room_id,
+        start.chunk_size,
+        start.total_chunks,
+    );
     Json(TransferOkResponse { ok: true }).into_response()
 }
 
@@ -1329,15 +1663,21 @@ async fn receive_file_chunk_handler(
     AxumPath((room_id, transfer_id)): AxumPath<(String, String)>,
     State(ctx): State<RoomServerContext>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    let chunk_index = parse_u64_header(&headers, "x-pastey-chunk-index");
+    dev_log_receiver_chunk_route_hit(&transfer_id, &room_id, chunk_index);
     if room_id != ctx.room_id {
-        return StatusCode::NOT_FOUND.into_response();
+        return transfer_error(
+            StatusCode::NOT_FOUND,
+            "room_not_found",
+            "Room not found on receiver.".into(),
+        );
     }
     if let Some(response) = unavailable_room_response_for_active_transfer(&ctx.state, &room_id) {
         return response;
     }
-    let chunk_index = match parse_u64_header(&headers, "x-pastey-chunk-index") {
+    let chunk_index = match chunk_index {
         Some(value) => value,
         None => {
             return transfer_error(
@@ -1345,6 +1685,33 @@ async fn receive_file_chunk_handler(
                 "invalid_chunk",
                 "Received payload was not valid.".into(),
             )
+        }
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => {
+            let status = error.status();
+            let body_text = error.body_text();
+            let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                "Chunk too large for receiver."
+            } else {
+                "Received payload was not valid."
+            };
+            let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                "chunk_too_large"
+            } else {
+                "invalid_chunk"
+            };
+            dev_log_receiver_chunk_failure(
+                &transfer_id,
+                &room_id,
+                chunk_index,
+                0,
+                0,
+                status,
+                &format!("body_rejected: {body_text}"),
+            );
+            return transfer_error(status, code, message.into());
         }
     };
     let plaintext_size = match parse_u64_header(&headers, "x-pastey-plaintext-size") {
@@ -1358,7 +1725,13 @@ async fn receive_file_chunk_handler(
         }
     };
     let request_body_size = body.len();
-    dev_log_receiver_chunk_received(&transfer_id, chunk_index, plaintext_size, request_body_size);
+    dev_log_receiver_chunk_received(
+        &transfer_id,
+        &room_id,
+        chunk_index,
+        plaintext_size,
+        request_body_size,
+    );
     let nonce = match headers
         .get("x-pastey-nonce")
         .and_then(|value| value.to_str().ok())
@@ -1380,7 +1753,7 @@ async fn receive_file_chunk_handler(
             return transfer_error(
                 StatusCode::NOT_FOUND,
                 "transfer_missing",
-                "Network connection lost.".into(),
+                "Transfer session not found on receiver.".into(),
             );
         };
         if transfer.cancel_token.is_cancelled() {
@@ -1405,6 +1778,13 @@ async fn receive_file_chunk_handler(
             );
         };
         if *expected_chunk_index > 0 && chunk_index + 1 == *expected_chunk_index {
+            dev_log_receiver_chunk_ack(
+                &transfer_id,
+                &room_id,
+                chunk_index,
+                *transferred_bytes,
+                "duplicate",
+            );
             return Json(ChunkAckResponse {
                 ok: true,
                 chunk_index,
@@ -1438,44 +1818,36 @@ async fn receive_file_chunk_handler(
         Err(_) => {
             dev_log_receiver_chunk_failure(
                 &transfer_id,
+                &room_id,
                 chunk_index,
                 plaintext_size,
                 request_body_size,
                 StatusCode::BAD_REQUEST,
                 "integrity_failed",
             );
-            fail_receiver_transfer(
-                &ctx.state,
-                &transfer_id,
-                "Chunk failed integrity verification.",
-            )
-            .await;
+            fail_receiver_transfer(&ctx.state, &transfer_id, "Chunk integrity check failed.").await;
             return transfer_error(
                 StatusCode::BAD_REQUEST,
                 "integrity_failed",
-                "Chunk failed integrity verification.".into(),
+                "Chunk integrity check failed.".into(),
             );
         }
     };
     if plaintext.len() as u64 != plaintext_size {
         dev_log_receiver_chunk_failure(
             &transfer_id,
+            &room_id,
             chunk_index,
             plaintext_size,
             request_body_size,
             StatusCode::BAD_REQUEST,
             "plaintext_size_mismatch",
         );
-        fail_receiver_transfer(
-            &ctx.state,
-            &transfer_id,
-            "Chunk failed integrity verification.",
-        )
-        .await;
+        fail_receiver_transfer(&ctx.state, &transfer_id, "Chunk integrity check failed.").await;
         return transfer_error(
             StatusCode::BAD_REQUEST,
             "integrity_failed",
-            "Chunk failed integrity verification.".into(),
+            "Chunk integrity check failed.".into(),
         );
     }
 
@@ -1488,26 +1860,23 @@ async fn receive_file_chunk_handler(
     if let Err(error) = write_result {
         dev_log_receiver_chunk_failure(
             &transfer_id,
+            &room_id,
             chunk_index,
             plaintext_size,
             request_body_size,
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("write_failed: {error}"),
         );
-        fail_receiver_transfer(
-            &ctx.state,
-            &transfer_id,
-            "Could not write to destination folder.",
-        )
-        .await;
+        fail_receiver_transfer(&ctx.state, &transfer_id, "Receiver failed to write chunk.").await;
         return transfer_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "write_failed",
-            "Could not write to destination folder.".into(),
+            "Receiver failed to write chunk.".into(),
         );
     }
     dev_log_receiver_chunk_write_success(
         &transfer_id,
+        &room_id,
         chunk_index,
         plaintext_size,
         request_body_size,
@@ -1519,7 +1888,7 @@ async fn receive_file_chunk_handler(
             return transfer_error(
                 StatusCode::NOT_FOUND,
                 "transfer_missing",
-                "Network connection lost.".into(),
+                "Transfer session not found on receiver.".into(),
             );
         };
         let now = Instant::now();
@@ -1573,6 +1942,13 @@ async fn receive_file_chunk_handler(
     if let Some((event, _)) = maybe_event {
         let _ = ctx.state.app_handle.emit(TRANSFER_EVENT, event);
     }
+    dev_log_receiver_chunk_ack(
+        &transfer_id,
+        &room_id,
+        chunk_index,
+        ack_transferred_bytes,
+        "ok",
+    );
 
     Json(ChunkAckResponse {
         ok: true,
@@ -1588,7 +1964,11 @@ async fn finish_file_transfer_handler(
     Json(finish): Json<FileTransferFinishRequest>,
 ) -> Response {
     if room_id != ctx.room_id {
-        return StatusCode::NOT_FOUND.into_response();
+        return transfer_error(
+            StatusCode::NOT_FOUND,
+            "room_not_found",
+            "Room not found on receiver.".into(),
+        );
     }
 
     let transfer = match ctx.state.active_file_transfers.lock().remove(&transfer_id) {
@@ -1597,7 +1977,7 @@ async fn finish_file_transfer_handler(
             return transfer_error(
                 StatusCode::NOT_FOUND,
                 "transfer_missing",
-                "Network connection lost.".into(),
+                "Transfer session not found on receiver.".into(),
             )
         }
     };
@@ -1630,12 +2010,12 @@ async fn finish_file_transfer_handler(
             0.0,
             average_speed(&transfer, *transferred_bytes),
             None,
-            Some("Network connection lost.".into()),
+            Some("Received payload was not valid.".into()),
         );
         return transfer_error(
             StatusCode::BAD_REQUEST,
             "invalid_transfer",
-            "Network connection lost.".into(),
+            "Received payload was not valid.".into(),
         );
     }
 
@@ -1649,12 +2029,12 @@ async fn finish_file_transfer_handler(
             0.0,
             average_speed(&transfer, *transferred_bytes),
             None,
-            Some("Could not write to destination folder.".into()),
+            Some("Receiver failed to write chunk.".into()),
         );
         return transfer_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "write_failed",
-            "Could not write to destination folder.".into(),
+            "Receiver failed to write chunk.".into(),
         );
     }
 
@@ -1697,9 +2077,14 @@ async fn finish_file_transfer_handler(
 async fn cancel_file_transfer_handler(
     AxumPath((room_id, transfer_id)): AxumPath<(String, String)>,
     State(ctx): State<RoomServerContext>,
+    request: Option<Json<TransferCancelRequest>>,
 ) -> Response {
     if room_id != ctx.room_id {
-        return StatusCode::NOT_FOUND.into_response();
+        return transfer_error(
+            StatusCode::NOT_FOUND,
+            "room_not_found",
+            "Room not found on receiver.".into(),
+        );
     }
     let Some(transfer) = ctx.state.active_file_transfers.lock().remove(&transfer_id) else {
         return Json(TransferOkResponse { ok: true }).into_response();
@@ -1708,15 +2093,22 @@ async fn cancel_file_transfer_handler(
     if let ActiveFileTransferKind::Receiver { part_path, .. } = &transfer.kind {
         let _ = tokio::fs::remove_file(part_path).await;
     }
+    let failure = request
+        .as_ref()
+        .is_some_and(|Json(request)| request.status.as_deref() == Some("failed"));
+    let status = if failure { "failed" } else { "cancelled" };
+    let message = request
+        .and_then(|Json(request)| request.message)
+        .unwrap_or_else(|| "Transfer cancelled.".into());
     emit_event(
         &ctx.state,
         &transfer,
-        "cancelled",
+        status,
         current_transferred(&transfer),
         0.0,
         average_speed(&transfer, current_transferred(&transfer)),
         None,
-        Some("Transfer cancelled.".into()),
+        Some(message),
     );
     Json(TransferOkResponse { ok: true }).into_response()
 }
@@ -1760,7 +2152,13 @@ async fn remote_leave_handler(
 fn unavailable_room_response(state: &Arc<AppState>, room_id: &str) -> Option<Response> {
     let room = match storage::get_room_by_id(&state.paths, room_id) {
         Ok(room) => room,
-        Err(_) => return Some(StatusCode::NOT_FOUND.into_response()),
+        Err(_) => {
+            return Some(transfer_error(
+                StatusCode::NOT_FOUND,
+                "room_not_found",
+                "Room not found on receiver.".into(),
+            ))
+        }
     };
     if room.expires_at <= storage::now_ts()
         || matches!(room.status, RoomStatus::Burned | RoomStatus::Expired)
@@ -1780,7 +2178,13 @@ fn unavailable_room_response_for_active_transfer(
 ) -> Option<Response> {
     let room = match storage::get_room_by_id(&state.paths, room_id) {
         Ok(room) => room,
-        Err(_) => return Some(StatusCode::NOT_FOUND.into_response()),
+        Err(_) => {
+            return Some(transfer_error(
+                StatusCode::NOT_FOUND,
+                "room_not_found",
+                "Room not found on receiver.".into(),
+            ))
+        }
     };
     if room.expires_at <= storage::now_ts() || room.status == RoomStatus::Expired {
         if room_has_active_transfer(state, room_id) {
@@ -1815,16 +2219,57 @@ fn transfer_error(status: StatusCode, code: &str, message: String) -> Response {
 }
 
 async fn response_error_message(response: reqwest::Response) -> String {
+    let details = response_error_details(response).await;
+    map_response_error_message(&details)
+}
+
+async fn response_error_details(response: reqwest::Response) -> ResponseErrorDetails {
     let status = response.status();
-    if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
-        return "Peer left the room.".to_string();
-    }
-    response
-        .json::<TransferErrorResponse>()
-        .await
-        .ok()
+    let body_text = response.text().await.unwrap_or_default();
+    let parsed = serde_json::from_str::<TransferErrorResponse>(&body_text).ok();
+    let code = parsed.as_ref().map(|error| error.code.clone());
+    let message = parsed
         .map(|error| error.message)
-        .unwrap_or_else(|| "Network connection lost.".to_string())
+        .unwrap_or_else(|| status_fallback_message(status).to_string());
+    ResponseErrorDetails {
+        status,
+        code,
+        message,
+        body_text,
+    }
+}
+
+fn map_response_error_message(details: &ResponseErrorDetails) -> String {
+    match details.code.as_deref() {
+        Some("room_not_found") => "Room not found on receiver.".into(),
+        Some("transfer_missing") => "Transfer session not found on receiver.".into(),
+        Some("chunk_too_large") => "Chunk too large for receiver.".into(),
+        Some("integrity_failed") => "Chunk integrity check failed.".into(),
+        Some("write_failed") => "Receiver failed to write chunk.".into(),
+        Some("cancelled") => "Transfer cancelled.".into(),
+        _ => {
+            if details.status == StatusCode::PAYLOAD_TOO_LARGE {
+                "Chunk too large for receiver.".into()
+            } else if details.status == StatusCode::NOT_FOUND {
+                "Transfer session not found on receiver.".into()
+            } else if details.status == StatusCode::INTERNAL_SERVER_ERROR {
+                "Receiver failed to write chunk.".into()
+            } else {
+                details.message.clone()
+            }
+        }
+    }
+}
+
+fn status_fallback_message(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::PAYLOAD_TOO_LARGE => "Chunk too large for receiver.",
+        StatusCode::NOT_FOUND => "Transfer session not found on receiver.",
+        StatusCode::INTERNAL_SERVER_ERROR => "Receiver failed to write chunk.",
+        StatusCode::REQUEST_TIMEOUT => "Transfer timed out.",
+        StatusCode::GONE => "Peer left the room.",
+        _ => "Connection lost.",
+    }
 }
 
 fn register_sender_transfer(
@@ -2045,6 +2490,22 @@ async fn notify_transfer_cancel(client: &reqwest::Client, base_url: &str, transf
         .await;
 }
 
+async fn notify_transfer_failed(
+    client: &reqwest::Client,
+    base_url: &str,
+    transfer_id: &str,
+    message: &str,
+) {
+    let _ = client
+        .post(format!("{base_url}/transfers/{transfer_id}/cancel"))
+        .json(&serde_json::json!({
+            "status": "failed",
+            "message": message,
+        }))
+        .send()
+        .await;
+}
+
 async fn apply_rate_limit(state: &Arc<AppState>, transferred: u64, started_at: Instant) {
     let limit_mbps = {
         let config = state.config.read();
@@ -2111,5 +2572,75 @@ fn available_disk_space(path: &Path) -> Option<u64> {
         }
         let text = String::from_utf8(output.stdout).ok()?;
         text.trim().parse::<u64>().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn details(status: StatusCode, code: Option<&str>, message: &str) -> ResponseErrorDetails {
+        ResponseErrorDetails {
+            status,
+            code: code.map(ToString::to_string),
+            message: message.to_string(),
+            body_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn response_error_mapping_uses_specific_transfer_messages() {
+        assert_eq!(
+            map_response_error_message(&details(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Some("chunk_too_large"),
+                "ignored"
+            )),
+            "Chunk too large for receiver."
+        );
+        assert_eq!(
+            map_response_error_message(&details(
+                StatusCode::NOT_FOUND,
+                Some("transfer_missing"),
+                "ignored"
+            )),
+            "Transfer session not found on receiver."
+        );
+        assert_eq!(
+            map_response_error_message(&details(
+                StatusCode::NOT_FOUND,
+                Some("room_not_found"),
+                "ignored"
+            )),
+            "Room not found on receiver."
+        );
+        assert_eq!(
+            map_response_error_message(&details(
+                StatusCode::BAD_REQUEST,
+                Some("integrity_failed"),
+                "ignored"
+            )),
+            "Chunk integrity check failed."
+        );
+        assert_eq!(
+            map_response_error_message(&details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some("write_failed"),
+                "ignored"
+            )),
+            "Receiver failed to write chunk."
+        );
+        assert_eq!(
+            map_response_error_message(&details(StatusCode::REQUEST_TIMEOUT, None, "timed out")),
+            "timed out"
+        );
+        assert_eq!(
+            map_response_error_message(&details(
+                StatusCode::CONFLICT,
+                Some("cancelled"),
+                "ignored"
+            )),
+            "Transfer cancelled."
+        );
     }
 }
