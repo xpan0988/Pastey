@@ -50,7 +50,7 @@ impl AppError {
                     .to_string(),
             },
             Self::Sql(_) | Self::Json(_) => "Could not update local pastey storage.".to_string(),
-            Self::Http(error) if error.is_timeout() => "Network connection lost.".to_string(),
+            Self::Http(error) if error.is_timeout() => "Transfer timed out.".to_string(),
             Self::Http(error) if error.is_connect() => "Peer left the room.".to_string(),
             Self::Http(_) => "Network connection lost.".to_string(),
             Self::Url(_) => "Selected file path is invalid.".to_string(),

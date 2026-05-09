@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use tokio::{
     fs::OpenOptions,
@@ -38,6 +38,13 @@ use crate::{
 pub const DEFAULT_CHUNK_SIZE_BYTES: u64 = 8 * 1024 * 1024;
 const DISK_SPACE_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
 const TRANSFER_EVENT: &str = "pastey://transfer-progress";
+const TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const CHUNK_RETRY_BACKOFFS: [Duration; 3] = [
+    Duration::from_millis(300),
+    Duration::from_millis(800),
+    Duration::from_millis(1500),
+];
 
 pub struct ActiveFileTransfer {
     room_id: String,
@@ -79,9 +86,46 @@ struct ActiveRoomSnapshot {
     transport_public_key: String,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct TransferOkResponse {
     ok: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ChunkAckResponse {
+    ok: bool,
+    chunk_index: u64,
+    transferred_bytes: u64,
+}
+
+#[derive(Debug)]
+struct ChunkSendFailure {
+    message: String,
+    kind: ChunkSendFailureKind,
+    retryable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChunkSendFailureKind {
+    Cancelled,
+    HttpStatus,
+    InvalidAck,
+    PeerLeft,
+    Timeout,
+    Unreachable,
+}
+
+impl ChunkSendFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::HttpStatus => "http_status",
+            Self::InvalidAck => "invalid_ack",
+            Self::PeerLeft => "peer_left",
+            Self::Timeout => "timeout",
+            Self::Unreachable => "unreachable",
+        }
+    }
 }
 
 pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult<u16> {
@@ -367,6 +411,7 @@ pub async fn send_room_file(
 
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
+        .timeout(TRANSFER_REQUEST_TIMEOUT)
         .build()
         .map_err(|_| AppError::Network("Network connection lost.".into()))?;
     let base_url = format!("http://{peer_host}:{peer_port}/rooms/{room_id}");
@@ -415,7 +460,6 @@ pub async fn send_room_file(
     let started_at = Instant::now();
     let mut last_report_at = started_at;
     let mut last_report_bytes = 0u64;
-    let mut transferred = 0u64;
     let mut chunk_index = 0u64;
 
     loop {
@@ -440,35 +484,47 @@ pub async fn send_room_file(
         }
 
         let (encrypted_bytes, nonce) = crypto::encrypt_bytes(&buffer[..bytes_read], &payload_key)?;
-        let chunk_response = client
-            .post(format!("{base_url}/transfers/{transfer_id}/chunks"))
-            .header("x-pastey-chunk-index", chunk_index.to_string())
-            .header("x-pastey-plaintext-size", bytes_read.to_string())
-            .header("x-pastey-nonce", crypto::encode_nonce(&nonce))
-            .body(encrypted_bytes)
-            .send()
-            .await;
-
-        match chunk_response {
-            Ok(response) if response.status().is_success() => {}
-            Ok(response) => {
-                let message = response_error_message(response).await;
-                fail_transfer(&state, &transfer_id, item_id, message.clone());
-                return Err(AppError::Network(message));
-            }
+        let ack = match send_chunk_with_retry(
+            &client,
+            &base_url,
+            &transfer_id,
+            chunk_index,
+            bytes_read,
+            &nonce,
+            &encrypted_bytes,
+            &cancel_token,
+        )
+        .await
+        {
+            Ok(ack) => ack,
             Err(error) => {
-                fail_transfer(
-                    &state,
-                    &transfer_id,
-                    item_id,
-                    "Network connection lost.".into(),
-                );
-                return Err(AppError::Http(error));
+                if error.kind == ChunkSendFailureKind::Cancelled || cancel_token.is_cancelled() {
+                    notify_transfer_cancel(&client, &base_url, &transfer_id).await;
+                    let _ = storage::set_room_item_status(
+                        &state.paths,
+                        item_id,
+                        RoomItemStatus::Cancelled,
+                    );
+                    finish_transfer_locally(
+                        &state,
+                        &transfer_id,
+                        "cancelled",
+                        Some("Transfer cancelled.".into()),
+                    );
+                    return Err(AppError::InvalidInput("Transfer cancelled.".into()));
+                }
+
+                fail_transfer(&state, &transfer_id, item_id, error.message.clone());
+                return if error.kind == ChunkSendFailureKind::Timeout {
+                    Err(AppError::Timeout(error.message))
+                } else {
+                    Err(AppError::Network(error.message))
+                };
             }
-        }
+        };
 
         chunk_index += 1;
-        transferred += bytes_read as u64;
+        let transferred = ack.transferred_bytes;
         let now = Instant::now();
         let interval = now.duration_since(last_report_at).as_secs_f64().max(0.001);
         let current_speed = (transferred - last_report_bytes) as f64 / interval;
@@ -532,6 +588,186 @@ fn update_sender_transfer_report(
         transfer.last_report_bytes = transferred;
         transfer.last_report_at = reported_at;
     }
+}
+
+async fn send_chunk_with_retry(
+    client: &reqwest::Client,
+    base_url: &str,
+    transfer_id: &str,
+    chunk_index: u64,
+    plaintext_size: usize,
+    nonce: &[u8; 12],
+    encrypted_bytes: &[u8],
+    cancel_token: &CancellationToken,
+) -> Result<ChunkAckResponse, ChunkSendFailure> {
+    for retry_count in 0..=CHUNK_RETRY_BACKOFFS.len() {
+        if cancel_token.is_cancelled() {
+            return Err(ChunkSendFailure {
+                message: "Transfer cancelled.".into(),
+                kind: ChunkSendFailureKind::Cancelled,
+                retryable: false,
+            });
+        }
+
+        let attempt_started_at = Instant::now();
+        let result = send_chunk_once(
+            client,
+            base_url,
+            transfer_id,
+            chunk_index,
+            plaintext_size,
+            nonce,
+            encrypted_bytes,
+        )
+        .await;
+        let elapsed = attempt_started_at.elapsed();
+
+        match result {
+            Ok(ack) => {
+                dev_log_chunk_attempt(transfer_id, chunk_index, retry_count, "ok", elapsed);
+                return Ok(ack);
+            }
+            Err(error) => {
+                dev_log_chunk_attempt(
+                    transfer_id,
+                    chunk_index,
+                    retry_count,
+                    error.kind.as_str(),
+                    elapsed,
+                );
+                if cancel_token.is_cancelled() {
+                    return Err(ChunkSendFailure {
+                        message: "Transfer cancelled.".into(),
+                        kind: ChunkSendFailureKind::Cancelled,
+                        retryable: false,
+                    });
+                }
+                if !error.retryable || retry_count == CHUNK_RETRY_BACKOFFS.len() {
+                    return Err(error);
+                }
+                tokio::time::sleep(CHUNK_RETRY_BACKOFFS[retry_count]).await;
+            }
+        }
+    }
+
+    Err(ChunkSendFailure {
+        message: "Transfer timed out.".into(),
+        kind: ChunkSendFailureKind::Timeout,
+        retryable: false,
+    })
+}
+
+async fn send_chunk_once(
+    client: &reqwest::Client,
+    base_url: &str,
+    transfer_id: &str,
+    chunk_index: u64,
+    plaintext_size: usize,
+    nonce: &[u8; 12],
+    encrypted_bytes: &[u8],
+) -> Result<ChunkAckResponse, ChunkSendFailure> {
+    let response = client
+        .post(format!("{base_url}/transfers/{transfer_id}/chunks"))
+        .timeout(CHUNK_REQUEST_TIMEOUT)
+        .header("x-pastey-chunk-index", chunk_index.to_string())
+        .header("x-pastey-plaintext-size", plaintext_size.to_string())
+        .header("x-pastey-nonce", crypto::encode_nonce(nonce))
+        .body(encrypted_bytes.to_vec())
+        .send()
+        .await
+        .map_err(chunk_failure_from_reqwest)?;
+
+    if !response.status().is_success() {
+        return Err(chunk_failure_from_response(response).await);
+    }
+
+    let ack = response
+        .json::<ChunkAckResponse>()
+        .await
+        .map_err(|_| ChunkSendFailure {
+            message: "Network connection lost.".into(),
+            kind: ChunkSendFailureKind::InvalidAck,
+            retryable: true,
+        })?;
+    if !ack.ok || ack.chunk_index != chunk_index {
+        return Err(ChunkSendFailure {
+            message: "Network connection lost.".into(),
+            kind: ChunkSendFailureKind::InvalidAck,
+            retryable: true,
+        });
+    }
+
+    Ok(ack)
+}
+
+fn chunk_failure_from_reqwest(error: reqwest::Error) -> ChunkSendFailure {
+    if error.is_timeout() {
+        return ChunkSendFailure {
+            message: "Transfer timed out.".into(),
+            kind: ChunkSendFailureKind::Timeout,
+            retryable: true,
+        };
+    }
+    if error.is_connect() {
+        return ChunkSendFailure {
+            message: "Network connection lost.".into(),
+            kind: ChunkSendFailureKind::Unreachable,
+            retryable: true,
+        };
+    }
+    ChunkSendFailure {
+        message: "Network connection lost.".into(),
+        kind: ChunkSendFailureKind::Unreachable,
+        retryable: true,
+    }
+}
+
+async fn chunk_failure_from_response(response: reqwest::Response) -> ChunkSendFailure {
+    let status = response.status();
+    if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
+        return ChunkSendFailure {
+            message: "Peer left the room.".into(),
+            kind: ChunkSendFailureKind::PeerLeft,
+            retryable: false,
+        };
+    }
+
+    let error = response.json::<TransferErrorResponse>().await.ok();
+    if error
+        .as_ref()
+        .is_some_and(|error| error.code == "cancelled")
+    {
+        return ChunkSendFailure {
+            message: "Transfer cancelled.".into(),
+            kind: ChunkSendFailureKind::Cancelled,
+            retryable: false,
+        };
+    }
+
+    ChunkSendFailure {
+        message: error
+            .map(|error| error.message)
+            .unwrap_or_else(|| "Network connection lost.".to_string()),
+        kind: ChunkSendFailureKind::HttpStatus,
+        retryable: status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT,
+    }
+}
+
+fn dev_log_chunk_attempt(
+    transfer_id: &str,
+    chunk_index: u64,
+    retry_count: usize,
+    error_kind: &str,
+    elapsed: Duration,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "transfer chunk attempt transfer_id={transfer_id} chunk_index={chunk_index} retry_count={retry_count} error_kind={error_kind} elapsed_ms={}",
+        elapsed.as_millis()
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, chunk_index, retry_count, error_kind, elapsed);
 }
 
 pub async fn cancel_transfer(state: Arc<AppState>, transfer_id: &str) -> AppResult<bool> {
@@ -623,6 +859,15 @@ pub async fn cancel_room_transfers(
     }
 }
 
+pub fn active_transfer_room_ids(state: &Arc<AppState>) -> Vec<String> {
+    state
+        .active_file_transfers
+        .lock()
+        .values()
+        .map(|transfer| transfer.room_id.clone())
+        .collect()
+}
+
 async fn notify_room_event(peer_host: &str, peer_port: u16, room_id: &str, action: &str) {
     let _ = reqwest::Client::new()
         .post(format!(
@@ -657,6 +902,14 @@ fn room_server_snapshot(state: &Arc<AppState>, room_id: &str) -> AppResult<Activ
         transport_secret: server.transport_secret,
         transport_public_key: server.transport_public_key(),
     })
+}
+
+fn room_has_active_transfer(state: &Arc<AppState>, room_id: &str) -> bool {
+    state
+        .active_file_transfers
+        .lock()
+        .values()
+        .any(|transfer| transfer.room_id == room_id)
 }
 
 async fn join_handler(
@@ -962,7 +1215,7 @@ async fn receive_file_chunk_handler(
     if room_id != ctx.room_id {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if let Some(response) = unavailable_room_response(&ctx.state, &room_id) {
+    if let Some(response) = unavailable_room_response_for_active_transfer(&ctx.state, &room_id) {
         return response;
     }
     let chunk_index = match parse_u64_header(&headers, "x-pastey-chunk-index") {
@@ -1019,6 +1272,7 @@ async fn receive_file_chunk_handler(
         let ActiveFileTransferKind::Receiver {
             session_key,
             part_path,
+            transferred_bytes,
             expected_chunk_index,
             ..
         } = &transfer.kind
@@ -1029,11 +1283,19 @@ async fn receive_file_chunk_handler(
                 "Received payload was not valid.".into(),
             );
         };
+        if *expected_chunk_index > 0 && chunk_index + 1 == *expected_chunk_index {
+            return Json(ChunkAckResponse {
+                ok: true,
+                chunk_index,
+                transferred_bytes: *transferred_bytes,
+            })
+            .into_response();
+        }
         if *expected_chunk_index != chunk_index {
             return transfer_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_chunk_order",
-                "Network connection lost.".into(),
+                "Received chunks out of order.".into(),
             );
         }
         (
@@ -1153,11 +1415,20 @@ async fn receive_file_chunk_handler(
             current,
         ))
     };
+    let ack_transferred_bytes = maybe_event
+        .as_ref()
+        .map(|(_, current)| *current)
+        .unwrap_or(plaintext_size);
     if let Some((event, _)) = maybe_event {
         let _ = ctx.state.app_handle.emit(TRANSFER_EVENT, event);
     }
 
-    Json(TransferOkResponse { ok: true }).into_response()
+    Json(ChunkAckResponse {
+        ok: true,
+        chunk_index,
+        transferred_bytes: ack_transferred_bytes,
+    })
+    .into_response()
 }
 
 async fn finish_file_transfer_handler(
@@ -1307,7 +1578,7 @@ async fn remote_burn_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    cancel_room_transfers(ctx.state.clone(), &room_id, "Peer left the room.", false).await;
+    cancel_room_transfers(ctx.state.clone(), &room_id, "Transfer cancelled.", false).await;
     storage::mark_peer_burned(&ctx.state.paths, &room_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let state = ctx.state.clone();
@@ -1343,6 +1614,34 @@ fn unavailable_room_response(state: &Arc<AppState>, room_id: &str) -> Option<Res
     if room.expires_at <= storage::now_ts()
         || matches!(room.status, RoomStatus::Burned | RoomStatus::Expired)
     {
+        return Some(transfer_error(
+            StatusCode::GONE,
+            "room_expired",
+            "Room expired.".into(),
+        ));
+    }
+    None
+}
+
+fn unavailable_room_response_for_active_transfer(
+    state: &Arc<AppState>,
+    room_id: &str,
+) -> Option<Response> {
+    let room = match storage::get_room_by_id(&state.paths, room_id) {
+        Ok(room) => room,
+        Err(_) => return Some(StatusCode::NOT_FOUND.into_response()),
+    };
+    if room.expires_at <= storage::now_ts() || room.status == RoomStatus::Expired {
+        if room_has_active_transfer(state, room_id) {
+            return None;
+        }
+        return Some(transfer_error(
+            StatusCode::GONE,
+            "room_expired",
+            "Room expired.".into(),
+        ));
+    }
+    if room.status == RoomStatus::Burned {
         return Some(transfer_error(
             StatusCode::GONE,
             "room_expired",
@@ -1438,14 +1737,19 @@ fn finish_transfer_locally(
     message: Option<String>,
 ) {
     if let Some(transfer) = state.active_file_transfers.lock().remove(transfer_id) {
+        let transferred_bytes = if status == "completed" {
+            transfer.file_size
+        } else {
+            current_transferred(&transfer)
+        };
         emit_event(
             state,
             &transfer,
             status,
-            transfer.file_size,
+            transferred_bytes,
             0.0,
-            average_speed(&transfer, transfer.file_size),
-            Some(0.0),
+            average_speed(&transfer, transferred_bytes),
+            (status == "completed").then_some(0.0),
             message,
         );
     }

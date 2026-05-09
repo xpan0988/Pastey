@@ -20,7 +20,9 @@ pub fn start_cleanup_scheduler(app: AppHandle) {
 
 pub async fn run_cleanup_once(app: &AppHandle) -> AppResult<()> {
     let state = app.state::<Arc<AppState>>().inner().clone();
-    let expired_room_ids = crate::storage::cleanup_expired_rooms(&state.paths)?;
+    let active_transfer_room_ids = transfer::active_transfer_room_ids(&state);
+    let expired_room_ids =
+        crate::storage::cleanup_expired_rooms_except(&state.paths, &active_transfer_room_ids)?;
 
     for room_id in expired_room_ids {
         if let Err(error) = transfer::stop_room_server(state.clone(), &room_id).await {

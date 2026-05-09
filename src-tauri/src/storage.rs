@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -612,14 +613,22 @@ pub fn leave_room(paths: &AppPaths, room_id: &str) -> AppResult<Option<StoredRoo
     Ok(room)
 }
 
-pub fn cleanup_expired_rooms(paths: &AppPaths) -> AppResult<Vec<String>> {
+pub fn cleanup_expired_rooms_except(
+    paths: &AppPaths,
+    excluded_room_ids: &[String],
+) -> AppResult<Vec<String>> {
     let conn = connection(paths)?;
     let now = now_ts();
     let mut stmt = conn.prepare(
         "SELECT id FROM rooms WHERE expires_at <= ?1 AND status NOT IN ('expired', 'burned')",
     )?;
     let rows = stmt.query_map([now], |row| row.get::<_, String>(0))?;
-    let room_ids = rows.collect::<Result<Vec<_>, _>>()?;
+    let excluded_room_ids = excluded_room_ids.iter().cloned().collect::<HashSet<_>>();
+    let room_ids = rows
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|room_id| !excluded_room_ids.contains(room_id))
+        .collect::<Vec<_>>();
 
     for room_id in &room_ids {
         delete_room_payloads(paths, room_id)?;

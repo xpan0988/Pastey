@@ -26,7 +26,8 @@ pub async fn create_room(
     state: State<'_, Arc<AppState>>,
 ) -> Result<RoomInfo, String> {
     run_async(async move {
-        let _ = storage::cleanup_expired_rooms(&state.paths);
+        let active_transfer_room_ids = transfer::active_transfer_room_ids(&state);
+        let _ = storage::cleanup_expired_rooms_except(&state.paths, &active_transfer_room_ids);
         let master_key = {
             let config = state.config.read();
             config::master_key(&config)?
@@ -95,7 +96,8 @@ pub async fn join_room(code: String, state: State<'_, Arc<AppState>>) -> Result<
 #[tauri::command]
 pub async fn list_rooms(state: State<'_, Arc<AppState>>) -> Result<Vec<RoomInfo>, String> {
     run_async(async move {
-        let _ = storage::cleanup_expired_rooms(&state.paths);
+        let active_transfer_room_ids = transfer::active_transfer_room_ids(&state);
+        let _ = storage::cleanup_expired_rooms_except(&state.paths, &active_transfer_room_ids);
         let master_key = {
             let config = state.config.read();
             config::master_key(&config)?
