@@ -399,7 +399,7 @@ pub async fn send_room_file(
         ));
     }
     let chunk_size = DEFAULT_CHUNK_SIZE_BYTES;
-    let total_chunks = file_size.div_ceil(chunk_size);
+    let total_chunks = total_chunks_for(file_size, chunk_size);
     let file_name = item
         .display_name
         .clone()
@@ -442,6 +442,13 @@ pub async fn send_room_file(
         &base_url,
         &start_url,
         &chunk_url,
+        chunk_size,
+        total_chunks,
+        file_size,
+    );
+    dev_log_sender_start_transfer_metadata(
+        &transfer_id,
+        room_id,
         chunk_size,
         total_chunks,
         file_size,
@@ -528,6 +535,7 @@ pub async fn send_room_file(
         }
 
         let (encrypted_bytes, nonce) = crypto::encrypt_bytes(&buffer[..bytes_read], &payload_key)?;
+        dev_log_sender_chunk_plaintext(&transfer_id, room_id, chunk_index, bytes_read);
         let ack = match send_chunk_with_retry(
             &client,
             &base_url,
@@ -600,6 +608,20 @@ pub async fn send_room_file(
         last_report_at = now;
         last_report_bytes = transferred;
         apply_rate_limit(&state, transferred, started_at).await;
+    }
+
+    if chunk_index != total_chunks {
+        let message = "Transfer metadata mismatch".to_string();
+        notify_transfer_failed(&client, &base_url, &transfer_id, &message).await;
+        dev_log_sender_final_error(
+            &transfer_id,
+            room_id,
+            None,
+            "metadata_mismatch",
+            &format!("sent_chunks={chunk_index} total_chunks={total_chunks}"),
+        );
+        fail_transfer(&state, &transfer_id, item_id, message.clone());
+        return Err(AppError::Network(message));
     }
 
     let finish_response = client
@@ -910,8 +932,10 @@ async fn chunk_failure_from_response(
                 | "invalid_chunk_payload"
                 | "invalid_payload"
                 | "invalid_transfer"
+                | "metadata_mismatch"
                 | "not_enough_disk_space"
                 | "receiver_cannot_write"
+                | "size_mismatch"
                 | "temp_file_disappeared"
                 | "write_failed"
         )
@@ -974,6 +998,37 @@ fn dev_log_sender_transfer_start_response(
     let _ = (transfer_id, room_id, status, body_text);
 }
 
+fn dev_log_sender_start_transfer_metadata(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_size: u64,
+    total_chunks: u64,
+    file_size: u64,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=start_transfer_metadata chunk_size={chunk_size} total_chunks={total_chunks} file_size={file_size}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, room_id, chunk_size, total_chunks, file_size);
+}
+
+fn dev_log_sender_chunk_plaintext(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: u64,
+    actual_plaintext_size: usize,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_plaintext actual_plaintext_size={actual_plaintext_size}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, room_id, chunk_index, actual_plaintext_size);
+}
+
 fn dev_log_sender_chunk_request(
     transfer_id: &str,
     room_id: &str,
@@ -986,7 +1041,7 @@ fn dev_log_sender_chunk_request(
 ) {
     #[cfg(debug_assertions)]
     eprintln!(
-        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_request method={method} chunk_url={chunk_url} plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} payload_format=json"
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_request method={method} chunk_url={chunk_url} actual_plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} payload_format=json"
     );
 
     #[cfg(not(debug_assertions))]
@@ -1014,7 +1069,7 @@ fn dev_log_sender_chunk_response(
 ) {
     #[cfg(debug_assertions)]
     eprintln!(
-        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_response plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} response_status={status} response_body={body_text:?}"
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_response actual_plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} response_status={status} response_body={body_text:?}"
     );
 
     #[cfg(not(debug_assertions))]
@@ -1612,11 +1667,11 @@ async fn start_file_transfer_handler(
             "Chunk too large for receiver".into(),
         );
     }
-    if start.total_chunks != start.size_bytes.div_ceil(start.chunk_size) {
+    if start.total_chunks != total_chunks_for(start.size_bytes, start.chunk_size) {
         return transfer_error(
             StatusCode::BAD_REQUEST,
-            "invalid_transfer",
-            "Invalid file metadata".into(),
+            "metadata_mismatch",
+            "Transfer metadata mismatch".into(),
         );
     }
     match storage::room_item_exists(&ctx.state.paths, &start.item_id) {
@@ -1906,6 +1961,12 @@ async fn receive_file_chunk_handler(
                 "Invalid chunk payload",
                 "invalid_chunk_payload",
             ))
+        } else if plaintext_size > transfer.chunk_size {
+            Err((
+                "metadata_mismatch",
+                "Transfer metadata mismatch",
+                "chunk_larger_than_metadata_chunk_size",
+            ))
         } else if *expected_chunk_index > 0
             && chunk_index.checked_add(1) == Some(*expected_chunk_index)
         {
@@ -2164,13 +2225,14 @@ async fn finish_file_transfer_handler(
         &room_id,
         "finalize_verify_size",
         &format!(
-            "item_id={} finish_item_id={} received_bytes={} file_size={} expected_chunks={} total_chunks={}",
+            "item_id={} finish_item_id={} received_bytes={} file_size={} received_chunks={} total_chunks={} chunk_size={}",
             transfer.item_id,
             finish.item_id,
             transferred_bytes,
             transfer.file_size,
             expected_chunk_index,
-            transfer.total_chunks
+            transfer.total_chunks,
+            transfer.chunk_size
         ),
     );
     if finish.item_id != transfer.item_id {
@@ -2191,7 +2253,12 @@ async fn finish_file_transfer_handler(
             "Invalid file metadata".into(),
         );
     }
-    if *transferred_bytes != transfer.file_size || *expected_chunk_index != transfer.total_chunks {
+    if let Err((code, message)) = verify_finalize_metadata(
+        *transferred_bytes,
+        transfer.file_size,
+        *expected_chunk_index,
+        transfer.total_chunks,
+    ) {
         let _ = tokio::fs::remove_file(part_path).await;
         emit_event(
             &ctx.state,
@@ -2201,13 +2268,9 @@ async fn finish_file_transfer_handler(
             0.0,
             average_speed(&transfer, *transferred_bytes),
             None,
-            Some("Chunk integrity check failed".into()),
+            Some(message.into()),
         );
-        return transfer_error(
-            StatusCode::BAD_REQUEST,
-            "integrity_failed",
-            "Chunk integrity check failed".into(),
-        );
+        return transfer_error(StatusCode::BAD_REQUEST, code, message.into());
     }
 
     dev_log_receiver_finalize(
@@ -2472,8 +2535,10 @@ fn map_response_error_message(details: &ResponseErrorDetails) -> String {
         Some("invalid_chunk_encoding") => "Invalid chunk encoding".into(),
         Some("integrity_failed") => "Chunk integrity check failed".into(),
         Some("invalid_chunk_order") => "Unexpected chunk index".into(),
+        Some("metadata_mismatch") => "Transfer metadata mismatch".into(),
         Some("not_enough_disk_space") => "Not enough disk space on receiver".into(),
         Some("receiver_cannot_write") => "Receiver cannot write to inbox".into(),
+        Some("size_mismatch") => "Received file size mismatch".into(),
         Some("temp_file_disappeared") => "Receiver temporary file disappeared".into(),
         Some("write_failed") => "Receiver failed to write chunk".into(),
         Some("cancelled") => "Transfer cancelled.".into(),
@@ -2700,6 +2765,49 @@ fn eta_seconds(file_size: u64, transferred: u64, current_speed_bps: f64) -> Opti
         return None;
     }
     Some((file_size - transferred) as f64 / current_speed_bps)
+}
+
+fn total_chunks_for(file_size: u64, chunk_size: u64) -> u64 {
+    if chunk_size == 0 {
+        return 0;
+    }
+    file_size.div_ceil(chunk_size)
+}
+
+fn verify_finalize_metadata(
+    received_bytes: u64,
+    file_size: u64,
+    received_chunks: u64,
+    total_chunks: u64,
+) -> Result<(), (&'static str, &'static str)> {
+    if received_bytes != file_size {
+        return Err(("size_mismatch", "Received file size mismatch"));
+    }
+    if received_chunks != total_chunks {
+        return Err(("metadata_mismatch", "Transfer metadata mismatch"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn sender_chunk_count_for(file_size: u64, chunk_size: u64) -> u64 {
+    sender_chunk_plaintext_sizes(file_size, chunk_size).len() as u64
+}
+
+#[cfg(test)]
+fn sender_chunk_plaintext_sizes(file_size: u64, chunk_size: u64) -> Vec<u64> {
+    if file_size == 0 || chunk_size == 0 {
+        return Vec::new();
+    }
+
+    let mut remaining = file_size;
+    let mut sizes = Vec::new();
+    while remaining > 0 {
+        let next = remaining.min(chunk_size);
+        sizes.push(next);
+        remaining -= next;
+    }
+    sizes
 }
 
 fn cancel_token_clone(transfer: &ActiveFileTransfer) -> CancellationToken {
@@ -2982,6 +3090,22 @@ mod tests {
         assert_eq!(
             map_response_error_message(&details(
                 StatusCode::BAD_REQUEST,
+                Some("metadata_mismatch"),
+                "ignored"
+            )),
+            "Transfer metadata mismatch"
+        );
+        assert_eq!(
+            map_response_error_message(&details(
+                StatusCode::BAD_REQUEST,
+                Some("size_mismatch"),
+                "ignored"
+            )),
+            "Received file size mismatch"
+        );
+        assert_eq!(
+            map_response_error_message(&details(
+                StatusCode::BAD_REQUEST,
                 Some("invalid_chunk_order"),
                 "ignored"
             )),
@@ -3046,6 +3170,51 @@ mod tests {
         let body = serde_json::to_vec(&upload).expect("chunk upload serializes");
 
         assert!(body.len() < MAX_CHUNK_BODY_BYTES);
+    }
+
+    #[test]
+    fn sixty_mb_file_total_chunks_matches_sender_read_loop_count() {
+        let file_size = 60_109_151;
+        let chunk_size = DEFAULT_CHUNK_SIZE_BYTES;
+        let total_chunks = total_chunks_for(file_size, chunk_size);
+        let chunk_sizes = sender_chunk_plaintext_sizes(file_size, chunk_size);
+
+        assert_eq!(chunk_size, 4 * 1024 * 1024);
+        assert_eq!(total_chunks, 15);
+        assert_eq!(sender_chunk_count_for(file_size, chunk_size), total_chunks);
+        assert_eq!(chunk_sizes.len() as u64, total_chunks);
+        assert_eq!(chunk_sizes.iter().sum::<u64>(), file_size);
+        assert!(chunk_sizes[..chunk_sizes.len() - 1]
+            .iter()
+            .all(|size| *size == chunk_size));
+        assert_eq!(*chunk_sizes.last().unwrap(), 1_388_895);
+    }
+
+    #[test]
+    fn two_mib_sender_chunks_would_not_match_four_mib_metadata() {
+        let file_size = 60_109_151;
+        let metadata_total_chunks = total_chunks_for(file_size, DEFAULT_CHUNK_SIZE_BYTES);
+        let two_mib_actual_chunks = sender_chunk_count_for(file_size, 2 * 1024 * 1024);
+
+        assert_eq!(metadata_total_chunks, 15);
+        assert_eq!(two_mib_actual_chunks, 29);
+        assert_ne!(two_mib_actual_chunks, metadata_total_chunks);
+    }
+
+    #[test]
+    fn finalize_metadata_verification_distinguishes_size_and_chunk_mismatch() {
+        assert_eq!(
+            verify_finalize_metadata(60_109_151, 60_109_151, 15, 15),
+            Ok(())
+        );
+        assert_eq!(
+            verify_finalize_metadata(60_109_150, 60_109_151, 15, 15),
+            Err(("size_mismatch", "Received file size mismatch"))
+        );
+        assert_eq!(
+            verify_finalize_metadata(60_109_151, 60_109_151, 29, 15),
+            Err(("metadata_mismatch", "Transfer metadata mismatch"))
+        );
     }
 
     #[tokio::test]
