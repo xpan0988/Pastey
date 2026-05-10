@@ -280,6 +280,23 @@ pub struct FileTransferStartRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChunkUploadRequest {
+    pub chunk_index: u64,
+    pub nonce: String,
+    pub ciphertext: String,
+    pub plaintext_size: u64,
+    pub is_final: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChunkAckResponse {
+    pub ok: bool,
+    pub chunk_index: u64,
+    pub written_bytes: u64,
+    pub total_received_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileTransferFinishRequest {
     pub item_id: String,
 }

@@ -12,12 +12,37 @@ It is built with:
 - Temporary local HTTP transfer endpoints
 - UDP LAN discovery
 
-## 1.2.0
+## Version history
 
-- Refined home screen layout.
+### 0.1.0 — Initial MVP
+
+- Built the first Tauri v2 desktop app with React, TypeScript, and Rust.
+- Added local encrypted payload storage, SQLite metadata, UDP LAN discovery, and temporary HTTP transfer endpoints.
+- Produced the first macOS `.app` / `.dmg` build.
+
+### 1.0.0 — Room-based transfer
+
+- Reworked transfer flow from one code per item to one reusable room code per room.
+- Added room items, recent rooms, burn/expiry cleanup, screenshot paste, drag/drop files, and Windows/macOS packaging.
+- Stabilized local encrypted text/file/image transfer for small payloads.
+
+### 1.1.0 — Large-file transfer
+
+- Raised file support to 10GB with chunked encrypted LAN transfer.
+- Added `.part` receiver writes, progress, speed, ETA, cancel, speed limits, disk-space checks, and stale-part cleanup.
+- Generalized file handling so unknown binary files use the same transfer path as common file types.
+
+### 1.2.0 — UI and release polish
+
+- Refined the monochrome glass-style UI and balanced the home screen layout.
 - Matched Transfer room and Join room panels visually.
-- Preserved compact monochrome utility style.
-- No transfer protocol changes.
+- Updated README wording and kept release artifacts small with build-size auditing.
+
+### 1.3.x — Transfer stabilization
+
+- Improved chunk timeout, retry, ACK, and transfer error mapping.
+- Added detailed dev logs for chunked transfer diagnostics.
+- Began replacing ambiguous raw chunk uploads with a shared structured chunk protocol.
 
 ## What pastey does
 
