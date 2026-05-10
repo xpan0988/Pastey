@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use tokio::{
     fs::OpenOptions,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::oneshot,
 };
@@ -398,8 +398,8 @@ pub async fn send_room_file(
             "File changed after it was selected. Choose it again to transfer.".into(),
         ));
     }
-    let chunk_size = DEFAULT_CHUNK_SIZE_BYTES;
-    let total_chunks = total_chunks_for(file_size, chunk_size);
+    let chunk_size = DEFAULT_CHUNK_SIZE_BYTES as usize;
+    let total_chunks = chunk_count(file_size, chunk_size);
     let file_name = item
         .display_name
         .clone()
@@ -412,7 +412,7 @@ pub async fn send_room_file(
         item_id,
         &file_name,
         file_size,
-        chunk_size,
+        chunk_size as u64,
         total_chunks,
         cancel_token.clone(),
     )?;
@@ -442,14 +442,14 @@ pub async fn send_room_file(
         &base_url,
         &start_url,
         &chunk_url,
-        chunk_size,
+        chunk_size as u64,
         total_chunks,
         file_size,
     );
     dev_log_sender_start_transfer_metadata(
         &transfer_id,
         room_id,
-        chunk_size,
+        chunk_size as u64,
         total_chunks,
         file_size,
     );
@@ -459,7 +459,7 @@ pub async fn send_room_file(
         display_name: item.display_name.clone(),
         mime_type: item.mime_type.clone(),
         size_bytes: file_size,
-        chunk_size,
+        chunk_size: chunk_size as u64,
         total_chunks,
         created_at: item.created_at,
         wrapped_session_key,
@@ -507,7 +507,8 @@ pub async fn send_room_file(
     let mut file = tokio::fs::File::open(file_path)
         .await
         .map_err(|_| AppError::InvalidInput("Could not read selected file.".into()))?;
-    let mut buffer = vec![0u8; chunk_size as usize];
+    let mut buffer = vec![0u8; chunk_size];
+    dev_log_sender_read_loop_config(&transfer_id, room_id, chunk_size, buffer.len(), chunk_size);
     let started_at = Instant::now();
     let mut last_report_at = started_at;
     let mut last_report_bytes = 0u64;
@@ -526,16 +527,39 @@ pub async fn send_room_file(
             return Err(AppError::InvalidInput("Transfer cancelled.".into()));
         }
 
-        let bytes_read = file
-            .read(&mut buffer)
+        let bytes_read = read_next_chunk(&mut file, &mut buffer, chunk_size)
             .await
             .map_err(|_| AppError::InvalidInput("Could not read selected file.".into()))?;
         if bytes_read == 0 {
             break;
         }
 
+        let is_final = chunk_index.checked_add(1) == Some(total_chunks);
+        if bytes_read != chunk_size && !is_final {
+            let message = "Internal chunk size mismatch".to_string();
+            notify_transfer_failed(&client, &base_url, &transfer_id, &message).await;
+            dev_log_sender_final_error(
+                &transfer_id,
+                room_id,
+                Some(chunk_index),
+                "internal_chunk_size_mismatch",
+                &format!(
+                    "actual_plaintext_size={bytes_read} expected_non_final_chunk_size={chunk_size}"
+                ),
+            );
+            fail_transfer(&state, &transfer_id, item_id, message.clone());
+            return Err(AppError::Network(message));
+        }
+
         let (encrypted_bytes, nonce) = crypto::encrypt_bytes(&buffer[..bytes_read], &payload_key)?;
-        dev_log_sender_chunk_plaintext(&transfer_id, room_id, chunk_index, bytes_read);
+        dev_log_sender_chunk_plaintext(
+            &transfer_id,
+            room_id,
+            chunk_index,
+            bytes_read,
+            is_final,
+            chunk_size,
+        );
         let ack = match send_chunk_with_retry(
             &client,
             &base_url,
@@ -672,6 +696,35 @@ fn update_sender_transfer_report(
         transfer.last_report_bytes = transferred;
         transfer.last_report_at = reported_at;
     }
+}
+
+async fn read_next_chunk<R>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    chunk_size: usize,
+) -> std::io::Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    if chunk_size == 0 {
+        buffer.clear();
+        return Ok(0);
+    }
+
+    if buffer.len() != chunk_size {
+        buffer.resize(chunk_size, 0);
+    }
+
+    let mut bytes_read = 0;
+    while bytes_read < chunk_size {
+        let read = reader.read(&mut buffer[bytes_read..chunk_size]).await?;
+        if read == 0 {
+            break;
+        }
+        bytes_read += read;
+    }
+
+    Ok(bytes_read)
 }
 
 async fn send_chunk_with_retry(
@@ -1014,19 +1067,50 @@ fn dev_log_sender_start_transfer_metadata(
     let _ = (transfer_id, room_id, chunk_size, total_chunks, file_size);
 }
 
+fn dev_log_sender_read_loop_config(
+    transfer_id: &str,
+    room_id: &str,
+    metadata_chunk_size: usize,
+    read_buffer_len: usize,
+    expected_chunk_size: usize,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=read_loop_config metadata_chunk_size={metadata_chunk_size} read_buffer_len={read_buffer_len} expected_chunk_size={expected_chunk_size}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (
+        transfer_id,
+        room_id,
+        metadata_chunk_size,
+        read_buffer_len,
+        expected_chunk_size,
+    );
+}
+
 fn dev_log_sender_chunk_plaintext(
     transfer_id: &str,
     room_id: &str,
     chunk_index: u64,
     actual_plaintext_size: usize,
+    is_final: bool,
+    expected_non_final_chunk_size: usize,
 ) {
     #[cfg(debug_assertions)]
     eprintln!(
-        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_plaintext actual_plaintext_size={actual_plaintext_size}"
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_plaintext chunk_index={chunk_index} actual_plaintext_size={actual_plaintext_size} is_final={is_final} expected_non_final_chunk_size={expected_non_final_chunk_size}"
     );
 
     #[cfg(not(debug_assertions))]
-    let _ = (transfer_id, room_id, chunk_index, actual_plaintext_size);
+    let _ = (
+        transfer_id,
+        room_id,
+        chunk_index,
+        actual_plaintext_size,
+        is_final,
+        expected_non_final_chunk_size,
+    );
 }
 
 fn dev_log_sender_chunk_request(
@@ -2768,10 +2852,14 @@ fn eta_seconds(file_size: u64, transferred: u64, current_speed_bps: f64) -> Opti
 }
 
 fn total_chunks_for(file_size: u64, chunk_size: u64) -> u64 {
+    chunk_count(file_size, chunk_size as usize)
+}
+
+fn chunk_count(file_size: u64, chunk_size: usize) -> u64 {
     if chunk_size == 0 {
         return 0;
     }
-    file_size.div_ceil(chunk_size)
+    file_size.div_ceil(chunk_size as u64)
 }
 
 fn verify_finalize_metadata(
@@ -2791,11 +2879,11 @@ fn verify_finalize_metadata(
 
 #[cfg(test)]
 fn sender_chunk_count_for(file_size: u64, chunk_size: u64) -> u64 {
-    sender_chunk_plaintext_sizes(file_size, chunk_size).len() as u64
+    sender_chunk_plaintext_sizes(file_size, chunk_size as usize).len() as u64
 }
 
 #[cfg(test)]
-fn sender_chunk_plaintext_sizes(file_size: u64, chunk_size: u64) -> Vec<u64> {
+fn sender_chunk_plaintext_sizes(file_size: u64, chunk_size: usize) -> Vec<u64> {
     if file_size == 0 || chunk_size == 0 {
         return Vec::new();
     }
@@ -2803,7 +2891,7 @@ fn sender_chunk_plaintext_sizes(file_size: u64, chunk_size: u64) -> Vec<u64> {
     let mut remaining = file_size;
     let mut sizes = Vec::new();
     while remaining > 0 {
-        let next = remaining.min(chunk_size);
+        let next = remaining.min(chunk_size as u64);
         sizes.push(next);
         remaining -= next;
     }
@@ -3027,6 +3115,49 @@ fn available_disk_space(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::ReadBuf;
+
+    struct ShortAsyncReader {
+        data: Vec<u8>,
+        position: usize,
+        max_read: usize,
+    }
+
+    impl ShortAsyncReader {
+        fn new(data: Vec<u8>, max_read: usize) -> Self {
+            Self {
+                data,
+                position: 0,
+                max_read,
+            }
+        }
+    }
+
+    impl AsyncRead for ShortAsyncReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.position >= self.data.len() || buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let start = self.position;
+            let read_len = (self.data.len() - start)
+                .min(self.max_read)
+                .min(buf.remaining());
+            let end = start + read_len;
+            buf.put_slice(&self.data[start..end]);
+            self.position = end;
+
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn details(status: StatusCode, code: Option<&str>, message: &str) -> ResponseErrorDetails {
         ResponseErrorDetails {
@@ -3174,31 +3305,57 @@ mod tests {
 
     #[test]
     fn sixty_mb_file_total_chunks_matches_sender_read_loop_count() {
-        let file_size = 60_109_151;
-        let chunk_size = DEFAULT_CHUNK_SIZE_BYTES;
-        let total_chunks = total_chunks_for(file_size, chunk_size);
+        let file_size = 60_755_281;
+        let chunk_size = DEFAULT_CHUNK_SIZE_BYTES as usize;
+        let total_chunks = chunk_count(file_size, chunk_size);
         let chunk_sizes = sender_chunk_plaintext_sizes(file_size, chunk_size);
 
         assert_eq!(chunk_size, 4 * 1024 * 1024);
         assert_eq!(total_chunks, 15);
-        assert_eq!(sender_chunk_count_for(file_size, chunk_size), total_chunks);
+        assert_eq!(
+            sender_chunk_count_for(file_size, chunk_size as u64),
+            total_chunks
+        );
         assert_eq!(chunk_sizes.len() as u64, total_chunks);
         assert_eq!(chunk_sizes.iter().sum::<u64>(), file_size);
         assert!(chunk_sizes[..chunk_sizes.len() - 1]
             .iter()
-            .all(|size| *size == chunk_size));
-        assert_eq!(*chunk_sizes.last().unwrap(), 1_388_895);
+            .all(|size| *size == chunk_size as u64));
+        assert_eq!(*chunk_sizes.last().unwrap(), 2_035_025);
+        assert!(chunk_sizes.iter().all(|size| *size != 2 * 1024 * 1024));
     }
 
     #[test]
     fn two_mib_sender_chunks_would_not_match_four_mib_metadata() {
-        let file_size = 60_109_151;
+        let file_size = 60_755_281;
         let metadata_total_chunks = total_chunks_for(file_size, DEFAULT_CHUNK_SIZE_BYTES);
         let two_mib_actual_chunks = sender_chunk_count_for(file_size, 2 * 1024 * 1024);
 
         assert_eq!(metadata_total_chunks, 15);
         assert_eq!(two_mib_actual_chunks, 29);
         assert_ne!(two_mib_actual_chunks, metadata_total_chunks);
+    }
+
+    #[tokio::test]
+    async fn read_next_chunk_fills_buffer_across_two_mib_short_reads() {
+        let chunk_size = DEFAULT_CHUNK_SIZE_BYTES as usize;
+        let mut reader = ShortAsyncReader::new(vec![7u8; chunk_size + 123], 2 * 1024 * 1024);
+        let mut buffer = Vec::new();
+
+        let first = read_next_chunk(&mut reader, &mut buffer, chunk_size)
+            .await
+            .unwrap();
+        let second = read_next_chunk(&mut reader, &mut buffer, chunk_size)
+            .await
+            .unwrap();
+        let third = read_next_chunk(&mut reader, &mut buffer, chunk_size)
+            .await
+            .unwrap();
+
+        assert_eq!(first, chunk_size);
+        assert_eq!(second, 123);
+        assert_eq!(third, 0);
+        assert_eq!(buffer.len(), chunk_size);
     }
 
     #[test]
