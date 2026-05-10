@@ -469,9 +469,15 @@ pub fn create_outgoing_file_item_with_metadata(
     )
 }
 
-pub fn file_transfer_metadata(file_path: &Path) -> AppResult<(String, Option<String>, u64)> {
+pub fn file_transfer_metadata(file_path: &Path) -> AppResult<(String, Option<String>, u64, u64)> {
     let metadata = fs::metadata(file_path)?;
     validate_file_size(metadata.len())?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
     let display_name = file_path
         .file_name()
         .and_then(|value| value.to_str())
@@ -483,7 +489,7 @@ pub fn file_transfer_metadata(file_path: &Path) -> AppResult<(String, Option<Str
         .map(ToString::to_string)
         .or_else(|| Some("application/octet-stream".to_string()));
 
-    Ok((display_name, mime_type, metadata.len()))
+    Ok((display_name, mime_type, metadata.len(), modified_ms))
 }
 
 pub fn validate_file_size(size_bytes: u64) -> AppResult<()> {
@@ -728,6 +734,14 @@ pub fn room_item_to_info(
 }
 
 pub fn next_inbox_path(base_dir: &Path, display_name: Option<&str>) -> AppResult<PathBuf> {
+    next_inbox_path_excluding(base_dir, display_name, &[])
+}
+
+pub fn next_inbox_path_excluding(
+    base_dir: &Path,
+    display_name: Option<&str>,
+    reserved_paths: &[PathBuf],
+) -> AppResult<PathBuf> {
     fs::create_dir_all(base_dir)?;
     let raw_name = display_name.unwrap_or("pastey_file");
     let safe_name = sanitize(raw_name);
@@ -738,7 +752,7 @@ pub fn next_inbox_path(base_dir: &Path, display_name: Option<&str>) -> AppResult
     };
 
     let candidate = base_dir.join(&fallback);
-    if !candidate.exists() && !part_path_for(&candidate).exists() {
+    if inbox_path_available(&candidate, reserved_paths) {
         return Ok(candidate);
     }
 
@@ -759,7 +773,7 @@ pub fn next_inbox_path(base_dir: &Path, display_name: Option<&str>) -> AppResult
             format!("{stem} ({index}).{ext}")
         };
         let next = base_dir.join(file_name);
-        if !next.exists() && !part_path_for(&next).exists() {
+        if inbox_path_available(&next, reserved_paths) {
             return Ok(next);
         }
     }
@@ -767,6 +781,22 @@ pub fn next_inbox_path(base_dir: &Path, display_name: Option<&str>) -> AppResult
     Err(AppError::InvalidInput(
         "unable to allocate inbox file name".into(),
     ))
+}
+
+fn inbox_path_available(candidate: &Path, reserved_paths: &[PathBuf]) -> bool {
+    !candidate.exists()
+        && !part_path_for(candidate).exists()
+        && !reserved_paths.iter().any(|reserved| reserved == candidate)
+}
+
+pub fn transfer_part_path(base_dir: &Path, transfer_id: &str) -> PathBuf {
+    let safe_transfer_id = sanitize(transfer_id);
+    let file_name = if safe_transfer_id.is_empty() {
+        format!("{}.part", Uuid::new_v4())
+    } else {
+        format!("{safe_transfer_id}.part")
+    };
+    base_dir.join(".pastey-parts").join(file_name)
 }
 
 pub fn part_path_for(final_path: &Path) -> PathBuf {
@@ -1075,11 +1105,13 @@ mod tests {
         let path = dir.join("payload.not-a-known-extension");
         fs::write(&path, [0_u8, 1, 2, 3, 4, 5]).unwrap();
 
-        let (display_name, mime_type, size_bytes) = file_transfer_metadata(&path).unwrap();
+        let (display_name, mime_type, size_bytes, modified_ms) =
+            file_transfer_metadata(&path).unwrap();
 
         assert_eq!(display_name, "payload.not-a-known-extension");
         assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
         assert_eq!(size_bytes, 6);
+        assert!(modified_ms > 0);
         validate_file_size(size_bytes).unwrap();
 
         let _ = fs::remove_file(path);
@@ -1097,5 +1129,38 @@ mod tests {
 
         assert!(!part_path.exists());
         let _ = fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn transfer_part_path_is_unique_per_transfer_id() {
+        let dir = std::env::temp_dir().join(format!("pastey_part_path_{}", Uuid::new_v4()));
+        let first = transfer_part_path(&dir, "transfer-a");
+        let second = transfer_part_path(&dir, "transfer-b");
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first
+                .parent()
+                .and_then(|path| path.file_name())
+                .and_then(|value| value.to_str()),
+            Some(".pastey-parts")
+        );
+        assert!(first.ends_with("transfer-a.part"));
+        assert!(second.ends_with("transfer-b.part"));
+    }
+
+    #[test]
+    fn inbox_path_excludes_active_reserved_final_paths() {
+        let dir = std::env::temp_dir().join(format!("pastey_reserved_path_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let reserved = dir.join("file.pdf");
+
+        let next = next_inbox_path_excluding(&dir, Some("file.pdf"), &[reserved]).unwrap();
+
+        assert_eq!(
+            next.file_name().and_then(|value| value.to_str()),
+            Some("file (1).pdf")
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }

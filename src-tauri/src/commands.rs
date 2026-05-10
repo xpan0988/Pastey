@@ -18,6 +18,7 @@ pub struct FileTransferMetadata {
     display_name: String,
     mime_type: Option<String>,
     size_bytes: u64,
+    modified_ms: u64,
 }
 
 #[tauri::command]
@@ -226,13 +227,14 @@ pub fn get_file_transfer_metadata(path: String) -> Result<FileTransferMetadata, 
         return Err(AppError::InvalidInput("selected path is not a file".into()).message());
     }
 
-    let (display_name, mime_type, size_bytes) =
+    let (display_name, mime_type, size_bytes, modified_ms) =
         storage::file_transfer_metadata(&file_path).map_err(|error| error.message())?;
     Ok(FileTransferMetadata {
         path,
         display_name,
         mime_type,
         size_bytes,
+        modified_ms,
     })
 }
 

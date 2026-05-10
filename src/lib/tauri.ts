@@ -11,6 +11,7 @@ export interface FileTransferMetadata {
   display_name: string;
   mime_type?: string | null;
   size_bytes: number;
+  modified_ms: number;
 }
 
 export async function createRoom(expiryMinutes: number): Promise<RoomInfo> {

@@ -1,7 +1,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useMemo, useRef, useState, type ClipboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type MouseEvent } from "react";
 import {
   cancelTransfer,
   copyTextToClipboard,
@@ -26,6 +26,22 @@ interface RoomPageProps {
   onLeave: (roomId: string) => Promise<void>;
 }
 
+type FileSendSource = "drop" | "picker" | "paste";
+
+function fileIdentityKey(name: string, size: number, lastModified: number): string {
+  return `${name}:${size}:${lastModified}`;
+}
+
+function logFileSendTrigger(source: FileSendSource, fileName: string, size: number, dedupeKey: string, ignoredDuplicate: boolean) {
+  console.debug("[pastey file-send]", {
+    source,
+    file_name: fileName,
+    size,
+    dedupe_key: dedupeKey,
+    ignored_duplicate: ignoredDuplicate
+  });
+}
+
 export function RoomPage({
   room,
   items,
@@ -38,10 +54,10 @@ export function RoomPage({
   const [text, setText] = useState("");
   const [busy, setBusy] = useState<"text" | "file" | "burn" | "leave" | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [activeFileKey, setActiveFileKey] = useState<string | null>(null);
   const [cancellingTransferId, setCancellingTransferId] = useState<string | null>(null);
   const [composerDropActive, setComposerDropActive] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const inFlightFileKeysRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     composerRef.current?.focus();
@@ -78,9 +94,8 @@ export function RoomPage({
         if (event.payload.type === "drop") {
           setComposerDropActive(false);
           if (!room.peer_connected || busy !== null) return;
-          const [firstPath] = event.payload.paths;
-          if (firstPath) {
-            await handleSendFile(firstPath);
+          for (const path of event.payload.paths) {
+            await handleSendFile(path, "drop");
           }
           return;
         }
@@ -115,7 +130,7 @@ export function RoomPage({
     }
   }
 
-  async function handleSendFile(path: string) {
+  async function handleSendFile(path: string, source: FileSendSource) {
     try {
       const metadata = await getFileTransferMetadata(path);
       if (metadata.size_bytes > MAX_FILE_SIZE_BYTES) {
@@ -124,17 +139,21 @@ export function RoomPage({
       }
 
       await sendFileMessage({
+        source,
         path,
         displayName: metadata.display_name,
         mimeType: metadata.mime_type,
-        fileKey: `${metadata.path}:${metadata.size_bytes}`
+        size: metadata.size_bytes,
+        fileKey: fileIdentityKey(metadata.display_name, metadata.size_bytes, metadata.modified_ms)
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
   }
 
-  async function handlePickFile() {
+  async function handlePickFile(event?: MouseEvent<HTMLButtonElement>) {
+    event?.preventDefault();
+    event?.stopPropagation();
     if (!room.peer_connected || busy !== null) return;
     const selected = await open({
       multiple: false,
@@ -142,28 +161,35 @@ export function RoomPage({
     });
 
     if (typeof selected === "string") {
-      await handleSendFile(selected);
+      await handleSendFile(selected, "picker");
     }
   }
 
   async function sendFileMessage({
+    source,
     path,
     displayName,
     mimeType,
+    size,
     fileKey
   }: {
+    source: FileSendSource;
     path: string;
     displayName?: string;
     mimeType?: string | null;
+    size: number;
     fileKey?: string;
   }) {
-    if (fileKey && activeFileKey === fileKey) {
+    const dedupeKey = fileKey ?? fileIdentityKey(displayName ?? path, size, 0);
+    const ignoredDuplicate = inFlightFileKeysRef.current.has(dedupeKey);
+    logFileSendTrigger(source, displayName ?? path, size, dedupeKey, ignoredDuplicate);
+    if (ignoredDuplicate) {
       return;
     }
+    inFlightFileKeysRef.current.add(dedupeKey);
 
     setBusy("file");
     setError(null);
-    setActiveFileKey(fileKey ?? null);
 
     try {
       await sendFileToRoom(room.id, path, { displayName, mimeType });
@@ -171,19 +197,14 @@ export function RoomPage({
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setActiveFileKey(null);
+      inFlightFileKeysRef.current.delete(dedupeKey);
       setBusy(null);
     }
   }
 
-  async function handleSendPastedImage(file: File) {
+  async function handleSendPastedImage(file: File, fileKey: string) {
     if (file.size > MAX_FILE_SIZE_BYTES) {
       setError(FILE_TOO_LARGE_MESSAGE);
-      return;
-    }
-
-    const fileKey = `${file.name}:${file.size}:${file.lastModified}`;
-    if (activeFileKey === fileKey) {
       return;
     }
 
@@ -192,9 +213,11 @@ export function RoomPage({
       const buffer = await file.arrayBuffer();
       tempPath = await writeTempFile(file.name, Array.from(new Uint8Array(buffer)));
       await sendFileMessage({
+        source: "paste",
         path: tempPath,
         displayName: file.name,
         mimeType: file.type || "image/png",
+        size: file.size,
         fileKey
       });
     } finally {
@@ -211,6 +234,7 @@ export function RoomPage({
     }
 
     event.preventDefault();
+    event.stopPropagation();
 
     if (!room.peer_connected || busy !== null) {
       return;
@@ -223,13 +247,24 @@ export function RoomPage({
     }
 
     const mimeType = imageItem.type || clipboardFile.type || "image/png";
+    const dedupeKey = fileIdentityKey(clipboardFile.name || "clipboard-image", clipboardFile.size, clipboardFile.lastModified);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const screenshotFile = new File([clipboardFile], `screenshot_${timestamp}.png`, {
       type: mimeType,
       lastModified: Date.now()
     });
 
-    await handleSendPastedImage(screenshotFile);
+    await handleSendPastedImage(screenshotFile, dedupeKey);
+  }
+
+  function handleComposerDragOver(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  function handleComposerDrop(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
   }
 
   async function handleCopyCode() {
@@ -354,10 +389,14 @@ export function RoomPage({
       </section>
 
       <section className="panel composer-panel">
-        <div className={`composer-row ${composerDropActive ? "drop-active" : ""}`}>
+        <div
+          className={`composer-row ${composerDropActive ? "drop-active" : ""}`}
+          onDragOver={handleComposerDragOver}
+          onDrop={handleComposerDrop}
+        >
           <button
             className="plus-button"
-            onClick={() => void handlePickFile()}
+            onClick={(event) => void handlePickFile(event)}
             disabled={!room.peer_connected || busy !== null}
             title="Add file"
             aria-label="Add file"

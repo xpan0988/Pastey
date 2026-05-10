@@ -106,6 +106,16 @@ struct ResponseErrorDetails {
 }
 
 #[derive(Debug)]
+struct ReceiverWriteFailure {
+    code: &'static str,
+    message: &'static str,
+    status: StatusCode,
+    cause: String,
+    parent_exists: bool,
+    file_exists: bool,
+}
+
+#[derive(Debug)]
 struct ChunkSendFailure {
     message: String,
     kind: ChunkSendFailureKind,
@@ -900,6 +910,9 @@ async fn chunk_failure_from_response(
                 | "invalid_chunk_payload"
                 | "invalid_payload"
                 | "invalid_transfer"
+                | "not_enough_disk_space"
+                | "receiver_cannot_write"
+                | "temp_file_disappeared"
                 | "write_failed"
         )
     }) {
@@ -1328,6 +1341,18 @@ pub fn active_transfer_room_ids(state: &Arc<AppState>) -> Vec<String> {
         .collect()
 }
 
+fn active_receiver_final_paths(state: &Arc<AppState>) -> Vec<PathBuf> {
+    state
+        .active_file_transfers
+        .lock()
+        .values()
+        .filter_map(|transfer| match &transfer.kind {
+            ActiveFileTransferKind::Receiver { final_path, .. } => Some(final_path.clone()),
+            ActiveFileTransferKind::Sender => None,
+        })
+        .collect()
+}
+
 async fn notify_room_event(peer_host: &str, peer_port: u16, room_id: &str, action: &str) {
     let _ = reqwest::Client::new()
         .post(format!(
@@ -1626,7 +1651,12 @@ async fn start_file_transfer_handler(
             "Not enough disk space to receive this file.".into(),
         );
     }
-    let final_path = match storage::next_inbox_path(&inbox_dir, start.display_name.as_deref()) {
+    let reserved_final_paths = active_receiver_final_paths(&ctx.state);
+    let final_path = match storage::next_inbox_path_excluding(
+        &inbox_dir,
+        start.display_name.as_deref(),
+        &reserved_final_paths,
+    ) {
         Ok(path) => path,
         Err(_) => {
             return transfer_error(
@@ -1636,8 +1666,15 @@ async fn start_file_transfer_handler(
             )
         }
     };
-    let part_path = storage::part_path_for(&final_path);
-    if tokio::fs::create_dir_all(&inbox_dir).await.is_err()
+    let part_path = storage::transfer_part_path(&inbox_dir, &start.transfer_id);
+    let Some(part_dir) = part_path.parent() else {
+        return transfer_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "write_failed",
+            "Receiver failed to write chunk".into(),
+        );
+    };
+    if tokio::fs::create_dir_all(part_dir).await.is_err()
         || tokio::fs::File::create(&part_path).await.is_err()
     {
         dev_log_receiver_start_failure(
@@ -1896,10 +1933,11 @@ async fn receive_file_chunk_handler(
                 *session_key,
                 part_path.clone(),
                 cancel_token_clone(transfer),
+                *transferred_bytes,
             ))
         }
     };
-    let (session_key, part_path, cancel_token) = match transfer_lookup {
+    let (session_key, part_path, cancel_token, received_before) = match transfer_lookup {
         Ok(value) => value,
         Err((code, message, cause)) => {
             dev_log_receiver_chunk_failure(
@@ -1964,13 +2002,7 @@ async fn receive_file_chunk_handler(
         );
     }
 
-    let write_result = async {
-        let mut file = OpenOptions::new().append(true).open(&part_path).await?;
-        file.write_all(&plaintext).await?;
-        file.flush().await
-    }
-    .await;
-    if let Err(error) = write_result {
+    if let Err(error) = write_receiver_chunk(&part_path, &plaintext, received_before).await {
         dev_log_receiver_chunk_failure(
             &transfer_id,
             &room_id,
@@ -1978,15 +2010,17 @@ async fn receive_file_chunk_handler(
             plaintext_size,
             ciphertext_bytes,
             encoded_json_body_size,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("write_failed: {error}"),
+            error.status,
+            &format!(
+                "{}: part_path={} parent_exists={} file_exists={} transfer_status=active",
+                error.cause,
+                part_path.display(),
+                error.parent_exists,
+                error.file_exists
+            ),
         );
-        fail_receiver_transfer(&ctx.state, &transfer_id, "Receiver failed to write chunk").await;
-        return transfer_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "write_failed",
-            "Receiver failed to write chunk".into(),
-        );
+        fail_receiver_transfer(&ctx.state, &transfer_id, error.message).await;
+        return transfer_error(error.status, error.code, error.message.into());
     }
     dev_log_receiver_chunk_write_success(
         &transfer_id,
@@ -2365,6 +2399,9 @@ fn map_response_error_message(details: &ResponseErrorDetails) -> String {
         Some("invalid_chunk_encoding") => "Invalid chunk encoding".into(),
         Some("integrity_failed") => "Chunk integrity check failed".into(),
         Some("invalid_chunk_order") => "Unexpected chunk index".into(),
+        Some("not_enough_disk_space") => "Not enough disk space on receiver".into(),
+        Some("receiver_cannot_write") => "Receiver cannot write to inbox".into(),
+        Some("temp_file_disappeared") => "Receiver temporary file disappeared".into(),
         Some("write_failed") => "Receiver failed to write chunk".into(),
         Some("cancelled") => "Transfer cancelled.".into(),
         _ => {
@@ -2596,6 +2633,124 @@ fn cancel_token_clone(transfer: &ActiveFileTransfer) -> CancellationToken {
     transfer.cancel_token.clone()
 }
 
+async fn write_receiver_chunk(
+    part_path: &Path,
+    plaintext: &[u8],
+    received_before: u64,
+) -> Result<(), ReceiverWriteFailure> {
+    let Some(parent) = part_path.parent() else {
+        return Err(receiver_write_failure(
+            part_path,
+            "write_failed",
+            "Receiver failed to write chunk",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "part_path_missing_parent".to_string(),
+        ));
+    };
+
+    if let Err(error) = tokio::fs::create_dir_all(parent).await {
+        let (code, message, status) = map_receiver_write_error(&error);
+        return Err(receiver_write_failure(
+            part_path,
+            code,
+            message,
+            status,
+            format!("create_parent_failed: {error}"),
+        ));
+    }
+
+    let file_exists = tokio::fs::try_exists(part_path).await.unwrap_or(false);
+    if !file_exists && received_before > 0 {
+        return Err(receiver_write_failure(
+            part_path,
+            "temp_file_disappeared",
+            "Receiver temporary file disappeared",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "temp_file_disappeared".to_string(),
+        ));
+    }
+
+    let mut file = OpenOptions::new()
+        .create(received_before == 0)
+        .append(true)
+        .open(part_path)
+        .await
+        .map_err(|error| {
+            let (code, message, status) = map_receiver_write_error(&error);
+            receiver_write_failure(
+                part_path,
+                code,
+                message,
+                status,
+                format!("open_failed: {error}"),
+            )
+        })?;
+    file.write_all(plaintext).await.map_err(|error| {
+        let (code, message, status) = map_receiver_write_error(&error);
+        receiver_write_failure(
+            part_path,
+            code,
+            message,
+            status,
+            format!("write_failed: {error}"),
+        )
+    })?;
+    file.flush().await.map_err(|error| {
+        let (code, message, status) = map_receiver_write_error(&error);
+        receiver_write_failure(
+            part_path,
+            code,
+            message,
+            status,
+            format!("flush_failed: {error}"),
+        )
+    })
+}
+
+fn receiver_write_failure(
+    part_path: &Path,
+    code: &'static str,
+    message: &'static str,
+    status: StatusCode,
+    cause: String,
+) -> ReceiverWriteFailure {
+    let parent_exists = part_path.parent().is_some_and(Path::exists);
+    let file_exists = part_path.exists();
+    ReceiverWriteFailure {
+        code,
+        message,
+        status,
+        cause,
+        parent_exists,
+        file_exists,
+    }
+}
+
+fn map_receiver_write_error(error: &std::io::Error) -> (&'static str, &'static str, StatusCode) {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => (
+            "receiver_cannot_write",
+            "Receiver cannot write to inbox",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::WriteZero => (
+            "not_enough_disk_space",
+            "Not enough disk space on receiver",
+            StatusCode::INSUFFICIENT_STORAGE,
+        ),
+        std::io::ErrorKind::NotFound => (
+            "temp_file_disappeared",
+            "Receiver temporary file disappeared",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        _ => (
+            "write_failed",
+            "Receiver failed to write chunk",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
 async fn notify_transfer_cancel(client: &reqwest::Client, base_url: &str, transfer_id: &str) {
     let _ = client
         .post(format!("{base_url}/transfers/{transfer_id}/cancel"))
@@ -2762,6 +2917,30 @@ mod tests {
         assert_eq!(
             map_response_error_message(&details(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                Some("temp_file_disappeared"),
+                "ignored"
+            )),
+            "Receiver temporary file disappeared"
+        );
+        assert_eq!(
+            map_response_error_message(&details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some("receiver_cannot_write"),
+                "ignored"
+            )),
+            "Receiver cannot write to inbox"
+        );
+        assert_eq!(
+            map_response_error_message(&details(
+                StatusCode::INSUFFICIENT_STORAGE,
+                Some("not_enough_disk_space"),
+                "ignored"
+            )),
+            "Not enough disk space on receiver"
+        );
+        assert_eq!(
+            map_response_error_message(&details(
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Some("write_failed"),
                 "ignored"
             )),
@@ -2794,5 +2973,31 @@ mod tests {
         let body = serde_json::to_vec(&upload).expect("chunk upload serializes");
 
         assert!(body.len() < MAX_CHUNK_BODY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn writing_chunk_zero_creates_missing_parent_and_part_file() {
+        let dir = std::env::temp_dir().join(format!("pastey_chunk_write_{}", uuid::Uuid::new_v4()));
+        let part_path = dir.join(".pastey-parts").join("transfer.part");
+
+        write_receiver_chunk(&part_path, b"hello", 0).await.unwrap();
+
+        assert_eq!(tokio::fs::read(&part_path).await.unwrap(), b"hello");
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn missing_part_after_partial_write_is_reported_as_temp_disappeared() {
+        let dir =
+            std::env::temp_dir().join(format!("pastey_chunk_missing_{}", uuid::Uuid::new_v4()));
+        let part_path = dir.join(".pastey-parts").join("transfer.part");
+
+        let error = write_receiver_chunk(&part_path, b"later", 5)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "temp_file_disappeared");
+        assert_eq!(error.message, "Receiver temporary file disappeared");
+        let _ = tokio::fs::remove_dir_all(dir).await;
     }
 }
