@@ -170,6 +170,7 @@ pub struct RoomItem {
     pub id: String,
     pub room_id: String,
     pub direction: RoomItemDirection,
+    pub item_kind: String,
     pub payload_type: PayloadType,
     pub display_name: Option<String>,
     pub mime_type: Option<String>,
@@ -178,6 +179,7 @@ pub struct RoomItem {
     pub status: RoomItemStatus,
     pub text: Option<String>,
     pub saved_path: Option<String>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Clone, Debug)]

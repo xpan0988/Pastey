@@ -55,7 +55,7 @@ impl AppError {
             Self::Http(_) => "Network connection lost.".to_string(),
             Self::Url(_) => "Selected file path is invalid.".to_string(),
             Self::Utf8(_) => "Received text was not valid UTF-8.".to_string(),
-            Self::Base64(_) => "Received payload was not valid.".to_string(),
+            Self::Base64(_) => "Invalid file metadata".to_string(),
         }
     }
 }

@@ -29,6 +29,7 @@ export interface RoomItem {
   id: string;
   room_id: string;
   direction: RoomItemDirection;
+  item_kind: "text" | "outgoing_file" | "incoming_file";
   payload_type: PayloadType;
   display_name?: string | null;
   mime_type?: string | null;
@@ -37,6 +38,7 @@ export interface RoomItem {
   status: RoomItemStatus;
   text?: string | null;
   saved_path?: string | null;
+  error_message?: string | null;
 }
 
 export interface AppConfig {

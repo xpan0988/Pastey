@@ -1243,6 +1243,16 @@ fn dev_log_receiver_chunk_failure(
     );
 }
 
+fn dev_log_receiver_finalize(transfer_id: &str, room_id: &str, event: &str, details: &str) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}] event={event} {details}"
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (transfer_id, room_id, event, details);
+}
+
 pub async fn cancel_transfer(state: Arc<AppState>, transfer_id: &str) -> AppResult<bool> {
     let removed = state.active_file_transfers.lock().remove(transfer_id);
     let Some(transfer) = removed else {
@@ -1474,7 +1484,7 @@ async fn receive_item_handler(
             return transfer_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_payload",
-                "Received payload was not valid.".into(),
+                legacy_payload_error_message(&upload.payload_type).into(),
             )
         }
     };
@@ -1484,7 +1494,7 @@ async fn receive_item_handler(
             return transfer_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_payload",
-                "Received payload was not valid.".into(),
+                legacy_payload_error_message(&upload.payload_type).into(),
             )
         }
     };
@@ -1494,7 +1504,7 @@ async fn receive_item_handler(
             return transfer_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_payload",
-                "Received payload was not valid.".into(),
+                legacy_payload_error_message(&upload.payload_type).into(),
             )
         }
     };
@@ -1606,7 +1616,7 @@ async fn start_file_transfer_handler(
         return transfer_error(
             StatusCode::BAD_REQUEST,
             "invalid_transfer",
-            "Received payload was not valid.".into(),
+            "Invalid file metadata".into(),
         );
     }
     match storage::room_item_exists(&ctx.state.paths, &start.item_id) {
@@ -2114,6 +2124,7 @@ async fn finish_file_transfer_handler(
     State(ctx): State<RoomServerContext>,
     Json(finish): Json<FileTransferFinishRequest>,
 ) -> Response {
+    dev_log_receiver_finalize(&transfer_id, &room_id, "finalize_start", "");
     if room_id != ctx.room_id {
         return transfer_error(
             StatusCode::NOT_FOUND,
@@ -2145,13 +2156,24 @@ async fn finish_file_transfer_handler(
         return transfer_error(
             StatusCode::BAD_REQUEST,
             "invalid_transfer",
-            "Received payload was not valid.".into(),
+            "Invalid file metadata".into(),
         );
     };
-    if finish.item_id != transfer.item_id
-        || *transferred_bytes != transfer.file_size
-        || *expected_chunk_index != transfer.total_chunks
-    {
+    dev_log_receiver_finalize(
+        &transfer_id,
+        &room_id,
+        "finalize_verify_size",
+        &format!(
+            "item_id={} finish_item_id={} received_bytes={} file_size={} expected_chunks={} total_chunks={}",
+            transfer.item_id,
+            finish.item_id,
+            transferred_bytes,
+            transfer.file_size,
+            expected_chunk_index,
+            transfer.total_chunks
+        ),
+    );
+    if finish.item_id != transfer.item_id {
         let _ = tokio::fs::remove_file(part_path).await;
         emit_event(
             &ctx.state,
@@ -2161,15 +2183,43 @@ async fn finish_file_transfer_handler(
             0.0,
             average_speed(&transfer, *transferred_bytes),
             None,
-            Some("Received payload was not valid.".into()),
+            Some("Invalid file metadata".into()),
         );
         return transfer_error(
             StatusCode::BAD_REQUEST,
             "invalid_transfer",
-            "Received payload was not valid.".into(),
+            "Invalid file metadata".into(),
+        );
+    }
+    if *transferred_bytes != transfer.file_size || *expected_chunk_index != transfer.total_chunks {
+        let _ = tokio::fs::remove_file(part_path).await;
+        emit_event(
+            &ctx.state,
+            &transfer,
+            "failed",
+            *transferred_bytes,
+            0.0,
+            average_speed(&transfer, *transferred_bytes),
+            None,
+            Some("Chunk integrity check failed".into()),
+        );
+        return transfer_error(
+            StatusCode::BAD_REQUEST,
+            "integrity_failed",
+            "Chunk integrity check failed".into(),
         );
     }
 
+    dev_log_receiver_finalize(
+        &transfer_id,
+        &room_id,
+        "finalize_rename",
+        &format!(
+            "part_path={} final_path={}",
+            part_path.display(),
+            final_path.display()
+        ),
+    );
     if tokio::fs::rename(part_path, final_path).await.is_err() {
         let _ = tokio::fs::remove_file(part_path).await;
         emit_event(
@@ -2189,6 +2239,16 @@ async fn finish_file_transfer_handler(
         );
     }
 
+    dev_log_receiver_finalize(
+        &transfer_id,
+        &room_id,
+        "finalize_item_update",
+        &format!(
+            "item_kind=incoming_file status=received final_path={} mime_type={:?}",
+            final_path.display(),
+            mime_type
+        ),
+    );
     let master_key = {
         let config = ctx.state.config.read();
         match config::master_key(&config) {
@@ -2212,6 +2272,12 @@ async fn finish_file_transfer_handler(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let _ = storage::set_room_status(&ctx.state.paths, &room_id, RoomStatus::Active);
+    dev_log_receiver_finalize(
+        &transfer_id,
+        &room_id,
+        "finalize_complete",
+        "status=completed",
+    );
     emit_event(
         &ctx.state,
         &transfer,
@@ -2355,6 +2421,13 @@ fn unavailable_room_response_for_active_transfer(
         ));
     }
     None
+}
+
+fn legacy_payload_error_message(payload_type: &PayloadType) -> &'static str {
+    match payload_type {
+        PayloadType::Text => "Could not decode received text",
+        PayloadType::File => "Invalid file metadata",
+    }
 }
 
 fn transfer_error(status: StatusCode, code: &str, message: String) -> Response {

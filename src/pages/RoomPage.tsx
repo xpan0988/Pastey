@@ -526,6 +526,7 @@ function MessageRow({ item, onCopyText, onReveal }: MessageRowProps) {
               {item.status === "cancelled" ? " • cancelled" : ""}
               {item.status === "failed" ? " • failed" : ""}
             </span>
+            {item.error_message ? <span className="transfer-error">{item.error_message}</span> : null}
             {imagePreview ? <img className="image-preview chat-image" src={imagePreview} alt={item.display_name ?? "Preview"} /> : null}
             {item.saved_path ? (
               <button className="ghost-button inline-ghost" onClick={() => void onReveal(item.saved_path ?? "")}>

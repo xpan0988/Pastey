@@ -555,7 +555,7 @@ pub fn persist_incoming_item(
 
 pub fn persist_incoming_file_item_metadata(
     paths: &AppPaths,
-    master_key: &[u8; 32],
+    _master_key: &[u8; 32],
     room_id: &str,
     item_id: &str,
     size_bytes: u64,
@@ -564,20 +564,24 @@ pub fn persist_incoming_file_item_metadata(
     created_at: i64,
     saved_path: Option<String>,
 ) -> AppResult<StoredRoomItem> {
-    persist_room_item_with_size(
-        paths,
-        master_key,
-        room_id,
-        PayloadType::File,
-        RoomItemDirection::Incoming,
-        &[],
-        size_bytes,
+    let item = StoredRoomItem {
+        id: item_id.to_string(),
+        room_id: room_id.to_string(),
+        direction: RoomItemDirection::Incoming,
+        payload_type: PayloadType::File,
+        encrypted_path: String::new(),
         display_name,
         mime_type,
-        RoomItemStatus::Received,
-        Some(item_id.to_string()),
-        Some((created_at, saved_path)),
-    )
+        size_bytes,
+        created_at,
+        status: RoomItemStatus::Received,
+        nonce: String::new(),
+        wrapped_key: String::new(),
+        key_nonce: String::new(),
+        saved_path,
+    };
+    insert_room_item(paths, &item)?;
+    Ok(item)
 }
 
 pub fn set_room_item_status(
@@ -707,30 +711,124 @@ pub fn room_item_to_info(
     master_key: &[u8; 32],
     item: StoredRoomItem,
 ) -> AppResult<RoomItem> {
+    let item_kind = room_item_kind(&item);
+    let mut status = item.status.clone();
+    let mut error_message = None;
     let text = if item.payload_type == PayloadType::Text {
-        let key = read_room_item_key(&item, master_key)?;
-        let nonce = crypto::decode_nonce(&item.nonce)?;
-        let encrypted = fs::read(encrypted_file_path(paths, &item.encrypted_path))
-            .map_err(map_missing_payload_error)?;
-        let plaintext = crypto::decrypt_bytes(&encrypted, &key, &nonce)?;
-        Some(String::from_utf8(plaintext)?)
+        match decode_legacy_text_item(paths, master_key, &item) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                dev_log_room_item_render_kind(
+                    &item.id,
+                    &item_kind,
+                    &item.status,
+                    "legacy_text_payload",
+                    Some(&error.message()),
+                );
+                status = RoomItemStatus::Failed;
+                error_message = Some("Could not decode received text".to_string());
+                None
+            }
+        }
     } else {
+        if item.direction == RoomItemDirection::Incoming && item.status == RoomItemStatus::Received
+        {
+            match validate_incoming_file_metadata(&item) {
+                Ok(()) => {}
+                Err(message) => {
+                    status = RoomItemStatus::Failed;
+                    error_message = Some(message);
+                }
+            }
+        }
         None
     };
+    let path_kind = match (
+        &item.payload_type,
+        &item.direction,
+        item.saved_path.as_deref(),
+    ) {
+        (PayloadType::Text, _, _) => "legacy_text_payload",
+        (PayloadType::File, RoomItemDirection::Incoming, Some(_)) => "final_path",
+        (PayloadType::File, RoomItemDirection::Incoming, None) => "missing_final_path",
+        (PayloadType::File, RoomItemDirection::Outgoing, _) => "outgoing_encrypted_payload",
+    };
+    dev_log_room_item_render_kind(
+        &item.id,
+        &item_kind,
+        &status,
+        path_kind,
+        error_message.as_deref(),
+    );
 
     Ok(RoomItem {
         id: item.id,
         room_id: item.room_id,
         direction: item.direction,
+        item_kind,
         payload_type: item.payload_type,
         display_name: item.display_name,
         mime_type: item.mime_type,
         size_bytes: item.size_bytes,
         created_at: item.created_at,
-        status: item.status,
+        status,
         text,
         saved_path: item.saved_path,
+        error_message,
     })
+}
+
+fn decode_legacy_text_item(
+    paths: &AppPaths,
+    master_key: &[u8; 32],
+    item: &StoredRoomItem,
+) -> AppResult<String> {
+    let key = read_room_item_key(item, master_key)
+        .map_err(|_| AppError::InvalidInput("Could not decode received text".into()))?;
+    let nonce = crypto::decode_nonce(&item.nonce)
+        .map_err(|_| AppError::InvalidInput("Could not decode received text".into()))?;
+    let encrypted = fs::read(encrypted_file_path(paths, &item.encrypted_path))
+        .map_err(map_missing_payload_error)?;
+    let plaintext = crypto::decrypt_bytes(&encrypted, &key, &nonce)
+        .map_err(|_| AppError::InvalidInput("Could not decode received text".into()))?;
+    String::from_utf8(plaintext)
+        .map_err(|_| AppError::InvalidInput("Could not decode received text".into()))
+}
+
+fn validate_incoming_file_metadata(item: &StoredRoomItem) -> Result<(), String> {
+    let Some(saved_path) = item.saved_path.as_deref().filter(|path| !path.is_empty()) else {
+        return Err("Invalid file metadata".into());
+    };
+    if !Path::new(saved_path).is_file() {
+        return Err("Received file is no longer available".into());
+    }
+    Ok(())
+}
+
+fn room_item_kind(item: &StoredRoomItem) -> String {
+    match (&item.payload_type, &item.direction) {
+        (PayloadType::Text, _) => "text",
+        (PayloadType::File, RoomItemDirection::Outgoing) => "outgoing_file",
+        (PayloadType::File, RoomItemDirection::Incoming) => "incoming_file",
+    }
+    .to_string()
+}
+
+fn dev_log_room_item_render_kind(
+    item_id: &str,
+    item_kind: &str,
+    status: &RoomItemStatus,
+    path_kind: &str,
+    error_message: Option<&str>,
+) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[pastey transfer][receiver][transfer_id={item_id}] event=room_item_render_kind item_kind={item_kind} status={} path_kind={path_kind} error_message={error_message:?}",
+        status.as_str()
+    );
+
+    #[cfg(not(debug_assertions))]
+    let _ = (item_id, item_kind, status, path_kind, error_message);
 }
 
 pub fn next_inbox_path(base_dir: &Path, display_name: Option<&str>) -> AppResult<PathBuf> {
@@ -887,8 +985,17 @@ fn persist_room_item_with_size(
         saved_path,
     };
 
+    if let Err(error) = insert_room_item(paths, &item) {
+        let _ = remove_file_if_exists(&absolute_path);
+        return Err(error);
+    }
+
+    Ok(item)
+}
+
+fn insert_room_item(paths: &AppPaths, item: &StoredRoomItem) -> AppResult<()> {
     let conn = connection(paths)?;
-    if let Err(error) = conn.execute(
+    conn.execute(
         r#"
         INSERT INTO room_items (
             id,
@@ -909,27 +1016,23 @@ fn persist_room_item_with_size(
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         "#,
         params![
-            item.id,
-            item.room_id,
+            &item.id,
+            &item.room_id,
             item.direction.as_str(),
             item.payload_type.as_str(),
-            item.encrypted_path,
-            item.display_name,
-            item.mime_type,
+            &item.encrypted_path,
+            &item.display_name,
+            &item.mime_type,
             item.size_bytes as i64,
             item.created_at,
             item.status.as_str(),
-            item.nonce,
-            item.wrapped_key,
-            item.key_nonce,
-            item.saved_path
+            &item.nonce,
+            &item.wrapped_key,
+            &item.key_nonce,
+            &item.saved_path
         ],
-    ) {
-        let _ = remove_file_if_exists(&absolute_path);
-        return Err(error.into());
-    }
-
-    Ok(item)
+    )?;
+    Ok(())
 }
 
 fn cleanup_stale_part_files_in_dir(dir: &Path) -> AppResult<()> {
@@ -1025,6 +1128,9 @@ fn migrate_room_statuses(conn: &Connection) -> AppResult<()> {
 }
 
 fn delete_payload_file(paths: &AppPaths, relative_path: &str) -> AppResult<()> {
+    if relative_path.is_empty() {
+        return Ok(());
+    }
     let absolute = encrypted_file_path(paths, relative_path);
     remove_file_if_exists(&absolute).map(|_| ())
 }
@@ -1098,6 +1204,19 @@ mod tests {
 
     use super::*;
 
+    fn test_paths(name: &str) -> AppPaths {
+        let root = std::env::temp_dir().join(format!("{name}_{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        AppPaths {
+            app_data_dir: root.clone(),
+            db_path: root.join("db.sqlite"),
+            payloads_dir: root.join("payloads"),
+            inbox_dir: root.join("inbox"),
+            temp_dir: root.join("temp"),
+            config_path: root.join("config.json"),
+        }
+    }
+
     #[test]
     fn unknown_extension_metadata_remains_generic_and_transferable() {
         let dir = std::env::temp_dir().join(format!("pastey_unknown_ext_{}", Uuid::new_v4()));
@@ -1162,5 +1281,153 @@ mod tests {
             Some("file (1).pdf")
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn completed_incoming_chunked_file_does_not_require_legacy_payload_decode() {
+        let paths = test_paths("pastey_incoming_file_metadata");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        fs::create_dir_all(&paths.inbox_dir).unwrap();
+        let final_path = paths.inbox_dir.join("payload.bin");
+        fs::write(&final_path, [1_u8, 2, 3]).unwrap();
+
+        let item = persist_incoming_file_item_metadata(
+            &paths,
+            &master_key,
+            "room",
+            "transfer",
+            3,
+            Some("payload.bin".into()),
+            Some("application/octet-stream".into()),
+            now_ts(),
+            Some(final_path.display().to_string()),
+        )
+        .unwrap();
+
+        assert!(item.encrypted_path.is_empty());
+        let info = room_item_to_info(&paths, &master_key, item).unwrap();
+        assert_eq!(info.item_kind, "incoming_file");
+        assert_eq!(info.payload_type, PayloadType::File);
+        assert_eq!(info.status, RoomItemStatus::Received);
+        assert_eq!(
+            info.saved_path.as_deref(),
+            Some(final_path.to_str().unwrap())
+        );
+        assert!(info.text.is_none());
+        assert!(info.error_message.is_none());
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn missing_completed_incoming_file_maps_to_file_unavailable() {
+        let paths = test_paths("pastey_missing_incoming_file");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        let missing_path = paths.inbox_dir.join("missing.zip");
+        let item = persist_incoming_file_item_metadata(
+            &paths,
+            &master_key,
+            "room",
+            "transfer",
+            3,
+            Some("missing.zip".into()),
+            Some("application/zip".into()),
+            now_ts(),
+            Some(missing_path.display().to_string()),
+        )
+        .unwrap();
+
+        let info = room_item_to_info(&paths, &master_key, item).unwrap();
+
+        assert_eq!(info.item_kind, "incoming_file");
+        assert_eq!(info.status, RoomItemStatus::Failed);
+        assert_eq!(
+            info.error_message.as_deref(),
+            Some("Received file is no longer available")
+        );
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn invalid_legacy_text_payload_does_not_break_file_item_display() {
+        let paths = test_paths("pastey_invalid_text_with_file");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        let broken_text = StoredRoomItem {
+            id: "broken-text".into(),
+            room_id: "room".into(),
+            direction: RoomItemDirection::Incoming,
+            payload_type: PayloadType::Text,
+            encrypted_path: "missing.bin".into(),
+            display_name: None,
+            mime_type: None,
+            size_bytes: 5,
+            created_at: now_ts(),
+            status: RoomItemStatus::Received,
+            nonce: "not-base64".into(),
+            wrapped_key: "not-base64".into(),
+            key_nonce: "not-base64".into(),
+            saved_path: None,
+        };
+        insert_room_item(&paths, &broken_text).unwrap();
+        fs::create_dir_all(&paths.inbox_dir).unwrap();
+        let final_path = paths.inbox_dir.join("archive.zip");
+        fs::write(&final_path, [1_u8, 2, 3]).unwrap();
+        let file_item = persist_incoming_file_item_metadata(
+            &paths,
+            &master_key,
+            "room",
+            "file",
+            3,
+            Some("archive.zip".into()),
+            Some("application/zip".into()),
+            now_ts(),
+            Some(final_path.display().to_string()),
+        )
+        .unwrap();
+
+        let text_info = room_item_to_info(&paths, &master_key, broken_text).unwrap();
+        let file_info = room_item_to_info(&paths, &master_key, file_item).unwrap();
+
+        assert_eq!(text_info.status, RoomItemStatus::Failed);
+        assert_eq!(
+            text_info.error_message.as_deref(),
+            Some("Could not decode received text")
+        );
+        assert_eq!(file_info.status, RoomItemStatus::Received);
+        assert_eq!(file_info.item_kind, "incoming_file");
+        assert!(file_info.error_message.is_none());
+        let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 }
