@@ -14,29 +14,13 @@ It is built with:
 
 ## Version history
 
-### 0.1.0 — Initial MVP
+### 1.3.2 — Burn lifecycle cleanup
 
-- Built the first Tauri v2 desktop app with React, TypeScript, and Rust.
-- Added local encrypted payload storage, SQLite metadata, UDP LAN discovery, and temporary HTTP transfer endpoints.
-- Produced the first macOS `.app` / `.dmg` build.
-
-### 1.0.0 — Room-based transfer
-
-- Reworked transfer flow from one code per item to one reusable room code per room.
-- Added room items, recent rooms, burn/expiry cleanup, screenshot paste, drag/drop files, and Windows/macOS packaging.
-- Stabilized local encrypted text/file/image transfer for small payloads.
-
-### 1.1.0 — Large-file transfer
-
-- Raised file support to 10GB with chunked encrypted LAN transfer.
-- Added `.part` receiver writes, progress, speed, ETA, cancel, speed limits, disk-space checks, and stale-part cleanup.
-- Generalized file handling so unknown binary files use the same transfer path as common file types.
-
-### 1.2.0 — UI and release polish
-
-- Refined the monochrome glass-style UI and balanced the home screen layout.
-- Matched Transfer room and Join room panels visually.
-- Updated README wording and kept release artifacts small with build-size auditing.
+- Updated Burn Room semantics so tracked local room content is deleted.
+- Burn now removes encrypted payloads, completed incoming files for that room, related `.part` files, room items, and active receiver transfer state.
+- Preserves files from other rooms and skips paths outside allowed app-controlled roots.
+- Added clearer burn error reporting for local deletion or permission failures.
+- Added tests for same-room inbox cleanup, other-room preservation, missing paths, `.pastey-parts` cleanup, outside-root skips, and idempotent burn behavior.
 
 ### 1.3.1 — Chunked transfer stabilization
 
@@ -44,6 +28,30 @@ It is built with:
 - Fixed duplicate file sends, incoming file metadata handling, and legacy payload decoding conflicts for completed chunked files.
 - Fixed the Windows short-read bug so configured 4MiB chunks stay consistent with transfer metadata and final verification.
 - Added local release-build log files and GitHub Actions release builds.
+
+### 1.2.0 — UI and release polish
+
+- Refined the monochrome glass-style UI and balanced the home screen layout.
+- Matched Transfer room and Join room panels visually.
+- Updated README wording and kept release artifacts small with build-size auditing.
+
+### 1.1.0 — Large-file transfer
+
+- Raised file support to 10GB with chunked encrypted LAN transfer.
+- Added `.part` receiver writes, progress, speed, ETA, cancel, speed limits, disk-space checks, and stale-part cleanup.
+- Generalized file handling so unknown binary files use the same transfer path as common file types.
+
+### 1.0.0 — Room-based transfer
+
+- Reworked transfer flow from one code per item to one reusable room code per room.
+- Added room items, recent rooms, burn/expiry cleanup, screenshot paste, drag/drop files, and Windows/macOS packaging.
+- Stabilized local encrypted text/file/image transfer for small payloads.
+
+### 0.1.0 — Initial MVP
+
+- Built the first Tauri v2 desktop app with React, TypeScript, and Rust.
+- Added local encrypted payload storage, SQLite metadata, UDP LAN discovery, and temporary HTTP transfer endpoints.
+- Produced the first macOS `.app` / `.dmg` build.
 
 ## What pastey does
 
