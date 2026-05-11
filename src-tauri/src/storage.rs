@@ -718,15 +718,8 @@ pub fn room_item_to_info(
         match decode_legacy_text_item(paths, master_key, &item) {
             Ok(text) => Some(text),
             Err(error) => {
-                dev_log_room_item_render_kind(
-                    &item.id,
-                    &item_kind,
-                    &item.status,
-                    "legacy_text_payload",
-                    Some(&error.message()),
-                );
                 status = RoomItemStatus::Failed;
-                error_message = Some("Could not decode received text".to_string());
+                error_message = Some(error.message());
                 None
             }
         }

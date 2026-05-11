@@ -40,7 +40,6 @@ const TRANSFER_EVENT: &str = "pastey://transfer-progress";
 const TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CHUNK_BODY_BYTES: usize = 16 * 1024 * 1024;
-const MAX_CHUNK_PLAINTEXT_BYTES: u64 = DEFAULT_CHUNK_SIZE_BYTES;
 const CHUNK_RETRY_BACKOFFS: [Duration; 3] = [
     Duration::from_millis(300),
     Duration::from_millis(800),
@@ -1744,7 +1743,7 @@ async fn start_file_transfer_handler(
             error.message(),
         );
     }
-    if start.chunk_size == 0 || start.chunk_size > MAX_CHUNK_PLAINTEXT_BYTES {
+    if start.chunk_size == 0 || start.chunk_size > DEFAULT_CHUNK_SIZE_BYTES {
         return transfer_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "chunk_too_large",
@@ -1936,7 +1935,7 @@ async fn receive_file_chunk_handler(
         .unwrap_or_default();
     dev_log_receiver_chunk_route_hit(&transfer_id, &room_id, Some(chunk_index));
 
-    if plaintext_size == 0 || plaintext_size > MAX_CHUNK_PLAINTEXT_BYTES {
+    if plaintext_size == 0 || plaintext_size > DEFAULT_CHUNK_SIZE_BYTES {
         dev_log_receiver_chunk_failure(
             &transfer_id,
             &room_id,
@@ -3323,6 +3322,17 @@ mod tests {
             .all(|size| *size == chunk_size as u64));
         assert_eq!(*chunk_sizes.last().unwrap(), 2_035_025);
         assert!(chunk_sizes.iter().all(|size| *size != 2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn sender_default_chunk_size_is_not_two_mib() {
+        let two_mib = 2 * 1024 * 1024;
+        let chunk_size = DEFAULT_CHUNK_SIZE_BYTES as usize;
+        let chunk_sizes = sender_chunk_plaintext_sizes((chunk_size * 2 + 1) as u64, chunk_size);
+
+        assert_eq!(chunk_size, 4 * 1024 * 1024);
+        assert_ne!(chunk_size, two_mib);
+        assert_eq!(chunk_sizes, vec![chunk_size as u64, chunk_size as u64, 1]);
     }
 
     #[test]

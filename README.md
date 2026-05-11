@@ -38,11 +38,11 @@ It is built with:
 - Matched Transfer room and Join room panels visually.
 - Updated README wording and kept release artifacts small with build-size auditing.
 
-### 1.3.x — Transfer stabilization
+### 1.3.1 — Chunked transfer stabilization
 
-- Improved chunk timeout, retry, ACK, and transfer error mapping.
-- Added detailed dev logs for chunked transfer diagnostics.
-- Began replacing ambiguous raw chunk uploads with a shared structured chunk protocol.
+- Stabilized large-file transfer with a shared JSON chunk protocol, ACK-based progress, clearer transfer errors, and unique `.part` paths.
+- Fixed duplicate file sends, incoming file metadata handling, and legacy payload decoding conflicts for completed chunked files.
+- Fixed the Windows short-read bug so configured 4MiB chunks stay consistent with transfer metadata and final verification.
 
 ## What pastey does
 
