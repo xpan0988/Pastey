@@ -1,7 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
 import { prettifyShortcut } from "../lib/format";
-import { updateConfig } from "../lib/tauri";
+import { checkForUpdates, copyLastError, openLogsFolder, updateConfig } from "../lib/tauri";
 import type { AppConfig } from "../lib/types";
 
 interface SettingsPageProps {
@@ -14,6 +14,7 @@ const PRESET_SPEEDS = [10, 50, 100];
 export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
   const [speedValue, setSpeedValue] = useState(speedSelectionFromConfig(config.speed_limit_mbps, PRESET_SPEEDS));
   const [customSpeed, setCustomSpeed] = useState(customSpeedFromConfig(config.speed_limit_mbps, PRESET_SPEEDS));
+  const [logActionMessage, setLogActionMessage] = useState<string | null>(null);
 
   useEffect(() => {
     setSpeedValue(speedSelectionFromConfig(config.speed_limit_mbps, PRESET_SPEEDS));
@@ -64,6 +65,34 @@ export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
     }
   }
 
+  async function handleOpenLogsFolder() {
+    setLogActionMessage(null);
+    try {
+      await openLogsFolder();
+    } catch (err) {
+      setLogActionMessage(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleCopyLastError() {
+    setLogActionMessage(null);
+    try {
+      const copied = await copyLastError();
+      setLogActionMessage(copied ? "Last error copied." : "No transfer error logged yet.");
+    } catch (err) {
+      setLogActionMessage(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleCheckForUpdates() {
+    setLogActionMessage(null);
+    try {
+      await checkForUpdates();
+    } catch (err) {
+      setLogActionMessage(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   return (
     <div className="stack">
       <div className="panel subtle-stack">
@@ -77,7 +106,7 @@ export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
           </div>
           <div className="meta-card">
             <span className="meta-label">App version</span>
-            <strong>{config.app_version}</strong>
+            <strong>pastey {config.app_version}</strong>
           </div>
         </div>
 
@@ -159,6 +188,22 @@ export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
         <div className="field">
           <span>App data path</span>
           <code className="path-box">{config.app_data_path}</code>
+        </div>
+
+        <div className="field">
+          <span>Diagnostics</span>
+          <div className="row gap wrap">
+            <button className="ghost-button" onClick={() => void handleOpenLogsFolder()}>
+              Open Logs Folder
+            </button>
+            <button className="ghost-button" onClick={() => void handleCopyLastError()}>
+              Copy Last Error
+            </button>
+            <button className="ghost-button" onClick={() => void handleCheckForUpdates()}>
+              Check for updates
+            </button>
+          </div>
+          {logActionMessage ? <p className="muted">{logActionMessage}</p> : null}
         </div>
       </div>
     </div>

@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config, crypto, discovery,
     error::{AppError, AppResult},
+    logging,
     models::{
         ChunkAckResponse, ChunkUploadRequest, FileTransferFinishRequest, FileTransferProgressEvent,
         FileTransferStartRequest, JoinRoomRequest, JoinRoomResponse, PayloadType, RoomItemStatus,
@@ -1007,6 +1008,47 @@ async fn chunk_failure_from_response(
     }
 }
 
+fn emit_transfer_log(line: String) {
+    #[cfg(debug_assertions)]
+    eprintln!("{line}");
+
+    if is_transfer_error_log(&line) {
+        logging::write_error_line(&line);
+    } else {
+        logging::write_transfer_line(&line);
+    }
+}
+
+fn is_transfer_error_log(line: &str) -> bool {
+    line.contains("event=final_error")
+        || line.contains("event=start_failure")
+        || line.contains("event=chunk_failure")
+        || line.contains("event=finalize_failure")
+}
+
+fn receiver_failure_log_message(error_cause: &str) -> &'static str {
+    if error_cause.contains("integrity_failed") || error_cause.contains("plaintext_size_mismatch") {
+        "Chunk integrity check failed"
+    } else if error_cause.contains("write_failed") {
+        "Receiver failed to write chunk"
+    } else if error_cause.contains("temp_file_disappeared") {
+        "Receiver temporary file disappeared"
+    } else if error_cause.contains("invalid_chunk_encoding")
+        || error_cause.contains("invalid_nonce_encoding")
+        || error_cause.contains("invalid_ciphertext_encoding")
+    {
+        "Invalid chunk encoding"
+    } else if error_cause.contains("metadata_mismatch")
+        || error_cause.contains("chunk_larger_than_metadata_chunk_size")
+    {
+        "Transfer metadata mismatch"
+    } else if error_cause.contains("invalid_chunk_order") {
+        "Unexpected chunk index"
+    } else {
+        "Invalid chunk payload"
+    }
+}
+
 fn dev_log_sender_transfer_start(
     transfer_id: &str,
     room_id: &str,
@@ -1017,22 +1059,9 @@ fn dev_log_sender_transfer_start(
     total_chunks: u64,
     file_size: u64,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=start_request method=POST peer_url={peer_url} start_url={start_url} chunk_url={chunk_url} chunk_payload_format=json chunk_size={chunk_size} total_chunks={total_chunks} file_size={file_size}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (
-        transfer_id,
-        room_id,
-        peer_url,
-        start_url,
-        chunk_url,
-        chunk_size,
-        total_chunks,
-        file_size,
-    );
+    ));
 }
 
 fn dev_log_sender_transfer_start_response(
@@ -1041,13 +1070,9 @@ fn dev_log_sender_transfer_start_response(
     status: StatusCode,
     body_text: &str,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=start_response response_status={status} response_body={body_text:?}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (transfer_id, room_id, status, body_text);
+    ));
 }
 
 fn dev_log_sender_start_transfer_metadata(
@@ -1057,13 +1082,9 @@ fn dev_log_sender_start_transfer_metadata(
     total_chunks: u64,
     file_size: u64,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=start_transfer_metadata chunk_size={chunk_size} total_chunks={total_chunks} file_size={file_size}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (transfer_id, room_id, chunk_size, total_chunks, file_size);
+    ));
 }
 
 fn dev_log_sender_read_loop_config(
@@ -1073,19 +1094,9 @@ fn dev_log_sender_read_loop_config(
     read_buffer_len: usize,
     expected_chunk_size: usize,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=read_loop_config metadata_chunk_size={metadata_chunk_size} read_buffer_len={read_buffer_len} expected_chunk_size={expected_chunk_size}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (
-        transfer_id,
-        room_id,
-        metadata_chunk_size,
-        read_buffer_len,
-        expected_chunk_size,
-    );
+    ));
 }
 
 fn dev_log_sender_chunk_plaintext(
@@ -1096,20 +1107,9 @@ fn dev_log_sender_chunk_plaintext(
     is_final: bool,
     expected_non_final_chunk_size: usize,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_plaintext chunk_index={chunk_index} actual_plaintext_size={actual_plaintext_size} is_final={is_final} expected_non_final_chunk_size={expected_non_final_chunk_size}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (
-        transfer_id,
-        room_id,
-        chunk_index,
-        actual_plaintext_size,
-        is_final,
-        expected_non_final_chunk_size,
-    );
+    ));
 }
 
 fn dev_log_sender_chunk_request(
@@ -1122,22 +1122,9 @@ fn dev_log_sender_chunk_request(
     ciphertext_bytes: usize,
     encoded_json_body_bytes: usize,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_request method={method} chunk_url={chunk_url} actual_plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} payload_format=json"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (
-        transfer_id,
-        room_id,
-        chunk_index,
-        chunk_url,
-        method,
-        plaintext_bytes,
-        ciphertext_bytes,
-        encoded_json_body_bytes,
-    );
+    ));
 }
 
 fn dev_log_sender_chunk_response(
@@ -1150,22 +1137,9 @@ fn dev_log_sender_chunk_response(
     status: StatusCode,
     body_text: &str,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_response actual_plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} response_status={status} response_body={body_text:?}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (
-        transfer_id,
-        room_id,
-        chunk_index,
-        plaintext_bytes,
-        ciphertext_bytes,
-        encoded_json_body_bytes,
-        status,
-        body_text,
-    );
+    ));
 }
 
 fn dev_log_sender_chunk_attempt(
@@ -1176,21 +1150,10 @@ fn dev_log_sender_chunk_attempt(
     error_kind: &str,
     elapsed: Duration,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_attempt retry_count={retry_count} result={error_kind} elapsed_ms={}",
         elapsed.as_millis()
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (
-        transfer_id,
-        room_id,
-        chunk_index,
-        retry_count,
-        error_kind,
-        elapsed,
-    );
+    ));
 }
 
 fn dev_log_sender_final_error(
@@ -1200,18 +1163,14 @@ fn dev_log_sender_final_error(
     error_kind: &str,
     message: &str,
 ) {
-    #[cfg(debug_assertions)]
     match chunk_index {
-        Some(chunk_index) => eprintln!(
+        Some(chunk_index) => emit_transfer_log(format!(
             "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=final_error error_kind={error_kind} message={message:?}"
-        ),
-        None => eprintln!(
+        )),
+        None => emit_transfer_log(format!(
             "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=final_error error_kind={error_kind} message={message:?}"
-        ),
+        )),
     }
-
-    #[cfg(not(debug_assertions))]
-    let _ = (transfer_id, room_id, chunk_index, error_kind, message);
 }
 
 fn dev_log_receiver_start_route_hit(
@@ -1221,13 +1180,9 @@ fn dev_log_receiver_start_route_hit(
     total_chunks: u64,
     file_size: u64,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}] event=start_route_hit chunk_size={chunk_size} total_chunks={total_chunks} file_size={file_size}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (transfer_id, room_id, chunk_size, total_chunks, file_size);
+    ));
 }
 
 fn dev_log_receiver_start_registered(
@@ -1236,13 +1191,9 @@ fn dev_log_receiver_start_registered(
     chunk_size: u64,
     total_chunks: u64,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}] event=start_registered chunk_size={chunk_size} total_chunks={total_chunks}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (transfer_id, room_id, chunk_size, total_chunks);
+    ));
 }
 
 fn dev_log_receiver_start_failure(
@@ -1251,28 +1202,20 @@ fn dev_log_receiver_start_failure(
     response_status: StatusCode,
     error_cause: &str,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}] event=start_failure response_status={response_status} error_cause={error_cause}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (transfer_id, room_id, response_status, error_cause);
+    ));
 }
 
 fn dev_log_receiver_chunk_route_hit(transfer_id: &str, room_id: &str, chunk_index: Option<u64>) {
-    #[cfg(debug_assertions)]
     match chunk_index {
-        Some(chunk_index) => eprintln!(
+        Some(chunk_index) => emit_transfer_log(format!(
             "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_route_hit"
-        ),
-        None => eprintln!(
+        )),
+        None => emit_transfer_log(format!(
             "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk=unknown] event=chunk_route_hit"
-        ),
+        )),
     }
-
-    #[cfg(not(debug_assertions))]
-    let _ = (transfer_id, room_id, chunk_index);
 }
 
 fn dev_log_receiver_chunk_received(
@@ -1283,20 +1226,9 @@ fn dev_log_receiver_chunk_received(
     encoded_ciphertext_bytes: usize,
     encoded_json_body_bytes: usize,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_received plaintext_size={plaintext_bytes} encoded_ciphertext_bytes={encoded_ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} payload_format=json"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (
-        transfer_id,
-        room_id,
-        chunk_index,
-        plaintext_bytes,
-        encoded_ciphertext_bytes,
-        encoded_json_body_bytes,
-    );
+    ));
 }
 
 fn dev_log_receiver_chunk_write_success(
@@ -1307,21 +1239,10 @@ fn dev_log_receiver_chunk_write_success(
     ciphertext_bytes: usize,
     encoded_json_body_bytes: usize,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_write plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} response_status={} result=success",
         StatusCode::OK
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (
-        transfer_id,
-        room_id,
-        chunk_index,
-        plaintext_bytes,
-        ciphertext_bytes,
-        encoded_json_body_bytes,
-    );
+    ));
 }
 
 fn dev_log_receiver_chunk_ack(
@@ -1332,20 +1253,9 @@ fn dev_log_receiver_chunk_ack(
     total_received_bytes: u64,
     result: &str,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_ack written_bytes={written_bytes} total_received_bytes={total_received_bytes} result={result}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (
-        transfer_id,
-        room_id,
-        chunk_index,
-        written_bytes,
-        total_received_bytes,
-        result,
-    );
+    ));
 }
 
 fn dev_log_receiver_chunk_failure(
@@ -1358,37 +1268,22 @@ fn dev_log_receiver_chunk_failure(
     response_status: StatusCode,
     error_cause: &str,
 ) {
-    #[cfg(debug_assertions)]
     match chunk_index {
-        Some(chunk_index) => eprintln!(
-            "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_failure plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} response_status={response_status} error_cause={error_cause}"
-        ),
-        None => eprintln!(
-            "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk=unknown] event=chunk_failure plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} response_status={response_status} error_cause={error_cause}"
-        ),
+        Some(chunk_index) => emit_transfer_log(format!(
+            "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_failure plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} response_status={response_status} error_cause={error_cause} mapped_error_message={:?}",
+            receiver_failure_log_message(error_cause)
+        )),
+        None => emit_transfer_log(format!(
+            "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk=unknown] event=chunk_failure plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} response_status={response_status} error_cause={error_cause} mapped_error_message={:?}",
+            receiver_failure_log_message(error_cause)
+        )),
     }
-
-    #[cfg(not(debug_assertions))]
-    let _ = (
-        transfer_id,
-        room_id,
-        chunk_index,
-        plaintext_bytes,
-        ciphertext_bytes,
-        encoded_json_body_bytes,
-        response_status,
-        error_cause,
-    );
 }
 
 fn dev_log_receiver_finalize(transfer_id: &str, room_id: &str, event: &str, details: &str) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    emit_transfer_log(format!(
         "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}] event={event} {details}"
-    );
-
-    #[cfg(not(debug_assertions))]
-    let _ = (transfer_id, room_id, event, details);
+    ));
 }
 
 pub async fn cancel_transfer(state: Arc<AppState>, transfer_id: &str) -> AppResult<bool> {
@@ -2319,6 +2214,12 @@ async fn finish_file_transfer_handler(
         ),
     );
     if finish.item_id != transfer.item_id {
+        dev_log_receiver_finalize(
+            &transfer_id,
+            &room_id,
+            "finalize_failure",
+            "error_kind=invalid_transfer message=\"Invalid file metadata\"",
+        );
         let _ = tokio::fs::remove_file(part_path).await;
         emit_event(
             &ctx.state,
@@ -2342,6 +2243,12 @@ async fn finish_file_transfer_handler(
         *expected_chunk_index,
         transfer.total_chunks,
     ) {
+        dev_log_receiver_finalize(
+            &transfer_id,
+            &room_id,
+            "finalize_failure",
+            &format!("error_kind={code} message={message:?}"),
+        );
         let _ = tokio::fs::remove_file(part_path).await;
         emit_event(
             &ctx.state,
@@ -2367,6 +2274,12 @@ async fn finish_file_transfer_handler(
         ),
     );
     if tokio::fs::rename(part_path, final_path).await.is_err() {
+        dev_log_receiver_finalize(
+            &transfer_id,
+            &room_id,
+            "finalize_failure",
+            "error_kind=write_failed message=\"Receiver failed to write chunk\"",
+        );
         let _ = tokio::fs::remove_file(part_path).await;
         emit_event(
             &ctx.state,
@@ -2415,6 +2328,12 @@ async fn finish_file_transfer_handler(
     )
     .is_err()
     {
+        dev_log_receiver_finalize(
+            &transfer_id,
+            &room_id,
+            "finalize_failure",
+            "error_kind=write_failed message=\"Receiver failed to write chunk\"",
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let _ = storage::set_room_status(&ctx.state.paths, &room_id, RoomStatus::Active);

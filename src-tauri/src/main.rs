@@ -4,6 +4,7 @@ mod config;
 mod crypto;
 mod discovery;
 mod error;
+mod logging;
 mod models;
 mod storage;
 mod transfer;
@@ -20,10 +21,10 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 
 use crate::{
     commands::{
-        burn_room, cancel_transfer, copy_text_to_clipboard, create_room, delete_temp_file,
-        get_config, get_file_transfer_metadata, get_room, join_room, leave_room, list_room_items,
-        list_rooms, reveal_in_folder, send_file_to_room, send_text_to_room, update_config,
-        write_temp_file,
+        burn_room, cancel_transfer, check_for_updates, copy_last_error, copy_text_to_clipboard,
+        create_room, delete_temp_file, get_config, get_file_transfer_metadata, get_room, join_room,
+        leave_room, list_room_items, list_rooms, open_logs_folder, reveal_in_folder,
+        send_file_to_room, send_text_to_room, update_config, write_temp_file,
     },
     config::StoredConfig,
     error::{AppError, AppResult},
@@ -67,6 +68,7 @@ fn main() {
         .setup(|app| {
             let shortcut_label = default_shortcut_label();
             let paths = storage::init_app_paths(&app.handle())?;
+            logging::init(paths.logs_dir.clone());
             storage::init_database(&paths)?;
             storage::mark_rooms_left_on_startup(&paths)?;
             storage::cleanup_stale_part_files(&paths)?;
@@ -109,6 +111,9 @@ fn main() {
             get_config,
             update_config,
             reveal_in_folder,
+            open_logs_folder,
+            copy_last_error,
+            check_for_updates,
             copy_text_to_clipboard
         ])
         .run(tauri::generate_context!())

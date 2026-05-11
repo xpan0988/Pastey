@@ -43,6 +43,7 @@ It is built with:
 - Stabilized large-file transfer with a shared JSON chunk protocol, ACK-based progress, clearer transfer errors, and unique `.part` paths.
 - Fixed duplicate file sends, incoming file metadata handling, and legacy payload decoding conflicts for completed chunked files.
 - Fixed the Windows short-read bug so configured 4MiB chunks stay consistent with transfer metadata and final verification.
+- Added local release-build log files and GitHub Actions release builds.
 
 ## What pastey does
 
@@ -131,6 +132,23 @@ SQLite metadata includes:
 4. Images are treated exactly like files
 5. No decode, resize, recompress, or transform step is applied
 
+## Download
+
+Prebuilt installers are published on the [GitHub Releases page](https://github.com/xpan0988/Pastey/releases).
+
+### macOS
+
+1. Download the latest `.dmg` from GitHub Releases.
+2. Open the `.dmg`.
+3. Drag `pastey.app` into Applications.
+4. Launch `pastey`.
+
+### Windows
+
+1. Download the latest `.msi` or `.exe` installer from GitHub Releases.
+2. Run the installer.
+3. Launch `pastey` from the Start menu.
+
 ## Run in development
 
 ```bash
@@ -157,6 +175,28 @@ Packaged desktop app with artifact audit:
 ```bash
 npm run build:checked
 ```
+
+## Create a release
+
+GitHub Actions builds precompiled macOS and Windows installers when a version tag is pushed:
+
+```bash
+git tag v1.3.1
+git push origin v1.3.1
+```
+
+The release workflow builds the frontend, runs `cargo check`, packages the Tauri app, audits bundle contents and size, then uploads the generated installers to the GitHub Release. It does not upload `node_modules`, build caches, local app data, logs, inbox contents, temp files, or local databases.
+
+The Settings screen includes a Check for updates button that opens GitHub Releases. A full signed auto-updater can be added later.
+
+## Logs
+
+Release builds write transfer diagnostics locally:
+
+- macOS: `~/Library/Application Support/pastey/logs/pastey.log`
+- Windows: `%LOCALAPPDATA%\pastey\logs\pastey.log`
+
+Logs rotate at 5MB and keep the last two rotated files. Logs never contain plaintext text, file contents, encryption keys, or original source file paths. The Settings screen can open the logs folder or copy the most recent transfer error summary.
 
 ## Release size expectations
 

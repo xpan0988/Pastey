@@ -8,9 +8,12 @@ use tauri_plugin_opener::OpenerExt;
 use crate::{
     config, crypto, discovery,
     error::{AppError, AppResult},
+    logging,
     models::{AppConfig, LocalRole, RoomInfo, RoomItem},
     storage, transfer, AppState,
 };
+
+const RELEASES_URL: &str = "https://github.com/xpan0988/Pastey/releases";
 
 #[derive(Serialize)]
 pub struct FileTransferMetadata {
@@ -314,6 +317,35 @@ pub fn reveal_in_folder(path: String, app: AppHandle) -> Result<(), String> {
     let path = resolve_user_path(&path).map_err(|error| error.message())?;
     app.opener()
         .reveal_item_in_dir(path)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn open_logs_folder(state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<(), String> {
+    std::fs::create_dir_all(&state.paths.logs_dir).map_err(|error| error.to_string())?;
+    app.opener()
+        .open_path(state.paths.logs_dir.display().to_string(), None::<String>)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn copy_last_error(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> Result<Option<String>, String> {
+    let Some(summary) = logging::latest_error_summary(&state.paths.logs_dir) else {
+        return Ok(None);
+    };
+    app.clipboard()
+        .write_text(summary.clone())
+        .map_err(|error| error.to_string())?;
+    Ok(Some(summary))
+}
+
+#[tauri::command]
+pub fn check_for_updates(app: AppHandle) -> Result<(), String> {
+    app.opener()
+        .open_url(RELEASES_URL, None::<String>)
         .map_err(|error| error.to_string())
 }
 

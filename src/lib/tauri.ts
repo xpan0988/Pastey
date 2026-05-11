@@ -83,6 +83,18 @@ export async function revealInFolder(path: string): Promise<void> {
   return invoke("reveal_in_folder", { path });
 }
 
+export async function openLogsFolder(): Promise<void> {
+  return invoke("open_logs_folder");
+}
+
+export async function copyLastError(): Promise<string | null> {
+  return invoke("copy_last_error");
+}
+
+export async function checkForUpdates(): Promise<void> {
+  return invoke("check_for_updates");
+}
+
 export async function copyTextToClipboard(text: string): Promise<void> {
   return invoke("copy_text_to_clipboard", { text });
 }

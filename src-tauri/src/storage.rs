@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::{
     crypto,
     error::{AppError, AppResult},
+    logging,
     models::{
         LocalRole, PayloadType, RoomInfo, RoomItem, RoomItemDirection, RoomItemStatus, RoomStatus,
         StoredRoom, StoredRoomItem,
@@ -31,6 +32,7 @@ pub struct AppPaths {
     pub payloads_dir: PathBuf,
     pub inbox_dir: PathBuf,
     pub temp_dir: PathBuf,
+    pub logs_dir: PathBuf,
     pub config_path: PathBuf,
 }
 
@@ -41,9 +43,11 @@ pub fn init_app_paths(app: &AppHandle) -> AppResult<AppPaths> {
     let payloads_dir = app_data_dir.join("payloads");
     let inbox_dir = app_data_dir.join("inbox");
     let temp_dir = app_data_dir.join("temp");
+    let logs_dir = default_logs_dir(&app_data_dir);
     fs::create_dir_all(&payloads_dir)?;
     fs::create_dir_all(&inbox_dir)?;
     fs::create_dir_all(&temp_dir)?;
+    fs::create_dir_all(&logs_dir)?;
 
     Ok(AppPaths {
         db_path: app_data_dir.join("db.sqlite"),
@@ -52,7 +56,30 @@ pub fn init_app_paths(app: &AppHandle) -> AppResult<AppPaths> {
         payloads_dir,
         inbox_dir,
         temp_dir,
+        logs_dir,
     })
+}
+
+fn default_logs_dir(app_data_dir: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("pastey")
+                .join("logs");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data).join("pastey").join("logs");
+        }
+    }
+
+    app_data_dir.join("logs")
 }
 
 pub fn init_database(paths: &AppPaths) -> AppResult<()> {
@@ -814,14 +841,15 @@ fn dev_log_room_item_render_kind(
     path_kind: &str,
     error_message: Option<&str>,
 ) {
-    #[cfg(debug_assertions)]
-    eprintln!(
+    let line = format!(
         "[pastey transfer][receiver][transfer_id={item_id}] event=room_item_render_kind item_kind={item_kind} status={} path_kind={path_kind} error_message={error_message:?}",
         status.as_str()
     );
 
-    #[cfg(not(debug_assertions))]
-    let _ = (item_id, item_kind, status, path_kind, error_message);
+    #[cfg(debug_assertions)]
+    eprintln!("{line}");
+
+    logging::write_transfer_line(&line);
 }
 
 pub fn next_inbox_path(base_dir: &Path, display_name: Option<&str>) -> AppResult<PathBuf> {
@@ -1206,6 +1234,7 @@ mod tests {
             payloads_dir: root.join("payloads"),
             inbox_dir: root.join("inbox"),
             temp_dir: root.join("temp"),
+            logs_dir: root.join("logs"),
             config_path: root.join("config.json"),
         }
     }
