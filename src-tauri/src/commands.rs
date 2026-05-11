@@ -259,8 +259,12 @@ pub async fn burn_room(room_id: String, state: State<'_, Arc<AppState>>) -> Resu
             "Transfer cancelled.",
             true,
         )
-        .await;
-        let removed = storage::burn_room(&state.paths, &room_id)?.is_some();
+        .await?;
+        let effective_inbox_dir = {
+            let config = state.config.read();
+            config::effective_inbox_dir(&state.paths, &config)
+        };
+        let removed = storage::burn_room(&state.paths, &room_id, &effective_inbox_dir)?.is_some();
         let _ = transfer::stop_room_server(state.inner().clone(), &room_id).await;
         if let Some((peer_host, peer_port)) = peer {
             transfer::notify_room_burn_with_peer(&peer_host, peer_port, &room_id).await;
@@ -273,7 +277,7 @@ pub async fn burn_room(room_id: String, state: State<'_, Arc<AppState>>) -> Resu
 #[tauri::command]
 pub async fn leave_room(room_id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
     run_async(async move {
-        transfer::cancel_room_transfers(
+        let _ = transfer::cancel_room_transfers(
             state.inner().clone(),
             &room_id,
             "Transfer cancelled.",

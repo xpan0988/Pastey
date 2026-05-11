@@ -24,6 +24,7 @@ use crate::{
 pub const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 pub const MAX_FILE_SIZE_MESSAGE: &str = "File too large. Max supported size: 10GB.";
 const STALE_PART_FILE_AGE_SECS: i64 = 24 * 60 * 60;
+const ROOM_FILE_DELETE_ERROR: &str = "Could not delete local room files. Check folder permissions.";
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -624,7 +625,11 @@ pub fn set_room_item_status(
     Ok(())
 }
 
-pub fn burn_room(paths: &AppPaths, room_id: &str) -> AppResult<Option<StoredRoom>> {
+pub fn burn_room(
+    paths: &AppPaths,
+    room_id: &str,
+    effective_inbox_dir: &Path,
+) -> AppResult<Option<StoredRoom>> {
     let room = get_room_by_id(paths, room_id).ok();
     if room.is_none() {
         return Ok(None);
@@ -635,7 +640,7 @@ pub fn burn_room(paths: &AppPaths, room_id: &str) -> AppResult<Option<StoredRoom
         "UPDATE rooms SET status = 'burned', peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL, local_burned_at = ?1 WHERE id = ?2",
         params![now_ts(), room_id],
     )?;
-    delete_room_payloads(paths, room_id)?;
+    delete_room_files(paths, room_id, effective_inbox_dir)?;
     conn.execute("DELETE FROM room_items WHERE room_id = ?1", [room_id])?;
     Ok(room)
 }
@@ -1156,6 +1161,126 @@ fn delete_payload_file(paths: &AppPaths, relative_path: &str) -> AppResult<()> {
     remove_file_if_exists(&absolute).map(|_| ())
 }
 
+fn delete_room_files(paths: &AppPaths, room_id: &str, effective_inbox_dir: &Path) -> AppResult<()> {
+    let items = list_room_items(paths, room_id)?;
+    for item in items {
+        delete_room_item_payload(paths, room_id, &item)?;
+        delete_room_item_saved_file(room_id, effective_inbox_dir, &item)?;
+        delete_room_item_part_files(paths, room_id, effective_inbox_dir, &item)?;
+    }
+    Ok(())
+}
+
+fn delete_room_item_payload(
+    paths: &AppPaths,
+    room_id: &str,
+    item: &StoredRoomItem,
+) -> AppResult<()> {
+    if item.encrypted_path.is_empty() {
+        return Ok(());
+    }
+
+    let path = encrypted_file_path(paths, &item.encrypted_path);
+    remove_tracked_room_file(room_id, "payload", &path, &[&paths.payloads_dir])
+}
+
+fn delete_room_item_saved_file(
+    room_id: &str,
+    effective_inbox_dir: &Path,
+    item: &StoredRoomItem,
+) -> AppResult<()> {
+    let Some(saved_path) = item.saved_path.as_deref().filter(|path| !path.is_empty()) else {
+        return Ok(());
+    };
+
+    let saved_path = PathBuf::from(saved_path);
+    let part_path = part_path_for(&saved_path);
+    remove_tracked_room_file(room_id, "saved_path", &saved_path, &[effective_inbox_dir])?;
+    remove_tracked_room_file(
+        room_id,
+        "saved_path_part",
+        &part_path,
+        &[effective_inbox_dir],
+    )
+}
+
+fn delete_room_item_part_files(
+    paths: &AppPaths,
+    room_id: &str,
+    effective_inbox_dir: &Path,
+    item: &StoredRoomItem,
+) -> AppResult<()> {
+    let inbox_part_path = transfer_part_path(effective_inbox_dir, &item.id);
+    let temp_part_path = transfer_part_path(&paths.temp_dir, &item.id);
+
+    remove_tracked_room_file(
+        room_id,
+        "inbox_part",
+        &inbox_part_path,
+        &[effective_inbox_dir],
+    )?;
+    remove_tracked_room_file(room_id, "temp_part", &temp_part_path, &[&paths.temp_dir])
+}
+
+fn remove_tracked_room_file(
+    room_id: &str,
+    category: &str,
+    path: &Path,
+    allowed_roots: &[&Path],
+) -> AppResult<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    if !is_path_under_any_root(path, allowed_roots) {
+        log_room_file_cleanup_warning(
+            room_id,
+            category,
+            path,
+            "skipped path outside allowed room cleanup roots",
+        );
+        return Ok(());
+    }
+
+    match remove_file_if_exists(path) {
+        Ok(_) => Ok(()),
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            log_room_file_cleanup_error(room_id, category, path, &error.to_string());
+            Err(AppError::InvalidInput(ROOM_FILE_DELETE_ERROR.into()))
+        }
+        Err(error) => {
+            log_room_file_cleanup_error(room_id, category, path, &error.message());
+            Err(AppError::InvalidInput(ROOM_FILE_DELETE_ERROR.into()))
+        }
+    }
+}
+
+fn is_path_under_any_root(path: &Path, roots: &[&Path]) -> bool {
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+
+    roots.iter().any(|root| {
+        root.canonicalize()
+            .map(|root| path.starts_with(root))
+            .unwrap_or(false)
+    })
+}
+
+fn log_room_file_cleanup_warning(room_id: &str, category: &str, path: &Path, message: &str) {
+    logging::write_transfer_line(&format!(
+        "[pastey cleanup][room_id={room_id}] event=room_file_cleanup_warning category={category} path={} message={message:?}",
+        path.display()
+    ));
+}
+
+fn log_room_file_cleanup_error(room_id: &str, category: &str, path: &Path, error: &str) {
+    logging::write_error_line(&format!(
+        "[pastey cleanup][room_id={room_id}] event=room_file_cleanup_error category={category} path={} error={error:?}",
+        path.display()
+    ));
+}
+
 fn remove_file_if_exists(path: &Path) -> AppResult<bool> {
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
@@ -1450,6 +1575,217 @@ mod tests {
         assert_eq!(file_info.status, RoomItemStatus::Received);
         assert_eq!(file_info.item_kind, "incoming_file");
         assert!(file_info.error_message.is_none());
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn burn_deletes_completed_incoming_file_for_room() {
+        let paths = test_paths("pastey_burn_deletes_incoming");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        fs::create_dir_all(&paths.inbox_dir).unwrap();
+        let final_path = paths.inbox_dir.join("payload.bin");
+        fs::write(&final_path, [1_u8, 2, 3]).unwrap();
+        persist_incoming_file_item_metadata(
+            &paths,
+            &master_key,
+            "room",
+            "transfer",
+            3,
+            Some("payload.bin".into()),
+            Some("application/octet-stream".into()),
+            now_ts(),
+            Some(final_path.display().to_string()),
+        )
+        .unwrap();
+
+        burn_room(&paths, "room", &paths.inbox_dir).unwrap();
+
+        assert!(!final_path.exists());
+        assert!(list_room_items(&paths, "room").unwrap().is_empty());
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn burn_does_not_delete_completed_file_from_another_room() {
+        let paths = test_paths("pastey_burn_keeps_other_room");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        for room_id in ["room-a", "room-b"] {
+            create_room(
+                &paths,
+                &master_key,
+                "123456",
+                5,
+                LocalRole::Creator,
+                Some(room_id.into()),
+                None,
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(&paths.inbox_dir).unwrap();
+        let first_path = paths.inbox_dir.join("first.bin");
+        let second_path = paths.inbox_dir.join("second.bin");
+        fs::write(&first_path, [1_u8]).unwrap();
+        fs::write(&second_path, [2_u8]).unwrap();
+        persist_incoming_file_item_metadata(
+            &paths,
+            &master_key,
+            "room-a",
+            "transfer-a",
+            1,
+            Some("first.bin".into()),
+            Some("application/octet-stream".into()),
+            now_ts(),
+            Some(first_path.display().to_string()),
+        )
+        .unwrap();
+        persist_incoming_file_item_metadata(
+            &paths,
+            &master_key,
+            "room-b",
+            "transfer-b",
+            1,
+            Some("second.bin".into()),
+            Some("application/octet-stream".into()),
+            now_ts(),
+            Some(second_path.display().to_string()),
+        )
+        .unwrap();
+
+        burn_room(&paths, "room-a", &paths.inbox_dir).unwrap();
+
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+        assert!(list_room_items(&paths, "room-a").unwrap().is_empty());
+        assert_eq!(list_room_items(&paths, "room-b").unwrap().len(), 1);
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn burn_ignores_missing_saved_path_and_remains_idempotent() {
+        let paths = test_paths("pastey_burn_missing_saved_path");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        let missing_path = paths.inbox_dir.join("missing.bin");
+        persist_incoming_file_item_metadata(
+            &paths,
+            &master_key,
+            "room",
+            "transfer",
+            3,
+            Some("missing.bin".into()),
+            Some("application/octet-stream".into()),
+            now_ts(),
+            Some(missing_path.display().to_string()),
+        )
+        .unwrap();
+
+        assert!(burn_room(&paths, "room", &paths.inbox_dir)
+            .unwrap()
+            .is_some());
+        assert!(burn_room(&paths, "room", &paths.inbox_dir)
+            .unwrap()
+            .is_some());
+
+        assert!(list_room_items(&paths, "room").unwrap().is_empty());
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn burn_skips_saved_path_outside_allowed_roots() {
+        let paths = test_paths("pastey_burn_skip_outside");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        let outside_dir = std::env::temp_dir().join(format!("pastey_outside_{}", Uuid::new_v4()));
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_path = outside_dir.join("outside.bin");
+        fs::write(&outside_path, [9_u8]).unwrap();
+        persist_incoming_file_item_metadata(
+            &paths,
+            &master_key,
+            "room",
+            "transfer",
+            1,
+            Some("outside.bin".into()),
+            Some("application/octet-stream".into()),
+            now_ts(),
+            Some(outside_path.display().to_string()),
+        )
+        .unwrap();
+
+        burn_room(&paths, "room", &paths.inbox_dir).unwrap();
+
+        assert!(outside_path.exists());
+        assert!(list_room_items(&paths, "room").unwrap().is_empty());
+        let _ = fs::remove_dir_all(outside_dir);
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn burn_deletes_pastey_parts_file_for_room_item() {
+        let paths = test_paths("pastey_burn_deletes_part");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        persist_incoming_file_item_metadata(
+            &paths,
+            &master_key,
+            "room",
+            "transfer",
+            3,
+            Some("payload.bin".into()),
+            Some("application/octet-stream".into()),
+            now_ts(),
+            None,
+        )
+        .unwrap();
+        let part_path = transfer_part_path(&paths.inbox_dir, "transfer");
+        fs::create_dir_all(part_path.parent().unwrap()).unwrap();
+        fs::write(&part_path, [1_u8, 2, 3]).unwrap();
+
+        burn_room(&paths, "room", &paths.inbox_dir).unwrap();
+
+        assert!(!part_path.exists());
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 }

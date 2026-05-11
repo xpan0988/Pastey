@@ -230,7 +230,7 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
 }
 
 pub async fn stop_room_server(state: Arc<AppState>, room_id: &str) -> AppResult<bool> {
-    cancel_room_transfers(state.clone(), room_id, "Room expired.", false).await;
+    let _ = cancel_room_transfers(state.clone(), room_id, "Room expired.", false).await;
     let maybe_server = state.active_servers.lock().remove(room_id);
     if let Some(mut server) = maybe_server {
         if let Some(shutdown) = server.shutdown.take() {
@@ -1294,7 +1294,7 @@ pub async fn cancel_transfer(state: Arc<AppState>, transfer_id: &str) -> AppResu
 
     transfer.cancel_token.cancel();
     if let ActiveFileTransferKind::Receiver { part_path, .. } = &transfer.kind {
-        let _ = tokio::fs::remove_file(part_path).await;
+        remove_active_receiver_part_file(&transfer.room_id, "active_part", part_path).await?;
     } else if let Ok(room) = storage::get_room_by_id(&state.paths, &transfer.room_id) {
         if let (Some(peer_host), Some(peer_port)) = (room.peer_host, room.peer_port) {
             let client = reqwest::Client::new();
@@ -1337,7 +1337,7 @@ pub async fn cancel_room_transfers(
     room_id: &str,
     message: &str,
     notify_peer: bool,
-) {
+) -> AppResult<()> {
     let transfer_ids = {
         let transfers = state.active_file_transfers.lock();
         transfers
@@ -1347,9 +1347,12 @@ pub async fn cancel_room_transfers(
             .collect::<Vec<_>>()
     };
 
+    let mut cleanup_failed = false;
     for transfer_id in transfer_ids {
         if notify_peer {
-            let _ = cancel_transfer(state.clone(), &transfer_id).await;
+            if cancel_transfer(state.clone(), &transfer_id).await.is_err() {
+                cleanup_failed = true;
+            }
         } else {
             let transfer = {
                 let mut transfers = state.active_file_transfers.lock();
@@ -1358,7 +1361,12 @@ pub async fn cancel_room_transfers(
             if let Some(transfer) = transfer {
                 transfer.cancel_token.cancel();
                 if let ActiveFileTransferKind::Receiver { part_path, .. } = &transfer.kind {
-                    let _ = tokio::fs::remove_file(part_path).await;
+                    if remove_active_receiver_part_file(room_id, "active_part", part_path)
+                        .await
+                        .is_err()
+                    {
+                        cleanup_failed = true;
+                    }
                 }
                 emit_event(
                     &state,
@@ -1373,6 +1381,13 @@ pub async fn cancel_room_transfers(
             }
         }
     }
+
+    if cleanup_failed {
+        return Err(AppError::InvalidInput(
+            "Could not delete local room files. Check folder permissions.".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn active_transfer_room_ids(state: &Arc<AppState>) -> Vec<String> {
@@ -2403,7 +2418,7 @@ async fn remote_burn_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    cancel_room_transfers(ctx.state.clone(), &room_id, "Transfer cancelled.", false).await;
+    let _ = cancel_room_transfers(ctx.state.clone(), &room_id, "Transfer cancelled.", false).await;
     storage::mark_peer_burned(&ctx.state.paths, &room_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let state = ctx.state.clone();
@@ -2421,7 +2436,7 @@ async fn remote_leave_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    cancel_room_transfers(ctx.state.clone(), &room_id, "Peer left the room.", false).await;
+    let _ = cancel_room_transfers(ctx.state.clone(), &room_id, "Peer left the room.", false).await;
     storage::mark_peer_left(&ctx.state.paths, &room_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let state = ctx.state.clone();
@@ -2664,6 +2679,27 @@ async fn fail_receiver_transfer(state: &Arc<AppState>, transfer_id: &str, messag
             None,
             Some(message.to_string()),
         );
+    }
+}
+
+async fn remove_active_receiver_part_file(
+    room_id: &str,
+    category: &str,
+    part_path: &Path,
+) -> AppResult<()> {
+    match tokio::fs::remove_file(part_path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            logging::write_error_line(&format!(
+                "[pastey cleanup][room_id={room_id}] event=room_file_cleanup_error category={category} path={} error={:?}",
+                part_path.display(),
+                error.to_string()
+            ));
+            Err(AppError::InvalidInput(
+                "Could not delete local room files. Check folder permissions.".into(),
+            ))
+        }
     }
 }
 

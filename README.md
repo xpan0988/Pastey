@@ -99,12 +99,15 @@ SQLite metadata includes:
 - session code hash
 - payload type
 - relative encrypted payload path
+- received-file inbox path
 - optional sanitized display name
 - MIME type
 - size
 - timestamps
 - status
 - encrypted wrapping material for the payload key and session code
+
+Burning a room deletes that room's local encrypted payloads, tracked received inbox files, and in-progress `.part` files. It does not delete logs, configuration, the database, or files that are not tracked by the burned room.
 
 ## What is never uploaded
 

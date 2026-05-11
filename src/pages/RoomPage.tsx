@@ -278,6 +278,8 @@ export function RoomPage({
     setBusy("burn");
     try {
       await onBurn(room.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(null);
     }
