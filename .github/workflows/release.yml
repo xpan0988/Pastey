@@ -59,20 +59,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          mkdir -p release-artifacts
-          shopt -s nullglob
-          for file in ${{ matrix.artifact_glob }}; do
-            ext="${file##*.}"
-            base="pastey_${version}_${RUNNER_OS}"
-            if [[ "${{ matrix.name }}" == *"Apple Silicon"* ]]; then
-              base="${base}_arm64"
-            fi
-            if [[ -e "release-artifacts/${base}.${ext}" ]]; then
-              base="${base}_${ext}"
-            fi
-            cp "$file" "release-artifacts/${base}.${ext}"
-          done
+          node scripts/normalize-release-artifacts.mjs
 
       - name: Upload installers to GitHub Release
         uses: softprops/action-gh-release@v2
