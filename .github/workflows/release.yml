@@ -43,6 +43,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Check release version
+        run: npm run check:version
+
       - name: Build frontend
         run: npm run build
 
@@ -52,8 +55,27 @@ jobs:
       - name: Build installers and audit bundle contents
         run: npm run build:checked
 
+      - name: Normalize installer artifact names
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p release-artifacts
+          shopt -s nullglob
+          for file in ${{ matrix.artifact_glob }}; do
+            ext="${file##*.}"
+            base="pastey_${version}_${RUNNER_OS}"
+            if [[ "${{ matrix.name }}" == *"Apple Silicon"* ]]; then
+              base="${base}_arm64"
+            fi
+            if [[ -e "release-artifacts/${base}.${ext}" ]]; then
+              base="${base}_${ext}"
+            fi
+            cp "$file" "release-artifacts/${base}.${ext}"
+          done
+
       - name: Upload installers to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.artifact_glob }}
+          files: release-artifacts/*
           fail_on_unmatched_files: true

@@ -70,9 +70,9 @@ fn main() {
             let paths = storage::init_app_paths(&app.handle())?;
             logging::init(paths.logs_dir.clone());
             storage::init_database(&paths)?;
-            storage::mark_rooms_left_on_startup(&paths)?;
-            storage::cleanup_stale_part_files(&paths)?;
             let config = config::load_or_create(&paths, shortcut_label)?;
+            let effective_inbox_dir = config::effective_inbox_dir(&paths, &config);
+            storage::run_startup_recovery(&paths, &effective_inbox_dir)?;
             let state = Arc::new(AppState {
                 app_handle: app.handle().clone(),
                 paths,

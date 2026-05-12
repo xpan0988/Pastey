@@ -1,6 +1,6 @@
 [package]
 name = "pastey"
-version = "1.3.1"
+version = "1.3.3"
 description = "Local-first encrypted paste and file transfer utility"
 authors = ["OpenAI"]
 edition = "2021"

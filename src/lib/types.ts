@@ -6,9 +6,9 @@ export type LocalRole = "creator" | "joined";
 
 export type RoomItemDirection = "outgoing" | "incoming";
 
-export type RoomItemStatus = "created" | "sent" | "received" | "failed" | "cancelled";
+export type RoomItemStatus = "created" | "sent" | "received" | "failed" | "cancelled" | "interrupted";
 
-export type TransferStatus = "pending" | "transferring" | "completed" | "failed" | "cancelled";
+export type TransferStatus = "pending" | "transferring" | "completed" | "failed" | "cancelled" | "burned" | "interrupted";
 
 export interface RoomInfo {
   id: string;

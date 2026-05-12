@@ -113,6 +113,7 @@ pub enum RoomItemStatus {
     Received,
     Failed,
     Cancelled,
+    Interrupted,
 }
 
 impl RoomItemStatus {
@@ -123,6 +124,7 @@ impl RoomItemStatus {
             Self::Received => "received",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
         }
     }
 
@@ -133,6 +135,7 @@ impl RoomItemStatus {
             "received" => Some(Self::Received),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
+            "interrupted" => Some(Self::Interrupted),
             _ => None,
         }
     }

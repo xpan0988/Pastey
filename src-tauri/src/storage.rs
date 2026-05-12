@@ -23,7 +23,6 @@ use crate::{
 
 pub const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 pub const MAX_FILE_SIZE_MESSAGE: &str = "File too large. Max supported size: 10GB.";
-const STALE_PART_FILE_AGE_SECS: i64 = 24 * 60 * 60;
 const ROOM_FILE_DELETE_ERROR: &str = "Could not delete local room files. Check folder permissions.";
 
 #[derive(Clone, Debug)]
@@ -306,7 +305,7 @@ pub fn update_room_peer(
             peer_transport_public_key = ?4,
             status = ?5,
             peer_burned_at = NULL
-        WHERE id = ?6
+        WHERE id = ?6 AND status NOT IN ('burned', 'expired')
         "#,
         params![
             peer_host,
@@ -355,10 +354,17 @@ pub fn mark_peer_burned(paths: &AppPaths, room_id: &str) -> AppResult<()> {
 
 pub fn set_room_status(paths: &AppPaths, room_id: &str, status: RoomStatus) -> AppResult<()> {
     let conn = connection(paths)?;
-    conn.execute(
-        "UPDATE rooms SET status = ?1 WHERE id = ?2",
-        params![status.as_str(), room_id],
-    )?;
+    if status == RoomStatus::Active {
+        conn.execute(
+            "UPDATE rooms SET status = ?1 WHERE id = ?2 AND status NOT IN ('burned', 'expired')",
+            params![status.as_str(), room_id],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE rooms SET status = ?1 WHERE id = ?2",
+            params![status.as_str(), room_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -619,7 +625,7 @@ pub fn set_room_item_status(
 ) -> AppResult<()> {
     let conn = connection(paths)?;
     conn.execute(
-        "UPDATE room_items SET status = ?1 WHERE id = ?2",
+        "UPDATE room_items SET status = ?1 WHERE id = ?2 AND (status NOT IN ('sent', 'received', 'failed', 'cancelled', 'interrupted') OR status = ?1)",
         params![status.as_str(), item_id],
     )?;
     Ok(())
@@ -684,19 +690,42 @@ pub fn cleanup_expired_rooms_except(
     Ok(room_ids)
 }
 
-pub fn cleanup_stale_part_files(paths: &AppPaths) -> AppResult<()> {
-    cleanup_stale_part_files_in_dir(&paths.inbox_dir)?;
-    cleanup_stale_part_files_in_dir(&paths.temp_dir)?;
+pub fn run_startup_recovery(paths: &AppPaths, effective_inbox_dir: &Path) -> AppResult<()> {
+    logging::write_transfer_line("[pastey recovery] event=startup_recovery");
+    let stale_items = mark_stale_created_items_interrupted(paths)?;
+    if stale_items > 0 {
+        logging::write_transfer_line(&format!(
+            "[pastey recovery] event=stale_transfer_mark_failed count={stale_items}"
+        ));
+    }
+    let disconnected_rooms = mark_rooms_left_on_startup(paths)?;
+    if disconnected_rooms > 0 {
+        logging::write_transfer_line(&format!(
+            "[pastey recovery] event=peer_disconnected count={disconnected_rooms}"
+        ));
+    }
+    cleanup_stale_part_files(paths, effective_inbox_dir);
     Ok(())
 }
 
-pub fn mark_rooms_left_on_startup(paths: &AppPaths) -> AppResult<()> {
+pub fn cleanup_stale_part_files(paths: &AppPaths, effective_inbox_dir: &Path) {
+    let mut roots = vec![paths.inbox_dir.clone(), paths.temp_dir.clone()];
+    if effective_inbox_dir != paths.inbox_dir {
+        roots.push(effective_inbox_dir.to_path_buf());
+    }
+
+    for root in roots {
+        cleanup_stale_part_files_in_dir(&root);
+    }
+}
+
+pub fn mark_rooms_left_on_startup(paths: &AppPaths) -> AppResult<usize> {
     let conn = connection(paths)?;
-    conn.execute(
+    let updated = conn.execute(
         "UPDATE rooms SET status = 'peer_left', peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL WHERE status IN ('active', 'peer_left', 'waiting', 'connected', 'left') AND peer_host IS NOT NULL",
         [],
     )?;
-    Ok(())
+    Ok(updated)
 }
 
 pub fn encrypted_file_path(paths: &AppPaths, relative_path: &str) -> PathBuf {
@@ -745,7 +774,11 @@ pub fn room_item_to_info(
 ) -> AppResult<RoomItem> {
     let item_kind = room_item_kind(&item);
     let mut status = item.status.clone();
-    let mut error_message = None;
+    let mut error_message = if item.status == RoomItemStatus::Interrupted {
+        Some("Transfer interrupted".to_string())
+    } else {
+        None
+    };
     let text = if item.payload_type == PayloadType::Text {
         match decode_legacy_text_item(paths, master_key, &item) {
             Ok(text) => Some(text),
@@ -1021,7 +1054,7 @@ fn persist_room_item_with_size(
 
 fn insert_room_item(paths: &AppPaths, item: &StoredRoomItem) -> AppResult<()> {
     let conn = connection(paths)?;
-    conn.execute(
+    let inserted = conn.execute(
         r#"
         INSERT INTO room_items (
             id,
@@ -1039,7 +1072,8 @@ fn insert_room_item(paths: &AppPaths, item: &StoredRoomItem) -> AppResult<()> {
             key_nonce,
             saved_path
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+        WHERE EXISTS(SELECT 1 FROM rooms WHERE id = ?2 AND status NOT IN ('burned', 'expired'))
         "#,
         params![
             &item.id,
@@ -1058,16 +1092,48 @@ fn insert_room_item(paths: &AppPaths, item: &StoredRoomItem) -> AppResult<()> {
             &item.saved_path
         ],
     )?;
+    if inserted == 0 {
+        return Err(AppError::InvalidInput("Room burned".into()));
+    }
     Ok(())
 }
 
-fn cleanup_stale_part_files_in_dir(dir: &Path) -> AppResult<()> {
+fn mark_stale_created_items_interrupted(paths: &AppPaths) -> AppResult<usize> {
+    let conn = connection(paths)?;
+    let updated = conn.execute(
+        r#"
+        UPDATE room_items
+        SET status = 'interrupted'
+        WHERE status = 'created'
+          AND room_id IN (
+            SELECT id FROM rooms WHERE status NOT IN ('burned', 'expired')
+          )
+        "#,
+        [],
+    )?;
+    Ok(updated)
+}
+
+fn cleanup_stale_part_files_in_dir(root: &Path) {
+    let dir = root.join(".pastey-parts");
     if !dir.exists() {
-        return Ok(());
+        return;
     }
 
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    let Ok(entries) = fs::read_dir(&dir) else {
+        logging::write_error_line(
+            "[pastey recovery] event=stale_part_cleanup_failed error=\"read_dir\"",
+        );
+        return;
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else {
+            logging::write_error_line(
+                "[pastey recovery] event=stale_part_cleanup_failed error=\"read_entry\"",
+            );
+            continue;
+        };
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -1080,21 +1146,17 @@ fn cleanup_stale_part_files_in_dir(dir: &Path) -> AppResult<()> {
             continue;
         }
 
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
-        if metadata.len() == 0 || now_ts().saturating_sub(modified) >= STALE_PART_FILE_AGE_SECS {
-            let _ = remove_file_if_exists(&path);
+        match remove_file_if_exists(&path) {
+            Ok(true) => logging::write_transfer_line(
+                "[pastey recovery] event=stale_part_cleanup_deleted location=pastey_parts",
+            ),
+            Ok(false) => {}
+            Err(error) => logging::write_error_line(&format!(
+                "[pastey recovery] event=stale_part_cleanup_failed location=pastey_parts error={:?}",
+                error.message()
+            )),
         }
     }
-
-    Ok(())
 }
 
 pub fn delete_room_item(paths: &AppPaths, item_id: &str) -> AppResult<bool> {
@@ -1387,14 +1449,15 @@ mod tests {
     #[test]
     fn stale_part_cleanup_removes_empty_part_files_immediately() {
         let dir = std::env::temp_dir().join(format!("pastey_empty_part_{}", Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        let part_path = dir.join("payload.bin.part");
+        let part_dir = dir.join(".pastey-parts");
+        fs::create_dir_all(&part_dir).unwrap();
+        let part_path = part_dir.join("payload.bin.part");
         fs::write(&part_path, []).unwrap();
 
-        cleanup_stale_part_files_in_dir(&dir).unwrap();
+        cleanup_stale_part_files_in_dir(&dir);
 
         assert!(!part_path.exists());
-        let _ = fs::remove_dir(dir);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1786,6 +1849,86 @@ mod tests {
         burn_room(&paths, "room", &paths.inbox_dir).unwrap();
 
         assert!(!part_path.exists());
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn startup_recovery_marks_created_items_interrupted_and_cleans_pastey_parts() {
+        let paths = test_paths("pastey_startup_recovery");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        let item = create_outgoing_text_item(&paths, &master_key, "room", "hello").unwrap();
+        let custom_inbox = paths.app_data_dir.join("custom-inbox");
+        let default_part = transfer_part_path(&paths.inbox_dir, "default-transfer");
+        let custom_part = transfer_part_path(&custom_inbox, "custom-transfer");
+        let temp_part = transfer_part_path(&paths.temp_dir, "temp-transfer");
+        for part_path in [&default_part, &custom_part, &temp_part] {
+            fs::create_dir_all(part_path.parent().unwrap()).unwrap();
+            fs::write(part_path, [1_u8, 2, 3]).unwrap();
+        }
+        let completed_other_file = custom_inbox.join("completed.bin");
+        fs::create_dir_all(&custom_inbox).unwrap();
+        fs::write(&completed_other_file, [9_u8]).unwrap();
+
+        run_startup_recovery(&paths, &custom_inbox).unwrap();
+
+        assert_eq!(
+            get_room_item_by_id(&paths, &item.id).unwrap().status,
+            RoomItemStatus::Interrupted
+        );
+        assert!(!default_part.exists());
+        assert!(!custom_part.exists());
+        assert!(!temp_part.exists());
+        assert!(completed_other_file.exists());
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn burned_room_cannot_be_resurrected_or_receive_late_finalized_item() {
+        let paths = test_paths("pastey_burn_no_resurrect");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+
+        burn_room(&paths, "room", &paths.inbox_dir).unwrap();
+        set_room_status(&paths, "room", RoomStatus::Active).unwrap();
+
+        assert_eq!(
+            get_room_by_id(&paths, "room").unwrap().status,
+            RoomStatus::Burned
+        );
+        assert!(persist_incoming_file_item_metadata(
+            &paths,
+            &master_key,
+            "room",
+            "late-transfer",
+            3,
+            Some("late.bin".into()),
+            Some("application/octet-stream".into()),
+            now_ts(),
+            Some(paths.inbox_dir.join("late.bin").display().to_string()),
+        )
+        .is_err());
+        assert!(list_room_items(&paths, "room").unwrap().is_empty());
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 }

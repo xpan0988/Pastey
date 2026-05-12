@@ -58,6 +58,8 @@ export function RoomPage({
   const [composerDropActive, setComposerDropActive] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const inFlightFileKeysRef = useRef<Set<string>>(new Set());
+  const roomUnavailable = room.status === "burned" || room.status === "expired" || busy === "burn" || busy === "leave";
+  const canSend = room.peer_connected && busy === null && !roomUnavailable;
 
   useEffect(() => {
     composerRef.current?.focus();
@@ -87,13 +89,13 @@ export function RoomPage({
     void getCurrentWebview()
       .onDragDropEvent(async (event) => {
         if (event.payload.type === "over") {
-          setComposerDropActive(room.peer_connected && busy === null);
+          setComposerDropActive(canSend);
           return;
         }
 
         if (event.payload.type === "drop") {
           setComposerDropActive(false);
-          if (!room.peer_connected || busy !== null) return;
+          if (!canSend) return;
           for (const path of event.payload.paths) {
             await handleSendFile(path, "drop");
           }
@@ -111,7 +113,7 @@ export function RoomPage({
         unlisten();
       }
     };
-  }, [busy, room.id, room.peer_connected]);
+  }, [canSend, room.id]);
 
   async function handleSendText() {
     if (!text.trim()) return;
@@ -154,7 +156,7 @@ export function RoomPage({
   async function handlePickFile(event?: MouseEvent<HTMLButtonElement>) {
     event?.preventDefault();
     event?.stopPropagation();
-    if (!room.peer_connected || busy !== null) return;
+    if (!canSend) return;
     const selected = await open({
       multiple: false,
       directory: false
@@ -236,7 +238,7 @@ export function RoomPage({
     event.preventDefault();
     event.stopPropagation();
 
-    if (!room.peer_connected || busy !== null) {
+    if (!canSend) {
       return;
     }
 
@@ -346,7 +348,7 @@ export function RoomPage({
             <button className="ghost-button" onClick={handleLeaveRoom} disabled={busy !== null}>
               {busy === "leave" ? "Leaving..." : "Leave"}
             </button>
-            <button className="ghost-button danger" onClick={handleBurnRoom} disabled={busy !== null}>
+            <button className="ghost-button danger" onClick={handleBurnRoom} disabled={busy !== null || room.status === "burned"}>
               {busy === "burn" ? "Burning..." : "Burn Room"}
             </button>
           </div>
@@ -399,7 +401,7 @@ export function RoomPage({
           <button
             className="plus-button"
             onClick={(event) => void handlePickFile(event)}
-            disabled={!room.peer_connected || busy !== null}
+            disabled={!canSend}
             title="Add file"
             aria-label="Add file"
           >
@@ -411,6 +413,8 @@ export function RoomPage({
             placeholder={
               room.peer_connected
                 ? "Message"
+                : room.status === "burned"
+                  ? "Room burned"
                 : room.peer_burned_at
                   ? "Peer burned this room. Burn locally when you're done."
                   : room.status === "peer_left"
@@ -418,7 +422,7 @@ export function RoomPage({
                     : "Waiting for the other device to join this room."
             }
             value={text}
-            disabled={!room.peer_connected || busy !== null}
+            disabled={!canSend}
             onChange={(event) => setText(event.target.value)}
             onPaste={(event) => {
               void handleComposerPaste(event);
@@ -433,7 +437,7 @@ export function RoomPage({
           <button
             className="primary-button"
             onClick={handleSendText}
-            disabled={!room.peer_connected || busy !== null || !text.trim()}
+            disabled={!canSend || !text.trim()}
           >
             {busy === "text" ? "Sending..." : "Send"}
           </button>
@@ -454,7 +458,7 @@ interface TransferCardProps {
 function TransferCard({ transfer, cancelling, onCancel }: TransferCardProps) {
   const percent = transfer.file_size > 0 ? Math.min(100, (transfer.transferred_bytes / transfer.file_size) * 100) : 0;
   const canCancel = transfer.status === "pending" || transfer.status === "transferring";
-  const statusLabel = transfer.status === "transferring" ? "Transferring" : transfer.status;
+  const statusLabel = transferStatusLabel(transfer.status);
 
   return (
     <div className={`transfer-card ${transfer.status}`}>
@@ -486,6 +490,25 @@ function TransferCard({ transfer, cancelling, onCancel }: TransferCardProps) {
       {transfer.error_message ? <div className="transfer-error">{transfer.error_message}</div> : null}
     </div>
   );
+}
+
+function transferStatusLabel(status: FileTransferProgressEvent["status"]): string {
+  switch (status) {
+    case "transferring":
+      return "Transferring";
+    case "completed":
+      return "Completed";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Transfer cancelled";
+    case "burned":
+      return "Room burned";
+    case "interrupted":
+      return "Transfer interrupted";
+    default:
+      return "Pending";
+  }
 }
 
 interface MessageRowProps {
@@ -526,6 +549,7 @@ function MessageRow({ item, onCopyText, onReveal }: MessageRowProps) {
               {" • "}
               {fileTypeLabel(item.display_name, item.mime_type)}
               {item.status === "cancelled" ? " • cancelled" : ""}
+              {item.status === "interrupted" ? " • interrupted" : ""}
               {item.status === "failed" ? " • failed" : ""}
             </span>
             {item.error_message ? <span className="transfer-error">{item.error_message}</span> : null}

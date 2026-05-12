@@ -253,13 +253,8 @@ pub async fn burn_room(room_id: String, state: State<'_, Arc<AppState>>) -> Resu
         let peer = storage::get_room_by_id(&state.paths, &room_id)
             .ok()
             .and_then(|room| room.peer_host.zip(room.peer_port));
-        transfer::cancel_room_transfers(
-            state.inner().clone(),
-            &room_id,
-            "Transfer cancelled.",
-            true,
-        )
-        .await?;
+        transfer::cancel_room_transfers(state.inner().clone(), &room_id, "Room burned", false)
+            .await?;
         let effective_inbox_dir = {
             let config = state.config.read();
             config::effective_inbox_dir(&state.paths, &config)
@@ -280,7 +275,7 @@ pub async fn leave_room(room_id: String, state: State<'_, Arc<AppState>>) -> Res
         let _ = transfer::cancel_room_transfers(
             state.inner().clone(),
             &room_id,
-            "Transfer cancelled.",
+            "Transfer cancelled",
             true,
         )
         .await;

@@ -1,13 +1,14 @@
 {
   "name": "pastey",
   "private": true,
-  "version": "1.3.1",
+  "version": "1.3.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "tauri:build": "npm run tauri -- build",
-    "build:checked": "npm run tauri:build && node scripts/check-build-size.mjs",
+    "check:version": "node scripts/check-version-consistency.mjs",
+    "build:checked": "npm run check:version && npm run tauri:build && node scripts/check-build-size.mjs",
     "preview": "vite preview",
     "tauri": "cross-env CI=true tauri"
   },
