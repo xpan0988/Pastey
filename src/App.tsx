@@ -1,9 +1,10 @@
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { HomePage } from "./pages/HomePage";
 import { RoomPage } from "./pages/RoomPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { burnRoom, getConfig, getRoom, leaveRoom, listRoomItems, listRooms } from "./lib/tauri";
+import { mergeTransferEvent } from "./lib/transferState";
 import type { AppConfig, FileTransferProgressEvent, RoomInfo, RoomItem } from "./lib/types";
 
 type View =
@@ -24,6 +25,7 @@ function App() {
   const [transfers, setTransfers] = useState<Record<string, FileTransferProgressEvent>>({});
   const [focusToken, setFocusToken] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const closedRoomIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     async function load() {
@@ -52,10 +54,10 @@ function App() {
     });
 
     void listen<FileTransferProgressEvent>("pastey://transfer-progress", (event) => {
-      setTransfers((current) => ({
-        ...current,
-        [event.payload.transfer_id]: event.payload
-      }));
+      if (closedRoomIdsRef.current.has(event.payload.room_id)) {
+        return;
+      }
+      setTransfers((current) => mergeTransferEvent(current, event.payload, closedRoomIdsRef.current));
       if (event.payload.status === "completed") {
         void refreshCurrentRoom();
       }
@@ -83,6 +85,7 @@ function App() {
   }
 
   async function openRoom(room: RoomInfo) {
+    closedRoomIdsRef.current.delete(room.id);
     setView({ screen: "room", roomId: room.id });
     try {
       const [nextRoom, nextItems] = await Promise.all([getRoom(room.id), listRoomItems(room.id)]);
@@ -126,6 +129,7 @@ function App() {
 
   async function handleBurnRoom(roomId: string) {
     await burnRoom(roomId);
+    closedRoomIdsRef.current.add(roomId);
     setView({ screen: "home" });
     setCurrentRoom(null);
     setRoomItems([]);
@@ -135,6 +139,7 @@ function App() {
 
   async function handleLeaveRoom(roomId: string) {
     await leaveRoom(roomId);
+    closedRoomIdsRef.current.add(roomId);
     setView({ screen: "home" });
     setCurrentRoom(null);
     setRoomItems([]);

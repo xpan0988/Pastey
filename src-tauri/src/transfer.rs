@@ -41,6 +41,10 @@ const TRANSFER_EVENT: &str = "pastey://transfer-progress";
 const TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CHUNK_BODY_BYTES: usize = 16 * 1024 * 1024;
+const TRANSFER_CANCELLED_MESSAGE: &str = "Transfer cancelled";
+const TRANSFER_INTERRUPTED_MESSAGE: &str = "Transfer interrupted";
+const PEER_DISCONNECTED_MESSAGE: &str = "Peer disconnected";
+const ROOM_BURNED_MESSAGE: &str = "Room burned";
 const CHUNK_RETRY_BACKOFFS: [Duration; 3] = [
     Duration::from_millis(300),
     Duration::from_millis(800),
@@ -264,7 +268,7 @@ pub async fn announce_join(
         .await?;
 
     if !response.status().is_success() {
-        return Err(AppError::Network("Peer left the room.".into()));
+        return Err(AppError::Network(PEER_DISCONNECTED_MESSAGE.into()));
     }
 
     response.json().await.map_err(Into::into)
@@ -272,17 +276,23 @@ pub async fn announce_join(
 
 pub async fn send_room_item(state: Arc<AppState>, room_id: &str, item_id: &str) -> AppResult<()> {
     let room = storage::get_room_by_id(&state.paths, room_id)?;
+    if room.status == RoomStatus::Burned {
+        return Err(AppError::InvalidInput(ROOM_BURNED_MESSAGE.into()));
+    }
+    if room.expires_at <= storage::now_ts() || room.status == RoomStatus::Expired {
+        return Err(AppError::InvalidInput(TRANSFER_INTERRUPTED_MESSAGE.into()));
+    }
     let peer_host = room
         .peer_host
         .clone()
-        .ok_or_else(|| AppError::InvalidInput("Peer left the room.".into()))?;
+        .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?;
     let peer_port = room
         .peer_port
-        .ok_or_else(|| AppError::InvalidInput("Peer left the room.".into()))?;
+        .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?;
     let peer_transport_public_key = room
         .peer_transport_public_key
         .clone()
-        .ok_or_else(|| AppError::InvalidInput("Peer left the room.".into()))?;
+        .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?;
 
     let item = storage::get_room_item_by_id(&state.paths, item_id)?;
     let master_key = {
@@ -354,22 +364,23 @@ pub async fn send_room_file(
     file_path: &Path,
 ) -> AppResult<()> {
     let room = storage::get_room_by_id(&state.paths, room_id)?;
-    if room.expires_at <= storage::now_ts()
-        || matches!(room.status, RoomStatus::Burned | RoomStatus::Expired)
-    {
-        return Err(AppError::InvalidInput("Room expired.".into()));
+    if room.status == RoomStatus::Burned {
+        return Err(AppError::InvalidInput(ROOM_BURNED_MESSAGE.into()));
+    }
+    if room.expires_at <= storage::now_ts() || room.status == RoomStatus::Expired {
+        return Err(AppError::InvalidInput(TRANSFER_INTERRUPTED_MESSAGE.into()));
     }
     let peer_host = room
         .peer_host
         .clone()
-        .ok_or_else(|| AppError::InvalidInput("Peer left the room.".into()))?;
+        .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?;
     let peer_port = room
         .peer_port
-        .ok_or_else(|| AppError::InvalidInput("Peer left the room.".into()))?;
+        .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?;
     let peer_transport_public_key = room
         .peer_transport_public_key
         .clone()
-        .ok_or_else(|| AppError::InvalidInput("Peer left the room.".into()))?;
+        .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?;
 
     let metadata = tokio::fs::metadata(file_path)
         .await
@@ -482,10 +493,27 @@ pub async fn send_room_file(
                 &details.body_text,
             );
             let message = map_response_error_message(&details);
-            fail_transfer(&state, &transfer_id, item_id, message.clone());
+            let status = if details.code.as_deref() == Some("room_burned") {
+                "burned"
+            } else if details.status == StatusCode::GONE
+                || matches!(
+                    details.code.as_deref(),
+                    Some("room_not_found") | Some("transfer_missing")
+                )
+            {
+                "interrupted"
+            } else {
+                "failed"
+            };
+            if status == "failed" {
+                fail_transfer(&state, &transfer_id, item_id, message.clone());
+            } else {
+                finish_sender_terminal(&state, &transfer_id, item_id, status, &message);
+            }
             return Err(AppError::Network(message));
         }
         Err(error) => {
+            let message = map_reqwest_transfer_message(&error);
             dev_log_sender_final_error(
                 &transfer_id,
                 room_id,
@@ -493,12 +521,7 @@ pub async fn send_room_file(
                 "start_failed",
                 &error.to_string(),
             );
-            fail_transfer(
-                &state,
-                &transfer_id,
-                item_id,
-                "Network connection lost.".into(),
-            );
+            finish_sender_terminal(&state, &transfer_id, item_id, "interrupted", &message);
             return Err(AppError::Http(error));
         }
     };
@@ -522,9 +545,15 @@ pub async fn send_room_file(
                 &state,
                 &transfer_id,
                 "cancelled",
-                Some("Transfer cancelled.".into()),
+                Some(TRANSFER_CANCELLED_MESSAGE.into()),
             );
-            return Err(AppError::InvalidInput("Transfer cancelled.".into()));
+            return Err(AppError::InvalidInput(TRANSFER_CANCELLED_MESSAGE.into()));
+        }
+
+        if let Some((status, message)) = sender_room_terminal_state(&state, room_id) {
+            notify_transfer_failed(&client, &base_url, &transfer_id, &message).await;
+            finish_sender_terminal(&state, &transfer_id, item_id, status, &message);
+            return Err(AppError::Network(message));
         }
 
         let bytes_read = read_next_chunk(&mut file, &mut buffer, chunk_size)
@@ -587,9 +616,9 @@ pub async fn send_room_file(
                         &state,
                         &transfer_id,
                         "cancelled",
-                        Some("Transfer cancelled.".into()),
+                        Some(TRANSFER_CANCELLED_MESSAGE.into()),
                     );
-                    return Err(AppError::InvalidInput("Transfer cancelled.".into()));
+                    return Err(AppError::InvalidInput(TRANSFER_CANCELLED_MESSAGE.into()));
                 }
 
                 notify_transfer_failed(&client, &base_url, &transfer_id, &error.message).await;
@@ -600,7 +629,22 @@ pub async fn send_room_file(
                     error.kind.as_str(),
                     &error.message,
                 );
-                fail_transfer(&state, &transfer_id, item_id, error.message.clone());
+                if matches!(
+                    error.kind,
+                    ChunkSendFailureKind::PeerLeft
+                        | ChunkSendFailureKind::Timeout
+                        | ChunkSendFailureKind::Unreachable
+                ) {
+                    finish_sender_terminal(
+                        &state,
+                        &transfer_id,
+                        item_id,
+                        "interrupted",
+                        &error.message,
+                    );
+                } else {
+                    fail_transfer(&state, &transfer_id, item_id, error.message.clone());
+                }
                 return if error.kind == ChunkSendFailureKind::Timeout {
                     Err(AppError::Timeout(error.message))
                 } else {
@@ -664,7 +708,20 @@ pub async fn send_room_file(
         Ok(response) => {
             let details = response_error_details(response).await;
             let message = map_response_error_message(&details);
-            fail_transfer(&state, &transfer_id, item_id, message.clone());
+            if matches!(
+                details.code.as_deref(),
+                Some("room_burned") | Some("room_not_found") | Some("transfer_missing")
+            ) || details.status == StatusCode::GONE
+            {
+                let status = if details.code.as_deref() == Some("room_burned") {
+                    "burned"
+                } else {
+                    "interrupted"
+                };
+                finish_sender_terminal(&state, &transfer_id, item_id, status, &message);
+            } else {
+                fail_transfer(&state, &transfer_id, item_id, message.clone());
+            }
             Err(AppError::Network(message))
         }
         Err(error) => {
@@ -675,12 +732,8 @@ pub async fn send_room_file(
                 "finish_failed",
                 &error.to_string(),
             );
-            fail_transfer(
-                &state,
-                &transfer_id,
-                item_id,
-                "Network connection lost.".into(),
-            );
+            let message = map_reqwest_transfer_message(&error);
+            finish_sender_terminal(&state, &transfer_id, item_id, "interrupted", &message);
             Err(AppError::Http(error))
         }
     }
@@ -742,7 +795,7 @@ async fn send_chunk_with_retry(
     for retry_count in 0..=CHUNK_RETRY_BACKOFFS.len() {
         if cancel_token.is_cancelled() {
             return Err(ChunkSendFailure {
-                message: "Transfer cancelled.".into(),
+                message: TRANSFER_CANCELLED_MESSAGE.into(),
                 kind: ChunkSendFailureKind::Cancelled,
                 retryable: false,
             });
@@ -786,7 +839,7 @@ async fn send_chunk_with_retry(
                 );
                 if cancel_token.is_cancelled() {
                     return Err(ChunkSendFailure {
-                        message: "Transfer cancelled.".into(),
+                        message: TRANSFER_CANCELLED_MESSAGE.into(),
                         kind: ChunkSendFailureKind::Cancelled,
                         retryable: false,
                     });
@@ -800,7 +853,7 @@ async fn send_chunk_with_retry(
     }
 
     Err(ChunkSendFailure {
-        message: "Transfer timed out.".into(),
+        message: TRANSFER_INTERRUPTED_MESSAGE.into(),
         kind: ChunkSendFailureKind::Timeout,
         retryable: false,
     })
@@ -897,20 +950,20 @@ async fn send_chunk_once(
 fn chunk_failure_from_reqwest(error: reqwest::Error) -> ChunkSendFailure {
     if error.is_timeout() {
         return ChunkSendFailure {
-            message: "Transfer timed out.".into(),
+            message: TRANSFER_INTERRUPTED_MESSAGE.into(),
             kind: ChunkSendFailureKind::Timeout,
             retryable: true,
         };
     }
     if error.is_connect() {
         return ChunkSendFailure {
-            message: "Connection lost.".into(),
+            message: PEER_DISCONNECTED_MESSAGE.into(),
             kind: ChunkSendFailureKind::Unreachable,
             retryable: true,
         };
     }
     ChunkSendFailure {
-        message: "Connection lost.".into(),
+        message: TRANSFER_INTERRUPTED_MESSAGE.into(),
         kind: ChunkSendFailureKind::Unreachable,
         retryable: true,
     }
@@ -947,7 +1000,7 @@ async fn chunk_failure_from_response(
     }
     if details.code.as_deref() == Some("room_not_found") {
         return ChunkSendFailure {
-            message: "Room not found on receiver.".into(),
+            message: PEER_DISCONNECTED_MESSAGE.into(),
             kind: ChunkSendFailureKind::PeerLeft,
             retryable: false,
         };
@@ -961,7 +1014,7 @@ async fn chunk_failure_from_response(
     }
     if details.status == StatusCode::GONE {
         return ChunkSendFailure {
-            message: "Peer left the room.".into(),
+            message: map_response_error_message(&details),
             kind: ChunkSendFailureKind::PeerLeft,
             retryable: false,
         };
@@ -969,7 +1022,7 @@ async fn chunk_failure_from_response(
 
     if details.code.as_deref() == Some("cancelled") {
         return ChunkSendFailure {
-            message: "Transfer cancelled.".into(),
+            message: TRANSFER_CANCELLED_MESSAGE.into(),
             kind: ChunkSendFailureKind::Cancelled,
             retryable: false,
         };
@@ -1312,7 +1365,7 @@ pub async fn cancel_transfer(state: Arc<AppState>, transfer_id: &str) -> AppResu
         0.0,
         average_speed(&transfer, current_transferred(&transfer)),
         None,
-        Some("Transfer cancelled.".into()),
+        Some(TRANSFER_CANCELLED_MESSAGE.into()),
     );
     Ok(true)
 }
@@ -1368,10 +1421,15 @@ pub async fn cancel_room_transfers(
                         cleanup_failed = true;
                     }
                 }
+                let status = if message == ROOM_BURNED_MESSAGE {
+                    "burned"
+                } else {
+                    "cancelled"
+                };
                 emit_event(
                     &state,
                     &transfer,
-                    "cancelled",
+                    status,
                     current_transferred(&transfer),
                     0.0,
                     average_speed(&transfer, current_transferred(&transfer)),
@@ -1439,7 +1497,7 @@ fn room_server_snapshot(state: &Arc<AppState>, room_id: &str) -> AppResult<Activ
     let servers = state.active_servers.lock();
     let server = servers
         .get(room_id)
-        .ok_or_else(|| AppError::NotFound("Peer left the room.".into()))?;
+        .ok_or_else(|| AppError::NotFound(PEER_DISCONNECTED_MESSAGE.into()))?;
     Ok(ActiveRoomSnapshot {
         port: server.port,
         transport_secret: server.transport_secret,
@@ -1920,6 +1978,7 @@ async fn receive_file_chunk_handler(
     let transfer_lookup = {
         let transfers = ctx.state.active_file_transfers.lock();
         let Some(transfer) = transfers.get(&transfer_id) else {
+            log_late_event_ignored(&transfer_id, &room_id, "chunk");
             return transfer_error(
                 StatusCode::NOT_FOUND,
                 "transfer_missing",
@@ -1930,7 +1989,7 @@ async fn receive_file_chunk_handler(
             return transfer_error(
                 StatusCode::CONFLICT,
                 "cancelled",
-                "Transfer cancelled.".into(),
+                TRANSFER_CANCELLED_MESSAGE.into(),
             );
         }
         let ActiveFileTransferKind::Receiver {
@@ -2022,7 +2081,7 @@ async fn receive_file_chunk_handler(
         return transfer_error(
             StatusCode::CONFLICT,
             "cancelled",
-            "Transfer cancelled.".into(),
+            TRANSFER_CANCELLED_MESSAGE.into(),
         );
     }
 
@@ -2098,6 +2157,7 @@ async fn receive_file_chunk_handler(
     let maybe_event = {
         let mut transfers = ctx.state.active_file_transfers.lock();
         let Some(transfer) = transfers.get_mut(&transfer_id) else {
+            log_late_event_ignored(&transfer_id, &room_id, "chunk_progress");
             return transfer_error(
                 StatusCode::NOT_FOUND,
                 "transfer_missing",
@@ -2190,11 +2250,15 @@ async fn finish_file_transfer_handler(
     let transfer = match ctx.state.active_file_transfers.lock().remove(&transfer_id) {
         Some(transfer) => transfer,
         None => {
+            log_late_event_ignored(&transfer_id, &room_id, "finalize");
+            if room_is_burned(&ctx.state, &room_id) {
+                return transfer_error(StatusCode::GONE, "room_burned", ROOM_BURNED_MESSAGE.into());
+            }
             return transfer_error(
                 StatusCode::NOT_FOUND,
                 "transfer_missing",
                 "Transfer session not found on receiver.".into(),
-            )
+            );
         }
     };
     let ActiveFileTransferKind::Receiver {
@@ -2213,6 +2277,15 @@ async fn finish_file_transfer_handler(
             "Invalid file metadata".into(),
         );
     };
+    if room_is_burned(&ctx.state, &room_id) {
+        return abort_receiver_finalize_for_burn(
+            &ctx.state,
+            &transfer,
+            &[part_path.clone()],
+            *transferred_bytes,
+        )
+        .await;
+    }
     dev_log_receiver_finalize(
         &transfer_id,
         &room_id,
@@ -2277,6 +2350,15 @@ async fn finish_file_transfer_handler(
         );
         return transfer_error(StatusCode::BAD_REQUEST, code, message.into());
     }
+    if room_is_burned(&ctx.state, &room_id) {
+        return abort_receiver_finalize_for_burn(
+            &ctx.state,
+            &transfer,
+            &[part_path.clone()],
+            *transferred_bytes,
+        )
+        .await;
+    }
 
     dev_log_receiver_finalize(
         &transfer_id,
@@ -2312,6 +2394,15 @@ async fn finish_file_transfer_handler(
             "Receiver failed to write chunk".into(),
         );
     }
+    if room_is_burned(&ctx.state, &room_id) {
+        return abort_receiver_finalize_for_burn(
+            &ctx.state,
+            &transfer,
+            &[final_path.clone()],
+            *transferred_bytes,
+        )
+        .await;
+    }
 
     dev_log_receiver_finalize(
         &transfer_id,
@@ -2330,7 +2421,7 @@ async fn finish_file_transfer_handler(
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     };
-    if storage::persist_incoming_file_item_metadata(
+    if let Err(error) = storage::persist_incoming_file_item_metadata(
         &ctx.state.paths,
         &master_key,
         &room_id,
@@ -2340,9 +2431,16 @@ async fn finish_file_transfer_handler(
         mime_type.clone(),
         *created_at,
         Some(final_path.display().to_string()),
-    )
-    .is_err()
-    {
+    ) {
+        if room_is_burned(&ctx.state, &room_id) || error.message() == ROOM_BURNED_MESSAGE {
+            return abort_receiver_finalize_for_burn(
+                &ctx.state,
+                &transfer,
+                &[final_path.clone()],
+                *transferred_bytes,
+            )
+            .await;
+        }
         dev_log_receiver_finalize(
             &transfer_id,
             &room_id,
@@ -2350,6 +2448,15 @@ async fn finish_file_transfer_handler(
             "error_kind=write_failed message=\"Receiver failed to write chunk\"",
         );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if room_is_burned(&ctx.state, &room_id) {
+        return abort_receiver_finalize_for_burn(
+            &ctx.state,
+            &transfer,
+            &[final_path.clone()],
+            *transferred_bytes,
+        )
+        .await;
     }
     let _ = storage::set_room_status(&ctx.state.paths, &room_id, RoomStatus::Active);
     dev_log_receiver_finalize(
@@ -2384,6 +2491,7 @@ async fn cancel_file_transfer_handler(
         );
     }
     let Some(transfer) = ctx.state.active_file_transfers.lock().remove(&transfer_id) else {
+        log_late_event_ignored(&transfer_id, &room_id, "cancel");
         return Json(TransferOkResponse { ok: true }).into_response();
     };
     transfer.cancel_token.cancel();
@@ -2396,7 +2504,7 @@ async fn cancel_file_transfer_handler(
     let status = if failure { "failed" } else { "cancelled" };
     let message = request
         .and_then(|Json(request)| request.message)
-        .unwrap_or_else(|| "Transfer cancelled.".into());
+        .unwrap_or_else(|| TRANSFER_CANCELLED_MESSAGE.into());
     emit_event(
         &ctx.state,
         &transfer,
@@ -2418,7 +2526,7 @@ async fn remote_burn_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let _ = cancel_room_transfers(ctx.state.clone(), &room_id, "Transfer cancelled.", false).await;
+    let _ = cancel_room_transfers(ctx.state.clone(), &room_id, ROOM_BURNED_MESSAGE, false).await;
     storage::mark_peer_burned(&ctx.state.paths, &room_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let state = ctx.state.clone();
@@ -2457,13 +2565,18 @@ fn unavailable_room_response(state: &Arc<AppState>, room_id: &str) -> Option<Res
             ))
         }
     };
-    if room.expires_at <= storage::now_ts()
-        || matches!(room.status, RoomStatus::Burned | RoomStatus::Expired)
-    {
+    if room.status == RoomStatus::Burned {
+        return Some(transfer_error(
+            StatusCode::GONE,
+            "room_burned",
+            ROOM_BURNED_MESSAGE.into(),
+        ));
+    }
+    if room.expires_at <= storage::now_ts() || room.status == RoomStatus::Expired {
         return Some(transfer_error(
             StatusCode::GONE,
             "room_expired",
-            "Room expired.".into(),
+            TRANSFER_INTERRUPTED_MESSAGE.into(),
         ));
     }
     None
@@ -2490,14 +2603,14 @@ fn unavailable_room_response_for_active_transfer(
         return Some(transfer_error(
             StatusCode::GONE,
             "room_expired",
-            "Room expired.".into(),
+            TRANSFER_INTERRUPTED_MESSAGE.into(),
         ));
     }
     if room.status == RoomStatus::Burned {
         return Some(transfer_error(
             StatusCode::GONE,
-            "room_expired",
-            "Room expired.".into(),
+            "room_burned",
+            ROOM_BURNED_MESSAGE.into(),
         ));
     }
     None
@@ -2555,10 +2668,11 @@ fn map_response_error_message(details: &ResponseErrorDetails) -> String {
         Some("metadata_mismatch") => "Transfer metadata mismatch".into(),
         Some("not_enough_disk_space") => "Not enough disk space on receiver".into(),
         Some("receiver_cannot_write") => "Receiver cannot write to inbox".into(),
+        Some("room_burned") => ROOM_BURNED_MESSAGE.into(),
         Some("size_mismatch") => "Received file size mismatch".into(),
         Some("temp_file_disappeared") => "Receiver temporary file disappeared".into(),
         Some("write_failed") => "Receiver failed to write chunk".into(),
-        Some("cancelled") => "Transfer cancelled.".into(),
+        Some("cancelled") => TRANSFER_CANCELLED_MESSAGE.into(),
         _ => {
             if details.status == StatusCode::PAYLOAD_TOO_LARGE {
                 "Chunk too large for receiver".into()
@@ -2566,6 +2680,8 @@ fn map_response_error_message(details: &ResponseErrorDetails) -> String {
                 "Transfer session not found on receiver.".into()
             } else if details.status == StatusCode::INTERNAL_SERVER_ERROR {
                 "Receiver failed to write chunk".into()
+            } else if details.status == StatusCode::GONE {
+                TRANSFER_INTERRUPTED_MESSAGE.into()
             } else {
                 details.message.clone()
             }
@@ -2578,9 +2694,9 @@ fn status_fallback_message(status: StatusCode) -> &'static str {
         StatusCode::PAYLOAD_TOO_LARGE => "Chunk too large for receiver",
         StatusCode::NOT_FOUND => "Transfer session not found on receiver.",
         StatusCode::INTERNAL_SERVER_ERROR => "Receiver failed to write chunk",
-        StatusCode::REQUEST_TIMEOUT => "Transfer timed out.",
-        StatusCode::GONE => "Peer left the room.",
-        _ => "Connection lost.",
+        StatusCode::REQUEST_TIMEOUT => TRANSFER_INTERRUPTED_MESSAGE,
+        StatusCode::GONE => TRANSFER_INTERRUPTED_MESSAGE,
+        _ => TRANSFER_INTERRUPTED_MESSAGE,
     }
 }
 
@@ -2638,6 +2754,28 @@ fn fail_transfer(state: &Arc<AppState>, transfer_id: &str, item_id: &str, messag
     }
 }
 
+fn finish_sender_terminal(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    item_id: &str,
+    status: &str,
+    message: &str,
+) {
+    let item_status = if status == "cancelled" {
+        RoomItemStatus::Cancelled
+    } else {
+        RoomItemStatus::Interrupted
+    };
+    let _ = storage::set_room_item_status(&state.paths, item_id, item_status);
+    if status == "interrupted" {
+        log_transfer_lifecycle(transfer_id, "transfer_interrupted", message);
+        if message == PEER_DISCONNECTED_MESSAGE {
+            log_transfer_lifecycle(transfer_id, "peer_disconnected", message);
+        }
+    }
+    finish_transfer_locally(state, transfer_id, status, Some(message.to_string()));
+}
+
 fn finish_transfer_locally(
     state: &Arc<AppState>,
     transfer_id: &str,
@@ -2663,6 +2801,40 @@ fn finish_transfer_locally(
     }
 }
 
+fn sender_room_terminal_state(
+    state: &Arc<AppState>,
+    room_id: &str,
+) -> Option<(&'static str, String)> {
+    let room = storage::get_room_by_id(&state.paths, room_id).ok()?;
+    if room.status == RoomStatus::Burned {
+        return Some(("burned", ROOM_BURNED_MESSAGE.into()));
+    }
+    if room.status == RoomStatus::Expired || room.expires_at <= storage::now_ts() {
+        return Some(("interrupted", TRANSFER_INTERRUPTED_MESSAGE.into()));
+    }
+    None
+}
+
+fn map_reqwest_transfer_message(error: &reqwest::Error) -> String {
+    if error.is_connect() {
+        PEER_DISCONNECTED_MESSAGE.into()
+    } else {
+        TRANSFER_INTERRUPTED_MESSAGE.into()
+    }
+}
+
+fn log_transfer_lifecycle(transfer_id: &str, event: &str, message: &str) {
+    logging::write_transfer_line(&format!(
+        "[pastey transfer][transfer_id={transfer_id}] event={event} message={message:?}"
+    ));
+}
+
+fn log_late_event_ignored(transfer_id: &str, room_id: &str, event_kind: &str) {
+    logging::write_transfer_line(&format!(
+        "[pastey transfer][transfer_id={transfer_id}][room_id={room_id}] event=late_event_ignored kind={event_kind}"
+    ));
+}
+
 async fn fail_receiver_transfer(state: &Arc<AppState>, transfer_id: &str, message: &str) {
     let transfer = state.active_file_transfers.lock().remove(transfer_id);
     if let Some(transfer) = transfer {
@@ -2680,6 +2852,47 @@ async fn fail_receiver_transfer(state: &Arc<AppState>, transfer_id: &str, messag
             Some(message.to_string()),
         );
     }
+}
+
+async fn abort_receiver_finalize_for_burn(
+    state: &Arc<AppState>,
+    transfer: &ActiveFileTransfer,
+    cleanup_paths: &[PathBuf],
+    transferred_bytes: u64,
+) -> Response {
+    for path in cleanup_paths {
+        if let Err(error) = tokio::fs::remove_file(path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                logging::write_error_line(&format!(
+                    "[pastey cleanup][room_id={}] event=room_file_cleanup_error category=burn_finalize path_kind=transfer_file error={:?}",
+                    transfer.room_id,
+                    error.to_string()
+                ));
+            }
+        }
+    }
+    log_transfer_lifecycle(
+        &transfer.item_id,
+        "burn_finalize_race_prevented",
+        ROOM_BURNED_MESSAGE,
+    );
+    emit_event(
+        state,
+        transfer,
+        "burned",
+        transferred_bytes,
+        0.0,
+        average_speed(transfer, transferred_bytes),
+        None,
+        Some(ROOM_BURNED_MESSAGE.into()),
+    );
+    transfer_error(StatusCode::GONE, "room_burned", ROOM_BURNED_MESSAGE.into())
+}
+
+fn room_is_burned(state: &Arc<AppState>, room_id: &str) -> bool {
+    storage::get_room_by_id(&state.paths, room_id)
+        .map(|room| room.status == RoomStatus::Burned)
+        .unwrap_or(true)
 }
 
 async fn remove_active_receiver_part_file(
@@ -2727,6 +2940,8 @@ fn emit_progress(
             error_message,
         );
         let _ = state.app_handle.emit(TRANSFER_EVENT, event);
+    } else {
+        log_late_event_ignored(transfer_id, "", "progress");
     }
 }
 
@@ -3238,7 +3453,7 @@ mod tests {
                 Some("cancelled"),
                 "ignored"
             )),
-            "Transfer cancelled."
+            TRANSFER_CANCELLED_MESSAGE
         );
     }
 

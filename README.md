@@ -14,6 +14,13 @@ It is built with:
 
 ## Version history
 
+### 1.3.3 — Destructive-transfer resilience
+
+- Hardened interrupted transfer handling for app quits, peer disconnects, network drops, burn/cancel, and finalize/burn races.
+- Startup recovery now marks stale in-progress items interrupted and removes stale receiver `.pastey-parts` files without scanning inbox contents.
+- Kept terminal transfer UI states stable so late progress or ack events cannot revive completed, cancelled, burned, failed, or interrupted transfers.
+- Aligned release versions and artifact naming so GitHub release assets match the tag/app version.
+
 ### 1.3.2 — Burn lifecycle cleanup
 
 - Updated Burn Room semantics so tracked local room content is deleted.
@@ -192,8 +199,8 @@ npm run build:checked
 GitHub Actions builds precompiled macOS and Windows installers when a version tag is pushed:
 
 ```bash
-git tag v1.3.1
-git push origin v1.3.1
+git tag v1.3.3
+git push origin v1.3.3
 ```
 
 The release workflow builds the frontend, runs `cargo check`, packages the Tauri app, audits bundle contents and size, then uploads the generated installers to the GitHub Release. It does not upload `node_modules`, build caches, local app data, logs, inbox contents, temp files, or local databases.
