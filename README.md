@@ -3,7 +3,6 @@
 `pastey` is a lightweight local-first desktop utility for moving text, files, and images directly between your own Windows and macOS devices on the same LAN.
 
 It is built with:
-
 - Tauri v2
 - React + TypeScript
 - Rust
