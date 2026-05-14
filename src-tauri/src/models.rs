@@ -185,6 +185,28 @@ pub struct RoomItem {
     pub error_message: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NearbyDevice {
+    pub device_id: String,
+    pub display_name: String,
+    pub platform: String,
+    pub app_version: String,
+    pub availability: String,
+    pub capabilities: Vec<String>,
+    pub last_seen_seconds_ago: u64,
+    pub compatible: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JoinRequestPrompt {
+    pub request_id: String,
+    pub device_name: String,
+    pub platform: String,
+    pub app_version: String,
+    pub received_at: i64,
+    pub expires_at: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct StoredRoom {
     pub id: String,

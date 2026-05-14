@@ -14,6 +14,13 @@ It is built with:
 
 ## Version history
 
+### 1.4.0 — Automatic Nearby Antenna Discovery
+
+- Added automatic LAN nearby-device discovery while the Pastey window is open.
+- Added explicit nearby join requests with Accept / Reject before a room is created.
+- Kept 8-digit room codes as the manual fallback for networks that block local discovery.
+- Nearby device cards show device name, platform, availability, and version without showing IP addresses or ports.
+
 ### 1.3.3 — Destructive-transfer resilience
 
 - Hardened interrupted transfer handling for app quits, peer disconnects, network drops, burn/cancel, and finalize/burn races.
@@ -199,8 +206,8 @@ npm run build:checked
 GitHub Actions builds precompiled macOS and Windows installers when a version tag is pushed:
 
 ```bash
-git tag v1.3.3
-git push origin v1.3.3
+git tag v1.4.0
+git push origin v1.4.0
 ```
 
 The release workflow builds the frontend, runs `cargo check`, packages the Tauri app, audits bundle contents and size, then uploads the generated installers to the GitHub Release. It does not upload `node_modules`, build caches, local app data, logs, inbox contents, temp files, or local databases.

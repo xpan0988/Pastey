@@ -14,24 +14,38 @@ pub struct StoredConfig {
     pub speed_limit_mbps: Option<f64>,
     pub shortcut: String,
     pub app_secret: String,
+    #[serde(default)]
+    pub device_id: String,
 }
 
 pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfig> {
     if paths.config_path.exists() {
         let content = fs::read_to_string(&paths.config_path)?;
         let mut stored: StoredConfig = serde_json::from_str(&content)?;
-        stored.version = stored.version.max(2);
+        let mut changed = false;
+        if stored.device_id.trim().is_empty() {
+            stored.device_id = uuid::Uuid::new_v4().to_string();
+            changed = true;
+        }
+        if stored.version < 3 {
+            stored.version = 3;
+            changed = true;
+        }
+        if changed {
+            save(paths, &stored)?;
+        }
         return Ok(stored);
     }
 
     let stored = StoredConfig {
-        version: 2,
+        version: 3,
         default_expiry_minutes: 15,
         inbox_dir: None,
         auto_burn_after_download: false,
         speed_limit_mbps: None,
         shortcut: shortcut.to_string(),
         app_secret: crypto::encode_key(&crypto::random_key()),
+        device_id: uuid::Uuid::new_v4().to_string(),
     };
 
     save(paths, &stored)?;
@@ -65,7 +79,7 @@ pub fn update(
     current.auto_burn_after_download = incoming.auto_burn_after_download;
     current.inbox_dir = normalize_inbox_dir(paths, incoming.inbox_dir.as_deref());
     current.speed_limit_mbps = normalize_speed_limit(incoming.speed_limit_mbps);
-    current.version = 2;
+    current.version = 3;
     save(paths, current)?;
     Ok(public_config(paths, current))
 }
