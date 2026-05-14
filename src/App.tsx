@@ -3,9 +3,18 @@ import { useEffect, useRef, useState } from "react";
 import { HomePage } from "./pages/HomePage";
 import { RoomPage } from "./pages/RoomPage";
 import { SettingsPage } from "./pages/SettingsPage";
-import { burnRoom, getConfig, getRoom, leaveRoom, listRoomItems, listRooms } from "./lib/tauri";
+import {
+  acceptNearbyJoin,
+  burnRoom,
+  getConfig,
+  getRoom,
+  leaveRoom,
+  listRoomItems,
+  listRooms,
+  rejectNearbyJoin
+} from "./lib/tauri";
 import { mergeTransferEvent } from "./lib/transferState";
-import type { AppConfig, FileTransferProgressEvent, RoomInfo, RoomItem } from "./lib/types";
+import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, RoomInfo, RoomItem } from "./lib/types";
 
 type View =
   | { screen: "home" }
@@ -23,6 +32,7 @@ function App() {
   const [currentRoom, setCurrentRoom] = useState<RoomInfo | null>(null);
   const [roomItems, setRoomItems] = useState<RoomItem[]>([]);
   const [transfers, setTransfers] = useState<Record<string, FileTransferProgressEvent>>({});
+  const [joinRequest, setJoinRequest] = useState<JoinRequestPrompt | null>(null);
   const [focusToken, setFocusToken] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const closedRoomIdsRef = useRef<Set<string>>(new Set());
@@ -44,6 +54,7 @@ function App() {
   useEffect(() => {
     let unlistenFocus: (() => void) | undefined;
     let unlistenTransfer: (() => void) | undefined;
+    let unlistenJoinRequest: (() => void) | undefined;
 
     void listen<FocusPayload>("pastey://focus", (event) => {
       const target = event.payload.target ?? "home";
@@ -65,9 +76,16 @@ function App() {
       unlistenTransfer = fn;
     });
 
+    void listen<JoinRequestPrompt>("pastey://join-request", (event) => {
+      setJoinRequest(event.payload);
+    }).then((fn) => {
+      unlistenJoinRequest = fn;
+    });
+
     return () => {
       if (unlistenFocus) unlistenFocus();
       if (unlistenTransfer) unlistenTransfer();
+      if (unlistenJoinRequest) unlistenJoinRequest();
     };
   }, [view]);
 
@@ -147,6 +165,25 @@ function App() {
     await refreshRooms();
   }
 
+  async function handleAcceptJoinRequest(request: JoinRequestPrompt) {
+    try {
+      const room = await acceptNearbyJoin(request.request_id);
+      setJoinRequest(null);
+      await openRoom(room);
+    } catch (err) {
+      setJoinRequest(null);
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleRejectJoinRequest(request: JoinRequestPrompt) {
+    try {
+      await rejectNearbyJoin(request.request_id);
+    } finally {
+      setJoinRequest(null);
+    }
+  }
+
   if (!config) {
     return (
       <div className="app-shell center-panel">
@@ -158,6 +195,24 @@ function App() {
   return (
     <div className="app-shell">
       {error ? <div className="error-box">{error}</div> : null}
+      {joinRequest ? (
+        <div className="join-request-banner panel">
+          <div className="subtle-stack tight">
+            <strong>{joinRequest.device_name} wants to join.</strong>
+            <span className="muted">
+              {joinRequest.platform} • Pastey {joinRequest.app_version}
+            </span>
+          </div>
+          <div className="row gap">
+            <button className="primary-button" onClick={() => void handleAcceptJoinRequest(joinRequest)}>
+              Accept
+            </button>
+            <button className="ghost-button" onClick={() => void handleRejectJoinRequest(joinRequest)}>
+              Reject
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       <main>
         {view.screen === "home" ? (

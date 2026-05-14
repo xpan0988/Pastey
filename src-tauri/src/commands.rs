@@ -9,7 +9,7 @@ use crate::{
     config, crypto, discovery,
     error::{AppError, AppResult},
     logging,
-    models::{AppConfig, LocalRole, RoomInfo, RoomItem},
+    models::{AppConfig, JoinRequestPrompt, LocalRole, NearbyDevice, RoomInfo, RoomItem},
     storage, transfer, AppState,
 };
 
@@ -95,6 +95,197 @@ pub async fn join_room(code: String, state: State<'_, Arc<AppState>>) -> Result<
         storage::room_to_info(updated, &master_key)
     })
     .await
+}
+
+#[tauri::command]
+pub fn list_nearby_devices(state: State<'_, Arc<AppState>>) -> Result<Vec<NearbyDevice>, String> {
+    Ok(discovery::list_nearby_devices(&state))
+}
+
+#[tauri::command]
+pub async fn request_nearby_join(
+    device_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomInfo, String> {
+    run_async(async move {
+        let (source, response) =
+            discovery::request_nearby_join(state.inner().clone(), &device_id).await?;
+        if !response.accepted {
+            logging::write_transfer_line("[pastey antenna] event=join_rejected");
+            return Err(AppError::InvalidInput(
+                response
+                    .message
+                    .unwrap_or_else(|| "Join request rejected.".into()),
+            ));
+        }
+
+        let room_code = response
+            .room_code
+            .ok_or_else(|| AppError::InvalidInput("Invalid join response.".into()))?;
+        let room_id = response
+            .room_id
+            .ok_or_else(|| AppError::InvalidInput("Invalid join response.".into()))?;
+        let expires_at = response
+            .expires_at
+            .ok_or_else(|| AppError::InvalidInput("Invalid join response.".into()))?;
+        let port = response
+            .port
+            .ok_or_else(|| AppError::InvalidInput("Invalid join response.".into()))?;
+        let transport_public_key = response
+            .transport_public_key
+            .ok_or_else(|| AppError::InvalidInput("Invalid join response.".into()))?;
+        let peer_device_name = response
+            .device_name
+            .unwrap_or_else(|| "Nearby device".into());
+
+        let master_key = {
+            let config = state.config.read();
+            config::master_key(&config)?
+        };
+        let room = storage::create_room(
+            &state.paths,
+            &master_key,
+            &room_code,
+            15,
+            LocalRole::Joined,
+            Some(room_id),
+            Some(expires_at),
+        )?;
+        transfer::start_room_server(state.inner().clone(), &room.id).await?;
+        transfer::announce_join(
+            state.inner().clone(),
+            &room.id,
+            &source.ip().to_string(),
+            port,
+        )
+        .await
+        .map_err(|_| {
+            logging::write_transfer_line("[pastey antenna] event=nearby_unreachable");
+            logging::write_transfer_line("[pastey antenna] event=blocked_network_suspected");
+            AppError::Network(
+                "Device found, but this network may block direct local connections.".into(),
+            )
+        })?;
+
+        storage::update_room_peer(
+            &state.paths,
+            &room.id,
+            Some(&source.ip().to_string()),
+            Some(port),
+            Some(&peer_device_name),
+            Some(&transport_public_key),
+            crate::models::RoomStatus::Active,
+        )?;
+
+        logging::write_transfer_line("[pastey antenna] event=join_accepted");
+        let updated = storage::get_room_by_id(&state.paths, &room.id)?;
+        storage::room_to_info(updated, &master_key)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn accept_nearby_join(
+    request_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomInfo, String> {
+    run_async(async move {
+        let request = state
+            .pending_join_requests
+            .lock()
+            .remove(&request_id)
+            .ok_or_else(|| AppError::NotFound("Join request timed out.".into()))?;
+        if request.expires_at <= storage::now_ts() {
+            return Err(AppError::InvalidInput("Join request timed out.".into()));
+        }
+
+        let master_key = {
+            let config = state.config.read();
+            config::master_key(&config)?
+        };
+        let code = unique_room_code(&state.paths)?;
+        let expiry_minutes = {
+            let config = state.config.read();
+            config.default_expiry_minutes
+        };
+        let room = storage::create_room(
+            &state.paths,
+            &master_key,
+            &code,
+            expiry_minutes,
+            LocalRole::Creator,
+            None,
+            None,
+        )?;
+        let port = transfer::start_room_server(state.inner().clone(), &room.id).await?;
+        let transport_public_key = state
+            .active_servers
+            .lock()
+            .get(&room.id)
+            .map(|server| server.transport_public_key())
+            .ok_or_else(|| AppError::Network("Firewall may be blocking Pastey.".into()))?;
+        let response = discovery::NearbyJoinResponse {
+            kind: "join_response".into(),
+            request_id: request.request_id.clone(),
+            accepted: true,
+            message: None,
+            room_id: Some(room.id.clone()),
+            room_code: Some(code),
+            port: Some(port),
+            expires_at: Some(room.expires_at),
+            transport_public_key: Some(transport_public_key),
+            device_name: Some(transfer::device_name()),
+        };
+        discovery::send_join_response(&request, &response).await?;
+        logging::write_transfer_line("[pastey antenna] event=join_accepted");
+        storage::room_to_info(room, &master_key)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn reject_nearby_join(
+    request_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    run_async(async move {
+        let Some(request) = state.pending_join_requests.lock().remove(&request_id) else {
+            return Ok(false);
+        };
+        let response = discovery::NearbyJoinResponse {
+            kind: "join_response".into(),
+            request_id: request.request_id.clone(),
+            accepted: false,
+            message: Some("Join request rejected.".into()),
+            room_id: None,
+            room_code: None,
+            port: None,
+            expires_at: None,
+            transport_public_key: None,
+            device_name: Some(transfer::device_name()),
+        };
+        discovery::send_join_response(&request, &response).await?;
+        logging::write_transfer_line("[pastey antenna] event=join_rejected");
+        Ok(true)
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn pending_join_requests(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<JoinRequestPrompt>, String> {
+    let now = storage::now_ts();
+    state
+        .pending_join_requests
+        .lock()
+        .retain(|_, request| request.expires_at > now);
+    Ok(state
+        .pending_join_requests
+        .lock()
+        .values()
+        .map(discovery::pending_join_prompt)
+        .collect())
 }
 
 #[tauri::command]

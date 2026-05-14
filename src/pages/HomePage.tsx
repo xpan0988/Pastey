@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { createRoom, joinRoom } from "../lib/tauri";
+import { createRoom, joinRoom, listNearbyDevices, requestNearbyJoin } from "../lib/tauri";
 import { formatCode, formatRelativeExpiry, formatTimestamp } from "../lib/format";
-import type { AppConfig, RoomInfo } from "../lib/types";
+import type { AppConfig, NearbyDevice, RoomInfo } from "../lib/types";
 
 interface HomePageProps {
   config: AppConfig;
@@ -20,8 +20,11 @@ export function HomePage({
 }: HomePageProps) {
   const [expiryMinutes, setExpiryMinutes] = useState(config.default_expiry_minutes);
   const [joinCode, setJoinCode] = useState("");
-  const [busy, setBusy] = useState<"create" | "join" | null>(null);
+  const [nearbyDevices, setNearbyDevices] = useState<NearbyDevice[]>([]);
+  const [busy, setBusy] = useState<"create" | "join" | "nearby" | null>(null);
+  const [joiningDeviceId, setJoiningDeviceId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [nearbyMessage, setNearbyMessage] = useState<string | null>(null);
   const joinInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -34,6 +37,34 @@ export function HomePage({
       joinInputRef.current?.select();
     }
   }, [shouldFocus]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadNearby() {
+      try {
+        const devices = await listNearbyDevices();
+        if (cancelled) return;
+        setNearbyDevices(devices);
+        setNearbyMessage(devices.length === 0 ? "No nearby Pastey devices found." : null);
+      } catch {
+        if (!cancelled) {
+          setNearbyDevices([]);
+          setNearbyMessage("Firewall may be blocking Pastey.");
+        }
+      }
+    }
+
+    void loadNearby();
+    const interval = window.setInterval(() => {
+      void loadNearby();
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
 
   async function handleCreateRoom() {
     setBusy("create");
@@ -60,6 +91,25 @@ export function HomePage({
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleNearbyJoin(device: NearbyDevice) {
+    setBusy("nearby");
+    setJoiningDeviceId(device.device_id);
+    setError(null);
+    setNearbyMessage(`Waiting for ${device.display_name} to accept...`);
+
+    try {
+      const room = await requestNearbyJoin(device.device_id);
+      setNearbyMessage(null);
+      onOpenRoom(room);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setNearbyMessage(networkHelpMessage(message));
+    } finally {
+      setJoiningDeviceId(null);
       setBusy(null);
     }
   }
@@ -101,8 +151,49 @@ export function HomePage({
           </div>
 
           <div className="join-card">
+            <div className="subtle-stack tight">
+              <h3>Nearby devices</h3>
+              {nearbyDevices.length === 0 ? <div className="empty-state compact-empty">No nearby Pastey devices found.</div> : null}
+            </div>
+
+            {nearbyDevices.length > 0 ? (
+              <div className="nearby-list">
+                {nearbyDevices.map((device) => (
+                  <div key={device.device_id} className="nearby-device-card">
+                    <div className="subtle-stack tight">
+                      <div className="row spread gap">
+                        <strong>{device.display_name}</strong>
+                        <span className={`pill ${device.availability === "Available" ? "connected" : "waiting"}`}>
+                          {device.availability}
+                        </span>
+                      </div>
+                      <div className="row spread wrap">
+                        <span className="muted">{device.platform}</span>
+                        <span className="muted">Pastey {device.app_version}</span>
+                      </div>
+                      <span className="muted">
+                        {device.last_seen_seconds_ago <= 2 ? "just now" : `${device.last_seen_seconds_ago}s ago`}
+                        {device.capabilities.includes("large_file") ? " • Large file ready" : ""}
+                      </span>
+                    </div>
+                    <button
+                      className="ghost-button compact-button"
+                      onClick={() => void handleNearbyJoin(device)}
+                      disabled={busy !== null || device.availability !== "Available" || !device.compatible}
+                    >
+                      {joiningDeviceId === device.device_id ? "Waiting..." : "Join"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
+            {nearbyMessage ? <div className="muted nearby-message">{nearbyMessage}</div> : null}
+
+            <div className="manual-join-divider">Can't see the device? Enter room code manually.</div>
+
             <label className="field">
-              <span>Join room</span>
+              <span>Room code</span>
               <input
                 ref={joinInputRef}
                 inputMode="numeric"
@@ -167,4 +258,14 @@ export function HomePage({
       </section>
     </div>
   );
+}
+
+function networkHelpMessage(message: string): string {
+  if (message.includes("rejected")) return "Join request rejected.";
+  if (message.includes("timed out")) return "Join request timed out.";
+  if (message.includes("No nearby")) return "No nearby Pastey devices found.";
+  if (message.includes("block") || message.includes("Firewall")) {
+    return "Device found, but this network may block direct local connections. Try the same Wi-Fi, same router, or a phone hotspot. You can still use the 8-digit code fallback.";
+  }
+  return message;
 }

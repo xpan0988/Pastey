@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppConfig, RoomInfo, RoomItem } from "./types";
+import type { AppConfig, JoinRequestPrompt, NearbyDevice, RoomInfo, RoomItem } from "./types";
 
 interface SendFileOptions {
   displayName?: string;
@@ -20,6 +20,26 @@ export async function createRoom(expiryMinutes: number): Promise<RoomInfo> {
 
 export async function joinRoom(code: string): Promise<RoomInfo> {
   return invoke("join_room", { code });
+}
+
+export async function listNearbyDevices(): Promise<NearbyDevice[]> {
+  return invoke("list_nearby_devices");
+}
+
+export async function requestNearbyJoin(deviceId: string): Promise<RoomInfo> {
+  return invoke("request_nearby_join", { deviceId });
+}
+
+export async function acceptNearbyJoin(requestId: string): Promise<RoomInfo> {
+  return invoke("accept_nearby_join", { requestId });
+}
+
+export async function rejectNearbyJoin(requestId: string): Promise<boolean> {
+  return invoke("reject_nearby_join", { requestId });
+}
+
+export async function pendingJoinRequests(): Promise<JoinRequestPrompt[]> {
+  return invoke("pending_join_requests");
 }
 
 export async function listRooms(): Promise<RoomInfo[]> {

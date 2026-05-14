@@ -25,6 +25,26 @@ export interface RoomInfo {
   peer_burned_at?: number | null;
 }
 
+export interface NearbyDevice {
+  device_id: string;
+  display_name: string;
+  platform: string;
+  app_version: string;
+  availability: "Available" | "Waiting" | "Busy" | "Expired" | string;
+  capabilities: string[];
+  last_seen_seconds_ago: number;
+  compatible: boolean;
+}
+
+export interface JoinRequestPrompt {
+  request_id: string;
+  device_name: string;
+  platform: string;
+  app_version: string;
+  received_at: number;
+  expires_at: number;
+}
+
 export interface RoomItem {
   id: string;
   room_id: string;
