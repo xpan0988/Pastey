@@ -45,6 +45,7 @@ const TRANSFER_CANCELLED_MESSAGE: &str = "Transfer cancelled";
 const TRANSFER_INTERRUPTED_MESSAGE: &str = "Transfer interrupted";
 const PEER_DISCONNECTED_MESSAGE: &str = "Peer disconnected";
 const ROOM_BURNED_MESSAGE: &str = "Room burned";
+const TERMINAL_TRANSFER_REASON_TTL: Duration = Duration::from_secs(120);
 const CHUNK_RETRY_BACKOFFS: [Duration; 3] = [
     Duration::from_millis(300),
     Duration::from_millis(800),
@@ -63,6 +64,13 @@ pub struct ActiveFileTransfer {
     last_report_bytes: u64,
     cancel_token: CancellationToken,
     kind: ActiveFileTransferKind,
+}
+
+#[derive(Clone)]
+pub struct TerminalTransferReason {
+    code: String,
+    message: String,
+    recorded_at: Instant,
 }
 
 enum ActiveFileTransferKind {
@@ -100,6 +108,7 @@ struct TransferOkResponse {
 struct TransferCancelRequest {
     status: Option<String>,
     message: Option<String>,
+    reason: Option<String>,
 }
 
 struct ResponseErrorDetails {
@@ -234,7 +243,14 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
 }
 
 pub async fn stop_room_server(state: Arc<AppState>, room_id: &str) -> AppResult<bool> {
-    let _ = cancel_room_transfers(state.clone(), room_id, "Room expired.", false).await;
+    let _ = cancel_room_transfers(
+        state.clone(),
+        room_id,
+        "Room expired.",
+        false,
+        Some("transfer_timed_out"),
+    )
+    .await;
     let maybe_server = state.active_servers.lock().remove(room_id);
     if let Some(mut server) = maybe_server {
         if let Some(shutdown) = server.shutdown.take() {
@@ -1012,6 +1028,21 @@ async fn chunk_failure_from_response(
             retryable: false,
         };
     }
+    if details
+        .code
+        .as_deref()
+        .is_some_and(is_receiver_terminal_reason)
+    {
+        let reason = details.code.as_deref().unwrap_or_default();
+        logging::write_transfer_line(&format!(
+            "[pastey transfer][transfer_id={transfer_id}] event=sender_mapped_terminal_reason reason={reason}"
+        ));
+        return ChunkSendFailure {
+            message: map_response_error_message(&details),
+            kind: ChunkSendFailureKind::PeerLeft,
+            retryable: false,
+        };
+    }
     if details.status == StatusCode::GONE {
         return ChunkSendFailure {
             message: map_response_error_message(&details),
@@ -1347,7 +1378,21 @@ pub async fn cancel_transfer(state: Arc<AppState>, transfer_id: &str) -> AppResu
 
     transfer.cancel_token.cancel();
     if let ActiveFileTransferKind::Receiver { part_path, .. } = &transfer.kind {
+        record_terminal_transfer_reason(&state, transfer_id, "receiver_cancelled");
+        logging::write_transfer_line(&format!(
+            "[pastey transfer][transfer_id={transfer_id}] event=active_transfer_removed reason=receiver_cancelled"
+        ));
+        logging::write_transfer_line(&format!(
+            "[pastey transfer][transfer_id={transfer_id}] event=receiver_cancelled_transfer"
+        ));
         remove_active_receiver_part_file(&transfer.room_id, "active_part", part_path).await?;
+        notify_peer_transfer_terminal_reason(
+            &state,
+            &transfer.room_id,
+            transfer_id,
+            "receiver_cancelled",
+        )
+        .await;
     } else if let Ok(room) = storage::get_room_by_id(&state.paths, &transfer.room_id) {
         if let (Some(peer_host), Some(peer_port)) = (room.peer_host, room.peer_port) {
             let client = reqwest::Client::new();
@@ -1390,6 +1435,7 @@ pub async fn cancel_room_transfers(
     room_id: &str,
     message: &str,
     notify_peer: bool,
+    receiver_reason: Option<&str>,
 ) -> AppResult<()> {
     let transfer_ids = {
         let transfers = state.active_file_transfers.lock();
@@ -1403,7 +1449,10 @@ pub async fn cancel_room_transfers(
     let mut cleanup_failed = false;
     for transfer_id in transfer_ids {
         if notify_peer {
-            if cancel_transfer(state.clone(), &transfer_id).await.is_err() {
+            if cancel_transfer_with_reason(state.clone(), &transfer_id, receiver_reason)
+                .await
+                .is_err()
+            {
                 cleanup_failed = true;
             }
         } else {
@@ -1414,6 +1463,12 @@ pub async fn cancel_room_transfers(
             if let Some(transfer) = transfer {
                 transfer.cancel_token.cancel();
                 if let ActiveFileTransferKind::Receiver { part_path, .. } = &transfer.kind {
+                    if let Some(reason) = receiver_reason {
+                        record_terminal_transfer_reason(&state, &transfer_id, reason);
+                        logging::write_transfer_line(&format!(
+                            "[pastey transfer][transfer_id={transfer_id}] event=active_transfer_removed reason={reason}"
+                        ));
+                    }
                     if remove_active_receiver_part_file(room_id, "active_part", part_path)
                         .await
                         .is_err()
@@ -1979,6 +2034,9 @@ async fn receive_file_chunk_handler(
         let transfers = ctx.state.active_file_transfers.lock();
         let Some(transfer) = transfers.get(&transfer_id) else {
             log_late_event_ignored(&transfer_id, &room_id, "chunk");
+            if let Some(response) = terminal_transfer_response(&ctx.state, &transfer_id, &room_id) {
+                return response;
+            }
             return transfer_error(
                 StatusCode::NOT_FOUND,
                 "transfer_missing",
@@ -2158,6 +2216,9 @@ async fn receive_file_chunk_handler(
         let mut transfers = ctx.state.active_file_transfers.lock();
         let Some(transfer) = transfers.get_mut(&transfer_id) else {
             log_late_event_ignored(&transfer_id, &room_id, "chunk_progress");
+            if let Some(response) = terminal_transfer_response(&ctx.state, &transfer_id, &room_id) {
+                return response;
+            }
             return transfer_error(
                 StatusCode::NOT_FOUND,
                 "transfer_missing",
@@ -2251,6 +2312,9 @@ async fn finish_file_transfer_handler(
         Some(transfer) => transfer,
         None => {
             log_late_event_ignored(&transfer_id, &room_id, "finalize");
+            if let Some(response) = terminal_transfer_response(&ctx.state, &transfer_id, &room_id) {
+                return response;
+            }
             if room_is_burned(&ctx.state, &room_id) {
                 return transfer_error(StatusCode::GONE, "room_burned", ROOM_BURNED_MESSAGE.into());
             }
@@ -2498,13 +2562,40 @@ async fn cancel_file_transfer_handler(
     if let ActiveFileTransferKind::Receiver { part_path, .. } = &transfer.kind {
         let _ = tokio::fs::remove_file(part_path).await;
     }
+    let reason = request
+        .as_ref()
+        .and_then(|Json(request)| request.reason.clone());
+    if let Some(reason) = reason.as_deref() {
+        record_terminal_transfer_reason(&ctx.state, &transfer_id, reason);
+    }
     let failure = request
         .as_ref()
         .is_some_and(|Json(request)| request.status.as_deref() == Some("failed"));
-    let status = if failure { "failed" } else { "cancelled" };
+    let remote_terminal = reason.as_deref().is_some_and(is_receiver_terminal_reason);
+    let status = if remote_terminal {
+        "interrupted"
+    } else if failure {
+        "failed"
+    } else {
+        "cancelled"
+    };
     let message = request
         .and_then(|Json(request)| request.message)
+        .or_else(|| {
+            reason
+                .as_deref()
+                .map(terminal_reason_message)
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| TRANSFER_CANCELLED_MESSAGE.into());
+    let item_status = if remote_terminal {
+        RoomItemStatus::Interrupted
+    } else if failure {
+        RoomItemStatus::Failed
+    } else {
+        RoomItemStatus::Cancelled
+    };
+    let _ = storage::set_room_item_status(&ctx.state.paths, &transfer.item_id, item_status);
     emit_event(
         &ctx.state,
         &transfer,
@@ -2526,7 +2617,14 @@ async fn remote_burn_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let _ = cancel_room_transfers(ctx.state.clone(), &room_id, ROOM_BURNED_MESSAGE, false).await;
+    let _ = cancel_room_transfers(
+        ctx.state.clone(),
+        &room_id,
+        ROOM_BURNED_MESSAGE,
+        false,
+        Some("peer_disconnected"),
+    )
+    .await;
     storage::mark_peer_burned(&ctx.state.paths, &room_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let state = ctx.state.clone();
@@ -2544,7 +2642,14 @@ async fn remote_leave_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let _ = cancel_room_transfers(ctx.state.clone(), &room_id, "Peer left the room.", false).await;
+    let _ = cancel_room_transfers(
+        ctx.state.clone(),
+        &room_id,
+        "Peer left the room.",
+        false,
+        Some("peer_disconnected"),
+    )
+    .await;
     storage::mark_peer_left(&ctx.state.paths, &room_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let state = ctx.state.clone();
@@ -2669,6 +2774,12 @@ fn map_response_error_message(details: &ResponseErrorDetails) -> String {
         Some("not_enough_disk_space") => "Not enough disk space on receiver".into(),
         Some("receiver_cannot_write") => "Receiver cannot write to inbox".into(),
         Some("room_burned") => ROOM_BURNED_MESSAGE.into(),
+        Some("receiver_cancelled") => "Receiver cancelled transfer".into(),
+        Some("receiver_burned_room") => "Peer burned the room".into(),
+        Some("receiver_left_room") => "Peer left the room".into(),
+        Some("receiver_interrupted") => "Receiver stopped receiving".into(),
+        Some("peer_disconnected") => PEER_DISCONNECTED_MESSAGE.into(),
+        Some("transfer_timed_out") => TRANSFER_INTERRUPTED_MESSAGE.into(),
         Some("size_mismatch") => "Received file size mismatch".into(),
         Some("temp_file_disappeared") => "Receiver temporary file disappeared".into(),
         Some("write_failed") => "Receiver failed to write chunk".into(),
@@ -2698,6 +2809,83 @@ fn status_fallback_message(status: StatusCode) -> &'static str {
         StatusCode::GONE => TRANSFER_INTERRUPTED_MESSAGE,
         _ => TRANSFER_INTERRUPTED_MESSAGE,
     }
+}
+
+fn is_receiver_terminal_reason(code: &str) -> bool {
+    matches!(
+        code,
+        "receiver_cancelled"
+            | "receiver_burned_room"
+            | "receiver_left_room"
+            | "receiver_interrupted"
+            | "peer_disconnected"
+            | "transfer_timed_out"
+    )
+}
+
+fn terminal_reason_message(code: &str) -> &'static str {
+    match code {
+        "receiver_cancelled" => "Receiver cancelled transfer",
+        "receiver_burned_room" => "Peer burned the room",
+        "receiver_left_room" => "Peer left the room",
+        "receiver_interrupted" => "Receiver stopped receiving",
+        "peer_disconnected" => PEER_DISCONNECTED_MESSAGE,
+        "transfer_timed_out" => TRANSFER_INTERRUPTED_MESSAGE,
+        _ => "Transfer session not found on receiver.",
+    }
+}
+
+fn purge_terminal_transfer_reasons(state: &Arc<AppState>) {
+    let now = Instant::now();
+    state
+        .terminal_transfer_reasons
+        .lock()
+        .retain(|_, reason| now.duration_since(reason.recorded_at) <= TERMINAL_TRANSFER_REASON_TTL);
+}
+
+fn record_terminal_transfer_reason(state: &Arc<AppState>, transfer_id: &str, code: &str) {
+    purge_terminal_transfer_reasons(state);
+    let message = terminal_reason_message(code).to_string();
+    state.terminal_transfer_reasons.lock().insert(
+        transfer_id.to_string(),
+        TerminalTransferReason {
+            code: code.to_string(),
+            message: message.clone(),
+            recorded_at: Instant::now(),
+        },
+    );
+    logging::write_transfer_line(&format!(
+        "[pastey transfer][transfer_id={transfer_id}] event=transfer_terminal_reason_recorded reason={code} message={message:?}"
+    ));
+}
+
+fn terminal_transfer_reason(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+) -> Option<TerminalTransferReason> {
+    purge_terminal_transfer_reasons(state);
+    state
+        .terminal_transfer_reasons
+        .lock()
+        .get(transfer_id)
+        .cloned()
+}
+
+fn terminal_transfer_response(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    room_id: &str,
+) -> Option<Response> {
+    let reason = terminal_transfer_reason(state, transfer_id)?;
+    logging::write_transfer_line(&format!(
+        "[pastey transfer][transfer_id={transfer_id}][room_id={room_id}] event=chunk_for_terminal_transfer reason={}",
+        reason.code
+    ));
+    Some(transfer_error(
+        StatusCode::CONFLICT,
+        &reason.code,
+        reason.message,
+    ))
 }
 
 fn register_sender_transfer(
@@ -2838,6 +3026,13 @@ fn log_late_event_ignored(transfer_id: &str, room_id: &str, event_kind: &str) {
 async fn fail_receiver_transfer(state: &Arc<AppState>, transfer_id: &str, message: &str) {
     let transfer = state.active_file_transfers.lock().remove(transfer_id);
     if let Some(transfer) = transfer {
+        record_terminal_transfer_reason(state, transfer_id, "receiver_interrupted");
+        logging::write_transfer_line(&format!(
+            "[pastey transfer][transfer_id={transfer_id}] event=active_transfer_removed reason=receiver_interrupted"
+        ));
+        logging::write_transfer_line(&format!(
+            "[pastey transfer][transfer_id={transfer_id}] event=receiver_interrupted_transfer"
+        ));
         if let ActiveFileTransferKind::Receiver { part_path, .. } = &transfer.kind {
             let _ = tokio::fs::remove_file(part_path).await;
         }
@@ -3212,6 +3407,73 @@ async fn notify_transfer_failed(
         .await;
 }
 
+async fn notify_peer_transfer_terminal_reason(
+    state: &Arc<AppState>,
+    room_id: &str,
+    transfer_id: &str,
+    reason: &str,
+) {
+    let Ok(room) = storage::get_room_by_id(&state.paths, room_id) else {
+        return;
+    };
+    let (Some(peer_host), Some(peer_port)) = (room.peer_host, room.peer_port) else {
+        return;
+    };
+    let base_url = format!("http://{peer_host}:{peer_port}/rooms/{room_id}");
+    let _ = reqwest::Client::new()
+        .post(format!("{base_url}/transfers/{transfer_id}/cancel"))
+        .json(&serde_json::json!({
+            "status": "failed",
+            "message": terminal_reason_message(reason),
+            "reason": reason,
+        }))
+        .send()
+        .await;
+}
+
+async fn cancel_transfer_with_reason(
+    state: Arc<AppState>,
+    transfer_id: &str,
+    receiver_reason: Option<&str>,
+) -> AppResult<bool> {
+    let Some(reason) = receiver_reason else {
+        return cancel_transfer(state, transfer_id).await;
+    };
+
+    let removed = state.active_file_transfers.lock().remove(transfer_id);
+    let Some(transfer) = removed else {
+        return Ok(false);
+    };
+    transfer.cancel_token.cancel();
+    if let ActiveFileTransferKind::Receiver { part_path, .. } = &transfer.kind {
+        record_terminal_transfer_reason(&state, transfer_id, reason);
+        logging::write_transfer_line(&format!(
+            "[pastey transfer][transfer_id={transfer_id}] event=active_transfer_removed reason={reason}"
+        ));
+        remove_active_receiver_part_file(&transfer.room_id, "active_part", part_path).await?;
+        notify_peer_transfer_terminal_reason(&state, &transfer.room_id, transfer_id, reason).await;
+    } else if let Ok(room) = storage::get_room_by_id(&state.paths, &transfer.room_id) {
+        if let (Some(peer_host), Some(peer_port)) = (room.peer_host, room.peer_port) {
+            let client = reqwest::Client::new();
+            let base_url = format!("http://{peer_host}:{peer_port}/rooms/{}", transfer.room_id);
+            notify_transfer_cancel(&client, &base_url, transfer_id).await;
+        }
+    }
+    let _ =
+        storage::set_room_item_status(&state.paths, &transfer.item_id, RoomItemStatus::Cancelled);
+    emit_event(
+        &state,
+        &transfer,
+        "cancelled",
+        current_transferred(&transfer),
+        0.0,
+        average_speed(&transfer, current_transferred(&transfer)),
+        None,
+        Some(terminal_reason_message(reason).into()),
+    );
+    Ok(true)
+}
+
 async fn apply_rate_limit(state: &Arc<AppState>, transferred: u64, started_at: Instant) {
     let limit_mbps = {
         let config = state.config.read();
@@ -3373,6 +3635,14 @@ mod tests {
         );
         assert_eq!(
             map_response_error_message(&details(
+                StatusCode::CONFLICT,
+                Some("receiver_cancelled"),
+                "ignored"
+            )),
+            "Receiver cancelled transfer"
+        );
+        assert_eq!(
+            map_response_error_message(&details(
                 StatusCode::NOT_FOUND,
                 Some("room_not_found"),
                 "ignored"
@@ -3454,6 +3724,26 @@ mod tests {
                 "ignored"
             )),
             TRANSFER_CANCELLED_MESSAGE
+        );
+    }
+
+    #[test]
+    fn terminal_reason_messages_are_specific() {
+        assert_eq!(
+            terminal_reason_message("receiver_cancelled"),
+            "Receiver cancelled transfer"
+        );
+        assert_eq!(
+            terminal_reason_message("receiver_burned_room"),
+            "Peer burned the room"
+        );
+        assert_eq!(
+            terminal_reason_message("receiver_left_room"),
+            "Peer left the room"
+        );
+        assert_eq!(
+            terminal_reason_message("receiver_interrupted"),
+            "Receiver stopped receiving"
         );
     }
 

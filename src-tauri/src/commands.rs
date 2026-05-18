@@ -289,6 +289,12 @@ pub fn pending_join_requests(
 }
 
 #[tauri::command]
+pub fn mark_join_prompt_rendered() -> Result<bool, String> {
+    logging::write_transfer_line("[pastey antenna] event=join_prompt_rendered");
+    Ok(true)
+}
+
+#[tauri::command]
 pub async fn list_rooms(state: State<'_, Arc<AppState>>) -> Result<Vec<RoomInfo>, String> {
     run_async(async move {
         let active_transfer_room_ids = transfer::active_transfer_room_ids(&state);
@@ -444,8 +450,14 @@ pub async fn burn_room(room_id: String, state: State<'_, Arc<AppState>>) -> Resu
         let peer = storage::get_room_by_id(&state.paths, &room_id)
             .ok()
             .and_then(|room| room.peer_host.zip(room.peer_port));
-        transfer::cancel_room_transfers(state.inner().clone(), &room_id, "Room burned", false)
-            .await?;
+        transfer::cancel_room_transfers(
+            state.inner().clone(),
+            &room_id,
+            "Room burned",
+            false,
+            Some("receiver_burned_room"),
+        )
+        .await?;
         let effective_inbox_dir = {
             let config = state.config.read();
             config::effective_inbox_dir(&state.paths, &config)
@@ -468,6 +480,7 @@ pub async fn leave_room(room_id: String, state: State<'_, Arc<AppState>>) -> Res
             &room_id,
             "Transfer cancelled",
             true,
+            Some("receiver_left_room"),
         )
         .await;
         transfer::notify_room_leave(state.inner().clone(), &room_id).await;

@@ -11,6 +11,8 @@ import {
   leaveRoom,
   listRoomItems,
   listRooms,
+  markJoinPromptRendered,
+  pendingJoinRequests,
   rejectNearbyJoin
 } from "./lib/tauri";
 import { mergeTransferEvent } from "./lib/transferState";
@@ -49,6 +51,14 @@ function App() {
     }
 
     void load();
+  }, []);
+
+  useEffect(() => {
+    void pendingJoinRequests().then((requests) => {
+      if (requests.length > 0) {
+        setJoinRequest(requests[0]);
+      }
+    });
   }, []);
 
   useEffect(() => {
@@ -175,6 +185,12 @@ function App() {
       setError(err instanceof Error ? err.message : String(err));
     }
   }
+
+  useEffect(() => {
+    if (joinRequest) {
+      void markJoinPromptRendered();
+    }
+  }, [joinRequest]);
 
   async function handleRejectJoinRequest(request: JoinRequestPrompt) {
     try {

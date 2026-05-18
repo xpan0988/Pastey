@@ -264,8 +264,11 @@ function networkHelpMessage(message: string): string {
   if (message.includes("rejected")) return "Join request rejected.";
   if (message.includes("timed out")) return "Join request timed out.";
   if (message.includes("No nearby")) return "No nearby Pastey devices found.";
+  if (message.includes("could not connect")) {
+    return "Device found, but Pastey could not connect to it.";
+  }
   if (message.includes("block") || message.includes("Firewall")) {
-    return "Device found, but this network may block direct local connections. Try the same Wi-Fi, same router, or a phone hotspot. You can still use the 8-digit code fallback.";
+    return "This network may block local device-to-device connections.";
   }
   return message;
 }
