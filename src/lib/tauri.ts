@@ -42,6 +42,10 @@ export async function pendingJoinRequests(): Promise<JoinRequestPrompt[]> {
   return invoke("pending_join_requests");
 }
 
+export async function markJoinPromptRendered(): Promise<boolean> {
+  return invoke("mark_join_prompt_rendered");
+}
+
 export async function listRooms(): Promise<RoomInfo[]> {
   return invoke("list_rooms");
 }

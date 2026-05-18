@@ -24,9 +24,9 @@ use crate::{
         accept_nearby_join, burn_room, cancel_transfer, check_for_updates, copy_last_error,
         copy_text_to_clipboard, create_room, delete_temp_file, get_config,
         get_file_transfer_metadata, get_room, join_room, leave_room, list_nearby_devices,
-        list_room_items, list_rooms, open_logs_folder, pending_join_requests, reject_nearby_join,
-        request_nearby_join, reveal_in_folder, send_file_to_room, send_text_to_room, update_config,
-        write_temp_file,
+        list_room_items, list_rooms, mark_join_prompt_rendered, open_logs_folder,
+        pending_join_requests, reject_nearby_join, request_nearby_join, reveal_in_folder,
+        send_file_to_room, send_text_to_room, update_config, write_temp_file,
     },
     config::StoredConfig,
     error::{AppError, AppResult},
@@ -40,9 +40,12 @@ pub struct AppState {
     pub active_servers: Mutex<HashMap<String, ActiveRoomServer>>,
     pub active_file_transfers: Mutex<HashMap<String, transfer::ActiveFileTransfer>>,
     pub discovery_handle: Mutex<Option<DiscoveryHandle>>,
+    pub nearby_http_handle: Mutex<Option<NearbyHttpHandle>>,
     pub antenna_handle: Mutex<Option<DiscoveryHandle>>,
     pub nearby_devices: Mutex<HashMap<String, discovery::NearbyDeviceRecord>>,
     pub pending_join_requests: Mutex<HashMap<String, discovery::PendingJoinRequest>>,
+    pub outgoing_join_requests: Mutex<HashMap<String, discovery::OutgoingJoinRequest>>,
+    pub terminal_transfer_reasons: Mutex<HashMap<String, transfer::TerminalTransferReason>>,
 }
 
 pub struct ActiveRoomServer {
@@ -65,6 +68,11 @@ pub struct DiscoveryHandle {
     pub shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
+pub struct NearbyHttpHandle {
+    pub shutdown: tokio::sync::oneshot::Sender<()>,
+    pub port: u16,
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -85,9 +93,12 @@ fn main() {
                 active_servers: Mutex::new(HashMap::new()),
                 active_file_transfers: Mutex::new(HashMap::new()),
                 discovery_handle: Mutex::new(None),
+                nearby_http_handle: Mutex::new(None),
                 antenna_handle: Mutex::new(None),
                 nearby_devices: Mutex::new(HashMap::new()),
                 pending_join_requests: Mutex::new(HashMap::new()),
+                outgoing_join_requests: Mutex::new(HashMap::new()),
+                terminal_transfer_reasons: Mutex::new(HashMap::new()),
             });
 
             app.manage(state.clone());
@@ -128,6 +139,7 @@ fn main() {
             accept_nearby_join,
             reject_nearby_join,
             pending_join_requests,
+            mark_join_prompt_rendered,
             list_rooms,
             get_room,
             list_room_items,

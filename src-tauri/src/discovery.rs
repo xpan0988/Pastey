@@ -1,10 +1,17 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use axum::{
+    extract::{ConnectInfo, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::post,
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::Emitter;
 use tokio::{
-    net::UdpSocket,
+    net::{TcpListener, UdpSocket},
     sync::oneshot,
     time::{sleep, timeout},
 };
@@ -20,12 +27,14 @@ const DISCOVERY_PORT: u16 = 48392;
 const BEACON_INTERVAL_SECS: u64 = 2;
 const BEACON_TTL_SECS: i64 = 6;
 const JOIN_REQUEST_TIMEOUT_SECS: u64 = 30;
+const JOIN_REQUEST_CONNECT_TIMEOUT_SECS: u64 = 5;
 const JOIN_REQUEST_EVENT: &str = "pastey://join-request";
 
 #[derive(Clone, Debug)]
 pub struct NearbyDeviceRecord {
     pub device: NearbyDevice,
     pub source: SocketAddr,
+    pub join_request_port: u16,
     pub expires_at: i64,
 }
 
@@ -38,6 +47,12 @@ pub struct PendingJoinRequest {
     pub app_version: String,
     pub received_at: i64,
     pub expires_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct OutgoingJoinRequest {
+    pub request_id: String,
+    pub created_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,6 +77,8 @@ pub struct NearbyJoinRequest {
     pub display_name: String,
     pub platform: String,
     pub app_version: String,
+    #[serde(default)]
+    pub response_port: Option<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,42 +96,88 @@ pub struct NearbyJoinResponse {
 }
 
 pub async fn ensure_service(state: Arc<AppState>) -> AppResult<()> {
-    if state.discovery_handle.lock().is_some() {
+    ensure_join_request_service(state.clone()).await?;
+
+    if state.discovery_handle.lock().is_none() {
+        let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
+            .await
+            .map_err(|error| {
+                AppError::Network(format!("unable to bind discovery socket: {error}"))
+            })?;
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let service_state = state.clone();
+
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 4096];
+
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        logging::write_transfer_line("[pastey antenna] event=antenna_stop");
+                        break;
+                    }
+                    result = socket.recv_from(&mut buffer) => {
+                        let Ok((size, source)) = result else {
+                            break;
+                        };
+
+                        handle_discovery_packet(service_state.clone(), &socket, &buffer[..size], source).await;
+                    }
+                }
+            }
+        });
+
+        let mut handle = state.discovery_handle.lock();
+        if handle.is_none() {
+            *handle = Some(crate::DiscoveryHandle {
+                shutdown: shutdown_tx,
+            });
+            logging::write_transfer_line("[pastey antenna] event=antenna_start");
+        }
+    }
+
+    Ok(())
+}
+
+async fn ensure_join_request_service(state: Arc<AppState>) -> AppResult<()> {
+    if state.nearby_http_handle.lock().is_some() {
         return Ok(());
     }
 
-    let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
-        .await
-        .map_err(|error| AppError::Network(format!("unable to bind discovery socket: {error}")))?;
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-    let service_state = state.clone();
+    let router = Router::new()
+        .route("/nearby/join-request", post(join_request_endpoint))
+        .with_state(state.clone());
+    let listener = TcpListener::bind(("0.0.0.0", 0)).await.map_err(|error| {
+        AppError::Network(format!("unable to bind nearby join socket: {error}"))
+    })?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| {
+            AppError::Network(format!("unable to inspect nearby join socket: {error}"))
+        })?
+        .port();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     tokio::spawn(async move {
-        let mut buffer = vec![0u8; 4096];
-
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => {
-                    logging::write_transfer_line("[pastey antenna] event=antenna_stop");
-                    break;
-                }
-                result = socket.recv_from(&mut buffer) => {
-                    let Ok((size, source)) = result else {
-                        break;
-                    };
-
-                    handle_discovery_packet(service_state.clone(), &socket, &buffer[..size], source).await;
-                }
-            }
-        }
+        let server = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        });
+        let _ = server.await;
     });
 
-    let mut handle = state.discovery_handle.lock();
+    let mut handle = state.nearby_http_handle.lock();
     if handle.is_none() {
-        *handle = Some(crate::DiscoveryHandle {
+        *handle = Some(crate::NearbyHttpHandle {
             shutdown: shutdown_tx,
+            port,
         });
-        logging::write_transfer_line("[pastey antenna] event=antenna_start");
+        logging::write_transfer_line(&format!(
+            "[pastey antenna] event=join_request_server_start port={port}"
+        ));
     }
     Ok(())
 }
@@ -185,6 +248,9 @@ pub async fn maybe_stop_service(state: Arc<AppState>) {
     if let Some(handle) = state.discovery_handle.lock().take() {
         let _ = handle.shutdown.send(());
     }
+    if let Some(handle) = state.nearby_http_handle.lock().take() {
+        let _ = handle.shutdown.send(());
+    }
 }
 
 pub fn list_nearby_devices(state: &Arc<AppState>) -> Vec<NearbyDevice> {
@@ -224,6 +290,10 @@ pub async fn request_nearby_join(
     let socket = UdpSocket::bind(("0.0.0.0", 0))
         .await
         .map_err(|_| AppError::Network("Firewall may be blocking Pastey.".into()))?;
+    let response_port = socket
+        .local_addr()
+        .map_err(|_| AppError::Network("Firewall may be blocking Pastey.".into()))?
+        .port();
     let request = NearbyJoinRequest {
         kind: "join_request".into(),
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -231,16 +301,55 @@ pub async fn request_nearby_join(
         display_name: crate::transfer::device_name(),
         platform: platform_name().into(),
         app_version: env!("CARGO_PKG_VERSION").into(),
+        response_port: Some(response_port),
     };
-    let payload = serde_json::to_vec(&request)?;
-    logging::write_transfer_line("[pastey antenna] event=join_request_sent");
-    socket.send_to(&payload, record.source).await.map_err(|_| {
-        logging::write_transfer_line("[pastey antenna] event=nearby_unreachable");
-        logging::write_transfer_line("[pastey antenna] event=blocked_network_suspected");
-        AppError::Network(
-            "Device found, but this network may block direct local connections.".into(),
-        )
-    })?;
+    state.outgoing_join_requests.lock().insert(
+        request.request_id.clone(),
+        OutgoingJoinRequest {
+            request_id: request.request_id.clone(),
+            created_at: storage::now_ts(),
+        },
+    );
+    let join_url = join_request_url(record.source, record.join_request_port);
+    logging::write_transfer_line(&format!(
+        "[pastey antenna] event=join_request_url url={join_url}"
+    ));
+    logging::write_transfer_line("[pastey antenna] event=join_request_attempt");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(JOIN_REQUEST_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(|_| AppError::Network("Firewall may be blocking Pastey.".into()))?;
+    let response = client
+        .post(&join_url)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|_| {
+            state
+                .outgoing_join_requests
+                .lock()
+                .remove(&request.request_id);
+            logging::write_transfer_line("[pastey antenna] event=nearby_unreachable");
+            logging::write_transfer_line("[pastey antenna] event=blocked_network_suspected");
+            AppError::Network("Device found, but Pastey could not connect to it.".into())
+        })?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    logging::write_transfer_line(&format!(
+        "[pastey antenna] event=join_request_response_status status={status}"
+    ));
+    logging::write_transfer_line(&format!(
+        "[pastey antenna] event=join_request_response_body body={body:?}"
+    ));
+    if !status.is_success() {
+        state
+            .outgoing_join_requests
+            .lock()
+            .remove(&request.request_id);
+        return Err(AppError::Network(
+            "Device found, but Pastey could not connect to it.".into(),
+        ));
+    }
 
     let mut buffer = vec![0u8; 4096];
     loop {
@@ -250,6 +359,10 @@ pub async fn request_nearby_join(
         )
         .await
         .map_err(|_| {
+            state
+                .outgoing_join_requests
+                .lock()
+                .remove(&request.request_id);
             logging::write_transfer_line("[pastey antenna] event=join_timeout");
             AppError::Timeout("Join request timed out.".into())
         })?
@@ -259,6 +372,10 @@ pub async fn request_nearby_join(
             continue;
         };
         if response.kind == "join_response" && response.request_id == request.request_id {
+            state
+                .outgoing_join_requests
+                .lock()
+                .remove(&request.request_id);
             return Ok((source, response));
         }
     }
@@ -406,6 +523,7 @@ fn handle_beacon(state: Arc<AppState>, value: Value, source: SocketAddr) {
         NearbyDeviceRecord {
             device,
             source,
+            join_request_port: beacon.listen_port,
             expires_at: beacon.expires_at,
         },
     );
@@ -418,8 +536,32 @@ fn handle_join_request(state: Arc<AppState>, value: Value, source: SocketAddr) {
     let Ok(request) = serde_json::from_value::<NearbyJoinRequest>(value) else {
         return;
     };
+    let response_port = request.response_port.unwrap_or(source.port());
+    surface_join_request(state, request, SocketAddr::new(source.ip(), response_port));
+}
+
+async fn join_request_endpoint(
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<NearbyJoinRequest>,
+) -> impl IntoResponse {
+    logging::write_transfer_line(&format!(
+        "[pastey antenna] event=join_request_endpoint_hit source={source}"
+    ));
+    let response_port = request.response_port.unwrap_or(source.port());
+    surface_join_request(state, request, SocketAddr::new(source.ip(), response_port));
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "ok": true })),
+    )
+}
+
+fn surface_join_request(state: Arc<AppState>, request: NearbyJoinRequest, source: SocketAddr) {
     if request.device_id == local_device_id(&state) {
         return;
+    }
+    if !state.outgoing_join_requests.lock().is_empty() {
+        logging::write_transfer_line("[pastey antenna] event=simultaneous_join_detected");
     }
     let now = storage::now_ts();
     let pending = PendingJoinRequest {
@@ -443,10 +585,11 @@ fn handle_join_request(state: Arc<AppState>, value: Value, source: SocketAddr) {
         .pending_join_requests
         .lock()
         .insert(pending.request_id.clone(), pending);
-    let _ = state.app_handle.emit(JOIN_REQUEST_EVENT, prompt);
     logging::write_transfer_line(&format!(
         "[pastey antenna] event=join_request_received source={source}"
     ));
+    let _ = state.app_handle.emit(JOIN_REQUEST_EVENT, prompt);
+    logging::write_transfer_line("[pastey antenna] event=join_request_emitted_to_ui");
 }
 
 fn current_beacon(state: &Arc<AppState>) -> NearbyBeacon {
@@ -463,11 +606,24 @@ fn current_beacon(state: &Arc<AppState>) -> NearbyBeacon {
         platform: platform_name().into(),
         app_version: env!("CARGO_PKG_VERSION").into(),
         capabilities: vec!["large_file".into(), "nearby_join".into()],
-        listen_port: DISCOVERY_PORT,
+        listen_port: advertised_join_request_port(state),
         room_offer_id: local_device_id(state),
         expires_at: now + BEACON_TTL_SECS,
         availability: availability.into(),
     }
+}
+
+fn advertised_join_request_port(state: &Arc<AppState>) -> u16 {
+    state
+        .nearby_http_handle
+        .lock()
+        .as_ref()
+        .map(|handle| handle.port)
+        .unwrap_or_default()
+}
+
+fn join_request_url(source: SocketAddr, listen_port: u16) -> String {
+    format!("http://{}:{listen_port}/nearby/join-request", source.ip())
 }
 
 fn expire_nearby_devices(state: &Arc<AppState>) {
@@ -527,7 +683,7 @@ mod tests {
             platform: "macOS".into(),
             app_version: "1.4.0".into(),
             capabilities: vec!["large_file".into()],
-            listen_port: DISCOVERY_PORT,
+            listen_port: 43123,
             room_offer_id: "offer".into(),
             expires_at: 123,
             availability: "Available".into(),
@@ -610,7 +766,7 @@ mod tests {
             platform: "Windows".into(),
             app_version: "1.4.0".into(),
             capabilities: vec!["large_file".into()],
-            listen_port: DISCOVERY_PORT,
+            listen_port: 43123,
             room_offer_id: "offer".into(),
             expires_at: 10,
             availability: "Available".into(),
@@ -620,5 +776,15 @@ mod tests {
         assert!(!beacon_is_fresh(&beacon, 10));
         beacon.expires_at = 11;
         assert!(beacon_is_fresh(&beacon, 10));
+    }
+
+    #[test]
+    fn join_request_url_uses_advertised_http_port_not_udp_source_port() {
+        let source: SocketAddr = "192.168.1.9:54321".parse().unwrap();
+
+        assert_eq!(
+            join_request_url(source, 43123),
+            "http://192.168.1.9:43123/nearby/join-request"
+        );
     }
 }
