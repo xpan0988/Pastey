@@ -13,6 +13,16 @@ It is built with:
 
 ## Version history
 
+### 1.4.1 — Nearby join reliability
+
+- Fixed nearby join requests using the advertised LAN HTTP endpoint instead of the UDP beacon source port.
+- Added clearer nearby join diagnostics, including request URL, endpoint hit, response, UI prompt rendering, and timeout logs.
+- Restored pending join prompts from backend state so Accept / Reject is not lost if the request arrives before the frontend subscribes.
+- Prevented simultaneous nearby join attempts from deadlocking the UI.
+- Added receiver-side terminal transfer reasons for cancelled, burned, left, interrupted, disconnected, and timed-out transfers.
+- Mapped receiver-side interruption cases to clear sender messages such as “Receiver cancelled transfer,” “Peer burned the room,” and “Receiver stopped receiving.”
+- Added tests for advertised HTTP port regression and terminal transfer reason mapping.
+
 ### 1.4.0 — Automatic Nearby Antenna Discovery
 
 - Added automatic LAN nearby-device discovery while the Pastey window is open.
