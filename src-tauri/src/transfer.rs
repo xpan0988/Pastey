@@ -6,8 +6,9 @@ use std::{
 };
 
 use axum::{
-    extract::{rejection::JsonRejection, ConnectInfo, DefaultBodyLimit, Path as AxumPath, State},
-    http::StatusCode,
+    body::Bytes,
+    extract::{rejection::BytesRejection, ConnectInfo, DefaultBodyLimit, Path as AxumPath, State},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
@@ -24,6 +25,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    chunk_frame::{
+        decode_binary_chunk_frame, encode_binary_chunk_frame, BinaryChunkFrame,
+        BinaryChunkFrameError, BINARY_CHUNK_NONCE_LEN,
+    },
     config, crypto, discovery,
     error::{AppError, AppResult},
     logging,
@@ -41,6 +46,9 @@ const TRANSFER_EVENT: &str = "pastey://transfer-progress";
 const TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CHUNK_BODY_BYTES: usize = 16 * 1024 * 1024;
+const CHUNK_PROTOCOL_HEADER: &str = "x-pastey-chunk-protocol";
+const CHUNK_PROTOCOL_BINARY_V1: &str = "binary-v1";
+const CHUNK_PROTOCOL_JSON_V1: &str = "json-v1";
 const TRANSFER_CANCELLED_MESSAGE: &str = "Transfer cancelled";
 const TRANSFER_INTERRUPTED_MESSAGE: &str = "Transfer interrupted";
 const PEER_DISCONNECTED_MESSAGE: &str = "Peer disconnected";
@@ -104,6 +112,15 @@ struct TransferOkResponse {
     ok: bool,
 }
 
+#[derive(Deserialize, Serialize)]
+struct FileTransferStartResponse {
+    ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preferred_chunk_protocol: Option<String>,
+    #[serde(default)]
+    supported_chunk_protocols: Vec<String>,
+}
+
 #[derive(Deserialize)]
 struct TransferCancelRequest {
     status: Option<String>,
@@ -135,6 +152,41 @@ struct ChunkSendFailure {
     retryable: bool,
 }
 
+#[derive(Debug)]
+struct ReceivedChunkUpload {
+    chunk_index: u64,
+    nonce: [u8; BINARY_CHUNK_NONCE_LEN],
+    ciphertext: Vec<u8>,
+    plaintext_size: u64,
+    is_final: bool,
+    protocol: ChunkProtocol,
+    payload_body_size: usize,
+    encoded_ciphertext_bytes: usize,
+}
+
+#[derive(Debug)]
+struct ChunkPayloadDecodeFailure {
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+    cause: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChunkProtocol {
+    BinaryV1,
+    JsonV1,
+}
+
+impl ChunkProtocol {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BinaryV1 => CHUNK_PROTOCOL_BINARY_V1,
+            Self::JsonV1 => CHUNK_PROTOCOL_JSON_V1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChunkSendFailureKind {
     Cancelled,
@@ -143,6 +195,7 @@ enum ChunkSendFailureKind {
     InvalidAck,
     PeerLeft,
     Timeout,
+    UnsupportedProtocol,
     Unreachable,
 }
 
@@ -155,6 +208,7 @@ impl ChunkSendFailureKind {
             Self::InvalidAck => "invalid_ack",
             Self::PeerLeft => "peer_left",
             Self::Timeout => "timeout",
+            Self::UnsupportedProtocol => "unsupported_protocol",
             Self::Unreachable => "unreachable",
         }
     }
@@ -492,13 +546,26 @@ pub async fn send_room_file(
         wrapped_session_key,
         transport_nonce,
         sender_public_key,
+        preferred_chunk_protocol: Some(CHUNK_PROTOCOL_BINARY_V1.to_string()),
     };
 
     let start_response = client.post(&start_url).json(&start).send().await;
-    let start_response = match start_response {
+    let chunk_protocol = match start_response {
         Ok(response) if response.status().is_success() => {
-            dev_log_sender_transfer_start_response(&transfer_id, room_id, response.status(), "");
-            response
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            dev_log_sender_transfer_start_response(&transfer_id, room_id, status, &body_text);
+            let protocol = selected_chunk_protocol_from_start_response(&body_text);
+            dev_log_sender_chunk_protocol_selected(&transfer_id, room_id, protocol, &body_text);
+            if protocol == ChunkProtocol::JsonV1 {
+                dev_log_sender_binary_fallback_to_json(
+                    &transfer_id,
+                    room_id,
+                    None,
+                    "receiver_capability_unknown",
+                );
+            }
+            protocol
         }
         Ok(response) => {
             let details = response_error_details(response).await;
@@ -541,7 +608,6 @@ pub async fn send_room_file(
             return Err(AppError::Http(error));
         }
     };
-    drop(start_response);
 
     let mut file = tokio::fs::File::open(file_path)
         .await
@@ -552,6 +618,7 @@ pub async fn send_room_file(
     let mut last_report_at = started_at;
     let mut last_report_bytes = 0u64;
     let mut chunk_index = 0u64;
+    let mut chunk_protocol = chunk_protocol;
 
     loop {
         if cancel_token.is_cancelled() {
@@ -616,56 +683,144 @@ pub async fn send_room_file(
             &nonce,
             &encrypted_bytes,
             &cancel_token,
+            chunk_protocol,
         )
         .await
         {
             Ok(ack) => ack,
             Err(error) => {
-                if error.kind == ChunkSendFailureKind::Cancelled || cancel_token.is_cancelled() {
-                    notify_transfer_cancel(&client, &base_url, &transfer_id).await;
-                    let _ = storage::set_room_item_status(
-                        &state.paths,
-                        item_id,
-                        RoomItemStatus::Cancelled,
-                    );
-                    finish_transfer_locally(
-                        &state,
+                if chunk_protocol == ChunkProtocol::BinaryV1
+                    && error.kind == ChunkSendFailureKind::UnsupportedProtocol
+                {
+                    dev_log_sender_binary_fallback_to_json(
                         &transfer_id,
-                        "cancelled",
-                        Some(TRANSFER_CANCELLED_MESSAGE.into()),
-                    );
-                    return Err(AppError::InvalidInput(TRANSFER_CANCELLED_MESSAGE.into()));
-                }
-
-                notify_transfer_failed(&client, &base_url, &transfer_id, &error.message).await;
-                dev_log_sender_final_error(
-                    &transfer_id,
-                    room_id,
-                    Some(chunk_index),
-                    error.kind.as_str(),
-                    &error.message,
-                );
-                if matches!(
-                    error.kind,
-                    ChunkSendFailureKind::PeerLeft
-                        | ChunkSendFailureKind::Timeout
-                        | ChunkSendFailureKind::Unreachable
-                ) {
-                    finish_sender_terminal(
-                        &state,
-                        &transfer_id,
-                        item_id,
-                        "interrupted",
+                        room_id,
+                        Some(chunk_index),
                         &error.message,
                     );
+                    chunk_protocol = ChunkProtocol::JsonV1;
+                    match send_chunk_with_retry(
+                        &client,
+                        &base_url,
+                        room_id,
+                        &transfer_id,
+                        chunk_index,
+                        total_chunks,
+                        bytes_read,
+                        &nonce,
+                        &encrypted_bytes,
+                        &cancel_token,
+                        chunk_protocol,
+                    )
+                    .await
+                    {
+                        Ok(ack) => ack,
+                        Err(error) => {
+                            if error.kind == ChunkSendFailureKind::Cancelled
+                                || cancel_token.is_cancelled()
+                            {
+                                notify_transfer_cancel(&client, &base_url, &transfer_id).await;
+                                let _ = storage::set_room_item_status(
+                                    &state.paths,
+                                    item_id,
+                                    RoomItemStatus::Cancelled,
+                                );
+                                finish_transfer_locally(
+                                    &state,
+                                    &transfer_id,
+                                    "cancelled",
+                                    Some(TRANSFER_CANCELLED_MESSAGE.into()),
+                                );
+                                return Err(AppError::InvalidInput(
+                                    TRANSFER_CANCELLED_MESSAGE.into(),
+                                ));
+                            }
+
+                            notify_transfer_failed(
+                                &client,
+                                &base_url,
+                                &transfer_id,
+                                &error.message,
+                            )
+                            .await;
+                            dev_log_sender_final_error(
+                                &transfer_id,
+                                room_id,
+                                Some(chunk_index),
+                                error.kind.as_str(),
+                                &error.message,
+                            );
+                            if matches!(
+                                error.kind,
+                                ChunkSendFailureKind::PeerLeft
+                                    | ChunkSendFailureKind::Timeout
+                                    | ChunkSendFailureKind::Unreachable
+                            ) {
+                                finish_sender_terminal(
+                                    &state,
+                                    &transfer_id,
+                                    item_id,
+                                    "interrupted",
+                                    &error.message,
+                                );
+                            } else {
+                                fail_transfer(&state, &transfer_id, item_id, error.message.clone());
+                            }
+                            return if error.kind == ChunkSendFailureKind::Timeout {
+                                Err(AppError::Timeout(error.message))
+                            } else {
+                                Err(AppError::Network(error.message))
+                            };
+                        }
+                    }
                 } else {
-                    fail_transfer(&state, &transfer_id, item_id, error.message.clone());
+                    if error.kind == ChunkSendFailureKind::Cancelled || cancel_token.is_cancelled()
+                    {
+                        notify_transfer_cancel(&client, &base_url, &transfer_id).await;
+                        let _ = storage::set_room_item_status(
+                            &state.paths,
+                            item_id,
+                            RoomItemStatus::Cancelled,
+                        );
+                        finish_transfer_locally(
+                            &state,
+                            &transfer_id,
+                            "cancelled",
+                            Some(TRANSFER_CANCELLED_MESSAGE.into()),
+                        );
+                        return Err(AppError::InvalidInput(TRANSFER_CANCELLED_MESSAGE.into()));
+                    }
+
+                    notify_transfer_failed(&client, &base_url, &transfer_id, &error.message).await;
+                    dev_log_sender_final_error(
+                        &transfer_id,
+                        room_id,
+                        Some(chunk_index),
+                        error.kind.as_str(),
+                        &error.message,
+                    );
+                    if matches!(
+                        error.kind,
+                        ChunkSendFailureKind::PeerLeft
+                            | ChunkSendFailureKind::Timeout
+                            | ChunkSendFailureKind::Unreachable
+                    ) {
+                        finish_sender_terminal(
+                            &state,
+                            &transfer_id,
+                            item_id,
+                            "interrupted",
+                            &error.message,
+                        );
+                    } else {
+                        fail_transfer(&state, &transfer_id, item_id, error.message.clone());
+                    }
+                    return if error.kind == ChunkSendFailureKind::Timeout {
+                        Err(AppError::Timeout(error.message))
+                    } else {
+                        Err(AppError::Network(error.message))
+                    };
                 }
-                return if error.kind == ChunkSendFailureKind::Timeout {
-                    Err(AppError::Timeout(error.message))
-                } else {
-                    Err(AppError::Network(error.message))
-                };
             }
         };
 
@@ -807,6 +962,7 @@ async fn send_chunk_with_retry(
     nonce: &[u8; 12],
     encrypted_bytes: &[u8],
     cancel_token: &CancellationToken,
+    protocol: ChunkProtocol,
 ) -> Result<ChunkAckResponse, ChunkSendFailure> {
     for retry_count in 0..=CHUNK_RETRY_BACKOFFS.len() {
         if cancel_token.is_cancelled() {
@@ -828,6 +984,7 @@ async fn send_chunk_with_retry(
             plaintext_size,
             nonce,
             encrypted_bytes,
+            protocol,
         )
         .await;
         let elapsed = attempt_started_at.elapsed();
@@ -885,6 +1042,129 @@ async fn send_chunk_once(
     plaintext_size: usize,
     nonce: &[u8; 12],
     encrypted_bytes: &[u8],
+    protocol: ChunkProtocol,
+) -> Result<ChunkAckResponse, ChunkSendFailure> {
+    match protocol {
+        ChunkProtocol::BinaryV1 => {
+            send_binary_chunk_once(
+                client,
+                base_url,
+                room_id,
+                transfer_id,
+                chunk_index,
+                total_chunks,
+                plaintext_size,
+                nonce,
+                encrypted_bytes,
+            )
+            .await
+        }
+        ChunkProtocol::JsonV1 => {
+            send_json_chunk_once(
+                client,
+                base_url,
+                room_id,
+                transfer_id,
+                chunk_index,
+                total_chunks,
+                plaintext_size,
+                nonce,
+                encrypted_bytes,
+            )
+            .await
+        }
+    }
+}
+
+async fn send_binary_chunk_once(
+    client: &reqwest::Client,
+    base_url: &str,
+    room_id: &str,
+    transfer_id: &str,
+    chunk_index: u64,
+    total_chunks: u64,
+    plaintext_size: usize,
+    nonce: &[u8; 12],
+    encrypted_bytes: &[u8],
+) -> Result<ChunkAckResponse, ChunkSendFailure> {
+    let plaintext_size_u32 = u32::try_from(plaintext_size).map_err(|_| ChunkSendFailure {
+        message: "Invalid chunk payload".into(),
+        kind: ChunkSendFailureKind::HttpStatus,
+        retryable: false,
+    })?;
+    let frame = BinaryChunkFrame {
+        chunk_index,
+        nonce: *nonce,
+        ciphertext: encrypted_bytes.to_vec(),
+        plaintext_size: plaintext_size_u32,
+        is_final: chunk_index.checked_add(1) == Some(total_chunks),
+    };
+    let request_body = encode_binary_chunk_frame(&frame).map_err(|_| ChunkSendFailure {
+        message: "Invalid chunk payload".into(),
+        kind: ChunkSendFailureKind::HttpStatus,
+        retryable: false,
+    })?;
+    let request_body_size = request_body.len();
+    let json_estimated_len = json_base64_estimated_chunk_len(
+        chunk_index,
+        plaintext_size,
+        encrypted_bytes.len(),
+        frame.is_final,
+    );
+    dev_log_sender_binary_chunk_encode(
+        transfer_id,
+        room_id,
+        chunk_index,
+        plaintext_size,
+        encrypted_bytes.len(),
+        request_body_size,
+        json_estimated_len,
+    );
+    let chunk_url = format!("{base_url}/transfers/{transfer_id}/chunks");
+    dev_log_sender_chunk_request(
+        transfer_id,
+        room_id,
+        chunk_index,
+        &chunk_url,
+        "POST",
+        plaintext_size,
+        encrypted_bytes.len(),
+        request_body_size,
+        ChunkProtocol::BinaryV1,
+    );
+    let response = client
+        .post(&chunk_url)
+        .timeout(CHUNK_REQUEST_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .header(CHUNK_PROTOCOL_HEADER, CHUNK_PROTOCOL_BINARY_V1)
+        .body(request_body)
+        .send()
+        .await
+        .map_err(chunk_failure_from_reqwest)?;
+
+    receive_chunk_ack_response(
+        response,
+        transfer_id,
+        room_id,
+        chunk_index,
+        plaintext_size,
+        encrypted_bytes.len(),
+        request_body_size,
+        ChunkProtocol::BinaryV1,
+    )
+    .await
+}
+
+async fn send_json_chunk_once(
+    client: &reqwest::Client,
+    base_url: &str,
+    room_id: &str,
+    transfer_id: &str,
+    chunk_index: u64,
+    total_chunks: u64,
+    plaintext_size: usize,
+    nonce: &[u8; 12],
+    encrypted_bytes: &[u8],
 ) -> Result<ChunkAckResponse, ChunkSendFailure> {
     let ciphertext = STANDARD.encode(encrypted_bytes);
     let upload = ChunkUploadRequest {
@@ -910,6 +1190,7 @@ async fn send_chunk_once(
         plaintext_size,
         encrypted_bytes.len(),
         request_body_size,
+        ChunkProtocol::JsonV1,
     );
     let response = client
         .post(&chunk_url)
@@ -920,6 +1201,29 @@ async fn send_chunk_once(
         .await
         .map_err(chunk_failure_from_reqwest)?;
 
+    receive_chunk_ack_response(
+        response,
+        transfer_id,
+        room_id,
+        chunk_index,
+        plaintext_size,
+        encrypted_bytes.len(),
+        request_body_size,
+        ChunkProtocol::JsonV1,
+    )
+    .await
+}
+
+async fn receive_chunk_ack_response(
+    response: reqwest::Response,
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: u64,
+    plaintext_size: usize,
+    ciphertext_bytes: usize,
+    request_body_size: usize,
+    protocol: ChunkProtocol,
+) -> Result<ChunkAckResponse, ChunkSendFailure> {
     let status = response.status();
     if !response.status().is_success() {
         return Err(chunk_failure_from_response(
@@ -928,8 +1232,9 @@ async fn send_chunk_once(
             room_id,
             chunk_index,
             plaintext_size,
-            encrypted_bytes.len(),
+            ciphertext_bytes,
             request_body_size,
+            protocol,
         )
         .await);
     }
@@ -940,8 +1245,9 @@ async fn send_chunk_once(
         room_id,
         chunk_index,
         plaintext_size,
-        encrypted_bytes.len(),
+        ciphertext_bytes,
         request_body_size,
+        protocol,
         status,
         &body_text,
     );
@@ -993,6 +1299,7 @@ async fn chunk_failure_from_response(
     plaintext_size: usize,
     ciphertext_bytes: usize,
     request_body_size: usize,
+    protocol: ChunkProtocol,
 ) -> ChunkSendFailure {
     let details = response_error_details(response).await;
     dev_log_sender_chunk_response(
@@ -1002,9 +1309,19 @@ async fn chunk_failure_from_response(
         plaintext_size,
         ciphertext_bytes,
         request_body_size,
+        protocol,
         details.status,
         &details.body_text,
     );
+    if details.status == StatusCode::UNSUPPORTED_MEDIA_TYPE
+        || details.code.as_deref() == Some("unsupported_chunk_protocol")
+    {
+        return ChunkSendFailure {
+            message: "Unsupported chunk protocol".into(),
+            kind: ChunkSendFailureKind::UnsupportedProtocol,
+            retryable: false,
+        };
+    }
     if details.status == StatusCode::PAYLOAD_TOO_LARGE
         || details.code.as_deref() == Some("chunk_too_large")
     {
@@ -1144,7 +1461,7 @@ fn dev_log_sender_transfer_start(
     file_size: u64,
 ) {
     emit_transfer_log(format!(
-        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=start_request method=POST peer_url={peer_url} start_url={start_url} chunk_url={chunk_url} chunk_payload_format=json chunk_size={chunk_size} total_chunks={total_chunks} file_size={file_size}"
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=start_request method=POST peer_url={peer_url} start_url={start_url} chunk_url={chunk_url} chunk_payload_format=binary-v1 chunk_size={chunk_size} total_chunks={total_chunks} file_size={file_size}"
     ));
 }
 
@@ -1168,6 +1485,18 @@ fn dev_log_sender_start_transfer_metadata(
 ) {
     emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=start_transfer_metadata chunk_size={chunk_size} total_chunks={total_chunks} file_size={file_size}"
+    ));
+}
+
+fn dev_log_sender_chunk_protocol_selected(
+    transfer_id: &str,
+    room_id: &str,
+    protocol: ChunkProtocol,
+    start_response_body: &str,
+) {
+    emit_transfer_log(format!(
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=chunk_protocol_selected protocol={} start_response_body={start_response_body:?}",
+        protocol.as_str()
     ));
 }
 
@@ -1204,10 +1533,12 @@ fn dev_log_sender_chunk_request(
     method: &str,
     plaintext_bytes: usize,
     ciphertext_bytes: usize,
-    encoded_json_body_bytes: usize,
+    encoded_payload_bytes: usize,
+    protocol: ChunkProtocol,
 ) {
     emit_transfer_log(format!(
-        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_request method={method} chunk_url={chunk_url} actual_plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} payload_format=json"
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_request method={method} chunk_url={chunk_url} actual_plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_payload_bytes={encoded_payload_bytes} payload_format={}"
+        , protocol.as_str()
     ));
 }
 
@@ -1217,13 +1548,47 @@ fn dev_log_sender_chunk_response(
     chunk_index: u64,
     plaintext_bytes: usize,
     ciphertext_bytes: usize,
-    encoded_json_body_bytes: usize,
+    encoded_payload_bytes: usize,
+    protocol: ChunkProtocol,
     status: StatusCode,
     body_text: &str,
 ) {
     emit_transfer_log(format!(
-        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_response actual_plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} response_status={status} response_body={body_text:?}"
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_response actual_plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_payload_bytes={encoded_payload_bytes} payload_format={} response_status={status} response_body={body_text:?}"
+        , protocol.as_str()
     ));
+}
+
+fn dev_log_sender_binary_chunk_encode(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: u64,
+    plaintext_size: usize,
+    ciphertext_len: usize,
+    frame_len: usize,
+    json_base64_estimated_len: usize,
+) {
+    let overhead_saved_estimate = json_base64_estimated_len.saturating_sub(frame_len);
+    let overhead_ratio = frame_len as f64 / plaintext_size.max(1) as f64;
+    emit_transfer_log(format!(
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=binary_chunk_encode plaintext_size={plaintext_size} ciphertext_len={ciphertext_len} frame_len={frame_len} json_base64_estimated_len={json_base64_estimated_len} overhead_saved_estimate={overhead_saved_estimate} overhead_ratio={overhead_ratio:.4}"
+    ));
+}
+
+fn dev_log_sender_binary_fallback_to_json(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: Option<u64>,
+    reason: &str,
+) {
+    match chunk_index {
+        Some(chunk_index) => emit_transfer_log(format!(
+            "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=binary_chunk_fallback_to_json reason={reason:?}"
+        )),
+        None => emit_transfer_log(format!(
+            "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=binary_chunk_fallback_to_json reason={reason:?}"
+        )),
+    }
 }
 
 fn dev_log_sender_chunk_attempt(
@@ -1308,10 +1673,12 @@ fn dev_log_receiver_chunk_received(
     chunk_index: u64,
     plaintext_bytes: u64,
     encoded_ciphertext_bytes: usize,
-    encoded_json_body_bytes: usize,
+    encoded_payload_bytes: usize,
+    protocol: ChunkProtocol,
 ) {
     emit_transfer_log(format!(
-        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_received plaintext_size={plaintext_bytes} encoded_ciphertext_bytes={encoded_ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} payload_format=json"
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_received plaintext_size={plaintext_bytes} encoded_ciphertext_bytes={encoded_ciphertext_bytes} encoded_payload_bytes={encoded_payload_bytes} payload_format={}"
+        , protocol.as_str()
     ));
 }
 
@@ -1321,10 +1688,12 @@ fn dev_log_receiver_chunk_write_success(
     chunk_index: u64,
     plaintext_bytes: u64,
     ciphertext_bytes: usize,
-    encoded_json_body_bytes: usize,
+    encoded_payload_bytes: usize,
+    protocol: ChunkProtocol,
 ) {
     emit_transfer_log(format!(
-        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_write plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} response_status={} result=success",
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_write plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_payload_bytes={encoded_payload_bytes} payload_format={} response_status={} result=success",
+        protocol.as_str(),
         StatusCode::OK
     ));
 }
@@ -1348,17 +1717,17 @@ fn dev_log_receiver_chunk_failure(
     chunk_index: Option<u64>,
     plaintext_bytes: u64,
     ciphertext_bytes: usize,
-    encoded_json_body_bytes: usize,
+    encoded_payload_bytes: usize,
     response_status: StatusCode,
     error_cause: &str,
 ) {
     match chunk_index {
         Some(chunk_index) => emit_transfer_log(format!(
-            "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_failure plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} response_status={response_status} error_cause={error_cause} mapped_error_message={:?}",
+            "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_failure plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_payload_bytes={encoded_payload_bytes} response_status={response_status} error_cause={error_cause} mapped_error_message={:?}",
             receiver_failure_log_message(error_cause)
         )),
         None => emit_transfer_log(format!(
-            "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk=unknown] event=chunk_failure plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_json_body_bytes={encoded_json_body_bytes} response_status={response_status} error_cause={error_cause} mapped_error_message={:?}",
+            "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk=unknown] event=chunk_failure plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_payload_bytes={encoded_payload_bytes} response_status={response_status} error_cause={error_cause} mapped_error_message={:?}",
             receiver_failure_log_message(error_cause)
         )),
     }
@@ -1781,7 +2150,7 @@ async fn start_file_transfer_handler(
         );
     }
     match storage::room_item_exists(&ctx.state.paths, &start.item_id) {
-        Ok(true) => return StatusCode::OK.into_response(),
+        Ok(true) => return Json(file_transfer_start_response()).into_response(),
         Ok(false) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -1901,13 +2270,140 @@ async fn start_file_transfer_handler(
         start.chunk_size,
         start.total_chunks,
     );
-    Json(TransferOkResponse { ok: true }).into_response()
+    Json(file_transfer_start_response()).into_response()
+}
+
+fn decode_received_chunk_upload(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<ReceivedChunkUpload, ChunkPayloadDecodeFailure> {
+    match chunk_upload_protocol(headers)? {
+        ChunkProtocol::BinaryV1 => decode_binary_chunk_upload(body),
+        ChunkProtocol::JsonV1 => decode_json_chunk_upload(body),
+    }
+}
+
+fn chunk_upload_protocol(headers: &HeaderMap) -> Result<ChunkProtocol, ChunkPayloadDecodeFailure> {
+    if let Some(protocol) = headers.get(CHUNK_PROTOCOL_HEADER) {
+        let protocol = protocol.to_str().unwrap_or_default();
+        return match protocol {
+            CHUNK_PROTOCOL_BINARY_V1 => Ok(ChunkProtocol::BinaryV1),
+            CHUNK_PROTOCOL_JSON_V1 => Ok(ChunkProtocol::JsonV1),
+            _ => Err(ChunkPayloadDecodeFailure {
+                status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                code: "unsupported_chunk_protocol",
+                message: "Unsupported chunk protocol",
+                cause: format!("unsupported_chunk_protocol: {protocol:?}"),
+            }),
+        };
+    }
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.starts_with("application/octet-stream") {
+        Ok(ChunkProtocol::BinaryV1)
+    } else {
+        Ok(ChunkProtocol::JsonV1)
+    }
+}
+
+fn decode_binary_chunk_upload(
+    body: &[u8],
+) -> Result<ReceivedChunkUpload, ChunkPayloadDecodeFailure> {
+    let frame = decode_binary_chunk_frame(body).map_err(binary_chunk_decode_failure)?;
+    let ciphertext_len = frame.ciphertext.len();
+    Ok(ReceivedChunkUpload {
+        chunk_index: frame.chunk_index,
+        nonce: frame.nonce,
+        ciphertext: frame.ciphertext,
+        plaintext_size: frame.plaintext_size as u64,
+        is_final: frame.is_final,
+        protocol: ChunkProtocol::BinaryV1,
+        payload_body_size: body.len(),
+        encoded_ciphertext_bytes: ciphertext_len,
+    })
+}
+
+fn binary_chunk_decode_failure(error: BinaryChunkFrameError) -> ChunkPayloadDecodeFailure {
+    match error {
+        BinaryChunkFrameError::UnsupportedVersion => ChunkPayloadDecodeFailure {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            code: "unsupported_chunk_protocol",
+            message: "Unsupported chunk protocol",
+            cause: error.as_str().to_string(),
+        },
+        BinaryChunkFrameError::FrameTooLarge => ChunkPayloadDecodeFailure {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: "chunk_too_large",
+            message: "Chunk too large for receiver",
+            cause: error.as_str().to_string(),
+        },
+        _ => ChunkPayloadDecodeFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_chunk_payload",
+            message: "Invalid chunk payload",
+            cause: error.as_str().to_string(),
+        },
+    }
+}
+
+fn decode_json_chunk_upload(body: &[u8]) -> Result<ReceivedChunkUpload, ChunkPayloadDecodeFailure> {
+    let upload = serde_json::from_slice::<ChunkUploadRequest>(body).map_err(|error| {
+        ChunkPayloadDecodeFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_chunk_payload",
+            message: "Invalid chunk payload",
+            cause: format!("body_rejected: {error}"),
+        }
+    })?;
+    let nonce = crypto::decode_nonce(&upload.nonce).map_err(|_| ChunkPayloadDecodeFailure {
+        status: StatusCode::BAD_REQUEST,
+        code: "invalid_chunk_encoding",
+        message: "Invalid chunk encoding",
+        cause: "invalid_nonce_encoding".to_string(),
+    })?;
+    let ciphertext =
+        STANDARD
+            .decode(&upload.ciphertext)
+            .map_err(|_| ChunkPayloadDecodeFailure {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_chunk_encoding",
+                message: "Invalid chunk encoding",
+                cause: "invalid_ciphertext_encoding".to_string(),
+            })?;
+    let encoded_ciphertext_bytes = upload.ciphertext.len();
+
+    Ok(ReceivedChunkUpload {
+        chunk_index: upload.chunk_index,
+        nonce,
+        ciphertext,
+        plaintext_size: upload.plaintext_size,
+        is_final: upload.is_final,
+        protocol: ChunkProtocol::JsonV1,
+        payload_body_size: body.len(),
+        encoded_ciphertext_bytes,
+    })
+}
+
+fn file_transfer_start_response() -> FileTransferStartResponse {
+    FileTransferStartResponse {
+        ok: true,
+        preferred_chunk_protocol: Some(CHUNK_PROTOCOL_BINARY_V1.to_string()),
+        supported_chunk_protocols: vec![
+            CHUNK_PROTOCOL_BINARY_V1.to_string(),
+            CHUNK_PROTOCOL_JSON_V1.to_string(),
+        ],
+    }
 }
 
 async fn receive_file_chunk_handler(
     AxumPath((room_id, transfer_id)): AxumPath<(String, String)>,
     State(ctx): State<RoomServerContext>,
-    upload: Result<Json<ChunkUploadRequest>, JsonRejection>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
     if room_id != ctx.room_id {
         dev_log_receiver_chunk_route_hit(&transfer_id, &room_id, None);
@@ -1921,8 +2417,8 @@ async fn receive_file_chunk_handler(
         return response;
     }
 
-    let Json(upload) = match upload {
-        Ok(upload) => upload,
+    let body = match body {
+        Ok(body) => body,
         Err(error) => {
             let status = error.status();
             let body_text = error.body_text();
@@ -1950,12 +2446,27 @@ async fn receive_file_chunk_handler(
             return transfer_error(status, code, message.into());
         }
     };
+    let upload = match decode_received_chunk_upload(&headers, &body) {
+        Ok(upload) => upload,
+        Err(error) => {
+            dev_log_receiver_chunk_failure(
+                &transfer_id,
+                &room_id,
+                None,
+                0,
+                0,
+                body.len(),
+                error.status,
+                &error.cause,
+            );
+            fail_receiver_transfer(&ctx.state, &transfer_id, error.message).await;
+            return transfer_error(error.status, error.code, error.message.into());
+        }
+    };
 
     let chunk_index = upload.chunk_index;
     let plaintext_size = upload.plaintext_size;
-    let encoded_json_body_size = serde_json::to_vec(&upload)
-        .map(|body| body.len())
-        .unwrap_or_default();
+    let encoded_payload_size = upload.payload_body_size;
     dev_log_receiver_chunk_route_hit(&transfer_id, &room_id, Some(chunk_index));
 
     if plaintext_size == 0 || plaintext_size > DEFAULT_CHUNK_SIZE_BYTES {
@@ -1965,7 +2476,7 @@ async fn receive_file_chunk_handler(
             Some(chunk_index),
             plaintext_size,
             0,
-            encoded_json_body_size,
+            encoded_payload_size,
             StatusCode::BAD_REQUEST,
             "invalid_chunk_payload",
         );
@@ -1982,52 +2493,13 @@ async fn receive_file_chunk_handler(
         &room_id,
         chunk_index,
         plaintext_size,
-        upload.ciphertext.len(),
-        encoded_json_body_size,
+        upload.encoded_ciphertext_bytes,
+        encoded_payload_size,
+        upload.protocol,
     );
 
-    let nonce = match crypto::decode_nonce(&upload.nonce) {
-        Ok(nonce) => nonce,
-        Err(_) => {
-            dev_log_receiver_chunk_failure(
-                &transfer_id,
-                &room_id,
-                Some(chunk_index),
-                plaintext_size,
-                0,
-                encoded_json_body_size,
-                StatusCode::BAD_REQUEST,
-                "invalid_nonce_encoding",
-            );
-            fail_receiver_transfer(&ctx.state, &transfer_id, "Invalid chunk encoding").await;
-            return transfer_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_chunk_encoding",
-                "Invalid chunk encoding".into(),
-            );
-        }
-    };
-    let ciphertext = match STANDARD.decode(&upload.ciphertext) {
-        Ok(ciphertext) => ciphertext,
-        Err(_) => {
-            dev_log_receiver_chunk_failure(
-                &transfer_id,
-                &room_id,
-                Some(chunk_index),
-                plaintext_size,
-                0,
-                encoded_json_body_size,
-                StatusCode::BAD_REQUEST,
-                "invalid_ciphertext_encoding",
-            );
-            fail_receiver_transfer(&ctx.state, &transfer_id, "Invalid chunk encoding").await;
-            return transfer_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_chunk_encoding",
-                "Invalid chunk encoding".into(),
-            );
-        }
-    };
+    let nonce = upload.nonce;
+    let ciphertext = upload.ciphertext;
     let ciphertext_bytes = ciphertext.len();
 
     let transfer_lookup = {
@@ -2127,7 +2599,7 @@ async fn receive_file_chunk_handler(
                 Some(chunk_index),
                 plaintext_size,
                 ciphertext_bytes,
-                encoded_json_body_size,
+                encoded_payload_size,
                 StatusCode::BAD_REQUEST,
                 cause,
             );
@@ -2152,7 +2624,7 @@ async fn receive_file_chunk_handler(
                 Some(chunk_index),
                 plaintext_size,
                 ciphertext_bytes,
-                encoded_json_body_size,
+                encoded_payload_size,
                 StatusCode::BAD_REQUEST,
                 "integrity_failed",
             );
@@ -2171,7 +2643,7 @@ async fn receive_file_chunk_handler(
             Some(chunk_index),
             plaintext_size,
             ciphertext_bytes,
-            encoded_json_body_size,
+            encoded_payload_size,
             StatusCode::BAD_REQUEST,
             "plaintext_size_mismatch",
         );
@@ -2190,7 +2662,7 @@ async fn receive_file_chunk_handler(
             Some(chunk_index),
             plaintext_size,
             ciphertext_bytes,
-            encoded_json_body_size,
+            encoded_payload_size,
             error.status,
             &format!(
                 "{}: part_path={} parent_exists={} file_exists={} transfer_status=active",
@@ -2209,7 +2681,8 @@ async fn receive_file_chunk_handler(
         chunk_index,
         plaintext_size,
         ciphertext_bytes,
-        encoded_json_body_size,
+        encoded_payload_size,
+        upload.protocol,
     );
 
     let maybe_event = {
@@ -2745,6 +3218,25 @@ async fn response_error_message(response: reqwest::Response) -> String {
     map_response_error_message(&details)
 }
 
+fn selected_chunk_protocol_from_start_response(body_text: &str) -> ChunkProtocol {
+    let Ok(response) = serde_json::from_str::<FileTransferStartResponse>(body_text) else {
+        return ChunkProtocol::JsonV1;
+    };
+    if !response.ok {
+        return ChunkProtocol::JsonV1;
+    }
+    if response.preferred_chunk_protocol.as_deref() == Some(CHUNK_PROTOCOL_BINARY_V1)
+        || response
+            .supported_chunk_protocols
+            .iter()
+            .any(|protocol| protocol == CHUNK_PROTOCOL_BINARY_V1)
+    {
+        ChunkProtocol::BinaryV1
+    } else {
+        ChunkProtocol::JsonV1
+    }
+}
+
 async fn response_error_details(response: reqwest::Response) -> ResponseErrorDetails {
     let status = response.status();
     let body_text = response.text().await.unwrap_or_default();
@@ -2766,6 +3258,7 @@ fn map_response_error_message(details: &ResponseErrorDetails) -> String {
         Some("room_not_found") => "Room not found on receiver.".into(),
         Some("transfer_missing") => "Transfer session not found on receiver.".into(),
         Some("chunk_too_large") => "Chunk too large for receiver".into(),
+        Some("unsupported_chunk_protocol") => "Unsupported chunk protocol".into(),
         Some("invalid_chunk_payload") => "Invalid chunk payload".into(),
         Some("invalid_chunk_encoding") => "Invalid chunk encoding".into(),
         Some("integrity_failed") => "Chunk integrity check failed".into(),
@@ -2789,6 +3282,8 @@ fn map_response_error_message(details: &ResponseErrorDetails) -> String {
                 "Chunk too large for receiver".into()
             } else if details.status == StatusCode::NOT_FOUND {
                 "Transfer session not found on receiver.".into()
+            } else if details.status == StatusCode::UNSUPPORTED_MEDIA_TYPE {
+                "Unsupported chunk protocol".into()
             } else if details.status == StatusCode::INTERNAL_SERVER_ERROR {
                 "Receiver failed to write chunk".into()
             } else if details.status == StatusCode::GONE {
@@ -2804,6 +3299,7 @@ fn status_fallback_message(status: StatusCode) -> &'static str {
     match status {
         StatusCode::PAYLOAD_TOO_LARGE => "Chunk too large for receiver",
         StatusCode::NOT_FOUND => "Transfer session not found on receiver.",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => "Unsupported chunk protocol",
         StatusCode::INTERNAL_SERVER_ERROR => "Receiver failed to write chunk",
         StatusCode::REQUEST_TIMEOUT => TRANSFER_INTERRUPTED_MESSAGE,
         StatusCode::GONE => TRANSFER_INTERRUPTED_MESSAGE,
@@ -3224,6 +3720,22 @@ fn chunk_count(file_size: u64, chunk_size: usize) -> u64 {
         return 0;
     }
     file_size.div_ceil(chunk_size as u64)
+}
+
+fn json_base64_estimated_chunk_len(
+    chunk_index: u64,
+    plaintext_size: usize,
+    ciphertext_len: usize,
+    is_final: bool,
+) -> usize {
+    let nonce_len = STANDARD.encode([0u8; BINARY_CHUNK_NONCE_LEN]).len();
+    let ciphertext_len = ciphertext_len.div_ceil(3) * 4;
+    format!(
+        r#"{{"chunk_index":{chunk_index},"nonce":"","ciphertext":"","plaintext_size":{plaintext_size},"is_final":{is_final}}}"#
+    )
+    .len()
+        + nonce_len
+        + ciphertext_len
 }
 
 fn verify_finalize_metadata(
@@ -3760,6 +4272,163 @@ mod tests {
         let body = serde_json::to_vec(&upload).expect("chunk upload serializes");
 
         assert!(body.len() < MAX_CHUNK_BODY_BYTES);
+    }
+
+    #[test]
+    fn four_mib_binary_chunk_frame_stays_below_receiver_limit() {
+        let ciphertext_len = DEFAULT_CHUNK_SIZE_BYTES as usize + 16;
+        let frame_len = crate::chunk_frame::BINARY_CHUNK_HEADER_LEN + ciphertext_len;
+
+        assert!(frame_len < MAX_CHUNK_BODY_BYTES);
+    }
+
+    #[test]
+    fn binary_frame_payload_is_smaller_than_json_base64_estimate() {
+        let ciphertext_len = DEFAULT_CHUNK_SIZE_BYTES as usize + 16;
+        let binary_len = crate::chunk_frame::BINARY_CHUNK_HEADER_LEN + ciphertext_len;
+        let json_len = json_base64_estimated_chunk_len(
+            0,
+            DEFAULT_CHUNK_SIZE_BYTES as usize,
+            ciphertext_len,
+            false,
+        );
+
+        assert!(binary_len < json_len);
+        assert_eq!(json_len - binary_len, 1_398_174);
+    }
+
+    #[test]
+    fn receiver_accepts_binary_v1_chunk_payload() {
+        let frame = BinaryChunkFrame {
+            chunk_index: 3,
+            nonce: [5u8; BINARY_CHUNK_NONCE_LEN],
+            ciphertext: vec![1, 2, 3, 4],
+            plaintext_size: 4,
+            is_final: true,
+        };
+        let body = encode_binary_chunk_frame(&frame).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
+        headers.insert(
+            CHUNK_PROTOCOL_HEADER,
+            CHUNK_PROTOCOL_BINARY_V1.parse().unwrap(),
+        );
+
+        let decoded = decode_received_chunk_upload(&headers, &body).unwrap();
+
+        assert_eq!(decoded.protocol, ChunkProtocol::BinaryV1);
+        assert_eq!(decoded.chunk_index, frame.chunk_index);
+        assert_eq!(decoded.nonce, frame.nonce);
+        assert_eq!(decoded.ciphertext, frame.ciphertext);
+        assert_eq!(decoded.plaintext_size, frame.plaintext_size as u64);
+        assert!(decoded.is_final);
+    }
+
+    #[test]
+    fn receiver_still_accepts_legacy_json_chunk_upload() {
+        let upload = ChunkUploadRequest {
+            chunk_index: 2,
+            nonce: STANDARD.encode([8u8; BINARY_CHUNK_NONCE_LEN]),
+            ciphertext: STANDARD.encode([1u8, 2, 3, 4]),
+            plaintext_size: 4,
+            is_final: false,
+        };
+        let body = serde_json::to_vec(&upload).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+
+        let decoded = decode_received_chunk_upload(&headers, &body).unwrap();
+
+        assert_eq!(decoded.protocol, ChunkProtocol::JsonV1);
+        assert_eq!(decoded.chunk_index, upload.chunk_index);
+        assert_eq!(decoded.nonce, [8u8; BINARY_CHUNK_NONCE_LEN]);
+        assert_eq!(decoded.ciphertext, vec![1, 2, 3, 4]);
+        assert_eq!(decoded.plaintext_size, upload.plaintext_size);
+    }
+
+    #[test]
+    fn json_protocol_header_keeps_fallback_path_working() {
+        let upload = ChunkUploadRequest {
+            chunk_index: 0,
+            nonce: STANDARD.encode([1u8; BINARY_CHUNK_NONCE_LEN]),
+            ciphertext: STANDARD.encode([9u8; 16]),
+            plaintext_size: 16,
+            is_final: true,
+        };
+        let body = serde_json::to_vec(&upload).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CHUNK_PROTOCOL_HEADER,
+            CHUNK_PROTOCOL_JSON_V1.parse().unwrap(),
+        );
+
+        let decoded = decode_received_chunk_upload(&headers, &body).unwrap();
+
+        assert_eq!(decoded.protocol, ChunkProtocol::JsonV1);
+        assert_eq!(decoded.ciphertext.len(), 16);
+        assert!(decoded.is_final);
+    }
+
+    #[test]
+    fn start_response_selects_binary_when_receiver_advertises_support() {
+        let body = serde_json::to_string(&file_transfer_start_response()).unwrap();
+
+        assert_eq!(
+            selected_chunk_protocol_from_start_response(&body),
+            ChunkProtocol::BinaryV1
+        );
+    }
+
+    #[test]
+    fn start_response_uses_json_when_capability_is_unknown() {
+        assert_eq!(
+            selected_chunk_protocol_from_start_response(r#"{"ok":true}"#),
+            ChunkProtocol::JsonV1
+        );
+        assert_eq!(
+            selected_chunk_protocol_from_start_response(""),
+            ChunkProtocol::JsonV1
+        );
+    }
+
+    #[test]
+    fn unsupported_protocol_maps_to_unsupported_chunk_protocol() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CHUNK_PROTOCOL_HEADER, "binary-v2".parse().unwrap());
+
+        let error = decode_received_chunk_upload(&headers, b"ignored").unwrap_err();
+
+        assert_eq!(error.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(error.code, "unsupported_chunk_protocol");
+        assert_eq!(error.message, "Unsupported chunk protocol");
+    }
+
+    #[test]
+    fn body_limit_status_still_maps_to_chunk_too_large() {
+        assert_eq!(
+            map_response_error_message(&details(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                None,
+                "body limit exceeded"
+            )),
+            "Chunk too large for receiver"
+        );
+    }
+
+    #[test]
+    fn corrupted_ciphertext_maps_to_integrity_failure_after_decrypt_attempt() {
+        let key = [3u8; 32];
+        let (mut ciphertext, nonce) = crypto::encrypt_bytes(b"hello", &key).unwrap();
+        ciphertext[0] ^= 0xff;
+
+        assert!(crypto::decrypt_bytes(&ciphertext, &key, &nonce).is_err());
+        assert_eq!(
+            receiver_failure_log_message("integrity_failed"),
+            "Chunk integrity check failed"
+        );
     }
 
     #[test]

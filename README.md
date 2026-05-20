@@ -13,6 +13,15 @@ It is built with:
 
 ## Version history
 
+### 1.5.0 — Binary chunk protocol
+
+- Added binary-v1 chunk frames for high-speed LAN file transfer.
+- Reduced full 4 MiB chunk payload size from about 5.59 MB with JSON/base64 to about 4.19 MB with binary framing.
+- Preserved legacy JSON/base64 chunk upload support for compatibility.
+- Added protocol capability selection so updated peers use binary-v1 while unknown peers remain on JSON.
+- Kept encryption, nonce behavior, chunk sizing, ACKs, burn/finalize lifecycle, and nearby discovery semantics unchanged.
+- Added binary frame encode/decode validation and regression tests.
+
 ### 1.4.1 — Nearby join reliability
 
 - Fixed nearby join requests using the advertised LAN HTTP endpoint instead of the UDP beacon source port.

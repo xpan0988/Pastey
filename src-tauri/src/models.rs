@@ -304,6 +304,8 @@ pub struct FileTransferStartRequest {
     pub wrapped_session_key: String,
     pub transport_nonce: String,
     pub sender_public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_chunk_protocol: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

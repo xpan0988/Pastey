@@ -1,3 +1,4 @@
+mod chunk_frame;
 mod cleanup;
 mod commands;
 mod config;
