@@ -100,7 +100,10 @@ export async function getConfig(): Promise<AppConfig> {
 }
 
 export async function updateConfig(config: AppConfig): Promise<AppConfig> {
-  return invoke("update_config", { config });
+  console.debug("[pastey settings][frontend] updateConfig payload", {
+    speed_limit_mbps: config.speed_limit_mbps
+  });
+  return invoke("update_config", { configValue: config });
 }
 
 export async function revealInFolder(path: string): Promise<void> {

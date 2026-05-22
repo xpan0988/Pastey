@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{crypto, error::AppResult, models::AppConfig, storage::AppPaths};
+use crate::{crypto, error::AppResult, logging, models::AppConfig, storage::AppPaths};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredConfig {
@@ -34,6 +34,10 @@ pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfi
         if changed {
             save(paths, &stored)?;
         }
+        logging::write_transfer_line(&format!(
+            "[pastey settings][backend] event=config_loaded speed_limit_mbps={:?}",
+            normalize_speed_limit(stored.speed_limit_mbps)
+        ));
         return Ok(stored);
     }
 
@@ -49,12 +53,19 @@ pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfi
     };
 
     save(paths, &stored)?;
+    logging::write_transfer_line(
+        "[pastey settings][backend] event=config_created speed_limit_mbps=None",
+    );
     Ok(stored)
 }
 
 pub fn save(paths: &AppPaths, config: &StoredConfig) -> AppResult<()> {
     let json = serde_json::to_string_pretty(config)?;
     fs::write(&paths.config_path, json)?;
+    logging::write_transfer_line(&format!(
+        "[pastey settings][backend] event=config_persisted speed_limit_mbps={:?}",
+        normalize_speed_limit(config.speed_limit_mbps)
+    ));
     Ok(())
 }
 
@@ -75,6 +86,10 @@ pub fn update(
     current: &mut StoredConfig,
     incoming: AppConfig,
 ) -> AppResult<AppConfig> {
+    logging::write_transfer_line(&format!(
+        "[pastey settings][backend] event=config_update_received speed_limit_mbps={:?}",
+        incoming.speed_limit_mbps
+    ));
     current.default_expiry_minutes = clamp_expiry(incoming.default_expiry_minutes);
     current.auto_burn_after_download = incoming.auto_burn_after_download;
     current.inbox_dir = normalize_inbox_dir(paths, incoming.inbox_dir.as_deref());
