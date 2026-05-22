@@ -503,10 +503,6 @@ pub async fn cancel_transfer(
 #[tauri::command]
 pub fn get_config(state: State<'_, Arc<AppState>>) -> Result<AppConfig, String> {
     let config = state.config.read().clone();
-    crate::logging::write_transfer_line(&format!(
-        "[pastey settings][backend] event=config_read speed_limit_mbps={:?}",
-        config.speed_limit_mbps
-    ));
     Ok(config::public_config(&state.paths, &config))
 }
 

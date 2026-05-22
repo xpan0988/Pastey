@@ -65,7 +65,8 @@ export interface AppConfig {
   default_expiry_minutes: number;
   inbox_dir?: string | null;
   auto_burn_after_download: boolean;
-  speed_limit_mbps?: number | null;
+  transfer_window_override?: number | null;
+  dev_tools_enabled: boolean;
   shortcut: string;
   app_data_path: string;
   app_version: string;

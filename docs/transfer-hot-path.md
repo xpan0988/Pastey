@@ -13,23 +13,18 @@ Investigation summary for the LAN throughput collapse:
 
 Implemented first incremental fix:
 
-- Binary-v1 senders use a conservative window of 4 in-flight chunk uploads.
+- Binary-v1 senders use pipelined in-flight chunk uploads.
 - Receiver accepts chunks by `chunk_index` and writes each chunk at its file offset, allowing pipelined chunks to complete out of order.
 - Receiver tracks a per-transfer received bitmap; finalize still verifies the received chunk count and size.
 - Hot-path progress and non-error logs are sampled/throttled to reduce self-inflicted I/O overhead.
 - Sampled timing logs now report sender read/encrypt/send/ACK timing and receiver decode/decrypt/write/UI timing without paths, keys, or content.
 
-Speed limit wiring:
+Default transfer tuning:
 
-- The Settings UI saves `speed_limit_mbps` through `update_config`.
-- Rust persists it in `StoredConfig` and active transfers read `state.config`, so pacing changes are visible without app restart.
-- Existing pacing applies to both binary-v1 and legacy JSON/base64 paths after ACK progress.
-- Binary-v1 now also maps the configured MB/s limit to its transfer window at transfer start:
-  - Unlimited: window 4
-  - 100 MB/s and higher: window 4
-  - 50 MB/s or custom up to 50: window 2
-  - 10 MB/s or lower: window 1
-- Benchmark runs can force a window with `PASTEY_TRANSFER_WINDOW_SIZE`; values are clamped to 1..16.
+- Normal binary-v1 transfers default to `window=8`.
+- Release-build LAN testing found `window=8` to be the best observed stable default: `window=4` reached about 96-103 MB/s, `window=8` reached about 111 MB/s, and `window=16` averaged about 107 MB/s with higher ACK wait.
+- User-facing MB/s speed limiting was removed; normal transfers do not sleep for speed pacing.
+- Developer benchmarking can still force a window with `PASTEY_TRANSFER_WINDOW_SIZE`; values are clamped to 1..16.
 
 ## Transfer Window Tuning
 
@@ -37,7 +32,9 @@ Speed limit wiring:
 
 Increasing the window is expected to improve throughput only until something else becomes the bottleneck: link bandwidth, receiver CPU, disk writes, queueing, or OS/network buffers. Scaling is not guaranteed to be linear, and very large windows can increase memory usage, latency, and receiver backlog.
 
-The normal Settings UI does not expose window size. For release-build benchmarking, start Pastey with `PASTEY_TRANSFER_WINDOW_SIZE` set to one of `1`, `2`, `4`, `8`, or `16`. Invalid values fall back to the speed-limit mapping; numeric values outside the supported range are clamped to `1..16`.
+The normal Settings UI does not expose window size. Developer tools can expose a Transfer Window block with Default / Auto, `window=1`, `window=2`, `window=4`, `window=8`, `window=16`, and custom window options. Enable it with a debug build or `PASTEY_DEV_TOOLS=1`.
+
+For release-build benchmarking, start Pastey with `PASTEY_TRANSFER_WINDOW_SIZE` set to one of `1`, `2`, `4`, `8`, or `16`. The environment override takes precedence over the dev Settings value. Invalid non-numeric values fall back to the dev Settings value or default; numeric values outside the supported range are clamped to `1..16`.
 
 Manual launch examples:
 
@@ -71,4 +68,4 @@ For each run, record:
 - failed chunks
 - finalize success
 
-The transfer logs include `event=transfer_tuning` at transfer start with `configured_speed_limit_mbps`, `effective_window_size`, `chunk_size`, `override_source`, and `transfer_protocol`. Successful binary-v1 transfers also emit `event=transfer_benchmark_summary` with sender and receiver timing summaries.
+The transfer logs include `event=transfer_tuning` at transfer start with `effective_window_size`, `chunk_size`, `override_source`, and `transfer_protocol`. Successful binary-v1 transfers also emit `event=transfer_benchmark_summary` with sender and receiver timing summaries.

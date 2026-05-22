@@ -3,6 +3,7 @@ mod cleanup;
 mod commands;
 mod config;
 mod crypto;
+mod dev_tools;
 mod discovery;
 mod error;
 mod logging;
