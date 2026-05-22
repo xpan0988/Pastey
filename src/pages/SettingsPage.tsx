@@ -27,6 +27,7 @@ export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
   }
 
   async function saveSpeedLimit(nextValue: string) {
+    console.debug("[pastey settings][frontend] speed dropdown selected", { value: nextValue });
     setSpeedValue(nextValue);
     if (nextValue === "custom") {
       const currentCustom = validCustomSpeed(customSpeed) ?? 25;
@@ -50,6 +51,9 @@ export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
 
     setCustomSpeed(String(nextCustom));
     setSpeedValue("custom");
+    console.debug("[pastey settings][frontend] custom speed selected", {
+      speed_limit_mbps: nextCustom
+    });
     await save({ ...config, speed_limit_mbps: nextCustom });
   }
 
