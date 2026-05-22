@@ -13,6 +13,26 @@ It is built with:
 
 ## Version history
 
+### 1.5.2 — Speed policy and settings persistence
+
+- Wired the Settings transfer speed limit into binary-v1 transfer window selection.
+- Mapped Unlimited / 100 MB/s to window 4, 50 MB/s to window 2, and 10 MB/s to window 1.
+- Added a debug transfer window override for benchmarking window 1, 2, 4, 8, and 16.
+- Added transfer benchmark summary logs with effective window size, duration, throughput, and hot-path timing.
+- Fixed the frontend Tauri argument name for config updates so speed limit changes persist correctly.
+- Kept existing pacing behavior for both binary-v1 and legacy JSON transfer paths.
+- Verified bidirectional transfers after the speed policy fix.
+
+### 1.5.1 — Transfer pipeline validation
+
+- Replaced stop-and-wait binary-v1 chunk uploads with pipelined in-flight chunk uploads.
+- Added out-of-order binary chunk handling with receiver-side file offset writes.
+- Added received-chunk bitmap tracking so finalize still verifies full chunk count and total size.
+- Safely ACKed duplicate chunks without double-counting received bytes.
+- Reduced transfer hot-path overhead by throttling progress events and sampling non-error chunk logs.
+- Removed per-chunk file flush after each receiver write.
+- Added sampled sender and receiver timing logs for transfer hot-path profiling.
+- Validated release transfer throughput improving from about 4.6 MB/s to about 91 MB/s in local LAN testing.
 ### 1.5.0 — Binary chunk protocol
 
 - Added binary-v1 chunk frames for high-speed LAN file transfer.
@@ -219,18 +239,34 @@ Packaged desktop app with artifact audit:
 npm run build:checked
 ```
 
-## Create a release
-
-GitHub Actions builds precompiled macOS and Windows installers when a version tag is pushed:
+### Release workflow
 
 ```bash
-git tag v1.4.0
-git push origin v1.4.0
+npm run release:version -- 1.5.3 "Release Title"
+git push origin main --tags
 ```
 
-The release workflow builds the frontend, runs `cargo check`, packages the Tauri app, audits bundle contents and size, then uploads the generated installers to the GitHub Release. It does not upload `node_modules`, build caches, local app data, logs, inbox contents, temp files, or local databases.
+### Dry-run release workflow
 
-The Settings screen includes a Check for updates button that opens GitHub Releases. A full signed auto-updater can be added later.
+```bash
+npm run release:version -- 1.5.3 "Release Title" --dry-run
+```
+
+### What the release workflow does
+
+- Uses `src-tauri/Cargo.toml` as the authoritative version source.
+- Syncs `package.json`, `package-lock.json`, `tauri.conf.json`, and `Cargo.lock` when needed.
+- Updates `CHANGELOG.md`.
+- Creates commit:
+  ```text
+  chore(release): vX.Y.Z
+  ```
+- Creates annotated tag:
+  ```text
+  vX.Y.Z
+  ```
+- Does not push automatically.
+- Pushing tags triggers GitHub Actions release builds.
 
 ## Logs
 
