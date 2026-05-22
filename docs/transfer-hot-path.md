@@ -30,3 +30,45 @@ Speed limit wiring:
   - 50 MB/s or custom up to 50: window 2
   - 10 MB/s or lower: window 1
 - Benchmark runs can force a window with `PASTEY_TRANSFER_WINDOW_SIZE`; values are clamped to 1..16.
+
+## Transfer Window Tuning
+
+`window=1` is equivalent to the old stop-and-wait behavior: the sender uploads one encrypted chunk and waits for its ACK before starting the next chunk. Larger windows allow multiple encrypted binary-v1 chunks to be in flight at the same time, which keeps a fast LAN link busier while the receiver decrypts, writes, and acknowledges earlier chunks.
+
+Increasing the window is expected to improve throughput only until something else becomes the bottleneck: link bandwidth, receiver CPU, disk writes, queueing, or OS/network buffers. Scaling is not guaranteed to be linear, and very large windows can increase memory usage, latency, and receiver backlog.
+
+The normal Settings UI does not expose window size. For release-build benchmarking, start Pastey with `PASTEY_TRANSFER_WINDOW_SIZE` set to one of `1`, `2`, `4`, `8`, or `16`. Invalid values fall back to the speed-limit mapping; numeric values outside the supported range are clamped to `1..16`.
+
+Manual launch examples:
+
+```sh
+PASTEY_TRANSFER_WINDOW_SIZE=8 open /Applications/pastey.app
+```
+
+```powershell
+$env:PASTEY_TRANSFER_WINDOW_SIZE="8"; Start-Process "pastey.exe"
+```
+
+## Benchmark Checklist
+
+Use the same large file, same sender, same receiver, same network, and release builds only. Record one row per forced window:
+
+- `window=1`
+- `window=2`
+- `window=4`
+- `window=8`
+- `window=16`
+
+For each run, record:
+
+- average MB/s
+- receiver CPU
+- sender CPU
+- `decrypt_ms`
+- `write_ms`
+- `send_ack_ms`
+- duplicate chunks
+- failed chunks
+- finalize success
+
+The transfer logs include `event=transfer_tuning` at transfer start with `configured_speed_limit_mbps`, `effective_window_size`, `chunk_size`, `override_source`, and `transfer_protocol`. Successful binary-v1 transfers also emit `event=transfer_benchmark_summary` with sender and receiver timing summaries.
