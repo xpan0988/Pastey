@@ -23,7 +23,7 @@ Default transfer tuning:
 
 - Normal binary-v1 transfers default to `window=8`.
 - Release-build LAN testing found `window=8` to be the best observed stable default: `window=4` reached about 96-103 MB/s, `window=8` reached about 111 MB/s, and `window=16` averaged about 107 MB/s with higher ACK wait.
-- User-facing MB/s speed limiting was removed; normal transfers do not sleep for speed pacing.
+- There is no user-facing MB/s transfer limiter; normal transfers do not sleep for speed pacing.
 - Developer benchmarking can still force a window with `PASTEY_TRANSFER_WINDOW_SIZE`; values are clamped to 1..16.
 
 ## Transfer Window Tuning
@@ -58,7 +58,7 @@ Use the same large file, same sender, same receiver, same network, and release b
 
 For each run, record:
 
-- average MB/s
+- `average_MBps`
 - receiver CPU
 - sender CPU
 - `decrypt_ms`

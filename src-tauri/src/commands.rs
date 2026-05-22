@@ -508,6 +508,8 @@ pub fn get_config(state: State<'_, Arc<AppState>>) -> Result<AppConfig, String> 
 
 #[tauri::command]
 pub fn update_config(
+    // The frontend must invoke this as `configValue`; Tauri maps that camel-case
+    // argument onto this Rust `config_value` parameter.
     config_value: AppConfig,
     state: State<'_, Arc<AppState>>,
 ) -> Result<AppConfig, String> {
