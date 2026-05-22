@@ -1,0 +1,20 @@
+# Transfer Hot Path Notes
+
+Investigation summary for the LAN throughput collapse:
+
+- Sender chunk upload was stop-and-wait: read one chunk, encrypt it, encode it, POST it, wait for that chunk ACK, emit progress, then continue.
+- Receiver chunk handling enforced strict `expected_chunk_index == chunk_index`, so concurrent or out-of-order binary chunk uploads were rejected.
+- ACK generation is per chunk in `receive_file_chunk_handler`; sender ACK waiting was inside `send_chunk_with_retry`.
+- Frontend progress was emitted per acknowledged sender chunk and per received receiver chunk.
+- SQLite room item status is not written per chunk; status writes happen at terminal states such as sent, failed, cancelled, and finalize.
+- Logging was in the per-chunk hot path on sender and receiver. Each log line goes through `logging::write_transfer_line`, which opens/appends the log file.
+- Binary-v1 frame encode/decode lives in `src-tauri/src/chunk_frame.rs`; the binary sender still builds one per-chunk request body, but avoids JSON/base64.
+- Receiver `.part` writes previously opened the part file in append mode for each chunk and flushed each chunk.
+
+Implemented first incremental fix:
+
+- Binary-v1 senders use a conservative window of 4 in-flight chunk uploads.
+- Receiver accepts chunks by `chunk_index` and writes each chunk at its file offset, allowing pipelined chunks to complete out of order.
+- Receiver tracks a per-transfer received bitmap; finalize still verifies the received chunk count and size.
+- Hot-path progress and non-error logs are sampled/throttled to reduce self-inflicted I/O overhead.
+- Sampled timing logs now report sender read/encrypt/send/ACK timing and receiver decode/decrypt/write/UI timing without paths, keys, or content.

@@ -14,11 +14,12 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use tokio::{
     fs::OpenOptions,
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
     net::TcpListener,
     sync::oneshot,
 };
@@ -49,6 +50,8 @@ const MAX_CHUNK_BODY_BYTES: usize = 16 * 1024 * 1024;
 const CHUNK_PROTOCOL_HEADER: &str = "x-pastey-chunk-protocol";
 const CHUNK_PROTOCOL_BINARY_V1: &str = "binary-v1";
 const CHUNK_PROTOCOL_JSON_V1: &str = "json-v1";
+const BINARY_CHUNK_PIPELINE_WINDOW: usize = 4;
+const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(250);
 const TRANSFER_CANCELLED_MESSAGE: &str = "Transfer cancelled";
 const TRANSFER_INTERRUPTED_MESSAGE: &str = "Transfer interrupted";
 const PEER_DISCONNECTED_MESSAGE: &str = "Peer disconnected";
@@ -91,6 +94,7 @@ enum ActiveFileTransferKind {
         created_at: i64,
         transferred_bytes: u64,
         expected_chunk_index: u64,
+        received_chunks: Vec<bool>,
     },
 }
 
@@ -620,233 +624,276 @@ pub async fn send_room_file(
     let mut chunk_index = 0u64;
     let mut chunk_protocol = chunk_protocol;
 
-    loop {
-        if cancel_token.is_cancelled() {
-            notify_transfer_cancel(&client, &base_url, &transfer_id).await;
-            storage::set_room_item_status(&state.paths, item_id, RoomItemStatus::Cancelled)?;
-            finish_transfer_locally(
-                &state,
-                &transfer_id,
-                "cancelled",
-                Some(TRANSFER_CANCELLED_MESSAGE.into()),
-            );
-            return Err(AppError::InvalidInput(TRANSFER_CANCELLED_MESSAGE.into()));
-        }
-
-        if let Some((status, message)) = sender_room_terminal_state(&state, room_id) {
-            notify_transfer_failed(&client, &base_url, &transfer_id, &message).await;
-            finish_sender_terminal(&state, &transfer_id, item_id, status, &message);
-            return Err(AppError::Network(message));
-        }
-
-        let bytes_read = read_next_chunk(&mut file, &mut buffer, chunk_size)
-            .await
-            .map_err(|_| AppError::InvalidInput("Could not read selected file.".into()))?;
-        if bytes_read == 0 {
-            break;
-        }
-
-        let is_final = chunk_index.checked_add(1) == Some(total_chunks);
-        if bytes_read != chunk_size && !is_final {
-            let message = "Internal chunk size mismatch".to_string();
-            notify_transfer_failed(&client, &base_url, &transfer_id, &message).await;
-            dev_log_sender_final_error(
-                &transfer_id,
-                room_id,
-                Some(chunk_index),
-                "internal_chunk_size_mismatch",
-                &format!(
-                    "actual_plaintext_size={bytes_read} expected_non_final_chunk_size={chunk_size}"
-                ),
-            );
-            fail_transfer(&state, &transfer_id, item_id, message.clone());
-            return Err(AppError::Network(message));
-        }
-
-        let (encrypted_bytes, nonce) = crypto::encrypt_bytes(&buffer[..bytes_read], &payload_key)?;
-        dev_log_sender_chunk_plaintext(
-            &transfer_id,
-            room_id,
-            chunk_index,
-            bytes_read,
-            is_final,
-            chunk_size,
-        );
-        let ack = match send_chunk_with_retry(
+    if chunk_protocol == ChunkProtocol::BinaryV1 {
+        chunk_index = match send_binary_chunks_pipelined(
+            &state,
             &client,
             &base_url,
             room_id,
             &transfer_id,
-            chunk_index,
+            &mut file,
+            &mut buffer,
+            chunk_size,
             total_chunks,
-            bytes_read,
-            &nonce,
-            &encrypted_bytes,
+            file_size,
+            &payload_key,
             &cancel_token,
-            chunk_protocol,
         )
         .await
         {
-            Ok(ack) => ack,
+            Ok(sent_chunks) => sent_chunks,
             Err(error) => {
-                if chunk_protocol == ChunkProtocol::BinaryV1
-                    && error.kind == ChunkSendFailureKind::UnsupportedProtocol
-                {
-                    dev_log_sender_binary_fallback_to_json(
-                        &transfer_id,
-                        room_id,
-                        Some(chunk_index),
-                        &error.message,
-                    );
-                    chunk_protocol = ChunkProtocol::JsonV1;
-                    match send_chunk_with_retry(
-                        &client,
-                        &base_url,
-                        room_id,
-                        &transfer_id,
-                        chunk_index,
-                        total_chunks,
-                        bytes_read,
-                        &nonce,
-                        &encrypted_bytes,
-                        &cancel_token,
-                        chunk_protocol,
-                    )
-                    .await
-                    {
-                        Ok(ack) => ack,
-                        Err(error) => {
-                            if error.kind == ChunkSendFailureKind::Cancelled
-                                || cancel_token.is_cancelled()
-                            {
-                                notify_transfer_cancel(&client, &base_url, &transfer_id).await;
-                                let _ = storage::set_room_item_status(
-                                    &state.paths,
-                                    item_id,
-                                    RoomItemStatus::Cancelled,
-                                );
-                                finish_transfer_locally(
-                                    &state,
-                                    &transfer_id,
-                                    "cancelled",
-                                    Some(TRANSFER_CANCELLED_MESSAGE.into()),
-                                );
-                                return Err(AppError::InvalidInput(
-                                    TRANSFER_CANCELLED_MESSAGE.into(),
-                                ));
-                            }
-
-                            notify_transfer_failed(
-                                &client,
-                                &base_url,
-                                &transfer_id,
-                                &error.message,
-                            )
-                            .await;
-                            dev_log_sender_final_error(
-                                &transfer_id,
-                                room_id,
-                                Some(chunk_index),
-                                error.kind.as_str(),
-                                &error.message,
-                            );
-                            if matches!(
-                                error.kind,
-                                ChunkSendFailureKind::PeerLeft
-                                    | ChunkSendFailureKind::Timeout
-                                    | ChunkSendFailureKind::Unreachable
-                            ) {
-                                finish_sender_terminal(
-                                    &state,
-                                    &transfer_id,
-                                    item_id,
-                                    "interrupted",
-                                    &error.message,
-                                );
-                            } else {
-                                fail_transfer(&state, &transfer_id, item_id, error.message.clone());
-                            }
-                            return if error.kind == ChunkSendFailureKind::Timeout {
-                                Err(AppError::Timeout(error.message))
-                            } else {
-                                Err(AppError::Network(error.message))
-                            };
-                        }
-                    }
-                } else {
-                    if error.kind == ChunkSendFailureKind::Cancelled || cancel_token.is_cancelled()
-                    {
-                        notify_transfer_cancel(&client, &base_url, &transfer_id).await;
-                        let _ = storage::set_room_item_status(
-                            &state.paths,
-                            item_id,
-                            RoomItemStatus::Cancelled,
-                        );
-                        finish_transfer_locally(
-                            &state,
-                            &transfer_id,
-                            "cancelled",
-                            Some(TRANSFER_CANCELLED_MESSAGE.into()),
-                        );
-                        return Err(AppError::InvalidInput(TRANSFER_CANCELLED_MESSAGE.into()));
-                    }
-
-                    notify_transfer_failed(&client, &base_url, &transfer_id, &error.message).await;
-                    dev_log_sender_final_error(
-                        &transfer_id,
-                        room_id,
-                        Some(chunk_index),
-                        error.kind.as_str(),
-                        &error.message,
-                    );
-                    if matches!(
-                        error.kind,
-                        ChunkSendFailureKind::PeerLeft
-                            | ChunkSendFailureKind::Timeout
-                            | ChunkSendFailureKind::Unreachable
-                    ) {
-                        finish_sender_terminal(
-                            &state,
-                            &transfer_id,
-                            item_id,
-                            "interrupted",
-                            &error.message,
-                        );
-                    } else {
-                        fail_transfer(&state, &transfer_id, item_id, error.message.clone());
-                    }
-                    return if error.kind == ChunkSendFailureKind::Timeout {
-                        Err(AppError::Timeout(error.message))
-                    } else {
-                        Err(AppError::Network(error.message))
-                    };
-                }
+                return Err(finish_sender_after_chunk_error(
+                    &state,
+                    &client,
+                    &base_url,
+                    room_id,
+                    item_id,
+                    &transfer_id,
+                    None,
+                    error,
+                    &cancel_token,
+                )
+                .await);
             }
         };
+    } else {
+        loop {
+            if cancel_token.is_cancelled() {
+                notify_transfer_cancel(&client, &base_url, &transfer_id).await;
+                storage::set_room_item_status(&state.paths, item_id, RoomItemStatus::Cancelled)?;
+                finish_transfer_locally(
+                    &state,
+                    &transfer_id,
+                    "cancelled",
+                    Some(TRANSFER_CANCELLED_MESSAGE.into()),
+                );
+                return Err(AppError::InvalidInput(TRANSFER_CANCELLED_MESSAGE.into()));
+            }
 
-        chunk_index += 1;
-        let transferred = ack.total_received_bytes;
-        let now = Instant::now();
-        let interval = now.duration_since(last_report_at).as_secs_f64().max(0.001);
-        let current_speed = (transferred - last_report_bytes) as f64 / interval;
-        let average_speed =
-            transferred as f64 / now.duration_since(started_at).as_secs_f64().max(0.001);
-        let eta = eta_seconds(file_size, transferred, current_speed);
-        update_sender_transfer_report(&state, &transfer_id, transferred, now);
-        emit_progress(
-            &state,
-            &transfer_id,
-            "outgoing",
-            "transferring",
-            transferred,
-            current_speed,
-            average_speed,
-            eta,
-            None,
-        );
-        last_report_at = now;
-        last_report_bytes = transferred;
-        apply_rate_limit(&state, transferred, started_at).await;
+            if let Some((status, message)) = sender_room_terminal_state(&state, room_id) {
+                notify_transfer_failed(&client, &base_url, &transfer_id, &message).await;
+                finish_sender_terminal(&state, &transfer_id, item_id, status, &message);
+                return Err(AppError::Network(message));
+            }
+
+            let bytes_read = read_next_chunk(&mut file, &mut buffer, chunk_size)
+                .await
+                .map_err(|_| AppError::InvalidInput("Could not read selected file.".into()))?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let is_final = chunk_index.checked_add(1) == Some(total_chunks);
+            if bytes_read != chunk_size && !is_final {
+                let message = "Internal chunk size mismatch".to_string();
+                notify_transfer_failed(&client, &base_url, &transfer_id, &message).await;
+                dev_log_sender_final_error(
+                    &transfer_id,
+                    room_id,
+                    Some(chunk_index),
+                    "internal_chunk_size_mismatch",
+                    &format!(
+                    "actual_plaintext_size={bytes_read} expected_non_final_chunk_size={chunk_size}"
+                ),
+                );
+                fail_transfer(&state, &transfer_id, item_id, message.clone());
+                return Err(AppError::Network(message));
+            }
+
+            let (encrypted_bytes, nonce) =
+                crypto::encrypt_bytes(&buffer[..bytes_read], &payload_key)?;
+            dev_log_sender_chunk_plaintext(
+                &transfer_id,
+                room_id,
+                chunk_index,
+                bytes_read,
+                is_final,
+                chunk_size,
+            );
+            let ack = match send_chunk_with_retry(
+                &client,
+                &base_url,
+                room_id,
+                &transfer_id,
+                chunk_index,
+                total_chunks,
+                bytes_read,
+                &nonce,
+                &encrypted_bytes,
+                &cancel_token,
+                chunk_protocol,
+            )
+            .await
+            {
+                Ok(ack) => ack,
+                Err(error) => {
+                    if chunk_protocol == ChunkProtocol::BinaryV1
+                        && error.kind == ChunkSendFailureKind::UnsupportedProtocol
+                    {
+                        dev_log_sender_binary_fallback_to_json(
+                            &transfer_id,
+                            room_id,
+                            Some(chunk_index),
+                            &error.message,
+                        );
+                        chunk_protocol = ChunkProtocol::JsonV1;
+                        match send_chunk_with_retry(
+                            &client,
+                            &base_url,
+                            room_id,
+                            &transfer_id,
+                            chunk_index,
+                            total_chunks,
+                            bytes_read,
+                            &nonce,
+                            &encrypted_bytes,
+                            &cancel_token,
+                            chunk_protocol,
+                        )
+                        .await
+                        {
+                            Ok(ack) => ack,
+                            Err(error) => {
+                                if error.kind == ChunkSendFailureKind::Cancelled
+                                    || cancel_token.is_cancelled()
+                                {
+                                    notify_transfer_cancel(&client, &base_url, &transfer_id).await;
+                                    let _ = storage::set_room_item_status(
+                                        &state.paths,
+                                        item_id,
+                                        RoomItemStatus::Cancelled,
+                                    );
+                                    finish_transfer_locally(
+                                        &state,
+                                        &transfer_id,
+                                        "cancelled",
+                                        Some(TRANSFER_CANCELLED_MESSAGE.into()),
+                                    );
+                                    return Err(AppError::InvalidInput(
+                                        TRANSFER_CANCELLED_MESSAGE.into(),
+                                    ));
+                                }
+
+                                notify_transfer_failed(
+                                    &client,
+                                    &base_url,
+                                    &transfer_id,
+                                    &error.message,
+                                )
+                                .await;
+                                dev_log_sender_final_error(
+                                    &transfer_id,
+                                    room_id,
+                                    Some(chunk_index),
+                                    error.kind.as_str(),
+                                    &error.message,
+                                );
+                                if matches!(
+                                    error.kind,
+                                    ChunkSendFailureKind::PeerLeft
+                                        | ChunkSendFailureKind::Timeout
+                                        | ChunkSendFailureKind::Unreachable
+                                ) {
+                                    finish_sender_terminal(
+                                        &state,
+                                        &transfer_id,
+                                        item_id,
+                                        "interrupted",
+                                        &error.message,
+                                    );
+                                } else {
+                                    fail_transfer(
+                                        &state,
+                                        &transfer_id,
+                                        item_id,
+                                        error.message.clone(),
+                                    );
+                                }
+                                return if error.kind == ChunkSendFailureKind::Timeout {
+                                    Err(AppError::Timeout(error.message))
+                                } else {
+                                    Err(AppError::Network(error.message))
+                                };
+                            }
+                        }
+                    } else {
+                        if error.kind == ChunkSendFailureKind::Cancelled
+                            || cancel_token.is_cancelled()
+                        {
+                            notify_transfer_cancel(&client, &base_url, &transfer_id).await;
+                            let _ = storage::set_room_item_status(
+                                &state.paths,
+                                item_id,
+                                RoomItemStatus::Cancelled,
+                            );
+                            finish_transfer_locally(
+                                &state,
+                                &transfer_id,
+                                "cancelled",
+                                Some(TRANSFER_CANCELLED_MESSAGE.into()),
+                            );
+                            return Err(AppError::InvalidInput(TRANSFER_CANCELLED_MESSAGE.into()));
+                        }
+
+                        notify_transfer_failed(&client, &base_url, &transfer_id, &error.message)
+                            .await;
+                        dev_log_sender_final_error(
+                            &transfer_id,
+                            room_id,
+                            Some(chunk_index),
+                            error.kind.as_str(),
+                            &error.message,
+                        );
+                        if matches!(
+                            error.kind,
+                            ChunkSendFailureKind::PeerLeft
+                                | ChunkSendFailureKind::Timeout
+                                | ChunkSendFailureKind::Unreachable
+                        ) {
+                            finish_sender_terminal(
+                                &state,
+                                &transfer_id,
+                                item_id,
+                                "interrupted",
+                                &error.message,
+                            );
+                        } else {
+                            fail_transfer(&state, &transfer_id, item_id, error.message.clone());
+                        }
+                        return if error.kind == ChunkSendFailureKind::Timeout {
+                            Err(AppError::Timeout(error.message))
+                        } else {
+                            Err(AppError::Network(error.message))
+                        };
+                    }
+                }
+            };
+
+            chunk_index += 1;
+            let transferred = ack.total_received_bytes;
+            let now = Instant::now();
+            let interval = now.duration_since(last_report_at).as_secs_f64().max(0.001);
+            let current_speed = (transferred - last_report_bytes) as f64 / interval;
+            let average_speed =
+                transferred as f64 / now.duration_since(started_at).as_secs_f64().max(0.001);
+            let eta = eta_seconds(file_size, transferred, current_speed);
+            update_sender_transfer_report(&state, &transfer_id, transferred, now);
+            emit_progress(
+                &state,
+                &transfer_id,
+                "outgoing",
+                "transferring",
+                transferred,
+                current_speed,
+                average_speed,
+                eta,
+                None,
+            );
+            last_report_at = now;
+            last_report_bytes = transferred;
+            apply_rate_limit(&state, transferred, started_at).await;
+        }
     }
 
     if chunk_index != total_chunks {
@@ -920,6 +967,224 @@ fn update_sender_transfer_report(
         transfer.last_report_bytes = transferred;
         transfer.last_report_at = reported_at;
     }
+}
+
+async fn finish_sender_after_chunk_error(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    base_url: &str,
+    room_id: &str,
+    item_id: &str,
+    transfer_id: &str,
+    chunk_index: Option<u64>,
+    error: ChunkSendFailure,
+    cancel_token: &CancellationToken,
+) -> AppError {
+    if error.kind == ChunkSendFailureKind::Cancelled || cancel_token.is_cancelled() {
+        notify_transfer_cancel(client, base_url, transfer_id).await;
+        let _ = storage::set_room_item_status(&state.paths, item_id, RoomItemStatus::Cancelled);
+        finish_transfer_locally(
+            state,
+            transfer_id,
+            "cancelled",
+            Some(TRANSFER_CANCELLED_MESSAGE.into()),
+        );
+        return AppError::InvalidInput(TRANSFER_CANCELLED_MESSAGE.into());
+    }
+
+    notify_transfer_failed(client, base_url, transfer_id, &error.message).await;
+    dev_log_sender_final_error(
+        transfer_id,
+        room_id,
+        chunk_index,
+        error.kind.as_str(),
+        &error.message,
+    );
+    if matches!(
+        error.kind,
+        ChunkSendFailureKind::PeerLeft
+            | ChunkSendFailureKind::Timeout
+            | ChunkSendFailureKind::Unreachable
+    ) {
+        finish_sender_terminal(state, transfer_id, item_id, "interrupted", &error.message);
+    } else {
+        fail_transfer(state, transfer_id, item_id, error.message.clone());
+    }
+
+    if error.kind == ChunkSendFailureKind::Timeout {
+        AppError::Timeout(error.message)
+    } else {
+        AppError::Network(error.message)
+    }
+}
+
+async fn send_binary_chunks_pipelined<R>(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    base_url: &str,
+    room_id: &str,
+    transfer_id: &str,
+    file: &mut R,
+    buffer: &mut Vec<u8>,
+    chunk_size: usize,
+    total_chunks: u64,
+    file_size: u64,
+    payload_key: &[u8; 32],
+    cancel_token: &CancellationToken,
+) -> Result<u64, ChunkSendFailure>
+where
+    R: AsyncRead + Unpin,
+{
+    let started_at = Instant::now();
+    let mut next_chunk_index = 0u64;
+    let mut eof = false;
+    let mut max_acknowledged_bytes = 0u64;
+    let mut last_report_at = started_at;
+    let mut last_report_bytes = 0u64;
+    let mut in_flight = FuturesUnordered::new();
+
+    while !eof || !in_flight.is_empty() {
+        while !eof && in_flight.len() < BINARY_CHUNK_PIPELINE_WINDOW {
+            if cancel_token.is_cancelled() {
+                return Err(ChunkSendFailure {
+                    message: TRANSFER_CANCELLED_MESSAGE.into(),
+                    kind: ChunkSendFailureKind::Cancelled,
+                    retryable: false,
+                });
+            }
+            if let Some((_status, message)) = sender_room_terminal_state(state, room_id) {
+                return Err(ChunkSendFailure {
+                    message,
+                    kind: ChunkSendFailureKind::PeerLeft,
+                    retryable: false,
+                });
+            }
+
+            let read_started = Instant::now();
+            let bytes_read = read_next_chunk(file, buffer, chunk_size)
+                .await
+                .map_err(|_| ChunkSendFailure {
+                    message: "Could not read selected file.".into(),
+                    kind: ChunkSendFailureKind::HttpStatus,
+                    retryable: false,
+                })?;
+            let read_elapsed = read_started.elapsed();
+            if bytes_read == 0 {
+                eof = true;
+                break;
+            }
+
+            let chunk_index = next_chunk_index;
+            let is_final = chunk_index.checked_add(1) == Some(total_chunks);
+            if bytes_read != chunk_size && !is_final {
+                return Err(ChunkSendFailure {
+                    message: "Internal chunk size mismatch".into(),
+                    kind: ChunkSendFailureKind::HttpStatus,
+                    retryable: false,
+                });
+            }
+
+            let encrypt_started = Instant::now();
+            let (encrypted_bytes, nonce) =
+                crypto::encrypt_bytes(&buffer[..bytes_read], payload_key).map_err(|_| {
+                    ChunkSendFailure {
+                        message: "Invalid chunk payload".into(),
+                        kind: ChunkSendFailureKind::HttpStatus,
+                        retryable: false,
+                    }
+                })?;
+            let encrypt_elapsed = encrypt_started.elapsed();
+            dev_log_sender_chunk_plaintext(
+                transfer_id,
+                room_id,
+                chunk_index,
+                bytes_read,
+                is_final,
+                chunk_size,
+            );
+
+            let client = client.clone();
+            let base_url = base_url.to_string();
+            let room_id = room_id.to_string();
+            let transfer_id = transfer_id.to_string();
+            let cancel_token = cancel_token.clone();
+            in_flight.push(async move {
+                let send_started = Instant::now();
+                let result = send_chunk_with_retry(
+                    &client,
+                    &base_url,
+                    &room_id,
+                    &transfer_id,
+                    chunk_index,
+                    total_chunks,
+                    bytes_read,
+                    &nonce,
+                    &encrypted_bytes,
+                    &cancel_token,
+                    ChunkProtocol::BinaryV1,
+                )
+                .await;
+                (
+                    chunk_index,
+                    bytes_read,
+                    read_elapsed,
+                    encrypt_elapsed,
+                    send_started.elapsed(),
+                    result,
+                )
+            });
+            next_chunk_index += 1;
+        }
+
+        let Some((
+            chunk_index,
+            plaintext_size,
+            read_elapsed,
+            encrypt_elapsed,
+            send_elapsed,
+            result,
+        )) = in_flight.next().await
+        else {
+            continue;
+        };
+        let ack = result?;
+        max_acknowledged_bytes = max_acknowledged_bytes.max(ack.total_received_bytes);
+        let now = Instant::now();
+        let should_emit_progress = now.duration_since(last_report_at) >= PROGRESS_EMIT_INTERVAL
+            || max_acknowledged_bytes >= file_size;
+        update_sender_transfer_report(state, transfer_id, max_acknowledged_bytes, now);
+        if should_emit_progress {
+            let interval = now.duration_since(last_report_at).as_secs_f64().max(0.001);
+            let current_speed = (max_acknowledged_bytes - last_report_bytes) as f64 / interval;
+            let average_speed = max_acknowledged_bytes as f64
+                / now.duration_since(started_at).as_secs_f64().max(0.001);
+            emit_progress(
+                state,
+                transfer_id,
+                "outgoing",
+                "transferring",
+                max_acknowledged_bytes,
+                current_speed,
+                average_speed,
+                eta_seconds(file_size, max_acknowledged_bytes, current_speed),
+                None,
+            );
+            last_report_at = now;
+            last_report_bytes = max_acknowledged_bytes;
+        }
+        dev_log_sender_chunk_timing(
+            transfer_id,
+            room_id,
+            chunk_index,
+            plaintext_size,
+            read_elapsed,
+            encrypt_elapsed,
+            send_elapsed,
+        );
+        apply_rate_limit(state, max_acknowledged_bytes, started_at).await;
+    }
+
+    Ok(next_chunk_index)
 }
 
 async fn read_next_chunk<R>(
@@ -1420,6 +1685,10 @@ fn emit_transfer_log(line: String) {
     }
 }
 
+fn should_log_chunk_sample(chunk_index: u64) -> bool {
+    chunk_index < 4 || chunk_index % 32 == 0
+}
+
 fn is_transfer_error_log(line: &str) -> bool {
     line.contains("event=final_error")
         || line.contains("event=start_failure")
@@ -1520,6 +1789,9 @@ fn dev_log_sender_chunk_plaintext(
     is_final: bool,
     expected_non_final_chunk_size: usize,
 ) {
+    if !should_log_chunk_sample(chunk_index) && !is_final {
+        return;
+    }
     emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_plaintext chunk_index={chunk_index} actual_plaintext_size={actual_plaintext_size} is_final={is_final} expected_non_final_chunk_size={expected_non_final_chunk_size}"
     ));
@@ -1536,6 +1808,9 @@ fn dev_log_sender_chunk_request(
     encoded_payload_bytes: usize,
     protocol: ChunkProtocol,
 ) {
+    if !should_log_chunk_sample(chunk_index) {
+        return;
+    }
     emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_request method={method} chunk_url={chunk_url} actual_plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_payload_bytes={encoded_payload_bytes} payload_format={}"
         , protocol.as_str()
@@ -1553,6 +1828,9 @@ fn dev_log_sender_chunk_response(
     status: StatusCode,
     body_text: &str,
 ) {
+    if !should_log_chunk_sample(chunk_index) && status.is_success() {
+        return;
+    }
     emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_response actual_plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_payload_bytes={encoded_payload_bytes} payload_format={} response_status={status} response_body={body_text:?}"
         , protocol.as_str()
@@ -1568,10 +1846,38 @@ fn dev_log_sender_binary_chunk_encode(
     frame_len: usize,
     json_base64_estimated_len: usize,
 ) {
+    if !should_log_chunk_sample(chunk_index) {
+        return;
+    }
     let overhead_saved_estimate = json_base64_estimated_len.saturating_sub(frame_len);
     let overhead_ratio = frame_len as f64 / plaintext_size.max(1) as f64;
     emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=binary_chunk_encode plaintext_size={plaintext_size} ciphertext_len={ciphertext_len} frame_len={frame_len} json_base64_estimated_len={json_base64_estimated_len} overhead_saved_estimate={overhead_saved_estimate} overhead_ratio={overhead_ratio:.4}"
+    ));
+}
+
+fn dev_log_sender_chunk_timing(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: u64,
+    plaintext_size: usize,
+    read_elapsed: Duration,
+    encrypt_elapsed: Duration,
+    send_elapsed: Duration,
+) {
+    if !should_log_chunk_sample(chunk_index) {
+        return;
+    }
+    emit_transfer_log(format!(
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_timing protocol=binary-v1 plaintext_size={plaintext_size} read_ms={} encrypt_ms={} encode_ms=0 http_send_ms={} ack_wait_ms={} total_chunk_ms={}",
+        read_elapsed.as_millis(),
+        encrypt_elapsed.as_millis(),
+        send_elapsed.as_millis(),
+        send_elapsed.as_millis(),
+        read_elapsed
+            .saturating_add(encrypt_elapsed)
+            .saturating_add(send_elapsed)
+            .as_millis()
     ));
 }
 
@@ -1599,6 +1905,9 @@ fn dev_log_sender_chunk_attempt(
     error_kind: &str,
     elapsed: Duration,
 ) {
+    if !should_log_chunk_sample(chunk_index) && error_kind == "ok" {
+        return;
+    }
     emit_transfer_log(format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_attempt retry_count={retry_count} result={error_kind} elapsed_ms={}",
         elapsed.as_millis()
@@ -1658,9 +1967,13 @@ fn dev_log_receiver_start_failure(
 
 fn dev_log_receiver_chunk_route_hit(transfer_id: &str, room_id: &str, chunk_index: Option<u64>) {
     match chunk_index {
-        Some(chunk_index) => emit_transfer_log(format!(
-            "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_route_hit"
-        )),
+        Some(chunk_index) => {
+            if should_log_chunk_sample(chunk_index) {
+                emit_transfer_log(format!(
+                    "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_route_hit"
+                ));
+            }
+        }
         None => emit_transfer_log(format!(
             "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk=unknown] event=chunk_route_hit"
         )),
@@ -1676,6 +1989,9 @@ fn dev_log_receiver_chunk_received(
     encoded_payload_bytes: usize,
     protocol: ChunkProtocol,
 ) {
+    if !should_log_chunk_sample(chunk_index) {
+        return;
+    }
     emit_transfer_log(format!(
         "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_received plaintext_size={plaintext_bytes} encoded_ciphertext_bytes={encoded_ciphertext_bytes} encoded_payload_bytes={encoded_payload_bytes} payload_format={}"
         , protocol.as_str()
@@ -1691,10 +2007,37 @@ fn dev_log_receiver_chunk_write_success(
     encoded_payload_bytes: usize,
     protocol: ChunkProtocol,
 ) {
+    if !should_log_chunk_sample(chunk_index) {
+        return;
+    }
     emit_transfer_log(format!(
         "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_write plaintext_size={plaintext_bytes} ciphertext_bytes={ciphertext_bytes} encoded_payload_bytes={encoded_payload_bytes} payload_format={} response_status={} result=success",
         protocol.as_str(),
         StatusCode::OK
+    ));
+}
+
+fn dev_log_receiver_chunk_timing(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_index: u64,
+    plaintext_size: u64,
+    decode_elapsed: Duration,
+    decrypt_elapsed: Duration,
+    write_elapsed: Duration,
+    ui_emit_elapsed: Duration,
+    total_elapsed: Duration,
+) {
+    if !should_log_chunk_sample(chunk_index) {
+        return;
+    }
+    emit_transfer_log(format!(
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_timing plaintext_size={plaintext_size} receiver_decode_ms={} decrypt_ms={} write_ms={} sqlite_ms=0 log_ms=0 ui_emit_ms={} total_chunk_ms={}",
+        decode_elapsed.as_millis(),
+        decrypt_elapsed.as_millis(),
+        write_elapsed.as_millis(),
+        ui_emit_elapsed.as_millis(),
+        total_elapsed.as_millis()
     ));
 }
 
@@ -1706,6 +2049,9 @@ fn dev_log_receiver_chunk_ack(
     total_received_bytes: u64,
     result: &str,
 ) {
+    if !should_log_chunk_sample(chunk_index) && result == "ok" {
+        return;
+    }
     emit_transfer_log(format!(
         "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_ack written_bytes={written_bytes} total_received_bytes={total_received_bytes} result={result}"
     ));
@@ -2256,6 +2602,7 @@ async fn start_file_transfer_handler(
             created_at: start.created_at,
             transferred_bytes: 0,
             expected_chunk_index: 0,
+            received_chunks: vec![false; start.total_chunks as usize],
         },
     };
     emit_event(&ctx.state, &transfer, "pending", 0, 0.0, 0.0, None, None);
@@ -2446,6 +2793,8 @@ async fn receive_file_chunk_handler(
             return transfer_error(status, code, message.into());
         }
     };
+    let total_started = Instant::now();
+    let decode_started = Instant::now();
     let upload = match decode_received_chunk_upload(&headers, &body) {
         Ok(upload) => upload,
         Err(error) => {
@@ -2463,6 +2812,7 @@ async fn receive_file_chunk_handler(
             return transfer_error(error.status, error.code, error.message.into());
         }
     };
+    let decode_elapsed = decode_started.elapsed();
 
     let chunk_index = upload.chunk_index;
     let plaintext_size = upload.plaintext_size;
@@ -2526,7 +2876,7 @@ async fn receive_file_chunk_handler(
             session_key,
             part_path,
             transferred_bytes,
-            expected_chunk_index,
+            received_chunks,
             ..
         } = &transfer.kind
         else {
@@ -2534,6 +2884,13 @@ async fn receive_file_chunk_handler(
                 StatusCode::BAD_REQUEST,
                 "invalid_transfer",
                 "Invalid chunk payload".into(),
+            );
+        };
+        let Some(received) = received_chunks.get(chunk_index as usize) else {
+            return transfer_error(
+                StatusCode::BAD_REQUEST,
+                "metadata_mismatch",
+                "Transfer metadata mismatch".into(),
             );
         };
         let is_expected_final = chunk_index.checked_add(1) == Some(transfer.total_chunks);
@@ -2549,9 +2906,7 @@ async fn receive_file_chunk_handler(
                 "Transfer metadata mismatch",
                 "chunk_larger_than_metadata_chunk_size",
             ))
-        } else if *expected_chunk_index > 0
-            && chunk_index.checked_add(1) == Some(*expected_chunk_index)
-        {
+        } else if *received {
             let duplicate_written_bytes =
                 if chunk_index.checked_add(1) == Some(transfer.total_chunks) {
                     transfer
@@ -2575,22 +2930,16 @@ async fn receive_file_chunk_handler(
                 total_received_bytes: *transferred_bytes,
             })
             .into_response();
-        } else if *expected_chunk_index != chunk_index {
-            Err((
-                "invalid_chunk_order",
-                "Unexpected chunk index",
-                "invalid_chunk_order",
-            ))
         } else {
             Ok((
                 *session_key,
                 part_path.clone(),
                 cancel_token_clone(transfer),
-                *transferred_bytes,
+                transfer.chunk_size.saturating_mul(chunk_index),
             ))
         }
     };
-    let (session_key, part_path, cancel_token, received_before) = match transfer_lookup {
+    let (session_key, part_path, cancel_token, write_offset) = match transfer_lookup {
         Ok(value) => value,
         Err((code, message, cause)) => {
             dev_log_receiver_chunk_failure(
@@ -2615,6 +2964,7 @@ async fn receive_file_chunk_handler(
         );
     }
 
+    let decrypt_started = Instant::now();
     let plaintext = match crypto::decrypt_bytes(&ciphertext, &session_key, &nonce) {
         Ok(plaintext) => plaintext,
         Err(_) => {
@@ -2636,6 +2986,7 @@ async fn receive_file_chunk_handler(
             );
         }
     };
+    let decrypt_elapsed = decrypt_started.elapsed();
     if plaintext.len() as u64 != plaintext_size {
         dev_log_receiver_chunk_failure(
             &transfer_id,
@@ -2655,7 +3006,8 @@ async fn receive_file_chunk_handler(
         );
     }
 
-    if let Err(error) = write_receiver_chunk(&part_path, &plaintext, received_before).await {
+    let write_started = Instant::now();
+    if let Err(error) = write_receiver_chunk(&part_path, &plaintext, write_offset).await {
         dev_log_receiver_chunk_failure(
             &transfer_id,
             &room_id,
@@ -2675,6 +3027,7 @@ async fn receive_file_chunk_handler(
         fail_receiver_transfer(&ctx.state, &transfer_id, error.message).await;
         return transfer_error(error.status, error.code, error.message.into());
     }
+    let write_elapsed = write_started.elapsed();
     dev_log_receiver_chunk_write_success(
         &transfer_id,
         &room_id,
@@ -2685,7 +3038,7 @@ async fn receive_file_chunk_handler(
         upload.protocol,
     );
 
-    let maybe_event = {
+    let (maybe_event, ack_transferred_bytes) = {
         let mut transfers = ctx.state.active_file_transfers.lock();
         let Some(transfer) = transfers.get_mut(&transfer_id) else {
             log_late_event_ignored(&transfer_id, &room_id, "chunk_progress");
@@ -2704,6 +3057,7 @@ async fn receive_file_chunk_handler(
         let ActiveFileTransferKind::Receiver {
             transferred_bytes,
             expected_chunk_index,
+            received_chunks,
             ..
         } = &mut transfer.kind
         else {
@@ -2713,8 +3067,18 @@ async fn receive_file_chunk_handler(
                 "Invalid chunk payload".into(),
             );
         };
-        *transferred_bytes += plaintext_size;
-        *expected_chunk_index += 1;
+        let Some(received) = received_chunks.get_mut(chunk_index as usize) else {
+            return transfer_error(
+                StatusCode::BAD_REQUEST,
+                "metadata_mismatch",
+                "Transfer metadata mismatch".into(),
+            );
+        };
+        if !*received {
+            *received = true;
+            *transferred_bytes += plaintext_size;
+            *expected_chunk_index += 1;
+        }
         let current = *transferred_bytes;
         let interval = now
             .duration_since(previous_report_at)
@@ -2726,29 +3090,44 @@ async fn receive_file_chunk_handler(
                 .duration_since(transfer.started_at)
                 .as_secs_f64()
                 .max(0.001);
-        transfer.last_report_at = now;
-        transfer.last_report_bytes = current;
-        Some((
-            clone_event_base(
-                transfer,
-                "incoming",
-                "transferring",
+        let should_emit_progress = now.duration_since(previous_report_at) >= PROGRESS_EMIT_INTERVAL
+            || current >= transfer.file_size;
+        if should_emit_progress {
+            transfer.last_report_at = now;
+            transfer.last_report_bytes = current;
+            (
+                Some(clone_event_base(
+                    transfer,
+                    "incoming",
+                    "transferring",
+                    current,
+                    current_speed,
+                    average_speed,
+                    eta_seconds(transfer.file_size, current, current_speed),
+                    None,
+                )),
                 current,
-                current_speed,
-                average_speed,
-                eta_seconds(transfer.file_size, current, current_speed),
-                None,
-            ),
-            current,
-        ))
+            )
+        } else {
+            (None, current)
+        }
     };
-    let ack_transferred_bytes = maybe_event
-        .as_ref()
-        .map(|(_, current)| *current)
-        .unwrap_or(plaintext_size);
-    if let Some((event, _)) = maybe_event {
+    let ui_emit_started = Instant::now();
+    if let Some(event) = maybe_event {
         let _ = ctx.state.app_handle.emit(TRANSFER_EVENT, event);
     }
+    let ui_emit_elapsed = ui_emit_started.elapsed();
+    dev_log_receiver_chunk_timing(
+        &transfer_id,
+        &room_id,
+        chunk_index,
+        plaintext_size,
+        decode_elapsed,
+        decrypt_elapsed,
+        write_elapsed,
+        ui_emit_elapsed,
+        total_started.elapsed(),
+    );
     dev_log_receiver_chunk_ack(
         &transfer_id,
         &room_id,
@@ -3781,7 +4160,7 @@ fn cancel_token_clone(transfer: &ActiveFileTransfer) -> CancellationToken {
 async fn write_receiver_chunk(
     part_path: &Path,
     plaintext: &[u8],
-    received_before: u64,
+    write_offset: u64,
 ) -> Result<(), ReceiverWriteFailure> {
     let Some(parent) = part_path.parent() else {
         return Err(receiver_write_failure(
@@ -3805,7 +4184,7 @@ async fn write_receiver_chunk(
     }
 
     let file_exists = tokio::fs::try_exists(part_path).await.unwrap_or(false);
-    if !file_exists && received_before > 0 {
+    if !file_exists && write_offset > 0 {
         return Err(receiver_write_failure(
             part_path,
             "temp_file_disappeared",
@@ -3816,8 +4195,8 @@ async fn write_receiver_chunk(
     }
 
     let mut file = OpenOptions::new()
-        .create(received_before == 0)
-        .append(true)
+        .create(write_offset == 0)
+        .write(true)
         .open(part_path)
         .await
         .map_err(|error| {
@@ -3830,6 +4209,18 @@ async fn write_receiver_chunk(
                 format!("open_failed: {error}"),
             )
         })?;
+    file.seek(SeekFrom::Start(write_offset))
+        .await
+        .map_err(|error| {
+            let (code, message, status) = map_receiver_write_error(&error);
+            receiver_write_failure(
+                part_path,
+                code,
+                message,
+                status,
+                format!("seek_failed: {error}"),
+            )
+        })?;
     file.write_all(plaintext).await.map_err(|error| {
         let (code, message, status) = map_receiver_write_error(&error);
         receiver_write_failure(
@@ -3838,16 +4229,6 @@ async fn write_receiver_chunk(
             message,
             status,
             format!("write_failed: {error}"),
-        )
-    })?;
-    file.flush().await.map_err(|error| {
-        let (code, message, status) = map_receiver_write_error(&error);
-        receiver_write_failure(
-            part_path,
-            code,
-            message,
-            status,
-            format!("flush_failed: {error}"),
         )
     })
 }
@@ -4521,6 +4902,24 @@ mod tests {
         write_receiver_chunk(&part_path, b"hello", 0).await.unwrap();
 
         assert_eq!(tokio::fs::read(&part_path).await.unwrap(), b"hello");
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn writing_pipelined_chunks_uses_file_offsets() {
+        let dir =
+            std::env::temp_dir().join(format!("pastey_chunk_offset_{}", uuid::Uuid::new_v4()));
+        let part_path = dir.join(".pastey-parts").join("transfer.part");
+        tokio::fs::create_dir_all(part_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::File::create(&part_path).await.unwrap();
+
+        write_receiver_chunk(&part_path, b"world", 5).await.unwrap();
+        write_receiver_chunk(&part_path, b"hello", 0).await.unwrap();
+        write_receiver_chunk(&part_path, b"world", 5).await.unwrap();
+
+        assert_eq!(tokio::fs::read(&part_path).await.unwrap(), b"helloworld");
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
