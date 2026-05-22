@@ -18,8 +18,10 @@ function main() {
   const tauriConfig = readJson(path.join("src-tauri", "tauri.conf.json"));
   const cargoToml = fs.readFileSync(path.join(repoRoot, "src-tauri", "Cargo.toml"), "utf8");
   const cargoLock = fs.readFileSync(path.join(repoRoot, "src-tauri", "Cargo.lock"), "utf8");
+  const configRs = fs.readFileSync(path.join(repoRoot, "src-tauri", "src", "config.rs"), "utf8");
 
   const versions = {
+    "src-tauri/Cargo.toml": parseCargoTomlPackageVersion(cargoToml),
     "package.json": requiredValue("package.json version", packageJson.version),
     "package-lock.json": requiredValue("package-lock.json version", packageLock.version),
     "package-lock.json packages[\"\"]": requiredValue(
@@ -27,14 +29,23 @@ function main() {
       packageLock.packages?.[""]?.version
     ),
     "src-tauri/tauri.conf.json": requiredValue("src-tauri/tauri.conf.json version", tauriConfig.version),
-    "src-tauri/Cargo.toml": parseCargoTomlPackageVersion(cargoToml),
     "src-tauri/Cargo.lock pastey": parseCargoLockPackageVersion(cargoLock, "pastey")
   };
+  if (tauriConfig.package?.version) {
+    versions["src-tauri/tauri.conf.json package.version"] = requiredValue(
+      "src-tauri/tauri.conf.json package.version",
+      tauriConfig.package.version
+    );
+  }
 
-  const expected = versions["package.json"];
+  const expected = versions["src-tauri/Cargo.toml"];
   const failures = Object.entries(versions)
     .filter(([, version]) => version !== expected)
     .map(([source, version]) => `${source} is ${JSON.stringify(version)}, expected ${JSON.stringify(expected)}`);
+
+  if (!configRs.includes('env!("CARGO_PKG_VERSION")')) {
+    failures.push("Frontend app version must be sourced from Rust env!(\"CARGO_PKG_VERSION\") via AppConfig.");
+  }
 
   if (process.env.GITHUB_REF_TYPE === "tag" && process.env.GITHUB_REF_NAME) {
     const tagVersion = process.env.GITHUB_REF_NAME.replace(/^v/, "");
