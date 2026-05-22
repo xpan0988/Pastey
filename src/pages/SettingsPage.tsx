@@ -9,52 +9,49 @@ interface SettingsPageProps {
   onConfigChange: (config: AppConfig) => void;
 }
 
-const PRESET_SPEEDS = [10, 50, 100];
+const PRESET_WINDOWS = [1, 2, 4, 8, 16];
+const DEFAULT_WINDOW = 8;
 
 export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
-  const [speedValue, setSpeedValue] = useState(speedSelectionFromConfig(config.speed_limit_mbps, PRESET_SPEEDS));
-  const [customSpeed, setCustomSpeed] = useState(customSpeedFromConfig(config.speed_limit_mbps, PRESET_SPEEDS));
+  const [windowValue, setWindowValue] = useState(windowSelectionFromConfig(config.transfer_window_override, PRESET_WINDOWS));
+  const [customWindow, setCustomWindow] = useState(customWindowFromConfig(config.transfer_window_override, PRESET_WINDOWS));
   const [logActionMessage, setLogActionMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    setSpeedValue(speedSelectionFromConfig(config.speed_limit_mbps, PRESET_SPEEDS));
-    setCustomSpeed(customSpeedFromConfig(config.speed_limit_mbps, PRESET_SPEEDS));
-  }, [config.speed_limit_mbps]);
+    setWindowValue(windowSelectionFromConfig(config.transfer_window_override, PRESET_WINDOWS));
+    setCustomWindow(customWindowFromConfig(config.transfer_window_override, PRESET_WINDOWS));
+  }, [config.transfer_window_override]);
 
   async function save(next: AppConfig) {
     const saved = await updateConfig(next);
     onConfigChange(saved);
   }
 
-  async function saveSpeedLimit(nextValue: string) {
-    console.debug("[pastey settings][frontend] speed dropdown selected", { value: nextValue });
-    setSpeedValue(nextValue);
+  async function saveTransferWindow(nextValue: string) {
+    setWindowValue(nextValue);
     if (nextValue === "custom") {
-      const currentCustom = validCustomSpeed(customSpeed) ?? 25;
-      setCustomSpeed(String(currentCustom));
-      await save({ ...config, speed_limit_mbps: currentCustom });
+      const currentCustom = validCustomWindow(customWindow) ?? DEFAULT_WINDOW;
+      setCustomWindow(String(currentCustom));
+      await save({ ...config, transfer_window_override: currentCustom });
       return;
     }
 
     await save({
       ...config,
-      speed_limit_mbps: nextValue === "unlimited" ? null : Number(nextValue)
+      transfer_window_override: nextValue === "default" ? null : Number(nextValue)
     });
   }
 
-  async function saveCustomSpeed() {
-    const nextCustom = validCustomSpeed(customSpeed);
+  async function saveCustomWindow() {
+    const nextCustom = validCustomWindow(customWindow);
     if (!nextCustom) {
-      setCustomSpeed(customSpeedFromConfig(config.speed_limit_mbps, PRESET_SPEEDS) || "25");
+      setCustomWindow(customWindowFromConfig(config.transfer_window_override, PRESET_WINDOWS) || String(DEFAULT_WINDOW));
       return;
     }
 
-    setCustomSpeed(String(nextCustom));
-    setSpeedValue("custom");
-    console.debug("[pastey settings][frontend] custom speed selected", {
-      speed_limit_mbps: nextCustom
-    });
-    await save({ ...config, speed_limit_mbps: nextCustom });
+    setCustomWindow(String(nextCustom));
+    setWindowValue("custom");
+    await save({ ...config, transfer_window_override: nextCustom });
   }
 
   async function chooseInbox() {
@@ -129,38 +126,45 @@ export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
           </select>
         </label>
 
-        <label className="field">
-          <span>Transfer speed limit</span>
-          <select
-            value={speedValue}
-            onChange={(event) => void saveSpeedLimit(event.target.value)}
-          >
-            <option value="unlimited">Unlimited</option>
-            <option value="10">10 MB/s</option>
-            <option value="50">50 MB/s</option>
-            <option value="100">100 MB/s</option>
-            <option value="custom">Custom MB/s</option>
-          </select>
-        </label>
+        {config.dev_tools_enabled ? (
+          <>
+            <label className="field">
+              <span>Transfer window</span>
+              <select
+                value={windowValue}
+                onChange={(event) => void saveTransferWindow(event.target.value)}
+              >
+                <option value="default">Default / Auto (window 8)</option>
+                <option value="1">window 1</option>
+                <option value="2">window 2</option>
+                <option value="4">window 4</option>
+                <option value="8">window 8</option>
+                <option value="16">window 16</option>
+                <option value="custom">Custom window</option>
+              </select>
+            </label>
 
-        {speedValue === "custom" ? (
-          <label className="field">
-            <span>Custom speed</span>
-            <input
-              type="number"
-              min={1}
-              step={1}
-              value={customSpeed}
-              placeholder="25"
-              onChange={(event) => setCustomSpeed(event.target.value)}
-              onBlur={() => void saveCustomSpeed()}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.currentTarget.blur();
-                }
-              }}
-            />
-          </label>
+            {windowValue === "custom" ? (
+              <label className="field">
+                <span>Custom window</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={16}
+                  step={1}
+                  value={customWindow}
+                  placeholder={String(DEFAULT_WINDOW)}
+                  onChange={(event) => setCustomWindow(event.target.value)}
+                  onBlur={() => void saveCustomWindow()}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
+              </label>
+            ) : null}
+          </>
         ) : null}
 
         <label className="toggle-row">
@@ -214,18 +218,18 @@ export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
   );
 }
 
-function speedSelectionFromConfig(value: number | null | undefined, presets: number[]): string {
-  if (!value || !Number.isFinite(value) || value <= 0) return "unlimited";
+export function windowSelectionFromConfig(value: number | null | undefined, presets: number[]): string {
+  if (!value || !Number.isFinite(value) || value <= 0) return "default";
   return presets.includes(value) ? String(value) : "custom";
 }
 
-function customSpeedFromConfig(value: number | null | undefined, presets: number[]): string {
+export function customWindowFromConfig(value: number | null | undefined, presets: number[]): string {
   if (!value || !Number.isFinite(value) || value <= 0 || presets.includes(value)) return "";
   return String(value);
 }
 
-function validCustomSpeed(value: string): number | null {
+export function validCustomWindow(value: string): number | null {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
-  return Math.min(10_000, Math.max(1, parsed));
+  return Math.min(16, Math.max(1, Math.trunc(parsed)));
 }

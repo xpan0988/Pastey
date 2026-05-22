@@ -51,7 +51,7 @@ const MAX_CHUNK_BODY_BYTES: usize = 16 * 1024 * 1024;
 const CHUNK_PROTOCOL_HEADER: &str = "x-pastey-chunk-protocol";
 const CHUNK_PROTOCOL_BINARY_V1: &str = "binary-v1";
 const CHUNK_PROTOCOL_JSON_V1: &str = "json-v1";
-const BINARY_CHUNK_PIPELINE_WINDOW: usize = 4;
+const BINARY_CHUNK_PIPELINE_WINDOW: usize = 8;
 const MIN_BINARY_CHUNK_WINDOW: usize = 1;
 const MAX_BINARY_CHUNK_WINDOW: usize = 16;
 const DEBUG_WINDOW_ENV: &str = "PASTEY_TRANSFER_WINDOW_SIZE";
@@ -183,19 +183,15 @@ struct ChunkPayloadDecodeFailure {
 
 #[derive(Clone, Copy, Debug)]
 struct TransferTuning {
-    speed_limit_mbps: Option<f64>,
     window_size: usize,
-    debug_window_override: Option<usize>,
     override_source: WindowOverrideSource,
 }
 
 impl Default for TransferTuning {
     fn default() -> Self {
         Self {
-            speed_limit_mbps: None,
             window_size: BINARY_CHUNK_PIPELINE_WINDOW,
-            debug_window_override: None,
-            override_source: WindowOverrideSource::SpeedLimitMapping,
+            override_source: WindowOverrideSource::Default,
         }
     }
 }
@@ -203,14 +199,16 @@ impl Default for TransferTuning {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowOverrideSource {
     Env,
-    SpeedLimitMapping,
+    DevSettings,
+    Default,
 }
 
 impl WindowOverrideSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::Env => "env",
-            Self::SpeedLimitMapping => "speed_limit_mapping",
+            Self::DevSettings => "dev_settings",
+            Self::Default => "default",
         }
     }
 }
@@ -965,7 +963,6 @@ pub async fn send_room_file(
             );
             last_report_at = now;
             last_report_bytes = transferred;
-            apply_rate_limit(&state, transferred, started_at).await;
         }
     }
 
@@ -1043,46 +1040,43 @@ fn update_sender_transfer_report(
 }
 
 fn current_transfer_tuning(state: &Arc<AppState>) -> TransferTuning {
-    let speed_limit_mbps = {
+    let dev_window_override = {
         let config = state.config.read();
-        config.speed_limit_mbps
+        config.transfer_window_override
     };
-    transfer_tuning_from_speed_limit_and_override(
-        speed_limit_mbps,
+    transfer_tuning_from_overrides(
+        dev_window_override,
+        crate::dev_tools::is_dev_tools_enabled(),
         env::var(DEBUG_WINDOW_ENV).ok().as_deref(),
     )
 }
 
-fn transfer_tuning_from_speed_limit_and_override(
-    speed_limit_mbps: Option<f64>,
-    debug_window_override: Option<&str>,
+fn transfer_tuning_from_overrides(
+    dev_window_override: Option<usize>,
+    dev_tools_enabled: bool,
+    env_window_override: Option<&str>,
 ) -> TransferTuning {
-    let speed_limit_mbps = speed_limit_mbps.filter(|value| value.is_finite() && *value > 0.0);
-    let debug_window_override =
-        debug_window_override.and_then(|value| value.trim().parse::<usize>().ok());
-    let override_source = if debug_window_override.is_some() {
-        WindowOverrideSource::Env
-    } else {
-        WindowOverrideSource::SpeedLimitMapping
-    };
-    let mapped_window = debug_window_override
-        .map(clamp_binary_chunk_window)
-        .unwrap_or_else(|| window_size_for_speed_limit(speed_limit_mbps));
+    if let Some(window_size) =
+        env_window_override.and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        return TransferTuning {
+            window_size: clamp_binary_chunk_window(window_size),
+            override_source: WindowOverrideSource::Env,
+        };
+    }
+
+    if dev_tools_enabled {
+        if let Some(window_size) = dev_window_override {
+            return TransferTuning {
+                window_size: clamp_binary_chunk_window(window_size),
+                override_source: WindowOverrideSource::DevSettings,
+            };
+        }
+    }
 
     TransferTuning {
-        speed_limit_mbps,
-        window_size: mapped_window,
-        debug_window_override: debug_window_override.map(clamp_binary_chunk_window),
-        override_source,
-    }
-}
-
-fn window_size_for_speed_limit(speed_limit_mbps: Option<f64>) -> usize {
-    match speed_limit_mbps {
-        None => BINARY_CHUNK_PIPELINE_WINDOW,
-        Some(value) if value <= 10.0 => 1,
-        Some(value) if value <= 50.0 => 2,
-        Some(_) => BINARY_CHUNK_PIPELINE_WINDOW,
+        window_size: BINARY_CHUNK_PIPELINE_WINDOW,
+        override_source: WindowOverrideSource::Default,
     }
 }
 
@@ -1308,7 +1302,6 @@ where
             encrypt_elapsed,
             send_elapsed,
         );
-        apply_rate_limit(state, max_acknowledged_bytes, started_at).await;
     }
 
     dev_log_sender_transfer_summary(
@@ -1925,12 +1918,10 @@ fn sender_transfer_tuning_log_line(
     protocol: ChunkProtocol,
 ) -> String {
     format!(
-        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=transfer_tuning configured_speed_limit_mbps={:?} effective_window_size={} chunk_size={} override_source={} debug_window_override={:?} transfer_protocol={}",
-        tuning.speed_limit_mbps,
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=transfer_tuning effective_window_size={} chunk_size={} override_source={} transfer_protocol={}",
         tuning.window_size,
         chunk_size,
         tuning.override_source.as_str(),
-        tuning.debug_window_override,
         protocol.log_label()
     )
 }
@@ -1965,8 +1956,7 @@ fn dev_log_sender_transfer_summary(
     let average_mbps = total_bytes as f64 * 8.0 / 1_000_000.0 / duration_secs;
     let chunks = timing.chunks.max(1) as u128;
     emit_transfer_log(format!(
-        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=transfer_benchmark_summary transfer_protocol=binary-v1 configured_speed_limit_mbps={:?} effective_window_size={} total_bytes={} duration_ms={} average_mbps={average_mbps:.2} average_MBps={average_mb_per_sec:.2} chunk_size={} chunk_count={} sender_avg_read_ms={} sender_avg_encrypt_ms={} sender_avg_send_ack_ms={} receiver_avg_decode_ms=0 receiver_avg_decrypt_ms=0 receiver_avg_write_ms=0 failed_chunks=0 duplicate_chunks=0 finalize_status=chunks_acknowledged",
-        tuning.speed_limit_mbps,
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=transfer_benchmark_summary transfer_protocol=binary-v1 effective_window_size={} total_bytes={} duration_ms={} average_mbps={average_mbps:.2} average_MBps={average_mb_per_sec:.2} chunk_size={} chunk_count={} sender_avg_read_ms={} sender_avg_encrypt_ms={} sender_avg_send_ack_ms={} receiver_avg_decode_ms=0 receiver_avg_decrypt_ms=0 receiver_avg_write_ms=0 failed_chunks=0 duplicate_chunks=0 finalize_status=chunks_acknowledged",
         tuning.window_size,
         total_bytes,
         total_duration.as_millis(),
@@ -4633,25 +4623,6 @@ async fn cancel_transfer_with_reason(
     Ok(true)
 }
 
-async fn apply_rate_limit(state: &Arc<AppState>, transferred: u64, started_at: Instant) {
-    let limit_mbps = {
-        let config = state.config.read();
-        config.speed_limit_mbps
-    };
-    let Some(limit_mbps) = limit_mbps else {
-        return;
-    };
-    let bytes_per_second = limit_mbps * 1024.0 * 1024.0;
-    if bytes_per_second <= 0.0 {
-        return;
-    }
-    let expected_elapsed = Duration::from_secs_f64(transferred as f64 / bytes_per_second);
-    let actual_elapsed = started_at.elapsed();
-    if expected_elapsed > actual_elapsed {
-        tokio::time::sleep(expected_elapsed - actual_elapsed).await;
-    }
-}
-
 fn has_enough_disk_space(path: &Path, file_size: u64) -> bool {
     let required = file_size.saturating_add(DISK_SPACE_MARGIN_BYTES);
     match available_disk_space(path) {
@@ -5042,17 +5013,15 @@ mod tests {
     }
 
     #[test]
-    fn speed_limit_maps_to_binary_window_size() {
-        assert_eq!(window_size_for_speed_limit(None), 4);
-        assert_eq!(window_size_for_speed_limit(Some(100.0)), 4);
-        assert_eq!(window_size_for_speed_limit(Some(50.0)), 2);
-        assert_eq!(window_size_for_speed_limit(Some(10.0)), 1);
-        assert_eq!(window_size_for_speed_limit(Some(25.0)), 2);
-        assert_eq!(window_size_for_speed_limit(Some(250.0)), 4);
+    fn default_binary_window_is_eight() {
+        let tuning = transfer_tuning_from_overrides(None, false, None);
+
+        assert_eq!(tuning.window_size, 8);
+        assert_eq!(tuning.override_source, WindowOverrideSource::Default);
     }
 
     #[test]
-    fn custom_debug_window_override_is_clamped() {
+    fn env_window_override_is_clamped() {
         for (override_value, expected_window) in [
             ("1", 1),
             ("2", 2),
@@ -5062,36 +5031,51 @@ mod tests {
             ("0", 1),
             ("99", 16),
         ] {
-            let tuning = transfer_tuning_from_speed_limit_and_override(None, Some(override_value));
+            let tuning = transfer_tuning_from_overrides(None, false, Some(override_value));
             assert_eq!(tuning.window_size, expected_window);
             assert_eq!(tuning.override_source, WindowOverrideSource::Env);
         }
     }
 
     #[test]
-    fn debug_window_override_takes_precedence_over_speed_limit() {
-        let tuning = transfer_tuning_from_speed_limit_and_override(Some(10.0), Some("8"));
+    fn env_window_override_takes_precedence_over_dev_setting() {
+        let tuning = transfer_tuning_from_overrides(Some(4), true, Some("8"));
 
         assert_eq!(tuning.window_size, 8);
-        assert_eq!(tuning.debug_window_override, Some(8));
         assert_eq!(tuning.override_source, WindowOverrideSource::Env);
     }
 
     #[test]
-    fn invalid_debug_window_override_falls_back_to_speed_limit() {
-        let tuning = transfer_tuning_from_speed_limit_and_override(Some(50.0), Some("nope"));
+    fn invalid_env_window_override_falls_back_to_dev_setting_or_default() {
+        let dev_tuning = transfer_tuning_from_overrides(Some(4), true, Some("nope"));
+        let default_tuning = transfer_tuning_from_overrides(Some(4), false, Some("nope"));
 
-        assert_eq!(tuning.window_size, 2);
-        assert_eq!(tuning.debug_window_override, None);
+        assert_eq!(dev_tuning.window_size, 4);
         assert_eq!(
-            tuning.override_source,
-            WindowOverrideSource::SpeedLimitMapping
+            dev_tuning.override_source,
+            WindowOverrideSource::DevSettings
+        );
+        assert_eq!(default_tuning.window_size, 8);
+        assert_eq!(
+            default_tuning.override_source,
+            WindowOverrideSource::Default
         );
     }
 
     #[test]
+    fn dev_transfer_window_setting_maps_to_effective_window() {
+        let tuning = transfer_tuning_from_overrides(Some(16), true, None);
+        let hidden_tuning = transfer_tuning_from_overrides(Some(16), false, None);
+
+        assert_eq!(tuning.window_size, 16);
+        assert_eq!(tuning.override_source, WindowOverrideSource::DevSettings);
+        assert_eq!(hidden_tuning.window_size, 8);
+        assert_eq!(hidden_tuning.override_source, WindowOverrideSource::Default);
+    }
+
+    #[test]
     fn transfer_tuning_log_includes_effective_window_and_protocol() {
-        let tuning = transfer_tuning_from_speed_limit_and_override(Some(50.0), Some("8"));
+        let tuning = transfer_tuning_from_overrides(Some(4), true, Some("8"));
 
         let line = sender_transfer_tuning_log_line(
             "transfer-1",
@@ -5102,7 +5086,6 @@ mod tests {
         );
 
         assert!(line.contains("event=transfer_tuning"));
-        assert!(line.contains("configured_speed_limit_mbps=Some(50.0)"));
         assert!(line.contains("effective_window_size=8"));
         assert!(line.contains("chunk_size=4194304"));
         assert!(line.contains("override_source=env"));

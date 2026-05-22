@@ -13,6 +13,13 @@ It is built with:
 
 ## Version history
 
+### 1.5.3 — Dev-only transfer tuning
+
+- Removed user-facing transfer speed limit behavior so normal transfers run at maximum practical speed.
+- Defaulted binary-v1 transfers to window 8 after release LAN testing showed it as the best stable result.
+- Converted transfer tuning into a developer-only Transfer Window control.
+- Kept `PASTEY_TRANSFER_WINDOW_SIZE` for developer benchmarking.
+
 ### 1.5.2 — Speed policy and settings persistence
 
 - Wired the Settings transfer speed limit into binary-v1 transfer window selection.

@@ -2,7 +2,10 @@ use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{crypto, error::AppResult, logging, models::AppConfig, storage::AppPaths};
+use crate::{crypto, dev_tools, error::AppResult, models::AppConfig, storage::AppPaths};
+
+pub const MIN_TRANSFER_WINDOW: usize = 1;
+pub const MAX_TRANSFER_WINDOW: usize = 16;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredConfig {
@@ -11,7 +14,7 @@ pub struct StoredConfig {
     pub inbox_dir: Option<String>,
     pub auto_burn_after_download: bool,
     #[serde(default)]
-    pub speed_limit_mbps: Option<f64>,
+    pub transfer_window_override: Option<usize>,
     pub shortcut: String,
     pub app_secret: String,
     #[serde(default)]
@@ -34,10 +37,6 @@ pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfi
         if changed {
             save(paths, &stored)?;
         }
-        logging::write_transfer_line(&format!(
-            "[pastey settings][backend] event=config_loaded speed_limit_mbps={:?}",
-            normalize_speed_limit(stored.speed_limit_mbps)
-        ));
         return Ok(stored);
     }
 
@@ -46,35 +45,41 @@ pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfi
         default_expiry_minutes: 15,
         inbox_dir: None,
         auto_burn_after_download: false,
-        speed_limit_mbps: None,
+        transfer_window_override: None,
         shortcut: shortcut.to_string(),
         app_secret: crypto::encode_key(&crypto::random_key()),
         device_id: uuid::Uuid::new_v4().to_string(),
     };
 
     save(paths, &stored)?;
-    logging::write_transfer_line(
-        "[pastey settings][backend] event=config_created speed_limit_mbps=None",
-    );
     Ok(stored)
 }
 
 pub fn save(paths: &AppPaths, config: &StoredConfig) -> AppResult<()> {
     let json = serde_json::to_string_pretty(config)?;
     fs::write(&paths.config_path, json)?;
-    logging::write_transfer_line(&format!(
-        "[pastey settings][backend] event=config_persisted speed_limit_mbps={:?}",
-        normalize_speed_limit(config.speed_limit_mbps)
-    ));
     Ok(())
 }
 
 pub fn public_config(paths: &AppPaths, config: &StoredConfig) -> AppConfig {
+    public_config_with_dev_tools(paths, config, dev_tools::is_dev_tools_enabled())
+}
+
+fn public_config_with_dev_tools(
+    paths: &AppPaths,
+    config: &StoredConfig,
+    dev_tools_enabled: bool,
+) -> AppConfig {
     AppConfig {
         default_expiry_minutes: clamp_expiry(config.default_expiry_minutes),
         inbox_dir: Some(effective_inbox_dir(paths, config).display().to_string()),
         auto_burn_after_download: config.auto_burn_after_download,
-        speed_limit_mbps: normalize_speed_limit(config.speed_limit_mbps),
+        transfer_window_override: if dev_tools_enabled {
+            normalize_transfer_window(config.transfer_window_override)
+        } else {
+            None
+        },
+        dev_tools_enabled,
         shortcut: config.shortcut.clone(),
         app_data_path: paths.app_data_dir.display().to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -86,17 +91,29 @@ pub fn update(
     current: &mut StoredConfig,
     incoming: AppConfig,
 ) -> AppResult<AppConfig> {
-    logging::write_transfer_line(&format!(
-        "[pastey settings][backend] event=config_update_received speed_limit_mbps={:?}",
-        incoming.speed_limit_mbps
-    ));
+    update_with_dev_tools_enabled(paths, current, incoming, dev_tools::is_dev_tools_enabled())
+}
+
+fn update_with_dev_tools_enabled(
+    paths: &AppPaths,
+    current: &mut StoredConfig,
+    incoming: AppConfig,
+    dev_tools_enabled: bool,
+) -> AppResult<AppConfig> {
     current.default_expiry_minutes = clamp_expiry(incoming.default_expiry_minutes);
     current.auto_burn_after_download = incoming.auto_burn_after_download;
     current.inbox_dir = normalize_inbox_dir(paths, incoming.inbox_dir.as_deref());
-    current.speed_limit_mbps = normalize_speed_limit(incoming.speed_limit_mbps);
+    if dev_tools_enabled {
+        current.transfer_window_override =
+            normalize_transfer_window(incoming.transfer_window_override);
+    }
     current.version = 3;
     save(paths, current)?;
-    Ok(public_config(paths, current))
+    Ok(public_config_with_dev_tools(
+        paths,
+        current,
+        dev_tools_enabled,
+    ))
 }
 
 pub fn effective_inbox_dir(paths: &AppPaths, config: &StoredConfig) -> std::path::PathBuf {
@@ -130,13 +147,9 @@ fn normalize_inbox_dir(paths: &AppPaths, value: Option<&str>) -> Option<String> 
     }
 }
 
-fn normalize_speed_limit(value: Option<f64>) -> Option<f64> {
+pub fn normalize_transfer_window(value: Option<usize>) -> Option<usize> {
     let value = value?;
-    if !value.is_finite() || value <= 0.0 {
-        None
-    } else {
-        Some(value.clamp(1.0, 10_000.0))
-    }
+    Some(value.clamp(MIN_TRANSFER_WINDOW, MAX_TRANSFER_WINDOW))
 }
 
 #[cfg(test)]
@@ -159,39 +172,74 @@ mod tests {
     }
 
     #[test]
-    fn speed_limit_normalization_treats_invalid_values_as_unlimited() {
-        assert_eq!(normalize_speed_limit(None), None);
-        assert_eq!(normalize_speed_limit(Some(0.0)), None);
-        assert_eq!(normalize_speed_limit(Some(-10.0)), None);
-        assert_eq!(normalize_speed_limit(Some(f64::NAN)), None);
+    fn transfer_window_normalization_clamps_supported_range() {
+        assert_eq!(normalize_transfer_window(None), None);
+        assert_eq!(normalize_transfer_window(Some(0)), Some(1));
+        assert_eq!(normalize_transfer_window(Some(1)), Some(1));
+        assert_eq!(normalize_transfer_window(Some(8)), Some(8));
+        assert_eq!(normalize_transfer_window(Some(99)), Some(16));
     }
 
     #[test]
-    fn speed_limit_normalization_accepts_positive_values() {
-        assert_eq!(normalize_speed_limit(Some(10.0)), Some(10.0));
-        assert_eq!(normalize_speed_limit(Some(50.0)), Some(50.0));
-        assert_eq!(normalize_speed_limit(Some(100.0)), Some(100.0));
-        assert_eq!(normalize_speed_limit(Some(20_000.0)), Some(10_000.0));
+    fn old_config_with_speed_limit_deserializes_safely() {
+        let stored: StoredConfig = serde_json::from_str(
+            r#"{
+                "version": 3,
+                "default_expiry_minutes": 15,
+                "inbox_dir": null,
+                "auto_burn_after_download": false,
+                "speed_limit_mbps": 50,
+                "shortcut": "Ctrl+Shift+V",
+                "app_secret": "abc",
+                "device_id": "device"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(stored.transfer_window_override, None);
     }
 
     #[test]
-    fn speed_limit_update_is_persisted() {
+    fn transfer_window_update_is_persisted_when_dev_tools_are_enabled() {
         let paths = test_paths();
         let mut stored = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
-        let incoming = public_config(&paths, &stored);
-        let updated = update(
+        let incoming = public_config_with_dev_tools(&paths, &stored, true);
+        let updated = update_with_dev_tools_enabled(
             &paths,
             &mut stored,
             AppConfig {
-                speed_limit_mbps: Some(50.0),
+                transfer_window_override: Some(8),
                 ..incoming
             },
+            true,
         )
         .unwrap();
         let reloaded = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
 
-        assert_eq!(updated.speed_limit_mbps, Some(50.0));
-        assert_eq!(reloaded.speed_limit_mbps, Some(50.0));
+        assert_eq!(updated.transfer_window_override, Some(8));
+        assert_eq!(reloaded.transfer_window_override, Some(8));
+
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn normal_public_config_hides_dev_transfer_window() {
+        let paths = test_paths();
+        let stored = StoredConfig {
+            version: 3,
+            default_expiry_minutes: 15,
+            inbox_dir: None,
+            auto_burn_after_download: false,
+            transfer_window_override: Some(16),
+            shortcut: "Ctrl+Shift+V".into(),
+            app_secret: "abc".into(),
+            device_id: "device".into(),
+        };
+
+        let public = public_config_with_dev_tools(&paths, &stored, false);
+
+        assert_eq!(public.transfer_window_override, None);
+        assert!(!public.dev_tools_enabled);
 
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }

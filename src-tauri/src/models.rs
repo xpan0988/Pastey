@@ -146,7 +146,10 @@ pub struct AppConfig {
     pub default_expiry_minutes: u64,
     pub inbox_dir: Option<String>,
     pub auto_burn_after_download: bool,
-    pub speed_limit_mbps: Option<f64>,
+    #[serde(default)]
+    pub transfer_window_override: Option<usize>,
+    #[serde(default)]
+    pub dev_tools_enabled: bool,
     pub shortcut: String,
     pub app_data_path: String,
     pub app_version: String,
