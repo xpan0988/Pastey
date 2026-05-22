@@ -26,20 +26,8 @@ interface RoomPageProps {
   onLeave: (roomId: string) => Promise<void>;
 }
 
-type FileSendSource = "drop" | "picker" | "paste";
-
 function fileIdentityKey(name: string, size: number, lastModified: number): string {
   return `${name}:${size}:${lastModified}`;
-}
-
-function logFileSendTrigger(source: FileSendSource, fileName: string, size: number, dedupeKey: string, ignoredDuplicate: boolean) {
-  console.debug("[pastey file-send]", {
-    source,
-    file_name: fileName,
-    size,
-    dedupe_key: dedupeKey,
-    ignored_duplicate: ignoredDuplicate
-  });
 }
 
 export function RoomPage({
@@ -97,7 +85,7 @@ export function RoomPage({
           setComposerDropActive(false);
           if (!canSend) return;
           for (const path of event.payload.paths) {
-            await handleSendFile(path, "drop");
+            await handleSendFile(path);
           }
           return;
         }
@@ -132,7 +120,7 @@ export function RoomPage({
     }
   }
 
-  async function handleSendFile(path: string, source: FileSendSource) {
+  async function handleSendFile(path: string) {
     try {
       const metadata = await getFileTransferMetadata(path);
       if (metadata.size_bytes > MAX_FILE_SIZE_BYTES) {
@@ -141,7 +129,6 @@ export function RoomPage({
       }
 
       await sendFileMessage({
-        source,
         path,
         displayName: metadata.display_name,
         mimeType: metadata.mime_type,
@@ -163,19 +150,17 @@ export function RoomPage({
     });
 
     if (typeof selected === "string") {
-      await handleSendFile(selected, "picker");
+      await handleSendFile(selected);
     }
   }
 
   async function sendFileMessage({
-    source,
     path,
     displayName,
     mimeType,
     size,
     fileKey
   }: {
-    source: FileSendSource;
     path: string;
     displayName?: string;
     mimeType?: string | null;
@@ -184,7 +169,6 @@ export function RoomPage({
   }) {
     const dedupeKey = fileKey ?? fileIdentityKey(displayName ?? path, size, 0);
     const ignoredDuplicate = inFlightFileKeysRef.current.has(dedupeKey);
-    logFileSendTrigger(source, displayName ?? path, size, dedupeKey, ignoredDuplicate);
     if (ignoredDuplicate) {
       return;
     }
@@ -215,7 +199,6 @@ export function RoomPage({
       const buffer = await file.arrayBuffer();
       tempPath = await writeTempFile(file.name, Array.from(new Uint8Array(buffer)));
       await sendFileMessage({
-        source: "paste",
         path: tempPath,
         displayName: file.name,
         mimeType: file.type || "image/png",

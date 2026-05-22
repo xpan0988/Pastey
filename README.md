@@ -11,23 +11,45 @@ It is built with:
 - Temporary local HTTP transfer endpoints
 - UDP LAN discovery
 
+## Long-term Direction
+
+Pastey started as a lightweight local-first transfer utility for moving files, text, and images between personal devices.
+
+The long-term goal is broader than file transfer alone.
+
+Pastey is gradually evolving toward a local-first device workspace and capability bridge:
+- secure multi-device coordination
+- persistent trusted rooms
+- local-first task and file workflows
+- developer-oriented device tooling
+- controlled capability execution between trusted devices
+- future agent-assisted workflows across nearby or owned devices
+
+The project intentionally prioritizes:
+- local-first operation
+- explicit trust and approval
+- minimal cloud dependency
+- transparent transfer behavior
+- developer visibility and debugging tools
+- high-performance LAN transport
+
+Current releases focus on stabilizing the transport, lifecycle, and cross-platform foundation before larger multi-device workflow features are introduced.
+
 ## Version history
 
 ### 1.5.3 — Dev-only transfer tuning
 
-- Removed user-facing transfer speed limit behavior so normal transfers run at maximum practical speed.
+- Normal transfers now run at maximum practical speed; Settings no longer exposes an MB/s transfer control.
 - Defaulted binary-v1 transfers to window 8 after release LAN testing showed it as the best stable result.
 - Converted transfer tuning into a developer-only Transfer Window control.
 - Kept `PASTEY_TRANSFER_WINDOW_SIZE` for developer benchmarking.
 
 ### 1.5.2 — Speed policy and settings persistence
 
-- Wired the Settings transfer speed limit into binary-v1 transfer window selection.
-- Mapped Unlimited / 100 MB/s to window 4, 50 MB/s to window 2, and 10 MB/s to window 1.
+- Added early transfer-window benchmarking controls for binary-v1 transfer tuning.
 - Added a debug transfer window override for benchmarking window 1, 2, 4, 8, and 16.
 - Added transfer benchmark summary logs with effective window size, duration, throughput, and hot-path timing.
-- Fixed the frontend Tauri argument name for config updates so speed limit changes persist correctly.
-- Kept existing pacing behavior for both binary-v1 and legacy JSON transfer paths.
+- Fixed the frontend Tauri argument name for config updates so Settings changes persist correctly.
 - Verified bidirectional transfers after the speed policy fix.
 
 ### 1.5.1 — Transfer pipeline validation
@@ -97,7 +119,7 @@ It is built with:
 ### 1.1.0 — Large-file transfer
 
 - Raised file support to 10GB with chunked encrypted LAN transfer.
-- Added `.part` receiver writes, progress, speed, ETA, cancel, speed limits, disk-space checks, and stale-part cleanup.
+- Added `.part` receiver writes, progress, speed, ETA, cancel, disk-space checks, and stale-part cleanup.
 - Generalized file handling so unknown binary files use the same transfer path as common file types.
 
 ### 1.0.0 — Room-based transfer

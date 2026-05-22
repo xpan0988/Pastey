@@ -1,5 +1,4 @@
 use std::{
-    env,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -39,7 +38,9 @@ use crate::{
         FileTransferStartRequest, JoinRoomRequest, JoinRoomResponse, PayloadType, RoomItemStatus,
         RoomItemUpload, RoomStatus, TransferErrorResponse,
     },
-    storage, ActiveRoomServer, AppState,
+    storage,
+    transfer_tuning::{self, TransferTuning},
+    ActiveRoomServer, AppState,
 };
 
 pub const DEFAULT_CHUNK_SIZE_BYTES: u64 = 4 * 1024 * 1024;
@@ -51,10 +52,6 @@ const MAX_CHUNK_BODY_BYTES: usize = 16 * 1024 * 1024;
 const CHUNK_PROTOCOL_HEADER: &str = "x-pastey-chunk-protocol";
 const CHUNK_PROTOCOL_BINARY_V1: &str = "binary-v1";
 const CHUNK_PROTOCOL_JSON_V1: &str = "json-v1";
-const BINARY_CHUNK_PIPELINE_WINDOW: usize = 8;
-const MIN_BINARY_CHUNK_WINDOW: usize = 1;
-const MAX_BINARY_CHUNK_WINDOW: usize = 16;
-const DEBUG_WINDOW_ENV: &str = "PASTEY_TRANSFER_WINDOW_SIZE";
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(250);
 const TRANSFER_CANCELLED_MESSAGE: &str = "Transfer cancelled";
 const TRANSFER_INTERRUPTED_MESSAGE: &str = "Transfer interrupted";
@@ -179,38 +176,6 @@ struct ChunkPayloadDecodeFailure {
     code: &'static str,
     message: &'static str,
     cause: String,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TransferTuning {
-    window_size: usize,
-    override_source: WindowOverrideSource,
-}
-
-impl Default for TransferTuning {
-    fn default() -> Self {
-        Self {
-            window_size: BINARY_CHUNK_PIPELINE_WINDOW,
-            override_source: WindowOverrideSource::Default,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WindowOverrideSource {
-    Env,
-    DevSettings,
-    Default,
-}
-
-impl WindowOverrideSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Env => "env",
-            Self::DevSettings => "dev_settings",
-            Self::Default => "default",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -593,13 +558,6 @@ pub async fn send_room_file(
         total_chunks,
         file_size,
     );
-    dev_log_sender_start_transfer_metadata(
-        &transfer_id,
-        room_id,
-        chunk_size as u64,
-        total_chunks,
-        file_size,
-    );
     let start = FileTransferStartRequest {
         transfer_id: transfer_id.clone(),
         item_id: item.id.clone(),
@@ -679,7 +637,6 @@ pub async fn send_room_file(
         .await
         .map_err(|_| AppError::InvalidInput("Could not read selected file.".into()))?;
     let mut buffer = vec![0u8; chunk_size];
-    dev_log_sender_read_loop_config(&transfer_id, room_id, chunk_size, buffer.len(), chunk_size);
     let started_at = Instant::now();
     let mut last_report_at = started_at;
     let mut last_report_bytes = 0u64;
@@ -774,14 +731,6 @@ pub async fn send_room_file(
 
             let (encrypted_bytes, nonce) =
                 crypto::encrypt_bytes(&buffer[..bytes_read], &payload_key)?;
-            dev_log_sender_chunk_plaintext(
-                &transfer_id,
-                room_id,
-                chunk_index,
-                bytes_read,
-                is_final,
-                chunk_size,
-            );
             let ack = match send_chunk_with_retry(
                 &client,
                 &base_url,
@@ -1044,44 +993,10 @@ fn current_transfer_tuning(state: &Arc<AppState>) -> TransferTuning {
         let config = state.config.read();
         config.transfer_window_override
     };
-    transfer_tuning_from_overrides(
+    transfer_tuning::effective_transfer_tuning_from_env(
         dev_window_override,
         crate::dev_tools::is_dev_tools_enabled(),
-        env::var(DEBUG_WINDOW_ENV).ok().as_deref(),
     )
-}
-
-fn transfer_tuning_from_overrides(
-    dev_window_override: Option<usize>,
-    dev_tools_enabled: bool,
-    env_window_override: Option<&str>,
-) -> TransferTuning {
-    if let Some(window_size) =
-        env_window_override.and_then(|value| value.trim().parse::<usize>().ok())
-    {
-        return TransferTuning {
-            window_size: clamp_binary_chunk_window(window_size),
-            override_source: WindowOverrideSource::Env,
-        };
-    }
-
-    if dev_tools_enabled {
-        if let Some(window_size) = dev_window_override {
-            return TransferTuning {
-                window_size: clamp_binary_chunk_window(window_size),
-                override_source: WindowOverrideSource::DevSettings,
-            };
-        }
-    }
-
-    TransferTuning {
-        window_size: BINARY_CHUNK_PIPELINE_WINDOW,
-        override_source: WindowOverrideSource::Default,
-    }
-}
-
-fn clamp_binary_chunk_window(value: usize) -> usize {
-    value.clamp(MIN_BINARY_CHUNK_WINDOW, MAX_BINARY_CHUNK_WINDOW)
 }
 
 async fn finish_sender_after_chunk_error(
@@ -1161,7 +1076,7 @@ where
     let mut timing_summary = SenderTimingSummary::default();
 
     while !eof || !in_flight.is_empty() {
-        while !eof && in_flight.len() < tuning.window_size {
+        while !eof && in_flight.len() < tuning.effective_window_size {
             if cancel_token.is_cancelled() {
                 return Err(ChunkSendFailure {
                     message: TRANSFER_CANCELLED_MESSAGE.into(),
@@ -1211,14 +1126,6 @@ where
                     }
                 })?;
             let encrypt_elapsed = encrypt_started.elapsed();
-            dev_log_sender_chunk_plaintext(
-                transfer_id,
-                room_id,
-                chunk_index,
-                bytes_read,
-                is_final,
-                chunk_size,
-            );
 
             let client = client.clone();
             let base_url = base_url.to_string();
@@ -1874,18 +1781,6 @@ fn dev_log_sender_transfer_start_response(
     ));
 }
 
-fn dev_log_sender_start_transfer_metadata(
-    transfer_id: &str,
-    room_id: &str,
-    chunk_size: u64,
-    total_chunks: u64,
-    file_size: u64,
-) {
-    emit_transfer_log(format!(
-        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=start_transfer_metadata chunk_size={chunk_size} total_chunks={total_chunks} file_size={file_size}"
-    ));
-}
-
 fn dev_log_sender_chunk_protocol_selected(
     transfer_id: &str,
     room_id: &str,
@@ -1898,18 +1793,6 @@ fn dev_log_sender_chunk_protocol_selected(
     ));
 }
 
-fn dev_log_sender_read_loop_config(
-    transfer_id: &str,
-    room_id: &str,
-    metadata_chunk_size: usize,
-    read_buffer_len: usize,
-    expected_chunk_size: usize,
-) {
-    emit_transfer_log(format!(
-        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=read_loop_config metadata_chunk_size={metadata_chunk_size} read_buffer_len={read_buffer_len} expected_chunk_size={expected_chunk_size}"
-    ));
-}
-
 fn sender_transfer_tuning_log_line(
     transfer_id: &str,
     room_id: &str,
@@ -1919,7 +1802,7 @@ fn sender_transfer_tuning_log_line(
 ) -> String {
     format!(
         "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=transfer_tuning effective_window_size={} chunk_size={} override_source={} transfer_protocol={}",
-        tuning.window_size,
+        tuning.effective_window_size,
         chunk_size,
         tuning.override_source.as_str(),
         protocol.log_label()
@@ -1953,11 +1836,10 @@ fn dev_log_sender_transfer_summary(
 ) {
     let duration_secs = total_duration.as_secs_f64().max(0.001);
     let average_mb_per_sec = total_bytes as f64 / 1024.0 / 1024.0 / duration_secs;
-    let average_mbps = total_bytes as f64 * 8.0 / 1_000_000.0 / duration_secs;
     let chunks = timing.chunks.max(1) as u128;
     emit_transfer_log(format!(
-        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=transfer_benchmark_summary transfer_protocol=binary-v1 effective_window_size={} total_bytes={} duration_ms={} average_mbps={average_mbps:.2} average_MBps={average_mb_per_sec:.2} chunk_size={} chunk_count={} sender_avg_read_ms={} sender_avg_encrypt_ms={} sender_avg_send_ack_ms={} receiver_avg_decode_ms=0 receiver_avg_decrypt_ms=0 receiver_avg_write_ms=0 failed_chunks=0 duplicate_chunks=0 finalize_status=chunks_acknowledged",
-        tuning.window_size,
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=transfer_benchmark_summary transfer_protocol=binary-v1 effective_window_size={} total_bytes={} duration_ms={} average_MBps={average_mb_per_sec:.2} chunk_size={} chunk_count={} sender_avg_read_ms={} sender_avg_encrypt_ms={} sender_avg_send_ack_ms={} receiver_avg_decode_ms=0 receiver_avg_decrypt_ms=0 receiver_avg_write_ms=0 failed_chunks=0 duplicate_chunks=0 finalize_status=chunks_acknowledged",
+        tuning.effective_window_size,
         total_bytes,
         total_duration.as_millis(),
         chunk_size,
@@ -1965,22 +1847,6 @@ fn dev_log_sender_transfer_summary(
         timing.read_ms / chunks,
         timing.encrypt_ms / chunks,
         timing.request_ms / chunks,
-    ));
-}
-
-fn dev_log_sender_chunk_plaintext(
-    transfer_id: &str,
-    room_id: &str,
-    chunk_index: u64,
-    actual_plaintext_size: usize,
-    is_final: bool,
-    expected_non_final_chunk_size: usize,
-) {
-    if !should_log_chunk_sample(chunk_index) && !is_final {
-        return;
-    }
-    emit_transfer_log(format!(
-        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}][chunk={chunk_index}] event=chunk_plaintext chunk_index={chunk_index} actual_plaintext_size={actual_plaintext_size} is_final={is_final} expected_non_final_chunk_size={expected_non_final_chunk_size}"
     ));
 }
 
@@ -2240,10 +2106,9 @@ fn dev_log_receiver_transfer_summary(
 ) {
     let duration_secs = total_duration.as_secs_f64().max(0.001);
     let average_mb_per_sec = received_bytes as f64 / 1024.0 / 1024.0 / duration_secs;
-    let average_mbps = received_bytes as f64 * 8.0 / 1_000_000.0 / duration_secs;
     let chunks = timing.chunks.max(1) as u128;
     emit_transfer_log(format!(
-        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}] event=transfer_benchmark_summary transfer_protocol=receiver effective_window_size=unknown total_bytes={total_bytes} received_bytes={received_bytes} duration_ms={} average_mbps={average_mbps:.2} average_MBps={average_mb_per_sec:.2} chunk_size={chunk_size} chunk_count={} sender_avg_read_ms=0 sender_avg_encrypt_ms=0 sender_avg_send_ack_ms=0 receiver_avg_decode_ms={} receiver_avg_decrypt_ms={} receiver_avg_write_ms={} failed_chunks=0 duplicate_chunks={} finalize_status={finalize_status}",
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}] event=transfer_benchmark_summary transfer_protocol=receiver effective_window_size=unknown total_bytes={total_bytes} received_bytes={received_bytes} duration_ms={} average_MBps={average_mb_per_sec:.2} chunk_size={chunk_size} chunk_count={} sender_avg_read_ms=0 sender_avg_encrypt_ms=0 sender_avg_send_ack_ms=0 receiver_avg_decode_ms={} receiver_avg_decrypt_ms={} receiver_avg_write_ms={} failed_chunks=0 duplicate_chunks={} finalize_status={finalize_status}",
         total_duration.as_millis(),
         timing.chunks,
         timing.decode_ms / chunks,
@@ -5013,69 +4878,8 @@ mod tests {
     }
 
     #[test]
-    fn default_binary_window_is_eight() {
-        let tuning = transfer_tuning_from_overrides(None, false, None);
-
-        assert_eq!(tuning.window_size, 8);
-        assert_eq!(tuning.override_source, WindowOverrideSource::Default);
-    }
-
-    #[test]
-    fn env_window_override_is_clamped() {
-        for (override_value, expected_window) in [
-            ("1", 1),
-            ("2", 2),
-            ("4", 4),
-            ("8", 8),
-            ("16", 16),
-            ("0", 1),
-            ("99", 16),
-        ] {
-            let tuning = transfer_tuning_from_overrides(None, false, Some(override_value));
-            assert_eq!(tuning.window_size, expected_window);
-            assert_eq!(tuning.override_source, WindowOverrideSource::Env);
-        }
-    }
-
-    #[test]
-    fn env_window_override_takes_precedence_over_dev_setting() {
-        let tuning = transfer_tuning_from_overrides(Some(4), true, Some("8"));
-
-        assert_eq!(tuning.window_size, 8);
-        assert_eq!(tuning.override_source, WindowOverrideSource::Env);
-    }
-
-    #[test]
-    fn invalid_env_window_override_falls_back_to_dev_setting_or_default() {
-        let dev_tuning = transfer_tuning_from_overrides(Some(4), true, Some("nope"));
-        let default_tuning = transfer_tuning_from_overrides(Some(4), false, Some("nope"));
-
-        assert_eq!(dev_tuning.window_size, 4);
-        assert_eq!(
-            dev_tuning.override_source,
-            WindowOverrideSource::DevSettings
-        );
-        assert_eq!(default_tuning.window_size, 8);
-        assert_eq!(
-            default_tuning.override_source,
-            WindowOverrideSource::Default
-        );
-    }
-
-    #[test]
-    fn dev_transfer_window_setting_maps_to_effective_window() {
-        let tuning = transfer_tuning_from_overrides(Some(16), true, None);
-        let hidden_tuning = transfer_tuning_from_overrides(Some(16), false, None);
-
-        assert_eq!(tuning.window_size, 16);
-        assert_eq!(tuning.override_source, WindowOverrideSource::DevSettings);
-        assert_eq!(hidden_tuning.window_size, 8);
-        assert_eq!(hidden_tuning.override_source, WindowOverrideSource::Default);
-    }
-
-    #[test]
     fn transfer_tuning_log_includes_effective_window_and_protocol() {
-        let tuning = transfer_tuning_from_overrides(Some(4), true, Some("8"));
+        let tuning = transfer_tuning::effective_transfer_tuning(Some(4), true, Some("8"));
 
         let line = sender_transfer_tuning_log_line(
             "transfer-1",

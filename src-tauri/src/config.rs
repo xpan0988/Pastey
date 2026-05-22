@@ -2,10 +2,9 @@ use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{crypto, dev_tools, error::AppResult, models::AppConfig, storage::AppPaths};
-
-pub const MIN_TRANSFER_WINDOW: usize = 1;
-pub const MAX_TRANSFER_WINDOW: usize = 16;
+use crate::{
+    crypto, dev_tools, error::AppResult, models::AppConfig, storage::AppPaths, transfer_tuning,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredConfig {
@@ -75,7 +74,7 @@ fn public_config_with_dev_tools(
         inbox_dir: Some(effective_inbox_dir(paths, config).display().to_string()),
         auto_burn_after_download: config.auto_burn_after_download,
         transfer_window_override: if dev_tools_enabled {
-            normalize_transfer_window(config.transfer_window_override)
+            transfer_tuning::normalize_transfer_window_override(config.transfer_window_override)
         } else {
             None
         },
@@ -105,7 +104,7 @@ fn update_with_dev_tools_enabled(
     current.inbox_dir = normalize_inbox_dir(paths, incoming.inbox_dir.as_deref());
     if dev_tools_enabled {
         current.transfer_window_override =
-            normalize_transfer_window(incoming.transfer_window_override);
+            transfer_tuning::normalize_transfer_window_override(incoming.transfer_window_override);
     }
     current.version = 3;
     save(paths, current)?;
@@ -147,11 +146,6 @@ fn normalize_inbox_dir(paths: &AppPaths, value: Option<&str>) -> Option<String> 
     }
 }
 
-pub fn normalize_transfer_window(value: Option<usize>) -> Option<usize> {
-    let value = value?;
-    Some(value.clamp(MIN_TRANSFER_WINDOW, MAX_TRANSFER_WINDOW))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,15 +163,6 @@ mod tests {
             logs_dir: root.join("logs"),
             config_path: root.join("config.json"),
         }
-    }
-
-    #[test]
-    fn transfer_window_normalization_clamps_supported_range() {
-        assert_eq!(normalize_transfer_window(None), None);
-        assert_eq!(normalize_transfer_window(Some(0)), Some(1));
-        assert_eq!(normalize_transfer_window(Some(1)), Some(1));
-        assert_eq!(normalize_transfer_window(Some(8)), Some(8));
-        assert_eq!(normalize_transfer_window(Some(99)), Some(16));
     }
 
     #[test]
