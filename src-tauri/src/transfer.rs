@@ -1,4 +1,5 @@
 use std::{
+    env,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -51,6 +52,9 @@ const CHUNK_PROTOCOL_HEADER: &str = "x-pastey-chunk-protocol";
 const CHUNK_PROTOCOL_BINARY_V1: &str = "binary-v1";
 const CHUNK_PROTOCOL_JSON_V1: &str = "json-v1";
 const BINARY_CHUNK_PIPELINE_WINDOW: usize = 4;
+const MIN_BINARY_CHUNK_WINDOW: usize = 1;
+const MAX_BINARY_CHUNK_WINDOW: usize = 16;
+const DEBUG_WINDOW_ENV: &str = "PASTEY_TRANSFER_WINDOW_SIZE";
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(250);
 const TRANSFER_CANCELLED_MESSAGE: &str = "Transfer cancelled";
 const TRANSFER_INTERRUPTED_MESSAGE: &str = "Transfer interrupted";
@@ -95,6 +99,7 @@ enum ActiveFileTransferKind {
         transferred_bytes: u64,
         expected_chunk_index: u64,
         received_chunks: Vec<bool>,
+        timing: ReceiverTimingSummary,
     },
 }
 
@@ -174,6 +179,30 @@ struct ChunkPayloadDecodeFailure {
     code: &'static str,
     message: &'static str,
     cause: String,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TransferTuning {
+    speed_limit_mbps: Option<f64>,
+    window_size: usize,
+    debug_window_override: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SenderTimingSummary {
+    chunks: u64,
+    read_ms: u128,
+    encrypt_ms: u128,
+    request_ms: u128,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReceiverTimingSummary {
+    chunks: u64,
+    decode_ms: u128,
+    decrypt_ms: u128,
+    write_ms: u128,
+    ui_emit_ms: u128,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -623,6 +652,8 @@ pub async fn send_room_file(
     let mut last_report_bytes = 0u64;
     let mut chunk_index = 0u64;
     let mut chunk_protocol = chunk_protocol;
+    let transfer_tuning = current_transfer_tuning(&state);
+    dev_log_sender_transfer_tuning(&transfer_id, room_id, transfer_tuning);
 
     if chunk_protocol == ChunkProtocol::BinaryV1 {
         chunk_index = match send_binary_chunks_pipelined(
@@ -638,6 +669,7 @@ pub async fn send_room_file(
             file_size,
             &payload_key,
             &cancel_token,
+            transfer_tuning,
         )
         .await
         {
@@ -969,6 +1001,48 @@ fn update_sender_transfer_report(
     }
 }
 
+fn current_transfer_tuning(state: &Arc<AppState>) -> TransferTuning {
+    let speed_limit_mbps = {
+        let config = state.config.read();
+        config.speed_limit_mbps
+    };
+    transfer_tuning_from_speed_limit_and_override(
+        speed_limit_mbps,
+        env::var(DEBUG_WINDOW_ENV).ok().as_deref(),
+    )
+}
+
+fn transfer_tuning_from_speed_limit_and_override(
+    speed_limit_mbps: Option<f64>,
+    debug_window_override: Option<&str>,
+) -> TransferTuning {
+    let speed_limit_mbps = speed_limit_mbps.filter(|value| value.is_finite() && *value > 0.0);
+    let debug_window_override =
+        debug_window_override.and_then(|value| value.trim().parse::<usize>().ok());
+    let mapped_window = debug_window_override
+        .map(clamp_binary_chunk_window)
+        .unwrap_or_else(|| window_size_for_speed_limit(speed_limit_mbps));
+
+    TransferTuning {
+        speed_limit_mbps,
+        window_size: mapped_window,
+        debug_window_override: debug_window_override.map(clamp_binary_chunk_window),
+    }
+}
+
+fn window_size_for_speed_limit(speed_limit_mbps: Option<f64>) -> usize {
+    match speed_limit_mbps {
+        None => BINARY_CHUNK_PIPELINE_WINDOW,
+        Some(value) if value <= 10.0 => 1,
+        Some(value) if value <= 50.0 => 2,
+        Some(_) => BINARY_CHUNK_PIPELINE_WINDOW,
+    }
+}
+
+fn clamp_binary_chunk_window(value: usize) -> usize {
+    value.clamp(MIN_BINARY_CHUNK_WINDOW, MAX_BINARY_CHUNK_WINDOW)
+}
+
 async fn finish_sender_after_chunk_error(
     state: &Arc<AppState>,
     client: &reqwest::Client,
@@ -1031,6 +1105,7 @@ async fn send_binary_chunks_pipelined<R>(
     file_size: u64,
     payload_key: &[u8; 32],
     cancel_token: &CancellationToken,
+    tuning: TransferTuning,
 ) -> Result<u64, ChunkSendFailure>
 where
     R: AsyncRead + Unpin,
@@ -1042,9 +1117,10 @@ where
     let mut last_report_at = started_at;
     let mut last_report_bytes = 0u64;
     let mut in_flight = FuturesUnordered::new();
+    let mut timing_summary = SenderTimingSummary::default();
 
     while !eof || !in_flight.is_empty() {
-        while !eof && in_flight.len() < BINARY_CHUNK_PIPELINE_WINDOW {
+        while !eof && in_flight.len() < tuning.window_size {
             if cancel_token.is_cancelled() {
                 return Err(ChunkSendFailure {
                     message: TRANSFER_CANCELLED_MESSAGE.into(),
@@ -1148,6 +1224,10 @@ where
             continue;
         };
         let ack = result?;
+        timing_summary.chunks += 1;
+        timing_summary.read_ms += read_elapsed.as_millis();
+        timing_summary.encrypt_ms += encrypt_elapsed.as_millis();
+        timing_summary.request_ms += send_elapsed.as_millis();
         max_acknowledged_bytes = max_acknowledged_bytes.max(ack.total_received_bytes);
         let now = Instant::now();
         let should_emit_progress = now.duration_since(last_report_at) >= PROGRESS_EMIT_INTERVAL
@@ -1184,6 +1264,15 @@ where
         apply_rate_limit(state, max_acknowledged_bytes, started_at).await;
     }
 
+    dev_log_sender_transfer_summary(
+        transfer_id,
+        room_id,
+        tuning,
+        chunk_size,
+        file_size,
+        started_at.elapsed(),
+        timing_summary,
+    );
     Ok(next_chunk_index)
 }
 
@@ -1781,6 +1870,40 @@ fn dev_log_sender_read_loop_config(
     ));
 }
 
+fn dev_log_sender_transfer_tuning(transfer_id: &str, room_id: &str, tuning: TransferTuning) {
+    emit_transfer_log(format!(
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=transfer_tuning configured_speed_limit_mbps={:?} effective_window_size={} debug_window_override={:?}",
+        tuning.speed_limit_mbps,
+        tuning.window_size,
+        tuning.debug_window_override
+    ));
+}
+
+fn dev_log_sender_transfer_summary(
+    transfer_id: &str,
+    room_id: &str,
+    tuning: TransferTuning,
+    chunk_size: usize,
+    total_bytes: u64,
+    total_duration: Duration,
+    timing: SenderTimingSummary,
+) {
+    let duration_secs = total_duration.as_secs_f64().max(0.001);
+    let average_mbps = total_bytes as f64 / 1024.0 / 1024.0 / duration_secs;
+    let chunks = timing.chunks.max(1) as u128;
+    emit_transfer_log(format!(
+        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=transfer_benchmark_summary protocol=binary-v1 configured_speed_limit_mbps={:?} effective_window_size={} chunk_size={} total_bytes={} total_duration_ms={} average_mbps={average_mbps:.2} avg_read_ms={} avg_encrypt_ms={} avg_send_ack_ms={}",
+        tuning.speed_limit_mbps,
+        tuning.window_size,
+        chunk_size,
+        total_bytes,
+        total_duration.as_millis(),
+        timing.read_ms / chunks,
+        timing.encrypt_ms / chunks,
+        timing.request_ms / chunks,
+    ));
+}
+
 fn dev_log_sender_chunk_plaintext(
     transfer_id: &str,
     room_id: &str,
@@ -2038,6 +2161,28 @@ fn dev_log_receiver_chunk_timing(
         write_elapsed.as_millis(),
         ui_emit_elapsed.as_millis(),
         total_elapsed.as_millis()
+    ));
+}
+
+fn dev_log_receiver_transfer_summary(
+    transfer_id: &str,
+    room_id: &str,
+    chunk_size: u64,
+    total_bytes: u64,
+    received_bytes: u64,
+    total_duration: Duration,
+    timing: ReceiverTimingSummary,
+) {
+    let duration_secs = total_duration.as_secs_f64().max(0.001);
+    let average_mbps = received_bytes as f64 / 1024.0 / 1024.0 / duration_secs;
+    let chunks = timing.chunks.max(1) as u128;
+    emit_transfer_log(format!(
+        "[pastey transfer][receiver][transfer_id={transfer_id}][room_id={room_id}] event=transfer_benchmark_summary chunk_size={chunk_size} total_bytes={total_bytes} received_bytes={received_bytes} total_duration_ms={} average_mbps={average_mbps:.2} avg_decode_ms={} avg_decrypt_ms={} avg_write_ms={} avg_ui_emit_ms={}",
+        total_duration.as_millis(),
+        timing.decode_ms / chunks,
+        timing.decrypt_ms / chunks,
+        timing.write_ms / chunks,
+        timing.ui_emit_ms / chunks,
     ));
 }
 
@@ -2603,6 +2748,7 @@ async fn start_file_transfer_handler(
             transferred_bytes: 0,
             expected_chunk_index: 0,
             received_chunks: vec![false; start.total_chunks as usize],
+            timing: ReceiverTimingSummary::default(),
         },
     };
     emit_event(&ctx.state, &transfer, "pending", 0, 0.0, 0.0, None, None);
@@ -3128,6 +3274,14 @@ async fn receive_file_chunk_handler(
         ui_emit_elapsed,
         total_started.elapsed(),
     );
+    record_receiver_chunk_timing(
+        &ctx.state,
+        &transfer_id,
+        decode_elapsed,
+        decrypt_elapsed,
+        write_elapsed,
+        ui_emit_elapsed,
+    );
     dev_log_receiver_chunk_ack(
         &transfer_id,
         &room_id,
@@ -3184,6 +3338,7 @@ async fn finish_file_transfer_handler(
         created_at,
         transferred_bytes,
         expected_chunk_index,
+        timing,
         ..
     } = &transfer.kind
     else {
@@ -3202,6 +3357,15 @@ async fn finish_file_transfer_handler(
         )
         .await;
     }
+    dev_log_receiver_transfer_summary(
+        &transfer_id,
+        &room_id,
+        transfer.chunk_size,
+        transfer.file_size,
+        *transferred_bytes,
+        transfer.started_at.elapsed(),
+        *timing,
+    );
     dev_log_receiver_finalize(
         &transfer_id,
         &room_id,
@@ -4042,6 +4206,28 @@ fn emit_event(
     let _ = state.app_handle.emit(TRANSFER_EVENT, event);
 }
 
+fn record_receiver_chunk_timing(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    decode_elapsed: Duration,
+    decrypt_elapsed: Duration,
+    write_elapsed: Duration,
+    ui_emit_elapsed: Duration,
+) {
+    let mut transfers = state.active_file_transfers.lock();
+    let Some(transfer) = transfers.get_mut(transfer_id) else {
+        return;
+    };
+    let ActiveFileTransferKind::Receiver { timing, .. } = &mut transfer.kind else {
+        return;
+    };
+    timing.chunks += 1;
+    timing.decode_ms += decode_elapsed.as_millis();
+    timing.decrypt_ms += decrypt_elapsed.as_millis();
+    timing.write_ms += write_elapsed.as_millis();
+    timing.ui_emit_ms += ui_emit_elapsed.as_millis();
+}
+
 fn clone_event_base(
     transfer: &ActiveFileTransfer,
     direction: &str,
@@ -4772,6 +4958,48 @@ mod tests {
         assert_eq!(
             selected_chunk_protocol_from_start_response(""),
             ChunkProtocol::JsonV1
+        );
+    }
+
+    #[test]
+    fn speed_limit_maps_to_binary_window_size() {
+        assert_eq!(window_size_for_speed_limit(None), 4);
+        assert_eq!(window_size_for_speed_limit(Some(100.0)), 4);
+        assert_eq!(window_size_for_speed_limit(Some(50.0)), 2);
+        assert_eq!(window_size_for_speed_limit(Some(10.0)), 1);
+        assert_eq!(window_size_for_speed_limit(Some(25.0)), 2);
+        assert_eq!(window_size_for_speed_limit(Some(250.0)), 4);
+    }
+
+    #[test]
+    fn custom_debug_window_override_is_clamped() {
+        assert_eq!(
+            transfer_tuning_from_speed_limit_and_override(None, Some("1")).window_size,
+            1
+        );
+        assert_eq!(
+            transfer_tuning_from_speed_limit_and_override(None, Some("8")).window_size,
+            8
+        );
+        assert_eq!(
+            transfer_tuning_from_speed_limit_and_override(None, Some("16")).window_size,
+            16
+        );
+        assert_eq!(
+            transfer_tuning_from_speed_limit_and_override(None, Some("0")).window_size,
+            1
+        );
+        assert_eq!(
+            transfer_tuning_from_speed_limit_and_override(None, Some("99")).window_size,
+            16
+        );
+    }
+
+    #[test]
+    fn invalid_debug_window_override_falls_back_to_speed_limit() {
+        assert_eq!(
+            transfer_tuning_from_speed_limit_and_override(Some(50.0), Some("nope")).window_size,
+            2
         );
     }
 

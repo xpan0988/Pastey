@@ -127,6 +127,21 @@ fn normalize_speed_limit(value: Option<f64>) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::AppPaths;
+
+    fn test_paths() -> AppPaths {
+        let root = std::env::temp_dir().join(format!("pastey_config_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        AppPaths {
+            app_data_dir: root.clone(),
+            db_path: root.join("db.sqlite"),
+            payloads_dir: root.join("payloads"),
+            inbox_dir: root.join("inbox"),
+            temp_dir: root.join("temp"),
+            logs_dir: root.join("logs"),
+            config_path: root.join("config.json"),
+        }
+    }
 
     #[test]
     fn speed_limit_normalization_treats_invalid_values_as_unlimited() {
@@ -142,5 +157,27 @@ mod tests {
         assert_eq!(normalize_speed_limit(Some(50.0)), Some(50.0));
         assert_eq!(normalize_speed_limit(Some(100.0)), Some(100.0));
         assert_eq!(normalize_speed_limit(Some(20_000.0)), Some(10_000.0));
+    }
+
+    #[test]
+    fn speed_limit_update_is_persisted() {
+        let paths = test_paths();
+        let mut stored = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
+        let incoming = public_config(&paths, &stored);
+        let updated = update(
+            &paths,
+            &mut stored,
+            AppConfig {
+                speed_limit_mbps: Some(50.0),
+                ..incoming
+            },
+        )
+        .unwrap();
+        let reloaded = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
+
+        assert_eq!(updated.speed_limit_mbps, Some(50.0));
+        assert_eq!(reloaded.speed_limit_mbps, Some(50.0));
+
+        let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 }

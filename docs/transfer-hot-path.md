@@ -18,3 +18,15 @@ Implemented first incremental fix:
 - Receiver tracks a per-transfer received bitmap; finalize still verifies the received chunk count and size.
 - Hot-path progress and non-error logs are sampled/throttled to reduce self-inflicted I/O overhead.
 - Sampled timing logs now report sender read/encrypt/send/ACK timing and receiver decode/decrypt/write/UI timing without paths, keys, or content.
+
+Speed limit wiring:
+
+- The Settings UI saves `speed_limit_mbps` through `update_config`.
+- Rust persists it in `StoredConfig` and active transfers read `state.config`, so pacing changes are visible without app restart.
+- Existing pacing applies to both binary-v1 and legacy JSON/base64 paths after ACK progress.
+- Binary-v1 now also maps the configured MB/s limit to its transfer window at transfer start:
+  - Unlimited: window 4
+  - 100 MB/s and higher: window 4
+  - 50 MB/s or custom up to 50: window 2
+  - 10 MB/s or lower: window 1
+- Benchmark runs can force a window with `PASTEY_TRANSFER_WINDOW_SIZE`; values are clamped to 1..16.
