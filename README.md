@@ -37,6 +37,17 @@ Current releases focus on stabilizing the transport, lifecycle, and cross-platfo
 
 ## Version history
 
+### 1.5.4 — Engineering cleanup and transport consolidation
+
+- Centralized transfer window policy into `transfer_tuning.rs`.
+- Removed duplicated transfer-window logic from `transfer.rs` and `config.rs`.
+- Kept normal binary-v1 transfers on the established window 8 default.
+- Preserved old `speed_limit_mbps` config compatibility without restoring user-facing speed limits.
+- Cleaned temporary debugging logs and stale transfer scaffolding.
+- Simplified Settings and Room page code after the transfer tuning changes.
+- Updated README, transfer hot-path docs, and release workflow docs to match current behavior.
+- Kept release workflow, binary-v1 transfer, legacy JSON fallback, burn/finalize, and nearby join behavior unchanged.
+
 ### 1.5.3 — Dev-only transfer tuning
 
 - Normal transfers now run at maximum practical speed; Settings no longer exposes an MB/s transfer control.
