@@ -13,7 +13,7 @@ import {
   writeTempFile
 } from "../lib/tauri";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
-import { fileTypeLabel, formatBytes, formatDuration, formatRelativeExpiry, formatSpeed, formatTimestamp } from "../lib/format";
+import { fileTypeLabel, formatBytes, formatDuration, formatSpeed, formatTimestamp } from "../lib/format";
 import type { FileTransferProgressEvent, RoomInfo, RoomItem } from "../lib/types";
 
 interface RoomPageProps {
@@ -46,7 +46,7 @@ export function RoomPage({
   const [composerDropActive, setComposerDropActive] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const inFlightFileKeysRef = useRef<Set<string>>(new Set());
-  const roomUnavailable = room.status === "burned" || room.status === "expired" || busy === "burn" || busy === "leave";
+  const roomUnavailable = room.status === "burned" || busy === "burn" || busy === "leave";
   const canSend = room.peer_connected && busy === null && !roomUnavailable;
 
   useEffect(() => {
@@ -54,7 +54,7 @@ export function RoomPage({
   }, [room.id]);
 
   useEffect(() => {
-    if (busy === "burn" || room.status === "burned" || room.status === "expired") {
+    if (busy === "burn" || room.status === "burned") {
       return;
     }
 
@@ -294,7 +294,7 @@ export function RoomPage({
   }
 
   const peerStateMessage = room.peer_burned_at
-    ? "Peer burned room. Your local items stay here until you burn this room or it expires."
+    ? "Peer burned room. Saved Inbox files stay on this device; burn locally when you're done."
     : room.status === "peer_left"
       ? "Peer left this room. Sending is disabled until a new connection exists."
       : null;
@@ -344,9 +344,9 @@ export function RoomPage({
             <span className="muted">{room.peer_device_name ?? "No peer device yet"}</span>
           </div>
           <div className="meta-card">
-            <span className="meta-label">Expiry</span>
-            <strong title={formatTimestamp(room.expires_at)}>{formatRelativeExpiry(room.expires_at)}</strong>
-            <span className="muted">Encrypted room cleanup stays local.</span>
+            <span className="meta-label">Lifecycle</span>
+            <strong title={formatTimestamp(room.created_at)}>Manual burn</strong>
+            <span className="muted">Burn clears room state, not saved Inbox files.</span>
           </div>
         </div>
 

@@ -1,7 +1,9 @@
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState } from "react";
-import { HomePage } from "./pages/HomePage";
+import { BottomTabBar, type TabKey } from "./components/BottomTabBar";
+import { DevicesPage } from "./pages/DevicesPage";
 import { RoomPage } from "./pages/RoomPage";
+import { RoomsPage } from "./pages/RoomsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import {
   acceptNearbyJoin,
@@ -19,8 +21,7 @@ import { mergeTransferEvent } from "./lib/transferState";
 import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, RoomInfo, RoomItem } from "./lib/types";
 
 type View =
-  | { screen: "home" }
-  | { screen: "settings" }
+  | { screen: "tabs" }
   | { screen: "room"; roomId: string };
 
 interface FocusPayload {
@@ -28,7 +29,8 @@ interface FocusPayload {
 }
 
 function App() {
-  const [view, setView] = useState<View>({ screen: "home" });
+  const [view, setView] = useState<View>({ screen: "tabs" });
+  const [activeTab, setActiveTab] = useState<TabKey>("devices");
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [rooms, setRooms] = useState<RoomInfo[]>([]);
   const [currentRoom, setCurrentRoom] = useState<RoomInfo | null>(null);
@@ -68,7 +70,8 @@ function App() {
 
     void listen<FocusPayload>("pastey://focus", (event) => {
       const target = event.payload.target ?? "home";
-      setView(target === "settings" ? { screen: "settings" } : { screen: "home" });
+      setView({ screen: "tabs" });
+      setActiveTab(target === "settings" ? "settings" : "devices");
       setFocusToken((value) => value + 1);
     }).then((fn) => {
       unlistenFocus = fn;
@@ -133,7 +136,7 @@ function App() {
       setRoomItems(nextItems);
       const visibleRoom = await refreshRooms(view.roomId);
       if (!visibleRoom) {
-        setView({ screen: "home" });
+        setView({ screen: "tabs" });
         setRoomItems([]);
       }
     } catch (err) {
@@ -145,7 +148,7 @@ function App() {
         message === "Peer left the room" ||
         message === "Peer left the room."
       ) {
-        setView({ screen: "home" });
+        setView({ screen: "tabs" });
         setCurrentRoom(null);
         setRoomItems([]);
         return;
@@ -158,7 +161,8 @@ function App() {
   async function handleBurnRoom(roomId: string) {
     await burnRoom(roomId);
     closedRoomIdsRef.current.add(roomId);
-    setView({ screen: "home" });
+    setView({ screen: "tabs" });
+    setActiveTab("rooms");
     setCurrentRoom(null);
     setRoomItems([]);
     setTransfers((current) => Object.fromEntries(Object.entries(current).filter(([, transfer]) => transfer.room_id !== roomId)));
@@ -168,7 +172,8 @@ function App() {
   async function handleLeaveRoom(roomId: string) {
     await leaveRoom(roomId);
     closedRoomIdsRef.current.add(roomId);
-    setView({ screen: "home" });
+    setView({ screen: "tabs" });
+    setActiveTab("rooms");
     setCurrentRoom(null);
     setRoomItems([]);
     setTransfers((current) => Object.fromEntries(Object.entries(current).filter(([, transfer]) => transfer.room_id !== roomId)));
@@ -231,13 +236,17 @@ function App() {
       ) : null}
 
       <main>
-        {view.screen === "home" ? (
-          <HomePage
+        {view.screen === "tabs" && activeTab === "devices" ? (
+          <DevicesPage rooms={rooms} onOpenRoom={(room) => void openRoom(room)} shouldFocus={focusToken > 0} />
+        ) : null}
+
+        {view.screen === "tabs" && activeTab === "rooms" ? (
+          <RoomsPage
             config={config}
             rooms={rooms}
+            transfers={Object.values(transfers)}
             onOpenRoom={(room) => void openRoom(room)}
-            onShowSettings={() => setView({ screen: "settings" })}
-            shouldFocus={focusToken > 0}
+            onConfigChange={setConfig}
           />
         ) : null}
 
@@ -247,7 +256,7 @@ function App() {
             items={roomItems}
             transfers={Object.values(transfers).filter((transfer) => transfer.room_id === currentRoom.id)}
             onBack={() => {
-              setView({ screen: "home" });
+              setView({ screen: "tabs" });
               void refreshRooms();
             }}
             onRefresh={refreshCurrentRoom}
@@ -256,15 +265,19 @@ function App() {
           />
         ) : null}
 
-        {view.screen === "settings" ? (
-          <div className="stack">
-            <button className="text-button back-button settings-back" onClick={() => setView({ screen: "home" })}>
-              Back
-            </button>
-            <SettingsPage config={config} onConfigChange={setConfig} />
-          </div>
+        {view.screen === "tabs" && activeTab === "settings" ? (
+          <SettingsPage
+            config={config}
+            onConfigChange={setConfig}
+            onJoinWithCode={() => {
+              setActiveTab("devices");
+              setFocusToken((value) => value + 1);
+            }}
+          />
         ) : null}
       </main>
+
+      {view.screen === "tabs" ? <BottomTabBar activeTab={activeTab} onSelectTab={setActiveTab} /> : null}
     </div>
   );
 }

@@ -3,7 +3,11 @@ use std::{fs, path::Path};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    crypto, dev_tools, error::AppResult, models::AppConfig, storage::AppPaths, transfer_tuning,
+    crypto, dev_tools,
+    error::AppResult,
+    models::{default_save_received_to_inbox, AppConfig},
+    storage::AppPaths,
+    transfer_tuning,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -12,6 +16,10 @@ pub struct StoredConfig {
     pub default_expiry_minutes: u64,
     pub inbox_dir: Option<String>,
     pub auto_burn_after_download: bool,
+    #[serde(default = "default_save_received_to_inbox")]
+    pub save_received_files_to_inbox: bool,
+    #[serde(default = "default_save_received_to_inbox")]
+    pub save_received_images_to_inbox: bool,
     #[serde(default)]
     pub transfer_window_override: Option<usize>,
     pub shortcut: String,
@@ -29,8 +37,8 @@ pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfi
             stored.device_id = uuid::Uuid::new_v4().to_string();
             changed = true;
         }
-        if stored.version < 3 {
-            stored.version = 3;
+        if stored.version < 4 {
+            stored.version = 4;
             changed = true;
         }
         if changed {
@@ -40,10 +48,12 @@ pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfi
     }
 
     let stored = StoredConfig {
-        version: 3,
+        version: 4,
         default_expiry_minutes: 15,
         inbox_dir: None,
         auto_burn_after_download: false,
+        save_received_files_to_inbox: true,
+        save_received_images_to_inbox: true,
         transfer_window_override: None,
         shortcut: shortcut.to_string(),
         app_secret: crypto::encode_key(&crypto::random_key()),
@@ -73,6 +83,8 @@ fn public_config_with_dev_tools(
         default_expiry_minutes: clamp_expiry(config.default_expiry_minutes),
         inbox_dir: Some(effective_inbox_dir(paths, config).display().to_string()),
         auto_burn_after_download: config.auto_burn_after_download,
+        save_received_files_to_inbox: config.save_received_files_to_inbox,
+        save_received_images_to_inbox: config.save_received_images_to_inbox,
         transfer_window_override: if dev_tools_enabled {
             transfer_tuning::normalize_transfer_window_override(config.transfer_window_override)
         } else {
@@ -101,12 +113,14 @@ fn update_with_dev_tools_enabled(
 ) -> AppResult<AppConfig> {
     current.default_expiry_minutes = clamp_expiry(incoming.default_expiry_minutes);
     current.auto_burn_after_download = incoming.auto_burn_after_download;
+    current.save_received_files_to_inbox = incoming.save_received_files_to_inbox;
+    current.save_received_images_to_inbox = incoming.save_received_images_to_inbox;
     current.inbox_dir = normalize_inbox_dir(paths, incoming.inbox_dir.as_deref());
     if dev_tools_enabled {
         current.transfer_window_override =
             transfer_tuning::normalize_transfer_window_override(incoming.transfer_window_override);
     }
-    current.version = 3;
+    current.version = 4;
     save(paths, current)?;
     Ok(public_config_with_dev_tools(
         paths,
@@ -119,6 +133,29 @@ pub fn effective_inbox_dir(paths: &AppPaths, config: &StoredConfig) -> std::path
     match config.inbox_dir.as_deref() {
         Some(path) if !path.trim().is_empty() => Path::new(path).to_path_buf(),
         _ => paths.inbox_dir.clone(),
+    }
+}
+
+pub fn received_item_destination_dir(
+    paths: &AppPaths,
+    config: &StoredConfig,
+    mime_type: Option<&str>,
+) -> std::path::PathBuf {
+    if should_save_received_to_inbox(config, mime_type) {
+        effective_inbox_dir(paths, config)
+    } else {
+        paths.temp_dir.clone()
+    }
+}
+
+pub fn should_save_received_to_inbox(config: &StoredConfig, mime_type: Option<&str>) -> bool {
+    if mime_type
+        .map(|value| value.trim().to_ascii_lowercase().starts_with("image/"))
+        .unwrap_or(false)
+    {
+        config.save_received_images_to_inbox
+    } else {
+        config.save_received_files_to_inbox
     }
 }
 
@@ -182,6 +219,77 @@ mod tests {
         .unwrap();
 
         assert_eq!(stored.transfer_window_override, None);
+        assert!(stored.save_received_files_to_inbox);
+        assert!(stored.save_received_images_to_inbox);
+    }
+
+    #[test]
+    fn received_inbox_persistence_defaults_to_enabled() {
+        let paths = test_paths();
+        let stored = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
+        let public = public_config_with_dev_tools(&paths, &stored, false);
+
+        assert!(stored.save_received_files_to_inbox);
+        assert!(stored.save_received_images_to_inbox);
+        assert!(public.save_received_files_to_inbox);
+        assert!(public.save_received_images_to_inbox);
+
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn received_inbox_persistence_roundtrips() {
+        let paths = test_paths();
+        let mut stored = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
+        let incoming = public_config_with_dev_tools(&paths, &stored, false);
+
+        let updated = update_with_dev_tools_enabled(
+            &paths,
+            &mut stored,
+            AppConfig {
+                save_received_files_to_inbox: false,
+                save_received_images_to_inbox: true,
+                ..incoming
+            },
+            false,
+        )
+        .unwrap();
+        let reloaded = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
+
+        assert!(!updated.save_received_files_to_inbox);
+        assert!(updated.save_received_images_to_inbox);
+        assert!(!reloaded.save_received_files_to_inbox);
+        assert!(reloaded.save_received_images_to_inbox);
+
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn received_item_destination_honors_file_and_image_toggles() {
+        let paths = test_paths();
+        let stored = StoredConfig {
+            version: 4,
+            default_expiry_minutes: 15,
+            inbox_dir: None,
+            auto_burn_after_download: false,
+            save_received_files_to_inbox: false,
+            save_received_images_to_inbox: true,
+            transfer_window_override: None,
+            shortcut: "Ctrl+Shift+V".into(),
+            app_secret: "abc".into(),
+            device_id: "device".into(),
+        };
+
+        assert_eq!(
+            received_item_destination_dir(&paths, &stored, Some("application/pdf")),
+            paths.temp_dir
+        );
+        assert_eq!(
+            received_item_destination_dir(&paths, &stored, Some("image/png")),
+            paths.inbox_dir
+        );
+
+        let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 
     #[test]
@@ -211,10 +319,12 @@ mod tests {
     fn normal_public_config_hides_dev_transfer_window() {
         let paths = test_paths();
         let stored = StoredConfig {
-            version: 3,
+            version: 4,
             default_expiry_minutes: 15,
             inbox_dir: None,
             auto_burn_after_download: false,
+            save_received_files_to_inbox: true,
+            save_received_images_to_inbox: true,
             transfer_window_override: Some(16),
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),

@@ -109,7 +109,8 @@ Current releases focus on stabilizing the transport, lifecycle, and cross-platfo
 ### 1.3.2 — Burn lifecycle cleanup
 
 - Updated Burn Room semantics so tracked local room content is deleted.
-- Burn now removes encrypted payloads, completed incoming files for that room, related `.part` files, room items, and active receiver transfer state.
+- Burn now removes encrypted payloads, transient incoming files for that room, related `.part` files, room items, and active receiver transfer state.
+- Inbox-saved received files are preserved when a room is burned.
 - Preserves files from other rooms and skips paths outside allowed app-controlled roots.
 - Added clearer burn error reporting for local deletion or permission failures.
 - Added tests for same-room inbox cleanup, other-room preservation, missing paths, `.pastey-parts` cleanup, outside-root skips, and idempotent burn behavior.
@@ -136,7 +137,7 @@ Current releases focus on stabilizing the transport, lifecycle, and cross-platfo
 ### 1.0.0 — Room-based transfer
 
 - Reworked transfer flow from one code per item to one reusable room code per room.
-- Added room items, recent rooms, burn/expiry cleanup, screenshot paste, drag/drop files, and Windows/macOS packaging.
+- Added room items, recent rooms, manual burn cleanup, screenshot paste, drag/drop files, and Windows/macOS packaging.
 - Stabilized local encrypted text/file/image transfer for small payloads.
 
 ### 0.1.0 — Initial MVP
@@ -147,7 +148,7 @@ Current releases focus on stabilizing the transport, lifecycle, and cross-platfo
 
 ## What pastey does
 
-`pastey` lets one device open a short-lived encrypted transfer room, show an 8-digit code, and wait for another device on the same LAN to join it.
+`pastey` lets one device open an encrypted local transfer room, show an 8-digit code, and wait for another device on the same LAN to join it.
 
 The receiver:
 
@@ -156,7 +157,7 @@ The receiver:
 3. Discovers the sender on the LAN
 4. Receives encrypted text or file data directly over the local network
 5. Decrypts locally
-6. Displays text or saves files into the local inbox
+6. Displays text or saves received files/images according to the Inbox settings
 
 There is no account system, no cloud relay, no telemetry, and no remote database.
 
@@ -181,7 +182,7 @@ There is no account system, no cloud relay, no telemetry, and no remote database
 - Original source file paths are never stored in the database.
 - Local payload file names use generated UUID-based identifiers only.
 
-The app keeps a local app secret in `config.json` so it can re-open short-lived encrypted sessions after an app restart without storing plaintext payloads in the database.
+The app keeps a local app secret in `config.json` so it can re-open local encrypted metadata after an app restart without storing plaintext payloads in the database.
 
 ## What is stored locally
 
@@ -200,6 +201,7 @@ SQLite metadata includes:
 - payload type
 - relative encrypted payload path
 - received-file inbox path
+- received-file Inbox persistence preferences
 - optional sanitized display name
 - MIME type
 - size
@@ -207,7 +209,7 @@ SQLite metadata includes:
 - status
 - encrypted wrapping material for the payload key and session code
 
-Burning a room deletes that room's local encrypted payloads, tracked received inbox files, and in-progress `.part` files. It does not delete logs, configuration, the database, or files that are not tracked by the burned room.
+Rooms exist until manually burned. Burning a room deletes that room's local encrypted payloads, transient received files, related `.part` files, room items, and active receiver transfer state. Files and images already saved to Inbox are user-owned output and are not deleted by Burn.
 
 ## What is never uploaded
 
