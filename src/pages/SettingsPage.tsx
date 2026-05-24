@@ -1,5 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ChangeEvent, type ReactNode } from "react";
 import { prettifyShortcut } from "../lib/format";
 import { checkForUpdates, copyLastError, openLogsFolder, updateConfig } from "../lib/tauri";
 import type { AppConfig } from "../lib/types";
@@ -7,12 +7,13 @@ import type { AppConfig } from "../lib/types";
 interface SettingsPageProps {
   config: AppConfig;
   onConfigChange: (config: AppConfig) => void;
+  onJoinWithCode: () => void;
 }
 
 const PRESET_WINDOWS = [1, 2, 4, 8, 16];
 const DEFAULT_WINDOW = 8;
 
-export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
+export function SettingsPage({ config, onConfigChange, onJoinWithCode }: SettingsPageProps) {
   const [windowValue, setWindowValue] = useState(windowSelectionFromConfig(config.transfer_window_override, PRESET_WINDOWS));
   const [customWindow, setCustomWindow] = useState(customWindowFromConfig(config.transfer_window_override, PRESET_WINDOWS));
   const [logActionMessage, setLogActionMessage] = useState<string | null>(null);
@@ -95,126 +96,178 @@ export function SettingsPage({ config, onConfigChange }: SettingsPageProps) {
   }
 
   return (
-    <div className="stack">
-      <div className="panel subtle-stack">
-        <h2>Settings</h2>
-        <p className="muted">Only local utility settings live here. No cloud sync, no account data.</p>
-
-        <div className="settings-grid">
-          <div className="meta-card">
-            <span className="meta-label">Max file size</span>
-            <strong>10GB</strong>
-          </div>
-          <div className="meta-card">
-            <span className="meta-label">App version</span>
-            <strong>pastey {config.app_version}</strong>
-          </div>
+    <div className="page-stack">
+      <header className="page-header">
+        <div>
+          <h1>Settings</h1>
+          <p>Local preferences and device behavior</p>
         </div>
+        <button className="page-menu-button" aria-label="More options">
+          ...
+        </button>
+      </header>
 
-        <label className="field">
-          <span>Default expiry</span>
-          <select
-            value={config.default_expiry_minutes}
-            onChange={(event) =>
-              void save({ ...config, default_expiry_minutes: Number(event.target.value) })
-            }
-          >
-            <option value={5}>5 min</option>
-            <option value={15}>15 min</option>
-            <option value={60}>1 hour</option>
-            <option value={1440}>24 hours</option>
-          </select>
-        </label>
+      <SettingsGroup title="General" icon="gear">
+        <SettingsRow icon="folder" title="Downloads location" detail="Where received files are saved" value={config.inbox_dir ? "Custom" : "Inbox"} onAction={chooseInbox} />
+        <SettingsRow icon="bell" title="Notifications" detail="Alerts about transfers and devices" control={<Switch checked readOnly />} />
+        <SettingsRow icon="shortcut" title="Global shortcut" detail="Open Pastey quickly" value={prettifyShortcut(config.shortcut)} />
+      </SettingsGroup>
 
-        {config.dev_tools_enabled ? (
-          <>
-            <label className="field">
-              <span>Transfer window</span>
-              <select
-                value={windowValue}
-                onChange={(event) => void saveTransferWindow(event.target.value)}
-              >
-                <option value="default">Default / Auto (window 8)</option>
-                <option value="1">window 1</option>
-                <option value="2">window 2</option>
-                <option value="4">window 4</option>
-                <option value="8">window 8</option>
-                <option value="16">window 16</option>
-                <option value="custom">Custom window</option>
-              </select>
-            </label>
+      <SettingsGroup title="Trust & Sharing" icon="shield">
+        <SettingsRow
+          icon="trusted"
+          title="Auto-accept trusted devices"
+          detail="Automatically accept from trusted devices"
+          control={<Switch checked={false} disabled readOnly />}
+        />
+        <SettingsRow
+          icon="approval"
+          title="Require approval for new devices"
+          detail="Review and approve new connections"
+          control={<Switch checked disabled readOnly />}
+        />
+        <SettingsRow icon="qr" title="Join with code" detail="Enter a code to connect a device" onAction={onJoinWithCode} />
+      </SettingsGroup>
 
-            {windowValue === "custom" ? (
-              <label className="field">
-                <span>Custom window</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={16}
-                  step={1}
-                  value={customWindow}
-                  placeholder={String(DEFAULT_WINDOW)}
-                  onChange={(event) => setCustomWindow(event.target.value)}
-                  onBlur={() => void saveCustomWindow()}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.currentTarget.blur();
-                    }
-                  }}
-                />
-              </label>
-            ) : null}
-          </>
-        ) : null}
+      <SettingsGroup title="About" icon="info">
+        <SettingsRow icon="info" title="App version" detail="Pastey release" value={`pastey ${config.app_version}`} />
+        <SettingsRow icon="drive" title="Max file size" detail="Largest file allowed per transfer" value="10GB" />
+        <SettingsRow icon="wrench" title="Developer tools" detail="Diagnostics and advanced options" value={config.dev_tools_enabled ? "Enabled" : "Hidden"} />
+      </SettingsGroup>
 
-        <label className="toggle-row">
-          <span>Keep automatic cleanup enabled</span>
-          <input
-            type="checkbox"
-            checked={config.auto_burn_after_download}
-            onChange={(event) =>
-              void save({ ...config, auto_burn_after_download: event.target.checked })
-            }
-          />
-        </label>
-
-        <div className="field">
-          <span>Inbox folder</span>
-          <div className="row spread">
-            <code className="path-box">{config.inbox_dir ?? "(using app inbox)"}</code>
-            <button className="ghost-button" onClick={chooseInbox}>
-              Choose
-            </button>
+      {config.dev_tools_enabled ? (
+        <SettingsGroup title="Developer Tools" icon="wrench">
+          <SettingsRow icon="window" title="Transfer Window" detail="Binary transfer pipeline depth" control={
+            <select value={windowValue} onChange={(event) => void saveTransferWindow(event.target.value)}>
+              <option value="default">Default / Auto (window 8)</option>
+              <option value="1">window 1</option>
+              <option value="2">window 2</option>
+              <option value="4">window 4</option>
+              <option value="8">window 8</option>
+              <option value="16">window 16</option>
+              <option value="custom">Custom window</option>
+            </select>
+          } />
+          {windowValue === "custom" ? (
+            <SettingsRow icon="window" title="Custom window" detail="1 to 16" control={
+              <input
+                type="number"
+                min={1}
+                max={16}
+                step={1}
+                value={customWindow}
+                placeholder={String(DEFAULT_WINDOW)}
+                onChange={(event) => setCustomWindow(event.target.value)}
+                onBlur={() => void saveCustomWindow()}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") event.currentTarget.blur();
+                }}
+              />
+            } />
+          ) : null}
+          <SettingsRow icon="folder" title="App data path" detail="Local storage" value={config.app_data_path} />
+          <div className="settings-row diagnostics-row">
+            <span className="settings-icon wrench" aria-hidden="true" />
+            <div>
+              <strong>Diagnostics</strong>
+              <p className="muted">Logs, recent error, and update check.</p>
+              {logActionMessage ? <p className="muted">{logActionMessage}</p> : null}
+            </div>
+            <div className="diagnostic-actions">
+              <button className="secondary-button" onClick={() => void handleOpenLogsFolder()}>
+                Open Logs
+              </button>
+              <button className="secondary-button" onClick={() => void handleCopyLastError()}>
+                Copy Error
+              </button>
+              <button className="secondary-button" onClick={() => void handleCheckForUpdates()}>
+                Check Updates
+              </button>
+            </div>
           </div>
-        </div>
+        </SettingsGroup>
+      ) : null}
 
-        <div className="field">
-          <span>Global shortcut</span>
-          <code className="path-box">{prettifyShortcut(config.shortcut)}</code>
-        </div>
-
-        <div className="field">
-          <span>App data path</span>
-          <code className="path-box">{config.app_data_path}</code>
-        </div>
-
-        <div className="field">
-          <span>Diagnostics</span>
-          <div className="row gap wrap">
-            <button className="ghost-button" onClick={() => void handleOpenLogsFolder()}>
-              Open Logs Folder
-            </button>
-            <button className="ghost-button" onClick={() => void handleCopyLastError()}>
-              Copy Last Error
-            </button>
-            <button className="ghost-button" onClick={() => void handleCheckForUpdates()}>
-              Check for updates
-            </button>
-          </div>
-          {logActionMessage ? <p className="muted">{logActionMessage}</p> : null}
+      <div className="local-note-card">
+        <span className="settings-icon trusted" aria-hidden="true" />
+        <div>
+          <strong>Local-first by design</strong>
+          <p className="muted">Only local preferences live here. No cloud sync or account data.</p>
         </div>
       </div>
     </div>
+  );
+}
+
+function SettingsGroup({ title, icon, children }: { title: string; icon: string; children: ReactNode }) {
+  return (
+    <section className="settings-group">
+      <div className="settings-group-title">
+        <span className={`section-icon ${icon}`} aria-hidden="true" />
+        <h2>{title}</h2>
+      </div>
+      <div className="settings-card">{children}</div>
+    </section>
+  );
+}
+
+function SettingsRow({
+  icon,
+  title,
+  detail,
+  value,
+  control,
+  onAction
+}: {
+  icon: string;
+  title: string;
+  detail: string;
+  value?: string;
+  control?: ReactNode;
+  onAction?: () => void | Promise<void>;
+}) {
+  const content = (
+    <>
+      <span className={`settings-icon ${icon}`} aria-hidden="true" />
+      <div className="settings-row-copy">
+        <strong>{title}</strong>
+        <p className="muted">{detail}</p>
+      </div>
+      <div className="settings-row-trailing">
+        {control ? <div className="settings-control">{control}</div> : null}
+        {value ? <span className="settings-value">{value}</span> : null}
+        {onAction || value ? (
+          <span aria-hidden="true">&gt;</span>
+        ) : null}
+      </div>
+    </>
+  );
+
+  return onAction ? (
+    <button className="settings-row settings-row-button" onClick={() => void onAction()}>
+      {content}
+    </button>
+  ) : (
+    <div className="settings-row">{content}</div>
+  );
+}
+
+function Switch({
+  checked,
+  disabled,
+  readOnly,
+  onChange
+}: {
+  checked: boolean;
+  disabled?: boolean;
+  readOnly?: boolean;
+  onChange?: (event: ChangeEvent<HTMLInputElement>) => void;
+}) {
+  return (
+    <label className="switch">
+      <input type="checkbox" checked={checked} disabled={disabled} readOnly={readOnly} onChange={onChange} />
+      <span aria-hidden="true" />
+    </label>
   );
 }
 

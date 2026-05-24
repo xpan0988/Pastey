@@ -254,9 +254,6 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
     }
 
     let room = storage::get_room_by_id(&state.paths, room_id)?;
-    if room.expires_at <= storage::now_ts() {
-        return Err(AppError::InvalidInput("Room expired.".into()));
-    }
 
     let transport_secret = crypto::generate_transport_secret();
     let router = Router::new()
@@ -319,7 +316,7 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
         },
     );
 
-    if room.status != RoomStatus::Burned && room.status != RoomStatus::Expired {
+    if room.status != RoomStatus::Burned {
         storage::set_room_status(&state.paths, room_id, RoomStatus::Active)?;
     }
 
@@ -331,9 +328,9 @@ pub async fn stop_room_server(state: Arc<AppState>, room_id: &str) -> AppResult<
     let _ = cancel_room_transfers(
         state.clone(),
         room_id,
-        "Room expired.",
+        TRANSFER_INTERRUPTED_MESSAGE,
         false,
-        Some("transfer_timed_out"),
+        Some("peer_disconnected"),
     )
     .await;
     let maybe_server = state.active_servers.lock().remove(room_id);
@@ -379,9 +376,6 @@ pub async fn send_room_item(state: Arc<AppState>, room_id: &str, item_id: &str) 
     let room = storage::get_room_by_id(&state.paths, room_id)?;
     if room.status == RoomStatus::Burned {
         return Err(AppError::InvalidInput(ROOM_BURNED_MESSAGE.into()));
-    }
-    if room.expires_at <= storage::now_ts() || room.status == RoomStatus::Expired {
-        return Err(AppError::InvalidInput(TRANSFER_INTERRUPTED_MESSAGE.into()));
     }
     let peer_host = room
         .peer_host
@@ -467,9 +461,6 @@ pub async fn send_room_file(
     let room = storage::get_room_by_id(&state.paths, room_id)?;
     if room.status == RoomStatus::Burned {
         return Err(AppError::InvalidInput(ROOM_BURNED_MESSAGE.into()));
-    }
-    if room.expires_at <= storage::now_ts() || room.status == RoomStatus::Expired {
-        return Err(AppError::InvalidInput(TRANSFER_INTERRUPTED_MESSAGE.into()));
     }
     let peer_host = room
         .peer_host
@@ -2352,14 +2343,6 @@ fn room_server_snapshot(state: &Arc<AppState>, room_id: &str) -> AppResult<Activ
     })
 }
 
-fn room_has_active_transfer(state: &Arc<AppState>, room_id: &str) -> bool {
-    state
-        .active_file_transfers
-        .lock()
-        .values()
-        .any(|transfer| transfer.room_id == room_id)
-}
-
 async fn join_handler(
     AxumPath(room_id): AxumPath<String>,
     ConnectInfo(source): ConnectInfo<SocketAddr>,
@@ -2372,9 +2355,7 @@ async fn join_handler(
 
     let room =
         storage::get_room_by_id(&ctx.state.paths, &room_id).map_err(|_| StatusCode::NOT_FOUND)?;
-    if room.expires_at <= storage::now_ts()
-        || matches!(room.status, RoomStatus::Burned | RoomStatus::Expired)
-    {
+    if room.status == RoomStatus::Burned {
         return Err(StatusCode::GONE);
     }
 
@@ -2473,22 +2454,26 @@ async fn receive_item_handler(
     };
 
     let saved_path = if upload.payload_type == PayloadType::File {
-        let inbox_dir = {
+        let destination_dir = {
             let config = ctx.state.config.read();
-            config::effective_inbox_dir(&ctx.state.paths, &config)
+            config::received_item_destination_dir(
+                &ctx.state.paths,
+                &config,
+                upload.mime_type.as_deref(),
+            )
         };
-        let output_path = match storage::next_inbox_path(&inbox_dir, upload.display_name.as_deref())
-        {
-            Ok(path) => path,
-            Err(_) => {
-                return transfer_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "write_failed",
-                    "Could not write to destination folder.".into(),
-                )
-            }
-        };
-        if tokio::fs::create_dir_all(&inbox_dir).await.is_err()
+        let output_path =
+            match storage::next_inbox_path(&destination_dir, upload.display_name.as_deref()) {
+                Ok(path) => path,
+                Err(_) => {
+                    return transfer_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "write_failed",
+                        "Could not write to destination folder.".into(),
+                    )
+                }
+            };
+        if tokio::fs::create_dir_all(&destination_dir).await.is_err()
             || tokio::fs::write(&output_path, &plaintext).await.is_err()
         {
             return transfer_error(
@@ -2603,11 +2588,11 @@ async fn start_file_transfer_handler(
             );
         }
     };
-    let inbox_dir = {
+    let destination_dir = {
         let config = ctx.state.config.read();
-        config::effective_inbox_dir(&ctx.state.paths, &config)
+        config::received_item_destination_dir(&ctx.state.paths, &config, start.mime_type.as_deref())
     };
-    if !has_enough_disk_space(&inbox_dir, start.size_bytes) {
+    if !has_enough_disk_space(&destination_dir, start.size_bytes) {
         return transfer_error(
             StatusCode::INSUFFICIENT_STORAGE,
             "not_enough_disk_space",
@@ -2616,7 +2601,7 @@ async fn start_file_transfer_handler(
     }
     let reserved_final_paths = active_receiver_final_paths(&ctx.state);
     let final_path = match storage::next_inbox_path_excluding(
-        &inbox_dir,
+        &destination_dir,
         start.display_name.as_deref(),
         &reserved_final_paths,
     ) {
@@ -2629,7 +2614,7 @@ async fn start_file_transfer_handler(
             )
         }
     };
-    let part_path = storage::transfer_part_path(&inbox_dir, &start.transfer_id);
+    let part_path = storage::transfer_part_path(&destination_dir, &start.transfer_id);
     let Some(part_dir) = part_path.parent() else {
         return transfer_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3628,13 +3613,6 @@ fn unavailable_room_response(state: &Arc<AppState>, room_id: &str) -> Option<Res
             ROOM_BURNED_MESSAGE.into(),
         ));
     }
-    if room.expires_at <= storage::now_ts() || room.status == RoomStatus::Expired {
-        return Some(transfer_error(
-            StatusCode::GONE,
-            "room_expired",
-            TRANSFER_INTERRUPTED_MESSAGE.into(),
-        ));
-    }
     None
 }
 
@@ -3652,16 +3630,6 @@ fn unavailable_room_response_for_active_transfer(
             ))
         }
     };
-    if room.expires_at <= storage::now_ts() || room.status == RoomStatus::Expired {
-        if room_has_active_transfer(state, room_id) {
-            return None;
-        }
-        return Some(transfer_error(
-            StatusCode::GONE,
-            "room_expired",
-            TRANSFER_INTERRUPTED_MESSAGE.into(),
-        ));
-    }
     if room.status == RoomStatus::Burned {
         return Some(transfer_error(
             StatusCode::GONE,
@@ -3970,9 +3938,6 @@ fn sender_room_terminal_state(
     let room = storage::get_room_by_id(&state.paths, room_id).ok()?;
     if room.status == RoomStatus::Burned {
         return Some(("burned", ROOM_BURNED_MESSAGE.into()));
-    }
-    if room.status == RoomStatus::Expired || room.expires_at <= storage::now_ts() {
-        return Some(("interrupted", TRANSFER_INTERRUPTED_MESSAGE.into()));
     }
     None
 }

@@ -14,7 +14,7 @@ export interface FileTransferMetadata {
   modified_ms: number;
 }
 
-export async function createRoom(expiryMinutes: number): Promise<RoomInfo> {
+export async function createRoom(expiryMinutes = 15): Promise<RoomInfo> {
   return invoke("create_room", { expiryMinutes });
 }
 

@@ -146,6 +146,10 @@ pub struct AppConfig {
     pub default_expiry_minutes: u64,
     pub inbox_dir: Option<String>,
     pub auto_burn_after_download: bool,
+    #[serde(default = "default_save_received_to_inbox")]
+    pub save_received_files_to_inbox: bool,
+    #[serde(default = "default_save_received_to_inbox")]
+    pub save_received_images_to_inbox: bool,
     #[serde(default)]
     pub transfer_window_override: Option<usize>,
     #[serde(default)]
@@ -153,6 +157,10 @@ pub struct AppConfig {
     pub shortcut: String,
     pub app_data_path: String,
     pub app_version: String,
+}
+
+pub fn default_save_received_to_inbox() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

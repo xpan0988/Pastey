@@ -65,6 +65,8 @@ export interface AppConfig {
   default_expiry_minutes: number;
   inbox_dir?: string | null;
   auto_burn_after_download: boolean;
+  save_received_files_to_inbox: boolean;
+  save_received_images_to_inbox: boolean;
   transfer_window_override?: number | null;
   dev_tools_enabled: boolean;
   shortcut: string;

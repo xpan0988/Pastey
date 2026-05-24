@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -24,6 +23,7 @@ use crate::{
 pub const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 pub const MAX_FILE_SIZE_MESSAGE: &str = "File too large. Max supported size: 10GB.";
 const ROOM_FILE_DELETE_ERROR: &str = "Could not delete local room files. Check folder permissions.";
+const MANUAL_BURN_ROOM_LIFETIME_SECS: i64 = 100 * 365 * 24 * 60 * 60;
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -145,7 +145,8 @@ pub fn create_room(
 ) -> AppResult<StoredRoom> {
     let id = room_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let now = now_ts();
-    let expires_at = expires_at_override.unwrap_or(now + (expiry_minutes as i64 * 60));
+    let _ = expiry_minutes;
+    let expires_at = expires_at_override.unwrap_or(now + MANUAL_BURN_ROOM_LIFETIME_SECS);
     let (wrapped_room_code, code_nonce) = crypto::wrap_bytes(code.as_bytes(), master_key)?;
     let room = StoredRoom {
         id,
@@ -155,7 +156,7 @@ pub fn create_room(
         status: RoomStatus::Active,
         local_role,
         peer_device_name: None,
-        auto_burn_after_expiry: true,
+        auto_burn_after_expiry: false,
         wrapped_room_code,
         code_nonce,
         peer_host: None,
@@ -220,7 +221,7 @@ pub fn create_room(
 pub fn active_room_code_exists(paths: &AppPaths, code_hash: &str) -> AppResult<bool> {
     let conn = connection(paths)?;
     let exists = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM rooms WHERE room_code_hash = ?1 AND status NOT IN ('burned', 'expired'))",
+        "SELECT EXISTS(SELECT 1 FROM rooms WHERE room_code_hash = ?1 AND status != 'burned')",
         [code_hash],
         |row| row.get::<_, i64>(0),
     )?;
@@ -248,7 +249,7 @@ pub fn list_rooms(paths: &AppPaths) -> AppResult<Vec<StoredRoom>> {
             local_burned_at,
             peer_burned_at
         FROM rooms
-        WHERE status NOT IN ('burned', 'expired')
+        WHERE status != 'burned'
         ORDER BY created_at DESC
         "#,
     )?;
@@ -305,7 +306,7 @@ pub fn update_room_peer(
             peer_transport_public_key = ?4,
             status = ?5,
             peer_burned_at = NULL
-        WHERE id = ?6 AND status NOT IN ('burned', 'expired')
+        WHERE id = ?6 AND status != 'burned'
         "#,
         params![
             peer_host,
@@ -328,7 +329,7 @@ pub fn mark_peer_left(paths: &AppPaths, room_id: &str) -> AppResult<()> {
             peer_port = NULL,
             peer_transport_public_key = NULL,
             status = ?1
-        WHERE id = ?2 AND status NOT IN ('burned', 'expired')
+        WHERE id = ?2 AND status != 'burned'
         "#,
         params![RoomStatus::PeerLeft.as_str(), room_id],
     )?;
@@ -345,7 +346,7 @@ pub fn mark_peer_burned(paths: &AppPaths, room_id: &str) -> AppResult<()> {
             peer_transport_public_key = NULL,
             status = ?1,
             peer_burned_at = ?2
-        WHERE id = ?3 AND status NOT IN ('burned', 'expired')
+        WHERE id = ?3 AND status != 'burned'
         "#,
         params![RoomStatus::PeerLeft.as_str(), now_ts(), room_id],
     )?;
@@ -356,7 +357,7 @@ pub fn set_room_status(paths: &AppPaths, room_id: &str, status: RoomStatus) -> A
     let conn = connection(paths)?;
     if status == RoomStatus::Active {
         conn.execute(
-            "UPDATE rooms SET status = ?1 WHERE id = ?2 AND status NOT IN ('burned', 'expired')",
+            "UPDATE rooms SET status = ?1 WHERE id = ?2 AND status != 'burned'",
             params![status.as_str(), room_id],
         )?;
     } else {
@@ -665,29 +666,10 @@ pub fn cleanup_expired_rooms_except(
     paths: &AppPaths,
     excluded_room_ids: &[String],
 ) -> AppResult<Vec<String>> {
-    let conn = connection(paths)?;
-    let now = now_ts();
-    let mut stmt = conn.prepare(
-        "SELECT id FROM rooms WHERE expires_at <= ?1 AND status NOT IN ('expired', 'burned')",
-    )?;
-    let rows = stmt.query_map([now], |row| row.get::<_, String>(0))?;
-    let excluded_room_ids = excluded_room_ids.iter().cloned().collect::<HashSet<_>>();
-    let room_ids = rows
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|room_id| !excluded_room_ids.contains(room_id))
-        .collect::<Vec<_>>();
-
-    for room_id in &room_ids {
-        delete_room_payloads(paths, room_id)?;
-        conn.execute("DELETE FROM room_items WHERE room_id = ?1", [room_id])?;
-        conn.execute(
-            "UPDATE rooms SET status = 'expired', peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL WHERE id = ?1",
-            [room_id],
-        )?;
-    }
-
-    Ok(room_ids)
+    // Rooms are now manual-burn lifecycle objects. Keep this compatibility hook
+    // for callers/tests, but never destroy room metadata due to elapsed time.
+    let _ = (paths, excluded_room_ids);
+    Ok(Vec::new())
 }
 
 pub fn run_startup_recovery(paths: &AppPaths, effective_inbox_dir: &Path) -> AppResult<()> {
@@ -705,6 +687,12 @@ pub fn run_startup_recovery(paths: &AppPaths, effective_inbox_dir: &Path) -> App
         ));
     }
     cleanup_stale_part_files(paths, effective_inbox_dir);
+    let cleaned_transient_items = cleanup_transient_received_files(paths)?;
+    if cleaned_transient_items > 0 {
+        logging::write_transfer_line(&format!(
+            "[pastey recovery] event=transient_received_cleanup count={cleaned_transient_items}"
+        ));
+    }
     Ok(())
 }
 
@@ -717,6 +705,50 @@ pub fn cleanup_stale_part_files(paths: &AppPaths, effective_inbox_dir: &Path) {
     for root in roots {
         cleanup_stale_part_files_in_dir(&root);
     }
+}
+
+pub fn cleanup_transient_received_files(paths: &AppPaths) -> AppResult<usize> {
+    let conn = connection(paths)?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, room_id, saved_path
+        FROM room_items
+        WHERE direction = 'incoming'
+          AND payload_type = 'file'
+          AND status = 'received'
+          AND saved_path IS NOT NULL
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let candidates = rows.collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut cleaned = 0;
+    for (item_id, room_id, saved_path) in candidates {
+        let saved_path = PathBuf::from(saved_path);
+        if !is_path_under_any_root(&saved_path, &[&paths.temp_dir]) {
+            continue;
+        }
+        remove_tracked_room_file(
+            &room_id,
+            "transient_saved_path",
+            &saved_path,
+            &[&paths.temp_dir],
+        )?;
+        conn.execute(
+            "UPDATE room_items SET status = 'interrupted', saved_path = NULL WHERE id = ?1",
+            [item_id],
+        )?;
+        cleaned += 1;
+    }
+
+    Ok(cleaned)
 }
 
 pub fn mark_rooms_left_on_startup(paths: &AppPaths) -> AppResult<usize> {
@@ -1073,7 +1105,7 @@ fn insert_room_item(paths: &AppPaths, item: &StoredRoomItem) -> AppResult<()> {
             saved_path
         )
         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
-        WHERE EXISTS(SELECT 1 FROM rooms WHERE id = ?2 AND status NOT IN ('burned', 'expired'))
+        WHERE EXISTS(SELECT 1 FROM rooms WHERE id = ?2 AND status != 'burned')
         "#,
         params![
             &item.id,
@@ -1106,7 +1138,7 @@ fn mark_stale_created_items_interrupted(paths: &AppPaths) -> AppResult<usize> {
         SET status = 'interrupted'
         WHERE status = 'created'
           AND room_id IN (
-            SELECT id FROM rooms WHERE status NOT IN ('burned', 'expired')
+            SELECT id FROM rooms WHERE status != 'burned'
           )
         "#,
         [],
@@ -1172,14 +1204,6 @@ pub fn delete_room_item(paths: &AppPaths, item_id: &str) -> AppResult<bool> {
     Ok(true)
 }
 
-fn delete_room_payloads(paths: &AppPaths, room_id: &str) -> AppResult<()> {
-    let items = list_room_items(paths, room_id)?;
-    for item in items {
-        delete_payload_file(paths, &item.encrypted_path)?;
-    }
-    Ok(())
-}
-
 fn connection(paths: &AppPaths) -> AppResult<Connection> {
     let conn = Connection::open(&paths.db_path)?;
     conn.execute("PRAGMA foreign_keys = ON", [])?;
@@ -1212,6 +1236,10 @@ fn migrate_room_statuses(conn: &Connection) -> AppResult<()> {
         "UPDATE rooms SET status = 'peer_left' WHERE status = 'left'",
         [],
     )?;
+    conn.execute(
+        "UPDATE rooms SET status = 'peer_left' WHERE status = 'expired'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -1227,7 +1255,7 @@ fn delete_room_files(paths: &AppPaths, room_id: &str, effective_inbox_dir: &Path
     let items = list_room_items(paths, room_id)?;
     for item in items {
         delete_room_item_payload(paths, room_id, &item)?;
-        delete_room_item_saved_file(room_id, effective_inbox_dir, &item)?;
+        delete_room_item_transient_saved_file(paths, room_id, &item)?;
         delete_room_item_part_files(paths, room_id, effective_inbox_dir, &item)?;
     }
     Ok(())
@@ -1246,9 +1274,9 @@ fn delete_room_item_payload(
     remove_tracked_room_file(room_id, "payload", &path, &[&paths.payloads_dir])
 }
 
-fn delete_room_item_saved_file(
+fn delete_room_item_transient_saved_file(
+    paths: &AppPaths,
     room_id: &str,
-    effective_inbox_dir: &Path,
     item: &StoredRoomItem,
 ) -> AppResult<()> {
     let Some(saved_path) = item.saved_path.as_deref().filter(|path| !path.is_empty()) else {
@@ -1257,12 +1285,19 @@ fn delete_room_item_saved_file(
 
     let saved_path = PathBuf::from(saved_path);
     let part_path = part_path_for(&saved_path);
-    remove_tracked_room_file(room_id, "saved_path", &saved_path, &[effective_inbox_dir])?;
+    // Inbox files are durable user-owned output. Burn removes transient room
+    // state and temp-backed received files only; it must not delete Inbox files.
     remove_tracked_room_file(
         room_id,
-        "saved_path_part",
+        "transient_saved_path",
+        &saved_path,
+        &[&paths.temp_dir],
+    )?;
+    remove_tracked_room_file(
+        room_id,
+        "transient_saved_path_part",
         &part_path,
-        &[effective_inbox_dir],
+        &[&paths.temp_dir],
     )
 }
 
@@ -1642,8 +1677,8 @@ mod tests {
     }
 
     #[test]
-    fn burn_deletes_completed_incoming_file_for_room() {
-        let paths = test_paths("pastey_burn_deletes_incoming");
+    fn burn_preserves_completed_inbox_file_for_room() {
+        let paths = test_paths("pastey_burn_preserves_inbox");
         init_database(&paths).unwrap();
         let master_key = crypto::random_key();
         create_room(
@@ -1674,7 +1709,7 @@ mod tests {
 
         burn_room(&paths, "room", &paths.inbox_dir).unwrap();
 
-        assert!(!final_path.exists());
+        assert!(final_path.exists());
         assert!(list_room_items(&paths, "room").unwrap().is_empty());
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
@@ -1728,10 +1763,75 @@ mod tests {
 
         burn_room(&paths, "room-a", &paths.inbox_dir).unwrap();
 
-        assert!(!first_path.exists());
+        assert!(first_path.exists());
         assert!(second_path.exists());
         assert!(list_room_items(&paths, "room-a").unwrap().is_empty());
         assert_eq!(list_room_items(&paths, "room-b").unwrap().len(), 1);
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn burn_deletes_transient_received_file_for_room() {
+        let paths = test_paths("pastey_burn_deletes_transient");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        fs::create_dir_all(&paths.temp_dir).unwrap();
+        let transient_path = paths.temp_dir.join("payload.bin");
+        fs::write(&transient_path, [1_u8, 2, 3]).unwrap();
+        persist_incoming_file_item_metadata(
+            &paths,
+            &master_key,
+            "room",
+            "transfer",
+            3,
+            Some("payload.bin".into()),
+            Some("application/octet-stream".into()),
+            now_ts(),
+            Some(transient_path.display().to_string()),
+        )
+        .unwrap();
+
+        burn_room(&paths, "room", &paths.inbox_dir).unwrap();
+
+        assert!(!transient_path.exists());
+        assert!(list_room_items(&paths, "room").unwrap().is_empty());
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn room_is_not_automatically_destroyed_by_default_expiry() {
+        let paths = test_paths("pastey_manual_burn_lifecycle");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        let room = create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            Some(now_ts() - 1),
+        )
+        .unwrap();
+
+        let expired = cleanup_expired_rooms_except(&paths, &[]).unwrap();
+
+        assert!(expired.is_empty());
+        assert_eq!(
+            get_room_by_id(&paths, &room.id).unwrap().status,
+            RoomStatus::Active
+        );
+        assert_eq!(list_rooms(&paths).unwrap().len(), 1);
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 
@@ -1879,6 +1979,21 @@ mod tests {
         let completed_other_file = custom_inbox.join("completed.bin");
         fs::create_dir_all(&custom_inbox).unwrap();
         fs::write(&completed_other_file, [9_u8]).unwrap();
+        let transient_received = paths.temp_dir.join("transient.png");
+        fs::create_dir_all(&paths.temp_dir).unwrap();
+        fs::write(&transient_received, [4_u8, 5, 6]).unwrap();
+        let transient_item = persist_incoming_file_item_metadata(
+            &paths,
+            &master_key,
+            "room",
+            "transient-transfer",
+            3,
+            Some("transient.png".into()),
+            Some("image/png".into()),
+            now_ts(),
+            Some(transient_received.display().to_string()),
+        )
+        .unwrap();
 
         run_startup_recovery(&paths, &custom_inbox).unwrap();
 
@@ -1890,6 +2005,10 @@ mod tests {
         assert!(!custom_part.exists());
         assert!(!temp_part.exists());
         assert!(completed_other_file.exists());
+        assert!(!transient_received.exists());
+        let recovered_transient = get_room_item_by_id(&paths, &transient_item.id).unwrap();
+        assert_eq!(recovered_transient.status, RoomItemStatus::Interrupted);
+        assert_eq!(recovered_transient.saved_path, None);
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 
