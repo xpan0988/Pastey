@@ -47,6 +47,18 @@ Peer benchmarks are LAN baselines between trusted Pastey devices. Peer raw link 
 
 ## Version history
 
+### 1.6.0 — Device diagnostics foundation
+
+- Added a lightweight Device Diagnostics foundation behind Developer Tools.
+- Added local `DeviceProfile` and capability probing for device name, platform, OS, CPU, memory, GPU, power state, and a small whitelist of useful runtimes.
+- Added local loopback diagnostics for raw memory/socket baseline and Pastey encrypted/framed pipeline overhead.
+- Added peer benchmark backend support for trusted room peers without writing benchmark payloads to Inbox or disk.
+- Clarified diagnostics semantics in the UI and README: loopback tests stay on the same device, peer tests measure LAN behavior, and only real transfers represent end-user file transfer speed.
+- Refined diagnostics display to show concrete CPU, GPU, and runtime facts instead of internal routing role hints.
+- Improved macOS and Windows device name, CPU, and GPU detection while avoiding serial numbers, MAC addresses, arbitrary commands, cloud upload, disk stress tests, and system-wide software inventory.
+- Kept `recommended_roles` in backend data for future routing while hiding those internal hints from the main diagnostics card.
+- Added serialization, compatibility, parsing, benchmark discard, and diagnostics quality-label tests.
+
 ### 1.5.4 — Engineering cleanup and transport consolidation
 
 - Centralized transfer window policy into `transfer_tuning.rs`.
