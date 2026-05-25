@@ -35,6 +35,16 @@ The project intentionally prioritizes:
 
 Current releases focus on stabilizing the transport, lifecycle, and cross-platform foundation before larger multi-device workflow features are introduced.
 
+## Device diagnostics
+
+Pastey diagnostics are lightweight, local-first, and capability-oriented. They are intended to help future trusted-device routing decisions, not to rank hardware or stress-test a machine.
+
+Diagnostics may summarize the local device profile, a small whitelist of useful runtimes, GPU acceleration availability, and discard-only link benchmark results between trusted devices. They do not run disk stress tests, upload data to a cloud service, scan the whole system, store benchmark payloads, or keep a system-wide software inventory.
+
+Loopback benchmarks are local baselines. They use localhost and stay on the same device, so they do not measure Wi-Fi, Ethernet, router, ISP, school network, or internet speed. Loopback raw memory measures local memory/socket overhead; loopback Pastey pipeline adds Pastey's encryption and binary framing overhead while still discarding payloads in memory.
+
+Peer benchmarks are LAN baselines between trusted Pastey devices. Peer raw link is a lightweight device-to-device memory benchmark, and peer Pastey pipeline adds Pastey's encrypted/framed transport path without writing benchmark data to Inbox or disk. Real file transfers are the only path comparable to end-user transfer behavior because they include network, Pastey protocol, file read/write, Inbox/finalize, and UI lifecycle.
+
 ## Version history
 
 ### 1.5.4 — Engineering cleanup and transport consolidation

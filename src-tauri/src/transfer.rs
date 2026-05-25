@@ -32,7 +32,7 @@ use crate::{
     },
     config, crypto, discovery,
     error::{AppError, AppResult},
-    logging,
+    link_benchmark, logging,
     models::{
         ChunkAckResponse, ChunkUploadRequest, FileTransferFinishRequest, FileTransferProgressEvent,
         FileTransferStartRequest, JoinRoomRequest, JoinRoomResponse, PayloadType, RoomItemStatus,
@@ -274,6 +274,20 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
         .route(
             "/rooms/:room_id/transfers/:transfer_id/cancel",
             post(cancel_file_transfer_handler),
+        )
+        .route(
+            "/rooms/:room_id/diagnostics/ping",
+            post(diagnostics_ping_handler),
+        )
+        .route(
+            "/rooms/:room_id/diagnostics/benchmark/raw",
+            post(diagnostics_raw_benchmark_handler)
+                .layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES)),
+        )
+        .route(
+            "/rooms/:room_id/diagnostics/benchmark/pipeline",
+            post(diagnostics_pipeline_benchmark_handler)
+                .layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES)),
         )
         .route("/rooms/:room_id/burn", post(remote_burn_handler))
         .route("/rooms/:room_id/leave", post(remote_leave_handler))
@@ -2512,6 +2526,86 @@ async fn receive_item_handler(
     }
     let _ = storage::set_room_status(&ctx.state.paths, &room_id, RoomStatus::Active);
     StatusCode::OK.into_response()
+}
+
+async fn diagnostics_ping_handler(
+    AxumPath(room_id): AxumPath<String>,
+    State(ctx): State<RoomServerContext>,
+) -> Response {
+    if room_id != ctx.room_id {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if let Some(response) = unavailable_room_response(&ctx.state, &room_id) {
+        return response;
+    }
+
+    StatusCode::OK.into_response()
+}
+
+async fn diagnostics_raw_benchmark_handler(
+    AxumPath(room_id): AxumPath<String>,
+    State(ctx): State<RoomServerContext>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    diagnostics_benchmark_handler(
+        room_id,
+        ctx,
+        crate::diagnostics::BenchmarkMode::RawMemory,
+        body,
+    )
+}
+
+async fn diagnostics_pipeline_benchmark_handler(
+    AxumPath(room_id): AxumPath<String>,
+    State(ctx): State<RoomServerContext>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    diagnostics_benchmark_handler(
+        room_id,
+        ctx,
+        crate::diagnostics::BenchmarkMode::PasteyPipeline,
+        body,
+    )
+}
+
+fn diagnostics_benchmark_handler(
+    room_id: String,
+    ctx: RoomServerContext,
+    mode: crate::diagnostics::BenchmarkMode,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    if room_id != ctx.room_id {
+        return transfer_error(
+            StatusCode::NOT_FOUND,
+            "room_not_found",
+            "Room not found on receiver.".into(),
+        );
+    }
+    if let Some(response) = unavailable_room_response(&ctx.state, &room_id) {
+        return response;
+    }
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => {
+            return transfer_error(
+                error.status(),
+                "invalid_benchmark_payload",
+                "Invalid benchmark payload.".into(),
+            )
+        }
+    };
+    match link_benchmark::discard_benchmark_payload(mode, &body) {
+        Ok(received_bytes) => Json(link_benchmark::BenchmarkDiscardResponse {
+            received_bytes,
+            receiver_cpu_hint: link_benchmark::cpu_hint(),
+        })
+        .into_response(),
+        Err(error) => transfer_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_benchmark_payload",
+            error.message(),
+        ),
+    }
 }
 
 async fn start_file_transfer_handler(

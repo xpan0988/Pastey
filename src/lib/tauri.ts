@@ -1,5 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppConfig, JoinRequestPrompt, NearbyDevice, RoomInfo, RoomItem } from "./types";
+import type {
+  AppConfig,
+  BenchmarkMode,
+  DeviceCapabilities,
+  DeviceProfile,
+  JoinRequestPrompt,
+  LinkBenchmarkResult,
+  NearbyDevice,
+  RoomInfo,
+  RoomItem
+} from "./types";
 
 interface SendFileOptions {
   displayName?: string;
@@ -97,6 +107,46 @@ export async function leaveRoom(roomId: string): Promise<boolean> {
 
 export async function getConfig(): Promise<AppConfig> {
   return invoke("get_config");
+}
+
+export async function getDeviceProfile(): Promise<DeviceProfile> {
+  return invoke("get_device_profile");
+}
+
+export async function getDeviceCapabilities(): Promise<DeviceCapabilities> {
+  return invoke("get_device_capabilities");
+}
+
+export async function runLoopbackBenchmark(options?: {
+  mode?: BenchmarkMode;
+  durationSeconds?: number;
+  windowSize?: number | null;
+}): Promise<LinkBenchmarkResult> {
+  return invoke("run_loopback_benchmark", {
+    mode: options?.mode ?? null,
+    durationSeconds: options?.durationSeconds ?? null,
+    windowSize: options?.windowSize ?? null
+  });
+}
+
+export async function runPeerLinkBenchmark(
+  roomId: string,
+  options?: {
+    mode?: BenchmarkMode;
+    durationSeconds?: number;
+    windowSize?: number | null;
+  }
+): Promise<LinkBenchmarkResult> {
+  return invoke("run_peer_link_benchmark", {
+    roomId,
+    mode: options?.mode ?? null,
+    durationSeconds: options?.durationSeconds ?? null,
+    windowSize: options?.windowSize ?? null
+  });
+}
+
+export async function getLastBenchmarkResults(): Promise<LinkBenchmarkResult[]> {
+  return invoke("get_last_benchmark_results");
 }
 
 export async function updateConfig(config: AppConfig): Promise<AppConfig> {

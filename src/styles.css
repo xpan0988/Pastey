@@ -1253,6 +1253,64 @@ label {
   flex-wrap: wrap;
 }
 
+.diagnostics-panel-row {
+  align-items: flex-start;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.diagnostics-panel {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.diagnostics-note {
+  max-width: 780px;
+}
+
+.diagnostics-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.diagnostic-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.diagnostic-block {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid rgba(13, 31, 61, 0.08);
+  border-radius: 8px;
+  background: rgba(247, 250, 255, 0.68);
+}
+
+.diagnostic-metric {
+  display: grid;
+  grid-template-columns: minmax(84px, max-content) minmax(0, 1fr);
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.94rem;
+}
+
+.diagnostic-metric span:last-child {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.benchmark-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .local-note-card {
   display: flex;
   align-items: center;
@@ -1860,9 +1918,20 @@ label {
 
   .create-room-actions,
   .settings-row,
-  .diagnostics-row {
+  .diagnostics-row,
+  .diagnostics-panel-row {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .diagnostics-panel-header,
+  .benchmark-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .diagnostic-grid {
+    grid-template-columns: 1fr;
   }
 
   .settings-control,

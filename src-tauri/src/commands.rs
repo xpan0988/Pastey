@@ -6,9 +6,9 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::{
-    config, crypto, discovery,
+    capability_probe, config, crypto, device_profile, diagnostics, discovery,
     error::{AppError, AppResult},
-    logging,
+    link_benchmark, logging,
     models::{AppConfig, JoinRequestPrompt, LocalRole, NearbyDevice, RoomInfo, RoomItem},
     storage, transfer, AppState,
 };
@@ -500,6 +500,98 @@ pub async fn cancel_transfer(
 pub fn get_config(state: State<'_, Arc<AppState>>) -> Result<AppConfig, String> {
     let config = state.config.read().clone();
     Ok(config::public_config(&state.paths, &config))
+}
+
+#[tauri::command]
+pub fn get_device_profile(
+    state: State<'_, Arc<AppState>>,
+) -> Result<diagnostics::DeviceProfile, String> {
+    let config = state.config.read().clone();
+    let profile = device_profile::local_device_profile(&config);
+    state.latest_device_profile.lock().replace(profile.clone());
+    Ok(profile)
+}
+
+#[tauri::command]
+pub fn get_device_capabilities(
+    state: State<'_, Arc<AppState>>,
+) -> Result<diagnostics::DeviceCapabilities, String> {
+    let config = state.config.read().clone();
+    let profile = device_profile::local_device_profile(&config);
+    state.latest_device_profile.lock().replace(profile.clone());
+    let capabilities = capability_probe::probe_device_capabilities(&profile);
+    state
+        .latest_device_capabilities
+        .lock()
+        .replace(capabilities.clone());
+    Ok(capabilities)
+}
+
+#[tauri::command]
+pub async fn run_loopback_benchmark(
+    mode: Option<String>,
+    duration_seconds: Option<u64>,
+    window_size: Option<usize>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<diagnostics::LinkBenchmarkResult, String> {
+    run_async(async move {
+        let mode = diagnostics::BenchmarkMode::from_option(mode.as_deref());
+        let result = link_benchmark::run_loopback_benchmark(
+            mode,
+            duration_seconds,
+            window_size,
+            link_benchmark::cpu_hint(),
+        )
+        .await?;
+        state
+            .latest_benchmark_results
+            .lock()
+            .insert("loopback".into(), result.clone());
+        Ok(result)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn run_peer_link_benchmark(
+    room_id: String,
+    mode: Option<String>,
+    duration_seconds: Option<u64>,
+    window_size: Option<usize>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<diagnostics::LinkBenchmarkResult, String> {
+    run_async(async move {
+        let mode = diagnostics::BenchmarkMode::from_option(mode.as_deref());
+        let result = link_benchmark::run_peer_link_benchmark(
+            state.inner().clone(),
+            room_id.clone(),
+            mode,
+            duration_seconds,
+            window_size,
+            link_benchmark::cpu_hint(),
+        )
+        .await?;
+        state
+            .latest_benchmark_results
+            .lock()
+            .insert(room_id, result.clone());
+        Ok(result)
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn get_last_benchmark_results(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<diagnostics::LinkBenchmarkResult>, String> {
+    let mut results = state
+        .latest_benchmark_results
+        .lock()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    Ok(results)
 }
 
 #[tauri::command]
