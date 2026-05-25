@@ -74,6 +74,65 @@ export interface AppConfig {
   app_version: string;
 }
 
+export type PowerState = "plugged_in" | "on_battery" | "unknown";
+
+export interface DeviceProfile {
+  device_id: string;
+  device_name: string;
+  platform: string;
+  os_version?: string | null;
+  arch: string;
+  cpu_name?: string | null;
+  cpu_physical_core_count?: number | null;
+  cpu_logical_processor_count?: number | null;
+  cpu_core_count?: number | null;
+  memory_total_gb?: number | null;
+  gpu_names: string[];
+  power_state: PowerState;
+  battery_percent?: number | null;
+  updated_at: number;
+}
+
+export interface RuntimeCapability {
+  name: string;
+  available: boolean;
+  version?: string | null;
+  source: "path" | "command" | "api" | "unknown";
+}
+
+export interface DeviceCapabilities {
+  runtimes: RuntimeCapability[];
+  gpu_acceleration: {
+    cuda_available: boolean;
+    metal_available: boolean;
+    gpu_names: string[];
+    vram_gb?: number | null;
+  };
+  recommended_roles: string[];
+  updated_at: number;
+}
+
+export type BenchmarkMode = "raw_memory" | "pastey_pipeline";
+export type LinkQuality = "Poor" | "Fair" | "Good" | "Excellent";
+
+export interface LinkBenchmarkResult {
+  peer_id?: string | null;
+  peer_name?: string | null;
+  average_MBps: number;
+  peak_MBps: number;
+  latency_ms?: number | null;
+  duration_ms: number;
+  total_bytes: number;
+  effective_window_size?: number | null;
+  sender_cpu_hint?: string | null;
+  receiver_cpu_hint?: string | null;
+  failed_chunks: number;
+  duplicate_chunks: number;
+  benchmark_mode: BenchmarkMode;
+  link_quality: LinkQuality;
+  timestamp: number;
+}
+
 export interface FileTransferProgressEvent {
   transfer_id: string;
   room_id: string;

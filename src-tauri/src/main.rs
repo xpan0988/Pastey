@@ -1,11 +1,15 @@
+mod capability_probe;
 mod chunk_frame;
 mod cleanup;
 mod commands;
 mod config;
 mod crypto;
 mod dev_tools;
+mod device_profile;
+mod diagnostics;
 mod discovery;
 mod error;
+mod link_benchmark;
 mod logging;
 mod models;
 mod storage;
@@ -25,10 +29,11 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 use crate::{
     commands::{
         accept_nearby_join, burn_room, cancel_transfer, check_for_updates, copy_last_error,
-        copy_text_to_clipboard, create_room, delete_temp_file, get_config,
-        get_file_transfer_metadata, get_room, join_room, leave_room, list_nearby_devices,
-        list_room_items, list_rooms, mark_join_prompt_rendered, open_logs_folder,
-        pending_join_requests, reject_nearby_join, request_nearby_join, reveal_in_folder,
+        copy_text_to_clipboard, create_room, delete_temp_file, get_config, get_device_capabilities,
+        get_device_profile, get_file_transfer_metadata, get_last_benchmark_results, get_room,
+        join_room, leave_room, list_nearby_devices, list_room_items, list_rooms,
+        mark_join_prompt_rendered, open_logs_folder, pending_join_requests, reject_nearby_join,
+        request_nearby_join, reveal_in_folder, run_loopback_benchmark, run_peer_link_benchmark,
         send_file_to_room, send_text_to_room, update_config, write_temp_file,
     },
     config::StoredConfig,
@@ -49,6 +54,9 @@ pub struct AppState {
     pub pending_join_requests: Mutex<HashMap<String, discovery::PendingJoinRequest>>,
     pub outgoing_join_requests: Mutex<HashMap<String, discovery::OutgoingJoinRequest>>,
     pub terminal_transfer_reasons: Mutex<HashMap<String, transfer::TerminalTransferReason>>,
+    pub latest_device_profile: Mutex<Option<diagnostics::DeviceProfile>>,
+    pub latest_device_capabilities: Mutex<Option<diagnostics::DeviceCapabilities>>,
+    pub latest_benchmark_results: Mutex<HashMap<String, diagnostics::LinkBenchmarkResult>>,
 }
 
 pub struct ActiveRoomServer {
@@ -102,6 +110,9 @@ fn main() {
                 pending_join_requests: Mutex::new(HashMap::new()),
                 outgoing_join_requests: Mutex::new(HashMap::new()),
                 terminal_transfer_reasons: Mutex::new(HashMap::new()),
+                latest_device_profile: Mutex::new(None),
+                latest_device_capabilities: Mutex::new(None),
+                latest_benchmark_results: Mutex::new(HashMap::new()),
             });
 
             app.manage(state.clone());
@@ -155,6 +166,11 @@ fn main() {
             burn_room,
             leave_room,
             get_config,
+            get_device_profile,
+            get_device_capabilities,
+            run_loopback_benchmark,
+            run_peer_link_benchmark,
+            get_last_benchmark_results,
             update_config,
             reveal_in_folder,
             open_logs_folder,
