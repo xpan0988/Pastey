@@ -994,14 +994,14 @@ fn update_sender_transfer_report(
 }
 
 fn current_transfer_tuning(state: &Arc<AppState>) -> TransferTuning {
-    let dev_window_override = {
+    let (dev_window_override, dev_tools_enabled) = {
         let config = state.config.read();
-        config.transfer_window_override
+        (
+            config.transfer_window_override,
+            crate::dev_tools::effective_dev_tools_enabled(config.dev_tools_enabled),
+        )
     };
-    transfer_tuning::effective_transfer_tuning_from_env(
-        dev_window_override,
-        crate::dev_tools::is_dev_tools_enabled(),
-    )
+    transfer_tuning::effective_transfer_tuning_from_env(dev_window_override, dev_tools_enabled)
 }
 
 async fn finish_sender_after_chunk_error(

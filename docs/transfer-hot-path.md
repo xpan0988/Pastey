@@ -23,7 +23,7 @@ SQLite room item status is not written per chunk. Status writes happen at termin
 
 Increasing the window is expected to improve throughput only until something else becomes the bottleneck: link bandwidth, receiver CPU, disk writes, queueing, or OS/network buffers. Scaling is not guaranteed to be linear, and very large windows can increase memory usage, latency, and receiver backlog.
 
-The normal Settings UI does not expose window size. Developer tools can expose a Transfer Window block with Default / Auto, `window=1`, `window=2`, `window=4`, `window=8`, `window=16`, and custom window options. Enable it with a debug build or `PASTEY_DEV_TOOLS=1`.
+The normal Settings UI does not expose window size. Developer Tools can expose a Transfer Window block with Default / Auto, `window=1`, `window=2`, `window=4`, `window=8`, `window=16`, and custom window options. Release builds keep Developer Tools hidden by default; enable the Settings toggle when release diagnostics are needed. `PASTEY_DEV_TOOLS=1` still force-enables the same tools for developer sessions.
 
 For release-build benchmarking, start Pastey with `PASTEY_TRANSFER_WINDOW_SIZE` set to one of `1`, `2`, `4`, `8`, or `16`. The environment override takes precedence over the dev Settings value. Invalid non-numeric values fall back to the dev Settings value or default; numeric values outside the supported range are clamped to `1..16`.
 

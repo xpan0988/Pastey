@@ -2,6 +2,8 @@
 
 Pastey uses `src-tauri/Cargo.toml` as the authoritative app version. All other app/package version files should be derived from it during a release bump.
 
+Detailed product update history lives in [version-history.md](version-history.md).
+
 ## Bump Version
 
 Run:
