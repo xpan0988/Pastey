@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.1 — Enable DevTool — 2026-05-27
+
+- Release version v1.6.1.
+
+
 ## 1.6.0 — Logic optimization and UI rework — 2026-05-27
 
 - Release version v1.6.0.
