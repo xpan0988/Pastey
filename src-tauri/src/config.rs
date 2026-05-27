@@ -22,6 +22,8 @@ pub struct StoredConfig {
     pub save_received_images_to_inbox: bool,
     #[serde(default)]
     pub transfer_window_override: Option<usize>,
+    #[serde(default = "dev_tools::default_dev_tools_enabled")]
+    pub dev_tools_enabled: bool,
     pub shortcut: String,
     pub app_secret: String,
     #[serde(default)]
@@ -55,6 +57,7 @@ pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfi
         save_received_files_to_inbox: true,
         save_received_images_to_inbox: true,
         transfer_window_override: None,
+        dev_tools_enabled: dev_tools::default_dev_tools_enabled(),
         shortcut: shortcut.to_string(),
         app_secret: crypto::encode_key(&crypto::random_key()),
         device_id: uuid::Uuid::new_v4().to_string(),
@@ -71,7 +74,11 @@ pub fn save(paths: &AppPaths, config: &StoredConfig) -> AppResult<()> {
 }
 
 pub fn public_config(paths: &AppPaths, config: &StoredConfig) -> AppConfig {
-    public_config_with_dev_tools(paths, config, dev_tools::is_dev_tools_enabled())
+    public_config_with_dev_tools(
+        paths,
+        config,
+        dev_tools::effective_dev_tools_enabled(config.dev_tools_enabled),
+    )
 }
 
 fn public_config_with_dev_tools(
@@ -102,7 +109,18 @@ pub fn update(
     current: &mut StoredConfig,
     incoming: AppConfig,
 ) -> AppResult<AppConfig> {
-    update_with_dev_tools_enabled(paths, current, incoming, dev_tools::is_dev_tools_enabled())
+    let was_effective_dev_tools_enabled =
+        dev_tools::effective_dev_tools_enabled(current.dev_tools_enabled);
+    current.dev_tools_enabled = incoming.dev_tools_enabled;
+    let effective_dev_tools_enabled =
+        dev_tools::effective_dev_tools_enabled(current.dev_tools_enabled);
+    update_with_dev_tools_enabled(
+        paths,
+        current,
+        incoming,
+        effective_dev_tools_enabled,
+        was_effective_dev_tools_enabled,
+    )
 }
 
 fn update_with_dev_tools_enabled(
@@ -110,13 +128,14 @@ fn update_with_dev_tools_enabled(
     current: &mut StoredConfig,
     incoming: AppConfig,
     dev_tools_enabled: bool,
+    was_dev_tools_enabled: bool,
 ) -> AppResult<AppConfig> {
     current.default_expiry_minutes = clamp_expiry(incoming.default_expiry_minutes);
     current.auto_burn_after_download = incoming.auto_burn_after_download;
     current.save_received_files_to_inbox = incoming.save_received_files_to_inbox;
     current.save_received_images_to_inbox = incoming.save_received_images_to_inbox;
     current.inbox_dir = normalize_inbox_dir(paths, incoming.inbox_dir.as_deref());
-    if dev_tools_enabled {
+    if dev_tools_enabled && (was_dev_tools_enabled || incoming.transfer_window_override.is_some()) {
         current.transfer_window_override =
             transfer_tuning::normalize_transfer_window_override(incoming.transfer_window_override);
     }
@@ -221,6 +240,10 @@ mod tests {
         assert_eq!(stored.transfer_window_override, None);
         assert!(stored.save_received_files_to_inbox);
         assert!(stored.save_received_images_to_inbox);
+        assert_eq!(
+            stored.dev_tools_enabled,
+            dev_tools::default_dev_tools_enabled()
+        );
     }
 
     #[test]
@@ -252,6 +275,7 @@ mod tests {
                 ..incoming
             },
             false,
+            false,
         )
         .unwrap();
         let reloaded = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
@@ -275,6 +299,7 @@ mod tests {
             save_received_files_to_inbox: false,
             save_received_images_to_inbox: true,
             transfer_window_override: None,
+            dev_tools_enabled: false,
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
@@ -305,6 +330,7 @@ mod tests {
                 ..incoming
             },
             true,
+            true,
         )
         .unwrap();
         let reloaded = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
@@ -326,6 +352,7 @@ mod tests {
             save_received_files_to_inbox: true,
             save_received_images_to_inbox: true,
             transfer_window_override: Some(16),
+            dev_tools_enabled: false,
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
@@ -335,6 +362,116 @@ mod tests {
 
         assert_eq!(public.transfer_window_override, None);
         assert!(!public.dev_tools_enabled);
+
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn stored_dev_tools_setting_is_visible_in_public_config() {
+        let paths = test_paths();
+        let stored = StoredConfig {
+            version: 4,
+            default_expiry_minutes: 15,
+            inbox_dir: None,
+            auto_burn_after_download: false,
+            save_received_files_to_inbox: true,
+            save_received_images_to_inbox: true,
+            transfer_window_override: Some(8),
+            dev_tools_enabled: true,
+            shortcut: "Ctrl+Shift+V".into(),
+            app_secret: "abc".into(),
+            device_id: "device".into(),
+        };
+
+        let public = public_config_with_dev_tools(&paths, &stored, true);
+
+        assert!(public.dev_tools_enabled);
+        assert_eq!(public.transfer_window_override, Some(8));
+
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn dev_tools_toggle_is_persisted() {
+        let paths = test_paths();
+        let mut stored = StoredConfig {
+            version: 4,
+            default_expiry_minutes: 15,
+            inbox_dir: None,
+            auto_burn_after_download: false,
+            save_received_files_to_inbox: true,
+            save_received_images_to_inbox: true,
+            transfer_window_override: None,
+            dev_tools_enabled: false,
+            shortcut: "Ctrl+Shift+V".into(),
+            app_secret: "abc".into(),
+            device_id: "device".into(),
+        };
+        save(&paths, &stored).unwrap();
+        let incoming = public_config_with_dev_tools(&paths, &stored, false);
+
+        let updated = update(
+            &paths,
+            &mut stored,
+            AppConfig {
+                dev_tools_enabled: true,
+                ..incoming
+            },
+        )
+        .unwrap();
+        let reloaded = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
+
+        assert!(updated.dev_tools_enabled);
+        assert!(reloaded.dev_tools_enabled);
+
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn diagnostics_stay_hidden_when_dev_tools_are_disabled() {
+        let paths = test_paths();
+        let stored = StoredConfig {
+            version: 4,
+            default_expiry_minutes: 15,
+            inbox_dir: None,
+            auto_burn_after_download: false,
+            save_received_files_to_inbox: true,
+            save_received_images_to_inbox: true,
+            transfer_window_override: Some(16),
+            dev_tools_enabled: false,
+            shortcut: "Ctrl+Shift+V".into(),
+            app_secret: "abc".into(),
+            device_id: "device".into(),
+        };
+
+        let public = public_config_with_dev_tools(&paths, &stored, false);
+
+        assert!(!public.dev_tools_enabled);
+        assert_eq!(public.transfer_window_override, None);
+
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn release_mode_can_show_diagnostics_when_dev_tools_are_enabled() {
+        let paths = test_paths();
+        let stored = StoredConfig {
+            version: 4,
+            default_expiry_minutes: 15,
+            inbox_dir: None,
+            auto_burn_after_download: false,
+            save_received_files_to_inbox: true,
+            save_received_images_to_inbox: true,
+            transfer_window_override: None,
+            dev_tools_enabled: true,
+            shortcut: "Ctrl+Shift+V".into(),
+            app_secret: "abc".into(),
+            device_id: "device".into(),
+        };
+
+        let public = public_config_with_dev_tools(&paths, &stored, true);
+
+        assert!(public.dev_tools_enabled);
 
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }

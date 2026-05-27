@@ -61,6 +61,10 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
     onConfigChange(saved);
   }
 
+  async function saveDevToolsEnabled(enabled: boolean) {
+    await save({ ...config, dev_tools_enabled: enabled });
+  }
+
   async function saveTransferWindow(nextValue: string) {
     setWindowValue(nextValue);
     if (nextValue === "custom") {
@@ -209,7 +213,12 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
       <SettingsGroup title="About" icon="info">
         <SettingsRow icon="info" title="App version" detail="Pastey release" value={`pastey ${config.app_version}`} />
         <SettingsRow icon="drive" title="Max file size" detail="Largest file allowed per transfer" value="10GB" />
-        <SettingsRow icon="wrench" title="Developer tools" detail="Diagnostics and advanced options" value={config.dev_tools_enabled ? "Enabled" : "Hidden"} />
+        <SettingsRow
+          icon="wrench"
+          title="Developer Tools"
+          detail="Show diagnostics, transfer window, and local benchmark tools."
+          control={<Switch checked={config.dev_tools_enabled} onChange={(event) => void saveDevToolsEnabled(event.target.checked)} />}
+        />
       </SettingsGroup>
 
       {config.dev_tools_enabled ? (
