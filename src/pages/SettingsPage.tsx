@@ -21,6 +21,17 @@ interface SettingsPageProps {
 
 const PRESET_WINDOWS = [1, 2, 4, 8, 16];
 const DEFAULT_WINDOW = 8;
+const DIAGNOSTICS_FRONTEND_TTL_MS = 60_000;
+
+interface DiagnosticsSnapshot {
+  profile: DeviceProfile | null;
+  capabilities: DeviceCapabilities | null;
+  benchmark: LinkBenchmarkResult | null;
+  cachedAt: number;
+}
+
+let cachedDiagnostics: DiagnosticsSnapshot | null = null;
+let diagnosticsRequest: Promise<DiagnosticsSnapshot> | null = null;
 
 export function SettingsPage({ config, onConfigChange, onJoinWithCode }: SettingsPageProps) {
   const [windowValue, setWindowValue] = useState(windowSelectionFromConfig(config.transfer_window_override, PRESET_WINDOWS));
@@ -32,6 +43,7 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
   const [benchmarkMode, setBenchmarkMode] = useState<BenchmarkMode>("raw_memory");
   const [benchmarkDuration, setBenchmarkDuration] = useState(5);
   const [diagnosticMessage, setDiagnosticMessage] = useState<string | null>(null);
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
   const [benchmarkRunning, setBenchmarkRunning] = useState(false);
 
   useEffect(() => {
@@ -41,7 +53,7 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
 
   useEffect(() => {
     if (!config.dev_tools_enabled) return;
-    void refreshDiagnostics();
+    void refreshDiagnostics(false);
   }, [config.dev_tools_enabled]);
 
   async function save(next: AppConfig) {
@@ -116,19 +128,30 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
     }
   }
 
-  async function refreshDiagnostics() {
+  async function refreshDiagnostics(forceRefresh = false) {
+    if (!forceRefresh && cachedDiagnostics && diagnosticsSnapshotFresh(cachedDiagnostics)) {
+      setDeviceProfile(cachedDiagnostics.profile);
+      setDeviceCapabilities(cachedDiagnostics.capabilities);
+      setLastBenchmark(cachedDiagnostics.benchmark);
+      return;
+    }
+
     setDiagnosticMessage(null);
+    setDiagnosticsLoading(true);
+    const request = !forceRefresh && diagnosticsRequest ? diagnosticsRequest : loadDiagnosticsSnapshot(forceRefresh);
+    diagnosticsRequest = request;
     try {
-      const [profile, capabilities, benchmarks] = await Promise.all([
-        getDeviceProfile(),
-        getDeviceCapabilities(),
-        getLastBenchmarkResults()
-      ]);
+      const { profile, capabilities, benchmark } = await request;
       setDeviceProfile(profile);
       setDeviceCapabilities(capabilities);
-      setLastBenchmark(benchmarks[0] ?? null);
+      setLastBenchmark(benchmark);
     } catch (err) {
       setDiagnosticMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDiagnosticsLoading(false);
+      if (diagnosticsRequest === request) {
+        diagnosticsRequest = null;
+      }
     }
   }
 
@@ -228,8 +251,8 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
                   <strong>Device Diagnostics</strong>
                   <p className="muted">Lightweight local profile, capabilities, and link checks.</p>
                 </div>
-                <button className="secondary-button" onClick={() => void refreshDiagnostics()}>
-                  Refresh
+                <button className="secondary-button" disabled={diagnosticsLoading} onClick={() => void refreshDiagnostics(true)}>
+                  {diagnosticsLoading ? "Loading..." : "Refresh"}
                 </button>
               </div>
               <p className="muted diagnostics-note">
@@ -365,7 +388,7 @@ function gpuTitle(capabilities: DeviceCapabilities): string {
 
 function availableRuntimeTitle(capabilities: DeviceCapabilities): string {
   const names = capabilities.runtimes.filter((runtime) => runtime.available).map((runtime) => runtime.name);
-  return names.length ? names.slice(0, 4).join(", ") : "None detected";
+  return names.length ? names.slice(0, 4).join(", ") : "Unknown";
 }
 
 function benchmarkModeDescription(mode: BenchmarkMode): string {
@@ -380,6 +403,29 @@ function platformDeviceFallback(profile: DeviceProfile): string {
   if (profile.platform === "macos") return "Mac";
   if (profile.platform === "windows") return "Windows PC";
   return "This device";
+}
+
+async function loadDiagnosticsSnapshot(forceRefresh: boolean): Promise<DiagnosticsSnapshot> {
+  const [profileResult, capabilitiesResult, benchmarkResult] = await Promise.allSettled([
+    getDeviceProfile({ forceRefresh }),
+    getDeviceCapabilities({ forceRefresh }),
+    getLastBenchmarkResults()
+  ]);
+  const profile = profileResult.status === "fulfilled" ? profileResult.value : cachedDiagnostics?.profile ?? null;
+  const capabilities = capabilitiesResult.status === "fulfilled" ? capabilitiesResult.value : cachedDiagnostics?.capabilities ?? null;
+  const benchmark = benchmarkResult.status === "fulfilled" ? benchmarkResult.value[0] ?? null : cachedDiagnostics?.benchmark ?? null;
+
+  cachedDiagnostics = {
+    profile,
+    capabilities,
+    benchmark,
+    cachedAt: Date.now()
+  };
+  return cachedDiagnostics;
+}
+
+function diagnosticsSnapshotFresh(snapshot: DiagnosticsSnapshot): boolean {
+  return Date.now() - snapshot.cachedAt <= DIAGNOSTICS_FRONTEND_TTL_MS;
 }
 
 function SettingsRow({

@@ -6,8 +6,17 @@ use crate::{
     storage,
 };
 
-pub fn local_device_profile(config: &StoredConfig) -> DeviceProfile {
-    let cpu = cpu_info();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileProbeMode {
+    Quick,
+    Full,
+}
+
+pub fn local_device_profile_with_mode(
+    config: &StoredConfig,
+    mode: ProfileProbeMode,
+) -> DeviceProfile {
+    let cpu = cpu_info(mode);
     DeviceProfile {
         device_id: config.device_id.clone(),
         device_name: device_name(),
@@ -18,8 +27,8 @@ pub fn local_device_profile(config: &StoredConfig) -> DeviceProfile {
         cpu_physical_core_count: cpu.physical_core_count,
         cpu_logical_processor_count: cpu.logical_processor_count,
         cpu_core_count: cpu.logical_processor_count.or(cpu.physical_core_count),
-        memory_total_gb: memory_total_gb(),
-        gpu_names: gpu_names(),
+        memory_total_gb: memory_total_gb(mode),
+        gpu_names: gpu_names(mode),
         power_state: power_state(),
         battery_percent: battery_percent(),
         updated_at: storage::now_ts(),
@@ -100,11 +109,15 @@ fn os_version() -> Option<String> {
     }
 }
 
-fn cpu_info() -> CpuInfo {
+fn cpu_info(mode: ProfileProbeMode) -> CpuInfo {
     #[cfg(target_os = "macos")]
     {
-        let hardware = fixed_command_text("/usr/sbin/system_profiler", &["SPHardwareDataType"])
-            .or_else(|| fixed_command_text("system_profiler", &["SPHardwareDataType"]));
+        let hardware = if mode == ProfileProbeMode::Full {
+            fixed_command_text("/usr/sbin/system_profiler", &["SPHardwareDataType"])
+                .or_else(|| fixed_command_text("system_profiler", &["SPHardwareDataType"]))
+        } else {
+            None
+        };
         let chip_name = hardware
             .as_deref()
             .and_then(parse_macos_chip_name)
@@ -135,7 +148,7 @@ fn cpu_info() -> CpuInfo {
 
     #[cfg(target_os = "windows")]
     {
-        windows_cpu_info()
+        windows_cpu_info(mode)
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -169,7 +182,7 @@ fn cpu_info() -> CpuInfo {
     }
 }
 
-fn memory_total_gb() -> Option<u64> {
+fn memory_total_gb(_mode: ProfileProbeMode) -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         let bytes = fixed_command_text("/usr/sbin/sysctl", &["-n", "hw.memsize"])
@@ -181,6 +194,10 @@ fn memory_total_gb() -> Option<u64> {
 
     #[cfg(target_os = "windows")]
     {
+        if _mode == ProfileProbeMode::Quick {
+            return None;
+        }
+
         fixed_command_text(
             "powershell",
             &[
@@ -213,9 +230,17 @@ fn memory_total_gb() -> Option<u64> {
     }
 }
 
-fn gpu_names() -> Vec<String> {
+fn gpu_names(mode: ProfileProbeMode) -> Vec<String> {
     #[cfg(target_os = "macos")]
     {
+        if mode == ProfileProbeMode::Quick {
+            return if std::env::consts::ARCH == "aarch64" {
+                vec!["Apple GPU".into()]
+            } else {
+                Vec::new()
+            };
+        }
+
         let names = fixed_command_text("/usr/sbin/system_profiler", &["SPDisplaysDataType"])
             .or_else(|| fixed_command_text("system_profiler", &["SPDisplaysDataType"]))
             .map(|output| parse_macos_gpu_names(&output))
@@ -229,6 +254,10 @@ fn gpu_names() -> Vec<String> {
 
     #[cfg(target_os = "windows")]
     {
+        if mode == ProfileProbeMode::Quick {
+            return Vec::new();
+        }
+
         fixed_command_text(
             "powershell",
             &[
@@ -379,7 +408,17 @@ fn parse_battery_percent(output: &str) -> Option<u8> {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_cpu_info() -> CpuInfo {
+fn windows_cpu_info(mode: ProfileProbeMode) -> CpuInfo {
+    if mode == ProfileProbeMode::Quick {
+        return CpuInfo {
+            name: std::env::var("PROCESSOR_IDENTIFIER")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            logical_processor_count: logical_parallelism(),
+            ..CpuInfo::default()
+        };
+    }
+
     let output = fixed_command_text(
         "powershell",
         &[

@@ -658,6 +658,8 @@ pub fn leave_room(paths: &AppPaths, room_id: &str) -> AppResult<Option<StoredRoo
         return Ok(None);
     }
 
+    // Internal disconnect cleanup only. Product-level room ending is Burn Room,
+    // while this path preserves metadata and saved Inbox output.
     mark_peer_left(paths, room_id)?;
     Ok(room)
 }

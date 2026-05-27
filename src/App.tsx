@@ -10,7 +10,6 @@ import {
   burnRoom,
   getConfig,
   getRoom,
-  leaveRoom,
   listRoomItems,
   listRooms,
   markJoinPromptRendered,
@@ -144,9 +143,7 @@ function App() {
       if (
         message === "room not found" ||
         message === "File is no longer available" ||
-        message === "File is no longer available." ||
-        message === "Peer left the room" ||
-        message === "Peer left the room."
+        message === "File is no longer available."
       ) {
         setView({ screen: "tabs" });
         setCurrentRoom(null);
@@ -160,17 +157,6 @@ function App() {
 
   async function handleBurnRoom(roomId: string) {
     await burnRoom(roomId);
-    closedRoomIdsRef.current.add(roomId);
-    setView({ screen: "tabs" });
-    setActiveTab("rooms");
-    setCurrentRoom(null);
-    setRoomItems([]);
-    setTransfers((current) => Object.fromEntries(Object.entries(current).filter(([, transfer]) => transfer.room_id !== roomId)));
-    await refreshRooms();
-  }
-
-  async function handleLeaveRoom(roomId: string) {
-    await leaveRoom(roomId);
     closedRoomIdsRef.current.add(roomId);
     setView({ screen: "tabs" });
     setActiveTab("rooms");
@@ -261,7 +247,6 @@ function App() {
             }}
             onRefresh={refreshCurrentRoom}
             onBurn={handleBurnRoom}
-            onLeave={handleLeaveRoom}
           />
         ) : null}
 
