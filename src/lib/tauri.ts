@@ -101,20 +101,20 @@ export async function burnRoom(roomId: string): Promise<boolean> {
   return invoke("burn_room", { roomId });
 }
 
-export async function leaveRoom(roomId: string): Promise<boolean> {
-  return invoke("leave_room", { roomId });
-}
-
 export async function getConfig(): Promise<AppConfig> {
   return invoke("get_config");
 }
 
-export async function getDeviceProfile(): Promise<DeviceProfile> {
-  return invoke("get_device_profile");
+export async function getDeviceProfile(options?: { forceRefresh?: boolean }): Promise<DeviceProfile> {
+  return invoke("get_device_profile", {
+    forceRefresh: options?.forceRefresh ?? false
+  });
 }
 
-export async function getDeviceCapabilities(): Promise<DeviceCapabilities> {
-  return invoke("get_device_capabilities");
+export async function getDeviceCapabilities(options?: { forceRefresh?: boolean }): Promise<DeviceCapabilities> {
+  return invoke("get_device_capabilities", {
+    forceRefresh: options?.forceRefresh ?? false
+  });
 }
 
 export async function runLoopbackBenchmark(options?: {

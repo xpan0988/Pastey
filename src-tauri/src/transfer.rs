@@ -3672,10 +3672,12 @@ async fn remote_leave_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    // Legacy/internal peer disconnect signal. The user-facing room lifecycle is
+    // Burn Room; a peer disappearing should surface as interrupted connection.
     let _ = cancel_room_transfers(
         ctx.state.clone(),
         &room_id,
-        "Peer left the room.",
+        "Peer disconnected.",
         false,
         Some("peer_disconnected"),
     )
@@ -3809,7 +3811,7 @@ fn map_response_error_message(details: &ResponseErrorDetails) -> String {
         Some("room_burned") => ROOM_BURNED_MESSAGE.into(),
         Some("receiver_cancelled") => "Receiver cancelled transfer".into(),
         Some("receiver_burned_room") => "Peer burned the room".into(),
-        Some("receiver_left_room") => "Peer left the room".into(),
+        Some("receiver_left_room") => PEER_DISCONNECTED_MESSAGE.into(),
         Some("receiver_interrupted") => "Receiver stopped receiving".into(),
         Some("peer_disconnected") => PEER_DISCONNECTED_MESSAGE.into(),
         Some("transfer_timed_out") => TRANSFER_INTERRUPTED_MESSAGE.into(),
@@ -3863,7 +3865,7 @@ fn terminal_reason_message(code: &str) -> &'static str {
     match code {
         "receiver_cancelled" => "Receiver cancelled transfer",
         "receiver_burned_room" => "Peer burned the room",
-        "receiver_left_room" => "Peer left the room",
+        "receiver_left_room" => PEER_DISCONNECTED_MESSAGE,
         "receiver_interrupted" => "Receiver stopped receiving",
         "peer_disconnected" => PEER_DISCONNECTED_MESSAGE,
         "transfer_timed_out" => TRANSFER_INTERRUPTED_MESSAGE,
@@ -4793,7 +4795,7 @@ mod tests {
         );
         assert_eq!(
             terminal_reason_message("receiver_left_room"),
-            "Peer left the room"
+            PEER_DISCONNECTED_MESSAGE
         );
         assert_eq!(
             terminal_reason_message("receiver_interrupted"),

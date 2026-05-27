@@ -195,7 +195,7 @@ function roomDevices(room: RoomInfo): string {
 function roomStatusLabel(room: RoomInfo): string {
   if (room.peer_connected) return "Active";
   if (room.peer_burned_at) return "Peer done";
-  if (room.status === "peer_left") return "Peer left";
+  if (room.status === "peer_left") return "Peer disconnected";
   if (room.status === "burned") return "Burned";
   return "Waiting";
 }

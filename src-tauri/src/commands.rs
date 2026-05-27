@@ -6,7 +6,10 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::{
-    capability_probe, config, crypto, device_profile, diagnostics, discovery,
+    capability_probe::{self, CapabilityProbeMode},
+    config, crypto,
+    device_profile::{self, ProfileProbeMode},
+    diagnostics, discovery,
     error::{AppError, AppResult},
     link_benchmark, logging,
     models::{AppConfig, JoinRequestPrompt, LocalRole, NearbyDevice, RoomInfo, RoomItem},
@@ -14,6 +17,7 @@ use crate::{
 };
 
 const RELEASES_URL: &str = "https://github.com/xpan0988/Pastey/releases";
+const DIAGNOSTICS_CACHE_TTL_SECONDS: i64 = 60;
 
 #[derive(Serialize)]
 pub struct FileTransferMetadata {
@@ -471,12 +475,14 @@ pub async fn burn_room(room_id: String, state: State<'_, Arc<AppState>>) -> Resu
 #[tauri::command]
 pub async fn leave_room(room_id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
     run_async(async move {
+        // Internal legacy disconnect cleanup. This is not a user-facing room
+        // lifecycle action; Burn Room is the product-level terminal action.
         let _ = transfer::cancel_room_transfers(
             state.inner().clone(),
             &room_id,
             "Transfer cancelled",
             true,
-            Some("receiver_left_room"),
+            Some("peer_disconnected"),
         )
         .await;
         transfer::notify_room_leave(state.inner().clone(), &room_id).await;
@@ -503,28 +509,74 @@ pub fn get_config(state: State<'_, Arc<AppState>>) -> Result<AppConfig, String> 
 }
 
 #[tauri::command]
-pub fn get_device_profile(
+pub async fn get_device_profile(
+    force_refresh: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<diagnostics::DeviceProfile, String> {
-    let config = state.config.read().clone();
-    let profile = device_profile::local_device_profile(&config);
-    state.latest_device_profile.lock().replace(profile.clone());
-    Ok(profile)
+    run_async(async move {
+        let force_refresh = force_refresh.unwrap_or(false);
+        if let Some(profile) = cached_device_profile(&state, force_refresh) {
+            return Ok(profile);
+        }
+
+        let _guard = state.diagnostics_refresh.lock().await;
+        if let Some(profile) = cached_device_profile(&state, force_refresh) {
+            return Ok(profile);
+        }
+
+        let config = state.config.read().clone();
+        let mode = diagnostics_profile_mode(force_refresh);
+        let profile = tauri::async_runtime::spawn_blocking(move || {
+            device_profile::local_device_profile_with_mode(&config, mode)
+        })
+        .await
+        .map_err(|error| AppError::InvalidInput(format!("device profile probe failed: {error}")))?;
+        state.latest_device_profile.lock().replace(profile.clone());
+        Ok(profile)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn get_device_capabilities(
+pub async fn get_device_capabilities(
+    force_refresh: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<diagnostics::DeviceCapabilities, String> {
-    let config = state.config.read().clone();
-    let profile = device_profile::local_device_profile(&config);
-    state.latest_device_profile.lock().replace(profile.clone());
-    let capabilities = capability_probe::probe_device_capabilities(&profile);
-    state
-        .latest_device_capabilities
-        .lock()
-        .replace(capabilities.clone());
-    Ok(capabilities)
+    run_async(async move {
+        let force_refresh = force_refresh.unwrap_or(false);
+        if let Some(capabilities) = cached_device_capabilities(&state, force_refresh) {
+            return Ok(capabilities);
+        }
+
+        let _guard = state.diagnostics_refresh.lock().await;
+        if let Some(capabilities) = cached_device_capabilities(&state, force_refresh) {
+            return Ok(capabilities);
+        }
+
+        let config = state.config.read().clone();
+        let profile_mode = diagnostics_profile_mode(force_refresh);
+        let capability_mode = diagnostics_capability_mode(force_refresh);
+        let cached_profile = cached_device_profile(&state, false);
+        let (profile, capabilities) = tauri::async_runtime::spawn_blocking(move || {
+            let profile = cached_profile.unwrap_or_else(|| {
+                device_profile::local_device_profile_with_mode(&config, profile_mode)
+            });
+            let capabilities =
+                capability_probe::probe_device_capabilities_with_mode(&profile, capability_mode);
+            (profile, capabilities)
+        })
+        .await
+        .map_err(|error| {
+            AppError::InvalidInput(format!("device capability probe failed: {error}"))
+        })?;
+        state.latest_device_profile.lock().replace(profile);
+        state
+            .latest_device_capabilities
+            .lock()
+            .replace(capabilities.clone());
+        Ok(capabilities)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -649,6 +701,50 @@ pub fn copy_text_to_clipboard(text: String, app: AppHandle) -> Result<(), String
         .map_err(|error| error.to_string())
 }
 
+fn cached_device_profile(
+    state: &Arc<AppState>,
+    force_refresh: bool,
+) -> Option<diagnostics::DeviceProfile> {
+    state
+        .latest_device_profile
+        .lock()
+        .clone()
+        .filter(|profile| diagnostics_cache_is_fresh(profile.updated_at, force_refresh))
+}
+
+fn cached_device_capabilities(
+    state: &Arc<AppState>,
+    force_refresh: bool,
+) -> Option<diagnostics::DeviceCapabilities> {
+    state
+        .latest_device_capabilities
+        .lock()
+        .clone()
+        .filter(|capabilities| diagnostics_cache_is_fresh(capabilities.updated_at, force_refresh))
+}
+
+fn diagnostics_cache_is_fresh(updated_at: i64, force_refresh: bool) -> bool {
+    !force_refresh
+        && updated_at > 0
+        && storage::now_ts() <= updated_at.saturating_add(DIAGNOSTICS_CACHE_TTL_SECONDS)
+}
+
+fn diagnostics_profile_mode(force_refresh: bool) -> ProfileProbeMode {
+    if force_refresh {
+        ProfileProbeMode::Full
+    } else {
+        ProfileProbeMode::Quick
+    }
+}
+
+fn diagnostics_capability_mode(force_refresh: bool) -> CapabilityProbeMode {
+    if force_refresh {
+        CapabilityProbeMode::Full
+    } else {
+        CapabilityProbeMode::Quick
+    }
+}
+
 async fn run_async<T>(
     future: impl std::future::Future<Output = AppResult<T>>,
 ) -> Result<T, String> {
@@ -685,4 +781,34 @@ fn resolve_user_path(input: &str) -> AppResult<PathBuf> {
     }
 
     Ok(PathBuf::from(input))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_cache_respects_force_refresh_and_ttl() {
+        let now = storage::now_ts();
+
+        assert!(now > 0);
+        assert!(now <= now.saturating_add(DIAGNOSTICS_CACHE_TTL_SECONDS));
+        assert!(diagnostics_cache_is_fresh(now, false));
+        assert!(!diagnostics_cache_is_fresh(now, true));
+        assert!(!diagnostics_cache_is_fresh(
+            now - DIAGNOSTICS_CACHE_TTL_SECONDS - 1,
+            false
+        ));
+    }
+
+    #[test]
+    fn diagnostics_normal_load_uses_quick_probe_modes() {
+        assert_eq!(diagnostics_profile_mode(false), ProfileProbeMode::Quick);
+        assert_eq!(
+            diagnostics_capability_mode(false),
+            CapabilityProbeMode::Quick
+        );
+        assert_eq!(diagnostics_profile_mode(true), ProfileProbeMode::Full);
+        assert_eq!(diagnostics_capability_mode(true), CapabilityProbeMode::Full);
+    }
 }

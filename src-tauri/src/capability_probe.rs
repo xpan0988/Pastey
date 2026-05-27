@@ -75,11 +75,24 @@ const RUNTIME_PROBES: &[RuntimeProbe] = &[
     },
 ];
 
-pub fn probe_device_capabilities(profile: &DeviceProfile) -> DeviceCapabilities {
-    let runtimes = RUNTIME_PROBES
-        .iter()
-        .map(|probe| probe_runtime(*probe, run_fixed_probe))
-        .collect::<Vec<_>>();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityProbeMode {
+    Quick,
+    Full,
+}
+
+pub fn probe_device_capabilities_with_mode(
+    profile: &DeviceProfile,
+    mode: CapabilityProbeMode,
+) -> DeviceCapabilities {
+    let runtimes = if mode == CapabilityProbeMode::Full {
+        RUNTIME_PROBES
+            .iter()
+            .map(|probe| probe_runtime(*probe, run_fixed_probe))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let cuda_available = runtimes
         .iter()
         .any(|runtime| runtime.name == "cuda" && runtime.available);
@@ -240,6 +253,19 @@ mod tests {
     }
 
     #[test]
+    fn quick_capability_probe_skips_runtime_commands() {
+        let capabilities = probe_device_capabilities_with_mode(
+            &profile(PowerState::PluggedIn, Some(16)),
+            CapabilityProbeMode::Quick,
+        );
+
+        assert!(capabilities.runtimes.is_empty());
+        assert!(capabilities
+            .recommended_roles
+            .contains(&"approval_node".to_string()));
+    }
+
+    #[test]
     fn available_command_uses_only_version_summary() {
         let runtime = probe_runtime(
             RuntimeProbe {
@@ -257,7 +283,10 @@ mod tests {
 
     #[test]
     fn battery_devices_are_not_given_heavy_roles() {
-        let capabilities = probe_device_capabilities(&profile(PowerState::OnBattery, Some(24)));
+        let capabilities = probe_device_capabilities_with_mode(
+            &profile(PowerState::OnBattery, Some(24)),
+            CapabilityProbeMode::Full,
+        );
 
         assert!(capabilities
             .recommended_roles

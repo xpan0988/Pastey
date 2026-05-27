@@ -23,7 +23,6 @@ interface RoomPageProps {
   onBack: () => void;
   onRefresh: () => Promise<void>;
   onBurn: (roomId: string) => Promise<void>;
-  onLeave: (roomId: string) => Promise<void>;
 }
 
 function fileIdentityKey(name: string, size: number, lastModified: number): string {
@@ -36,17 +35,16 @@ export function RoomPage({
   transfers,
   onBack,
   onRefresh,
-  onBurn,
-  onLeave
+  onBurn
 }: RoomPageProps) {
   const [text, setText] = useState("");
-  const [busy, setBusy] = useState<"text" | "file" | "burn" | "leave" | null>(null);
+  const [busy, setBusy] = useState<"text" | "file" | "burn" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [cancellingTransferId, setCancellingTransferId] = useState<string | null>(null);
   const [composerDropActive, setComposerDropActive] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const inFlightFileKeysRef = useRef<Set<string>>(new Set());
-  const roomUnavailable = room.status === "burned" || busy === "burn" || busy === "leave";
+  const roomUnavailable = room.status === "burned" || busy === "burn";
   const canSend = room.peer_connected && busy === null && !roomUnavailable;
 
   useEffect(() => {
@@ -270,16 +268,6 @@ export function RoomPage({
     }
   }
 
-  async function handleLeaveRoom() {
-    setError(null);
-    setBusy("leave");
-    try {
-      await onLeave(room.id);
-    } finally {
-      setBusy(null);
-    }
-  }
-
   async function handleCancelTransfer(transferId: string) {
     setCancellingTransferId(transferId);
     setError(null);
@@ -296,7 +284,7 @@ export function RoomPage({
   const peerStateMessage = room.peer_burned_at
     ? "Peer burned room. Saved Inbox files stay on this device; burn locally when you're done."
     : room.status === "peer_left"
-      ? "Peer left this room. Sending is disabled until a new connection exists."
+      ? "Peer disconnected. Sending is disabled until a new connection exists."
       : null;
 
   const headerStatus = room.peer_connected
@@ -304,8 +292,8 @@ export function RoomPage({
     : room.peer_burned_at
       ? "Peer burned room"
       : room.status === "peer_left"
-        ? "Peer left"
-        : "Waiting for peer";
+        ? "Peer disconnected"
+        : "Waiting for peer to join";
 
   return (
     <div className="stack room-shell">
@@ -327,9 +315,6 @@ export function RoomPage({
             </button>
             <button className="ghost-button" onClick={() => void onRefresh()}>
               Refresh
-            </button>
-            <button className="ghost-button" onClick={handleLeaveRoom} disabled={busy !== null}>
-              {busy === "leave" ? "Leaving..." : "Leave"}
             </button>
             <button className="ghost-button danger" onClick={handleBurnRoom} disabled={busy !== null || room.status === "burned"}>
               {busy === "burn" ? "Burning..." : "Burn Room"}
@@ -401,7 +386,7 @@ export function RoomPage({
                 : room.peer_burned_at
                   ? "Peer burned this room. Burn locally when you're done."
                   : room.status === "peer_left"
-                    ? "Peer left this room."
+                    ? "Peer disconnected."
                     : "Waiting for the other device to join this room."
             }
             value={text}
