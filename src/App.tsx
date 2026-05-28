@@ -8,14 +8,39 @@ import { SettingsPage } from "./pages/SettingsPage";
 import {
   acceptNearbyJoin,
   burnRoom,
+  cancelTransfer,
+  deleteTempFile,
   getConfig,
+  getFileTransferMetadata,
   getRoom,
   listRoomItems,
   listRooms,
   markJoinPromptRendered,
   pendingJoinRequests,
-  rejectNearbyJoin
+  rejectNearbyJoin,
+  sendFileToRoom
 } from "./lib/tauri";
+import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "./lib/constants";
+import {
+  activeCancellableTransferIds,
+  cancelBatchLocally,
+  cancelQueueItem,
+  clearQueuedItemsForRoom,
+  correlateTransferProgress,
+  createTransferSchedulerState,
+  enqueueTransferBatch,
+  fileIdentityKey,
+  hasNonterminalDedupeKey,
+  markQueueItemCancelled,
+  markQueueItemCompleted,
+  markQueueItemFailed,
+  markQueueItemPreparing,
+  markQueueItemSending,
+  nextQueuedTransferItem,
+  selectRoomTransferQueue,
+  type TransferQueueInput,
+  type TransferSchedulerState
+} from "./lib/transferScheduler";
 import { mergeTransferEvent } from "./lib/transferState";
 import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, RoomInfo, RoomItem } from "./lib/types";
 
@@ -35,10 +60,31 @@ function App() {
   const [currentRoom, setCurrentRoom] = useState<RoomInfo | null>(null);
   const [roomItems, setRoomItems] = useState<RoomItem[]>([]);
   const [transfers, setTransfers] = useState<Record<string, FileTransferProgressEvent>>({});
+  const [scheduler, setScheduler] = useState<TransferSchedulerState>(() => createTransferSchedulerState());
   const [joinRequest, setJoinRequest] = useState<JoinRequestPrompt | null>(null);
   const [focusToken, setFocusToken] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const closedRoomIdsRef = useRef<Set<string>>(new Set());
+  const schedulerRef = useRef(scheduler);
+  const viewRef = useRef(view);
+  const schedulerWorkerRef = useRef(false);
+  const cancellingQueueTransferIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    schedulerRef.current = scheduler;
+  }, [scheduler]);
+
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  function updateSchedulerState(updater: (current: TransferSchedulerState) => TransferSchedulerState) {
+    setScheduler((current) => {
+      const next = updater(current);
+      schedulerRef.current = next;
+      return next;
+    });
+  }
 
   useEffect(() => {
     async function load() {
@@ -81,6 +127,14 @@ function App() {
         return;
       }
       setTransfers((current) => mergeTransferEvent(current, event.payload, closedRoomIdsRef.current));
+      updateSchedulerState((current) => correlateTransferProgress(current, {
+        roomId: event.payload.room_id,
+        direction: event.payload.direction,
+        fileName: event.payload.file_name,
+        fileSize: event.payload.file_size,
+        transferId: event.payload.transfer_id,
+        status: event.payload.status
+      }));
       if (event.payload.status === "completed") {
         void refreshCurrentRoom();
       }
@@ -100,6 +154,37 @@ function App() {
       if (unlistenJoinRequest) unlistenJoinRequest();
     };
   }, [view]);
+
+  useEffect(() => {
+    if (schedulerWorkerRef.current) {
+      return;
+    }
+
+    const nextItem = nextQueuedTransferItem(scheduler);
+    if (!nextItem) {
+      return;
+    }
+
+    schedulerWorkerRef.current = true;
+    void processTransferQueueItem(nextItem.id).finally(() => {
+      schedulerWorkerRef.current = false;
+      updateSchedulerState((current) => ({ ...current }));
+    });
+  }, [scheduler]);
+
+  useEffect(() => {
+    const transferIds = activeCancellableTransferIds(scheduler);
+    for (const transferId of transferIds) {
+      if (cancellingQueueTransferIdsRef.current.has(transferId)) {
+        continue;
+      }
+
+      cancellingQueueTransferIdsRef.current.add(transferId);
+      void cancelTransfer(transferId).catch((err) => {
+        setError(err instanceof Error ? err.message : String(err));
+      });
+    }
+  }, [scheduler]);
 
   async function refreshRooms(selectedRoomId?: string): Promise<RoomInfo | null> {
     const nextRooms = await listRooms();
@@ -155,7 +240,151 @@ function App() {
     }
   }
 
+  async function refreshRoomAfterQueueItem(roomId: string) {
+    const currentView = viewRef.current;
+    if (currentView.screen !== "room" || currentView.roomId !== roomId) {
+      await refreshRooms();
+      return;
+    }
+
+    try {
+      const [nextRoom, nextItems] = await Promise.all([getRoom(roomId), listRoomItems(roomId)]);
+      setCurrentRoom(nextRoom);
+      setRoomItems(nextItems);
+      const visibleRoom = await refreshRooms(roomId);
+      if (!visibleRoom) {
+        setView({ screen: "tabs" });
+        setRoomItems([]);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (
+        message === "room not found" ||
+        message === "File is no longer available" ||
+        message === "File is no longer available."
+      ) {
+        setView({ screen: "tabs" });
+        setCurrentRoom(null);
+        setRoomItems([]);
+        return;
+      }
+
+      setError(message);
+    }
+  }
+
+  async function processTransferQueueItem(itemId: string) {
+    updateSchedulerState((current) => markQueueItemPreparing(current, itemId));
+
+    let item = schedulerRef.current.items[itemId];
+    if (!item || item.cancelRequested) {
+      updateSchedulerState((current) => markQueueItemCancelled(current, itemId));
+      await cleanupSchedulerTempFile(itemId);
+      return;
+    }
+
+    try {
+      const metadata = await getFileTransferMetadata(item.path);
+      if (metadata.size_bytes > MAX_FILE_SIZE_BYTES) {
+        updateSchedulerState((current) => markQueueItemFailed(current, itemId, FILE_TOO_LARGE_MESSAGE));
+        await cleanupSchedulerTempFile(itemId);
+        await refreshRoomAfterQueueItem(item.roomId);
+        return;
+      }
+
+      const dedupeKey = fileIdentityKey(metadata.display_name, metadata.size_bytes, metadata.modified_ms);
+      if (hasNonterminalDedupeKey(schedulerRef.current, dedupeKey, itemId)) {
+        updateSchedulerState((current) => markQueueItemCancelled(current, itemId));
+        await cleanupSchedulerTempFile(itemId);
+        return;
+      }
+
+      updateSchedulerState((current) => markQueueItemSending(current, itemId, {
+        displayName: metadata.display_name,
+        mimeType: metadata.mime_type,
+        sizeBytes: metadata.size_bytes,
+        modifiedMs: metadata.modified_ms
+      }));
+
+      item = schedulerRef.current.items[itemId];
+      const batch = item ? schedulerRef.current.batches[item.batchId] : null;
+      if (!item || item.cancelRequested || batch?.cancelRequested) {
+        updateSchedulerState((current) => markQueueItemCancelled(current, itemId));
+        await cleanupSchedulerTempFile(itemId);
+        return;
+      }
+
+      await sendFileToRoom(item.roomId, item.path, {
+        displayName: metadata.display_name,
+        mimeType: metadata.mime_type
+      });
+      updateSchedulerState((current) => markQueueItemCompleted(current, itemId));
+      await refreshRoomAfterQueueItem(item.roomId);
+    } catch (err) {
+      const latestItem = schedulerRef.current.items[itemId];
+      const message = err instanceof Error ? err.message : String(err);
+      updateSchedulerState((current) => latestItem?.cancelRequested
+        ? markQueueItemCancelled(current, itemId)
+        : markQueueItemFailed(current, itemId, message)
+      );
+      if (latestItem) {
+        await refreshRoomAfterQueueItem(latestItem.roomId);
+      }
+    } finally {
+      await cleanupSchedulerTempFile(itemId);
+    }
+  }
+
+  async function cleanupSchedulerTempFile(itemId: string) {
+    const item = schedulerRef.current.items[itemId];
+    if (!item?.deleteWhenDone) {
+      return;
+    }
+
+    try {
+      await deleteTempFile(item.path);
+    } catch {
+      // Scheduler-created temp files are best-effort cleanup; send state is authoritative.
+    }
+  }
+
+  function enqueueRoomFiles(roomId: string, paths: string[]) {
+    updateSchedulerState((current) => enqueueTransferBatch(
+      current,
+      roomId,
+      paths.map((path) => ({ path }))
+    ));
+  }
+
+  function enqueueRoomTransferInputs(roomId: string, inputs: TransferQueueInput[]) {
+    updateSchedulerState((current) => enqueueTransferBatch(current, roomId, inputs));
+  }
+
+  async function handleCancelQueueItem(itemId: string) {
+    const item = schedulerRef.current.items[itemId];
+    const transferId = item?.status === "sending" ? item.activeTransferId : undefined;
+    updateSchedulerState((current) => cancelQueueItem(current, itemId));
+
+    if (transferId) {
+      await cancelTransfer(transferId);
+    }
+  }
+
+  async function handleCancelQueueBatch(batchId: string) {
+    const transferIds = Object.values(schedulerRef.current.items)
+      .filter((item) => item.batchId === batchId && item.status === "sending" && item.activeTransferId)
+      .map((item) => item.activeTransferId)
+      .filter((transferId): transferId is string => Boolean(transferId));
+
+    updateSchedulerState((current) => cancelBatchLocally(current, batchId));
+
+    for (const transferId of transferIds) {
+      await cancelTransfer(transferId);
+    }
+  }
+
   async function handleBurnRoom(roomId: string) {
+    updateSchedulerState((current) => clearQueuedItemsForRoom(current, roomId));
     await burnRoom(roomId);
     closedRoomIdsRef.current.add(roomId);
     setView({ screen: "tabs" });
@@ -241,12 +470,17 @@ function App() {
             room={currentRoom}
             items={roomItems}
             transfers={Object.values(transfers).filter((transfer) => transfer.room_id === currentRoom.id)}
+            queue={selectRoomTransferQueue(scheduler, currentRoom.id)}
             onBack={() => {
               setView({ screen: "tabs" });
               void refreshRooms();
             }}
             onRefresh={refreshCurrentRoom}
             onBurn={handleBurnRoom}
+            onEnqueueFiles={enqueueRoomFiles}
+            onEnqueueTransferInputs={enqueueRoomTransferInputs}
+            onCancelQueueItem={handleCancelQueueItem}
+            onCancelQueueBatch={handleCancelQueueBatch}
           />
         ) : null}
 

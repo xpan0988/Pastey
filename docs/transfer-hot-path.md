@@ -4,9 +4,13 @@ These notes describe Pastey's current file-transfer hot path, developer transfer
 
 ## Current Transfer Path
 
+Global Transfer Scheduler v1 is frontend orchestration only. Multi-file picker and drag/drop input is normalized into an in-memory queue, and the scheduler starts one file at a time by calling the existing `sendFileToRoom` wrapper and Rust `send_file_to_room` command. `sendFileToRoom` resolution or rejection remains the authoritative completion signal for each queued item.
+
 Binary-v1 is the normal high-performance transfer path. Each file is split into encrypted chunks, encoded as binary-v1 frames, sent over the LAN peer endpoint, acknowledged per chunk, and finalized after the receiver verifies the expected chunk count and size.
 
 Binary-v1 senders use pipelined in-flight chunk uploads. Receivers accept chunks by `chunk_index` and write each chunk at its file offset, so chunks may complete out of order. The receiver tracks a per-transfer received bitmap; finalize still verifies completeness before marking the transfer complete.
+
+The scheduler does not introduce parallel transfers, adaptive transfer windows, per-transfer window allocation, archive bundling, folder recursion, new chunk protocols, or backend transfer-core changes. Text sending remains immediate and does not enter the file queue. File type may affect labels, but transport behavior is opaque binary file transfer and does not branch on file type.
 
 The old stop-and-wait behavior is historical context only. It is still useful as a conceptual baseline for `window=1`, but normal binary-v1 transfers use a larger window.
 
