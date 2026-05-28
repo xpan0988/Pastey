@@ -8,7 +8,7 @@ This report describes the current Pastey codebase as checked out locally. It is 
 - Repository documentation, especially `README.md`, `docs/transfer-hot-path.md`, and `docs/internal/room-semantics.md`.
 - Source-level verification of the transfer, diagnostics, tuning, frontend, and lifecycle paths.
 
-CodeGraph output was checked as a navigation aid. In this checkout, `.codegraph/` exists but contains only `.gitignore`, so no CodeGraph-generated maps or dependency summaries were available to use.
+CodeGraph was checked as a navigation aid through `.codegraph/codegraph.db`, which identified the current scheduler, room UI, Tauri command, transfer, and tuning symbols. Source code remains the authority for behavior.
 
 Source code is treated as the source of truth. Existing docs are useful context, but claims in this report are grounded in the source files named below.
 
@@ -25,7 +25,7 @@ At a high level:
 - Local filesystem directories store encrypted payloads, received Inbox files, temp files, and logs.
 - Peers communicate through temporary local HTTP servers started per active room.
 - UDP discovery and nearby join requests are used to find local peers, while manual 8-digit code join remains available.
-- The current large-file transport is single-file, chunked, encrypted, LAN peer transfer.
+- The current large-file transport is per-file, chunked, encrypted, LAN peer transfer. The frontend can queue multiple selected, dropped, or pasted files, but it dispatches queued files serially and each file uses the existing single-file transfer command.
 - Binary-v1 chunk frames are the preferred high-performance chunk protocol; JSON/base64 chunk upload remains a legacy fallback.
 - Device diagnostics and link benchmarks exist, but they are advisory and do not currently drive routing or transfer tuning.
 
@@ -129,18 +129,27 @@ The long-term direction described in `README.md` is broader local-first device c
 
 - Owns top-level view state, config, rooms, current room items, transfer progress events, and nearby join prompts.
 - Listens for `pastey://transfer-progress` and merges events through `mergeTransferEvent`.
+- Owns the frontend `TransferSchedulerState`, starts the queue worker, and dispatches one queued file at a time.
+- `processTransferQueueItem` performs metadata preflight and calls `sendFileToRoom` for the active queued file.
 - Renders `DevicesPage`, `RoomsPage`, `RoomPage`, or `SettingsPage`.
 - Calls `burnRoom`, `getRoom`, `listRoomItems`, `listRooms`, and nearby join commands through `src/lib/tauri.ts`.
 
 `src/pages/RoomPage.tsx`
 
 - Main room transfer surface.
-- File picker path: `handlePickFile` calls Tauri dialog `open({ multiple: false, directory: false })`, then `handleSendFile`.
-- Drag/drop path: `getCurrentWebview().onDragDropEvent(...)` iterates dropped paths and calls `handleSendFile(path)`. The React `onDrop` handler only prevents default browser behavior; the Tauri webview drag/drop event is the actual file-processing path.
-- Paste image path: `handleComposerPaste` creates a temporary file through `writeTempFile`, then calls `sendFileMessage`.
-- Send path: `sendFileMessage` calls `sendFileToRoom`.
+- File picker path: `handlePickFile` calls Tauri dialog `open({ multiple: true, directory: false })`, then queues the selected path or paths through `onEnqueueFiles`.
+- Drag/drop path: `getCurrentWebview().onDragDropEvent(...)` queues all dropped paths through `onEnqueueFiles`. The Tauri webview drag/drop event is the file-processing path.
+- Paste image path: `handleComposerPaste` creates a temporary file through `writeTempFile`, then queues it through `onEnqueueTransferInputs`.
+- Send path: queued file inputs flow to `App.tsx`, where the scheduler serially calls `sendFileToRoom` for each active item.
 - Transfer progress rendering happens in `TransferCard`.
-- Current file picker is single-file only. Directory selection is disabled in the send picker.
+- Current file picker supports multiple files. Directory selection is disabled in the send picker.
+
+`src/lib/transferScheduler.ts`
+
+- Frontend-only outbound file scheduler.
+- Supports batches of queued file inputs, dedupes nonterminal queued/sending items, tracks queued/preparing/sending/completed/failed/cancelled item state, and exposes room-local queue summaries.
+- `nextQueuedTransferItem` returns `null` while any item is preparing or sending, so current dispatch is serial across the global frontend scheduler.
+- Cancellation is local for queued/preparing items and calls backend `cancelTransfer` only for an active sending item once a transfer id has been correlated.
 
 `src/pages/SettingsPage.tsx`
 
@@ -181,14 +190,17 @@ The long-term direction described in `README.md` is broader local-first device c
 
 ## 5. File Transfer Pipeline
 
-Current single-file picker path:
+Current queued file-send path:
 
 ```text
 src/pages/RoomPage.tsx
-  -> handlePickFile(...)
-  -> handleSendFile(path)
+  -> handlePickFile(...) / webview onDragDropEvent(...) / handleComposerPaste(...)
+  -> onEnqueueFiles(...) or onEnqueueTransferInputs(...)
+  -> App.tsx::enqueueRoomFiles(...) / enqueueRoomTransferInputs(...)
+  -> transferScheduler::enqueueTransferBatch(...)
+  -> transferScheduler::nextQueuedTransferItem(...)
+  -> App.tsx::processTransferQueueItem(...)
   -> getFileTransferMetadata(path)
-  -> sendFileMessage(...)
   -> sendFileToRoom(room.id, path, { displayName, mimeType })
   -> Tauri command send_file_to_room(...)
   -> storage::create_outgoing_file_item_with_metadata(...)
@@ -204,9 +216,11 @@ src/pages/RoomPage.tsx
 
 How the file path enters the system:
 
-- `RoomPage.tsx` receives an absolute path from the Tauri dialog or webview drag/drop event.
-- `getFileTransferMetadata` verifies the path is a file and returns display name, MIME guess, size, and modified timestamp.
-- `send_file_to_room` calls `resolve_user_path`, rejects non-files, and creates the outgoing room item.
+- `RoomPage.tsx` receives one or more absolute paths from the Tauri dialog or webview drag/drop event, or creates a temporary pasted-image path through `writeTempFile`.
+- The frontend scheduler stores each path as a queued item.
+- `App.tsx::processTransferQueueItem` handles one active queued item at a time.
+- `getFileTransferMetadata` verifies the active path is a file and returns display name, MIME guess, size, and modified timestamp.
+- `send_file_to_room` calls `resolve_user_path`, rejects non-files, and creates the outgoing room item for that single active file.
 
 Where the room item is created:
 
@@ -243,7 +257,7 @@ How progress is emitted:
 
 - Backend emits `pastey://transfer-progress` from `emit_progress` and `emit_event`.
 - Frontend listens in `App.tsx` and merges events into `transfers`.
-- `RoomPage.tsx` renders room-local progress through `TransferCard`; `RoomsPage.tsx` renders recent activity.
+- `RoomPage.tsx` renders backend transfer progress through `TransferCard` and queued file state through the queue panel; `RoomsPage.tsx` renders recent activity.
 
 How failure is surfaced:
 
@@ -504,12 +518,13 @@ Diagnostics models:
 
 Verified current limitations:
 
-- The file picker in `RoomPage.tsx` is single-file only: `multiple: false`.
+- The file picker in `RoomPage.tsx` supports multiple files: `multiple: true`.
 - Directory selection for sending is disabled: `directory: false`.
 - Settings uses directory selection only for Inbox location.
-- Tauri webview drag/drop can process multiple dropped paths because `onDragDropEvent` iterates `event.payload.paths`.
-- Each dropped path is still sent through `handleSendFile` as a separate single-file transfer. There is no bundled multi-file transfer model.
-- The React `onDrop` handler in the composer only prevents default behavior; file processing happens in the Tauri webview drag/drop event handler.
+- Tauri webview drag/drop can queue multiple dropped paths through `event.payload.paths`.
+- Pasted images are written to a temp file and queued through the same frontend scheduler.
+- The frontend scheduler is global and serial: only one queued item is preparing or sending at a time.
+- Each queued file is still sent through `sendFileToRoom` / `send_file_to_room` as a separate single-file transfer. There is no bundled multi-file transfer model.
 - Existing `.zip` or archive files are not treated specially by the transport. They are ordinary files.
 - No archive extraction implementation was found.
 - No archive creation/bundling implementation was found.
@@ -533,9 +548,12 @@ The current source follows this principle for transport: chunking, encryption, A
 ```text
 RoomPage.tsx
   -> handlePickFile / webview onDragDropEvent / handleComposerPaste
-  -> handleSendFile
+  -> onEnqueueFiles / onEnqueueTransferInputs
+  -> App.tsx::enqueueRoomFiles / enqueueRoomTransferInputs
+  -> transferScheduler::enqueueTransferBatch
+  -> transferScheduler::nextQueuedTransferItem
+  -> App.tsx::processTransferQueueItem
   -> getFileTransferMetadata
-  -> sendFileMessage
   -> src/lib/tauri.ts::sendFileToRoom
   -> commands.rs::send_file_to_room
   -> storage::create_outgoing_file_item_with_metadata
@@ -672,12 +690,12 @@ Baseline rules:
 
 Risks and unknowns:
 
-- CodeGraph may be stale or absent; in this checkout it was absent except for `.codegraph/.gitignore`.
+- CodeGraph may be stale; in this checkout it was available as `.codegraph/codegraph.db` and was used only as a navigation aid.
 - Receiver-side correctness requires careful source-level inspection before modification.
 - Archive extraction is not currently implemented.
 - Archive creation/bundling is not currently implemented.
-- Multi-file bundled flow is not currently implemented.
-- Drag/drop can submit multiple paths, but each path becomes an individual single-file transfer.
+- Multi-file queued input is implemented in the frontend scheduler, but multi-file bundled transfer is not currently implemented.
+- File picker and drag/drop can submit multiple paths, but each path becomes an individual queued single-file transfer.
 - Adaptive transfer must not bypass env/dev override precedence.
 - Capability routing signals are advisory, not permissions.
 - Diagnostics currently do not affect actual transfer behavior.
