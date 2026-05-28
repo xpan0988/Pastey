@@ -2,7 +2,7 @@
 name = "pastey"
 version = "1.6.1"
 description = "Local-first encrypted paste and file transfer utility"
-authors = ["OpenAI"]
+authors = ["xpan0988"]
 edition = "2021"
 
 [build-dependencies]

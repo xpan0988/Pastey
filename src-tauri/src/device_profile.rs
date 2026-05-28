@@ -341,6 +341,7 @@ fn logical_parallelism() -> Option<usize> {
         .map(|count| count.get())
 }
 
+#[cfg(target_os = "macos")]
 fn sysctl_usize(name: &str) -> Option<usize> {
     fixed_command_text("/usr/sbin/sysctl", &["-n", name])
         .or_else(|| fixed_command_text("sysctl", &["-n", name]))?
@@ -354,6 +355,7 @@ fn bytes_to_gb(bytes: u64) -> u64 {
     (bytes + gb / 2) / gb
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_macos_gpu_names(output: &str) -> Vec<String> {
     output
         .lines()
@@ -367,6 +369,7 @@ fn parse_macos_gpu_names(output: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_macos_chip_name(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         line.trim()
@@ -378,6 +381,7 @@ fn parse_macos_chip_name(output: &str) -> Option<String> {
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_macos_total_cores(output: &str) -> Option<usize> {
     output.lines().find_map(|line| {
         line.trim()
@@ -398,6 +402,7 @@ fn parse_lines(output: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_battery_percent(output: &str) -> Option<u8> {
     let (_, rest) = output.split_once('%')?;
     let before_percent = output[..output.len() - rest.len() - 1]
