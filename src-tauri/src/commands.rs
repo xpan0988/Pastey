@@ -556,7 +556,7 @@ pub async fn get_device_capabilities(
         let config = state.config.read().clone();
         let profile_mode = diagnostics_profile_mode(force_refresh);
         let capability_mode = diagnostics_capability_mode(force_refresh);
-        let cached_profile = cached_device_profile(&state, false);
+        let cached_profile = cached_profile_for_capability_probe(&state, force_refresh);
         let (profile, capabilities) = tauri::async_runtime::spawn_blocking(move || {
             let profile = cached_profile.unwrap_or_else(|| {
                 device_profile::local_device_profile_with_mode(&config, profile_mode)
@@ -723,6 +723,21 @@ fn cached_device_capabilities(
         .filter(|capabilities| diagnostics_cache_is_fresh(capabilities.updated_at, force_refresh))
 }
 
+fn cached_profile_for_capability_probe(
+    state: &Arc<AppState>,
+    force_refresh: bool,
+) -> Option<diagnostics::DeviceProfile> {
+    if should_reuse_cached_profile_for_capability_probe(force_refresh) {
+        cached_device_profile(state, false)
+    } else {
+        None
+    }
+}
+
+fn should_reuse_cached_profile_for_capability_probe(force_refresh: bool) -> bool {
+    !force_refresh
+}
+
 fn diagnostics_cache_is_fresh(updated_at: i64, force_refresh: bool) -> bool {
     !force_refresh
         && updated_at > 0
@@ -810,5 +825,11 @@ mod tests {
         );
         assert_eq!(diagnostics_profile_mode(true), ProfileProbeMode::Full);
         assert_eq!(diagnostics_capability_mode(true), CapabilityProbeMode::Full);
+    }
+
+    #[test]
+    fn forced_capability_refresh_does_not_reuse_cached_quick_profile() {
+        assert!(should_reuse_cached_profile_for_capability_probe(false));
+        assert!(!should_reuse_cached_profile_for_capability_probe(true));
     }
 }

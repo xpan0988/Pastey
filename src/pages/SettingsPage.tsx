@@ -398,7 +398,8 @@ function gpuTitle(capabilities: DeviceCapabilities): string {
 
 function availableRuntimeTitle(capabilities: DeviceCapabilities): string {
   const names = capabilities.runtimes.filter((runtime) => runtime.available).map((runtime) => runtime.name);
-  return names.length ? names.slice(0, 4).join(", ") : "Unknown";
+  if (names.length) return names.slice(0, 4).join(", ");
+  return capabilities.runtimes.length ? "None detected" : "Unknown";
 }
 
 function benchmarkModeDescription(mode: BenchmarkMode): string {
