@@ -2,6 +2,16 @@
 
 Detailed update and release history for Pastey.
 
+## Unreleased — Global Transfer Scheduler v1
+
+- Added a frontend-only serial transfer scheduler for multi-file picker, drag/drop, and pasted-image sends.
+- Added a lightweight room queue panel with batch counts, queued/failed/completed totals, current active file display, and local queue cancellation controls.
+- Kept text sending immediate and outside the file queue.
+- Preserved the existing `sendFileToRoom` frontend wrapper and Rust `send_file_to_room` command as the authoritative single-file transfer path.
+- Kept binary-v1 framing, JSON fallback, ACK behavior, receiver `.part` writes, finalize/cancel/burn handling, terminal transfer reason mapping, and transfer-window policy unchanged.
+- Did not add parallel transfers, adaptive transfer windows, per-transfer window allocation, archive bundling, folder transfer, benchmark UI, or transfer-core changes.
+- Kept file type as display metadata only; core binary file transport remains opaque and file-type independent.
+
 ## 1.6.0 — Device diagnostics foundation
 
 - Added a lightweight Device Diagnostics foundation behind Developer Tools.

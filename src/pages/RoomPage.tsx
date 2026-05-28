@@ -5,45 +5,48 @@ import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEve
 import {
   cancelTransfer,
   copyTextToClipboard,
-  deleteTempFile,
-  getFileTransferMetadata,
   revealInFolder,
-  sendFileToRoom,
   sendTextToRoom,
   writeTempFile
 } from "../lib/tauri";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
 import { fileTypeLabel, formatBytes, formatDuration, formatSpeed, formatTimestamp } from "../lib/format";
+import { fileIdentityKey, type RoomTransferQueueView, type TransferQueueBatch, type TransferQueueInput, type TransferQueueItem } from "../lib/transferScheduler";
 import type { FileTransferProgressEvent, RoomInfo, RoomItem } from "../lib/types";
 
 interface RoomPageProps {
   room: RoomInfo;
   items: RoomItem[];
   transfers: FileTransferProgressEvent[];
+  queue: RoomTransferQueueView;
   onBack: () => void;
   onRefresh: () => Promise<void>;
   onBurn: (roomId: string) => Promise<void>;
-}
-
-function fileIdentityKey(name: string, size: number, lastModified: number): string {
-  return `${name}:${size}:${lastModified}`;
+  onEnqueueFiles: (roomId: string, paths: string[]) => void;
+  onEnqueueTransferInputs: (roomId: string, inputs: TransferQueueInput[]) => void;
+  onCancelQueueItem: (itemId: string) => Promise<void>;
+  onCancelQueueBatch: (batchId: string) => Promise<void>;
 }
 
 export function RoomPage({
   room,
   items,
   transfers,
+  queue,
   onBack,
   onRefresh,
-  onBurn
+  onBurn,
+  onEnqueueFiles,
+  onEnqueueTransferInputs,
+  onCancelQueueItem,
+  onCancelQueueBatch
 }: RoomPageProps) {
   const [text, setText] = useState("");
-  const [busy, setBusy] = useState<"text" | "file" | "burn" | null>(null);
+  const [busy, setBusy] = useState<"text" | "burn" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [cancellingTransferId, setCancellingTransferId] = useState<string | null>(null);
   const [composerDropActive, setComposerDropActive] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
-  const inFlightFileKeysRef = useRef<Set<string>>(new Set());
   const roomUnavailable = room.status === "burned" || busy === "burn";
   const canSend = room.peer_connected && busy === null && !roomUnavailable;
 
@@ -82,8 +85,8 @@ export function RoomPage({
         if (event.payload.type === "drop") {
           setComposerDropActive(false);
           if (!canSend) return;
-          for (const path of event.payload.paths) {
-            await handleSendFile(path);
+          if (event.payload.paths.length > 0) {
+            onEnqueueFiles(room.id, event.payload.paths);
           }
           return;
         }
@@ -118,71 +121,22 @@ export function RoomPage({
     }
   }
 
-  async function handleSendFile(path: string) {
-    try {
-      const metadata = await getFileTransferMetadata(path);
-      if (metadata.size_bytes > MAX_FILE_SIZE_BYTES) {
-        setError(FILE_TOO_LARGE_MESSAGE);
-        return;
-      }
-
-      await sendFileMessage({
-        path,
-        displayName: metadata.display_name,
-        mimeType: metadata.mime_type,
-        size: metadata.size_bytes,
-        fileKey: fileIdentityKey(metadata.display_name, metadata.size_bytes, metadata.modified_ms)
-      });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }
-
   async function handlePickFile(event?: MouseEvent<HTMLButtonElement>) {
     event?.preventDefault();
     event?.stopPropagation();
     if (!canSend) return;
     const selected = await open({
-      multiple: false,
+      multiple: true,
       directory: false
     });
 
     if (typeof selected === "string") {
-      await handleSendFile(selected);
-    }
-  }
-
-  async function sendFileMessage({
-    path,
-    displayName,
-    mimeType,
-    size,
-    fileKey
-  }: {
-    path: string;
-    displayName?: string;
-    mimeType?: string | null;
-    size: number;
-    fileKey?: string;
-  }) {
-    const dedupeKey = fileKey ?? fileIdentityKey(displayName ?? path, size, 0);
-    const ignoredDuplicate = inFlightFileKeysRef.current.has(dedupeKey);
-    if (ignoredDuplicate) {
+      onEnqueueFiles(room.id, [selected]);
       return;
     }
-    inFlightFileKeysRef.current.add(dedupeKey);
 
-    setBusy("file");
-    setError(null);
-
-    try {
-      await sendFileToRoom(room.id, path, { displayName, mimeType });
-      await onRefresh();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      inFlightFileKeysRef.current.delete(dedupeKey);
-      setBusy(null);
+    if (Array.isArray(selected) && selected.length > 0) {
+      onEnqueueFiles(room.id, selected);
     }
   }
 
@@ -196,16 +150,19 @@ export function RoomPage({
     try {
       const buffer = await file.arrayBuffer();
       tempPath = await writeTempFile(file.name, Array.from(new Uint8Array(buffer)));
-      await sendFileMessage({
+      onEnqueueTransferInputs(room.id, [{
         path: tempPath,
         displayName: file.name,
         mimeType: file.type || "image/png",
-        size: file.size,
-        fileKey
-      });
-    } finally {
+        sizeBytes: file.size,
+        dedupeKey: fileKey,
+        deleteWhenDone: true
+      }]);
+    } catch (err) {
       if (tempPath) {
-        void deleteTempFile(tempPath);
+        setError("Unable to queue image from clipboard.");
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
       }
     }
   }
@@ -281,6 +238,26 @@ export function RoomPage({
     }
   }
 
+  async function handleCancelQueueItem(itemId: string) {
+    setError(null);
+    try {
+      await onCancelQueueItem(itemId);
+      await onRefresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleCancelQueueBatch(batchId: string) {
+    setError(null);
+    try {
+      await onCancelQueueBatch(batchId);
+      await onRefresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   const peerStateMessage = room.peer_burned_at
     ? "Peer burned room. Saved Inbox files stay on this device; burn locally when you're done."
     : room.status === "peer_left"
@@ -339,6 +316,14 @@ export function RoomPage({
       </section>
 
       <section className="panel chat-panel">
+        {queue.items.length > 0 ? (
+          <QueuePanel
+            queue={queue}
+            onCancelItem={handleCancelQueueItem}
+            onCancelBatch={handleCancelQueueBatch}
+          />
+        ) : null}
+
         {transfers.length > 0 ? (
           <div className="transfer-list">
             {transfers.map((transfer) => (
@@ -415,6 +400,125 @@ export function RoomPage({
       </section>
     </div>
   );
+}
+
+interface QueuePanelProps {
+  queue: RoomTransferQueueView;
+  onCancelItem: (itemId: string) => Promise<void>;
+  onCancelBatch: (batchId: string) => Promise<void>;
+}
+
+function QueuePanel({ queue, onCancelItem, onCancelBatch }: QueuePanelProps) {
+  const activeBatch = queue.batches.find((batch) => batch.status === "running") ?? queue.batches[queue.batches.length - 1];
+  const panelItems = activeBatch
+    ? activeBatch.itemIds
+      .map((itemId) => queue.items.find((item) => item.id === itemId))
+      .filter((item): item is TransferQueueItem => Boolean(item))
+    : queue.items;
+  const activeItem = panelItems.find((item) => item.status === "preparing" || item.status === "sending");
+  const completedCount = panelItems.filter((item) => item.status === "completed").length;
+  const failedCount = panelItems.filter((item) => item.status === "failed").length;
+  const queuedCount = panelItems.filter((item) => item.status === "queued").length;
+  const visibleItems = panelItems
+    .filter((item) => item.status === "queued" || item.status === "preparing" || item.status === "sending" || item.status === "failed")
+    .slice(0, 4);
+
+  return (
+    <div className="queue-panel">
+      <div className="row spread gap">
+        <div className="subtle-stack tight">
+          <span className="meta-label">Transfer queue</span>
+          <strong>{queueStatusLabel(activeBatch)}</strong>
+          <span className="muted">
+            {panelItems.length} files · {completedCount} done · {failedCount} failed · {queuedCount} queued
+          </span>
+        </div>
+        {activeBatch?.status === "running" ? (
+          <button className="ghost-button compact-button" onClick={() => void onCancelBatch(activeBatch.id)}>
+            Cancel batch
+          </button>
+        ) : null}
+      </div>
+
+      {activeItem ? (
+        <div className="queue-current">
+          <span className="muted">Current</span>
+          <strong>{activeItem.displayName ?? fileNameFromPath(activeItem.path)}</strong>
+        </div>
+      ) : null}
+
+      {visibleItems.length > 0 ? (
+        <div className="queue-items">
+          {visibleItems.map((item) => (
+            <QueueItemRow key={item.id} item={item} onCancelItem={onCancelItem} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function QueueItemRow({
+  item,
+  onCancelItem
+}: {
+  item: TransferQueueItem;
+  onCancelItem: (itemId: string) => Promise<void>;
+}) {
+  const canCancel = item.status === "queued" || item.status === "preparing" || item.status === "sending";
+
+  return (
+    <div className={`queue-item ${item.status}`}>
+      <div className="subtle-stack tight">
+        <strong>{item.displayName ?? fileNameFromPath(item.path)}</strong>
+        <span className="muted">
+          {queueItemStatusLabel(item)}
+          {typeof item.sizeBytes === "number" ? ` · ${formatBytes(item.sizeBytes)}` : ""}
+        </span>
+        {item.errorMessage ? <span className="transfer-error">{item.errorMessage}</span> : null}
+      </div>
+      {canCancel ? (
+        <button className="ghost-button compact-button" onClick={() => void onCancelItem(item.id)}>
+          Cancel
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function queueStatusLabel(batch?: TransferQueueBatch): string {
+  if (!batch) return "No active batch";
+  switch (batch.status) {
+    case "completed":
+      return "Batch completed";
+    case "completed_with_errors":
+      return "Batch completed with errors";
+    case "cancelled":
+      return "Batch cancelled";
+    default:
+      return "Batch running";
+  }
+}
+
+function queueItemStatusLabel(item: TransferQueueItem): string {
+  switch (item.status) {
+    case "preparing":
+      return "Preparing";
+    case "sending":
+      return item.cancelRequested ? "Cancelling" : "Sending";
+    case "completed":
+      return "Completed";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Cancelled";
+    default:
+      return "Queued";
+  }
+}
+
+function fileNameFromPath(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? "file";
 }
 
 interface TransferCardProps {
