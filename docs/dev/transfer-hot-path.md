@@ -43,9 +43,17 @@ $env:PASTEY_TRANSFER_WINDOW_SIZE="8"; Start-Process "pastey.exe"
 
 The transfer logs include `event=transfer_tuning` at transfer start with `effective_window_size`, `chunk_size`, `override_source`, and `transfer_protocol`. Successful binary-v1 transfers also emit `event=transfer_benchmark_summary` with sender and receiver timing summaries, average throughput, failed chunk count, duplicate chunk count, and finalize status.
 
+## Local Dev-Fast Transfer Testing
+
+Normal Tauri dev uses Cargo's `dev` profile. That keeps the edit/run loop quick, but it under-represents transfer throughput because the Rust transfer hot path runs without optimization and still carries debug-profile overhead.
+
+Use `npm run tauri:dev-fast` for local transfer-throughput testing. It keeps the Tauri dev workflow and Vite frontend server, but runs the Rust app with Pastey's optimized `dev-fast` Cargo profile. This mode is intended for realistic local transfer testing before scheduling work; it is not a production release replacement.
+
+Packaged release builds remain the final production benchmark. Use release artifacts when validating end-user throughput before shipping.
+
 ## Real Transfer Benchmark Checklist
 
-Use the same large file, same sender, same receiver, same network, and release builds only. Record one row per forced window:
+Use the same large file, same sender, same receiver, same network, and the same app mode. For local pre-release transfer testing, use `npm run tauri:dev-fast`; for final production validation, use packaged release builds. Record one row per forced window:
 
 - `window=1`
 - `window=2`

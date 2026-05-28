@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "tauri:dev": "npm run tauri -- dev",
+    "tauri:dev-fast": "npm run tauri -- dev -- --profile dev-fast",
     "build": "tsc && vite build",
     "tauri:build": "npm run tauri -- build",
     "check:version": "node scripts/check-version-consistency.mjs",

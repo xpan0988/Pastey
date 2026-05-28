@@ -52,8 +52,8 @@ See [docs/version-history.md](docs/version-history.md) for detailed update and v
 ## Documentation
 
 - [Version history](docs/version-history.md)
-- [Release workflow](docs/release-workflow.md)
-- [Transfer hot path notes](docs/transfer-hot-path.md)
+- [Release workflow](docs/dev/release-workflow.md)
+- [Transfer hot path notes](docs/dev/transfer-hot-path.md)
 
 ## What pastey does
 
@@ -170,7 +170,13 @@ Prebuilt installers are published on the [GitHub Releases page](https://github.c
 
 ```bash
 npm install
-npm run tauri dev
+npm run tauri:dev
+```
+
+For local transfer-throughput testing, use the optimized dev-fast mode:
+
+```bash
+npm run tauri:dev-fast
 ```
 
 ## Build
