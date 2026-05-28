@@ -261,7 +261,7 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
                   <p className="muted">Lightweight local profile, capabilities, and link checks.</p>
                 </div>
                 <button className="secondary-button" disabled={diagnosticsLoading} onClick={() => void refreshDiagnostics(true)}>
-                  {diagnosticsLoading ? "Loading..." : "Refresh"}
+                  {diagnosticsLoading ? "Loading..." : "Refresh profile"}
                 </button>
               </div>
               <p className="muted diagnostics-note">
@@ -280,6 +280,7 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
                   ["Runtimes", deviceCapabilities ? availableRuntimeTitle(deviceCapabilities) : "Unknown"]
                 ]} />
                 <DiagnosticBlock title="Last Benchmark" rows={[
+                  ["Mode", lastBenchmark ? benchmarkModeTitle(lastBenchmark.benchmark_mode) : "Unknown"],
                   ["Quality", lastBenchmark ? lastBenchmark.link_quality : "Not run"],
                   ["Average", lastBenchmark ? `${lastBenchmark.average_MBps.toFixed(1)} MB/s` : "Not run"],
                   ["Latency", lastBenchmark?.latency_ms != null ? `${lastBenchmark.latency_ms.toFixed(1)} ms` : "Unknown"]
@@ -406,6 +407,12 @@ function benchmarkModeDescription(mode: BenchmarkMode): string {
   }
 
   return "Localhost memory/socket baseline. Does not use LAN or internet.";
+}
+
+function benchmarkModeTitle(mode?: BenchmarkMode | null): string {
+  if (mode === "raw_memory") return "Loopback raw memory";
+  if (mode === "pastey_pipeline") return "Loopback Pastey pipeline";
+  return "Unknown";
 }
 
 function platformDeviceFallback(profile: DeviceProfile): string {
