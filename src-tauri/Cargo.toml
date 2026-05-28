@@ -42,6 +42,15 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
+[profile.dev-fast]
+inherits = "dev"
+opt-level = 2
+debug = "line-tables-only"
+debug-assertions = false
+overflow-checks = false
+incremental = true
+codegen-units = 16
+
 [profile.release]
 opt-level = "z"
 lto = true
