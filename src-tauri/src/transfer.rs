@@ -67,6 +67,7 @@ const CHUNK_RETRY_BACKOFFS: [Duration; 3] = [
 pub struct ActiveFileTransfer {
     room_id: String,
     item_id: String,
+    queue_item_id: Option<String>,
     file_name: String,
     file_size: u64,
     chunk_size: u64,
@@ -471,6 +472,8 @@ pub async fn send_room_file(
     room_id: &str,
     item_id: &str,
     file_path: &Path,
+    queue_item_id: Option<String>,
+    requested_window: Option<usize>,
 ) -> AppResult<()> {
     let room = storage::get_room_by_id(&state.paths, room_id)?;
     if room.status == RoomStatus::Burned {
@@ -531,6 +534,7 @@ pub async fn send_room_file(
         file_size,
         chunk_size as u64,
         total_chunks,
+        queue_item_id,
         cancel_token.clone(),
     )?;
     emit_progress(
@@ -647,7 +651,7 @@ pub async fn send_room_file(
     let mut last_report_bytes = 0u64;
     let mut chunk_index = 0u64;
     let mut chunk_protocol = chunk_protocol;
-    let transfer_tuning = current_transfer_tuning(&state);
+    let transfer_tuning = current_transfer_tuning(&state, requested_window);
     dev_log_sender_transfer_tuning(
         &transfer_id,
         room_id,
@@ -993,7 +997,10 @@ fn update_sender_transfer_report(
     }
 }
 
-fn current_transfer_tuning(state: &Arc<AppState>) -> TransferTuning {
+fn current_transfer_tuning(
+    state: &Arc<AppState>,
+    requested_window: Option<usize>,
+) -> TransferTuning {
     let (dev_window_override, dev_tools_enabled) = {
         let config = state.config.read();
         (
@@ -1001,7 +1008,11 @@ fn current_transfer_tuning(state: &Arc<AppState>) -> TransferTuning {
             crate::dev_tools::effective_dev_tools_enabled(config.dev_tools_enabled),
         )
     };
-    transfer_tuning::effective_transfer_tuning_from_env(dev_window_override, dev_tools_enabled)
+    transfer_tuning::effective_transfer_tuning_from_env(
+        dev_window_override,
+        dev_tools_enabled,
+        requested_window,
+    )
 }
 
 async fn finish_sender_after_chunk_error(
@@ -2742,6 +2753,7 @@ async fn start_file_transfer_handler(
     let transfer = ActiveFileTransfer {
         room_id: room_id.clone(),
         item_id: start.item_id.clone(),
+        queue_item_id: None,
         file_name,
         file_size: start.size_bytes,
         chunk_size: start.chunk_size,
@@ -3935,6 +3947,7 @@ fn register_sender_transfer(
     file_size: u64,
     chunk_size: u64,
     total_chunks: u64,
+    queue_item_id: Option<String>,
     cancel_token: CancellationToken,
 ) -> AppResult<()> {
     let now = Instant::now();
@@ -3949,6 +3962,7 @@ fn register_sender_transfer(
         ActiveFileTransfer {
             room_id: room_id.to_string(),
             item_id: item_id.to_string(),
+            queue_item_id,
             file_name: file_name.to_string(),
             file_size,
             chunk_size,
@@ -4238,6 +4252,7 @@ fn clone_event_base(
         transfer_id: transfer.item_id.clone(),
         room_id: transfer.room_id.clone(),
         item_id: transfer.item_id.clone(),
+        queue_item_id: transfer.queue_item_id.clone(),
         direction: direction.to_string(),
         file_name: transfer.file_name.clone(),
         file_size: transfer.file_size,
@@ -4940,7 +4955,7 @@ mod tests {
 
     #[test]
     fn transfer_tuning_log_includes_effective_window_and_protocol() {
-        let tuning = transfer_tuning::effective_transfer_tuning(Some(4), true, Some("8"));
+        let tuning = transfer_tuning::effective_transfer_tuning(Some(4), true, Some(2), Some("8"));
 
         let line = sender_transfer_tuning_log_line(
             "transfer-1",
@@ -4954,6 +4969,23 @@ mod tests {
         assert!(line.contains("effective_window_size=8"));
         assert!(line.contains("chunk_size=4194304"));
         assert!(line.contains("override_source=env"));
+        assert!(line.contains("transfer_protocol=binary-v1"));
+    }
+
+    #[test]
+    fn planner_requested_window_is_visible_to_binary_transfer_tuning() {
+        let tuning = transfer_tuning::effective_transfer_tuning(None, false, Some(3), None);
+
+        let line = sender_transfer_tuning_log_line(
+            "transfer-1",
+            "room-1",
+            tuning,
+            DEFAULT_CHUNK_SIZE_BYTES as usize,
+            ChunkProtocol::BinaryV1,
+        );
+
+        assert!(line.contains("effective_window_size=3"));
+        assert!(line.contains("override_source=planner_request"));
         assert!(line.contains("transfer_protocol=binary-v1"));
     }
 

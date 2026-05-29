@@ -137,6 +137,7 @@ export interface FileTransferProgressEvent {
   transfer_id: string;
   room_id: string;
   item_id: string;
+  queue_item_id?: string | null;
   direction: RoomItemDirection;
   file_name: string;
   file_size: number;

@@ -14,6 +14,8 @@ import type {
 interface SendFileOptions {
   displayName?: string;
   mimeType?: string | null;
+  queueItemId?: string | null;
+  requestedWindow?: number | null;
 }
 
 export interface FileTransferMetadata {
@@ -77,7 +79,9 @@ export async function sendFileToRoom(roomId: string, path: string, options?: Sen
     roomId,
     path,
     displayName: options?.displayName ?? null,
-    mimeType: options?.mimeType ?? null
+    mimeType: options?.mimeType ?? null,
+    queueItemId: options?.queueItemId ?? null,
+    requestedWindow: options?.requestedWindow ?? null
   });
 }
 

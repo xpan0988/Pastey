@@ -22,6 +22,7 @@ impl Default for TransferTuning {
 pub enum TransferWindowOverrideSource {
     Env,
     DevSettings,
+    PlannerRequest,
     Default,
 }
 
@@ -30,6 +31,7 @@ impl TransferWindowOverrideSource {
         match self {
             Self::Env => "env",
             Self::DevSettings => "dev_settings",
+            Self::PlannerRequest => "planner_request",
             Self::Default => "default",
         }
     }
@@ -42,11 +44,13 @@ pub fn normalize_transfer_window_override(value: Option<usize>) -> Option<usize>
 pub fn effective_transfer_tuning_from_env(
     dev_window_override: Option<usize>,
     dev_tools_enabled: bool,
+    requested_window: Option<usize>,
 ) -> TransferTuning {
     let env_window_override = std::env::var(TRANSFER_WINDOW_ENV).ok();
     effective_transfer_tuning(
         dev_window_override,
         dev_tools_enabled,
+        requested_window,
         env_window_override.as_deref(),
     )
 }
@@ -54,6 +58,7 @@ pub fn effective_transfer_tuning_from_env(
 pub fn effective_transfer_tuning(
     dev_window_override: Option<usize>,
     dev_tools_enabled: bool,
+    requested_window: Option<usize>,
     env_window_override: Option<&str>,
 ) -> TransferTuning {
     if let Some(window_size) =
@@ -72,6 +77,13 @@ pub fn effective_transfer_tuning(
                 override_source: TransferWindowOverrideSource::DevSettings,
             };
         }
+    }
+
+    if let Some(window_size) = requested_window {
+        return TransferTuning {
+            effective_window_size: clamp_transfer_window(window_size),
+            override_source: TransferWindowOverrideSource::PlannerRequest,
+        };
     }
 
     TransferTuning::default()
@@ -96,7 +108,7 @@ mod tests {
 
     #[test]
     fn default_binary_window_is_eight() {
-        let tuning = effective_transfer_tuning(None, false, None);
+        let tuning = effective_transfer_tuning(None, false, None, None);
 
         assert_eq!(tuning.effective_window_size, 8);
         assert_eq!(
@@ -116,7 +128,7 @@ mod tests {
             ("0", 1),
             ("99", 16),
         ] {
-            let tuning = effective_transfer_tuning(None, false, Some(override_value));
+            let tuning = effective_transfer_tuning(None, false, Some(3), Some(override_value));
             assert_eq!(tuning.effective_window_size, expected_window);
             assert_eq!(tuning.override_source, TransferWindowOverrideSource::Env);
         }
@@ -124,7 +136,7 @@ mod tests {
 
     #[test]
     fn env_window_override_takes_precedence_over_dev_setting() {
-        let tuning = effective_transfer_tuning(Some(4), true, Some("8"));
+        let tuning = effective_transfer_tuning(Some(4), true, Some(2), Some("8"));
 
         assert_eq!(tuning.effective_window_size, 8);
         assert_eq!(tuning.override_source, TransferWindowOverrideSource::Env);
@@ -132,13 +144,19 @@ mod tests {
 
     #[test]
     fn invalid_env_window_override_falls_back_to_dev_setting_or_default() {
-        let dev_tuning = effective_transfer_tuning(Some(4), true, Some("nope"));
-        let default_tuning = effective_transfer_tuning(Some(4), false, Some("nope"));
+        let dev_tuning = effective_transfer_tuning(Some(4), true, Some(2), Some("nope"));
+        let planner_tuning = effective_transfer_tuning(Some(4), false, Some(2), Some("nope"));
+        let default_tuning = effective_transfer_tuning(Some(4), false, None, Some("nope"));
 
         assert_eq!(dev_tuning.effective_window_size, 4);
         assert_eq!(
             dev_tuning.override_source,
             TransferWindowOverrideSource::DevSettings
+        );
+        assert_eq!(planner_tuning.effective_window_size, 2);
+        assert_eq!(
+            planner_tuning.override_source,
+            TransferWindowOverrideSource::PlannerRequest
         );
         assert_eq!(default_tuning.effective_window_size, 8);
         assert_eq!(
@@ -149,8 +167,8 @@ mod tests {
 
     #[test]
     fn dev_transfer_window_setting_maps_to_effective_window() {
-        let tuning = effective_transfer_tuning(Some(16), true, None);
-        let hidden_tuning = effective_transfer_tuning(Some(16), false, None);
+        let tuning = effective_transfer_tuning(Some(16), true, Some(2), None);
+        let hidden_tuning = effective_transfer_tuning(Some(16), false, None, None);
 
         assert_eq!(tuning.effective_window_size, 16);
         assert_eq!(
@@ -161,6 +179,45 @@ mod tests {
         assert_eq!(
             hidden_tuning.override_source,
             TransferWindowOverrideSource::Default
+        );
+    }
+
+    #[test]
+    fn requested_window_is_used_between_dev_setting_and_default() {
+        let tuning = effective_transfer_tuning(None, false, Some(3), None);
+
+        assert_eq!(tuning.effective_window_size, 3);
+        assert_eq!(
+            tuning.override_source,
+            TransferWindowOverrideSource::PlannerRequest
+        );
+    }
+
+    #[test]
+    fn requested_window_is_clamped_to_supported_range() {
+        let low = effective_transfer_tuning(None, false, Some(0), None);
+        let high = effective_transfer_tuning(None, false, Some(99), None);
+
+        assert_eq!(low.effective_window_size, 1);
+        assert_eq!(
+            low.override_source,
+            TransferWindowOverrideSource::PlannerRequest
+        );
+        assert_eq!(high.effective_window_size, 16);
+        assert_eq!(
+            high.override_source,
+            TransferWindowOverrideSource::PlannerRequest
+        );
+    }
+
+    #[test]
+    fn dev_setting_takes_precedence_over_requested_window() {
+        let tuning = effective_transfer_tuning(Some(4), true, Some(2), None);
+
+        assert_eq!(tuning.effective_window_size, 4);
+        assert_eq!(
+            tuning.override_source,
+            TransferWindowOverrideSource::DevSettings
         );
     }
 }

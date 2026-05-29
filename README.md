@@ -77,7 +77,7 @@ There is no account system, no cloud relay, no telemetry, and no remote database
 - Text is converted to bytes, encrypted, and stored locally.
 - Files and images are transferred as generic encrypted binary data.
 - Large files are streamed in encrypted chunks up to 10GB.
-- Multi-file picker and drag/drop sends are queued by a frontend scheduler and transferred one file at a time through the existing single-file path.
+- Multi-file picker and drag/drop sends are queued by a frontend weighted scheduler, which can start multiple file-like transfers while keeping each transfer on the existing single-file path.
 - The transfer server only runs during an active session.
 - LAN discovery only runs while there are active send sessions or a receive attempt is in progress.
 
@@ -147,7 +147,7 @@ Rooms exist until manually burned. Burning a room deletes that room's local encr
 4. Images are treated exactly like files
 5. No decode, resize, recompress, or transform step is applied
 
-Global Transfer Scheduler v1 is frontend orchestration only. It keeps transfers serial, reuses the existing single-file transfer command, and does not add parallel transfers, adaptive transfer windows, archive bundling, folder transfer, or transfer-core changes. File type may affect labels, but the binary file transport remains opaque and file-type independent.
+Global Transfer Scheduler v1 is frontend orchestration only. It uses a weighted planner for existing queued file-like transfers, passes per-transfer requested sender windows through the existing single-file transfer command, and does not add runtime window rebalancing, archive bundling, folder transfer, or transfer-core changes. File type may affect labels, but the binary file transport remains opaque and file-type independent.
 
 ## Download
 

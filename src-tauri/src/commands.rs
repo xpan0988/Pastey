@@ -377,6 +377,8 @@ pub async fn send_file_to_room(
     path: String,
     display_name: Option<String>,
     mime_type: Option<String>,
+    queue_item_id: Option<String>,
+    requested_window: Option<usize>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<RoomItem, String> {
     run_async(async move {
@@ -397,8 +399,15 @@ pub async fn send_file_to_room(
             display_name,
             mime_type,
         )?;
-        if let Err(error) =
-            transfer::send_room_file(state.inner().clone(), &room_id, &item.id, &file_path).await
+        if let Err(error) = transfer::send_room_file(
+            state.inner().clone(),
+            &room_id,
+            &item.id,
+            &file_path,
+            queue_item_id,
+            requested_window,
+        )
+        .await
         {
             let _ = storage::delete_room_item(&state.paths, &item.id);
             return Err(error);
