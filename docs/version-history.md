@@ -4,14 +4,19 @@ Detailed update and release history for Pastey.
 
 ## Unreleased — Global Transfer Scheduler v1
 
-- Added a frontend-only serial transfer scheduler for multi-file picker, drag/drop, and pasted-image sends.
+- Added a frontend-owned weighted transfer scheduler for multi-file picker, drag/drop, and pasted-image sends.
+- Added queue-item metadata readiness/cache so file-like items resolve display name, MIME type, size, modified time, and dedupe metadata before planner allocation.
+- Added optional frontend queue-item correlation metadata to outgoing file progress events so future concurrent sends can distinguish same-name/same-size queue items without changing transfer ids or chunk protocols.
+- Added a pure weighted transfer planner module with deterministic allocation tests for lane budgets, held reasons, active budget reservation, runnable launch selection, duplicate-launch prevention, and requested-window invariants.
+- Added planner-driven multi-worker execution for existing queued file-like transfers while preserving the existing `sendFileToRoom` / `send_file_to_room` single-file transfer path.
+- Added optional sender-side `requestedWindow` plumbing through `sendFileToRoom`, Rust `send_file_to_room`, `send_room_file`, and transfer tuning. Planner-selected sends pass requested windows; env and effective Developer Tools overrides still take precedence, omitted values keep the window 8 default, and no receiver protocol fields changed.
 - Added `npm run tauri:dev-fast`, backed by an optimized custom Cargo `dev-fast` profile, for faster local transfer-throughput testing before future scheduling work.
 - Documented that normal Tauri dev uses Cargo `dev` and can under-represent transfer throughput; packaged release builds remain the final production benchmark.
 - Added a lightweight room queue panel with batch counts, queued/failed/completed totals, current active file display, and local queue cancellation controls.
 - Kept text sending immediate and outside the file queue.
 - Preserved the existing `sendFileToRoom` frontend wrapper and Rust `send_file_to_room` command as the authoritative single-file transfer path.
-- Kept binary-v1 framing, JSON fallback, ACK behavior, receiver `.part` writes, finalize/cancel/burn handling, terminal transfer reason mapping, and transfer-window policy unchanged.
-- Did not add parallel transfers, adaptive transfer windows, per-transfer window allocation, archive bundling, folder transfer, benchmark UI, or transfer-core changes.
+- Kept binary-v1 framing, JSON fallback, ACK behavior, receiver `.part` writes, finalize/cancel/burn handling, and terminal transfer reason mapping unchanged.
+- Did not add Phase 4 runtime window mutation, adaptive rebalancing, archive bundling, folder transfer, benchmark UI, or transfer-core changes.
 - Kept file type as display metadata only; core binary file transport remains opaque and file-type independent.
 
 ## 1.6.0 — Device diagnostics foundation

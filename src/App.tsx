@@ -34,9 +34,13 @@ import {
   markQueueItemCancelled,
   markQueueItemCompleted,
   markQueueItemFailed,
+  markQueueItemMetadataFailed,
+  markQueueItemMetadataLoading,
+  markQueueItemMetadataReady,
   markQueueItemPreparing,
   markQueueItemSending,
-  nextQueuedTransferItem,
+  planRunnableTransferLaunches,
+  queuedItemsNeedingMetadata,
   selectRoomTransferQueue,
   type TransferQueueInput,
   type TransferSchedulerState
@@ -47,6 +51,14 @@ import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, RoomInfo,
 type View =
   | { screen: "tabs" }
   | { screen: "room"; roomId: string };
+
+interface PreparedQueueMetadata {
+  displayName: string;
+  mimeType?: string | null;
+  sizeBytes: number;
+  modifiedMs: number;
+  dedupeKey: string;
+}
 
 interface FocusPayload {
   target?: "home" | "settings";
@@ -67,7 +79,8 @@ function App() {
   const closedRoomIdsRef = useRef<Set<string>>(new Set());
   const schedulerRef = useRef(scheduler);
   const viewRef = useRef(view);
-  const schedulerWorkerRef = useRef(false);
+  const launchingQueueItemWindowsRef = useRef<Map<string, number>>(new Map());
+  const metadataPreflightItemIdsRef = useRef<Set<string>>(new Set());
   const cancellingQueueTransferIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
@@ -129,6 +142,7 @@ function App() {
       setTransfers((current) => mergeTransferEvent(current, event.payload, closedRoomIdsRef.current));
       updateSchedulerState((current) => correlateTransferProgress(current, {
         roomId: event.payload.room_id,
+        queueItemId: event.payload.queue_item_id,
         direction: event.payload.direction,
         fileName: event.payload.file_name,
         fileSize: event.payload.file_size,
@@ -156,21 +170,71 @@ function App() {
   }, [view]);
 
   useEffect(() => {
-    if (schedulerWorkerRef.current) {
-      return;
+    const metadataItems = queuedItemsNeedingMetadata(
+      scheduler,
+      rooms,
+      closedRoomIdsRef.current,
+      metadataPreflightItemIdsRef.current
+    );
+
+    for (const item of metadataItems) {
+      metadataPreflightItemIdsRef.current.add(item.id);
+      void prepareQueueItemMetadata(item.id)
+        .catch((err) => {
+          const message = err instanceof Error ? err.message : String(err);
+          updateSchedulerState((current) => markQueueItemMetadataFailed(current, item.id, message));
+          void refreshRoomAfterQueueItem(item.roomId);
+        })
+        .finally(() => {
+          metadataPreflightItemIdsRef.current.delete(item.id);
+          updateSchedulerState((current) => ({ ...current }));
+        });
+    }
+  }, [scheduler, rooms]);
+
+  useEffect(() => {
+    const { runnablePlans } = planRunnableTransferLaunches(
+      scheduler,
+      rooms,
+      closedRoomIdsRef.current,
+      launchingQueueItemWindowsRef.current
+    );
+
+    for (const plan of runnablePlans) {
+      if (launchingQueueItemWindowsRef.current.has(plan.itemId)) {
+        continue;
+      }
+
+      launchingQueueItemWindowsRef.current.set(plan.itemId, plan.requestedWindow);
+      void processTransferQueueItem(plan.itemId, plan.requestedWindow).finally(() => {
+        launchingQueueItemWindowsRef.current.delete(plan.itemId);
+        updateSchedulerState((current) => ({ ...current }));
+      });
+    }
+  }, [scheduler, rooms]);
+
+  useEffect(() => {
+    for (const itemId of [...launchingQueueItemWindowsRef.current.keys()]) {
+      const item = scheduler.items[itemId];
+      if (!item || item.status === "completed" || item.status === "failed" || item.status === "cancelled") {
+        launchingQueueItemWindowsRef.current.delete(itemId);
+      }
     }
 
-    const nextItem = nextQueuedTransferItem(scheduler);
-    if (!nextItem) {
-      return;
+    for (const itemId of [...metadataPreflightItemIdsRef.current]) {
+      const item = scheduler.items[itemId];
+      if (!item || item.status !== "queued" || item.metadataStatus !== "unknown") {
+        metadataPreflightItemIdsRef.current.delete(itemId);
+      }
     }
-
-    schedulerWorkerRef.current = true;
-    void processTransferQueueItem(nextItem.id).finally(() => {
-      schedulerWorkerRef.current = false;
-      updateSchedulerState((current) => ({ ...current }));
-    });
   }, [scheduler]);
+
+  useEffect(() => {
+    return () => {
+      launchingQueueItemWindowsRef.current.clear();
+      metadataPreflightItemIdsRef.current.clear();
+    };
+  }, []);
 
   useEffect(() => {
     const transferIds = activeCancellableTransferIds(scheduler);
@@ -273,66 +337,133 @@ function App() {
     }
   }
 
-  async function processTransferQueueItem(itemId: string) {
-    updateSchedulerState((current) => markQueueItemPreparing(current, itemId));
-
-    let item = schedulerRef.current.items[itemId];
-    if (!item || item.cancelRequested) {
-      updateSchedulerState((current) => markQueueItemCancelled(current, itemId));
-      await cleanupSchedulerTempFile(itemId);
-      return;
-    }
+  async function processTransferQueueItem(itemId: string, requestedWindow: number) {
+    updateSchedulerState((current) => markQueueItemPreparing(current, itemId, requestedWindow));
 
     try {
-      const metadata = await getFileTransferMetadata(item.path);
-      if (metadata.size_bytes > MAX_FILE_SIZE_BYTES) {
+      let item = schedulerRef.current.items[itemId];
+      if (!item || item.cancelRequested) {
+        updateSchedulerState((current) => markQueueItemCancelled(current, itemId));
+        return;
+      }
+
+      const metadata = await prepareQueueItemMetadata(itemId);
+      if (!metadata) {
+        updateSchedulerState((current) => markQueueItemCancelled(current, itemId));
+        return;
+      }
+
+      item = schedulerRef.current.items[itemId];
+      if (!item || item.cancelRequested) {
+        updateSchedulerState((current) => markQueueItemCancelled(current, itemId));
+        return;
+      }
+
+      if (metadata.sizeBytes > MAX_FILE_SIZE_BYTES) {
         updateSchedulerState((current) => markQueueItemFailed(current, itemId, FILE_TOO_LARGE_MESSAGE));
-        await cleanupSchedulerTempFile(itemId);
         await refreshRoomAfterQueueItem(item.roomId);
         return;
       }
 
-      const dedupeKey = fileIdentityKey(metadata.display_name, metadata.size_bytes, metadata.modified_ms);
-      if (hasNonterminalDedupeKey(schedulerRef.current, dedupeKey, itemId)) {
+      if (hasNonterminalDedupeKey(schedulerRef.current, metadata.dedupeKey, itemId)) {
         updateSchedulerState((current) => markQueueItemCancelled(current, itemId));
-        await cleanupSchedulerTempFile(itemId);
         return;
       }
 
       updateSchedulerState((current) => markQueueItemSending(current, itemId, {
-        displayName: metadata.display_name,
-        mimeType: metadata.mime_type,
-        sizeBytes: metadata.size_bytes,
-        modifiedMs: metadata.modified_ms
+        displayName: metadata.displayName,
+        mimeType: metadata.mimeType,
+        sizeBytes: metadata.sizeBytes,
+        modifiedMs: metadata.modifiedMs,
+        dedupeKey: metadata.dedupeKey
       }));
 
       item = schedulerRef.current.items[itemId];
       const batch = item ? schedulerRef.current.batches[item.batchId] : null;
       if (!item || item.cancelRequested || batch?.cancelRequested) {
         updateSchedulerState((current) => markQueueItemCancelled(current, itemId));
-        await cleanupSchedulerTempFile(itemId);
         return;
       }
 
       await sendFileToRoom(item.roomId, item.path, {
-        displayName: metadata.display_name,
-        mimeType: metadata.mime_type
+        displayName: metadata.displayName,
+        mimeType: metadata.mimeType,
+        queueItemId: item.id,
+        requestedWindow
       });
       updateSchedulerState((current) => markQueueItemCompleted(current, itemId));
       await refreshRoomAfterQueueItem(item.roomId);
     } catch (err) {
       const latestItem = schedulerRef.current.items[itemId];
       const message = err instanceof Error ? err.message : String(err);
-      updateSchedulerState((current) => latestItem?.cancelRequested
-        ? markQueueItemCancelled(current, itemId)
-        : markQueueItemFailed(current, itemId, message)
-      );
-      if (latestItem) {
+      updateSchedulerState((current) => {
+        if (latestItem?.cancelRequested) {
+          return markQueueItemCancelled(current, itemId);
+        }
+
+        return latestItem?.metadataStatus === "loading"
+          ? markQueueItemMetadataFailed(current, itemId, message)
+          : markQueueItemFailed(current, itemId, message);
+      });
+      if (latestItem && latestItem.metadataStatus !== "loading") {
         await refreshRoomAfterQueueItem(latestItem.roomId);
       }
     } finally {
       await cleanupSchedulerTempFile(itemId);
     }
+  }
+
+  async function prepareQueueItemMetadata(itemId: string): Promise<PreparedQueueMetadata | null> {
+    const cached = cachedQueueItemMetadata(schedulerRef.current.items[itemId]);
+    if (cached) {
+      return cached;
+    }
+
+    updateSchedulerState((current) => markQueueItemMetadataLoading(current, itemId));
+
+    let item = schedulerRef.current.items[itemId];
+    if (!item || item.cancelRequested) {
+      return null;
+    }
+
+    const metadata = await getFileTransferMetadata(item.path);
+    item = schedulerRef.current.items[itemId];
+    if (!item || item.cancelRequested) {
+      return null;
+    }
+
+    const displayName = item.displayName?.trim() ? item.displayName : metadata.display_name;
+    const prepared: PreparedQueueMetadata = {
+      displayName,
+      mimeType: item.mimeType ?? metadata.mime_type,
+      sizeBytes: metadata.size_bytes,
+      modifiedMs: metadata.modified_ms,
+      dedupeKey: item.dedupeKey ?? fileIdentityKey(displayName, metadata.size_bytes, metadata.modified_ms)
+    };
+
+    updateSchedulerState((current) => markQueueItemMetadataReady(current, itemId, prepared));
+    return prepared;
+  }
+
+  function cachedQueueItemMetadata(item: TransferSchedulerState["items"][string] | undefined): PreparedQueueMetadata | null {
+    if (
+      !item ||
+      item.metadataStatus !== "ready" ||
+      !item.displayName ||
+      typeof item.sizeBytes !== "number" ||
+      typeof item.modifiedMs !== "number" ||
+      !item.dedupeKey
+    ) {
+      return null;
+    }
+
+    return {
+      displayName: item.displayName,
+      mimeType: item.mimeType,
+      sizeBytes: item.sizeBytes,
+      modifiedMs: item.modifiedMs,
+      dedupeKey: item.dedupeKey
+    };
   }
 
   async function cleanupSchedulerTempFile(itemId: string) {

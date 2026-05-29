@@ -1,4 +1,15 @@
+import {
+  planWeightedTransfers,
+  type TransferPlannerResult,
+  type TransferPlannerRunnablePlan,
+  type TransferPlannerTask,
+  type TransferPlannerTaskKind
+} from "./transferPlanner";
+import type { RoomInfo } from "./types";
+
 export type TransferQueueItemStatus = "queued" | "preparing" | "sending" | "completed" | "failed" | "cancelled";
+
+export type TransferQueueItemMetadataStatus = "unknown" | "loading" | "ready" | "failed";
 
 export type TransferQueueBatchStatus = "running" | "completed" | "completed_with_errors" | "cancelled";
 
@@ -23,7 +34,9 @@ export interface TransferQueueItem {
   modifiedMs?: number;
   dedupeKey?: string;
   activeTransferId?: string;
+  requestedWindow?: number;
   status: TransferQueueItemStatus;
+  metadataStatus: TransferQueueItemMetadataStatus;
   errorMessage?: string;
   deleteWhenDone: boolean;
   cancelRequested: boolean;
@@ -62,8 +75,18 @@ export interface RoomTransferQueueView {
   summary: TransferQueueSummary;
 }
 
+export interface RunnableTransferLaunchPlan extends TransferPlannerRunnablePlan {
+  itemId: string;
+}
+
+export interface TransferLaunchPlannerResult {
+  plannerResult: TransferPlannerResult;
+  runnablePlans: RunnableTransferLaunchPlan[];
+}
+
 interface ProgressCorrelationInput {
   roomId: string;
+  queueItemId?: string | null;
   direction: string;
   fileName: string;
   fileSize: number;
@@ -118,6 +141,7 @@ export function enqueueTransferBatch(
     }
 
     const itemId = createId("item");
+    const hasCompleteMetadata = inputHasCompleteMetadata(input);
     itemIds.push(itemId);
     nextItems[itemId] = {
       id: itemId,
@@ -128,8 +152,11 @@ export function enqueueTransferBatch(
       mimeType: input.mimeType,
       sizeBytes: input.sizeBytes,
       modifiedMs: input.modifiedMs,
-      dedupeKey: input.dedupeKey,
+      dedupeKey: input.dedupeKey ?? (hasCompleteMetadata
+        ? fileIdentityKey(input.displayName ?? "", input.sizeBytes ?? 0, input.modifiedMs ?? 0)
+        : undefined),
       status: "queued",
+      metadataStatus: hasCompleteMetadata ? "ready" : "unknown",
       deleteWhenDone: input.deleteWhenDone ?? false,
       cancelRequested: false,
       createdAt: now,
@@ -162,33 +189,44 @@ export function enqueueTransferBatch(
   };
 }
 
-export function nextQueuedTransferItem(state: TransferSchedulerState): TransferQueueItem | null {
-  if (Object.values(state.items).some((item) => item.status === "preparing" || item.status === "sending")) {
-    return null;
-  }
+export function markQueueItemPreparing(
+  state: TransferSchedulerState,
+  itemId: string,
+  requestedWindow?: number
+): TransferSchedulerState {
+  const item = state.items[itemId];
+  if (!item) return state;
 
-  for (const batchId of state.batchOrder) {
-    const batch = state.batches[batchId];
-    if (!batch || batch.status !== "running" || batch.cancelRequested) {
-      continue;
-    }
-
-    for (const itemId of batch.itemIds) {
-      const item = state.items[itemId];
-      if (item?.status === "queued" && !item.cancelRequested) {
-        return item;
-      }
-    }
-  }
-
-  return null;
+  return replaceItem(
+    state,
+    {
+      ...item,
+      status: "preparing",
+      requestedWindow: requestedWindow ?? item.requestedWindow,
+      errorMessage: undefined,
+      updatedAt: Date.now()
+    },
+    true
+  );
 }
 
-export function markQueueItemPreparing(state: TransferSchedulerState, itemId: string): TransferSchedulerState {
-  return updateItemStatus(state, itemId, "preparing");
+export function markQueueItemMetadataLoading(state: TransferSchedulerState, itemId: string): TransferSchedulerState {
+  const item = state.items[itemId];
+  if (!item || isTerminalQueueItem(item)) return state;
+
+  return replaceItem(
+    state,
+    {
+      ...item,
+      metadataStatus: "loading",
+      errorMessage: undefined,
+      updatedAt: Date.now()
+    },
+    true
+  );
 }
 
-export function markQueueItemSending(
+export function markQueueItemMetadataReady(
   state: TransferSchedulerState,
   itemId: string,
   metadata: {
@@ -196,6 +234,7 @@ export function markQueueItemSending(
     mimeType?: string | null;
     sizeBytes: number;
     modifiedMs: number;
+    dedupeKey: string;
   }
 ): TransferSchedulerState {
   const item = state.items[itemId];
@@ -209,8 +248,61 @@ export function markQueueItemSending(
       mimeType: metadata.mimeType,
       sizeBytes: metadata.sizeBytes,
       modifiedMs: metadata.modifiedMs,
-      dedupeKey: fileIdentityKey(metadata.displayName, metadata.sizeBytes, metadata.modifiedMs),
+      dedupeKey: metadata.dedupeKey,
+      metadataStatus: "ready",
+      errorMessage: undefined,
+      updatedAt: Date.now()
+    },
+    true
+  );
+}
+
+export function markQueueItemMetadataFailed(
+  state: TransferSchedulerState,
+  itemId: string,
+  errorMessage: string
+): TransferSchedulerState {
+  const item = state.items[itemId];
+  if (!item) return state;
+
+  return replaceItem(
+    state,
+    {
+      ...item,
+      status: "failed",
+      metadataStatus: "failed",
+      errorMessage,
+      updatedAt: Date.now()
+    },
+    true
+  );
+}
+
+export function markQueueItemSending(
+  state: TransferSchedulerState,
+  itemId: string,
+  metadata: {
+    displayName: string;
+    mimeType?: string | null;
+    sizeBytes: number;
+    modifiedMs: number;
+    dedupeKey?: string;
+  }
+): TransferSchedulerState {
+  const item = state.items[itemId];
+  if (!item) return state;
+
+  return replaceItem(
+    state,
+    {
+      ...item,
+      displayName: metadata.displayName,
+      mimeType: metadata.mimeType,
+      sizeBytes: metadata.sizeBytes,
+      modifiedMs: metadata.modifiedMs,
+      dedupeKey: metadata.dedupeKey ?? fileIdentityKey(metadata.displayName, metadata.sizeBytes, metadata.modifiedMs),
       status: "sending",
+      metadataStatus: "ready",
       errorMessage: undefined,
       updatedAt: Date.now()
     },
@@ -316,6 +408,28 @@ export function correlateTransferProgress(
     return state;
   }
 
+  if (progress.queueItemId) {
+    const item = state.items[progress.queueItemId];
+    if (
+      !item ||
+      item.roomId !== progress.roomId ||
+      item.status !== "sending" ||
+      item.activeTransferId
+    ) {
+      return state;
+    }
+
+    return replaceItem(
+      state,
+      {
+        ...item,
+        activeTransferId: progress.transferId,
+        updatedAt: Date.now()
+      },
+      true
+    );
+  }
+
   const item = Object.values(state.items).find((candidate) => (
     candidate.roomId === progress.roomId &&
     candidate.status === "sending" &&
@@ -380,6 +494,106 @@ export function activeCancellableTransferIds(state: TransferSchedulerState): str
     .filter((item) => item.status === "sending" && item.cancelRequested && item.activeTransferId)
     .map((item) => item.activeTransferId)
     .filter((transferId): transferId is string => Boolean(transferId));
+}
+
+export function planRunnableTransferLaunches(
+  state: TransferSchedulerState,
+  rooms: readonly Pick<RoomInfo, "id" | "status">[],
+  closedRoomIds: ReadonlySet<string> = new Set(),
+  launchingItemWindows: ReadonlyMap<string, number> = new Map()
+): TransferLaunchPlannerResult {
+  const roomStatusById = new Map(rooms.map((room) => [room.id, room.status]));
+  const tasks: TransferPlannerTask[] = [];
+
+  for (const batchId of state.batchOrder) {
+    const batch = state.batches[batchId];
+    if (!batch) {
+      continue;
+    }
+
+    for (const itemId of batch.itemIds) {
+      const item = state.items[itemId];
+      if (!item) {
+        continue;
+      }
+
+      const roomStatus = roomStatusById.get(item.roomId);
+      const isLaunching = launchingItemWindows.has(item.id);
+      const isBatchCancelled = batch.cancelRequested || batch.status === "cancelled";
+      tasks.push({
+        id: item.id,
+        roomId: item.roomId,
+        kind: transferPlannerTaskKind(item),
+        state: plannerTaskState(item, isLaunching),
+        metadataStatus: item.metadataStatus,
+        sizeBytes: item.sizeBytes,
+        roomStatus: closedRoomIds.has(item.roomId) ? "unavailable" : roomStatus ?? "unavailable",
+        roomAvailable: !closedRoomIds.has(item.roomId) && roomStatus === "active",
+        cancelRequested: item.cancelRequested || isBatchCancelled,
+        requestedWindow: isLaunching ? launchingItemWindows.get(item.id) : item.requestedWindow,
+        activeRequestedWindow: isLaunching ? launchingItemWindows.get(item.id) : item.requestedWindow,
+        createdAt: item.createdAt
+      });
+    }
+  }
+
+  const plannerResult = planWeightedTransfers(tasks);
+  const runnablePlans = plannerResult.runnablePlans
+    .filter((plan) => {
+      const item = state.items[plan.taskId];
+      const batch = item ? state.batches[item.batchId] : undefined;
+      return Boolean(
+        item &&
+        batch &&
+        item.status === "queued" &&
+        item.metadataStatus === "ready" &&
+        !item.cancelRequested &&
+        batch.status === "running" &&
+        !batch.cancelRequested &&
+        !closedRoomIds.has(item.roomId) &&
+        roomStatusById.get(item.roomId) === "active" &&
+        !launchingItemWindows.has(item.id)
+      );
+    })
+    .map((plan) => ({ ...plan, itemId: plan.taskId }));
+
+  return {
+    plannerResult,
+    runnablePlans
+  };
+}
+
+export function queuedItemsNeedingMetadata(
+  state: TransferSchedulerState,
+  rooms: readonly Pick<RoomInfo, "id" | "status">[],
+  closedRoomIds: ReadonlySet<string> = new Set(),
+  loadingItemIds: ReadonlySet<string> = new Set()
+): TransferQueueItem[] {
+  const roomStatusById = new Map(rooms.map((room) => [room.id, room.status]));
+  const items: TransferQueueItem[] = [];
+
+  for (const batchId of state.batchOrder) {
+    const batch = state.batches[batchId];
+    if (!batch || batch.status !== "running" || batch.cancelRequested) {
+      continue;
+    }
+
+    for (const itemId of batch.itemIds) {
+      const item = state.items[itemId];
+      if (
+        item?.status === "queued" &&
+        item.metadataStatus === "unknown" &&
+        !item.cancelRequested &&
+        !closedRoomIds.has(item.roomId) &&
+        roomStatusById.get(item.roomId) === "active" &&
+        !loadingItemIds.has(item.id)
+      ) {
+        items.push(item);
+      }
+    }
+  }
+
+  return items;
 }
 
 function updateItemStatus(
@@ -450,6 +664,26 @@ function replaceBatch(state: TransferSchedulerState, batch: TransferQueueBatch):
   };
 }
 
+function plannerTaskState(item: TransferQueueItem, isLaunching: boolean): TransferPlannerTask["state"] {
+  if (item.status === "queued") {
+    return isLaunching ? "active" : "queued";
+  }
+  if (item.status === "preparing" || item.status === "sending") {
+    return "active";
+  }
+  return item.status;
+}
+
+function transferPlannerTaskKind(item: TransferQueueItem): TransferPlannerTaskKind {
+  if (item.deleteWhenDone && item.mimeType?.startsWith("image/")) {
+    return "pasted_image";
+  }
+  if (item.mimeType?.startsWith("image/")) {
+    return "image";
+  }
+  return "file";
+}
+
 function nonterminalDedupeKeys(state: TransferSchedulerState): Set<string> {
   const keys = new Set<string>();
   for (const item of Object.values(state.items)) {
@@ -466,6 +700,12 @@ function nonterminalDedupeKeys(state: TransferSchedulerState): Set<string> {
 
 function inputDedupeKeys(input: Pick<TransferQueueInput, "path" | "dedupeKey">): string[] {
   return [pathDedupeKey(input.path), input.dedupeKey].filter((key): key is string => Boolean(key));
+}
+
+function inputHasCompleteMetadata(input: TransferQueueInput): boolean {
+  return Boolean(input.displayName) &&
+    typeof input.sizeBytes === "number" &&
+    typeof input.modifiedMs === "number";
 }
 
 function pathDedupeKey(path: string): string {

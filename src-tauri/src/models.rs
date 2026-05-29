@@ -346,6 +346,7 @@ pub struct FileTransferProgressEvent {
     pub transfer_id: String,
     pub room_id: String,
     pub item_id: String,
+    pub queue_item_id: Option<String>,
     pub direction: String,
     pub file_name: String,
     pub file_size: u64,

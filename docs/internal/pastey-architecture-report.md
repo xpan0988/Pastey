@@ -25,9 +25,10 @@ At a high level:
 - Local filesystem directories store encrypted payloads, received Inbox files, temp files, and logs.
 - Peers communicate through temporary local HTTP servers started per active room.
 - UDP discovery and nearby join requests are used to find local peers, while manual 8-digit code join remains available.
-- The current large-file transport is per-file, chunked, encrypted, LAN peer transfer. The frontend can queue multiple selected, dropped, or pasted files, but it dispatches queued files serially and each file uses the existing single-file transfer command.
+- The current large-file transport is per-file, chunked, encrypted, LAN peer transfer. The frontend can queue multiple selected, dropped, or pasted files, and weighted planner output can start multiple existing queued file-like transfers. Each file still uses the existing single-file transfer command.
 - Binary-v1 chunk frames are the preferred high-performance chunk protocol; JSON/base64 chunk upload remains a legacy fallback.
 - Device diagnostics and link benchmarks exist, but they are advisory and do not currently drive routing or transfer tuning.
+- A pure frontend weighted transfer planner drives runtime dispatch for existing queued file-like transfers. It does not mutate running transfer windows.
 
 The current product model is room-based. A room is the coordination object for a transfer session. Room lifecycle is manual-burn based: Burn ends the local room state and cleans transient room data, but Inbox-saved received files are treated as durable user output.
 
@@ -53,7 +54,7 @@ The long-term direction described in `README.md` is broader local-first device c
 
 `src-tauri/src/transfer_tuning.rs`
 
-- Responsibility: Static/override-based binary-v1 transfer window policy.
+- Responsibility: Static/override/request-based binary-v1 transfer window policy.
 - Important types/functions: `TransferTuning`, `TransferWindowOverrideSource`, `DEFAULT_BINARY_V1_WINDOW`, `MIN_TRANSFER_WINDOW`, `MAX_TRANSFER_WINDOW`, `normalize_transfer_window_override`, `effective_transfer_tuning_from_env`, `effective_transfer_tuning`.
 - Depends on: Environment variable `PASTEY_TRANSFER_WINDOW_SIZE`.
 - Depended on by: `transfer.rs`, `config.rs`, and `link_benchmark.rs`.
@@ -129,8 +130,8 @@ The long-term direction described in `README.md` is broader local-first device c
 
 - Owns top-level view state, config, rooms, current room items, transfer progress events, and nearby join prompts.
 - Listens for `pastey://transfer-progress` and merges events through `mergeTransferEvent`.
-- Owns the frontend `TransferSchedulerState`, starts the queue worker, and dispatches one queued file at a time.
-- `processTransferQueueItem` performs metadata preflight and calls `sendFileToRoom` for the active queued file.
+- Owns the frontend `TransferSchedulerState`, starts metadata preflight for queued file-like items, and launches planner runnable plans.
+- `processTransferQueueItem` calls `sendFileToRoom` for one planned queued file, passing the frontend queue item id as optional progress-correlation metadata and the planner requested sender window. Metadata failure marks the queue item failed before any transfer starts.
 - Renders `DevicesPage`, `RoomsPage`, `RoomPage`, or `SettingsPage`.
 - Calls `burnRoom`, `getRoom`, `listRoomItems`, `listRooms`, and nearby join commands through `src/lib/tauri.ts`.
 
@@ -140,16 +141,25 @@ The long-term direction described in `README.md` is broader local-first device c
 - File picker path: `handlePickFile` calls Tauri dialog `open({ multiple: true, directory: false })`, then queues the selected path or paths through `onEnqueueFiles`.
 - Drag/drop path: `getCurrentWebview().onDragDropEvent(...)` queues all dropped paths through `onEnqueueFiles`. The Tauri webview drag/drop event is the file-processing path.
 - Paste image path: `handleComposerPaste` creates a temporary file through `writeTempFile`, then queues it through `onEnqueueTransferInputs`.
-- Send path: queued file inputs flow to `App.tsx`, where the scheduler serially calls `sendFileToRoom` for each active item.
+- Send path: queued file inputs flow to `App.tsx`, where the scheduler uses planner output to call `sendFileToRoom` for each runnable planned item.
 - Transfer progress rendering happens in `TransferCard`.
 - Current file picker supports multiple files. Directory selection is disabled in the send picker.
 
 `src/lib/transferScheduler.ts`
 
 - Frontend-only outbound file scheduler.
-- Supports batches of queued file inputs, dedupes nonterminal queued/sending items, tracks queued/preparing/sending/completed/failed/cancelled item state, and exposes room-local queue summaries.
-- `nextQueuedTransferItem` returns `null` while any item is preparing or sending, so current dispatch is serial across the global frontend scheduler.
+- Supports batches of queued file inputs, dedupes nonterminal queued/sending items, tracks queued/preparing/sending/completed/failed/cancelled item state, tracks metadata readiness as unknown/loading/ready/failed, correlates outgoing progress by queue item id when present, exposes room-local queue summaries, and adapts scheduler state into weighted planner tasks.
+- `planRunnableTransferLaunches` accounts for active and already launching items, excludes cancelled/burned/closed-room work, and returns runnable plans for `App.tsx` to execute.
 - Cancellation is local for queued/preparing items and calls backend `cancelTransfer` only for an active sending item once a transfer id has been correlated.
+
+`src/lib/transferPlanner.ts`
+
+- Pure frontend weighted transfer planner.
+- Defines planner task kinds, size classes, lanes, priority, sensitivity flags, runnable plans, active plans, held plans, lane budget reports, requested windows, and held/debug reasons.
+- Default policy uses `globalWindowBudget = 8`, `minRequestedWindow = 1`, lane weights for `small_file` and `bulk_file`, a model-only `control_text` lane, and a safety active-transfer cap.
+- Requires metadata-ready tasks for allocation; missing metadata, burned/unavailable rooms, cancelled tasks, and terminal tasks become held plans.
+- Reserves active transfer budget before producing runnable plans and keeps total active plus runnable requested windows within the global window budget.
+- Used by `App.tsx` runtime dispatch for queued file-like transfers only. Text/control/agent/command lanes remain model-only.
 
 `src/pages/SettingsPage.tsx`
 
@@ -198,10 +208,12 @@ src/pages/RoomPage.tsx
   -> onEnqueueFiles(...) or onEnqueueTransferInputs(...)
   -> App.tsx::enqueueRoomFiles(...) / enqueueRoomTransferInputs(...)
   -> transferScheduler::enqueueTransferBatch(...)
-  -> transferScheduler::nextQueuedTransferItem(...)
-  -> App.tsx::processTransferQueueItem(...)
+  -> App.tsx::prepareQueueItemMetadata(...)
   -> getFileTransferMetadata(path)
-  -> sendFileToRoom(room.id, path, { displayName, mimeType })
+  -> transferScheduler::planRunnableTransferLaunches(...)
+  -> transferPlanner::planWeightedTransfers(...)
+  -> App.tsx::processTransferQueueItem(...)
+  -> sendFileToRoom(room.id, path, { displayName, mimeType, queueItemId, requestedWindow })
   -> Tauri command send_file_to_room(...)
   -> storage::create_outgoing_file_item_with_metadata(...)
   -> transfer::send_room_file(...)
@@ -217,10 +229,11 @@ src/pages/RoomPage.tsx
 How the file path enters the system:
 
 - `RoomPage.tsx` receives one or more absolute paths from the Tauri dialog or webview drag/drop event, or creates a temporary pasted-image path through `writeTempFile`.
-- The frontend scheduler stores each path as a queued item.
-- `App.tsx::processTransferQueueItem` handles one active queued item at a time.
+- The frontend scheduler stores each path as a queued item with metadata readiness/cache state.
+- `App.tsx::processTransferQueueItem` handles one planned queued item; multiple calls may be active when the planner starts multiple runnable plans.
+- `App.tsx::prepareQueueItemMetadata` resolves metadata before send start and caches display name, MIME guess, size, modified timestamp, and dedupe identity on the queued item.
 - `getFileTransferMetadata` verifies the active path is a file and returns display name, MIME guess, size, and modified timestamp.
-- `send_file_to_room` calls `resolve_user_path`, rejects non-files, and creates the outgoing room item for that single active file.
+- `send_file_to_room` calls `resolve_user_path`, rejects non-files, and creates the outgoing room item for that single active file. Its optional queue item id argument is correlation metadata only. Its optional requested-window argument is sender-side tuning input only.
 
 Where the room item is created:
 
@@ -231,6 +244,7 @@ Where the room item is created:
 Where metadata is collected:
 
 - Frontend preflight uses `get_file_transfer_metadata`.
+- Queue metadata preflight failures mark the queue item failed before `sendFileToRoom` or `send_file_to_room` starts a transfer.
 - Backend authority uses `storage::file_transfer_metadata`, `storage::validate_file_size`, and a fresh `tokio::fs::metadata` check in `send_room_file`.
 - `send_room_file` rejects the transfer if the file size changed after item creation.
 
@@ -256,6 +270,7 @@ Where chunks start:
 How progress is emitted:
 
 - Backend emits `pastey://transfer-progress` from `emit_progress` and `emit_event`.
+- Outgoing queued file progress includes optional `queue_item_id` correlation metadata when the frontend provided it. Incoming progress and non-queued legacy sends may omit it.
 - Frontend listens in `App.tsx` and merges events into `transfers`.
 - `RoomPage.tsx` renders backend transfer progress through `TransferCard` and queued file state through the queue panel; `RoomsPage.tsx` renders recent activity.
 
@@ -331,6 +346,7 @@ Precedence:
 ```text
 PASTEY_TRANSFER_WINDOW_SIZE
   -> dev Settings transfer_window_override, only when Developer Tools are effective-enabled
+  -> planner requested_window
   -> default window 8
 ```
 
@@ -339,10 +355,11 @@ Normalization:
 - `normalize_transfer_window_override` clamps numeric values into `1..16`.
 - Invalid non-numeric env values are ignored by `effective_transfer_tuning`.
 - Numeric env values are clamped and take precedence over dev settings.
+- Requested-window values are clamped and used only when there is no env override and no effective Developer Tools override.
 
 Where tuning is computed:
 
-- `transfer::current_transfer_tuning` reads `StoredConfig.transfer_window_override` and effective Developer Tools state through `dev_tools::effective_dev_tools_enabled`.
+- `transfer::current_transfer_tuning` reads `StoredConfig.transfer_window_override` and effective Developer Tools state through `dev_tools::effective_dev_tools_enabled`, then applies the optional requested-window argument if no higher-precedence override is active.
 - It calls `transfer_tuning::effective_transfer_tuning_from_env`.
 
 Where tuning is used:
@@ -507,7 +524,7 @@ Transfer protocol DTOs:
 
 Frontend events:
 
-- `FileTransferProgressEvent` reports transfer id, room id, item id, direction, file name/size, chunk size/count, transferred bytes, status, current/average speeds, ETA, and optional error message.
+- `FileTransferProgressEvent` reports transfer id, room id, item id, optional frontend queue item id, direction, file name/size, chunk size/count, transferred bytes, status, current/average speeds, ETA, and optional error message.
 
 Diagnostics models:
 
@@ -523,7 +540,9 @@ Verified current limitations:
 - Settings uses directory selection only for Inbox location.
 - Tauri webview drag/drop can queue multiple dropped paths through `event.payload.paths`.
 - Pasted images are written to a temp file and queued through the same frontend scheduler.
-- The frontend scheduler is global and serial: only one queued item is preparing or sending at a time.
+- The frontend scheduler is global and planner-driven: multiple queued file-like items may be preparing or sending when the weighted planner allocates runnable plans.
+- Queued file-like items cache metadata readiness before planner allocation; picker and drag/drop items begin unknown, pasted images may provide display/MIME/size hints, and launch still refreshes file metadata before sending.
+- Queued outgoing file progress can correlate by frontend queue item id. The older room id, display name, and size fallback remains for progress events without queue correlation metadata.
 - Each queued file is still sent through `sendFileToRoom` / `send_file_to_room` as a separate single-file transfer. There is no bundled multi-file transfer model.
 - Existing `.zip` or archive files are not treated specially by the transport. They are ordinary files.
 - No archive extraction implementation was found.
@@ -551,9 +570,10 @@ RoomPage.tsx
   -> onEnqueueFiles / onEnqueueTransferInputs
   -> App.tsx::enqueueRoomFiles / enqueueRoomTransferInputs
   -> transferScheduler::enqueueTransferBatch
-  -> transferScheduler::nextQueuedTransferItem
-  -> App.tsx::processTransferQueueItem
   -> getFileTransferMetadata
+  -> transferScheduler::planRunnableTransferLaunches
+  -> transferPlanner::planWeightedTransfers
+  -> App.tsx::processTransferQueueItem
   -> src/lib/tauri.ts::sendFileToRoom
   -> commands.rs::send_file_to_room
   -> storage::create_outgoing_file_item_with_metadata
