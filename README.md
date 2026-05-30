@@ -47,11 +47,11 @@ Peer benchmarks are LAN baselines between trusted Pastey devices. Peer raw link 
 
 ## Release history
 
-See [docs/version-history.md](docs/version-history.md) for detailed update and version history.
+See [CHANGELOG.md](CHANGELOG.md) for detailed update and version history.
 
 ## Documentation
 
-- [Version history](docs/version-history.md)
+- [Changelog](CHANGELOG.md)
 - [Release workflow](docs/dev/release-workflow.md)
 - [Transfer hot path notes](docs/dev/transfer-hot-path.md)
 
@@ -202,14 +202,14 @@ npm run build:checked
 ### Release workflow
 
 ```bash
-npm run release:version -- 1.5.3 "Release Title"
+npm run release:version -- X.Y.Z "Release Title"
 git push origin main --tags
 ```
 
 ### Dry-run release workflow
 
 ```bash
-npm run release:version -- 1.5.3 "Release Title" --dry-run
+npm run release:version -- X.Y.Z "Release Title" --dry-run
 ```
 
 ### What the release workflow does
