@@ -229,7 +229,9 @@ export function RoomPage({
     setCancellingTransferId(transferId);
     setError(null);
     try {
-      await cancelTransfer(transferId);
+      await cancelTransfer(transferId, {
+        source: "transfer-card"
+      });
       await onRefresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

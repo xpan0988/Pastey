@@ -23,7 +23,7 @@ import {
 } from "./lib/tauri";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "./lib/constants";
 import {
-  activeCancellableTransferIds,
+  activeCancellableTransferRequests,
   cancelBatchLocally,
   cancelQueueItem,
   clearQueuedItemsForRoom,
@@ -254,14 +254,19 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const transferIds = activeCancellableTransferIds(scheduler);
-    for (const transferId of transferIds) {
-      if (cancellingQueueTransferIdsRef.current.has(transferId)) {
+    const transferRequests = activeCancellableTransferRequests(scheduler);
+    for (const request of transferRequests) {
+      if (cancellingQueueTransferIdsRef.current.has(request.transferId)) {
         continue;
       }
 
-      cancellingQueueTransferIdsRef.current.add(transferId);
-      void cancelTransfer(transferId).catch((err) => {
+      cancellingQueueTransferIdsRef.current.add(request.transferId);
+      void cancelTransfer(request.transferId, {
+        source: "queue-cancel-effect",
+        queueItemId: request.itemId,
+        batchId: request.batchId,
+        roomId: request.roomId
+      }).catch((err) => {
         setError(err instanceof Error ? err.message : String(err));
       });
     }
@@ -550,21 +555,35 @@ function App() {
     const transferId = item?.status === "sending" ? item.activeTransferId : undefined;
     updateSchedulerState((current) => cancelQueueItem(current, itemId));
 
-    if (transferId) {
-      await cancelTransfer(transferId);
+    if (transferId && item) {
+      await cancelTransfer(transferId, {
+        source: "queue-item-cancel",
+        queueItemId: item.id,
+        batchId: item.batchId,
+        roomId: item.roomId
+      });
     }
   }
 
   async function handleCancelQueueBatch(batchId: string) {
-    const transferIds = Object.values(schedulerRef.current.items)
+    const transferRequests = Object.values(schedulerRef.current.items)
       .filter((item) => item.batchId === batchId && item.status === "sending" && item.activeTransferId)
-      .map((item) => item.activeTransferId)
-      .filter((transferId): transferId is string => Boolean(transferId));
+      .map((item) => ({
+        transferId: item.activeTransferId as string,
+        itemId: item.id,
+        batchId: item.batchId,
+        roomId: item.roomId
+      }));
 
     updateSchedulerState((current) => cancelBatchLocally(current, batchId));
 
-    for (const transferId of transferIds) {
-      await cancelTransfer(transferId);
+    for (const request of transferRequests) {
+      await cancelTransfer(request.transferId, {
+        source: "queue-batch-cancel",
+        queueItemId: request.itemId,
+        batchId: request.batchId,
+        roomId: request.roomId
+      });
     }
   }
 

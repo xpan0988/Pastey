@@ -91,6 +91,13 @@ export interface TransferWindowRebalancePlan {
   previousWindow: number;
 }
 
+export interface CancellableTransferRequest {
+  transferId: string;
+  itemId: string;
+  batchId: string;
+  roomId: string;
+}
+
 interface ProgressCorrelationInput {
   roomId: string;
   queueItemId?: string | null;
@@ -512,10 +519,18 @@ export function selectRoomTransferQueue(state: TransferSchedulerState, roomId: s
 }
 
 export function activeCancellableTransferIds(state: TransferSchedulerState): string[] {
+  return activeCancellableTransferRequests(state).map((request) => request.transferId);
+}
+
+export function activeCancellableTransferRequests(state: TransferSchedulerState): CancellableTransferRequest[] {
   return Object.values(state.items)
     .filter((item) => item.status === "sending" && item.cancelRequested && item.activeTransferId)
-    .map((item) => item.activeTransferId)
-    .filter((transferId): transferId is string => Boolean(transferId));
+    .map((item) => ({
+      transferId: item.activeTransferId as string,
+      itemId: item.id,
+      batchId: item.batchId,
+      roomId: item.roomId
+    }));
 }
 
 export function planRunnableTransferLaunches(
@@ -541,7 +556,7 @@ export function planRunnableTransferLaunches(
       }
 
       const roomStatus = roomStatusById.get(item.roomId);
-      const isLaunching = launchingItemWindows.has(item.id);
+      const isLaunching = item.status === "queued" && launchingItemWindows.has(item.id);
       const isBatchCancelled = batch.cancelRequested || batch.status === "cancelled";
       const isActive = isLaunching || item.status === "preparing" || item.status === "sending";
       tasks.push({

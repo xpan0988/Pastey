@@ -18,6 +18,13 @@ interface SendFileOptions {
   requestedWindow?: number | null;
 }
 
+interface CancelTransferOptions {
+  source?: string;
+  queueItemId?: string | null;
+  batchId?: string | null;
+  roomId?: string | null;
+}
+
 export interface FileTransferMetadata {
   path: string;
   display_name: string;
@@ -94,8 +101,14 @@ export async function sendFileToRoom(roomId: string, path: string, options?: Sen
   });
 }
 
-export async function cancelTransfer(transferId: string): Promise<boolean> {
-  return invoke("cancel_transfer", { transferId });
+export async function cancelTransfer(transferId: string, options?: CancelTransferOptions): Promise<boolean> {
+  return invoke("cancel_transfer", {
+    transferId,
+    cancelSource: options?.source ?? null,
+    queueItemId: options?.queueItemId ?? null,
+    batchId: options?.batchId ?? null,
+    roomId: options?.roomId ?? null
+  });
 }
 
 export async function updateTransferWindow(
