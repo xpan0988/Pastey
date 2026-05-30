@@ -10,6 +10,8 @@ import {
 
 const MiB = 1024 * 1024;
 const GiB = 1024 * MiB;
+const TWO_POINT_SEVEN_GB_BYTES = 2707513952;
+const ONE_HUNDRED_FORTY_SEVEN_MB_BYTES = 147642115;
 
 function fileTask(overrides: Partial<TransferPlannerTask> & Pick<TransferPlannerTask, "id">): TransferPlannerTask {
   return {
@@ -54,7 +56,59 @@ test("huge plus small gives bulk about 7 and small 1", () => {
   assert.equal(result.requestedWindowTotal, 8);
 });
 
-test("many small files create multiple low-window plans bounded by lane budget and safety cap", () => {
+test("huge plus tiny keeps the tiny transfer bounded at window 1", () => {
+  const result = planWeightedTransfers([
+    fileTask({ id: "huge", sizeBytes: 4 * GiB, createdAt: 1 }),
+    fileTask({ id: "tiny", sizeBytes: 4 * 1024, createdAt: 2 })
+  ]);
+
+  const byId = new Map(result.runnablePlans.map((plan) => [plan.taskId, plan]));
+  assert.equal(byId.get("huge")?.requestedWindow, 7);
+  assert.equal(byId.get("tiny")?.requestedWindow, 1);
+  assert.equal(result.requestedWindowTotal, 8);
+});
+
+test("2.7GB plus 147MB uses batch-relative windows around 7 and 1", () => {
+  const result = planWeightedTransfers([
+    fileTask({ id: "2.7gb", sizeBytes: TWO_POINT_SEVEN_GB_BYTES, createdAt: 1 }),
+    fileTask({ id: "147mb", sizeBytes: ONE_HUNDRED_FORTY_SEVEN_MB_BYTES, createdAt: 2 })
+  ]);
+
+  const byId = new Map(result.runnablePlans.map((plan) => [plan.taskId, plan]));
+  assert.equal(byId.get("2.7gb")?.requestedWindow, 7);
+  assert.equal(byId.get("147mb")?.requestedWindow, 1);
+  assert.equal(result.requestedWindowTotal, 8);
+});
+
+test("similarly large files split the global window fairly", () => {
+  const result = planWeightedTransfers([
+    fileTask({ id: "2.7gb", sizeBytes: TWO_POINT_SEVEN_GB_BYTES, createdAt: 1 }),
+    fileTask({ id: "2.5gb", sizeBytes: 2.5 * GiB, createdAt: 2 })
+  ]);
+
+  assert.deepEqual(
+    result.runnablePlans.map((plan) => plan.requestedWindow).sort((left, right) => left - right),
+    [4, 4]
+  );
+  assert.equal(result.requestedWindowTotal, 8);
+});
+
+test("three similarly large files split fairly within the global budget", () => {
+  const result = planWeightedTransfers([
+    fileTask({ id: "large-a", sizeBytes: 2.7 * GiB, createdAt: 1 }),
+    fileTask({ id: "large-b", sizeBytes: 2.6 * GiB, createdAt: 2 }),
+    fileTask({ id: "large-c", sizeBytes: 2.5 * GiB, createdAt: 3 })
+  ]);
+
+  assert.equal(result.runnablePlans.length, 3);
+  assert.deepEqual(
+    result.runnablePlans.map((plan) => plan.requestedWindow).sort((left, right) => left - right),
+    [2, 3, 3]
+  );
+  assert.equal(result.requestedWindowTotal, 8);
+});
+
+test("many small files create multiple low-window plans bounded by global budget and safety cap", () => {
   const result = planWeightedTransfers(Array.from({ length: 12 }, (_, index) => (
     fileTask({ id: `small-${index}`, sizeBytes: 512 * 1024, createdAt: index })
   )));
@@ -65,7 +119,7 @@ test("many small files create multiple low-window plans bounded by lane budget a
   assert.ok(result.heldPlans.every((plan) => plan.reason === "safety_cap_reached"));
 });
 
-test("lane cap prevents many tiny files from creating unbounded runnable transfers", () => {
+test("safety cap prevents many tiny files from creating unbounded runnable transfers", () => {
   const result = planWeightedTransfers(Array.from({ length: 40 }, (_, index) => (
     fileTask({ id: `tiny-${index}`, sizeBytes: 4 * 1024, createdAt: index })
   )));

@@ -80,8 +80,8 @@ test("2.7GB plus 147MB metadata-ready together are both runnable in one planner 
   assert.equal(plannerResult.activePlans.length, 0);
   assert.equal(byName.get("2.7gb.bin")?.lane, "bulk_file");
   assert.equal(byName.get("147mb.bin")?.lane, "bulk_file");
-  assert.equal(byName.get("2.7gb.bin")?.requestedWindow, 4);
-  assert.equal(byName.get("147mb.bin")?.requestedWindow, 4);
+  assert.equal(byName.get("2.7gb.bin")?.requestedWindow, 7);
+  assert.equal(byName.get("147mb.bin")?.requestedWindow, 1);
 });
 
 test("all runnable plans from one planner pass can be marked launching together", () => {
@@ -100,7 +100,7 @@ test("all runnable plans from one planner pass can be marked launching together"
   assert.equal(secondPass.plannerResult.activePlans.length, 2);
   assert.deepEqual(
     secondPass.plannerResult.activePlans.map((plan) => plan.requestedWindow).sort((left, right) => left - right),
-    [4, 4]
+    [1, 7]
   );
 });
 

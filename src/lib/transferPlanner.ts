@@ -169,47 +169,62 @@ export function planWeightedTransfers(
   const laneBudgets = computeLaneBudgets([...activeCandidates, ...queuedCandidates], policy);
   const activePlans: TransferPlannerActivePlan[] = [];
   const runnablePlans: TransferPlannerRunnablePlan[] = [];
-  const laneRemaining = new Map<TransferPlannerLane, number>();
-  for (const lane of lanes) {
-    laneRemaining.set(lane, laneBudgets[lane] ?? 0);
-  }
 
   let globalRemaining = policy.globalWindowBudget;
   if (policy.rebalanceActiveWindows) {
-    const activeTransferCount = activeCandidates.length;
-    let runnableSlots = Math.max(0, policy.safetyActiveTransferCap - activeTransferCount);
+    const maxPlannedTransfers = Math.floor(policy.globalWindowBudget / policy.minRequestedWindow);
+    const sortedActive = sortAllocationCandidates(activeCandidates);
+    const plannedActive = sortedActive.slice(0, maxPlannedTransfers);
+    for (const candidate of sortedActive.slice(maxPlannedTransfers)) {
+      heldPlans.push(createHeldPlan(
+        candidate.task,
+        candidate.priority,
+        "global_budget_exhausted",
+        "active transfer could not reserve planner budget",
+        candidate
+      ));
+    }
 
-    for (const lane of lanes) {
-      const laneBudget = Math.min(laneRemaining.get(lane) ?? 0, globalRemaining);
-      const laneActive = sortCandidates(activeCandidates.filter((candidate) => candidate.lane === lane));
-      const laneQueued = sortCandidates(queuedCandidates.filter((candidate) => candidate.lane === lane));
-      const queuedCount = Math.min(laneQueued.length, Math.max(0, laneBudget - laneActive.length), runnableSlots);
-      const selected = [...laneActive, ...laneQueued.slice(0, queuedCount)];
-      const windows = distributeWindows(laneBudget, selected.length);
+    const runnableSlots = Math.max(0, policy.safetyActiveTransferCap - plannedActive.length);
+    const selectedQueued = selectRunnableCandidates(
+      queuedCandidates,
+      runnableSlots,
+      policy.globalWindowBudget - plannedActive.length * policy.minRequestedWindow,
+      policy
+    );
+    const selectedQueuedIds = new Set(selectedQueued.map((candidate) => candidate.task.id));
+    const selected = [...plannedActive, ...selectedQueued];
+    const windows = distributeWeightedWindows(selected, policy.globalWindowBudget, policy);
 
-      selected.forEach((candidate, index) => {
-        const requestedWindow = windows[index] ?? 0;
-        if (requestedWindow < policy.minRequestedWindow) {
-          return;
-        }
-        if (candidate.task.state === "active") {
-          activePlans.push(createPlan(candidate, requestedWindow));
-        } else {
-          runnablePlans.push(createPlan(candidate, requestedWindow));
-          runnableSlots -= 1;
-        }
-        globalRemaining -= requestedWindow;
-      });
-
-      for (const candidate of laneQueued.slice(queuedCount)) {
-        let reason: TransferPlannerHeldReason = "lane_budget_exhausted";
-        if (runnableSlots <= 0) {
-          reason = "safety_cap_reached";
-        } else if (globalRemaining <= 0) {
-          reason = "global_budget_exhausted";
-        }
-        heldPlans.push(createHeldPlan(candidate.task, candidate.priority, reason, reason, candidate));
+    selected.forEach((candidate, index) => {
+      const requestedWindow = windows[index] ?? 0;
+      if (requestedWindow < policy.minRequestedWindow) {
+        return;
       }
+      if (candidate.task.state === "active") {
+        activePlans.push(createPlan(candidate, requestedWindow));
+      } else {
+        runnablePlans.push(createPlan(candidate, requestedWindow));
+      }
+      globalRemaining -= requestedWindow;
+    });
+
+    const remainingRunnableSlots = Math.max(0, runnableSlots - selectedQueued.length);
+    const remainingRunnableBudget = (
+      policy.globalWindowBudget -
+      plannedActive.length * policy.minRequestedWindow -
+      selectedQueued.length * policy.minRequestedWindow
+    );
+    for (const candidate of queuedCandidates) {
+      if (selectedQueuedIds.has(candidate.task.id)) {
+        continue;
+      }
+      const reason = heldReasonForSkippedRunnable(
+        remainingRunnableSlots,
+        remainingRunnableBudget,
+        policy
+      );
+      heldPlans.push(createHeldPlan(candidate.task, candidate.priority, reason, reason, candidate));
     }
   } else {
     const sortedActive = sortCandidates(activeCandidates);
@@ -218,7 +233,6 @@ export function planWeightedTransfers(
         candidate.task.activeRequestedWindow ?? candidate.task.requestedWindow ?? policy.minRequestedWindow,
         policy
       );
-      const laneBudget = laneRemaining.get(candidate.lane) ?? 0;
       const reservedWindow = Math.min(requestedWindow, globalRemaining);
       if (reservedWindow < policy.minRequestedWindow) {
         heldPlans.push(createHeldPlan(
@@ -232,40 +246,31 @@ export function planWeightedTransfers(
       }
 
       activePlans.push(createPlan(candidate, reservedWindow));
-      laneRemaining.set(candidate.lane, Math.max(0, laneBudget - reservedWindow));
       globalRemaining -= reservedWindow;
     }
 
     const activeTransferCount = activePlans.length;
     let runnableSlots = Math.max(0, policy.safetyActiveTransferCap - activeTransferCount);
+    const selectedQueued = selectRunnableCandidates(queuedCandidates, runnableSlots, globalRemaining, policy);
+    const selectedQueuedIds = new Set(selectedQueued.map((candidate) => candidate.task.id));
+    const windows = distributeWeightedWindows(selectedQueued, globalRemaining, policy);
 
-    for (const lane of lanes) {
-      const laneBudget = Math.min(laneRemaining.get(lane) ?? 0, globalRemaining);
-      const laneQueued = sortCandidates(queuedCandidates.filter((candidate) => candidate.lane === lane));
-      const runnableCount = Math.min(laneQueued.length, laneBudget, runnableSlots);
-      const selected = laneQueued.slice(0, runnableCount);
-      const windows = distributeWindows(laneBudget, selected.length);
-
-      selected.forEach((candidate, index) => {
-        const requestedWindow = windows[index] ?? 0;
-        if (requestedWindow < policy.minRequestedWindow) {
-          return;
-        }
-        runnablePlans.push(createPlan(candidate, requestedWindow));
-        globalRemaining -= requestedWindow;
-        runnableSlots -= 1;
-      });
-
-      const skipped = laneQueued.slice(runnableCount);
-      for (const candidate of skipped) {
-        let reason: TransferPlannerHeldReason = "lane_budget_exhausted";
-        if (runnableSlots <= 0) {
-          reason = "safety_cap_reached";
-        } else if (globalRemaining <= 0) {
-          reason = "global_budget_exhausted";
-        }
-        heldPlans.push(createHeldPlan(candidate.task, candidate.priority, reason, reason, candidate));
+    selectedQueued.forEach((candidate, index) => {
+      const requestedWindow = windows[index] ?? 0;
+      if (requestedWindow < policy.minRequestedWindow) {
+        return;
       }
+      runnablePlans.push(createPlan(candidate, requestedWindow));
+      globalRemaining -= requestedWindow;
+      runnableSlots -= 1;
+    });
+
+    for (const candidate of queuedCandidates) {
+      if (selectedQueuedIds.has(candidate.task.id)) {
+        continue;
+      }
+      const reason = heldReasonForSkippedRunnable(runnableSlots, globalRemaining, policy);
+      heldPlans.push(createHeldPlan(candidate.task, candidate.priority, reason, reason, candidate));
     }
   }
 
@@ -429,6 +434,15 @@ function sortCandidates(candidates: readonly ClassifiedTask[]): ClassifiedTask[]
   ));
 }
 
+function sortAllocationCandidates(candidates: readonly ClassifiedTask[]): ClassifiedTask[] {
+  return [...candidates].sort((left, right) => (
+    priorityValue(right.priority) - priorityValue(left.priority) ||
+    allocationWeight(right) - allocationWeight(left) ||
+    (left.task.createdAt ?? 0) - (right.task.createdAt ?? 0) ||
+    left.task.id.localeCompare(right.task.id)
+  ));
+}
+
 function priorityValue(priority: TransferPlannerPriority): number {
   switch (priority) {
     case "urgent":
@@ -447,17 +461,90 @@ function clampWindow(value: number, policy: TransferPlannerPolicy): number {
   return Math.min(policy.maxRequestedWindow, Math.max(policy.minRequestedWindow, normalized));
 }
 
-function distributeWindows(budget: number, count: number): number[] {
-  if (count <= 0 || budget <= 0) {
+function selectRunnableCandidates(
+  candidates: readonly ClassifiedTask[],
+  runnableSlots: number,
+  availableBudget: number,
+  policy: TransferPlannerPolicy
+): ClassifiedTask[] {
+  const windowBoundedCount = Math.floor(Math.max(0, availableBudget) / policy.minRequestedWindow);
+  const count = Math.min(candidates.length, Math.max(0, runnableSlots), windowBoundedCount);
+  return sortAllocationCandidates(candidates).slice(0, count);
+}
+
+function heldReasonForSkippedRunnable(
+  runnableSlots: number,
+  availableBudget: number,
+  policy: TransferPlannerPolicy
+): TransferPlannerHeldReason {
+  if (runnableSlots <= 0) {
+    return "safety_cap_reached";
+  }
+  if (availableBudget < policy.minRequestedWindow) {
+    return "global_budget_exhausted";
+  }
+  return "global_budget_exhausted";
+}
+
+function distributeWeightedWindows(
+  candidates: readonly ClassifiedTask[],
+  budget: number,
+  policy: TransferPlannerPolicy
+): number[] {
+  if (candidates.length === 0 || budget < policy.minRequestedWindow) {
     return [];
   }
-  const base = Math.floor(budget / count);
-  let remainder = budget % count;
-  return Array.from({ length: count }, () => {
-    const window = base + (remainder > 0 ? 1 : 0);
-    remainder -= 1;
-    return window;
+
+  const windowCount = Math.min(candidates.length, Math.floor(budget / policy.minRequestedWindow));
+  const selected = candidates.slice(0, windowCount);
+  const windows = selected.map(() => policy.minRequestedWindow);
+  const remaining = Math.max(0, budget - selected.length * policy.minRequestedWindow);
+  if (remaining === 0) {
+    return windows;
+  }
+
+  const weights = selected.map(allocationWeight);
+  const totalWeight = weights.reduce((total, weight) => total + weight, 0) || selected.length;
+  const remainders: Array<{ index: number; remainder: number; weight: number }> = [];
+
+  weights.forEach((weight, index) => {
+    const capacity = policy.maxRequestedWindow - windows[index];
+    if (capacity <= 0) {
+      remainders.push({ index, remainder: 0, weight });
+      return;
+    }
+
+    const exact = remaining * weight / totalWeight;
+    const additional = Math.min(capacity, Math.floor(exact));
+    windows[index] += additional;
+    remainders.push({ index, remainder: exact - Math.floor(exact), weight });
   });
+
+  let allocated = windows.reduce((total, window) => total + window, 0);
+  let guard = remaining + selected.length;
+  while (allocated < budget && guard > 0) {
+    const candidate = [...remainders]
+      .filter((entry) => windows[entry.index] < policy.maxRequestedWindow)
+      .sort((left, right) => (
+        right.remainder - left.remainder ||
+        right.weight - left.weight ||
+        left.index - right.index
+      ))[0];
+    if (!candidate) {
+      break;
+    }
+
+    windows[candidate.index] += 1;
+    allocated += 1;
+    candidate.remainder = 0;
+    guard -= 1;
+  }
+
+  return windows;
+}
+
+function allocationWeight(candidate: ClassifiedTask): number {
+  return Math.max(1, candidate.task.sizeBytes ?? 1);
 }
 
 function createPlan(candidate: ClassifiedTask, requestedWindow: number): TransferPlannerPlan {
