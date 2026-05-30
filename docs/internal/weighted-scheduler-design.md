@@ -32,7 +32,7 @@ Cross-checked docs:
 - `docs/dev/transfer-hot-path.md`
 - `docs/internal/room-semantics.md`
 - `docs/internal/pastey-architecture-report.md`
-- `docs/version-history.md`
+- `CHANGELOG.md`
 
 ## Code Validation Answers
 

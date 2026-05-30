@@ -648,6 +648,6 @@ When planner-driven dispatch changes again, update the original docs that descri
 - `docs/dev/transfer-hot-path.md`
 - `docs/internal/room-semantics.md`
 - `docs/internal/pastey-architecture-report.md`
-- `docs/version-history.md`
+- `CHANGELOG.md`
 
 Do not leave stale statements that imply file-like queue dispatch is serial-only or that active binary-v1 sender windows are immutable. Step 5 and Phase 4A are implemented; retry/timeout and history-aware runtime adaptation remain future work.

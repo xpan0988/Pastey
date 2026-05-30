@@ -2,7 +2,7 @@
 
 Pastey uses `src-tauri/Cargo.toml` as the authoritative app version. All other app/package version files should be derived from it during a release bump.
 
-Detailed product update history lives in [version-history.md](version-history.md).
+Detailed product update history lives in [../../CHANGELOG.md](../../CHANGELOG.md).
 
 ## Bump Version
 
@@ -38,6 +38,12 @@ The changelog heading becomes:
 
 ```md
 ## X.Y.Z — Release Title — YYYY-MM-DD
+```
+
+Use GitHub Release titles in this format:
+
+```text
+Pastey vX.Y.Z — Theme
 ```
 
 Without a title, the heading is:
