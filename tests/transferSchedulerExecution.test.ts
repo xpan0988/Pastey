@@ -545,6 +545,59 @@ test("completion-only rebalance requests remaining huge transfer window update",
   assert.deepEqual(activeCancellableTransferIds(state), []);
 });
 
+test("completion-only rebalance uses post-terminal state immediately after small transfer completes", () => {
+  let state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    readyInput("2.7gb.bin", TWO_POINT_SEVEN_GB_BYTES, "/tmp/2.7gb.bin", 1),
+    readyInput("147mb.bin", ONE_HUNDRED_FORTY_SEVEN_MB_BYTES, "/tmp/147mb.bin", 2)
+  ]);
+  const [huge, small] = queuedItems(state);
+
+  state = markQueueItemPreparing(state, huge.id, 7);
+  state = markQueueItemSending(state, huge.id, {
+    displayName: "2.7gb.bin",
+    sizeBytes: TWO_POINT_SEVEN_GB_BYTES,
+    modifiedMs: 1,
+    dedupeKey: "huge"
+  });
+  state = correlateTransferProgress(state, {
+    roomId: "room-1",
+    queueItemId: huge.id,
+    direction: "outgoing",
+    fileName: "2.7gb.bin",
+    fileSize: TWO_POINT_SEVEN_GB_BYTES,
+    transferId: "transfer-huge",
+    status: "transferring"
+  });
+  state = markQueueItemPreparing(state, small.id, 1);
+  state = markQueueItemSending(state, small.id, {
+    displayName: "147mb.bin",
+    sizeBytes: ONE_HUNDRED_FORTY_SEVEN_MB_BYTES,
+    modifiedMs: 2,
+    dedupeKey: "small"
+  });
+  state = correlateTransferProgress(state, {
+    roomId: "room-1",
+    queueItemId: small.id,
+    direction: "outgoing",
+    fileName: "147mb.bin",
+    fileSize: ONE_HUNDRED_FORTY_SEVEN_MB_BYTES,
+    transferId: "transfer-small",
+    status: "transferring"
+  });
+
+  assert.deepEqual(planActiveTransferWindowRebalances(state, activeRooms), []);
+
+  const postTerminalState = markQueueItemCompleted(state, small.id);
+  const plans = planActiveTransferWindowRebalances(postTerminalState, activeRooms);
+
+  assert.deepEqual(plans, [{
+    itemId: huge.id,
+    transferId: "transfer-huge",
+    requestedWindow: 8,
+    previousWindow: 7
+  }]);
+});
+
 test("completion-only rebalance ignores stale launching marker for already sending item", () => {
   let state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
     readyInput("huge.bin", 2 * GiB, "/tmp/huge.bin", 1),
