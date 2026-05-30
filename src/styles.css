@@ -1829,14 +1829,13 @@ label {
   background: rgba(255, 255, 255, 0.84);
 }
 
-.queue-current {
+.queue-active {
   display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 8px;
   min-width: 0;
 }
 
-.queue-current strong,
 .queue-item strong {
   overflow-wrap: anywhere;
 }
@@ -1853,6 +1852,15 @@ label {
   justify-content: space-between;
   gap: 10px;
   min-width: 0;
+}
+
+.queue-item .subtle-stack {
+  min-width: 0;
+  flex: 1;
+}
+
+.queue-item .compact-button {
+  flex-shrink: 0;
 }
 
 .transfer-card {
