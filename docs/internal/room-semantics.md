@@ -111,7 +111,7 @@ Large files MUST NOT be automatically broadcast to every room peer by default.
 
 File transfers SHOULD be targeted to one or more selected destination devices.
 
-Current Global Transfer Scheduler v1 is local frontend orchestration for outbound file sends. It may queue multiple selected or dropped files and can start multiple existing queued file-like transfers according to weighted planner output. Each runnable plan still uses the existing single-file transfer path. It MUST NOT imply archive bundling, folder recursion, runtime window rebalancing, adaptive transfer windows, or a second backend transfer core.
+Current Global Transfer Scheduler v1 is local frontend orchestration for outbound file sends. It may queue multiple selected or dropped files, start multiple existing queued file-like transfers according to weighted planner output, and update active outgoing binary-v1 sender windows after planner-managed queue item completion. Each runnable plan still uses the existing single-file transfer path. It MUST NOT imply archive bundling, folder recursion, retry/timeout adaptive windows, history-aware tuning, protocol changes, or a second backend transfer core.
 
 File type MAY affect display labels. It MUST NOT change the core file transport behavior.
 

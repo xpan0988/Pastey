@@ -89,7 +89,7 @@ pub fn effective_transfer_tuning(
     TransferTuning::default()
 }
 
-fn clamp_transfer_window(value: usize) -> usize {
+pub fn clamp_transfer_window(value: usize) -> usize {
     value.clamp(MIN_TRANSFER_WINDOW, MAX_TRANSFER_WINDOW)
 }
 

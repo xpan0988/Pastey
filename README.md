@@ -147,7 +147,7 @@ Rooms exist until manually burned. Burning a room deletes that room's local encr
 4. Images are treated exactly like files
 5. No decode, resize, recompress, or transform step is applied
 
-Global Transfer Scheduler v1 is frontend orchestration only. It uses a weighted planner for existing queued file-like transfers, passes per-transfer requested sender windows through the existing single-file transfer command, and does not add runtime window rebalancing, archive bundling, folder transfer, or transfer-core changes. File type may affect labels, but the binary file transport remains opaque and file-type independent.
+Global Transfer Scheduler v1 is frontend orchestration only. It uses a weighted planner for existing queued file-like transfers, passes per-transfer requested sender windows through the existing single-file transfer command, and can rebalance active outgoing binary-v1 sender windows after planner-managed queue item completion. It does not add retry/timeout adaptive windows, archive bundling, folder transfer, backend-owned scheduling, or protocol changes. File type may affect labels, but the binary file transport remains opaque and file-type independent.
 
 ## Download
 

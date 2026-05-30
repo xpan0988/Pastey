@@ -21,9 +21,11 @@ Current implemented behavior:
 - `PASTEY_TRANSFER_WINDOW_SIZE` and effective Developer Tools transfer-window settings remain the debugging overrides.
 - A pure weighted planner exists, has unit coverage, and drives runtime dispatch for queued file-like transfers.
 - The transfer API accepts an optional sender-side planner requested window; planner-driven sends pass it.
+- Active outgoing binary-v1 sender transfers have a sender-only runtime window handle that can be updated by a structured command while the transfer is running.
+- Planner-managed queued file-like transfers trigger completion-only active-window rebalance after a queue item reaches a terminal state.
 - `npm run tauri:dev-fast` is available for faster local transfer-throughput testing.
 
-Current dispatch is planner-driven for file-like queue items. Phase 4 runtime rebalancing is not implemented.
+Current dispatch is planner-driven for file-like queue items. Phase 4A completion-only runtime window mutation is implemented for active outgoing binary-v1 sender transfers. Retry/timeout downshift, stable cooldown recovery, speed-history heuristics, and broader adaptive rebalance policies are not implemented.
 
 ## Phase Boundaries
 
@@ -53,7 +55,7 @@ Non-goals:
 
 ### Phase 4: Dynamic Weighted Rebalancer
 
-Goal: periodically rerun the same allocation function over queued plus active transfers and apply updated windows to running transfers.
+Goal: rerun the same allocation function over queued plus active transfers and apply updated windows to running transfers.
 
 Scope:
 
@@ -63,7 +65,36 @@ Scope:
 - Apply changes conservatively and log rebalance decisions.
 - Keep binary-v1 protocol semantics unchanged.
 
-Phase 4 must define how an active binary-v1 sender observes a new effective window without violating ACK, retry, cancel, or finalize behavior.
+Phase 4A defines how an active binary-v1 sender observes a new effective window without violating ACK, retry, cancel, or finalize behavior.
+
+#### Phase 4A: Completion-Based Runtime Window Mutation Foundation
+
+Implementation status: completed. Phase 4A uses a narrow sender-side runtime window handle and a completion-only frontend trigger. It does not add retry/timeout downshift, stable cooldown upshift, speed-history heuristics, ML/DL policy, backend-owned scheduling, or protocol changes.
+
+Intended behavior:
+
+- Example: huge plus small may start as windows 7 plus 1. When the small transfer reaches a terminal state, the frontend reruns the existing planner over queued plus active tasks and may request that the remaining huge sender move from window 7 to 8 without restarting.
+- Only existing queued file-like transfers managed by the frontend planner are eligible for Phase 4A updates.
+- Runtime updates are sender-side binary-v1 pipelining policy only. They must not enter binary-v1 frames, JSON fallback DTOs, receiver protocol DTOs, ACKs, retry payloads, cancel payloads, burn payloads, finalize payloads, or Inbox metadata.
+
+Implemented design:
+
+1. Runtime window handle location: Rust active sender transfer state stores sender-only runtime window metadata in `ActiveFileTransferKind::Sender`. The handle is created from the resolved transfer tuning before `register_sender_transfer`, stored in `active_file_transfers` for command lookup by `transfer_id`, and passed by clone into `send_binary_chunks_pipelined`.
+2. Primitive: the current window is an `Arc<AtomicUsize>`. The hot path uses independent integer loads and stores and does not lock the active-transfer map for every chunk. Values are clamped before use. `Ordering::Relaxed` is used because this tuning value does not protect memory safety or order other shared state. Sender-vs-receiver, protocol, and override checks stay behind the existing active-transfer map mutex in the update command.
+3. Safe reads in `send_binary_chunks_pipelined`: the binary-v1 fill loop loads from the runtime handle at each outer fill opportunity, clamped to `1..16`. The loop dispatches new chunk futures only while `in_flight.len() < current_window`. Existing in-flight futures keep their normal ACK, retry, cancel, and timeout behavior.
+4. Decreasing behavior: a lower window must not cancel or abort already in-flight chunks. If `in_flight.len()` is already greater than the new window, the sender simply stops launching additional chunks until enough ACKs or terminal errors reduce in-flight work below the target. This avoids violating ACK/retry/finalize semantics.
+5. Increasing behavior: the next fill loop observes the larger window and launches additional chunks until the in-flight count reaches the new target or EOF is reached. No transfer restart, resend, receiver notification, or protocol change is required.
+6. `update_transfer_window` return policy: the command returns a structured result rather than hard errors for normal no-op states. Result fields are `updated`, `transfer_id`, `previous_window`, `effective_window`, `requested_window`, and `reason`. Missing, terminal, or cancelled transfers return `updated=false` with `reason="not_active"`. Receiver-side transfers return `updated=false` with `reason="receiver_transfer"`. JSON fallback or otherwise non-mutable sender transfers return `updated=false` with `reason="unsupported_protocol"`. Env/dev forced transfers return `updated=false` with `reason="override_active"`. Invalid requested values are clamped before comparison.
+7. Env/dev override precedence: runtime planner updates are another planner request and remain below `PASTEY_TRANSFER_WINDOW_SIZE` and effective Developer Tools `transfer_window_override`. If an env/dev override is active for the transfer or currently effective at update time, planner mutation is reported as `override_active` and does not override the forced window.
+8. Frontend trigger: `App.tsx` triggers completion-based rebalance after a planner-managed queue item reaches a terminal state through the existing `sendFileToRoom` resolution/rejection path. The trigger reruns planner output with active transfers included, compares active plan windows to each active queue item's stored requested window, and calls the update command only for active sending items with an `activeTransferId` and a changed target window. It is not timer-driven or progress-speed-driven in Phase 4A.
+9. Reusing planner output: `planActiveTransferWindowRebalances` reuses the same planner task adaptation with active-window rebalance enabled and returns update plans for changed active sender windows. It does not feed retry counts, timeout counts, throughput, CPU, or historical measurements into the planner. Completion is the only new stimulus. Queued runnable starts remain governed by the existing planner-driven dispatch path.
+10. Tests: frontend scheduler coverage proves completion of a small transfer can request an active huge transfer update from 7 to 8, no update is sent when the target is unchanged, no update is sent without `activeTransferId`, and no update is sent for cancelled or closed-room items. Rust coverage verifies clamp/update behavior and structured no-op reasons for missing, receiver-side, JSON fallback, env/dev override, and unchanged transfers.
+
+Remaining Phase 4 limits:
+
+- JSON fallback has no pipelined mutable window behavior; Phase 4A returns a structured no-op for it rather than redesigning fallback transfer.
+- Retry/timeout downshift, stable cooldown recovery, speed-history heuristics, and history-aware weighting remain future work.
+- Manual huge-plus-small smoke validation for live runtime mutation remains separate from the unit and build validation listed here.
 
 ### Later: History-Aware Heuristic Planner
 
@@ -341,7 +372,7 @@ Test coverage:
 
 Exit gate:
 
-- Existing binary-v1, JSON fallback, ACK, retry, cancel, burn, finalize, terminal reason, and Inbox tests still pass, with added multi-active coverage. No Phase 4 runtime rebalancing or protocol changes are included.
+- Existing binary-v1, JSON fallback, ACK, retry, cancel, burn, finalize, terminal reason, and Inbox tests still pass, with added multi-active coverage. Phase 4A runtime window mutation is completion-only and does not change protocols.
 
 ### Step 8: Dev-Fast Benchmark Matrix
 
@@ -379,6 +410,12 @@ Measurements:
 Exit gate:
 
 - The planner improves or preserves practical transfer behavior in `tauri:dev-fast`, and release-build validation is planned before shipping.
+
+Smoke validation status: partially passed.
+
+Manual smoke testing with random mixed files dragged in at once validated the v1 planner path at a practical level, but did not complete the full benchmark matrix above. Mixed small, medium, and large files completed successfully. Multiple files started in close succession, with some starts staggered by roughly one second. A 2.5GB GGUF file completed successfully at about 108 MB/s average. Medium installers/archive files and small image/PDF-like files completed successfully. In a two-file model/installer run, the remaining large transfer's throughput increased after the other file completed. Burn behaved normally.
+
+No obvious progress cross-correlation, duplicate launch, terminal-state mutation, or cancel/burn corruption was observed during this smoke pass. This evidence validates Weighted Transfer Planner v1 smoke behavior only. It is not full benchmark validation, release-build throughput validation, or Phase 4 runtime window mutation evidence.
 
 ## Required Minimal Model Additions
 
@@ -520,7 +557,7 @@ Phase 4 rebalancer:
 4. Log the reason for each rebalance.
 5. Preserve env/dev override precedence.
 
-Runtime window mutation is Phase 4, not Phase 2+3.
+Completion-only runtime window mutation is Phase 4A. Retry/timeout adaptation and history-aware rebalance remain future Phase 4 work.
 
 ## Complexity Target
 
@@ -601,4 +638,4 @@ When planner-driven dispatch changes again, update the original docs that descri
 - `docs/internal/pastey-architecture-report.md`
 - `docs/version-history.md`
 
-Do not leave stale statements that imply file-like queue dispatch is serial-only. Step 5 is implemented; Phase 4 runtime rebalancing is still not implemented.
+Do not leave stale statements that imply file-like queue dispatch is serial-only or that active binary-v1 sender windows are immutable. Step 5 and Phase 4A are implemented; retry/timeout and history-aware runtime adaptation remain future work.

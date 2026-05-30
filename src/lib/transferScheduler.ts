@@ -84,6 +84,13 @@ export interface TransferLaunchPlannerResult {
   runnablePlans: RunnableTransferLaunchPlan[];
 }
 
+export interface TransferWindowRebalancePlan {
+  itemId: string;
+  transferId: string;
+  requestedWindow: number;
+  previousWindow: number;
+}
+
 interface ProgressCorrelationInput {
   roomId: string;
   queueItemId?: string | null;
@@ -326,6 +333,25 @@ export function markQueueItemCancelled(state: TransferSchedulerState, itemId: st
   return updateItemStatus(state, itemId, "cancelled");
 }
 
+export function markQueueItemRuntimeWindow(
+  state: TransferSchedulerState,
+  itemId: string,
+  requestedWindow: number
+): TransferSchedulerState {
+  const item = state.items[itemId];
+  if (!item || isTerminalQueueItem(item)) return state;
+
+  return replaceItem(
+    state,
+    {
+      ...item,
+      requestedWindow,
+      updatedAt: Date.now()
+    },
+    true
+  );
+}
+
 export function cancelQueueItem(state: TransferSchedulerState, itemId: string): TransferSchedulerState {
   const item = state.items[itemId];
   if (!item || isTerminalQueueItem(item)) {
@@ -496,7 +522,8 @@ export function planRunnableTransferLaunches(
   state: TransferSchedulerState,
   rooms: readonly Pick<RoomInfo, "id" | "status">[],
   closedRoomIds: ReadonlySet<string> = new Set(),
-  launchingItemWindows: ReadonlyMap<string, number> = new Map()
+  launchingItemWindows: ReadonlyMap<string, number> = new Map(),
+  rebalanceActiveWindows = false
 ): TransferLaunchPlannerResult {
   const roomStatusById = new Map(rooms.map((room) => [room.id, room.status]));
   const tasks: TransferPlannerTask[] = [];
@@ -534,7 +561,7 @@ export function planRunnableTransferLaunches(
     }
   }
 
-  const plannerResult = planWeightedTransfers(tasks);
+  const plannerResult = planWeightedTransfers(tasks, { rebalanceActiveWindows });
   const runnablePlans = plannerResult.runnablePlans
     .filter((plan) => {
       const item = state.items[plan.taskId];
@@ -558,6 +585,50 @@ export function planRunnableTransferLaunches(
     plannerResult,
     runnablePlans
   };
+}
+
+export function planActiveTransferWindowRebalances(
+  state: TransferSchedulerState,
+  rooms: readonly Pick<RoomInfo, "id" | "status">[],
+  closedRoomIds: ReadonlySet<string> = new Set(),
+  launchingItemWindows: ReadonlyMap<string, number> = new Map()
+): TransferWindowRebalancePlan[] {
+  const { plannerResult } = planRunnableTransferLaunches(
+    state,
+    rooms,
+    closedRoomIds,
+    launchingItemWindows,
+    true
+  );
+  const roomStatusById = new Map(rooms.map((room) => [room.id, room.status]));
+
+  return plannerResult.activePlans
+    .map((plan): TransferWindowRebalancePlan | null => {
+      const item = state.items[plan.taskId];
+      const batch = item ? state.batches[item.batchId] : undefined;
+      if (
+        !item ||
+        !batch ||
+        item.status !== "sending" ||
+        item.cancelRequested ||
+        batch.cancelRequested ||
+        batch.status !== "running" ||
+        closedRoomIds.has(item.roomId) ||
+        roomStatusById.get(item.roomId) !== "active" ||
+        !item.activeTransferId ||
+        item.requestedWindow === plan.requestedWindow
+      ) {
+        return null;
+      }
+
+      return {
+        itemId: item.id,
+        transferId: item.activeTransferId,
+        requestedWindow: plan.requestedWindow,
+        previousWindow: item.requestedWindow ?? plan.requestedWindow
+      };
+    })
+    .filter((plan): plan is TransferWindowRebalancePlan => Boolean(plan));
 }
 
 export function queuedItemsNeedingMetadata(

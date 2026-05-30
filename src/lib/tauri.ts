@@ -26,6 +26,15 @@ export interface FileTransferMetadata {
   modified_ms: number;
 }
 
+export interface UpdateTransferWindowResult {
+  updated: boolean;
+  transfer_id: string;
+  previous_window?: number | null;
+  effective_window?: number | null;
+  requested_window: number;
+  reason: "updated" | "unchanged" | "not_active" | "receiver_transfer" | "unsupported_protocol" | "override_active";
+}
+
 export async function createRoom(expiryMinutes = 15): Promise<RoomInfo> {
   return invoke("create_room", { expiryMinutes });
 }
@@ -87,6 +96,13 @@ export async function sendFileToRoom(roomId: string, path: string, options?: Sen
 
 export async function cancelTransfer(transferId: string): Promise<boolean> {
   return invoke("cancel_transfer", { transferId });
+}
+
+export async function updateTransferWindow(
+  transferId: string,
+  requestedWindow: number
+): Promise<UpdateTransferWindowResult> {
+  return invoke("update_transfer_window", { transferId, requestedWindow });
 }
 
 export async function writeTempFile(fileName: string, bytes: number[]): Promise<string> {

@@ -1,7 +1,10 @@
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -87,7 +90,11 @@ pub struct TerminalTransferReason {
 }
 
 enum ActiveFileTransferKind {
-    Sender,
+    Sender {
+        runtime_window: Arc<AtomicUsize>,
+        override_source: transfer_tuning::TransferWindowOverrideSource,
+        protocol: SenderTransferProtocol,
+    },
     Receiver {
         session_key: [u8; 32],
         part_path: PathBuf,
@@ -99,6 +106,23 @@ enum ActiveFileTransferKind {
         received_chunks: Vec<bool>,
         timing: ReceiverTimingSummary,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SenderTransferProtocol {
+    Pending,
+    BinaryV1,
+    JsonV1,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UpdateTransferWindowResult {
+    pub updated: bool,
+    pub transfer_id: String,
+    pub previous_window: Option<usize>,
+    pub effective_window: Option<usize>,
+    pub requested_window: usize,
+    pub reason: &'static str,
 }
 
 #[derive(Clone)]
@@ -525,6 +549,8 @@ pub async fn send_room_file(
         .clone()
         .unwrap_or_else(|| "pastey_file".to_string());
     let cancel_token = CancellationToken::new();
+    let transfer_tuning = current_transfer_tuning(&state, requested_window);
+    let runtime_window = Arc::new(AtomicUsize::new(transfer_tuning.effective_window_size));
     register_sender_transfer(
         &state,
         &transfer_id,
@@ -536,6 +562,8 @@ pub async fn send_room_file(
         total_chunks,
         queue_item_id,
         cancel_token.clone(),
+        runtime_window.clone(),
+        transfer_tuning.override_source,
     )?;
     emit_progress(
         &state,
@@ -651,7 +679,7 @@ pub async fn send_room_file(
     let mut last_report_bytes = 0u64;
     let mut chunk_index = 0u64;
     let mut chunk_protocol = chunk_protocol;
-    let transfer_tuning = current_transfer_tuning(&state, requested_window);
+    set_sender_transfer_protocol(&state, &transfer_id, chunk_protocol);
     dev_log_sender_transfer_tuning(
         &transfer_id,
         room_id,
@@ -675,6 +703,7 @@ pub async fn send_room_file(
             &payload_key,
             &cancel_token,
             transfer_tuning,
+            runtime_window,
         )
         .await
         {
@@ -1078,6 +1107,7 @@ async fn send_binary_chunks_pipelined<R>(
     payload_key: &[u8; 32],
     cancel_token: &CancellationToken,
     tuning: TransferTuning,
+    runtime_window: Arc<AtomicUsize>,
 ) -> Result<u64, ChunkSendFailure>
 where
     R: AsyncRead + Unpin,
@@ -1092,7 +1122,7 @@ where
     let mut timing_summary = SenderTimingSummary::default();
 
     while !eof || !in_flight.is_empty() {
-        while !eof && in_flight.len() < tuning.effective_window_size {
+        while !eof && in_flight.len() < current_runtime_window(&runtime_window) {
             if cancel_token.is_cancelled() {
                 return Err(ChunkSendFailure {
                     message: TRANSFER_CANCELLED_MESSAGE.into(),
@@ -1237,6 +1267,90 @@ where
         timing_summary,
     );
     Ok(next_chunk_index)
+}
+
+fn current_runtime_window(runtime_window: &AtomicUsize) -> usize {
+    transfer_tuning::clamp_transfer_window(runtime_window.load(Ordering::Relaxed))
+}
+
+fn update_active_transfer_window(
+    transfer_id: &str,
+    requested_window: usize,
+    transfer: Option<&ActiveFileTransfer>,
+    override_active: bool,
+) -> UpdateTransferWindowResult {
+    let requested_window = transfer_tuning::clamp_transfer_window(requested_window);
+    let Some(transfer) = transfer else {
+        return transfer_window_noop(transfer_id, requested_window, "not_active");
+    };
+
+    let ActiveFileTransferKind::Sender {
+        runtime_window,
+        override_source,
+        protocol,
+    } = &transfer.kind
+    else {
+        return transfer_window_noop(transfer_id, requested_window, "receiver_transfer");
+    };
+
+    if *protocol != SenderTransferProtocol::BinaryV1 {
+        return transfer_window_noop(transfer_id, requested_window, "unsupported_protocol");
+    }
+
+    if override_active
+        || matches!(
+            override_source,
+            transfer_tuning::TransferWindowOverrideSource::Env
+                | transfer_tuning::TransferWindowOverrideSource::DevSettings
+        )
+    {
+        let previous_window = current_runtime_window(runtime_window);
+        return UpdateTransferWindowResult {
+            updated: false,
+            transfer_id: transfer_id.to_string(),
+            previous_window: Some(previous_window),
+            effective_window: Some(previous_window),
+            requested_window,
+            reason: "override_active",
+        };
+    }
+
+    let previous_window = current_runtime_window(runtime_window);
+    if previous_window == requested_window {
+        return UpdateTransferWindowResult {
+            updated: false,
+            transfer_id: transfer_id.to_string(),
+            previous_window: Some(previous_window),
+            effective_window: Some(previous_window),
+            requested_window,
+            reason: "unchanged",
+        };
+    }
+
+    runtime_window.store(requested_window, Ordering::Relaxed);
+    UpdateTransferWindowResult {
+        updated: true,
+        transfer_id: transfer_id.to_string(),
+        previous_window: Some(previous_window),
+        effective_window: Some(requested_window),
+        requested_window,
+        reason: "updated",
+    }
+}
+
+fn transfer_window_noop(
+    transfer_id: &str,
+    requested_window: usize,
+    reason: &'static str,
+) -> UpdateTransferWindowResult {
+    UpdateTransferWindowResult {
+        updated: false,
+        transfer_id: transfer_id.to_string(),
+        previous_window: None,
+        effective_window: None,
+        requested_window,
+        reason,
+    }
 }
 
 async fn read_next_chunk<R>(
@@ -2223,6 +2337,28 @@ pub async fn cancel_transfer(state: Arc<AppState>, transfer_id: &str) -> AppResu
     Ok(true)
 }
 
+pub fn update_transfer_window(
+    state: Arc<AppState>,
+    transfer_id: &str,
+    requested_window: usize,
+) -> AppResult<UpdateTransferWindowResult> {
+    let requested_window = transfer_tuning::clamp_transfer_window(requested_window);
+    let current_tuning = current_transfer_tuning(&state, Some(requested_window));
+    let override_active = matches!(
+        current_tuning.override_source,
+        transfer_tuning::TransferWindowOverrideSource::Env
+            | transfer_tuning::TransferWindowOverrideSource::DevSettings
+    );
+    let transfers = state.active_file_transfers.lock();
+    let result = update_active_transfer_window(
+        transfer_id,
+        requested_window,
+        transfers.get(transfer_id),
+        override_active,
+    );
+    Ok(result)
+}
+
 pub async fn notify_room_burn_with_peer(peer_host: &str, peer_port: u16, room_id: &str) {
     notify_room_event(peer_host, peer_port, room_id, "burn").await;
 }
@@ -2327,7 +2463,7 @@ fn active_receiver_final_paths(state: &Arc<AppState>) -> Vec<PathBuf> {
         .values()
         .filter_map(|transfer| match &transfer.kind {
             ActiveFileTransferKind::Receiver { final_path, .. } => Some(final_path.clone()),
-            ActiveFileTransferKind::Sender => None,
+            ActiveFileTransferKind::Sender { .. } => None,
         })
         .collect()
 }
@@ -3949,6 +4085,8 @@ fn register_sender_transfer(
     total_chunks: u64,
     queue_item_id: Option<String>,
     cancel_token: CancellationToken,
+    runtime_window: Arc<AtomicUsize>,
+    override_source: transfer_tuning::TransferWindowOverrideSource,
 ) -> AppResult<()> {
     let now = Instant::now();
     let mut transfers = state.active_file_transfers.lock();
@@ -3971,10 +4109,29 @@ fn register_sender_transfer(
             last_report_at: now,
             last_report_bytes: 0,
             cancel_token,
-            kind: ActiveFileTransferKind::Sender,
+            kind: ActiveFileTransferKind::Sender {
+                runtime_window,
+                override_source,
+                protocol: SenderTransferProtocol::Pending,
+            },
         },
     );
     Ok(())
+}
+
+fn set_sender_transfer_protocol(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    chunk_protocol: ChunkProtocol,
+) {
+    if let Some(transfer) = state.active_file_transfers.lock().get_mut(transfer_id) {
+        if let ActiveFileTransferKind::Sender { protocol, .. } = &mut transfer.kind {
+            *protocol = match chunk_protocol {
+                ChunkProtocol::BinaryV1 => SenderTransferProtocol::BinaryV1,
+                ChunkProtocol::JsonV1 => SenderTransferProtocol::JsonV1,
+            };
+        }
+    }
 }
 
 fn fail_transfer(state: &Arc<AppState>, transfer_id: &str, item_id: &str, message: String) {
@@ -4200,7 +4357,7 @@ fn emit_event(
     error_message: Option<String>,
 ) {
     let direction = match transfer.kind {
-        ActiveFileTransferKind::Sender => "outgoing",
+        ActiveFileTransferKind::Sender { .. } => "outgoing",
         ActiveFileTransferKind::Receiver { .. } => "incoming",
     };
     let event = clone_event_base(
@@ -4269,7 +4426,7 @@ fn clone_event_base(
 
 fn current_transferred(transfer: &ActiveFileTransfer) -> u64 {
     match &transfer.kind {
-        ActiveFileTransferKind::Sender => transfer.last_report_bytes,
+        ActiveFileTransferKind::Sender { .. } => transfer.last_report_bytes,
         ActiveFileTransferKind::Receiver {
             transferred_bytes, ..
         } => *transferred_bytes,
@@ -4668,6 +4825,126 @@ mod tests {
             message: message.to_string(),
             body_text: String::new(),
         }
+    }
+
+    fn test_sender_transfer(
+        window: usize,
+        protocol: SenderTransferProtocol,
+        override_source: transfer_tuning::TransferWindowOverrideSource,
+    ) -> ActiveFileTransfer {
+        let now = Instant::now();
+        ActiveFileTransfer {
+            room_id: "room-1".into(),
+            item_id: "item-1".into(),
+            queue_item_id: Some("queue-1".into()),
+            file_name: "file.bin".into(),
+            file_size: 1024,
+            chunk_size: 256,
+            total_chunks: 4,
+            started_at: now,
+            last_report_at: now,
+            last_report_bytes: 0,
+            cancel_token: CancellationToken::new(),
+            kind: ActiveFileTransferKind::Sender {
+                runtime_window: Arc::new(AtomicUsize::new(window)),
+                override_source,
+                protocol,
+            },
+        }
+    }
+
+    fn test_receiver_transfer() -> ActiveFileTransfer {
+        let now = Instant::now();
+        ActiveFileTransfer {
+            room_id: "room-1".into(),
+            item_id: "item-1".into(),
+            queue_item_id: None,
+            file_name: "file.bin".into(),
+            file_size: 1024,
+            chunk_size: 256,
+            total_chunks: 4,
+            started_at: now,
+            last_report_at: now,
+            last_report_bytes: 0,
+            cancel_token: CancellationToken::new(),
+            kind: ActiveFileTransferKind::Receiver {
+                session_key: [0; 32],
+                part_path: PathBuf::from("/tmp/pastey-test.part"),
+                final_path: PathBuf::from("/tmp/pastey-test.bin"),
+                mime_type: None,
+                created_at: 0,
+                transferred_bytes: 0,
+                expected_chunk_index: 0,
+                received_chunks: vec![false; 4],
+                timing: ReceiverTimingSummary::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn runtime_transfer_window_update_succeeds_and_clamps() {
+        let transfer = test_sender_transfer(
+            4,
+            SenderTransferProtocol::BinaryV1,
+            transfer_tuning::TransferWindowOverrideSource::PlannerRequest,
+        );
+
+        let result = update_active_transfer_window("transfer-1", 99, Some(&transfer), false);
+
+        assert!(result.updated);
+        assert_eq!(result.previous_window, Some(4));
+        assert_eq!(result.effective_window, Some(16));
+        assert_eq!(result.requested_window, 16);
+        assert_eq!(result.reason, "updated");
+        let ActiveFileTransferKind::Sender { runtime_window, .. } = &transfer.kind else {
+            panic!("expected sender transfer");
+        };
+        assert_eq!(current_runtime_window(runtime_window), 16);
+    }
+
+    #[test]
+    fn runtime_transfer_window_update_handles_noop_cases() {
+        let binary_sender = test_sender_transfer(
+            4,
+            SenderTransferProtocol::BinaryV1,
+            transfer_tuning::TransferWindowOverrideSource::PlannerRequest,
+        );
+        let json_sender = test_sender_transfer(
+            4,
+            SenderTransferProtocol::JsonV1,
+            transfer_tuning::TransferWindowOverrideSource::PlannerRequest,
+        );
+        let env_sender = test_sender_transfer(
+            4,
+            SenderTransferProtocol::BinaryV1,
+            transfer_tuning::TransferWindowOverrideSource::Env,
+        );
+        let receiver = test_receiver_transfer();
+
+        assert_eq!(
+            update_active_transfer_window("missing", 8, None, false).reason,
+            "not_active"
+        );
+        assert_eq!(
+            update_active_transfer_window("receiver", 8, Some(&receiver), false).reason,
+            "receiver_transfer"
+        );
+        assert_eq!(
+            update_active_transfer_window("json", 8, Some(&json_sender), false).reason,
+            "unsupported_protocol"
+        );
+        assert_eq!(
+            update_active_transfer_window("env", 8, Some(&env_sender), false).reason,
+            "override_active"
+        );
+        assert_eq!(
+            update_active_transfer_window("dev", 8, Some(&binary_sender), true).reason,
+            "override_active"
+        );
+        assert_eq!(
+            update_active_transfer_window("same", 4, Some(&binary_sender), false).reason,
+            "unchanged"
+        );
     }
 
     #[test]

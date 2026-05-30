@@ -18,7 +18,8 @@ import {
   markJoinPromptRendered,
   pendingJoinRequests,
   rejectNearbyJoin,
-  sendFileToRoom
+  sendFileToRoom,
+  updateTransferWindow
 } from "./lib/tauri";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "./lib/constants";
 import {
@@ -38,7 +39,9 @@ import {
   markQueueItemMetadataLoading,
   markQueueItemMetadataReady,
   markQueueItemPreparing,
+  markQueueItemRuntimeWindow,
   markQueueItemSending,
+  planActiveTransferWindowRebalances,
   planRunnableTransferLaunches,
   queuedItemsNeedingMetadata,
   selectRoomTransferQueue,
@@ -82,6 +85,7 @@ function App() {
   const launchingQueueItemWindowsRef = useRef<Map<string, number>>(new Map());
   const metadataPreflightItemIdsRef = useRef<Set<string>>(new Set());
   const cancellingQueueTransferIdsRef = useRef<Set<string>>(new Set());
+  const runtimeWindowUpdateKeysRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     schedulerRef.current = scheduler;
@@ -227,12 +231,25 @@ function App() {
         metadataPreflightItemIdsRef.current.delete(itemId);
       }
     }
+
+    const activeTransferIds = new Set(
+      Object.values(scheduler.items)
+        .filter((item) => item.status === "sending" && item.activeTransferId)
+        .map((item) => item.activeTransferId)
+    );
+    for (const updateKey of [...runtimeWindowUpdateKeysRef.current]) {
+      const transferId = updateKey.split(":")[0];
+      if (!activeTransferIds.has(transferId)) {
+        runtimeWindowUpdateKeysRef.current.delete(updateKey);
+      }
+    }
   }, [scheduler]);
 
   useEffect(() => {
     return () => {
       launchingQueueItemWindowsRef.current.clear();
       metadataPreflightItemIdsRef.current.clear();
+      runtimeWindowUpdateKeysRef.current.clear();
     };
   }, []);
 
@@ -392,6 +409,7 @@ function App() {
         requestedWindow
       });
       updateSchedulerState((current) => markQueueItemCompleted(current, itemId));
+      void rebalanceActiveTransferWindows();
       await refreshRoomAfterQueueItem(item.roomId);
     } catch (err) {
       const latestItem = schedulerRef.current.items[itemId];
@@ -405,6 +423,7 @@ function App() {
           ? markQueueItemMetadataFailed(current, itemId, message)
           : markQueueItemFailed(current, itemId, message);
       });
+      void rebalanceActiveTransferWindows();
       if (latestItem && latestItem.metadataStatus !== "loading") {
         await refreshRoomAfterQueueItem(latestItem.roomId);
       }
@@ -476,6 +495,41 @@ function App() {
       await deleteTempFile(item.path);
     } catch {
       // Scheduler-created temp files are best-effort cleanup; send state is authoritative.
+    }
+  }
+
+  async function rebalanceActiveTransferWindows() {
+    const plans = planActiveTransferWindowRebalances(
+      schedulerRef.current,
+      rooms,
+      closedRoomIdsRef.current,
+      launchingQueueItemWindowsRef.current
+    );
+
+    for (const plan of plans) {
+      const updateKey = `${plan.transferId}:${plan.requestedWindow}`;
+      if (runtimeWindowUpdateKeysRef.current.has(updateKey)) {
+        continue;
+      }
+
+      runtimeWindowUpdateKeysRef.current.add(updateKey);
+      void updateTransferWindow(plan.transferId, plan.requestedWindow)
+        .then((result) => {
+          const effectiveWindow = result.effective_window ?? null;
+          if (
+            (result.updated || result.reason === "unchanged") &&
+            typeof effectiveWindow === "number"
+          ) {
+            updateSchedulerState((current) => markQueueItemRuntimeWindow(
+              current,
+              plan.itemId,
+              effectiveWindow
+            ));
+          }
+        })
+        .catch((err) => {
+          setError(err instanceof Error ? err.message : String(err));
+        });
     }
   }
 
