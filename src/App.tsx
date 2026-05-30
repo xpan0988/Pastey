@@ -98,12 +98,11 @@ function App() {
     viewRef.current = view;
   }, [view]);
 
-  function updateSchedulerState(updater: (current: TransferSchedulerState) => TransferSchedulerState) {
-    setScheduler((current) => {
-      const next = updater(current);
-      schedulerRef.current = next;
-      return next;
-    });
+  function updateSchedulerState(updater: (current: TransferSchedulerState) => TransferSchedulerState): TransferSchedulerState {
+    const next = updater(schedulerRef.current);
+    schedulerRef.current = next;
+    setScheduler(next);
+    return next;
   }
 
   useEffect(() => {
@@ -440,21 +439,26 @@ function App() {
         requestedWindow
       });
       updateSchedulerState((current) => markQueueItemCompleted(current, itemId));
-      void rebalanceActiveTransferWindows();
+      void rebalanceActiveTransferWindows({ itemId, status: "completed" });
       await refreshRoomAfterQueueItem(item.roomId);
     } catch (err) {
       const latestItem = schedulerRef.current.items[itemId];
       const message = err instanceof Error ? err.message : String(err);
+      let terminalStatus: "cancelled" | "failed" | null = null;
       updateSchedulerState((current) => {
         if (latestItem?.cancelRequested) {
+          terminalStatus = "cancelled";
           return markQueueItemCancelled(current, itemId);
         }
 
+        terminalStatus = latestItem?.metadataStatus === "loading" ? null : "failed";
         return latestItem?.metadataStatus === "loading"
           ? markQueueItemMetadataFailed(current, itemId, message)
           : markQueueItemFailed(current, itemId, message);
       });
-      void rebalanceActiveTransferWindows();
+      if (terminalStatus) {
+        void rebalanceActiveTransferWindows({ itemId, status: terminalStatus });
+      }
       if (latestItem && latestItem.metadataStatus !== "loading") {
         await refreshRoomAfterQueueItem(latestItem.roomId);
       }
@@ -536,12 +540,27 @@ function App() {
     }
   }
 
-  async function rebalanceActiveTransferWindows() {
+  async function rebalanceActiveTransferWindows(trigger?: { itemId: string; status: "completed" | "failed" | "cancelled" }) {
     const plans = planActiveTransferWindowRebalances(
       schedulerRef.current,
       rooms,
       closedRoomIdsRef.current,
       launchingQueueItemWindowsRef.current
+    );
+    if (trigger) {
+      const triggerItem = schedulerRef.current.items[trigger.itemId];
+      console.info(
+        "[pastey queue] event=rebalance_trigger room_id=%s batch_id=%s queue_item_id=%s status=%s",
+        triggerItem?.roomId ?? "unknown",
+        triggerItem?.batchId ?? "unknown",
+        trigger.itemId,
+        trigger.status
+      );
+    }
+    console.info(
+      "[pastey queue] event=rebalance_active_targets count=%d targets=%s",
+      plans.length,
+      plans.map((plan) => `${plan.itemId}:${plan.transferId}:${plan.previousWindow}->${plan.requestedWindow}`).join(",")
     );
 
     for (const plan of plans) {
@@ -551,8 +570,28 @@ function App() {
       }
 
       runtimeWindowUpdateKeysRef.current.add(updateKey);
+      const item = schedulerRef.current.items[plan.itemId];
+      console.info(
+        "[pastey queue] event=rebalance_update_attempt room_id=%s batch_id=%s queue_item_id=%s transfer_id=%s previous_window=%d requested_window=%d",
+        item?.roomId ?? "unknown",
+        item?.batchId ?? "unknown",
+        plan.itemId,
+        plan.transferId,
+        plan.previousWindow,
+        plan.requestedWindow
+      );
       void updateTransferWindow(plan.transferId, plan.requestedWindow)
         .then((result) => {
+          console.info(
+            "[pastey queue] event=rebalance_update_result queue_item_id=%s transfer_id=%s updated=%s reason=%s previous_window=%s effective_window=%s requested_window=%d",
+            plan.itemId,
+            plan.transferId,
+            String(result.updated),
+            result.reason ?? "none",
+            result.previous_window === null || typeof result.previous_window === "undefined" ? "unknown" : String(result.previous_window),
+            result.effective_window === null || typeof result.effective_window === "undefined" ? "unknown" : String(result.effective_window),
+            plan.requestedWindow
+          );
           const effectiveWindow = result.effective_window ?? null;
           if (
             (result.updated || result.reason === "unchanged") &&
