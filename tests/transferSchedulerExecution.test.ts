@@ -14,7 +14,9 @@ import {
   markQueueItemMetadataFailed,
   markQueueItemMetadataReady,
   markQueueItemPreparing,
+  markQueueItemRuntimeWindow,
   markQueueItemSending,
+  planActiveTransferWindowRebalances,
   planRunnableTransferLaunches,
   type TransferQueueItem,
   type TransferSchedulerState
@@ -379,4 +381,80 @@ test("same-name same-size concurrent queued files keep queue-item correlation", 
 
   assert.equal(state.items[first.id].activeTransferId, "transfer-first");
   assert.equal(state.items[second.id].activeTransferId, "transfer-second");
+});
+
+test("completion-only rebalance requests remaining huge transfer window update", () => {
+  let state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    readyInput("huge.bin", 2 * GiB, "/tmp/huge.bin", 1),
+    readyInput("small.bin", 1 * MiB, "/tmp/small.bin", 2)
+  ]);
+  const [huge, small] = queuedItems(state);
+  state = markQueueItemPreparing(state, huge.id, 7);
+  state = markQueueItemSending(state, huge.id, {
+    displayName: "huge.bin",
+    sizeBytes: 2 * GiB,
+    modifiedMs: 1,
+    dedupeKey: "huge"
+  });
+  state = correlateTransferProgress(state, {
+    roomId: "room-1",
+    queueItemId: huge.id,
+    direction: "outgoing",
+    fileName: "huge.bin",
+    fileSize: 2 * GiB,
+    transferId: "transfer-huge",
+    status: "transferring"
+  });
+  state = markQueueItemCompleted(state, small.id);
+
+  const plans = planActiveTransferWindowRebalances(state, activeRooms);
+
+  assert.deepEqual(plans, [{
+    itemId: huge.id,
+    transferId: "transfer-huge",
+    requestedWindow: 8,
+    previousWindow: 7
+  }]);
+});
+
+test("runtime rebalance skips unchanged, uncorrelated, cancelled, and closed-room active items", () => {
+  let unchangedState = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    readyInput("huge.bin", 2 * GiB)
+  ]);
+  const unchanged = queuedItems(unchangedState)[0];
+  unchangedState = markQueueItemPreparing(unchangedState, unchanged.id, 8);
+  unchangedState = markQueueItemSending(unchangedState, unchanged.id, {
+    displayName: "huge.bin",
+    sizeBytes: 2 * GiB,
+    modifiedMs: 2 * GiB,
+    dedupeKey: "huge"
+  });
+  unchangedState = correlateTransferProgress(unchangedState, {
+    roomId: "room-1",
+    queueItemId: unchanged.id,
+    direction: "outgoing",
+    fileName: "huge.bin",
+    fileSize: 2 * GiB,
+    transferId: "transfer-huge",
+    status: "transferring"
+  });
+  assert.equal(planActiveTransferWindowRebalances(unchangedState, activeRooms).length, 0);
+
+  let uncorrelatedState = markQueueItemRuntimeWindow(unchangedState, unchanged.id, 7);
+  uncorrelatedState = {
+    ...uncorrelatedState,
+    items: {
+      ...uncorrelatedState.items,
+      [unchanged.id]: {
+        ...uncorrelatedState.items[unchanged.id],
+        activeTransferId: undefined
+      }
+    }
+  };
+  assert.equal(planActiveTransferWindowRebalances(uncorrelatedState, activeRooms).length, 0);
+
+  let cancelledState = markQueueItemRuntimeWindow(unchangedState, unchanged.id, 7);
+  cancelledState = cancelQueueItem(cancelledState, unchanged.id);
+  assert.equal(planActiveTransferWindowRebalances(cancelledState, activeRooms).length, 0);
+  assert.equal(planActiveTransferWindowRebalances(unchangedState, activeRooms, new Set(["room-1"])).length, 0);
 });

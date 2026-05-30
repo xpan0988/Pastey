@@ -304,10 +304,19 @@ Already implemented:
 - Rust transfer tuning precedence for env override, effective dev override, planner request, then default.
 - Planner-driven dispatch from `App.tsx` for existing queued file-like transfers.
 - Multi-worker outgoing file-like transfer execution bounded by planner output and the safety active-transfer cap.
+- Completion-only runtime window mutation for active outgoing binary-v1 sender transfers.
 
 Still not implemented:
 
-- Runtime window mutation for active transfers.
+- Retry/timeout downshift or stable cooldown recovery.
+- Speed-history or history-aware runtime adaptation.
 - Binary-v1 protocol changes.
 - JSON fallback changes.
 - ACK, retry, cancel, burn, finalize, Inbox, security, or room semantic changes.
+
+Phase 4A implementation note:
+
+- A narrow completion-based runtime window mutation foundation is implemented without changing protocols. The current shape is a sender-only `Arc<AtomicUsize>` runtime window handle stored with active Rust sender transfers, read by the binary-v1 pipelined send loop when deciding whether to launch more chunks.
+- Downshifts should stop launching new chunks until in-flight work drops below the target; they must not cancel already in-flight chunks. Upshifts should let the next fill loop launch additional chunks up to the new target.
+- `update_transfer_window` is idempotent and returns structured no-op reasons for missing, terminal, cancelled, receiver-side, JSON fallback, or env/dev-override-forced transfers.
+- Frontend Phase 4A is completion-triggered only: rerun existing planner output after a planner-managed queue item reaches terminal state, update active sender windows whose target changed, and avoid retry/timeout/speed-history adaptation.

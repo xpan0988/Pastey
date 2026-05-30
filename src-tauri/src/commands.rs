@@ -512,6 +512,16 @@ pub async fn cancel_transfer(
 }
 
 #[tauri::command]
+pub fn update_transfer_window(
+    transfer_id: String,
+    requested_window: usize,
+    state: State<'_, Arc<AppState>>,
+) -> Result<transfer::UpdateTransferWindowResult, String> {
+    transfer::update_transfer_window(state.inner().clone(), &transfer_id, requested_window)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
 pub fn get_config(state: State<'_, Arc<AppState>>) -> Result<AppConfig, String> {
     let config = state.config.read().clone();
     Ok(config::public_config(&state.paths, &config))

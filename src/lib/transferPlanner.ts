@@ -53,6 +53,7 @@ export interface TransferPlannerPolicy {
   maxRequestedWindow: number;
   safetyActiveTransferCap: number;
   laneWeights: Record<TransferPlannerLane, number>;
+  rebalanceActiveWindows: boolean;
 }
 
 export interface TransferPlannerPlan {
@@ -118,6 +119,7 @@ export const DEFAULT_TRANSFER_PLANNER_POLICY: TransferPlannerPolicy = {
   minRequestedWindow: 1,
   maxRequestedWindow: 8,
   safetyActiveTransferCap: 4,
+  rebalanceActiveWindows: false,
   laneWeights: {
     control_text: 1,
     small_file: 1,
@@ -173,59 +175,97 @@ export function planWeightedTransfers(
   }
 
   let globalRemaining = policy.globalWindowBudget;
-  const sortedActive = sortCandidates(activeCandidates);
-  for (const candidate of sortedActive) {
-    const requestedWindow = clampWindow(
-      candidate.task.activeRequestedWindow ?? candidate.task.requestedWindow ?? policy.minRequestedWindow,
-      policy
-    );
-    const laneBudget = laneRemaining.get(candidate.lane) ?? 0;
-    const reservedWindow = Math.min(requestedWindow, globalRemaining);
-    if (reservedWindow < policy.minRequestedWindow) {
-      heldPlans.push(createHeldPlan(
-        candidate.task,
-        candidate.priority,
-        "global_budget_exhausted",
-        "active transfer could not reserve planner budget",
-        candidate
-      ));
-      continue;
+  if (policy.rebalanceActiveWindows) {
+    const activeTransferCount = activeCandidates.length;
+    let runnableSlots = Math.max(0, policy.safetyActiveTransferCap - activeTransferCount);
+
+    for (const lane of lanes) {
+      const laneBudget = Math.min(laneRemaining.get(lane) ?? 0, globalRemaining);
+      const laneActive = sortCandidates(activeCandidates.filter((candidate) => candidate.lane === lane));
+      const laneQueued = sortCandidates(queuedCandidates.filter((candidate) => candidate.lane === lane));
+      const queuedCount = Math.min(laneQueued.length, Math.max(0, laneBudget - laneActive.length), runnableSlots);
+      const selected = [...laneActive, ...laneQueued.slice(0, queuedCount)];
+      const windows = distributeWindows(laneBudget, selected.length);
+
+      selected.forEach((candidate, index) => {
+        const requestedWindow = windows[index] ?? 0;
+        if (requestedWindow < policy.minRequestedWindow) {
+          return;
+        }
+        if (candidate.task.state === "active") {
+          activePlans.push(createPlan(candidate, requestedWindow));
+        } else {
+          runnablePlans.push(createPlan(candidate, requestedWindow));
+          runnableSlots -= 1;
+        }
+        globalRemaining -= requestedWindow;
+      });
+
+      for (const candidate of laneQueued.slice(queuedCount)) {
+        let reason: TransferPlannerHeldReason = "lane_budget_exhausted";
+        if (runnableSlots <= 0) {
+          reason = "safety_cap_reached";
+        } else if (globalRemaining <= 0) {
+          reason = "global_budget_exhausted";
+        }
+        heldPlans.push(createHeldPlan(candidate.task, candidate.priority, reason, reason, candidate));
+      }
+    }
+  } else {
+    const sortedActive = sortCandidates(activeCandidates);
+    for (const candidate of sortedActive) {
+      const requestedWindow = clampWindow(
+        candidate.task.activeRequestedWindow ?? candidate.task.requestedWindow ?? policy.minRequestedWindow,
+        policy
+      );
+      const laneBudget = laneRemaining.get(candidate.lane) ?? 0;
+      const reservedWindow = Math.min(requestedWindow, globalRemaining);
+      if (reservedWindow < policy.minRequestedWindow) {
+        heldPlans.push(createHeldPlan(
+          candidate.task,
+          candidate.priority,
+          "global_budget_exhausted",
+          "active transfer could not reserve planner budget",
+          candidate
+        ));
+        continue;
+      }
+
+      activePlans.push(createPlan(candidate, reservedWindow));
+      laneRemaining.set(candidate.lane, Math.max(0, laneBudget - reservedWindow));
+      globalRemaining -= reservedWindow;
     }
 
-    activePlans.push(createPlan(candidate, reservedWindow));
-    laneRemaining.set(candidate.lane, Math.max(0, laneBudget - reservedWindow));
-    globalRemaining -= reservedWindow;
-  }
+    const activeTransferCount = activePlans.length;
+    let runnableSlots = Math.max(0, policy.safetyActiveTransferCap - activeTransferCount);
 
-  const activeTransferCount = activePlans.length;
-  let runnableSlots = Math.max(0, policy.safetyActiveTransferCap - activeTransferCount);
+    for (const lane of lanes) {
+      const laneBudget = Math.min(laneRemaining.get(lane) ?? 0, globalRemaining);
+      const laneQueued = sortCandidates(queuedCandidates.filter((candidate) => candidate.lane === lane));
+      const runnableCount = Math.min(laneQueued.length, laneBudget, runnableSlots);
+      const selected = laneQueued.slice(0, runnableCount);
+      const windows = distributeWindows(laneBudget, selected.length);
 
-  for (const lane of lanes) {
-    const laneBudget = Math.min(laneRemaining.get(lane) ?? 0, globalRemaining);
-    const laneQueued = sortCandidates(queuedCandidates.filter((candidate) => candidate.lane === lane));
-    const runnableCount = Math.min(laneQueued.length, laneBudget, runnableSlots);
-    const selected = laneQueued.slice(0, runnableCount);
-    const windows = distributeWindows(laneBudget, selected.length);
+      selected.forEach((candidate, index) => {
+        const requestedWindow = windows[index] ?? 0;
+        if (requestedWindow < policy.minRequestedWindow) {
+          return;
+        }
+        runnablePlans.push(createPlan(candidate, requestedWindow));
+        globalRemaining -= requestedWindow;
+        runnableSlots -= 1;
+      });
 
-    selected.forEach((candidate, index) => {
-      const requestedWindow = windows[index] ?? 0;
-      if (requestedWindow < policy.minRequestedWindow) {
-        return;
+      const skipped = laneQueued.slice(runnableCount);
+      for (const candidate of skipped) {
+        let reason: TransferPlannerHeldReason = "lane_budget_exhausted";
+        if (runnableSlots <= 0) {
+          reason = "safety_cap_reached";
+        } else if (globalRemaining <= 0) {
+          reason = "global_budget_exhausted";
+        }
+        heldPlans.push(createHeldPlan(candidate.task, candidate.priority, reason, reason, candidate));
       }
-      runnablePlans.push(createPlan(candidate, requestedWindow));
-      globalRemaining -= requestedWindow;
-      runnableSlots -= 1;
-    });
-
-    const skipped = laneQueued.slice(runnableCount);
-    for (const candidate of skipped) {
-      let reason: TransferPlannerHeldReason = "lane_budget_exhausted";
-      if (runnableSlots <= 0) {
-        reason = "safety_cap_reached";
-      } else if (globalRemaining <= 0) {
-        reason = "global_budget_exhausted";
-      }
-      heldPlans.push(createHeldPlan(candidate.task, candidate.priority, reason, reason, candidate));
     }
   }
 
@@ -282,6 +322,7 @@ function normalizePolicy(overrides: Partial<TransferPlannerPolicy>): TransferPla
     minRequestedWindow,
     maxRequestedWindow,
     safetyActiveTransferCap,
+    rebalanceActiveWindows: overrides.rebalanceActiveWindows ?? DEFAULT_TRANSFER_PLANNER_POLICY.rebalanceActiveWindows,
     laneWeights: {
       ...DEFAULT_TRANSFER_PLANNER_POLICY.laneWeights,
       ...(overrides.laneWeights ?? {})

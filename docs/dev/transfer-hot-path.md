@@ -10,7 +10,7 @@ Binary-v1 is the normal high-performance transfer path. Each file is split into 
 
 Binary-v1 senders use pipelined in-flight chunk uploads. Receivers accept chunks by `chunk_index` and write each chunk at its file offset, so chunks may complete out of order. The receiver tracks a per-transfer received bitmap; finalize still verifies completeness before marking the transfer complete.
 
-The scheduler can start multiple existing queued file-like transfers when the planner allocates runnable plans. It does not introduce adaptive transfer windows, runtime window mutation, archive bundling, folder recursion, new chunk protocols, or backend transfer-core changes. Queue item correlation metadata and requested sender windows are not part of the binary-v1 or JSON chunk protocols. Text sending remains immediate and does not enter the file queue. File type may affect labels, but transport behavior is opaque binary file transfer and does not branch on file type.
+The scheduler can start multiple existing queued file-like transfers when the planner allocates runnable plans. Active outgoing binary-v1 sender transfers can update their future in-flight window after a planner-managed queue item reaches a terminal state. This is completion-only runtime window mutation; it is not retry/timeout adaptive control, speed-history tuning, archive bundling, folder recursion, a new chunk protocol, or backend-owned scheduling. Queue item correlation metadata and requested sender windows are not part of the binary-v1 or JSON chunk protocols. Text sending remains immediate and does not enter the file queue. File type may affect labels, but transport behavior is opaque binary file transfer and does not branch on file type.
 
 The old stop-and-wait behavior is historical context only. It is still useful as a conceptual baseline for `window=1`, but normal binary-v1 transfers use a larger window.
 
@@ -23,6 +23,7 @@ SQLite room item status is not written per chunk. Status writes happen at termin
 - The old user-facing transfer-limit mapping, such as "10 MB/s -> window 1", "50 MB/s -> window 2", and "100 MB/s -> window 4", is obsolete and should not be reused.
 - Developer benchmarking can force a window with `PASTEY_TRANSFER_WINDOW_SIZE`; values are clamped to `1..16`.
 - Planner-driven file-like sends pass an optional sender-side requested window. Non-planner sends omit it and keep the default unless an env or effective Developer Tools override is active.
+- For active outgoing binary-v1 planner-managed sends, a completion-only rebalance can update the sender's runtime window for future chunk scheduling. Existing in-flight chunks are not cancelled when the window decreases, and JSON fallback transfers return a structured no-op for runtime window updates.
 
 `window=1` means the sender uploads one encrypted chunk and waits for its ACK before starting the next chunk. Larger windows allow multiple encrypted binary-v1 chunks to be in flight at the same time, which keeps a fast LAN link busier while the receiver decrypts, writes, and acknowledges earlier chunks.
 
