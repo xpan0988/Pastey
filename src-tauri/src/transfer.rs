@@ -2292,9 +2292,17 @@ fn dev_log_receiver_finalize(transfer_id: &str, room_id: &str, event: &str, deta
     ));
 }
 
-pub async fn cancel_transfer(state: Arc<AppState>, transfer_id: &str) -> AppResult<bool> {
+pub async fn cancel_transfer(
+    state: Arc<AppState>,
+    transfer_id: &str,
+    cancel_source: Option<String>,
+) -> AppResult<bool> {
     let removed = state.active_file_transfers.lock().remove(transfer_id);
     let Some(transfer) = removed else {
+        logging::write_transfer_line(&format!(
+            "[pastey transfer][transfer_id={transfer_id}] event=cancel_transfer_noop source={} reason=not_active",
+            cancel_source.as_deref().unwrap_or("none")
+        ));
         return Ok(false);
     };
 
@@ -2321,6 +2329,15 @@ pub async fn cancel_transfer(state: Arc<AppState>, transfer_id: &str) -> AppResu
             let base_url = format!("http://{peer_host}:{peer_port}/rooms/{}", transfer.room_id);
             notify_transfer_cancel(&client, &base_url, transfer_id).await;
         }
+    }
+    if matches!(transfer.kind, ActiveFileTransferKind::Sender { .. }) {
+        logging::write_transfer_line(&format!(
+            "[pastey transfer][sender][transfer_id={transfer_id}][room_id={}][item_id={}] event=active_transfer_removed reason=sender_cancelled source={} queue_item_id={}",
+            transfer.room_id,
+            transfer.item_id,
+            cancel_source.as_deref().unwrap_or("none"),
+            transfer.queue_item_id.as_deref().unwrap_or("none")
+        ));
     }
     let _ =
         storage::set_room_item_status(&state.paths, &transfer.item_id, RoomItemStatus::Cancelled);
@@ -4684,7 +4701,12 @@ async fn cancel_transfer_with_reason(
     receiver_reason: Option<&str>,
 ) -> AppResult<bool> {
     let Some(reason) = receiver_reason else {
-        return cancel_transfer(state, transfer_id).await;
+        return cancel_transfer(
+            state,
+            transfer_id,
+            Some("cancel_transfer_with_reason".into()),
+        )
+        .await;
     };
 
     let removed = state.active_file_transfers.lock().remove(transfer_id);

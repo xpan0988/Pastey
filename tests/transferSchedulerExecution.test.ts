@@ -415,6 +415,46 @@ test("completion-only rebalance requests remaining huge transfer window update",
     requestedWindow: 8,
     previousWindow: 7
   }]);
+  assert.deepEqual(activeCancellableTransferIds(state), []);
+});
+
+test("completion-only rebalance ignores stale launching marker for already sending item", () => {
+  let state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    readyInput("huge.bin", 2 * GiB, "/tmp/huge.bin", 1),
+    readyInput("small.bin", 1 * MiB, "/tmp/small.bin", 2)
+  ]);
+  const [huge, small] = queuedItems(state);
+  state = markQueueItemPreparing(state, huge.id, 7);
+  state = markQueueItemSending(state, huge.id, {
+    displayName: "huge.bin",
+    sizeBytes: 2 * GiB,
+    modifiedMs: 1,
+    dedupeKey: "huge"
+  });
+  state = correlateTransferProgress(state, {
+    roomId: "room-1",
+    queueItemId: huge.id,
+    direction: "outgoing",
+    fileName: "huge.bin",
+    fileSize: 2 * GiB,
+    transferId: "transfer-huge",
+    status: "transferring"
+  });
+  state = markQueueItemCompleted(state, small.id);
+
+  const plans = planActiveTransferWindowRebalances(
+    state,
+    activeRooms,
+    new Set(),
+    new Map([[huge.id, 7]])
+  );
+
+  assert.deepEqual(plans, [{
+    itemId: huge.id,
+    transferId: "transfer-huge",
+    requestedWindow: 8,
+    previousWindow: 7
+  }]);
 });
 
 test("runtime rebalance skips unchanged, uncorrelated, cancelled, and closed-room active items", () => {

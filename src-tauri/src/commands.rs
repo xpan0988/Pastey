@@ -505,10 +505,23 @@ pub async fn leave_room(room_id: String, state: State<'_, Arc<AppState>>) -> Res
 #[tauri::command]
 pub async fn cancel_transfer(
     transfer_id: String,
+    cancel_source: Option<String>,
+    queue_item_id: Option<String>,
+    batch_id: Option<String>,
+    room_id: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<bool, String> {
-    run_async(async move { transfer::cancel_transfer(state.inner().clone(), &transfer_id).await })
-        .await
+    logging::write_transfer_line(&format!(
+        "[pastey transfer][transfer_id={transfer_id}] event=cancel_transfer_command source={} queue_item_id={} batch_id={} room_id={}",
+        log_field(cancel_source.as_deref()),
+        log_field(queue_item_id.as_deref()),
+        log_field(batch_id.as_deref()),
+        log_field(room_id.as_deref())
+    ));
+    run_async(async move {
+        transfer::cancel_transfer(state.inner().clone(), &transfer_id, cancel_source).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -517,8 +530,18 @@ pub fn update_transfer_window(
     requested_window: usize,
     state: State<'_, Arc<AppState>>,
 ) -> Result<transfer::UpdateTransferWindowResult, String> {
-    transfer::update_transfer_window(state.inner().clone(), &transfer_id, requested_window)
-        .map_err(|error| error.message())
+    let result =
+        transfer::update_transfer_window(state.inner().clone(), &transfer_id, requested_window)
+            .map_err(|error| error.message())?;
+    logging::write_transfer_line(&format!(
+        "[pastey transfer][transfer_id={transfer_id}] event=update_transfer_window updated={} reason={} requested_window={} previous_window={} effective_window={}",
+        result.updated,
+        result.reason,
+        result.requested_window,
+        result.previous_window.map(|value| value.to_string()).unwrap_or_else(|| "none".into()),
+        result.effective_window.map(|value| value.to_string()).unwrap_or_else(|| "none".into())
+    ));
+    Ok(result)
 }
 
 #[tauri::command]
@@ -777,6 +800,12 @@ fn diagnostics_capability_mode(force_refresh: bool) -> CapabilityProbeMode {
     } else {
         CapabilityProbeMode::Quick
     }
+}
+
+fn log_field(value: Option<&str>) -> &str {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("none")
 }
 
 async fn run_async<T>(
