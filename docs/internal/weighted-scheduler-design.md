@@ -70,7 +70,7 @@ queued file/image/pasted-image task
 
 Concurrency is an output of the planner. It is not a fixed `maxActiveTransfers = 2` input.
 
-The global budget is expressed as a binary-v1 window budget and lane weights. The default global binary-v1 window budget is 8. The implemented pure planner assigns an integer requested window to each runnable or active transfer, and the sum of requested windows never exceeds the global budget.
+The global budget is expressed as a binary-v1 window budget. The default global binary-v1 window budget is 8. The implemented pure planner assigns an integer requested window to each runnable or active transfer, and the sum of requested windows never exceeds the global budget. Lane and size-class metadata still provide classification, priority, eligibility, and reporting context, but the final file-like requested-window split is batch-relative and weighted by each selected transfer's size contribution.
 
 The first implementation should apply only to:
 
@@ -120,10 +120,10 @@ Initial lanes:
 | Lane | Implementation status | Typical tasks | Sensitivity | Suggested share |
 | --- | --- | --- | --- | --- |
 | `control_text` | Model-only, not dispatched | text, control, agent, command streams | low latency | weight 1 |
-| `small_file` | Implemented in pure planner, not dispatched | small files, images, pasted images | mixed | weight 1 |
-| `bulk_file` | Implemented in pure planner, not dispatched | large and huge files | throughput | weight 7 |
+| `small_file` | Implemented for file-like planner classification | small files, images, pasted images | mixed | weight 1 |
+| `bulk_file` | Implemented for file-like planner classification | large and huge files | throughput | weight 7 |
 
-Lane-level budget prevents 100 tiny tasks from becoming 100 active transfers. A lane receives a window budget first, then chooses a bounded number of runnable transfers inside that budget. Each active transfer must receive at least window 1.
+Lane and size class no longer dominate the final file-like requested-window split. They remain useful for classification, priority, eligibility, and lane budget reports. The safety active-transfer cap and global window budget prevent 100 tiny tasks from becoming 100 active transfers. Each selected active or runnable transfer must receive at least window 1.
 
 Suggested file size classes:
 
@@ -143,7 +143,7 @@ Current pure planner policy fields:
 
 - `globalWindowBudget`: default 8.
 - `safetyActiveTransferCap`: guardrail only, not the main strategy.
-- `laneWeights`: relative weight per lane.
+- `laneWeights`: relative weight per lane for reporting and future lane-aware policy. Current file-like final requested-window distribution is batch-relative across selected transfers rather than mostly lane-budget driven.
 - `minRequestedWindow`: default 1.
 - `maxRequestedWindow`: default 8 for planner output unless a later benchmark justifies more; Rust clamps transfer windows to `1..16`.
 - `defaultRequestedWindow`: omitted planner request falls through to Rust's default window 8.
@@ -202,12 +202,10 @@ interface LaneBudgetReport {
 
 `reason` strings should be short and suitable for logs or Developer Tools diagnostics, for example:
 
-- `bulk lane only eligible lane; assigned full budget`
-- `small lane minimum share reserved`
 - `held because room is burned`
-- `held because lane active cap reached`
 - `held because metadata is missing`
 - `held because active transfer cap reached`
+- `held because global budget is exhausted`
 
 ## Example Allocations
 
@@ -222,14 +220,24 @@ Only one huge file:
 Huge file plus one small file:
 
 - Eligible lanes: `bulk_file`, `small_file`.
-- Allocation: bulk gets approximately 7 windows, small gets 1 window.
+- Allocation: selected transfers receive a minimum window first, then remaining windows are assigned by relative size contribution. This commonly gives the huge file about 7 windows and the small file 1 window.
 - Runnable: huge file requested window 7, small file requested window 1.
+
+2.7GB file plus 147MB file:
+
+- Eligible lanes: both may classify as `bulk_file`.
+- Allocation: because the final split is batch-relative by size contribution, the 2.7GB file requests about 7 windows and the 147MB file requests 1 window instead of splitting 4 plus 4 only because both are in the same lane.
+
+Two similarly large files:
+
+- Eligible lanes: both usually classify as `bulk_file`.
+- Allocation: similar size contributions split the global budget fairly, for example 4 plus 4.
 
 Many small files:
 
 - Eligible lanes: `small_file`.
-- Allocation: small gets full budget.
-- Runnable: several small transfers may run with low windows, for example four transfers at window 2 or eight at window 1, bounded by the safety active-transfer cap.
+- Allocation: selected files share the available budget by relative size contribution.
+- Runnable: several small transfers may run with low windows, bounded by the safety active-transfer cap and global window budget.
 - Guardrail: the planner must not create one active transfer per tiny task just because enough tasks exist.
 
 Future 100 tiny text/control tasks plus one huge file:
@@ -248,38 +256,28 @@ Planner v1:
 3. Ensure each candidate has metadata needed for classification, or mark it held with `metadata missing`.
 4. Classify each candidate by kind and size class.
 5. Assign a lane to each candidate.
-6. Group candidates by lane.
-7. Compute lane percentages from configured weights and min/max lane percentages.
-8. Convert lane percentages to integer window budgets.
-9. Ensure every active lane with runnable work gets at least one window when the global budget allows it.
-10. Account for active transfers first, preserving their current requested windows in Phase 2+3.
-11. Choose additional runnable queued tasks by lane priority, age, and fairness.
-12. Assign each runnable transfer an integer requested window.
-13. Enforce the global window budget and safety active-transfer cap.
-14. Return runnable plans, active plans, lane budget report, and held reasons.
+6. Compute lane budget reports for diagnostics and future lane-aware policy.
+7. For normal launch planning, account for active transfers first by preserving their current requested windows.
+8. Choose additional runnable queued tasks within the remaining global budget and safety active-transfer cap, ordered by priority, size contribution, age, and id.
+9. Assign every selected transfer at least one requested window.
+10. Distribute remaining windows across the selected set by relative size contribution using deterministic largest-remainder integer apportionment.
+11. Clamp by per-transfer requested-window limits and the global window budget.
+12. Return runnable plans, active plans, lane budget report, and held reasons.
 
-Integer budget conversion should be deterministic. A simple largest-remainder method is sufficient:
-
-1. Compute each lane's exact fractional budget.
-2. Floor each lane to an integer.
-3. Reserve one window for active eligible lanes when possible.
-4. Distribute remaining windows by largest fractional remainder.
-5. Clamp by lane min/max and global budget.
+Completion-only Phase 4A rebalance reruns the same planner with active-window rebalance enabled. In that mode, selected active and queued transfers are allocated together using the same batch-relative weighted math, so a completed small transfer naturally releases window budget to the remaining active transfer without adding retry, timeout, throughput-history, or speed-heuristic adaptation.
 
 ## Complexity
 
 Let `n` be the number of nonterminal queued or active tasks. Let `L` be the number of lanes.
 
-The first version should be `O(n)` time with constant `L`:
+The current planner sorts runnable allocation candidates to keep priority and tie-breaking deterministic:
 
 - collection and filtering: `O(n)`
-- classification and grouping: `O(n)`
-- lane budget computation: `O(L)`
-- runnable selection with small fixed lane queues: `O(n)`
+- classification and lane reporting: `O(n + L)`
+- lane report computation: `O(L)`
+- runnable selection and deterministic allocation ordering: `O(n log n)`
 
 Space complexity should be `O(n + L)`, which is `O(n)` when lane count is constant.
-
-Sorting all tasks is not required for v1. If a later history-aware planner introduces richer priority ordering, document any complexity change.
 
 ## Correctness Invariants
 

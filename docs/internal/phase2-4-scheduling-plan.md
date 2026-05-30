@@ -19,7 +19,7 @@ Current implemented behavior:
 - JSON/base64 remains the fallback path.
 - Binary-v1 transfers default to window 8.
 - `PASTEY_TRANSFER_WINDOW_SIZE` and effective Developer Tools transfer-window settings remain the debugging overrides.
-- A pure weighted planner exists, has unit coverage, and drives runtime dispatch for queued file-like transfers.
+- A pure weighted planner exists, has unit coverage, and drives runtime dispatch for queued file-like transfers. Lane and size class still provide classification, priority, constraints, and reports, while final requested-window allocation for selected file-like transfers is batch-relative and size-weighted.
 - The transfer API accepts an optional sender-side planner requested window; planner-driven sends pass it.
 - Active outgoing binary-v1 sender transfers have a sender-only runtime window handle that can be updated by a structured command while the transfer is running.
 - Planner-managed queued file-like transfers trigger completion-only active-window rebalance after a queue item reaches a terminal state.
@@ -59,7 +59,7 @@ Goal: rerun the same allocation function over queued plus active transfers and a
 
 Scope:
 
-- Reuse Phase 2+3 task classification and lane budget logic.
+- Reuse Phase 2+3 task classification, lane reports, and batch-relative weighted window allocation.
 - Add runtime window mutation only after Phase 2+3 proves safe.
 - Preserve env/dev override precedence.
 - Apply changes conservatively and log rebalance decisions.
@@ -117,7 +117,7 @@ Phase 2+3 should introduce a pure allocation function that can be unit-tested wi
 ```text
 TransferSchedulerState + room availability + policy
   -> classify nonterminal tasks
-  -> compute lane budgets
+  -> compute lane reports and batch-relative weighted windows
   -> output runnable plans, active plans, held reasons
 ```
 
@@ -127,7 +127,7 @@ The first implementation should make concurrency an output:
 
 - If only one huge file is eligible, start one transfer with most or all of the budget.
 - If a huge file and one small file are eligible, start both with weighted windows.
-- If many small files are eligible, start several low-window transfers up to the lane budget and safety cap.
+- If many small files are eligible, start several low-window transfers within the global window budget and safety cap.
 - If future low-latency lanes are implemented, reserve a small share without exploding active transfer count.
 
 ## Detailed Implementation Sequence
@@ -210,7 +210,7 @@ Implementation status: completed as a pure frontend module. Step 5 now calls it 
 Rationale:
 
 - The scheduling policy should be testable without Tauri, file I/O, or network transfer.
-- Concurrency must be the output of lane budget allocation, not a fixed input.
+- Concurrency must be the output of weighted planner allocation, not a fixed input.
 
 Implemented changes:
 
@@ -219,14 +219,17 @@ Implemented changes:
 - Added default policy with `globalWindowBudget = 8`, `minRequestedWindow = 1`, lane weights for `small_file` and `bulk_file`, future `control_text` modeling, and a safety active-transfer cap.
 - Required metadata-ready tasks for allocation. Missing metadata becomes a held plan.
 - Held burned/unavailable rooms and cancelled/terminal tasks instead of producing runnable plans.
-- Reserved active transfer budget before producing new runnable plans.
+- Reserved active transfer budget before producing new runnable plans in the normal launch pass.
+- Allocated selected queued file-like transfer windows batch-relatively by size contribution, after giving every selected transfer at least one requested window. Lane and size class remain classification and reporting inputs rather than the dominant final split.
 - Enforced the invariant that total active plus runnable requested windows do not exceed the global budget and every active/runnable plan has `requestedWindow >= 1`.
 
 Tests:
 
 - Only huge file -> one bulk plan, requested window 8.
 - Huge plus small -> approximate 7 + 1 allocation.
-- Many small files -> multiple low-window small-file plans, bounded by lane budget and safety cap.
+- 2.7GB plus 147MB -> approximate 7 + 1 allocation even when both classify as `bulk_file`.
+- Similarly large files -> fair splits such as 4 + 4 or 3 + 3 + 2 within the global budget.
+- Many small files -> multiple low-window small-file plans, bounded by the global window budget and safety cap.
 - Burned room -> no runnable plans.
 - Cancelled task -> no runnable plan.
 - Missing metadata -> held with reason.
@@ -296,7 +299,7 @@ Implemented changes:
 - Replaced `nextQueuedTransferItem` dispatch in `App.tsx` with `planRunnableTransferLaunches`, which adapts scheduler state into weighted planner tasks.
 - Replaced the single `schedulerWorkerRef` boolean with per-item launch tracking in `launchingQueueItemWindowsRef`.
 - Added metadata preflight tracking so queued items become metadata-ready before planner allocation.
-- Started runnable plans concurrently according to lane budget and the safety active-transfer cap.
+- Started runnable plans concurrently according to planner output, bounded by the global window budget and safety active-transfer cap.
 - Passed each runnable plan's requested window into `sendFileToRoom`.
 - Accounted for active and already launching transfers when rerunning the planner, without mutating running windows.
 - Ensured burned/closed rooms, cancelled batches, cancelled items, and terminal items cannot launch new work.
@@ -523,7 +526,10 @@ Assume default global budget 8.
 | --- | --- |
 | One huge file | One bulk transfer, requested window 8 |
 | Huge plus small | Huge requested window about 7, small requested window 1 |
-| Many small files | Several small transfers, each low window, bounded by lane budget and safety cap |
+| 2.7GB plus 147MB | Larger file requested window about 7, smaller file requested window 1, even when both classify as `bulk_file` |
+| Two similarly large files | Similar files split fairly, for example about 4 plus 4 |
+| Three similarly large files | Similar files split fairly within the global budget, for example about 3 plus 3 plus 2 |
+| Many small files | Several small transfers, each low window, bounded by global window budget and safety cap |
 | Future 100 tiny text/control tasks plus huge file | Control lane gets small guaranteed share; huge file keeps most windows; control lane active count remains capped |
 
 Exact splits may vary by policy, but the invariants must hold: no starvation, no global budget overrun, and no fixed two-transfer assumption.
@@ -539,19 +545,18 @@ Phase 2+3 planner:
 5. Classify task kind.
 6. Classify size class.
 7. Assign lane.
-8. Group by lane.
-9. Compute lane percentages or weights.
-10. Convert percentages to integer window budgets.
-11. Reserve budget for active transfers.
-12. Choose runnable queued tasks.
-13. Assign requested windows.
-14. Enforce global budget.
-15. Enforce safety active-transfer cap.
-16. Return runnable plans, active plans, lane budget report, and held reasons.
+8. Compute lane budget reports for diagnostics and future lane-aware policy.
+9. In the normal launch pass, reserve budget for active transfers using their current requested windows.
+10. Choose runnable queued tasks within the remaining budget and safety active-transfer cap.
+11. Assign every selected transfer at least one requested window.
+12. Distribute remaining windows batch-relatively by size contribution using deterministic largest-remainder apportionment.
+13. Enforce global budget.
+14. Enforce safety active-transfer cap.
+15. Return runnable plans, active plans, lane budget report, and held reasons.
 
 Phase 4 rebalancer:
 
-1. Rerun the same allocation function over queued and active tasks.
+1. Rerun the same allocation function over queued and active tasks with active-window rebalance enabled.
 2. Compare previous active requested windows to new requested windows.
 3. Apply runtime window updates only where the sender supports mutation safely.
 4. Log the reason for each rebalance.
@@ -563,9 +568,7 @@ Completion-only runtime window mutation is Phase 4A. Retry/timeout adaptation an
 
 Let `n` be the number of nonterminal queued or active tasks. Let `L` be lane count.
 
-The first planner should be `O(n)` time and `O(n + L)` space. Since `L` is a small constant in Phase 2+3, this is effectively `O(n)` time and `O(n)` space.
-
-Avoid global sorting in the first implementation unless a clearly documented priority rule requires it.
+The current planner sorts allocation candidates to keep priority, size contribution, age, and id tie-breaking deterministic. Expected complexity is `O(n log n)` time and `O(n + L)` space. Since `L` is a small constant in Phase 2+3, this is effectively `O(n log n)` time and `O(n)` space.
 
 ## Correctness Invariants
 
