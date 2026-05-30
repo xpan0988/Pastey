@@ -291,12 +291,55 @@ test("burned room cancellation stops queued, preparing, and several active sendi
 
   assert.equal(state.items[queued.id].status, "cancelled");
   assert.equal(state.items[preparing.id].status, "cancelled");
-  assert.equal(state.items[sendingA.id].status, "sending");
+  assert.equal(state.items[sendingA.id].status, "cancelled");
   assert.equal(state.items[sendingA.id].cancelRequested, true);
-  assert.equal(state.items[sendingB.id].status, "sending");
+  assert.equal(state.items[sendingB.id].status, "cancelled");
   assert.equal(state.items[sendingB.id].cancelRequested, true);
-  assert.deepEqual(activeCancellableTransferIds(state), ["transfer-sending-a", "transfer-sending-b"]);
+  assert.deepEqual(activeCancellableTransferIds(state), []);
   assert.equal(planRunnableTransferLaunches(state, [{ id: "room-1", status: "burned" }]).runnablePlans.length, 0);
+});
+
+test("burned room queue cleanup does not block same file in a new room", () => {
+  let state = enqueueTransferBatch(createTransferSchedulerState(), "old-room", [
+    readyInput("model.bin", 2 * GiB, "/tmp/model.bin", 1)
+  ]);
+  const oldItem = queuedItems(state)[0];
+  state = markQueueItemSending(state, oldItem.id, {
+    displayName: "model.bin",
+    sizeBytes: 2 * GiB,
+    modifiedMs: 1,
+    dedupeKey: "model"
+  });
+  state = correlateTransferProgress(state, {
+    roomId: "old-room",
+    queueItemId: oldItem.id,
+    direction: "outgoing",
+    fileName: "model.bin",
+    fileSize: 2 * GiB,
+    transferId: "old-transfer",
+    status: "transferring"
+  });
+
+  state = clearQueuedItemsForRoom(state, "old-room");
+  state = enqueueTransferBatch(state, "new-room", [
+    readyInput("model.bin", 2 * GiB, "/tmp/model.bin", 1)
+  ]);
+
+  const newItem = Object.values(state.items).find((item) => item.roomId === "new-room");
+  assert.ok(newItem);
+  assert.equal(newItem.status, "queued");
+  assert.equal(newItem.metadataStatus, "ready");
+
+  const { runnablePlans, plannerResult } = planRunnableTransferLaunches(
+    state,
+    [
+      { id: "old-room", status: "burned" },
+      { id: "new-room", status: "active" }
+    ],
+    new Set(["old-room"])
+  );
+  assert.deepEqual(runnablePlans.map((plan) => plan.itemId), [newItem.id]);
+  assert.equal(plannerResult.activePlans.length, 0);
 });
 
 test("failed item does not block unrelated queued work", () => {
