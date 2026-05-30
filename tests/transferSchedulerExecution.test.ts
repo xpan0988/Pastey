@@ -24,6 +24,8 @@ import {
 
 const MiB = 1024 * 1024;
 const GiB = 1024 * MiB;
+const TWO_POINT_SEVEN_GB_BYTES = 2707513952;
+const ONE_HUNDRED_FORTY_SEVEN_MB_BYTES = 147642115;
 const activeRooms = [{ id: "room-1", status: "active" as const }];
 
 function readyInput(name: string, sizeBytes: number, path = `/tmp/${name}`, modifiedMs = sizeBytes) {
@@ -63,6 +65,88 @@ test("huge-plus-small queue starts both with expected requested windows", () => 
   assert.equal(runnablePlans.length, 2);
   assert.equal(byName.get("huge.bin")?.requestedWindow, 7);
   assert.equal(byName.get("small.bin")?.requestedWindow, 1);
+});
+
+test("2.7GB plus 147MB metadata-ready together are both runnable in one planner pass", () => {
+  const state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    readyInput("2.7gb.bin", TWO_POINT_SEVEN_GB_BYTES, "/tmp/2.7gb.bin", 1),
+    readyInput("147mb.bin", ONE_HUNDRED_FORTY_SEVEN_MB_BYTES, "/tmp/147mb.bin", 2)
+  ]);
+
+  const { runnablePlans, plannerResult } = planRunnableTransferLaunches(state, activeRooms);
+  const byName = new Map(runnablePlans.map((plan) => [state.items[plan.itemId].displayName, plan]));
+
+  assert.equal(runnablePlans.length, 2);
+  assert.equal(plannerResult.activePlans.length, 0);
+  assert.equal(byName.get("2.7gb.bin")?.lane, "bulk_file");
+  assert.equal(byName.get("147mb.bin")?.lane, "bulk_file");
+  assert.equal(byName.get("2.7gb.bin")?.requestedWindow, 4);
+  assert.equal(byName.get("147mb.bin")?.requestedWindow, 4);
+});
+
+test("all runnable plans from one planner pass can be marked launching together", () => {
+  const state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    readyInput("2.7gb.bin", TWO_POINT_SEVEN_GB_BYTES, "/tmp/2.7gb.bin", 1),
+    readyInput("147mb.bin", ONE_HUNDRED_FORTY_SEVEN_MB_BYTES, "/tmp/147mb.bin", 2)
+  ]);
+  const firstPass = planRunnableTransferLaunches(state, activeRooms);
+  const launching = new Map(firstPass.runnablePlans.map((plan) => [plan.itemId, plan.requestedWindow]));
+
+  const secondPass = planRunnableTransferLaunches(state, activeRooms, new Set(), launching);
+
+  assert.equal(firstPass.runnablePlans.length, 2);
+  assert.equal(launching.size, 2);
+  assert.equal(secondPass.runnablePlans.length, 0);
+  assert.equal(secondPass.plannerResult.activePlans.length, 2);
+  assert.deepEqual(
+    secondPass.plannerResult.activePlans.map((plan) => plan.requestedWindow).sort((left, right) => left - right),
+    [4, 4]
+  );
+});
+
+test("staggered metadata readiness documents small-first launch behavior", () => {
+  let state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    { path: "/tmp/2.7gb.bin" },
+    readyInput("147mb.bin", ONE_HUNDRED_FORTY_SEVEN_MB_BYTES, "/tmp/147mb.bin", 2)
+  ]);
+  const [large, small] = queuedItems(state);
+
+  const smallOnlyPass = planRunnableTransferLaunches(state, activeRooms);
+
+  assert.deepEqual(smallOnlyPass.runnablePlans.map((plan) => plan.itemId), [small.id]);
+  assert.equal(smallOnlyPass.runnablePlans[0].requestedWindow, 8);
+  assert.equal(smallOnlyPass.plannerResult.heldPlans.find((plan) => plan.taskId === large.id)?.reason, "missing_metadata");
+
+  state = markQueueItemPreparing(state, small.id, 8);
+  state = markQueueItemSending(state, small.id, {
+    displayName: "147mb.bin",
+    sizeBytes: ONE_HUNDRED_FORTY_SEVEN_MB_BYTES,
+    modifiedMs: 2,
+    dedupeKey: "147mb"
+  });
+  state = markQueueItemMetadataReady(state, large.id, {
+    displayName: "2.7gb.bin",
+    mimeType: "application/octet-stream",
+    sizeBytes: TWO_POINT_SEVEN_GB_BYTES,
+    modifiedMs: 1,
+    dedupeKey: "2.7gb"
+  });
+
+  const largeReadyWhileSmallActive = planRunnableTransferLaunches(state, activeRooms);
+
+  assert.equal(largeReadyWhileSmallActive.runnablePlans.length, 0);
+  assert.equal(largeReadyWhileSmallActive.plannerResult.activePlans[0].taskId, small.id);
+  assert.equal(largeReadyWhileSmallActive.plannerResult.activePlans[0].requestedWindow, 8);
+  assert.equal(
+    largeReadyWhileSmallActive.plannerResult.heldPlans.find((plan) => plan.taskId === large.id)?.reason,
+    "global_budget_exhausted"
+  );
+
+  state = markQueueItemCompleted(state, small.id);
+  const afterSmallCompletes = planRunnableTransferLaunches(state, activeRooms);
+
+  assert.deepEqual(afterSmallCompletes.runnablePlans.map((plan) => plan.itemId), [large.id]);
+  assert.equal(afterSmallCompletes.runnablePlans[0].requestedWindow, 8);
 });
 
 test("many-small queue starts bounded multiple transfers", () => {

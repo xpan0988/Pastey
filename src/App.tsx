@@ -1,5 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState } from "react";
+import type { MutableRefObject } from "react";
 import { BottomTabBar, type TabKey } from "./components/BottomTabBar";
 import { DevicesPage } from "./pages/DevicesPage";
 import { RoomPage } from "./pages/RoomPage";
@@ -45,6 +46,7 @@ import {
   planRunnableTransferLaunches,
   queuedItemsNeedingMetadata,
   selectRoomTransferQueue,
+  type TransferLaunchPlannerResult,
   type TransferQueueInput,
   type TransferSchedulerState
 } from "./lib/transferScheduler";
@@ -86,6 +88,7 @@ function App() {
   const metadataPreflightItemIdsRef = useRef<Set<string>>(new Set());
   const cancellingQueueTransferIdsRef = useRef<Set<string>>(new Set());
   const runtimeWindowUpdateKeysRef = useRef<Set<string>>(new Set());
+  const plannerLaunchSummaryKeyRef = useRef<string>("");
 
   useEffect(() => {
     schedulerRef.current = scheduler;
@@ -199,12 +202,19 @@ function App() {
   }, [scheduler, rooms]);
 
   useEffect(() => {
-    const { runnablePlans } = planRunnableTransferLaunches(
+    const launchPlan = planRunnableTransferLaunches(
       scheduler,
       rooms,
       closedRoomIdsRef.current,
       launchingQueueItemWindowsRef.current
     );
+    logPlannerLaunchSummary(
+      scheduler,
+      launchPlan,
+      plannerLaunchSummaryKeyRef,
+      launchingQueueItemWindowsRef.current
+    );
+    const { runnablePlans } = launchPlan;
 
     if (runnablePlans.length > 0) {
       console.info("[pastey queue] event=planner_launch_plan_count count=%d", runnablePlans.length);
@@ -216,6 +226,16 @@ function App() {
       }
 
       launchingQueueItemWindowsRef.current.set(plan.itemId, plan.requestedWindow);
+      const item = scheduler.items[plan.itemId];
+      console.info(
+        "[pastey queue] event=planner_launch_start room_id=%s queue_item_id=%s display_name=%s size_bytes=%s requested_window=%d lane=%s",
+        plan.roomId,
+        plan.itemId,
+        item?.displayName ?? "unknown",
+        typeof item?.sizeBytes === "number" ? String(item.sizeBytes) : "unknown",
+        plan.requestedWindow,
+        plan.lane
+      );
       void processTransferQueueItem(plan.itemId, plan.requestedWindow).finally(() => {
         launchingQueueItemWindowsRef.current.delete(plan.itemId);
         updateSchedulerState((current) => ({ ...current }));
@@ -471,6 +491,13 @@ function App() {
       dedupeKey: item.dedupeKey ?? fileIdentityKey(displayName, metadata.size_bytes, metadata.modified_ms)
     };
 
+    console.info(
+      "[pastey queue] event=metadata_preflight_ready room_id=%s queue_item_id=%s display_name=%s size_bytes=%d",
+      item.roomId,
+      item.id,
+      prepared.displayName,
+      prepared.sizeBytes
+    );
     updateSchedulerState((current) => markQueueItemMetadataReady(current, itemId, prepared));
     return prepared;
   }
@@ -722,6 +749,70 @@ function App() {
 
       {view.screen === "tabs" ? <BottomTabBar activeTab={activeTab} onSelectTab={setActiveTab} /> : null}
     </div>
+  );
+}
+
+function logPlannerLaunchSummary(
+  scheduler: TransferSchedulerState,
+  launchPlan: TransferLaunchPlannerResult,
+  lastSummaryKeyRef: MutableRefObject<string>,
+  launchingItemWindows: ReadonlyMap<string, number>
+) {
+  const candidates = Object.values(scheduler.items).filter((item) => (
+    item.status === "queued" || item.status === "preparing" || item.status === "sending"
+  ));
+  if (candidates.length === 0 && launchPlan.runnablePlans.length === 0 && launchPlan.plannerResult.heldPlans.length === 0) {
+    return;
+  }
+
+  const metadataReadyCount = candidates.filter((item) => (
+    item.metadataStatus === "ready" && typeof item.sizeBytes === "number"
+  )).length;
+  const activeCandidateCount = candidates.filter((item) => (
+    item.status === "preparing" || item.status === "sending" || launchingItemWindows.has(item.id)
+  )).length;
+  const heldReasonCounts = launchPlan.plannerResult.heldPlans.reduce<Record<string, number>>((counts, plan) => {
+    counts[plan.reason] = (counts[plan.reason] ?? 0) + 1;
+    return counts;
+  }, {});
+  const runnableDetails = launchPlan.runnablePlans.map((plan) => {
+    const item = scheduler.items[plan.itemId];
+    return {
+      itemId: plan.itemId,
+      roomId: plan.roomId,
+      displayName: item?.displayName ?? null,
+      sizeBytes: item?.sizeBytes ?? null,
+      requestedWindow: plan.requestedWindow,
+      lane: plan.lane
+    };
+  });
+  const summaryKey = JSON.stringify({
+    candidates: candidates.map((item) => [
+      item.id,
+      item.status,
+      item.metadataStatus,
+      item.sizeBytes ?? null,
+      item.requestedWindow ?? null,
+      item.activeTransferId ?? null,
+      item.cancelRequested
+    ]),
+    launching: [...launchingItemWindows.entries()],
+    runnableDetails,
+    heldReasonCounts
+  });
+  if (summaryKey === lastSummaryKeyRef.current) {
+    return;
+  }
+  lastSummaryKeyRef.current = summaryKey;
+
+  console.info(
+    "[pastey queue] event=planner_launch_summary total_candidates=%d metadata_ready_candidates=%d active_candidates=%d runnable_count=%d held_reasons=%s runnable=%s",
+    candidates.length,
+    metadataReadyCount,
+    activeCandidateCount,
+    launchPlan.runnablePlans.length,
+    JSON.stringify(heldReasonCounts),
+    JSON.stringify(runnableDetails)
   );
 }
 
