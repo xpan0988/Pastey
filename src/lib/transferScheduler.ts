@@ -195,7 +195,7 @@ export function markQueueItemPreparing(
   requestedWindow?: number
 ): TransferSchedulerState {
   const item = state.items[itemId];
-  if (!item) return state;
+  if (!item || isTerminalQueueItem(item)) return state;
 
   return replaceItem(
     state,
@@ -238,7 +238,7 @@ export function markQueueItemMetadataReady(
   }
 ): TransferSchedulerState {
   const item = state.items[itemId];
-  if (!item) return state;
+  if (!item || isTerminalQueueItem(item)) return state;
 
   return replaceItem(
     state,
@@ -263,7 +263,7 @@ export function markQueueItemMetadataFailed(
   errorMessage: string
 ): TransferSchedulerState {
   const item = state.items[itemId];
-  if (!item) return state;
+  if (!item || isTerminalQueueItem(item)) return state;
 
   return replaceItem(
     state,
@@ -290,7 +290,7 @@ export function markQueueItemSending(
   }
 ): TransferSchedulerState {
   const item = state.items[itemId];
-  if (!item) return state;
+  if (!item || isTerminalQueueItem(item)) return state;
 
   return replaceItem(
     state,
@@ -346,11 +346,7 @@ export function cancelQueueItem(state: TransferSchedulerState, itemId: string): 
     true
   );
 
-  if (item.activeTransferId) {
-    return nextState;
-  }
-
-  return cancelBatchLocally(nextState, item.batchId);
+  return nextState;
 }
 
 export function cancelBatchLocally(state: TransferSchedulerState, batchId: string): TransferSchedulerState {
@@ -520,6 +516,7 @@ export function planRunnableTransferLaunches(
       const roomStatus = roomStatusById.get(item.roomId);
       const isLaunching = launchingItemWindows.has(item.id);
       const isBatchCancelled = batch.cancelRequested || batch.status === "cancelled";
+      const isActive = isLaunching || item.status === "preparing" || item.status === "sending";
       tasks.push({
         id: item.id,
         roomId: item.roomId,
@@ -529,7 +526,7 @@ export function planRunnableTransferLaunches(
         sizeBytes: item.sizeBytes,
         roomStatus: closedRoomIds.has(item.roomId) ? "unavailable" : roomStatus ?? "unavailable",
         roomAvailable: !closedRoomIds.has(item.roomId) && roomStatus === "active",
-        cancelRequested: item.cancelRequested || isBatchCancelled,
+        cancelRequested: isActive ? false : item.cancelRequested || isBatchCancelled,
         requestedWindow: isLaunching ? launchingItemWindows.get(item.id) : item.requestedWindow,
         activeRequestedWindow: isLaunching ? launchingItemWindows.get(item.id) : item.requestedWindow,
         createdAt: item.createdAt
@@ -604,6 +601,7 @@ function updateItemStatus(
 ): TransferSchedulerState {
   const item = state.items[itemId];
   if (!item) return state;
+  if (isTerminalQueueItem(item) && item.status !== status) return state;
 
   return replaceItem(
     state,

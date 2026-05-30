@@ -292,12 +292,12 @@ Goal: make the queue UI honest and usable when more than one item can be active.
 
 Rationale:
 
-- The current queue panel has singular "Current" language and shows a small visible subset.
-- Multi-active dispatch needs clear active, queued, failed, and cancelling state without implying only one transfer can run.
+- The serial-era queue panel had singular "Current" language and showed only one active item.
+- Multi-active dispatch now needs clear active, queued, failed, cancelled, and cancelling state without implying only one transfer can run.
 
 Likely changes:
 
-- Replace singular current-item display with an active transfers section or active count.
+- Replace singular current-item display with an active transfers section and active count.
 - Show requested/effective window only in developer-oriented surfaces if exposed at all.
 - Keep normal user copy focused on transfer state, not scheduler internals.
 - Keep text sending UI unchanged.
@@ -312,7 +312,7 @@ Tests:
 
 Exit gate:
 
-- The UI no longer assumes exactly one active queued item.
+- The UI no longer assumes exactly one active queued item; it shows active counts and multiple active queued rows without changing runtime dispatch.
 
 ### Step 7: Burn/Cancel/Finalize Regression Tests
 
@@ -322,6 +322,7 @@ Rationale:
 
 - Rust transfer lifecycle is already keyed by transfer id and has burn/finalize protections.
 - Multiple active transfers increase race exposure and require focused regression coverage.
+- Implementation status: frontend scheduler regression coverage now includes multi-active batch cancel, single-item cancel before and after transfer-id correlation, burned-room queue cleanup, active budget reservation during in-flight cancellation, and late queue mutations against terminal queue items. Existing Rust coverage continues to cover receiver `.part` cleanup, burn/finalize race prevention, terminal reason mapping, and Inbox ownership.
 
 Test coverage:
 
@@ -330,6 +331,7 @@ Test coverage:
 - Batch cancel with several active sending queue items.
 - Single-item cancel before transfer id correlation.
 - Single-item cancel after transfer id correlation.
+- Late queue mutations must not resurrect terminal queue items.
 - Late chunk after cancel.
 - Late finalize after burn.
 - Receiver interruption removes or records `.part` cleanup correctly.
@@ -339,7 +341,7 @@ Test coverage:
 
 Exit gate:
 
-- Existing binary-v1, JSON fallback, ACK, retry, cancel, burn, finalize, terminal reason, and Inbox tests still pass, with added multi-active coverage.
+- Existing binary-v1, JSON fallback, ACK, retry, cancel, burn, finalize, terminal reason, and Inbox tests still pass, with added multi-active coverage. No Phase 4 runtime rebalancing or protocol changes are included.
 
 ### Step 8: Dev-Fast Benchmark Matrix
 

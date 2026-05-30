@@ -415,12 +415,16 @@ function QueuePanel({ queue, onCancelItem, onCancelBatch }: QueuePanelProps) {
       .map((itemId) => queue.items.find((item) => item.id === itemId))
       .filter((item): item is TransferQueueItem => Boolean(item))
     : queue.items;
-  const activeItem = panelItems.find((item) => item.status === "preparing" || item.status === "sending");
+  const activeItems = panelItems.filter((item) => item.status === "preparing" || item.status === "sending");
+  const activeCount = activeItems.length;
   const completedCount = panelItems.filter((item) => item.status === "completed").length;
   const failedCount = panelItems.filter((item) => item.status === "failed").length;
   const queuedCount = panelItems.filter((item) => item.status === "queued").length;
+  const cancelledCount = panelItems.filter((item) => item.status === "cancelled").length;
+  const visibleActiveItems = activeItems.slice(0, 4);
+  const remainingActiveCount = Math.max(0, activeCount - visibleActiveItems.length);
   const visibleItems = panelItems
-    .filter((item) => item.status === "queued" || item.status === "preparing" || item.status === "sending" || item.status === "failed")
+    .filter((item) => item.status === "queued" || item.status === "failed")
     .slice(0, 4);
 
   return (
@@ -430,7 +434,7 @@ function QueuePanel({ queue, onCancelItem, onCancelBatch }: QueuePanelProps) {
           <span className="meta-label">Transfer queue</span>
           <strong>{queueStatusLabel(activeBatch)}</strong>
           <span className="muted">
-            {panelItems.length} files · {completedCount} done · {failedCount} failed · {queuedCount} queued
+            {panelItems.length} files · {activeCount} active · {queuedCount} queued · {completedCount} done · {failedCount} failed · {cancelledCount} cancelled
           </span>
         </div>
         {activeBatch?.status === "running" ? (
@@ -440,10 +444,17 @@ function QueuePanel({ queue, onCancelItem, onCancelBatch }: QueuePanelProps) {
         ) : null}
       </div>
 
-      {activeItem ? (
-        <div className="queue-current">
-          <span className="muted">Current</span>
-          <strong>{activeItem.displayName ?? fileNameFromPath(activeItem.path)}</strong>
+      {activeCount > 0 ? (
+        <div className="queue-active">
+          <div className="row spread gap">
+            <span className="muted">{activeCount === 1 ? "Active transfer" : `${activeCount} active transfers`}</span>
+            {remainingActiveCount > 0 ? <span className="muted">+{remainingActiveCount} more</span> : null}
+          </div>
+          <div className="queue-items">
+            {visibleActiveItems.map((item) => (
+              <QueueItemRow key={item.id} item={item} onCancelItem={onCancelItem} />
+            ))}
+          </div>
         </div>
       ) : null}
 
