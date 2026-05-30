@@ -28,7 +28,7 @@ At a high level:
 - The current large-file transport is per-file, chunked, encrypted, LAN peer transfer. The frontend can queue multiple selected, dropped, or pasted files, and weighted planner output can start multiple existing queued file-like transfers. Each file still uses the existing single-file transfer command.
 - Binary-v1 chunk frames are the preferred high-performance chunk protocol; JSON/base64 chunk upload remains a legacy fallback.
 - Device diagnostics and link benchmarks exist, but they are advisory and do not currently drive routing or transfer tuning.
-- A pure frontend weighted transfer planner drives runtime dispatch for existing queued file-like transfers. It does not mutate running transfer windows.
+- A pure frontend weighted transfer planner drives runtime dispatch for existing queued file-like transfers. Phase 4A completion-only rebalance can update active outgoing binary-v1 sender runtime windows after a planner-managed queue item reaches a terminal state. Diagnostics and benchmarks remain advisory and do not drive adaptive tuning.
 
 The current product model is room-based. A room is the coordination object for a transfer session. Room lifecycle is manual-burn based: Burn ends the local room state and cleans transient room data, but Inbox-saved received files are treated as durable user output.
 
@@ -158,7 +158,7 @@ The long-term direction described in `README.md` is broader local-first device c
 - Defines planner task kinds, size classes, lanes, priority, sensitivity flags, runnable plans, active plans, held plans, lane budget reports, requested windows, and held/debug reasons.
 - Default policy uses `globalWindowBudget = 8`, `minRequestedWindow = 1`, lane weights for `small_file` and `bulk_file`, a model-only `control_text` lane, and a safety active-transfer cap.
 - Requires metadata-ready tasks for allocation; missing metadata, burned/unavailable rooms, cancelled tasks, and terminal tasks become held plans.
-- Reserves active transfer budget before producing runnable plans and keeps total active plus runnable requested windows within the global window budget.
+- Reserves active transfer budget before producing runnable plans in the normal launch pass, and uses batch-relative size weighting for final file-like requested-window allocation. Completion-only Phase 4A rebalance can reallocate active sender windows while keeping total active plus runnable requested windows within the global window budget.
 - Used by `App.tsx` runtime dispatch for queued file-like transfers only. Text/control/agent/command lanes remain model-only.
 
 `src/pages/SettingsPage.tsx`
