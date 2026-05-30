@@ -94,7 +94,14 @@ Remaining Phase 4 limits:
 
 - JSON fallback has no pipelined mutable window behavior; Phase 4A returns a structured no-op for it rather than redesigning fallback transfer.
 - Retry/timeout downshift, stable cooldown recovery, speed-history heuristics, and history-aware weighting remain future work.
-- Manual huge-plus-small smoke validation for live runtime mutation remains separate from the unit and build validation listed here.
+
+Phase 4A smoke validation:
+
+- Status: passed for the tested 2.7GB plus 147MB scenario.
+- Batch-relative planner allocation produced the expected approximate 7 plus 1 startup split: the 147MB transfer used window 1 and the 2.7GB transfer used window 7 initially.
+- After the 147MB transfer completed successfully, completion-only rebalance updated the still-active 2.7GB transfer from runtime window 7 to 8 and `update_transfer_window` returned `updated=true`.
+- The 2.7GB transfer then completed successfully without failed or duplicate chunks.
+- This validates Phase 4A completion-only rebalance for that smoke scenario only. It is not Phase 4B retry/timeout adaptation, stable cooldown recovery, speed/history heuristics, ML/DL policy, full benchmark validation, or release-build throughput validation.
 
 ### Later: History-Aware Heuristic Planner
 
@@ -242,7 +249,7 @@ Exit gate:
 
 ### Step 4: `requestedWindow` Parameter Chain
 
-Goal: allow the future planner to request a per-transfer sender window while preserving omitted-option behavior.
+Goal: allow the planner to request a per-transfer sender window while preserving omitted-option behavior.
 
 Implementation status: completed. Planner-driven dispatch passes requested windows; non-planner sends may still omit them.
 
@@ -414,11 +421,13 @@ Exit gate:
 
 - The planner improves or preserves practical transfer behavior in `tauri:dev-fast`, and release-build validation is planned before shipping.
 
-Smoke validation status: partially passed.
+Step 8 smoke validation status: partially passed.
 
 Manual smoke testing with random mixed files dragged in at once validated the v1 planner path at a practical level, but did not complete the full benchmark matrix above. Mixed small, medium, and large files completed successfully. Multiple files started in close succession, with some starts staggered by roughly one second. A 2.5GB GGUF file completed successfully at about 108 MB/s average. Medium installers/archive files and small image/PDF-like files completed successfully. In a two-file model/installer run, the remaining large transfer's throughput increased after the other file completed. Burn behaved normally.
 
-No obvious progress cross-correlation, duplicate launch, terminal-state mutation, or cancel/burn corruption was observed during this smoke pass. This evidence validates Weighted Transfer Planner v1 smoke behavior only. It is not full benchmark validation, release-build throughput validation, or Phase 4 runtime window mutation evidence.
+No obvious progress cross-correlation, duplicate launch, terminal-state mutation, or cancel/burn corruption was observed during this smoke pass. This earlier evidence validates Weighted Transfer Planner v1 smoke behavior only. It is not full benchmark validation, release-build throughput validation, or evidence for the later Phase 4A runtime window mutation path.
+
+Phase 4A smoke validation is recorded separately above. The later 2.7GB plus 147MB smoke pass validated the expected 7 plus 1 startup allocation and a completion-only runtime update from 7 to 8 on the still-active large transfer, but it still does not complete the full benchmark matrix or release-build throughput validation.
 
 ## Required Minimal Model Additions
 
