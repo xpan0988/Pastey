@@ -182,10 +182,12 @@ function App() {
     );
 
     for (const item of metadataItems) {
+      console.info("[pastey queue] event=metadata_preflight_start room_id=%s queue_item_id=%s path=%s", item.roomId, item.id, item.path);
       metadataPreflightItemIdsRef.current.add(item.id);
       void prepareQueueItemMetadata(item.id)
         .catch((err) => {
           const message = err instanceof Error ? err.message : String(err);
+          console.info("[pastey queue] event=metadata_preflight_failed room_id=%s queue_item_id=%s error=%s", item.roomId, item.id, message);
           updateSchedulerState((current) => markQueueItemMetadataFailed(current, item.id, message));
           void refreshRoomAfterQueueItem(item.roomId);
         })
@@ -203,6 +205,10 @@ function App() {
       closedRoomIdsRef.current,
       launchingQueueItemWindowsRef.current
     );
+
+    if (runnablePlans.length > 0) {
+      console.info("[pastey queue] event=planner_launch_plan_count count=%d", runnablePlans.length);
+    }
 
     for (const plan of runnablePlans) {
       if (launchingQueueItemWindowsRef.current.has(plan.itemId)) {
@@ -539,15 +545,29 @@ function App() {
   }
 
   function enqueueRoomFiles(roomId: string, paths: string[]) {
-    updateSchedulerState((current) => enqueueTransferBatch(
-      current,
-      roomId,
-      paths.map((path) => ({ path }))
-    ));
+    console.info("[pastey queue] event=queue_enqueue_attempt room_id=%s file_count=%d", roomId, paths.length);
+    updateSchedulerState((current) => {
+      const next = enqueueTransferBatch(
+        current,
+        roomId,
+        paths.map((path) => ({ path }))
+      );
+      if (next === current) {
+        console.info("[pastey queue] event=queue_enqueue_rejected room_id=%s reason=no_new_items", roomId);
+      }
+      return next;
+    });
   }
 
   function enqueueRoomTransferInputs(roomId: string, inputs: TransferQueueInput[]) {
-    updateSchedulerState((current) => enqueueTransferBatch(current, roomId, inputs));
+    console.info("[pastey queue] event=queue_enqueue_attempt room_id=%s file_count=%d", roomId, inputs.length);
+    updateSchedulerState((current) => {
+      const next = enqueueTransferBatch(current, roomId, inputs);
+      if (next === current) {
+        console.info("[pastey queue] event=queue_enqueue_rejected room_id=%s reason=no_new_items", roomId);
+      }
+      return next;
+    });
   }
 
   async function handleCancelQueueItem(itemId: string) {

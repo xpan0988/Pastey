@@ -84,8 +84,12 @@ export function RoomPage({
 
         if (event.payload.type === "drop") {
           setComposerDropActive(false);
-          if (!canSend) return;
+          if (!canSend) {
+            console.info("[pastey queue] event=file_drop_rejected reason=send_disabled room_id=%s status=%s peer_connected=%s busy=%s", room.id, room.status, room.peer_connected, busy ?? "none");
+            return;
+          }
           if (event.payload.paths.length > 0) {
+            console.info("[pastey queue] event=file_drop_received room_id=%s file_count=%d", room.id, event.payload.paths.length);
             onEnqueueFiles(room.id, event.payload.paths);
           }
           return;
@@ -124,18 +128,23 @@ export function RoomPage({
   async function handlePickFile(event?: MouseEvent<HTMLButtonElement>) {
     event?.preventDefault();
     event?.stopPropagation();
-    if (!canSend) return;
+    if (!canSend) {
+      console.info("[pastey queue] event=file_input_rejected reason=send_disabled room_id=%s status=%s peer_connected=%s busy=%s", room.id, room.status, room.peer_connected, busy ?? "none");
+      return;
+    }
     const selected = await open({
       multiple: true,
       directory: false
     });
 
     if (typeof selected === "string") {
+      console.info("[pastey queue] event=file_input_selected room_id=%s file_count=1", room.id);
       onEnqueueFiles(room.id, [selected]);
       return;
     }
 
     if (Array.isArray(selected) && selected.length > 0) {
+      console.info("[pastey queue] event=file_input_selected room_id=%s file_count=%d", room.id, selected.length);
       onEnqueueFiles(room.id, selected);
     }
   }

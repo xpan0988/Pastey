@@ -420,12 +420,40 @@ export function cancelBatchLocally(state: TransferSchedulerState, batchId: strin
 }
 
 export function clearQueuedItemsForRoom(state: TransferSchedulerState, roomId: string): TransferSchedulerState {
-  let nextState = state;
+  const now = Date.now();
+  let nextState: TransferSchedulerState = {
+    ...state,
+    batches: { ...state.batches },
+    items: { ...state.items }
+  };
+
   for (const batch of Object.values(state.batches)) {
-    if (batch.roomId === roomId) {
-      nextState = cancelBatchLocally(nextState, batch.id);
+    if (batch.roomId !== roomId) {
+      continue;
+    }
+
+    nextState.batches[batch.id] = {
+      ...batch,
+      status: "cancelled",
+      cancelRequested: true,
+      updatedAt: now
+    };
+
+    for (const itemId of batch.itemIds) {
+      const item = nextState.items[itemId];
+      if (!item || isTerminalQueueItem(item)) {
+        continue;
+      }
+
+      nextState.items[itemId] = {
+        ...item,
+        status: "cancelled",
+        cancelRequested: true,
+        updatedAt: now
+      };
     }
   }
+
   return nextState;
 }
 
