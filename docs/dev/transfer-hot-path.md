@@ -46,7 +46,15 @@ $env:PASTEY_TRANSFER_WINDOW_SIZE="8"; Start-Process "pastey.exe"
 
 The transfer logs include `event=transfer_tuning` at transfer start with `effective_window_size`, `chunk_size`, `override_source`, and `transfer_protocol`. Successful binary-v1 transfers also emit `event=transfer_benchmark_summary` with sender and receiver timing summaries, average throughput, failed chunk count, duplicate chunk count, and finalize status.
 
-MicroFlowGroup manual-validation logs use the `[pastey:micro-group]` prefix. They record planner decisions, group launch, the currently running child, child terminal status, stop reasons for batch cancellation or room burn/cleanup, and final group status/terminal reason. These logs use room ids, group ids, queue item ids, display names, sizes, counts, statuses, and terminal reasons; they must not include absolute file paths.
+Frontend scheduler diagnostics are bridged into the normal app log with allowlisted prefixes. `[pastey:planner]` records launch-plan summaries, `[pastey:micro-group]` records planned, launched, running, child_running, child_terminal, stopped, and final group lifecycle events, and `[pastey:runtime-window]` records planner runtime-window update attempts and per-transfer window summaries. These lines use room ids, group ids, queue item ids, display names, sizes, counts, statuses, terminal reasons, requested/effective windows, override source, and transfer protocol when the frontend can infer it. They must not include absolute file paths.
+
+Example validation searches, using the app log path for the current platform:
+
+```sh
+rg "\\[pastey:(planner|micro-group|runtime-window)\\]" /path/to/pastey.log
+rg "\\[pastey:micro-group\\].*event=final" /path/to/pastey.log
+rg "\\[pastey:runtime-window\\].*event=summary" /path/to/pastey.log
+```
 
 ## Local Dev-Fast Transfer Testing
 

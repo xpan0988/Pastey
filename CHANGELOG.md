@@ -12,7 +12,7 @@ Detailed update and release history for Pastey.
 - Added planner-driven multi-worker execution for existing queued file-like transfers while preserving the existing `sendFileToRoom` / `send_file_to_room` single-file transfer path.
 - Added `MicroFlowGroup` planner output for eligible tiny file-like queue items, including shadow reporting and scheduler-only serial dispatch where a group consumes one requested window and each child still uses the existing single-file transfer path.
 - Added internal MicroFlowGroup runtime status tracking for queued, running, completed, completed-with-errors, cancelled, and interrupted serial groups.
-- Added low-noise `[pastey:micro-group]` planner/runtime logs for manual validation without logging absolute file paths.
+- Added low-noise `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]` diagnostics that persist through the normal app log for manual validation without logging absolute file paths.
 - Added planner and scheduler coverage for huge-plus-many-tiny allocation, serial MicroFlowGroup launch plans, one-window group invariants, group terminal state, and shadow grouping that leaves child runnable plans unchanged.
 - Added optional sender-side `requestedWindow` plumbing through `sendFileToRoom`, Rust `send_file_to_room`, `send_room_file`, and transfer tuning. Planner-selected sends pass requested windows; env and effective Developer Tools overrides still take precedence, omitted values keep the window 8 default, and no receiver protocol fields changed.
 - Added `npm run tauri:dev-fast`, backed by an optimized custom Cargo `dev-fast` profile, for faster local transfer-throughput testing before future scheduling work.

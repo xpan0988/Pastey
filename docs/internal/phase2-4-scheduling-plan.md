@@ -21,6 +21,7 @@ Current implemented behavior:
 - `PASTEY_TRANSFER_WINDOW_SIZE` and effective Developer Tools transfer-window settings remain the debugging overrides.
 - A pure weighted planner exists, has unit coverage, and drives runtime dispatch for queued file-like transfers. Lane and size class still provide classification, priority, constraints, and reports, while final requested-window allocation for selected file-like transfers is batch-relative and size-weighted.
 - `MicroFlowGroup` planner output and scheduler-only serial dispatch are implemented for eligible tiny file-like queue items. A group consumes one planner window while its children are sent one at a time through the existing single-file transfer path.
+- Planner, MicroFlowGroup, and runtime-window frontend diagnostics are bridged into the normal app log with `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]` prefixes for manual validation. These diagnostics are low-noise internal logs and must not include absolute file paths.
 - The transfer API accepts an optional sender-side planner requested window; planner-driven sends pass it.
 - Active outgoing binary-v1 sender transfers have a sender-only runtime window handle that can be updated by a structured command while the transfer is running.
 - Planner-managed queued file-like transfers trigger completion-only active-window rebalance after a queue item reaches a terminal state.

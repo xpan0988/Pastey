@@ -205,3 +205,7 @@ export async function checkForUpdates(): Promise<void> {
 export async function copyTextToClipboard(text: string): Promise<void> {
   return invoke("copy_text_to_clipboard", { text });
 }
+
+export async function logFrontendDiagnostic(line: string): Promise<boolean> {
+  return invoke("log_frontend_diagnostic", { line });
+}
