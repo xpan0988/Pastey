@@ -1,6 +1,9 @@
 import {
+  classifyTransferPlannerSize,
+  DEFAULT_TRANSFER_PLANNER_POLICY,
   planWeightedTransfers,
   type MicroFlowGroupPlan,
+  type TransferPlannerPolicy,
   type TransferPlannerResult,
   type TransferPlannerRunnablePlan,
   type TransferPlannerTask,
@@ -120,6 +123,17 @@ export interface TransferWindowRebalancePlan {
   transferId: string;
   requestedWindow: number;
   previousWindow: number;
+}
+
+export interface MicroFlowGroupPlanningDiagnostics {
+  tinyCandidates: number;
+  eligibleTinyCandidates: number;
+  largestEligibleBucket: number;
+  overChildSizeLimit: number;
+  metadataMissing: number;
+  roomUnavailable: number;
+  cancelledOrTerminal: number;
+  microGroupSkipReason: string;
 }
 
 export interface CancellableTransferRequest {
@@ -884,6 +898,95 @@ export function planActiveTransferWindowRebalances(
     .filter((plan): plan is TransferWindowRebalancePlan => Boolean(plan));
 }
 
+export function summarizeMicroFlowGroupPlanning(
+  state: TransferSchedulerState,
+  rooms: readonly Pick<RoomInfo, "id" | "status">[],
+  closedRoomIds: ReadonlySet<string> = new Set(),
+  policy: TransferPlannerPolicy = DEFAULT_TRANSFER_PLANNER_POLICY
+): MicroFlowGroupPlanningDiagnostics {
+  const roomStatusById = new Map(rooms.map((room) => [room.id, room.status]));
+  const eligibleBuckets = new Map<string, number>();
+  let tinyCandidates = 0;
+  let eligibleTinyCandidates = 0;
+  let overChildSizeLimit = 0;
+  let metadataMissing = 0;
+  let roomUnavailable = 0;
+  let cancelledOrTerminal = 0;
+
+  for (const batchId of state.batchOrder) {
+    const batch = state.batches[batchId];
+    if (!batch) {
+      continue;
+    }
+
+    for (const itemId of batch.itemIds) {
+      const item = state.items[itemId];
+      if (!item) {
+        continue;
+      }
+
+      if (isTerminalQueueItem(item) || item.cancelRequested || batch.cancelRequested || batch.status === "cancelled") {
+        cancelledOrTerminal += 1;
+        continue;
+      }
+      if (item.status !== "queued") {
+        continue;
+      }
+
+      const roomStatus = closedRoomIds.has(item.roomId) ? "unavailable" : roomStatusById.get(item.roomId);
+      if (roomStatus !== "active") {
+        roomUnavailable += 1;
+        continue;
+      }
+      if (item.metadataStatus !== "ready" || typeof item.sizeBytes !== "number") {
+        metadataMissing += 1;
+        continue;
+      }
+      if (item.sizeBytes > policy.microGroupMaxChildSizeBytes) {
+        overChildSizeLimit += 1;
+        continue;
+      }
+
+      const sizeClass = classifyTransferPlannerSize(item.sizeBytes);
+      const lane = sizeClass === "large" || sizeClass === "huge" ? "bulk_file" : "small_file";
+      if ((sizeClass !== "tiny" && sizeClass !== "small") || lane !== "small_file") {
+        continue;
+      }
+
+      tinyCandidates += 1;
+      eligibleTinyCandidates += 1;
+      const key = [
+        item.roomId,
+        lane,
+        sizeClass,
+        "file_like",
+        broadMimeFamily(item.mimeType)
+      ].join(":");
+      eligibleBuckets.set(key, (eligibleBuckets.get(key) ?? 0) + 1);
+    }
+  }
+
+  const largestEligibleBucket = Math.max(0, ...eligibleBuckets.values());
+
+  return {
+    tinyCandidates,
+    eligibleTinyCandidates,
+    largestEligibleBucket,
+    overChildSizeLimit,
+    metadataMissing,
+    roomUnavailable,
+    cancelledOrTerminal,
+    microGroupSkipReason: microGroupSkipReason({
+      policy,
+      eligibleTinyCandidates,
+      largestEligibleBucket,
+      overChildSizeLimit,
+      metadataMissing,
+      roomUnavailable
+    })
+  };
+}
+
 export function queuedItemsNeedingMetadata(
   state: TransferSchedulerState,
   rooms: readonly Pick<RoomInfo, "id" | "status">[],
@@ -1056,6 +1159,40 @@ function transferPlannerTaskKind(item: TransferQueueItem): TransferPlannerTaskKi
     return "image";
   }
   return "file";
+}
+
+function broadMimeFamily(mimeType?: string | null): string {
+  const trimmed = mimeType?.trim().toLowerCase();
+  if (!trimmed || !trimmed.includes("/")) {
+    return "unknown";
+  }
+  return trimmed.split("/", 1)[0] || "unknown";
+}
+
+function microGroupSkipReason(input: {
+  policy: TransferPlannerPolicy;
+  eligibleTinyCandidates: number;
+  largestEligibleBucket: number;
+  overChildSizeLimit: number;
+  metadataMissing: number;
+  roomUnavailable: number;
+}): string {
+  if (input.policy.microGroupDispatchMode !== "serial" && input.policy.microGroupDispatchMode !== "shadow") {
+    return "disabled";
+  }
+  if (input.eligibleTinyCandidates === 0 && input.metadataMissing > 0) {
+    return "metadata_missing";
+  }
+  if (input.eligibleTinyCandidates === 0 && input.roomUnavailable > 0) {
+    return "room_unavailable";
+  }
+  if (input.eligibleTinyCandidates === 0 && input.overChildSizeLimit > 0) {
+    return "over_child_size_limit";
+  }
+  if (input.largestEligibleBucket < 2) {
+    return "not_enough_eligible_children";
+  }
+  return "not_selected_by_allocator";
 }
 
 function nonterminalDedupeKeys(state: TransferSchedulerState): Set<string> {

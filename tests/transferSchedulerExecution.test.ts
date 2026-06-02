@@ -22,6 +22,7 @@ import {
   planActiveTransferWindowRebalances,
   planRunnableTransferLaunches,
   recordMicroFlowGroupChildTerminal,
+  summarizeMicroFlowGroupPlanning,
   type TransferQueueItem,
   type TransferSchedulerState
 } from "../src/lib/transferScheduler";
@@ -168,6 +169,45 @@ test("many-tiny queue produces one serial micro group launch plan", () => {
   assert.equal(microGroupPlans[0].requestedWindow, 1);
   assert.equal(microGroupPlans[0].childItemIds.length, 16);
   assert.equal(plannerResult.requestedWindowTotal, 1);
+});
+
+test("single eligible tiny queue item explains no micro group", () => {
+  const state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    [readyInput("tiny-one.bin", 350 * 1024, "/tmp/tiny-one.bin", 1)]
+  );
+
+  const { runnablePlans, microGroupPlans } = planRunnableTransferLaunches(state, activeRooms);
+  const diagnostics = summarizeMicroFlowGroupPlanning(state, activeRooms);
+
+  assert.equal(microGroupPlans.length, 0);
+  assert.equal(runnablePlans.length, 1);
+  assert.equal(diagnostics.tinyCandidates, 1);
+  assert.equal(diagnostics.eligibleTinyCandidates, 1);
+  assert.equal(diagnostics.largestEligibleBucket, 1);
+  assert.equal(diagnostics.microGroupSkipReason, "not_enough_eligible_children");
+});
+
+test("twenty sub-one-megabyte queue items group and suppress child runnable plans", () => {
+  const state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    Array.from({ length: 20 }, (_, index) => (
+      readyInput(`sub-mib-${index}.bin`, (100 + index * 30) * 1024, `/tmp/sub-mib-${index}.bin`, index)
+    ))
+  );
+
+  const { runnablePlans, microGroupPlans, plannerResult } = planRunnableTransferLaunches(state, activeRooms);
+  const groupedChildIds = new Set(microGroupPlans.flatMap((plan) => plan.childItemIds));
+  const diagnostics = summarizeMicroFlowGroupPlanning(state, activeRooms);
+
+  assert.ok(microGroupPlans.length >= 1);
+  assert.ok(microGroupPlans.every((plan) => plan.requestedWindow === 1));
+  assert.equal(runnablePlans.filter((plan) => groupedChildIds.has(plan.itemId)).length, 0);
+  assert.equal(plannerResult.requestedWindowTotal, microGroupPlans.length);
+  assert.equal(diagnostics.eligibleTinyCandidates, 20);
+  assert.ok(diagnostics.largestEligibleBucket >= 2);
 });
 
 test("huge plus many tiny queue gives huge runnable window seven and micro group window one", () => {

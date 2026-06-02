@@ -21,7 +21,7 @@ Current implemented behavior:
 - `PASTEY_TRANSFER_WINDOW_SIZE` and effective Developer Tools transfer-window settings remain the debugging overrides.
 - A pure weighted planner exists, has unit coverage, and drives runtime dispatch for queued file-like transfers. Lane and size class still provide classification, priority, constraints, and reports, while final requested-window allocation for selected file-like transfers is batch-relative and size-weighted.
 - `MicroFlowGroup` planner output and scheduler-only serial dispatch are implemented for eligible tiny file-like queue items. A group consumes one planner window while its children are sent one at a time through the existing single-file transfer path.
-- Planner, MicroFlowGroup, and runtime-window frontend diagnostics are bridged into the normal app log with `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]` prefixes for manual validation. These diagnostics are low-noise internal logs and must not include absolute file paths.
+- Planner, MicroFlowGroup, and runtime-window frontend diagnostics are bridged into the normal app log with `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]` prefixes for manual validation. Planner summaries include MicroFlowGroup candidate counts and skip reason when no group is produced. These diagnostics are low-noise internal logs and must not include absolute file paths.
 - The transfer API accepts an optional sender-side planner requested window; planner-driven sends pass it.
 - Active outgoing binary-v1 sender transfers have a sender-only runtime window handle that can be updated by a structured command while the transfer is running.
 - Planner-managed queued file-like transfers trigger completion-only active-window rebalance after a queue item reaches a terminal state.
@@ -48,6 +48,7 @@ Current invariants:
 - Total requested windows, including groups, must never exceed `globalWindowBudget`.
 - A `MicroFlowGroup` consumes exactly one requested window in the current implementation.
 - Children inside a `MicroFlowGroup` do not independently consume planner windows while grouped.
+- A group requires at least two eligible children. Each child must be a queued, metadata-ready, non-cancelled file-like item in an active room, no larger than `maxChildSizeBytes`, assigned to the small-file lane, and in the same room/lane/size-class/broad-MIME grouping key.
 - Internal group status is tracked as `queued`, `running`, `completed`, `completed_with_errors`, `cancelled`, or `interrupted`.
 - Grouping does not change child file metadata, payload encryption, binary-v1 frame behavior, ACK behavior, finalize behavior, cancel/burn behavior, or Inbox behavior.
 - Grouping does not alter file contents at the transport layer.
@@ -133,6 +134,7 @@ Remaining Phase 4 limits:
 
 - JSON fallback has no pipelined mutable window behavior; Phase 4A returns a structured no-op for it rather than redesigning fallback transfer.
 - Retry/timeout downshift, stable cooldown recovery, speed-history heuristics, and history-aware weighting remain future work.
+- Runtime-window frontend diagnostics emit `event=tracking_started` before a planner-managed send, `event=update` after each update command result, and `event=summary` when the frontend observes a terminal queue state. If the app process exits while a transfer is active, no frontend terminal cleanup can run, so the tracking/update lines are the durable pre-exit evidence.
 
 Phase 4A smoke validation:
 
