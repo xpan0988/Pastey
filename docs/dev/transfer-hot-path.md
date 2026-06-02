@@ -46,6 +46,8 @@ $env:PASTEY_TRANSFER_WINDOW_SIZE="8"; Start-Process "pastey.exe"
 
 The transfer logs include `event=transfer_tuning` at transfer start with `effective_window_size`, `chunk_size`, `override_source`, and `transfer_protocol`. Successful binary-v1 transfers also emit `event=transfer_benchmark_summary` with sender and receiver timing summaries, average throughput, failed chunk count, duplicate chunk count, and finalize status.
 
+MicroFlowGroup manual-validation logs use the `[pastey:micro-group]` prefix. They record planner decisions, group launch, the currently running child, child terminal status, stop reasons for batch cancellation or room burn/cleanup, and final group status/terminal reason. These logs use room ids, group ids, queue item ids, display names, sizes, counts, statuses, and terminal reasons; they must not include absolute file paths.
+
 ## Local Dev-Fast Transfer Testing
 
 Normal Tauri dev uses Cargo's `dev` profile. That keeps the edit/run loop quick, but it under-represents transfer throughput because the Rust transfer hot path runs without optimization and still carries debug-profile overhead.
