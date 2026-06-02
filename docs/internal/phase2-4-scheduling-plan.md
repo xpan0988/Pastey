@@ -1,6 +1,6 @@
 # Phase 2-4 Scheduling Plan
 
-Validated against the current codebase on 2026-05-29.
+Validated against the current codebase on 2026-06-02.
 
 This plan supersedes a fixed two-transfer Phase 2 design. Phase 2+3 should introduce a Weighted Transfer Planner v1. Phase 4 should introduce dynamic rebalancing by rerunning the same allocation function and applying updated windows to running transfers.
 
@@ -20,12 +20,48 @@ Current implemented behavior:
 - Binary-v1 transfers default to window 8.
 - `PASTEY_TRANSFER_WINDOW_SIZE` and effective Developer Tools transfer-window settings remain the debugging overrides.
 - A pure weighted planner exists, has unit coverage, and drives runtime dispatch for queued file-like transfers. Lane and size class still provide classification, priority, constraints, and reports, while final requested-window allocation for selected file-like transfers is batch-relative and size-weighted.
+- `MicroFlowGroup` planner output and scheduler-only serial dispatch are implemented for eligible tiny file-like queue items. A group consumes one planner window while its children are sent one at a time through the existing single-file transfer path.
 - The transfer API accepts an optional sender-side planner requested window; planner-driven sends pass it.
 - Active outgoing binary-v1 sender transfers have a sender-only runtime window handle that can be updated by a structured command while the transfer is running.
 - Planner-managed queued file-like transfers trigger completion-only active-window rebalance after a queue item reaches a terminal state.
 - `npm run tauri:dev-fast` is available for faster local transfer-throughput testing.
 
-Current dispatch is planner-driven for file-like queue items. Phase 4A completion-only runtime window mutation is implemented for active outgoing binary-v1 sender transfers. Retry/timeout downshift, stable cooldown recovery, speed-history heuristics, and broader adaptive rebalance policies are not implemented.
+Current dispatch is planner-driven for file-like queue items. Phase 4A completion-only runtime window mutation is implemented for active outgoing binary-v1 sender transfers. MicroFlowGroup serial dispatch is implemented as a scheduler/resource abstraction only. Retry/timeout downshift, stable cooldown recovery, speed-history heuristics, broader adaptive rebalance policies, archive/bundle transfer, substream multiplexing, and binary-v2 are not implemented.
+
+## MicroFlowGroup Staging
+
+`MicroFlowGroup` / `SparseFlowGroup` is a scheduler-level grouping abstraction. It is not a bundle, archive, zip, room item, protocol object, binary-v2 stream, remote execution object, or permission grant.
+
+Implemented scope:
+
+- Phase A: documentation plus shadow planner decisions. The pure planner can report `microGroupPlans` with `dispatchMode = "shadow"` without changing child runnable plans.
+- Phase B: scheduler-only serial `MicroFlowGroup`. This is current behavior for eligible tiny file-like queue items: grouped children share exactly one planner requested window and dispatch serially through `sendFileToRoom`.
+
+Future scope:
+
+- Phase C: optional shared group semaphore if evidence shows serial child dispatch is too conservative.
+- Phase D: binary-v2 only if scheduler grouping and binary-v1 are proven insufficient.
+
+Current invariants:
+
+- Total requested windows, including groups, must never exceed `globalWindowBudget`.
+- A `MicroFlowGroup` consumes exactly one requested window in the current implementation.
+- Children inside a `MicroFlowGroup` do not independently consume planner windows while grouped.
+- Internal group status is tracked as `queued`, `running`, `completed`, `completed_with_errors`, `cancelled`, or `interrupted`.
+- Grouping does not change child file metadata, payload encryption, binary-v1 frame behavior, ACK behavior, finalize behavior, cancel/burn behavior, or Inbox behavior.
+- Grouping does not alter file contents at the transport layer.
+- File type, MIME type, and extension do not alter core transport behavior. Broad MIME family may be used as grouping metadata, not as a protocol rule.
+- A failed child must not corrupt or resurrect other terminal children.
+- Burned rooms do not launch group work.
+- Cancelled children do not launch.
+- Terminal group status must not be overwritten by late child results.
+- Future text/control/agent/command lanes remain model-only unless a later task explicitly implements their authority and dispatch path.
+
+Policy defaults:
+
+- `maxChildSizeBytes = 1 MiB`
+- `maxGroupBytes = 4 MiB`
+- `maxGroupItems = 32`
 
 ## Phase Boundaries
 
@@ -36,6 +72,7 @@ Goal: replace serial queue selection with a weighted planner for existing queued
 Scope:
 
 - Apply only to queued file, image, and pasted-image transfers.
+- Group only eligible tiny/small file-like queue items when using `MicroFlowGroup`.
 - Keep `sendFileToRoom` and Rust `send_file_to_room` as the single-file transfer path.
 - Optional requested-window plumbing is implemented and planner-driven sends pass requested windows.
 - Resolve requested windows below env/dev override and above default.
@@ -49,6 +86,7 @@ Non-goals:
 - No fixed `maxActiveTransfers = 2` policy.
 - No ML or DL model.
 - No archive bundling.
+- No `MicroFlowGroup` archive, bundle, zip, protocol object, room item, or remote execution object.
 - No folder transfer.
 - No protocol change.
 - No receiver finalize/cancel/burn redesign.
@@ -134,7 +172,7 @@ The first implementation should make concurrency an output:
 
 - If only one huge file is eligible, start one transfer with most or all of the budget.
 - If a huge file and one small file are eligible, start both with weighted windows.
-- If many small files are eligible, start several low-window transfers within the global window budget and safety cap.
+- If many tiny file-like items are eligible, represent them as one or more one-window serial `MicroFlowGroup` plans instead of making every child independently consume planner budget.
 - If future low-latency lanes are implemented, reserve a small share without exploding active transfer count.
 
 ## Detailed Implementation Sequence
@@ -223,12 +261,13 @@ Implemented changes:
 
 - Added `src/lib/transferPlanner.ts` as a focused pure module.
 - Defined task kind, size class, lane, priority, latency-sensitive flag, throughput-sensitive flag, runnable plans, active plans, held plans, lane budget reports, requested-window output, and held/debug reasons.
-- Added default policy with `globalWindowBudget = 8`, `minRequestedWindow = 1`, lane weights for `small_file` and `bulk_file`, future `control_text` modeling, and a safety active-transfer cap.
+- Added default policy with `globalWindowBudget = 8`, `minRequestedWindow = 1`, lane weights for `small_file` and `bulk_file`, future `control_text` modeling, MicroFlowGroup policy thresholds, and a safety active-transfer cap.
 - Required metadata-ready tasks for allocation. Missing metadata becomes a held plan.
 - Held burned/unavailable rooms and cancelled/terminal tasks instead of producing runnable plans.
 - Reserved active transfer budget before producing new runnable plans in the normal launch pass.
-- Allocated selected queued file-like transfer windows batch-relatively by size contribution, after giving every selected transfer at least one requested window. Lane and size class remain classification and reporting inputs rather than the dominant final split.
-- Enforced the invariant that total active plus runnable requested windows do not exceed the global budget and every active/runnable plan has `requestedWindow >= 1`.
+- Allocated selected queued file-like transfer windows batch-relatively by size contribution, after giving every selected transfer or group at least one requested window. Lane and size class remain classification and reporting inputs rather than the dominant final split.
+- Capped serial `MicroFlowGroup` plans at exactly one requested window.
+- Enforced the invariant that total active plus runnable/group requested windows do not exceed the global budget and every active/runnable/group plan has `requestedWindow >= 1`.
 
 Tests:
 
@@ -236,7 +275,7 @@ Tests:
 - Huge plus small -> approximate 7 + 1 allocation.
 - 2.7GB plus 147MB -> approximate 7 + 1 allocation even when both classify as `bulk_file`.
 - Similarly large files -> fair splits such as 4 + 4 or 3 + 3 + 2 within the global budget.
-- Many small files -> multiple low-window small-file plans, bounded by the global window budget and safety cap.
+- Many tiny file-like items -> one or more one-window serial MicroFlowGroup plans, bounded by group byte/item policy and the global window budget.
 - Burned room -> no runnable plans.
 - Cancelled task -> no runnable plan.
 - Missing metadata -> held with reason.
@@ -315,7 +354,8 @@ Tests:
 
 - Huge-only queue starts one transfer.
 - Huge-plus-small queue starts both with requested windows.
-- Many-small queue starts bounded multiple transfers.
+- Many tiny file-like items produce serial `MicroFlowGroup` launch plans instead of independently runnable child plans.
+- Huge plus many tiny file-like items gives the huge transfer about 7 windows and the serial micro group 1 window.
 - Batch cancellation cancels queued, preparing, and active sending items.
 - Failed item does not block unrelated queued work.
 - Planner rerun does not duplicate an already launching item.
@@ -326,6 +366,38 @@ Tests:
 Exit gate:
 
 - Multiple active outgoing file-like transfers work through the existing single-file transfer path, with no protocol or receiver lifecycle changes.
+
+### Step 5A: MicroFlowGroup Shadow And Serial Dispatch
+
+Goal: let high-concurrency tiny file-like flows share planner budget without changing binary-v1 or creating bundled transfer.
+
+Implementation status: completed for eligible queued file-like items.
+
+Implemented changes:
+
+- Added `micro_group` as a planner task kind.
+- Added `MicroFlowGroupPlan` output with `groupId`, `roomId`, `lane`, `requestedWindow`, `childTaskIds`, `totalBytes`, `reason`, and `dispatchMode`.
+- Added shadow planner support so group decisions can be reported without changing child runnable allocation.
+- Added serial dispatch mode where grouped children are replaced by one synthetic planner task for allocation.
+- Capped serial groups at exactly one requested window.
+- Grouped only queued, metadata-ready, active-room, noncancelled, nonterminal file-like tasks.
+- Used policy thresholds for child size, group bytes, and group items.
+- Used grouping metadata based on room, lane, size class, file-like safety class, and broad MIME family. Extension is not a core grouping or transport rule.
+- Exposed serial group launch plans from `planRunnableTransferLaunches` separately from ordinary runnable file launch plans.
+- Added an `App.tsx` serial group runner that calls the existing single-file queue processing path for each child.
+- Added internal scheduler group runtime state so serial groups become `completed`, `completed_with_errors`, `cancelled`, or `interrupted` instead of ending ambiguously.
+
+Tests:
+
+- Planner shadow output reports possible grouping while preserving ordinary child runnable plans.
+- Huge plus many tiny file-like tasks gives the huge file 7 windows and the micro group 1 window.
+- Many tiny tasks become one or more one-window serial groups, bounded by `maxGroupItems` and `maxGroupBytes`.
+- Scheduler launch adaptation exposes serial group plans separately from ordinary runnable item plans.
+- Scheduler coverage verifies clean completion, child-failure `completed_with_errors`, batch-cancelled groups, and room-interrupted groups.
+
+Exit gate:
+
+- Grouped children launch only through the existing single-file transfer path, and no Rust protocol behavior changes are required.
 
 ### Step 6: UI Adjustments For Multiple Active Transfers
 
@@ -397,7 +469,7 @@ Matrix:
 
 - Huge only.
 - Huge plus small.
-- Many small files.
+- Many tiny file-like items.
 - Cancel during multiple active transfers.
 - Burn during multiple active transfers.
 - Peer burn during multiple active transfers.
@@ -538,7 +610,8 @@ Assume default global budget 8.
 | 2.7GB plus 147MB | Larger file requested window about 7, smaller file requested window 1, even when both classify as `bulk_file` |
 | Two similarly large files | Similar files split fairly, for example about 4 plus 4 |
 | Three similarly large files | Similar files split fairly within the global budget, for example about 3 plus 3 plus 2 |
-| Many small files | Several small transfers, each low window, bounded by global window budget and safety cap |
+| Many tiny file-like items | One or more serial `MicroFlowGroup` plans, each requested window 1 |
+| Huge plus many tiny file-like items | Huge transfer about 7 windows, serial `MicroFlowGroup` 1 window |
 | Future 100 tiny text/control tasks plus huge file | Control lane gets small guaranteed share; huge file keeps most windows; control lane active count remains capped |
 
 Exact splits may vary by policy, but the invariants must hold: no starvation, no global budget overrun, and no fixed two-transfer assumption.
@@ -581,11 +654,15 @@ The current planner sorts allocation candidates to keep priority, size contribut
 
 ## Correctness Invariants
 
-- Requested windows across active and runnable plans never exceed `globalWindowBudget`.
+- Requested windows across active, runnable, and grouped plans never exceed `globalWindowBudget`.
 - Each active transfer has at least window 1.
+- Each serial `MicroFlowGroup` has exactly window 1 in the current implementation.
+- Grouped children do not independently consume planner windows while grouped.
 - Safety active-transfer cap is a guardrail, not the main scheduling strategy.
 - Burned rooms do not launch new work.
 - Cancelled items do not launch new work.
+- Burned rooms do not launch group work.
+- Cancelled children do not launch.
 - Low-latency lanes do not starve when implemented.
 - Bulk lane does not starve under many small tasks.
 - Binary-v1 frame format remains unchanged.
@@ -600,7 +677,8 @@ Planner unit tests:
 
 - Huge only: one runnable bulk plan, window 8.
 - Huge plus small: bulk gets about 7, small gets 1.
-- Many small files: several runnable plans, low windows, no budget overrun.
+- Many tiny file-like items: serial MicroFlowGroup plans request one window each and do not expose child items as ordinary runnable plans.
+- Huge plus many tiny file-like items: huge gets about 7 windows and the micro group gets 1.
 - Lane cap: 100 tiny tasks do not create 100 runnable transfers.
 - Burned room: no runnable plans.
 - Cancelled item: no runnable plan.
@@ -614,6 +692,7 @@ Frontend integration tests:
 - Single cancel works before and after transfer id correlation.
 - Same-name/same-size concurrent files correlate correctly after the correlation fix.
 - Pasted image temp files are cleaned after terminal state.
+- Serial MicroFlowGroup launch plans are exposed separately from ordinary runnable queue item plans.
 
 Backend tests:
 
@@ -630,7 +709,8 @@ Manual/dev-fast benchmark matrix:
 
 - Huge only.
 - Huge plus small.
-- Many small files.
+- Many tiny file-like items.
+- Huge plus many tiny file-like items.
 - Cancel during multiple active transfers.
 - Burn during multiple active transfers.
 - Peer burn during multiple active transfers.

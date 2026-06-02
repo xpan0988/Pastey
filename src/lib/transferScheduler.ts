@@ -1,5 +1,6 @@
 import {
   planWeightedTransfers,
+  type MicroFlowGroupPlan,
   type TransferPlannerResult,
   type TransferPlannerRunnablePlan,
   type TransferPlannerTask,
@@ -12,6 +13,14 @@ export type TransferQueueItemStatus = "queued" | "preparing" | "sending" | "comp
 export type TransferQueueItemMetadataStatus = "unknown" | "loading" | "ready" | "failed";
 
 export type TransferQueueBatchStatus = "running" | "completed" | "completed_with_errors" | "cancelled";
+
+export type MicroFlowGroupStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "completed_with_errors"
+  | "cancelled"
+  | "interrupted";
 
 export interface TransferQueueInput {
   path: string;
@@ -54,9 +63,26 @@ export interface TransferQueueBatch {
   updatedAt: number;
 }
 
+export interface MicroFlowGroupRuntimeState {
+  id: string;
+  roomId: string;
+  childItemIds: string[];
+  requestedWindow: number;
+  status: MicroFlowGroupStatus;
+  completedChildIds: string[];
+  failedChildIds: string[];
+  cancelledChildIds: string[];
+  createdAt: number;
+  updatedAt: number;
+  startedAt?: number;
+  completedAt?: number;
+  terminalReason?: string;
+}
+
 export interface TransferSchedulerState {
   batches: Record<string, TransferQueueBatch>;
   items: Record<string, TransferQueueItem>;
+  microGroups: Record<string, MicroFlowGroupRuntimeState>;
   batchOrder: string[];
 }
 
@@ -79,9 +105,14 @@ export interface RunnableTransferLaunchPlan extends TransferPlannerRunnablePlan 
   itemId: string;
 }
 
+export interface RunnableMicroFlowGroupLaunchPlan extends MicroFlowGroupPlan {
+  childItemIds: string[];
+}
+
 export interface TransferLaunchPlannerResult {
   plannerResult: TransferPlannerResult;
   runnablePlans: RunnableTransferLaunchPlan[];
+  microGroupPlans: RunnableMicroFlowGroupLaunchPlan[];
 }
 
 export interface TransferWindowRebalancePlan {
@@ -111,17 +142,28 @@ interface ProgressCorrelationInput {
 let nextId = 1;
 
 const terminalItemStatuses = new Set<TransferQueueItemStatus>(["completed", "failed", "cancelled"]);
+const terminalMicroGroupStatuses = new Set<MicroFlowGroupStatus>([
+  "completed",
+  "completed_with_errors",
+  "cancelled",
+  "interrupted"
+]);
 
 export function createTransferSchedulerState(): TransferSchedulerState {
   return {
     batches: {},
     items: {},
+    microGroups: {},
     batchOrder: []
   };
 }
 
 export function isTerminalQueueItem(item: TransferQueueItem): boolean {
   return terminalItemStatuses.has(item.status);
+}
+
+export function isTerminalMicroFlowGroup(group: MicroFlowGroupRuntimeState): boolean {
+  return terminalMicroGroupStatuses.has(group.status);
 }
 
 export function fileIdentityKey(name: string, size: number, modifiedMs: number): string {
@@ -199,6 +241,7 @@ export function enqueueTransferBatch(
       ...state.items,
       ...nextItems
     },
+    microGroups: state.microGroups,
     batchOrder: [...state.batchOrder, batchId]
   };
 }
@@ -359,6 +402,143 @@ export function markQueueItemRuntimeWindow(
   );
 }
 
+export function markMicroFlowGroupQueued(
+  state: TransferSchedulerState,
+  plan: Pick<MicroFlowGroupPlan, "groupId" | "roomId" | "childTaskIds" | "requestedWindow">
+): TransferSchedulerState {
+  const existing = state.microGroups?.[plan.groupId];
+  if (existing && isTerminalMicroFlowGroup(existing)) {
+    return state;
+  }
+
+  const now = Date.now();
+  const nextGroup: MicroFlowGroupRuntimeState = existing
+    ? {
+      ...existing,
+      childItemIds: plan.childTaskIds,
+      requestedWindow: plan.requestedWindow,
+      updatedAt: now
+    }
+    : {
+      id: plan.groupId,
+      roomId: plan.roomId,
+      childItemIds: plan.childTaskIds,
+      requestedWindow: plan.requestedWindow,
+      status: "queued",
+      completedChildIds: [],
+      failedChildIds: [],
+      cancelledChildIds: [],
+      createdAt: now,
+      updatedAt: now
+    };
+
+  return replaceMicroFlowGroup(state, nextGroup);
+}
+
+export function markMicroFlowGroupRunning(
+  state: TransferSchedulerState,
+  groupId: string
+): TransferSchedulerState {
+  const group = state.microGroups[groupId];
+  if (!group || isTerminalMicroFlowGroup(group)) {
+    return state;
+  }
+
+  const now = Date.now();
+  return replaceMicroFlowGroup(state, {
+    ...group,
+    status: "running",
+    startedAt: group.startedAt ?? now,
+    updatedAt: now
+  });
+}
+
+export function recordMicroFlowGroupChildTerminal(
+  state: TransferSchedulerState,
+  groupId: string,
+  childItemId: string,
+  status: Extract<TransferQueueItemStatus, "completed" | "failed" | "cancelled">
+): TransferSchedulerState {
+  const group = state.microGroups[groupId];
+  if (!group || isTerminalMicroFlowGroup(group)) {
+    return state;
+  }
+
+  const completedChildIds = withoutId(group.completedChildIds, childItemId);
+  const failedChildIds = withoutId(group.failedChildIds, childItemId);
+  const cancelledChildIds = withoutId(group.cancelledChildIds, childItemId);
+
+  if (status === "completed") {
+    completedChildIds.push(childItemId);
+  } else if (status === "failed") {
+    failedChildIds.push(childItemId);
+  } else {
+    cancelledChildIds.push(childItemId);
+  }
+
+  return replaceMicroFlowGroup(state, {
+    ...group,
+    completedChildIds,
+    failedChildIds,
+    cancelledChildIds,
+    updatedAt: Date.now()
+  });
+}
+
+export function completeMicroFlowGroupFromChildren(
+  state: TransferSchedulerState,
+  groupId: string
+): TransferSchedulerState {
+  const group = state.microGroups[groupId];
+  if (!group || isTerminalMicroFlowGroup(group)) {
+    return state;
+  }
+
+  const childCount = group.childItemIds.length;
+  const completedCount = group.completedChildIds.length;
+  const failedCount = group.failedChildIds.length;
+  const cancelledCount = group.cancelledChildIds.length;
+  const accountedCount = completedCount + failedCount + cancelledCount;
+  let status: MicroFlowGroupStatus;
+  let terminalReason: string;
+
+  if (childCount > 0 && completedCount === childCount) {
+    status = "completed";
+    terminalReason = "all_children_completed";
+  } else if (childCount > 0 && completedCount === 0 && failedCount === 0 && cancelledCount === childCount) {
+    status = "cancelled";
+    terminalReason = "all_children_cancelled";
+  } else {
+    status = "completed_with_errors";
+    terminalReason = accountedCount < childCount
+      ? "some_children_unaccounted"
+      : "one_or_more_children_failed_or_cancelled";
+  }
+
+  return finishMicroFlowGroup(state, groupId, status, terminalReason);
+}
+
+export function finishMicroFlowGroup(
+  state: TransferSchedulerState,
+  groupId: string,
+  status: Exclude<MicroFlowGroupStatus, "queued" | "running">,
+  terminalReason: string
+): TransferSchedulerState {
+  const group = state.microGroups[groupId];
+  if (!group || isTerminalMicroFlowGroup(group)) {
+    return state;
+  }
+
+  const now = Date.now();
+  return replaceMicroFlowGroup(state, {
+    ...group,
+    status,
+    terminalReason,
+    completedAt: now,
+    updatedAt: now
+  });
+}
+
 export function cancelQueueItem(state: TransferSchedulerState, itemId: string): TransferSchedulerState {
   const item = state.items[itemId];
   if (!item || isTerminalQueueItem(item)) {
@@ -416,6 +596,8 @@ export function cancelBatchLocally(state: TransferSchedulerState, batchId: strin
       : { ...item, status: "cancelled", cancelRequested: true, updatedAt: now };
   }
 
+  nextState = finishMicroFlowGroupsForBatch(nextState, batchId, "cancelled", "batch_cancelled");
+
   return nextState;
 }
 
@@ -453,6 +635,8 @@ export function clearQueuedItemsForRoom(state: TransferSchedulerState, roomId: s
       };
     }
   }
+
+  nextState = finishMicroFlowGroupsForRoom(nextState, roomId, "interrupted", "room_cleared_or_burned");
 
   return nextState;
 }
@@ -599,6 +783,7 @@ export function planRunnableTransferLaunches(
         cancelRequested: isActive ? false : item.cancelRequested || isBatchCancelled,
         requestedWindow: isLaunching ? launchingItemWindows.get(item.id) : item.requestedWindow,
         activeRequestedWindow: isLaunching ? launchingItemWindows.get(item.id) : item.requestedWindow,
+        mimeType: item.mimeType,
         createdAt: item.createdAt
       });
     }
@@ -607,6 +792,9 @@ export function planRunnableTransferLaunches(
   const plannerResult = planWeightedTransfers(tasks, { rebalanceActiveWindows });
   const runnablePlans = plannerResult.runnablePlans
     .filter((plan) => {
+      if (plan.kind === "micro_group") {
+        return false;
+      }
       const item = state.items[plan.taskId];
       const batch = item ? state.batches[item.batchId] : undefined;
       return Boolean(
@@ -623,10 +811,32 @@ export function planRunnableTransferLaunches(
       );
     })
     .map((plan) => ({ ...plan, itemId: plan.taskId }));
+  const microGroupPlans = plannerResult.microGroupPlans
+    .filter((plan) => (
+      plan.dispatchMode === "serial" &&
+      plan.childTaskIds.every((itemId) => {
+        const item = state.items[itemId];
+        const batch = item ? state.batches[item.batchId] : undefined;
+        return Boolean(
+          item &&
+          batch &&
+          item.status === "queued" &&
+          item.metadataStatus === "ready" &&
+          !item.cancelRequested &&
+          batch.status === "running" &&
+          !batch.cancelRequested &&
+          !closedRoomIds.has(item.roomId) &&
+          roomStatusById.get(item.roomId) === "active" &&
+          !launchingItemWindows.has(item.id)
+        );
+      })
+    ))
+    .map((plan) => ({ ...plan, childItemIds: plan.childTaskIds }));
 
   return {
     plannerResult,
-    runnablePlans
+    runnablePlans,
+    microGroupPlans
   };
 }
 
@@ -746,6 +956,58 @@ function replaceItem(
   return shouldUpdateBatch ? updateBatchStatus(nextState, item.batchId) : nextState;
 }
 
+function replaceMicroFlowGroup(
+  state: TransferSchedulerState,
+  group: MicroFlowGroupRuntimeState
+): TransferSchedulerState {
+  return {
+    ...state,
+    microGroups: {
+      ...(state.microGroups ?? {}),
+      [group.id]: group
+    }
+  };
+}
+
+function finishMicroFlowGroupsForBatch(
+  state: TransferSchedulerState,
+  batchId: string,
+  status: Exclude<MicroFlowGroupStatus, "queued" | "running">,
+  terminalReason: string
+): TransferSchedulerState {
+  const batch = state.batches[batchId];
+  if (!batch) {
+    return state;
+  }
+
+  const batchItemIds = new Set(batch.itemIds);
+  let nextState = state;
+  for (const group of Object.values(state.microGroups ?? {})) {
+    if (
+      !isTerminalMicroFlowGroup(group) &&
+      group.childItemIds.some((itemId) => batchItemIds.has(itemId))
+    ) {
+      nextState = finishMicroFlowGroup(nextState, group.id, status, terminalReason);
+    }
+  }
+  return nextState;
+}
+
+function finishMicroFlowGroupsForRoom(
+  state: TransferSchedulerState,
+  roomId: string,
+  status: Exclude<MicroFlowGroupStatus, "queued" | "running">,
+  terminalReason: string
+): TransferSchedulerState {
+  let nextState = state;
+  for (const group of Object.values(state.microGroups ?? {})) {
+    if (!isTerminalMicroFlowGroup(group) && group.roomId === roomId) {
+      nextState = finishMicroFlowGroup(nextState, group.id, status, terminalReason);
+    }
+  }
+  return nextState;
+}
+
 function updateBatchStatus(state: TransferSchedulerState, batchId: string): TransferSchedulerState {
   const batch = state.batches[batchId];
   if (!batch || batch.cancelRequested || batch.status === "cancelled") {
@@ -822,6 +1084,10 @@ function inputHasCompleteMetadata(input: TransferQueueInput): boolean {
 
 function pathDedupeKey(path: string): string {
   return `path:${path}`;
+}
+
+function withoutId(values: readonly string[], id: string): string[] {
+  return values.filter((value) => value !== id);
 }
 
 function createId(prefix: string): string {

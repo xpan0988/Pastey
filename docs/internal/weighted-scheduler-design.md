@@ -1,10 +1,10 @@
 # Weighted Transfer Planner Design
 
-Validated against the current codebase on 2026-05-29.
+Validated against the current codebase on 2026-06-02.
 
 ## Validation Result
 
-The weighted planner design is consistent with the current architecture. Runtime dispatch is now planner-driven for existing queued file, image, and pasted-image sends. The implementation preserves `sendFileToRoom` / Rust `send_file_to_room` as the authoritative single-file transfer path.
+The weighted planner design is consistent with the current architecture. Runtime dispatch is now planner-driven for existing queued file, image, and pasted-image sends. The planner can represent eligible tiny file-like work as a `MicroFlowGroup`, and the first implemented group runner dispatches those children serially. The implementation preserves `sendFileToRoom` / Rust `send_file_to_room` as the authoritative single-file transfer path.
 
 This document is design-forward. It describes implemented behavior only where explicitly marked as current.
 
@@ -46,7 +46,7 @@ Cross-checked docs:
 8. The biggest `activeTransferId` correlation risk was ambiguity when outgoing progress matched a sending queue item only by room id, display name, and size. Step 2 added optional frontend queue item id correlation metadata for queued outgoing sends, while preserving the old fallback for progress events that omit it. Planner-driven concurrent dispatch uses the queue item id path instead of display metadata alone.
 9. Burn, cancel, finalize, and interruption semantics are protected in Rust by active transfer maps keyed by transfer id, cancellation tokens, terminal reason mapping, `.part` cleanup, and burn/finalize race checks. Multiple active transfers increase the number of simultaneous terminal paths, so tests must prove every active transfer in a room is cancelled or marked terminal during Burn and that late chunks/finalize requests stay idempotent. Frontend scheduler state also guards terminal queue items from late metadata or transfer-result mutations.
 10. Receiver `.part` writes use a per-transfer `.pastey-parts/{transfer_id}.part` path and write chunks at offsets, which supports multiple active receiver transfers. Risks remain around path sanitization, reserved final paths, cleanup roots, Windows path behavior, permission errors, and final-name collisions. Existing `next_inbox_path_excluding` reserves active receiver final paths, which is the right shape for multi-active receipt.
-11. The first implementation can limit runtime changes to queued file, image, and pasted-image transfers. Text currently calls `sendTextToRoom` directly and should stay out of the scheduler. Control, agent, command, and text lanes should be design-only until explicitly implemented.
+11. The first implementation limits grouping to queued file, image, and pasted-image transfers. Text currently calls `sendTextToRoom` directly and stays out of the file scheduler. Control, agent, command, and text lanes remain model-only until explicitly implemented.
 12. The design can preserve room semantics. Burned rooms must reject new work, Burn must not delete user-owned Inbox output, and capability metadata such as `DeviceProfile`, `DeviceCapabilities`, and recommended roles must remain advisory rather than authority-granting.
 
 No blocking architectural mismatch was found. Runtime dispatch is implemented narrowly for queued file-like transfers.
@@ -79,6 +79,60 @@ The first implementation should apply only to:
 - pasted-image transfers that were written to a temp file and queued
 
 Future text, control, agent, and command streams may be modeled as lanes in the planner, but they must not be routed through the scheduler until a later task explicitly implements those stream types.
+
+## MicroFlowGroup Model
+
+`MicroFlowGroup`, also called `SparseFlowGroup` in some planning notes, is a planner/scheduler-level resource abstraction. It lets several eligible tiny file-like queue items share one logical planner window while preserving each child as an ordinary single-file transfer.
+
+Current implementation:
+
+- The pure planner emits `microGroupPlans` alongside ordinary runnable, active, held, and lane-budget reports.
+- In serial dispatch mode, grouped children are replaced by one synthetic planner task with `kind = "micro_group"` for allocation. That synthetic task consumes exactly one requested window.
+- `planRunnableTransferLaunches` exposes serial group launch plans separately from ordinary runnable plans. Ordinary runnable launch plans still reference real queue item ids only.
+- `App.tsx` runs one serial micro group at a time by calling the existing `processTransferQueueItem` path for each child with the group requested window. Each child still calls `sendFileToRoom` / Rust `send_file_to_room` independently.
+- The frontend scheduler stores internal MicroFlowGroup runtime state with status `queued`, `running`, `completed`, `completed_with_errors`, `cancelled`, or `interrupted`. This is scheduler bookkeeping only; it is not persisted as a room item and is not sent to the peer.
+- Shadow mode is still available in the pure planner for diagnostics: it reports what would group without replacing child runnable plans.
+
+Eligibility is deliberately narrow:
+
+- queued only, not already preparing or sending;
+- metadata-ready, with known size;
+- active room only;
+- not cancelled and not terminal;
+- file-like kinds only: `file`, `image`, and `pasted_image`;
+- tiny/small by policy, with default `maxChildSizeBytes = 1 MiB`;
+- default `maxGroupBytes = 4 MiB`;
+- default `maxGroupItems = 32`.
+
+The grouping key is not extension-first. It uses room id, lane, size class, a file-like safety class, and broad MIME family. File extension may be display metadata elsewhere, but it is not a core transport or grouping rule.
+
+A `MicroFlowGroup` is not a bundle, archive, zip, room item, protocol object, binary-v2 stream, remote execution object, or permission grant. It does not alter child file metadata, payload encryption, binary-v1 frame behavior, ACK behavior, retry behavior, finalize behavior, cancel/burn behavior, or Inbox behavior. It does not change file contents at the transport layer, and file type or extension must not alter core transport behavior.
+
+## MicroFlowGroup Terminal Semantics
+
+The current serial group runner records group-level lifecycle state so internal logs/tests can distinguish a clean group from a partially failed or externally stopped group:
+
+- `queued`: a serial group launch plan has been selected and recorded, but the child loop has not started.
+- `running`: the serial child loop has started.
+- `completed`: every planned child reached queue item status `completed`.
+- `completed_with_errors`: at least one child failed or was individually cancelled, or the group finished with unaccounted children without a batch/room terminal reason.
+- `cancelled`: the group was stopped by batch cancellation, or all children were cancelled.
+- `interrupted`: room work was cleared or burned while the group was queued/running.
+
+Child terminal accounting is per queue item id. A child failure does not corrupt or revive other children; the runner continues to later queued children unless batch cancellation or room interruption stops the group. Batch cancellation marks the group `cancelled`. Burn/room cleanup marks the group `interrupted`. Late child progress still uses the existing queue item terminal guards and cannot mutate terminal group state.
+
+Future text, control, agent, or command lanes may be modeled as possible child categories, but they remain non-dispatched unless a later implementation adds an explicit authority model and transport path. The scheduler must not grant command execution authority, route agent commands through file transfer, or treat room membership as a permission grant.
+
+## Staged Roadmap
+
+Current grouping roadmap:
+
+- Phase A: Documentation plus shadow planner decisions.
+- Phase B: Scheduler-only serial `MicroFlowGroup`.
+- Phase C: Optional shared group semaphore if serial groups need more overlap without making children independent planner-window consumers.
+- Phase D: `binary-v2` only if evidence proves scheduler grouping and binary-v1 are insufficient.
+
+Deferred/non-goals remain explicit: no `binary-v2`, no archive/bundle transfer, no substream multiplexing, no protocol frame changes, and no receiver lifecycle redesign.
 
 ## Task Model
 
@@ -123,7 +177,7 @@ Initial lanes:
 | `small_file` | Implemented for file-like planner classification | small files, images, pasted images | mixed | weight 1 |
 | `bulk_file` | Implemented for file-like planner classification | large and huge files | throughput | weight 7 |
 
-Lane and size class no longer dominate the final file-like requested-window split. They remain useful for classification, priority, eligibility, and lane budget reports. The safety active-transfer cap and global window budget prevent 100 tiny tasks from becoming 100 active transfers. Each selected active or runnable transfer must receive at least window 1.
+Lane and size class no longer dominate the final file-like requested-window split. They remain useful for classification, priority, eligibility, and lane budget reports. The safety active-transfer cap, MicroFlowGroup policy, and global window budget prevent 100 tiny tasks from becoming 100 active transfers. Each selected active/runnable transfer or serial group must receive at least window 1.
 
 Suggested file size classes:
 
@@ -146,6 +200,10 @@ Current pure planner policy fields:
 - `laneWeights`: relative weight per lane for reporting and future lane-aware policy. Current file-like final requested-window distribution is batch-relative across selected transfers rather than mostly lane-budget driven.
 - `minRequestedWindow`: default 1.
 - `maxRequestedWindow`: default 8 for planner output unless a later benchmark justifies more; Rust clamps transfer windows to `1..16`.
+- `microGroupDispatchMode`: current default `serial`; `shadow` reports groups without replacing child runnable plans.
+- `microGroupMaxChildSizeBytes`: default `1 MiB`.
+- `microGroupMaxGroupBytes`: default `4 MiB`.
+- `microGroupMaxGroupItems`: default `32`.
 - `defaultRequestedWindow`: omitted planner request falls through to Rust's default window 8.
 
 Precedence for final transfer window resolution:
@@ -169,6 +227,7 @@ The current planner returns a deterministic allocation report:
 interface TransferPlannerResult {
   runnablePlans: RunnableTransferPlan[];
   activePlans: ActiveTransferPlan[];
+  microGroupPlans: MicroFlowGroupPlan[];
   laneBudgets: LaneBudgetReport[];
   heldPlans: HeldTransferPlan[];
   requestedWindowTotal: number;
@@ -187,6 +246,17 @@ interface ActiveTransferPlan {
   roomId: string;
   lane: TransferLane;
   requestedWindow: number;
+}
+
+interface MicroFlowGroupPlan {
+  groupId: string;
+  roomId: string;
+  lane: TransferLane;
+  requestedWindow: number;
+  childTaskIds: string[];
+  totalBytes: number;
+  reason: string;
+  dispatchMode: "shadow" | "serial";
 }
 
 interface LaneBudgetReport {
@@ -233,12 +303,19 @@ Two similarly large files:
 - Eligible lanes: both usually classify as `bulk_file`.
 - Allocation: similar size contributions split the global budget fairly, for example 4 plus 4.
 
-Many small files:
+Many tiny file-like items:
 
 - Eligible lanes: `small_file`.
-- Allocation: selected files share the available budget by relative size contribution.
-- Runnable: several small transfers may run with low windows, bounded by the safety active-transfer cap and global window budget.
+- Allocation: eligible tiny file-like items may become one or more `MicroFlowGroup` plans. Each group consumes exactly one requested window and runs children serially in the first implementation.
+- Runnable: ordinary runnable plans contain non-grouped real queue items; serial group launch plans contain child queue item ids.
 - Guardrail: the planner must not create one active transfer per tiny task just because enough tasks exist.
+
+One huge file plus many tiny file-like items:
+
+- Eligible lanes: `bulk_file` and `small_file`.
+- Allocation: the huge file may request 7 windows while one serial `MicroFlowGroup` requests 1 window.
+- Runnable: the huge file starts through the normal single-file path; the group runner starts child file transfers one at a time through the same single-file path.
+- Guardrail: grouped children do not independently consume planner windows while grouped.
 
 Future 100 tiny text/control tasks plus one huge file:
 
@@ -258,11 +335,13 @@ Planner v1:
 5. Assign a lane to each candidate.
 6. Compute lane budget reports for diagnostics and future lane-aware policy.
 7. For normal launch planning, account for active transfers first by preserving their current requested windows.
-8. Choose additional runnable queued tasks within the remaining global budget and safety active-transfer cap, ordered by priority, size contribution, age, and id.
-9. Assign every selected transfer at least one requested window.
-10. Distribute remaining windows across the selected set by relative size contribution using deterministic largest-remainder integer apportionment.
-11. Clamp by per-transfer requested-window limits and the global window budget.
-12. Return runnable plans, active plans, lane budget report, and held reasons.
+8. Build optional `MicroFlowGroup` decisions from eligible queued tiny file-like candidates. In serial mode, replace grouped children with one synthetic planner task for allocation; in shadow mode, leave child allocation unchanged and report the group only.
+9. Choose additional runnable queued tasks within the remaining global budget and safety active-transfer cap, ordered by priority, size contribution, age, and id.
+10. Assign every selected transfer or group at least one requested window.
+11. Cap serial `MicroFlowGroup` tasks at exactly one requested window.
+12. Distribute remaining windows across the selected non-capped set by relative size contribution using deterministic largest-remainder integer apportionment.
+13. Clamp by per-transfer requested-window limits and the global window budget.
+14. Return runnable plans, active plans, micro group plans, lane budget report, and held reasons.
 
 Completion-only Phase 4A rebalance reruns the same planner with active-window rebalance enabled. In that mode, selected active and queued transfers are allocated together using the same batch-relative weighted math, so a completed small transfer naturally releases window budget to the remaining active transfer without adding retry, timeout, throughput-history, or speed-heuristic adaptation.
 
@@ -282,9 +361,14 @@ Space complexity should be `O(n + L)`, which is `O(n)` when lane count is consta
 ## Correctness Invariants
 
 - Total requested windows never exceed `globalWindowBudget`.
+- Total requested windows, including groups, never exceed `globalWindowBudget`.
 - Every active transfer has at least requested window 1.
+- A `MicroFlowGroup` consumes exactly one requested window in the first implementation.
+- Children inside a `MicroFlowGroup` do not independently consume planner windows while grouped.
 - Burned rooms do not launch new work.
 - Cancelled tasks do not launch new work.
+- Failed children must not corrupt or resurrect other terminal children.
+- Terminal MicroFlowGroup state must not be overwritten by late child completion, cancellation, failure, or room cleanup.
 - Low-latency lanes do not starve when they are implemented.
 - Bulk lane does not starve under many small tasks.
 - The planner does not change binary-v1 frame format, ACK behavior, retry behavior, finalize semantics, cancel semantics, burn semantics, or terminal reason mapping.
@@ -298,6 +382,7 @@ Space complexity should be `O(n + L)`, which is `O(n)` when lane count is consta
 Already implemented:
 
 - Pure TypeScript planner module and tests.
+- `MicroFlowGroup` shadow planner output and scheduler-only serial child dispatch for eligible tiny file-like queue items.
 - Optional `requestedWindow` / `requested_window` sender-side API plumbing.
 - Rust transfer tuning precedence for env override, effective dev override, planner request, then default.
 - Planner-driven dispatch from `App.tsx` for existing queued file-like transfers.
@@ -306,8 +391,10 @@ Already implemented:
 
 Still not implemented:
 
+- Shared group semaphore across children.
 - Retry/timeout downshift or stable cooldown recovery.
 - Speed-history or history-aware runtime adaptation.
+- Binary-v2 substreams or bundle/archive transport.
 - Binary-v1 protocol changes.
 - JSON fallback changes.
 - ACK, retry, cancel, burn, finalize, Inbox, security, or room semantic changes.
