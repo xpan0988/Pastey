@@ -104,6 +104,8 @@ Eligibility is deliberately narrow:
 - default `maxGroupBytes = 4 MiB`;
 - default `maxGroupItems = 32`.
 
+At least two eligible children are required. A single eligible tiny file remains an ordinary runnable transfer. Files above the child-size limit, such as 1.1 MiB to 1.3 MiB files under the current default, are not MicroFlowGroup children.
+
 The grouping key is not extension-first. It uses room id, lane, size class, a file-like safety class, and broad MIME family. File extension may be display metadata elsewhere, but it is not a core transport or grouping rule.
 
 A `MicroFlowGroup` is not a bundle, archive, zip, room item, protocol object, binary-v2 stream, remote execution object, or permission grant. It does not alter child file metadata, payload encryption, binary-v1 frame behavior, ACK behavior, retry behavior, finalize behavior, cancel/burn behavior, or Inbox behavior. It does not change file contents at the transport layer, and file type or extension must not alter core transport behavior.
@@ -121,7 +123,7 @@ The current serial group runner records group-level lifecycle state so internal 
 
 Child terminal accounting is per queue item id. A child failure does not corrupt or revive other children; the runner continues to later queued children unless batch cancellation or room interruption stops the group. Batch cancellation marks the group `cancelled`. Burn/room cleanup marks the group `interrupted`. Late child progress still uses the existing queue item terminal guards and cannot mutate terminal group state.
 
-Manual validation logs are bridged into the normal app log with `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]` prefixes. MicroFlowGroup lines report planned, launched, running, child_running, child_terminal, stopped, and final events. They include room id, group id, queue item id, display name, size, child counts, status, and terminal reason, but not absolute file paths.
+Manual validation logs are bridged into the normal app log with `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]` prefixes. MicroFlowGroup lines report planned, launched, running, child_running, child_terminal, stopped, and final events. Planner summary lines also report MicroFlowGroup candidate counts and a `micro_group_skip_reason` when no group is produced. They include room id, group id, queue item id, display name, size, child counts, status, and terminal reason, but not absolute file paths.
 
 Future text, control, agent, or command lanes may be modeled as possible child categories, but they remain non-dispatched unless a later implementation adds an explicit authority model and transport path. The scheduler must not grant command execution authority, route agent commands through file transfer, or treat room membership as a permission grant.
 

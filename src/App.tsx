@@ -53,6 +53,7 @@ import {
   queuedItemsNeedingMetadata,
   recordMicroFlowGroupChildTerminal,
   selectRoomTransferQueue,
+  summarizeMicroFlowGroupPlanning,
   type TransferLaunchPlannerResult,
   type TransferQueueInput,
   type TransferQueueItemStatus,
@@ -90,6 +91,8 @@ interface RuntimeWindowDiagnosticStats {
   protocol: string;
   overrideSource: string;
 }
+
+type RuntimeWindowTerminalStatus = Extract<TransferQueueItemStatus, "completed" | "failed" | "cancelled"> | "interrupted";
 
 function App() {
   const [view, setView] = useState<View>({ screen: "tabs" });
@@ -241,7 +244,9 @@ function App() {
       scheduler,
       launchPlan,
       plannerLaunchSummaryKeyRef,
-      launchingQueueItemWindowsRef.current
+      launchingQueueItemWindowsRef.current,
+      rooms,
+      closedRoomIdsRef.current
     );
     const { runnablePlans, microGroupPlans } = launchPlan;
 
@@ -321,11 +326,19 @@ function App() {
     const liveItemIds = new Set(Object.keys(scheduler.items));
     for (const [itemId, stats] of [...runtimeWindowStatsRef.current.entries()]) {
       const item = scheduler.items[itemId];
-      if (!item || item.status === "completed" || item.status === "failed" || item.status === "cancelled") {
-        if (!stats.transferId || !activeTransferIds.has(stats.transferId)) {
-          runtimeWindowStatsRef.current.delete(itemId);
-        }
-      } else if (!liveItemIds.has(itemId)) {
+      if (!item) {
+        runtimeWindowStatsRef.current.delete(itemId);
+        continue;
+      }
+      if (item.status === "completed" || item.status === "failed" || item.status === "cancelled") {
+        emitRuntimeWindowDiagnosticSummary(
+          itemId,
+          item.status,
+          runtimeWindowTerminalReason(item.status, item)
+        );
+        continue;
+      }
+      if (!liveItemIds.has(itemId) || (stats.transferId && !activeTransferIds.has(stats.transferId) && item.status !== "sending")) {
         runtimeWindowStatsRef.current.delete(itemId);
       }
     }
@@ -464,6 +477,21 @@ function App() {
       protocol: "unknown",
       overrideSource: "planner_request"
     });
+    emitPasteyDiagnostic("[pastey:runtime-window]", {
+      event: "tracking_started",
+      room_id: item.roomId,
+      queue_item_id: itemId,
+      item_id: itemId,
+      transfer_id: item.activeTransferId ?? "pending",
+      initial_window: requestedWindow,
+      final_window: requestedWindow,
+      min_window: requestedWindow,
+      max_window: requestedWindow,
+      update_count: 0,
+      protocol: "unknown",
+      transfer_protocol: "unknown",
+      override_source: "planner_request"
+    });
   }
 
   function recordRuntimeWindowTransferId(progress: FileTransferProgressEvent) {
@@ -519,6 +547,7 @@ function App() {
     emitPasteyDiagnostic("[pastey:runtime-window]", {
       event: "update",
       room_id: item?.roomId ?? stats.roomId,
+      queue_item_id: plan.itemId,
       item_id: plan.itemId,
       transfer_id: stats.transferId,
       previous_window: plan.previousWindow,
@@ -534,7 +563,8 @@ function App() {
 
   function emitRuntimeWindowDiagnosticSummary(
     itemId: string,
-    terminalStatus: Extract<TransferQueueItemStatus, "completed" | "failed" | "cancelled">
+    terminalStatus: RuntimeWindowTerminalStatus,
+    terminalReason: string = terminalStatus
   ) {
     const stats = runtimeWindowStatsRef.current.get(itemId);
     if (!stats) {
@@ -549,6 +579,7 @@ function App() {
     emitPasteyDiagnostic("[pastey:runtime-window]", {
       event: "summary",
       room_id: item?.roomId ?? stats.roomId,
+      queue_item_id: itemId,
       item_id: itemId,
       transfer_id: stats.transferId ?? "none",
       initial_window: stats.initialWindow,
@@ -563,9 +594,52 @@ function App() {
       protocol: stats.protocol,
       transfer_protocol: stats.protocol,
       override_source: stats.overrideSource,
-      terminal_status: terminalStatus
+      terminal_status: terminalStatus,
+      terminal_reason: terminalReason
     });
     runtimeWindowStatsRef.current.delete(itemId);
+  }
+
+  function emitRuntimeWindowSummariesForBatch(
+    batchId: string,
+    terminalStatus: RuntimeWindowTerminalStatus,
+    terminalReason: string
+  ) {
+    for (const [itemId] of [...runtimeWindowStatsRef.current.entries()]) {
+      const item = schedulerRef.current.items[itemId];
+      if (item?.batchId === batchId) {
+        emitRuntimeWindowDiagnosticSummary(itemId, terminalStatus, terminalReason);
+      }
+    }
+  }
+
+  function emitRuntimeWindowSummariesForRoom(
+    roomId: string,
+    terminalStatus: RuntimeWindowTerminalStatus,
+    terminalReason: string
+  ) {
+    for (const [itemId] of [...runtimeWindowStatsRef.current.entries()]) {
+      const item = schedulerRef.current.items[itemId];
+      if ((item?.roomId ?? runtimeWindowStatsRef.current.get(itemId)?.roomId) === roomId) {
+        emitRuntimeWindowDiagnosticSummary(itemId, terminalStatus, terminalReason);
+      }
+    }
+  }
+
+  function runtimeWindowTerminalReason(
+    terminalStatus: Extract<TransferQueueItemStatus, "completed" | "failed" | "cancelled">,
+    item?: TransferSchedulerState["items"][string]
+  ): string {
+    if (terminalStatus === "completed") {
+      return "send_result";
+    }
+    if (item?.errorMessage?.trim()) {
+      return item.errorMessage;
+    }
+    if (terminalStatus === "cancelled") {
+      return item?.cancelRequested ? "cancel_requested" : "cancelled";
+    }
+    return "send_result";
   }
 
   async function processTransferQueueItem(
@@ -657,7 +731,11 @@ function App() {
       return terminalStatus ?? "failed";
     } finally {
       if (runtimeTerminalStatus) {
-        emitRuntimeWindowDiagnosticSummary(itemId, runtimeTerminalStatus);
+        emitRuntimeWindowDiagnosticSummary(
+          itemId,
+          runtimeTerminalStatus,
+          runtimeWindowTerminalReason(runtimeTerminalStatus, schedulerRef.current.items[itemId])
+        );
       }
       await cleanupSchedulerTempFile(itemId);
     }
@@ -1081,6 +1159,7 @@ function App() {
   async function handleCancelQueueItem(itemId: string) {
     const item = schedulerRef.current.items[itemId];
     const transferId = item?.status === "sending" ? item.activeTransferId : undefined;
+    emitRuntimeWindowDiagnosticSummary(itemId, "cancelled", "queue_item_cancelled");
     updateSchedulerState((current) => cancelQueueItem(current, itemId));
 
     if (transferId && item) {
@@ -1103,6 +1182,7 @@ function App() {
         roomId: item.roomId
       }));
 
+    emitRuntimeWindowSummariesForBatch(batchId, "cancelled", "batch_cancelled");
     updateSchedulerState((current) => cancelBatchLocally(current, batchId));
 
     for (const request of transferRequests) {
@@ -1116,6 +1196,7 @@ function App() {
   }
 
   async function handleBurnRoom(roomId: string) {
+    emitRuntimeWindowSummariesForRoom(roomId, "interrupted", "room_burned");
     updateSchedulerState((current) => clearQueuedItemsForRoom(current, roomId));
     await burnRoom(roomId);
     closedRoomIdsRef.current.add(roomId);
@@ -1237,7 +1318,9 @@ function logPlannerLaunchSummary(
   scheduler: TransferSchedulerState,
   launchPlan: TransferLaunchPlannerResult,
   lastSummaryKeyRef: MutableRefObject<string>,
-  launchingItemWindows: ReadonlyMap<string, number>
+  launchingItemWindows: ReadonlyMap<string, number>,
+  rooms: readonly Pick<RoomInfo, "id" | "status">[],
+  closedRoomIds: ReadonlySet<string>
 ) {
   const candidates = Object.values(scheduler.items).filter((item) => (
     item.status === "queued" || item.status === "preparing" || item.status === "sending"
@@ -1256,6 +1339,12 @@ function logPlannerLaunchSummary(
     counts[plan.reason] = (counts[plan.reason] ?? 0) + 1;
     return counts;
   }, {});
+  const microGroupDiagnostics = summarizeMicroFlowGroupPlanning(
+    scheduler,
+    rooms,
+    closedRoomIds,
+    DEFAULT_TRANSFER_PLANNER_POLICY
+  );
   const runnableDetails = launchPlan.runnablePlans.map((plan) => {
     const item = scheduler.items[plan.itemId];
     return {
@@ -1289,7 +1378,8 @@ function logPlannerLaunchSummary(
     launching: [...launchingItemWindows.entries()],
     runnableDetails,
     microGroupDetails,
-    heldReasonCounts
+    heldReasonCounts,
+    microGroupDiagnostics
   });
   if (summaryKey === lastSummaryKeyRef.current) {
     return;
@@ -1318,6 +1408,14 @@ function logPlannerLaunchSummary(
     global_window_budget: launchPlan.plannerResult.globalWindowBudget,
     tiny_grouped_children: launchPlan.microGroupPlans.reduce((total, plan) => total + plan.childItemIds.length, 0),
     tiny_individual_runnable: launchPlan.runnablePlans.filter((plan) => plan.sizeClass === "tiny").length,
+    tiny_candidates: microGroupDiagnostics.tinyCandidates,
+    eligible_tiny_candidates: microGroupDiagnostics.eligibleTinyCandidates,
+    largest_eligible_micro_group_bucket: microGroupDiagnostics.largestEligibleBucket,
+    over_child_size_limit: microGroupDiagnostics.overChildSizeLimit,
+    metadata_missing: microGroupDiagnostics.metadataMissing,
+    room_unavailable: microGroupDiagnostics.roomUnavailable,
+    cancelled_or_terminal: microGroupDiagnostics.cancelledOrTerminal,
+    micro_group_skip_reason: launchPlan.microGroupPlans.length > 0 ? "group_planned" : microGroupDiagnostics.microGroupSkipReason,
     held_reasons: formatHeldReasonCounts(heldReasonCounts)
   });
   for (const plan of launchPlan.microGroupPlans) {

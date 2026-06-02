@@ -124,6 +124,30 @@ test("many tiny files create one serial micro group with one planner window", ()
   assert.equal(result.requestedWindowTotal, 1);
 });
 
+test("twenty sub-one-megabyte files create a serial micro group without child runnable plans", () => {
+  const tasks = Array.from({ length: 20 }, (_, index) => (
+    fileTask({ id: `sub-mib-${index}`, sizeBytes: (100 + index * 30) * 1024, createdAt: index })
+  ));
+  const result = planWeightedTransfers(tasks);
+  const groupedChildIds = new Set(result.microGroupPlans.flatMap((plan) => plan.childTaskIds));
+
+  assert.ok(result.microGroupPlans.length >= 1);
+  assert.ok(result.microGroupPlans.every((plan) => plan.requestedWindow === 1));
+  assert.ok(result.microGroupPlans.every((plan) => plan.childTaskIds.length >= 2));
+  assert.equal(result.runnablePlans.filter((plan) => plan.kind === "micro_group").length, result.microGroupPlans.length);
+  assert.equal(result.runnablePlans.filter((plan) => groupedChildIds.has(plan.taskId)).length, 0);
+});
+
+test("single eligible tiny file does not create a micro group", () => {
+  const result = planWeightedTransfers([
+    fileTask({ id: "tiny-one", sizeBytes: 350 * 1024, createdAt: 1 })
+  ]);
+
+  assert.equal(result.microGroupPlans.length, 0);
+  assert.deepEqual(result.runnablePlans.map((plan) => plan.taskId), ["tiny-one"]);
+  assert.equal(result.runnablePlans[0].requestedWindow, 8);
+});
+
 test("shadow micro group reports possible grouping without changing runnable child plans", () => {
   const result = planWeightedTransfers(
     Array.from({ length: 6 }, (_, index) => (

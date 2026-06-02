@@ -46,12 +46,17 @@ $env:PASTEY_TRANSFER_WINDOW_SIZE="8"; Start-Process "pastey.exe"
 
 The transfer logs include `event=transfer_tuning` at transfer start with `effective_window_size`, `chunk_size`, `override_source`, and `transfer_protocol`. Successful binary-v1 transfers also emit `event=transfer_benchmark_summary` with sender and receiver timing summaries, average throughput, failed chunk count, duplicate chunk count, and finalize status.
 
-Frontend scheduler diagnostics are bridged into the normal app log with allowlisted prefixes. `[pastey:planner]` records launch-plan summaries, `[pastey:micro-group]` records planned, launched, running, child_running, child_terminal, stopped, and final group lifecycle events, and `[pastey:runtime-window]` records planner runtime-window update attempts and per-transfer window summaries. These lines use room ids, group ids, queue item ids, display names, sizes, counts, statuses, terminal reasons, requested/effective windows, override source, and transfer protocol when the frontend can infer it. They must not include absolute file paths.
+Frontend scheduler diagnostics are bridged into the normal app log with allowlisted prefixes. `[pastey:planner]` records launch-plan summaries, `[pastey:micro-group]` records planned, launched, running, child_running, child_terminal, stopped, and final group lifecycle events, and `[pastey:runtime-window]` records planner runtime-window tracking start, update attempts, and per-transfer window summaries. These lines use room ids, group ids, queue item ids, display names, sizes, counts, statuses, terminal reasons, requested/effective windows, override source, and transfer protocol when the frontend can infer it. They must not include absolute file paths.
+
+MicroFlowGroup validation requires at least two eligible children in the same grouping key. A single sub-1 MiB file, or a batch whose small files are mostly over `maxChildSizeBytes = 1 MiB`, will not emit `[pastey:micro-group]` lifecycle lines. In that case, inspect the `[pastey:planner] event=launch_summary` fields `tiny_candidates`, `eligible_tiny_candidates`, `largest_eligible_micro_group_bucket`, `over_child_size_limit`, and `micro_group_skip_reason`.
+
+Runtime-window summaries are emitted when the frontend observes a terminal queue state, including normal completion and frontend-known cancel/burn paths. If the app process exits while a transfer is active, frontend terminal cleanup cannot run; use the earlier `[pastey:runtime-window] event=tracking_started` and `event=update` lines as the durable pre-exit evidence.
 
 Example validation searches, using the app log path for the current platform:
 
 ```sh
 rg "\\[pastey:(planner|micro-group|runtime-window)\\]" /path/to/pastey.log
+rg "\\[pastey:planner\\].*micro_group_skip_reason" /path/to/pastey.log
 rg "\\[pastey:micro-group\\].*event=final" /path/to/pastey.log
 rg "\\[pastey:runtime-window\\].*event=summary" /path/to/pastey.log
 ```
