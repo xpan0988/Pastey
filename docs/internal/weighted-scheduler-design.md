@@ -121,6 +121,8 @@ The current serial group runner records group-level lifecycle state so internal 
 
 Child terminal accounting is per queue item id. A child failure does not corrupt or revive other children; the runner continues to later queued children unless batch cancellation or room interruption stops the group. Batch cancellation marks the group `cancelled`. Burn/room cleanup marks the group `interrupted`. Late child progress still uses the existing queue item terminal guards and cannot mutate terminal group state.
 
+Manual validation logs use `[pastey:micro-group]` and report planned, launched, child_running, child_terminal, stopped, and final events. They include room id, group id, queue item id, display name, size, child counts, status, and terminal reason, but not absolute file paths.
+
 Future text, control, agent, or command lanes may be modeled as possible child categories, but they remain non-dispatched unless a later implementation adds an explicit authority model and transport path. The scheduler must not grant command execution authority, route agent commands through file transfer, or treat room membership as a permission grant.
 
 ## Staged Roadmap

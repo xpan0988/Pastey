@@ -192,7 +192,12 @@ function App() {
     );
 
     for (const item of metadataItems) {
-      console.info("[pastey queue] event=metadata_preflight_start room_id=%s queue_item_id=%s path=%s", item.roomId, item.id, item.path);
+      console.info(
+        "[pastey queue] event=metadata_preflight_start room_id=%s queue_item_id=%s display_name=%s",
+        item.roomId,
+        item.id,
+        item.displayName ?? "unknown"
+      );
       metadataPreflightItemIdsRef.current.add(item.id);
       void prepareQueueItemMetadata(item.id)
         .catch((err) => {
@@ -226,9 +231,6 @@ function App() {
     if (runnablePlans.length > 0) {
       console.info("[pastey queue] event=planner_launch_plan_count count=%d", runnablePlans.length);
     }
-    if (microGroupPlans.length > 0 && !serialMicroGroupRunningRef.current) {
-      console.info("[pastey queue] event=micro_group_launch_plan_count count=%d", microGroupPlans.length);
-    }
 
     for (const plan of runnablePlans) {
       if (launchingQueueItemWindowsRef.current.has(plan.itemId)) {
@@ -257,13 +259,13 @@ function App() {
       serialMicroGroupRunningRef.current = true;
       updateSchedulerState((current) => markMicroFlowGroupQueued(current, microGroupPlan));
       console.info(
-        "[pastey queue] event=micro_group_launch_start room_id=%s group_id=%s child_count=%d requested_window=%d lane=%s total_bytes=%d",
-        microGroupPlan.roomId,
+        "[pastey:micro-group] launched groupId=%s roomId=%s children=%d requestedWindow=%d totalBytes=%d dispatchMode=%s",
         microGroupPlan.groupId,
+        microGroupPlan.roomId,
         microGroupPlan.childItemIds.length,
         microGroupPlan.requestedWindow,
-        microGroupPlan.lane,
-        microGroupPlan.totalBytes
+        microGroupPlan.totalBytes,
+        microGroupPlan.dispatchMode
       );
       void processMicroFlowGroup(microGroupPlan.groupId, microGroupPlan.childItemIds, microGroupPlan.requestedWindow).finally(() => {
         serialMicroGroupRunningRef.current = false;
@@ -505,8 +507,18 @@ function App() {
 
   async function processMicroFlowGroup(groupId: string, childItemIds: string[], requestedWindow: number) {
     updateSchedulerState((current) => markMicroFlowGroupRunning(current, groupId));
+    const runningGroup = schedulerRef.current.microGroups[groupId];
+    if (runningGroup) {
+      console.info(
+        "[pastey:micro-group] status groupId=%s roomId=%s status=running children=%d requestedWindow=%d",
+        groupId,
+        runningGroup.roomId,
+        runningGroup.childItemIds.length,
+        runningGroup.requestedWindow
+      );
+    }
 
-    for (const childItemId of childItemIds) {
+    for (const [childIndex, childItemId] of childItemIds.entries()) {
       const group = schedulerRef.current.microGroups[groupId];
       if (!group || isTerminalMicroFlowGroup(group)) {
         break;
@@ -520,6 +532,13 @@ function App() {
           childItemId,
           "failed"
         ));
+        console.info(
+          "[pastey:micro-group] child_terminal groupId=%s childItemId=%s childIndex=%d children=%d status=failed reason=missing_queue_item",
+          groupId,
+          childItemId,
+          childIndex + 1,
+          childItemIds.length
+        );
         continue;
       }
 
@@ -531,10 +550,32 @@ function App() {
           childItemId,
           terminalChildStatus
         ));
+        console.info(
+          "[pastey:micro-group] child_terminal groupId=%s roomId=%s childItemId=%s displayName=%s sizeBytes=%s childIndex=%d children=%d status=%s reason=already_terminal",
+          groupId,
+          item.roomId,
+          childItemId,
+          item.displayName ?? "unknown",
+          typeof item.sizeBytes === "number" ? String(item.sizeBytes) : "unknown",
+          childIndex + 1,
+          childItemIds.length,
+          terminalChildStatus
+        );
         continue;
       }
 
       if (item.status !== "queued") {
+        console.info(
+          "[pastey:micro-group] child_skipped groupId=%s roomId=%s childItemId=%s displayName=%s sizeBytes=%s childIndex=%d children=%d status=%s reason=not_queued",
+          groupId,
+          item.roomId,
+          childItemId,
+          item.displayName ?? "unknown",
+          typeof item.sizeBytes === "number" ? String(item.sizeBytes) : "unknown",
+          childIndex + 1,
+          childItemIds.length,
+          item.status
+        );
         continue;
       }
       if (closedRoomIdsRef.current.has(item.roomId)) {
@@ -544,6 +585,14 @@ function App() {
           "interrupted",
           "room_closed_before_child_launch"
         ));
+        console.info(
+          "[pastey:micro-group] stopped groupId=%s roomId=%s status=interrupted terminalReason=room_closed_before_child_launch nextChildItemId=%s childIndex=%d children=%d",
+          groupId,
+          item.roomId,
+          childItemId,
+          childIndex + 1,
+          childItemIds.length
+        );
         break;
       }
 
@@ -555,6 +604,14 @@ function App() {
           "cancelled",
           "batch_cancelled_before_child_launch"
         ));
+        console.info(
+          "[pastey:micro-group] stopped groupId=%s roomId=%s status=cancelled terminalReason=batch_cancelled_before_child_launch nextChildItemId=%s childIndex=%d children=%d",
+          groupId,
+          item.roomId,
+          childItemId,
+          childIndex + 1,
+          childItemIds.length
+        );
         break;
       }
       if (item.cancelRequested) {
@@ -564,14 +621,28 @@ function App() {
           childItemId,
           "cancelled"
         ));
+        console.info(
+          "[pastey:micro-group] child_terminal groupId=%s roomId=%s childItemId=%s displayName=%s sizeBytes=%s childIndex=%d children=%d status=cancelled reason=child_cancel_requested_before_launch",
+          groupId,
+          item.roomId,
+          childItemId,
+          item.displayName ?? "unknown",
+          typeof item.sizeBytes === "number" ? String(item.sizeBytes) : "unknown",
+          childIndex + 1,
+          childItemIds.length
+        );
         continue;
       }
 
       console.info(
-        "[pastey queue] event=micro_group_child_start room_id=%s group_id=%s queue_item_id=%s requested_window=%d",
-        item.roomId,
+        "[pastey:micro-group] child_running groupId=%s roomId=%s childItemId=%s displayName=%s sizeBytes=%s childIndex=%d children=%d requestedWindow=%d",
         groupId,
+        item.roomId,
         childItemId,
+        item.displayName ?? "unknown",
+        typeof item.sizeBytes === "number" ? String(item.sizeBytes) : "unknown",
+        childIndex + 1,
+        childItemIds.length,
         requestedWindow
       );
       const childStatus = await processTransferQueueItem(childItemId, requestedWindow);
@@ -582,6 +653,18 @@ function App() {
           childItemId,
           childStatus
         ));
+        const latestChild = schedulerRef.current.items[childItemId] ?? item;
+        console.info(
+          "[pastey:micro-group] child_terminal groupId=%s roomId=%s childItemId=%s displayName=%s sizeBytes=%s childIndex=%d children=%d status=%s",
+          groupId,
+          latestChild.roomId,
+          childItemId,
+          latestChild.displayName ?? item.displayName ?? "unknown",
+          typeof latestChild.sizeBytes === "number" ? String(latestChild.sizeBytes) : "unknown",
+          childIndex + 1,
+          childItemIds.length,
+          childStatus
+        );
       }
 
       const latestGroup = schedulerRef.current.microGroups[groupId];
@@ -595,6 +678,14 @@ function App() {
           "interrupted",
           "room_closed_during_child_transfer"
         ));
+        console.info(
+          "[pastey:micro-group] stopped groupId=%s roomId=%s status=interrupted terminalReason=room_closed_during_child_transfer lastChildItemId=%s childIndex=%d children=%d",
+          groupId,
+          item.roomId,
+          childItemId,
+          childIndex + 1,
+          childItemIds.length
+        );
         break;
       }
 
@@ -607,12 +698,34 @@ function App() {
           "cancelled",
           "batch_cancelled_during_child_transfer"
         ));
+        console.info(
+          "[pastey:micro-group] stopped groupId=%s roomId=%s status=cancelled terminalReason=batch_cancelled_during_child_transfer lastChildItemId=%s childIndex=%d children=%d",
+          groupId,
+          item.roomId,
+          childItemId,
+          childIndex + 1,
+          childItemIds.length
+        );
         break;
       }
     }
 
     updateSchedulerState((current) => completeMicroFlowGroupFromChildren(current, groupId));
-    console.info("[pastey queue] event=micro_group_launch_done group_id=%s", groupId);
+    const terminalGroup = schedulerRef.current.microGroups[groupId];
+    if (terminalGroup) {
+      console.info(
+        "[pastey:micro-group] final groupId=%s roomId=%s status=%s terminalReason=%s children=%d completed=%d failed=%d cancelled=%d requestedWindow=%d",
+        groupId,
+        terminalGroup.roomId,
+        terminalGroup.status,
+        terminalGroup.terminalReason ?? "none",
+        terminalGroup.childItemIds.length,
+        terminalGroup.completedChildIds.length,
+        terminalGroup.failedChildIds.length,
+        terminalGroup.cancelledChildIds.length,
+        terminalGroup.requestedWindow
+      );
+    }
   }
 
   async function prepareQueueItemMetadata(itemId: string): Promise<PreparedQueueMetadata | null> {
@@ -979,7 +1092,8 @@ function logPlannerLaunchSummary(
     childCount: plan.childItemIds.length,
     requestedWindow: plan.requestedWindow,
     lane: plan.lane,
-    totalBytes: plan.totalBytes
+    totalBytes: plan.totalBytes,
+    dispatchMode: plan.dispatchMode
   }));
   const summaryKey = JSON.stringify({
     candidates: candidates.map((item) => [
@@ -1012,6 +1126,17 @@ function logPlannerLaunchSummary(
     JSON.stringify(runnableDetails),
     JSON.stringify(microGroupDetails)
   );
+  for (const plan of launchPlan.microGroupPlans) {
+    console.info(
+      "[pastey:micro-group] planned groupId=%s roomId=%s children=%d requestedWindow=%d totalBytes=%d dispatchMode=%s",
+      plan.groupId,
+      plan.roomId,
+      plan.childItemIds.length,
+      plan.requestedWindow,
+      plan.totalBytes,
+      plan.dispatchMode
+    );
+  }
 }
 
 export default App;
