@@ -743,6 +743,13 @@ pub fn copy_text_to_clipboard(text: String, app: AppHandle) -> Result<(), String
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+pub fn log_frontend_diagnostic(line: String) -> Result<bool, String> {
+    let line = normalize_frontend_diagnostic_line(&line)?;
+    logging::write_transfer_line(&line);
+    Ok(true)
+}
+
 fn cached_device_profile(
     state: &Arc<AppState>,
     force_refresh: bool,
@@ -806,6 +813,46 @@ fn log_field(value: Option<&str>) -> &str {
     value
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("none")
+}
+
+fn normalize_frontend_diagnostic_line(line: &str) -> Result<String, String> {
+    const MAX_FRONTEND_DIAGNOSTIC_CHARS: usize = 2_000;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err("diagnostic log line is empty".into());
+    }
+    if trimmed.len() > MAX_FRONTEND_DIAGNOSTIC_CHARS {
+        return Err("diagnostic log line is too long".into());
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err("diagnostic log line must be single-line".into());
+    }
+    if !is_allowed_frontend_diagnostic_prefix(trimmed) {
+        return Err("unsupported frontend diagnostic prefix".into());
+    }
+    if contains_path_like_sensitive_value(trimmed) {
+        return Err("diagnostic log line must not include absolute paths".into());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn is_allowed_frontend_diagnostic_prefix(line: &str) -> bool {
+    line.starts_with("[pastey:planner] ")
+        || line.starts_with("[pastey:micro-group] ")
+        || line.starts_with("[pastey:runtime-window] ")
+}
+
+fn contains_path_like_sensitive_value(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("path=")
+        || lower.contains("file://")
+        || lower.contains("/users/")
+        || lower.contains("/volumes/")
+        || lower.contains("/tmp/")
+        || lower.contains("/private/")
+        || lower.contains("\\users\\")
+        || lower.contains("c:\\")
+        || lower.contains("d:\\")
 }
 
 async fn run_async<T>(
@@ -879,5 +926,28 @@ mod tests {
     fn forced_capability_refresh_does_not_reuse_cached_quick_profile() {
         assert!(should_reuse_cached_profile_for_capability_probe(false));
         assert!(!should_reuse_cached_profile_for_capability_probe(true));
+    }
+
+    #[test]
+    fn frontend_diagnostic_log_accepts_known_prefixes() {
+        let line = "[pastey:micro-group] event=planned room_id=room group_id=group children=2 requested_window=1";
+
+        assert_eq!(
+            normalize_frontend_diagnostic_line(line).unwrap(),
+            line
+        );
+    }
+
+    #[test]
+    fn frontend_diagnostic_log_rejects_unknown_prefix_and_paths() {
+        assert!(normalize_frontend_diagnostic_line("[pastey queue] event=nope").is_err());
+        assert!(normalize_frontend_diagnostic_line(
+            "[pastey:planner] event=launch_summary path=/Users/example/secret.txt"
+        )
+        .is_err());
+        assert!(normalize_frontend_diagnostic_line(
+            "[pastey:runtime-window] event=summary display_name=C:\\Users\\me\\secret.txt"
+        )
+        .is_err());
     }
 }

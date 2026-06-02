@@ -32,6 +32,7 @@ use crate::{
         copy_text_to_clipboard, create_room, delete_temp_file, get_config, get_device_capabilities,
         get_device_profile, get_file_transfer_metadata, get_last_benchmark_results, get_room,
         join_room, leave_room, list_nearby_devices, list_room_items, list_rooms,
+        log_frontend_diagnostic,
         mark_join_prompt_rendered, open_logs_folder, pending_join_requests, reject_nearby_join,
         request_nearby_join, reveal_in_folder, run_loopback_benchmark, run_peer_link_benchmark,
         send_file_to_room, send_text_to_room, update_config, update_transfer_window,
@@ -180,7 +181,8 @@ fn main() {
             open_logs_folder,
             copy_last_error,
             check_for_updates,
-            copy_text_to_clipboard
+            copy_text_to_clipboard,
+            log_frontend_diagnostic
         ])
         .run(tauri::generate_context!())
         .expect("error while running pastey");

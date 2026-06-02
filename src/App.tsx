@@ -16,6 +16,7 @@ import {
   getRoom,
   listRoomItems,
   listRooms,
+  logFrontendDiagnostic,
   markJoinPromptRendered,
   pendingJoinRequests,
   rejectNearbyJoin,
@@ -57,6 +58,7 @@ import {
   type TransferQueueItemStatus,
   type TransferSchedulerState
 } from "./lib/transferScheduler";
+import { DEFAULT_TRANSFER_PLANNER_POLICY } from "./lib/transferPlanner";
 import { mergeTransferEvent } from "./lib/transferState";
 import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, RoomInfo, RoomItem } from "./lib/types";
 
@@ -74,6 +76,19 @@ interface PreparedQueueMetadata {
 
 interface FocusPayload {
   target?: "home" | "settings";
+}
+
+interface RuntimeWindowDiagnosticStats {
+  transferId?: string;
+  roomId: string;
+  itemId: string;
+  initialWindow: number;
+  finalWindow: number;
+  minWindow: number;
+  maxWindow: number;
+  updateCount: number;
+  protocol: string;
+  overrideSource: string;
 }
 
 function App() {
@@ -95,6 +110,7 @@ function App() {
   const metadataPreflightItemIdsRef = useRef<Set<string>>(new Set());
   const cancellingQueueTransferIdsRef = useRef<Set<string>>(new Set());
   const runtimeWindowUpdateKeysRef = useRef<Set<string>>(new Set());
+  const runtimeWindowStatsRef = useRef<Map<string, RuntimeWindowDiagnosticStats>>(new Map());
   const plannerLaunchSummaryKeyRef = useRef<string>("");
   const serialMicroGroupRunningRef = useRef(false);
 
@@ -153,6 +169,7 @@ function App() {
       if (closedRoomIdsRef.current.has(event.payload.room_id)) {
         return;
       }
+      recordRuntimeWindowTransferId(event.payload);
       setTransfers((current) => mergeTransferEvent(current, event.payload, closedRoomIdsRef.current));
       updateSchedulerState((current) => correlateTransferProgress(current, {
         roomId: event.payload.room_id,
@@ -258,15 +275,15 @@ function App() {
     if (microGroupPlan) {
       serialMicroGroupRunningRef.current = true;
       updateSchedulerState((current) => markMicroFlowGroupQueued(current, microGroupPlan));
-      console.info(
-        "[pastey:micro-group] launched groupId=%s roomId=%s children=%d requestedWindow=%d totalBytes=%d dispatchMode=%s",
-        microGroupPlan.groupId,
-        microGroupPlan.roomId,
-        microGroupPlan.childItemIds.length,
-        microGroupPlan.requestedWindow,
-        microGroupPlan.totalBytes,
-        microGroupPlan.dispatchMode
-      );
+      emitPasteyDiagnostic("[pastey:micro-group]", {
+        event: "launched",
+        group_id: microGroupPlan.groupId,
+        room_id: microGroupPlan.roomId,
+        children: microGroupPlan.childItemIds.length,
+        requested_window: microGroupPlan.requestedWindow,
+        total_bytes: microGroupPlan.totalBytes,
+        dispatch_mode: microGroupPlan.dispatchMode
+      });
       void processMicroFlowGroup(microGroupPlan.groupId, microGroupPlan.childItemIds, microGroupPlan.requestedWindow).finally(() => {
         serialMicroGroupRunningRef.current = false;
         updateSchedulerState((current) => ({ ...current }));
@@ -300,6 +317,18 @@ function App() {
         runtimeWindowUpdateKeysRef.current.delete(updateKey);
       }
     }
+
+    const liveItemIds = new Set(Object.keys(scheduler.items));
+    for (const [itemId, stats] of [...runtimeWindowStatsRef.current.entries()]) {
+      const item = scheduler.items[itemId];
+      if (!item || item.status === "completed" || item.status === "failed" || item.status === "cancelled") {
+        if (!stats.transferId || !activeTransferIds.has(stats.transferId)) {
+          runtimeWindowStatsRef.current.delete(itemId);
+        }
+      } else if (!liveItemIds.has(itemId)) {
+        runtimeWindowStatsRef.current.delete(itemId);
+      }
+    }
   }, [scheduler]);
 
   useEffect(() => {
@@ -307,6 +336,7 @@ function App() {
       launchingQueueItemWindowsRef.current.clear();
       metadataPreflightItemIdsRef.current.clear();
       runtimeWindowUpdateKeysRef.current.clear();
+      runtimeWindowStatsRef.current.clear();
       serialMicroGroupRunningRef.current = false;
     };
   }, []);
@@ -417,11 +447,133 @@ function App() {
     }
   }
 
+  function startRuntimeWindowDiagnostic(itemId: string, requestedWindow: number) {
+    const item = schedulerRef.current.items[itemId];
+    if (!item) {
+      return;
+    }
+
+    runtimeWindowStatsRef.current.set(itemId, {
+      roomId: item.roomId,
+      itemId,
+      initialWindow: requestedWindow,
+      finalWindow: requestedWindow,
+      minWindow: requestedWindow,
+      maxWindow: requestedWindow,
+      updateCount: 0,
+      protocol: "unknown",
+      overrideSource: "planner_request"
+    });
+  }
+
+  function recordRuntimeWindowTransferId(progress: FileTransferProgressEvent) {
+    if (progress.direction !== "outgoing" || !progress.queue_item_id) {
+      return;
+    }
+
+    const stats = runtimeWindowStatsRef.current.get(progress.queue_item_id);
+    if (!stats) {
+      return;
+    }
+
+    stats.transferId = progress.transfer_id;
+  }
+
+  function recordRuntimeWindowUpdateResult(
+    plan: { itemId: string; transferId: string; previousWindow: number; requestedWindow: number },
+    result: Awaited<ReturnType<typeof updateTransferWindow>>
+  ) {
+    const item = schedulerRef.current.items[plan.itemId];
+    let stats = runtimeWindowStatsRef.current.get(plan.itemId);
+    if (!stats) {
+      stats = {
+        roomId: item?.roomId ?? "unknown",
+        itemId: plan.itemId,
+        initialWindow: plan.previousWindow,
+        finalWindow: plan.previousWindow,
+        minWindow: plan.previousWindow,
+        maxWindow: plan.previousWindow,
+        updateCount: 0,
+        protocol: "unknown",
+        overrideSource: "planner_request"
+      };
+      runtimeWindowStatsRef.current.set(plan.itemId, stats);
+    }
+
+    const effectiveWindow = result.effective_window ?? null;
+    stats.transferId = result.transfer_id || plan.transferId;
+    if (result.updated) {
+      stats.updateCount += 1;
+    }
+    if (typeof effectiveWindow === "number") {
+      stats.finalWindow = effectiveWindow;
+      stats.minWindow = Math.min(stats.minWindow, effectiveWindow);
+      stats.maxWindow = Math.max(stats.maxWindow, effectiveWindow);
+    }
+    if (result.reason === "unsupported_protocol") {
+      stats.protocol = "unsupported";
+    } else if (result.updated || result.reason === "unchanged") {
+      stats.protocol = "binary-v1";
+    }
+
+    emitPasteyDiagnostic("[pastey:runtime-window]", {
+      event: "update",
+      room_id: item?.roomId ?? stats.roomId,
+      item_id: plan.itemId,
+      transfer_id: stats.transferId,
+      previous_window: plan.previousWindow,
+      requested_window: plan.requestedWindow,
+      effective_window: typeof effectiveWindow === "number" ? effectiveWindow : "unknown",
+      updated: result.updated,
+      reason: result.reason,
+      update_count: stats.updateCount,
+      protocol: stats.protocol,
+      override_source: stats.overrideSource
+    });
+  }
+
+  function emitRuntimeWindowDiagnosticSummary(
+    itemId: string,
+    terminalStatus: Extract<TransferQueueItemStatus, "completed" | "failed" | "cancelled">
+  ) {
+    const stats = runtimeWindowStatsRef.current.get(itemId);
+    if (!stats) {
+      return;
+    }
+
+    const item = schedulerRef.current.items[itemId];
+    if (item?.activeTransferId) {
+      stats.transferId = item.activeTransferId;
+    }
+
+    emitPasteyDiagnostic("[pastey:runtime-window]", {
+      event: "summary",
+      room_id: item?.roomId ?? stats.roomId,
+      item_id: itemId,
+      transfer_id: stats.transferId ?? "none",
+      initial_window: stats.initialWindow,
+      final_runtime_window: stats.finalWindow,
+      min_runtime_window: stats.minWindow,
+      max_runtime_window: stats.maxWindow,
+      runtime_window_update_count: stats.updateCount,
+      final_window: stats.finalWindow,
+      min_window: stats.minWindow,
+      max_window: stats.maxWindow,
+      update_count: stats.updateCount,
+      protocol: stats.protocol,
+      transfer_protocol: stats.protocol,
+      override_source: stats.overrideSource,
+      terminal_status: terminalStatus
+    });
+    runtimeWindowStatsRef.current.delete(itemId);
+  }
+
   async function processTransferQueueItem(
     itemId: string,
     requestedWindow: number
   ): Promise<Extract<TransferQueueItemStatus, "completed" | "failed" | "cancelled"> | null> {
     updateSchedulerState((current) => markQueueItemPreparing(current, itemId, requestedWindow));
+    let runtimeTerminalStatus: Extract<TransferQueueItemStatus, "completed" | "failed" | "cancelled"> | null = null;
 
     try {
       let item = schedulerRef.current.items[itemId];
@@ -468,6 +620,7 @@ function App() {
         return "cancelled";
       }
 
+      startRuntimeWindowDiagnostic(itemId, requestedWindow);
       await sendFileToRoom(item.roomId, item.path, {
         displayName: metadata.displayName,
         mimeType: metadata.mimeType,
@@ -475,6 +628,7 @@ function App() {
         requestedWindow
       });
       updateSchedulerState((current) => markQueueItemCompleted(current, itemId));
+      runtimeTerminalStatus = "completed";
       void rebalanceActiveTransferWindows({ itemId, status: "completed" });
       await refreshRoomAfterQueueItem(item.roomId);
       return "completed";
@@ -494,6 +648,7 @@ function App() {
           : markQueueItemFailed(current, itemId, message);
       });
       if (terminalStatus) {
+        runtimeTerminalStatus = terminalStatus;
         void rebalanceActiveTransferWindows({ itemId, status: terminalStatus });
       }
       if (latestItem && latestItem.metadataStatus !== "loading") {
@@ -501,6 +656,9 @@ function App() {
       }
       return terminalStatus ?? "failed";
     } finally {
+      if (runtimeTerminalStatus) {
+        emitRuntimeWindowDiagnosticSummary(itemId, runtimeTerminalStatus);
+      }
       await cleanupSchedulerTempFile(itemId);
     }
   }
@@ -509,13 +667,14 @@ function App() {
     updateSchedulerState((current) => markMicroFlowGroupRunning(current, groupId));
     const runningGroup = schedulerRef.current.microGroups[groupId];
     if (runningGroup) {
-      console.info(
-        "[pastey:micro-group] status groupId=%s roomId=%s status=running children=%d requestedWindow=%d",
-        groupId,
-        runningGroup.roomId,
-        runningGroup.childItemIds.length,
-        runningGroup.requestedWindow
-      );
+      emitPasteyDiagnostic("[pastey:micro-group]", {
+        event: "running",
+        group_id: groupId,
+        room_id: runningGroup.roomId,
+        status: "running",
+        children: runningGroup.childItemIds.length,
+        requested_window: runningGroup.requestedWindow
+      });
     }
 
     for (const [childIndex, childItemId] of childItemIds.entries()) {
@@ -532,13 +691,18 @@ function App() {
           childItemId,
           "failed"
         ));
-        console.info(
-          "[pastey:micro-group] child_terminal groupId=%s childItemId=%s childIndex=%d children=%d status=failed reason=missing_queue_item",
-          groupId,
-          childItemId,
-          childIndex + 1,
-          childItemIds.length
-        );
+        emitPasteyDiagnostic("[pastey:micro-group]", {
+          event: "child_terminal",
+          group_id: groupId,
+          room_id: "unknown",
+          child_item_id: childItemId,
+          child_index: childIndex + 1,
+          children: childItemIds.length,
+          display_name: "unknown",
+          size_bytes: "unknown",
+          status: "failed",
+          reason: "missing_queue_item"
+        });
         continue;
       }
 
@@ -550,32 +714,34 @@ function App() {
           childItemId,
           terminalChildStatus
         ));
-        console.info(
-          "[pastey:micro-group] child_terminal groupId=%s roomId=%s childItemId=%s displayName=%s sizeBytes=%s childIndex=%d children=%d status=%s reason=already_terminal",
-          groupId,
-          item.roomId,
-          childItemId,
-          item.displayName ?? "unknown",
-          typeof item.sizeBytes === "number" ? String(item.sizeBytes) : "unknown",
-          childIndex + 1,
-          childItemIds.length,
-          terminalChildStatus
-        );
+        emitPasteyDiagnostic("[pastey:micro-group]", {
+          event: "child_terminal",
+          group_id: groupId,
+          room_id: item.roomId,
+          child_item_id: childItemId,
+          child_index: childIndex + 1,
+          children: childItemIds.length,
+          display_name: item.displayName ?? "unknown",
+          size_bytes: typeof item.sizeBytes === "number" ? item.sizeBytes : "unknown",
+          status: terminalChildStatus,
+          reason: "already_terminal"
+        });
         continue;
       }
 
       if (item.status !== "queued") {
-        console.info(
-          "[pastey:micro-group] child_skipped groupId=%s roomId=%s childItemId=%s displayName=%s sizeBytes=%s childIndex=%d children=%d status=%s reason=not_queued",
-          groupId,
-          item.roomId,
-          childItemId,
-          item.displayName ?? "unknown",
-          typeof item.sizeBytes === "number" ? String(item.sizeBytes) : "unknown",
-          childIndex + 1,
-          childItemIds.length,
-          item.status
-        );
+        emitPasteyDiagnostic("[pastey:micro-group]", {
+          event: "child_skipped",
+          group_id: groupId,
+          room_id: item.roomId,
+          child_item_id: childItemId,
+          child_index: childIndex + 1,
+          children: childItemIds.length,
+          display_name: item.displayName ?? "unknown",
+          size_bytes: typeof item.sizeBytes === "number" ? item.sizeBytes : "unknown",
+          status: item.status,
+          reason: "not_queued"
+        });
         continue;
       }
       if (closedRoomIdsRef.current.has(item.roomId)) {
@@ -585,14 +751,16 @@ function App() {
           "interrupted",
           "room_closed_before_child_launch"
         ));
-        console.info(
-          "[pastey:micro-group] stopped groupId=%s roomId=%s status=interrupted terminalReason=room_closed_before_child_launch nextChildItemId=%s childIndex=%d children=%d",
-          groupId,
-          item.roomId,
-          childItemId,
-          childIndex + 1,
-          childItemIds.length
-        );
+        emitPasteyDiagnostic("[pastey:micro-group]", {
+          event: "stopped",
+          group_id: groupId,
+          room_id: item.roomId,
+          status: "interrupted",
+          terminal_reason: "room_closed_before_child_launch",
+          next_child_item_id: childItemId,
+          child_index: childIndex + 1,
+          children: childItemIds.length
+        });
         break;
       }
 
@@ -604,14 +772,16 @@ function App() {
           "cancelled",
           "batch_cancelled_before_child_launch"
         ));
-        console.info(
-          "[pastey:micro-group] stopped groupId=%s roomId=%s status=cancelled terminalReason=batch_cancelled_before_child_launch nextChildItemId=%s childIndex=%d children=%d",
-          groupId,
-          item.roomId,
-          childItemId,
-          childIndex + 1,
-          childItemIds.length
-        );
+        emitPasteyDiagnostic("[pastey:micro-group]", {
+          event: "stopped",
+          group_id: groupId,
+          room_id: item.roomId,
+          status: "cancelled",
+          terminal_reason: "batch_cancelled_before_child_launch",
+          next_child_item_id: childItemId,
+          child_index: childIndex + 1,
+          children: childItemIds.length
+        });
         break;
       }
       if (item.cancelRequested) {
@@ -621,30 +791,32 @@ function App() {
           childItemId,
           "cancelled"
         ));
-        console.info(
-          "[pastey:micro-group] child_terminal groupId=%s roomId=%s childItemId=%s displayName=%s sizeBytes=%s childIndex=%d children=%d status=cancelled reason=child_cancel_requested_before_launch",
-          groupId,
-          item.roomId,
-          childItemId,
-          item.displayName ?? "unknown",
-          typeof item.sizeBytes === "number" ? String(item.sizeBytes) : "unknown",
-          childIndex + 1,
-          childItemIds.length
-        );
+        emitPasteyDiagnostic("[pastey:micro-group]", {
+          event: "child_terminal",
+          group_id: groupId,
+          room_id: item.roomId,
+          child_item_id: childItemId,
+          child_index: childIndex + 1,
+          children: childItemIds.length,
+          display_name: item.displayName ?? "unknown",
+          size_bytes: typeof item.sizeBytes === "number" ? item.sizeBytes : "unknown",
+          status: "cancelled",
+          reason: "child_cancel_requested_before_launch"
+        });
         continue;
       }
 
-      console.info(
-        "[pastey:micro-group] child_running groupId=%s roomId=%s childItemId=%s displayName=%s sizeBytes=%s childIndex=%d children=%d requestedWindow=%d",
-        groupId,
-        item.roomId,
-        childItemId,
-        item.displayName ?? "unknown",
-        typeof item.sizeBytes === "number" ? String(item.sizeBytes) : "unknown",
-        childIndex + 1,
-        childItemIds.length,
-        requestedWindow
-      );
+      emitPasteyDiagnostic("[pastey:micro-group]", {
+        event: "child_running",
+        group_id: groupId,
+        room_id: item.roomId,
+        child_item_id: childItemId,
+        child_index: childIndex + 1,
+        children: childItemIds.length,
+        display_name: item.displayName ?? "unknown",
+        size_bytes: typeof item.sizeBytes === "number" ? item.sizeBytes : "unknown",
+        requested_window: requestedWindow
+      });
       const childStatus = await processTransferQueueItem(childItemId, requestedWindow);
       if (childStatus) {
         updateSchedulerState((current) => recordMicroFlowGroupChildTerminal(
@@ -654,17 +826,18 @@ function App() {
           childStatus
         ));
         const latestChild = schedulerRef.current.items[childItemId] ?? item;
-        console.info(
-          "[pastey:micro-group] child_terminal groupId=%s roomId=%s childItemId=%s displayName=%s sizeBytes=%s childIndex=%d children=%d status=%s",
-          groupId,
-          latestChild.roomId,
-          childItemId,
-          latestChild.displayName ?? item.displayName ?? "unknown",
-          typeof latestChild.sizeBytes === "number" ? String(latestChild.sizeBytes) : "unknown",
-          childIndex + 1,
-          childItemIds.length,
-          childStatus
-        );
+        emitPasteyDiagnostic("[pastey:micro-group]", {
+          event: "child_terminal",
+          group_id: groupId,
+          room_id: latestChild.roomId,
+          child_item_id: childItemId,
+          child_index: childIndex + 1,
+          children: childItemIds.length,
+          display_name: latestChild.displayName ?? item.displayName ?? "unknown",
+          size_bytes: typeof latestChild.sizeBytes === "number" ? latestChild.sizeBytes : "unknown",
+          status: childStatus,
+          reason: "send_result"
+        });
       }
 
       const latestGroup = schedulerRef.current.microGroups[groupId];
@@ -678,14 +851,17 @@ function App() {
           "interrupted",
           "room_closed_during_child_transfer"
         ));
-        console.info(
-          "[pastey:micro-group] stopped groupId=%s roomId=%s status=interrupted terminalReason=room_closed_during_child_transfer lastChildItemId=%s childIndex=%d children=%d",
-          groupId,
-          item.roomId,
-          childItemId,
-          childIndex + 1,
-          childItemIds.length
-        );
+        emitPasteyDiagnostic("[pastey:micro-group]", {
+          event: "stopped",
+          group_id: groupId,
+          room_id: item.roomId,
+          status: "interrupted",
+          terminal_reason: "room_closed_during_child_transfer",
+          next_child_item_id: "none",
+          last_child_item_id: childItemId,
+          child_index: childIndex + 1,
+          children: childItemIds.length
+        });
         break;
       }
 
@@ -698,14 +874,17 @@ function App() {
           "cancelled",
           "batch_cancelled_during_child_transfer"
         ));
-        console.info(
-          "[pastey:micro-group] stopped groupId=%s roomId=%s status=cancelled terminalReason=batch_cancelled_during_child_transfer lastChildItemId=%s childIndex=%d children=%d",
-          groupId,
-          item.roomId,
-          childItemId,
-          childIndex + 1,
-          childItemIds.length
-        );
+        emitPasteyDiagnostic("[pastey:micro-group]", {
+          event: "stopped",
+          group_id: groupId,
+          room_id: item.roomId,
+          status: "cancelled",
+          terminal_reason: "batch_cancelled_during_child_transfer",
+          next_child_item_id: "none",
+          last_child_item_id: childItemId,
+          child_index: childIndex + 1,
+          children: childItemIds.length
+        });
         break;
       }
     }
@@ -713,18 +892,19 @@ function App() {
     updateSchedulerState((current) => completeMicroFlowGroupFromChildren(current, groupId));
     const terminalGroup = schedulerRef.current.microGroups[groupId];
     if (terminalGroup) {
-      console.info(
-        "[pastey:micro-group] final groupId=%s roomId=%s status=%s terminalReason=%s children=%d completed=%d failed=%d cancelled=%d requestedWindow=%d",
-        groupId,
-        terminalGroup.roomId,
-        terminalGroup.status,
-        terminalGroup.terminalReason ?? "none",
-        terminalGroup.childItemIds.length,
-        terminalGroup.completedChildIds.length,
-        terminalGroup.failedChildIds.length,
-        terminalGroup.cancelledChildIds.length,
-        terminalGroup.requestedWindow
-      );
+      emitPasteyDiagnostic("[pastey:micro-group]", {
+        event: "final",
+        group_id: groupId,
+        room_id: terminalGroup.roomId,
+        status: terminalGroup.status,
+        terminal_reason: terminalGroup.terminalReason ?? "none",
+        children: terminalGroup.childItemIds.length,
+        completed: terminalGroup.completedChildIds.length,
+        failed: terminalGroup.failedChildIds.length,
+        cancelled: terminalGroup.cancelledChildIds.length,
+        requested_window: terminalGroup.requestedWindow,
+        total_bytes: microGroupTotalBytesFromScheduler(schedulerRef.current, terminalGroup.childItemIds)
+      });
     }
   }
 
@@ -853,6 +1033,7 @@ function App() {
             result.effective_window === null || typeof result.effective_window === "undefined" ? "unknown" : String(result.effective_window),
             plan.requestedWindow
           );
+          recordRuntimeWindowUpdateResult(plan, result);
           const effectiveWindow = result.effective_window ?? null;
           if (
             (result.updated || result.reason === "unchanged") &&
@@ -1126,17 +1307,102 @@ function logPlannerLaunchSummary(
     JSON.stringify(runnableDetails),
     JSON.stringify(microGroupDetails)
   );
+  emitPasteyDiagnostic("[pastey:planner]", {
+    event: "launch_summary",
+    room_id: plannerSummaryRoomId(launchPlan),
+    runnable_plans: launchPlan.runnablePlans.length,
+    micro_group_plans: launchPlan.microGroupPlans.length,
+    active_plans: launchPlan.plannerResult.activePlans.length,
+    held_plans: launchPlan.plannerResult.heldPlans.length,
+    requested_window_total: launchPlan.plannerResult.requestedWindowTotal,
+    global_window_budget: launchPlan.plannerResult.globalWindowBudget,
+    tiny_grouped_children: launchPlan.microGroupPlans.reduce((total, plan) => total + plan.childItemIds.length, 0),
+    tiny_individual_runnable: launchPlan.runnablePlans.filter((plan) => plan.sizeClass === "tiny").length,
+    held_reasons: formatHeldReasonCounts(heldReasonCounts)
+  });
   for (const plan of launchPlan.microGroupPlans) {
-    console.info(
-      "[pastey:micro-group] planned groupId=%s roomId=%s children=%d requestedWindow=%d totalBytes=%d dispatchMode=%s",
-      plan.groupId,
-      plan.roomId,
-      plan.childItemIds.length,
-      plan.requestedWindow,
-      plan.totalBytes,
-      plan.dispatchMode
-    );
+    emitPasteyDiagnostic("[pastey:micro-group]", {
+      event: "planned",
+      group_id: plan.groupId,
+      room_id: plan.roomId,
+      children: plan.childItemIds.length,
+      requested_window: plan.requestedWindow,
+      total_bytes: plan.totalBytes,
+      dispatch_mode: plan.dispatchMode,
+      max_child_size_bytes: DEFAULT_TRANSFER_PLANNER_POLICY.microGroupMaxChildSizeBytes,
+      max_group_bytes: DEFAULT_TRANSFER_PLANNER_POLICY.microGroupMaxGroupBytes
+    });
   }
+}
+
+function emitPasteyDiagnostic(
+  prefix: "[pastey:planner]" | "[pastey:micro-group]" | "[pastey:runtime-window]",
+  fields: Record<string, string | number | boolean | null | undefined>
+) {
+  emitDiagnosticLine(`${prefix} ${formatDiagnosticFields(fields)}`);
+}
+
+function emitDiagnosticLine(line: string) {
+  console.info(line);
+  void logFrontendDiagnostic(line).catch((err) => {
+    console.warn(
+      "[pastey diagnostics] event=frontend_log_failed error=%s",
+      err instanceof Error ? err.message : String(err)
+    );
+  });
+}
+
+function formatDiagnosticFields(fields: Record<string, string | number | boolean | null | undefined>): string {
+  return Object.entries(fields)
+    .map(([key, value]) => `${key}=${diagnosticValue(value)}`)
+    .join(" ");
+}
+
+function diagnosticValue(value: string | number | boolean | null | undefined): string {
+  if (value === null || typeof value === "undefined") {
+    return "none";
+  }
+  const raw = String(value).trim() || "none";
+  const sanitized = raw
+    .replace(/[\s=]+/g, "_")
+    .replace(/[\\/]+/g, "_")
+    .replace(/[^A-Za-z0-9._:,-]/g, "_")
+    .slice(0, 160);
+  return sanitized || "none";
+}
+
+function formatHeldReasonCounts(counts: Record<string, number>): string {
+  const entries = Object.entries(counts).sort(([left], [right]) => left.localeCompare(right));
+  if (entries.length === 0) {
+    return "none";
+  }
+
+  return entries.map(([reason, count]) => `${diagnosticValue(reason)}:${count}`).join(",");
+}
+
+function plannerSummaryRoomId(launchPlan: TransferLaunchPlannerResult): string {
+  const roomIds = new Set<string>();
+  launchPlan.runnablePlans.forEach((plan) => roomIds.add(plan.roomId));
+  launchPlan.microGroupPlans.forEach((plan) => roomIds.add(plan.roomId));
+  launchPlan.plannerResult.activePlans.forEach((plan) => roomIds.add(plan.roomId));
+  launchPlan.plannerResult.heldPlans.forEach((plan) => roomIds.add(plan.roomId));
+  if (roomIds.size === 0) {
+    return "none";
+  }
+  if (roomIds.size === 1) {
+    return [...roomIds][0];
+  }
+  return "mixed";
+}
+
+function microGroupTotalBytesFromScheduler(
+  scheduler: TransferSchedulerState,
+  childItemIds: readonly string[]
+): number {
+  return childItemIds.reduce((total, childItemId) => {
+    const sizeBytes = scheduler.items[childItemId]?.sizeBytes;
+    return total + (typeof sizeBytes === "number" ? sizeBytes : 0);
+  }, 0);
 }
 
 export default App;
