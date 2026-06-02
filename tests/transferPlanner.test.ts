@@ -29,6 +29,7 @@ function fileTask(overrides: Partial<TransferPlannerTask> & Pick<TransferPlanner
     cancelRequested: overrides.cancelRequested,
     requestedWindow: overrides.requestedWindow,
     activeRequestedWindow: overrides.activeRequestedWindow,
+    mimeType: overrides.mimeType,
     createdAt: overrides.createdAt
   };
 }
@@ -108,15 +109,55 @@ test("three similarly large files split fairly within the global budget", () => 
   assert.equal(result.requestedWindowTotal, 8);
 });
 
-test("many small files create multiple low-window plans bounded by global budget and safety cap", () => {
+test("many tiny files create one serial micro group with one planner window", () => {
   const result = planWeightedTransfers(Array.from({ length: 12 }, (_, index) => (
-    fileTask({ id: `small-${index}`, sizeBytes: 512 * 1024, createdAt: index })
+    fileTask({ id: `small-${index}`, sizeBytes: 128 * 1024, createdAt: index })
   )));
 
-  assert.equal(result.runnablePlans.length, 4);
+  assert.equal(result.runnablePlans.length, 1);
+  assert.equal(result.runnablePlans[0].kind, "micro_group");
+  assert.equal(result.runnablePlans[0].requestedWindow, 1);
+  assert.equal(result.microGroupPlans.length, 1);
+  assert.equal(result.microGroupPlans[0].dispatchMode, "serial");
+  assert.equal(result.microGroupPlans[0].requestedWindow, 1);
+  assert.deepEqual(result.microGroupPlans[0].childTaskIds, Array.from({ length: 12 }, (_, index) => `small-${index}`));
+  assert.equal(result.requestedWindowTotal, 1);
+});
+
+test("shadow micro group reports possible grouping without changing runnable child plans", () => {
+  const result = planWeightedTransfers(
+    Array.from({ length: 6 }, (_, index) => (
+      fileTask({ id: `tiny-${index}`, sizeBytes: 128 * 1024, createdAt: index })
+    )),
+    { microGroupDispatchMode: "shadow" }
+  );
+
+  assert.equal(result.microGroupPlans.length, 1);
+  assert.equal(result.microGroupPlans[0].dispatchMode, "shadow");
+  assert.equal(result.microGroupPlans[0].requestedWindow, 1);
+  assert.deepEqual(result.runnablePlans.map((plan) => plan.taskId), ["tiny-0", "tiny-1", "tiny-2", "tiny-3"]);
   assert.deepEqual(result.runnablePlans.map((plan) => plan.requestedWindow), [2, 2, 2, 2]);
   assert.equal(result.requestedWindowTotal, 8);
-  assert.ok(result.heldPlans.every((plan) => plan.reason === "safety_cap_reached"));
+});
+
+test("huge plus many tiny gives the huge seven windows and the micro group one", () => {
+  const tinyTasks = Array.from({ length: 16 }, (_, index) => (
+    fileTask({ id: `tiny-${index}`, sizeBytes: 128 * 1024, createdAt: index + 2 })
+  ));
+  const result = planWeightedTransfers([
+    fileTask({ id: "huge", sizeBytes: 2 * GiB, createdAt: 1 }),
+    ...tinyTasks
+  ]);
+
+  assert.equal(result.microGroupPlans.length, 1);
+  assert.equal(result.microGroupPlans[0].requestedWindow, 1);
+  assert.equal(result.microGroupPlans[0].childTaskIds.length, 16);
+
+  const byId = new Map(result.runnablePlans.map((plan) => [plan.taskId, plan]));
+  assert.equal(byId.get("huge")?.requestedWindow, 7);
+  assert.equal(byId.get(result.microGroupPlans[0].groupId)?.kind, "micro_group");
+  assert.equal(byId.get(result.microGroupPlans[0].groupId)?.requestedWindow, 1);
+  assert.equal(result.requestedWindowTotal, 8);
 });
 
 test("safety cap prevents many tiny files from creating unbounded runnable transfers", () => {
@@ -125,7 +166,9 @@ test("safety cap prevents many tiny files from creating unbounded runnable trans
   )));
 
   assert.ok(result.runnablePlans.length <= 4);
-  assert.equal(result.requestedWindowTotal, 8);
+  assert.equal(result.requestedWindowTotal, 2);
+  assert.equal(result.microGroupPlans.length, 2);
+  assert.ok(result.microGroupPlans.every((plan) => plan.requestedWindow === 1));
 });
 
 test("burned room does not produce runnable plans", () => {

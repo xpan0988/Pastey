@@ -111,7 +111,7 @@ Large files MUST NOT be automatically broadcast to every room peer by default.
 
 File transfers SHOULD be targeted to one or more selected destination devices.
 
-Current Global Transfer Scheduler v1 is local frontend orchestration for outbound file sends. It may queue multiple selected or dropped files, start multiple existing queued file-like transfers according to weighted planner output, and update active outgoing binary-v1 sender windows after planner-managed queue item completion. Each runnable plan still uses the existing single-file transfer path. It MUST NOT imply archive bundling, folder recursion, retry/timeout adaptive windows, history-aware tuning, protocol changes, or a second backend transfer core.
+Current Global Transfer Scheduler v1 is local frontend orchestration for outbound file sends. It may queue multiple selected or dropped files, start multiple existing queued file-like transfers according to weighted planner output, group eligible tiny file-like queue items as scheduler-only `MicroFlowGroup` plans, track internal group terminal state, and update active outgoing binary-v1 sender windows after planner-managed queue item completion. Each ordinary runnable plan and each grouped child still uses the existing single-file transfer path. `MicroFlowGroup` is not a room item, archive, bundle, zip, protocol object, remote execution object, or permission grant. Scheduler grouping MUST NOT imply archive bundling, folder recursion, retry/timeout adaptive windows, history-aware tuning, protocol changes, command execution authority, or a second backend transfer core.
 
 File type MAY affect display labels. It MUST NOT change the core file transport behavior.
 

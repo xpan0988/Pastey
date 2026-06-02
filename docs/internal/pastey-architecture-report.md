@@ -25,10 +25,10 @@ At a high level:
 - Local filesystem directories store encrypted payloads, received Inbox files, temp files, and logs.
 - Peers communicate through temporary local HTTP servers started per active room.
 - UDP discovery and nearby join requests are used to find local peers, while manual 8-digit code join remains available.
-- The current large-file transport is per-file, chunked, encrypted, LAN peer transfer. The frontend can queue multiple selected, dropped, or pasted files, and weighted planner output can start multiple existing queued file-like transfers. Each file still uses the existing single-file transfer command.
+- The current large-file transport is per-file, chunked, encrypted, LAN peer transfer. The frontend can queue multiple selected, dropped, or pasted files, and weighted planner output can start multiple existing queued file-like transfers. Eligible tiny file-like queue items may be represented as a `MicroFlowGroup`, but each child still uses the existing single-file transfer command.
 - Binary-v1 chunk frames are the preferred high-performance chunk protocol; JSON/base64 chunk upload remains a legacy fallback.
 - Device diagnostics and link benchmarks exist, but they are advisory and do not currently drive routing or transfer tuning.
-- A pure frontend weighted transfer planner drives runtime dispatch for existing queued file-like transfers. Phase 4A completion-only rebalance can update active outgoing binary-v1 sender runtime windows after a planner-managed queue item reaches a terminal state. Diagnostics and benchmarks remain advisory and do not drive adaptive tuning.
+- A pure frontend weighted transfer planner drives runtime dispatch for existing queued file-like transfers. The planner emits ordinary runnable plans plus serial `MicroFlowGroup` plans for eligible tiny file-like work. Phase 4A completion-only rebalance can update active outgoing binary-v1 sender runtime windows after a planner-managed queue item reaches a terminal state. Diagnostics and benchmarks remain advisory and do not drive adaptive tuning.
 
 The current product model is room-based. A room is the coordination object for a transfer session. Room lifecycle is manual-burn based: Burn ends the local room state and cleans transient room data, but Inbox-saved received files are treated as durable user output.
 
@@ -130,7 +130,7 @@ The long-term direction described in `README.md` is broader local-first device c
 
 - Owns top-level view state, config, rooms, current room items, transfer progress events, and nearby join prompts.
 - Listens for `pastey://transfer-progress` and merges events through `mergeTransferEvent`.
-- Owns the frontend `TransferSchedulerState`, starts metadata preflight for queued file-like items, and launches planner runnable plans.
+- Owns the frontend `TransferSchedulerState`, starts metadata preflight for queued file-like items, launches planner runnable plans, and runs serial `MicroFlowGroup` children through the normal single-file queue path.
 - `processTransferQueueItem` calls `sendFileToRoom` for one planned queued file, passing the frontend queue item id as optional progress-correlation metadata and the planner requested sender window. Metadata failure marks the queue item failed before any transfer starts.
 - Renders `DevicesPage`, `RoomsPage`, `RoomPage`, or `SettingsPage`.
 - Calls `burnRoom`, `getRoom`, `listRoomItems`, `listRooms`, and nearby join commands through `src/lib/tauri.ts`.
@@ -148,18 +148,18 @@ The long-term direction described in `README.md` is broader local-first device c
 `src/lib/transferScheduler.ts`
 
 - Frontend-only outbound file scheduler.
-- Supports batches of queued file inputs, dedupes nonterminal queued/sending items, tracks queued/preparing/sending/completed/failed/cancelled item state, tracks metadata readiness as unknown/loading/ready/failed, correlates outgoing progress by queue item id when present, exposes room-local queue summaries, and adapts scheduler state into weighted planner tasks.
+- Supports batches of queued file inputs, dedupes nonterminal queued/sending items, tracks queued/preparing/sending/completed/failed/cancelled item state, tracks internal MicroFlowGroup queued/running/terminal state, tracks metadata readiness as unknown/loading/ready/failed, correlates outgoing progress by queue item id when present, exposes room-local queue summaries, and adapts scheduler state into weighted planner tasks and serial MicroFlowGroup launch plans.
 - `planRunnableTransferLaunches` accounts for active and already launching items, excludes cancelled/burned/closed-room work, and returns runnable plans for `App.tsx` to execute.
 - Cancellation is local for queued/preparing items and calls backend `cancelTransfer` only for an active sending item once a transfer id has been correlated.
 
 `src/lib/transferPlanner.ts`
 
 - Pure frontend weighted transfer planner.
-- Defines planner task kinds, size classes, lanes, priority, sensitivity flags, runnable plans, active plans, held plans, lane budget reports, requested windows, and held/debug reasons.
+- Defines planner task kinds, size classes, lanes, priority, sensitivity flags, runnable plans, active plans, held plans, MicroFlowGroup plans, lane budget reports, requested windows, and held/debug reasons.
 - Default policy uses `globalWindowBudget = 8`, `minRequestedWindow = 1`, lane weights for `small_file` and `bulk_file`, a model-only `control_text` lane, and a safety active-transfer cap.
 - Requires metadata-ready tasks for allocation; missing metadata, burned/unavailable rooms, cancelled tasks, and terminal tasks become held plans.
 - Reserves active transfer budget before producing runnable plans in the normal launch pass, and uses batch-relative size weighting for final file-like requested-window allocation. Completion-only Phase 4A rebalance can reallocate active sender windows while keeping total active plus runnable requested windows within the global window budget.
-- Used by `App.tsx` runtime dispatch for queued file-like transfers only. Text/control/agent/command lanes remain model-only.
+- Used by `App.tsx` runtime dispatch for queued file-like transfers only. `micro_group` is a scheduler/resource abstraction for grouped tiny file-like children and is not a room item or protocol object. Text/control/agent/command lanes remain model-only.
 
 `src/pages/SettingsPage.tsx`
 
@@ -212,7 +212,7 @@ src/pages/RoomPage.tsx
   -> getFileTransferMetadata(path)
   -> transferScheduler::planRunnableTransferLaunches(...)
   -> transferPlanner::planWeightedTransfers(...)
-  -> App.tsx::processTransferQueueItem(...)
+  -> App.tsx::processTransferQueueItem(...) or App.tsx::processMicroFlowGroup(...)
   -> sendFileToRoom(room.id, path, { displayName, mimeType, queueItemId, requestedWindow })
   -> Tauri command send_file_to_room(...)
   -> storage::create_outgoing_file_item_with_metadata(...)
@@ -230,7 +230,7 @@ How the file path enters the system:
 
 - `RoomPage.tsx` receives one or more absolute paths from the Tauri dialog or webview drag/drop event, or creates a temporary pasted-image path through `writeTempFile`.
 - The frontend scheduler stores each path as a queued item with metadata readiness/cache state.
-- `App.tsx::processTransferQueueItem` handles one planned queued item; multiple calls may be active when the planner starts multiple runnable plans.
+- `App.tsx::processTransferQueueItem` handles one planned queued item; multiple calls may be active when the planner starts multiple runnable plans. For serial `MicroFlowGroup` work, `App.tsx::processMicroFlowGroup` calls the same queue-item path for each child one at a time and records group terminal state as completed, completed with errors, cancelled, or interrupted.
 - `App.tsx::prepareQueueItemMetadata` resolves metadata before send start and caches display name, MIME guess, size, modified timestamp, and dedupe identity on the queued item.
 - `getFileTransferMetadata` verifies the active path is a file and returns display name, MIME guess, size, and modified timestamp.
 - `send_file_to_room` calls `resolve_user_path`, rejects non-files, and creates the outgoing room item for that single active file. Its optional queue item id argument is correlation metadata only. Its optional requested-window argument is sender-side tuning input only.
@@ -544,6 +544,7 @@ Verified current limitations:
 - Queued file-like items cache metadata readiness before planner allocation; picker and drag/drop items begin unknown, pasted images may provide display/MIME/size hints, and launch still refreshes file metadata before sending.
 - Queued outgoing file progress can correlate by frontend queue item id. The older room id, display name, and size fallback remains for progress events without queue correlation metadata.
 - Each queued file is still sent through `sendFileToRoom` / `send_file_to_room` as a separate single-file transfer. There is no bundled multi-file transfer model.
+- Eligible tiny file-like queue items may be grouped as a scheduler-only `MicroFlowGroup`; the current group runner dispatches children serially, records internal group terminal state, and does not create a bundle, archive, room item, protocol stream, or shared file payload.
 - Existing `.zip` or archive files are not treated specially by the transport. They are ordinary files.
 - No archive extraction implementation was found.
 - No archive creation/bundling implementation was found.

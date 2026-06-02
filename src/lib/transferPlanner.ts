@@ -2,6 +2,7 @@ export type TransferPlannerTaskKind =
   | "file"
   | "image"
   | "pasted_image"
+  | "micro_group"
   | "text"
   | "control"
   | "agent"
@@ -18,6 +19,8 @@ export type TransferPlannerTaskState = "queued" | "active" | "completed" | "fail
 export type TransferPlannerMetadataStatus = "unknown" | "loading" | "ready" | "failed";
 
 export type TransferPlannerRoomStatus = "active" | "peer_left" | "burned" | "expired" | "unavailable";
+
+export type MicroFlowGroupDispatchMode = "shadow" | "serial";
 
 export type TransferPlannerHeldReason =
   | "cancelled"
@@ -44,6 +47,7 @@ export interface TransferPlannerTask {
   cancelRequested?: boolean;
   requestedWindow?: number | null;
   activeRequestedWindow?: number | null;
+  mimeType?: string | null;
   createdAt?: number;
 }
 
@@ -54,6 +58,10 @@ export interface TransferPlannerPolicy {
   safetyActiveTransferCap: number;
   laneWeights: Record<TransferPlannerLane, number>;
   rebalanceActiveWindows: boolean;
+  microGroupDispatchMode: MicroFlowGroupDispatchMode;
+  microGroupMaxChildSizeBytes: number;
+  microGroupMaxGroupBytes: number;
+  microGroupMaxGroupItems: number;
 }
 
 export interface TransferPlannerPlan {
@@ -66,6 +74,17 @@ export interface TransferPlannerPlan {
   latencySensitive: boolean;
   throughputSensitive: boolean;
   requestedWindow: number;
+}
+
+export interface MicroFlowGroupPlan {
+  groupId: string;
+  roomId: string;
+  lane: TransferPlannerLane;
+  requestedWindow: number;
+  childTaskIds: string[];
+  totalBytes: number;
+  reason: string;
+  dispatchMode: MicroFlowGroupDispatchMode;
 }
 
 export type TransferPlannerRunnablePlan = TransferPlannerPlan;
@@ -96,6 +115,7 @@ export interface TransferPlannerResult {
   runnablePlans: TransferPlannerRunnablePlan[];
   activePlans: TransferPlannerActivePlan[];
   heldPlans: TransferPlannerHeldPlan[];
+  microGroupPlans: MicroFlowGroupPlan[];
   laneBudgets: TransferPlannerLaneBudgetReport[];
   requestedWindowTotal: number;
   globalWindowBudget: number;
@@ -111,6 +131,16 @@ interface ClassifiedTask {
   throughputSensitive: boolean;
 }
 
+interface PlannedMicroFlowGroup {
+  groupId: string;
+  roomId: string;
+  lane: TransferPlannerLane;
+  childTaskIds: string[];
+  totalBytes: number;
+  reason: string;
+  candidate: ClassifiedTask;
+}
+
 const KiB = 1024;
 const MiB = 1024 * KiB;
 
@@ -120,6 +150,10 @@ export const DEFAULT_TRANSFER_PLANNER_POLICY: TransferPlannerPolicy = {
   maxRequestedWindow: 8,
   safetyActiveTransferCap: 4,
   rebalanceActiveWindows: false,
+  microGroupDispatchMode: "serial",
+  microGroupMaxChildSizeBytes: MiB,
+  microGroupMaxGroupBytes: 4 * MiB,
+  microGroupMaxGroupItems: 32,
   laneWeights: {
     control_text: 1,
     small_file: 1,
@@ -169,6 +203,18 @@ export function planWeightedTransfers(
   const laneBudgets = computeLaneBudgets([...activeCandidates, ...queuedCandidates], policy);
   const activePlans: TransferPlannerActivePlan[] = [];
   const runnablePlans: TransferPlannerRunnablePlan[] = [];
+  const microGroupCandidates = planMicroFlowGroups(queuedCandidates, policy);
+  const groupedTaskIds = new Set(
+    policy.microGroupDispatchMode === "serial"
+      ? microGroupCandidates.flatMap((group) => group.childTaskIds)
+      : []
+  );
+  const allocationQueuedCandidates = policy.microGroupDispatchMode === "serial"
+    ? [
+      ...queuedCandidates.filter((candidate) => !groupedTaskIds.has(candidate.task.id)),
+      ...microGroupCandidates.map((group) => group.candidate)
+    ]
+    : queuedCandidates;
 
   let globalRemaining = policy.globalWindowBudget;
   if (policy.rebalanceActiveWindows) {
@@ -187,7 +233,7 @@ export function planWeightedTransfers(
 
     const runnableSlots = Math.max(0, policy.safetyActiveTransferCap - plannedActive.length);
     const selectedQueued = selectRunnableCandidates(
-      queuedCandidates,
+      allocationQueuedCandidates,
       runnableSlots,
       policy.globalWindowBudget - plannedActive.length * policy.minRequestedWindow,
       policy
@@ -215,7 +261,7 @@ export function planWeightedTransfers(
       plannedActive.length * policy.minRequestedWindow -
       selectedQueued.length * policy.minRequestedWindow
     );
-    for (const candidate of queuedCandidates) {
+    for (const candidate of allocationQueuedCandidates) {
       if (selectedQueuedIds.has(candidate.task.id)) {
         continue;
       }
@@ -251,7 +297,7 @@ export function planWeightedTransfers(
 
     const activeTransferCount = activePlans.length;
     let runnableSlots = Math.max(0, policy.safetyActiveTransferCap - activeTransferCount);
-    const selectedQueued = selectRunnableCandidates(queuedCandidates, runnableSlots, globalRemaining, policy);
+    const selectedQueued = selectRunnableCandidates(allocationQueuedCandidates, runnableSlots, globalRemaining, policy);
     const selectedQueuedIds = new Set(selectedQueued.map((candidate) => candidate.task.id));
     const windows = distributeWeightedWindows(selectedQueued, globalRemaining, policy);
 
@@ -265,7 +311,7 @@ export function planWeightedTransfers(
       runnableSlots -= 1;
     });
 
-    for (const candidate of queuedCandidates) {
+    for (const candidate of allocationQueuedCandidates) {
       if (selectedQueuedIds.has(candidate.task.id)) {
         continue;
       }
@@ -275,6 +321,20 @@ export function planWeightedTransfers(
   }
 
   const requestedWindowTotal = sumWindows(activePlans) + sumWindows(runnablePlans);
+  const serialMicroGroupWindows = new Map(
+    runnablePlans
+      .filter((plan) => plan.kind === "micro_group")
+      .map((plan) => [plan.taskId, plan.requestedWindow])
+  );
+  const microGroupPlans = microGroupCandidates
+    .filter((group) => policy.microGroupDispatchMode === "shadow" || serialMicroGroupWindows.has(group.groupId))
+    .map((group) => createMicroGroupPlan(
+      group,
+      policy.microGroupDispatchMode === "serial"
+        ? serialMicroGroupWindows.get(group.groupId) ?? policy.minRequestedWindow
+        : policy.minRequestedWindow,
+      policy.microGroupDispatchMode
+    ));
   if (requestedWindowTotal > policy.globalWindowBudget) {
     debugReasons.push("requested windows exceeded global budget before final accounting");
   }
@@ -298,6 +358,7 @@ export function planWeightedTransfers(
     runnablePlans,
     activePlans,
     heldPlans,
+    microGroupPlans,
     laneBudgets: reports,
     requestedWindowTotal,
     globalWindowBudget: policy.globalWindowBudget,
@@ -321,6 +382,12 @@ function normalizePolicy(overrides: Partial<TransferPlannerPolicy>): TransferPla
     Math.floor(overrides.maxRequestedWindow ?? DEFAULT_TRANSFER_PLANNER_POLICY.maxRequestedWindow)
   );
   const safetyActiveTransferCap = Math.max(1, Math.floor(overrides.safetyActiveTransferCap ?? DEFAULT_TRANSFER_PLANNER_POLICY.safetyActiveTransferCap));
+  const microGroupMaxChildSizeBytes = Math.max(1, Math.floor(overrides.microGroupMaxChildSizeBytes ?? DEFAULT_TRANSFER_PLANNER_POLICY.microGroupMaxChildSizeBytes));
+  const microGroupMaxGroupBytes = Math.max(
+    microGroupMaxChildSizeBytes,
+    Math.floor(overrides.microGroupMaxGroupBytes ?? DEFAULT_TRANSFER_PLANNER_POLICY.microGroupMaxGroupBytes)
+  );
+  const microGroupMaxGroupItems = Math.max(2, Math.floor(overrides.microGroupMaxGroupItems ?? DEFAULT_TRANSFER_PLANNER_POLICY.microGroupMaxGroupItems));
 
   return {
     globalWindowBudget,
@@ -328,6 +395,10 @@ function normalizePolicy(overrides: Partial<TransferPlannerPolicy>): TransferPla
     maxRequestedWindow,
     safetyActiveTransferCap,
     rebalanceActiveWindows: overrides.rebalanceActiveWindows ?? DEFAULT_TRANSFER_PLANNER_POLICY.rebalanceActiveWindows,
+    microGroupDispatchMode: overrides.microGroupDispatchMode ?? DEFAULT_TRANSFER_PLANNER_POLICY.microGroupDispatchMode,
+    microGroupMaxChildSizeBytes,
+    microGroupMaxGroupBytes,
+    microGroupMaxGroupItems,
     laneWeights: {
       ...DEFAULT_TRANSFER_PLANNER_POLICY.laneWeights,
       ...(overrides.laneWeights ?? {})
@@ -508,7 +579,7 @@ function distributeWeightedWindows(
   const remainders: Array<{ index: number; remainder: number; weight: number }> = [];
 
   weights.forEach((weight, index) => {
-    const capacity = policy.maxRequestedWindow - windows[index];
+    const capacity = maxRequestedWindowForCandidate(selected[index], policy) - windows[index];
     if (capacity <= 0) {
       remainders.push({ index, remainder: 0, weight });
       return;
@@ -524,7 +595,7 @@ function distributeWeightedWindows(
   let guard = remaining + selected.length;
   while (allocated < budget && guard > 0) {
     const candidate = [...remainders]
-      .filter((entry) => windows[entry.index] < policy.maxRequestedWindow)
+      .filter((entry) => windows[entry.index] < maxRequestedWindowForCandidate(selected[entry.index], policy))
       .sort((left, right) => (
         right.remainder - left.remainder ||
         right.weight - left.weight ||
@@ -545,6 +616,162 @@ function distributeWeightedWindows(
 
 function allocationWeight(candidate: ClassifiedTask): number {
   return Math.max(1, candidate.task.sizeBytes ?? 1);
+}
+
+function maxRequestedWindowForCandidate(candidate: ClassifiedTask, policy: TransferPlannerPolicy): number {
+  if (candidate.task.kind === "micro_group") {
+    return policy.minRequestedWindow;
+  }
+  return policy.maxRequestedWindow;
+}
+
+function planMicroFlowGroups(
+  candidates: readonly ClassifiedTask[],
+  policy: TransferPlannerPolicy
+): PlannedMicroFlowGroup[] {
+  const groupsByKey = new Map<string, ClassifiedTask[]>();
+  for (const candidate of sortAllocationCandidates(candidates)) {
+    if (!isMicroFlowGroupEligible(candidate, policy)) {
+      continue;
+    }
+
+    const key = microFlowGroupKey(candidate);
+    const entries = groupsByKey.get(key) ?? [];
+    entries.push(candidate);
+    groupsByKey.set(key, entries);
+  }
+
+  const groups: PlannedMicroFlowGroup[] = [];
+  for (const entries of groupsByKey.values()) {
+    let pending: ClassifiedTask[] = [];
+    let pendingBytes = 0;
+
+    for (const candidate of entries) {
+      const sizeBytes = candidate.task.sizeBytes ?? 0;
+      if (
+        pending.length >= policy.microGroupMaxGroupItems ||
+        (pending.length > 0 && pendingBytes + sizeBytes > policy.microGroupMaxGroupBytes)
+      ) {
+        pushMicroFlowGroup(groups, pending);
+        pending = [];
+        pendingBytes = 0;
+      }
+
+      pending.push(candidate);
+      pendingBytes += sizeBytes;
+    }
+
+    pushMicroFlowGroup(groups, pending);
+  }
+
+  return groups.sort((left, right) => left.groupId.localeCompare(right.groupId));
+}
+
+function pushMicroFlowGroup(
+  groups: PlannedMicroFlowGroup[],
+  candidates: readonly ClassifiedTask[]
+) {
+  if (candidates.length < 2) {
+    return;
+  }
+
+  const sorted = sortCandidates(candidates);
+  const first = sorted[0];
+  const totalBytes = sorted.reduce((total, candidate) => total + (candidate.task.sizeBytes ?? 0), 0);
+  const childTaskIds = sorted.map((candidate) => candidate.task.id);
+  const groupId = [
+    "micro-group",
+    first.task.roomId,
+    first.lane,
+    first.sizeClass,
+    broadMimeFamily(first.task.mimeType),
+    childTaskIds[0]
+  ].join(":");
+  const priority = sorted.reduce((highest, candidate) => (
+    priorityValue(candidate.priority) > priorityValue(highest) ? candidate.priority : highest
+  ), first.priority);
+  const task: TransferPlannerTask = {
+    id: groupId,
+    roomId: first.task.roomId,
+    kind: "micro_group",
+    state: "queued",
+    metadataStatus: "ready",
+    sizeBytes: totalBytes,
+    priority,
+    latencySensitive: true,
+    throughputSensitive: false,
+    roomStatus: "active",
+    roomAvailable: true,
+    createdAt: Math.min(...sorted.map((candidate) => candidate.task.createdAt ?? 0))
+  };
+
+  groups.push({
+    groupId,
+    roomId: first.task.roomId,
+    lane: first.lane,
+    childTaskIds,
+    totalBytes,
+    reason: `grouped ${childTaskIds.length} tiny file-like tasks by room/lane/size/mime family`,
+    candidate: {
+      task,
+      lane: first.lane,
+      sizeClass: classifyTransferPlannerSize(totalBytes),
+      priority,
+      latencySensitive: true,
+      throughputSensitive: false
+    }
+  });
+}
+
+function isMicroFlowGroupEligible(candidate: ClassifiedTask, policy: TransferPlannerPolicy): boolean {
+  return isFileLikeTaskKind(candidate.task.kind) &&
+    candidate.task.state === "queued" &&
+    candidate.task.roomStatus === "active" &&
+    candidate.task.roomAvailable !== false &&
+    candidate.task.metadataStatus === "ready" &&
+    typeof candidate.task.sizeBytes === "number" &&
+    candidate.task.sizeBytes <= policy.microGroupMaxChildSizeBytes &&
+    (candidate.sizeClass === "tiny" || candidate.sizeClass === "small") &&
+    candidate.lane === "small_file";
+}
+
+function isFileLikeTaskKind(kind: TransferPlannerTaskKind): boolean {
+  return kind === "file" || kind === "image" || kind === "pasted_image";
+}
+
+function microFlowGroupKey(candidate: ClassifiedTask): string {
+  return [
+    candidate.task.roomId,
+    candidate.lane,
+    candidate.sizeClass,
+    "file_like",
+    broadMimeFamily(candidate.task.mimeType)
+  ].join(":");
+}
+
+function broadMimeFamily(mimeType?: string | null): string {
+  const trimmed = mimeType?.trim().toLowerCase();
+  if (!trimmed || !trimmed.includes("/")) {
+    return "unknown";
+  }
+  return trimmed.split("/", 1)[0] || "unknown";
+}
+
+function createMicroGroupPlan(
+  group: PlannedMicroFlowGroup,
+  requestedWindow: number,
+  dispatchMode: MicroFlowGroupDispatchMode
+): MicroFlowGroupPlan {
+  return {
+    groupId: group.groupId,
+    roomId: group.roomId,
+    lane: group.lane,
+    requestedWindow,
+    childTaskIds: group.childTaskIds,
+    totalBytes: group.totalBytes,
+    reason: group.reason,
+    dispatchMode
+  };
 }
 
 function createPlan(candidate: ClassifiedTask, requestedWindow: number): TransferPlannerPlan {

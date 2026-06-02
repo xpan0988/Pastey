@@ -6,9 +6,12 @@ import {
   cancelBatchLocally,
   cancelQueueItem,
   clearQueuedItemsForRoom,
+  completeMicroFlowGroupFromChildren,
   correlateTransferProgress,
   createTransferSchedulerState,
   enqueueTransferBatch,
+  markMicroFlowGroupQueued,
+  markMicroFlowGroupRunning,
   markQueueItemCompleted,
   markQueueItemFailed,
   markQueueItemMetadataFailed,
@@ -18,6 +21,7 @@ import {
   markQueueItemSending,
   planActiveTransferWindowRebalances,
   planRunnableTransferLaunches,
+  recordMicroFlowGroupChildTerminal,
   type TransferQueueItem,
   type TransferSchedulerState
 } from "../src/lib/transferScheduler";
@@ -149,17 +153,122 @@ test("staggered metadata readiness documents small-first launch behavior", () =>
   assert.equal(afterSmallCompletes.runnablePlans[0].requestedWindow, 8);
 });
 
-test("many-small queue starts bounded multiple transfers", () => {
+test("many-tiny queue produces one serial micro group launch plan", () => {
   const state = enqueueTransferBatch(
     createTransferSchedulerState(),
     "room-1",
     Array.from({ length: 16 }, (_, index) => readyInput(`small-${index}.bin`, 128 * 1024, `/tmp/small-${index}.bin`, index))
   );
 
-  const { runnablePlans } = planRunnableTransferLaunches(state, activeRooms);
+  const { runnablePlans, microGroupPlans, plannerResult } = planRunnableTransferLaunches(state, activeRooms);
 
-  assert.equal(runnablePlans.length, 4);
-  assert.deepEqual(runnablePlans.map((plan) => plan.requestedWindow), [2, 2, 2, 2]);
+  assert.equal(runnablePlans.length, 0);
+  assert.equal(microGroupPlans.length, 1);
+  assert.equal(microGroupPlans[0].dispatchMode, "serial");
+  assert.equal(microGroupPlans[0].requestedWindow, 1);
+  assert.equal(microGroupPlans[0].childItemIds.length, 16);
+  assert.equal(plannerResult.requestedWindowTotal, 1);
+});
+
+test("huge plus many tiny queue gives huge runnable window seven and micro group window one", () => {
+  const state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    [
+      readyInput("huge.bin", 2 * GiB, "/tmp/huge.bin", 1),
+      ...Array.from({ length: 16 }, (_, index) => (
+        readyInput(`tiny-${index}.bin`, 128 * 1024, `/tmp/tiny-${index}.bin`, index + 2)
+      ))
+    ]
+  );
+
+  const { runnablePlans, microGroupPlans, plannerResult } = planRunnableTransferLaunches(state, activeRooms);
+  const hugePlan = runnablePlans.find((plan) => state.items[plan.itemId].displayName === "huge.bin");
+
+  assert.equal(runnablePlans.length, 1);
+  assert.equal(hugePlan?.requestedWindow, 7);
+  assert.equal(microGroupPlans.length, 1);
+  assert.equal(microGroupPlans[0].requestedWindow, 1);
+  assert.equal(microGroupPlans[0].childItemIds.length, 16);
+  assert.equal(plannerResult.requestedWindowTotal, 8);
+});
+
+test("micro group terminal state completes when all children complete", () => {
+  let state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    Array.from({ length: 3 }, (_, index) => readyInput(`tiny-${index}.bin`, 128 * 1024, `/tmp/tiny-${index}.bin`, index))
+  );
+  const groupPlan = planRunnableTransferLaunches(state, activeRooms).microGroupPlans[0];
+
+  state = markMicroFlowGroupQueued(state, groupPlan);
+  state = markMicroFlowGroupRunning(state, groupPlan.groupId);
+  for (const childItemId of groupPlan.childItemIds) {
+    state = recordMicroFlowGroupChildTerminal(state, groupPlan.groupId, childItemId, "completed");
+  }
+  state = completeMicroFlowGroupFromChildren(state, groupPlan.groupId);
+
+  const group = state.microGroups[groupPlan.groupId];
+  assert.equal(group.status, "completed");
+  assert.equal(group.terminalReason, "all_children_completed");
+  assert.deepEqual(group.completedChildIds, groupPlan.childItemIds);
+});
+
+test("micro group terminal state records completed_with_errors when one child fails", () => {
+  let state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    Array.from({ length: 3 }, (_, index) => readyInput(`tiny-${index}.bin`, 128 * 1024, `/tmp/tiny-${index}.bin`, index))
+  );
+  const groupPlan = planRunnableTransferLaunches(state, activeRooms).microGroupPlans[0];
+  const [first, second, third] = groupPlan.childItemIds;
+
+  state = markMicroFlowGroupQueued(state, groupPlan);
+  state = markMicroFlowGroupRunning(state, groupPlan.groupId);
+  state = recordMicroFlowGroupChildTerminal(state, groupPlan.groupId, first, "completed");
+  state = recordMicroFlowGroupChildTerminal(state, groupPlan.groupId, second, "failed");
+  state = recordMicroFlowGroupChildTerminal(state, groupPlan.groupId, third, "completed");
+  state = completeMicroFlowGroupFromChildren(state, groupPlan.groupId);
+
+  const group = state.microGroups[groupPlan.groupId];
+  assert.equal(group.status, "completed_with_errors");
+  assert.equal(group.terminalReason, "one_or_more_children_failed_or_cancelled");
+  assert.deepEqual(group.failedChildIds, [second]);
+});
+
+test("micro group terminal state is cancelled by batch cancellation", () => {
+  let state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    Array.from({ length: 3 }, (_, index) => readyInput(`tiny-${index}.bin`, 128 * 1024, `/tmp/tiny-${index}.bin`, index))
+  );
+  const groupPlan = planRunnableTransferLaunches(state, activeRooms).microGroupPlans[0];
+  const firstChild = state.items[groupPlan.childItemIds[0]];
+
+  state = markMicroFlowGroupQueued(state, groupPlan);
+  state = markMicroFlowGroupRunning(state, groupPlan.groupId);
+  state = cancelBatchLocally(state, firstChild.batchId);
+
+  const group = state.microGroups[groupPlan.groupId];
+  assert.equal(group.status, "cancelled");
+  assert.equal(group.terminalReason, "batch_cancelled");
+});
+
+test("micro group terminal state is interrupted when room work is cleared", () => {
+  let state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    Array.from({ length: 3 }, (_, index) => readyInput(`tiny-${index}.bin`, 128 * 1024, `/tmp/tiny-${index}.bin`, index))
+  );
+  const groupPlan = planRunnableTransferLaunches(state, activeRooms).microGroupPlans[0];
+
+  state = markMicroFlowGroupQueued(state, groupPlan);
+  state = markMicroFlowGroupRunning(state, groupPlan.groupId);
+  state = clearQueuedItemsForRoom(state, "room-1");
+
+  const group = state.microGroups[groupPlan.groupId];
+  assert.equal(group.status, "interrupted");
+  assert.equal(group.terminalReason, "room_cleared_or_burned");
 });
 
 test("planner rerun does not duplicate an already launching item", () => {
