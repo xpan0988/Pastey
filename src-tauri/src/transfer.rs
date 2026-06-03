@@ -2504,6 +2504,16 @@ fn map_missing_payload_error(error: std::io::Error) -> AppError {
 
 pub fn device_name() -> String {
     std::env::var("PASTEY_DEVICE_NAME")
+        .or_else(|_| {
+            std::env::var("PASTEY_PROFILE").map(|profile| {
+                let trimmed = profile.trim();
+                if trimmed.is_empty() {
+                    "Pastey local".to_string()
+                } else {
+                    format!("Pastey {trimmed}")
+                }
+            })
+        })
         .or_else(|_| std::env::var("HOSTNAME"))
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "Nearby device".to_string())

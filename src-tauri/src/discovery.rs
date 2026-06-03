@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     extract::{ConnectInfo, State},
@@ -9,6 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use socket2::{Domain, Protocol, Socket, Type};
 use tauri::Emitter;
 use tokio::{
     net::{TcpListener, UdpSocket},
@@ -99,11 +104,7 @@ pub async fn ensure_service(state: Arc<AppState>) -> AppResult<()> {
     ensure_join_request_service(state.clone()).await?;
 
     if state.discovery_handle.lock().is_none() {
-        let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
-            .await
-            .map_err(|error| {
-                AppError::Network(format!("unable to bind discovery socket: {error}"))
-            })?;
+        let socket = bind_discovery_socket()?;
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let service_state = state.clone();
 
@@ -137,6 +138,26 @@ pub async fn ensure_service(state: Arc<AppState>) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+fn bind_discovery_socket() -> AppResult<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|error| AppError::Network(format!("unable to create discovery socket: {error}")))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|error| AppError::Network(format!("unable to reuse discovery socket address: {error}")))?;
+    #[cfg(unix)]
+    socket
+        .set_reuse_port(true)
+        .map_err(|error| AppError::Network(format!("unable to reuse discovery socket port: {error}")))?;
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT).into())
+        .map_err(|error| AppError::Network(format!("unable to bind discovery socket: {error}")))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|error| AppError::Network(format!("unable to set discovery socket nonblocking: {error}")))?;
+    UdpSocket::from_std(socket.into())
+        .map_err(|error| AppError::Network(format!("unable to initialize discovery socket: {error}")))
 }
 
 async fn ensure_join_request_service(state: Arc<AppState>) -> AppResult<()> {
