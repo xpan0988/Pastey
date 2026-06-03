@@ -56,10 +56,51 @@ Example validation searches, using the app log path for the current platform:
 
 ```sh
 rg "\\[pastey:(planner|micro-group|runtime-window)\\]" /path/to/pastey.log
+rg "\\[pastey:planner\\].*micro_group_capacity_mode=" /path/to/pastey.log
 rg "\\[pastey:planner\\].*micro_group_skip_reason" /path/to/pastey.log
+rg "one_window_quantum_bytes=|dynamic_child_cap_bytes=|dynamic_group_cap_bytes=" /path/to/pastey.log
 rg "\\[pastey:micro-group\\].*event=final" /path/to/pastey.log
 rg "\\[pastey:runtime-window\\].*event=summary" /path/to/pastey.log
 ```
+
+Equivalent `grep -E` forms:
+
+```sh
+grep -E "\\[pastey:planner\\].*micro_group_capacity_mode=" /path/to/pastey.log
+grep -E "one_window_quantum_bytes=|dynamic_child_cap_bytes=|dynamic_group_cap_bytes=" /path/to/pastey.log
+grep -E "\\[pastey:micro-group\\].*event=(planned|final)" /path/to/pastey.log
+grep -E "\\[pastey:runtime-window\\].*event=summary" /path/to/pastey.log
+```
+
+## Single-Machine Validation Tiers
+
+Use three different validation tiers for scheduler work:
+
+- Planner replay is algorithm validation. It does not launch Tauri, open a room server, read payload files, or use the network.
+- Single-machine dual-instance mode is lifecycle smoke. It uses isolated local app data and real local HTTP transfer paths where possible, but it is not a throughput benchmark.
+- Two-machine LAN validation is the real throughput validation path.
+
+Planner replay:
+
+```sh
+rtk node scripts/replay-transfer-planner-scenarios.mjs
+```
+
+The replay prints grep-friendly scenario lines with fixed and dynamic-shadow MicroFlowGroup counts, eligible child counts, contention, one-window quantum, dynamic child/group caps, skip reason, and requested-window totals.
+
+Single-machine dual-instance smoke requires separate app data roots:
+
+```sh
+PASTEY_PROFILE=sender PASTEY_APP_DATA_DIR=/tmp/pastey-sender PASTEY_DEVICE_NAME="Pastey sender" rtk npm run tauri:dev-fast
+```
+
+```sh
+PASTEY_PROFILE=receiver PASTEY_APP_DATA_DIR=/tmp/pastey-receiver PASTEY_DEVICE_NAME="Pastey receiver" rtk npm run tauri:dev-fast
+```
+
+`PASTEY_APP_DATA_DIR` redirects SQLite, config, payloads, temp files, Inbox, and logs together. With the override above, logs are under `/tmp/pastey-sender/logs/pastey.log` and `/tmp/pastey-receiver/logs/pastey.log`. `PASTEY_PROFILE` is a developer label for local identity; `PASTEY_DEVICE_NAME` remains the explicit display-name override.
+
+When running two dev instances from the same checkout, the default Tauri dev URL and Vite port are fixed at `localhost:1420`. Use one dev instance plus one packaged/built app, a second checkout with an overridden Tauri dev URL, or a Tauri `--config` devUrl override so the frontend ports do not collide. Room transfer servers and nearby join HTTP servers bind dynamic local ports, and the discovery socket is reusable for local dual-instance smoke.
 
 ## Local Dev-Fast Transfer Testing
 

@@ -26,6 +26,8 @@ Current implemented behavior:
 - Active outgoing binary-v1 sender transfers have a sender-only runtime window handle that can be updated by a structured command while the transfer is running.
 - Planner-managed queued file-like transfers trigger completion-only active-window rebalance after a queue item reaches a terminal state.
 - `npm run tauri:dev-fast` is available for faster local transfer-throughput testing.
+- `scripts/replay-transfer-planner-scenarios.mjs` provides Tauri-free planner replay for fixed-vs-dynamic-shadow MicroFlowGroup diagnostics. It is algorithm validation only.
+- Developer-only `PASTEY_APP_DATA_DIR` and `PASTEY_PROFILE` support single-machine dual-instance lifecycle smoke with isolated local app data and distinct profile labels.
 
 Current dispatch is planner-driven for file-like queue items. Phase 4A completion-only runtime window mutation is implemented for active outgoing binary-v1 sender transfers. MicroFlowGroup serial dispatch is implemented as a scheduler/resource abstraction only. Retry/timeout downshift, stable cooldown recovery, speed-history heuristics, broader adaptive rebalance policies, archive/bundle transfer, substream multiplexing, and binary-v2 are not implemented.
 
@@ -49,6 +51,7 @@ Current invariants:
 - A `MicroFlowGroup` consumes exactly one requested window in the current implementation.
 - Children inside a `MicroFlowGroup` do not independently consume planner windows while grouped.
 - A group requires at least two eligible children. Each child must be a queued, metadata-ready, non-cancelled file-like item in an active room, no larger than `maxChildSizeBytes`, assigned to the small-file lane, and in the same room/lane/size-class/broad-MIME grouping key.
+- Planner diagnostics may report dynamic-shadow capacity fields such as `one_window_quantum_bytes`, `dynamic_child_cap_bytes`, and `dynamic_group_cap_bytes`, but current runtime dispatch still uses the fixed serial MicroFlowGroup policy.
 - Internal group status is tracked as `queued`, `running`, `completed`, `completed_with_errors`, `cancelled`, or `interrupted`.
 - Grouping does not change child file metadata, payload encryption, binary-v1 frame behavior, ACK behavior, finalize behavior, cancel/burn behavior, or Inbox behavior.
 - Grouping does not alter file contents at the transport layer.
@@ -135,6 +138,16 @@ Remaining Phase 4 limits:
 - JSON fallback has no pipelined mutable window behavior; Phase 4A returns a structured no-op for it rather than redesigning fallback transfer.
 - Retry/timeout downshift, stable cooldown recovery, speed-history heuristics, and history-aware weighting remain future work.
 - Runtime-window frontend diagnostics emit `event=tracking_started` before a planner-managed send, `event=update` after each update command result, and `event=summary` when the frontend observes a terminal queue state. If the app process exits while a transfer is active, no frontend terminal cleanup can run, so the tracking/update lines are the durable pre-exit evidence.
+
+## Single-Machine Validation
+
+Planner replay, single-machine dual-instance smoke, and two-machine LAN validation answer different questions:
+
+- Planner replay (`rtk node scripts/replay-transfer-planner-scenarios.mjs`) validates planner algorithms, fixed MicroFlowGroup behavior, and dynamic-shadow grouping diagnostics without Tauri, files, room servers, or network.
+- Single-machine dual-instance smoke validates basic lifecycle behavior with isolated app data roots and local HTTP room transfer paths. It is useful when two physical machines are unavailable, but same-machine throughput is not representative.
+- Two-machine LAN runs remain required for production transfer-throughput validation.
+
+Dual-instance smoke uses `PASTEY_APP_DATA_DIR` to keep SQLite DB, config, payloads, temp files, Inbox, and logs separate per instance. `PASTEY_PROFILE` gives a readable local identity fallback, and `PASTEY_DEVICE_NAME` can override the displayed device name. Room HTTP servers use dynamic ports; discovery uses a reusable UDP socket for local dual-instance smoke. The default Tauri dev frontend port is fixed, so two dev instances from one checkout need a second dev URL override, a second checkout, or one packaged/built instance.
 
 Phase 4A smoke validation:
 

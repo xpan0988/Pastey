@@ -125,6 +125,14 @@ Child terminal accounting is per queue item id. A child failure does not corrupt
 
 Manual validation logs are bridged into the normal app log with `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]` prefixes. MicroFlowGroup lines report planned, launched, running, child_running, child_terminal, stopped, and final events. Planner summary lines also report MicroFlowGroup candidate counts and a `micro_group_skip_reason` when no group is produced. They include room id, group id, queue item id, display name, size, child counts, status, and terminal reason, but not absolute file paths.
 
+Planner replay can compare the current fixed policy with a dynamic-shadow capacity estimate:
+
+```sh
+rtk node scripts/replay-transfer-planner-scenarios.mjs
+```
+
+Replay output is algorithm evidence only. It reports `micro_group_capacity_mode=fixed|dynamic_shadow`, fixed and dynamic-shadow group counts, eligible child counts, contention, `one_window_quantum_bytes`, `dynamic_child_cap_bytes`, and `dynamic_group_cap_bytes`. Dynamic-shadow replay does not change runtime scheduling; it is for rollout analysis when real two-machine testing is unavailable.
+
 Future text, control, agent, or command lanes may be modeled as possible child categories, but they remain non-dispatched unless a later implementation adds an explicit authority model and transport path. The scheduler must not grant command execution authority, route agent commands through file transfer, or treat room membership as a permission grant.
 
 ## Staged Roadmap

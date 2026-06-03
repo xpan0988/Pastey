@@ -133,6 +133,11 @@ export interface MicroFlowGroupPlanningDiagnostics {
   metadataMissing: number;
   roomUnavailable: number;
   cancelledOrTerminal: number;
+  contention: boolean;
+  contentionSeverity: string;
+  oneWindowQuantumBytes: number;
+  dynamicChildCapBytes: number;
+  dynamicGroupCapBytes: number;
   microGroupSkipReason: string;
 }
 
@@ -912,6 +917,9 @@ export function summarizeMicroFlowGroupPlanning(
   let metadataMissing = 0;
   let roomUnavailable = 0;
   let cancelledOrTerminal = 0;
+  let readyQueuedCount = 0;
+  let largestReadyQueuedBytes = 0;
+  let hasBulkCandidate = false;
 
   for (const batchId of state.batchOrder) {
     const batch = state.batches[batchId];
@@ -942,13 +950,20 @@ export function summarizeMicroFlowGroupPlanning(
         metadataMissing += 1;
         continue;
       }
+      readyQueuedCount += 1;
+      largestReadyQueuedBytes = Math.max(largestReadyQueuedBytes, item.sizeBytes);
       if (item.sizeBytes > policy.microGroupMaxChildSizeBytes) {
         overChildSizeLimit += 1;
-        continue;
       }
 
       const sizeClass = classifyTransferPlannerSize(item.sizeBytes);
       const lane = sizeClass === "large" || sizeClass === "huge" ? "bulk_file" : "small_file";
+      if (lane === "bulk_file") {
+        hasBulkCandidate = true;
+      }
+      if (item.sizeBytes > policy.microGroupMaxChildSizeBytes) {
+        continue;
+      }
       if ((sizeClass !== "tiny" && sizeClass !== "small") || lane !== "small_file") {
         continue;
       }
@@ -967,6 +982,18 @@ export function summarizeMicroFlowGroupPlanning(
   }
 
   const largestEligibleBucket = Math.max(0, ...eligibleBuckets.values());
+  const contention = readyQueuedCount > policy.safetyActiveTransferCap ||
+    (hasBulkCandidate && readyQueuedCount > 1 && (eligibleTinyCandidates > 0 || overChildSizeLimit > 0));
+  const oneWindowQuantumBytes = Math.max(
+    policy.microGroupMaxChildSizeBytes,
+    Math.floor(largestReadyQueuedBytes / policy.globalWindowBudget)
+  );
+  const dynamicChildCapBytes = contention
+    ? Math.min(8 * 1024 * 1024, Math.max(policy.microGroupMaxChildSizeBytes, oneWindowQuantumBytes))
+    : policy.microGroupMaxChildSizeBytes;
+  const dynamicGroupCapBytes = contention
+    ? Math.min(32 * 1024 * 1024, Math.max(policy.microGroupMaxGroupBytes, dynamicChildCapBytes * 4))
+    : policy.microGroupMaxGroupBytes;
 
   return {
     tinyCandidates,
@@ -976,6 +1003,11 @@ export function summarizeMicroFlowGroupPlanning(
     metadataMissing,
     roomUnavailable,
     cancelledOrTerminal,
+    contention,
+    contentionSeverity: contentionSeverity(readyQueuedCount, policy),
+    oneWindowQuantumBytes,
+    dynamicChildCapBytes,
+    dynamicGroupCapBytes,
     microGroupSkipReason: microGroupSkipReason({
       policy,
       eligibleTinyCandidates,
@@ -1193,6 +1225,16 @@ function microGroupSkipReason(input: {
     return "not_enough_eligible_children";
   }
   return "not_selected_by_allocator";
+}
+
+function contentionSeverity(readyQueuedCount: number, policy: TransferPlannerPolicy): string {
+  if (readyQueuedCount <= policy.safetyActiveTransferCap) {
+    return "none";
+  }
+  if (readyQueuedCount <= policy.safetyActiveTransferCap * 2) {
+    return "moderate";
+  }
+  return "high";
 }
 
 function nonterminalDedupeKeys(state: TransferSchedulerState): Set<string> {

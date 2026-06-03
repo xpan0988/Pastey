@@ -1408,6 +1408,7 @@ function logPlannerLaunchSummary(
     global_window_budget: launchPlan.plannerResult.globalWindowBudget,
     tiny_grouped_children: launchPlan.microGroupPlans.reduce((total, plan) => total + plan.childItemIds.length, 0),
     tiny_individual_runnable: launchPlan.runnablePlans.filter((plan) => plan.sizeClass === "tiny").length,
+    micro_group_capacity_mode: "fixed",
     tiny_candidates: microGroupDiagnostics.tinyCandidates,
     eligible_tiny_candidates: microGroupDiagnostics.eligibleTinyCandidates,
     largest_eligible_micro_group_bucket: microGroupDiagnostics.largestEligibleBucket,
@@ -1415,6 +1416,11 @@ function logPlannerLaunchSummary(
     metadata_missing: microGroupDiagnostics.metadataMissing,
     room_unavailable: microGroupDiagnostics.roomUnavailable,
     cancelled_or_terminal: microGroupDiagnostics.cancelledOrTerminal,
+    contention: microGroupDiagnostics.contention,
+    contention_severity: microGroupDiagnostics.contentionSeverity,
+    one_window_quantum_bytes: microGroupDiagnostics.oneWindowQuantumBytes,
+    dynamic_child_cap_bytes: microGroupDiagnostics.dynamicChildCapBytes,
+    dynamic_group_cap_bytes: microGroupDiagnostics.dynamicGroupCapBytes,
     micro_group_skip_reason: launchPlan.microGroupPlans.length > 0 ? "group_planned" : microGroupDiagnostics.microGroupSkipReason,
     held_reasons: formatHeldReasonCounts(heldReasonCounts)
   });

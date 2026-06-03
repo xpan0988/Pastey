@@ -24,6 +24,7 @@ pub const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 pub const MAX_FILE_SIZE_MESSAGE: &str = "File too large. Max supported size: 10GB.";
 const ROOM_FILE_DELETE_ERROR: &str = "Could not delete local room files. Check folder permissions.";
 const MANUAL_BURN_ROOM_LIFETIME_SECS: i64 = 100 * 365 * 24 * 60 * 60;
+const APP_DATA_DIR_ENV: &str = "PASTEY_APP_DATA_DIR";
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -37,13 +38,20 @@ pub struct AppPaths {
 }
 
 pub fn init_app_paths(app: &AppHandle) -> AppResult<AppPaths> {
-    let app_data_dir = app.path().app_data_dir().map_err(|error| {
+    let default_app_data_dir = app.path().app_data_dir().map_err(|error| {
         AppError::InvalidInput(format!("unable to resolve app data directory: {error}"))
     })?;
+    let app_data_dir_override = app_data_dir_override()?;
+    let app_data_dir = app_data_dir_override
+        .clone()
+        .unwrap_or(default_app_data_dir);
     let payloads_dir = app_data_dir.join("payloads");
     let inbox_dir = app_data_dir.join("inbox");
     let temp_dir = app_data_dir.join("temp");
-    let logs_dir = default_logs_dir(&app_data_dir);
+    let logs_dir = app_data_dir_override
+        .as_ref()
+        .map(|dir| dir.join("logs"))
+        .unwrap_or_else(|| default_logs_dir(&app_data_dir));
     fs::create_dir_all(&payloads_dir)?;
     fs::create_dir_all(&inbox_dir)?;
     fs::create_dir_all(&temp_dir)?;
@@ -58,6 +66,24 @@ pub fn init_app_paths(app: &AppHandle) -> AppResult<AppPaths> {
         temp_dir,
         logs_dir,
     })
+}
+
+fn app_data_dir_override() -> AppResult<Option<PathBuf>> {
+    let Some(value) = std::env::var_os(APP_DATA_DIR_ENV) else {
+        return Ok(None);
+    };
+    let display = value.to_string_lossy();
+    if display.trim().is_empty() {
+        return Err(AppError::InvalidInput(format!(
+            "{APP_DATA_DIR_ENV} must not be empty"
+        )));
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(Some(path))
+    } else {
+        Ok(Some(std::env::current_dir()?.join(path)))
+    }
 }
 
 fn default_logs_dir(app_data_dir: &Path) -> PathBuf {
