@@ -21,12 +21,13 @@ Current implemented behavior:
 - `PASTEY_TRANSFER_WINDOW_SIZE` and effective Developer Tools transfer-window settings remain the debugging overrides.
 - A pure weighted planner exists, has unit coverage, and drives runtime dispatch for queued file-like transfers. Lane and size class still provide classification, priority, constraints, and reports, while final requested-window allocation for selected file-like transfers is batch-relative and size-weighted.
 - `MicroFlowGroup` planner output and scheduler-only serial dispatch are implemented for eligible tiny file-like queue items. A group consumes one planner window while its children are sent one at a time through the existing single-file transfer path.
-- Planner, MicroFlowGroup, and runtime-window frontend diagnostics are bridged into the normal app log with `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]` prefixes for manual validation. Planner summaries include MicroFlowGroup candidate counts and skip reason when no group is produced. These diagnostics are low-noise internal logs and must not include absolute file paths.
+- Planner, MicroFlowGroup, and runtime-window frontend diagnostics are bridged into the normal app log with `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]` prefixes for manual validation. Planner summaries include live scheduling fields, MicroFlowGroup candidate counts, and skip reason when no group is produced. These diagnostics are low-noise internal logs and must not include absolute file paths.
 - The transfer API accepts an optional sender-side planner requested window; planner-driven sends pass it.
 - Active outgoing binary-v1 sender transfers have a sender-only runtime window handle that can be updated by a structured command while the transfer is running.
 - Planner-managed queued file-like transfers trigger completion-only active-window rebalance after a queue item reaches a terminal state.
 - `npm run tauri:dev-fast` is available for faster local transfer-throughput testing.
 - `scripts/replay-transfer-planner-scenarios.mjs` provides Tauri-free planner replay for fixed-vs-dynamic-shadow MicroFlowGroup diagnostics. It is algorithm validation only.
+- `scripts/generate-transfer-fixtures.mjs` creates deterministic local file clusters from source-controlled manifests under `tests/fixtures/transfer-corpus/manifests/` for real app smoke tests. Generated payload files are local-only and ignored under `.generated/transfer-fixtures/` by default.
 - Developer-only `PASTEY_APP_DATA_DIR` and `PASTEY_PROFILE` support single-machine dual-instance lifecycle smoke with isolated local app data and distinct profile labels.
 
 Current dispatch is planner-driven for file-like queue items. Phase 4A completion-only runtime window mutation is implemented for active outgoing binary-v1 sender transfers. MicroFlowGroup serial dispatch is implemented as a scheduler/resource abstraction only. Retry/timeout downshift, stable cooldown recovery, speed-history heuristics, broader adaptive rebalance policies, archive/bundle transfer, substream multiplexing, and binary-v2 are not implemented.
@@ -144,6 +145,7 @@ Remaining Phase 4 limits:
 Planner replay, single-machine dual-instance smoke, and two-machine LAN validation answer different questions:
 
 - Planner replay (`rtk node scripts/replay-transfer-planner-scenarios.mjs`) validates planner algorithms, fixed MicroFlowGroup behavior, and dynamic-shadow grouping diagnostics without Tauri, files, room servers, or network.
+- Transfer fixture generation (`rtk node scripts/generate-transfer-fixtures.mjs <scenario>`) creates deterministic local files for real Pastey smoke tests. The manifests are source-controlled, but generated payloads are local-only and are not bundled into release installers.
 - Single-machine dual-instance smoke validates basic lifecycle behavior with isolated app data roots and local HTTP room transfer paths. It is useful when two physical machines are unavailable, but same-machine throughput is not representative.
 - Two-machine LAN runs remain required for production transfer-throughput validation.
 

@@ -1,0 +1,73 @@
+{
+  "name": "huge-plus-many-0-3-to-1-3MiB",
+  "description": "One large file plus many 0.3-1.3 MiB files. Expected planner meaning: fixed mode groups only sub-1 MiB children; dynamic_shadow can identify more one-window service candidates.",
+  "files": [
+    {
+      "name": "huge-anchor-512mib.bin",
+      "sizeBytes": 536870912,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream",
+      "description": "Large anchor file that creates contention without making the fixture corpus multi-gigabyte by default."
+    },
+    {
+      "name": "mixed-small-00-0-30mib.bin",
+      "sizeBytes": 314573,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "mixed-small-01-0-45mib.bin",
+      "sizeBytes": 471859,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "mixed-small-02-0-70mib.bin",
+      "sizeBytes": 734003,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "mixed-small-03-0-90mib.bin",
+      "sizeBytes": 943718,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "mixed-small-04-1-10mib.bin",
+      "sizeBytes": 1153434,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "mixed-small-05-1-20mib.bin",
+      "sizeBytes": 1258291,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "mixed-small-06-1-30mib.bin",
+      "sizeBytes": 1363149,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "mixed-small-07-0-35mib.bin",
+      "sizeBytes": 367002,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "mixed-small-08-0-80mib.bin",
+      "sizeBytes": 838861,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "mixed-small-09-1-25mib.bin",
+      "sizeBytes": 1310720,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "name": "interrupt-huge-small",
+  "description": "One 1 GiB-plus file, one 100 MiB file, and several small files. Expected use: start transfer then manually quit, cancel, or burn to inspect terminal/interruption logs.",
+  "files": [
+    {
+      "name": "interrupt-anchor-1-25gib.bin",
+      "sizeBytes": 1342177280,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream",
+      "description": "Manual interruption anchor file."
+    },
+    {
+      "name": "interrupt-medium-100mib.bin",
+      "sizeBytes": 104857600,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "interrupt-small-128kib.bin",
+      "sizeBytes": 131072,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "interrupt-small-512kib.bin",
+      "sizeBytes": 524288,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "interrupt-small-900kib.bin",
+      "sizeBytes": 921600,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "interrupt-note.txt",
+      "sizeBytes": 8192,
+      "pattern": "text",
+      "mimeHint": "text/plain",
+      "description": "Small deterministic text file for mixed MIME smoke."
+    }
+  ]
+}

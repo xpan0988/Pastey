@@ -1,0 +1,26 @@
+{
+  "name": "many-100KiB-to-900KiB-files",
+  "description": "Twenty files under 1 MiB. Expected planner meaning: MicroFlowGroup should be visible; dynamic_shadow may reduce group fragmentation.",
+  "files": [
+    { "name": "tiny-00-100kib.bin", "sizeBytes": 102400, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-01-140kib.bin", "sizeBytes": 143360, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-02-180kib.bin", "sizeBytes": 184320, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-03-220kib.bin", "sizeBytes": 225280, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-04-260kib.bin", "sizeBytes": 266240, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-05-300kib.bin", "sizeBytes": 307200, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-06-340kib.bin", "sizeBytes": 348160, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-07-380kib.bin", "sizeBytes": 389120, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-08-420kib.bin", "sizeBytes": 430080, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-09-460kib.bin", "sizeBytes": 471040, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-10-500kib.bin", "sizeBytes": 512000, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-11-540kib.bin", "sizeBytes": 552960, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-12-580kib.bin", "sizeBytes": 593920, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-13-620kib.bin", "sizeBytes": 634880, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-14-660kib.bin", "sizeBytes": 675840, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-15-700kib.bin", "sizeBytes": 716800, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-16-740kib.bin", "sizeBytes": 757760, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-17-780kib.bin", "sizeBytes": 798720, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-18-820kib.bin", "sizeBytes": 839680, "pattern": "seeded", "mimeHint": "application/octet-stream" },
+    { "name": "tiny-19-860kib.bin", "sizeBytes": 880640, "pattern": "seeded", "mimeHint": "application/octet-stream" }
+  ]
+}

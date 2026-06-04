@@ -48,7 +48,7 @@ The transfer logs include `event=transfer_tuning` at transfer start with `effect
 
 Frontend scheduler diagnostics are bridged into the normal app log with allowlisted prefixes. `[pastey:planner]` records launch-plan summaries, `[pastey:micro-group]` records planned, launched, running, child_running, child_terminal, stopped, and final group lifecycle events, and `[pastey:runtime-window]` records planner runtime-window tracking start, update attempts, and per-transfer window summaries. These lines use room ids, group ids, queue item ids, display names, sizes, counts, statuses, terminal reasons, requested/effective windows, override source, and transfer protocol when the frontend can infer it. They must not include absolute file paths.
 
-MicroFlowGroup validation requires at least two eligible children in the same grouping key. A single sub-1 MiB file, or a batch whose small files are mostly over `maxChildSizeBytes = 1 MiB`, will not emit `[pastey:micro-group]` lifecycle lines. In that case, inspect the `[pastey:planner] event=launch_summary` fields `tiny_candidates`, `eligible_tiny_candidates`, `largest_eligible_micro_group_bucket`, `over_child_size_limit`, and `micro_group_skip_reason`.
+MicroFlowGroup validation requires at least two eligible children in the same grouping key. A single sub-1 MiB file, or a batch whose small files are mostly over `maxChildSizeBytes = 1 MiB`, will not emit `[pastey:micro-group]` lifecycle lines. In that case, inspect the `[pastey:planner] event=launch_summary` fields `live_micro_group_plans`, `live_requested_window_total`, `live_held_reasons`, `tiny_candidates`, `eligible_tiny_candidates`, `largest_eligible_micro_group_bucket`, `over_child_size_limit`, and `micro_group_skip_reason`.
 
 Runtime-window summaries are emitted when the frontend observes a terminal queue state, including normal completion and frontend-known cancel/burn paths. If the app process exits while a transfer is active, frontend terminal cleanup cannot run; use the earlier `[pastey:runtime-window] event=tracking_started` and `event=update` lines as the durable pre-exit evidence.
 
@@ -77,6 +77,7 @@ grep -E "\\[pastey:runtime-window\\].*event=summary" /path/to/pastey.log
 Use three different validation tiers for scheduler work:
 
 - Planner replay is algorithm validation. It does not launch Tauri, open a room server, read payload files, or use the network.
+- Transfer fixture generation creates deterministic local file clusters for real app smoke tests. Generated files are local-only under `.generated/transfer-fixtures/` by default and must not be committed.
 - Single-machine dual-instance mode is lifecycle smoke. It uses isolated local app data and real local HTTP transfer paths where possible, but it is not a throughput benchmark.
 - Two-machine LAN validation is the real throughput validation path.
 
@@ -86,7 +87,17 @@ Planner replay:
 rtk node scripts/replay-transfer-planner-scenarios.mjs
 ```
 
-The replay prints grep-friendly scenario lines with fixed and dynamic-shadow MicroFlowGroup counts, eligible child counts, contention, one-window quantum, dynamic child/group caps, skip reason, and requested-window totals.
+The replay prints grep-friendly scenario lines with live fixed scheduling separated from dynamic-shadow evidence. Live fields use `live_micro_group_plans`, `live_requested_window_total`, and `live_held_reasons`; shadow-only fields use `dynamic_shadow_micro_group_plans`, `dynamic_shadow_grouped_children`, `dynamic_shadow_requested_window_total`, and `dynamic_shadow_skip_reason`. Shadow capacity fields remain diagnostic only and include contention, one-window quantum, and dynamic child/group caps.
+
+Fixture generator:
+
+```sh
+rtk node scripts/generate-transfer-fixtures.mjs --list
+rtk node scripts/generate-transfer-fixtures.mjs mixed-chaos-recent-log-shape
+rtk node scripts/generate-transfer-fixtures.mjs interrupt-huge-small --scale small
+```
+
+The source-controlled fixture manifests live under `tests/fixtures/transfer-corpus/manifests/`. They describe stable scenario file names, sizes, content patterns, MIME hints, and planner meaning. The generator streams deterministic file contents into `.generated/transfer-fixtures/<scenario-name>/` unless `--out` is provided; matching existing files are skipped unless `--force` is passed. Drag a generated scenario folder into Pastey for real app smoke, then compare planner and MicroFlowGroup diagnostics in the app log. These generated files are not release inputs: `.generated/`, `tests/fixtures/transfer-corpus/generated/`, and `*.pastey-fixture.tmp` are ignored by git, and the Tauri bundle config does not include fixture resources.
 
 Single-machine dual-instance smoke requires separate app data roots:
 

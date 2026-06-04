@@ -1,0 +1,55 @@
+{
+  "name": "mixed-chaos-recent-log-shape",
+  "description": "One large file, several medium files, several 1.1-1.3 MiB files, and one sub-1 MiB file. Expected planner meaning: fixed may produce no group; dynamic_shadow should report a candidate group.",
+  "files": [
+    {
+      "name": "large-anchor-96mib.bin",
+      "sizeBytes": 100663296,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream",
+      "description": "Large anchor file that creates contention while keeping local fixture smoke fast."
+    },
+    {
+      "name": "medium-a-32mib.bin",
+      "sizeBytes": 33554432,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "medium-b-48mib.bin",
+      "sizeBytes": 50331648,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "medium-c-64mib.bin",
+      "sizeBytes": 67108864,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "small-over-a-1-10mib.bin",
+      "sizeBytes": 1153434,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "small-over-b-1-20mib.bin",
+      "sizeBytes": 1258291,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "small-over-c-1-30mib.bin",
+      "sizeBytes": 1363149,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    },
+    {
+      "name": "single-sub-mib-0-35mib.bin",
+      "sizeBytes": 367002,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream"
+    }
+  ]
+}

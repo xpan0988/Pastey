@@ -1,6 +1,9 @@
 node_modules
 dist
+.generated/
 .DS_Store
 src-tauri/target
 src-tauri/gen
 *.log
+tests/fixtures/transfer-corpus/generated/
+*.pastey-fixture.tmp

@@ -2,6 +2,11 @@
 
 Detailed update and release history for Pastey.
 
+## Unreleased
+
+- Added source-controlled transfer fixture manifests and a streaming deterministic generator for local scheduler, MicroFlowGroup, chaos, and interruption smoke scenarios. Generated payload files stay local-only under `.generated/transfer-fixtures/` by default and are excluded from git and release bundle resources.
+- Moved the Dynamic MicroFlowGroup window-capacity research report into `docs/research/`.
+
 ## 1.7.0 — Global Transfer Scheduler — 2026-05-30
 
 - Added a frontend-owned weighted transfer scheduler for multi-file picker, drag/drop, and pasted-image sends.

@@ -1,0 +1,20 @@
+{
+  "name": "two-1-2MiB-files-only",
+  "description": "Two around-1.2 MiB files. Expected planner meaning: no contention and no MicroFlowGroup.",
+  "files": [
+    {
+      "name": "alpha-1-2mib.bin",
+      "sizeBytes": 1258291,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream",
+      "description": "First around-1.2 MiB file."
+    },
+    {
+      "name": "beta-1-2mib.bin",
+      "sizeBytes": 1259008,
+      "pattern": "seeded",
+      "mimeHint": "application/octet-stream",
+      "description": "Second around-1.2 MiB file."
+    }
+  ]
+}

@@ -2,6 +2,8 @@
 
 Validated against the current codebase on 2026-06-02.
 
+Related research note: [Dynamic MicroFlowGroup Window-Capacity Design](../research/dynamic-microflowgroup-window-capacity-design.pdf).
+
 ## Validation Result
 
 The weighted planner design is consistent with the current architecture. Runtime dispatch is now planner-driven for existing queued file, image, and pasted-image sends. The planner can represent eligible tiny file-like work as a `MicroFlowGroup`, and the first implemented group runner dispatches those children serially. The implementation preserves `sendFileToRoom` / Rust `send_file_to_room` as the authoritative single-file transfer path.
@@ -123,7 +125,7 @@ The current serial group runner records group-level lifecycle state so internal 
 
 Child terminal accounting is per queue item id. A child failure does not corrupt or revive other children; the runner continues to later queued children unless batch cancellation or room interruption stops the group. Batch cancellation marks the group `cancelled`. Burn/room cleanup marks the group `interrupted`. Late child progress still uses the existing queue item terminal guards and cannot mutate terminal group state.
 
-Manual validation logs are bridged into the normal app log with `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]` prefixes. MicroFlowGroup lines report planned, launched, running, child_running, child_terminal, stopped, and final events. Planner summary lines also report MicroFlowGroup candidate counts and a `micro_group_skip_reason` when no group is produced. They include room id, group id, queue item id, display name, size, child counts, status, and terminal reason, but not absolute file paths.
+Manual validation logs are bridged into the normal app log with `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]` prefixes. MicroFlowGroup lines report planned, launched, running, child_running, child_terminal, stopped, and final events. Planner summary lines report live scheduling fields such as `live_micro_group_plans`, `live_requested_window_total`, and `live_held_reasons`, plus MicroFlowGroup candidate counts and a `micro_group_skip_reason` when no group is produced. They include room id, group id, queue item id, display name, size, child counts, status, and terminal reason, but not absolute file paths.
 
 Planner replay can compare the current fixed policy with a dynamic-shadow capacity estimate:
 
@@ -131,7 +133,15 @@ Planner replay can compare the current fixed policy with a dynamic-shadow capaci
 rtk node scripts/replay-transfer-planner-scenarios.mjs
 ```
 
-Replay output is algorithm evidence only. It reports `micro_group_capacity_mode=fixed|dynamic_shadow`, fixed and dynamic-shadow group counts, eligible child counts, contention, `one_window_quantum_bytes`, `dynamic_child_cap_bytes`, and `dynamic_group_cap_bytes`. Dynamic-shadow replay does not change runtime scheduling; it is for rollout analysis when real two-machine testing is unavailable.
+Replay output is algorithm evidence only. It reports live fixed scheduling with `live_micro_group_plans`, `live_requested_window_total`, and `live_held_reasons`, and reports shadow-only evidence with `dynamic_shadow_micro_group_plans`, `dynamic_shadow_grouped_children`, `dynamic_shadow_requested_window_total`, and `dynamic_shadow_skip_reason`. It also reports eligible child counts, contention, `one_window_quantum_bytes`, `dynamic_child_cap_bytes`, and `dynamic_group_cap_bytes`. Dynamic-shadow replay does not change runtime scheduling; it is for rollout analysis when real two-machine testing is unavailable.
+
+Real app smoke can use the local fixture corpus instead of hand-picked files:
+
+```sh
+rtk node scripts/generate-transfer-fixtures.mjs mixed-chaos-recent-log-shape
+```
+
+Fixture manifests are source-controlled under `tests/fixtures/transfer-corpus/manifests/`, but generated payloads are local-only under `.generated/transfer-fixtures/` by default. The generated files are for manual app smoke and log inspection; they are not planner replay inputs, not release resources, and not included in DMG/MSI artifacts.
 
 Future text, control, agent, or command lanes may be modeled as possible child categories, but they remain non-dispatched unless a later implementation adds an explicit authority model and transport path. The scheduler must not grant command execution authority, route agent commands through file transfer, or treat room membership as a permission grant.
 

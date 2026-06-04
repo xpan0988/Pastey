@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEFAULT_TRANSFER_PLANNER_POLICY
+} from "../src/lib/transferPlanner";
+import {
   activeCancellableTransferIds,
   cancelBatchLocally,
   cancelQueueItem,
@@ -186,7 +189,51 @@ test("single eligible tiny queue item explains no micro group", () => {
   assert.equal(diagnostics.tinyCandidates, 1);
   assert.equal(diagnostics.eligibleTinyCandidates, 1);
   assert.equal(diagnostics.largestEligibleBucket, 1);
-  assert.equal(diagnostics.microGroupSkipReason, "not_enough_eligible_children");
+  assert.equal(diagnostics.microGroupSkipReason, "no_contention");
+});
+
+test("dynamic micro group diagnostics clamp huge-file quantum conservatively", () => {
+  const state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    [
+      readyInput("huge.bin", 2 * GiB, "/tmp/huge.bin", 1),
+      readyInput("small-over-a.bin", 1.1 * MiB, "/tmp/small-over-a.bin", 2),
+      readyInput("small-over-b.bin", 1.2 * MiB, "/tmp/small-over-b.bin", 3),
+      readyInput("small-over-c.bin", 1.3 * MiB, "/tmp/small-over-c.bin", 4),
+      readyInput("single-sub-mib.bin", 350 * 1024, "/tmp/single-sub-mib.bin", 5)
+    ]
+  );
+
+  const diagnostics = summarizeMicroFlowGroupPlanning(state, activeRooms);
+
+  assert.equal(diagnostics.contention, true);
+  assert.equal(diagnostics.oneWindowQuantumBytes, 16 * MiB);
+  assert.equal(diagnostics.dynamicChildCapBytes, 4 * MiB);
+  assert.equal(diagnostics.dynamicGroupCapBytes, 16 * MiB);
+});
+
+test("no-contention skip reason takes precedence over child-size limit", () => {
+  const state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    [
+      readyInput("small-over-a.bin", 1.1 * MiB, "/tmp/small-over-a.bin", 1),
+      readyInput("small-over-b.bin", 1.2 * MiB, "/tmp/small-over-b.bin", 2)
+    ]
+  );
+
+  const diagnostics = summarizeMicroFlowGroupPlanning(state, activeRooms);
+  const dynamicDiagnostics = summarizeMicroFlowGroupPlanning(state, activeRooms, new Set(), {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    microGroupDispatchMode: "shadow",
+    microGroupMaxChildSizeBytes: diagnostics.dynamicChildCapBytes,
+    microGroupMaxGroupBytes: diagnostics.dynamicGroupCapBytes
+  });
+
+  assert.equal(diagnostics.contention, false);
+  assert.equal(dynamicDiagnostics.overChildSizeLimit, 2);
+  assert.equal(dynamicDiagnostics.microGroupSkipReason, "no_contention");
 });
 
 test("twenty sub-one-megabyte queue items group and suppress child runnable plans", () => {
