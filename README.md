@@ -53,7 +53,9 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed update and version history.
 
 - [Changelog](CHANGELOG.md)
 - [Release workflow](docs/dev/release-workflow.md)
-- [Transfer hot path notes](docs/dev/transfer-hot-path.md)
+- [Transfer architecture](docs/transfer/architecture.md)
+- [Transfer scheduler](docs/transfer/scheduler.md)
+- [Transfer validation](docs/transfer/validation.md)
 
 ## What pastey does
 
