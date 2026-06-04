@@ -5,7 +5,7 @@
 This report describes the current Pastey codebase as checked out locally. It is based on:
 
 - Actual local source files under `src-tauri/src/` and `src/`.
-- Repository documentation, especially `README.md`, `docs/transfer-hot-path.md`, and `docs/internal/room-semantics.md`.
+- Repository documentation, especially `README.md`, `docs/transfer/architecture.md`, `docs/transfer/scheduler.md`, `docs/transfer/validation.md`, and `docs/internal/room-semantics.md`.
 - Source-level verification of the transfer, diagnostics, tuning, frontend, and lifecycle paths.
 
 CodeGraph was checked as a navigation aid through `.codegraph/codegraph.db`, which identified the current scheduler, room UI, Tauri command, transfer, and tuning symbols. Source code remains the authority for behavior.

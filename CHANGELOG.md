@@ -4,7 +4,11 @@ Detailed update and release history for Pastey.
 
 ## Unreleased
 
+- Consolidated transfer documentation under `docs/transfer/`: current architecture now lives in `docs/transfer/architecture.md`, active scheduler/MicroFlowGroup/dynamic-shadow design lives in `docs/transfer/scheduler.md`, and active validation/logging guidance lives in `docs/transfer/validation.md`.
+- Moved the completed Phase 2-4 scheduler/runtime-window implementation record to `docs/binary-v2/early-implementation.md` and replaced old overlapping docs with short moved stubs.
+- Kept the fixture corpus README focused on generating and dragging deterministic payload folders, with full validation workflow details linked to `docs/transfer/validation.md`.
 - Added source-controlled transfer fixture manifests and a streaming deterministic generator for local scheduler, MicroFlowGroup, chaos, and interruption smoke scenarios. Generated payload files stay local-only under `.generated/transfer-fixtures/` by default and are excluded from git and release bundle resources.
+- Clarified transfer validation docs so developers generate and drag `.generated/transfer-fixtures/<scenario-name>/` payload folders, identify the actual sender log by planner/MicroFlowGroup/runtime-window diagnostics, and treat single-machine dual-instance runs as lifecycle/logging smoke rather than throughput evidence.
 - Moved the Dynamic MicroFlowGroup window-capacity research report into `docs/research/`.
 
 ## 1.7.0 — Global Transfer Scheduler — 2026-05-30
