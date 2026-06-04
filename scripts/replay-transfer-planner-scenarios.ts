@@ -131,8 +131,7 @@ function replayScenario(scenario: Scenario) {
     policy: dynamicPolicy
   };
 
-  printSummary(scenario.name, fixed, fixed, dynamic, fixedDiagnostics);
-  printSummary(scenario.name, dynamic, fixed, dynamic, fixedDiagnostics);
+  printSummary(scenario.name, fixed, dynamic, fixedDiagnostics);
 }
 
 function item(id: string, sizeBytes: number, createdAt: number): ScenarioItem {
@@ -221,19 +220,22 @@ function roomsForScenario(scenario: Scenario) {
 
 function printSummary(
   scenario: string,
-  mode: ReplayMode,
   fixed: ReplayMode,
   dynamic: ReplayMode,
   fixedDiagnostics: MicroFlowGroupPlanningDiagnostics
 ) {
   const fields = {
     scenario,
-    mode: mode.name,
-    micro_group_capacity_mode: mode.name,
-    runnable_plans: mode.result.runnablePlans.length,
-    micro_group_plans: mode.result.microGroupPlans.length,
-    fixed_micro_group_plans: fixed.result.microGroupPlans.length,
+    live_capacity_mode: fixed.name,
+    dynamic_shadow_capacity_mode: dynamic.name,
+    live_runnable_plans: fixed.result.runnablePlans.length,
+    live_micro_group_plans: fixed.result.microGroupPlans.length,
+    live_requested_window_total: fixed.result.requestedWindowTotal,
+    live_held_reasons: heldReasons(fixed.result.heldPlans),
     dynamic_shadow_micro_group_plans: dynamic.result.microGroupPlans.length,
+    dynamic_shadow_grouped_children: groupedChildren(dynamic.result),
+    dynamic_shadow_requested_window_total: dynamic.result.requestedWindowTotal,
+    dynamic_shadow_skip_reason: dynamicShadowSkipReason(dynamic),
     eligible_children_fixed: fixed.diagnostics.eligibleTinyCandidates,
     eligible_children_dynamic: dynamic.diagnostics.eligibleTinyCandidates,
     contention: fixedDiagnostics.contention,
@@ -241,12 +243,23 @@ function printSummary(
     one_window_quantum_bytes: fixedDiagnostics.oneWindowQuantumBytes,
     dynamic_child_cap_bytes: fixedDiagnostics.dynamicChildCapBytes,
     dynamic_group_cap_bytes: fixedDiagnostics.dynamicGroupCapBytes,
-    micro_group_skip_reason: mode.result.microGroupPlans.length > 0 ? "group_planned" : mode.diagnostics.microGroupSkipReason,
-    requested_window_total: mode.result.requestedWindowTotal,
-    global_window_budget: mode.result.globalWindowBudget,
-    held_reasons: heldReasons(mode.result.heldPlans)
+    global_window_budget: fixed.result.globalWindowBudget
   };
   console.log(Object.entries(fields).map(([key, value]) => `${key}=${value}`).join(" "));
+}
+
+function dynamicShadowSkipReason(mode: ReplayMode): string {
+  if (mode.result.microGroupPlans.length > 0) {
+    return "group_planned";
+  }
+  if (!mode.diagnostics.contention) {
+    return "no_contention";
+  }
+  return mode.diagnostics.microGroupSkipReason;
+}
+
+function groupedChildren(result: TransferPlannerResult): number {
+  return result.microGroupPlans.reduce((total, plan) => total + plan.childTaskIds.length, 0);
 }
 
 function heldReasons(heldPlans: readonly TransferPlannerHeldPlan[]): string {

@@ -1401,10 +1401,10 @@ function logPlannerLaunchSummary(
     event: "launch_summary",
     room_id: plannerSummaryRoomId(launchPlan),
     runnable_plans: launchPlan.runnablePlans.length,
-    micro_group_plans: launchPlan.microGroupPlans.length,
+    live_micro_group_plans: launchPlan.microGroupPlans.length,
     active_plans: launchPlan.plannerResult.activePlans.length,
     held_plans: launchPlan.plannerResult.heldPlans.length,
-    requested_window_total: launchPlan.plannerResult.requestedWindowTotal,
+    live_requested_window_total: launchPlan.plannerResult.requestedWindowTotal,
     global_window_budget: launchPlan.plannerResult.globalWindowBudget,
     tiny_grouped_children: launchPlan.microGroupPlans.reduce((total, plan) => total + plan.childItemIds.length, 0),
     tiny_individual_runnable: launchPlan.runnablePlans.filter((plan) => plan.sizeClass === "tiny").length,
@@ -1422,7 +1422,7 @@ function logPlannerLaunchSummary(
     dynamic_child_cap_bytes: microGroupDiagnostics.dynamicChildCapBytes,
     dynamic_group_cap_bytes: microGroupDiagnostics.dynamicGroupCapBytes,
     micro_group_skip_reason: launchPlan.microGroupPlans.length > 0 ? "group_planned" : microGroupDiagnostics.microGroupSkipReason,
-    held_reasons: formatHeldReasonCounts(heldReasonCounts)
+    live_held_reasons: formatHeldReasonCounts(heldReasonCounts)
   });
   for (const plan of launchPlan.microGroupPlans) {
     emitPasteyDiagnostic("[pastey:micro-group]", {
