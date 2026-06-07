@@ -1,4 +1,8 @@
-<div class="discovery-visual" aria-label="Nearby devices discovering one another on a local network">
+---
+interface Props { aria: string; }
+const { aria } = Astro.props;
+---
+<div class="discovery-visual" aria-label={aria}>
   <div class="discovery-center">
     <div class="discovery-rings" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
     <i class="ph ph-broadcast discovery-core" aria-hidden="true"></i>

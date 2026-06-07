@@ -18,6 +18,11 @@ pnpm build
 
 The fully static output is written to `dist/`.
 
+## Localized routes
+
+- English: `/`, `/download`, `/architecture`
+- Simplified Chinese: `/zh-CN/`, `/zh-CN/download`, `/zh-CN/architecture`
+
 ## Cloudflare Pages
 
 - Root directory: `site`

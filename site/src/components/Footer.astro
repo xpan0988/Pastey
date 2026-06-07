@@ -1,15 +1,18 @@
 ---
 import { links } from "../data/links";
+import { localePath, type Locale } from "../i18n/config";
+interface Props { locale: Locale; copy: Record<string, string>; }
+const { locale, copy } = Astro.props;
 ---
 
 <footer class="footer shell">
   <div>
-    <a class="brand" href="/"><img src="/favicon.png" alt="" width="26" height="26" /><span>Pastey</span></a>
-    <p>Ephemeral local handoff.<br />No account. No cloud relay.</p>
+    <a class="brand" href={localePath(locale)}><img src="/favicon.png" alt="" width="26" height="26" /><span>Pastey</span></a>
+    <p>{copy.footerTagline}<br />{copy.footerSubline}</p>
   </div>
   <div class="footer-links">
-    <div><strong>Product</strong><a href="/#features">Features</a><a href="/#how-it-works">How it works</a><a href="/download">Download</a></div>
-    <div><strong>Resources</strong><a href={links.changelog}>Changelog</a><a href={links.validation}>Validation notes</a><a href={links.github}>GitHub</a></div>
+    <div><strong>{copy.product}</strong><a href={`${localePath(locale)}#features`}>{copy.features}</a><a href={`${localePath(locale)}#how-it-works`}>{copy.howItWorks}</a><a href={localePath(locale, "download")}>{copy.download}</a></div>
+    <div><strong>{copy.resources}</strong><a href={links.changelog}>{copy.changelog}</a><a href={links.validation}>{copy.validationNotes}</a><a href={links.github}>{copy.github}</a></div>
   </div>
-  <p class="footer-meta">© 2026 Pastey<br />Open source. Local first.</p>
+  <p class="footer-meta">© 2026 Pastey<br />{copy.footerMeta}</p>
 </footer>

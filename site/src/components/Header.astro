@@ -1,25 +1,35 @@
 ---
 import { links } from "../data/links";
+import LanguageSwitcher from "./LanguageSwitcher.astro";
+import { localePath, type Locale } from "../i18n/config";
+
+interface Props {
+  locale: Locale;
+  pathname: string;
+  copy: Record<string, string>;
+}
+const { locale, pathname, copy } = Astro.props;
 ---
 
 <header class="site-header">
-  <nav class="nav shell" aria-label="Main navigation">
-    <a class="brand" href="/" aria-label="Pastey home">
+  <nav class="nav shell" aria-label={copy.navigation}>
+    <a class="brand" href={localePath(locale)} aria-label={copy.pasteyHome}>
       <img src="/favicon.png" alt="" width="30" height="30" />
       <span>Pastey</span>
     </a>
     <div class="nav-links" id="nav-links">
-      <a href="/#features">Features</a>
-      <a href="/#how-it-works">How it works</a>
-      <a href="/architecture">Architecture</a>
-      <a href="/download">Download</a>
-      <a href={links.github}>GitHub</a>
+      <a href={`${localePath(locale)}#features`}>{copy.features}</a>
+      <a href={`${localePath(locale)}#how-it-works`}>{copy.howItWorks}</a>
+      <a href={localePath(locale, "architecture")}>{copy.architecture}</a>
+      <a href={localePath(locale, "download")}>{copy.download}</a>
+      <a href={links.github}>{copy.github}</a>
     </div>
+    <LanguageSwitcher locale={locale} pathname={pathname} label={copy.language} />
     <a class="button button-small button-quiet desktop-download" href={links.latestRelease}>
       <i class="ph ph-download-simple" aria-hidden="true"></i>
-      Download latest
+      {copy.downloadLatest}
     </a>
-    <button class="menu-button" aria-expanded="false" aria-controls="nav-links" aria-label="Toggle navigation">
+    <button class="menu-button" aria-expanded="false" aria-controls="nav-links" aria-label={copy.toggleNavigation}>
       <i class="ph ph-list" aria-hidden="true"></i>
     </button>
   </nav>

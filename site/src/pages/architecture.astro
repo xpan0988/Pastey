@@ -1,27 +1,5 @@
 ---
-import BaseLayout from "../layouts/BaseLayout.astro";
-import { links } from "../data/links";
+import ArchitecturePage from "../components/pages/ArchitecturePage.astro";
+import { getDictionary } from "../i18n";
 ---
-<BaseLayout title="Pastey Architecture — Local-first transfer stack" description="A concise overview of Pastey's current local-first transfer architecture, validation, and boundaries.">
-  <section class="page-hero shell">
-    <p class="eyebrow"><span></span> Architecture</p>
-    <h1>Direct enough to use.<br /><em>Documented enough to inspect.</em></h1>
-    <p>Pastey combines local encrypted payload storage, UDP LAN discovery, temporary HTTP transfer endpoints, and a binary chunk transport.</p>
-    <div class="button-row centered"><a class="button button-primary" href={links.architecture}>Read the canonical architecture doc</a><a class="button" href={links.github}><i class="ph ph-github-logo"></i>View source</a></div>
-  </section>
-  <section class="architecture-grid shell">
-    <article><span>01</span><i class="ph ph-radar"></i><h2>Discover</h2><p>Nearby devices advertise and discover active sessions on the same LAN. An 8-digit room code remains the manual fallback.</p></article>
-    <article><span>02</span><i class="ph ph-lock-key"></i><h2>Encrypt</h2><p>Text becomes bytes. Files and images remain generic binary data. Payload encryption and decryption happen locally.</p></article>
-    <article><span>03</span><i class="ph ph-stack"></i><h2>Schedule</h2><p>A frontend-owned weighted scheduler plans queued file-like transfers while keeping each transfer on the established single-file path.</p></article>
-    <article><span>04</span><i class="ph ph-arrows-left-right"></i><h2>Transfer</h2><p>Binary-v1 encrypts, chunks, streams, acknowledges, and finalizes files over the local peer endpoint. JSON/base64 remains a compatibility fallback.</p></article>
-  </section>
-  <section class="boundary-section shell" id="boundaries">
-    <div><p class="eyebrow"><span></span> Current boundaries</p><h2>Clear about what exists now.</h2></div>
-    <div class="boundary-list">
-      <p><i class="ph ph-check-circle"></i><span><strong>Implemented:</strong> encrypted local storage, LAN discovery, nearby join, binary-v1 transfer, compatibility fallback, and validation tooling.</span></p>
-      <p><i class="ph ph-flask"></i><span><strong>Experimental or diagnostic:</strong> planner shadow diagnostics and broader device-capability work.</span></p>
-      <p><i class="ph ph-minus-circle"></i><span><strong>Not current:</strong> cloud relay, remote storage, backend-owned scheduling, bundle transfer, binary-v2, or substream multiplexing.</span></p>
-    </div>
-  </section>
-  <section class="doc-links shell"><a href={links.scheduler}><i class="ph ph-tree-structure"></i><strong>Transfer scheduler</strong><span>Read the planner and orchestration boundaries →</span></a><a href={links.validation}><i class="ph ph-check-square"></i><strong>Validation notes</strong><span>See replay, fixture, smoke, and LAN validation →</span></a></section>
-</BaseLayout>
+<ArchitecturePage locale="en" dictionary={getDictionary("en")} />
