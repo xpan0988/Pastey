@@ -1,0 +1,18 @@
+---
+const steps = [
+  ["ph-file", "Create"],
+  ["ph-lock-key", "Encrypt"],
+  ["ph-squares-four", "Chunk"],
+  ["ph-waveform", "Stream"],
+  ["ph-download-simple", "Receive"],
+  ["ph-sparkle", "Clear"]
+];
+---
+<ol class="lifecycle" aria-label="Transfer lifecycle">
+  {steps.map(([icon, label], index) => (
+    <li class={label === "Clear" ? "clear-step" : ""} style={`--i:${index}`}>
+      <span><i class={`ph ${icon}`} aria-hidden="true"></i></span>
+      <strong>{label}</strong>
+    </li>
+  ))}
+</ol>

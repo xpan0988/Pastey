@@ -1,0 +1,80 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import DeviceEcho from "../components/DeviceEcho.astro";
+import BinaryStream from "../components/BinaryStream.astro";
+import NoCloudPath from "../components/NoCloudPath.astro";
+import TransferLifecycle from "../components/TransferLifecycle.astro";
+import DiscoveryVisual from "../components/DiscoveryVisual.astro";
+import { links } from "../data/links";
+
+const inspectCards = [
+  ["ph-stack", "Architecture", "Current transfer stack and its boundaries.", "/architecture", "Read"],
+  ["ph-notebook", "Changelog", "Changes, decisions, and release history.", links.changelog, "View"],
+  ["ph-check-circle", "Validation notes", "Replay, fixtures, smoke, and LAN validation.", links.validation, "Open"],
+  ["ph-warning", "Limitations", "Known constraints and non-current work.", "/architecture#boundaries", "See"],
+  ["ph-github-logo", "GitHub repository", "Source, issues, docs, and roadmap.", links.github, "Open"]
+];
+---
+
+<BaseLayout>
+  <section class="hero shell">
+    <div class="hero-copy">
+      <p class="eyebrow"><span></span> Local-first device handoff</p>
+      <h1>Ephemeral local<br />handoff, at <em>LAN speed.</em></h1>
+      <p class="hero-lede">Move text, images, and any file between your nearby devices — no account, no cloud relay, no storage buildup.</p>
+      <div class="button-row">
+        <a class="button button-primary" href={links.latestRelease}><i class="ph ph-download-simple"></i>Download latest release</a>
+        <a class="button" href={links.github}><i class="ph ph-github-logo"></i>View on GitHub</a>
+      </div>
+      <a class="text-link" href="/architecture">Read architecture <i class="ph ph-arrow-right"></i></a>
+    </div>
+    <DeviceEcho />
+  </section>
+
+  <section class="feature-frame shell" id="features">
+    <article class="feature-row handoff-row">
+      <div class="feature-copy"><i class="ph ph-folder-open feature-icon"></i><div><h2>Handoff, not storage</h2><p>Pastey is built for passing things across devices, not collecting them forever. Encrypted room payloads stay local, and burning the room clears its managed transfer state.</p></div></div>
+      <div class="handoff-visual">
+        <div class="pile-card"><div class="pile-icons"><i class="ph ph-file-pdf"></i><i class="ph ph-file-zip"></i><i class="ph ph-file-image"></i><i class="ph ph-file-video"></i></div><p>Uploads, relays, and caches accumulate.</p></div>
+        <i class="ph ph-arrow-right handoff-arrow"></i>
+        <div class="complete-card"><i class="ph ph-check"></i><p>Room burned<br /><span>managed payloads cleared</span></p></div>
+      </div>
+    </article>
+
+    <article class="feature-row" id="how-it-works">
+      <div class="feature-copy"><i class="ph ph-broadcast feature-icon"></i><div><h2>Nearby devices,<br />zero ceremony</h2><p>Open Pastey on two devices under the same local network. They discover each other automatically, so sending feels closer to dropping something across the desk than uploading it somewhere.</p></div></div>
+      <DiscoveryVisual />
+    </article>
+
+    <article class="feature-row">
+      <div class="feature-copy"><i class="ph ph-code feature-icon"></i><div><h2>Any file is just bytes.</h2><p>Different file formats enter the same encrypted transfer path. Pastey does not need per-format adapters: payload chunks flow to the receiver while acknowledgements return to the sender.</p></div></div>
+      <BinaryStream />
+    </article>
+
+    <article class="feature-row">
+      <div class="feature-copy"><i class="ph ph-lightning feature-icon"></i><div><h2>LAN-native speed</h2><p>Pastey avoids the upload-relay-download loop. It is built to use most of your LAN, with current validation observing roughly 75–80% of a practical LAN ceiling.</p><small>This is an observed range, not a guarantee. Actual throughput depends on Wi-Fi or Ethernet quality, device I/O, CPU, system load, and runtime conditions.</small></div></div>
+      <NoCloudPath />
+    </article>
+
+    <article class="feature-row">
+      <div class="feature-copy"><i class="ph ph-arrows-clockwise feature-icon"></i><div><h2>Transfer lifecycles<br />that end</h2><p>Payloads are temporary by design, so transfers do not become another storage pile. Room owners decide when the managed lifecycle ends.</p></div></div>
+      <TransferLifecycle />
+    </article>
+
+    <article class="feature-row inspect-row">
+      <div class="feature-copy"><i class="ph ph-shield-check feature-icon"></i><div><h2>Built to be inspected</h2><p>Pastey documents how transfers work, what is validated, and what is still experimental.</p></div></div>
+      <div class="inspect-grid">
+        {inspectCards.map(([icon, title, text, href, action]) => <a class="inspect-card" href={href}><i class={`ph ${icon}`}></i><strong>{title}</strong><p>{text}</p><span>{action} <i class="ph ph-arrow-right"></i></span></a>)}
+      </div>
+    </article>
+  </section>
+
+  <section class="final-cta shell">
+    <p class="eyebrow centered"><span></span> Local. Direct. Deliberate.</p>
+    <h2>Move it locally. <em>Clear it cleanly.</em></h2>
+    <div class="button-row centered">
+      <a class="button button-primary" href={links.latestRelease}><i class="ph ph-download-simple"></i>Download latest release</a>
+      <a class="button" href={links.github}><i class="ph ph-github-logo"></i>View on GitHub</a>
+    </div>
+  </section>
+</BaseLayout>
