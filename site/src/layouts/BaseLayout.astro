@@ -2,40 +2,51 @@
 import Header from "../components/Header.astro";
 import Footer from "../components/Footer.astro";
 import "../styles/global.css";
+import { getDictionary } from "../i18n";
+import { localePath, type Locale } from "../i18n/config";
 
 interface Props {
   title?: string;
   description?: string;
+  locale?: Locale;
 }
 
 const {
-  title = "Pastey — Ephemeral local handoff at LAN speed",
-  description = "Pastey moves text, images, and any file between nearby devices with no account, no cloud relay, and no storage buildup."
+  locale = "en",
+  title,
+  description
 } = Astro.props;
+const dictionary = getDictionary(locale);
+const pageTitle = title ?? dictionary.seo.title;
+const pageDescription = description ?? dictionary.seo.description;
+const canonicalPath = localePath(locale, Astro.url.pathname.replace(/^\/zh-CN(?=\/|$)/, "") || "/");
 ---
 
 <!doctype html>
-<html lang="en">
+<html lang={locale}>
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width" />
-    <meta name="description" content={description} />
+    <meta name="description" content={pageDescription} />
     <meta name="theme-color" content="#050912" />
     <meta property="og:type" content="website" />
-    <meta property="og:title" content={title} />
-    <meta property="og:description" content={description} />
+    <meta property="og:title" content={pageTitle} />
+    <meta property="og:description" content={pageDescription} />
     <meta property="og:image" content="/og-placeholder.png" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content={title} />
-    <meta name="twitter:description" content={description} />
+    <meta name="twitter:title" content={pageTitle} />
+    <meta name="twitter:description" content={pageDescription} />
     <meta name="twitter:image" content="/og-placeholder.png" />
+    <link rel="canonical" href={canonicalPath} />
+    <link rel="alternate" hreflang="en" href={localePath("en", Astro.url.pathname.replace(/^\/zh-CN(?=\/|$)/, "") || "/")} />
+    <link rel="alternate" hreflang="zh-CN" href={localePath("zh-CN", Astro.url.pathname.replace(/^\/zh-CN(?=\/|$)/, "") || "/")} />
     <link rel="icon" type="image/png" href="/favicon.png" />
-    <title>{title}</title>
+    <title>{pageTitle}</title>
   </head>
   <body>
-    <a class="skip-link" href="#main">Skip to content</a>
-    <Header />
+    <a class="skip-link" href="#main">{dictionary.common.skip}</a>
+    <Header locale={locale} pathname={Astro.url.pathname} copy={dictionary.common} />
     <main id="main"><slot /></main>
-    <Footer />
+    <Footer locale={locale} copy={dictionary.common} />
   </body>
 </html>

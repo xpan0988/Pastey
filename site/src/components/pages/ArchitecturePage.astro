@@ -1,0 +1,29 @@
+---
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import { links } from "../../data/links";
+import type { Locale } from "../../i18n/config";
+import type { Dictionary } from "../../i18n";
+interface Props { locale: Locale; dictionary: Dictionary; }
+const { locale, dictionary: d } = Astro.props;
+const a = d.architecture;
+---
+<BaseLayout locale={locale} title={d.seo.architectureTitle} description={d.seo.architectureDescription}>
+  <section class="page-hero shell">
+    <p class="eyebrow"><span></span> {a.eyebrow}</p>
+    <h1>{a.titleLead}<br /><em>{a.titleAccent}</em></h1>
+    <p>{a.description}</p>
+    <div class="button-row centered"><a class="button button-primary" href={links.architecture}>{a.canonicalDoc}</a><a class="button" href={links.github}><i class="ph ph-github-logo"></i>{a.viewSource}</a></div>
+  </section>
+  <section class="architecture-grid shell">
+    {a.stages.map(([icon, title, text], index) => <article><span>{String(index + 1).padStart(2, "0")}</span><i class={`ph ${icon}`}></i><h2>{title}</h2><p>{text}</p></article>)}
+  </section>
+  <section class="boundary-section shell" id="boundaries">
+    <div><p class="eyebrow"><span></span> {a.boundariesEyebrow}</p><h2>{a.boundariesTitle}</h2></div>
+    <div class="boundary-list">
+      <p><i class="ph ph-check-circle"></i><span><strong>{a.implementedLabel}</strong> {a.implementedText}</span></p>
+      <p><i class="ph ph-flask"></i><span><strong>{a.experimentalLabel}</strong> {a.experimentalText}</span></p>
+      <p><i class="ph ph-minus-circle"></i><span><strong>{a.notCurrentLabel}</strong> {a.notCurrentText}</span></p>
+    </div>
+  </section>
+  <section class="doc-links shell"><a href={links.scheduler}><i class="ph ph-tree-structure"></i><strong>{a.scheduler}</strong><span>{a.schedulerText}</span></a><a href={links.validation}><i class="ph ph-check-square"></i><strong>{a.validation}</strong><span>{a.validationText}</span></a></section>
+</BaseLayout>

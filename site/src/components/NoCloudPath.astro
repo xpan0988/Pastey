@@ -1,21 +1,38 @@
+---
+interface Props {
+  labels: {
+    cloudPath: string;
+    pasteyPath: string;
+    deviceA: string;
+    deviceB: string;
+    upload: string;
+    relay: string;
+    download: string;
+    useMostLan: string;
+    observedRange: string;
+    capacityAria: string;
+  };
+}
+const { labels } = Astro.props;
+---
 <div class="path-visual">
   <div class="path-row cloud-row">
-    <strong>Cloud path</strong>
+    <strong>{labels.cloudPath}</strong>
     <div class="path-items">
-      <span><i class="ph ph-laptop"></i><small>Device A</small></span><b>→</b>
-      <span><i class="ph ph-cloud-arrow-up"></i><small>Upload</small></span><b>→</b>
-      <span><i class="ph ph-cloud"></i><small>Relay</small></span><b>→</b>
-      <span><i class="ph ph-cloud-arrow-down"></i><small>Download</small></span><b>→</b>
-      <span><i class="ph ph-laptop"></i><small>Device B</small></span>
+      <span><i class="ph ph-laptop"></i><small>{labels.deviceA}</small></span><b>→</b>
+      <span><i class="ph ph-cloud-arrow-up"></i><small>{labels.upload}</small></span><b>→</b>
+      <span><i class="ph ph-cloud"></i><small>{labels.relay}</small></span><b>→</b>
+      <span><i class="ph ph-cloud-arrow-down"></i><small>{labels.download}</small></span><b>→</b>
+      <span><i class="ph ph-laptop"></i><small>{labels.deviceB}</small></span>
     </div>
   </div>
   <div class="path-row local-row">
-    <strong>Pastey path</strong>
-    <div class="local-line"><span><i class="ph ph-laptop"></i><small>Device A</small></span><b>LAN</b><span><i class="ph ph-laptop"></i><small>Device B</small></span></div>
+    <strong>{labels.pasteyPath}</strong>
+    <div class="local-line"><span><i class="ph ph-laptop"></i><small>{labels.deviceA}</small></span><b>LAN</b><span><i class="ph ph-laptop"></i><small>{labels.deviceB}</small></span></div>
   </div>
   <div class="capacity-row">
-    <div><strong>Built to use most of your LAN</strong><span>Observed validation range</span></div>
-    <div class="capacity-meter" aria-label="Observed at roughly 75 to 80 percent of practical LAN ceiling">
+    <div><strong>{labels.useMostLan}</strong><span>{labels.observedRange}</span></div>
+    <div class="capacity-meter" aria-label={labels.capacityAria}>
       <span class="capacity-fill"></span>
       <i>75–80%</i>
     </div>

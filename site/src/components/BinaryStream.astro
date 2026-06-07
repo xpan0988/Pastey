@@ -2,15 +2,27 @@
 const formats = [".pdf", ".png", ".zip", ".gguf"];
 const chunks = Array.from({ length: 7 });
 const acks = Array.from({ length: 4 });
+interface Props {
+  labels: {
+    aria: string;
+    sender: string;
+    receiver: string;
+    payloadChunks: string;
+    ackControl: string;
+    binaryPath: string;
+    chunksReceived: string;
+  };
+}
+const { labels } = Astro.props;
 ---
-<div class="binary-transfer" aria-label="Different file formats entering the same bidirectional binary transfer path">
+<div class="binary-transfer" aria-label={labels.aria}>
   <div class="binary-endpoint sender-endpoint">
     <i class="ph ph-laptop" aria-hidden="true"></i>
-    <strong>Sender</strong>
+    <strong>{labels.sender}</strong>
     <div class="sender-formats">{formats.map((format, index) => <span style={`--i:${index}`}>{format}</span>)}</div>
   </div>
   <div class="transfer-lane">
-    <div class="lane-labels"><span>Encrypted payload chunks</span><span>ACK / control</span></div>
+    <div class="lane-labels"><span>{labels.payloadChunks}</span><span>{labels.ackControl}</span></div>
     <div class="payload-rail" aria-hidden="true">
       <span class="rail-arrow">→</span>
       {chunks.map((_, index) => <i style={`--i:${index}`}>01</i>)}
@@ -19,11 +31,11 @@ const acks = Array.from({ length: 4 });
       <span class="rail-arrow">←</span>
       {acks.map((_, index) => <i style={`--i:${index}`}></i>)}
     </div>
-    <p>One binary path. No per-format adapters.</p>
+    <p>{labels.binaryPath}</p>
   </div>
   <div class="binary-endpoint receiver-endpoint">
     <i class="ph ph-desktop-tower" aria-hidden="true"></i>
-    <strong>Receiver</strong>
-    <span class="received-state"><i class="ph ph-check-circle"></i> chunks received</span>
+    <strong>{labels.receiver}</strong>
+    <span class="received-state"><i class="ph ph-check-circle"></i> {labels.chunksReceived}</span>
   </div>
 </div>

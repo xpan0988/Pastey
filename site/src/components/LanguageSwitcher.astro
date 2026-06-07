@@ -1,0 +1,17 @@
+---
+import { alternateLocalePath, type Locale } from "../i18n/config";
+
+interface Props {
+  locale: Locale;
+  pathname: string;
+  label: string;
+}
+
+const { locale, pathname, label } = Astro.props;
+const alternatePath = alternateLocalePath(locale, pathname);
+---
+<div class="language-switcher" aria-label={label}>
+  {locale === "en"
+    ? <><span aria-current="page">English</span><a href={alternatePath} lang="zh-CN">简体中文</a></>
+    : <><a href={alternatePath} lang="en">English</a><span aria-current="page">简体中文</span></>}
+</div>

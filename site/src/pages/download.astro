@@ -1,17 +1,5 @@
 ---
-import BaseLayout from "../layouts/BaseLayout.astro";
-import { links } from "../data/links";
+import DownloadPage from "../components/pages/DownloadPage.astro";
+import { getDictionary } from "../i18n";
 ---
-<BaseLayout title="Download Pastey — Local handoff for macOS and Windows" description="Download Pastey for macOS or Windows from GitHub Releases.">
-  <section class="page-hero shell">
-    <p class="eyebrow"><span></span> Download Pastey</p>
-    <h1>Your devices are already nearby.</h1>
-    <p>Get the latest release for macOS or Windows. Pastey needs no account, server, cloud relay, or environment variables.</p>
-    <div class="button-row centered"><a class="button button-primary" href={links.latestRelease}><i class="ph ph-download-simple"></i>Download latest release</a><a class="button" href={links.releases}>All releases</a></div>
-  </section>
-  <section class="download-grid shell">
-    <article class="download-card"><i class="ph ph-apple-logo"></i><h2>macOS</h2><p>Download the latest <code>.dmg</code>, drag Pastey into Applications, and launch it.</p><a class="text-link" href={links.latestRelease}>Get the latest release <i class="ph ph-arrow-right"></i></a></article>
-    <article class="download-card"><i class="ph ph-windows-logo"></i><h2>Windows</h2><p>Download the latest <code>.msi</code> or <code>.exe</code> installer and launch Pastey from the Start menu.</p><a class="text-link" href={links.latestRelease}>Get the latest release <i class="ph ph-arrow-right"></i></a></article>
-  </section>
-  <aside class="note-card shell"><i class="ph ph-info"></i><div><strong>Local network access</strong><p>Your operating system or firewall may ask for local network permission. Pastey uses it for nearby discovery and direct device-to-device transfer.</p></div></aside>
-</BaseLayout>
+<DownloadPage locale="en" dictionary={getDictionary("en")} />
