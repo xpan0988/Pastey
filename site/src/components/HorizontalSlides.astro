@@ -22,7 +22,15 @@ const { labels, progressAria } = Astro.props;
   const progressFill = progress?.querySelector<HTMLElement>(".slide-progress-rail i");
   const desktop = window.matchMedia("(min-width: 761px)");
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  const SLIDE_COOLDOWN_MS = 500;
+  const KEYBOARD_COOLDOWN_MS = 325;
+  const WHEEL_THRESHOLD = 40;
+  const WHEEL_GESTURE_END_MS = 320;
   let activeIndex = 0;
+  let lastSlideChangeAt = 0;
+  let lastKeyboardChangeAt = 0;
+  let wheelGestureLocked = false;
+  let wheelGestureTimer: number | undefined;
 
   const setActive = (index: number) => {
     activeIndex = index;
@@ -58,8 +66,23 @@ const { labels, progressAria } = Astro.props;
   deck?.addEventListener("wheel", (event) => {
     if (!desktop.matches || Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
     event.preventDefault();
-    deck.scrollBy({ left: event.deltaY, behavior: "auto" });
-    setActive(Math.round(deck.scrollLeft / deck.clientWidth));
+
+    window.clearTimeout(wheelGestureTimer);
+    wheelGestureTimer = window.setTimeout(() => {
+      wheelGestureLocked = false;
+    }, WHEEL_GESTURE_END_MS);
+
+    if (Math.abs(event.deltaY) < WHEEL_THRESHOLD) return;
+    if (wheelGestureLocked) return;
+    wheelGestureLocked = true;
+
+    const now = Date.now();
+    if (now - lastSlideChangeAt < SLIDE_COOLDOWN_MS) return;
+
+    const nextIndex = Math.max(0, Math.min(activeIndex + Math.sign(event.deltaY), slides.length - 1));
+    if (nextIndex === activeIndex) return;
+    lastSlideChangeAt = now;
+    goTo(nextIndex);
   }, { passive: false });
 
   deck?.addEventListener("scroll", () => {
@@ -69,14 +92,20 @@ const { labels, progressAria } = Astro.props;
 
   document.addEventListener("keydown", (event) => {
     if (!desktop.matches || event.altKey || event.ctrlKey || event.metaKey) return;
-    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
-      event.preventDefault();
-      goTo(activeIndex + 1);
-    }
-    if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
-      event.preventDefault();
-      goTo(activeIndex - 1);
-    }
+    const direction = event.key === "ArrowRight" || event.key === "ArrowDown"
+      ? 1
+      : event.key === "ArrowLeft" || event.key === "ArrowUp"
+        ? -1
+        : 0;
+    if (!direction) return;
+
+    event.preventDefault();
+    if (event.repeat) return;
+
+    const now = Date.now();
+    if (now - lastKeyboardChangeAt < KEYBOARD_COOLDOWN_MS) return;
+    lastKeyboardChangeAt = now;
+    goTo(activeIndex + direction);
   });
 
   document.querySelectorAll<HTMLAnchorElement>('a[href*="#"]').forEach((link) => {
