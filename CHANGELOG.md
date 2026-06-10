@@ -4,6 +4,9 @@ Detailed update and release history for Pastey.
 
 ## Unreleased
 
+- Added a static Astro + TypeScript + Tailwind product website under `site/`, with English and Simplified Chinese routes, canonical/hreflang metadata, Cloudflare Pages configuration, and canonical latest/all GitHub Release links.
+- Refined the desktop landing page into an eight-slide horizontal product presentation with fixed navigation, wheel/trackpad and keyboard cooldowns, direct hash/progress navigation, staged slide-entry reveals, and a vertical mobile fallback.
+- Synchronized repository website, download, deployment, product-positioning, format-agnostic binary transfer, and qualified LAN-validation documentation.
 - Added a `dev-fast` transfer resource estimate and Linux feasibility report covering local fixture disk usage, CPU/memory expectations, dev-mode benchmark boundaries, cleanup guidance, and future real-machine measurements.
 - Consolidated transfer documentation under `docs/transfer/`: current architecture now lives in `docs/transfer/architecture.md`, active scheduler/MicroFlowGroup/dynamic-shadow design lives in `docs/transfer/scheduler.md`, and active validation/logging guidance lives in `docs/transfer/validation.md`.
 - Moved the completed Phase 2-4 scheduler/runtime-window implementation record to `docs/binary-v2/early-implementation.md` and replaced old overlapping docs with short moved stubs.

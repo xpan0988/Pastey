@@ -2,6 +2,8 @@
 
 `pastey` is a lightweight local-first desktop utility for moving text, files, and images directly between your own Windows and macOS devices on the same LAN.
 
+Pastey is built for ephemeral local handoff: nearby devices echo back when ready, payloads follow a format-agnostic binary transfer path, and managed room state can be cleared instead of becoming storage buildup. There is no account system, cloud relay, or remote storage.
+
 It is built with:
 - Tauri v2
 - React + TypeScript
@@ -52,10 +54,23 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed update and version history.
 ## Documentation
 
 - [Changelog](CHANGELOG.md)
+- [Product website](site/README.md)
 - [Release workflow](docs/dev/release-workflow.md)
 - [Transfer architecture](docs/transfer/architecture.md)
 - [Transfer scheduler](docs/transfer/scheduler.md)
 - [Transfer validation](docs/transfer/validation.md)
+
+## Product website
+
+The static product website lives under [`site/`](site/). It uses Astro, TypeScript, and Tailwind CSS, with English and Simplified Chinese routes. The desktop landing page is an eight-slide horizontal product presentation; small screens use a vertical fallback.
+
+The site is configured for Cloudflare Pages:
+
+- Root directory: `site`
+- Build command: `pnpm build` when pnpm is available, otherwise `npm run build`
+- Output directory: `dist`
+
+See [`site/README.md`](site/README.md) for local development, route, deployment, and public-claim guidance.
 
 ## What pastey does
 
@@ -149,22 +164,22 @@ Rooms exist until manually burned. Burning a room deletes that room's local encr
 4. Images are treated exactly like files
 5. No decode, resize, recompress, or transform step is applied
 
-Global Transfer Scheduler v1 is frontend orchestration only. It uses a weighted planner for existing queued file-like transfers, passes per-transfer requested sender windows through the existing single-file transfer command, and can rebalance active outgoing binary-v1 sender windows after planner-managed queue item completion. It does not add retry/timeout adaptive windows, archive bundling, folder transfer, backend-owned scheduling, or protocol changes. File type may affect labels, but the binary file transport remains opaque and file-type independent.
+Global Transfer Scheduler v1 is frontend orchestration only. It uses a weighted planner for existing queued file-like transfers, passes per-transfer requested sender windows through the existing single-file transfer command, and can rebalance active outgoing binary-v1 sender windows after planner-managed queue item completion. It does not add retry/timeout adaptive windows, archive bundling, folder transfer, backend-owned scheduling, or protocol changes. File type may affect labels, but the binary-v1 transport remains opaque, format-agnostic, and file-type independent.
 
 ## Download
 
-Prebuilt installers are published on the [GitHub Releases page](https://github.com/xpan0988/Pastey/releases).
+Download the [latest release](https://github.com/xpan0988/Pastey/releases/latest), or browse [all GitHub Releases](https://github.com/xpan0988/Pastey/releases).
 
 ### macOS
 
-1. Download the latest `.dmg` from GitHub Releases.
+1. Download the latest `.dmg` from the [latest release](https://github.com/xpan0988/Pastey/releases/latest).
 2. Open the `.dmg`.
 3. Drag `pastey.app` into Applications.
 4. Launch `pastey`.
 
 ### Windows
 
-1. Download the latest `.msi` or `.exe` installer from GitHub Releases.
+1. Download the latest `.msi` or `.exe` installer from the [latest release](https://github.com/xpan0988/Pastey/releases/latest).
 2. Run the installer.
 3. Launch `pastey` from the Start menu.
 
