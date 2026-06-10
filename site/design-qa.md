@@ -36,7 +36,7 @@ Simplified Chinese public copy uses `近距离即焚式传输`, `云端中转`, 
 
 ## Verification
 
-- `pnpm build`: passed through the equivalent local `npm run build` script; Astro reported 0 errors, 0 warnings, and generated all 6 routes.
+- `npm run build`: used because pnpm was unavailable; Astro reported 0 errors, 0 warnings, and generated all 6 routes.
 - Routes checked: `/`, `/download`, `/architecture`, `/zh-CN/`, `/zh-CN/download`, `/zh-CN/architecture`.
 - Canonical links, hreflang pairs, and language-switch route preservation: passed.
 - Desktop slide dimensions and no body overflow at 1440px, 1280px, and 864px: passed.
@@ -48,6 +48,10 @@ Simplified Chinese public copy uses `近距离即焚式传输`, `云端中转`, 
 - Staged reveal entry, inactive reset, and replay after returning to a slide: passed.
 - Reduced-motion rules: source-verified to keep content immediately visible with transforms and transitions disabled.
 - Browser console: no errors.
+
+## Documentation synchronization
+
+Repository documentation points to `site/` as the static Astro + TypeScript + Tailwind product website, records the Cloudflare Pages build settings, uses canonical latest/all GitHub Release links, and keeps public product claims aligned with the current transfer architecture and validation caveats.
 
 ## Known limitation
 

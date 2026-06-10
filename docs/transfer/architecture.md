@@ -4,7 +4,7 @@ This is the current high-level map for Pastey's transfer stack. For scheduler de
 
 ## Current Stack
 
-Pastey currently uses binary-v1 as its normal high-performance file transport. Each file is encrypted, split into chunks, sent over the LAN peer endpoint, acknowledged per chunk, and finalized after the receiver verifies the expected chunk count and total size. JSON/base64 remains the compatibility fallback.
+Pastey currently uses binary-v1 as its normal high-performance, format-agnostic file transport. File type may affect display metadata, but the transfer path operates on encrypted bytes rather than per-format adapters. Each file is encrypted, split into chunks, sent over the LAN peer endpoint, acknowledged per chunk, and finalized after the receiver verifies the expected chunk count and total size. JSON/base64 remains the compatibility fallback.
 
 The global transfer scheduler is frontend-owned. Multi-file picker, drag/drop, and pasted-image inputs enter an in-memory queue; text sends remain immediate and stay outside the file queue. The scheduler decides which queued file-like work can run, but every ordinary file transfer still goes through the existing `sendFileToRoom` frontend wrapper and Rust `send_file_to_room` command. Those remain the authoritative single-file transfer path.
 
