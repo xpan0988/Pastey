@@ -4,6 +4,7 @@ Detailed update and release history for Pastey.
 
 ## Unreleased
 
+- Added a `dev-fast` transfer resource estimate and Linux feasibility report covering local fixture disk usage, CPU/memory expectations, dev-mode benchmark boundaries, cleanup guidance, and future real-machine measurements.
 - Consolidated transfer documentation under `docs/transfer/`: current architecture now lives in `docs/transfer/architecture.md`, active scheduler/MicroFlowGroup/dynamic-shadow design lives in `docs/transfer/scheduler.md`, and active validation/logging guidance lives in `docs/transfer/validation.md`.
 - Moved the completed Phase 2-4 scheduler/runtime-window implementation record to `docs/binary-v2/early-implementation.md` and replaced old overlapping docs with short moved stubs.
 - Kept the fixture corpus README focused on generating and dragging deterministic payload folders, with full validation workflow details linked to `docs/transfer/validation.md`.

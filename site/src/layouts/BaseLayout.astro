@@ -9,12 +9,16 @@ interface Props {
   title?: string;
   description?: string;
   locale?: Locale;
+  bodyClass?: string;
+  hideFooter?: boolean;
 }
 
 const {
   locale = "en",
   title,
-  description
+  description,
+  bodyClass = "",
+  hideFooter = false
 } = Astro.props;
 const dictionary = getDictionary(locale);
 const pageTitle = title ?? dictionary.seo.title;
@@ -43,10 +47,10 @@ const canonicalPath = localePath(locale, Astro.url.pathname.replace(/^\/zh-CN(?=
     <link rel="icon" type="image/png" href="/favicon.png" />
     <title>{pageTitle}</title>
   </head>
-  <body>
+  <body class={bodyClass}>
     <a class="skip-link" href="#main">{dictionary.common.skip}</a>
     <Header locale={locale} pathname={Astro.url.pathname} copy={dictionary.common} />
     <main id="main"><slot /></main>
-    <Footer locale={locale} copy={dictionary.common} />
+    {!hideFooter && <Footer locale={locale} copy={dictionary.common} />}
   </body>
 </html>

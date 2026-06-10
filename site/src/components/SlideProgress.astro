@@ -1,0 +1,19 @@
+---
+interface Props {
+  labels: readonly string[];
+  aria: string;
+}
+
+const { labels, aria } = Astro.props;
+---
+
+<nav class="slide-progress" aria-label={aria} data-slide-progress>
+  <span class="slide-progress-rail" aria-hidden="true"><i></i></span>
+  <div class="slide-progress-dots">
+    {labels.map((label, index) => (
+      <button type="button" data-slide-target={index} aria-label={label} title={label}>
+        <span></span>
+      </button>
+    ))}
+  </div>
+</nav>
