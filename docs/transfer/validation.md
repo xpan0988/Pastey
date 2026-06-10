@@ -2,6 +2,8 @@
 
 This is the active validation and logging guide for Pastey transfer scheduler work. It covers planner replay, deterministic fixtures, single-machine dual-instance smoke, sender log identification, and release-build LAN validation boundaries. For scheduler theory, see [scheduler.md](scheduler.md).
 
+For `dev-fast` CPU, memory, disk, and Linux feasibility notes, see [devfast-resource-estimate.md](devfast-resource-estimate.md).
+
 ## Validation Layers
 
 - Planner replay: algorithm strategy validation. It does not launch Tauri and does not require files, a receiver, network, or a room server. It is the best local check for fixed-vs-dynamic-shadow comparison.

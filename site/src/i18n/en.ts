@@ -32,6 +32,8 @@ export const en = {
     footerMeta: "Open source. Local first."
   },
   landing: {
+    slideProgress: "Product presentation progress",
+    slideLabels: ["Nearby Echo", "Handoff, not storage", "Nearby devices", "Any file is just bytes", "LAN-native speed", "Transfer lifecycle", "Built to be inspected", "Download Pastey"],
     heroEyebrow: "Local-first device handoff",
     heroLead: "Ephemeral local handoff, at",
     heroAccent: "LAN speed.",
@@ -46,8 +48,8 @@ export const en = {
     bytesTitle: "Any file is just bytes.",
     bytesText: "Different file formats enter the same encrypted transfer path. Pastey does not need per-format adapters: payload chunks flow to the receiver while acknowledgements return to the sender.",
     speedTitle: "LAN-native speed",
-    speedText: "Pastey avoids the upload-relay-download loop. It is built to use most of your LAN, with current validation observing roughly 75–80% of a practical LAN ceiling.",
-    speedCaveat: "This is an observed range, not a guarantee. Actual throughput depends on Wi-Fi or Ethernet quality, device I/O, CPU, system load, and runtime conditions.",
+    speedText: "Pastey avoids the upload-relay-download loop. Built to use most of your LAN. Observed at roughly 75–80% of practical LAN ceiling in current validation.",
+    speedCaveat: "Actual throughput depends on Wi-Fi/Ethernet quality, device I/O, CPU, system load, and runtime conditions.",
     lifecycleTitle: "Transfer lifecycles that end",
     lifecycleText: "Payloads are temporary by design, so transfers do not become another storage pile. Room owners decide when the managed lifecycle ends.",
     inspectedTitle: "Built to be inspected",
@@ -55,6 +57,7 @@ export const en = {
     finalEyebrow: "Local. Direct. Deliberate.",
     finalLead: "Move it locally.",
     finalAccent: "Clear it cleanly.",
+    finalText: "Download Pastey for macOS or Windows and move your next handoff across the LAN.",
     inspectCards: [
       ["ph-stack", "Architecture", "Current transfer stack and its boundaries.", "architecture", "Read"],
       ["ph-notebook", "Changelog", "Changes, decisions, and release history.", "changelog", "View"],
@@ -86,8 +89,8 @@ export const en = {
     upload: "Upload",
     relay: "Relay",
     download: "Download",
-    useMostLan: "Built to use most of your LAN",
-    observedRange: "Observed validation range",
+    useMostLan: "Built to use most of your LAN.",
+    observedRange: "Observed at roughly 75–80% of practical LAN ceiling in current validation.",
     capacityAria: "Observed at roughly 75 to 80 percent of practical LAN ceiling",
     lifecycleAria: "Transfer lifecycle",
     lifecycleSteps: ["Create", "Encrypt", "Chunk", "Stream", "Receive", "Clear"]

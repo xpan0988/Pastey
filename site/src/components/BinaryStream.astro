@@ -1,6 +1,6 @@
 ---
 const formats = [".pdf", ".png", ".zip", ".gguf"];
-const chunks = Array.from({ length: 7 });
+const chunks = ["A7", "0C", "F2", "91", "4D", "B8", "3E"];
 const acks = Array.from({ length: 4 });
 interface Props {
   labels: {
@@ -25,7 +25,7 @@ const { labels } = Astro.props;
     <div class="lane-labels"><span>{labels.payloadChunks}</span><span>{labels.ackControl}</span></div>
     <div class="payload-rail" aria-hidden="true">
       <span class="rail-arrow">→</span>
-      {chunks.map((_, index) => <i style={`--i:${index}`}>01</i>)}
+      {chunks.map((chunk, index) => <i style={`--i:${index}`}>{chunk}</i>)}
     </div>
     <div class="ack-rail" aria-hidden="true">
       <span class="rail-arrow">←</span>

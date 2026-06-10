@@ -1,6 +1,6 @@
 # Transfer Architecture
 
-This is the current high-level map for Pastey's transfer stack. For scheduler details, see [scheduler.md](scheduler.md). For replay, fixture, single-machine, and LAN validation, see [validation.md](validation.md).
+This is the current high-level map for Pastey's transfer stack. For scheduler details, see [scheduler.md](scheduler.md). For replay, fixture, single-machine, and LAN validation, see [validation.md](validation.md). For `dev-fast` resource estimates and Linux feasibility notes, see [devfast-resource-estimate.md](devfast-resource-estimate.md).
 
 ## Current Stack
 
