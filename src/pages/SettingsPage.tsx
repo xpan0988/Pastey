@@ -65,6 +65,10 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
     await save({ ...config, dev_tools_enabled: enabled });
   }
 
+  async function saveMicroFlowGroupMode(mode: AppConfig["micro_flow_group_mode"]) {
+    await save({ ...config, micro_flow_group_mode: mode });
+  }
+
   async function saveTransferWindow(nextValue: string) {
     setWindowValue(nextValue);
     if (nextValue === "custom") {
@@ -223,6 +227,19 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
 
       {config.dev_tools_enabled ? (
         <SettingsGroup title="Developer Tools" icon="wrench">
+          <SettingsRow icon="window" title="MicroFlowGroup mode" detail={
+            config.micro_flow_group_mode === "fixed"
+              ? "Fixed: legacy threshold-based grouping"
+              : "Dynamic: contention-aware one-window grouping"
+          } control={
+            <select
+              value={config.micro_flow_group_mode}
+              onChange={(event) => void saveMicroFlowGroupMode(event.target.value as AppConfig["micro_flow_group_mode"])}
+            >
+              <option value="dynamic">Dynamic</option>
+              <option value="fixed">Fixed</option>
+            </select>
+          } />
           <SettingsRow icon="window" title="Transfer Window" detail="Binary transfer pipeline depth" control={
             <select value={windowValue} onChange={(event) => void saveTransferWindow(event.target.value)}>
               <option value="default">Default / Auto (window 8)</option>

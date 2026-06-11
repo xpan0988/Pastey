@@ -112,13 +112,14 @@ test("three similarly large files split fairly within the global budget", () => 
 test("many tiny files create one serial micro group with one planner window", () => {
   const result = planWeightedTransfers(Array.from({ length: 12 }, (_, index) => (
     fileTask({ id: `small-${index}`, sizeBytes: 128 * 1024, createdAt: index })
-  )));
+  )), { microGroupMode: "fixed" });
 
   assert.equal(result.runnablePlans.length, 1);
   assert.equal(result.runnablePlans[0].kind, "micro_group");
   assert.equal(result.runnablePlans[0].requestedWindow, 1);
   assert.equal(result.microGroupPlans.length, 1);
   assert.equal(result.microGroupPlans[0].dispatchMode, "serial");
+  assert.equal(result.microGroupPlans[0].microGroupMode, "fixed");
   assert.equal(result.microGroupPlans[0].requestedWindow, 1);
   assert.deepEqual(result.microGroupPlans[0].childTaskIds, Array.from({ length: 12 }, (_, index) => `small-${index}`));
   assert.equal(result.requestedWindowTotal, 1);
@@ -148,20 +149,32 @@ test("single eligible tiny file does not create a micro group", () => {
   assert.equal(result.runnablePlans[0].requestedWindow, 8);
 });
 
-test("shadow micro group reports possible grouping without changing runnable child plans", () => {
+test("dynamic mode groups broader small-file work live under contention", () => {
   const result = planWeightedTransfers(
-    Array.from({ length: 6 }, (_, index) => (
-      fileTask({ id: `tiny-${index}`, sizeBytes: 128 * 1024, createdAt: index })
-    )),
-    { microGroupDispatchMode: "shadow" }
+    [
+      fileTask({ id: "huge", sizeBytes: 2 * GiB, createdAt: 0 }),
+      ...Array.from({ length: 6 }, (_, index) => (
+        fileTask({ id: `small-${index}`, sizeBytes: 1.2 * MiB, createdAt: index + 1 })
+      ))
+    ],
+    { microGroupMode: "dynamic" }
   );
 
   assert.equal(result.microGroupPlans.length, 1);
-  assert.equal(result.microGroupPlans[0].dispatchMode, "shadow");
+  assert.equal(result.microGroupPlans[0].microGroupMode, "dynamic");
   assert.equal(result.microGroupPlans[0].requestedWindow, 1);
-  assert.deepEqual(result.runnablePlans.map((plan) => plan.taskId), ["tiny-0", "tiny-1", "tiny-2", "tiny-3"]);
-  assert.deepEqual(result.runnablePlans.map((plan) => plan.requestedWindow), [2, 2, 2, 2]);
+  assert.equal(result.microGroupPlans[0].childTaskIds.length, 6);
+  assert.equal(result.runnablePlans.filter((plan) => plan.kind === "micro_group").length, 1);
   assert.equal(result.requestedWindowTotal, 8);
+});
+
+test("dynamic mode does not group two around-1.2 MiB files without contention", () => {
+  const result = planWeightedTransfers([
+    fileTask({ id: "small-a", sizeBytes: 1.2 * MiB, createdAt: 1 }),
+    fileTask({ id: "small-b", sizeBytes: 1.2 * MiB, createdAt: 2 })
+  ], { microGroupMode: "dynamic" });
+
+  assert.equal(result.microGroupPlans.length, 0);
 });
 
 test("huge plus many tiny gives the huge seven windows and the micro group one", () => {

@@ -20,7 +20,8 @@ export type TransferPlannerMetadataStatus = "unknown" | "loading" | "ready" | "f
 
 export type TransferPlannerRoomStatus = "active" | "peer_left" | "burned" | "expired" | "unavailable";
 
-export type MicroFlowGroupDispatchMode = "shadow" | "serial";
+export type MicroFlowGroupMode = "fixed" | "dynamic";
+export type MicroFlowGroupDispatchMode = "serial";
 
 export type TransferPlannerHeldReason =
   | "cancelled"
@@ -58,7 +59,7 @@ export interface TransferPlannerPolicy {
   safetyActiveTransferCap: number;
   laneWeights: Record<TransferPlannerLane, number>;
   rebalanceActiveWindows: boolean;
-  microGroupDispatchMode: MicroFlowGroupDispatchMode;
+  microGroupMode: MicroFlowGroupMode;
   microGroupMaxChildSizeBytes: number;
   microGroupMaxGroupBytes: number;
   microGroupMaxGroupItems: number;
@@ -85,6 +86,7 @@ export interface MicroFlowGroupPlan {
   totalBytes: number;
   reason: string;
   dispatchMode: MicroFlowGroupDispatchMode;
+  microGroupMode: MicroFlowGroupMode;
 }
 
 export type TransferPlannerRunnablePlan = TransferPlannerPlan;
@@ -143,6 +145,14 @@ interface PlannedMicroFlowGroup {
 
 const KiB = 1024;
 const MiB = 1024 * KiB;
+export const MICRO_GROUP_PER_FILE_OVERHEAD_BYTES = 256 * KiB;
+export const DYNAMIC_MICRO_GROUP_MIN_WINDOW_QUANTUM_BYTES = 4 * MiB;
+export const DYNAMIC_MICRO_GROUP_MAX_WINDOW_QUANTUM_BYTES = 16 * MiB;
+export const DYNAMIC_MICRO_GROUP_MIN_CHILD_CAP_BYTES = MiB;
+export const DYNAMIC_MICRO_GROUP_MAX_CHILD_CAP_BYTES = 4 * MiB;
+export const DYNAMIC_MICRO_GROUP_MIN_GROUP_CAP_BYTES = 4 * MiB;
+export const DYNAMIC_MICRO_GROUP_MAX_GROUP_CAP_BYTES = 16 * MiB;
+export const DYNAMIC_MICRO_GROUP_MAX_ACTIVE_WINDOWS = 1;
 
 export const DEFAULT_TRANSFER_PLANNER_POLICY: TransferPlannerPolicy = {
   globalWindowBudget: 8,
@@ -150,7 +160,7 @@ export const DEFAULT_TRANSFER_PLANNER_POLICY: TransferPlannerPolicy = {
   maxRequestedWindow: 8,
   safetyActiveTransferCap: 4,
   rebalanceActiveWindows: false,
-  microGroupDispatchMode: "serial",
+  microGroupMode: "fixed",
   microGroupMaxChildSizeBytes: MiB,
   microGroupMaxGroupBytes: 4 * MiB,
   microGroupMaxGroupItems: 32,
@@ -203,18 +213,13 @@ export function planWeightedTransfers(
   const laneBudgets = computeLaneBudgets([...activeCandidates, ...queuedCandidates], policy);
   const activePlans: TransferPlannerActivePlan[] = [];
   const runnablePlans: TransferPlannerRunnablePlan[] = [];
-  const microGroupCandidates = planMicroFlowGroups(queuedCandidates, policy);
-  const groupedTaskIds = new Set(
-    policy.microGroupDispatchMode === "serial"
-      ? microGroupCandidates.flatMap((group) => group.childTaskIds)
-      : []
-  );
-  const allocationQueuedCandidates = policy.microGroupDispatchMode === "serial"
-    ? [
-      ...queuedCandidates.filter((candidate) => !groupedTaskIds.has(candidate.task.id)),
-      ...microGroupCandidates.map((group) => group.candidate)
-    ]
-    : queuedCandidates;
+  const liveMicroGroupPolicy = resolveLiveMicroGroupPolicy([...activeCandidates, ...queuedCandidates], policy);
+  const microGroupCandidates = planMicroFlowGroups(queuedCandidates, liveMicroGroupPolicy);
+  const groupedTaskIds = new Set(microGroupCandidates.flatMap((group) => group.childTaskIds));
+  const allocationQueuedCandidates = [
+    ...queuedCandidates.filter((candidate) => !groupedTaskIds.has(candidate.task.id)),
+    ...microGroupCandidates.map((group) => group.candidate)
+  ];
 
   let globalRemaining = policy.globalWindowBudget;
   if (policy.rebalanceActiveWindows) {
@@ -327,13 +332,11 @@ export function planWeightedTransfers(
       .map((plan) => [plan.taskId, plan.requestedWindow])
   );
   const microGroupPlans = microGroupCandidates
-    .filter((group) => policy.microGroupDispatchMode === "shadow" || serialMicroGroupWindows.has(group.groupId))
+    .filter((group) => serialMicroGroupWindows.has(group.groupId))
     .map((group) => createMicroGroupPlan(
       group,
-      policy.microGroupDispatchMode === "serial"
-        ? serialMicroGroupWindows.get(group.groupId) ?? policy.minRequestedWindow
-        : policy.minRequestedWindow,
-      policy.microGroupDispatchMode
+      serialMicroGroupWindows.get(group.groupId) ?? policy.minRequestedWindow,
+      policy.microGroupMode
     ));
   if (requestedWindowTotal > policy.globalWindowBudget) {
     debugReasons.push("requested windows exceeded global budget before final accounting");
@@ -395,7 +398,9 @@ function normalizePolicy(overrides: Partial<TransferPlannerPolicy>): TransferPla
     maxRequestedWindow,
     safetyActiveTransferCap,
     rebalanceActiveWindows: overrides.rebalanceActiveWindows ?? DEFAULT_TRANSFER_PLANNER_POLICY.rebalanceActiveWindows,
-    microGroupDispatchMode: overrides.microGroupDispatchMode ?? DEFAULT_TRANSFER_PLANNER_POLICY.microGroupDispatchMode,
+    microGroupMode: overrides.microGroupMode === "fixed" || overrides.microGroupMode === "dynamic"
+      ? overrides.microGroupMode
+      : DEFAULT_TRANSFER_PLANNER_POLICY.microGroupMode,
     microGroupMaxChildSizeBytes,
     microGroupMaxGroupBytes,
     microGroupMaxGroupItems,
@@ -630,7 +635,7 @@ function planMicroFlowGroups(
   policy: TransferPlannerPolicy
 ): PlannedMicroFlowGroup[] {
   const groupsByKey = new Map<string, ClassifiedTask[]>();
-  for (const candidate of sortAllocationCandidates(candidates)) {
+  for (const candidate of sortMicroFlowGroupCandidates(candidates, policy)) {
     if (!isMicroFlowGroupEligible(candidate, policy)) {
       continue;
     }
@@ -647,12 +652,12 @@ function planMicroFlowGroups(
     let pendingBytes = 0;
 
     for (const candidate of entries) {
-      const sizeBytes = candidate.task.sizeBytes ?? 0;
+      const sizeBytes = microFlowGroupCandidateCost(candidate, policy);
       if (
         pending.length >= policy.microGroupMaxGroupItems ||
         (pending.length > 0 && pendingBytes + sizeBytes > policy.microGroupMaxGroupBytes)
       ) {
-        pushMicroFlowGroup(groups, pending);
+        pushMicroFlowGroup(groups, pending, policy);
         pending = [];
         pendingBytes = 0;
       }
@@ -661,15 +666,39 @@ function planMicroFlowGroups(
       pendingBytes += sizeBytes;
     }
 
-    pushMicroFlowGroup(groups, pending);
+    pushMicroFlowGroup(groups, pending, policy);
   }
 
+  if (policy.microGroupMode === "dynamic") {
+    return groups
+      .sort((left, right) => (
+        right.childTaskIds.length - left.childTaskIds.length ||
+        right.totalBytes - left.totalBytes ||
+        left.groupId.localeCompare(right.groupId)
+      ))
+      .slice(0, DYNAMIC_MICRO_GROUP_MAX_ACTIVE_WINDOWS);
+  }
   return groups.sort((left, right) => left.groupId.localeCompare(right.groupId));
+}
+
+function sortMicroFlowGroupCandidates(
+  candidates: readonly ClassifiedTask[],
+  policy: TransferPlannerPolicy
+): ClassifiedTask[] {
+  if (policy.microGroupMode === "fixed") {
+    return sortAllocationCandidates(candidates);
+  }
+  return [...candidates].sort((left, right) => (
+    (left.task.sizeBytes ?? 0) - (right.task.sizeBytes ?? 0) ||
+    (left.task.createdAt ?? 0) - (right.task.createdAt ?? 0) ||
+    left.task.id.localeCompare(right.task.id)
+  ));
 }
 
 function pushMicroFlowGroup(
   groups: PlannedMicroFlowGroup[],
-  candidates: readonly ClassifiedTask[]
+  candidates: readonly ClassifiedTask[],
+  policy: TransferPlannerPolicy
 ) {
   if (candidates.length < 2) {
     return;
@@ -677,7 +706,7 @@ function pushMicroFlowGroup(
 
   const sorted = sortCandidates(candidates);
   const first = sorted[0];
-  const totalBytes = sorted.reduce((total, candidate) => total + (candidate.task.sizeBytes ?? 0), 0);
+  const totalBytes = sorted.reduce((total, candidate) => total + microFlowGroupCandidateCost(candidate, policy), 0);
   const childTaskIds = sorted.map((candidate) => candidate.task.id);
   const groupId = [
     "micro-group",
@@ -711,7 +740,7 @@ function pushMicroFlowGroup(
     lane: first.lane,
     childTaskIds,
     totalBytes,
-    reason: `grouped ${childTaskIds.length} tiny file-like tasks by room/lane/size/mime family`,
+    reason: `grouped ${childTaskIds.length} file-like tasks using ${policy.microGroupMode} one-window policy`,
     candidate: {
       task,
       lane: first.lane,
@@ -730,7 +759,7 @@ function isMicroFlowGroupEligible(candidate: ClassifiedTask, policy: TransferPla
     candidate.task.roomAvailable !== false &&
     candidate.task.metadataStatus === "ready" &&
     typeof candidate.task.sizeBytes === "number" &&
-    candidate.task.sizeBytes <= policy.microGroupMaxChildSizeBytes &&
+    microFlowGroupCandidateCost(candidate, policy) <= policy.microGroupMaxChildSizeBytes &&
     (candidate.sizeClass === "tiny" || candidate.sizeClass === "small") &&
     candidate.lane === "small_file";
 }
@@ -760,7 +789,7 @@ function broadMimeFamily(mimeType?: string | null): string {
 function createMicroGroupPlan(
   group: PlannedMicroFlowGroup,
   requestedWindow: number,
-  dispatchMode: MicroFlowGroupDispatchMode
+  microGroupMode: MicroFlowGroupMode
 ): MicroFlowGroupPlan {
   return {
     groupId: group.groupId,
@@ -770,8 +799,63 @@ function createMicroGroupPlan(
     childTaskIds: group.childTaskIds,
     totalBytes: group.totalBytes,
     reason: group.reason,
-    dispatchMode
+    dispatchMode: "serial",
+    microGroupMode
   };
+}
+
+function resolveLiveMicroGroupPolicy(
+  candidates: readonly ClassifiedTask[],
+  policy: TransferPlannerPolicy
+): TransferPlannerPolicy {
+  if (policy.microGroupMode === "fixed") {
+    return policy;
+  }
+
+  const serviceCandidates = candidates.filter((candidate) => (
+    candidate.task.state === "queued" || candidate.task.state === "active"
+  ));
+  const hasBulkCandidate = serviceCandidates.some((candidate) => candidate.lane === "bulk_file");
+  const contention = serviceCandidates.length > policy.safetyActiveTransferCap ||
+    (hasBulkCandidate && serviceCandidates.length > 1);
+  if (!contention) {
+    return {
+      ...policy,
+      microGroupMaxChildSizeBytes: 1,
+      microGroupMaxGroupBytes: 1
+    };
+  }
+
+  const largestReadyQueuedBytes = Math.max(0, ...serviceCandidates.map((candidate) => candidate.task.sizeBytes ?? 0));
+  const oneWindowQuantumBytes = clampBytes(
+    Math.floor(largestReadyQueuedBytes / policy.globalWindowBudget),
+    DYNAMIC_MICRO_GROUP_MIN_WINDOW_QUANTUM_BYTES,
+    DYNAMIC_MICRO_GROUP_MAX_WINDOW_QUANTUM_BYTES
+  );
+  const dynamicChildCapBytes = clampBytes(
+    oneWindowQuantumBytes,
+    DYNAMIC_MICRO_GROUP_MIN_CHILD_CAP_BYTES,
+    DYNAMIC_MICRO_GROUP_MAX_CHILD_CAP_BYTES
+  );
+  const dynamicGroupCapBytes = clampBytes(
+    oneWindowQuantumBytes,
+    DYNAMIC_MICRO_GROUP_MIN_GROUP_CAP_BYTES,
+    DYNAMIC_MICRO_GROUP_MAX_GROUP_CAP_BYTES
+  );
+  return {
+    ...policy,
+    microGroupMaxChildSizeBytes: dynamicChildCapBytes,
+    microGroupMaxGroupBytes: dynamicGroupCapBytes
+  };
+}
+
+function microFlowGroupCandidateCost(candidate: ClassifiedTask, policy: TransferPlannerPolicy): number {
+  return (candidate.task.sizeBytes ?? 0) +
+    (policy.microGroupMode === "dynamic" ? MICRO_GROUP_PER_FILE_OVERHEAD_BYTES : 0);
+}
+
+function clampBytes(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, Math.floor(value)));
 }
 
 function createPlan(candidate: ClassifiedTask, requestedWindow: number): TransferPlannerPlan {

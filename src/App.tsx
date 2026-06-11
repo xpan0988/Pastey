@@ -48,6 +48,7 @@ import {
   markQueueItemPreparing,
   markQueueItemRuntimeWindow,
   markQueueItemSending,
+  microGroupPlannerDiagnosticFields,
   planActiveTransferWindowRebalances,
   planRunnableTransferLaunches,
   queuedItemsNeedingMetadata,
@@ -59,7 +60,11 @@ import {
   type TransferQueueItemStatus,
   type TransferSchedulerState
 } from "./lib/transferScheduler";
-import { DEFAULT_TRANSFER_PLANNER_POLICY } from "./lib/transferPlanner";
+import {
+  DEFAULT_TRANSFER_PLANNER_POLICY,
+  type MicroFlowGroupMode,
+  type TransferPlannerPolicy
+} from "./lib/transferPlanner";
 import { mergeTransferEvent } from "./lib/transferState";
 import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, RoomInfo, RoomItem } from "./lib/types";
 
@@ -116,10 +121,6 @@ function App() {
   const runtimeWindowStatsRef = useRef<Map<string, RuntimeWindowDiagnosticStats>>(new Map());
   const plannerLaunchSummaryKeyRef = useRef<string>("");
   const serialMicroGroupRunningRef = useRef(false);
-
-  useEffect(() => {
-    schedulerRef.current = scheduler;
-  }, [scheduler]);
 
   useEffect(() => {
     viewRef.current = view;
@@ -234,11 +235,14 @@ function App() {
   }, [scheduler, rooms]);
 
   useEffect(() => {
+    const plannerPolicy = microGroupPlannerPolicy(config?.micro_flow_group_mode);
     const launchPlan = planRunnableTransferLaunches(
       scheduler,
       rooms,
       closedRoomIdsRef.current,
-      launchingQueueItemWindowsRef.current
+      launchingQueueItemWindowsRef.current,
+      false,
+      plannerPolicy
     );
     logPlannerLaunchSummary(
       scheduler,
@@ -246,7 +250,8 @@ function App() {
       plannerLaunchSummaryKeyRef,
       launchingQueueItemWindowsRef.current,
       rooms,
-      closedRoomIdsRef.current
+      closedRoomIdsRef.current,
+      plannerPolicy
     );
     const { runnablePlans, microGroupPlans } = launchPlan;
 
@@ -279,6 +284,9 @@ function App() {
     const microGroupPlan = serialMicroGroupRunningRef.current ? undefined : microGroupPlans[0];
     if (microGroupPlan) {
       serialMicroGroupRunningRef.current = true;
+      for (const childItemId of microGroupPlan.childItemIds) {
+        launchingQueueItemWindowsRef.current.set(childItemId, 0);
+      }
       updateSchedulerState((current) => markMicroFlowGroupQueued(current, microGroupPlan));
       emitPasteyDiagnostic("[pastey:micro-group]", {
         event: "launched",
@@ -290,11 +298,14 @@ function App() {
         dispatch_mode: microGroupPlan.dispatchMode
       });
       void processMicroFlowGroup(microGroupPlan.groupId, microGroupPlan.childItemIds, microGroupPlan.requestedWindow).finally(() => {
+        for (const childItemId of microGroupPlan.childItemIds) {
+          launchingQueueItemWindowsRef.current.delete(childItemId);
+        }
         serialMicroGroupRunningRef.current = false;
         updateSchedulerState((current) => ({ ...current }));
       });
     }
-  }, [scheduler, rooms]);
+  }, [scheduler, rooms, config?.micro_flow_group_mode]);
 
   useEffect(() => {
     for (const itemId of [...launchingQueueItemWindowsRef.current.keys()]) {
@@ -945,7 +956,7 @@ function App() {
 
       const latestItem = schedulerRef.current.items[childItemId];
       const latestBatch = latestItem ? schedulerRef.current.batches[latestItem.batchId] : undefined;
-      if (!latestBatch || latestBatch.cancelRequested || latestBatch.status !== "running") {
+      if (!latestBatch || latestBatch.cancelRequested || latestBatch.status === "cancelled") {
         updateSchedulerState((current) => finishMicroFlowGroup(
           current,
           groupId,
@@ -1320,7 +1331,8 @@ function logPlannerLaunchSummary(
   lastSummaryKeyRef: MutableRefObject<string>,
   launchingItemWindows: ReadonlyMap<string, number>,
   rooms: readonly Pick<RoomInfo, "id" | "status">[],
-  closedRoomIds: ReadonlySet<string>
+  closedRoomIds: ReadonlySet<string>,
+  plannerPolicy: TransferPlannerPolicy
 ) {
   const candidates = Object.values(scheduler.items).filter((item) => (
     item.status === "queued" || item.status === "preparing" || item.status === "sending"
@@ -1339,12 +1351,50 @@ function logPlannerLaunchSummary(
     counts[plan.reason] = (counts[plan.reason] ?? 0) + 1;
     return counts;
   }, {});
+  const fixedPolicy: TransferPlannerPolicy = {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    microGroupMode: "fixed"
+  };
+  const fixedDiagnostics = summarizeMicroFlowGroupPlanning(
+    scheduler,
+    rooms,
+    closedRoomIds,
+    fixedPolicy
+  );
+  const dynamicPolicy: TransferPlannerPolicy = {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    microGroupMode: "dynamic",
+    microGroupMaxChildSizeBytes: fixedDiagnostics.dynamicChildCapBytes,
+    microGroupMaxGroupBytes: fixedDiagnostics.dynamicGroupCapBytes
+  };
   const microGroupDiagnostics = summarizeMicroFlowGroupPlanning(
     scheduler,
     rooms,
     closedRoomIds,
-    DEFAULT_TRANSFER_PLANNER_POLICY
+    plannerPolicy.microGroupMode === "dynamic" ? dynamicPolicy : fixedPolicy
   );
+  const dynamicDiagnostics = summarizeMicroFlowGroupPlanning(
+    scheduler,
+    rooms,
+    closedRoomIds,
+    dynamicPolicy
+  );
+  const fixedCandidateResult = planRunnableTransferLaunches(
+    scheduler,
+    rooms,
+    closedRoomIds,
+    launchingItemWindows,
+    false,
+    fixedPolicy
+  ).plannerResult;
+  const dynamicCandidateResult = planRunnableTransferLaunches(
+    scheduler,
+    rooms,
+    closedRoomIds,
+    launchingItemWindows,
+    false,
+    dynamicPolicy
+  ).plannerResult;
   const runnableDetails = launchPlan.runnablePlans.map((plan) => {
     const item = scheduler.items[plan.itemId];
     return {
@@ -1379,7 +1429,11 @@ function logPlannerLaunchSummary(
     runnableDetails,
     microGroupDetails,
     heldReasonCounts,
-    microGroupDiagnostics
+    microGroupDiagnostics,
+    fixedDiagnostics,
+    dynamicDiagnostics,
+    fixedCandidateResult,
+    dynamicCandidateResult
   });
   if (summaryKey === lastSummaryKeyRef.current) {
     return;
@@ -1401,27 +1455,26 @@ function logPlannerLaunchSummary(
     event: "launch_summary",
     room_id: plannerSummaryRoomId(launchPlan),
     runnable_plans: launchPlan.runnablePlans.length,
-    live_micro_group_plans: launchPlan.microGroupPlans.length,
+    ...microGroupPlannerDiagnosticFields(
+      plannerPolicy.microGroupMode,
+      launchPlan.microGroupPlans.length,
+      launchPlan.microGroupPlans.reduce((total, plan) => total + plan.childItemIds.length, 0),
+      microGroupDiagnostics,
+      fixedCandidateResult.microGroupPlans.reduce((total, plan) => total + plan.childTaskIds.length, 0),
+      dynamicCandidateResult.microGroupPlans.reduce((total, plan) => total + plan.childTaskIds.length, 0)
+    ),
     active_plans: launchPlan.plannerResult.activePlans.length,
     held_plans: launchPlan.plannerResult.heldPlans.length,
     live_requested_window_total: launchPlan.plannerResult.requestedWindowTotal,
     global_window_budget: launchPlan.plannerResult.globalWindowBudget,
     tiny_grouped_children: launchPlan.microGroupPlans.reduce((total, plan) => total + plan.childItemIds.length, 0),
     tiny_individual_runnable: launchPlan.runnablePlans.filter((plan) => plan.sizeClass === "tiny").length,
-    micro_group_capacity_mode: "fixed",
     tiny_candidates: microGroupDiagnostics.tinyCandidates,
-    eligible_tiny_candidates: microGroupDiagnostics.eligibleTinyCandidates,
     largest_eligible_micro_group_bucket: microGroupDiagnostics.largestEligibleBucket,
     over_child_size_limit: microGroupDiagnostics.overChildSizeLimit,
     metadata_missing: microGroupDiagnostics.metadataMissing,
     room_unavailable: microGroupDiagnostics.roomUnavailable,
     cancelled_or_terminal: microGroupDiagnostics.cancelledOrTerminal,
-    contention: microGroupDiagnostics.contention,
-    contention_severity: microGroupDiagnostics.contentionSeverity,
-    one_window_quantum_bytes: microGroupDiagnostics.oneWindowQuantumBytes,
-    dynamic_child_cap_bytes: microGroupDiagnostics.dynamicChildCapBytes,
-    dynamic_group_cap_bytes: microGroupDiagnostics.dynamicGroupCapBytes,
-    micro_group_skip_reason: launchPlan.microGroupPlans.length > 0 ? "group_planned" : microGroupDiagnostics.microGroupSkipReason,
     live_held_reasons: formatHeldReasonCounts(heldReasonCounts)
   });
   for (const plan of launchPlan.microGroupPlans) {
@@ -1433,10 +1486,22 @@ function logPlannerLaunchSummary(
       requested_window: plan.requestedWindow,
       total_bytes: plan.totalBytes,
       dispatch_mode: plan.dispatchMode,
-      max_child_size_bytes: DEFAULT_TRANSFER_PLANNER_POLICY.microGroupMaxChildSizeBytes,
-      max_group_bytes: DEFAULT_TRANSFER_PLANNER_POLICY.microGroupMaxGroupBytes
+      micro_group_mode: plan.microGroupMode,
+      max_child_size_bytes: plannerPolicy.microGroupMode === "dynamic"
+        ? microGroupDiagnostics.dynamicChildCapBytes
+        : plannerPolicy.microGroupMaxChildSizeBytes,
+      max_group_bytes: plannerPolicy.microGroupMode === "dynamic"
+        ? microGroupDiagnostics.dynamicGroupCapBytes
+        : plannerPolicy.microGroupMaxGroupBytes
     });
   }
+}
+
+function microGroupPlannerPolicy(mode?: MicroFlowGroupMode): TransferPlannerPolicy {
+  return {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    microGroupMode: mode === "fixed" ? "fixed" : "dynamic"
+  };
 }
 
 function emitPasteyDiagnostic(

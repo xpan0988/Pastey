@@ -1,6 +1,6 @@
 {
   "name": "many-100KiB-to-900KiB-files",
-  "description": "Twenty files under 1 MiB. Expected planner meaning: MicroFlowGroup should be visible; dynamic_shadow may reduce group fragmentation.",
+  "description": "Twenty files under 1 MiB. Expected planner meaning: compare fixed threshold grouping with dynamic one-window service grouping.",
   "files": [
     { "name": "tiny-00-100kib.bin", "sizeBytes": 102400, "pattern": "seeded", "mimeHint": "application/octet-stream" },
     { "name": "tiny-01-140kib.bin", "sizeBytes": 143360, "pattern": "seeded", "mimeHint": "application/octet-stream" },

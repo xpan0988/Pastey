@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     crypto, dev_tools,
     error::AppResult,
-    models::{default_save_received_to_inbox, AppConfig},
+    models::{default_micro_flow_group_mode, default_save_received_to_inbox, AppConfig},
     storage::AppPaths,
     transfer_tuning,
 };
@@ -24,6 +24,8 @@ pub struct StoredConfig {
     pub transfer_window_override: Option<usize>,
     #[serde(default = "dev_tools::default_dev_tools_enabled")]
     pub dev_tools_enabled: bool,
+    #[serde(default = "default_micro_flow_group_mode")]
+    pub micro_flow_group_mode: String,
     pub shortcut: String,
     pub app_secret: String,
     #[serde(default)]
@@ -39,8 +41,14 @@ pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfi
             stored.device_id = uuid::Uuid::new_v4().to_string();
             changed = true;
         }
-        if stored.version < 4 {
-            stored.version = 4;
+        if stored.version < 5 {
+            stored.version = 5;
+            changed = true;
+        }
+        let normalized_micro_flow_group_mode =
+            normalize_micro_flow_group_mode(&stored.micro_flow_group_mode);
+        if stored.micro_flow_group_mode != normalized_micro_flow_group_mode {
+            stored.micro_flow_group_mode = normalized_micro_flow_group_mode;
             changed = true;
         }
         if changed {
@@ -50,7 +58,7 @@ pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfi
     }
 
     let stored = StoredConfig {
-        version: 4,
+        version: 5,
         default_expiry_minutes: 15,
         inbox_dir: None,
         auto_burn_after_download: false,
@@ -58,6 +66,7 @@ pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfi
         save_received_images_to_inbox: true,
         transfer_window_override: None,
         dev_tools_enabled: dev_tools::default_dev_tools_enabled(),
+        micro_flow_group_mode: default_micro_flow_group_mode(),
         shortcut: shortcut.to_string(),
         app_secret: crypto::encode_key(&crypto::random_key()),
         device_id: uuid::Uuid::new_v4().to_string(),
@@ -98,6 +107,7 @@ fn public_config_with_dev_tools(
             None
         },
         dev_tools_enabled,
+        micro_flow_group_mode: normalize_micro_flow_group_mode(&config.micro_flow_group_mode),
         shortcut: config.shortcut.clone(),
         app_data_path: paths.app_data_dir.display().to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -134,18 +144,27 @@ fn update_with_dev_tools_enabled(
     current.auto_burn_after_download = incoming.auto_burn_after_download;
     current.save_received_files_to_inbox = incoming.save_received_files_to_inbox;
     current.save_received_images_to_inbox = incoming.save_received_images_to_inbox;
+    current.micro_flow_group_mode = normalize_micro_flow_group_mode(&incoming.micro_flow_group_mode);
     current.inbox_dir = normalize_inbox_dir(paths, incoming.inbox_dir.as_deref());
     if dev_tools_enabled && (was_dev_tools_enabled || incoming.transfer_window_override.is_some()) {
         current.transfer_window_override =
             transfer_tuning::normalize_transfer_window_override(incoming.transfer_window_override);
     }
-    current.version = 4;
+    current.version = 5;
     save(paths, current)?;
     Ok(public_config_with_dev_tools(
         paths,
         current,
         dev_tools_enabled,
     ))
+}
+
+fn normalize_micro_flow_group_mode(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fixed" => "fixed".to_string(),
+        "dynamic" => "dynamic".to_string(),
+        _ => default_micro_flow_group_mode(),
+    }
 }
 
 pub fn effective_inbox_dir(paths: &AppPaths, config: &StoredConfig) -> std::path::PathBuf {
@@ -244,6 +263,7 @@ mod tests {
             stored.dev_tools_enabled,
             dev_tools::default_dev_tools_enabled()
         );
+        assert_eq!(stored.micro_flow_group_mode, "dynamic");
     }
 
     #[test]
@@ -300,6 +320,7 @@ mod tests {
             save_received_images_to_inbox: true,
             transfer_window_override: None,
             dev_tools_enabled: false,
+            micro_flow_group_mode: default_micro_flow_group_mode(),
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
@@ -353,6 +374,7 @@ mod tests {
             save_received_images_to_inbox: true,
             transfer_window_override: Some(16),
             dev_tools_enabled: false,
+            micro_flow_group_mode: default_micro_flow_group_mode(),
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
@@ -378,6 +400,7 @@ mod tests {
             save_received_images_to_inbox: true,
             transfer_window_override: Some(8),
             dev_tools_enabled: true,
+            micro_flow_group_mode: default_micro_flow_group_mode(),
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
@@ -403,6 +426,7 @@ mod tests {
             save_received_images_to_inbox: true,
             transfer_window_override: None,
             dev_tools_enabled: false,
+            micro_flow_group_mode: default_micro_flow_group_mode(),
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
@@ -428,6 +452,37 @@ mod tests {
     }
 
     #[test]
+    fn micro_flow_group_mode_persists_and_invalid_values_fall_back_to_dynamic() {
+        let paths = test_paths();
+        let mut stored = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
+        let incoming = public_config_with_dev_tools(&paths, &stored, false);
+
+        let updated = update(
+            &paths,
+            &mut stored,
+            AppConfig {
+                micro_flow_group_mode: "fixed".into(),
+                ..incoming
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.micro_flow_group_mode, "fixed");
+        assert_eq!(
+            load_or_create(&paths, "Ctrl+Shift+V")
+                .unwrap()
+                .micro_flow_group_mode,
+            "fixed"
+        );
+
+        stored.micro_flow_group_mode = "invalid".into();
+        save(&paths, &stored).unwrap();
+        let reloaded = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
+        assert_eq!(reloaded.micro_flow_group_mode, "dynamic");
+
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
     fn diagnostics_stay_hidden_when_dev_tools_are_disabled() {
         let paths = test_paths();
         let stored = StoredConfig {
@@ -439,6 +494,7 @@ mod tests {
             save_received_images_to_inbox: true,
             transfer_window_override: Some(16),
             dev_tools_enabled: false,
+            micro_flow_group_mode: default_micro_flow_group_mode(),
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
@@ -464,6 +520,7 @@ mod tests {
             save_received_images_to_inbox: true,
             transfer_window_override: None,
             dev_tools_enabled: true,
+            micro_flow_group_mode: default_micro_flow_group_mode(),
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),

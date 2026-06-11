@@ -17,7 +17,7 @@ The estimates are based on the current transfer architecture, scheduler validati
 
 ## Current Transfer Test Layers
 
-- Planner replay: `rtk node scripts/replay-transfer-planner-scenarios.mjs` validates planner strategy, fixed live MicroFlowGroup behavior, and dynamic-shadow diagnostics without Tauri, payload files, a receiver, network, or a room server.
+- Planner replay: `rtk node scripts/replay-transfer-planner-scenarios.mjs` validates planner strategy and compares fixed and dynamic live MicroFlowGroup policies without Tauri, payload files, a receiver, network, or a room server.
 - Generated fixture corpus: `rtk node scripts/generate-transfer-fixtures.mjs <scenario>` creates deterministic local payload files from source-controlled manifests. Generated payloads are ignored by git and are not release inputs.
 - Single-machine dual-instance smoke: two isolated `PASTEY_APP_DATA_DIR` roots validate local room join, send/receive lifecycle, planner logs, MicroFlowGroup logs, runtime-window logs, and interruption evidence. This is lifecycle/logging smoke only.
 - Two-machine LAN/release build: release artifacts on real machines remain required for throughput, cross-device UX, Wi-Fi/Ethernet behavior, OS differences, and final performance evidence.

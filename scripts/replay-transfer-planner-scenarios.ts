@@ -41,7 +41,7 @@ interface Scenario {
 }
 
 interface ReplayMode {
-  name: "fixed" | "dynamic_shadow";
+  name: "fixed" | "dynamic";
   result: TransferPlannerResult;
   diagnostics: MicroFlowGroupPlanningDiagnostics;
   policy: TransferPlannerPolicy;
@@ -106,14 +106,14 @@ for (const scenario of scenarios) {
 }
 
 function replayScenario(scenario: Scenario) {
-  const fixedPolicy = { ...DEFAULT_TRANSFER_PLANNER_POLICY };
+  const fixedPolicy: TransferPlannerPolicy = { ...DEFAULT_TRANSFER_PLANNER_POLICY, microGroupMode: "fixed" };
   const tasks = scenario.items.map(toPlannerTask);
   const state = toSchedulerState(scenario);
   const rooms = roomsForScenario(scenario);
   const fixedDiagnostics = summarizeMicroFlowGroupPlanning(state, rooms, new Set(), fixedPolicy);
   const dynamicPolicy: TransferPlannerPolicy = {
     ...fixedPolicy,
-    microGroupDispatchMode: "shadow",
+    microGroupMode: "dynamic",
     microGroupMaxChildSizeBytes: fixedDiagnostics.dynamicChildCapBytes,
     microGroupMaxGroupBytes: fixedDiagnostics.dynamicGroupCapBytes
   };
@@ -125,7 +125,7 @@ function replayScenario(scenario: Scenario) {
     policy: fixedPolicy
   };
   const dynamic: ReplayMode = {
-    name: "dynamic_shadow",
+    name: "dynamic",
     result: planWeightedTransfers(tasks, dynamicPolicy),
     diagnostics: dynamicDiagnostics,
     policy: dynamicPolicy
@@ -226,18 +226,16 @@ function printSummary(
 ) {
   const fields = {
     scenario,
-    live_capacity_mode: fixed.name,
-    dynamic_shadow_capacity_mode: dynamic.name,
-    live_runnable_plans: fixed.result.runnablePlans.length,
-    live_micro_group_plans: fixed.result.microGroupPlans.length,
-    live_requested_window_total: fixed.result.requestedWindowTotal,
-    live_held_reasons: heldReasons(fixed.result.heldPlans),
-    dynamic_shadow_micro_group_plans: dynamic.result.microGroupPlans.length,
-    dynamic_shadow_grouped_children: groupedChildren(dynamic.result),
-    dynamic_shadow_requested_window_total: dynamic.result.requestedWindowTotal,
-    dynamic_shadow_skip_reason: dynamicShadowSkipReason(dynamic),
-    eligible_children_fixed: fixed.diagnostics.eligibleTinyCandidates,
-    eligible_children_dynamic: dynamic.diagnostics.eligibleTinyCandidates,
+    fixed_micro_group_plans: fixed.result.microGroupPlans.length,
+    fixed_grouped_children: groupedChildren(fixed.result),
+    fixed_requested_window_total: fixed.result.requestedWindowTotal,
+    fixed_held_reasons: heldReasons(fixed.result.heldPlans),
+    dynamic_micro_group_plans: dynamic.result.microGroupPlans.length,
+    dynamic_grouped_children: groupedChildren(dynamic.result),
+    dynamic_requested_window_total: dynamic.result.requestedWindowTotal,
+    dynamic_skip_reason: liveSkipReason(dynamic),
+    fixed_candidate_children: fixed.diagnostics.eligibleTinyCandidates,
+    dynamic_candidate_children: dynamic.diagnostics.eligibleTinyCandidates,
     contention: fixedDiagnostics.contention,
     contention_severity: fixedDiagnostics.contentionSeverity,
     one_window_quantum_bytes: fixedDiagnostics.oneWindowQuantumBytes,
@@ -248,7 +246,7 @@ function printSummary(
   console.log(Object.entries(fields).map(([key, value]) => `${key}=${value}`).join(" "));
 }
 
-function dynamicShadowSkipReason(mode: ReplayMode): string {
+function liveSkipReason(mode: ReplayMode): string {
   if (mode.result.microGroupPlans.length > 0) {
     return "group_planned";
   }

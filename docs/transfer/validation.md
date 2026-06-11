@@ -6,7 +6,7 @@ For `dev-fast` CPU, memory, disk, and Linux feasibility notes, see [devfast-reso
 
 ## Validation Layers
 
-- Planner replay: algorithm strategy validation. It does not launch Tauri and does not require files, a receiver, network, or a room server. It is the best local check for fixed-vs-dynamic-shadow comparison.
+- Planner replay: algorithm strategy validation. It does not launch Tauri and does not require files, a receiver, network, or a room server. It is the best local check for fixed-versus-dynamic live policy comparison.
 - Generated fixture corpus: deterministic real file clusters for app smoke tests. Source-controlled manifests live under `tests/fixtures/transfer-corpus/manifests/`; actual payload files are generated locally under `.generated/transfer-fixtures/`. Generated files are ignored by git and are not bundled into release artifacts.
 - Single-machine dual-instance smoke: local lifecycle and logging smoke when two physical machines are unavailable. It validates room join, send/receive lifecycle, planner logs, MicroFlowGroup logs, runtime-window logs, and cancel/burn/interruption evidence where applicable. It is not valid for final LAN throughput conclusions.
 - Two-machine LAN/release build: final performance and UX validation. It is required for real network throughput, cross-device behavior, Wi-Fi/Ethernet behavior, OS differences, and release artifact behavior.
@@ -17,7 +17,7 @@ For `dev-fast` CPU, memory, disk, and Linux feasibility notes, see [devfast-reso
 rtk node scripts/replay-transfer-planner-scenarios.mjs
 ```
 
-Planner replay prints grep-friendly scenario lines with live fixed scheduling separated from dynamic-shadow evidence. Live fields use `live_micro_group_plans`, `live_requested_window_total`, and `live_held_reasons`; shadow-only fields use `dynamic_shadow_micro_group_plans`, `dynamic_shadow_grouped_children`, `dynamic_shadow_requested_window_total`, and `dynamic_shadow_skip_reason`.
+Planner replay prints grep-friendly fixed and dynamic live-policy results, including group counts, grouped children, requested-window totals, held reasons, contention, and dynamic capacity clamps.
 
 Replay is algorithm evidence only. It does not validate files, Tauri startup, room join, receive/finalize, Inbox, network behavior, or release-build throughput.
 
@@ -111,7 +111,7 @@ for f in $(find /tmp/pastey-sender /tmp/pastey-receiver -name "*.log" -type f); 
 done | sort -nr
 ```
 
-The log with planner/runtime-window diagnostics is the actual sender log. The receiver log may contain receive, finalize, and Inbox evidence, but dynamic-shadow planner evidence is sender-side.
+The log with planner/runtime-window diagnostics is the actual sender log. The receiver log may contain receive, finalize, and Inbox evidence, but live planner evidence is sender-side.
 
 Extract an actual-sender summary:
 
@@ -129,11 +129,11 @@ SUMMARY="/tmp/pastey-actual-sender-summary.txt"
   echo "===== planner ====="
   grep -E "\[pastey:planner\]" "$ACTUAL_SENDER_LOG" || true
   echo
-  echo "===== live vs dynamic shadow ====="
-  grep -E "live_micro_group_plans|dynamic_shadow_micro_group_plans|dynamic_shadow_grouped_children|eligible_children_fixed|eligible_children_dynamic" "$ACTUAL_SENDER_LOG" || true
+  echo "===== live micro group mode ====="
+  grep -E "micro_group_mode=|micro_group_plans=|micro_group_grouped_children=|fixed_candidate_children=|dynamic_candidate_children=" "$ACTUAL_SENDER_LOG" || true
   echo
   echo "===== dynamic capacity ====="
-  grep -E "contention=|contention_severity=|one_window_quantum_bytes=|dynamic_child_cap_bytes=|dynamic_group_cap_bytes=|dynamic_shadow_skip_reason=" "$ACTUAL_SENDER_LOG" || true
+  grep -E "contention=|contention_severity=|one_window_quantum_bytes=|dynamic_child_cap_bytes=|dynamic_group_cap_bytes=|micro_group_skip_reason=" "$ACTUAL_SENDER_LOG" || true
   echo
   echo "===== micro group lifecycle ====="
   grep -E "\[pastey:micro-group\].*event=(planned|launched|running|child_running|child_terminal|stopped|final)" "$ACTUAL_SENDER_LOG" || true
@@ -151,10 +151,12 @@ open "$SUMMARY"
 
 ## Interpretation
 
-Planner summary lines report live scheduler fields such as `live_micro_group_plans`, `live_requested_window_total`, and `live_held_reasons`, plus dynamic-shadow fields when available. Dynamic-shadow fields are diagnostic only and do not imply live MicroFlowGroup behavior changes.
+Planner summary lines report the selected live mode and live group counts. Capacity and candidate fields explain why fixed and dynamic policies differ without treating dynamic as a shadow mode.
 
-MicroFlowGroup lifecycle lines report `planned`, `launched`, `running`, `child_running`, `child_terminal`, `stopped`, and `final` events for fixed live serial groups. Runtime-window lines report `tracking_started`, `update`, and `summary` for planner-managed active outgoing transfers.
+MicroFlowGroup lifecycle lines report `planned`, `launched`, `running`, `child_running`, `child_terminal`, `stopped`, and `final` events for fixed or dynamic live serial groups. Runtime-window lines report `tracking_started`, `update`, and `summary` for planner-managed active outgoing transfers.
 
-If MicroFlowGroup lifecycle appears but children are manifest JSON files, the test only validates tiny-file fixed MicroFlowGroup smoke and logging. It does not validate the generated fixture corpus or dynamic-shadow behavior. A recent single-machine smoke showed planner logs on the actual sender side, MicroFlowGroup lifecycle logs, runtime-window tracking/update/summary logs, and benchmark summaries with `failed_chunks=0` and `duplicate_chunks=0`, but the sent files were manifest JSON files rather than generated payload files.
+If MicroFlowGroup lifecycle appears but children are manifest JSON files, the test only validates those manifest files, not the generated fixture corpus.
+
+A generated-payload single-machine smoke on June 10, 2026 validated the earlier fixed-live and dynamic-candidate diagnostics and helped reproduce frontend-only MicroFlowGroup final-accounting races. The accounting fixes remain covered by focused regression tests. Full generated-fixture app smoke for selectable live modes remains the next testing phase.
 
 Two-machine release-build testing remains the final performance benchmark. Single-machine smoke can validate lifecycle/logging shape, but it cannot prove real LAN throughput, Wi-Fi/Ethernet behavior, cross-device OS behavior, or release artifact UX.

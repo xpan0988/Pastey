@@ -22,6 +22,7 @@ import {
   markQueueItemPreparing,
   markQueueItemRuntimeWindow,
   markQueueItemSending,
+  microGroupPlannerDiagnosticFields,
   planActiveTransferWindowRebalances,
   planRunnableTransferLaunches,
   recordMicroFlowGroupChildTerminal,
@@ -189,7 +190,7 @@ test("single eligible tiny queue item explains no micro group", () => {
   assert.equal(diagnostics.tinyCandidates, 1);
   assert.equal(diagnostics.eligibleTinyCandidates, 1);
   assert.equal(diagnostics.largestEligibleBucket, 1);
-  assert.equal(diagnostics.microGroupSkipReason, "no_contention");
+  assert.equal(diagnostics.microGroupSkipReason, "not_enough_eligible_children");
 });
 
 test("dynamic micro group diagnostics clamp huge-file quantum conservatively", () => {
@@ -213,6 +214,128 @@ test("dynamic micro group diagnostics clamp huge-file quantum conservatively", (
   assert.equal(diagnostics.dynamicGroupCapBytes, 16 * MiB);
 });
 
+test("planner diagnostics identify fixed and dynamic live modes with live group counts", () => {
+  const state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    readyInput("huge.bin", 2 * GiB, "/tmp/huge.bin", 1),
+    readyInput("small-a.bin", 1.1 * MiB, "/tmp/small-a.bin", 2),
+    readyInput("small-b.bin", 1.2 * MiB, "/tmp/small-b.bin", 3),
+    readyInput("small-c.bin", 1.3 * MiB, "/tmp/small-c.bin", 4)
+  ]);
+  const diagnostics = summarizeMicroFlowGroupPlanning(state, activeRooms);
+
+  for (const mode of ["fixed", "dynamic"] as const) {
+    const plan = planRunnableTransferLaunches(state, activeRooms, new Set(), new Map(), false, {
+      ...DEFAULT_TRANSFER_PLANNER_POLICY,
+      microGroupMode: mode
+    });
+    const fields = microGroupPlannerDiagnosticFields(
+      mode,
+      plan.microGroupPlans.length,
+      plan.microGroupPlans.reduce((total, group) => total + group.childItemIds.length, 0),
+      diagnostics,
+      0,
+      3
+    );
+
+    assert.equal(fields.micro_group_mode, mode);
+    assert.equal(fields.micro_group_plans, plan.microGroupPlans.length);
+    assert.equal(fields.one_window_quantum_bytes, 16 * MiB);
+    assert.equal(fields.dynamic_child_cap_bytes, 4 * MiB);
+    assert.equal(fields.dynamic_group_cap_bytes, 16 * MiB);
+  }
+});
+
+test("dynamic live planner policy reports broader groups than fixed mode", () => {
+  const state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    [
+      readyInput("huge.bin", 2 * GiB, "/tmp/huge.bin", 1),
+      readyInput("small-over-a.bin", 1.1 * MiB, "/tmp/small-over-a.bin", 2),
+      readyInput("small-over-b.bin", 1.2 * MiB, "/tmp/small-over-b.bin", 3),
+      readyInput("small-over-c.bin", 1.3 * MiB, "/tmp/small-over-c.bin", 4),
+      readyInput("single-sub-mib.bin", 350 * 1024, "/tmp/single-sub-mib.bin", 5)
+    ]
+  );
+  const fixed = planRunnableTransferLaunches(state, activeRooms, new Set(), new Map(), false, {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    microGroupMode: "fixed"
+  });
+  const liveDiagnostics = summarizeMicroFlowGroupPlanning(state, activeRooms);
+  const dynamicPolicy = {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    microGroupMode: "dynamic" as const,
+    microGroupMaxChildSizeBytes: liveDiagnostics.dynamicChildCapBytes,
+    microGroupMaxGroupBytes: liveDiagnostics.dynamicGroupCapBytes
+  };
+  const dynamic = planRunnableTransferLaunches(state, activeRooms, new Set(), new Map(), false, dynamicPolicy);
+
+  assert.equal(fixed.plannerResult.microGroupPlans.length, 0);
+  assert.equal(dynamic.plannerResult.microGroupPlans.length, 1);
+  assert.equal(dynamic.plannerResult.microGroupPlans[0].childTaskIds.length, 4);
+  assert.equal(dynamic.microGroupPlans.length, 1);
+  assert.equal(dynamic.runnablePlans.find((plan) => state.items[plan.itemId].displayName === "huge.bin")?.requestedWindow, 7);
+  assert.equal(dynamic.plannerResult.requestedWindowTotal, 8);
+});
+
+test("many-small dynamic mode produces fewer larger live groups than fixed mode", () => {
+  const state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    Array.from({ length: 20 }, (_, index) => (
+      readyInput(`small-${index}.bin`, (100 + index * 40) * 1024, `/tmp/small-${index}.bin`, index)
+    ))
+  );
+  const fixed = planRunnableTransferLaunches(state, activeRooms, new Set(), new Map(), false, {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    microGroupMode: "fixed"
+  });
+  const dynamic = planRunnableTransferLaunches(state, activeRooms, new Set(), new Map(), false, {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    microGroupMode: "dynamic"
+  });
+
+  assert.ok(fixed.microGroupPlans.length > dynamic.microGroupPlans.length);
+  assert.equal(dynamic.microGroupPlans.length, 1);
+  assert.ok(dynamic.microGroupPlans[0].childItemIds.length >= 2);
+  assert.equal(dynamic.microGroupPlans[0].requestedWindow, 1);
+});
+
+test("switching fixed and dynamic changes only subsequent planner output", () => {
+  const state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    readyInput("huge.bin", 2 * GiB, "/tmp/huge.bin", 1),
+    readyInput("small-a.bin", 1.1 * MiB, "/tmp/small-a.bin", 2),
+    readyInput("small-b.bin", 1.2 * MiB, "/tmp/small-b.bin", 3),
+    readyInput("small-c.bin", 1.3 * MiB, "/tmp/small-c.bin", 4)
+  ]);
+  const fixedPolicy = { ...DEFAULT_TRANSFER_PLANNER_POLICY, microGroupMode: "fixed" as const };
+  const dynamicPolicy = { ...DEFAULT_TRANSFER_PLANNER_POLICY, microGroupMode: "dynamic" as const };
+
+  assert.equal(planRunnableTransferLaunches(state, activeRooms, new Set(), new Map(), false, fixedPolicy).microGroupPlans.length, 0);
+  assert.equal(planRunnableTransferLaunches(state, activeRooms, new Set(), new Map(), false, dynamicPolicy).microGroupPlans.length, 1);
+  assert.equal(planRunnableTransferLaunches(state, activeRooms, new Set(), new Map(), false, fixedPolicy).microGroupPlans.length, 0);
+});
+
+test("mode switching does not regroup or relaunch already reserved dynamic children", () => {
+  const state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    Array.from({ length: 12 }, (_, index) => readyInput(`tiny-${index}.bin`, 256 * 1024, `/tmp/tiny-${index}.bin`, index))
+  );
+  const dynamicPolicy = { ...DEFAULT_TRANSFER_PLANNER_POLICY, microGroupMode: "dynamic" as const };
+  const group = planRunnableTransferLaunches(state, activeRooms, new Set(), new Map(), false, dynamicPolicy).microGroupPlans[0];
+  const reserved = new Map(group.childItemIds.map((itemId) => [itemId, 0]));
+
+  for (const mode of ["fixed", "dynamic"] as const) {
+    const next = planRunnableTransferLaunches(state, activeRooms, new Set(), reserved, false, {
+      ...DEFAULT_TRANSFER_PLANNER_POLICY,
+      microGroupMode: mode
+    });
+    assert.equal(next.runnablePlans.some((plan) => reserved.has(plan.itemId)), false);
+    assert.equal(next.microGroupPlans.some((plan) => plan.childItemIds.some((itemId) => reserved.has(itemId))), false);
+  }
+});
+
 test("no-contention skip reason takes precedence over child-size limit", () => {
   const state = enqueueTransferBatch(
     createTransferSchedulerState(),
@@ -226,7 +349,7 @@ test("no-contention skip reason takes precedence over child-size limit", () => {
   const diagnostics = summarizeMicroFlowGroupPlanning(state, activeRooms);
   const dynamicDiagnostics = summarizeMicroFlowGroupPlanning(state, activeRooms, new Set(), {
     ...DEFAULT_TRANSFER_PLANNER_POLICY,
-    microGroupDispatchMode: "shadow",
+    microGroupMode: "dynamic",
     microGroupMaxChildSizeBytes: diagnostics.dynamicChildCapBytes,
     microGroupMaxGroupBytes: diagnostics.dynamicGroupCapBytes
   });
@@ -255,6 +378,24 @@ test("twenty sub-one-megabyte queue items group and suppress child runnable plan
   assert.equal(plannerResult.requestedWindowTotal, microGroupPlans.length);
   assert.equal(diagnostics.eligibleTinyCandidates, 20);
   assert.ok(diagnostics.largestEligibleBucket >= 2);
+});
+
+test("serial micro group launch reservations keep grouped children out of stale runnable plans", () => {
+  const state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    Array.from({ length: 8 }, (_, index) => (
+      readyInput(`sub-mib-${index}.bin`, (300 + index * 20) * 1024, `/tmp/sub-mib-${index}.bin`, index)
+    ))
+  );
+  const groupPlan = planRunnableTransferLaunches(state, activeRooms).microGroupPlans[0];
+  const launching = new Map(groupPlan.childItemIds.map((itemId) => [itemId, 0]));
+  const staleRerun = planRunnableTransferLaunches(state, activeRooms, new Set(), launching);
+  const reservedChildIds = new Set(groupPlan.childItemIds);
+
+  assert.equal(staleRerun.runnablePlans.filter((plan) => reservedChildIds.has(plan.itemId)).length, 0);
+  assert.equal(staleRerun.microGroupPlans.flatMap((plan) => plan.childItemIds).filter((itemId) => reservedChildIds.has(itemId)).length, 0);
+  assert.equal(staleRerun.plannerResult.requestedWindowTotal, 0);
 });
 
 test("huge plus many tiny queue gives huge runnable window seven and micro group window one", () => {
@@ -299,6 +440,28 @@ test("micro group terminal state completes when all children complete", () => {
   assert.equal(group.status, "completed");
   assert.equal(group.terminalReason, "all_children_completed");
   assert.deepEqual(group.completedChildIds, groupPlan.childItemIds);
+});
+
+test("micro group completes when its last child also completes the batch", () => {
+  let state = enqueueTransferBatch(
+    createTransferSchedulerState(),
+    "room-1",
+    Array.from({ length: 3 }, (_, index) => readyInput(`tiny-${index}.bin`, 128 * 1024, `/tmp/tiny-${index}.bin`, index))
+  );
+  const groupPlan = planRunnableTransferLaunches(state, activeRooms).microGroupPlans[0];
+  const batchId = state.items[groupPlan.childItemIds[0]].batchId;
+
+  state = markMicroFlowGroupQueued(state, groupPlan);
+  state = markMicroFlowGroupRunning(state, groupPlan.groupId);
+  for (const childItemId of groupPlan.childItemIds) {
+    state = markQueueItemCompleted(state, childItemId);
+    state = recordMicroFlowGroupChildTerminal(state, groupPlan.groupId, childItemId, "completed");
+  }
+  assert.equal(state.batches[batchId].status, "completed");
+
+  state = completeMicroFlowGroupFromChildren(state, groupPlan.groupId);
+  assert.equal(state.microGroups[groupPlan.groupId].status, "completed");
+  assert.equal(state.microGroups[groupPlan.groupId].terminalReason, "all_children_completed");
 });
 
 test("micro group terminal state records completed_with_errors when one child fails", () => {
@@ -394,6 +557,22 @@ test("burned and closed room items do not launch", () => {
 
   assert.equal(planRunnableTransferLaunches(burnedState, [{ id: "room-1", status: "burned" }]).runnablePlans.length, 0);
   assert.equal(planRunnableTransferLaunches(closedState, activeRooms, new Set(["room-1"])).runnablePlans.length, 0);
+});
+
+test("cancelled burned and closed room items do not launch in fixed or dynamic mode", () => {
+  let cancelled = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    readyInput("a.bin", 256 * 1024),
+    readyInput("b.bin", 256 * 1024)
+  ]);
+  cancelled = cancelBatchLocally(cancelled, cancelled.batchOrder[0]);
+
+  for (const mode of ["fixed", "dynamic"] as const) {
+    const policy = { ...DEFAULT_TRANSFER_PLANNER_POLICY, microGroupMode: mode };
+    assert.equal(planRunnableTransferLaunches(cancelled, activeRooms, new Set(), new Map(), false, policy).microGroupPlans.length, 0);
+    assert.equal(planRunnableTransferLaunches(cancelled, activeRooms, new Set(), new Map(), false, policy).runnablePlans.length, 0);
+    assert.equal(planRunnableTransferLaunches(cancelled, [{ id: "room-1", status: "burned" }], new Set(), new Map(), false, policy).runnablePlans.length, 0);
+    assert.equal(planRunnableTransferLaunches(cancelled, activeRooms, new Set(["room-1"]), new Map(), false, policy).runnablePlans.length, 0);
+  }
 });
 
 test("batch cancellation handles queued, preparing, and active sending items", () => {

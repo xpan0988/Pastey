@@ -4,15 +4,19 @@ Detailed update and release history for Pastey.
 
 ## Unreleased
 
+- Added selectable live MicroFlowGroup modes: Release 2.0 defaults to dynamic contention-aware one-window grouping, while fixed mode preserves the legacy threshold baseline. The persisted Developer Tools setting hot-switches future planner cycles only.
+- Retired dynamic shadow as an active mode and updated persistent planner diagnostics and replay output to report the actual live mode, live group counts, dynamic capacity clamps, and fixed/dynamic candidate comparisons.
+- Kept MicroFlowGroup execution frontend-owned and serial through the existing single-file path; no protocol, binary-v1, Rust transfer hot path, receiver, ACK/finalize/cancel/burn, Inbox, encryption, JSON fallback, binary-v2, multiplexing, or adaptive runtime-window behavior changed.
 - Added a static Astro + TypeScript + Tailwind product website under `site/`, with English and Simplified Chinese routes, canonical/hreflang metadata, Cloudflare Pages configuration, and canonical latest/all GitHub Release links.
 - Refined the desktop landing page into an eight-slide horizontal product presentation with fixed navigation, wheel/trackpad and keyboard cooldowns, direct hash/progress navigation, staged slide-entry reveals, and a vertical mobile fallback.
 - Synchronized repository website, download, deployment, product-positioning, format-agnostic binary transfer, and qualified LAN-validation documentation.
 - Added a `dev-fast` transfer resource estimate and Linux feasibility report covering local fixture disk usage, CPU/memory expectations, dev-mode benchmark boundaries, cleanup guidance, and future real-machine measurements.
-- Consolidated transfer documentation under `docs/transfer/`: current architecture now lives in `docs/transfer/architecture.md`, active scheduler/MicroFlowGroup/dynamic-shadow design lives in `docs/transfer/scheduler.md`, and active validation/logging guidance lives in `docs/transfer/validation.md`.
+- Consolidated transfer documentation under `docs/transfer/`: current architecture now lives in `docs/transfer/architecture.md`, active scheduler/MicroFlowGroup design lives in `docs/transfer/scheduler.md`, and active validation/logging guidance lives in `docs/transfer/validation.md`.
 - Moved the completed Phase 2-4 scheduler/runtime-window implementation record to `docs/binary-v2/early-implementation.md` and replaced old overlapping docs with short moved stubs.
 - Kept the fixture corpus README focused on generating and dragging deterministic payload folders, with full validation workflow details linked to `docs/transfer/validation.md`.
 - Added source-controlled transfer fixture manifests and a streaming deterministic generator for local scheduler, MicroFlowGroup, chaos, and interruption smoke scenarios. Generated payload files stay local-only under `.generated/transfer-fixtures/` by default and are excluded from git and release bundle resources.
 - Clarified transfer validation docs so developers generate and drag `.generated/transfer-fixtures/<scenario-name>/` payload folders, identify the actual sender log by planner/MicroFlowGroup/runtime-window diagnostics, and treat single-machine dual-instance runs as lifecycle/logging smoke rather than throughput evidence.
+- Added complete fixed-versus-dynamic candidate fields to persistent planner diagnostics and fixed frontend-only MicroFlowGroup final accounting during fast serial generated-payload runs, without changing transfer protocol behavior.
 - Moved the Dynamic MicroFlowGroup window-capacity research report into `docs/research/`.
 
 ## 1.7.0 — Global Transfer Scheduler — 2026-05-30

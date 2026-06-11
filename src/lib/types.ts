@@ -69,6 +69,7 @@ export interface AppConfig {
   save_received_images_to_inbox: boolean;
   transfer_window_override?: number | null;
   dev_tools_enabled: boolean;
+  micro_flow_group_mode: "fixed" | "dynamic";
   shortcut: string;
   app_data_path: string;
   app_version: string;
