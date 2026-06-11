@@ -154,6 +154,8 @@ pub struct AppConfig {
     pub transfer_window_override: Option<usize>,
     #[serde(default)]
     pub dev_tools_enabled: bool,
+    #[serde(default = "default_micro_flow_group_mode")]
+    pub micro_flow_group_mode: String,
     pub shortcut: String,
     pub app_data_path: String,
     pub app_version: String,
@@ -161,6 +163,10 @@ pub struct AppConfig {
 
 pub fn default_save_received_to_inbox() -> bool {
     true
+}
+
+pub fn default_micro_flow_group_mode() -> String {
+    "dynamic".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

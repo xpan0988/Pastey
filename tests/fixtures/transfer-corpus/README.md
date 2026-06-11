@@ -49,7 +49,7 @@ Those are JSON manifest definitions only. If the app log shows display names lik
 ## Scenarios
 
 - `two-1-2MiB-files-only`: two around-1.2 MiB files; expected planner meaning is no contention and no MicroFlowGroup.
-- `huge-plus-many-0-3-to-1-3MiB`: one large file plus mixed 0.3-1.3 MiB files; fixed mode groups only sub-1 MiB children, while dynamic shadow can identify more one-window service candidates.
-- `many-100KiB-to-900KiB-files`: twenty sub-1 MiB files; MicroFlowGroup should be visible and dynamic shadow may reduce group fragmentation.
-- `mixed-chaos-recent-log-shape`: one large file, several medium files, several 1.1-1.3 MiB files, and one sub-1 MiB file; fixed mode may produce no group, while dynamic shadow should report a candidate group.
+- `huge-plus-many-0-3-to-1-3MiB`: one large file plus mixed 0.3-1.3 MiB files; compare fixed threshold grouping with dynamic live one-window service grouping.
+- `many-100KiB-to-900KiB-files`: twenty sub-1 MiB files; compare fixed group fragmentation with the single active dynamic group strategy.
+- `mixed-chaos-recent-log-shape`: one large file, several medium files, several 1.1-1.3 MiB files, and one sub-1 MiB file; compare fixed and dynamic live admission under contention.
 - `interrupt-huge-small`: one 1 GiB-plus file, one 100 MiB file, and several small files; use it to start a transfer and manually quit, cancel, or burn while inspecting terminal/interruption logs.

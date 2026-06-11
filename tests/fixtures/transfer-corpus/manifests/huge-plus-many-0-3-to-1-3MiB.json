@@ -1,6 +1,6 @@
 {
   "name": "huge-plus-many-0-3-to-1-3MiB",
-  "description": "One large file plus many 0.3-1.3 MiB files. Expected planner meaning: fixed mode groups only sub-1 MiB children; dynamic_shadow can identify more one-window service candidates.",
+  "description": "One large file plus many 0.3-1.3 MiB files. Expected planner meaning: dynamic live mode groups more one-window service children while preserving most budget for the large transfer.",
   "files": [
     {
       "name": "huge-anchor-512mib.bin",

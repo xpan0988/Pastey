@@ -1,7 +1,15 @@
 import {
   classifyTransferPlannerSize,
   DEFAULT_TRANSFER_PLANNER_POLICY,
+  DYNAMIC_MICRO_GROUP_MAX_CHILD_CAP_BYTES,
+  DYNAMIC_MICRO_GROUP_MAX_GROUP_CAP_BYTES,
+  DYNAMIC_MICRO_GROUP_MAX_WINDOW_QUANTUM_BYTES,
+  DYNAMIC_MICRO_GROUP_MIN_CHILD_CAP_BYTES,
+  DYNAMIC_MICRO_GROUP_MIN_GROUP_CAP_BYTES,
+  DYNAMIC_MICRO_GROUP_MIN_WINDOW_QUANTUM_BYTES,
+  MICRO_GROUP_PER_FILE_OVERHEAD_BYTES,
   planWeightedTransfers,
+  type MicroFlowGroupMode,
   type MicroFlowGroupPlan,
   type TransferPlannerPolicy,
   type TransferPlannerResult,
@@ -141,6 +149,30 @@ export interface MicroFlowGroupPlanningDiagnostics {
   microGroupSkipReason: string;
 }
 
+export function microGroupPlannerDiagnosticFields(
+  mode: MicroFlowGroupMode,
+  liveMicroGroupPlans: number,
+  liveGroupedChildren: number,
+  diagnostics: MicroFlowGroupPlanningDiagnostics,
+  fixedCandidateChildren: number,
+  dynamicCandidateChildren: number
+): Record<string, string | number | boolean> {
+  return {
+    micro_group_mode: mode,
+    micro_group_plans: liveMicroGroupPlans,
+    micro_group_grouped_children: liveGroupedChildren,
+    eligible_micro_group_children: diagnostics.eligibleTinyCandidates,
+    contention: diagnostics.contention,
+    contention_severity: diagnostics.contentionSeverity,
+    one_window_quantum_bytes: diagnostics.oneWindowQuantumBytes,
+    dynamic_child_cap_bytes: diagnostics.dynamicChildCapBytes,
+    dynamic_group_cap_bytes: diagnostics.dynamicGroupCapBytes,
+    micro_group_skip_reason: liveMicroGroupPlans > 0 ? "group_planned" : diagnostics.microGroupSkipReason,
+    fixed_candidate_children: fixedCandidateChildren,
+    dynamic_candidate_children: dynamicCandidateChildren
+  };
+}
+
 export interface CancellableTransferRequest {
   transferId: string;
   itemId: string;
@@ -167,13 +199,6 @@ const terminalMicroGroupStatuses = new Set<MicroFlowGroupStatus>([
   "cancelled",
   "interrupted"
 ]);
-const DYNAMIC_MICRO_GROUP_MIN_WINDOW_QUANTUM_BYTES = 4 * 1024 * 1024;
-const DYNAMIC_MICRO_GROUP_MAX_WINDOW_QUANTUM_BYTES = 16 * 1024 * 1024;
-const DYNAMIC_MICRO_GROUP_MIN_CHILD_CAP_BYTES = 1024 * 1024;
-const DYNAMIC_MICRO_GROUP_MAX_CHILD_CAP_BYTES = 4 * 1024 * 1024;
-const DYNAMIC_MICRO_GROUP_MIN_GROUP_CAP_BYTES = 4 * 1024 * 1024;
-const DYNAMIC_MICRO_GROUP_MAX_GROUP_CAP_BYTES = 16 * 1024 * 1024;
-
 export function createTransferSchedulerState(): TransferSchedulerState {
   return {
     batches: {},
@@ -775,7 +800,8 @@ export function planRunnableTransferLaunches(
   rooms: readonly Pick<RoomInfo, "id" | "status">[],
   closedRoomIds: ReadonlySet<string> = new Set(),
   launchingItemWindows: ReadonlyMap<string, number> = new Map(),
-  rebalanceActiveWindows = false
+  rebalanceActiveWindows = false,
+  policy: TransferPlannerPolicy = DEFAULT_TRANSFER_PLANNER_POLICY
 ): TransferLaunchPlannerResult {
   const roomStatusById = new Map(rooms.map((room) => [room.id, room.status]));
   const tasks: TransferPlannerTask[] = [];
@@ -789,6 +815,9 @@ export function planRunnableTransferLaunches(
     for (const itemId of batch.itemIds) {
       const item = state.items[itemId];
       if (!item) {
+        continue;
+      }
+      if (item.status === "queued" && launchingItemWindows.get(item.id) === 0) {
         continue;
       }
 
@@ -814,7 +843,7 @@ export function planRunnableTransferLaunches(
     }
   }
 
-  const plannerResult = planWeightedTransfers(tasks, { rebalanceActiveWindows });
+  const plannerResult = planWeightedTransfers(tasks, { ...policy, rebalanceActiveWindows });
   const runnablePlans = plannerResult.runnablePlans
     .filter((plan) => {
       if (plan.kind === "micro_group") {
@@ -943,7 +972,7 @@ export function summarizeMicroFlowGroupPlanning(
         cancelledOrTerminal += 1;
         continue;
       }
-      if (item.status !== "queued") {
+      if (item.status !== "queued" && item.status !== "preparing" && item.status !== "sending") {
         continue;
       }
 
@@ -958,7 +987,9 @@ export function summarizeMicroFlowGroupPlanning(
       }
       readyQueuedCount += 1;
       largestReadyQueuedBytes = Math.max(largestReadyQueuedBytes, item.sizeBytes);
-      if (item.sizeBytes > policy.microGroupMaxChildSizeBytes) {
+      const candidateCost = item.sizeBytes +
+        (policy.microGroupMode === "dynamic" ? MICRO_GROUP_PER_FILE_OVERHEAD_BYTES : 0);
+      if (candidateCost > policy.microGroupMaxChildSizeBytes) {
         overChildSizeLimit += 1;
       }
 
@@ -967,7 +998,10 @@ export function summarizeMicroFlowGroupPlanning(
       if (lane === "bulk_file") {
         hasBulkCandidate = true;
       }
-      if (item.sizeBytes > policy.microGroupMaxChildSizeBytes) {
+      if (item.status !== "queued") {
+        continue;
+      }
+      if (candidateCost > policy.microGroupMaxChildSizeBytes) {
         continue;
       }
       if ((sizeClass !== "tiny" && sizeClass !== "small") || lane !== "small_file") {
@@ -997,21 +1031,21 @@ export function summarizeMicroFlowGroupPlanning(
       DYNAMIC_MICRO_GROUP_MIN_WINDOW_QUANTUM_BYTES,
       DYNAMIC_MICRO_GROUP_MAX_WINDOW_QUANTUM_BYTES
     )
-    : Math.max(policy.microGroupMaxChildSizeBytes, unclampedOneWindowQuantumBytes);
+    : Math.max(DEFAULT_TRANSFER_PLANNER_POLICY.microGroupMaxChildSizeBytes, unclampedOneWindowQuantumBytes);
   const dynamicChildCapBytes = contention
     ? clampBytes(
-      Math.max(policy.microGroupMaxChildSizeBytes, oneWindowQuantumBytes),
+      oneWindowQuantumBytes,
       DYNAMIC_MICRO_GROUP_MIN_CHILD_CAP_BYTES,
       DYNAMIC_MICRO_GROUP_MAX_CHILD_CAP_BYTES
     )
-    : policy.microGroupMaxChildSizeBytes;
+    : DEFAULT_TRANSFER_PLANNER_POLICY.microGroupMaxChildSizeBytes;
   const dynamicGroupCapBytes = contention
     ? clampBytes(
-      Math.max(policy.microGroupMaxGroupBytes, dynamicChildCapBytes * 4),
+      oneWindowQuantumBytes,
       DYNAMIC_MICRO_GROUP_MIN_GROUP_CAP_BYTES,
       DYNAMIC_MICRO_GROUP_MAX_GROUP_CAP_BYTES
     )
-    : policy.microGroupMaxGroupBytes;
+    : DEFAULT_TRANSFER_PLANNER_POLICY.microGroupMaxGroupBytes;
 
   return {
     tinyCandidates,
@@ -1229,10 +1263,7 @@ function microGroupSkipReason(input: {
   roomUnavailable: number;
   contention: boolean;
 }): string {
-  if (input.policy.microGroupDispatchMode !== "serial" && input.policy.microGroupDispatchMode !== "shadow") {
-    return "disabled";
-  }
-  if (!input.contention) {
+  if (input.policy.microGroupMode === "dynamic" && !input.contention) {
     return "no_contention";
   }
   if (input.eligibleTinyCandidates === 0 && input.metadataMissing > 0) {

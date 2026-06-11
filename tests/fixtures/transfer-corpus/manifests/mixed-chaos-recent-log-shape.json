@@ -1,6 +1,6 @@
 {
   "name": "mixed-chaos-recent-log-shape",
-  "description": "One large file, several medium files, several 1.1-1.3 MiB files, and one sub-1 MiB file. Expected planner meaning: fixed may produce no group; dynamic_shadow should report a candidate group.",
+  "description": "One large file, several medium files, several 1.1-1.3 MiB files, and one sub-1 MiB file. Expected planner meaning: compare fixed and dynamic live admission under contention.",
   "files": [
     {
       "name": "large-anchor-96mib.bin",

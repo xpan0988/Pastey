@@ -21,11 +21,11 @@ Active outgoing binary-v1 sender transfers can receive completion-triggered runt
 
 ## MicroFlowGroup Boundary
 
-`MicroFlowGroup` is a scheduler-only resource abstraction for eligible tiny file-like queue items. A live fixed serial group consumes one planner window, and its children are still sent one at a time through the existing single-file path.
+`MicroFlowGroup` is a scheduler-only resource abstraction for eligible small file-like queue items. Release 2.0 supports selectable live `fixed` and `dynamic` modes. Every live group consumes exactly one planner window, and its children are still sent one at a time through the existing single-file path.
 
 `MicroFlowGroup` is not a bundle, archive, zip, room item, protocol object, binary-v2 stream, remote execution object, or permission grant. It does not alter child file metadata, payload encryption, binary-v1 frame behavior, ACK behavior, retry behavior, finalize behavior, cancel/burn behavior, or Inbox behavior.
 
-Dynamic MicroFlowGroup shadow diagnostics are diagnostic only. They compare fixed live behavior with a possible dynamic capacity model, but dynamic live MicroFlowGroup dispatch is not enabled.
+Dynamic mode is the Release 2.0 live contention-aware one-window service implementation. Fixed mode preserves the legacy threshold-based behavior as a fallback and debugging baseline. Changing modes affects the next planner cycle; it does not restart active transfers or regroup already active work.
 
 ## Non-Current Work
 
