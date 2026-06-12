@@ -50,10 +50,14 @@ duplicate helpers, and a pure unwired `8/0` or `7/1` capacity feasibility
 helper. CL-2 adds a local-only outbound/inbound control queue simulation with
 priority, replay/expiry handling, local status transitions, next-item
 selection, and hypothetical `8/0` or `7/1` budget display. It sends and
-receives nothing and is not wired into the scheduler. Actual room transport and
-scheduler reservation remain blocked because ordinary room text is not a
-capability-preview channel. Provider output is untrusted and no action,
-capability transport, peer execution consent, or peer execution exists.
+receives nothing and is not wired into the scheduler. CL-3B now provides the
+smallest real preview-only transport: a separate bounded encrypted room HTTP
+endpoint with a current-session inbox and transport-only delivery receipt, not
+ordinary item/file semantics. Developer Tools can send one preview and refresh
+the received inbox. Transport delivery is not consent, current-session binding
+is not durable device identity, and scheduler reservation remains inactive.
+Provider output is untrusted and no capability execution, peer execution
+consent, or peer execution exists.
 
 ## Device diagnostics
 

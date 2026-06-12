@@ -7,9 +7,13 @@ import type {
   JoinRequestPrompt,
   LinkBenchmarkResult,
   NearbyDevice,
+  ReceivedRoomControlEvent,
+  RoomControlDeliveryReceipt,
+  RoomControlSessionContext,
   RoomInfo,
   RoomItem
 } from "./types";
+import { validateRoomControlEvent, type RoomControlEvent } from "./agentBridge";
 
 interface SendFileOptions {
   displayName?: string;
@@ -88,6 +92,31 @@ export async function listRoomItems(roomId: string): Promise<RoomItem[]> {
 
 export async function sendTextToRoom(roomId: string, text: string): Promise<RoomItem> {
   return invoke("send_text_to_room", { roomId, text });
+}
+
+export async function sendRoomControlEvent(
+  roomId: string,
+  event: RoomControlEvent,
+): Promise<RoomControlDeliveryReceipt> {
+  const validation = validateRoomControlEvent(event, {
+    expectedRoomRef: roomId,
+  });
+  if (!validation.valid) {
+    throw new Error(validation.errors.join(" "));
+  }
+  return invoke("send_room_control_event", { roomId, event: validation.value });
+}
+
+export async function getRoomControlSessionContext(
+  roomId: string,
+): Promise<RoomControlSessionContext> {
+  return invoke("get_room_control_session_context", { roomId });
+}
+
+export async function listReceivedRoomControlEvents(
+  roomId: string,
+): Promise<ReceivedRoomControlEvent[]> {
+  return invoke("list_received_room_control_events", { roomId });
 }
 
 export async function sendFileToRoom(roomId: string, path: string, options?: SendFileOptions): Promise<RoomItem> {

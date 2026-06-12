@@ -31,6 +31,7 @@ import {
 import {
   buildCapabilityPreviewControlEvent,
   buildCapabilityPreviewStatusControlEvent,
+  buildSessionBoundCapabilityPreviewControlEvent,
   createControlQueueState,
   enqueueRoomControlEvent,
   getControlQueueBudget,
@@ -41,6 +42,18 @@ import {
   type ControlQueueItem,
   type ControlQueueState
 } from "../lib/agentBridge";
+import {
+  getRoomControlSessionContext,
+  listReceivedRoomControlEvents,
+  listRooms,
+  sendRoomControlEvent
+} from "../lib/tauri";
+import type {
+  ReceivedRoomControlEvent,
+  RoomControlDeliveryReceipt,
+  RoomControlSessionContext,
+  RoomInfo
+} from "../lib/types";
 
 type PreviewProvider = "mock" | "cloud";
 
@@ -418,8 +431,46 @@ function LocalControlQueueSimulation({
 }) {
   const [queue, setQueue] = useState<ControlQueueState>(createControlQueueState);
   const [messages, setMessages] = useState<string[]>([]);
+  const [activeRooms, setActiveRooms] = useState<RoomInfo[]>([]);
+  const [selectedRoomId, setSelectedRoomId] = useState("");
+  const [session, setSession] = useState<RoomControlSessionContext | null>(null);
+  const [deliveryReceipt, setDeliveryReceipt] = useState<RoomControlDeliveryReceipt | null>(null);
+  const [receivedEvents, setReceivedEvents] = useState<ReceivedRoomControlEvent[]>([]);
+  const [transportBusy, setTransportBusy] = useState(false);
   const budget = getControlQueueBudget(queue);
   const selected = [...queue.inbound, ...queue.outbound].find((item) => item.status === "selected");
+
+  useEffect(() => {
+    void refreshTransportRooms();
+  }, []);
+
+  useEffect(() => {
+    if (!selectedRoomId) {
+      setSession(null);
+      setReceivedEvents([]);
+      return;
+    }
+    void getRoomControlSessionContext(selectedRoomId)
+      .then(setSession)
+      .catch((error) => {
+        setSession(null);
+        setMessages([error instanceof Error ? error.message : String(error)]);
+      });
+  }, [selectedRoomId]);
+
+  async function refreshTransportRooms() {
+    try {
+      const rooms = (await listRooms()).filter(
+        (room) => room.status === "active" && room.peer_connected
+      );
+      setActiveRooms(rooms);
+      setSelectedRoomId((current) =>
+        rooms.some((room) => room.id === current) ? current : rooms[0]?.id ?? ""
+      );
+    } catch (error) {
+      setMessages([error instanceof Error ? error.message : String(error)]);
+    }
+  }
 
   function enqueueOutboundPreview() {
     const buildResult = buildCapabilityPreviewControlEvent(envelope, {
@@ -485,6 +536,52 @@ function LocalControlQueueSimulation({
       : [result.reason]);
   }
 
+  async function sendPreviewOverTransport() {
+    if (!session) {
+      setMessages(["Select an active room session before transport delivery."]);
+      return;
+    }
+    const buildResult = buildSessionBoundCapabilityPreviewControlEvent(envelope, session);
+    if (!buildResult.ok) {
+      setMessages(buildResult.errors);
+      return;
+    }
+    setTransportBusy(true);
+    try {
+      const receipt = await sendRoomControlEvent(session.roomId, buildResult.event);
+      setDeliveryReceipt(receipt);
+      setMessages([
+        `Transport accepted ${receipt.eventId} for the peer's bounded local inbox.`,
+        "Transport delivery is not peer consent."
+      ]);
+    } catch (error) {
+      setDeliveryReceipt(null);
+      setMessages([
+        error instanceof Error ? error.message : String(error),
+        "Failed delivery was not converted into acknowledgement or denial."
+      ]);
+    } finally {
+      setTransportBusy(false);
+    }
+  }
+
+  async function refreshReceivedInbox() {
+    if (!session) {
+      setMessages(["Select an active room session before refreshing the control inbox."]);
+      return;
+    }
+    setTransportBusy(true);
+    try {
+      const events = await listReceivedRoomControlEvents(session.roomId);
+      setReceivedEvents(events);
+      setMessages([`Loaded ${events.length} current-session control inbox event(s).`]);
+    } catch (error) {
+      setMessages([error instanceof Error ? error.message : String(error)]);
+    } finally {
+      setTransportBusy(false);
+    }
+  }
+
   return (
     <div className="ai-slot-pending-card">
       <div className="ai-slot-pending-header">
@@ -500,6 +597,63 @@ function LocalControlQueueSimulation({
         <span>Current scheduler behavior is unchanged.</span>
         <span>Acknowledging preview is not execution consent.</span>
       </div>
+      <div className="ai-slot-advisory-notice">
+        <strong>CL-3B preview-only transport delivery.</strong>
+        <span>Transport delivery is not peer consent.</span>
+        <span>Preview acknowledgement is not execution consent.</span>
+        <span>No capability is executed.</span>
+        <span>Scheduler reservation is not active.</span>
+      </div>
+      <div className="benchmark-controls">
+        <select
+          value={selectedRoomId}
+          onChange={(event) => setSelectedRoomId(event.target.value)}
+          aria-label="Active room-control transport room"
+        >
+          <option value="">No active room selected</option>
+          {activeRooms.map((room) => (
+            <option key={room.id} value={room.id}>
+              {room.peer_device_name ?? room.room_code_display ?? room.id}
+            </option>
+          ))}
+        </select>
+        <button className="secondary-button" onClick={() => void refreshTransportRooms()}>
+          Refresh active rooms
+        </button>
+        {session ? (
+          <>
+            <button
+              className="secondary-button"
+              disabled={transportBusy}
+              onClick={() => void sendPreviewOverTransport()}
+            >
+              Send preview over room-control transport
+            </button>
+            <button
+              className="secondary-button"
+              disabled={transportBusy}
+              onClick={() => void refreshReceivedInbox()}
+            >
+              Refresh received control inbox
+            </button>
+          </>
+        ) : null}
+      </div>
+      {session ? (
+        <div className="diagnostic-grid">
+          <PreviewBlock title="Transport room" value={session.roomId} />
+          <PreviewBlock title="Local session ref" value={session.localSessionRef} />
+          <PreviewBlock title="Peer session ref" value={session.peerSessionRef} />
+          <PreviewBlock title="Delivery status" value={deliveryReceipt ? "accepted_for_local_inbox" : "Not delivered"} />
+        </div>
+      ) : null}
+      {deliveryReceipt ? (
+        <div className="diagnostic-grid">
+          <PreviewBlock title="Delivered event ID" value={deliveryReceipt.eventId} />
+          <PreviewBlock title="Transport received at" value={deliveryReceipt.receivedAt} />
+        </div>
+      ) : null}
+      <ReceivedControlInbox events={receivedEvents} />
       <div className="benchmark-controls">
         <button className="secondary-button" onClick={enqueueOutboundPreview}>Enqueue outbound preview locally</button>
         <button className="secondary-button" onClick={selectNextLocally}>Select next locally</button>
@@ -517,6 +671,26 @@ function LocalControlQueueSimulation({
       <ControlQueueList title="Outbound queue" items={queue.outbound} />
       <ControlQueueList title="Inbound queue" items={queue.inbound} />
       <PreviewMessages title="Queue messages" messages={messages} emptyMessage="No duplicate, replay, or expiry messages." />
+    </div>
+  );
+}
+
+function ReceivedControlInbox({ events }: { events: ReceivedRoomControlEvent[] }) {
+  return (
+    <div className="ai-slot-preview-messages">
+      <strong>Received preview-only control inbox</strong>
+      {events.length > 0 ? (
+        <ul>
+          {events.map((event) => (
+            <li key={event.eventId}>
+              {event.kind} / {event.eventId} / {event.sourceDeviceRef} → {event.targetPeerRef} /
+              expires {new Date(event.expiresAt).toLocaleString()}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="muted">No received current-session control events.</p>
+      )}
     </div>
   );
 }

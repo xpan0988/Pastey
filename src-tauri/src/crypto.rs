@@ -146,6 +146,48 @@ pub fn derive_transport_key(shared_secret: &[u8; 32]) -> AppResult<[u8; 32]> {
     Ok(okm)
 }
 
+pub fn wrap_control_key_for_receiver(
+    event_key: &[u8; 32],
+    sender_secret_bytes: &[u8; 32],
+    receiver_public_key_bytes: &[u8; 32],
+) -> AppResult<(String, String, String)> {
+    let sender_secret = StaticSecret::from(*sender_secret_bytes);
+    let receiver_public = PublicKey::from(*receiver_public_key_bytes);
+    let sender_public = PublicKey::from(&sender_secret).to_bytes();
+    let shared_secret = sender_secret.diffie_hellman(&receiver_public);
+    let transport_key = derive_control_transport_key(shared_secret.as_bytes())?;
+    let (wrapped, nonce) = encrypt_bytes(event_key, &transport_key)?;
+    Ok((
+        STANDARD.encode(wrapped),
+        STANDARD.encode(nonce),
+        STANDARD.encode(sender_public),
+    ))
+}
+
+pub fn unwrap_control_key_from_sender(
+    wrapped_event_key: &str,
+    key_wrap_nonce: &str,
+    sender_public_key: &str,
+    receiver_secret_bytes: &[u8; 32],
+) -> AppResult<[u8; 32]> {
+    let wrapped = STANDARD.decode(wrapped_event_key)?;
+    let nonce = decode_nonce(key_wrap_nonce)?;
+    let sender_public = decode_key(sender_public_key)?;
+    let receiver_secret = StaticSecret::from(*receiver_secret_bytes);
+    let shared_secret = receiver_secret.diffie_hellman(&PublicKey::from(sender_public));
+    let transport_key = derive_control_transport_key(shared_secret.as_bytes())?;
+    let plaintext = decrypt_bytes(&wrapped, &transport_key, &nonce)?;
+    key_from_slice(&plaintext)
+}
+
+fn derive_control_transport_key(shared_secret: &[u8; 32]) -> AppResult<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(Some(b"pastey:transport:v1"), shared_secret);
+    let mut okm = [0u8; 32];
+    hk.expand(b"room-control-event-key-wrap-v1", &mut okm)
+        .map_err(|_| AppError::Crypto("failed to derive room control transport key".into()))?;
+    Ok(okm)
+}
+
 fn nonce_from_slice(value: &[u8]) -> AppResult<[u8; 12]> {
     value
         .try_into()

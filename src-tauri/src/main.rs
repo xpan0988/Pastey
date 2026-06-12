@@ -12,6 +12,7 @@ mod error;
 mod link_benchmark;
 mod logging;
 mod models;
+mod room_control;
 mod storage;
 mod transfer;
 mod transfer_tuning;
@@ -31,12 +32,12 @@ use crate::{
         accept_nearby_join, burn_room, cancel_transfer, check_for_updates, copy_last_error,
         copy_text_to_clipboard, create_room, delete_temp_file, get_config, get_device_capabilities,
         get_device_profile, get_file_transfer_metadata, get_last_benchmark_results, get_room,
-        join_room, leave_room, list_nearby_devices, list_room_items, list_rooms,
-        log_frontend_diagnostic,
+        get_room_control_session_context, join_room, leave_room, list_nearby_devices,
+        list_received_room_control_events, list_room_items, list_rooms, log_frontend_diagnostic,
         mark_join_prompt_rendered, open_logs_folder, pending_join_requests, reject_nearby_join,
         request_nearby_join, reveal_in_folder, run_loopback_benchmark, run_peer_link_benchmark,
-        send_file_to_room, send_text_to_room, update_config, update_transfer_window,
-        write_temp_file,
+        send_file_to_room, send_room_control_event, send_text_to_room, update_config,
+        update_transfer_window, write_temp_file,
     },
     config::StoredConfig,
     error::{AppError, AppResult},
@@ -60,6 +61,7 @@ pub struct AppState {
     pub latest_device_profile: Mutex<Option<diagnostics::DeviceProfile>>,
     pub latest_device_capabilities: Mutex<Option<diagnostics::DeviceCapabilities>>,
     pub latest_benchmark_results: Mutex<HashMap<String, diagnostics::LinkBenchmarkResult>>,
+    pub room_control: Mutex<room_control::RoomControlRuntimeState>,
 }
 
 pub struct ActiveRoomServer {
@@ -117,6 +119,7 @@ fn main() {
                 latest_device_profile: Mutex::new(None),
                 latest_device_capabilities: Mutex::new(None),
                 latest_benchmark_results: Mutex::new(HashMap::new()),
+                room_control: Mutex::new(room_control::RoomControlRuntimeState::default()),
             });
 
             app.manage(state.clone());
@@ -163,6 +166,9 @@ fn main() {
             list_room_items,
             send_text_to_room,
             send_file_to_room,
+            send_room_control_event,
+            get_room_control_session_context,
+            list_received_room_control_events,
             cancel_transfer,
             update_transfer_window,
             write_temp_file,

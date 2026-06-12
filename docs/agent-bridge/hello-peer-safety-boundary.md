@@ -7,15 +7,20 @@ runtime behavior.
 AI Slot Phase E1 can generate and evaluate an advisory plan, bind a local
 confirmation to a visible canonical payload and hash, and build a validated
 `HelloPeerRequest` outbound preview and `CapabilityRequestPreviewEnvelope`.
-Actual room transport remains blocked. The inbound card is a local simulation,
-not a peer receive path, and no peer-side execution behavior described below is
-implemented.
+CL-3B now provides preview-only room-control transport delivery and a bounded
+received inbox. Transport delivery is not preview acknowledgement, peer
+consent, or execution authorization. CL-2 queue integration and all peer-side
+execution behavior described below remain unimplemented.
 
 ## 1. What Does a Trusted Room Actually Trust?
 
-A trusted room means the devices have an authenticated, current room
-relationship sufficient for Pastey communication. It permits message exchange
-and capability negotiation.
+A trusted room means the devices have a current joined room relationship
+sufficient for existing Pastey communication. Current source exchanges
+ephemeral room-server transport public keys during join and encrypts item/file
+payloads, but the room server uses plain HTTP and does not provide a generic
+authenticated connection or durable device identity. A future room-control
+transport therefore needs explicit current-session peer-key/source/target
+binding.
 
 A trusted room does not grant execution authority. Room membership is necessary
 but not sufficient for peer-side execution. Every capability request still
@@ -69,10 +74,10 @@ The requesting device must revalidate peer visibility and advertised capability
 immediately before dispatch. The peer should keep a current-session replay cache
 only. Hello Peer v0 does not require a long-term hidden replay database.
 
-Phase E1 adds current-session duplicate detection for envelope IDs and embedded
-request IDs. It has no long-term database and no real peer replay cache because
-actual transport is not implemented. Full replay prevention remains future
-transport and peer-side work.
+Phase E1 adds frontend current-session duplicate detection for envelope IDs and
+embedded request IDs. CL-3B adds a bounded current-session Rust replay cache for
+received preview transport events. It has no long-term database. Broader
+capability-request replay prevention remains future peer-side work.
 
 **Conclusion:** replay defense = request ID + expiry + current-session binding +
 peer replay cache.
