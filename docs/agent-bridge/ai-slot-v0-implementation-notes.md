@@ -76,6 +76,14 @@ The receipt means accepted for the peer's local inbox only. It is not preview
 acknowledgement, peer consent, or execution authority. Received transport
 events are not yet injected into CL-2 queues; that remains CL-3C.
 
+CL-3B.2 adds send observability only. Every transport-send click now shows an
+immediate sending state followed by one visible accepted or sanitized rejected
+result. Duplicate/replay, expiry, validation, session, peer, inbox, rate-limit,
+oversize, malformed-receipt, and generic transport failures no longer fail
+silently in Developer Tools. Repeated clicks resend the same currently built
+event ID so replay behavior can be inspected. There is no automatic retry,
+CL-3C queue integration, consent, execution, or scheduler reservation.
+
 ## AI Slot Phase E1 Status
 
 - Mock advisory loop: implemented.
@@ -92,6 +100,8 @@ events are not yet injected into CL-2 queues; that remains CL-3C.
   expiry/replay handling, local status transitions, and hypothetical budget
   display: implemented.
 - CL-3B preview-only room-control send/receive and bounded Rust inbox:
+  implemented.
+- CL-3B.2 latest room-control send result and sanitized rejection visibility:
   implemented.
 - CL-3C transport delivery/status integration with CL-2 queues: not
   implemented.

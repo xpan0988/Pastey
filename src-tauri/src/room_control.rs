@@ -121,6 +121,51 @@ pub struct RoomControlDeliveryReceipt {
     pub received_at: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomControlSendError {
+    pub code: &'static str,
+    pub message: &'static str,
+}
+
+impl RoomControlSendError {
+    pub fn from_app_error(error: AppError) -> Self {
+        let message = error.message();
+        let (code, message) = if message.contains("expired") {
+            ("expired", "Room control event expired before delivery.")
+        } else if message.contains("already received") {
+            ("replay", "Room control event was already received.")
+        } else if message.contains("session mismatch") || message.contains("not active") {
+            ("session_mismatch", "Room control room or session mismatch.")
+        } else if message.contains("Room session is unavailable") {
+            (
+                "session_unavailable",
+                "Room control session is unavailable.",
+            )
+        } else if message.contains("Peer is unavailable") {
+            ("peer_unavailable", "Peer is unavailable.")
+        } else if message.contains("inbox is full") {
+            ("inbox_full", "Peer room control inbox is full.")
+        } else if message.contains("rate") {
+            ("rate_limited", "Peer room control rate limit was reached.")
+        } else if message.contains("too large") {
+            ("oversized", "Room control event is too large.")
+        } else if message.contains("receipt is invalid") {
+            (
+                "malformed_receipt",
+                "Room control delivery receipt was invalid.",
+            )
+        } else if matches!(error, AppError::Timeout(_) | AppError::Network(_)) {
+            ("transport_error", "Room control transport failed.")
+        } else if matches!(error, AppError::InvalidInput(_)) {
+            ("invalid_event", "Room control event validation failed.")
+        } else {
+            ("unknown", "Room control send failed.")
+        };
+        Self { code, message }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceivedRoomControlEvent {
@@ -144,11 +189,11 @@ pub struct RoomControlSessionContext {
     pub peer_connected: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ControlError {
-    code: &'static str,
-    message: &'static str,
+    code: String,
+    message: String,
 }
 
 #[derive(Clone)]
@@ -270,9 +315,7 @@ pub async fn send_room_control_event(
             }
         })?;
     if !response.status().is_success() {
-        return Err(AppError::Network(control_response_failure(
-            response.status(),
-        )));
+        return Err(control_response_failure(response).await);
     }
     if response.content_length().unwrap_or(0) > MAX_CONTROL_RESPONSE_BYTES as u64 {
         return Err(AppError::Network(
@@ -480,6 +523,13 @@ pub async fn receive_room_control_event_handler(
                 StatusCode::GONE,
                 "event_expired",
                 "Room control event expired.",
+            )
+        }
+        Err(AppError::InvalidInput(message)) if message.contains("session mismatch") => {
+            return control_error(
+                StatusCode::FORBIDDEN,
+                "session_mismatch",
+                "Room control session mismatch.",
             )
         }
         Err(_) => {
@@ -766,21 +816,48 @@ fn control_error(status: StatusCode, code: &'static str, message: &'static str) 
     (
         status,
         [(header::CONTENT_TYPE, CONTROL_ERROR_CONTENT_TYPE)],
-        Json(ControlError { code, message }),
+        Json(ControlError {
+            code: code.into(),
+            message: message.into(),
+        }),
     )
         .into_response()
 }
 
-fn control_response_failure(status: StatusCode) -> String {
-    match status {
-        StatusCode::CONFLICT => "Room control event was already received.",
-        StatusCode::GONE => "Room control event or room is unavailable.",
-        StatusCode::PAYLOAD_TOO_LARGE => "Room control event is too large.",
-        StatusCode::TOO_MANY_REQUESTS => "Room control inbox is full.",
-        StatusCode::FORBIDDEN => "Room control session mismatch.",
-        _ => "Room control delivery failed.",
-    }
-    .into()
+async fn control_response_failure(response: reqwest::Response) -> AppError {
+    let status = response.status();
+    let error_code = if response.content_length().unwrap_or(0) <= MAX_CONTROL_RESPONSE_BYTES as u64
+    {
+        response
+            .bytes()
+            .await
+            .ok()
+            .filter(|body| body.len() <= MAX_CONTROL_RESPONSE_BYTES)
+            .and_then(|body| serde_json::from_slice::<ControlError>(&body).ok())
+            .map(|error| error.code)
+    } else {
+        None
+    };
+    let message = match error_code.as_deref() {
+        Some("event_expired") => "Room control event expired before delivery.",
+        Some("event_replayed") => "Room control event was already received.",
+        Some("session_mismatch") => "Room control session mismatch.",
+        Some("inbox_full") => "Room control inbox is full.",
+        Some("rate_limited") => "Room control rate limit was reached.",
+        Some("request_too_large" | "event_too_large") => "Room control event is too large.",
+        Some("invalid_event" | "invalid_envelope" | "invalid_request") => {
+            "Room control event validation failed."
+        }
+        _ => match status {
+            StatusCode::CONFLICT => "Room control event was already received.",
+            StatusCode::GONE => "Room control event or room is unavailable.",
+            StatusCode::PAYLOAD_TOO_LARGE => "Room control event is too large.",
+            StatusCode::TOO_MANY_REQUESTS => "Room control transport rejected the event.",
+            StatusCode::FORBIDDEN => "Room control session mismatch.",
+            _ => "Room control delivery failed.",
+        },
+    };
+    AppError::Network(message.into())
 }
 
 fn record_replay_id(queue: &mut VecDeque<String>, set: &mut HashSet<String>, id: String) {
@@ -1092,5 +1169,35 @@ mod tests {
             event.request_id.clone().unwrap(),
         );
         assert!(is_replayed(&room, &event));
+    }
+
+    #[test]
+    fn send_errors_are_structured_and_sanitized() {
+        let replay = RoomControlSendError::from_app_error(AppError::Network(
+            "Room control event was already received.".into(),
+        ));
+        assert_eq!(replay.code, "replay");
+        assert_eq!(replay.message, "Room control event was already received.");
+
+        let receipt = RoomControlSendError::from_app_error(AppError::Network(
+            "Room control receipt is invalid.".into(),
+        ));
+        assert_eq!(receipt.code, "malformed_receipt");
+        assert!(!receipt.message.contains("ciphertext"));
+
+        assert_eq!(
+            RoomControlSendError::from_app_error(AppError::Network(
+                "Room control rate limit was reached.".into(),
+            ))
+            .code,
+            "rate_limited"
+        );
+        assert_eq!(
+            RoomControlSendError::from_app_error(AppError::Network(
+                "Room control inbox is full.".into(),
+            ))
+            .code,
+            "inbox_full"
+        );
     }
 }

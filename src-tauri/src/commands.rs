@@ -15,7 +15,8 @@ use crate::{
     link_benchmark, logging,
     models::{AppConfig, JoinRequestPrompt, LocalRole, NearbyDevice, RoomInfo, RoomItem},
     room_control::{
-        ReceivedRoomControlEvent, RoomControlDeliveryReceipt, RoomControlSessionContext,
+        ReceivedRoomControlEvent, RoomControlDeliveryReceipt, RoomControlSendError,
+        RoomControlSessionContext,
     },
     storage, transfer, AppState,
 };
@@ -427,13 +428,10 @@ pub async fn send_room_control_event(
     room_id: String,
     event: Value,
     state: State<'_, Arc<AppState>>,
-) -> Result<RoomControlDeliveryReceipt, String> {
-    run_async(crate::room_control::send_room_control_event(
-        state.inner().clone(),
-        &room_id,
-        event,
-    ))
-    .await
+) -> Result<RoomControlDeliveryReceipt, RoomControlSendError> {
+    crate::room_control::send_room_control_event(state.inner().clone(), &room_id, event)
+        .await
+        .map_err(RoomControlSendError::from_app_error)
 }
 
 #[tauri::command]

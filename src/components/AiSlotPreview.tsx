@@ -32,15 +32,20 @@ import {
   buildCapabilityPreviewControlEvent,
   buildCapabilityPreviewStatusControlEvent,
   buildSessionBoundCapabilityPreviewControlEvent,
+  createIdleRoomControlSendState,
   createControlQueueState,
   enqueueRoomControlEvent,
   getControlQueueBudget,
   markControlQueueItemStatus,
+  preserveRoomControlSendStateForSession,
+  sendCurrentRoomControlEvent,
   selectNextControlQueueItem,
   type CapabilityPreviewControlStatus,
   type CapabilityPreviewRoomControlEvent,
   type ControlQueueItem,
-  type ControlQueueState
+  type ControlQueueState,
+  type RoomControlEvent,
+  type RoomControlSendState
 } from "../lib/agentBridge";
 import {
   getRoomControlSessionContext,
@@ -50,7 +55,6 @@ import {
 } from "../lib/tauri";
 import type {
   ReceivedRoomControlEvent,
-  RoomControlDeliveryReceipt,
   RoomControlSessionContext,
   RoomInfo
 } from "../lib/types";
@@ -434,7 +438,8 @@ function LocalControlQueueSimulation({
   const [activeRooms, setActiveRooms] = useState<RoomInfo[]>([]);
   const [selectedRoomId, setSelectedRoomId] = useState("");
   const [session, setSession] = useState<RoomControlSessionContext | null>(null);
-  const [deliveryReceipt, setDeliveryReceipt] = useState<RoomControlDeliveryReceipt | null>(null);
+  const [transportEvent, setTransportEvent] = useState<RoomControlEvent | null>(null);
+  const [sendState, setSendState] = useState<RoomControlSendState>(createIdleRoomControlSendState);
   const [receivedEvents, setReceivedEvents] = useState<ReceivedRoomControlEvent[]>([]);
   const [transportBusy, setTransportBusy] = useState(false);
   const budget = getControlQueueBudget(queue);
@@ -446,17 +451,40 @@ function LocalControlQueueSimulation({
 
   useEffect(() => {
     if (!selectedRoomId) {
-      setSession(null);
+      applySession(null);
       setReceivedEvents([]);
       return;
     }
     void getRoomControlSessionContext(selectedRoomId)
-      .then(setSession)
+      .then(applySession)
       .catch((error) => {
-        setSession(null);
+        applySession(null);
         setMessages([error instanceof Error ? error.message : String(error)]);
       });
   }, [selectedRoomId]);
+
+  useEffect(() => {
+    if (!session) {
+      setTransportEvent(null);
+      return;
+    }
+    const buildResult = buildSessionBoundCapabilityPreviewControlEvent(envelope, session);
+    if (!buildResult.ok) {
+      setTransportEvent(null);
+      setMessages(buildResult.errors);
+      return;
+    }
+    setTransportEvent(buildResult.event);
+  }, [envelope, session?.roomId, session?.localSessionRef, session?.peerSessionRef]);
+
+  function applySession(nextSession: RoomControlSessionContext | null) {
+    setSession((currentSession) => {
+      setSendState((currentState) =>
+        preserveRoomControlSendStateForSession(currentState, currentSession, nextSession)
+      );
+      return nextSession;
+    });
+  }
 
   async function refreshTransportRooms() {
     try {
@@ -464,9 +492,13 @@ function LocalControlQueueSimulation({
         (room) => room.status === "active" && room.peer_connected
       );
       setActiveRooms(rooms);
-      setSelectedRoomId((current) =>
-        rooms.some((room) => room.id === current) ? current : rooms[0]?.id ?? ""
-      );
+      const nextRoomId = rooms.some((room) => room.id === selectedRoomId)
+        ? selectedRoomId
+        : rooms[0]?.id ?? "";
+      setSelectedRoomId(nextRoomId);
+      if (nextRoomId && nextRoomId === selectedRoomId) {
+        applySession(await getRoomControlSessionContext(nextRoomId));
+      }
     } catch (error) {
       setMessages([error instanceof Error ? error.message : String(error)]);
     }
@@ -537,31 +569,25 @@ function LocalControlQueueSimulation({
   }
 
   async function sendPreviewOverTransport() {
-    if (!session) {
+    if (!session || !transportEvent) {
       setMessages(["Select an active room session before transport delivery."]);
       return;
     }
-    const buildResult = buildSessionBoundCapabilityPreviewControlEvent(envelope, session);
-    if (!buildResult.ok) {
-      setMessages(buildResult.errors);
-      return;
-    }
-    setTransportBusy(true);
-    try {
-      const receipt = await sendRoomControlEvent(session.roomId, buildResult.event);
-      setDeliveryReceipt(receipt);
+    const result = await sendCurrentRoomControlEvent(
+      transportEvent,
+      (event) => sendRoomControlEvent(session.roomId, event),
+      setSendState
+    );
+    if (result.status === "accepted") {
       setMessages([
-        `Transport accepted ${receipt.eventId} for the peer's bounded local inbox.`,
+        `Transport accepted ${result.eventId} for the peer's bounded local inbox.`,
         "Transport delivery is not peer consent."
       ]);
-    } catch (error) {
-      setDeliveryReceipt(null);
+    } else if (result.status === "rejected") {
       setMessages([
-        error instanceof Error ? error.message : String(error),
+        result.message,
         "Failed delivery was not converted into acknowledgement or denial."
       ]);
-    } finally {
-      setTransportBusy(false);
     }
   }
 
@@ -624,7 +650,7 @@ function LocalControlQueueSimulation({
           <>
             <button
               className="secondary-button"
-              disabled={transportBusy}
+              disabled={transportBusy || sendState.status === "sending" || !transportEvent}
               onClick={() => void sendPreviewOverTransport()}
             >
               Send preview over room-control transport
@@ -636,6 +662,13 @@ function LocalControlQueueSimulation({
             >
               Refresh received control inbox
             </button>
+            <button
+              className="secondary-button"
+              disabled={sendState.status === "idle" || sendState.status === "sending"}
+              onClick={() => setSendState(createIdleRoomControlSendState())}
+            >
+              Clear latest send result
+            </button>
           </>
         ) : null}
       </div>
@@ -644,15 +677,10 @@ function LocalControlQueueSimulation({
           <PreviewBlock title="Transport room" value={session.roomId} />
           <PreviewBlock title="Local session ref" value={session.localSessionRef} />
           <PreviewBlock title="Peer session ref" value={session.peerSessionRef} />
-          <PreviewBlock title="Delivery status" value={deliveryReceipt ? "accepted_for_local_inbox" : "Not delivered"} />
+          <PreviewBlock title="Current transport event ID" value={transportEvent?.eventId ?? "Not built"} />
         </div>
       ) : null}
-      {deliveryReceipt ? (
-        <div className="diagnostic-grid">
-          <PreviewBlock title="Delivered event ID" value={deliveryReceipt.eventId} />
-          <PreviewBlock title="Transport received at" value={deliveryReceipt.receivedAt} />
-        </div>
-      ) : null}
+      <LatestRoomControlSend state={sendState} />
       <ReceivedControlInbox events={receivedEvents} />
       <div className="benchmark-controls">
         <button className="secondary-button" onClick={enqueueOutboundPreview}>Enqueue outbound preview locally</button>
@@ -671,6 +699,41 @@ function LocalControlQueueSimulation({
       <ControlQueueList title="Outbound queue" items={queue.outbound} />
       <ControlQueueList title="Inbound queue" items={queue.inbound} />
       <PreviewMessages title="Queue messages" messages={messages} emptyMessage="No duplicate, replay, or expiry messages." />
+    </div>
+  );
+}
+
+function LatestRoomControlSend({ state }: { state: RoomControlSendState }) {
+  const timestamp =
+    state.status === "sending"
+      ? state.startedAt
+      : state.status === "accepted"
+        ? state.receivedAt
+        : state.status === "rejected"
+          ? state.occurredAt
+          : null;
+  const summary =
+    state.status === "idle"
+      ? "No send attempted."
+      : state.status === "sending"
+        ? "Sending…"
+        : state.status === "accepted"
+          ? "Accepted for peer local inbox."
+          : state.message;
+  return (
+    <div className="ai-slot-preview-messages">
+      <strong>Latest room-control send</strong>
+      <div className="diagnostic-grid">
+        <PreviewBlock title="Status" value={state.status} />
+        <PreviewBlock title="Event ID" value={state.status === "idle" ? "None" : state.eventId} />
+        <PreviewBlock title="Timestamp" value={timestamp ?? "None"} />
+        <PreviewBlock
+          title="Result code"
+          value={state.status === "accepted" ? "accepted_for_local_inbox" : state.status === "rejected" ? state.errorCode : "None"}
+        />
+      </div>
+      <p className="muted">{summary}</p>
+      <p className="muted">Transport delivery is not peer consent.</p>
     </div>
   );
 }
