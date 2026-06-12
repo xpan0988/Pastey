@@ -126,9 +126,9 @@ pub struct UpdateTransferWindowResult {
 }
 
 #[derive(Clone)]
-struct RoomServerContext {
-    state: Arc<AppState>,
-    room_id: String,
+pub(crate) struct RoomServerContext {
+    pub(crate) state: Arc<AppState>,
+    pub(crate) room_id: String,
 }
 
 #[derive(Clone)]
@@ -285,6 +285,12 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
         .route("/rooms/:room_id/join", post(join_handler))
         .route("/rooms/:room_id/items", post(receive_item_handler))
         .route(
+            "/rooms/:room_id/control-events",
+            post(crate::room_control::receive_room_control_event_handler).layer(
+                DefaultBodyLimit::max(crate::room_control::MAX_CONTROL_REQUEST_BYTES),
+            ),
+        )
+        .route(
             "/rooms/:room_id/transfers/start",
             post(start_file_transfer_handler),
         )
@@ -372,6 +378,7 @@ pub async fn stop_room_server(state: Arc<AppState>, room_id: &str) -> AppResult<
         Some("peer_disconnected"),
     )
     .await;
+    crate::room_control::clear_room_control_state(&state, room_id);
     let maybe_server = state.active_servers.lock().remove(room_id);
     if let Some(mut server) = maybe_server {
         if let Some(shutdown) = server.shutdown.take() {
@@ -2549,6 +2556,7 @@ async fn join_handler(
 
     let snapshot = room_server_snapshot(&ctx.state, &room_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    crate::room_control::clear_room_control_state(&ctx.state, &room_id);
     storage::update_room_peer(
         &ctx.state.paths,
         &room_id,

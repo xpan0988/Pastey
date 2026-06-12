@@ -68,6 +68,14 @@ backlog the pure calculation is data `7` / control `1`; without backlog it is
 data `8` / control `0`. It is not wired into the scheduler and sends or
 receives nothing.
 
+Control Lane CL-3B adds real preview-only room-control transport delivery
+through a separate bounded encrypted room route. Developer Tools can bind a
+preview to an active current room session, send it, show the encrypted
+transport delivery receipt, and refresh the bounded received control inbox.
+The receipt means accepted for the peer's local inbox only. It is not preview
+acknowledgement, peer consent, or execution authority. Received transport
+events are not yet injected into CL-2 queues; that remains CL-3C.
+
 ## AI Slot Phase E1 Status
 
 - Mock advisory loop: implemented.
@@ -83,8 +91,11 @@ receives nothing.
 - CL-2 current-session local control queue simulation, priority selection,
   expiry/replay handling, local status transitions, and hypothetical budget
   display: implemented.
-- Actual room preview send and peer receive path: blocked/not implemented.
-- Room-control transport and scheduler reservation: not implemented.
+- CL-3B preview-only room-control send/receive and bounded Rust inbox:
+  implemented.
+- CL-3C transport delivery/status integration with CL-2 queues: not
+  implemented.
+- Scheduler reservation: not implemented.
 - Provider output: untrusted.
 - Execution: not implemented.
 - Peer request transport: not implemented.
@@ -100,7 +111,8 @@ The current boundary is deliberately narrow:
 - cloud calls use a strict whitelisted synthetic context;
 - no real room-state context;
 - no capability transport;
-- no room-control event send/receive or scheduler reservation;
+- preview-only room-control send/receive exists, but scheduler reservation does
+  not;
 - no persistence or runtime dispatch from the local control queue simulation;
 - no sent peer request, peer receive path, or peer execution;
 - local confirmation only, with no action dispatch;
@@ -115,10 +127,8 @@ The preview is informational only:
 
 - **Advisory only - no action is executed.**
 - **Local confirmation only - no action is executed.**
-- **Outbound preview only - no request was sent.**
-- **No peer received this request.**
-- **No peer request is sent in Phase E1.**
-- **Transport unavailable in this build.**
+- **Transport delivery is not peer consent.**
+- **Scheduler reservation is not active.**
 - **Inbound preview only - this cannot execute.**
 - **Acknowledging preview is not execution consent.**
 - **Local control queue simulation only - no room event is sent.**

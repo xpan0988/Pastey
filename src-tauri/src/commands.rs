@@ -1,6 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use serde::Serialize;
+use serde_json::Value;
 use tauri::{AppHandle, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
@@ -13,6 +14,9 @@ use crate::{
     error::{AppError, AppResult},
     link_benchmark, logging,
     models::{AppConfig, JoinRequestPrompt, LocalRole, NearbyDevice, RoomInfo, RoomItem},
+    room_control::{
+        ReceivedRoomControlEvent, RoomControlDeliveryReceipt, RoomControlSessionContext,
+    },
     storage, transfer, AppState,
 };
 
@@ -416,6 +420,38 @@ pub async fn send_file_to_room(
         storage::room_item_to_info(&state.paths, &master_key, stored)
     })
     .await
+}
+
+#[tauri::command]
+pub async fn send_room_control_event(
+    room_id: String,
+    event: Value,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomControlDeliveryReceipt, String> {
+    run_async(crate::room_control::send_room_control_event(
+        state.inner().clone(),
+        &room_id,
+        event,
+    ))
+    .await
+}
+
+#[tauri::command]
+pub fn get_room_control_session_context(
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomControlSessionContext, String> {
+    crate::room_control::room_control_session_context(&state, &room_id)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn list_received_room_control_events(
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<ReceivedRoomControlEvent>, String> {
+    crate::room_control::list_received_room_control_events(&state, &room_id)
+        .map_err(|error| error.message())
 }
 
 #[tauri::command]
@@ -932,10 +968,7 @@ mod tests {
     fn frontend_diagnostic_log_accepts_known_prefixes() {
         let line = "[pastey:micro-group] event=planned room_id=room group_id=group children=2 requested_window=1";
 
-        assert_eq!(
-            normalize_frontend_diagnostic_line(line).unwrap(),
-            line
-        );
+        assert_eq!(normalize_frontend_diagnostic_line(line).unwrap(), line);
     }
 
     #[test]

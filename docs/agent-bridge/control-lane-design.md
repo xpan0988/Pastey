@@ -437,12 +437,30 @@ persist queue state, reserve a scheduler window, mutate transfer or
 MicroFlowGroup behavior, or produce stdout, stderr, exit codes, or runtime
 results.
 
-### Stage CL-3: Safe Room-Control Transport - Future
+### Stage CL-3A: Room-Control Transport Design and Feasibility
 
-Introduce a typed, bounded room-control event path. Do not use user text,
-legacy room-item, file-transfer, or MicroFlowGroup paths. Allow preview-only
-events initially. Add explicit authentication, replay handling, rate limits,
-and UI visibility.
+Complete in `docs/agent-bridge/room-control-transport-design.md`. The
+repository-grounded recommendation is one separate bounded
+`POST /rooms/:room_id/control-events` route carrying a domain-separated
+encrypted current-session control envelope. Existing room HTTP requests are
+plain HTTP, so the future route must not assume that the connection itself is
+authenticated or encrypted. CL-3A changes no runtime behavior.
+
+### Stage CL-3B: Minimal Preview-Only Room-Control Transport
+
+Implemented for the five preview event kinds through the separate bounded
+`POST /rooms/:room_id/control-events` route. It uses current-session
+peer-key/source/target binding, control-specific domain-separated key wrapping,
+encrypted delivery receipts, bounded in-memory inbox/replay/rate state, narrow
+Tauri wrappers, and sanitized Developer Tools visibility. It has no automatic
+retry and does not use user text, legacy room-item, file-transfer, or
+MicroFlowGroup paths.
+
+### Stage CL-3C: Delivery/Status Integration With Local Control Queues - Future
+
+Connect transport acceptance and delivery state to CL-2 inbound/outbound
+control queues. Keep transport delivery receipt separate from
+`capability_preview_ack`, peer consent, and execution authorization.
 
 ### Stage CL-4: Scheduler Reservation - Future
 
@@ -454,12 +472,16 @@ ninth lane or make the binary-v1 hot path responsible for control scheduling.
 MicroFlowGroup does not change except that it plans within available data
 windows.
 
-### Stage CL-5: Future Capability Request/Result
+### Stage CL-5: Peer PolicyGate and Explicit Consent - Future
 
-Consider bounded request/result events only after peer PolicyGate, consent,
-identity/session binding, and restricted executor boundaries exist. This stage
-must still reject raw shell, arbitrary code, file bytes, unbounded output, and
-hidden transfer.
+Design and implement peer-side policy and explicit one-time consent. Trusted
+room membership and preview acknowledgement remain insufficient.
+
+### Stage CL-6: Bounded Hello Peer Executor - Future
+
+Only after CL-5, consider the separately reviewed fixed-template bounded Hello
+Peer executor. This stage must still reject raw shell, arbitrary code, file
+bytes, unbounded output, and hidden transfer.
 
 ## 13. Open Questions
 
@@ -468,7 +490,8 @@ hidden transfer.
   expectations?
 - Should control events appear in normal room history or a separate control
   panel?
-- What is the exact room-control transport mechanism?
+- Does CL-3B approve the recommended bounded encrypted room HTTP endpoint, or
+  require a stronger room-identity redesign first?
 - Is binary-v2 eventually required for clean control frames?
 - How are peer identity and current session bound?
 - What payload byte caps are acceptable for each event kind?

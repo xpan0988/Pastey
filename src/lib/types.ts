@@ -25,6 +25,32 @@ export interface RoomInfo {
   peer_burned_at?: number | null;
 }
 
+export interface RoomControlSessionContext {
+  roomId: string;
+  localSessionRef: string;
+  peerSessionRef: string;
+  peerConnected: boolean;
+}
+
+export interface RoomControlDeliveryReceipt {
+  schemaVersion: "pastey-room-control-delivery/v1";
+  eventId: string;
+  acceptedForLocalInbox: true;
+  receivedAt: string;
+}
+
+export interface ReceivedRoomControlEvent {
+  eventId: string;
+  kind: string;
+  roomRef: string;
+  sourceDeviceRef: string;
+  targetPeerRef: string;
+  createdAt: string;
+  expiresAt: string;
+  receivedAt: string;
+  event: unknown;
+}
+
 export interface NearbyDevice {
   device_id: string;
   display_name: string;
