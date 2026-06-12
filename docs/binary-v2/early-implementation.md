@@ -37,7 +37,7 @@ Current implemented behavior:
 - Active outgoing binary-v1 sender transfers have a sender-only runtime window handle that can be updated by a structured command while the transfer is running.
 - Planner-managed queued file-like transfers trigger completion-only active-window rebalance after a queue item reaches a terminal state.
 - `npm run tauri:dev-fast` is available for faster local transfer-throughput testing.
-- `scripts/replay-transfer-planner-scenarios.mjs` provides Tauri-free planner replay for fixed-vs-dynamic-shadow MicroFlowGroup diagnostics. It is algorithm validation only.
+- `scripts/replay-transfer-planner-scenarios.mjs` provides Tauri-free planner replay for fixed-versus-dynamic live MicroFlowGroup policy comparison. It is algorithm validation only.
 - `scripts/generate-transfer-fixtures.mjs` creates deterministic local file clusters from source-controlled manifests under `tests/fixtures/transfer-corpus/manifests/` for real app smoke tests. Generated payload files are local-only and ignored under `.generated/transfer-fixtures/` by default.
 - Developer-only `PASTEY_APP_DATA_DIR` and `PASTEY_PROFILE` support single-machine dual-instance lifecycle smoke with isolated local app data and distinct profile labels.
 
@@ -63,7 +63,7 @@ Current invariants:
 - A `MicroFlowGroup` consumes exactly one requested window in the current implementation.
 - Children inside a `MicroFlowGroup` do not independently consume planner windows while grouped.
 - A group requires at least two eligible children. Each child must be a queued, metadata-ready, non-cancelled file-like item in an active room, no larger than `maxChildSizeBytes`, assigned to the small-file lane, and in the same room/lane/size-class/broad-MIME grouping key.
-- Planner diagnostics may report dynamic-shadow capacity fields such as `one_window_quantum_bytes`, `dynamic_child_cap_bytes`, and `dynamic_group_cap_bytes`, but current runtime dispatch still uses the fixed serial MicroFlowGroup policy.
+- The current scheduler supports selectable live fixed and dynamic serial MicroFlowGroup policies. Planner diagnostics report the actual live mode plus capacity and fixed/dynamic candidate comparison fields.
 - Internal group status is tracked as `queued`, `running`, `completed`, `completed_with_errors`, `cancelled`, or `interrupted`.
 - Grouping does not change child file metadata, payload encryption, binary-v1 frame behavior, ACK behavior, finalize behavior, cancel/burn behavior, or Inbox behavior.
 - Grouping does not alter file contents at the transport layer.
@@ -155,12 +155,12 @@ Remaining Phase 4 limits:
 
 Planner replay, generated fixture smoke, single-machine dual-instance smoke, and two-machine LAN validation answer different questions:
 
-- Planner replay (`rtk node scripts/replay-transfer-planner-scenarios.mjs`) validates algorithm strategy, fixed MicroFlowGroup behavior, and dynamic-shadow diagnostics without Tauri, files, a receiver, network, or a room server. It is the best fixed-vs-dynamic-shadow comparison path. Dynamic shadow is diagnostic only and does not enable dynamic live MicroFlowGroup runtime behavior.
+- Planner replay (`rtk node scripts/replay-transfer-planner-scenarios.mjs`) validates algorithm strategy and compares fixed and dynamic live MicroFlowGroup policies without Tauri, files, a receiver, network, or a room server.
 - Transfer fixture generation (`rtk node scripts/generate-transfer-fixtures.mjs <scenario>`) creates deterministic local files for real Pastey smoke tests. The manifests under `tests/fixtures/transfer-corpus/manifests/` are source-controlled definitions only. Drag generated payload folders under `.generated/transfer-fixtures/<scenario-name>/`, not the manifest directory. Generated payloads are local-only, ignored by git, and not bundled into release installers.
 - Single-machine dual-instance smoke validates local lifecycle and logging behavior with isolated app data roots and local HTTP room transfer paths. It can validate room join, send/receive lifecycle, planner logs, MicroFlowGroup logs, runtime-window logs, and cancel/burn/interruption evidence when applicable. It is useful when two physical machines are unavailable, but same-machine throughput is not representative.
 - Two-machine LAN release-build runs remain required for production transfer-throughput, cross-device behavior, Wi-Fi/Ethernet behavior, OS differences, release artifact behavior, and final UX validation.
 
-Dual-instance smoke uses `PASTEY_APP_DATA_DIR` to keep SQLite DB, config, payloads, temp files, Inbox, and logs separate per instance. `PASTEY_PROFILE` gives a readable local identity fallback, and `PASTEY_DEVICE_NAME` can override the displayed device name. `PASTEY_PROFILE=sender` and `PASTEY_PROFILE=receiver` are labels only; they do not determine transfer direction. The actual sender is whichever instance drags/sends files, and the actual sender log is the one containing `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]`. The receiver log may contain receive/finalize/Inbox evidence, but dynamic-shadow planner evidence is sender-side.
+Dual-instance smoke uses `PASTEY_APP_DATA_DIR` to keep SQLite DB, config, payloads, temp files, Inbox, and logs separate per instance. `PASTEY_PROFILE` gives a readable local identity fallback, and `PASTEY_DEVICE_NAME` can override the displayed device name. `PASTEY_PROFILE=sender` and `PASTEY_PROFILE=receiver` are labels only; they do not determine transfer direction. The actual sender is whichever instance drags/sends files, and the actual sender log is the one containing `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]`. The receiver log may contain receive/finalize/Inbox evidence, but live planner evidence is sender-side.
 
 Use one Vite server plus two direct Cargo launches from `src-tauri`; do not run `npm run tauri:dev-fast` twice from the same checkout because both attempts start Vite and collide on port `1420`. Room HTTP servers use dynamic ports; discovery uses a reusable UDP socket for local dual-instance smoke.
 
@@ -179,7 +179,7 @@ cd /Users/xiyuanpan/Pastey/src-tauri
 PASTEY_PROFILE=receiver PASTEY_APP_DATA_DIR=/tmp/pastey-receiver cargo run --profile dev-fast --no-default-features --color always --
 ```
 
-If MicroFlowGroup lifecycle appears but child display names are manifest JSON files such as `mixed-chaos-recent-log-shape.json`, that smoke validates tiny-file fixed MicroFlowGroup logging only. It does not validate generated fixture payloads or dynamic-shadow behavior.
+If MicroFlowGroup lifecycle appears but child display names are manifest JSON files such as `mixed-chaos-recent-log-shape.json`, that smoke validates transfers of those manifest files only. It does not validate generated fixture payloads or the intended fixed/dynamic workload comparison.
 
 Phase 4A smoke validation:
 

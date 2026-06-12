@@ -37,11 +37,31 @@ The project intentionally prioritizes:
 
 Current releases focus on stabilizing the transport, lifecycle, and cross-platform foundation before larger multi-device workflow features are introduced.
 
+The current AI Slot is an optional Developer Tools advisory preview. It supports
+a deterministic mock route and an experimental OpenAI-compatible cloud route
+against synthetic redacted context. Accepted Hello Peer proposals can enter a
+visible local pending-confirmation state, but confirmation is local only.
+Phase E0 can build and validate a `preview_only` Hello Peer request object, but
+it is not sent and no peer receives it. Phase E1 can wrap the request in a
+validated capability-preview envelope and simulate an inbound
+acknowledge/deny preview locally. Control Lane CL-1 also defines type-only
+preview/status `RoomControlEvent` wrappers, validators, current-session
+duplicate helpers, and a pure unwired `8/0` or `7/1` capacity feasibility
+helper. CL-2 adds a local-only outbound/inbound control queue simulation with
+priority, replay/expiry handling, local status transitions, next-item
+selection, and hypothetical `8/0` or `7/1` budget display. It sends and
+receives nothing and is not wired into the scheduler. Actual room transport and
+scheduler reservation remain blocked because ordinary room text is not a
+capability-preview channel. Provider output is untrusted and no action,
+capability transport, peer execution consent, or peer execution exists.
+
 ## Device diagnostics
 
-Pastey diagnostics are lightweight, local-first, and capability-oriented. They are intended to help future trusted-device routing decisions, not to rank hardware or stress-test a machine.
+Pastey diagnostics are lightweight, local-first, and capability-oriented. The Developer Tools section presents current-session informational snapshots and advisory checks; it does not keep long-term benchmark history.
 
 Diagnostics may summarize the local device profile, a small whitelist of useful runtimes, GPU acceleration availability, and discard-only link benchmark results between trusted devices. They do not run disk stress tests, upload data to a cloud service, scan the whole system, store benchmark payloads, or keep a system-wide software inventory.
+
+The capability probe computes internal `recommended_roles` hints, but Device Diagnostics does not display them as user role recommendations and they do not grant authority. The transfer scheduler does not consume device profiles, capabilities, role hints, or link benchmark results to change planner windows, MicroFlowGroup mode or grouping eligibility, or routing.
 
 Loopback benchmarks are local baselines. They use localhost and stay on the same device, so they do not measure Wi-Fi, Ethernet, router, ISP, school network, or internet speed. Loopback raw memory measures local memory/socket overhead; loopback Pastey pipeline adds Pastey's encryption and binary framing overhead while still discarding payloads in memory.
 
