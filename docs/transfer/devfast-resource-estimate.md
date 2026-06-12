@@ -218,6 +218,6 @@ Linux is feasible in principle but still needs:
 
 - This report does not implement binary-v2.
 - This report does not implement multiplexing.
-- This report does not enable dynamic live MicroFlowGroup.
+- This report does not change the selected live MicroFlowGroup mode or scheduler behavior.
 - This report does not implement adaptive retry/timeout window control.
 - This report does not claim production Linux support.

@@ -4,9 +4,10 @@ Detailed update and release history for Pastey.
 
 ## Unreleased
 
-- Added selectable live MicroFlowGroup modes: Release 2.0 defaults to dynamic contention-aware one-window grouping, while fixed mode preserves the legacy threshold baseline. The persisted Developer Tools setting hot-switches future planner cycles only.
+- Added selectable live MicroFlowGroup modes: dynamic contention-aware one-window grouping is the default, while fixed mode preserves the legacy threshold baseline. The persisted Developer Tools setting hot-switches future planner cycles only.
 - Retired dynamic shadow as an active mode and updated persistent planner diagnostics and replay output to report the actual live mode, live group counts, dynamic capacity clamps, and fixed/dynamic candidate comparisons.
 - Kept MicroFlowGroup execution frontend-owned and serial through the existing single-file path; no protocol, binary-v1, Rust transfer hot path, receiver, ACK/finalize/cancel/burn, Inbox, encryption, JSON fallback, binary-v2, multiplexing, or adaptive runtime-window behavior changed.
+- Clarified that Device Diagnostics is current-session, informational, and advisory-only: profile/capability snapshots and latest benchmark results are kept in memory rather than as long-term benchmark history, internal `recommended_roles` hints are not shown as automatic user recommendations, and the scheduler does not consume diagnostics to change windows, MicroFlowGroup mode or eligibility, or routing.
 - Added a static Astro + TypeScript + Tailwind product website under `site/`, with English and Simplified Chinese routes, canonical/hreflang metadata, Cloudflare Pages configuration, and canonical latest/all GitHub Release links.
 - Refined the desktop landing page into an eight-slide horizontal product presentation with fixed navigation, wheel/trackpad and keyboard cooldowns, direct hash/progress navigation, staged slide-entry reveals, and a vertical mobile fallback.
 - Synchronized repository website, download, deployment, product-positioning, format-agnostic binary transfer, and qualified LAN-validation documentation.
@@ -55,7 +56,7 @@ Detailed update and release history for Pastey.
 - Clarified diagnostics semantics in the UI and README: loopback tests stay on the same device, peer tests measure LAN behavior, and only real transfers represent end-user file transfer speed.
 - Refined diagnostics display to show concrete CPU, GPU, and runtime facts instead of internal routing role hints.
 - Improved macOS and Windows device name, CPU, and GPU detection while avoiding serial numbers, MAC addresses, arbitrary commands, cloud upload, disk stress tests, and system-wide software inventory.
-- Kept `recommended_roles` in backend data for future routing while hiding those internal hints from the main diagnostics card.
+- Kept heuristically computed `recommended_roles` in backend data as internal advisory hints while hiding them from the main diagnostics card and leaving them disconnected from automatic routing or scheduler decisions.
 - Added serialization, compatibility, parsing, benchmark discard, and diagnostics quality-label tests.
 
 ## 1.5.4 — Engineering cleanup and transport consolidation

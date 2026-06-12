@@ -1326,6 +1326,123 @@ label {
   flex-wrap: wrap;
 }
 
+.ai-slot-preview {
+  width: 100%;
+}
+
+.ai-slot-advisory-notice {
+  display: grid;
+  gap: 5px;
+  padding: 12px 14px;
+  border: 1px solid rgba(31, 111, 255, 0.18);
+  border-radius: 8px;
+  background: rgba(237, 245, 255, 0.58);
+  color: var(--muted);
+}
+
+.ai-slot-advisory-notice strong {
+  color: var(--text);
+}
+
+.ai-slot-plan-copy,
+.ai-slot-preview-messages {
+  display: grid;
+  gap: 6px;
+}
+
+.ai-slot-plan-copy p,
+.ai-slot-preview-messages p {
+  margin: 0;
+}
+
+.ai-slot-preview-messages ul {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 20px;
+  color: var(--muted);
+}
+
+.ai-slot-provider-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 10px;
+}
+
+.ai-slot-provider-controls label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.ai-slot-provider-controls input,
+.ai-slot-provider-controls select {
+  width: 100%;
+}
+
+.ai-slot-pending-card {
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+  border: 1px solid rgba(31, 111, 255, 0.2);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.ai-slot-pending-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ai-slot-pending-header p {
+  margin: 4px 0 0;
+}
+
+.ai-slot-pending-status {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(31, 111, 255, 0.1);
+  color: var(--accent);
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.ai-slot-pending-status.cancelled,
+.ai-slot-pending-status.expired {
+  background: rgba(210, 54, 54, 0.1);
+  color: #a83232;
+}
+
+.ai-slot-canonical-payload {
+  display: grid;
+  gap: 6px;
+}
+
+.ai-slot-canonical-payload pre {
+  max-height: 220px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  border-radius: 8px;
+  background: rgba(12, 20, 34, 0.06);
+  color: var(--text);
+  font-size: 0.78rem;
+}
+
+.ai-slot-local-result {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+}
+
+.ai-slot-local-result strong {
+  color: var(--text);
+}
+
 .local-note-card {
   display: flex;
   align-items: center;

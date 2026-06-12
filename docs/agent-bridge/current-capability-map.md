@@ -1,0 +1,81 @@
+# Current Capability Map
+
+This map identifies current Pastey features that a future optional AI layer
+could safely summarize or use as the destination of a user-confirmed
+suggestion. It does not grant AI direct access to the listed functions.
+
+The current AI Slot Phase E1 preview uses synthetic state only. It does not read
+the current capabilities mapped below.
+
+First-phase access labels:
+
+- **Read summary only**: receive a minimized derived summary, never raw internal
+  state or secrets.
+- **Propose action**: return an advisory `AiActionPlan`.
+- **User confirmation**: any later execution must be confirmed and routed
+  through existing UI/action paths.
+- **Forbidden**: the AI Slot must not invoke or mutate this behavior in the
+  first phase.
+
+## Room, Peer, And Item State
+
+| Capability | Current implementation | Current boundary | First-phase AI use |
+| --- | --- | --- | --- |
+| Create room | `src/pages/RoomsPage.tsx::handleCreateRoom`; `src/lib/tauri.ts::createRoom`; `src-tauri/src/commands.rs::create_room`; `storage::create_room`; `transfer::start_room_server` | Creates local room state and starts its room server. | Read room-presence summary only after creation. Creating rooms is forbidden. |
+| Join by code | `src/pages/DevicesPage.tsx::handleJoinRoom`; `src/lib/tauri.ts::joinRoom`; `commands::join_room`; `discovery::discover_room`; `transfer::announce_join`; `storage::update_room_peer` | Discovers a room, creates local joined state, starts the local room server, announces the join, and records the peer. | Read joined-room/peer summary only. Joining rooms is forbidden. |
+| Nearby join | `DevicesPage.tsx`; `src/lib/tauri.ts::{requestNearbyJoin,acceptNearbyJoin}`; `commands::{request_nearby_join,accept_nearby_join}`; `discovery.rs` | Existing approval-oriented nearby join path. | Read summary only. Requesting or accepting joins is forbidden. |
+| Active room and peer state | `src/App.tsx` state `rooms`, `currentRoom`, and `roomItems`; `App.tsx::{openRoom,refreshRooms,refreshCurrentRoom}`; `src/lib/types.ts::RoomInfo`; `src-tauri/src/models.rs::{RoomInfo,StoredRoom}`; `AppState::active_servers`; `ActiveRoomServer` | `RoomInfo` exposes status, local role, peer display name, connection state, and burn timestamps. Backend stored state also contains sensitive host, port, room-code, and transport-key material that must not enter AI context. | Read a redacted room/peer summary; propose `summarize_room_state`. Direct room mutation is forbidden. |
+| Leave/disconnect cleanup | `src-tauri/src/commands.rs::leave_room`; `transfer::{cancel_room_transfers,notify_room_leave,stop_room_server}`; `storage::leave_room` | Explicitly an internal legacy disconnect cleanup, not the user-facing terminal lifecycle action. | Forbidden. |
+| Burn room | `RoomPage.tsx::handleBurnRoom`; `App.tsx::handleBurnRoom`; `src/lib/tauri.ts::burnRoom`; `commands::burn_room`; `storage::burn_room`; transfer cancellation and room-server shutdown helpers | Burn is the product-level terminal action. It clears queued work, cancels or interrupts active work, and preserves finalized Inbox output. | Read burned/active status summary only. Proposing or executing burn is forbidden. |
+| Room items | `src/lib/types.ts::RoomItem`; `src-tauri/src/models.rs::{RoomItem,StoredRoomItem}`; `commands::list_room_items`; `storage::{list_room_items,room_item_to_info}` | Room items expose user-visible status and errors. Stored items include encrypted payload metadata and key material that must not enter AI context. | Read a count/status summary only. Full item history, text history, saved paths, encrypted paths, and keys are forbidden. |
+
+## Text And File Transfer
+
+| Capability | Current implementation | Current boundary | First-phase AI use |
+| --- | --- | --- | --- |
+| Text send | `RoomPage.tsx::handleSendText`; `src/lib/tauri.ts::sendTextToRoom`; `commands::send_text_to_room`; `storage::create_outgoing_text_item`; `transfer::send_room_item` | Text sends immediately and stays outside the file queue and weighted planner. | Propose `draft_text_message`; later user confirmation must place the draft in the existing composer/send path. Direct send is forbidden. |
+| File input and queue entry | `RoomPage.tsx::{handlePickFile,handleComposerPaste}` and webview drag/drop handling; `App.tsx::{enqueueRoomFiles,enqueueRoomTransferInputs}`; `transferScheduler::enqueueTransferBatch` | File picker, dropped paths, and pasted-image temp files become frontend queue items. | Read selected-file metadata and queue summaries. Propose `suggest_transfer`; later confirmation must use existing selection/queue UI. Direct path access or hidden queue insertion is forbidden. |
+| Queue item model | `src/lib/transferScheduler.ts::{TransferQueueInput,TransferQueueItem,TransferQueueBatch,TransferSchedulerState,RoomTransferQueueView,TransferQueueSummary}` | Frontend-only in-memory outbound file queue with metadata, status, cancellation, dedupe, and correlation state. It currently stores absolute local paths internally. | Read a path-free queue summary; propose `suggest_retry` or `suggest_transfer`; confirmation required. Raw queue objects and paths are forbidden. |
+| Planned single-file send | `App.tsx::processTransferQueueItem`; `src/lib/tauri.ts::sendFileToRoom`; `commands::send_file_to_room`; `storage::create_outgoing_file_item_with_metadata`; `transfer::send_room_file` | Authoritative single-file path. Optional `queueItemId` is correlation metadata; optional `requestedWindow` is sender-side tuning input. | Future confirmed transfer must reuse this path through existing UI orchestration. Direct invocation by a provider is forbidden. |
+| Binary-v1 boundary | `transfer.rs::{send_room_file,send_binary_chunks_pipelined}`; `CHUNK_PROTOCOL_BINARY_V1`; `CHUNK_PROTOCOL_JSON_V1`; `FileTransferStartRequest::preferred_chunk_protocol`; current ACK/finalize/cancel/burn handlers | Sender prefers binary-v1 and may fall back to JSON v1. Runtime-window mutation applies only to supported active outgoing binary-v1 sender transfers. | Read a coarse protocol/status summary only when useful for explanation. Protocol selection, frames, ACK, finalize, retry, cancel, burn, and fallback behavior are forbidden. |
+| Transfer progress/status/errors | `src/lib/types.ts::{FileTransferProgressEvent,TransferStatus,RoomItemStatus}`; `src/lib/transferState.ts::{mergeTransferEvent,isTerminalTransferStatus}`; `src/lib/transferScheduler.ts` queue terminal state helpers; `RoomPage.tsx` transfer and queue rendering; Rust transfer terminal/error mapping | Progress events carry current/average speed, ETA, status, and optional error message. Terminal guards prevent late events from reviving completed work. | Read a minimized current status/error summary; propose `explain_status`, `explain_transfer_failure`, or `suggest_retry`. Retry requires confirmation. Direct status mutation, cancellation, or retry is forbidden. |
+
+## Scheduler, Planner, And MicroFlowGroup
+
+| Capability | Current implementation | Current boundary | First-phase AI use |
+| --- | --- | --- | --- |
+| Weighted planner | `src/lib/transferPlanner.ts::{TransferPlannerTask,TransferPlannerPolicy,TransferPlannerResult,planWeightedTransfers}`; `DEFAULT_TRANSFER_PLANNER_POLICY` | Pure frontend planner for queued file-like work. `text`, `control`, `agent`, and `command` exist only as model-level task-kind names and have no dispatch path. | Read a coarse planner summary and explain status. Creating agent/control/command work or changing policy is forbidden. |
+| Queue-to-planner adapter | `transferScheduler::{planRunnableTransferLaunches,planActiveTransferWindowRebalances}`; `App.tsx` planner effects | Converts frontend queue state and room availability into runnable, held, active, and group plans. `App.tsx` owns dispatch. | Read summary only. Planner invocation or dispatch control by AI is forbidden. |
+| `requestedWindow` | `TransferQueueItem.requestedWindow`; planner plan types; `SendFileOptions.requestedWindow`; `commands::send_file_to_room(requested_window)`; `transfer_tuning.rs`; `transfer::current_transfer_tuning` | Sender-side tuning input with env and effective Developer Tools overrides taking precedence. | Read summarized current/effective mode only. Proposing or changing windows is forbidden. |
+| Runtime-window update | `src/lib/tauri.ts::updateTransferWindow`; `commands::update_transfer_window`; `transfer::{update_transfer_window,update_active_transfer_window}`; `App.tsx::rebalanceActiveTransferWindows` | Existing completion-triggered, sender-only update for supported active outgoing binary-v1 transfers. | Read summary only. Proposing or changing runtime windows is forbidden. |
+| MicroFlowGroup model and lifecycle | `transferPlanner::{MicroFlowGroupMode,MicroFlowGroupPlan}`; `transferScheduler::{MicroFlowGroupRuntimeState,MicroFlowGroupStatus,markMicroFlowGroupQueued,markMicroFlowGroupRunning,recordMicroFlowGroupChildTerminal,completeMicroFlowGroupFromChildren,finishMicroFlowGroup}` | Scheduler/resource abstraction only. It is not a bundle, protocol object, room item, remote execution object, or permission grant. | Read summary and propose `explain_microflowgroup_mode`. Changing mode, grouping, or lifecycle is forbidden. |
+| Fixed/dynamic mode | `AppConfig.micro_flow_group_mode`; `src-tauri/src/models.rs::default_micro_flow_group_mode`; `config.rs::normalize_micro_flow_group_mode`; `SettingsPage.tsx::saveMicroFlowGroupMode`; `App.tsx::microGroupPlannerPolicy` | Persisted default is `dynamic`; `fixed` is an available fallback/debug mode. A mode change affects the next planner cycle. | Explain current mode only. Changing mode automatically or proposing a mode change is forbidden. |
+| Serial group dispatch | `App.tsx::processMicroFlowGroup` calling `processTransferQueueItem` for each child | Grouped children still use the normal single-file path one at a time. | Read summary only. Dispatch control is forbidden. |
+
+## Device Diagnostics, Logging, And Developer Tools
+
+| Capability | Current implementation | Current boundary | First-phase AI use |
+| --- | --- | --- | --- |
+| `DeviceProfile` | Rust `src-tauri/src/diagnostics.rs::DeviceProfile`; `device_profile::local_device_profile_with_mode`; `commands::get_device_profile`; frontend mirror and `getDeviceProfile` | Current-session cached profile snapshot. It includes device and hardware details that require minimization. | Read a redacted diagnostics summary and propose `summarize_diagnostics`. Raw identifiers and unnecessary hardware detail are forbidden. |
+| `DeviceCapabilities` | Rust `diagnostics.rs::{DeviceCapabilities,RuntimeCapability,GpuAcceleration}`; `capability_probe::probe_device_capabilities_with_mode`; `commands::get_device_capabilities`; frontend mirror and `getDeviceCapabilities` | Advisory runtime/GPU capabilities and internal `recommended_roles`; not scheduler input or authority. | Read a redacted summary. Capability data may inform explanations but may not authorize actions. |
+| `LinkBenchmarkResult` | Rust and frontend `LinkBenchmarkResult`; `src/lib/tauri.ts::{runLoopbackBenchmark,runPeerLinkBenchmark,getLastBenchmarkResults}`; `commands::{run_loopback_benchmark,run_peer_link_benchmark,get_last_benchmark_results}`; `link_benchmark::{run_loopback_benchmark,run_peer_link_benchmark}` | Latest results are held in `AppState::latest_benchmark_results` for the current app session; there is no persistent benchmark history. Peer benchmark payloads are discarded in memory. | Read latest benchmark summary; propose `suggest_benchmark` or `summarize_diagnostics`. Running a benchmark requires confirmation. Persistent history is forbidden. |
+| Device Diagnostics UI | `src/pages/SettingsPage.tsx::{refreshDiagnostics,handleRunLoopbackBenchmark,loadDiagnosticsSnapshot}` and Device Diagnostics panel | Visible under Developer Tools. It loads cached/current profile, capabilities, latest benchmark, and exposes local loopback controls. Peer benchmark exists in the bridge but is not exposed by current Settings UI. | Read summarized current state. AI must not auto-run benchmarks or alter diagnostics behavior. |
+| Developer Tools settings | `SettingsPage.tsx`; `AppConfig.dev_tools_enabled`; `AppConfig.micro_flow_group_mode`; transfer-window setting; `commands::update_config` | Developer Tools exposes diagnostics, logs, transfer window, and MicroFlowGroup mode controls. | Read summary only where necessary. Changing settings is forbidden. |
+| Planner/MicroFlowGroup/runtime-window diagnostics | `App.tsx::emitPasteyDiagnostic` with `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]`; `src/lib/tauri.ts::logFrontendDiagnostic`; `commands::{log_frontend_diagnostic,normalize_frontend_diagnostic_line}` | Frontend bridge accepts only known prefixes, single-line bounded text, and rejects path-like sensitive values before `logging::write_transfer_line`. | Consume a separately built structured summary only. Raw logs and direct log-bridge access are forbidden. |
+| Transfer logs and recent error | `src-tauri/src/logging.rs::{write_transfer_line,write_error_line,latest_error_summary}`; transfer-side diagnostic/error log helpers; `commands::{open_logs_folder,copy_last_error}`; Settings Diagnostics actions | Rotated local logs may contain private operational detail. `copy_last_error` exposes a bounded recent error summary to the user. | Read current error/status summary only. Full/private logs, logs folder access, and log upload are forbidden. |
+| AI Slot advisory, confirmation, request/envelope, and local inbound preview | `src/lib/ai::{MockProvider,CloudOpenAICompatibleProvider,buildMockAiContextSnapshot,buildCloudSafeAiContextSnapshot,validateAiActionPlan,evaluateAiPolicy,createPendingAiAction,confirmPendingAiAction,buildHelloPeerRequestFromPendingAction,validateHelloPeerRequest,buildCapabilityRequestPreviewEnvelope,validateCapabilityRequestPreviewEnvelope,checkAndRecordCapabilityPreview}`; `src/components/AiSlotPreview.tsx`; `tests/aiSlot.test.ts` | Developer Tools can build validated request/envelope previews, detect current-session duplicates, and simulate inbound acknowledge/deny locally. Actual room send is blocked because ordinary text items are not capability-preview transport. | Preview only. No Tauri command, room message, sent peer request, peer receive path, capability transport, transfer, benchmark, scheduler mutation, runtime output, or execution. |
+| CL-1 type-only room-control events | `src/lib/agentBridge::{RoomControlEvent,buildCapabilityPreviewControlEvent,buildCapabilityPreviewStatusControlEvent,validateRoomControlEvent,checkAndRecordRoomControlEvent,computeControlLaneBudget}`; `tests/roomControlEvent.test.ts` | Defines closed preview-only event wrappers and current-session validation/replay helpers. `computeControlLaneBudget` purely mirrors data `8` / control `0` without backlog and data `7` / control `1` with backlog; it is not wired into the scheduler. | Type and validation foundation only. No invoke, room send/receive, transport, persistence, scheduler reservation, transfer behavior, or execution authority. |
+| CL-2 local control queue simulation | `src/lib/agentBridge::{ControlQueueState,enqueueRoomControlEvent,selectNextControlQueueItem,markControlQueueItemStatus,getControlQueueBudget}`; `src/components/AiSlotPreview.tsx`; `tests/controlQueue.test.ts` | Simulates separate current-session outbound/inbound queues, priority/FIFO selection, duplicate and expiry handling, strict local terminal transitions, and hypothetical data `8` / control `0` or data `7` / control `1` budget display. | Local simulation only. No persistence, invoke, room send/receive, room-control transport, scheduler reservation/mutation, transfer or MicroFlowGroup behavior change, runtime result, or execution authority. |
+
+## Safe Reuse Summary
+
+The reusable first-phase surface is intentionally small:
+
+- redacted summaries of current room, peer, queue, selected-file metadata,
+  scheduler/MicroFlowGroup mode, Device Diagnostics, latest benchmark, and
+  current status/error;
+- advisory explanations and suggestions;
+- later user-confirmed handoff into existing text, file, and benchmark UI
+  paths.
+
+Everything below the advisory handoff remains owned by existing Pastey code.

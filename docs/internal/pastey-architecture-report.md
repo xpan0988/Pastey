@@ -27,12 +27,12 @@ At a high level:
 - UDP discovery and nearby join requests are used to find local peers, while manual 8-digit code join remains available.
 - The current large-file transport is per-file, chunked, encrypted, LAN peer transfer. The frontend can queue multiple selected, dropped, or pasted files, and weighted planner output can start multiple existing queued file-like transfers. Eligible tiny file-like queue items may be represented as a `MicroFlowGroup`, but each child still uses the existing single-file transfer command.
 - Binary-v1 chunk frames are the preferred high-performance chunk protocol; JSON/base64 chunk upload remains a legacy fallback.
-- Device diagnostics and link benchmarks exist, but they are advisory and do not currently drive routing or transfer tuning.
+- Device diagnostics and link benchmarks exist as current-session, in-memory informational snapshots, but they are advisory and do not currently drive routing or transfer tuning.
 - A pure frontend weighted transfer planner drives runtime dispatch for existing queued file-like transfers. The planner emits ordinary runnable plans plus serial `MicroFlowGroup` plans for eligible tiny file-like work. Phase 4A completion-only rebalance can update active outgoing binary-v1 sender runtime windows after a planner-managed queue item reaches a terminal state. Diagnostics and benchmarks remain advisory and do not drive adaptive tuning.
 
 The current product model is room-based. A room is the coordination object for a transfer session. Room lifecycle is manual-burn based: Burn ends the local room state and cleans transient room data, but Inbox-saved received files are treated as durable user output.
 
-The long-term direction described in `README.md` is broader local-first device coordination and a future capability bridge. The current implementation reflects early capability signals through `DeviceProfile`, `DeviceCapabilities`, `recommended_roles`, and link benchmark DTOs, but it does not implement automatic capability routing or permission-bearing remote execution.
+The long-term direction described in `README.md` is broader local-first device coordination and a future capability bridge. The current implementation reflects early capability signals through `DeviceProfile`, `DeviceCapabilities`, heuristically computed internal `recommended_roles`, and link benchmark DTOs, but it does not present automatic user role recommendations, implement automatic capability routing, or grant permission-bearing remote execution.
 
 ## 3. Backend Module Map
 
@@ -503,6 +503,7 @@ Authority and routing status:
 - These roles are advisory metadata only.
 - They are not permissions.
 - No current transfer routing behavior uses them to choose sender, receiver, protocol, window, or post-receive action.
+- Profile/capability snapshots and latest benchmark results are held in memory for the current app session; there is no long-term benchmark history.
 - `docs/internal/room-semantics.md` explicitly treats capabilities as metadata, not authority.
 
 ## 11. Data Models and Shared DTOs

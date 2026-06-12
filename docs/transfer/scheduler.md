@@ -31,7 +31,7 @@ Current planner defaults:
 - `minRequestedWindow = 1`
 - `maxRequestedWindow = 8`
 - `safetyActiveTransferCap = 4`
-- persisted Release 2.0 `micro_flow_group_mode = "dynamic"`; invalid or missing values normalize to `dynamic`
+- persisted `micro_flow_group_mode = "dynamic"` by default; invalid or missing values normalize to `dynamic`
 - `microGroupMaxChildSizeBytes = 1 MiB`
 - `microGroupMaxGroupBytes = 4 MiB`
 - `microGroupMaxGroupItems = 32`
@@ -76,7 +76,7 @@ Fixed mode preserves the stable legacy thresholds:
 
 A single eligible tiny file remains an ordinary runnable transfer. Files above the fixed child-size limit, such as 1.1 MiB to 1.3 MiB files under the current default, are not fixed-mode MicroFlowGroup children.
 
-Dynamic mode is the Release 2.0 live one-window service policy:
+Dynamic mode is the current default live one-window service policy:
 
 - grouping occurs only under contention;
 - service cost is payload bytes plus `256 KiB` per file;
@@ -109,6 +109,8 @@ Child terminal accounting is per queue item id. A child failure does not corrupt
 Changing `MicroFlowGroup mode` in Developer Tools affects the next planner cycle only. Active ordinary transfers keep their current state except for the existing Phase 4A completion-triggered runtime-window mechanism. Active groups are not regrouped, running children are not relaunched, and grouped-child reservations continue to prevent duplicate launches.
 
 Persistent planner diagnostics identify the actual live mode with `micro_group_mode=fixed|dynamic`. Live fields include `micro_group_plans`, `micro_group_grouped_children`, `micro_group_skip_reason`, `eligible_micro_group_children`, `one_window_quantum_bytes`, `dynamic_child_cap_bytes`, and `dynamic_group_cap_bytes`. Optional comparisons use candidate names such as `fixed_candidate_children` and `dynamic_candidate_children`; dynamic shadow is no longer an active mode.
+
+Device Diagnostics is separate from planner diagnostics. The planner does not consume `DeviceProfile`, `DeviceCapabilities`, internal `recommended_roles`, or `LinkBenchmarkResult` values to select requested windows, choose or change MicroFlowGroup mode, determine grouping eligibility, rebalance runtime windows, or route transfers.
 
 ## Future Extensions
 

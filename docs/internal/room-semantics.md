@@ -164,7 +164,7 @@ Capabilities are advertised metadata, not permission grants.
 
 Execution or sensitive actions require explicit approval in future capability workflows.
 
-Diagnostics are advisory signals only.
+Diagnostics are current-session informational and advisory signals only. The current implementation keeps profile/capability snapshots and latest benchmark results in memory rather than as long-term benchmark history.
 
 ## Diagnostics and Capability Relationship
 
@@ -172,11 +172,13 @@ Diagnostics are advisory signals only.
 
 Link benchmarks estimate routing suitability.
 
-These signals MAY influence recommendations.
+The current capability probe computes internal `recommended_roles` hints from profile/capability facts. The current UI does not present those hints as automatic user role recommendations.
 
 They MUST NOT by themselves authorize file access, command execution, or agent actions.
 
 `recommended_roles` are internal hints, not permissions.
+
+The current transfer scheduler does not consume diagnostics, benchmark results, or `recommended_roles` to change planner windows, MicroFlowGroup mode, grouping eligibility, runtime-window rebalance, or routing.
 
 ## Current Implementation Notes
 
