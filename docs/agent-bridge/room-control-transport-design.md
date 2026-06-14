@@ -2,13 +2,17 @@
 
 ## 1. Status and Scope
 
-This is CL-3A: transport design and feasibility only. It does not implement a
-room-control endpoint, Tauri command, network send/receive path, scheduler
-reservation, protocol change, peer execution, or runtime.
+This document began as CL-3A transport design and feasibility. CL-3B now
+implements the bounded preview-only transport, and CL-3C connects its delivery
+receipts and non-destructive Rust inbox retrieval to the existing frontend
+`ControlQueueState`. CL-4 implements scheduler reservation, CL-5 implements
+exact one-time consent, and CL-6 carries one fixed bounded execution
+request/result pair through the same typed transport.
 
 CL-1 provides closed preview-only `RoomControlEvent` types, validation, expiry,
-current-session replay helpers, and the pure capacity helper. CL-2 provides a
-local-only inbound/outbound queue simulation. Neither is a real transport.
+current-session replay helpers, and the pure capacity helper. CL-2 provides the
+current-session inbound/outbound queue model. CL-3B provides real transport,
+and CL-3C uses that same queue model for real transport events.
 
 The smallest feasible next transport is a separate bounded room HTTP endpoint
 that carries an encrypted typed control envelope. It must not reuse ordinary
@@ -53,7 +57,9 @@ POST /rooms/:room_id/burn
 POST /rooms/:room_id/leave
 ```
 
-No room-control, capability-request, or capability-result endpoint exists.
+The separate `POST /rooms/:room_id/control-events` endpoint carries only the
+closed typed room-control event kinds. It remains separate from ordinary room
+items and file transfer.
 
 ### Encryption and Key Handling
 
@@ -182,7 +188,7 @@ must never be parsed as control traffic.
 
 | Option | Complexity | Security boundary | Encryption/session reuse | Persistence | Binary-v1 compatibility | Scheduler integration | Auditability and extension |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| A. New bounded room HTTP endpoint, `POST /rooms/:room_id/control-events` | Lowest incremental complexity. Matches the existing Axum room-server shape. | Clear route, DTO, size cap, validation, and response boundary. Must add explicit encrypted-envelope and peer-session checks because HTTP itself is plain. | Can reuse current ephemeral X25519 room-server key context with a new domain-separated control key derivation. | Separate current-session memory only. | Fully compatible; does not touch chunk protocols. | CL-3B can operate without reservation; CL-4 can later account for its backlog. | Strongly inspectable with typed request/receipt and bounded sanitized errors. |
+| A. New bounded room HTTP endpoint, `POST /rooms/:room_id/control-events` | Lowest incremental complexity. Matches the existing Axum room-server shape. | Clear route, DTO, size cap, validation, and response boundary. Must add explicit encrypted-envelope and peer-session checks because HTTP itself is plain. | Can reuse current ephemeral X25519 room-server key context with a new domain-separated control key derivation. | Separate current-session memory only. | Fully compatible; does not touch chunk protocols. | CL-3B transport remains separate; CL-4 now accounts for real local outgoing demand at the frontend scheduler boundary. | Strongly inspectable with typed request/receipt and bounded sanitized errors. |
 | B. New typed frame within an existing authenticated room connection | Not currently available as described: the repo uses independent HTTP requests, not one authenticated persistent room connection. | Could be clean only after a connection/session protocol exists. | Would require designing that connection and framing first. | Separate by design. | Risks coupling control work to current transfer framing or inventing a new connection protocol. | Could integrate later. | Good eventually, but substantially larger than CL-3B. |
 | C. Dedicated control substream/session deferred to binary-v2 | Highest near-term complexity and depends on unimplemented binary-v2 design. | Potentially strongest protocol-native separation. | Could define purpose-built session keys and frames. | Separate by design. | Does not help binary-v1 peers without another path. | Natural later integration. | Extensible, but premature for preview-only transport. |
 
@@ -291,8 +297,9 @@ This receipt means only that the peer transport validated and accepted the
 event into bounded current-session control processing. It is not
 `capability_preview_ack`, peer consent, or execution authorization.
 
-`capability_preview_ack` is a separate `RoomControlEvent` sent later by the
-peer after its preview UI state changes.
+`capability_preview_ack` is a separate `RoomControlEvent` sent later after the
+receiver user explicitly allows that exact preview once. It is not transport
+delivery, execution, completion, or reusable authority.
 
 ### Status Codes and Sanitized Errors
 
@@ -398,9 +405,12 @@ current-session preview processing. No hidden long-term replay or behavior
 history should be introduced. A persistent visible audit record is a separate
 future product/security decision.
 
-Developer Tools should show transport acceptance, rejection category, queue
-state, and final preview state without raw keys, ciphertext, secrets, or
-payload dumps.
+The active Room Agent Bridge panel shows transport acceptance, rejection
+category, queue state, and final preview state without raw keys, ciphertext,
+secrets, or payload dumps. Advanced transport details remain collapsed.
+Redacted structured lifecycle entries in `pastey.log` mirror these transitions
+for audit only and are never used to restore queue, consent, or transport
+state.
 
 ## 8. Future Inbound Processing Path
 
@@ -435,8 +445,10 @@ Likely repository ownership:
 The Rust receive boundary must validate independently. A network handler cannot
 trust that a remote sender ran the TypeScript validator.
 
-No inbound step executes a capability, launches a runtime, or creates
-stdout/stderr/exit-code output.
+The Rust receive/transport boundary never executes a capability. A later
+explicit frontend queue-processing step may pass a validated CL-6 request to
+the fixed host-owned in-process function; no runtime launch or
+stdout/stderr/exit-code output exists.
 
 ## 9. Future Outbound Processing Path
 
@@ -476,9 +488,10 @@ visible bounded transport failure.
   abstraction of that same capacity.
 - They are not independent pools.
 - The proposed control transport is not a ninth lane.
-- CL-3B may send bounded control HTTP requests before scheduler reservation is
-  active.
-- CL-4 later connects real eligible control backlog to data `7` / control `1`.
+- CL-4 now reserves from the unified sender budget before an outbound control
+  send proceeds.
+- Real queued, selected, or sending outbound control work exposes data `7` /
+  control `1`; inbound-only review state does not reserve.
 - With no eligible control backlog, the model remains data `8` / control `0`.
 - Control events never enter MicroFlowGroup.
 
@@ -506,16 +519,17 @@ as a literal physical wire.
 | Peer disconnect or burned room | Reject/abort, clear bounded current-session control state, and surface a generic terminal transport status. |
 | Timeout | Mark local transport delivery failed/unknown; do not assume peer receipt and do not automatically retry. |
 | Transport delivery succeeds, then peer denies | Keep delivery and peer denial as separate states; denial is final and does not retry/escalate. |
-| Peer sends `capability_preview_ack` | Treat it only as preview acknowledgement, never execution consent. |
+| Peer sends `capability_preview_ack` | Treat it as exact one-time receiver consent for the matching preview. Never treat it as execution, completion, durable trust, or reusable authority. |
 | Ordinary text contains control-looking JSON | Preserve as ordinary user text. Never parse text-room items as control events. |
-| Malicious peer inside a trusted room | Enforce schema, caps, rate/inbox bounds, expiry, replay checks, visible UI, and no execution authority. Trusted-room membership does not bypass validation or consent. |
+| Malicious peer inside a trusted room | Enforce schema, caps, rate/inbox bounds, expiry, replay checks, visible UI, exact consent consumption, and fixed-capability validation. Trusted-room membership does not bypass validation or consent. |
 | Forged/plain HTTP success response | Require the bounded successful receipt to prove possession of the event key; otherwise delivery is not confirmed. |
 
 ## 12. Implemented CL-3B Scope
 
-CL-3B implements only:
+The transport currently implements:
 
-- the five preview-only event kinds;
+- the five preview/status kinds plus the closed CL-6
+  `capability_execute_request` and `capability_execution_result` kinds;
 - one `POST /rooms/:room_id/control-events` route;
 - one narrowly typed outbound bridge;
 - a `96 KiB` outer request cap, existing `64 KiB` decrypted event cap, and
@@ -527,9 +541,9 @@ CL-3B implements only:
 - a maximum two-minute event lifetime, shared `64`-record current-session
   inbox cap, `256` replay-record cap, and initial burst/sustained rate limit;
 - no ordinary room-item or transfer persistence;
-- no scheduler reservation;
+- no transport-owned execution authority;
 - no automatic retry;
-- Developer Tools visibility with sanitized state only;
+- active Room visibility with sanitized state only;
 - focused Rust/TypeScript contract, crypto-envelope, replay, expiry, cap, and
   failure tests.
 
@@ -543,8 +557,9 @@ Implemented files/functions:
 | `src-tauri/src/main.rs::{AppState,invoke_handler}` | Owns bounded current-session transport state and registers narrow control commands. |
 | `src-tauri/src/commands.rs` | Adds typed send, session-context, and received-inbox commands that delegate to `room_control`; no generic endpoint caller. |
 | `src/lib/tauri.ts` | Adds validated typed send/session/inbox wrappers. |
-| `src/lib/agentBridge/roomControlTransport.ts` | Rebinds a validated preview envelope to current-session room/source/target refs and recomputes its request hash before transport. |
-| `src/components/AiSlotPreview.tsx` | Adds Developer Tools send, delivery receipt, active session, and received-inbox visibility only; no executor UI. |
+| `src/lib/agentBridge/roomControlTransport.ts` | Rebinds a validated preview envelope to current-session refs, exposes bounded send observability, and processes one selected outbound queue item through transport. |
+| `src/lib/agentBridge/controlQueue.ts` and `controlWindowRuntime.ts` | Own the current-session queue and classify only nonterminal outbound transport work as runtime capacity demand. |
+| `src/components/AiSlotPreview.tsx` | Exposes the active Room's session-level queue/inbox controls independently of outbound advisory generation. The bounded execution action/result UI remains outside chat. |
 | CL-3B tests | Focused Rust transport/crypto/validation/bounds tests and TypeScript session-binding tests. |
 
 Files and behavior that CL-3B should not modify:
@@ -556,8 +571,7 @@ Files and behavior that CL-3B should not modify:
 - `src/lib/transferScheduler.ts`, `src/lib/transferPlanner.ts`, `src/App.tsx`
   file dispatch, and MicroFlowGroup;
 - room lifecycle semantics;
-- peer execution, PolicyGate consent, capability request/result, runtime, MCP,
-  or model-provider behavior.
+- generic peer execution, MCP, or model-provider behavior.
 
 ## 13. Staging
 
@@ -569,29 +583,44 @@ Complete in this document. No runtime behavior changed.
 
 Implemented. The bounded typed endpoint, encrypted session-bound envelope,
 encrypted delivery receipt, current-session backend inbox/replay/rate bounds,
-narrow outbound bridge, and Developer Tools visibility exist. No scheduler
+narrow outbound bridge, and active Room visibility exist. No scheduler
 reservation or execution exists.
 
 ### CL-3C: Delivery/Status Integration With Local Control Queues
 
-Connect transport acceptance/delivery state to CL-2 inbound/outbound
-`ControlQueueItem` state while preserving preview acknowledgement as a separate
-peer event.
+Implemented. Outbound events enqueue before one-item priority selection and
+transport send; receipts or sanitized failures update the same queue item.
+Non-destructive Rust inbox refresh validates and deduplicates events into the
+inbound queue. Transport delivery remains separate from preview
+acknowledgement, consent, and execution.
 
 ### CL-4: Real Scheduler Reservation From the Unified Eight-Window Budget
 
-Use real eligible control backlog to expose data `7` / control `1`; release to
-data `8` / control `0` when idle. Do not change MicroFlowGroup semantics.
+Implemented. Real eligible local outgoing control demand exposes data `7` /
+control `1`; idle restores data `8` / control `0` after a `750 ms` quiet
+period. Existing active binary-v1 senders hot-adjust without restart. Inbound
+review backlog alone does not reserve, and MicroFlowGroup semantics do not
+change.
 
 ### CL-5: Peer PolicyGate and Explicit Consent
 
-Design and implement peer-side capability policy and explicit one-time consent.
-Trusted room and preview acknowledgement remain insufficient.
+Implemented. Processing an inbound `capability_preview` runs a receiver-side
+PolicyGate for the exact fixed Hello Peer capability/message and exposes only
+explicit Allow once or Deny. The decision is event/envelope/request/session
+bound, current-session-only, and expiring. Allow once queues
+`capability_preview_ack`; deny queues `capability_preview_deny`; one later
+explicit queue-processing action sends it. An ack means the receiver allowed
+that exact preview once. It is not transport delivery, execution, completion,
+or durable trust.
 
 ### CL-6: Bounded Hello Peer Executor
 
-Only after CL-5, consider the separately reviewed fixed-template bounded Hello
-Peer executor. No raw shell or arbitrary code.
+Implemented. A matched allow-once ack permits one explicit sender action to
+queue an exact execution request. The receiver revalidates the local consent
+record, consumes it once, calls only the fixed in-process Hello Peer template,
+and queues a bounded typed result for a later explicit send. No shell, process,
+file, network, generic runtime, reusable trust, arbitrary output, or automatic
+retry exists.
 
 ## 14. Feasibility Conclusion
 
@@ -599,8 +628,10 @@ A minimal preview-only room-control transport appears feasible with the current
 architecture. The safest smallest insertion is a separate bounded Axum room
 route plus a narrow outbound Tauri bridge.
 
-The design does not require binary-v2, changes to binary-v1, changes to
-MicroFlowGroup, or scheduler reservation. It does require a new
+The transport design does not require binary-v2, changes to binary-v1 format,
+or changes to MicroFlowGroup. CL-4 separately adds sender-side scheduler
+reservation without changing this route or envelope. The transport requires a
+new
 domain-separated encrypted control envelope and explicit current-session
 peer-key/source/target binding because the existing room HTTP routes are not a
 generic authenticated/encrypted channel. The current join-state trust boundary
@@ -608,5 +639,8 @@ also requires an explicit security decision before CL-3B is enabled.
 
 CL-3B now provides real preview-only transport delivery bound to the currently
 recorded joined session; it does not claim durable authenticated device
-identity. CL-3C queue integration, scheduler reservation, peer consent, and
-execution remain future stages.
+identity. CL-3C connects that transport to the existing local queue and uses
+its priority/FIFO policy. CL-4 activates sender-side reservation for outgoing
+transport demand. CL-5 adds one-time peer consent. CL-6 adds only the fixed
+bounded Hello Peer execution/result stage and does not broaden transport
+authority.

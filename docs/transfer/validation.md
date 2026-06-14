@@ -7,6 +7,7 @@ For `dev-fast` CPU, memory, disk, and Linux feasibility notes, see [devfast-reso
 ## Validation Layers
 
 - Planner replay: algorithm strategy validation. It does not launch Tauri and does not require files, a receiver, network, or a room server. It is the best local check for fixed-versus-dynamic live policy comparison.
+- Automated CL-4 contention harness: deterministic lower-boundary integration evidence for the production outgoing-control demand reducer, `8 -> 7 -> 8` planner allocations, the real Rust active binary-v1 sender runtime-window atomic/update function, and the existing room-control transport test suites. It is not a full dual-instance Tauri or real network file-transfer run.
 - Generated fixture corpus: deterministic real file clusters for app smoke tests. Source-controlled manifests live under `tests/fixtures/transfer-corpus/manifests/`; actual payload files are generated locally under `.generated/transfer-fixtures/`. Generated files are ignored by git and are not bundled into release artifacts.
 - Single-machine dual-instance smoke: local lifecycle and logging smoke when two physical machines are unavailable. It validates room join, send/receive lifecycle, planner logs, MicroFlowGroup logs, runtime-window logs, and cancel/burn/interruption evidence where applicable. It is not valid for final LAN throughput conclusions.
 - Two-machine LAN/release build: final performance and UX validation. It is required for real network throughput, cross-device behavior, Wi-Fi/Ethernet behavior, OS differences, and release artifact behavior.
@@ -20,6 +21,43 @@ rtk node scripts/replay-transfer-planner-scenarios.mjs
 Planner replay prints grep-friendly fixed and dynamic live-policy results, including group counts, grouped children, requested-window totals, held reasons, contention, and dynamic capacity clamps.
 
 Replay is algorithm evidence only. It does not validate files, Tauri startup, room join, receive/finalize, Inbox, network behavior, or release-build throughput.
+
+## Automated CL-4 Contention Harness
+
+Run the deterministic CL-4 contention harness from the repository root:
+
+```sh
+rtk node scripts/run-cl4-contention-smoke.mjs
+```
+
+The runner:
+
+- uses the production TypeScript CL-4 demand/quiet-period reducer and transfer
+  planner to measure single-transfer, multiple-transfer, burst,
+  inbound-directionality, and terminal-failure-release scenarios;
+- runs the focused Rust
+  `transfer::tests::cl4_contention_runtime_window_evidence` test against the
+  real `update_active_transfer_window` function and active binary-v1 sender
+  runtime-window atomics;
+- runs the existing TypeScript and Rust room-control transport tests;
+- creates deterministic representative fixture bytes, checks source/destination
+  SHA-256 equality, and removes the temporary files after the run;
+- writes a bounded machine-readable report to
+  `.generated/cl4-contention-report.json`.
+
+Measured assertions include combined allocations no greater than the current
+target, stable transfer IDs, monotonic reported progress, no cancellation,
+`8 -> 7 -> 8` restoration after the deterministic `750 ms` virtual quiet
+period, no burst flapping, inbound-only target `8`, and restoration after
+delivery/replay/expiry/network/validation terminal outcomes.
+
+This is the lowest existing deterministic automated boundary. It does not
+launch the Tauri GUI, invoke the frontend Tauri bridge in a live app, send file
+bytes through a room server, or prove a two-device transfer checksum. Its
+fixture checksum verifies deterministic harness-file integrity, while the Rust
+evidence verifies the real active sender runtime-window update primitive. Keep
+the single-machine dual-instance smoke below for full app lifecycle evidence
+and the two-machine LAN/release run for real network performance evidence.
 
 ## Fixture Payloads
 
@@ -113,6 +151,12 @@ done | sort -nr
 
 The log with planner/runtime-window diagnostics is the actual sender log. The receiver log may contain receive, finalize, and Inbox evidence, but live planner evidence is sender-side.
 
+Agent Bridge lifecycle entries use the `[pastey:agent-bridge]` prefix followed
+by one redacted structured JSON object. Validate transition names, shortened
+references, and bounded error codes only. These entries must not contain
+secrets or raw control payloads and must never be used to reconstruct queue,
+consent, transport, or execution state.
+
 Extract an actual-sender summary:
 
 ```sh
@@ -157,6 +201,6 @@ MicroFlowGroup lifecycle lines report `planned`, `launched`, `running`, `child_r
 
 If MicroFlowGroup lifecycle appears but children are manifest JSON files, the test only validates those manifest files, not the generated fixture corpus.
 
-A generated-payload single-machine smoke on June 10, 2026 validated the earlier fixed-live and dynamic-candidate diagnostics and helped reproduce frontend-only MicroFlowGroup final-accounting races. The accounting fixes remain covered by focused regression tests. Full generated-fixture app smoke for selectable live modes remains the next testing phase.
+A generated-payload single-machine smoke on June 10, 2026 validated the earlier fixed-live and dynamic-candidate diagnostics and helped reproduce frontend-only MicroFlowGroup final-accounting races. The accounting fixes remain covered by focused regression tests. The automated CL-4 contention harness now supplements manual smoke with deterministic allocation/runtime-update evidence; full generated-fixture app smoke for selectable live modes remains a separate testing phase.
 
 Two-machine release-build testing remains the final performance benchmark. Single-machine smoke can validate lifecycle/logging shape, but it cannot prove real LAN throughput, Wi-Fi/Ethernet behavior, cross-device OS behavior, or release artifact UX.

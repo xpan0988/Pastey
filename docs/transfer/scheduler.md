@@ -12,7 +12,7 @@ Every ordinary runnable plan still calls the existing `sendFileToRoom` frontend 
 
 The pure planner classifies nonterminal queued and active tasks, then returns deterministic runnable, active, held, lane-budget, requested-window, and debug reports.
 
-The global planner budget is a binary-v1 requested-window budget. The default `globalWindowBudget` is `8`; each selected runnable or active file-like transfer receives at least window `1`, and the sum of active plus runnable requested windows must not exceed the global budget.
+The global planner budget is the scheduler representation of the tested binary-v1 outgoing runtime capacity. The normal target is `8`. CL-4 changes the effective data target to `7` while real local outgoing room-control work is queued, selected, or sending, then restores `8` after a short quiet period. Each selected runnable or active file-like transfer receives at least window `1`, and the sum of active plus runnable requested windows must not exceed the current data target.
 
 Lane and size class metadata still matter for classification, priority, eligibility, and reports, but the current file-like requested-window split is batch-relative and size-weighted across selected transfers rather than mostly lane-budget driven. Examples:
 
@@ -20,6 +20,10 @@ Lane and size class metadata still matter for classification, priority, eligibil
 - huge plus small can receive about `7 + 1`;
 - similarly large files split the global budget fairly;
 - active transfers reserve their existing requested window before queued work starts.
+
+Several outgoing binary-v1 transfers may be active at once. The planner
+recomputes their combined allocation within the current target; CL-4 never
+assigns window `7` independently to every active transfer.
 
 The safety active-transfer cap is a guardrail, not the main strategy.
 
@@ -37,6 +41,15 @@ Current planner defaults:
 - `microGroupMaxGroupItems = 32`
 - lane weights: `control_text = 1`, `small_file = 1`, `bulk_file = 7`
 
+CL-4 runtime policy:
+
+- outgoing control transport demand: effective data target `7`;
+- inbound-only control review state: effective data target remains `8`;
+- idle restoration quiet period: `750 ms`;
+- new launches use the current target;
+- existing supported active binary-v1 senders hot-adjust through
+  `update_transfer_window` without cancellation or restart.
+
 Final sender window precedence stays:
 
 ```text
@@ -47,6 +60,14 @@ PASTEY_TRANSFER_WINDOW_SIZE env override
 ```
 
 Env and Developer Tools overrides are debugging authorities and override planner requests.
+
+Focused automated CL-4 contention evidence is available through
+`rtk node scripts/run-cl4-contention-smoke.mjs`. It measures the production
+demand/target reducer and planner allocations, then verifies the real Rust
+active binary-v1 sender runtime-window update primitive and existing
+room-control transport tests. The harness is an in-process/lower-boundary
+integration run, not a full dual-instance Tauri or network file-transfer run;
+see [validation.md](validation.md) for its exact coverage and limits.
 
 ## Live MicroFlowGroup Modes
 
@@ -106,7 +127,7 @@ Child terminal accounting is per queue item id. A child failure does not corrupt
 
 ## Hot Switching And Diagnostics
 
-Changing `MicroFlowGroup mode` in Developer Tools affects the next planner cycle only. Active ordinary transfers keep their current state except for the existing Phase 4A completion-triggered runtime-window mechanism. Active groups are not regrouped, running children are not relaunched, and grouped-child reservations continue to prevent duplicate launches.
+Changing `MicroFlowGroup mode` in Developer Tools affects the next planner cycle only. Active ordinary transfers may receive completion-triggered or CL-4 control-demand-triggered runtime-window updates. Active groups are not regrouped, running children are not relaunched, and grouped-child reservations continue to prevent duplicate launches.
 
 Persistent planner diagnostics identify the actual live mode with `micro_group_mode=fixed|dynamic`. Live fields include `micro_group_plans`, `micro_group_grouped_children`, `micro_group_skip_reason`, `eligible_micro_group_children`, `one_window_quantum_bytes`, `dynamic_child_cap_bytes`, and `dynamic_group_cap_bytes`. Optional comparisons use candidate names such as `fixed_candidate_children` and `dynamic_candidate_children`; dynamic shadow is no longer an active mode.
 
@@ -114,4 +135,4 @@ Device Diagnostics is separate from planner diagnostics. The planner does not co
 
 ## Future Extensions
 
-Deficit-mode scheduling, broader adaptive rebalance policy, speed-history heuristics, binary-v2 substreams, and command/agent/control lanes remain non-current. Future text/control/agent/command lanes may be modeled as planner concepts, but they must not be dispatched until a later implementation explicitly defines the authority model and transport path.
+Deficit-mode scheduling, broader adaptive rebalance policy, speed-history heuristics, binary-v2 substreams, and command/agent execution lanes remain non-current. The implemented control reservation is sender-side capacity policy for the separate bounded room-control transport; it is not an execution lane.

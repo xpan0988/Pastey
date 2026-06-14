@@ -898,14 +898,16 @@ export function planActiveTransferWindowRebalances(
   state: TransferSchedulerState,
   rooms: readonly Pick<RoomInfo, "id" | "status">[],
   closedRoomIds: ReadonlySet<string> = new Set(),
-  launchingItemWindows: ReadonlyMap<string, number> = new Map()
+  launchingItemWindows: ReadonlyMap<string, number> = new Map(),
+  policy: TransferPlannerPolicy = DEFAULT_TRANSFER_PLANNER_POLICY
 ): TransferWindowRebalancePlan[] {
   const { plannerResult } = planRunnableTransferLaunches(
     state,
     rooms,
     closedRoomIds,
     launchingItemWindows,
-    true
+    true,
+    policy
   );
   const roomStatusById = new Map(rooms.map((room) => [room.id, room.status]));
 

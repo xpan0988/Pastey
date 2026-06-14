@@ -165,8 +165,21 @@ The long-term direction described in `README.md` is broader local-first device c
 
 - Shows normal settings and, when `config.dev_tools_enabled` is true, developer tools.
 - Developer tools expose Transfer Window controls, diagnostics profile/capability display, loopback benchmark controls, logs, error copy, and update check.
+- Agent Bridge Settings owns configuration only: enablement, runtime-memory
+  provider/base URL/model/API key values, lifecycle log level, log clearing,
+  and a concise safety summary.
 - Inbox location picker uses `open({ directory: true, multiple: false })`; this is settings configuration, not transfer selection.
 - The page calls `getDeviceProfile`, `getDeviceCapabilities`, `getLastBenchmarkResults`, `runLoopbackBenchmark`, and `updateConfig`.
+
+`src/pages/RoomPage.tsx` and `src/components/AiSlotPreview.tsx`
+
+- The active Room owns the current-session Agent Bridge workflow for its exact
+  room/session/peer context.
+- Room-scoped state is cleared on room/session/peer identity change and is
+  never reconstructed from logs.
+- `src/lib/agentBridge/logging.ts` mirrors allowlisted lifecycle transitions
+  through the existing bounded `pastey.log` path with shortened references;
+  logs are not authority, consent, trust, or workflow state.
 
 `src/pages/DevicesPage.tsx`
 

@@ -13,11 +13,21 @@ export type ControlQueueDirection = "outbound" | "inbound";
 export type ControlQueueItemStatus =
   | "queued"
   | "selected"
+  | "transport_sending"
+  | "transport_delivered"
+  | "transport_rejected"
+  | "awaiting_peer_decision"
+  | "allowed_once"
   | "acknowledged_preview_only"
   | "denied"
   | "invalid"
   | "expired"
-  | "duplicate";
+  | "duplicate"
+  | "execution_consumed"
+  | "execution_succeeded"
+  | "execution_rejected"
+  | "execution_failed"
+  | "already_consumed";
 
 export interface ControlQueueItem {
   queueId: string;
@@ -28,6 +38,8 @@ export interface ControlQueueItem {
   lastUpdatedAt: string;
   priority: number;
   reason?: string;
+  transportResultCode?: string;
+  transportReceivedAt?: string;
 }
 
 export interface ControlQueueState {
@@ -59,16 +71,29 @@ export type ControlQueueTransitionStatus = Exclude<
   "queued" | "selected" | "duplicate"
 >;
 
+export interface InboundControlQueueIntegrationResult {
+  state: ControlQueueState;
+  added: ControlQueueItem[];
+  diagnostics: string[];
+}
+
 export type ControlQueueTransitionResult =
   | { ok: true; state: ControlQueueState; item: ControlQueueItem }
   | { ok: false; state: ControlQueueState; errors: string[] };
 
 const TERMINAL_STATUSES = new Set<ControlQueueItemStatus>([
+  "transport_rejected",
+  "allowed_once",
   "acknowledged_preview_only",
   "denied",
   "invalid",
   "expired",
   "duplicate",
+  "execution_consumed",
+  "execution_succeeded",
+  "execution_rejected",
+  "execution_failed",
+  "already_consumed",
 ]);
 
 let localQueueSequence = 0;
@@ -101,7 +126,7 @@ export function getRoomControlEventPriority(
     return 2;
   }
 
-  if (event.kind === "capability_preview") {
+  if (event.kind === "capability_preview" || event.kind === "capability_execute_request") {
     return 3;
   }
 
@@ -158,7 +183,9 @@ export function hasControlBacklog(
   const now = options.now ?? new Date();
   return allQueueItems(state).some(
     (item) =>
-      (item.status === "queued" || item.status === "selected") &&
+      (item.status === "queued" ||
+        item.status === "selected" ||
+        item.status === "transport_sending") &&
       !isExpired(item.event, now),
   );
 }
@@ -224,7 +251,12 @@ export function markControlQueueItemStatus(
   state: ControlQueueState,
   queueId: string,
   status: ControlQueueTransitionStatus,
-  options: { now?: Date; reason?: string } = {},
+  options: {
+    now?: Date;
+    reason?: string;
+    transportResultCode?: string;
+    transportReceivedAt?: string;
+  } = {},
 ): ControlQueueTransitionResult {
   const item = allQueueItems(state).find((candidate) => candidate.queueId === queueId);
   if (!item) {
@@ -243,6 +275,36 @@ export function markControlQueueItemStatus(
     };
   }
 
+  if (
+    (status === "transport_sending" &&
+      (item.direction !== "outbound" || item.status !== "selected")) ||
+    ((status === "transport_delivered" || status === "transport_rejected") &&
+      (item.direction !== "outbound" || item.status !== "transport_sending"))
+  ) {
+    return {
+      ok: false,
+      state,
+      errors: [`Invalid control queue transport transition from ${item.status} to ${status}.`],
+    };
+  }
+
+  if (
+    (status === "awaiting_peer_decision" &&
+      (item.direction !== "inbound" ||
+        item.event.kind !== "capability_preview" ||
+        item.status !== "selected")) ||
+    (status === "allowed_once" &&
+      (item.direction !== "inbound" ||
+        item.event.kind !== "capability_preview" ||
+        item.status !== "awaiting_peer_decision"))
+  ) {
+    return {
+      ok: false,
+      state,
+      errors: [`Invalid peer review transition from ${item.status} to ${status}.`],
+    };
+  }
+
   if (options.reason !== undefined && options.reason.length > 512) {
     return {
       ok: false,
@@ -256,9 +318,54 @@ export function markControlQueueItemStatus(
     status,
     lastUpdatedAt: (options.now ?? new Date()).toISOString(),
     ...(options.reason ? { reason: options.reason } : {}),
+    ...(options.transportResultCode
+      ? { transportResultCode: options.transportResultCode.slice(0, 64) }
+      : {}),
+    ...(options.transportReceivedAt
+      ? { transportReceivedAt: options.transportReceivedAt.slice(0, 64) }
+      : {}),
   };
 
   return { ok: true, state: replaceQueueItem(state, updated), item: updated };
+}
+
+export function enqueueInboundRoomControlEvents(
+  state: ControlQueueState,
+  events: unknown[],
+  options: {
+    now?: Date;
+    expectedRoomRef?: string;
+    expectedSourceDeviceRef?: string;
+    expectedTargetPeerRef?: string;
+  } = {},
+): InboundControlQueueIntegrationResult {
+  const now = options.now ?? new Date();
+  let nextState = state;
+  const added: ControlQueueItem[] = [];
+  const diagnostics: string[] = [];
+
+  for (const event of events) {
+    const validation = validateRoomControlEvent(event, {
+      now,
+      expectedRoomRef: options.expectedRoomRef,
+      expectedSourceDeviceRef: options.expectedSourceDeviceRef,
+      expectedTargetPeerRef: options.expectedTargetPeerRef,
+    });
+    if (!validation.valid) {
+      diagnostics.push(`Inbound control event rejected: ${validation.errors.join(" ").slice(0, 512)}`);
+      continue;
+    }
+    const enqueue = enqueueRoomControlEvent(nextState, validation.value, "inbound", { now });
+    if (!enqueue.ok) {
+      diagnostics.push(`Inbound control event ${validation.value.eventId} not queued: ${enqueue.errors.join(" ").slice(0, 384)}`);
+      continue;
+    }
+    nextState = enqueue.state;
+    added.push(enqueue.item);
+    diagnostics.push(`Inbound control event queued: ${enqueue.item.event.eventId}.`);
+  }
+
+  return { state: nextState, added, diagnostics };
 }
 
 export function markControlQueueItemAcknowledged(

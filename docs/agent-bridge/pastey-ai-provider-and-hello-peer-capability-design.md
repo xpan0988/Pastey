@@ -4,16 +4,18 @@
 
 This is the design source for the AI Slot / Agent Bridge boundary. AI Slot
 Phase E1 now implements mock and experimental OpenAI-compatible cloud advisory
-provider calls, shared validation and policy gating, and a Developer Tools
-local pending-confirmation, outbound `HelloPeerRequest`, capability-envelope,
-and local inbound-preview simulation. Control Lane CL-1 additionally implements
+provider calls, shared validation and policy gating, Settings-owned
+runtime-memory provider configuration, and an active Room workflow for local
+pending confirmation, outbound `HelloPeerRequest`, capability envelope, and
+inbound review. Control Lane CL-1 additionally implements
 a type-only `RoomControlEvent` wrapper, validation/current-session duplicate
-helpers, and a pure unwired capacity-split feasibility helper. Actual room
-transport is blocked because the existing text path is an ordinary
-persisted/encrypted room-item transfer, not a capability-preview channel.
-Phase E1 and CL-1 do not implement peer execution consent, peer execution,
-action execution, scheduler reservation, or changes to existing transfer
-behavior.
+helpers, and a pure capacity-split helper. CL-3 implements the separate
+preview-only room-control transport and queue integration, CL-4 implements
+sender-side scheduler reservation, CL-5 implements receiver PolicyGate review
+with exact one-time consent, and CL-6 implements one fixed bounded Hello Peer
+executor. The existing text path remains an ordinary persisted/encrypted
+room-item transfer and is not reused. No generic peer executor, model-owned
+action execution, remembered trust, or generic capability framework exists.
 
 The target is the future Pastey AI Slot / Agent Bridge boundary. The design uses
 the cross-system findings in
@@ -37,10 +39,10 @@ The first capability bridge described here is deliberately narrow. It is a
 design for a fixed Hello Peer demonstration, not a general peer execution
 system.
 
-The implemented advisory-only frontend slice is recorded in
+The implemented advisory and bounded Hello Peer slice is recorded in
 [AI Slot v0 / Phase E1 Implementation Notes](ai-slot-v0-implementation-notes.md).
-It does not implement the future capability bridge or peer execution described
-here.
+CL-6 is deliberately limited to one host-owned zero-argument function and does
+not implement the broader future capability bridge described here.
 
 ## 2. Design Goal
 
@@ -86,7 +88,7 @@ transport to current room behavior.
 | Schema validation | `AiActionPlan` validator |
 | Policy gate | Pastey `PolicyGate` |
 | Approval | Local user confirmation, currently `confirmed_local_only` |
-| Executor | Existing Pastey action path / future restricted peer executor |
+| Executor | One fixed host-owned CL-6 Hello Peer function; no generic runtime |
 | Result/audit | `CapabilityResult` + visible status/audit summary |
 
 The model provider only generates text or structured output. It does not own:
@@ -456,10 +458,10 @@ The complete conceptual flow is:
 8. Pastey sends a capability request through the trusted room.
 9. Peer validates the request and room/source.
 10. Peer user confirms, or a separately designed demo-only grant applies.
-11. Peer executor runs a fixed hello template using a peer-selected available
-    runtime.
+11. Peer consumes the exact one-time consent and calls the fixed in-process
+    Hello Peer template.
 12. Peer returns a bounded structured result.
-13. Local device displays stdout and status.
+13. Local device displays the bounded result status outside chat.
 ```
 
 This is not raw shell and not arbitrary code. The model does not provide the
@@ -477,9 +479,9 @@ review.
 
 ## 11. Capability Request and Result Shapes
 
-Phase E0 implements the `HelloPeerRequest` shape below as a local-only outbound
-preview. No matching transport message, peer receive path, or result DTO
-exists.
+Phase E0 implements the preview `HelloPeerRequest`. CL-6 adds the separate
+host-owned execution request/result shapes below; the model cannot construct
+them.
 
 ```ts
 interface HelloPeerRequest {
@@ -510,28 +512,25 @@ interface HelloPeerRequest {
   transportStatus: "preview_only";
 }
 
-interface HelloPeerResult {
-  schemaVersion: "pastey-capability-result/v1";
+interface HelloPeerExecutionResult {
+  schemaVersion: "pastey-hello-peer-execution-result/v1";
+  executionId: string;
   requestId: string;
-  status: "completed" | "failed" | "denied" | "timeout";
-  runtime?: string;
-  stdout?: string;
-  stderr?: string;
-  exitCode?: number;
-  durationMs?: number;
+  consentId: string;
+  status: "succeeded" | "rejected" | "expired" | "already_consumed" | "failed";
+  output?: "hello peer!";
   errorCode?: string;
-  message?: string;
+  createdAt: string;
 }
 ```
 
 The E0 request ID, nonce, expiry, and hashes are local preview-binding fields.
-They prepare future replay defenses but do not provide transport integrity or
-complete replay protection. The result must be bounded before transport and
-display. The result is a report of one request, not permission for the model to
-start another action.
-
-`stderr`, `errorCode`, and `message` must be sanitized so they do not disclose
-paths, environment variables, commands, secrets, or unrelated peer state.
+They prepare replay defenses but do not provide transport integrity by
+themselves. CL-6 binds execution to an exact consent ID, preview event,
+envelope, request/hash, room/session, source/target, capability, and message.
+The result permits only fixed `hello peer!` success output or a bounded error
+code. It has no stdout/stderr stream, exit code, runtime name, log, stack trace,
+attachment, or authority to start another action.
 
 ## 12. Peer Runtime Capability
 
@@ -564,7 +563,9 @@ treated as one.
 ## 13. Peer PolicyGate and Restricted Executor
 
 The peer has an independent `PolicyGate`. Local approval cannot replace peer
-validation or peer consent.
+validation or peer consent. CL-5 implements the receiver PolicyGate and
+explicit one-time consent for the exact fixed Hello Peer preview. CL-6
+implements only the restricted executor described below.
 
 The peer `PolicyGate` rejects:
 
@@ -581,23 +582,19 @@ The peer `PolicyGate` rejects:
 - a stale, duplicate, or replayed request ID;
 - a malformed or unsupported request.
 
-The restricted executor:
+The implemented restricted executor:
 
 - executes a fixed internal template only;
-- uses a peer-selected available runtime;
-- captures bounded stdout and stderr;
-- enforces a short timeout;
-- returns a structured result;
+- is a zero-argument in-process host function;
+- returns exactly `hello peer!`;
+- enforces a one-second timeout check and 64-byte output cap;
+- returns a bounded typed result;
 - does not expose a shell;
 - does not search the filesystem;
 - does not read user files;
 - does not use network access;
-- does not persist hidden execution history beyond a visible status/audit
-  requirement.
-
-Cross-platform isolation will differ. The design must define the minimum
-acceptable OS-level boundary before implementation. Confirmation alone is not
-enough to make an unconstrained process safe.
+- does not start a process, capture stdout/stderr, or persist hidden execution
+  history.
 
 ## 14. Existing Pastey Mapping
 
@@ -622,13 +619,13 @@ Source code remains authoritative.
 | Device Diagnostics | Rust `src-tauri/src/diagnostics.rs::{DeviceProfile,DeviceCapabilities,RuntimeCapability,LinkBenchmarkResult}`; `device_profile::local_device_profile_with_mode`; `capability_probe::probe_device_capabilities_with_mode`; commands `get_device_profile`, `get_device_capabilities`; frontend mirrors in `src/lib/types.ts` | A future context builder may derive redacted summaries. Current diagnostic data is advisory, not permission. |
 | Runtime probing | `src-tauri/src/capability_probe.rs` fixed runtime probe list and `probe_runtime`; full probe includes Python, Node, Cargo, PowerShell, zsh, and bash where applicable; quick mode skips runtime commands | Potential informational input for future peer capability declaration. It does not currently authorize or execute Hello Peer. |
 | Link benchmarks | `src/lib/tauri.ts::{runLoopbackBenchmark,runPeerLinkBenchmark,getLastBenchmarkResults}`; commands `run_loopback_benchmark`, `run_peer_link_benchmark`, `get_last_benchmark_results`; `link_benchmark::{run_loopback_benchmark,run_peer_link_benchmark}`; `AppState::latest_benchmark_results` | Latest results are current-session summaries. Benchmarks remain separate from capability execution and require visible user action. |
-| Settings and Developer Tools | `src/pages/SettingsPage.tsx::{saveMicroFlowGroupMode,refreshDiagnostics,handleRunLoopbackBenchmark,loadDiagnosticsSnapshot,handleOpenLogsFolder,handleCopyLastError}`; `src/components/AiSlotPreview.tsx`; `AppConfig` fields; `commands::update_config` | Developer Tools mounts advisory previews, local confirmation, E0 request preview, and the E1 envelope/local inbound-preview simulation. Cloud base URL/model/key are runtime-memory inputs. All E1 controls change local state only; the preview does not change settings, auto-run diagnostics, send room items, or dispatch actions. |
-| Frontend diagnostics bridge | `App.tsx::emitPasteyDiagnostic`; `src/lib/tauri.ts::logFrontendDiagnostic`; `commands::{log_frontend_diagnostic,normalize_frontend_diagnostic_line}`; Rust `logging.rs` | Existing bridge is bounded to known prefixes and rejects path-like values. Future AI should consume structured summaries, not raw logs or direct bridge access. |
+| Settings and Developer Tools | `src/pages/SettingsPage.tsx`; `AgentBridgeSettings.tsx`; `src/lib/agentBridge/config.ts`; `AppConfig` fields; `commands::update_config` | Settings retains only Agent Bridge enablement, runtime-memory provider configuration/API key, lifecycle log level, log clearing, and safety summary. It does not require an active room or mount workflow controls. |
+| Frontend diagnostics bridge | `App.tsx::emitPasteyDiagnostic`; `src/lib/agentBridge/logging.ts`; `src/lib/tauri.ts::logFrontendDiagnostic`; `commands::{log_frontend_diagnostic,normalize_frontend_diagnostic_line}`; Rust `logging.rs` | Existing bridge is bounded to known prefixes and rejects path-like values. Agent Bridge writes allowlisted structured JSON with shortened references through `[pastey:agent-bridge]`; logs are redacted audit mirrors only, never runtime state or authorization evidence. |
 | Existing agent-bridge docs | `docs/agent-bridge/{ai-slot.md,current-capability-map.md,provider-model.md,context-boundary.md,action-plan-schema.md,non-goals.md,ai-slot-v0-implementation-notes.md}` | Current documentation staging area for the implemented mock slice and future design boundaries. |
-| AI Slot Phase E1 providers/types/policy/pending/request/envelope preview | `src/lib/ai/{types.ts,contextSnapshot.ts,mockProvider.ts,cloudOpenAICompatibleProvider.ts,actionPlanValidator.ts,policyGate.ts,pendingAction.ts,helloPeerRequest.ts,capabilityPreviewEnvelope.ts,index.ts}`; `src/components/AiSlotPreview.tsx`; `tests/aiSlot.test.ts`; `scripts/run-ai-slot-tests.mjs` | Implemented frontend-only advisory loops, local pending action, validated request/envelope previews, current-session duplicate detection, and local inbound acknowledge/deny simulation. No route has execution or room-dispatch authority. |
+| Active Room Agent Bridge workflow | `RoomPage.tsx`; `src/components/AiSlotPreview.tsx`; `RoomControlPanel.tsx`; `src/lib/ai/{types.ts,contextSnapshot.ts,mockProvider.ts,cloudOpenAICompatibleProvider.ts,actionPlanValidator.ts,policyGate.ts,pendingAction.ts,helloPeerRequest.ts,capabilityPreviewEnvelope.ts,index.ts}`; `tests/aiSlot.test.ts`; `scripts/run-ai-slot-tests.mjs` | The exact active room/session/peer owns advisory, explicit confirmation, validated preview, queue, consent review, and bounded Hello Peer execution presentation. No route has generic execution, ordinary room-item dispatch, or reusable trust authority. |
 | Control Lane CL-1 type foundation | `src/lib/agentBridge/{roomControlEvent.ts,index.ts}`; `tests/roomControlEvent.test.ts`; `scripts/run-room-control-event-tests.mjs` | Implements typed preview-only `RoomControlEvent` wrappers, builders, deny-first validation, current-session duplicate detection, and pure `computeControlLaneBudget`. It has no room-control transport, Tauri invoke, send/receive, scheduler wiring, transfer behavior, or execution authority. |
-| Capability request/result room transport | Not found in current source search. `sendTextToRoom` / `send_text_to_room` creates and transfers ordinary user text via `transfer::send_room_item`; Phase E1 does not reinterpret it as capability transport. | Future design decision requiring an explicit safe message boundary. Current text and file paths must not be reinterpreted silently as capability execution. |
-| Peer policy gate/restricted executor | Not found in current source search. | Future work requiring a separate implementation and threat-model review. |
+| Capability request/result room transport | `src/lib/agentBridge/{roomControlEvent,controlQueue,roomControlTransport}.ts`; `src-tauri/src/room_control.rs`; `RoomControlPanel.tsx` | Closed typed preview/status/execution request/result events use the separate bounded room-control path. Ordinary text/file paths are not reinterpreted. |
+| Peer policy gate/restricted executor | `src/lib/agentBridge/{peerConsent,helloPeerExecution}.ts`; `RoomControlPanel.tsx`; `tests/{peerConsent,helloPeerExecution}.test.ts` | Exact one-time receiver consent is revalidated and consumed before one fixed in-process Hello Peer function. No generic runtime or reusable trust. |
 | Pastey MCP/local tool server | Not found in current source search. | Future optional external-agent path only. |
 
 Additional detailed mappings are maintained in
@@ -659,7 +656,7 @@ implementation or establish a final product roadmap.
 - calls a configured OpenAI-compatible chat-completions endpoint;
 - sends a strict whitelisted synthetic context only;
 - accepts JSON action-plan output only and does not repair invalid JSON;
-- shows validation and PolicyGate results in Developer Tools only;
+- shows validation and PolicyGate results in the active Room only;
 - keeps API-key input in runtime memory and has no production credential store.
 
 ### Phase D: Local Confirmation UI - Current
@@ -676,7 +673,7 @@ implementation or establish a final product roadmap.
 
 - converts only `confirmed_local_only` into a canonical `HelloPeerRequest`;
 - validates exact fixed capability, message, constraints, expiry, and hashes;
-- renders `transportStatus: "preview_only"` in Developer Tools;
+- renders `transportStatus: "preview_only"` in the active Room;
 - sends no request and provides no peer receive path, peer consent, replay
   cache, or execution.
 
@@ -719,9 +716,9 @@ commands.
 
 ### Phase F: Peer Policy and Restricted Executor
 
-- require peer validation and confirmation;
-- execute the fixed hello template only;
-- return a bounded structured result.
+- CL-5 peer validation and explicit one-time Allow once/Deny: implemented;
+- fixed hello-template execution: not implemented;
+- bounded structured execution result: not implemented.
 
 ### Phase G: Hardening
 

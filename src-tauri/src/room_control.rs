@@ -48,6 +48,8 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "capability_preview_deny",
     "capability_preview_invalid",
     "capability_preview_expired",
+    "capability_execute_request",
+    "capability_execution_result",
 ];
 
 const UNSAFE_FIELDS: &[&str] = &[
@@ -634,9 +636,7 @@ fn validate_control_event(
             "payload",
         ],
     )?;
-    if string_field(object, "schemaVersion")? != ROOM_CONTROL_SCHEMA
-        || object.get("previewOnly") != Some(&Value::Bool(true))
-    {
+    if string_field(object, "schemaVersion")? != ROOM_CONTROL_SCHEMA {
         return Err(AppError::InvalidInput("Invalid room control event.".into()));
     }
     let event_id = bounded_string_field(object, "eventId", 256)?;
@@ -677,6 +677,11 @@ fn validate_control_event(
         .and_then(Value::as_object)
         .ok_or_else(|| AppError::InvalidInput("Invalid room control event payload.".into()))?;
     let (envelope_id, request_id) = if kind == "capability_preview" {
+        if object.get("previewOnly") != Some(&Value::Bool(true)) {
+            return Err(AppError::InvalidInput(
+                "Invalid capability preview event.".into(),
+            ));
+        }
         require_exact_fields(
             payload,
             &[
@@ -718,8 +723,128 @@ fn validate_control_event(
             Some(envelope_id),
             Some(bounded_string_field(request, "requestId", 256)?),
         )
+    } else if kind == "capability_execute_request" {
+        if object.get("previewOnly") != Some(&Value::Bool(false)) {
+            return Err(AppError::InvalidInput(
+                "Invalid execution request event.".into(),
+            ));
+        }
+        require_exact_fields(
+            payload,
+            &[
+                "schemaVersion",
+                "executionId",
+                "consentId",
+                "sourcePreviewEventId",
+                "envelopeId",
+                "requestId",
+                "requestPayloadHash",
+                "roomRef",
+                "sourceDeviceRef",
+                "targetPeerRef",
+                "capability",
+                "exactMessage",
+                "createdAt",
+                "expiresAt",
+            ],
+        )?;
+        if string_field(payload, "schemaVersion")? != "pastey-hello-peer-execution-request/v1"
+            || string_field(payload, "roomRef")? != expected_room
+            || string_field(payload, "sourceDeviceRef")? != expected_source
+            || string_field(payload, "targetPeerRef")? != expected_target
+            || string_field(payload, "capability")? != "runtime.execute_hello_template"
+            || string_field(payload, "exactMessage")? != "hello peer!"
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid execution request payload.".into(),
+            ));
+        }
+        for field in [
+            "consentId",
+            "sourcePreviewEventId",
+            "envelopeId",
+            "requestId",
+            "requestPayloadHash",
+        ] {
+            let _ = bounded_string_field(payload, field, 256)?;
+        }
+        let execution_id = bounded_string_field(payload, "executionId", 256)?;
+        let payload_created = OffsetDateTime::parse(string_field(payload, "createdAt")?, &Rfc3339)
+            .map_err(|_| AppError::InvalidInput("Invalid execution request time.".into()))?;
+        let payload_expires = OffsetDateTime::parse(string_field(payload, "expiresAt")?, &Rfc3339)
+            .map_err(|_| AppError::InvalidInput("Invalid execution request time.".into()))?;
+        if payload_expires <= now || payload_expires <= payload_created || payload_expires > expires
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid execution request time.".into(),
+            ));
+        }
+        (None, Some(format!("exec-request:{execution_id}")))
+    } else if kind == "capability_execution_result" {
+        if object.get("previewOnly") != Some(&Value::Bool(false)) {
+            return Err(AppError::InvalidInput(
+                "Invalid execution result event.".into(),
+            ));
+        }
+        let allowed_len = if payload.contains_key("output") || payload.contains_key("errorCode") {
+            7
+        } else {
+            6
+        };
+        if payload.len() != allowed_len
+            || !payload.contains_key("schemaVersion")
+            || !payload.contains_key("executionId")
+            || !payload.contains_key("requestId")
+            || !payload.contains_key("consentId")
+            || !payload.contains_key("status")
+            || !payload.contains_key("createdAt")
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid execution result payload.".into(),
+            ));
+        }
+        if string_field(payload, "schemaVersion")? != "pastey-hello-peer-execution-result/v1" {
+            return Err(AppError::InvalidInput(
+                "Invalid execution result payload.".into(),
+            ));
+        }
+        let execution_id = bounded_string_field(payload, "executionId", 256)?;
+        let _ = bounded_string_field(payload, "requestId", 256)?;
+        let _ = bounded_string_field(payload, "consentId", 256)?;
+        let _ = OffsetDateTime::parse(string_field(payload, "createdAt")?, &Rfc3339)
+            .map_err(|_| AppError::InvalidInput("Invalid execution result time.".into()))?;
+        let status = string_field(payload, "status")?;
+        if status == "succeeded" {
+            if payload.get("output") != Some(&Value::String("hello peer!".into()))
+                || payload.contains_key("errorCode")
+            {
+                return Err(AppError::InvalidInput(
+                    "Invalid execution result payload.".into(),
+                ));
+            }
+        } else if !["rejected", "expired", "already_consumed", "failed"].contains(&status)
+            || payload.contains_key("output")
+            || !payload.contains_key("errorCode")
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid execution result payload.".into(),
+            ));
+        } else {
+            let _ = bounded_string_field(payload, "errorCode", 64)?;
+        }
+        (None, Some(format!("exec-result:{execution_id}")))
     } else {
-        let allowed_len = if payload.contains_key("reason") { 4 } else { 3 };
+        if object.get("previewOnly") != Some(&Value::Bool(true)) {
+            return Err(AppError::InvalidInput(
+                "Invalid preview status event.".into(),
+            ));
+        }
+        let base_len = if payload.contains_key("reason") { 4 } else { 3 };
+        let allowed_len = if payload.contains_key("consent") {
+            base_len + 1
+        } else {
+            base_len
+        };
         if payload.len() != allowed_len
             || !payload.contains_key("envelopeId")
             || !payload.contains_key("requestId")
@@ -745,6 +870,52 @@ fn validate_control_event(
         let _ = bounded_string_field(payload, "requestId", 256)?;
         if payload.contains_key("reason") {
             let _ = bounded_string_field(payload, "reason", 512)?;
+        }
+        if payload.contains_key("consent") {
+            if kind != "capability_preview_ack" {
+                return Err(AppError::InvalidInput(
+                    "Invalid preview status payload.".into(),
+                ));
+            }
+            let consent = payload
+                .get("consent")
+                .and_then(Value::as_object)
+                .ok_or_else(|| AppError::InvalidInput("Invalid consent grant.".into()))?;
+            require_exact_fields(
+                consent,
+                &[
+                    "schemaVersion",
+                    "consentId",
+                    "sourcePreviewEventId",
+                    "envelopeId",
+                    "requestId",
+                    "requestPayloadHash",
+                    "capability",
+                    "exactMessage",
+                    "expiresAt",
+                ],
+            )?;
+            if string_field(consent, "schemaVersion")? != "pastey-hello-peer-consent-grant/v1"
+                || string_field(consent, "capability")? != "runtime.execute_hello_template"
+                || string_field(consent, "exactMessage")? != "hello peer!"
+            {
+                return Err(AppError::InvalidInput("Invalid consent grant.".into()));
+            }
+            for field in [
+                "consentId",
+                "sourcePreviewEventId",
+                "envelopeId",
+                "requestId",
+                "requestPayloadHash",
+            ] {
+                let _ = bounded_string_field(consent, field, 256)?;
+            }
+            let consent_expires =
+                OffsetDateTime::parse(string_field(consent, "expiresAt")?, &Rfc3339)
+                    .map_err(|_| AppError::InvalidInput("Invalid consent grant.".into()))?;
+            if consent_expires <= now {
+                return Err(AppError::InvalidInput("Invalid consent grant.".into()));
+            }
         }
         (None, None)
     };
@@ -1020,6 +1191,65 @@ mod tests {
         })
     }
 
+    fn execution_request_event(event_id: &str, execution_id: &str) -> Value {
+        let now = OffsetDateTime::now_utc();
+        let created_at = now.format(&Rfc3339).unwrap();
+        let expires_at = (now + time::Duration::seconds(60))
+            .format(&Rfc3339)
+            .unwrap();
+        serde_json::json!({
+            "schemaVersion": ROOM_CONTROL_SCHEMA,
+            "eventId": event_id,
+            "kind": "capability_execute_request",
+            "roomRef": "room",
+            "sourceDeviceRef": "source",
+            "targetPeerRef": "target",
+            "createdAt": created_at,
+            "expiresAt": expires_at,
+            "previewOnly": false,
+            "payload": {
+                "schemaVersion": "pastey-hello-peer-execution-request/v1",
+                "executionId": execution_id,
+                "consentId": "consent",
+                "sourcePreviewEventId": "preview",
+                "envelopeId": "envelope",
+                "requestId": "request",
+                "requestPayloadHash": "hash",
+                "roomRef": "room",
+                "sourceDeviceRef": "source",
+                "targetPeerRef": "target",
+                "capability": "runtime.execute_hello_template",
+                "exactMessage": "hello peer!",
+                "createdAt": created_at,
+                "expiresAt": expires_at
+            }
+        })
+    }
+
+    fn execution_result_event(event_id: &str, execution_id: &str) -> Value {
+        let now = OffsetDateTime::now_utc();
+        serde_json::json!({
+            "schemaVersion": ROOM_CONTROL_SCHEMA,
+            "eventId": event_id,
+            "kind": "capability_execution_result",
+            "roomRef": "room",
+            "sourceDeviceRef": "source",
+            "targetPeerRef": "target",
+            "createdAt": now.format(&Rfc3339).unwrap(),
+            "expiresAt": (now + time::Duration::seconds(60)).format(&Rfc3339).unwrap(),
+            "previewOnly": false,
+            "payload": {
+                "schemaVersion": "pastey-hello-peer-execution-result/v1",
+                "executionId": execution_id,
+                "requestId": "request",
+                "consentId": "consent",
+                "status": "succeeded",
+                "output": "hello peer!",
+                "createdAt": now.format(&Rfc3339).unwrap()
+            }
+        })
+    }
+
     #[test]
     fn validates_preview_and_rejects_unknown_or_execution_fields() {
         let now = OffsetDateTime::now_utc();
@@ -1041,6 +1271,39 @@ mod tests {
             validate_control_event(status_event("status-1"), "room", "source", "target", now)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn validates_only_fixed_bounded_hello_peer_execution_events() {
+        let now = OffsetDateTime::now_utc();
+        assert!(validate_control_event(
+            execution_request_event("execute", "execution"),
+            "room",
+            "source",
+            "target",
+            now
+        )
+        .is_ok());
+        assert!(validate_control_event(
+            execution_result_event("result", "execution"),
+            "room",
+            "source",
+            "target",
+            now
+        )
+        .is_ok());
+
+        let mut wrong_message = execution_request_event("wrong-message", "execution-2");
+        wrong_message["payload"]["exactMessage"] = Value::String("arbitrary".into());
+        assert!(validate_control_event(wrong_message, "room", "source", "target", now).is_err());
+
+        let mut arbitrary_output = execution_result_event("wrong-output", "execution-3");
+        arbitrary_output["payload"]["output"] = Value::String("arbitrary".into());
+        assert!(validate_control_event(arbitrary_output, "room", "source", "target", now).is_err());
+
+        let mut stdout = execution_result_event("stdout", "execution-4");
+        stdout["payload"]["stdout"] = Value::String("no".into());
+        assert!(validate_control_event(stdout, "room", "source", "target", now).is_err());
     }
 
     #[test]

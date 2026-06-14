@@ -22,7 +22,7 @@ into a validated `HelloPeerRequest` with `transportStatus: "preview_only"`.
 | `suggest_transfer` | Suggest transferring a user-selected file reference to the current room. | Explicit confirmation; use existing selection/queue and `sendFileToRoom` path. |
 | `draft_text_message` | Draft text for the current room composer. | User reviews/edits and explicitly sends through `sendTextToRoom`. |
 | `explain_microflowgroup_mode` | Explain current fixed/dynamic mode and visible planner summary. | No execution and no mode-change suggestion. |
-| `request_peer_hello_demo` | Propose the restricted Hello Peer design action against the synthetic preview peer. | Required confirmation flag and deny-first policy checks; Phase E0 can build a local request preview, but no request is sent and no execution path exists. |
+| `request_peer_hello_demo` | Propose the restricted Hello Peer design action against the synthetic preview peer. | Required confirmation and deny-first policy checks. The model can produce only the preview proposal; it cannot construct CL-6 execution requests. |
 
 ## Example Documentation Shape
 
@@ -79,19 +79,21 @@ Confirmation is a UI decision, not a provider capability. Phase D implements
 only a local pending Hello Peer confirmation. It binds the visible canonical
 payload, pending ID, and expiry to a deterministic payload hash, then changes
 status to `confirmed_local_only`, `cancelled`, or `expired`. It does not
-dispatch anything, satisfy peer consent, or provide replay protection for a
-transport that does not yet exist.
+dispatch anything or satisfy peer consent.
 
 Phase E0 converts only `confirmed_local_only` into a canonical outbound request
 preview and validates it again. A transport request object is not a sent
-request. No peer receives the preview, peer consent is not implemented, and
-request ID/nonce/expiry/hash fields do not complete replay protection.
+request. CL-3 later provides the separate preview-only transport, and CL-5
+provides explicit receiver one-time review. Request ID/nonce/expiry/hash fields
+alone do not complete replay protection or grant execution authority.
 
 Phase E1 wraps that request in a validated
 `CapabilityRequestPreviewEnvelope`, checks current-session duplicate envelope
-and request IDs, and renders a local inbound-preview simulation. Acknowledge
-and deny change preview status only. Actual room transport remains blocked, and
-no acknowledge or deny status is returned to a peer.
+and request IDs, and renders a local inbound-preview simulation. CL-3 carries
+real preview/status events separately from user text/file semantics. CL-5 uses
+acknowledge/deny as bounded one-time receiver decisions. CL-6 then permits a
+separate explicit sender action to build one exact host-owned execution request
+from the matched ack/consent chain. The model never constructs that request.
 
 In a separately reviewed future phase, confirmation may translate a narrow
 approved suggestion into an existing user flow:

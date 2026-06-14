@@ -39,9 +39,10 @@ paths, file contents, full transfer history, or peer filesystem state by
 default. Cloud output remains untrusted and passes through the same
 `validateAiActionPlan` and `evaluateAiPolicy` path as mock output.
 
-The Developer Tools preview accepts base URL, model, and an optional API key in
+Agent Bridge Settings accepts base URL, model, and an optional API key in
 runtime memory only. It does not persist provider configuration or credentials.
-Production key storage is not implemented.
+The active Room owns advisory generation and the current-session Agent Bridge
+workflow. Production key storage is not implemented.
 
 ### Mock Provider
 

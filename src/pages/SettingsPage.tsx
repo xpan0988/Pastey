@@ -1,6 +1,6 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState, type ChangeEvent, type ReactNode } from "react";
-import { AiSlotPreview } from "../components/AiSlotPreview";
+import { AgentBridgeSettings } from "../components/agentBridge/AgentBridgeSettings";
 import { prettifyShortcut } from "../lib/format";
 import {
   checkForUpdates,
@@ -321,7 +321,7 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
               <p className="muted diagnostics-note">{benchmarkModeDescription(benchmarkMode)}</p>
             </div>
           </div>
-          <AiSlotPreview />
+          <AgentBridgeSettings />
           <div className="settings-row diagnostics-row">
             <span className="settings-icon wrench" aria-hidden="true" />
             <div>

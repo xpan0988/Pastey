@@ -4,6 +4,13 @@ import {
   type RoomControlEventBuildResult,
 } from "./roomControlEvent";
 import {
+  createControlQueueState,
+  markControlQueueItemStatus,
+  selectNextControlQueueItem,
+  type ControlQueueItem,
+  type ControlQueueState,
+} from "./controlQueue";
+import {
   hashHelloPeerRequestPayload,
   validateCapabilityRequestPreviewEnvelope,
   type CapabilityRequestPreviewEnvelope,
@@ -51,6 +58,23 @@ export type RoomControlSendState =
 
 export type RoomControlRejectedSendState = Extract<RoomControlSendState, { status: "rejected" }>;
 
+export type ProcessNextControlQueueItemResult =
+  | {
+      ok: true;
+      action: "selected_inbound" | "transport_delivered";
+      state: ControlQueueState;
+      item: ControlQueueItem;
+      sendState?: RoomControlSendState;
+    }
+  | {
+      ok: false;
+      action: "no_selectable_item" | "transport_rejected" | "invalid_transition";
+      state: ControlQueueState;
+      message: string;
+      item?: ControlQueueItem;
+      sendState?: RoomControlSendState;
+    };
+
 interface StructuredRoomControlSendError {
   code?: unknown;
 }
@@ -94,6 +118,16 @@ export function preserveRoomControlSendStateForSession(
   return roomControlSessionIdentity(previousSession) === roomControlSessionIdentity(nextSession)
     ? state
     : createIdleRoomControlSendState();
+}
+
+export function preserveControlQueueForSession(
+  state: ControlQueueState,
+  previousSession: RoomControlSessionContext | null,
+  nextSession: RoomControlSessionContext | null,
+): ControlQueueState {
+  return roomControlSessionIdentity(previousSession) === roomControlSessionIdentity(nextSession)
+    ? state
+    : createControlQueueState();
 }
 
 export function mapRoomControlSendError(
@@ -169,6 +203,131 @@ export async function sendCurrentRoomControlEvent(
     onState(rejected);
     return rejected;
   }
+}
+
+export async function processNextControlQueueItem(
+  state: ControlQueueState,
+  sender: (event: RoomControlEvent) => Promise<RoomControlDeliveryReceipt>,
+  options: {
+    now?: () => Date;
+    onState?: (state: ControlQueueState) => void;
+    onSendState?: (state: RoomControlSendState) => void;
+  } = {},
+): Promise<ProcessNextControlQueueItemResult> {
+  const now = options.now ?? (() => new Date());
+  const selection = selectNextControlQueueItem(state, { now: now() });
+  options.onState?.(selection.state);
+  if (!selection.ok) {
+    return {
+      ok: false,
+      action: "no_selectable_item",
+      state: selection.state,
+      message: selection.reason,
+    };
+  }
+  if (selection.item.direction === "inbound") {
+    return {
+      ok: true,
+      action: "selected_inbound",
+      state: selection.state,
+      item: selection.item,
+    };
+  }
+
+  const sending = markControlQueueItemStatus(
+    selection.state,
+    selection.item.queueId,
+    "transport_sending",
+    { now: now(), reason: "Sending through preview-only room-control transport." },
+  );
+  if (!sending.ok) {
+    return {
+      ok: false,
+      action: "invalid_transition",
+      state: sending.state,
+      item: selection.item,
+      message: sending.errors.join(" ").slice(0, 512),
+    };
+  }
+  options.onState?.(sending.state);
+
+  const sendState = await sendCurrentRoomControlEvent(
+    sending.item.event,
+    sender,
+    (next) => options.onSendState?.(next),
+    now,
+  );
+  if (sendState.status === "accepted") {
+    const delivered = markControlQueueItemStatus(
+      sending.state,
+      sending.item.queueId,
+      "transport_delivered",
+      {
+        now: now(),
+        reason: "Accepted for peer local inbox. Transport delivery is not peer consent.",
+        transportResultCode: "accepted_for_local_inbox",
+        transportReceivedAt: sendState.receivedAt,
+      },
+    );
+    if (!delivered.ok) {
+      return {
+        ok: false,
+        action: "invalid_transition",
+        state: delivered.state,
+        item: sending.item,
+        sendState,
+        message: delivered.errors.join(" ").slice(0, 512),
+      };
+    }
+    options.onState?.(delivered.state);
+    return {
+      ok: true,
+      action: "transport_delivered",
+      state: delivered.state,
+      item: delivered.item,
+      sendState,
+    };
+  }
+  if (sendState.status !== "rejected") {
+    return {
+      ok: false,
+      action: "invalid_transition",
+      state: sending.state,
+      item: sending.item,
+      sendState,
+      message: "Room-control send did not reach a terminal state.",
+    };
+  }
+
+  const rejected = markControlQueueItemStatus(
+    sending.state,
+    sending.item.queueId,
+    "transport_rejected",
+    {
+      now: now(),
+      reason: sendState.message,
+      transportResultCode: sendState.errorCode,
+    },
+  );
+  if (!rejected.ok) {
+    return {
+      ok: false,
+      action: "invalid_transition",
+      state: rejected.state,
+      item: sending.item,
+      sendState,
+      message: rejected.errors.join(" ").slice(0, 512),
+    };
+  }
+  options.onState?.(rejected.state);
+  return {
+    ok: false,
+    action: "transport_rejected",
+    state: rejected.state,
+    item: rejected.item,
+    sendState,
+    message: sendState.message,
+  };
 }
 
 function isRoomControlSendErrorCode(value: string): value is RoomControlSendErrorCode {

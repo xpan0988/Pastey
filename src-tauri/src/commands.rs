@@ -874,6 +874,7 @@ fn is_allowed_frontend_diagnostic_prefix(line: &str) -> bool {
     line.starts_with("[pastey:planner] ")
         || line.starts_with("[pastey:micro-group] ")
         || line.starts_with("[pastey:runtime-window] ")
+        || line.starts_with("[pastey:agent-bridge] ")
 }
 
 fn contains_path_like_sensitive_value(line: &str) -> bool {
@@ -967,6 +968,11 @@ mod tests {
         let line = "[pastey:micro-group] event=planned room_id=room group_id=group children=2 requested_window=1";
 
         assert_eq!(normalize_frontend_diagnostic_line(line).unwrap(), line);
+        let agent_bridge = "[pastey:agent-bridge] {\"category\":\"agent_bridge\",\"eventKind\":\"peer_allowed_once\",\"roomRefShort\":\"room..short\"}";
+        assert_eq!(
+            normalize_frontend_diagnostic_line(agent_bridge).unwrap(),
+            agent_bridge
+        );
     }
 
     #[test]
