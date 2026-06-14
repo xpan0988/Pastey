@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { MutableRefObject } from "react";
 import { BottomTabBar, type TabKey } from "./components/BottomTabBar";
 import { DevicesPage } from "./pages/DevicesPage";
@@ -66,6 +66,18 @@ import {
   type TransferPlannerPolicy
 } from "./lib/transferPlanner";
 import { mergeTransferEvent } from "./lib/transferState";
+import {
+  createRuntimeDataWindowTargetState,
+  getControlWindowSessionRevision,
+  getOutgoingControlWindowDemand,
+  getRuntimeControlWindowStatus,
+  logAgentBridgeLifecycle,
+  publishRuntimeControlWindowStatus,
+  reduceRuntimeDataWindowTarget,
+  subscribeOutgoingControlWindowDemand,
+  subscribeControlWindowSessionRevision,
+  type RuntimeDataWindowTarget,
+} from "./lib/agentBridge";
 import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, RoomInfo, RoomItem } from "./lib/types";
 
 type View =
@@ -111,8 +123,20 @@ function App() {
   const [joinRequest, setJoinRequest] = useState<JoinRequestPrompt | null>(null);
   const [focusToken, setFocusToken] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const outgoingControlDemand = useSyncExternalStore(
+    subscribeOutgoingControlWindowDemand,
+    getOutgoingControlWindowDemand,
+  );
+  const controlWindowSessionRevision = useSyncExternalStore(
+    subscribeControlWindowSessionRevision,
+    getControlWindowSessionRevision,
+  );
+  const [runtimeDataWindowState, setRuntimeDataWindowState] = useState(
+    createRuntimeDataWindowTargetState,
+  );
   const closedRoomIdsRef = useRef<Set<string>>(new Set());
   const schedulerRef = useRef(scheduler);
+  const roomsRef = useRef(rooms);
   const viewRef = useRef(view);
   const launchingQueueItemWindowsRef = useRef<Map<string, number>>(new Map());
   const metadataPreflightItemIdsRef = useRef<Set<string>>(new Set());
@@ -121,10 +145,90 @@ function App() {
   const runtimeWindowStatsRef = useRef<Map<string, RuntimeWindowDiagnosticStats>>(new Map());
   const plannerLaunchSummaryKeyRef = useRef<string>("");
   const serialMicroGroupRunningRef = useRef(false);
+  const runtimeDataWindowTargetRef = useRef<RuntimeDataWindowTarget>(8);
+  const runtimeWindowRebalanceChainRef = useRef<Promise<unknown>>(Promise.resolve());
 
   useEffect(() => {
     viewRef.current = view;
   }, [view]);
+
+  useEffect(() => {
+    roomsRef.current = rooms;
+  }, [rooms]);
+
+  useEffect(() => {
+    setRuntimeDataWindowState((current) =>
+      reduceRuntimeDataWindowTarget(current, {
+        type: "demand_changed",
+        outgoingControlDemand,
+        nowMs: Date.now(),
+      })
+    );
+  }, [outgoingControlDemand]);
+
+  useEffect(() => {
+    setRuntimeDataWindowState(
+      outgoingControlDemand
+        ? reduceRuntimeDataWindowTarget(createRuntimeDataWindowTargetState(), {
+            type: "demand_changed",
+            outgoingControlDemand: true,
+            nowMs: Date.now(),
+          })
+        : createRuntimeDataWindowTargetState()
+    );
+  }, [controlWindowSessionRevision]);
+
+  useEffect(() => {
+    if (runtimeDataWindowState.restoreAfterMs === null) {
+      return;
+    }
+    const delayMs = Math.max(0, runtimeDataWindowState.restoreAfterMs - Date.now());
+    const timeout = window.setTimeout(() => {
+      setRuntimeDataWindowState((current) =>
+        reduceRuntimeDataWindowTarget(current, {
+          type: "restore_quiet_period_elapsed",
+          nowMs: Date.now(),
+        })
+      );
+    }, delayMs);
+    return () => window.clearTimeout(timeout);
+  }, [runtimeDataWindowState.restoreAfterMs]);
+
+  useEffect(() => {
+    runtimeDataWindowTargetRef.current = runtimeDataWindowState.targetDataWindows;
+    if (runtimeDataWindowState.targetDataWindows === 7) {
+      logAgentBridgeLifecycle({
+        eventKind: "control_demand_started",
+        roomRefShort: currentRoom?.id,
+        runtimeDataWindowTarget: 7,
+      });
+    }
+    logAgentBridgeLifecycle({
+      eventKind: runtimeDataWindowState.targetDataWindows === 7
+        ? "runtime_window_target_7"
+        : "runtime_window_target_8",
+      roomRefShort: currentRoom?.id,
+      runtimeDataWindowTarget: runtimeDataWindowState.targetDataWindows,
+    });
+    void scheduleActiveTransferWindowRebalance(undefined, runtimeDataWindowState.targetDataWindows);
+  }, [runtimeDataWindowState.targetDataWindows]);
+
+  useEffect(() => {
+    const current = getRuntimeControlWindowStatus();
+    if (current.targetDataWindows !== runtimeDataWindowState.targetDataWindows) {
+      return;
+    }
+    const reason = runtimeDataWindowState.targetDataWindows === 8
+      ? "idle"
+      : runtimeDataWindowState.outgoingControlDemand
+        ? "outgoing_control_demand"
+        : "restore_quiet_period";
+    publishRuntimeControlWindowStatus({ ...current, reason });
+  }, [
+    runtimeDataWindowState.outgoingControlDemand,
+    runtimeDataWindowState.restoreAfterMs,
+    runtimeDataWindowState.targetDataWindows,
+  ]);
 
   function updateSchedulerState(updater: (current: TransferSchedulerState) => TransferSchedulerState): TransferSchedulerState {
     const next = updater(schedulerRef.current);
@@ -235,7 +339,10 @@ function App() {
   }, [scheduler, rooms]);
 
   useEffect(() => {
-    const plannerPolicy = microGroupPlannerPolicy(config?.micro_flow_group_mode);
+    const plannerPolicy = microGroupPlannerPolicy(
+      config?.micro_flow_group_mode,
+      runtimeDataWindowState.targetDataWindows
+    );
     const launchPlan = planRunnableTransferLaunches(
       scheduler,
       rooms,
@@ -305,7 +412,7 @@ function App() {
         updateSchedulerState((current) => ({ ...current }));
       });
     }
-  }, [scheduler, rooms, config?.micro_flow_group_mode]);
+  }, [scheduler, rooms, config?.micro_flow_group_mode, runtimeDataWindowState.targetDataWindows]);
 
   useEffect(() => {
     for (const itemId of [...launchingQueueItemWindowsRef.current.keys()]) {
@@ -714,7 +821,7 @@ function App() {
       });
       updateSchedulerState((current) => markQueueItemCompleted(current, itemId));
       runtimeTerminalStatus = "completed";
-      void rebalanceActiveTransferWindows({ itemId, status: "completed" });
+      void scheduleActiveTransferWindowRebalance({ itemId, status: "completed" });
       await refreshRoomAfterQueueItem(item.roomId);
       return "completed";
     } catch (err) {
@@ -734,7 +841,7 @@ function App() {
       });
       if (terminalStatus) {
         runtimeTerminalStatus = terminalStatus;
-        void rebalanceActiveTransferWindows({ itemId, status: terminalStatus });
+        void scheduleActiveTransferWindowRebalance({ itemId, status: terminalStatus });
       }
       if (latestItem && latestItem.metadataStatus !== "loading") {
         await refreshRoomAfterQueueItem(latestItem.roomId);
@@ -1070,12 +1177,28 @@ function App() {
     }
   }
 
-  async function rebalanceActiveTransferWindows(trigger?: { itemId: string; status: "completed" | "failed" | "cancelled" }) {
+  function scheduleActiveTransferWindowRebalance(
+    trigger?: { itemId: string; status: "completed" | "failed" | "cancelled" },
+    targetDataWindows = runtimeDataWindowTargetRef.current,
+  ): Promise<unknown> {
+    const next = runtimeWindowRebalanceChainRef.current.then(() =>
+      rebalanceActiveTransferWindows(trigger, targetDataWindows)
+    );
+    runtimeWindowRebalanceChainRef.current = next.catch(() => undefined);
+    return next;
+  }
+
+  async function rebalanceActiveTransferWindows(
+    trigger?: { itemId: string; status: "completed" | "failed" | "cancelled" },
+    targetDataWindows = runtimeDataWindowTargetRef.current,
+  ): Promise<{ summary: string; error?: string }> {
+    const policy = microGroupPlannerPolicy(config?.micro_flow_group_mode, targetDataWindows);
     const plans = planActiveTransferWindowRebalances(
       schedulerRef.current,
-      rooms,
+      roomsRef.current,
       closedRoomIdsRef.current,
-      launchingQueueItemWindowsRef.current
+      launchingQueueItemWindowsRef.current,
+      policy
     );
     if (trigger) {
       const triggerItem = schedulerRef.current.items[trigger.itemId];
@@ -1093,10 +1216,10 @@ function App() {
       plans.map((plan) => `${plan.itemId}:${plan.transferId}:${plan.previousWindow}->${plan.requestedWindow}`).join(",")
     );
 
-    for (const plan of plans) {
+    const results = await Promise.all(plans.map(async (plan) => {
       const updateKey = `${plan.transferId}:${plan.requestedWindow}`;
       if (runtimeWindowUpdateKeysRef.current.has(updateKey)) {
-        continue;
+        return { description: `${plan.transferId}:coalesced`, failed: false };
       }
 
       runtimeWindowUpdateKeysRef.current.add(updateKey);
@@ -1110,35 +1233,70 @@ function App() {
         plan.previousWindow,
         plan.requestedWindow
       );
-      void updateTransferWindow(plan.transferId, plan.requestedWindow)
-        .then((result) => {
-          console.info(
-            "[pastey queue] event=rebalance_update_result queue_item_id=%s transfer_id=%s updated=%s reason=%s previous_window=%s effective_window=%s requested_window=%d",
+      try {
+        const result = await updateTransferWindow(plan.transferId, plan.requestedWindow);
+        console.info(
+          "[pastey queue] event=rebalance_update_result queue_item_id=%s transfer_id=%s updated=%s reason=%s previous_window=%s effective_window=%s requested_window=%d",
+          plan.itemId,
+          plan.transferId,
+          String(result.updated),
+          result.reason ?? "none",
+          result.previous_window === null || typeof result.previous_window === "undefined" ? "unknown" : String(result.previous_window),
+          result.effective_window === null || typeof result.effective_window === "undefined" ? "unknown" : String(result.effective_window),
+          plan.requestedWindow
+        );
+        recordRuntimeWindowUpdateResult(plan, result);
+        const effectiveWindow = result.effective_window ?? null;
+        if (
+          (result.updated || result.reason === "unchanged") &&
+          typeof effectiveWindow === "number"
+        ) {
+          updateSchedulerState((current) => markQueueItemRuntimeWindow(
+            current,
             plan.itemId,
-            plan.transferId,
-            String(result.updated),
-            result.reason ?? "none",
-            result.previous_window === null || typeof result.previous_window === "undefined" ? "unknown" : String(result.previous_window),
-            result.effective_window === null || typeof result.effective_window === "undefined" ? "unknown" : String(result.effective_window),
-            plan.requestedWindow
-          );
-          recordRuntimeWindowUpdateResult(plan, result);
-          const effectiveWindow = result.effective_window ?? null;
-          if (
-            (result.updated || result.reason === "unchanged") &&
-            typeof effectiveWindow === "number"
-          ) {
-            updateSchedulerState((current) => markQueueItemRuntimeWindow(
-              current,
-              plan.itemId,
-              effectiveWindow
-            ));
-          }
-        })
-        .catch((err) => {
-          setError(err instanceof Error ? err.message : String(err));
-        });
-    }
+            effectiveWindow
+          ));
+        }
+        const failed = !(
+          result.reason === "not_active" ||
+          ((result.updated || result.reason === "unchanged") &&
+            effectiveWindow === plan.requestedWindow)
+        );
+        return {
+          description: `${plan.transferId}:${plan.previousWindow}->${effectiveWindow ?? plan.requestedWindow} (${result.reason})`,
+          failed,
+        };
+      } catch (err) {
+        console.warn(
+          "[pastey queue] event=rebalance_update_failed transfer_id=%s requested_window=%d error=%s",
+          plan.transferId,
+          plan.requestedWindow,
+          err instanceof Error ? err.message.slice(0, 256) : String(err).slice(0, 256)
+        );
+        return { description: `${plan.transferId}:update_failed`, failed: true };
+      } finally {
+        runtimeWindowUpdateKeysRef.current.delete(updateKey);
+      }
+    }));
+    const failed = results.some((result) => result.failed);
+    const outcome = {
+      summary: results.length > 0
+        ? results.map((result) => result.description).join(", ").slice(0, 512)
+        : `No active data allocations required adjustment for target ${targetDataWindows}.`,
+      ...(failed ? { error: "One or more active data-window updates failed." } : {}),
+    };
+    publishRuntimeControlWindowStatus({
+      targetDataWindows,
+      reason: targetDataWindows === 8
+        ? "idle"
+        : getOutgoingControlWindowDemand()
+          ? "outgoing_control_demand"
+          : "restore_quiet_period",
+      reservationReady: !failed,
+      activeAllocationUpdates: outcome.summary,
+      ...(outcome.error ? { lastError: outcome.error } : {}),
+    });
+    return outcome;
   }
 
   function enqueueRoomFiles(roomId: string, paths: string[]) {
@@ -1305,6 +1463,7 @@ function App() {
             onEnqueueTransferInputs={enqueueRoomTransferInputs}
             onCancelQueueItem={handleCancelQueueItem}
             onCancelQueueBatch={handleCancelQueueBatch}
+            agentBridgeEnabled={config.dev_tools_enabled}
           />
         ) : null}
 
@@ -1497,9 +1656,17 @@ function logPlannerLaunchSummary(
   }
 }
 
-function microGroupPlannerPolicy(mode?: MicroFlowGroupMode): TransferPlannerPolicy {
+function microGroupPlannerPolicy(
+  mode?: MicroFlowGroupMode,
+  globalWindowBudget = DEFAULT_TRANSFER_PLANNER_POLICY.globalWindowBudget,
+): TransferPlannerPolicy {
   return {
     ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    globalWindowBudget,
+    maxRequestedWindow: Math.min(
+      DEFAULT_TRANSFER_PLANNER_POLICY.maxRequestedWindow,
+      globalWindowBudget
+    ),
     microGroupMode: mode === "fixed" ? "fixed" : "dynamic"
   };
 }

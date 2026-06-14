@@ -9,7 +9,9 @@ export type RoomControlEventKind =
   | "capability_preview_ack"
   | "capability_preview_deny"
   | "capability_preview_invalid"
-  | "capability_preview_expired";
+  | "capability_preview_expired"
+  | "capability_execute_request"
+  | "capability_execution_result";
 
 export type CapabilityPreviewControlStatus =
   | "acknowledged_preview_only"
@@ -26,12 +28,13 @@ export interface RoomControlEventBase {
   targetPeerRef?: string;
   createdAt: string;
   expiresAt: string;
-  previewOnly: true;
+  previewOnly: boolean;
 }
 
 export interface CapabilityPreviewRoomControlEvent extends RoomControlEventBase {
   kind: "capability_preview";
   targetPeerRef: string;
+  previewOnly: true;
   payload: CapabilityRequestPreviewEnvelope;
 }
 
@@ -44,13 +47,16 @@ export interface CapabilityPreviewStatusPayload {
 
 export interface CapabilityPreviewAckRoomControlEvent extends RoomControlEventBase {
   kind: "capability_preview_ack";
+  previewOnly: true;
   payload: CapabilityPreviewStatusPayload & {
     status: "acknowledged_preview_only";
+    consent?: HelloPeerConsentGrant;
   };
 }
 
 export interface CapabilityPreviewDenyRoomControlEvent extends RoomControlEventBase {
   kind: "capability_preview_deny";
+  previewOnly: true;
   payload: CapabilityPreviewStatusPayload & {
     status: "denied";
   };
@@ -58,6 +64,7 @@ export interface CapabilityPreviewDenyRoomControlEvent extends RoomControlEventB
 
 export interface CapabilityPreviewInvalidRoomControlEvent extends RoomControlEventBase {
   kind: "capability_preview_invalid";
+  previewOnly: true;
   payload: CapabilityPreviewStatusPayload & {
     status: "invalid";
   };
@@ -65,6 +72,7 @@ export interface CapabilityPreviewInvalidRoomControlEvent extends RoomControlEve
 
 export interface CapabilityPreviewExpiredRoomControlEvent extends RoomControlEventBase {
   kind: "capability_preview_expired";
+  previewOnly: true;
   payload: CapabilityPreviewStatusPayload & {
     status: "expired";
   };
@@ -76,9 +84,72 @@ export type CapabilityPreviewStatusRoomControlEvent =
   | CapabilityPreviewInvalidRoomControlEvent
   | CapabilityPreviewExpiredRoomControlEvent;
 
+export interface HelloPeerConsentGrant {
+  schemaVersion: "pastey-hello-peer-consent-grant/v1";
+  consentId: string;
+  sourcePreviewEventId: string;
+  envelopeId: string;
+  requestId: string;
+  requestPayloadHash: string;
+  capability: "runtime.execute_hello_template";
+  exactMessage: "hello peer!";
+  expiresAt: string;
+}
+
+export interface HelloPeerExecutionRequest {
+  schemaVersion: "pastey-hello-peer-execution-request/v1";
+  executionId: string;
+  consentId: string;
+  sourcePreviewEventId: string;
+  envelopeId: string;
+  requestId: string;
+  requestPayloadHash: string;
+  roomRef: string;
+  sourceDeviceRef: string;
+  targetPeerRef: string;
+  capability: "runtime.execute_hello_template";
+  exactMessage: "hello peer!";
+  createdAt: string;
+  expiresAt: string;
+}
+
+export type HelloPeerExecutionResultStatus =
+  | "succeeded"
+  | "rejected"
+  | "expired"
+  | "already_consumed"
+  | "failed";
+
+export interface HelloPeerExecutionResult {
+  schemaVersion: "pastey-hello-peer-execution-result/v1";
+  executionId: string;
+  requestId: string;
+  consentId: string;
+  status: HelloPeerExecutionResultStatus;
+  output?: "hello peer!";
+  errorCode?: string;
+  createdAt: string;
+}
+
+export interface CapabilityExecuteRequestRoomControlEvent extends RoomControlEventBase {
+  kind: "capability_execute_request";
+  targetPeerRef: string;
+  previewOnly: false;
+  payload: HelloPeerExecutionRequest;
+}
+
+export interface CapabilityExecutionResultRoomControlEvent extends RoomControlEventBase {
+  kind: "capability_execution_result";
+  targetPeerRef: string;
+  previewOnly: false;
+  payload: HelloPeerExecutionResult;
+}
+
 export type RoomControlEvent =
   | CapabilityPreviewRoomControlEvent
-  | CapabilityPreviewStatusRoomControlEvent;
+  | CapabilityPreviewStatusRoomControlEvent
+  | CapabilityExecuteRequestRoomControlEvent
+  | CapabilityExecutionResultRoomControlEvent;
 
 export type RoomControlEventBuildResult =
   | { ok: true; event: RoomControlEvent }
@@ -92,6 +163,8 @@ export interface RoomControlEventSessionState {
   seenEventIds: string[];
   seenEnvelopeIds: string[];
   seenRequestIds: string[];
+  seenExecutionRequestIds: string[];
+  seenExecutionResultIds: string[];
 }
 
 export type RoomControlEventReplayResult =
@@ -124,6 +197,13 @@ interface BuildCapabilityPreviewStatusControlEventOptions {
   ttlMs?: number;
   eventId?: string;
   reason?: string;
+  consent?: HelloPeerConsentGrant;
+}
+
+interface BuildExecutionControlEventOptions {
+  now?: Date;
+  ttlMs?: number;
+  eventId?: string;
 }
 
 interface ValidateRoomControlEventOptions {
@@ -155,15 +235,53 @@ const ROOM_CONTROL_EVENT_REQUIRED_FIELDS = [
 ];
 const ROOM_CONTROL_EVENT_OPTIONAL_FIELDS = ["targetPeerRef"];
 const STATUS_PAYLOAD_REQUIRED_FIELDS = ["envelopeId", "requestId", "status"];
-const STATUS_PAYLOAD_OPTIONAL_FIELDS = ["reason"];
+const STATUS_PAYLOAD_OPTIONAL_FIELDS = ["reason", "consent"];
+const CONSENT_GRANT_FIELDS = [
+  "schemaVersion",
+  "consentId",
+  "sourcePreviewEventId",
+  "envelopeId",
+  "requestId",
+  "requestPayloadHash",
+  "capability",
+  "exactMessage",
+  "expiresAt"
+];
+const EXECUTION_REQUEST_FIELDS = [
+  "schemaVersion",
+  "executionId",
+  "consentId",
+  "sourcePreviewEventId",
+  "envelopeId",
+  "requestId",
+  "requestPayloadHash",
+  "roomRef",
+  "sourceDeviceRef",
+  "targetPeerRef",
+  "capability",
+  "exactMessage",
+  "createdAt",
+  "expiresAt"
+];
+const EXECUTION_RESULT_REQUIRED_FIELDS = [
+  "schemaVersion",
+  "executionId",
+  "requestId",
+  "consentId",
+  "status",
+  "createdAt"
+];
+const EXECUTION_RESULT_OPTIONAL_FIELDS = ["output", "errorCode"];
 const ROOM_CONTROL_EVENT_KINDS = new Set<RoomControlEventKind>([
   "capability_preview",
   "capability_preview_ack",
   "capability_preview_deny",
   "capability_preview_invalid",
-  "capability_preview_expired"
+  "capability_preview_expired",
+  "capability_execute_request",
+  "capability_execution_result"
 ]);
-const STATUS_BY_KIND: Record<Exclude<RoomControlEventKind, "capability_preview">, CapabilityPreviewControlStatus> = {
+const STATUS_BY_KIND: Record<CapabilityPreviewStatusRoomControlEvent["kind"], CapabilityPreviewControlStatus> = {
   capability_preview_ack: "acknowledged_preview_only",
   capability_preview_deny: "denied",
   capability_preview_invalid: "invalid",
@@ -200,6 +318,12 @@ const UNSAFE_OR_EXECUTION_FIELDS = new Set([
   "process",
   "spawn"
 ].map(normalizeFieldName));
+const HELLO_CAPABILITY = "runtime.execute_hello_template";
+const HELLO_MESSAGE = "hello peer!";
+const CONSENT_GRANT_SCHEMA = "pastey-hello-peer-consent-grant/v1";
+const EXECUTION_REQUEST_SCHEMA = "pastey-hello-peer-execution-request/v1";
+const EXECUTION_RESULT_SCHEMA = "pastey-hello-peer-execution-result/v1";
+const MAX_EXECUTION_ERROR_CODE_LENGTH = 64;
 let eventSequence = 0;
 
 export function buildCapabilityPreviewControlEvent(
@@ -288,9 +412,80 @@ export function buildCapabilityPreviewStatusControlEvent(
       envelopeId: sourceEvent.payload.envelopeId,
       requestId: sourceEvent.payload.request.requestId,
       status,
-      ...(options.reason ? { reason: options.reason } : {})
+      ...(options.reason ? { reason: options.reason } : {}),
+      ...(options.consent ? { consent: options.consent } : {})
     }
   } as CapabilityPreviewStatusRoomControlEvent;
+  return validatedBuildResult(event, now);
+}
+
+export function buildCapabilityExecuteRequestControlEvent(
+  request: HelloPeerExecutionRequest,
+  options: BuildExecutionControlEventOptions = {}
+): RoomControlEventBuildResult {
+  const now = options.now ?? new Date();
+  const ttlMs = options.ttlMs ?? DEFAULT_CONTROL_EVENT_TTL_MS;
+  const errors = validateHelloPeerExecutionRequest(request, now);
+  validateBuilderInputs(now, ttlMs, request.roomRef, request.sourceDeviceRef, request.targetPeerRef, errors);
+  if (errors.length > 0) {
+    return { ok: false, errors: unique(errors) };
+  }
+  const event: CapabilityExecuteRequestRoomControlEvent = {
+    schemaVersion: ROOM_CONTROL_SCHEMA_VERSION,
+    eventId: options.eventId ?? createEventId(now),
+    kind: "capability_execute_request",
+    roomRef: request.roomRef,
+    sourceDeviceRef: request.sourceDeviceRef,
+    targetPeerRef: request.targetPeerRef,
+    createdAt: now.toISOString(),
+    expiresAt: new Date(Math.min(
+      now.getTime() + ttlMs,
+      Date.parse(request.expiresAt)
+    )).toISOString(),
+    previewOnly: false,
+    payload: request
+  };
+  return validatedBuildResult(event, now);
+}
+
+export function buildCapabilityExecutionResultControlEvent(
+  result: HelloPeerExecutionResult,
+  requestEvent: CapabilityExecuteRequestRoomControlEvent,
+  options: BuildExecutionControlEventOptions = {}
+): RoomControlEventBuildResult {
+  const now = options.now ?? new Date();
+  const ttlMs = options.ttlMs ?? DEFAULT_CONTROL_EVENT_TTL_MS;
+  const errors = validateHelloPeerExecutionResult(result);
+  validateBuilderInputs(
+    now,
+    ttlMs,
+    requestEvent.roomRef,
+    requestEvent.targetPeerRef,
+    requestEvent.sourceDeviceRef,
+    errors
+  );
+  if (
+    result.executionId !== requestEvent.payload.executionId ||
+    result.requestId !== requestEvent.payload.requestId ||
+    result.consentId !== requestEvent.payload.consentId
+  ) {
+    errors.push("Execution result must match the exact execution request IDs.");
+  }
+  if (errors.length > 0) {
+    return { ok: false, errors: unique(errors) };
+  }
+  const event: CapabilityExecutionResultRoomControlEvent = {
+    schemaVersion: ROOM_CONTROL_SCHEMA_VERSION,
+    eventId: options.eventId ?? createEventId(now),
+    kind: "capability_execution_result",
+    roomRef: requestEvent.roomRef,
+    sourceDeviceRef: requestEvent.targetPeerRef,
+    targetPeerRef: requestEvent.sourceDeviceRef,
+    createdAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + ttlMs).toISOString(),
+    previewOnly: false,
+    payload: result
+  };
   return validatedBuildResult(event, now);
 }
 
@@ -325,10 +520,6 @@ export function validateRoomControlEvent(
   requireBoundedString(value.sourceDeviceRef, "sourceDeviceRef", MAX_IDENTIFIER_LENGTH, errors);
   validateOptionalBoundedString(value.targetPeerRef, "targetPeerRef", MAX_IDENTIFIER_LENGTH, errors);
   validateDates(value.createdAt, value.expiresAt, now, errors);
-  if (value.previewOnly !== true) {
-    errors.push("Room control event requires previewOnly true.");
-  }
-
   const kind = typeof value.kind === "string" && ROOM_CONTROL_EVENT_KINDS.has(value.kind as RoomControlEventKind)
     ? value.kind as RoomControlEventKind
     : null;
@@ -336,8 +527,12 @@ export function validateRoomControlEvent(
     errors.push("Room control event contains an unknown or unsupported kind.");
   } else if (kind === "capability_preview") {
     validateCapabilityPreviewEvent(value, now, errors);
+  } else if (kind === "capability_execute_request") {
+    validateExecutionRequestEvent(value, now, errors);
+  } else if (kind === "capability_execution_result") {
+    validateExecutionResultEvent(value, errors);
   } else {
-    validateStatusEvent(value, kind, errors);
+    validateStatusEvent(value, kind as CapabilityPreviewStatusRoomControlEvent["kind"], errors);
   }
 
   if (options.expectedRoomRef && value.roomRef !== options.expectedRoomRef) {
@@ -359,7 +554,9 @@ export function createRoomControlEventSessionState(): RoomControlEventSessionSta
   return {
     seenEventIds: [],
     seenEnvelopeIds: [],
-    seenRequestIds: []
+    seenRequestIds: [],
+    seenExecutionRequestIds: [],
+    seenExecutionResultIds: []
   };
 }
 
@@ -387,7 +584,35 @@ export function checkAndRecordRoomControlEvent(
       state: {
         seenEventIds: [...state.seenEventIds, event.eventId],
         seenEnvelopeIds: [...state.seenEnvelopeIds, event.payload.envelopeId],
-        seenRequestIds: [...state.seenRequestIds, event.payload.request.requestId]
+        seenRequestIds: [...state.seenRequestIds, event.payload.request.requestId],
+        seenExecutionRequestIds: state.seenExecutionRequestIds,
+        seenExecutionResultIds: state.seenExecutionResultIds
+      }
+    };
+  }
+  if (event.kind === "capability_execute_request") {
+    if (state.seenExecutionRequestIds.includes(event.payload.executionId)) {
+      return { ok: false, reason: "duplicate_request", errors: ["Execution request ID is a duplicate."], state };
+    }
+    return {
+      ok: true,
+      state: {
+        ...state,
+        seenEventIds: [...state.seenEventIds, event.eventId],
+        seenExecutionRequestIds: [...state.seenExecutionRequestIds, event.payload.executionId]
+      }
+    };
+  }
+  if (event.kind === "capability_execution_result") {
+    if (state.seenExecutionResultIds.includes(event.payload.executionId)) {
+      return { ok: false, reason: "duplicate_request", errors: ["Execution result ID is a duplicate."], state };
+    }
+    return {
+      ok: true,
+      state: {
+        ...state,
+        seenEventIds: [...state.seenEventIds, event.eventId],
+        seenExecutionResultIds: [...state.seenExecutionResultIds, event.payload.executionId]
       }
     };
   }
@@ -420,6 +645,9 @@ function validateCapabilityPreviewEvent(
   now: Date,
   errors: string[]
 ) {
+  if (value.previewOnly !== true) {
+    errors.push("Capability preview event requires previewOnly true.");
+  }
   requireBoundedString(value.targetPeerRef, "targetPeerRef", MAX_IDENTIFIER_LENGTH, errors);
   const envelopeValidation = validateCapabilityRequestPreviewEnvelope(value.payload, {
     now,
@@ -441,9 +669,12 @@ function validateCapabilityPreviewEvent(
 
 function validateStatusEvent(
   value: Record<string, unknown>,
-  kind: Exclude<RoomControlEventKind, "capability_preview">,
+  kind: CapabilityPreviewStatusRoomControlEvent["kind"],
   errors: string[]
 ) {
+  if (value.previewOnly !== true) {
+    errors.push("Capability preview status event requires previewOnly true.");
+  }
   if (!isRecord(value.payload)) {
     errors.push("Room control status event payload must be an object.");
     return;
@@ -458,8 +689,157 @@ function validateStatusEvent(
   requireBoundedString(value.payload.envelopeId, "payload.envelopeId", MAX_IDENTIFIER_LENGTH, errors);
   requireBoundedString(value.payload.requestId, "payload.requestId", MAX_IDENTIFIER_LENGTH, errors);
   validateOptionalBoundedString(value.payload.reason, "payload.reason", MAX_REASON_LENGTH, errors);
+  if (value.payload.consent !== undefined) {
+    if (kind !== "capability_preview_ack") {
+      errors.push("Only a capability preview acknowledgement may contain a consent grant.");
+    }
+    errors.push(...validateHelloPeerConsentGrant(value.payload.consent));
+  }
   if (value.payload.status !== STATUS_BY_KIND[kind]) {
     errors.push(`Room control event kind ${kind} requires status ${STATUS_BY_KIND[kind]}.`);
+  }
+}
+
+function validateExecutionRequestEvent(
+  value: Record<string, unknown>,
+  now: Date,
+  errors: string[]
+) {
+  if (value.previewOnly !== false) {
+    errors.push("Execution request event requires previewOnly false.");
+  }
+  const requestErrors = validateHelloPeerExecutionRequest(value.payload, now);
+  errors.push(...requestErrors);
+  if (!isRecord(value.payload)) {
+    return;
+  }
+  if (
+    value.roomRef !== value.payload.roomRef ||
+    value.sourceDeviceRef !== value.payload.sourceDeviceRef ||
+    value.targetPeerRef !== value.payload.targetPeerRef
+  ) {
+    errors.push("Execution request event must match the exact room/source/target request bindings.");
+  }
+  const eventExpiry = typeof value.expiresAt === "string" ? Date.parse(value.expiresAt) : Number.NaN;
+  const requestExpiry = typeof value.payload.expiresAt === "string"
+    ? Date.parse(value.payload.expiresAt)
+    : Number.NaN;
+  if (Number.isFinite(eventExpiry) && Number.isFinite(requestExpiry) && eventExpiry > requestExpiry) {
+    errors.push("Execution request event expiry must not exceed request expiry.");
+  }
+}
+
+function validateExecutionResultEvent(
+  value: Record<string, unknown>,
+  errors: string[]
+) {
+  if (value.previewOnly !== false) {
+    errors.push("Execution result event requires previewOnly false.");
+  }
+  errors.push(...validateHelloPeerExecutionResult(value.payload));
+}
+
+export function validateHelloPeerConsentGrant(value: unknown): string[] {
+  const errors: string[] = [];
+  if (!isRecord(value)) {
+    return ["Hello Peer consent grant must be an object."];
+  }
+  requireExactFields(value, CONSENT_GRANT_FIELDS, [], "Hello Peer consent grant", errors);
+  if (value.schemaVersion !== CONSENT_GRANT_SCHEMA) {
+    errors.push(`Hello Peer consent grant schemaVersion must be ${CONSENT_GRANT_SCHEMA}.`);
+  }
+  for (const field of [
+    "consentId",
+    "sourcePreviewEventId",
+    "envelopeId",
+    "requestId",
+    "requestPayloadHash"
+  ]) {
+    requireBoundedString(value[field], `consent.${field}`, MAX_IDENTIFIER_LENGTH, errors);
+  }
+  validateFixedHelloCapabilityAndMessage(value, "Hello Peer consent grant", errors);
+  requireDateString(value.expiresAt, "consent.expiresAt", errors);
+  return unique(errors);
+}
+
+export function validateHelloPeerExecutionRequest(value: unknown, now = new Date()): string[] {
+  const errors: string[] = [];
+  if (!isRecord(value)) {
+    return ["Hello Peer execution request must be an object."];
+  }
+  requireExactFields(value, EXECUTION_REQUEST_FIELDS, [], "Hello Peer execution request", errors);
+  if (value.schemaVersion !== EXECUTION_REQUEST_SCHEMA) {
+    errors.push(`Hello Peer execution request schemaVersion must be ${EXECUTION_REQUEST_SCHEMA}.`);
+  }
+  for (const field of [
+    "executionId",
+    "consentId",
+    "sourcePreviewEventId",
+    "envelopeId",
+    "requestId",
+    "requestPayloadHash",
+    "roomRef",
+    "sourceDeviceRef",
+    "targetPeerRef"
+  ]) {
+    requireBoundedString(value[field], field, MAX_IDENTIFIER_LENGTH, errors);
+  }
+  validateFixedHelloCapabilityAndMessage(value, "Hello Peer execution request", errors);
+  validateDates(value.createdAt, value.expiresAt, now, errors);
+  return unique(errors);
+}
+
+export function validateHelloPeerExecutionResult(value: unknown): string[] {
+  const errors: string[] = [];
+  if (!isRecord(value)) {
+    return ["Hello Peer execution result must be an object."];
+  }
+  requireExactFields(
+    value,
+    EXECUTION_RESULT_REQUIRED_FIELDS,
+    EXECUTION_RESULT_OPTIONAL_FIELDS,
+    "Hello Peer execution result",
+    errors
+  );
+  if (value.schemaVersion !== EXECUTION_RESULT_SCHEMA) {
+    errors.push(`Hello Peer execution result schemaVersion must be ${EXECUTION_RESULT_SCHEMA}.`);
+  }
+  for (const field of ["executionId", "requestId", "consentId"]) {
+    requireBoundedString(value[field], field, MAX_IDENTIFIER_LENGTH, errors);
+  }
+  if (!["succeeded", "rejected", "expired", "already_consumed", "failed"].includes(String(value.status))) {
+    errors.push("Hello Peer execution result contains an unsupported status.");
+  }
+  requireDateString(value.createdAt, "createdAt", errors);
+  if (value.status === "succeeded") {
+    if (value.output !== HELLO_MESSAGE) {
+      errors.push(`Successful Hello Peer execution output must be exactly ${HELLO_MESSAGE}.`);
+    }
+    if (value.errorCode !== undefined) {
+      errors.push("Successful Hello Peer execution result must not contain errorCode.");
+    }
+  } else {
+    if (value.output !== undefined) {
+      errors.push("Rejected or failed Hello Peer execution result must not contain output.");
+    }
+    requireBoundedString(value.errorCode, "errorCode", MAX_EXECUTION_ERROR_CODE_LENGTH, errors);
+  }
+  if (serializedByteLength(value) > 1024) {
+    errors.push("Hello Peer execution result exceeds 1024 bytes.");
+  }
+  return unique(errors);
+}
+
+function validateFixedHelloCapabilityAndMessage(
+  value: Record<string, unknown>,
+  label: string,
+  errors: string[]
+) {
+  if (value.capability !== HELLO_CAPABILITY) {
+    errors.push(`${label} capability must be exactly ${HELLO_CAPABILITY}.`);
+  }
+  if (value.exactMessage !== HELLO_MESSAGE) {
+    errors.push(`${label} message must be exactly ${HELLO_MESSAGE}.`);
   }
 }
 
@@ -499,6 +879,12 @@ function validateDates(createdAt: unknown, expiresAt: unknown, now: Date, errors
   }
   if (Number.isFinite(createdAtMs) && Number.isFinite(expiresAtMs) && expiresAtMs <= createdAtMs) {
     errors.push("Room control event expiresAt must be after createdAt.");
+  }
+}
+
+function requireDateString(value: unknown, label: string, errors: string[]) {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+    errors.push(`Room control event requires a valid ${label}.`);
   }
 }
 

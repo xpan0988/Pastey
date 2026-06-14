@@ -13,6 +13,7 @@ import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
 import { fileTypeLabel, formatBytes, formatDuration, formatSpeed, formatTimestamp } from "../lib/format";
 import { fileIdentityKey, type RoomTransferQueueView, type TransferQueueBatch, type TransferQueueInput, type TransferQueueItem } from "../lib/transferScheduler";
 import type { FileTransferProgressEvent, RoomInfo, RoomItem } from "../lib/types";
+import { AiSlotPreview } from "../components/AiSlotPreview";
 
 interface RoomPageProps {
   room: RoomInfo;
@@ -26,6 +27,7 @@ interface RoomPageProps {
   onEnqueueTransferInputs: (roomId: string, inputs: TransferQueueInput[]) => void;
   onCancelQueueItem: (itemId: string) => Promise<void>;
   onCancelQueueBatch: (batchId: string) => Promise<void>;
+  agentBridgeEnabled: boolean;
 }
 
 export function RoomPage({
@@ -39,7 +41,8 @@ export function RoomPage({
   onEnqueueFiles,
   onEnqueueTransferInputs,
   onCancelQueueItem,
-  onCancelQueueBatch
+  onCancelQueueBatch,
+  agentBridgeEnabled
 }: RoomPageProps) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState<"text" | "burn" | null>(null);
@@ -325,6 +328,13 @@ export function RoomPage({
 
         {peerStateMessage ? <div className="error-box">{peerStateMessage}</div> : null}
       </section>
+
+      {agentBridgeEnabled ? (
+        <AiSlotPreview
+          key={`${room.id}:${room.peer_connected}:${room.peer_device_name ?? "none"}`}
+          room={room}
+        />
+      ) : null}
 
       <section className="panel chat-panel">
         {queue.items.length > 0 ? (

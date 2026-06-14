@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "1.0.0",
+  "toolVersion": "0.3.0",
+  "repositoryRoot": "/Users/xiyuanpan/Pastey",
+  "repositoryIdentity": "0992c561ba19ab05",
+  "gitCommit": "8bca25dd6ba7f61a0bb6910dda646213e3c8a3a5",
+  "generatedAt": "2026-06-14T07:16:44.193Z",
+  "enabledAdapters": [
+    "typescript",
+    "rust",
+    "react",
+    "tauri"
+  ],
+  "scannedFileCount": 90,
+  "excludedFileCount": 11169,
+  "nodeCount": 5920,
+  "edgeCount": 13270,
+  "diagnosticCount": 5087,
+  "analysisDuration": 3280
+}

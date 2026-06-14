@@ -17,7 +17,15 @@ PASTEY_TRANSFER_WINDOW_SIZE env override
   -> default binary-v1 window 8
 ```
 
-Active outgoing binary-v1 sender transfers can receive completion-triggered runtime-window updates. This is sender-side scheduling policy only; it does not add fields to binary-v1 frames, JSON fallback DTOs, ACKs, finalize, cancel, burn, Inbox metadata, or receiver protocol state.
+Active outgoing binary-v1 sender transfers can receive completion-triggered
+runtime-window updates and CL-4 hot adjustments. Real local outgoing
+room-control demand changes the unified data target from `8` to `7`; idle
+restores `8` after a short quiet period. The weighted planner reallocates the
+combined active/runnable budget, and existing active senders update without
+cancellation or restart. Inbound-only control review state does not reserve a
+sender window. This remains sender-side scheduling policy only; it does not add
+fields to binary-v1 frames, JSON fallback DTOs, ACKs, finalize, cancel, burn,
+Inbox metadata, or receiver protocol state.
 
 ## MicroFlowGroup Boundary
 
@@ -35,6 +43,6 @@ The capability probe computes internal advisory `recommended_roles` hints, but t
 
 ## Non-Current Work
 
-Binary-v2, stream-oriented transfer, substream multiplexing, archive/bundle transfer, backend-owned scheduling, command/agent dispatch lanes, retry/timeout adaptive downshift, stable cooldown recovery, and speed-history heuristics remain future or research topics unless a later implementation explicitly changes that.
+Binary-v2, stream-oriented transfer, substream multiplexing, archive/bundle transfer, backend-owned scheduling, command/agent dispatch lanes, retry/timeout adaptive downshift, and speed-history heuristics remain future or research topics unless a later implementation explicitly changes that.
 
 The completed Phase 2-4 implementation record has moved to [../binary-v2/early-implementation.md](../binary-v2/early-implementation.md). The Dynamic MicroFlowGroup capacity report remains a research reference at [../research/dynamic-microflowgroup-window-capacity-design.pdf](../research/dynamic-microflowgroup-window-capacity-design.pdf), not the active implementation source of truth.

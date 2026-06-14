@@ -37,10 +37,13 @@ The project intentionally prioritizes:
 
 Current releases focus on stabilizing the transport, lifecycle, and cross-platform foundation before larger multi-device workflow features are introduced.
 
-The current AI Slot is an optional Developer Tools advisory preview. It supports
-a deterministic mock route and an experimental OpenAI-compatible cloud route
-against synthetic redacted context. Accepted Hello Peer proposals can enter a
-visible local pending-confirmation state, but confirmation is local only.
+Agent Bridge provider selection, cloud base URL/model, runtime-memory-only API
+key, enablement, and redacted lifecycle-log level live in Settings / Developer
+Tools. The current-session Agent Bridge workflow lives in the active Room,
+bound directly to that room and peer. It supports a deterministic mock route
+and an experimental OpenAI-compatible cloud route against synthetic redacted
+context. Accepted Hello Peer proposals can enter a visible local
+pending-confirmation state, but confirmation is local only.
 Phase E0 can build and validate a `preview_only` Hello Peer request object, but
 it is not sent and no peer receives it. Phase E1 can wrap the request in a
 validated capability-preview envelope and simulate an inbound
@@ -50,14 +53,28 @@ duplicate helpers, and a pure unwired `8/0` or `7/1` capacity feasibility
 helper. CL-2 adds a local-only outbound/inbound control queue simulation with
 priority, replay/expiry handling, local status transitions, next-item
 selection, and hypothetical `8/0` or `7/1` budget display. It sends and
-receives nothing and is not wired into the scheduler. CL-3B now provides the
+receives nothing by itself and is not wired into the scheduler. CL-3B provides the
 smallest real preview-only transport: a separate bounded encrypted room HTTP
 endpoint with a current-session inbox and transport-only delivery receipt, not
-ordinary item/file semantics. Developer Tools can send one preview and refresh
-the received inbox. Transport delivery is not consent, current-session binding
-is not durable device identity, and scheduler reservation remains inactive.
-Provider output is untrusted and no capability execution, peer execution
-consent, or peer execution exists.
+ordinary item/file semantics. CL-3C connects that transport to the existing
+current-session local control queue: outbound events enqueue before one-item
+priority processing, and non-destructive inbox refresh validates and
+deduplicates inbound events. CL-4 activates sender-side runtime reservation:
+real local outgoing control demand changes the unified data target from `8` to
+`7`, hot-adjusts supported active binary-v1 sends without restart, and restores
+`8` after a short quiet period. Inbound-only review state does not reserve a
+window. Transport delivery is not consent and current-session binding is not
+durable device identity.
+CL-5 adds receiver-side PolicyGate review with explicit one-time Allow once or
+Deny for the exact fixed Hello Peer preview. The decision is current-session,
+request-bound, and expiring; ack/deny returns through the existing control
+queue. CL-6 adds exactly one host-owned in-process capability:
+`runtime.execute_hello_template`. After a matched allow-once ack, the sender
+must explicitly queue and send one execution request. The receiver revalidates
+the exact consent binding, consumes it once, returns exactly `hello peer!`, and
+queues a bounded typed result. There is no shell, process, file, network,
+generic runtime, reusable trust, automatic retry, or arbitrary execution.
+Provider output remains untrusted and cannot construct execution requests.
 
 ## Device diagnostics
 
@@ -188,7 +205,7 @@ Rooms exist until manually burned. Burning a room deletes that room's local encr
 4. Images are treated exactly like files
 5. No decode, resize, recompress, or transform step is applied
 
-Global Transfer Scheduler v1 is frontend orchestration only. It uses a weighted planner for existing queued file-like transfers, passes per-transfer requested sender windows through the existing single-file transfer command, and can rebalance active outgoing binary-v1 sender windows after planner-managed queue item completion. It does not add retry/timeout adaptive windows, archive bundling, folder transfer, backend-owned scheduling, or protocol changes. File type may affect labels, but the binary-v1 transport remains opaque, format-agnostic, and file-type independent.
+Global Transfer Scheduler v1 is frontend orchestration only. It uses a weighted planner for existing queued file-like transfers, passes per-transfer requested sender windows through the existing single-file transfer command, and can hot-adjust active outgoing binary-v1 sender windows after planner-managed completion or CL-4 outgoing control demand changes. The combined data target is `7` with outgoing control demand and `8` when idle. It does not add retry/timeout adaptive windows, archive bundling, folder transfer, backend-owned scheduling, or protocol changes. File type may affect labels, but the binary-v1 transport remains opaque, format-agnostic, and file-type independent.
 
 ## Download
 
@@ -276,7 +293,13 @@ Release builds write transfer diagnostics locally:
 - macOS: `~/Library/Application Support/pastey/logs/pastey.log`
 - Windows: `%LOCALAPPDATA%\pastey\logs\pastey.log`
 
-Logs rotate at 5MB and keep the last two rotated files. Logs never contain plaintext text, file contents, encryption keys, or original source file paths. The Settings screen can open the logs folder or copy the most recent transfer error summary.
+Logs rotate at 5MB and keep the last two rotated files. Agent Bridge lifecycle
+entries use bounded redacted structured fields and shortened references. Logs
+are audit mirrors only: they are never workflow state, consent, authority, or
+trust. Logs never contain plaintext text, file contents, encryption keys,
+Agent Bridge API keys, raw control payloads, or original source file paths. The
+Settings screen can open the logs folder or copy the most recent transfer
+error summary.
 
 ## Release size expectations
 

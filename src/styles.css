@@ -1330,6 +1330,129 @@ label {
   width: 100%;
 }
 
+.agent-bridge-section {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid rgba(31, 111, 255, 0.16);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.56);
+}
+
+.agent-bridge-section-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.agent-bridge-section-header > div {
+  min-width: 0;
+}
+
+.agent-bridge-section-header p {
+  margin: 4px 0 0;
+}
+
+.agent-bridge-safety-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.agent-bridge-status-row,
+.agent-bridge-next-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px 12px;
+  min-width: 0;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: rgba(247, 250, 255, 0.78);
+  flex-wrap: wrap;
+}
+
+.agent-bridge-status-label {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.agent-bridge-room-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.agent-bridge-room-toolbar select {
+  max-width: min(100%, 240px);
+}
+
+.agent-bridge-compact-ref {
+  min-width: 0;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-bridge-advanced,
+.agent-bridge-room-details {
+  min-width: 0;
+  border: 1px solid rgba(13, 31, 61, 0.1);
+  border-radius: 9px;
+  background: rgba(247, 250, 255, 0.52);
+}
+
+.agent-bridge-advanced > summary,
+.agent-bridge-room-details > summary {
+  padding: 11px 13px;
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 750;
+}
+
+.agent-bridge-advanced-content {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  padding: 0 13px 13px;
+}
+
+.agent-bridge-advanced-content section {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.agent-bridge-definition-list {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.agent-bridge-definition-list > div {
+  display: grid;
+  grid-template-columns: minmax(100px, 0.25fr) minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+}
+
+.agent-bridge-definition-list span,
+.diagnostic-block span,
+.ai-slot-preview-messages li {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .ai-slot-advisory-notice {
   display: grid;
   gap: 5px;
@@ -2102,9 +2225,21 @@ label {
   }
 
   .diagnostics-panel-header,
-  .benchmark-controls {
+  .benchmark-controls,
+  .agent-bridge-section-header,
+  .agent-bridge-room-toolbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .agent-bridge-room-toolbar select,
+  .agent-bridge-compact-ref {
+    width: 100%;
+    max-width: none;
+  }
+
+  .agent-bridge-definition-list > div {
+    grid-template-columns: 1fr;
   }
 
   .diagnostic-grid {

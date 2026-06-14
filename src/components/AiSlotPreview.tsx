@@ -28,38 +28,14 @@ import {
   type HelloPeerRequest,
   type PendingAiAction
 } from "../lib/ai";
+import { AgentBridgeOverview } from "./agentBridge/AgentBridgeOverview";
+import { AgentBridgeAdvancedDiagnostics } from "./agentBridge/AgentBridgeAdvancedDiagnostics";
+import { RoomControlPanel } from "./agentBridge/RoomControlPanel";
 import {
-  buildCapabilityPreviewControlEvent,
-  buildCapabilityPreviewStatusControlEvent,
-  buildSessionBoundCapabilityPreviewControlEvent,
-  createIdleRoomControlSendState,
-  createControlQueueState,
-  enqueueRoomControlEvent,
-  getControlQueueBudget,
-  markControlQueueItemStatus,
-  preserveRoomControlSendStateForSession,
-  sendCurrentRoomControlEvent,
-  selectNextControlQueueItem,
-  type CapabilityPreviewControlStatus,
-  type CapabilityPreviewRoomControlEvent,
-  type ControlQueueItem,
-  type ControlQueueState,
-  type RoomControlEvent,
-  type RoomControlSendState
+  logAgentBridgeLifecycle,
+  useAgentBridgeRuntimeConfig,
 } from "../lib/agentBridge";
-import {
-  getRoomControlSessionContext,
-  listReceivedRoomControlEvents,
-  listRooms,
-  sendRoomControlEvent
-} from "../lib/tauri";
-import type {
-  ReceivedRoomControlEvent,
-  RoomControlSessionContext,
-  RoomInfo
-} from "../lib/types";
-
-type PreviewProvider = "mock" | "cloud";
+import type { RoomInfo } from "../lib/types";
 
 interface AiSlotPreviewResult {
   provider: string;
@@ -83,7 +59,7 @@ interface CapabilityEnvelopePreviewState {
   errors: string[];
 }
 
-export function AiSlotPreview() {
+export function AiSlotPreview({ room }: { room: RoomInfo }) {
   const [result, setResult] = useState<AiSlotPreviewResult | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingAiAction | null>(null);
   const [outboundPreview, setOutboundPreview] = useState<HelloPeerOutboundPreviewState | null>(null);
@@ -91,10 +67,8 @@ export function AiSlotPreview() {
   const [inboundPreview, setInboundPreview] = useState<CapabilityEnvelopePreviewState | null>(null);
   const [previewSession, setPreviewSession] = useState<CapabilityPreviewSessionState>(createCapabilityPreviewSessionState);
   const [generating, setGenerating] = useState(false);
-  const [providerKind, setProviderKind] = useState<PreviewProvider>("mock");
-  const [cloudBaseUrl, setCloudBaseUrl] = useState("https://api.openai.com/v1");
-  const [cloudModel, setCloudModel] = useState("");
-  const [cloudApiKey, setCloudApiKey] = useState("");
+  const bridgeConfig = useAgentBridgeRuntimeConfig();
+  const { providerKind, cloudBaseUrl, cloudModel, cloudApiKey } = bridgeConfig;
 
   useEffect(() => {
     if (!pendingAction || pendingAction.status !== "pending") return;
@@ -119,6 +93,7 @@ export function AiSlotPreview() {
         userRequest: "Ask the visible trusted peer to run the restricted Hello Peer demo."
       });
       showGeneratedResult(generated, mockProvider.config.displayName, context);
+      logAgentBridgeLifecycle({ eventKind: "advisory_generated", roomRefShort: room.id });
     } finally {
       setGenerating(false);
     }
@@ -152,6 +127,7 @@ export function AiSlotPreview() {
         userRequest: "Propose the restricted Hello Peer advisory for the visible trusted mock peer."
       });
       showGeneratedResult(generated, provider.config.displayName, context);
+      logAgentBridgeLifecycle({ eventKind: "advisory_generated", roomRefShort: room.id });
     } finally {
       setGenerating(false);
     }
@@ -174,6 +150,13 @@ export function AiSlotPreview() {
         pendingError = error instanceof Error ? error.message : "Pending action creation failed closed.";
       }
     }
+    if (nextPendingAction) {
+      logAgentBridgeLifecycle({
+        eventKind: "local_confirmation_requested",
+        roomRefShort: room.id,
+        requestIdShort: nextPendingAction.pendingId,
+      });
+    }
     setPendingAction(nextPendingAction);
     setOutboundPreview(null);
     setEnvelopePreview(null);
@@ -189,6 +172,12 @@ export function AiSlotPreview() {
         ? `${generated.error.code}: ${generated.error.message}`
         : pendingError
     });
+    logAgentBridgeLifecycle({
+      eventKind: policy?.status === "accepted" ? "policy_accepted" : "policy_rejected",
+      roomRefShort: room.id,
+      policyResult: policy?.status ?? "not_evaluated",
+      errorCode: generated.error?.code,
+    });
   }
 
   function confirmPendingLocally() {
@@ -196,6 +185,7 @@ export function AiSlotPreview() {
     setEnvelopePreview(null);
     setInboundPreview(null);
     setPendingAction((current) => current ? confirmPendingAiAction(current) : current);
+    logAgentBridgeLifecycle({ eventKind: "local_confirmation_confirmed", roomRefShort: room.id });
   }
 
   function cancelPendingLocally() {
@@ -223,6 +213,7 @@ export function AiSlotPreview() {
       validationStatus: validation.valid ? "accepted" : "rejected",
       errors: validation.errors
     });
+    logAgentBridgeLifecycle({ eventKind: "preview_built", roomRefShort: room.id, requestIdShort: buildResult.request.requestId });
   }
 
   function buildPreviewEnvelope() {
@@ -247,6 +238,7 @@ export function AiSlotPreview() {
       validationStatus: validation.valid ? "accepted" : "rejected",
       errors: validation.errors
     });
+    logAgentBridgeLifecycle({ eventKind: "preview_built", roomRefShort: room.id, eventIdShort: buildResult.envelope.envelopeId });
     setInboundPreview(null);
   }
 
@@ -294,82 +286,65 @@ export function AiSlotPreview() {
   }
 
   const cloudReady = cloudBaseUrl.trim().length > 0 && cloudModel.trim().length > 0;
+  const workflowStatus = getWorkflowStatus({
+    result,
+    pendingAction,
+    outboundPreview,
+    envelopePreview
+  });
+  const workflowError = result?.providerError
+    ?? result?.validationErrors[0]
+    ?? outboundPreview?.errors[0]
+    ?? envelopePreview?.errors[0];
+  const nextAction = getNextWorkflowAction({
+    result,
+    pendingAction,
+    outboundPreview,
+    envelopePreview,
+    generating,
+    providerKind,
+    cloudReady,
+    generateMockAdvisoryPlan,
+    generateCloudAdvisoryPlan,
+    confirmPendingLocally,
+    cancelPendingLocally,
+    buildOutboundRequestPreview,
+    buildPreviewEnvelope,
+    queuePreview: () => {
+      document.getElementById("agent-bridge-room-control-title")?.scrollIntoView({
+        behavior: "smooth",
+        block: "center"
+      });
+    }
+  });
 
+  if (!bridgeConfig.enabled) return null;
   return (
-    <div className="settings-row diagnostics-panel-row">
-      <span className="settings-icon wrench" aria-hidden="true" />
-      <div className="diagnostics-panel ai-slot-preview">
+    <section className="panel ai-slot-preview room-agent-bridge" data-testid="room-agent-bridge-panel">
         <div className="diagnostics-panel-header">
           <div>
-            <strong>AI Slot Phase E1 Preview</strong>
-            <p className="muted">Capability-envelope and inbound-preview simulation. Actual room transport is unavailable.</p>
+            <strong>Agent Bridge</strong>
+            <p className="muted">Peer: {room.peer_device_name ?? "Waiting for peer"} · current-session bounded Hello Peer workflow.</p>
           </div>
         </div>
-        <div className="ai-slot-advisory-notice">
-          <strong>Advisory only - no action is executed.</strong>
-          <span>Local confirmation only - no action is executed.</span>
-          <span>No peer request is sent in this build.</span>
-          <span>Peer consent is still required before any future execution.</span>
-          <span>Trusted room is not execution authorization.</span>
-          <span>Cloud context is redacted and current-session only.</span>
-          <span>Provider output is untrusted and must pass validation and PolicyGate.</span>
-          <span>No raw shell, file access, or hidden transfer is available.</span>
+        <div className="agent-bridge-safety-summary">
+          <span>Preview-only room control. Delivery is not consent.</span>
+          <span>Allow once and execution request remain explicit. No generic runtime or reusable trust.</span>
         </div>
-        <div className="ai-slot-provider-controls">
-          <label>
-            Preview provider
-            <select value={providerKind} onChange={(event) => setProviderKind(event.target.value as PreviewProvider)}>
-              <option value="mock">MockProvider</option>
-              <option value="cloud">CloudOpenAICompatibleProvider</option>
-            </select>
-          </label>
-          {providerKind === "cloud" ? (
+        <AgentBridgeOverview
+          workflowStatus={workflowStatus}
+          summary={nextAction.summary}
+          error={workflowError}
+          actionLabel={nextAction.label}
+          actionDisabled={nextAction.disabled}
+          onAction={nextAction.onAction}
+          secondaryActionLabel={nextAction.secondaryLabel}
+          onSecondaryAction={nextAction.onSecondaryAction}
+        />
+        <RoomControlPanel room={room} envelope={envelopePreview?.envelope} />
+        <AgentBridgeAdvancedDiagnostics>
+          {result ? (
             <>
-              <label>
-                Base URL
-                <input value={cloudBaseUrl} onChange={(event) => setCloudBaseUrl(event.target.value)} />
-              </label>
-              <label>
-                Model
-                <input
-                  value={cloudModel}
-                  placeholder="Provider model ID"
-                  onChange={(event) => setCloudModel(event.target.value)}
-                />
-              </label>
-              <label>
-                API key (runtime memory only)
-                <input
-                  type="password"
-                  autoComplete="off"
-                  value={cloudApiKey}
-                  placeholder="Optional for compatible endpoints"
-                  onChange={(event) => setCloudApiKey(event.target.value)}
-                />
-              </label>
-            </>
-          ) : null}
-        </div>
-        <div className="benchmark-controls">
-          {providerKind === "mock" ? (
-            <button className="secondary-button" disabled={generating} onClick={() => void generateMockAdvisoryPlan()}>
-              {generating ? "Generating..." : "Generate Mock Advisory Plan"}
-            </button>
-          ) : (
-            <button
-              className="secondary-button"
-              disabled={generating || !cloudReady}
-              onClick={() => void generateCloudAdvisoryPlan()}
-            >
-              {generating ? "Generating..." : "Generate Cloud Advisory Plan"}
-            </button>
-          )}
-          {providerKind === "cloud" ? (
-            <span className="muted">Experimental preview. Provider configuration and API key are not persisted.</span>
-          ) : null}
-        </div>
-        {result ? (
-          <>
             <div className="diagnostic-grid">
               <PreviewBlock title="Provider" value={`${result.provider} / ${result.model}`} />
               <PreviewBlock title="Action kind" value={result.plan?.kind ?? "Rejected before parsing"} />
@@ -408,12 +383,6 @@ export function AiSlotPreview() {
                 onPreviewInbound={previewInboundLocally}
               />
             ) : null}
-            {envelopePreview?.envelope ? (
-              <LocalControlQueueSimulation
-                key={envelopePreview.envelope.envelopeId}
-                envelope={envelopePreview.envelope}
-              />
-            ) : null}
             {inboundPreview ? (
               <InboundCapabilityPreview
                 preview={inboundPreview}
@@ -421,361 +390,118 @@ export function AiSlotPreview() {
                 onDeny={denyInboundPreview}
               />
             ) : null}
-          </>
-        ) : null}
-      </div>
-    </div>
+            </>
+          ) : (
+            <p className="muted">Generate an advisory plan to populate planning diagnostics.</p>
+          )}
+        </AgentBridgeAdvancedDiagnostics>
+    </section>
   );
 }
 
-function LocalControlQueueSimulation({
-  envelope
-}: {
-  envelope: CapabilityRequestPreviewEnvelope;
-}) {
-  const [queue, setQueue] = useState<ControlQueueState>(createControlQueueState);
-  const [messages, setMessages] = useState<string[]>([]);
-  const [activeRooms, setActiveRooms] = useState<RoomInfo[]>([]);
-  const [selectedRoomId, setSelectedRoomId] = useState("");
-  const [session, setSession] = useState<RoomControlSessionContext | null>(null);
-  const [transportEvent, setTransportEvent] = useState<RoomControlEvent | null>(null);
-  const [sendState, setSendState] = useState<RoomControlSendState>(createIdleRoomControlSendState);
-  const [receivedEvents, setReceivedEvents] = useState<ReceivedRoomControlEvent[]>([]);
-  const [transportBusy, setTransportBusy] = useState(false);
-  const budget = getControlQueueBudget(queue);
-  const selected = [...queue.inbound, ...queue.outbound].find((item) => item.status === "selected");
-
-  useEffect(() => {
-    void refreshTransportRooms();
-  }, []);
-
-  useEffect(() => {
-    if (!selectedRoomId) {
-      applySession(null);
-      setReceivedEvents([]);
-      return;
-    }
-    void getRoomControlSessionContext(selectedRoomId)
-      .then(applySession)
-      .catch((error) => {
-        applySession(null);
-        setMessages([error instanceof Error ? error.message : String(error)]);
-      });
-  }, [selectedRoomId]);
-
-  useEffect(() => {
-    if (!session) {
-      setTransportEvent(null);
-      return;
-    }
-    const buildResult = buildSessionBoundCapabilityPreviewControlEvent(envelope, session);
-    if (!buildResult.ok) {
-      setTransportEvent(null);
-      setMessages(buildResult.errors);
-      return;
-    }
-    setTransportEvent(buildResult.event);
-  }, [envelope, session?.roomId, session?.localSessionRef, session?.peerSessionRef]);
-
-  function applySession(nextSession: RoomControlSessionContext | null) {
-    setSession((currentSession) => {
-      setSendState((currentState) =>
-        preserveRoomControlSendStateForSession(currentState, currentSession, nextSession)
-      );
-      return nextSession;
-    });
-  }
-
-  async function refreshTransportRooms() {
-    try {
-      const rooms = (await listRooms()).filter(
-        (room) => room.status === "active" && room.peer_connected
-      );
-      setActiveRooms(rooms);
-      const nextRoomId = rooms.some((room) => room.id === selectedRoomId)
-        ? selectedRoomId
-        : rooms[0]?.id ?? "";
-      setSelectedRoomId(nextRoomId);
-      if (nextRoomId && nextRoomId === selectedRoomId) {
-        applySession(await getRoomControlSessionContext(nextRoomId));
-      }
-    } catch (error) {
-      setMessages([error instanceof Error ? error.message : String(error)]);
-    }
-  }
-
-  function enqueueOutboundPreview() {
-    const buildResult = buildCapabilityPreviewControlEvent(envelope, {
-      roomRef: envelope.roomRef
-    });
-    if (!buildResult.ok || buildResult.event.kind !== "capability_preview") {
-      setMessages(buildResult.ok ? ["Expected a capability preview control event."] : buildResult.errors);
-      return;
-    }
-    const enqueueResult = enqueueRoomControlEvent(queue, buildResult.event, "outbound");
-    if (!enqueueResult.ok) {
-      setMessages(enqueueResult.errors);
-      return;
-    }
-    setQueue(enqueueResult.state);
-    setMessages(["Outbound capability preview enqueued locally. No room event was sent."]);
-  }
-
-  function simulateInboundStatus(status: CapabilityPreviewControlStatus) {
-    const outbound = [...queue.outbound]
-      .reverse()
-      .find((item): item is ControlQueueItem & { event: CapabilityPreviewRoomControlEvent } =>
-        item.event.kind === "capability_preview"
-      );
-    if (!outbound) {
-      setMessages(["Enqueue an outbound capability preview before simulating an inbound status."]);
-      return;
-    }
-    const buildResult = buildCapabilityPreviewStatusControlEvent(outbound.event, status);
-    if (!buildResult.ok) {
-      setMessages(buildResult.errors);
-      return;
-    }
-    const enqueueResult = enqueueRoomControlEvent(queue, buildResult.event, "inbound");
-    if (!enqueueResult.ok) {
-      setMessages(enqueueResult.errors);
-      return;
-    }
-    const transitionResult = markControlQueueItemStatus(
-      enqueueResult.state,
-      outbound.queueId,
-      status,
-      { reason: `Local simulation received ${buildResult.event.kind}.` }
-    );
-    if (!transitionResult.ok) {
-      setMessages(transitionResult.errors);
-      return;
-    }
-    setQueue(transitionResult.state);
-    setMessages([
-      `${buildResult.event.kind} enqueued inbound locally.`,
-      status === "acknowledged_preview_only"
-        ? "Acknowledgement is preview-only and is not execution consent."
-        : "No retry or escalation was created."
-    ]);
-  }
-
-  function selectNextLocally() {
-    const result = selectNextControlQueueItem(queue);
-    setQueue(result.state);
-    setMessages(result.ok
-      ? [`Selected ${result.item.event.kind} locally. Nothing was dispatched.`]
-      : [result.reason]);
-  }
-
-  async function sendPreviewOverTransport() {
-    if (!session || !transportEvent) {
-      setMessages(["Select an active room session before transport delivery."]);
-      return;
-    }
-    const result = await sendCurrentRoomControlEvent(
-      transportEvent,
-      (event) => sendRoomControlEvent(session.roomId, event),
-      setSendState
-    );
-    if (result.status === "accepted") {
-      setMessages([
-        `Transport accepted ${result.eventId} for the peer's bounded local inbox.`,
-        "Transport delivery is not peer consent."
-      ]);
-    } else if (result.status === "rejected") {
-      setMessages([
-        result.message,
-        "Failed delivery was not converted into acknowledgement or denial."
-      ]);
-    }
-  }
-
-  async function refreshReceivedInbox() {
-    if (!session) {
-      setMessages(["Select an active room session before refreshing the control inbox."]);
-      return;
-    }
-    setTransportBusy(true);
-    try {
-      const events = await listReceivedRoomControlEvents(session.roomId);
-      setReceivedEvents(events);
-      setMessages([`Loaded ${events.length} current-session control inbox event(s).`]);
-    } catch (error) {
-      setMessages([error instanceof Error ? error.message : String(error)]);
-    } finally {
-      setTransportBusy(false);
-    }
-  }
-
-  return (
-    <div className="ai-slot-pending-card">
-      <div className="ai-slot-pending-header">
-        <div>
-          <strong>CL-2 local control queue simulation</strong>
-          <p className="muted">Outbound/inbound priority and hypothetical budget only.</p>
-        </div>
-        <span className="ai-slot-pending-status">local_only</span>
-      </div>
-      <div className="ai-slot-advisory-notice">
-        <strong>Local control queue simulation only — no room event is sent.</strong>
-        <span>Control backlog would reserve one logical control lane in a future scheduler phase.</span>
-        <span>Current scheduler behavior is unchanged.</span>
-        <span>Acknowledging preview is not execution consent.</span>
-      </div>
-      <div className="ai-slot-advisory-notice">
-        <strong>CL-3B preview-only transport delivery.</strong>
-        <span>Transport delivery is not peer consent.</span>
-        <span>Preview acknowledgement is not execution consent.</span>
-        <span>No capability is executed.</span>
-        <span>Scheduler reservation is not active.</span>
-      </div>
-      <div className="benchmark-controls">
-        <select
-          value={selectedRoomId}
-          onChange={(event) => setSelectedRoomId(event.target.value)}
-          aria-label="Active room-control transport room"
-        >
-          <option value="">No active room selected</option>
-          {activeRooms.map((room) => (
-            <option key={room.id} value={room.id}>
-              {room.peer_device_name ?? room.room_code_display ?? room.id}
-            </option>
-          ))}
-        </select>
-        <button className="secondary-button" onClick={() => void refreshTransportRooms()}>
-          Refresh active rooms
-        </button>
-        {session ? (
-          <>
-            <button
-              className="secondary-button"
-              disabled={transportBusy || sendState.status === "sending" || !transportEvent}
-              onClick={() => void sendPreviewOverTransport()}
-            >
-              Send preview over room-control transport
-            </button>
-            <button
-              className="secondary-button"
-              disabled={transportBusy}
-              onClick={() => void refreshReceivedInbox()}
-            >
-              Refresh received control inbox
-            </button>
-            <button
-              className="secondary-button"
-              disabled={sendState.status === "idle" || sendState.status === "sending"}
-              onClick={() => setSendState(createIdleRoomControlSendState())}
-            >
-              Clear latest send result
-            </button>
-          </>
-        ) : null}
-      </div>
-      {session ? (
-        <div className="diagnostic-grid">
-          <PreviewBlock title="Transport room" value={session.roomId} />
-          <PreviewBlock title="Local session ref" value={session.localSessionRef} />
-          <PreviewBlock title="Peer session ref" value={session.peerSessionRef} />
-          <PreviewBlock title="Current transport event ID" value={transportEvent?.eventId ?? "Not built"} />
-        </div>
-      ) : null}
-      <LatestRoomControlSend state={sendState} />
-      <ReceivedControlInbox events={receivedEvents} />
-      <div className="benchmark-controls">
-        <button className="secondary-button" onClick={enqueueOutboundPreview}>Enqueue outbound preview locally</button>
-        <button className="secondary-button" onClick={selectNextLocally}>Select next locally</button>
-        <button className="secondary-button" onClick={() => simulateInboundStatus("acknowledged_preview_only")}>Simulate inbound ack</button>
-        <button className="secondary-button" onClick={() => simulateInboundStatus("denied")}>Simulate inbound deny</button>
-        <button className="secondary-button" onClick={() => simulateInboundStatus("invalid")}>Simulate inbound invalid</button>
-        <button className="secondary-button" onClick={() => simulateInboundStatus("expired")}>Simulate inbound expired</button>
-      </div>
-      <div className="diagnostic-grid">
-        <PreviewBlock title="Data windows (hypothetical)" value={String(budget.dataWindows)} />
-        <PreviewBlock title="Control windows (hypothetical)" value={String(budget.controlWindows)} />
-        <PreviewBlock title="Selected next event" value={selected?.event.kind ?? "None"} />
-        <PreviewBlock title="Selected queue ID" value={selected?.queueId ?? "None"} />
-      </div>
-      <ControlQueueList title="Outbound queue" items={queue.outbound} />
-      <ControlQueueList title="Inbound queue" items={queue.inbound} />
-      <PreviewMessages title="Queue messages" messages={messages} emptyMessage="No duplicate, replay, or expiry messages." />
-    </div>
-  );
+interface WorkflowState {
+  result: AiSlotPreviewResult | null;
+  pendingAction: PendingAiAction | null;
+  outboundPreview: HelloPeerOutboundPreviewState | null;
+  envelopePreview: CapabilityEnvelopePreviewState | null;
 }
 
-function LatestRoomControlSend({ state }: { state: RoomControlSendState }) {
-  const timestamp =
-    state.status === "sending"
-      ? state.startedAt
-      : state.status === "accepted"
-        ? state.receivedAt
-        : state.status === "rejected"
-          ? state.occurredAt
-          : null;
-  const summary =
-    state.status === "idle"
-      ? "No send attempted."
-      : state.status === "sending"
-        ? "Sending…"
-        : state.status === "accepted"
-          ? "Accepted for peer local inbox."
-          : state.message;
-  return (
-    <div className="ai-slot-preview-messages">
-      <strong>Latest room-control send</strong>
-      <div className="diagnostic-grid">
-        <PreviewBlock title="Status" value={state.status} />
-        <PreviewBlock title="Event ID" value={state.status === "idle" ? "None" : state.eventId} />
-        <PreviewBlock title="Timestamp" value={timestamp ?? "None"} />
-        <PreviewBlock
-          title="Result code"
-          value={state.status === "accepted" ? "accepted_for_local_inbox" : state.status === "rejected" ? state.errorCode : "None"}
-        />
-      </div>
-      <p className="muted">{summary}</p>
-      <p className="muted">Transport delivery is not peer consent.</p>
-    </div>
-  );
+interface WorkflowActionOptions extends WorkflowState {
+  generating: boolean;
+  providerKind: "mock" | "cloud";
+  cloudReady: boolean;
+  generateMockAdvisoryPlan: () => Promise<void>;
+  generateCloudAdvisoryPlan: () => Promise<void>;
+  confirmPendingLocally: () => void;
+  cancelPendingLocally: () => void;
+  buildOutboundRequestPreview: () => void;
+  buildPreviewEnvelope: () => void;
+  queuePreview: () => void;
 }
 
-function ReceivedControlInbox({ events }: { events: ReceivedRoomControlEvent[] }) {
-  return (
-    <div className="ai-slot-preview-messages">
-      <strong>Received preview-only control inbox</strong>
-      {events.length > 0 ? (
-        <ul>
-          {events.map((event) => (
-            <li key={event.eventId}>
-              {event.kind} / {event.eventId} / {event.sourceDeviceRef} → {event.targetPeerRef} /
-              expires {new Date(event.expiresAt).toLocaleString()}
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <p className="muted">No received current-session control events.</p>
-      )}
-    </div>
-  );
+function getWorkflowStatus({
+  result,
+  pendingAction,
+  outboundPreview,
+  envelopePreview
+}: WorkflowState): string {
+  if (envelopePreview?.envelope) return "Preview ready";
+  if (outboundPreview?.request) return "Confirmed locally";
+  if (pendingAction?.status === "confirmed_local_only") return "Confirmed locally";
+  if (pendingAction?.status === "pending") return "Awaiting local confirmation";
+  if (pendingAction?.status === "cancelled") return "Rejected";
+  if (pendingAction?.status === "expired") return "Rejected";
+  if (result?.validationStatus === "rejected" || result?.policy?.status === "rejected") {
+    return "Rejected";
+  }
+  if (result) return "Plan accepted";
+  return "No plan";
 }
 
-function ControlQueueList({ title, items }: { title: string; items: ControlQueueItem[] }) {
-  return (
-    <div className="ai-slot-preview-messages">
-      <strong>{title}</strong>
-      {items.length > 0 ? (
-        <ul>
-          {items.map((item) => (
-            <li key={item.queueId}>
-              {item.event.kind} / {item.status} / priority {item.priority} / {item.queueId}
-              {item.reason ? ` / ${item.reason}` : ""}
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <p className="muted">Empty.</p>
-      )}
-    </div>
-  );
+function getNextWorkflowAction({
+  result,
+  pendingAction,
+  outboundPreview,
+  envelopePreview,
+  generating,
+  providerKind,
+  cloudReady,
+  generateMockAdvisoryPlan,
+  generateCloudAdvisoryPlan,
+  confirmPendingLocally,
+  cancelPendingLocally,
+  buildOutboundRequestPreview,
+  buildPreviewEnvelope,
+  queuePreview
+}: WorkflowActionOptions) {
+  if (!result || result.validationStatus === "rejected" || result.policy?.status === "rejected") {
+    return {
+      label: generating ? "Generating..." : "Generate advisory",
+      disabled: generating || (providerKind === "cloud" && !cloudReady),
+      onAction: () => void (providerKind === "mock" ? generateMockAdvisoryPlan() : generateCloudAdvisoryPlan()),
+      summary: "Generate a bounded advisory plan."
+    };
+  }
+  if (pendingAction?.status === "pending") {
+    return {
+      label: "Confirm locally",
+      disabled: false,
+      onAction: confirmPendingLocally,
+      secondaryLabel: "Cancel",
+      onSecondaryAction: cancelPendingLocally,
+      summary: "Local confirmation is required before building a preview."
+    };
+  }
+  if (pendingAction?.status === "confirmed_local_only" && !outboundPreview?.request) {
+    return {
+      label: "Build request preview",
+      disabled: false,
+      onAction: buildOutboundRequestPreview,
+      summary: "Build the validated Hello Peer request preview."
+    };
+  }
+  if (outboundPreview?.request && !envelopePreview?.envelope) {
+    return {
+      label: "Build preview",
+      disabled: false,
+      onAction: buildPreviewEnvelope,
+      summary: "Wrap the request in a preview-only capability envelope."
+    };
+  }
+  if (envelopePreview?.envelope) {
+    return {
+      label: "Continue to Room control",
+      disabled: false,
+      onAction: queuePreview,
+      summary: "Queue the current preview from the active room-control session."
+    };
+  }
+  return {
+    label: "Generate advisory",
+    disabled: generating,
+    onAction: () => void generateMockAdvisoryPlan(),
+    summary: "Generate a new advisory plan."
+  };
 }
 
 function CapabilityEnvelopePreview({
@@ -801,9 +527,9 @@ function CapabilityEnvelopePreview({
         <strong>Preview-only capability request.</strong>
         <span>Sending this preview does not allow execution.</span>
         <span>The peer can only view, acknowledge, or deny this preview.</span>
-        <span>No peer executor exists in Phase E1.</span>
+        <span>Only the fixed bounded Hello Peer executor exists; this preview does not execute.</span>
         <span>No stdout, exit code, or runtime output can be produced in this phase.</span>
-        <span>Transport unavailable in this build. The ordinary room text path is not a capability-preview channel.</span>
+        <span>Preview-only room-control transport is available. The ordinary room text path is not a capability-preview channel.</span>
       </div>
       <div className="benchmark-controls">
         <button className="secondary-button" onClick={onBuild}>Build Preview Envelope</button>
@@ -839,7 +565,7 @@ function InboundCapabilityPreview({
       <div className="ai-slot-advisory-notice">
         <strong>Inbound preview only — this cannot execute.</strong>
         <span>Acknowledging this preview is not permission to run code.</span>
-        <span>Peer execution is not implemented in Phase E1.</span>
+        <span>A real execution still requires exact receiver Allow once and a separate explicit request.</span>
         <span>Trusted room is not execution authorization.</span>
       </div>
       <PreviewMessages title="Inbound validation" messages={preview.errors} emptyMessage="Inbound preview accepted." />
@@ -898,7 +624,7 @@ function HelloPeerOutboundPreview({
       <div className="ai-slot-advisory-notice">
         <strong>Outbound preview only — no request was sent.</strong>
         <span>No peer received this request.</span>
-        <span>Peer consent and transport are not implemented in Phase E0.</span>
+        <span>Receiver one-time consent requires explicit PolicyGate review through the Room control queue. No execution exists.</span>
         <span>Request ID, nonce, expiry, and hash prepare future replay defenses but do not provide transport security yet.</span>
       </div>
       <div className="benchmark-controls">
@@ -978,7 +704,7 @@ function PendingActionCard({
       <PreviewMessages title="Policy warnings" messages={pending.policyResult.warnings} emptyMessage="No warnings." />
       <div className="ai-slot-advisory-notice">
         <strong>Local confirmation only - no action is executed.</strong>
-        <span>No peer request is sent in this build.</span>
+        <span>Local confirmation does not send a peer request.</span>
         <span>Peer consent is still required before any future execution.</span>
         <span>Trusted room is not execution authorization.</span>
       </div>
@@ -991,7 +717,7 @@ function PendingActionCard({
       {pending.status === "confirmed_local_only" ? (
         <div className="ai-slot-local-result">
           <strong>Confirmed locally only - no peer request was sent.</strong>
-          <span>Peer consent and transport are not implemented in this phase.</span>
+          <span>Build and queue a preview explicitly; any receiver allow-once decision remains separate and non-executing.</span>
         </div>
       ) : null}
       {pending.status === "cancelled" ? (

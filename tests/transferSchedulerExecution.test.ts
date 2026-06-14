@@ -62,6 +62,30 @@ test("huge-only queue starts one transfer", () => {
   assert.equal(runnablePlans[0].requestedWindow, 8);
 });
 
+test("new transfer launches at seven while outgoing control demand reserves one window", () => {
+  const state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    readyInput("huge.bin", 2 * GiB),
+  ]);
+  const policy = {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    globalWindowBudget: 7,
+    maxRequestedWindow: 7,
+  };
+
+  const { runnablePlans, plannerResult } = planRunnableTransferLaunches(
+    state,
+    activeRooms,
+    new Set(),
+    new Map(),
+    false,
+    policy,
+  );
+
+  assert.equal(runnablePlans[0].requestedWindow, 7);
+  assert.equal(plannerResult.requestedWindowTotal, 7);
+  assert.equal(plannerResult.globalWindowBudget, 7);
+});
+
 test("huge-plus-small queue starts both with expected requested windows", () => {
   const state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
     readyInput("huge.bin", 2 * GiB, "/tmp/huge.bin", 1),
@@ -1052,4 +1076,91 @@ test("runtime rebalance skips unchanged, uncorrelated, cancelled, and closed-roo
   cancelledState = cancelQueueItem(cancelledState, unchanged.id);
   assert.equal(planActiveTransferWindowRebalances(cancelledState, activeRooms).length, 0);
   assert.equal(planActiveTransferWindowRebalances(unchangedState, activeRooms, new Set(["room-1"])).length, 0);
+});
+
+test("control demand hot-adjusts one active transfer from eight to seven", () => {
+  let state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    readyInput("huge.bin", 2 * GiB),
+  ]);
+  const active = queuedItems(state)[0];
+  state = markQueueItemPreparing(state, active.id, 8);
+  state = markQueueItemSending(state, active.id, {
+    displayName: "huge.bin",
+    sizeBytes: 2 * GiB,
+    modifiedMs: 1,
+    dedupeKey: "huge",
+  });
+  state = correlateTransferProgress(state, {
+    roomId: "room-1",
+    queueItemId: active.id,
+    direction: "outgoing",
+    fileName: "huge.bin",
+    fileSize: 2 * GiB,
+    transferId: "transfer-huge",
+    status: "transferring",
+  });
+  const policy = {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    globalWindowBudget: 7,
+    maxRequestedWindow: 7,
+  };
+
+  assert.deepEqual(planActiveTransferWindowRebalances(
+    state,
+    activeRooms,
+    new Set(),
+    new Map(),
+    policy,
+  ), [{
+    itemId: active.id,
+    transferId: "transfer-huge",
+    requestedWindow: 7,
+    previousWindow: 8,
+  }]);
+});
+
+test("control demand reallocates several active transfers within total budget seven", () => {
+  let state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    readyInput("large-a.bin", 2 * GiB, "/tmp/large-a.bin", 1),
+    readyInput("large-b.bin", 2 * GiB, "/tmp/large-b.bin", 2),
+  ]);
+  const [first, second] = queuedItems(state);
+  for (const [item, transferId] of [[first, "transfer-a"], [second, "transfer-b"]] as const) {
+    state = markQueueItemPreparing(state, item.id, 4);
+    state = markQueueItemSending(state, item.id, {
+      displayName: item.displayName ?? item.id,
+      sizeBytes: item.sizeBytes ?? 2 * GiB,
+      modifiedMs: item.modifiedMs ?? 1,
+      dedupeKey: item.dedupeKey ?? item.id,
+    });
+    state = correlateTransferProgress(state, {
+      roomId: "room-1",
+      queueItemId: item.id,
+      direction: "outgoing",
+      fileName: item.displayName ?? item.id,
+      fileSize: item.sizeBytes ?? 2 * GiB,
+      transferId,
+      status: "transferring",
+    });
+  }
+  const policy = {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    globalWindowBudget: 7,
+    maxRequestedWindow: 7,
+  };
+  const plans = planActiveTransferWindowRebalances(
+    state,
+    activeRooms,
+    new Set(),
+    new Map(),
+    policy,
+  );
+  const nextByItem = new Map(plans.map((plan) => [plan.itemId, plan.requestedWindow]));
+  const total = [first, second].reduce(
+    (sum, item) => sum + (nextByItem.get(item.id) ?? state.items[item.id].requestedWindow ?? 0),
+    0,
+  );
+
+  assert.equal(total, 7);
+  assert.ok([...nextByItem.values()].every((window) => window < 7));
 });

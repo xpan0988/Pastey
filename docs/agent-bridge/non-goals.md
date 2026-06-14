@@ -10,6 +10,7 @@ Pastey should not become:
 - a cloud sync tool;
 - an AI-dependent transfer tool;
 - a persistent behavior profiler.
+- a log-replayed workflow or authorization system.
 
 Joining a room, advertising capabilities, or enabling an AI provider must not
 grant command execution, filesystem access, transfer authority, or permission
@@ -19,23 +20,23 @@ to change scheduler behavior.
 
 The current advisory implementation does not implement:
 
-- action execution, model discovery, or model download;
+- model-driven or generic action execution, model discovery, or model download;
 - a direct GGUF loader or inference runtime;
 - a bundled sidecar;
 - production API-key storage;
 - real application-state context snapshots;
 - automatic transfer, retry, benchmark, room, scheduler, or diagnostics actions;
-- binary-v2, a runtime control lane or scheduler reservation, command lane,
-  peer executor, or agent stream;
+- binary-v2, a command lane, generic peer executor, or agent stream;
 - Layer 4 trusted-room/file-offer behavior;
-- peer-side actions or a capability bridge;
-- actual capability-request room transport, peer receive handling, peer
-  execution consent, or persistent replay cache.
+- generic peer-side actions or a capability framework;
+- persistent replay cache or reusable authorization.
 
-It also does not modify room lifecycle, the file queue, weighted planner,
-requested windows, runtime-window updates, MicroFlowGroup, Device Diagnostics,
-binary-v1, JSON fallback, ACK/finalize/cancel/burn, Inbox, transfer status, or
-error handling.
+It does not modify room lifecycle, user text/file semantics, MicroFlowGroup
+semantics, Device Diagnostics, binary-v1 format, JSON fallback,
+ACK/finalize/cancel/burn, Inbox, transfer status, or execution behavior. CL-4
+is the narrow exception for scheduler behavior: it changes the effective data
+budget and supported active sender runtime windows only while real local
+outgoing control demand exists.
 
 ## Future Phases
 
@@ -47,15 +48,15 @@ error handling.
 | Phase 3 | Experimental OpenAI-compatible cloud advisory provider and Developer Tools preview. | Runtime-memory provider configuration; cloud-whitelisted synthetic context; no execution path. |
 | Phase 4 | Local pending-action confirmation. | Visible canonical payload/hash, short expiry, and `confirmed_local_only`; no dispatch, peer consent, or execution. |
 | Phase E0 | Local `HelloPeerRequest` builder, validator, and outbound preview. | `preview_only`; no request send, peer receive, capability transport, completed replay defense, or execution. |
-| Phase E1 | Capability preview envelope, current-session duplicate detection, and local inbound-preview simulation. This is the current AI Slot UI boundary. | Actual room send is blocked; acknowledge/deny are local preview states only; no peer executor or runtime output. |
+| Phase E1 | Capability preview envelope, current-session duplicate detection, local inbound-preview simulation, and preview-only room-control delivery through the CL-3 path. | Ordinary room text/file send remains blocked for capability previews; this phase alone grants no execution authority. |
 | Control Lane CL-1 | Type-only `RoomControlEvent` preview/status wrappers, validation, current-session duplicate helper, and pure `computeControlLaneBudget` feasibility helper. | No room-control transport, send/receive, persistence, scheduler wiring/reservation, transfer change, or execution. |
 | Control Lane CL-2 | Current-session local outbound/inbound control queue simulation, priority selection, duplicate/expiry handling, local terminal transitions, and hypothetical budget display. | No persistence, room-control transport, send/receive, scheduler wiring/reservation, transfer or MicroFlowGroup change, runtime result, retry/escalation, or execution. |
 | Control Lane CL-3A | Repository-grounded safe room-control transport feasibility and contract. Recommends a separate bounded encrypted room HTTP endpoint for CL-3B. | Documentation only. No endpoint, Tauri command, send/receive, scheduler reservation, protocol change, queue integration, peer consent, or execution. |
-| Control Lane CL-3B | Implemented minimal preview-only room-control transport: five event kinds, separate bounded encrypted route, current-session binding/replay/inbox bounds, encrypted delivery receipt, and Developer Tools visibility. | No ordinary item/file semantics or persistence, no automatic retry, no CL-2 queue integration, no scheduler reservation, and no execution. |
-| Control Lane CL-3C | Future delivery/status integration with local control queues. | Transport delivery remains distinct from preview acknowledgement, peer consent, and execution. |
-| Control Lane CL-4 | Future real scheduler reservation from the unified eight-window budget. | Data `7` / control `1` only with eligible real control backlog; data `8` / control `0` when idle; no MicroFlowGroup semantic change. |
-| Control Lane CL-5 | Future peer PolicyGate and explicit one-time consent. | Trusted room membership and preview acknowledgement are insufficient. |
-| Control Lane CL-6 | Future bounded Hello Peer executor. | Separate reviewed fixed-template boundary only; no raw shell or arbitrary code. |
+| Control Lane CL-3B | Implemented bounded typed room-control transport over a separate encrypted route with current-session binding/replay/inbox bounds, encrypted delivery receipt, and active Room visibility. | No ordinary item/file semantics or persistence, automatic retry, scheduler authority, or transport-owned execution. |
+| Control Lane CL-3C | Implemented real transport integration with the existing current-session local control queue, one-item priority processing, receipt/rejection statuses, inbox validation/deduplication, and hypothetical budget preview. | CL-3C alone adds no persistence, automatic retry, scheduler reservation, peer consent, or execution; CL-5 later adds explicit one-time consent without execution. |
+| Control Lane CL-4 | Implemented sender-side runtime reservation from the unified eight-window budget. | Outgoing transport demand exposes data target `7`; idle restores `8` after a short quiet period. Inbound-only review does not reserve. No transfer restart, protocol change, MicroFlowGroup semantic change, retry loop, or execution. |
+| Control Lane CL-5 | Implemented receiver PolicyGate and explicit one-time Allow once/Deny decision bound to one exact preview. | No automatic approval, remembered trust, persistent consent, generic capability execution, executor, or runtime output. Ack records one-time consent but is not execution or completion. |
+| Control Lane CL-6 | Implemented bounded Hello Peer executor. | One fixed in-process `runtime.execute_hello_template` function, exact one-time consent consumption, explicit request/result queue actions, and fixed `hello peer!` output. No shell, process, file, network, generic runtime, reusable trust, automatic retry, or arbitrary code. |
 | Phase 5 | Layer 4 trusted room/file-offer integration. | Separate design review; preserve current transfer semantics unless explicitly changed. |
 | Phase 6 | Carefully scoped capability bridge for peer-side actions. | Separate threat model, authority model, permissions, audit design, and explicit approval UX are prerequisites. |
 
@@ -79,3 +80,7 @@ implementation. At minimum, it must define:
 
 The current room, diagnostics, planner task-kind names, and `recommended_roles`
 hints do not satisfy this gate and are not permission grants.
+
+Agent Bridge structured lifecycle logs likewise do not satisfy this gate. They
+are bounded redacted audit mirrors only and never create state, consent,
+authorization, durable identity, or reusable trust.

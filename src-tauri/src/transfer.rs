@@ -4988,6 +4988,82 @@ mod tests {
     }
 
     #[test]
+    fn cl4_contention_runtime_window_evidence() {
+        fn runtime_window(transfer: &ActiveFileTransfer) -> usize {
+            let ActiveFileTransferKind::Sender { runtime_window, .. } = &transfer.kind else {
+                panic!("expected sender transfer");
+            };
+            current_runtime_window(runtime_window)
+        }
+
+        let mut single = test_sender_transfer(
+            8,
+            SenderTransferProtocol::BinaryV1,
+            transfer_tuning::TransferWindowOverrideSource::PlannerRequest,
+        );
+        let single_id = "cl4-single";
+        let single_to_seven = update_active_transfer_window(single_id, 7, Some(&single), false);
+        single.last_report_bytes = 1024;
+        let single_to_eight = update_active_transfer_window(single_id, 8, Some(&single), false);
+        single.last_report_bytes = 2048;
+
+        let mut first = test_sender_transfer(
+            4,
+            SenderTransferProtocol::BinaryV1,
+            transfer_tuning::TransferWindowOverrideSource::PlannerRequest,
+        );
+        let mut second = test_sender_transfer(
+            4,
+            SenderTransferProtocol::BinaryV1,
+            transfer_tuning::TransferWindowOverrideSource::PlannerRequest,
+        );
+        let first_to_four = update_active_transfer_window("cl4-multi-a", 4, Some(&first), false);
+        let second_to_three = update_active_transfer_window("cl4-multi-b", 3, Some(&second), false);
+        first.last_report_bytes = 1024;
+        second.last_report_bytes = 768;
+        let control_allocation_total = runtime_window(&first) + runtime_window(&second);
+        let second_to_four = update_active_transfer_window("cl4-multi-b", 4, Some(&second), false);
+        first.last_report_bytes = 2048;
+        second.last_report_bytes = 1792;
+
+        assert!(single_to_seven.updated);
+        assert!(single_to_eight.updated);
+        assert_eq!(runtime_window(&single), 8);
+        assert!(!single.cancel_token.is_cancelled());
+        assert_eq!(single.last_report_bytes, 2048);
+
+        assert!(!first_to_four.updated);
+        assert!(second_to_three.updated);
+        assert_eq!(control_allocation_total, 7);
+        assert!(second_to_four.updated);
+        assert_eq!(runtime_window(&first) + runtime_window(&second), 8);
+        assert!(!first.cancel_token.is_cancelled());
+        assert!(!second.cancel_token.is_cancelled());
+
+        println!(
+            "CL4_RUST_EVIDENCE_JSON={}",
+            serde_json::json!({
+                "boundary": "transfer::update_active_transfer_window on active BinaryV1 sender atomics",
+                "singleTransfer": {
+                    "transferId": single_id,
+                    "allocationSequence": [8, 7, 8],
+                    "bytesSequence": [0, 1024, 2048],
+                    "cancelled": single.cancel_token.is_cancelled()
+                },
+                "multipleTransfers": {
+                    "transferIds": ["cl4-multi-a", "cl4-multi-b"],
+                    "allocationSequence": [[4, 4], [4, 3], [4, 4]],
+                    "bytesSequence": [[0, 0], [1024, 768], [2048, 1792]],
+                    "cancelled": [
+                        first.cancel_token.is_cancelled(),
+                        second.cancel_token.is_cancelled()
+                    ]
+                }
+            })
+        );
+    }
+
+    #[test]
     fn response_error_mapping_uses_specific_transfer_messages() {
         assert_eq!(
             map_response_error_message(&details(

@@ -2,29 +2,32 @@
 
 ## 1. Status and Scope
 
-This is a design and feasibility document. It does not change runtime behavior.
+This document records the control-lane design, feasibility findings, and the
+implemented CL-4 sender-side runtime reservation and CL-6 bounded Hello Peer
+use. CL-4 changes scheduler/runtime window allocation only; CL-6 uses the same
+typed lane without changing transfer protocol semantics.
 
-The proposed control lane is a semantically separate path for Agent Bridge and
+The control lane is a semantically separate path for Agent Bridge and
 other bounded room-control events. It is not a user text path, file-transfer
-path, MicroFlowGroup path, execution path, or permission grant.
+path, MicroFlowGroup path, generic execution path, or permission grant.
 
 The control lane:
 
-- does not authorize execution;
+- does not authorize execution by itself;
 - does not imply peer consent;
-- does not add a peer executor;
+- carries only one fixed CL-6 execution request/result kind pair;
 - does not change binary-v1 or binary-v2 behavior;
 - does not require binary-v2 initially, although the design may inform a later
   binary-v2 control-frame or substream design.
 
-The proposed capacity model uses eight logical window-equivalents as a
+The capacity model uses eight logical window-equivalents as a
 scheduler/resource-allocation concept. The binary-v1 default runtime window of
 `8` came first as the tested lower-level capacity basis. The frontend planner's
 `globalWindowBudget = 8` was then set to represent that same outgoing runtime
 capacity at the scheduler level. They are two layers of one logical outgoing
 capacity model, not independent or additive pools.
 
-A future shared inbound/outbound control lane therefore reserves one logical
+The shared inbound/outbound control lane therefore reserves one logical
 window-equivalent from the planner-level representation of that existing
 capacity. It does not create a ninth lane or treat binary-v1 as a separate
 hidden pool. The lane still requires explicit control queue/accounting and a
@@ -89,22 +92,28 @@ This is a **hard semantic separation** with a **soft capacity reservation**:
 - inbound replies and errors generally receive priority over outbound work;
 - every control event is typed, validated, small, and bounded.
 
+For CL-4 runtime accounting, "control backlog" means local outgoing work that
+still needs transport capacity. An inbound event already accepted into the
+local inbox may remain queued for review without shrinking this device's
+outgoing data target. A later outbound acknowledgement, denial, or status event
+does create local outgoing demand.
+
 The control lane is not an "AI lane." It is a room/control/event lane that can
 serve Agent Bridge preview events and future bounded room-level control or
 status events.
 
 The scheduler-level `globalWindowBudget` is the correct representation from
-which to reserve control capacity. When valid control backlog exists, a future
-resource arbiter exposes `7` windows to the data planner and holds at most `1`
-for the shared inbound/outbound control queue. When no control backlog exists,
-the data planner receives all `8`. This reservation preserves the lower-level
-binary-v1 capacity basis; the binary-v1 hot path does not own or schedule the
-control lane.
+which to reserve control capacity. CL-4 exposes `7` windows to the data planner
+while real local outgoing control work is queued, selected, or sending. It
+restores all `8` after a `750 ms` quiet period when outgoing demand clears.
+Inbound-only review backlog does not reserve sender capacity. This reservation
+preserves the lower-level binary-v1 capacity basis; the binary-v1 hot path does
+not own or transport the control lane.
 
-The future implementation must still define control backlog and control-lane
-occupancy explicitly. Reducing the data budget to `7` creates the capacity
-reservation, but does not by itself create the typed room-control transport or
-shared inbound/outbound control queue.
+`hasOutgoingControlWindowDemand` defines runtime demand separately from retained
+review/history state. Reducing the data budget to `7` creates the capacity
+reservation; the already separate CL-3B room-control transport carries the
+typed event.
 
 ## 4. Control Lane Internal Scheduling
 
@@ -235,8 +244,8 @@ frames or substreams, but that is not required for this feasibility phase.
 
 - The control lane has at most one logical window-equivalent.
 - Data may use all eight logical windows when no valid control backlog exists.
-- Data should yield to at most seven logical windows while a valid control
-  backlog exists.
+- Data should yield to at most seven logical windows while valid local outgoing
+  control transport demand exists.
 - The eight-window scheduler budget and binary-v1 default runtime window are
   two layers of the same logical outgoing capacity model, not additive pools.
 - The control reservation comes from the scheduler-level representation of
@@ -254,8 +263,9 @@ frames or substreams, but that is not required for this feasibility phase.
 - Raw stdout, stderr, logs, secrets, and streaming output must not use the
   control lane.
 
-A backlog must mean validated, eligible control work. Invalid or unauthenticated
-traffic must not be able to hold data at seven windows indefinitely.
+A runtime-demand backlog must mean validated, eligible local outgoing control
+work. Invalid, expired, terminal, inbound-only, or unauthenticated traffic must
+not be able to hold data at seven windows indefinitely.
 
 The reservation is a logical policy unit, not necessarily one binary-v1 chunk
 request. The transport-specific mapping remains an open design decision.
@@ -266,12 +276,12 @@ request. The transport-specific mapping remains an open design decision.
 
 | File / function | Current role | Future control-lane relevance | Avoid or preserve |
 | --- | --- | --- | --- |
-| `src/lib/transferPlanner.ts::DEFAULT_TRANSFER_PLANNER_POLICY` | Defines `globalWindowBudget = 8`, `minRequestedWindow = 1`, `maxRequestedWindow = 8`, file-lane weights, and MicroFlowGroup policy defaults. The global budget is the scheduler-level abstraction of the tested binary-v1 outgoing runtime capacity. | A future outer resource arbiter should derive an effective data budget of `8` or `7` before calling the planner. | Do not create a separate ninth capacity unit, reinterpret the existing `control_text` model lane as a transport, or put control events into the current file queue. |
+| `src/lib/transferPlanner.ts::DEFAULT_TRANSFER_PLANNER_POLICY` | Defines normal `globalWindowBudget = 8`, `minRequestedWindow = 1`, `maxRequestedWindow = 8`, file-lane weights, and MicroFlowGroup policy defaults. The global budget is the scheduler-level abstraction of the tested binary-v1 outgoing runtime capacity. | CL-4 derives an effective data budget of `8` or `7` before calling the planner. | Do not create a separate ninth capacity unit, reinterpret the existing `control_text` model lane as a transport, or put control events into the current file queue. |
 | `src/lib/transferPlanner.ts::planWeightedTransfers` | Pure planner that reserves active requested windows, selects runnable work, distributes the global budget, and ensures requested-window totals do not exceed the budget. | Safe data-allocation boundary after a separate control backlog decision has produced the effective data budget. | Do not add control dispatch, transport, peer execution, or control-event parsing here. |
 | `src/lib/transferPlanner.ts::computeLaneBudgets` and `classifyLane` | Reports/model-level lane classification; `text`, `control`, `agent`, and `command` classify to `control_text`. Current queue adapters produce only file-like tasks. | Useful only as historical/model context. A dedicated control lane should have separate semantics and queueing. | Do not treat lane weight `control_text = 1` as the proposed reservation; current allocation remains demand- and sender-task-based. |
 | `src-tauri/src/transfer_tuning.rs::DEFAULT_BINARY_V1_WINDOW` | Defines the tested lower-level binary-v1 sender pipeline capacity basis as `8`; supported values clamp from `1` to `16`. The planner's default global budget was set to match this basis. | Confirms the lower-level capacity represented by the scheduler budget. It is not a separate hidden pool for data in addition to planner capacity. | Do not make the binary-v1 hot path own the control lane or change defaults, override precedence, or binary-v1 tuning in the feasibility phase. |
 | `src-tauri/src/transfer.rs::send_binary_chunks_pipelined` and `current_runtime_window` | Enforces planner-selected or default runtime windows for outgoing binary-v1 chunks. | Existing mechanism remains the lower-level enforcement path for outgoing data allocations after the planner/resource arbiter exposes `8` or `7` data windows. | Do not insert control events into the binary-v1 file hot path or treat its default window as capacity in addition to the planner budget. |
-| `src-tauri/src/transfer.rs::update_active_transfer_window` | Updates supported active outgoing binary-v1 sender windows and rejects receiver, unsupported-protocol, and override-controlled cases. | Shows current runtime mutation is sender-only. A later data reservation may reuse the existing update path only to make outgoing data yield. | Do not change receiver behavior, protocol behavior, or override precedence for this design. |
+| `src-tauri/src/transfer.rs::update_active_transfer_window` | Updates supported active outgoing binary-v1 sender windows and rejects receiver, unsupported-protocol, and override-controlled cases. | CL-4 reuses this sender-only path to make outgoing data yield without restart. | Do not change receiver behavior, protocol behavior, or override precedence. |
 
 The current source therefore exposes two layers of the same logical outgoing
 runtime-window capacity model:
@@ -281,21 +291,30 @@ runtime-window capacity model:
 2. the frontend global requested-window budget of eight is the scheduler-level
    abstraction set to match that basis across planned outgoing file-like work.
 
-These values must not be added together or treated as independent pools. The
-future control lane reserves from the scheduler-level budget, reducing the data
-planner's available capacity from `8` to `7` while control backlog exists. The
+These values must not be added together or treated as independent pools. CL-4
+reserves from the scheduler-level budget, reducing the data planner's available
+capacity from `8` to `7` while local outgoing control demand exists. The
 binary-v1 hot path remains the lower-level data enforcement mechanism and does
 not own the control lane.
+
+Several outgoing transfers can be active concurrently. Frontend
+`TransferSchedulerState` records each active queue item's assigned
+`requestedWindow`; Rust `AppState.active_file_transfers` is a `HashMap` with one
+sender `runtime_window: Arc<AtomicUsize>` per active transfer.
+`planWeightedTransfers` allocates the combined target across those transfers,
+and `update_active_transfer_window` changes only the affected sender atomic.
+The enforced invariant is the sum of active data allocations, not a separate
+seven-window allowance per transfer.
 
 ### Planner, Queue, and Dispatch
 
 | File / function | Current role | Future control-lane relevance | Avoid or preserve |
 | --- | --- | --- | --- |
-| `src/lib/transferScheduler.ts::planRunnableTransferLaunches` | Adapts frontend file queue items and room state into planner tasks, calls `planWeightedTransfers`, and exposes ordinary and MicroFlowGroup launch plans. | A future outer resource arbiter could pass a policy with an effective data budget. | Keep the adapter file-only unless a later implementation deliberately creates a separate control scheduler. |
-| `src/lib/transferScheduler.ts::planActiveTransferWindowRebalances` | Produces sender-side window changes for active outgoing file transfers. | Potential future mechanism for making already-active data yield after control backlog appears, subject to debug-override and timing rules. | Do not use it as control transport or mutate it during this feasibility phase. |
-| `src/App.tsx` planner effect | Calls `planRunnableTransferLaunches`, records launch reservations, and dispatches ordinary file sends or one serial MicroFlowGroup. | A future resource-arbiter integration point could supply the effective data budget and trigger data-window rebalance. | Do not put control events in `launchingQueueItemWindowsRef`, the file queue, or the MicroFlowGroup runner. |
+| `src/lib/transferScheduler.ts::planRunnableTransferLaunches` | Adapts frontend file queue items and room state into planner tasks, calls `planWeightedTransfers`, and exposes ordinary and MicroFlowGroup launch plans. | CL-4 passes the effective data budget of `7` or `8`. | The adapter remains file-only; control events are not planner tasks. |
+| `src/lib/transferScheduler.ts::planActiveTransferWindowRebalances` | Produces sender-side window changes for active outgoing file transfers using existing planner fairness. | CL-4 recomputes the combined active allocation when the target changes. | Do not use it as control transport or multiply the global seven-window target per transfer. |
+| `src/App.tsx` planner and serialized rebalance effects | Calls `planRunnableTransferLaunches`, dispatches ordinary file sends or one serial MicroFlowGroup, and serializes supported active sender updates. | Applies the current `7` or `8` target to new and already-active data transfers. | Do not put control events in `launchingQueueItemWindowsRef`, the file queue, or the MicroFlowGroup runner. |
 | `src/App.tsx::processTransferQueueItem` | Sends one queued file through `sendFileToRoom` with the planner-requested window. | Data path should continue to consume only data-lane allocation. | Do not route control events through this function. |
-| `src/App.tsx::rebalanceActiveTransferWindows` | On file completion/failure/cancel, requests supported sender runtime-window changes from existing planner output. | A later reservation stage may need an additional control-backlog-triggered rebalance policy, after careful validation. | Do not change current completion-triggered behavior in this task. |
+| `src/App.tsx::{scheduleActiveTransferWindowRebalance,rebalanceActiveTransferWindows}` | On file completion/failure/cancel or CL-4 target change, requests only changed supported sender runtime windows from existing planner output. | Implemented hot-adjustment point. Updates are serialized and failures do not cancel transfers. | Preserve override precedence and avoid tight retry loops. |
 | `src/lib/transferScheduler.ts::TransferSchedulerState` | Holds frontend in-memory file queue, batch, cancellation, correlation, and MicroFlowGroup state. | Not the preferred home for semantically separate control queues. A separate control scheduler/state boundary is clearer. | Do not mix control-event state with user file queue state. |
 
 ### MicroFlowGroup Interaction
@@ -326,38 +345,38 @@ not own the control lane.
 | `src-tauri/src/transfer.rs::start_room_server` | Registers join, room-item, file-transfer, diagnostics, burn, and leave routes. | A future typed bounded room-control route is the clearest transport insertion area found in current architecture. | Do not modify existing item, file, diagnostics, burn, or leave semantics. |
 | `src/lib/ai/capabilityPreviewEnvelope.ts` | Defines and validates preview-only capability envelopes, exact fields, unsafe-field rejection, expiry, duplicate checks, and local acknowledge/deny state. | Supplies the specific Hello Peer preview payload wrapped by the CL-1 generic room-control event schema. | Do not treat current preview state as transport security, peer consent, or execution authority. |
 | `src/lib/agentBridge/roomControlEvent.ts` | Implements the CL-1 type-only `RoomControlEvent` wrapper, preview/status builders, deny-first validator, current-session duplicate helper, and pure `computeControlLaneBudget` feasibility helper. | Provides the closed preview-only event schema and local validation foundation for later simulation and transport work. | It has no Tauri invoke, room send/receive, transport, scheduler wiring, persistence, or execution authority. |
-| `src/lib/agentBridge/controlQueue.ts` | Implements the CL-2 current-session-only local control queue simulation: separate inbound/outbound arrays, priority ordering, duplicate/expiry rejection, strict local terminal transitions, selection, backlog detection, and hypothetical budget calculation. | Validates the proposed shared-lane queue policy before transport or scheduler integration. | It has no persistence, Tauri invoke, room send/receive, scheduler mutation, retry/escalation, runtime result, or execution authority. |
-| `src/components/AiSlotPreview.tsx` | Builds outbound envelope previews and exposes the CL-2 local control queue simulation in Developer Tools. It can enqueue local preview/status events, select the next item, show queue state, and show hypothetical data/control budgets. | Reusable UI for local simulation and later visible preview state. | Do not give it direct room-send, scheduler, or executor authority. |
-| `docs/agent-bridge/ai-slot-v0-implementation-notes.md` | Records that actual room transport is blocked and text transport was not reused. | Current safety boundary to preserve. | Keep synchronized if a future safe transport is implemented. |
+| `src/lib/agentBridge/controlQueue.ts` and `controlWindowRuntime.ts` | The queue owns current-session inbound/outbound priority state. The runtime helper classifies only nonterminal outbound transport work as capacity demand and drives deterministic `7`/`8` target state. | Implemented semantic boundary between review backlog and sender capacity demand. | It has no persistence, retry/escalation, runtime result, or execution authority. |
+| `src/components/AiSlotPreview.tsx` | Exposes the active Room's current-session room-control queue. Receivers can refresh the real Rust inbox without building an outbound advisory; outbound events enqueue and one explicit action processes one selected queue item. | Visible preview-only queue and transport state. | Do not give it scheduler or executor authority. |
+| `docs/agent-bridge/ai-slot-v0-implementation-notes.md` | Records the implemented preview-only transport, queue, reservation, and one-time consent boundaries, including that user text was not reused. | Current safety boundary to preserve. | Keep synchronized without implying execution or generic authority. |
 
-The CL-1 typed room-control event foundation and CL-2 local queue simulation
-now exist. The CL-2 queue is current-session frontend state only. No generic
-room-control transport, network send/receive, shared inbound/outbound runtime
-control-lane scheduler, peer execution path, or capability transport execution
-exists.
+The CL-1 typed event foundation, CL-2 queue model, CL-3B transport, CL-3C queue
+integration, CL-4 sender-side runtime reservation, and CL-5 peer PolicyGate
+with one-time consent now exist. The queue and consent state remain
+current-session frontend state only. No peer execution path or capability
+transport execution exists.
 
 ## 11. Feasibility Conclusion
 
-A one-window logical control reservation appears feasible as a
+A one-window logical control reservation is implemented as a
 scheduler/resource-allocation concept. The binary-v1 default runtime window of
 `8` is the tested lower-level outgoing capacity basis, and the frontend
 planner's `globalWindowBudget = 8` is the scheduler-level abstraction of that
 same capacity. They are not independent pools.
 
-The proposed model does not inherently require changing file transfer protocol
-semantics. The future planner/resource arbiter should expose all `8` windows to
-the data planner when control backlog is empty and `7` when valid control
-backlog exists. The reserved control window comes from the same logical
+The implementation does not change file transfer protocol semantics. The
+planner/resource arbiter exposes all `8` windows to the data planner when
+outgoing control demand is empty and `7` while eligible outbound work needs
+transport capacity. The reserved control window comes from the same logical
 capacity; it is not a ninth lane. Existing outgoing binary-v1 runtime-window
-mutation may later help active data yield, but the binary-v1 hot path must not
-own or transport the control lane. The control event itself must use a separate
-typed room-control transport.
+mutation makes active data yield without restart, but the binary-v1 hot path
+does not own or transport the control lane. The control event itself uses the
+separate typed room-control transport.
 
 The model does not require changing MicroFlowGroup. MicroFlowGroup should
 continue to plan and dispatch only data work within whatever data budget is
 available.
 
-The safest future insertion points are:
+The implemented insertion points are:
 
 1. a new dedicated control-event type/validator and separate in-memory
    inbound/outbound control queues;
@@ -366,14 +385,21 @@ The safest future insertion points are:
 3. a small outer resource arbiter at the planner boundary that computes
    `dataWindowBudget = 7 | 8` from the existing eight-window capacity before
    the file planner runs;
-4. only later, a carefully scoped trigger for supported active outgoing data
-   transfers to yield when control backlog appears.
+4. a carefully scoped serialized trigger for supported active outgoing
+   binary-v1 data transfers to yield without restart when outgoing demand
+   appears.
 
-With CL-1 types/validators and CL-2 local queue simulation implemented, the
-minimum remaining path is a safe typed room-control route for preview events,
-followed later by scheduler reservation. The local CL-2 budget calculation is
-evidence for the planner/resource-arbiter design; it does not change current
-scheduler behavior.
+With CL-1 through CL-4 implemented, real preview-only outbound events exercise
+the local queue and activate sender-side scheduler reservation. Inbound-only
+review state does not reserve a window. No peer execution path exists.
+
+CL-4 contention now has deterministic automated lower-boundary evidence through
+`scripts/run-cl4-contention-smoke.mjs`. The harness measures production
+TypeScript demand/target and planner behavior, verifies the real Rust active
+binary-v1 sender window-update primitive, and runs the existing room-control
+transport suites. It is not a full dual-instance Tauri/network transfer test;
+the generated report records that boundary explicitly at
+`.generated/cl4-contention-report.json`.
 
 Remaining risks include:
 
@@ -419,7 +445,7 @@ or execution.
 
 ### Stage CL-2: Local Outbound/Inbound Simulation
 
-Implemented in `src/lib/agentBridge/controlQueue.ts`, with a Developer Tools
+Implemented in `src/lib/agentBridge/controlQueue.ts`, with an active Room
 preview in `src/components/AiSlotPreview.tsx`. It simulates separate outbound
 and inbound current-session queues that share one local selection policy.
 Lower priority numbers win: inbound deny/invalid/expired events precede inbound
@@ -452,36 +478,46 @@ Implemented for the five preview event kinds through the separate bounded
 `POST /rooms/:room_id/control-events` route. It uses current-session
 peer-key/source/target binding, control-specific domain-separated key wrapping,
 encrypted delivery receipts, bounded in-memory inbox/replay/rate state, narrow
-Tauri wrappers, and sanitized Developer Tools visibility. It has no automatic
+Tauri wrappers, and sanitized active Room visibility. It has no automatic
 retry and does not use user text, legacy room-item, file-transfer, or
 MicroFlowGroup paths.
 
-### Stage CL-3C: Delivery/Status Integration With Local Control Queues - Future
+### Stage CL-3C: Delivery/Status Integration With Local Control Queues
 
-Connect transport acceptance and delivery state to CL-2 inbound/outbound
-control queues. Keep transport delivery receipt separate from
-`capability_preview_ack`, peer consent, and execution authorization.
+Implemented. Real outbound events enqueue, use one-item priority selection, and
+update the same item with transport delivery/rejection state. Rust inbox events
+validate and deduplicate into the inbound queue. Transport delivery remains
+separate from `capability_preview_ack`, peer consent, and execution authority.
 
-### Stage CL-4: Scheduler Reservation - Future
+### Stage CL-4: Scheduler Reservation - Implemented
 
-Add an outer resource arbiter that reserves at most one logical control
-window-equivalent from the existing eight-window scheduler abstraction when
-valid control backlog exists. Data may borrow all eight when idle; the data
-planner receives seven while control backlog exists. This does not create a
-ninth lane or make the binary-v1 hot path responsible for control scheduling.
-MicroFlowGroup does not change except that it plans within available data
+The outer resource arbiter reserves at most one logical control
+window-equivalent from the existing eight-window scheduler abstraction while
+real local outgoing control work needs transport capacity. Data uses all eight
+when idle and receives seven during demand. Supported active binary-v1 senders
+hot-adjust through the existing runtime update API without restart.
+MicroFlowGroup semantics remain unchanged and it plans within available data
 windows.
 
-### Stage CL-5: Peer PolicyGate and Explicit Consent - Future
+### Stage CL-5: Peer PolicyGate and Explicit Consent - Implemented
 
-Design and implement peer-side policy and explicit one-time consent. Trusted
-room membership and preview acknowledgement remain insufficient.
+The receiver-side PolicyGate accepts for review only the exact fixed Hello Peer
+preview in the current room/session. The receiver user may explicitly Allow
+once or Deny. Decisions are bound to one event/envelope/request, expire, remain
+current-session-only, and queue a bounded `capability_preview_ack` or
+`capability_preview_deny` for a later explicit send action. Ack records exact
+one-time receiver consent but does not execute anything or grant reusable
+authority. Trusted room membership and transport delivery remain insufficient.
 
-### Stage CL-6: Bounded Hello Peer Executor - Future
+### Stage CL-6: Bounded Hello Peer Executor - Implemented
 
-Only after CL-5, consider the separately reviewed fixed-template bounded Hello
-Peer executor. This stage must still reject raw shell, arbitrary code, file
-bytes, unbounded output, and hidden transfer.
+One explicit sender action builds an exact `capability_execute_request` only
+from a matched allow-once ack. The receiver revalidates the exact local consent
+record, consumes it once, calls only the fixed zero-argument in-process Hello
+Peer function, and queues a bounded `capability_execution_result` for one later
+explicit send action. The only successful output is `hello peer!`; there is no
+shell, process, file, network, generic runtime, reusable trust, arbitrary
+output, or automatic retry.
 
 ## 13. Open Questions
 
@@ -518,8 +554,8 @@ bytes, unbounded output, and hidden transfer.
 - no hidden transfer;
 - no AI-driven scheduler mutation;
 - no AI-driven MicroFlowGroup mutation;
-- no peer executor;
-- no runtime launch;
+- no generic peer executor;
+- no external runtime launch;
 - no process spawn;
 - no stdout or stderr streaming;
 - no raw logs or secrets;
