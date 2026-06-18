@@ -6,7 +6,7 @@ Detailed update and release history for Pastey.
 
 - No unreleased changes recorded.
 
-## 1.9.0 — Agent Bridge capability slice
+## 1.9.0 — Agent Bridge capability slice — 2026-06-18
 
 ### Added
 

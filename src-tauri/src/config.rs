@@ -144,7 +144,8 @@ fn update_with_dev_tools_enabled(
     current.auto_burn_after_download = incoming.auto_burn_after_download;
     current.save_received_files_to_inbox = incoming.save_received_files_to_inbox;
     current.save_received_images_to_inbox = incoming.save_received_images_to_inbox;
-    current.micro_flow_group_mode = normalize_micro_flow_group_mode(&incoming.micro_flow_group_mode);
+    current.micro_flow_group_mode =
+        normalize_micro_flow_group_mode(&incoming.micro_flow_group_mode);
     current.inbox_dir = normalize_inbox_dir(paths, incoming.inbox_dir.as_deref());
     if dev_tools_enabled && (was_dev_tools_enabled || incoming.transfer_window_override.is_some()) {
         current.transfer_window_override =
