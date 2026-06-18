@@ -141,23 +141,27 @@ pub async fn ensure_service(state: Arc<AppState>) -> AppResult<()> {
 }
 
 fn bind_discovery_socket() -> AppResult<UdpSocket> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-        .map_err(|error| AppError::Network(format!("unable to create discovery socket: {error}")))?;
-    socket
-        .set_reuse_address(true)
-        .map_err(|error| AppError::Network(format!("unable to reuse discovery socket address: {error}")))?;
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(|error| {
+        AppError::Network(format!("unable to create discovery socket: {error}"))
+    })?;
+    socket.set_reuse_address(true).map_err(|error| {
+        AppError::Network(format!("unable to reuse discovery socket address: {error}"))
+    })?;
     #[cfg(unix)]
-    socket
-        .set_reuse_port(true)
-        .map_err(|error| AppError::Network(format!("unable to reuse discovery socket port: {error}")))?;
+    socket.set_reuse_port(true).map_err(|error| {
+        AppError::Network(format!("unable to reuse discovery socket port: {error}"))
+    })?;
     socket
         .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT).into())
         .map_err(|error| AppError::Network(format!("unable to bind discovery socket: {error}")))?;
-    socket
-        .set_nonblocking(true)
-        .map_err(|error| AppError::Network(format!("unable to set discovery socket nonblocking: {error}")))?;
-    UdpSocket::from_std(socket.into())
-        .map_err(|error| AppError::Network(format!("unable to initialize discovery socket: {error}")))
+    socket.set_nonblocking(true).map_err(|error| {
+        AppError::Network(format!(
+            "unable to set discovery socket nonblocking: {error}"
+        ))
+    })?;
+    UdpSocket::from_std(socket.into()).map_err(|error| {
+        AppError::Network(format!("unable to initialize discovery socket: {error}"))
+    })
 }
 
 async fn ensure_join_request_service(state: Arc<AppState>) -> AppResult<()> {
