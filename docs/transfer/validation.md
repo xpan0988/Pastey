@@ -1,16 +1,14 @@
 # Transfer Validation
 
-This is the active validation and logging guide for Pastey transfer scheduler work. It covers planner replay, deterministic fixtures, single-machine dual-instance smoke, sender log identification, and release-build LAN validation boundaries. For scheduler theory, see [scheduler.md](scheduler.md).
-
-For `dev-fast` CPU, memory, disk, and Linux feasibility notes, see [devfast-resource-estimate.md](devfast-resource-estimate.md).
+This is the active validation and logging guide for Pastey transfer and orchestration work. It covers planner replay, deterministic fixtures, automated contention evidence, single-machine dual-instance smoke, sender log identification, and release-build LAN boundaries. For scheduler theory, see [scheduler.md](scheduler.md).
 
 ## Validation Layers
 
-- Planner replay: algorithm strategy validation. It does not launch Tauri and does not require files, a receiver, network, or a room server. It is the best local check for fixed-versus-dynamic live policy comparison.
-- Automated CL-4 contention harness: deterministic lower-boundary integration evidence for the production outgoing-control demand reducer, `8 -> 7 -> 8` planner allocations, the real Rust active binary-v1 sender runtime-window atomic/update function, and the existing room-control transport test suites. It is not a full dual-instance Tauri or real network file-transfer run.
-- Generated fixture corpus: deterministic real file clusters for app smoke tests. Source-controlled manifests live under `tests/fixtures/transfer-corpus/manifests/`; actual payload files are generated locally under `.generated/transfer-fixtures/`. Generated files are ignored by git and are not bundled into release artifacts.
-- Single-machine dual-instance smoke: local lifecycle and logging smoke when two physical machines are unavailable. It validates room join, send/receive lifecycle, planner logs, MicroFlowGroup logs, runtime-window logs, and cancel/burn/interruption evidence where applicable. It is not valid for final LAN throughput conclusions.
-- Two-machine LAN/release build: final performance and UX validation. It is required for real network throughput, cross-device behavior, Wi-Fi/Ethernet behavior, OS differences, and release artifact behavior.
+- Planner replay: algorithm strategy validation. It does not launch Tauri and does not require files, a receiver, network, or a room server.
+- Automated contention harness: deterministic lower-boundary integration evidence for the production outgoing-control demand reducer, `8 -> 7 -> 8` planner allocations, the real Rust active binary-v1 sender runtime-window atomic/update function, and room-control transport tests.
+- Generated fixture corpus: deterministic real file clusters for app smoke tests. Source-controlled manifests live under `tests/fixtures/transfer-corpus/manifests/`; generated payload files live under `.generated/transfer-fixtures/`.
+- Single-machine dual-instance smoke: local lifecycle and logging smoke when two physical machines are unavailable. It can validate room join, send/receive lifecycle, planner logs, MicroFlowGroup logs, runtime-window logs, and interruption evidence.
+- Two-machine LAN/release build: required for real throughput, cross-device behavior, Wi-Fi/Ethernet behavior, OS differences, release artifact behavior, and final product confidence.
 
 ## Planner Replay
 
@@ -18,13 +16,13 @@ For `dev-fast` CPU, memory, disk, and Linux feasibility notes, see [devfast-reso
 rtk node scripts/replay-transfer-planner-scenarios.mjs
 ```
 
-Planner replay prints grep-friendly fixed and dynamic live-policy results, including group counts, grouped children, requested-window totals, held reasons, contention, and dynamic capacity clamps.
+Planner replay prints fixed and dynamic live-policy results, including group counts, grouped children, requested-window totals, held reasons, contention, and dynamic capacity clamps.
 
 Replay is algorithm evidence only. It does not validate files, Tauri startup, room join, receive/finalize, Inbox, network behavior, or release-build throughput.
 
-## Automated CL-4 Contention Harness
+## Automated Contention Harness
 
-Run the deterministic CL-4 contention harness from the repository root:
+Run from the repository root:
 
 ```sh
 rtk node scripts/run-cl4-contention-smoke.mjs
@@ -32,36 +30,19 @@ rtk node scripts/run-cl4-contention-smoke.mjs
 
 The runner:
 
-- uses the production TypeScript CL-4 demand/quiet-period reducer and transfer
-  planner to measure single-transfer, multiple-transfer, burst,
-  inbound-directionality, and terminal-failure-release scenarios;
-- runs the focused Rust
-  `transfer::tests::cl4_contention_runtime_window_evidence` test against the
-  real `update_active_transfer_window` function and active binary-v1 sender
-  runtime-window atomics;
-- runs the existing TypeScript and Rust room-control transport tests;
-- creates deterministic representative fixture bytes, checks source/destination
-  SHA-256 equality, and removes the temporary files after the run;
-- writes a bounded machine-readable report to
-  `.generated/cl4-contention-report.json`.
+- uses the production TypeScript demand/quiet-period reducer and transfer planner to measure single-transfer, multiple-transfer, burst, inbound-directionality, and terminal-failure-release scenarios;
+- runs the focused Rust `transfer::tests::cl4_contention_runtime_window_evidence` test against the real `update_active_transfer_window` function and active binary-v1 sender runtime-window atomics;
+- runs TypeScript and Rust room-control transport tests;
+- creates deterministic representative fixture bytes, checks source/destination SHA-256 equality, and removes the temporary files after the run;
+- writes a bounded machine-readable report to `.generated/cl4-contention-report.json`.
 
-Measured assertions include combined allocations no greater than the current
-target, stable transfer IDs, monotonic reported progress, no cancellation,
-`8 -> 7 -> 8` restoration after the deterministic `750 ms` virtual quiet
-period, no burst flapping, inbound-only target `8`, and restoration after
-delivery/replay/expiry/network/validation terminal outcomes.
+Measured assertions include combined allocations no greater than the current target, stable transfer IDs, monotonic reported progress, no cancellation, `8 -> 7 -> 8` restoration after the deterministic `750 ms` virtual quiet period, no burst flapping, inbound-only target `8`, and restoration after delivery/replay/expiry/network/validation terminal outcomes.
 
-This is the lowest existing deterministic automated boundary. It does not
-launch the Tauri GUI, invoke the frontend Tauri bridge in a live app, send file
-bytes through a room server, or prove a two-device transfer checksum. Its
-fixture checksum verifies deterministic harness-file integrity, while the Rust
-evidence verifies the real active sender runtime-window update primitive. Keep
-the single-machine dual-instance smoke below for full app lifecycle evidence
-and the two-machine LAN/release run for real network performance evidence.
+This is the lowest existing deterministic automated boundary. It does not launch the Tauri GUI, invoke the frontend Tauri bridge in a live app, send file bytes through a room server, or prove a two-device transfer checksum.
 
 ## Fixture Payloads
 
-Generate fixture payloads from the repo root:
+Generate fixture payloads from the repository root:
 
 ```sh
 cd /Users/xiyuanpan/Pastey
@@ -89,15 +70,7 @@ Drag generated payload folders into Pastey:
 .generated/transfer-fixtures/interrupt-huge-small
 ```
 
-Do not drag this folder:
-
-```text
-tests/fixtures/transfer-corpus/manifests/
-```
-
-Those files are JSON manifest definitions only. They describe what to generate; they are not the transfer payload corpus.
-
-> Warning: if the app log shows display names like `two-1-2MiB-files-only.json` or `mixed-chaos-recent-log-shape.json`, the test dragged manifests, not generated fixture files.
+Do not drag `tests/fixtures/transfer-corpus/manifests/`. Those JSON files describe what to generate; they are not the transfer payload corpus.
 
 Generated files are not release inputs. `.generated/`, `tests/fixtures/transfer-corpus/generated/`, and `*.pastey-fixture.tmp` are ignored by git, and the Tauri bundle config does not include fixture resources. Fixture-specific details remain in [../../tests/fixtures/transfer-corpus/README.md](../../tests/fixtures/transfer-corpus/README.md).
 
@@ -136,7 +109,7 @@ cargo run --profile dev-fast --no-default-features --color always --
 
 `PASTEY_PROFILE=sender` and `PASTEY_PROFILE=receiver` are local profile/device-name labels for isolation. They do not determine transfer direction. The actual sender is the instance that drags/sends files in that run. The actual sender log is the one containing `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]`.
 
-Room transfer servers and nearby join HTTP servers bind dynamic local ports, and the discovery socket is reusable for local dual-instance smoke. macOS warnings such as `error messaging the mach port for IMKCFRunLoopWakeUpReliable` are usually AppKit/input-method warnings and are not necessarily transfer failures.
+Single-machine smoke is lifecycle evidence only. It cannot prove real LAN throughput, Wi-Fi/Ethernet behavior, cross-device OS behavior, or release artifact UX.
 
 ## Log Identification
 
@@ -149,58 +122,22 @@ for f in $(find /tmp/pastey-sender /tmp/pastey-receiver -name "*.log" -type f); 
 done | sort -nr
 ```
 
-The log with planner/runtime-window diagnostics is the actual sender log. The receiver log may contain receive, finalize, and Inbox evidence, but live planner evidence is sender-side.
+Agent Bridge lifecycle entries use the `[pastey:agent-bridge]` prefix followed by one redacted structured JSON object. Validate transition names, shortened references, and bounded error codes only. These entries must not contain secrets or raw control payloads and must never be used to reconstruct queue, consent, transport, or execution state.
 
-Agent Bridge lifecycle entries use the `[pastey:agent-bridge]` prefix followed
-by one redacted structured JSON object. Validate transition names, shortened
-references, and bounded error codes only. These entries must not contain
-secrets or raw control payloads and must never be used to reconstruct queue,
-consent, transport, or execution state.
+## Known Manual Smoke Evidence
 
-Extract an actual-sender summary:
+Recorded repository notes before this consolidation documented:
 
-```sh
-ACTUAL_SENDER_LOG="$(for f in $(find /tmp/pastey-sender /tmp/pastey-receiver -name "*.log" -type f); do
-  score=$(grep -cE "\[pastey:planner\]|\[pastey:micro-group\]|\[pastey:runtime-window\]" "$f" 2>/dev/null)
-  echo "$score $f"
-done | sort -nr | head -n 1 | cut -d' ' -f2-)"
+- a practical mixed-file smoke with binary-v1 transfer behavior;
+- a roughly 2.5 GB transfer at about 108 MB/s;
+- normal Burn behavior;
+- a later 2.7 GB plus 147 MB `7 + 1` / `7 -> 8` runtime-window smoke;
+- generated-payload single-machine smoke that helped reproduce and fix frontend-only MicroFlowGroup final-accounting races.
 
-SUMMARY="/tmp/pastey-actual-sender-summary.txt"
+Those results are useful implementation evidence, but they do not replace current two-machine release-build validation.
 
-{
-  echo "ACTUAL_SENDER_LOG=$ACTUAL_SENDER_LOG"
-  echo
-  echo "===== planner ====="
-  grep -E "\[pastey:planner\]" "$ACTUAL_SENDER_LOG" || true
-  echo
-  echo "===== live micro group mode ====="
-  grep -E "micro_group_mode=|micro_group_plans=|micro_group_grouped_children=|fixed_candidate_children=|dynamic_candidate_children=" "$ACTUAL_SENDER_LOG" || true
-  echo
-  echo "===== dynamic capacity ====="
-  grep -E "contention=|contention_severity=|one_window_quantum_bytes=|dynamic_child_cap_bytes=|dynamic_group_cap_bytes=|micro_group_skip_reason=" "$ACTUAL_SENDER_LOG" || true
-  echo
-  echo "===== micro group lifecycle ====="
-  grep -E "\[pastey:micro-group\].*event=(planned|launched|running|child_running|child_terminal|stopped|final)" "$ACTUAL_SENDER_LOG" || true
-  echo
-  echo "===== runtime window ====="
-  grep -E "\[pastey:runtime-window\].*event=(tracking_started|update|summary)" "$ACTUAL_SENDER_LOG" || true
-  echo
-  echo "===== transfer benchmark summaries ====="
-  grep -E "transfer_benchmark_summary|failed_chunks=|duplicate_chunks=|finalize_status=" "$ACTUAL_SENDER_LOG" || true
-} > "$SUMMARY"
+## Dev-Fast And Linux Notes
 
-echo "$SUMMARY"
-open "$SUMMARY"
-```
+`dev-fast` is a developer build profile for quicker Rust/Tauri iteration. It is appropriate for local smoke and scheduler/runtime diagnostics, not final performance or release-size claims.
 
-## Interpretation
-
-Planner summary lines report the selected live mode and live group counts. Capacity and candidate fields explain why fixed and dynamic policies differ without treating dynamic as a shadow mode.
-
-MicroFlowGroup lifecycle lines report `planned`, `launched`, `running`, `child_running`, `child_terminal`, `stopped`, and `final` events for fixed or dynamic live serial groups. Runtime-window lines report `tracking_started`, `update`, and `summary` for planner-managed active outgoing transfers.
-
-If MicroFlowGroup lifecycle appears but children are manifest JSON files, the test only validates those manifest files, not the generated fixture corpus.
-
-A generated-payload single-machine smoke on June 10, 2026 validated the earlier fixed-live and dynamic-candidate diagnostics and helped reproduce frontend-only MicroFlowGroup final-accounting races. The accounting fixes remain covered by focused regression tests. The automated CL-4 contention harness now supplements manual smoke with deterministic allocation/runtime-update evidence; full generated-fixture app smoke for selectable live modes remains a separate testing phase.
-
-Two-machine release-build testing remains the final performance benchmark. Single-machine smoke can validate lifecycle/logging shape, but it cannot prove real LAN throughput, Wi-Fi/Ethernet behavior, cross-device OS behavior, or release artifact UX.
+Linux remains feasibility-only unless release packaging and validation are added. The current release/validation confidence is for macOS and Windows desktop targets.

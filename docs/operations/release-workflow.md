@@ -28,8 +28,6 @@ It then runs its built-in checks, stages only the release files it edits, create
 
 ## Add Release Title
 
-Run:
-
 ```bash
 npm run release:version -- X.Y.Z "Release Title"
 ```
@@ -37,19 +35,13 @@ npm run release:version -- X.Y.Z "Release Title"
 The changelog heading becomes:
 
 ```md
-## X.Y.Z — Release Title — YYYY-MM-DD
+## X.Y.Z - Release Title - YYYY-MM-DD
 ```
 
 Use GitHub Release titles in this format:
 
 ```text
-Pastey vX.Y.Z — Theme
-```
-
-Without a title, the heading is:
-
-```md
-## X.Y.Z — YYYY-MM-DD
+Pastey vX.Y.Z - Theme
 ```
 
 ## Dry Run
@@ -92,7 +84,7 @@ npm run build:checked
 
 `npm run check:version` verifies that `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.lock` match the authoritative `src-tauri/Cargo.toml` version. On tag builds, it also checks the Git tag version.
 
-## Commit and Tag
+## Commit, Tag, And Push
 
 The release commit uses:
 
@@ -106,14 +98,10 @@ The annotated tag uses:
 vX.Y.Z
 ```
 
-## Push Release
-
 The script does not push automatically. After reviewing the commit and tag, run:
 
 ```bash
 git push origin main --tags
 ```
 
-## GitHub Actions
-
-The release build is triggered by the pushed tag, for example `vX.Y.Z`. The version check compares the tag version against the internal app version before the release build continues.
+Pushing a tag triggers the GitHub Actions release build. The version check compares the tag version against the internal app version before the release build continues.

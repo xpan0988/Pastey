@@ -4,27 +4,27 @@ Detailed update and release history for Pastey.
 
 ## Unreleased
 
-- Added selectable live MicroFlowGroup modes: dynamic contention-aware one-window grouping is the default, while fixed mode preserves the legacy threshold baseline. The persisted Developer Tools setting hot-switches future planner cycles only.
+- Added selectable live MicroFlowGroup modes: dynamic contention-aware one-window grouping is the default, while fixed mode preserves the legacy threshold baseline. The persisted Developer Tools setting hot-switches later planner cycles only.
 - Retired dynamic shadow as an active mode and updated persistent planner diagnostics and replay output to report the actual live mode, live group counts, dynamic capacity clamps, and fixed/dynamic candidate comparisons.
 - Kept MicroFlowGroup execution frontend-owned and serial through the existing single-file path; no protocol, binary-v1, Rust transfer hot path, receiver, ACK/finalize/cancel/burn, Inbox, encryption, JSON fallback, binary-v2, multiplexing, or adaptive runtime-window behavior changed.
 - Clarified that Device Diagnostics is current-session, informational, and advisory-only: profile/capability snapshots and latest benchmark results are kept in memory rather than as long-term benchmark history, internal `recommended_roles` hints are not shown as automatic user recommendations, and the scheduler does not consume diagnostics to change windows, MicroFlowGroup mode or eligibility, or routing.
 - Added a static Astro + TypeScript + Tailwind product website under `site/`, with English and Simplified Chinese routes, canonical/hreflang metadata, Cloudflare Pages configuration, and canonical latest/all GitHub Release links.
 - Refined the desktop landing page into an eight-slide horizontal product presentation with fixed navigation, wheel/trackpad and keyboard cooldowns, direct hash/progress navigation, staged slide-entry reveals, and a vertical mobile fallback.
 - Synchronized repository website, download, deployment, product-positioning, format-agnostic binary transfer, and qualified LAN-validation documentation.
-- Added a `dev-fast` transfer resource estimate and Linux feasibility report covering local fixture disk usage, CPU/memory expectations, dev-mode benchmark boundaries, cleanup guidance, and future real-machine measurements.
-- Consolidated transfer documentation under `docs/transfer/`: current architecture now lives in `docs/transfer/architecture.md`, active scheduler/MicroFlowGroup design lives in `docs/transfer/scheduler.md`, and active validation/logging guidance lives in `docs/transfer/validation.md`.
-- Moved the completed Phase 2-4 scheduler/runtime-window implementation record to `docs/binary-v2/early-implementation.md` and replaced old overlapping docs with short moved stubs.
+- Folded `dev-fast` transfer resource notes and Linux feasibility boundaries into `docs/transfer/validation.md`.
+- Consolidated transfer documentation under `docs/transfer/`: current architecture lives in `docs/transfer/architecture.md`, active scheduler/MicroFlowGroup design lives in `docs/transfer/scheduler.md`, and active validation/logging guidance lives in `docs/transfer/validation.md`.
+- Replaced completed scheduler/runtime-window phase reports with the canonical project-layout specification and current subsystem documents.
 - Kept the fixture corpus README focused on generating and dragging deterministic payload folders, with full validation workflow details linked to `docs/transfer/validation.md`.
 - Added source-controlled transfer fixture manifests and a streaming deterministic generator for local scheduler, MicroFlowGroup, chaos, and interruption smoke scenarios. Generated payload files stay local-only under `.generated/transfer-fixtures/` by default and are excluded from git and release bundle resources.
 - Clarified transfer validation docs so developers generate and drag `.generated/transfer-fixtures/<scenario-name>/` payload folders, identify the actual sender log by planner/MicroFlowGroup/runtime-window diagnostics, and treat single-machine dual-instance runs as lifecycle/logging smoke rather than throughput evidence.
 - Added complete fixed-versus-dynamic candidate fields to persistent planner diagnostics and fixed frontend-only MicroFlowGroup final accounting during fast serial generated-payload runs, without changing transfer protocol behavior.
-- Moved the Dynamic MicroFlowGroup window-capacity research report into `docs/research/`.
+- Moved the Dynamic MicroFlowGroup window-capacity research report into `docs/transfer/`.
 
 ## 1.7.0 — Global Transfer Scheduler — 2026-05-30
 
 - Added a frontend-owned weighted transfer scheduler for multi-file picker, drag/drop, and pasted-image sends.
 - Added queue-item metadata readiness/cache so file-like items resolve display name, MIME type, size, modified time, and dedupe metadata before planner allocation.
-- Added optional frontend queue-item correlation metadata to outgoing file progress events so future concurrent sends can distinguish same-name/same-size queue items without changing transfer ids or chunk protocols.
+- Added optional frontend queue-item correlation metadata to outgoing file progress events so concurrent sends can distinguish same-name/same-size queue items without changing transfer ids or chunk protocols.
 - Added a pure weighted transfer planner module with deterministic allocation tests for lane budgets, held reasons, active budget reservation, runnable launch selection, duplicate-launch prevention, and requested-window invariants.
 - Improved planner requested-window allocation so selected file-like transfers receive batch-relative size-weighted windows rather than mostly splitting by lane or size-class labels. Large-plus-small batches now request windows such as 7 plus 1, while similarly large batches split fairly within the global budget.
 - Added planner-driven multi-worker execution for existing queued file-like transfers while preserving the existing `sendFileToRoom` / `send_file_to_room` single-file transfer path.
@@ -34,7 +34,7 @@ Detailed update and release history for Pastey.
 - Added a single-machine validation path with Tauri-free planner replay scenarios, fixed-vs-dynamic-shadow MicroFlowGroup diagnostics, and developer-only isolated app data/profile overrides for local dual-instance lifecycle smoke.
 - Added planner and scheduler coverage for huge-plus-many-tiny allocation, serial MicroFlowGroup launch plans, one-window group invariants, group terminal state, and shadow grouping that leaves child runnable plans unchanged.
 - Added optional sender-side `requestedWindow` plumbing through `sendFileToRoom`, Rust `send_file_to_room`, `send_room_file`, and transfer tuning. Planner-selected sends pass requested windows; env and effective Developer Tools overrides still take precedence, omitted values keep the window 8 default, and no receiver protocol fields changed.
-- Added `npm run tauri:dev-fast`, backed by an optimized custom Cargo `dev-fast` profile, for faster local transfer-throughput testing before future scheduling work.
+- Added `npm run tauri:dev-fast`, backed by an optimized custom Cargo `dev-fast` profile, for faster local transfer-throughput testing.
 - Documented that normal Tauri dev uses Cargo `dev` and can under-represent transfer throughput; packaged release builds remain the final production benchmark.
 - Added a lightweight room queue panel with batch counts, active/queued/failed/completed/cancelled totals, multiple active transfer rows, and local queue cancellation controls.
 - Hardened scheduler regression coverage for multi-active batch cancel, item cancel before and after transfer-id correlation, burned-room queue cleanup, active budget reservation, and late queue mutations against terminal items.
