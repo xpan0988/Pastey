@@ -4,21 +4,86 @@ Detailed update and release history for Pastey.
 
 ## Unreleased
 
-- Added selectable live MicroFlowGroup modes: dynamic contention-aware one-window grouping is the default, while fixed mode preserves the legacy threshold baseline. The persisted Developer Tools setting hot-switches later planner cycles only.
-- Retired dynamic shadow as an active mode and updated persistent planner diagnostics and replay output to report the actual live mode, live group counts, dynamic capacity clamps, and fixed/dynamic candidate comparisons.
-- Kept MicroFlowGroup execution frontend-owned and serial through the existing single-file path; no protocol, binary-v1, Rust transfer hot path, receiver, ACK/finalize/cancel/burn, Inbox, encryption, JSON fallback, binary-v2, multiplexing, or adaptive runtime-window behavior changed.
-- Clarified that Device Diagnostics is current-session, informational, and advisory-only: profile/capability snapshots and latest benchmark results are kept in memory rather than as long-term benchmark history, internal `recommended_roles` hints are not shown as automatic user recommendations, and the scheduler does not consume diagnostics to change windows, MicroFlowGroup mode or eligibility, or routing.
-- Added a static Astro + TypeScript + Tailwind product website under `site/`, with English and Simplified Chinese routes, canonical/hreflang metadata, Cloudflare Pages configuration, and canonical latest/all GitHub Release links.
-- Refined the desktop landing page into an eight-slide horizontal product presentation with fixed navigation, wheel/trackpad and keyboard cooldowns, direct hash/progress navigation, staged slide-entry reveals, and a vertical mobile fallback.
-- Synchronized repository website, download, deployment, product-positioning, format-agnostic binary transfer, and qualified LAN-validation documentation.
-- Folded `dev-fast` transfer resource notes and Linux feasibility boundaries into `docs/transfer/validation.md`.
-- Consolidated transfer documentation under `docs/transfer/`: current architecture lives in `docs/transfer/architecture.md`, active scheduler/MicroFlowGroup design lives in `docs/transfer/scheduler.md`, and active validation/logging guidance lives in `docs/transfer/validation.md`.
-- Replaced completed scheduler/runtime-window phase reports with the canonical project-layout specification and current subsystem documents.
-- Kept the fixture corpus README focused on generating and dragging deterministic payload folders, with full validation workflow details linked to `docs/transfer/validation.md`.
-- Added source-controlled transfer fixture manifests and a streaming deterministic generator for local scheduler, MicroFlowGroup, chaos, and interruption smoke scenarios. Generated payload files stay local-only under `.generated/transfer-fixtures/` by default and are excluded from git and release bundle resources.
-- Clarified transfer validation docs so developers generate and drag `.generated/transfer-fixtures/<scenario-name>/` payload folders, identify the actual sender log by planner/MicroFlowGroup/runtime-window diagnostics, and treat single-machine dual-instance runs as lifecycle/logging smoke rather than throughput evidence.
-- Added complete fixed-versus-dynamic candidate fields to persistent planner diagnostics and fixed frontend-only MicroFlowGroup final accounting during fast serial generated-payload runs, without changing transfer protocol behavior.
-- Moved the Dynamic MicroFlowGroup window-capacity research report into `docs/transfer/`.
+- No unreleased changes recorded.
+
+## 1.9.0 — Agent Bridge capability slice
+
+### Added
+
+- Added the first Agent Bridge implementation: provider abstraction, deterministic mock provider, OpenAI-compatible cloud provider, redacted context snapshots, action-plan validation, deny-first PolicyGate, pending local confirmation, and a fixed Hello Peer request path.
+- Added typed room-control events for capability preview, acknowledgement, denial, invalid/expired status, execution request, and execution result.
+- Added an encrypted bounded room-control transport path with a current-session inbox, replay/expiry/rate bounds, delivery receipts, and queue integration separate from ordinary room text/file items.
+- Added sender-side control-demand reservation that lowers the active data target from `8` to `7` while outgoing control work is queued/sending, then restores `8` after the quiet period and hot-adjusts supported active binary-v1 senders.
+- Added receiver-side Peer PolicyGate review with explicit Allow once / Deny decisions, exact one-time consent binding, and consent consumption.
+- Added the fixed bounded `runtime.execute_hello_template` capability executor, which returns exactly `hello peer!` through a typed execution result.
+- Added room-scoped Agent Bridge UI for peer review, queue state, runtime reservation status, execution request/result state, and compact/advanced diagnostics.
+
+### Changed
+
+- Moved the active Agent Bridge workflow into the Room context while keeping provider kind, cloud base URL/model, runtime-memory API key, enablement, and redacted log level in Settings.
+- Reframed Agent Bridge as a narrow end-to-end capability slice, not a completed general agent platform.
+
+### Security
+
+- Kept model output advisory only: the model proposes, the host validates, the user authorizes, and a bounded host-owned executor acts.
+- Kept transport delivery separate from consent, trusted room membership separate from execution authority, and consent separate from reusable trust.
+- Added redacted structured Agent Bridge lifecycle logging under `[pastey:agent-bridge]`; logs are audit mirrors only and do not become runtime state or authorization.
+
+### Validation
+
+- Added focused tests and runners for AI plan validation, room-control event schemas, control queue behavior, room-control transport, control-window runtime, receiver consent, Hello Peer execution, room-owned UI placement, and Agent Bridge logging.
+- Added a deterministic control-lane contention harness that validates the production demand reducer, planner allocations, real Rust runtime-window update primitive, and room-control transport test stack.
+
+### Documentation
+
+- Established the canonical project-layout specification and completion-scoring rules in `docs/architecture/Project-specifications.md`.
+- Consolidated Agent Bridge documentation into current architecture/safety, room-control transport, capability-contract, and provider-configuration documents.
+- Simplified the docs tree so stale phase reports and duplicate status narratives are removed; Git history remains the archive.
+
+### Known limitations
+
+- Agent Bridge currently implements one narrow Hello Peer capability slice. It is not a reusable general capability registry, arbitrary tool runtime, multi-step agent workspace, MCP integration, local LLM scheduler, durable trusted-room identity system, or reusable trust mechanism.
+- Current room-control state is session-scoped and current-inbox based; it is not durable room history or durable authenticated peer identity.
+
+## 1.8.0 — Dynamic MicroFlowGroup orchestration
+
+### Added
+
+- Added selectable live MicroFlowGroup modes: dynamic contention-aware one-window grouping as the default and fixed threshold grouping as a Developer Tools fallback.
+- Added persisted `micro_flow_group_mode` configuration; mode changes affect later planner cycles without relaunching active transfers.
+- Added Dynamic MicroFlowGroup planning that groups eligible tiny file-like work only under contention, uses bounded service-cost and group-size caps, and keeps at most one dynamic MicroFlowGroup window active.
+- Added source-controlled transfer fixture manifests and a streaming deterministic generator for scheduler, MicroFlowGroup, chaos, and interruption smoke scenarios.
+- Added persistent planner diagnostics for live mode, grouped children, skip reasons, fixed/dynamic candidates, dynamic capacity clamps, and runtime-window behavior.
+
+### Changed
+
+- Retired dynamic shadow as an active mode and made dynamic grouping the live default.
+- Clarified weighted transfer planning around shared runtime-window capacity: active and runnable file-like transfers share the current target, with batch-relative requested-window allocation instead of independent per-transfer window claims.
+- Preserved active transfer hot-window adjustment for supported outgoing binary-v1 senders while keeping the scheduler frontend-owned and file-like queue scoped.
+- Clarified that Device Diagnostics remains current-session and advisory; `DeviceProfile`, `DeviceCapabilities`, `recommended_roles`, and benchmark results do not automatically command the scheduler.
+
+### Fixed
+
+- Hardened frontend-only MicroFlowGroup accounting so generated-payload serial groups do not finish with unaccounted children after successful child transfers.
+- Preserved grouped-child reservations and terminal queue guards so late progress, cancelled items, burned rooms, and batch interruption do not duplicate or revive work.
+
+### Validation
+
+- Added planner replay scenarios, deterministic fixture generation, fixture-corpus documentation, and single-machine dual-instance smoke guidance.
+- Documented how to identify the actual sender log by `[pastey:planner]`, `[pastey:micro-group]`, and `[pastey:runtime-window]` diagnostics.
+- Kept single-machine smoke framed as lifecycle/logging evidence; two-machine release-build validation remains required for final throughput and cross-device conclusions.
+
+### Documentation
+
+- Consolidated transfer documentation under `docs/transfer/` for current transfer architecture, scheduler/MicroFlowGroup behavior, and validation/logging guidance.
+- Folded `dev-fast` resource notes and Linux feasibility boundaries into transfer validation guidance.
+- Added the static product website under `site/` with English and Simplified Chinese routes, release links, and Cloudflare Pages configuration.
+
+### Unchanged
+
+- MicroFlowGroup remains a scheduler/resource abstraction only. It does not change room items, binary-v1 frames, encryption, the Rust transfer hot path, receiver behavior, ACK/finalize/cancel/burn handling, Inbox behavior, JSON fallback, protocol negotiation, binary-v2, or file contents.
+- Text sends remain immediate and outside the file queue.
+- No general performance improvement claim is made for this release beyond the retained validation boundaries.
 
 ## 1.7.0 — Global Transfer Scheduler — 2026-05-30
 
