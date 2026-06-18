@@ -1,211 +1,62 @@
 # pastey
 
-`pastey` is a lightweight local-first desktop utility for moving text, files, and images directly between your own Windows and macOS devices on the same LAN.
+`pastey` is a local-first desktop utility for moving text, files, and images directly between your own Windows and macOS devices on the same LAN.
 
-Pastey is built for ephemeral local handoff: nearby devices echo back when ready, payloads follow a format-agnostic binary transfer path, and managed room state can be cleared instead of becoming storage buildup. There is no account system, cloud relay, or remote storage.
+Pastey is built for ephemeral local handoff: nearby devices echo back when ready, payloads follow an encrypted format-agnostic transfer path, and room state can be burned when it is no longer useful. There is no account system, cloud relay, remote storage, or analytics pipeline.
 
-It is built with:
-- Tauri v2
-- React + TypeScript
-- Rust
-- SQLite for local metadata only
-- Local filesystem storage for encrypted payloads
-- Temporary local HTTP transfer endpoints
-- UDP LAN discovery
+It is built with Tauri v2, React + TypeScript, Rust, SQLite metadata storage, local encrypted payload storage, temporary local HTTP transfer endpoints, and UDP LAN discovery.
 
-## Long-term Direction
+## Current Architecture
 
-Pastey started as a lightweight local-first transfer utility for moving files, text, and images between personal devices.
+The canonical project architecture and layer boundaries live in [docs/architecture/Project specifications.md](docs/architecture/Project specifications.md). When older planning documents or diagrams conflict with that file, the specification takes precedence.
 
-The long-term goal is broader than file transfer alone.
+Current layer status:
 
-Pastey is gradually evolving toward a local-first device workspace and capability bridge:
-- secure multi-device coordination
-- persistent trusted rooms
-- local-first task and file workflows
-- developer-oriented device tooling
-- controlled capability execution between trusted devices
-- future agent-assisted workflows across nearby or owned devices
+| Layer | Definition | Current status |
+| --- | --- | --- |
+| Layer 1 - Secure LAN transport | Moves data securely and reliably over the LAN. | Mature operational core |
+| Layer 2 - Device intelligence | Observes, describes, and recommends based on current-session device and link conditions. | Advisory diagnostics implemented; recommendation UX partial |
+| Layer 3 - Smart orchestration | Plans and schedules data/control work and runtime capacity. | Operational orchestration core |
+| Layer 4 - Multi-device trusted rooms | Owns room relationships, identity continuity, provenance, routing, replay, reconnect, and trusted control plane. | Session-scoped trusted-room/control foundation |
+| Layer 5 - Agent-assisted device workspace | Owns model-assisted planning, validation, consent, bounded execution, result orchestration, and audit. | Narrow Hello Peer capability slice implemented |
 
-The project intentionally prioritizes:
-- local-first operation
-- explicit trust and approval
-- minimal cloud dependency
-- transparent transfer behavior
-- developer visibility and debugging tools
-- high-performance LAN transport
+Important boundaries:
 
-Current releases focus on stabilizing the transport, lifecycle, and cross-platform foundation before larger multi-device workflow features are introduced.
+- Device recommendation is not a scheduler command.
+- Encrypted session is not durable device identity.
+- Trusted room membership is not execution authority.
+- Transport delivery is not consent.
+- Consent is not reusable trust.
+- Model output is not executable instruction.
+- Logs are not runtime state or authorization.
 
-Agent Bridge provider selection, cloud base URL/model, runtime-memory-only API
-key, enablement, and redacted lifecycle-log level live in Settings / Developer
-Tools. The current-session Agent Bridge workflow lives in the active Room,
-bound directly to that room and peer. It supports a deterministic mock route
-and an experimental OpenAI-compatible cloud route against synthetic redacted
-context. Accepted Hello Peer proposals can enter a visible local
-pending-confirmation state, but confirmation is local only.
-Phase E0 can build and validate a `preview_only` Hello Peer request object, but
-it is not sent and no peer receives it. Phase E1 can wrap the request in a
-validated capability-preview envelope and simulate an inbound
-acknowledge/deny preview locally. Control Lane CL-1 also defines type-only
-preview/status `RoomControlEvent` wrappers, validators, current-session
-duplicate helpers, and a pure unwired `8/0` or `7/1` capacity feasibility
-helper. CL-2 adds a local-only outbound/inbound control queue simulation with
-priority, replay/expiry handling, local status transitions, next-item
-selection, and hypothetical `8/0` or `7/1` budget display. It sends and
-receives nothing by itself and is not wired into the scheduler. CL-3B provides the
-smallest real preview-only transport: a separate bounded encrypted room HTTP
-endpoint with a current-session inbox and transport-only delivery receipt, not
-ordinary item/file semantics. CL-3C connects that transport to the existing
-current-session local control queue: outbound events enqueue before one-item
-priority processing, and non-destructive inbox refresh validates and
-deduplicates inbound events. CL-4 activates sender-side runtime reservation:
-real local outgoing control demand changes the unified data target from `8` to
-`7`, hot-adjusts supported active binary-v1 sends without restart, and restores
-`8` after a short quiet period. Inbound-only review state does not reserve a
-window. Transport delivery is not consent and current-session binding is not
-durable device identity.
-CL-5 adds receiver-side PolicyGate review with explicit one-time Allow once or
-Deny for the exact fixed Hello Peer preview. The decision is current-session,
-request-bound, and expiring; ack/deny returns through the existing control
-queue. CL-6 adds exactly one host-owned in-process capability:
-`runtime.execute_hello_template`. After a matched allow-once ack, the sender
-must explicitly queue and send one execution request. The receiver revalidates
-the exact consent binding, consumes it once, returns exactly `hello peer!`, and
-queues a bounded typed result. There is no shell, process, file, network,
-generic runtime, reusable trust, automatic retry, or arbitrary execution.
-Provider output remains untrusted and cannot construct execution requests.
+## What Pastey Does
 
-## Device diagnostics
+One device opens an encrypted local transfer room and shows an 8-digit code. Another device on the same LAN enters the code, discovers the sender, and receives encrypted text or file data directly over the local network.
 
-Pastey diagnostics are lightweight, local-first, and capability-oriented. The Developer Tools section presents current-session informational snapshots and advisory checks; it does not keep long-term benchmark history.
+Payload bytes stay local to the participating devices. SQLite stores metadata only. Original source file paths are not stored in the database, and receiver-side decryption happens locally after download.
 
-Diagnostics may summarize the local device profile, a small whitelist of useful runtimes, GPU acceleration availability, and discard-only link benchmark results between trusted devices. They do not run disk stress tests, upload data to a cloud service, scan the whole system, store benchmark payloads, or keep a system-wide software inventory.
+Rooms can be burned. Burning removes that room's local encrypted payloads, transient received files, partial files, room items, and active receiver transfer state. Files already saved to Inbox are user-owned output and are not deleted by Burn.
 
-The capability probe computes internal `recommended_roles` hints, but Device Diagnostics does not display them as user role recommendations and they do not grant authority. The transfer scheduler does not consume device profiles, capabilities, role hints, or link benchmark results to change planner windows, MicroFlowGroup mode or grouping eligibility, or routing.
+## Agent Bridge
 
-Loopback benchmarks are local baselines. They use localhost and stay on the same device, so they do not measure Wi-Fi, Ethernet, router, ISP, school network, or internet speed. Loopback raw memory measures local memory/socket overhead; loopback Pastey pipeline adds Pastey's encryption and binary framing overhead while still discarding payloads in memory.
+Agent Bridge is room-scoped and safety-first. The current implementation supports a deterministic mock provider, an experimental OpenAI-compatible cloud provider against redacted context, and one fixed Hello Peer capability path.
 
-Peer benchmarks are LAN baselines between trusted Pastey devices. Peer raw link is a lightweight device-to-device memory benchmark, and peer Pastey pipeline adds Pastey's encrypted/framed transport path without writing benchmark data to Inbox or disk. Real file transfers are the only path comparable to end-user transfer behavior because they include network, Pastey protocol, file read/write, Inbox/finalize, and UI lifecycle.
-
-## Release history
-
-See [CHANGELOG.md](CHANGELOG.md) for detailed update and version history.
+The model proposes; the host validates; the sender chooses whether to ask; the receiver can Allow once or Deny; a fixed bounded executor acts; typed results return through room-control events. There is no shell, process, file, network, generic runtime, reusable trust, arbitrary tool execution, or local LLM scheduling in the current product.
 
 ## Documentation
 
-- [Changelog](CHANGELOG.md)
-- [Product website](site/README.md)
-- [Release workflow](docs/dev/release-workflow.md)
+- [Project layout specification](docs/architecture/Project specifications.md)
 - [Transfer architecture](docs/transfer/architecture.md)
 - [Transfer scheduler](docs/transfer/scheduler.md)
 - [Transfer validation](docs/transfer/validation.md)
-
-## Product website
-
-The static product website lives under [`site/`](site/). It uses Astro, TypeScript, and Tailwind CSS, with English and Simplified Chinese routes. The desktop landing page is an eight-slide horizontal product presentation; small screens use a vertical fallback.
-
-The site is configured for Cloudflare Pages:
-
-- Root directory: `site`
-- Build command: `pnpm build` when pnpm is available, otherwise `npm run build`
-- Output directory: `dist`
-
-See [`site/README.md`](site/README.md) for local development, route, deployment, and public-claim guidance.
-
-## What pastey does
-
-`pastey` lets one device open an encrypted local transfer room, show an 8-digit code, and wait for another device on the same LAN to join it.
-
-The receiver:
-
-1. Opens `pastey`
-2. Enters the code
-3. Discovers the sender on the LAN
-4. Receives encrypted text or file data directly over the local network
-5. Decrypts locally
-6. Displays text or saves received files/images according to the Inbox settings
-
-There is no account system, no cloud relay, no telemetry, and no remote database.
-
-## Local-first architecture
-
-- Payloads live on the sender until the receiver explicitly requests them.
-- SQLite stores metadata only.
-- Text is converted to bytes, encrypted, and stored locally.
-- Files and images are transferred as generic encrypted binary data.
-- Large files are streamed in encrypted chunks up to 10GB.
-- Multi-file picker and drag/drop sends are queued by a frontend weighted scheduler, which can start multiple file-like transfers while keeping each transfer on the existing single-file path.
-- The transfer server only runs during an active session.
-- LAN discovery only runs while there are active send sessions or a receive attempt is in progress.
-
-## Security model
-
-- User content is never stored in plaintext in SQLite.
-- Local payloads are encrypted before they are written to disk.
-- Payload encryption uses ChaCha20-Poly1305 authenticated encryption.
-- Each payload gets its own random session key and random nonce.
-- The 8-digit code is only the human access code.
-- Receiver-side decryption happens locally after download.
-- Original source file paths are never stored in the database.
-- Local payload file names use generated UUID-based identifiers only.
-
-The app keeps a local app secret in `config.json` so it can re-open local encrypted metadata after an app restart without storing plaintext payloads in the database.
-
-## What is stored locally
-
-App data directory contents:
-
-- `db.sqlite`
-- `config.json`
-- `payloads/`
-- `inbox/`
-- `temp/`
-
-SQLite metadata includes:
-
-- session ids
-- session code hash
-- payload type
-- relative encrypted payload path
-- received-file inbox path
-- received-file Inbox persistence preferences
-- optional sanitized display name
-- MIME type
-- size
-- timestamps
-- status
-- encrypted wrapping material for the payload key and session code
-
-Rooms exist until manually burned. Burning a room deletes that room's local encrypted payloads, transient received files, related `.part` files, room items, and active receiver transfer state. Files and images already saved to Inbox are user-owned output and are not deleted by Burn.
-
-## What is never uploaded
-
-- plaintext text
-- plaintext files
-- original local file paths
-- ciphertext to any cloud database
-- file names or keys to a remote service
-- analytics or telemetry events
-
-## Payload handling
-
-### Text
-
-1. UTF-8 text is converted to bytes
-2. Encrypted in Rust
-3. Written to local encrypted payload storage
-4. Only metadata is stored in SQLite
-
-### Files and images
-
-1. File bytes are read as-is
-2. Large files are streamed in chunks instead of loaded fully into memory
-3. Chunks are encrypted in Rust
-4. Images are treated exactly like files
-5. No decode, resize, recompress, or transform step is applied
-
-Global Transfer Scheduler v1 is frontend orchestration only. It uses a weighted planner for existing queued file-like transfers, passes per-transfer requested sender windows through the existing single-file transfer command, and can hot-adjust active outgoing binary-v1 sender windows after planner-managed completion or CL-4 outgoing control demand changes. The combined data target is `7` with outgoing control demand and `8` when idle. It does not add retry/timeout adaptive windows, archive bundling, folder transfer, backend-owned scheduling, or protocol changes. File type may affect labels, but the binary-v1 transport remains opaque, format-agnostic, and file-type independent.
+- [Agent Bridge architecture and safety](docs/agent-bridge/architecture-and-safety.md)
+- [Room-control transport](docs/agent-bridge/room-control-transport.md)
+- [Capability contracts](docs/agent-bridge/capability-contracts.md)
+- [Provider configuration](docs/agent-bridge/provider-configuration.md)
+- [Release workflow](docs/operations/release-workflow.md)
+- [Product website](site/README.md)
+- [Changelog](CHANGELOG.md)
 
 ## Download
 
@@ -213,18 +64,18 @@ Download the [latest release](https://github.com/xpan0988/Pastey/releases/latest
 
 ### macOS
 
-1. Download the latest `.dmg` from the [latest release](https://github.com/xpan0988/Pastey/releases/latest).
+1. Download the latest `.dmg`.
 2. Open the `.dmg`.
 3. Drag `pastey.app` into Applications.
 4. Launch `pastey`.
 
 ### Windows
 
-1. Download the latest `.msi` or `.exe` installer from the [latest release](https://github.com/xpan0988/Pastey/releases/latest).
+1. Download the latest `.msi` or `.exe` installer.
 2. Run the installer.
 3. Launch `pastey` from the Start menu.
 
-## Run in development
+## Run In Development
 
 ```bash
 npm install
@@ -257,76 +108,35 @@ Packaged desktop app with artifact audit:
 npm run build:checked
 ```
 
-### Release workflow
+## Release
 
 ```bash
 npm run release:version -- X.Y.Z "Release Title"
 git push origin main --tags
 ```
 
-### Dry-run release workflow
-
-```bash
-npm run release:version -- X.Y.Z "Release Title" --dry-run
-```
-
-### What the release workflow does
-
-- Uses `src-tauri/Cargo.toml` as the authoritative version source.
-- Syncs `package.json`, `package-lock.json`, `tauri.conf.json`, and `Cargo.lock` when needed.
-- Updates `CHANGELOG.md`.
-- Creates commit:
-  ```text
-  chore(release): vX.Y.Z
-  ```
-- Creates annotated tag:
-  ```text
-  vX.Y.Z
-  ```
-- Does not push automatically.
-- Pushing tags triggers GitHub Actions release builds.
+See [docs/operations/release-workflow.md](docs/operations/release-workflow.md) for the full release workflow.
 
 ## Logs
 
-Release builds write transfer diagnostics locally:
+Release builds write local diagnostics here:
 
 - macOS: `~/Library/Application Support/pastey/logs/pastey.log`
 - Windows: `%LOCALAPPDATA%\pastey\logs\pastey.log`
 
-Logs rotate at 5MB and keep the last two rotated files. Agent Bridge lifecycle
-entries use bounded redacted structured fields and shortened references. Logs
-are audit mirrors only: they are never workflow state, consent, authority, or
-trust. Logs never contain plaintext text, file contents, encryption keys,
-Agent Bridge API keys, raw control payloads, or original source file paths. The
-Settings screen can open the logs folder or copy the most recent transfer
-error summary.
+Logs rotate at 5 MB and keep the last two rotated files. Agent Bridge lifecycle entries use bounded redacted structured fields and shortened references. Logs are audit mirrors only: they are never workflow state, consent, authority, or trust.
 
-## Release size expectations
-
-- `src-tauri/target/` can grow to several GB during development. That is normal Rust/Tauri build cache and should not be treated as the shipped app size.
-- Final packaged artifacts should stay small because `pastey` only bundles the compiled desktop app plus the built frontend from `dist/`.
-- Use the checked release build before shipping.
-
-- The size audit prints packaged artifact sizes for `.app`, `.dmg`, `.msi`, `.exe`, and other generated bundle outputs under `src-tauri/target/release/bundle/`.
-- The audit fails if default size thresholds are exceeded:
-  - macOS `.dmg`: 100MB
-  - macOS `.app`: 200MB
-  - Windows `.msi`: 150MB
-  - Windows `.exe`: 150MB
-- The audit also fails if a final app bundle appears to contain development or local-data artifacts such as `node_modules`, `target`, `.git`, `src-tauri`, `src`, `outbox`, `inbox`, `temp`, or `db.sqlite`.
-- If the size check fails, inspect the bundle contents first. A large final artifact usually means build caches, source files, or local app data were accidentally included.
-
-## Platform notes
+## Platform Notes
 
 - macOS may ask for network access permission the first time you run active LAN transfers.
 - Windows Defender Firewall may prompt for local network access when the temporary transfer server starts.
 - Global shortcut defaults to `Ctrl+Shift+V` on Windows and `Cmd+Shift+V` on macOS.
 
-## Current limitations
+## Current Limitations
 
-- LAN-only
-- Sender must be online during the transfer
-- No cloud relay
-- No WebRTC yet
-- No TURN fallback yet
-- UDP discovery is simple broadcast-based LAN discovery
+- LAN-only.
+- Sender must be online during transfer.
+- No cloud relay.
+- No WebRTC or TURN fallback.
+- UDP discovery is simple broadcast-based LAN discovery.
+- Durable peer identity and persistent trusted-room continuity are not complete.

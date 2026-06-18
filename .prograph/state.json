@@ -1,10 +1,10 @@
 {
   "schemaVersion": "1.0.0",
   "toolVersion": "0.3.0",
-  "generatedAt": "2026-06-14T07:16:44.193Z",
+  "generatedAt": "2026-06-14T07:22:18.557Z",
   "repositoryRoot": "/Users/xiyuanpan/Pastey",
   "repositoryIdentity": "0992c561ba19ab05",
-  "gitCommit": "8bca25dd6ba7f61a0bb6910dda646213e3c8a3a5",
+  "gitCommit": "a79ee281b424699dd19626dda5dfed26aec06816",
   "configHash": "91275ad256f680e554d39688b09e155eff4247d024fea9eb5f681c76f96a4e6f",
   "adapterVersions": {
     "typescript": "1",
