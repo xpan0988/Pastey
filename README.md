@@ -8,7 +8,7 @@ It is built with Tauri v2, React + TypeScript, Rust, SQLite metadata storage, lo
 
 ## Current Architecture
 
-The canonical project architecture and layer boundaries live in [docs/architecture/Project specifications.md](docs/architecture/Project specifications.md). When older planning documents or diagrams conflict with that file, the specification takes precedence.
+The canonical project architecture and layer boundaries live in [docs/architecture/Project-specifications.md](docs/architecture/Project-specifications.md). When older planning documents or diagrams conflict with that file, the specification takes precedence.
 
 Current layer status:
 
@@ -46,7 +46,7 @@ The model proposes; the host validates; the sender chooses whether to ask; the r
 
 ## Documentation
 
-- [Project layout specification](docs/architecture/Project specifications.md)
+- [Project layout specification](docs/architecture/Project-specifications.md)
 - [Transfer architecture](docs/transfer/architecture.md)
 - [Transfer scheduler](docs/transfer/scheduler.md)
 - [Transfer validation](docs/transfer/validation.md)
