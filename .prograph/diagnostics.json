@@ -19527,7 +19527,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call incoming.inbox_dir.as_deref",
     "file": "src-tauri/src/config.rs",
-    "line": 148,
+    "line": 149,
     "column": 52,
     "adapter": "rust",
     "metadata": {
@@ -19539,7 +19539,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call incoming.transfer_window_override.is_some",
     "file": "src-tauri/src/config.rs",
-    "line": 149,
+    "line": 150,
     "column": 55,
     "adapter": "rust",
     "metadata": {
@@ -19551,7 +19551,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Ok",
     "file": "src-tauri/src/config.rs",
-    "line": 155,
+    "line": 156,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -19563,7 +19563,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call value.trim().to_ascii_lowercase().as_str",
     "file": "src-tauri/src/config.rs",
-    "line": 163,
+    "line": 164,
     "column": 11,
     "adapter": "rust",
     "metadata": {
@@ -19575,7 +19575,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call value.trim().to_ascii_lowercase",
     "file": "src-tauri/src/config.rs",
-    "line": 163,
+    "line": 164,
     "column": 11,
     "adapter": "rust",
     "metadata": {
@@ -19587,7 +19587,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call value.trim",
     "file": "src-tauri/src/config.rs",
-    "line": 163,
+    "line": 164,
     "column": 11,
     "adapter": "rust",
     "metadata": {
@@ -19599,7 +19599,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"fixed\".to_string",
     "file": "src-tauri/src/config.rs",
-    "line": 164,
+    "line": 165,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -19611,7 +19611,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"dynamic\".to_string",
     "file": "src-tauri/src/config.rs",
-    "line": 165,
+    "line": 166,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -19623,7 +19623,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call config.inbox_dir.as_deref",
     "file": "src-tauri/src/config.rs",
-    "line": 171,
+    "line": 172,
     "column": 11,
     "adapter": "rust",
     "metadata": {
@@ -19635,7 +19635,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call path.trim().is_empty",
     "file": "src-tauri/src/config.rs",
-    "line": 172,
+    "line": 173,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -19647,7 +19647,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call path.trim",
     "file": "src-tauri/src/config.rs",
-    "line": 172,
+    "line": 173,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -19659,7 +19659,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Path::new(path).to_path_buf",
     "file": "src-tauri/src/config.rs",
-    "line": 172,
+    "line": 173,
     "column": 50,
     "adapter": "rust",
     "metadata": {
@@ -19671,7 +19671,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Path::new",
     "file": "src-tauri/src/config.rs",
-    "line": 172,
+    "line": 173,
     "column": 50,
     "adapter": "rust",
     "metadata": {
@@ -19683,7 +19683,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call paths.inbox_dir.clone",
     "file": "src-tauri/src/config.rs",
-    "line": 173,
+    "line": 174,
     "column": 14,
     "adapter": "rust",
     "metadata": {
@@ -19695,7 +19695,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call paths.temp_dir.clone",
     "file": "src-tauri/src/config.rs",
-    "line": 185,
+    "line": 186,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -19707,7 +19707,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call mime_type\n        .map(|value| value.trim().to_ascii_lowercase().starts_with(\"image/\"))\n        .unwrap_or",
     "file": "src-tauri/src/config.rs",
-    "line": 190,
+    "line": 191,
     "column": 8,
     "adapter": "rust",
     "metadata": {
@@ -19719,7 +19719,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call mime_type\n        .map",
     "file": "src-tauri/src/config.rs",
-    "line": 190,
+    "line": 191,
     "column": 8,
     "adapter": "rust",
     "metadata": {
@@ -19731,7 +19731,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call value.trim().to_ascii_lowercase().starts_with",
     "file": "src-tauri/src/config.rs",
-    "line": 191,
+    "line": 192,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -19743,7 +19743,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call value.trim().to_ascii_lowercase",
     "file": "src-tauri/src/config.rs",
-    "line": 191,
+    "line": 192,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -19755,7 +19755,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call value.trim",
     "file": "src-tauri/src/config.rs",
-    "line": 191,
+    "line": 192,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -19767,7 +19767,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call path.trim",
     "file": "src-tauri/src/config.rs",
-    "line": 216,
+    "line": 217,
     "column": 19,
     "adapter": "rust",
     "metadata": {
@@ -19779,7 +19779,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call trimmed.is_empty",
     "file": "src-tauri/src/config.rs",
-    "line": 217,
+    "line": 218,
     "column": 8,
     "adapter": "rust",
     "metadata": {
@@ -19791,7 +19791,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call paths.inbox_dir.display().to_string",
     "file": "src-tauri/src/config.rs",
-    "line": 217,
+    "line": 218,
     "column": 41,
     "adapter": "rust",
     "metadata": {
@@ -19803,7 +19803,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call paths.inbox_dir.display",
     "file": "src-tauri/src/config.rs",
-    "line": 217,
+    "line": 218,
     "column": 41,
     "adapter": "rust",
     "metadata": {
@@ -19815,7 +19815,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Some",
     "file": "src-tauri/src/config.rs",
-    "line": 220,
+    "line": 221,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -19827,7 +19827,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call trimmed.to_string",
     "file": "src-tauri/src/config.rs",
-    "line": 220,
+    "line": 221,
     "column": 14,
     "adapter": "rust",
     "metadata": {
@@ -19839,7 +19839,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call std::env::temp_dir().join",
     "file": "src-tauri/src/config.rs",
-    "line": 230,
+    "line": 231,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -19851,7 +19851,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call std::env::temp_dir",
     "file": "src-tauri/src/config.rs",
-    "line": 230,
+    "line": 231,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -19863,7 +19863,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call fs::create_dir_all(&root).unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 231,
+    "line": 232,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -19875,7 +19875,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call fs::create_dir_all",
     "file": "src-tauri/src/config.rs",
-    "line": 231,
+    "line": 232,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -19887,20 +19887,8 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call root.clone",
     "file": "src-tauri/src/config.rs",
-    "line": 233,
-    "column": 27,
-    "adapter": "rust",
-    "metadata": {
-      "candidateCount": 0
-    }
-  },
-  {
-    "code": "unresolved-method-call",
-    "severity": "info",
-    "message": "Unable to uniquely resolve Rust call root.join",
-    "file": "src-tauri/src/config.rs",
     "line": 234,
-    "column": 22,
+    "column": 27,
     "adapter": "rust",
     "metadata": {
       "candidateCount": 0
@@ -19912,7 +19900,7 @@
     "message": "Unable to uniquely resolve Rust call root.join",
     "file": "src-tauri/src/config.rs",
     "line": 235,
-    "column": 27,
+    "column": 22,
     "adapter": "rust",
     "metadata": {
       "candidateCount": 0
@@ -19924,7 +19912,7 @@
     "message": "Unable to uniquely resolve Rust call root.join",
     "file": "src-tauri/src/config.rs",
     "line": 236,
-    "column": 24,
+    "column": 27,
     "adapter": "rust",
     "metadata": {
       "candidateCount": 0
@@ -19936,7 +19924,7 @@
     "message": "Unable to uniquely resolve Rust call root.join",
     "file": "src-tauri/src/config.rs",
     "line": 237,
-    "column": 23,
+    "column": 24,
     "adapter": "rust",
     "metadata": {
       "candidateCount": 0
@@ -19960,6 +19948,18 @@
     "message": "Unable to uniquely resolve Rust call root.join",
     "file": "src-tauri/src/config.rs",
     "line": 239,
+    "column": 23,
+    "adapter": "rust",
+    "metadata": {
+      "candidateCount": 0
+    }
+  },
+  {
+    "code": "unresolved-method-call",
+    "severity": "info",
+    "message": "Unable to uniquely resolve Rust call root.join",
+    "file": "src-tauri/src/config.rs",
+    "line": 240,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -19971,7 +19971,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::from_str(\n            r#\"{\n                \"version\": 3,\n                \"default_expiry_minutes\": 15,\n                \"inbox_dir\": null,\n                \"auto_burn_after_download\": false,\n                \"speed_limit_mbps\": 50,\n                \"shortcut\": \"Ctrl+Shift+V\",\n                \"app_secret\": \"abc\",\n                \"device_id\": \"device\"\n            }\"#,\n        )\n        .unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 245,
+    "line": 246,
     "column": 36,
     "adapter": "rust",
     "metadata": {
@@ -19983,7 +19983,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::from_str",
     "file": "src-tauri/src/config.rs",
-    "line": 245,
+    "line": 246,
     "column": 36,
     "adapter": "rust",
     "metadata": {
@@ -19995,7 +19995,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call load_or_create(&paths, \"Ctrl+Shift+V\").unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 272,
+    "line": 273,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -20007,7 +20007,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call fs::remove_dir_all",
     "file": "src-tauri/src/config.rs",
-    "line": 280,
+    "line": 281,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -20019,7 +20019,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call load_or_create(&paths, \"Ctrl+Shift+V\").unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 286,
+    "line": 287,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -20031,7 +20031,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call update_with_dev_tools_enabled(\n            &paths,\n            &mut stored,\n            AppConfig {\n                save_received_files_to_inbox: false,\n                save_received_images_to_inbox: true,\n                ..incoming\n            },\n            false,\n            false,\n        )\n        .unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 289,
+    "line": 290,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -20043,7 +20043,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call load_or_create(&paths, \"Ctrl+Shift+V\").unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 301,
+    "line": 302,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -20055,7 +20055,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call fs::remove_dir_all",
     "file": "src-tauri/src/config.rs",
-    "line": 308,
+    "line": 309,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -20067,7 +20067,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Ctrl+Shift+V\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 324,
+    "line": 325,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -20079,7 +20079,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"abc\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 325,
+    "line": 326,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -20091,7 +20091,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"device\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 326,
+    "line": 327,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -20103,7 +20103,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call fs::remove_dir_all",
     "file": "src-tauri/src/config.rs",
-    "line": 338,
+    "line": 339,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -20115,7 +20115,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call load_or_create(&paths, \"Ctrl+Shift+V\").unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 344,
+    "line": 345,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -20127,7 +20127,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call update_with_dev_tools_enabled(\n            &paths,\n            &mut stored,\n            AppConfig {\n                transfer_window_override: Some(8),\n                ..incoming\n            },\n            true,\n            true,\n        )\n        .unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 346,
+    "line": 347,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -20139,7 +20139,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Some",
     "file": "src-tauri/src/config.rs",
-    "line": 350,
+    "line": 351,
     "column": 43,
     "adapter": "rust",
     "metadata": {
@@ -20151,7 +20151,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call load_or_create(&paths, \"Ctrl+Shift+V\").unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 357,
+    "line": 358,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -20163,7 +20163,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call fs::remove_dir_all",
     "file": "src-tauri/src/config.rs",
-    "line": 362,
+    "line": 363,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -20175,7 +20175,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Some",
     "file": "src-tauri/src/config.rs",
-    "line": 375,
+    "line": 376,
     "column": 39,
     "adapter": "rust",
     "metadata": {
@@ -20186,20 +20186,20 @@
     "code": "unresolved-method-call",
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Ctrl+Shift+V\".into",
-    "file": "src-tauri/src/config.rs",
-    "line": 378,
-    "column": 23,
-    "adapter": "rust",
-    "metadata": {
-      "candidateCount": 0
-    }
-  },
-  {
-    "code": "unresolved-method-call",
-    "severity": "info",
-    "message": "Unable to uniquely resolve Rust call \"abc\".into",
     "file": "src-tauri/src/config.rs",
     "line": 379,
+    "column": 23,
+    "adapter": "rust",
+    "metadata": {
+      "candidateCount": 0
+    }
+  },
+  {
+    "code": "unresolved-method-call",
+    "severity": "info",
+    "message": "Unable to uniquely resolve Rust call \"abc\".into",
+    "file": "src-tauri/src/config.rs",
+    "line": 380,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -20211,7 +20211,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"device\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 380,
+    "line": 381,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -20223,7 +20223,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call fs::remove_dir_all",
     "file": "src-tauri/src/config.rs",
-    "line": 388,
+    "line": 389,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -20235,7 +20235,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Some",
     "file": "src-tauri/src/config.rs",
-    "line": 401,
+    "line": 402,
     "column": 39,
     "adapter": "rust",
     "metadata": {
@@ -20247,7 +20247,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Ctrl+Shift+V\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 404,
+    "line": 405,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -20259,7 +20259,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"abc\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 405,
+    "line": 406,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -20271,7 +20271,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"device\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 406,
+    "line": 407,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -20283,7 +20283,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call fs::remove_dir_all",
     "file": "src-tauri/src/config.rs",
-    "line": 414,
+    "line": 415,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -20295,7 +20295,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Ctrl+Shift+V\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 430,
+    "line": 431,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -20307,7 +20307,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"abc\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 431,
+    "line": 432,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -20319,7 +20319,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"device\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 432,
+    "line": 433,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -20331,7 +20331,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call save(&paths, &stored).unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 434,
+    "line": 435,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -20343,7 +20343,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call update(\n            &paths,\n            &mut stored,\n            AppConfig {\n                dev_tools_enabled: true,\n                ..incoming\n            },\n        )\n        .unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 437,
+    "line": 438,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -20355,7 +20355,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call load_or_create(&paths, \"Ctrl+Shift+V\").unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 446,
+    "line": 447,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -20367,7 +20367,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call fs::remove_dir_all",
     "file": "src-tauri/src/config.rs",
-    "line": 451,
+    "line": 452,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -20379,7 +20379,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call load_or_create(&paths, \"Ctrl+Shift+V\").unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 457,
+    "line": 458,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -20391,7 +20391,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call update(\n            &paths,\n            &mut stored,\n            AppConfig {\n                micro_flow_group_mode: \"fixed\".into(),\n                ..incoming\n            },\n        )\n        .unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 460,
+    "line": 461,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -20403,7 +20403,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"fixed\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 464,
+    "line": 465,
     "column": 40,
     "adapter": "rust",
     "metadata": {
@@ -20415,7 +20415,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"invalid\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 477,
+    "line": 478,
     "column": 40,
     "adapter": "rust",
     "metadata": {
@@ -20427,7 +20427,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call save(&paths, &stored).unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 478,
+    "line": 479,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -20439,7 +20439,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call load_or_create(&paths, \"Ctrl+Shift+V\").unwrap",
     "file": "src-tauri/src/config.rs",
-    "line": 479,
+    "line": 480,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -20451,7 +20451,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call fs::remove_dir_all",
     "file": "src-tauri/src/config.rs",
-    "line": 482,
+    "line": 483,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -20463,7 +20463,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Some",
     "file": "src-tauri/src/config.rs",
-    "line": 495,
+    "line": 496,
     "column": 39,
     "adapter": "rust",
     "metadata": {
@@ -20475,7 +20475,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Ctrl+Shift+V\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 498,
+    "line": 499,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -20487,7 +20487,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"abc\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 499,
+    "line": 500,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -20499,7 +20499,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"device\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 500,
+    "line": 501,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -20511,7 +20511,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call fs::remove_dir_all",
     "file": "src-tauri/src/config.rs",
-    "line": 508,
+    "line": 509,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -20523,7 +20523,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Ctrl+Shift+V\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 524,
+    "line": 525,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -20535,7 +20535,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"abc\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 525,
+    "line": 526,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -20547,7 +20547,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"device\".into",
     "file": "src-tauri/src/config.rs",
-    "line": 526,
+    "line": 527,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -20559,7 +20559,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call fs::remove_dir_all",
     "file": "src-tauri/src/config.rs",
-    "line": 533,
+    "line": 534,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -24913,7 +24913,7 @@
   {
     "code": "unresolved-method-call",
     "severity": "info",
-    "message": "Unable to uniquely resolve Rust call Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))\n        .map_err",
+    "message": "Unable to uniquely resolve Rust call Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err",
     "file": "src-tauri/src/discovery.rs",
     "line": 144,
     "column": 18,
@@ -24952,7 +24952,7 @@
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
     "line": 145,
-    "column": 26,
+    "column": 9,
     "adapter": "rust",
     "metadata": {
       "candidateCount": 0
@@ -24961,9 +24961,9 @@
   {
     "code": "unresolved-method-call",
     "severity": "info",
-    "message": "Unable to uniquely resolve Rust call socket\n        .set_reuse_address(true)\n        .map_err",
+    "message": "Unable to uniquely resolve Rust call socket.set_reuse_address(true).map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 146,
+    "line": 147,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -24973,9 +24973,9 @@
   {
     "code": "unresolved-method-call",
     "severity": "info",
-    "message": "Unable to uniquely resolve Rust call socket\n        .set_reuse_address",
+    "message": "Unable to uniquely resolve Rust call socket.set_reuse_address",
     "file": "src-tauri/src/discovery.rs",
-    "line": 146,
+    "line": 147,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -24988,7 +24988,7 @@
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
     "line": 148,
-    "column": 26,
+    "column": 9,
     "adapter": "rust",
     "metadata": {
       "candidateCount": 0
@@ -24997,9 +24997,9 @@
   {
     "code": "unresolved-method-call",
     "severity": "info",
-    "message": "Unable to uniquely resolve Rust call socket\n        .set_reuse_port(true)\n        .map_err",
+    "message": "Unable to uniquely resolve Rust call socket.set_reuse_port(true).map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 150,
+    "line": 151,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25009,9 +25009,9 @@
   {
     "code": "unresolved-method-call",
     "severity": "info",
-    "message": "Unable to uniquely resolve Rust call socket\n        .set_reuse_port",
+    "message": "Unable to uniquely resolve Rust call socket.set_reuse_port",
     "file": "src-tauri/src/discovery.rs",
-    "line": 150,
+    "line": 151,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25024,7 +25024,7 @@
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
     "line": 152,
-    "column": 26,
+    "column": 9,
     "adapter": "rust",
     "metadata": {
       "candidateCount": 0
@@ -25035,7 +25035,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket\n        .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT).into())\n        .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 153,
+    "line": 154,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25047,7 +25047,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket\n        .bind",
     "file": "src-tauri/src/discovery.rs",
-    "line": 153,
+    "line": 154,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25059,7 +25059,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT).into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 154,
+    "line": 155,
     "column": 16,
     "adapter": "rust",
     "metadata": {
@@ -25071,7 +25071,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call SocketAddrV4::new",
     "file": "src-tauri/src/discovery.rs",
-    "line": 154,
+    "line": 155,
     "column": 16,
     "adapter": "rust",
     "metadata": {
@@ -25083,7 +25083,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 155,
+    "line": 156,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -25093,9 +25093,9 @@
   {
     "code": "unresolved-method-call",
     "severity": "info",
-    "message": "Unable to uniquely resolve Rust call socket\n        .set_nonblocking(true)\n        .map_err",
+    "message": "Unable to uniquely resolve Rust call socket.set_nonblocking(true).map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 156,
+    "line": 157,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25105,9 +25105,9 @@
   {
     "code": "unresolved-method-call",
     "severity": "info",
-    "message": "Unable to uniquely resolve Rust call socket\n        .set_nonblocking",
+    "message": "Unable to uniquely resolve Rust call socket.set_nonblocking",
     "file": "src-tauri/src/discovery.rs",
-    "line": 156,
+    "line": 157,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25120,7 +25120,7 @@
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
     "line": 158,
-    "column": 26,
+    "column": 9,
     "adapter": "rust",
     "metadata": {
       "candidateCount": 0
@@ -25129,9 +25129,9 @@
   {
     "code": "unresolved-method-call",
     "severity": "info",
-    "message": "Unable to uniquely resolve Rust call UdpSocket::from_std(socket.into())\n        .map_err",
+    "message": "Unable to uniquely resolve Rust call UdpSocket::from_std(socket.into()).map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 159,
+    "line": 162,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25143,7 +25143,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call UdpSocket::from_std",
     "file": "src-tauri/src/discovery.rs",
-    "line": 159,
+    "line": 162,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25155,7 +25155,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket.into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 159,
+    "line": 162,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -25167,8 +25167,8 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 160,
-    "column": 26,
+    "line": 163,
+    "column": 9,
     "adapter": "rust",
     "metadata": {
       "candidateCount": 0
@@ -25179,7 +25179,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.nearby_http_handle.lock().is_some",
     "file": "src-tauri/src/discovery.rs",
-    "line": 164,
+    "line": 168,
     "column": 8,
     "adapter": "rust",
     "metadata": {
@@ -25191,7 +25191,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.nearby_http_handle.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 164,
+    "line": 168,
     "column": 8,
     "adapter": "rust",
     "metadata": {
@@ -25203,7 +25203,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Ok",
     "file": "src-tauri/src/discovery.rs",
-    "line": 165,
+    "line": 169,
     "column": 16,
     "adapter": "rust",
     "metadata": {
@@ -25215,7 +25215,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Router::new()\n        .route(\"/nearby/join-request\", post(join_request_endpoint))\n        .with_state",
     "file": "src-tauri/src/discovery.rs",
-    "line": 168,
+    "line": 172,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -25227,7 +25227,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Router::new()\n        .route",
     "file": "src-tauri/src/discovery.rs",
-    "line": 168,
+    "line": 172,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -25239,7 +25239,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Router::new",
     "file": "src-tauri/src/discovery.rs",
-    "line": 168,
+    "line": 172,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -25251,7 +25251,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call post",
     "file": "src-tauri/src/discovery.rs",
-    "line": 169,
+    "line": 173,
     "column": 40,
     "adapter": "rust",
     "metadata": {
@@ -25263,7 +25263,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 170,
+    "line": 174,
     "column": 21,
     "adapter": "rust",
     "metadata": {
@@ -25275,7 +25275,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call TcpListener::bind((\"0.0.0.0\", 0)).await.map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 171,
+    "line": 175,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -25287,7 +25287,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call TcpListener::bind",
     "file": "src-tauri/src/discovery.rs",
-    "line": 171,
+    "line": 175,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -25299,7 +25299,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 172,
+    "line": 176,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -25311,7 +25311,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call listener\n        .local_addr()\n        .map_err(|error| {\n            AppError::Network(format!(\"unable to inspect nearby join socket: {error}\"))\n        })?\n        .port",
     "file": "src-tauri/src/discovery.rs",
-    "line": 174,
+    "line": 178,
     "column": 16,
     "adapter": "rust",
     "metadata": {
@@ -25323,7 +25323,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call listener\n        .local_addr()\n        .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 174,
+    "line": 178,
     "column": 16,
     "adapter": "rust",
     "metadata": {
@@ -25335,7 +25335,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call listener\n        .local_addr",
     "file": "src-tauri/src/discovery.rs",
-    "line": 174,
+    "line": 178,
     "column": 16,
     "adapter": "rust",
     "metadata": {
@@ -25347,7 +25347,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 177,
+    "line": 181,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -25359,7 +25359,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call oneshot::channel::<()>",
     "file": "src-tauri/src/discovery.rs",
-    "line": 180,
+    "line": 184,
     "column": 38,
     "adapter": "rust",
     "metadata": {
@@ -25371,7 +25371,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call tokio::spawn",
     "file": "src-tauri/src/discovery.rs",
-    "line": 182,
+    "line": 186,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25383,7 +25383,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call axum::serve(\n            listener,\n            router.into_make_service_with_connect_info::<SocketAddr>(),\n        )\n        .with_graceful_shutdown",
     "file": "src-tauri/src/discovery.rs",
-    "line": 183,
+    "line": 187,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -25395,7 +25395,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call axum::serve",
     "file": "src-tauri/src/discovery.rs",
-    "line": 183,
+    "line": 187,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -25407,7 +25407,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call router.into_make_service_with_connect_info::<SocketAddr>",
     "file": "src-tauri/src/discovery.rs",
-    "line": 185,
+    "line": 189,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -25419,7 +25419,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.nearby_http_handle.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 193,
+    "line": 197,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -25431,7 +25431,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call handle.is_none",
     "file": "src-tauri/src/discovery.rs",
-    "line": 194,
+    "line": 198,
     "column": 8,
     "adapter": "rust",
     "metadata": {
@@ -25443,7 +25443,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Some",
     "file": "src-tauri/src/discovery.rs",
-    "line": 195,
+    "line": 199,
     "column": 19,
     "adapter": "rust",
     "metadata": {
@@ -25455,7 +25455,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Ok",
     "file": "src-tauri/src/discovery.rs",
-    "line": 203,
+    "line": 207,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25467,7 +25467,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.antenna_handle.lock().is_some",
     "file": "src-tauri/src/discovery.rs",
-    "line": 207,
+    "line": 211,
     "column": 8,
     "adapter": "rust",
     "metadata": {
@@ -25479,7 +25479,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.antenna_handle.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 207,
+    "line": 211,
     "column": 8,
     "adapter": "rust",
     "metadata": {
@@ -25491,7 +25491,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call UdpSocket::bind",
     "file": "src-tauri/src/discovery.rs",
-    "line": 211,
+    "line": 215,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -25503,7 +25503,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket.set_broadcast",
     "file": "src-tauri/src/discovery.rs",
-    "line": 221,
+    "line": 225,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -25515,7 +25515,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call oneshot::channel::<()>",
     "file": "src-tauri/src/discovery.rs",
-    "line": 229,
+    "line": 233,
     "column": 42,
     "adapter": "rust",
     "metadata": {
@@ -25527,7 +25527,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.antenna_handle.lock().replace",
     "file": "src-tauri/src/discovery.rs",
-    "line": 230,
+    "line": 234,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25539,7 +25539,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.antenna_handle.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 230,
+    "line": 234,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25551,7 +25551,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 233,
+    "line": 237,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -25563,7 +25563,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call tokio::spawn",
     "file": "src-tauri/src/discovery.rs",
-    "line": 235,
+    "line": 239,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25575,7 +25575,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.antenna_handle.lock().take",
     "file": "src-tauri/src/discovery.rs",
-    "line": 258,
+    "line": 262,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -25587,7 +25587,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.antenna_handle.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 258,
+    "line": 262,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -25599,7 +25599,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call handle.shutdown.send",
     "file": "src-tauri/src/discovery.rs",
-    "line": 259,
+    "line": 263,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -25611,7 +25611,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.active_servers.lock().is_empty",
     "file": "src-tauri/src/discovery.rs",
-    "line": 265,
+    "line": 269,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -25623,7 +25623,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.active_servers.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 265,
+    "line": 269,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -25635,7 +25635,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.antenna_handle.lock().is_some",
     "file": "src-tauri/src/discovery.rs",
-    "line": 265,
+    "line": 269,
     "column": 51,
     "adapter": "rust",
     "metadata": {
@@ -25647,7 +25647,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.antenna_handle.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 265,
+    "line": 269,
     "column": 51,
     "adapter": "rust",
     "metadata": {
@@ -25659,7 +25659,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.discovery_handle.lock().take",
     "file": "src-tauri/src/discovery.rs",
-    "line": 269,
+    "line": 273,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -25671,7 +25671,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.discovery_handle.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 269,
+    "line": 273,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -25683,7 +25683,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call handle.shutdown.send",
     "file": "src-tauri/src/discovery.rs",
-    "line": 270,
+    "line": 274,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -25695,7 +25695,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.nearby_http_handle.lock().take",
     "file": "src-tauri/src/discovery.rs",
-    "line": 272,
+    "line": 276,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -25707,7 +25707,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.nearby_http_handle.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 272,
+    "line": 276,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -25719,7 +25719,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call handle.shutdown.send",
     "file": "src-tauri/src/discovery.rs",
-    "line": 273,
+    "line": 277,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -25731,7 +25731,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .nearby_devices\n        .lock()\n        .values()\n        .map(|record| {\n            let mut device = record.device.clone();\n            device.last_seen_seconds_ago =\n                now.saturating_sub(record.expires_at - BEACON_TTL_SECS) as u64;\n            device\n        })\n        .collect::<Vec<_>>",
     "file": "src-tauri/src/discovery.rs",
-    "line": 280,
+    "line": 284,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -25743,7 +25743,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .nearby_devices\n        .lock()\n        .values()\n        .map",
     "file": "src-tauri/src/discovery.rs",
-    "line": 280,
+    "line": 284,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -25755,7 +25755,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .nearby_devices\n        .lock()\n        .values",
     "file": "src-tauri/src/discovery.rs",
-    "line": 280,
+    "line": 284,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -25767,7 +25767,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .nearby_devices\n        .lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 280,
+    "line": 284,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -25779,7 +25779,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call record.device.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 285,
+    "line": 289,
     "column": 30,
     "adapter": "rust",
     "metadata": {
@@ -25791,7 +25791,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call now.saturating_sub",
     "file": "src-tauri/src/discovery.rs",
-    "line": 287,
+    "line": 291,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -25803,7 +25803,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call devices.sort_by",
     "file": "src-tauri/src/discovery.rs",
-    "line": 291,
+    "line": 295,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -25815,7 +25815,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call left.display_name.cmp",
     "file": "src-tauri/src/discovery.rs",
-    "line": 291,
+    "line": 295,
     "column": 35,
     "adapter": "rust",
     "metadata": {
@@ -25827,7 +25827,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .nearby_devices\n        .lock()\n        .get(device_id)\n        .cloned()\n        .ok_or_else",
     "file": "src-tauri/src/discovery.rs",
-    "line": 300,
+    "line": 304,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -25839,7 +25839,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .nearby_devices\n        .lock()\n        .get(device_id)\n        .cloned",
     "file": "src-tauri/src/discovery.rs",
-    "line": 300,
+    "line": 304,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -25851,7 +25851,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .nearby_devices\n        .lock()\n        .get",
     "file": "src-tauri/src/discovery.rs",
-    "line": 300,
+    "line": 304,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -25863,7 +25863,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .nearby_devices\n        .lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 300,
+    "line": 304,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -25875,7 +25875,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::NotFound",
     "file": "src-tauri/src/discovery.rs",
-    "line": 305,
+    "line": 309,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -25887,7 +25887,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"No nearby Pastey devices found.\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 305,
+    "line": 309,
     "column": 43,
     "adapter": "rust",
     "metadata": {
@@ -25899,7 +25899,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 308,
+    "line": 312,
     "column": 16,
     "adapter": "rust",
     "metadata": {
@@ -25911,7 +25911,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::InvalidInput",
     "file": "src-tauri/src/discovery.rs",
-    "line": 308,
+    "line": 312,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -25923,7 +25923,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Device is busy.\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 308,
+    "line": 312,
     "column": 43,
     "adapter": "rust",
     "metadata": {
@@ -25935,7 +25935,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call UdpSocket::bind((\"0.0.0.0\", 0))\n        .await\n        .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 311,
+    "line": 315,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -25947,7 +25947,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call UdpSocket::bind",
     "file": "src-tauri/src/discovery.rs",
-    "line": 311,
+    "line": 315,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -25959,7 +25959,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 313,
+    "line": 317,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -25971,7 +25971,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Firewall may be blocking Pastey.\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 313,
+    "line": 317,
     "column": 40,
     "adapter": "rust",
     "metadata": {
@@ -25983,7 +25983,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket\n        .local_addr()\n        .map_err(|_| AppError::Network(\"Firewall may be blocking Pastey.\".into()))?\n        .port",
     "file": "src-tauri/src/discovery.rs",
-    "line": 314,
+    "line": 318,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -25995,7 +25995,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket\n        .local_addr()\n        .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 314,
+    "line": 318,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -26007,7 +26007,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket\n        .local_addr",
     "file": "src-tauri/src/discovery.rs",
-    "line": 314,
+    "line": 318,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -26019,7 +26019,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 316,
+    "line": 320,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -26031,7 +26031,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Firewall may be blocking Pastey.\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 316,
+    "line": 320,
     "column": 40,
     "adapter": "rust",
     "metadata": {
@@ -26043,7 +26043,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"join_request\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 319,
+    "line": 323,
     "column": 15,
     "adapter": "rust",
     "metadata": {
@@ -26055,7 +26055,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call uuid::Uuid::new_v4().to_string",
     "file": "src-tauri/src/discovery.rs",
-    "line": 320,
+    "line": 324,
     "column": 21,
     "adapter": "rust",
     "metadata": {
@@ -26067,7 +26067,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call uuid::Uuid::new_v4",
     "file": "src-tauri/src/discovery.rs",
-    "line": 320,
+    "line": 324,
     "column": 21,
     "adapter": "rust",
     "metadata": {
@@ -26079,7 +26079,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call platform_name().into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 323,
+    "line": 327,
     "column": 19,
     "adapter": "rust",
     "metadata": {
@@ -26091,7 +26091,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call env!(\"CARGO_PKG_VERSION\").into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 324,
+    "line": 328,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -26103,7 +26103,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Some",
     "file": "src-tauri/src/discovery.rs",
-    "line": 325,
+    "line": 329,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -26115,7 +26115,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.outgoing_join_requests.lock().insert",
     "file": "src-tauri/src/discovery.rs",
-    "line": 327,
+    "line": 331,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -26127,7 +26127,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.outgoing_join_requests.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 327,
+    "line": 331,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -26139,7 +26139,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call request.request_id.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 328,
+    "line": 332,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -26151,7 +26151,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call request.request_id.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 330,
+    "line": 334,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -26163,7 +26163,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call reqwest::Client::builder()\n        .timeout(Duration::from_secs(JOIN_REQUEST_CONNECT_TIMEOUT_SECS))\n        .build()\n        .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 339,
+    "line": 343,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -26175,7 +26175,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call reqwest::Client::builder()\n        .timeout(Duration::from_secs(JOIN_REQUEST_CONNECT_TIMEOUT_SECS))\n        .build",
     "file": "src-tauri/src/discovery.rs",
-    "line": 339,
+    "line": 343,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -26187,7 +26187,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call reqwest::Client::builder()\n        .timeout",
     "file": "src-tauri/src/discovery.rs",
-    "line": 339,
+    "line": 343,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -26199,7 +26199,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call reqwest::Client::builder",
     "file": "src-tauri/src/discovery.rs",
-    "line": 339,
+    "line": 343,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -26211,7 +26211,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Duration::from_secs",
     "file": "src-tauri/src/discovery.rs",
-    "line": 340,
+    "line": 344,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -26223,7 +26223,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 342,
+    "line": 346,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -26235,7 +26235,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Firewall may be blocking Pastey.\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 342,
+    "line": 346,
     "column": 40,
     "adapter": "rust",
     "metadata": {
@@ -26247,7 +26247,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call client\n        .post(&join_url)\n        .json(&request)\n        .send()\n        .await\n        .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 343,
+    "line": 347,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -26259,7 +26259,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call client\n        .post(&join_url)\n        .json(&request)\n        .send",
     "file": "src-tauri/src/discovery.rs",
-    "line": 343,
+    "line": 347,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -26271,7 +26271,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call client\n        .post(&join_url)\n        .json",
     "file": "src-tauri/src/discovery.rs",
-    "line": 343,
+    "line": 347,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -26283,7 +26283,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call client\n        .post",
     "file": "src-tauri/src/discovery.rs",
-    "line": 343,
+    "line": 347,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -26295,7 +26295,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n                .outgoing_join_requests\n                .lock()\n                .remove",
     "file": "src-tauri/src/discovery.rs",
-    "line": 349,
+    "line": 353,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -26307,7 +26307,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n                .outgoing_join_requests\n                .lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 349,
+    "line": 353,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -26319,7 +26319,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 355,
+    "line": 359,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -26331,7 +26331,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Device found, but Pastey could not connect to it.\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 355,
+    "line": 359,
     "column": 31,
     "adapter": "rust",
     "metadata": {
@@ -26343,7 +26343,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call response.status",
     "file": "src-tauri/src/discovery.rs",
-    "line": 357,
+    "line": 361,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -26355,7 +26355,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call response.text().await.unwrap_or_default",
     "file": "src-tauri/src/discovery.rs",
-    "line": 358,
+    "line": 362,
     "column": 16,
     "adapter": "rust",
     "metadata": {
@@ -26367,7 +26367,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call response.text",
     "file": "src-tauri/src/discovery.rs",
-    "line": 358,
+    "line": 362,
     "column": 16,
     "adapter": "rust",
     "metadata": {
@@ -26379,7 +26379,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call status.is_success",
     "file": "src-tauri/src/discovery.rs",
-    "line": 365,
+    "line": 369,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -26391,7 +26391,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n            .outgoing_join_requests\n            .lock()\n            .remove",
     "file": "src-tauri/src/discovery.rs",
-    "line": 366,
+    "line": 370,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -26403,7 +26403,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n            .outgoing_join_requests\n            .lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 366,
+    "line": 370,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -26415,7 +26415,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 370,
+    "line": 374,
     "column": 16,
     "adapter": "rust",
     "metadata": {
@@ -26427,7 +26427,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 370,
+    "line": 374,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -26439,7 +26439,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Device found, but Pastey could not connect to it.\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 371,
+    "line": 375,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -26451,7 +26451,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call timeout(\n            Duration::from_secs(JOIN_REQUEST_TIMEOUT_SECS),\n            socket.recv_from(&mut buffer),\n        )\n        .await\n        .map_err(|_| {\n            state\n                .outgoing_join_requests\n                .lock()\n                .remove(&request.request_id);\n            logging::write_transfer_line(\"[pastey antenna] event=join_timeout\");\n            AppError::Timeout(\"Join request timed out.\".into())\n        })?\n        .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 377,
+    "line": 381,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -26463,7 +26463,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call timeout(\n            Duration::from_secs(JOIN_REQUEST_TIMEOUT_SECS),\n            socket.recv_from(&mut buffer),\n        )\n        .await\n        .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 377,
+    "line": 381,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -26475,7 +26475,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call timeout",
     "file": "src-tauri/src/discovery.rs",
-    "line": 377,
+    "line": 381,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -26487,7 +26487,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Duration::from_secs",
     "file": "src-tauri/src/discovery.rs",
-    "line": 378,
+    "line": 382,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -26499,7 +26499,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket.recv_from",
     "file": "src-tauri/src/discovery.rs",
-    "line": 379,
+    "line": 383,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -26511,7 +26511,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n                .outgoing_join_requests\n                .lock()\n                .remove",
     "file": "src-tauri/src/discovery.rs",
-    "line": 383,
+    "line": 387,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -26523,7 +26523,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n                .outgoing_join_requests\n                .lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 383,
+    "line": 387,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -26535,7 +26535,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Timeout",
     "file": "src-tauri/src/discovery.rs",
-    "line": 388,
+    "line": 392,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -26547,7 +26547,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Join request timed out.\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 388,
+    "line": 392,
     "column": 31,
     "adapter": "rust",
     "metadata": {
@@ -26559,7 +26559,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 390,
+    "line": 394,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -26571,7 +26571,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Firewall may be blocking Pastey.\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 390,
+    "line": 394,
     "column": 40,
     "adapter": "rust",
     "metadata": {
@@ -26583,7 +26583,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::from_slice::<NearbyJoinResponse>",
     "file": "src-tauri/src/discovery.rs",
-    "line": 392,
+    "line": 396,
     "column": 28,
     "adapter": "rust",
     "metadata": {
@@ -26595,7 +26595,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n                .outgoing_join_requests\n                .lock()\n                .remove",
     "file": "src-tauri/src/discovery.rs",
-    "line": 396,
+    "line": 400,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -26607,7 +26607,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n                .outgoing_join_requests\n                .lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 396,
+    "line": 400,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -26619,7 +26619,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Ok",
     "file": "src-tauri/src/discovery.rs",
-    "line": 400,
+    "line": 404,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -26631,7 +26631,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call UdpSocket::bind((\"0.0.0.0\", 0))\n        .await\n        .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 409,
+    "line": 413,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -26643,7 +26643,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call UdpSocket::bind",
     "file": "src-tauri/src/discovery.rs",
-    "line": 409,
+    "line": 413,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -26655,7 +26655,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 411,
+    "line": 415,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -26667,7 +26667,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Firewall may be blocking Pastey.\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 411,
+    "line": 415,
     "column": 40,
     "adapter": "rust",
     "metadata": {
@@ -26679,7 +26679,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::to_vec",
     "file": "src-tauri/src/discovery.rs",
-    "line": 412,
+    "line": 416,
     "column": 19,
     "adapter": "rust",
     "metadata": {
@@ -26691,7 +26691,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket\n        .send_to(&payload, request.source)\n        .await\n        .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 413,
+    "line": 417,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -26703,7 +26703,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket\n        .send_to",
     "file": "src-tauri/src/discovery.rs",
-    "line": 413,
+    "line": 417,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -26715,7 +26715,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 417,
+    "line": 421,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -26727,7 +26727,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Device found, but this network may block direct local connections.\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 418,
+    "line": 422,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -26739,7 +26739,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Ok",
     "file": "src-tauri/src/discovery.rs",
-    "line": 421,
+    "line": 425,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -26751,7 +26751,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call UdpSocket::bind((\"0.0.0.0\", 0))\n        .await\n        .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 425,
+    "line": 429,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -26763,7 +26763,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call UdpSocket::bind",
     "file": "src-tauri/src/discovery.rs",
-    "line": 425,
+    "line": 429,
     "column": 18,
     "adapter": "rust",
     "metadata": {
@@ -26775,7 +26775,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 427,
+    "line": 431,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -26787,7 +26787,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket.set_broadcast(true).map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 428,
+    "line": 432,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -26799,7 +26799,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket.set_broadcast",
     "file": "src-tauri/src/discovery.rs",
-    "line": 428,
+    "line": 432,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -26811,7 +26811,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 429,
+    "line": 433,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -26823,7 +26823,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"discover_room\".to_string",
     "file": "src-tauri/src/discovery.rs",
-    "line": 433,
+    "line": 437,
     "column": 15,
     "adapter": "rust",
     "metadata": {
@@ -26835,7 +26835,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call uuid::Uuid::new_v4().to_string",
     "file": "src-tauri/src/discovery.rs",
-    "line": 434,
+    "line": 438,
     "column": 21,
     "adapter": "rust",
     "metadata": {
@@ -26847,7 +26847,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call uuid::Uuid::new_v4",
     "file": "src-tauri/src/discovery.rs",
-    "line": 434,
+    "line": 438,
     "column": 21,
     "adapter": "rust",
     "metadata": {
@@ -26859,7 +26859,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call request.request_id.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 437,
+    "line": 441,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -26871,7 +26871,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::to_vec",
     "file": "src-tauri/src/discovery.rs",
-    "line": 438,
+    "line": 442,
     "column": 19,
     "adapter": "rust",
     "metadata": {
@@ -26883,7 +26883,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket\n            .send_to(&payload, (\"255.255.255.255\", DISCOVERY_PORT))\n            .await\n            .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 441,
+    "line": 445,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -26895,7 +26895,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket\n            .send_to",
     "file": "src-tauri/src/discovery.rs",
-    "line": 441,
+    "line": 445,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -26907,7 +26907,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 445,
+    "line": 449,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -26919,7 +26919,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call sleep",
     "file": "src-tauri/src/discovery.rs",
-    "line": 447,
+    "line": 451,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -26931,7 +26931,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Duration::from_millis",
     "file": "src-tauri/src/discovery.rs",
-    "line": 447,
+    "line": 451,
     "column": 15,
     "adapter": "rust",
     "metadata": {
@@ -26943,7 +26943,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call timeout(Duration::from_secs(5), socket.recv_from(&mut buffer))\n            .await\n            .map_err(|_| AppError::Timeout(\"timed out while waiting for room discovery\".into()))?\n            .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 452,
+    "line": 456,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -26955,7 +26955,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call timeout(Duration::from_secs(5), socket.recv_from(&mut buffer))\n            .await\n            .map_err",
     "file": "src-tauri/src/discovery.rs",
-    "line": 452,
+    "line": 456,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -26967,7 +26967,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call timeout",
     "file": "src-tauri/src/discovery.rs",
-    "line": 452,
+    "line": 456,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -26979,7 +26979,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Duration::from_secs",
     "file": "src-tauri/src/discovery.rs",
-    "line": 452,
+    "line": 456,
     "column": 32,
     "adapter": "rust",
     "metadata": {
@@ -26991,7 +26991,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket.recv_from",
     "file": "src-tauri/src/discovery.rs",
-    "line": 452,
+    "line": 456,
     "column": 56,
     "adapter": "rust",
     "metadata": {
@@ -27003,7 +27003,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Timeout",
     "file": "src-tauri/src/discovery.rs",
-    "line": 454,
+    "line": 458,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -27015,7 +27015,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"timed out while waiting for room discovery\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 454,
+    "line": 458,
     "column": 44,
     "adapter": "rust",
     "metadata": {
@@ -27027,7 +27027,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call AppError::Network",
     "file": "src-tauri/src/discovery.rs",
-    "line": 455,
+    "line": 459,
     "column": 30,
     "adapter": "rust",
     "metadata": {
@@ -27039,7 +27039,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::from_slice",
     "file": "src-tauri/src/discovery.rs",
-    "line": 458,
+    "line": 462,
     "column": 42,
     "adapter": "rust",
     "metadata": {
@@ -27051,7 +27051,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Ok",
     "file": "src-tauri/src/discovery.rs",
-    "line": 460,
+    "line": 464,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -27063,7 +27063,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::from_slice::<Value>",
     "file": "src-tauri/src/discovery.rs",
-    "line": 471,
+    "line": 475,
     "column": 21,
     "adapter": "rust",
     "metadata": {
@@ -27075,7 +27075,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call value.get(\"kind\").and_then",
     "file": "src-tauri/src/discovery.rs",
-    "line": 474,
+    "line": 478,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -27087,7 +27087,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call value.get",
     "file": "src-tauri/src/discovery.rs",
-    "line": 474,
+    "line": 478,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -27099,7 +27099,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::from_value::<DiscoveryRequest>",
     "file": "src-tauri/src/discovery.rs",
-    "line": 492,
+    "line": 496,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -27111,7 +27111,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.active_servers.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 497,
+    "line": 501,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -27123,7 +27123,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call servers\n            .values()\n            .find(|server| server.room_code_hash == request.room_code_hash)\n            .map",
     "file": "src-tauri/src/discovery.rs",
-    "line": 498,
+    "line": 502,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -27135,7 +27135,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call servers\n            .values()\n            .find",
     "file": "src-tauri/src/discovery.rs",
-    "line": 498,
+    "line": 502,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -27147,7 +27147,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call servers\n            .values",
     "file": "src-tauri/src/discovery.rs",
-    "line": 498,
+    "line": 502,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -27159,7 +27159,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"room_offer\".to_string",
     "file": "src-tauri/src/discovery.rs",
-    "line": 502,
+    "line": 506,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -27171,7 +27171,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call request.request_id.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 503,
+    "line": 507,
     "column": 29,
     "adapter": "rust",
     "metadata": {
@@ -27183,7 +27183,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call server.room_id.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 504,
+    "line": 508,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -27195,7 +27195,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call server.transport_public_key",
     "file": "src-tauri/src/discovery.rs",
-    "line": 507,
+    "line": 511,
     "column": 39,
     "adapter": "rust",
     "metadata": {
@@ -27207,7 +27207,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::to_vec",
     "file": "src-tauri/src/discovery.rs",
-    "line": 513,
+    "line": 517,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -27219,7 +27219,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call socket.send_to",
     "file": "src-tauri/src/discovery.rs",
-    "line": 516,
+    "line": 520,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -27231,7 +27231,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::from_value::<NearbyBeacon>",
     "file": "src-tauri/src/discovery.rs",
-    "line": 521,
+    "line": 525,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -27243,7 +27243,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call beacon.device_id.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 533,
+    "line": 537,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -27255,7 +27255,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call beacon.app_version.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 536,
+    "line": 540,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -27267,7 +27267,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.nearby_devices.lock().insert",
     "file": "src-tauri/src/discovery.rs",
-    "line": 542,
+    "line": 546,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27279,7 +27279,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.nearby_devices.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 542,
+    "line": 546,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27291,7 +27291,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::from_value::<NearbyJoinRequest>",
     "file": "src-tauri/src/discovery.rs",
-    "line": 557,
+    "line": 561,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -27303,7 +27303,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call request.response_port.unwrap_or",
     "file": "src-tauri/src/discovery.rs",
-    "line": 560,
+    "line": 564,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -27315,7 +27315,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call source.port",
     "file": "src-tauri/src/discovery.rs",
-    "line": 560,
+    "line": 564,
     "column": 57,
     "adapter": "rust",
     "metadata": {
@@ -27327,7 +27327,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call SocketAddr::new",
     "file": "src-tauri/src/discovery.rs",
-    "line": 561,
+    "line": 565,
     "column": 42,
     "adapter": "rust",
     "metadata": {
@@ -27339,7 +27339,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call source.ip",
     "file": "src-tauri/src/discovery.rs",
-    "line": 561,
+    "line": 565,
     "column": 58,
     "adapter": "rust",
     "metadata": {
@@ -27351,7 +27351,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call request.response_port.unwrap_or",
     "file": "src-tauri/src/discovery.rs",
-    "line": 572,
+    "line": 576,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -27363,7 +27363,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call source.port",
     "file": "src-tauri/src/discovery.rs",
-    "line": 572,
+    "line": 576,
     "column": 57,
     "adapter": "rust",
     "metadata": {
@@ -27375,7 +27375,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call SocketAddr::new",
     "file": "src-tauri/src/discovery.rs",
-    "line": 573,
+    "line": 577,
     "column": 42,
     "adapter": "rust",
     "metadata": {
@@ -27387,7 +27387,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call source.ip",
     "file": "src-tauri/src/discovery.rs",
-    "line": 573,
+    "line": 577,
     "column": 58,
     "adapter": "rust",
     "metadata": {
@@ -27399,7 +27399,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Json",
     "file": "src-tauri/src/discovery.rs",
-    "line": 576,
+    "line": 580,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -27411,7 +27411,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.outgoing_join_requests.lock().is_empty",
     "file": "src-tauri/src/discovery.rs",
-    "line": 584,
+    "line": 588,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -27423,7 +27423,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.outgoing_join_requests.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 584,
+    "line": 588,
     "column": 9,
     "adapter": "rust",
     "metadata": {
@@ -27435,7 +27435,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call request.request_id.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 589,
+    "line": 593,
     "column": 21,
     "adapter": "rust",
     "metadata": {
@@ -27447,7 +27447,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call pending.request_id.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 598,
+    "line": 602,
     "column": 21,
     "adapter": "rust",
     "metadata": {
@@ -27459,7 +27459,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call pending.device_name.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 599,
+    "line": 603,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -27471,7 +27471,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call pending.platform.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 600,
+    "line": 604,
     "column": 19,
     "adapter": "rust",
     "metadata": {
@@ -27483,7 +27483,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call pending.app_version.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 601,
+    "line": 605,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -27495,7 +27495,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .pending_join_requests\n        .lock()\n        .insert",
     "file": "src-tauri/src/discovery.rs",
-    "line": 605,
+    "line": 609,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27507,7 +27507,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .pending_join_requests\n        .lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 605,
+    "line": 609,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27519,7 +27519,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call pending.request_id.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 608,
+    "line": 612,
     "column": 17,
     "adapter": "rust",
     "metadata": {
@@ -27531,7 +27531,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.app_handle.emit",
     "file": "src-tauri/src/discovery.rs",
-    "line": 612,
+    "line": 616,
     "column": 13,
     "adapter": "rust",
     "metadata": {
@@ -27543,7 +27543,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.active_servers.lock().is_empty",
     "file": "src-tauri/src/discovery.rs",
-    "line": 617,
+    "line": 621,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -27555,7 +27555,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.active_servers.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 617,
+    "line": 621,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -27567,7 +27567,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"nearby_beacon\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 624,
+    "line": 628,
     "column": 15,
     "adapter": "rust",
     "metadata": {
@@ -27579,7 +27579,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call platform_name().into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 627,
+    "line": 631,
     "column": 19,
     "adapter": "rust",
     "metadata": {
@@ -27591,7 +27591,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call env!(\"CARGO_PKG_VERSION\").into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 628,
+    "line": 632,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -27603,7 +27603,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call availability.into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 633,
+    "line": 637,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -27615,7 +27615,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .nearby_http_handle\n        .lock()\n        .as_ref()\n        .map(|handle| handle.port)\n        .unwrap_or_default",
     "file": "src-tauri/src/discovery.rs",
-    "line": 638,
+    "line": 642,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27627,7 +27627,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .nearby_http_handle\n        .lock()\n        .as_ref()\n        .map",
     "file": "src-tauri/src/discovery.rs",
-    "line": 638,
+    "line": 642,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27639,7 +27639,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .nearby_http_handle\n        .lock()\n        .as_ref",
     "file": "src-tauri/src/discovery.rs",
-    "line": 638,
+    "line": 642,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27651,7 +27651,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state\n        .nearby_http_handle\n        .lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 638,
+    "line": 642,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27663,7 +27663,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.nearby_devices.lock().retain",
     "file": "src-tauri/src/discovery.rs",
-    "line": 652,
+    "line": 656,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27675,7 +27675,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.nearby_devices.lock",
     "file": "src-tauri/src/discovery.rs",
-    "line": 652,
+    "line": 656,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27687,7 +27687,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call request.request_id.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 667,
+    "line": 671,
     "column": 21,
     "adapter": "rust",
     "metadata": {
@@ -27699,7 +27699,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call request.device_name.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 668,
+    "line": 672,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -27711,7 +27711,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call request.platform.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 669,
+    "line": 673,
     "column": 19,
     "adapter": "rust",
     "metadata": {
@@ -27723,7 +27723,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call request.app_version.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 670,
+    "line": 674,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -27735,7 +27735,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.config.read().device_id.clone",
     "file": "src-tauri/src/discovery.rs",
-    "line": 687,
+    "line": 691,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27747,7 +27747,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call state.config.read",
     "file": "src-tauri/src/discovery.rs",
-    "line": 687,
+    "line": 691,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27759,7 +27759,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call version.split('.').next",
     "file": "src-tauri/src/discovery.rs",
-    "line": 691,
+    "line": 695,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27771,7 +27771,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call version.split",
     "file": "src-tauri/src/discovery.rs",
-    "line": 691,
+    "line": 695,
     "column": 5,
     "adapter": "rust",
     "metadata": {
@@ -27783,7 +27783,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"nearby_beacon\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 701,
+    "line": 705,
     "column": 19,
     "adapter": "rust",
     "metadata": {
@@ -27795,7 +27795,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"device\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 702,
+    "line": 706,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -27807,7 +27807,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"MacBook Air\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 703,
+    "line": 707,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -27819,7 +27819,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"macOS\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 704,
+    "line": 708,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -27831,7 +27831,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"1.4.0\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 705,
+    "line": 709,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -27843,7 +27843,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"offer\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 708,
+    "line": 712,
     "column": 28,
     "adapter": "rust",
     "metadata": {
@@ -27855,7 +27855,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Available\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 710,
+    "line": 714,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -27867,7 +27867,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::to_string(&beacon).unwrap",
     "file": "src-tauri/src/discovery.rs",
-    "line": 712,
+    "line": 716,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -27879,7 +27879,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::to_string",
     "file": "src-tauri/src/discovery.rs",
-    "line": 712,
+    "line": 716,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -27891,7 +27891,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"request\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 724,
+    "line": 728,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -27903,7 +27903,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"127.0.0.1:12345\".parse().unwrap",
     "file": "src-tauri/src/discovery.rs",
-    "line": 725,
+    "line": 729,
     "column": 21,
     "adapter": "rust",
     "metadata": {
@@ -27915,7 +27915,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"127.0.0.1:12345\".parse",
     "file": "src-tauri/src/discovery.rs",
-    "line": 725,
+    "line": 729,
     "column": 21,
     "adapter": "rust",
     "metadata": {
@@ -27927,7 +27927,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Windows PC\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 726,
+    "line": 730,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -27939,7 +27939,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Windows\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 727,
+    "line": 731,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -27951,7 +27951,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"1.4.0\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 728,
+    "line": 732,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -27963,7 +27963,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::to_string(&prompt).unwrap",
     "file": "src-tauri/src/discovery.rs",
-    "line": 734,
+    "line": 738,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -27975,7 +27975,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::to_string",
     "file": "src-tauri/src/discovery.rs",
-    "line": 734,
+    "line": 738,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -27987,7 +27987,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"device\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 743,
+    "line": 747,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -27999,7 +27999,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"SuperDiao\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 744,
+    "line": 748,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -28011,7 +28011,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"macOS\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 745,
+    "line": 749,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -28023,7 +28023,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"1.4.0\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 746,
+    "line": 750,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -28035,7 +28035,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Available\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 747,
+    "line": 751,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -28047,7 +28047,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::to_string(&device).unwrap",
     "file": "src-tauri/src/discovery.rs",
-    "line": 753,
+    "line": 757,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -28059,7 +28059,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call serde_json::to_string",
     "file": "src-tauri/src/discovery.rs",
-    "line": 753,
+    "line": 757,
     "column": 20,
     "adapter": "rust",
     "metadata": {
@@ -28071,7 +28071,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"join_response\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 763,
+    "line": 767,
     "column": 19,
     "adapter": "rust",
     "metadata": {
@@ -28083,7 +28083,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"request\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 764,
+    "line": 768,
     "column": 25,
     "adapter": "rust",
     "metadata": {
@@ -28095,7 +28095,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Some",
     "file": "src-tauri/src/discovery.rs",
-    "line": 766,
+    "line": 770,
     "column": 22,
     "adapter": "rust",
     "metadata": {
@@ -28107,7 +28107,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Join request rejected.\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 766,
+    "line": 770,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -28119,7 +28119,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call Some",
     "file": "src-tauri/src/discovery.rs",
-    "line": 772,
+    "line": 776,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -28131,7 +28131,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"MacBook Air\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 772,
+    "line": 776,
     "column": 31,
     "adapter": "rust",
     "metadata": {
@@ -28143,7 +28143,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"nearby_beacon\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 784,
+    "line": 788,
     "column": 19,
     "adapter": "rust",
     "metadata": {
@@ -28155,7 +28155,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"device\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 785,
+    "line": 789,
     "column": 24,
     "adapter": "rust",
     "metadata": {
@@ -28167,7 +28167,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Windows PC\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 786,
+    "line": 790,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -28179,7 +28179,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Windows\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 787,
+    "line": 791,
     "column": 23,
     "adapter": "rust",
     "metadata": {
@@ -28191,7 +28191,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"1.4.0\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 788,
+    "line": 792,
     "column": 26,
     "adapter": "rust",
     "metadata": {
@@ -28203,7 +28203,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"offer\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 791,
+    "line": 795,
     "column": 28,
     "adapter": "rust",
     "metadata": {
@@ -28215,7 +28215,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"Available\".into",
     "file": "src-tauri/src/discovery.rs",
-    "line": 793,
+    "line": 797,
     "column": 27,
     "adapter": "rust",
     "metadata": {
@@ -28227,7 +28227,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"192.168.1.9:54321\".parse().unwrap",
     "file": "src-tauri/src/discovery.rs",
-    "line": 804,
+    "line": 808,
     "column": 34,
     "adapter": "rust",
     "metadata": {
@@ -28239,7 +28239,7 @@
     "severity": "info",
     "message": "Unable to uniquely resolve Rust call \"192.168.1.9:54321\".parse",
     "file": "src-tauri/src/discovery.rs",
-    "line": 804,
+    "line": 808,
     "column": 34,
     "adapter": "rust",
     "metadata": {

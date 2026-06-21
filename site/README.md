@@ -2,7 +2,7 @@
 
 Static Astro + TypeScript + Tailwind CSS product website for Pastey. It is deployable to Cloudflare Pages without a server or runtime environment variables.
 
-The website presents Pastey as an ephemeral local handoff tool with a format-agnostic binary transfer path, LAN-native speed, no cloud relay, no remote storage, and no storage buildup by design. Managed room state remains local and is cleared when the room owner burns the room; Inbox-saved output remains user-owned.
+The website presents Pastey as an ephemeral local handoff tool with a format-agnostic binary transfer path, LAN-native speed, no cloud relay, no remote storage, and no storage buildup by design. Managed Bridge session state remains local and is cleared when the session is burned; Inbox-saved output remains user-owned.
 
 ## Landing experience
 

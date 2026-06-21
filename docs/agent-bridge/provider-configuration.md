@@ -11,13 +11,13 @@ Current implemented provider paths:
 - `MockProvider` in `src/lib/ai/mockProvider.ts`, deterministic and local.
 - `CloudOpenAICompatibleProvider` in `src/lib/ai/cloudOpenAICompatibleProvider.ts`, using an OpenAI-compatible chat-completions shape against a configured base URL and model.
 
-Provider output is always untrusted advisory data. It must pass host-side validation and PolicyGate before it can become a local pending action or room-control preview.
+Provider output is always untrusted advisory data. It must pass host-side validation and PolicyGate before it can become a local pending action or Bridge control preview.
 
 ## Context Controls
 
 Context snapshots are built in `src/lib/ai/contextSnapshot.ts`.
 
-The cloud-safe context path redacts sensitive material and avoids sending raw secrets, file contents, encryption keys, API keys, raw room-control payloads, or local filesystem paths. The context is meant to help a model propose a bounded action plan, not reconstruct app state.
+The cloud-safe context path redacts sensitive material and avoids sending raw secrets, file contents, encryption keys, API keys, raw Bridge control payloads, or local filesystem paths. The context is meant to help a model propose a bounded action plan, not reconstruct app state.
 
 ## Credential Handling
 
@@ -25,7 +25,7 @@ Cloud provider configuration is Settings-owned. API keys are runtime-memory-only
 
 Provider configuration does not authorize execution. A valid provider response still requires host validation, local confirmation, receiver PolicyGate review, explicit receiver consent, and a bounded executor.
 
-## Settings Versus Room Ownership
+## Settings Versus Bridge Ownership
 
 Settings owns:
 
@@ -36,15 +36,17 @@ Settings owns:
 - enablement;
 - redacted lifecycle-log level.
 
-The active room owns:
+The active Bridge owns current-session workflow state:
 
-- current room/peer context;
+- current Bridge/peer context;
 - pending preview workflow;
 - receiver review state;
 - capability consent;
 - execution request/result state.
 
-This split keeps model configuration separate from room-scoped authority.
+Legacy implementation term: the active room owns this state.
+
+This split keeps model configuration separate from Bridge-scoped authority. Accepted peer status or session verification does not authorize capability execution.
 
 ## Non-Current Provider Work
 

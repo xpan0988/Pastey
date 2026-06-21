@@ -65,6 +65,7 @@ import {
   type MicroFlowGroupMode,
   type TransferPlannerPolicy
 } from "./lib/transferPlanner";
+import { sendFileToRoomWithBridgeRoute } from "./lib/bridgeRoutingRuntime";
 import { mergeTransferEvent } from "./lib/transferState";
 import {
   createRuntimeDataWindowTargetState,
@@ -813,12 +814,17 @@ function App() {
       }
 
       startRuntimeWindowDiagnostic(itemId, requestedWindow);
-      await sendFileToRoom(item.roomId, item.path, {
+      const sendOptions = {
         displayName: metadata.displayName,
         mimeType: metadata.mimeType,
         queueItemId: item.id,
         requestedWindow
-      });
+      };
+      const roomForRoute = rooms.find((room) => room.id === item.roomId);
+      if (!roomForRoute) {
+        throw new Error("No current Room state is available for Bridge file route derivation.");
+      }
+      await sendFileToRoomWithBridgeRoute(roomForRoute, item.path, sendOptions, sendFileToRoom);
       updateSchedulerState((current) => markQueueItemCompleted(current, itemId));
       runtimeTerminalStatus = "completed";
       void scheduleActiveTransferWindowRebalance({ itemId, status: "completed" });

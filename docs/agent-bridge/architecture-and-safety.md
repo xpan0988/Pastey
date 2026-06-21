@@ -1,21 +1,21 @@
 # Agent Bridge Architecture And Safety
 
-Agent Bridge is the Layer 5 narrow capability path for model-assisted planning, host validation, explicit consent, bounded execution, result return, and redacted audit. For the project-wide layer contract, see [../architecture/项目布局规范.md](../architecture/项目布局规范.md).
+Agent Bridge is the Layer 5 narrow capability path for model-assisted planning, host validation, explicit consent, bounded execution, result return, and redacted audit. For the project-wide layer contract, see [../architecture/Project-specifications.md](../architecture/Project-specifications.md). For Bridge membership and authority boundaries, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md).
 
 The current product reality is a fixed Hello Peer vertical slice. It proves the safety shape, not a general agent workspace.
 
 ## Current Flow
 
-1. The Room UI builds a redacted current-session context snapshot.
+1. The Bridge UI builds a redacted current-session context snapshot. Legacy implementation term: Room UI.
 2. A provider returns an advisory action plan.
 3. The host validates the plan with an allowlist and unsafe-field scan.
 4. The local PolicyGate decides whether the plan may enter pending confirmation.
 5. The local user explicitly confirms sending a Hello Peer preview.
 6. The preview becomes a typed capability preview envelope.
-7. The envelope is sent through the encrypted room-control transport.
+7. The envelope is sent through the encrypted Bridge control transport. Legacy implementation term: room-control transport.
 8. The receiver validates replay, expiry, queue bounds, and PolicyGate rules.
 9. The receiver can choose Allow once or Deny.
-10. A matched allow-once decision permits exactly one execution request for the same capability, request, peer, and room/session binding.
+10. A matched allow-once decision permits exactly one execution request for the same capability, request, peer, and Bridge/session binding.
 11. The receiver consumes the consent once, runs the fixed in-process Hello Peer executor, and returns a typed result.
 12. Both sides write redacted lifecycle audit logs.
 
@@ -30,12 +30,12 @@ The current product reality is a fixed Hello Peer vertical slice. It proves the 
 - Pending local confirmation: `src/lib/ai/pendingAction.ts`.
 - Hello Peer request construction: `src/lib/ai/helloPeerRequest.ts`.
 - Capability preview envelope: `src/lib/ai/capabilityPreviewEnvelope.ts`.
-- Room control events: `src/lib/agentBridge/roomControlEvent.ts`.
+- Bridge control events: `src/lib/agentBridge/roomControlEvent.ts`. Legacy implementation term: `RoomControlEvent`.
 - Control queue state: `src/lib/agentBridge/controlQueue.ts`.
 - Receiver consent: `src/lib/agentBridge/peerConsent.ts`.
 - Fixed executor: `src/lib/agentBridge/helloPeerExecution.ts`.
 - Redacted logging: `src/lib/agentBridge/logging.ts`.
-- Room-scoped UI: `src/components/agentBridge/RoomControlPanel.tsx` and `src/components/AiSlotPreview.tsx`.
+- Bridge-scoped UI: `src/components/agentBridge/RoomControlPanel.tsx` and `src/components/AiSlotPreview.tsx`.
 - Runtime room-control endpoint: `src-tauri/src/room_control.rs`.
 
 ## Safety Invariants
@@ -47,7 +47,9 @@ The current product reality is a fixed Hello Peer vertical slice. It proves the 
 - Transport delivery is not receiver consent.
 - Receiver Allow once applies to one exact bounded request.
 - Consent is consumed once and is not reusable trust.
-- Trusted room membership is not execution authority.
+- Accepted Bridge peer status is not durable trust or execution authority.
+- Nearby accept, 8-digit code join, and session verification never authorize capability execution.
+- Capability events must bind to an exact selected peer/session/request and must not use broadcast by default.
 - Logs mirror lifecycle but are not queue state, consent state, execution state, or authority.
 
 ## Trust Boundaries
@@ -77,10 +79,10 @@ The current Agent Bridge implementation does not provide:
 - MCP integration;
 - local LLM scheduling;
 - file/tool capabilities beyond Hello Peer;
-- cross-room or cross-device automatic delegation.
+- cross-Bridge or cross-device automatic delegation.
 
 Those features require new Layer 4 identity/routing work and new Layer 5 capability contracts before they can be treated as implemented.
 
 ## Current Completion Status
 
-Against the canonical Layer 5 definition, Agent Bridge is a narrow capability slice with strong safety boundaries. The implemented scope is mature enough to demonstrate model proposal, host validation, consent, bounded execution, result return, and audit. The full Agent-assisted device workspace remains incomplete until Pastey has broader capabilities, durable room identity integration, and real multi-step orchestration.
+Against the canonical Layer 5 definition, Agent Bridge is a narrow capability slice with strong safety boundaries. The implemented scope is mature enough to demonstrate model proposal, host validation, consent, bounded execution, result return, and audit. The full Agent-assisted device workspace remains incomplete until Pastey has broader capabilities, explicit durable peer identity integration where needed, and real multi-step orchestration.
