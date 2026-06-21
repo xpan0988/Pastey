@@ -14,12 +14,14 @@ import type {
   RoomItem
 } from "./types";
 import { validateRoomControlEvent, type RoomControlEvent } from "./agentBridge";
+import type { FileBridgeRoutePayload, TextBridgeRoutePayload } from "./bridgeRoutingRuntime";
 
 interface SendFileOptions {
   displayName?: string;
   mimeType?: string | null;
   queueItemId?: string | null;
   requestedWindow?: number | null;
+  bridgeRoute?: FileBridgeRoutePayload;
 }
 
 interface CancelTransferOptions {
@@ -90,8 +92,16 @@ export async function listRoomItems(roomId: string): Promise<RoomItem[]> {
   return invoke("list_room_items", { roomId });
 }
 
-export async function sendTextToRoom(roomId: string, text: string): Promise<RoomItem> {
-  return invoke("send_text_to_room", { roomId, text });
+export async function sendTextToRoom(
+  roomId: string,
+  text: string,
+  bridgeRoute?: TextBridgeRoutePayload,
+): Promise<RoomItem> {
+  return invoke("send_text_to_room", {
+    roomId,
+    text,
+    bridgeRoute: bridgeRoute ?? null,
+  });
 }
 
 export async function sendRoomControlEvent(
@@ -126,7 +136,8 @@ export async function sendFileToRoom(roomId: string, path: string, options?: Sen
     displayName: options?.displayName ?? null,
     mimeType: options?.mimeType ?? null,
     queueItemId: options?.queueItemId ?? null,
-    requestedWindow: options?.requestedWindow ?? null
+    requestedWindow: options?.requestedWindow ?? null,
+    bridgeRoute: options?.bridgeRoute ?? null
   });
 }
 

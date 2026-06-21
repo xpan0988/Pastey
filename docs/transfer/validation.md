@@ -4,10 +4,10 @@ This is the active validation and logging guide for Pastey transfer and orchestr
 
 ## Validation Layers
 
-- Planner replay: algorithm strategy validation. It does not launch Tauri and does not require files, a receiver, network, or a room server.
-- Automated contention harness: deterministic lower-boundary integration evidence for the production outgoing-control demand reducer, `8 -> 7 -> 8` planner allocations, the real Rust active binary-v1 sender runtime-window atomic/update function, and room-control transport tests.
+- Planner replay: algorithm strategy validation. It does not launch Tauri and does not require files, a receiver, network, or a Bridge server. Legacy implementation term: room server.
+- Automated contention harness: deterministic lower-boundary integration evidence for the production outgoing-control demand reducer, `8 -> 7 -> 8` planner allocations, the real Rust active binary-v1 sender runtime-window atomic/update function, and Bridge control transport tests.
 - Generated fixture corpus: deterministic real file clusters for app smoke tests. Source-controlled manifests live under `tests/fixtures/transfer-corpus/manifests/`; generated payload files live under `.generated/transfer-fixtures/`.
-- Single-machine dual-instance smoke: local lifecycle and logging smoke when two physical machines are unavailable. It can validate room join, send/receive lifecycle, planner logs, MicroFlowGroup logs, runtime-window logs, and interruption evidence.
+- Single-machine dual-instance smoke: local lifecycle and logging smoke when two physical machines are unavailable. It can validate Bridge join, send/receive lifecycle, planner logs, MicroFlowGroup logs, runtime-window logs, and interruption evidence.
 - Two-machine LAN/release build: required for real throughput, cross-device behavior, Wi-Fi/Ethernet behavior, OS differences, release artifact behavior, and final product confidence.
 
 ## Planner Replay
@@ -18,7 +18,7 @@ rtk node scripts/replay-transfer-planner-scenarios.mjs
 
 Planner replay prints fixed and dynamic live-policy results, including group counts, grouped children, requested-window totals, held reasons, contention, and dynamic capacity clamps.
 
-Replay is algorithm evidence only. It does not validate files, Tauri startup, room join, receive/finalize, Inbox, network behavior, or release-build throughput.
+Replay is algorithm evidence only. It does not validate files, Tauri startup, Bridge join, receive/finalize, Inbox, network behavior, or release-build throughput.
 
 ## Automated Contention Harness
 
@@ -32,13 +32,13 @@ The runner:
 
 - uses the production TypeScript demand/quiet-period reducer and transfer planner to measure single-transfer, multiple-transfer, burst, inbound-directionality, and terminal-failure-release scenarios;
 - runs the focused Rust `transfer::tests::cl4_contention_runtime_window_evidence` test against the real `update_active_transfer_window` function and active binary-v1 sender runtime-window atomics;
-- runs TypeScript and Rust room-control transport tests;
+- runs TypeScript and Rust Bridge control transport tests;
 - creates deterministic representative fixture bytes, checks source/destination SHA-256 equality, and removes the temporary files after the run;
 - writes a bounded machine-readable report to `.generated/cl4-contention-report.json`.
 
 Measured assertions include combined allocations no greater than the current target, stable transfer IDs, monotonic reported progress, no cancellation, `8 -> 7 -> 8` restoration after the deterministic `750 ms` virtual quiet period, no burst flapping, inbound-only target `8`, and restoration after delivery/replay/expiry/network/validation terminal outcomes.
 
-This is the lowest existing deterministic automated boundary. It does not launch the Tauri GUI, invoke the frontend Tauri bridge in a live app, send file bytes through a room server, or prove a two-device transfer checksum.
+This is the lowest existing deterministic automated boundary. It does not launch the Tauri GUI, invoke the frontend Tauri bridge in a live app, send file bytes through a Bridge server, or prove a two-device transfer checksum.
 
 ## Fixture Payloads
 
@@ -122,7 +122,7 @@ for f in $(find /tmp/pastey-sender /tmp/pastey-receiver -name "*.log" -type f); 
 done | sort -nr
 ```
 
-Agent Bridge lifecycle entries use the `[pastey:agent-bridge]` prefix followed by one redacted structured JSON object. Validate transition names, shortened references, and bounded error codes only. These entries must not contain secrets or raw control payloads and must never be used to reconstruct queue, consent, transport, or execution state.
+Agent Bridge lifecycle entries use the `[pastey:agent-bridge]` prefix followed by one redacted structured JSON object. Validate transition names, shortened references, and bounded error codes only. These entries must not contain secrets or raw control payloads and must never be used to reconstruct queue, consent, transport, execution state, durable identity, or Bridge history.
 
 ## Known Manual Smoke Evidence
 
@@ -130,7 +130,7 @@ Recorded repository notes before this consolidation documented:
 
 - a practical mixed-file smoke with binary-v1 transfer behavior;
 - a roughly 2.5 GB transfer at about 108 MB/s;
-- normal Burn behavior;
+- normal Burn behavior, with Inbox-saved output preserved;
 - a later 2.7 GB plus 147 MB `7 + 1` / `7 -> 8` runtime-window smoke;
 - generated-payload single-machine smoke that helped reproduce and fix frontend-only MicroFlowGroup final-accounting races.
 

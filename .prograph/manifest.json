@@ -3,8 +3,8 @@
   "toolVersion": "0.3.0",
   "repositoryRoot": "/Users/xiyuanpan/Pastey",
   "repositoryIdentity": "0992c561ba19ab05",
-  "gitCommit": "a79ee281b424699dd19626dda5dfed26aec06816",
-  "generatedAt": "2026-06-14T07:22:18.557Z",
+  "gitCommit": "eb45a80a92fc3a5a6fa95558bb225e5aa894bd14",
+  "generatedAt": "2026-06-19T16:46:33.651Z",
   "enabledAdapters": [
     "typescript",
     "rust",
@@ -12,9 +12,9 @@
     "tauri"
   ],
   "scannedFileCount": 90,
-  "excludedFileCount": 11169,
+  "excludedFileCount": 11170,
   "nodeCount": 5920,
   "edgeCount": 13270,
   "diagnosticCount": 5087,
-  "analysisDuration": 3314
+  "analysisDuration": 3622
 }

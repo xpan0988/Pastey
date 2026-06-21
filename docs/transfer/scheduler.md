@@ -1,12 +1,12 @@
 # Transfer Scheduler
 
-This is the active source of truth for Pastey's Layer 3 transfer scheduler, weighted planner, runtime-window allocation, and live MicroFlowGroup behavior. For transport mechanics, see [architecture.md](architecture.md). For validation, see [validation.md](validation.md). For the project-wide layer contract, see [../architecture/项目布局规范.md](../architecture/项目布局规范.md).
+This is the active source of truth for Pastey's Layer 3 transfer scheduler, weighted planner, runtime-window allocation, and live MicroFlowGroup behavior. For transport mechanics, see [architecture.md](architecture.md). For validation, see [validation.md](validation.md). For the project-wide layer contract, see [../architecture/Project-specifications.md](../architecture/Project-specifications.md). For Bridge terminology, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md).
 
 ## Planner Ownership
 
 The scheduler is frontend-owned and applies to queued file-like work: file picker transfers, drag/drop transfers, and pasted images that have been written to a temporary file and queued. Text still sends immediately through the text path and does not enter the file queue.
 
-Every ordinary runnable plan still calls the existing `sendFileToRoom` frontend wrapper and Rust `send_file_to_room` command for one file. Scheduler decisions do not create a second transfer core.
+Every ordinary runnable plan still calls the existing `sendFileToRoom` frontend wrapper and Rust `send_file_to_room` command for one file. These are legacy implementation names for Bridge file transfer. Scheduler decisions do not create a second transfer core.
 
 Production paths:
 
@@ -21,7 +21,7 @@ Production paths:
 
 The pure planner classifies queued and active file-like tasks, then returns deterministic runnable, active, held, lane-budget, requested-window, and debug reports.
 
-The global planner budget represents tested outgoing binary-v1 runtime capacity. The normal data target is `8`. Real local outgoing room-control demand changes the effective data target to `7`, then restores `8` after the quiet period. Each selected runnable or active transfer receives at least window `1`, and the sum of active plus runnable requested windows must not exceed the current data target.
+The global planner budget represents tested outgoing binary-v1 runtime capacity. The normal data target is `8`. Real local outgoing Bridge control demand changes the effective data target to `7`, then restores `8` after the quiet period. Each selected runnable or active transfer receives at least window `1`, and the sum of active plus runnable requested windows must not exceed the current data target.
 
 Lane and size metadata affect classification, priority, eligibility, and diagnostics. The file-like requested-window split is batch-relative and size-weighted across selected transfers.
 
@@ -51,7 +51,7 @@ Current planner defaults:
 
 Runtime control-demand policy:
 
-- outgoing control transport demand: effective data target `7`;
+- outgoing Bridge control transport demand: effective data target `7`;
 - inbound-only control review state: effective data target remains `8`;
 - idle restoration quiet period: `750 ms`;
 - new launches use the current target;
@@ -76,14 +76,14 @@ Fixed mode preserves the threshold-based fallback behavior:
 
 - queued only, not already preparing or sending;
 - metadata-ready with known size;
-- active room only;
+- active Bridge session only;
 - non-cancelled and nonterminal;
 - file-like kinds only: `file`, `image`, and `pasted_image`;
 - default child size no larger than `1 MiB`;
 - default total group size no larger than `4 MiB`;
 - default item count no more than `32`;
 - at least two eligible children;
-- same room, lane, size class, file-like safety class, and broad MIME family.
+- same Bridge session, lane, size class, file-like safety class, and broad MIME family.
 
 Dynamic mode is the current default live one-window service policy:
 
@@ -98,7 +98,7 @@ Dynamic mode is the current default live one-window service policy:
 
 Changing the persisted Settings mode affects the next planner cycle only. Active ordinary transfers may receive completion-triggered or control-demand-triggered runtime-window updates. Active groups are not regrouped, running children are not relaunched, and grouped-child reservations prevent duplicate launches.
 
-`MicroFlowGroup` is not a bundle, archive, zip, room item, protocol object, binary-v2 stream, remote execution object, or permission grant.
+`MicroFlowGroup` is not a bundle, archive, zip, Bridge item, protocol object, binary-v2 stream, remote execution object, or permission grant.
 
 ## Group Lifecycle
 
@@ -109,7 +109,7 @@ The serial group runner records internal lifecycle state for diagnostics and tes
 - `completed`: every planned child completed;
 - `completed_with_errors`: at least one child failed or was individually cancelled, or the group finished with unaccounted children without a batch/room terminal reason;
 - `cancelled`: the group was stopped by batch cancellation, or all children were cancelled;
-- `interrupted`: room work was cleared or burned while the group was queued/running.
+- `interrupted`: Bridge work was cleared or burned while the group was queued/running.
 
 Child terminal accounting is per queue item id. A child failure does not corrupt or revive other children, and late child progress still uses terminal queue item guards.
 
@@ -127,7 +127,7 @@ Focused automated contention evidence is available through:
 rtk node scripts/run-cl4-contention-smoke.mjs
 ```
 
-The harness measures the production control-demand reducer and planner allocations, verifies the real Rust active binary-v1 sender runtime-window update primitive, and runs room-control transport tests. It is deterministic lower-boundary integration evidence, not a full dual-instance GUI or two-device LAN transfer run.
+The harness measures the production control-demand reducer and planner allocations, verifies the real Rust active binary-v1 sender runtime-window update primitive, and runs Bridge control transport tests. It is deterministic lower-boundary integration evidence, not a full dual-instance GUI or two-device LAN transfer run.
 
 The Dynamic MicroFlowGroup capacity design reference is retained as [dynamic-microflowgroup-window-capacity-design.pdf](dynamic-microflowgroup-window-capacity-design.pdf). This scheduler document is the active implementation source of truth.
 

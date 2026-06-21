@@ -9,6 +9,13 @@ import {
   sendTextToRoom,
   writeTempFile
 } from "../lib/tauri";
+import {
+  deriveBridgeRoutingStateForRoom,
+  enqueueFilePathsWithBridgeRoute,
+  enqueueTransferInputsWithBridgeRoute,
+  routeStateLabel,
+  sendTextToRoomWithBridgeRoute,
+} from "../lib/bridgeRoutingRuntime";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
 import { fileTypeLabel, formatBytes, formatDuration, formatSpeed, formatTimestamp } from "../lib/format";
 import { fileIdentityKey, type RoomTransferQueueView, type TransferQueueBatch, type TransferQueueInput, type TransferQueueItem } from "../lib/transferScheduler";
@@ -51,7 +58,11 @@ export function RoomPage({
   const [composerDropActive, setComposerDropActive] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const roomUnavailable = room.status === "burned" || busy === "burn";
-  const canSend = room.peer_connected && busy === null && !roomUnavailable;
+  const bridgeRouteState = useMemo(() => deriveBridgeRoutingStateForRoom(room), [room]);
+  const canSend = room.peer_connected && bridgeRouteState.status === "ready_selected_peer" && busy === null && !roomUnavailable;
+  const bridgeRouteError = bridgeRouteState.status === "ready_selected_peer"
+    ? null
+    : bridgeRouteState.errors[0] ?? routeStateLabel(bridgeRouteState);
 
   useEffect(() => {
     composerRef.current?.focus();
@@ -89,11 +100,12 @@ export function RoomPage({
           setComposerDropActive(false);
           if (!canSend) {
             console.info("[pastey queue] event=file_drop_rejected reason=send_disabled room_id=%s status=%s peer_connected=%s busy=%s", room.id, room.status, room.peer_connected, busy ?? "none");
+            if (bridgeRouteError) setError(bridgeRouteError);
             return;
           }
           if (event.payload.paths.length > 0) {
             console.info("[pastey queue] event=file_drop_received room_id=%s file_count=%d", room.id, event.payload.paths.length);
-            onEnqueueFiles(room.id, event.payload.paths);
+            enqueueFilePathsWithBridgeRoute(room, event.payload.paths, onEnqueueFiles);
           }
           return;
         }
@@ -118,7 +130,7 @@ export function RoomPage({
     setCancellingTransferId(null);
 
     try {
-      await sendTextToRoom(room.id, text);
+      await sendTextToRoomWithBridgeRoute(room, text, sendTextToRoom);
       setText("");
       await onRefresh();
     } catch (err) {
@@ -133,6 +145,7 @@ export function RoomPage({
     event?.stopPropagation();
     if (!canSend) {
       console.info("[pastey queue] event=file_input_rejected reason=send_disabled room_id=%s status=%s peer_connected=%s busy=%s", room.id, room.status, room.peer_connected, busy ?? "none");
+      if (bridgeRouteError) setError(bridgeRouteError);
       return;
     }
     const selected = await open({
@@ -142,13 +155,13 @@ export function RoomPage({
 
     if (typeof selected === "string") {
       console.info("[pastey queue] event=file_input_selected room_id=%s file_count=1", room.id);
-      onEnqueueFiles(room.id, [selected]);
+      enqueueFilePathsWithBridgeRoute(room, [selected], onEnqueueFiles);
       return;
     }
 
     if (Array.isArray(selected) && selected.length > 0) {
       console.info("[pastey queue] event=file_input_selected room_id=%s file_count=%d", room.id, selected.length);
-      onEnqueueFiles(room.id, selected);
+      enqueueFilePathsWithBridgeRoute(room, selected, onEnqueueFiles);
     }
   }
 
@@ -162,14 +175,14 @@ export function RoomPage({
     try {
       const buffer = await file.arrayBuffer();
       tempPath = await writeTempFile(file.name, Array.from(new Uint8Array(buffer)));
-      onEnqueueTransferInputs(room.id, [{
+      enqueueTransferInputsWithBridgeRoute(room, [{
         path: tempPath,
         displayName: file.name,
         mimeType: file.type || "image/png",
         sizeBytes: file.size,
         dedupeKey: fileKey,
         deleteWhenDone: true
-      }]);
+      }], "pasted_image", onEnqueueTransferInputs);
     } catch (err) {
       if (tempPath) {
         setError("Unable to queue image from clipboard.");
@@ -189,6 +202,7 @@ export function RoomPage({
     event.stopPropagation();
 
     if (!canSend) {
+      if (bridgeRouteError) setError(bridgeRouteError);
       return;
     }
 
@@ -318,6 +332,7 @@ export function RoomPage({
             <span className="meta-label">Connection</span>
             <strong>{headerStatus}</strong>
             <span className="muted">{room.peer_device_name ?? "No peer device yet"}</span>
+            <span className="muted">{routeStateLabel(bridgeRouteState)}</span>
           </div>
           <div className="meta-card">
             <span className="meta-label">Lifecycle</span>
