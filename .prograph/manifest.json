@@ -1,20 +1,27 @@
 {
-  "schemaVersion": "1.0.0",
+  "schemaVersion": "1.1.0",
   "toolVersion": "0.3.0",
   "repositoryRoot": "/Users/xiyuanpan/Pastey",
   "repositoryIdentity": "0992c561ba19ab05",
-  "gitCommit": "eb45a80a92fc3a5a6fa95558bb225e5aa894bd14",
-  "generatedAt": "2026-06-19T16:46:33.651Z",
+  "gitCommit": "196e3ee08e17709a1885e03124e916fce1b11e20",
+  "generatedAt": "2026-06-21T17:19:08.262Z",
   "enabledAdapters": [
     "typescript",
     "rust",
     "react",
-    "tauri"
+    "tauri",
+    "markdown",
+    "packageJson",
+    "cargoToml",
+    "tauriConfig",
+    "tauriCapability",
+    "tests",
+    "semanticLinker"
   ],
-  "scannedFileCount": 90,
-  "excludedFileCount": 11170,
-  "nodeCount": 5920,
-  "edgeCount": 13270,
-  "diagnosticCount": 5087,
-  "analysisDuration": 3622
+  "scannedFileCount": 115,
+  "excludedFileCount": 12173,
+  "nodeCount": 6914,
+  "edgeCount": 16100,
+  "diagnosticCount": 5243,
+  "analysisDuration": 3754
 }
