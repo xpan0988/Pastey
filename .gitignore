@@ -7,3 +7,6 @@ src-tauri/gen
 *.log
 tests/fixtures/transfer-corpus/generated/
 *.pastey-fixture.tmp
+
+# ProGraph generated local index
+.prograph/
