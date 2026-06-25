@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   assertCapabilityEventHasSelectedPeerRoute,
   assertControlEventHasSelectedPeerRoute,
+  bridgeRoutePayload,
   deriveAuthoritativeCapabilityRoute,
   deriveAuthoritativeControlRoute,
   deriveAuthoritativeFileSendRoute,
@@ -18,7 +19,7 @@ import {
   sendFileToRoomWithBridgeRoute,
   sendTextToRoomWithBridgeRoute,
 } from "../src/lib/bridgeRoutingRuntime";
-import { validateBridgeRoute } from "../src/lib/bridgeRouting";
+import { bridgePeerSessionId, validateBridgeRoute } from "../src/lib/bridgeRouting";
 import type { RoomControlSessionContext, RoomInfo, RoomItem } from "../src/lib/types";
 
 const ROOM: RoomInfo = {
@@ -122,6 +123,92 @@ test("text send wrapper derives selected-peer route payload for Tauri", async ()
   }]);
 });
 
+test("text send wrapper sends explicit selected-peers and broadcast payloads", async () => {
+  const multiPeerRoom: RoomInfo = {
+    ...ROOM,
+    peers: [
+      { peerSessionId: "peer:a", displayName: "A", connected: true, liveness: "connected", joinMethod: "nearby_accept", currentSessionOnly: true },
+      { peerSessionId: "peer:b", displayName: "B", connected: true, liveness: "connected", joinMethod: "nearby_accept", currentSessionOnly: true },
+    ],
+  };
+  const calls: unknown[] = [];
+  const sender = async (roomId: string, text: string, bridgeRoute?: unknown) => {
+    calls.push({ roomId, text, bridgeRoute });
+    return item(roomId);
+  };
+
+  await sendTextToRoomWithBridgeRoute(multiPeerRoom, "hello", sender, {
+    bridgeSessionId: "legacy-room:room-1",
+    target: { kind: "selected_peers", peerSessionIds: [bridgePeerSessionId("peer:a"), bridgePeerSessionId("peer:b")] },
+  });
+  await sendTextToRoomWithBridgeRoute(multiPeerRoom, "all", sender, {
+    bridgeSessionId: "legacy-room:room-1",
+    target: { kind: "broadcast_bridge", explicit: true },
+  });
+
+  assert.deepEqual(calls, [
+    {
+      roomId: ROOM.id,
+      text: "hello",
+      bridgeRoute: {
+        schemaVersion: "pastey-bridge-text-route/v1",
+        bridgeSessionId: "legacy-room:room-1",
+        target: { kind: "selected_peers", peerSessionIds: ["peer:a", "peer:b"] },
+      },
+    },
+    {
+      roomId: ROOM.id,
+      text: "all",
+      bridgeRoute: {
+        schemaVersion: "pastey-bridge-text-route/v1",
+        bridgeSessionId: "legacy-room:room-1",
+        target: { kind: "broadcast_bridge", explicit: true },
+      },
+    },
+  ]);
+});
+
+test("explicit stale selected-peer route is route-expired and does not fall back to reconnected peer", async () => {
+  const reconnectedRoom: RoomInfo = {
+    ...ROOM,
+    peers: [
+      {
+        peerSessionId: "legacy-room-peer:room-1",
+        displayName: "Old route",
+        connected: false,
+        liveness: "stale",
+        joinMethod: "nearby_accept",
+        currentSessionOnly: true,
+      },
+      {
+        peerSessionId: "legacy-room-peer:room-1:reconnect:1",
+        displayName: "Reconnected route",
+        connected: true,
+        liveness: "connected",
+        joinMethod: "nearby_accept",
+        currentSessionOnly: true,
+      },
+    ],
+  };
+  const calls: unknown[] = [];
+  const staleRoute = {
+    bridgeSessionId: "legacy-room:room-1",
+    target: {
+      kind: "selected_peer" as const,
+      peerSessionId: bridgePeerSessionId("legacy-room-peer:room-1"),
+    },
+  };
+
+  await assert.rejects(
+    () => sendFileToRoomWithBridgeRoute(reconnectedRoom, "/tmp/a.png", {}, async (roomId, path, options) => {
+      calls.push({ roomId, path, options });
+      return { ...item(roomId), payload_type: "file", item_kind: "outgoing_file" };
+    }, staleRoute),
+    /route expired/i,
+  );
+  assert.deepEqual(calls, []);
+});
+
 test("zero routeable peers blocks text send and does not call sender", async () => {
   const calls: unknown[] = [];
 
@@ -154,7 +241,7 @@ test("multiple routeable peers blocks text send without broadcast", async () => 
   assert.deepEqual(calls, []);
 });
 
-test("production text send rejects selected-peers and broadcast routes in this pass", () => {
+test("production text route guard allows selected-peers and broadcast data routes", () => {
   const selectedPeers = validateBridgeRoute({
     bridgeSessionId: "bridge:one",
     target: { kind: "selected_peers", peerSessionIds: ["peer:a", "peer:b"] },
@@ -167,8 +254,45 @@ test("production text send rejects selected-peers and broadcast routes in this p
   assert.equal(broadcast.valid, true, broadcast.valid ? "" : broadcast.errors.join(" "));
   if (!selectedPeers.valid || !broadcast.valid) return;
 
-  assert.throws(() => deriveAuthoritativeTextSendRoute(selectedPeers.route), /exactly one selected Bridge peer/);
-  assert.throws(() => deriveAuthoritativeTextSendRoute(broadcast.route), /exactly one selected Bridge peer/);
+  assert.deepEqual(deriveAuthoritativeTextSendRoute(selectedPeers.route), selectedPeers.route);
+  assert.deepEqual(deriveAuthoritativeTextSendRoute(broadcast.route), broadcast.route);
+});
+
+test("route payload model can represent selected-peer selected-peers and broadcast without granting authority", () => {
+  const selectedPeer = validateBridgeRoute({
+    bridgeSessionId: "bridge:one",
+    target: { kind: "selected_peer", peerSessionId: "peer:a" },
+  });
+  const selectedPeers = validateBridgeRoute({
+    bridgeSessionId: "bridge:one",
+    target: { kind: "selected_peers", peerSessionIds: ["peer:a", "peer:b"] },
+  });
+  const broadcast = validateBridgeRoute({
+    bridgeSessionId: "bridge:one",
+    target: { kind: "broadcast_bridge", explicit: true },
+  });
+  assert.equal(selectedPeer.valid, true, selectedPeer.valid ? "" : selectedPeer.errors.join(" "));
+  assert.equal(selectedPeers.valid, true, selectedPeers.valid ? "" : selectedPeers.errors.join(" "));
+  assert.equal(broadcast.valid, true, broadcast.valid ? "" : broadcast.errors.join(" "));
+  if (!selectedPeer.valid || !selectedPeers.valid || !broadcast.valid) return;
+
+  assert.deepEqual(bridgeRoutePayload(selectedPeer.route, "pastey-bridge-text-route/v1"), {
+    schemaVersion: "pastey-bridge-text-route/v1",
+    bridgeSessionId: "bridge:one",
+    target: { kind: "selected_peer", peerSessionId: "peer:a" },
+  });
+  assert.deepEqual(bridgeRoutePayload(selectedPeers.route, "pastey-bridge-text-route/v1"), {
+    schemaVersion: "pastey-bridge-text-route/v1",
+    bridgeSessionId: "bridge:one",
+    target: { kind: "selected_peers", peerSessionIds: ["peer:a", "peer:b"] },
+  });
+  assert.deepEqual(bridgeRoutePayload(broadcast.route, "pastey-bridge-text-route/v1"), {
+    schemaVersion: "pastey-bridge-text-route/v1",
+    bridgeSessionId: "bridge:one",
+    target: { kind: "broadcast_bridge", explicit: true },
+  });
+  assert.equal(JSON.stringify([selectedPeer, selectedPeers, broadcast]).includes("authority"), false);
+  assert.equal(JSON.stringify([selectedPeer, selectedPeers, broadcast]).includes("consent"), false);
 });
 
 test("authoritative text route guard does not mutate Room state or create durable fields", () => {
@@ -312,7 +436,7 @@ test("multiple routeable peers blocks file and image enqueue without broadcast",
   assert.deepEqual(imageCalls, []);
 });
 
-test("production file and image send reject selected-peers and broadcast routes in this pass", () => {
+test("production file and image route guards allow selected-peers and broadcast data routes", () => {
   const selectedPeers = validateBridgeRoute({
     bridgeSessionId: "bridge:one",
     target: { kind: "selected_peers", peerSessionIds: ["peer:a", "peer:b"] },
@@ -325,10 +449,10 @@ test("production file and image send reject selected-peers and broadcast routes 
   assert.equal(broadcast.valid, true, broadcast.valid ? "" : broadcast.errors.join(" "));
   if (!selectedPeers.valid || !broadcast.valid) return;
 
-  assert.throws(() => deriveAuthoritativeFileSendRoute(selectedPeers.route), /Production file send requires/);
-  assert.throws(() => deriveAuthoritativeFileSendRoute(broadcast.route), /Production file send requires/);
-  assert.throws(() => deriveAuthoritativeImageSendRoute(selectedPeers.route), /Production image send requires/);
-  assert.throws(() => deriveAuthoritativeImageSendRoute(broadcast.route), /Production image send requires/);
+  assert.deepEqual(deriveAuthoritativeFileSendRoute(selectedPeers.route), selectedPeers.route);
+  assert.deepEqual(deriveAuthoritativeFileSendRoute(broadcast.route), broadcast.route);
+  assert.deepEqual(deriveAuthoritativeImageSendRoute(selectedPeers.route), selectedPeers.route);
+  assert.deepEqual(deriveAuthoritativeImageSendRoute(broadcast.route), broadcast.route);
 });
 
 test("authoritative file and image route guards do not mutate Room state or create durable fields", () => {
@@ -448,14 +572,17 @@ test("production integration sends text and file route payloads without route-be
   const controlPanel = readFileSync("src/components/agentBridge/RoomControlPanel.tsx", "utf8");
   const tauri = readFileSync("src/lib/tauri.ts", "utf8");
   const scheduler = readFileSync("src/lib/transferScheduler.ts", "utf8");
+  const outcomeTypes = readFileSync("src/lib/bridgeDeliveryOutcome.ts", "utf8");
   const controlWrapper = tauri.slice(
     tauri.indexOf("export async function sendRoomControlEvent"),
     tauri.indexOf("export async function getRoomControlSessionContext"),
   );
 
   assert.match(roomPage, /deriveBridgeRoutingStateForRoom\(room\)/);
-  assert.match(roomPage, /sendTextToRoomWithBridgeRoute\(room, text, sendTextToRoom\)/);
-  assert.match(app, /sendFileToRoomWithBridgeRoute\(roomForRoute, item\.path, sendOptions, sendFileToRoom\)/);
+  assert.match(roomPage, /sendTextToRoomWithBridgeRoute\(room, text, sendTextToRoom, selectedBridgeRoute\)/);
+  assert.match(roomPage, /formatBridgeRouteErrorForUser\(err\)/);
+  assert.match(app, /sendFileToRoomWithBridgeRoute\(\s*roomForRoute,\s*item\.path,\s*sendOptions,\s*sendFileToRoom,\s*item\.bridgeRoute,/s);
+  assert.match(app, /formatBridgeRouteErrorForUser\(err\)/);
   assert.match(app, /No current Room state is available for Bridge file route derivation/);
   assert.doesNotMatch(app, /else \{\s*await sendFileToRoom\(item\.roomId/s);
   assert.match(controlPanel, /assertCapabilityEventHasSelectedPeerRoute\(session, event\)/);
@@ -464,5 +591,11 @@ test("production integration sends text and file route payloads without route-be
   assert.match(tauri, /invoke\("send_file_to_room", \{/);
   assert.doesNotMatch(controlWrapper, /bridgeRoute/);
   assert.doesNotMatch(tauri, /selectedPeers|broadcast/);
-  assert.doesNotMatch(scheduler, /bridgeRoute|durable|trust|consent|history/);
+  assert.match(scheduler, /bridgeOperationId/);
+  assert.match(scheduler, /targetPeerSessionId/);
+  assert.doesNotMatch(scheduler, /durable|trust|consent|history/);
+  assert.match(outcomeTypes, /export interface BridgeDeliveryOutcome/);
+  assert.match(outcomeTypes, /peerSessionRef/);
+  assert.match(outcomeTypes, /export interface BridgeSendOperation/);
+  assert.match(outcomeTypes, /outcomes: readonly BridgeDeliveryOutcome\[\]/);
 });

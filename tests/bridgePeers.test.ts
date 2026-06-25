@@ -139,12 +139,14 @@ test("duplicate current-session peer ids are rejected", () => {
   }
 });
 
-test("routeable filtering excludes stale, left, disconnected, and local self peers", () => {
+test("routeable filtering excludes stale, expired, reconnecting, left, disconnected, and local self peers", () => {
   const peers = collection([
     peer(PEER_A),
     peer(PEER_B, { liveness: "disconnected" }),
     peer(PEER_C, { liveness: "stale" }),
     peer(bridgePeerSessionId("peer-session:left"), { liveness: "left" }),
+    peer(bridgePeerSessionId("peer-session:expired"), { liveness: "expired" }),
+    peer(bridgePeerSessionId("peer-session:reconnecting"), { liveness: "reconnecting" }),
     peer(LOCAL_PEER, { isLocalSelf: true }),
   ]);
 
@@ -183,7 +185,7 @@ test("selected peers route rejects any unknown or non-routeable target", () => {
   });
 
   assertRejects(() => assertRouteCompatibleWithPeerCollection(withUnknown, peers), "known current-session peer");
-  assertRejects(() => assertRouteCompatibleWithPeerCollection(withLeftPeer, peers), "connected");
+  assertRejects(() => assertRouteCompatibleWithPeerCollection(withLeftPeer, peers), "expired");
   assert.equal(duplicateRoute.valid, false);
 });
 

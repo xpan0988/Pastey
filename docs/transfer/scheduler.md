@@ -8,6 +8,8 @@ The scheduler is frontend-owned and applies to queued file-like work: file picke
 
 Every ordinary runnable plan still calls the existing `sendFileToRoom` frontend wrapper and Rust `send_file_to_room` command for one file. These are legacy implementation names for Bridge file transfer. Scheduler decisions do not create a second transfer core.
 
+Multi-target ordinary file-like sends are represented as queue children, not as a second transfer core. A selected-peers or explicit broadcast file/image/pasted-image action resolves the current routeable target set before enqueue and creates one ordinary queue item per target. The children share one in-memory `bridgeOperationId`, carry target display/session refs for UI accounting, and each child carries a selected-peer route for dispatch. These fields are current-session runtime state; they are not durable route metadata, durable trust, or reusable consent.
+
 Production paths:
 
 - Pure weighted planner: `src/lib/transferPlanner.ts`.
@@ -112,6 +114,21 @@ The serial group runner records internal lifecycle state for diagnostics and tes
 - `interrupted`: Bridge work was cleared or burned while the group was queued/running.
 
 Child terminal accounting is per queue item id. A child failure does not corrupt or revive other children, and late child progress still uses terminal queue item guards.
+
+## Bridge Target Children
+
+For multi-target file-like sends, the parent operation is derived from children with the same `bridgeOperationId`.
+
+- child `completed` means that target's selected-peer transfer completed;
+- child `failed` means that target failed without changing other children;
+- child `cancelled` means that target was cancelled by item or batch cancellation;
+- if a child carries an old selected-peer route that becomes stale, expired, disconnected, reconnecting, or otherwise unrouteable before dispatch, the child fails with the route-specific error and does not rebind to a reconnected peer row;
+- room burn/clear paths keep existing terminal guards and do not revive children;
+- aggregate UI state is completed when all children complete, partial when some complete and some fail/cancel, failed when no child completes, and cancelled/interrupted according to existing batch and room terminal paths.
+
+Target-aware dedupe keys allow the same file path to create one child per peer without collapsing multi-target sends into one item. The planner still sees ordinary queue items and applies the same global window budget, active-transfer cap, MicroFlowGroup rules, burn guards, cancellation guards, and terminal-item guards. The scheduler does not assign a separate unbounded transfer window per target.
+
+There is no automatic target-specific reconnect retry in the scheduler. A user can enqueue a new send against the current routeable peer set, which creates new current-session children and a new operation id. Existing failed or terminal children are not revived by reconnect.
 
 ## Device Intelligence Boundary
 

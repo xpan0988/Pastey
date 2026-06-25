@@ -1,8 +1,22 @@
 export type PayloadType = "text" | "file";
 
+import type { BridgeSendOperation } from "./bridgeDeliveryOutcome";
+
+export type {
+  BridgeDeliveryContentKind,
+  BridgeDeliveryOutcome,
+  BridgeDeliveryOutcomeStatus,
+  BridgeDeliveryTargetKind,
+  BridgeSendAggregateStatus,
+} from "./bridgeDeliveryOutcome";
+
 export type RoomStatus = "active" | "peer_left" | "burned" | "expired";
 
 export type LocalRole = "creator" | "joined";
+export type BridgePeerJoinMethod = "nearby_accept" | "manual_code";
+export type BridgePeerLiveness = "connected" | "reconnecting" | "disconnected" | "left" | "stale" | "expired";
+export type BridgePairingMethod = "manual_identity_code" | "verified_public_key";
+export type BridgePairingRotationState = "current" | "rotation_required" | "rotation_deferred" | "rotation_unsupported";
 
 export type RoomItemDirection = "outgoing" | "incoming";
 
@@ -23,6 +37,22 @@ export interface RoomInfo {
   peer_connected: boolean;
   local_burned_at?: number | null;
   peer_burned_at?: number | null;
+  peers?: RoomBridgePeerInfo[];
+}
+
+export interface RoomBridgePeerInfo {
+  peerSessionId: string;
+  displayName?: string | null;
+  joinMethod: BridgePeerJoinMethod;
+  liveness: BridgePeerLiveness;
+  connected: boolean;
+  currentSessionOnly: true;
+  durableIdentityId?: string | null;
+  pairedDeviceLabel?: string | null;
+  pairingPublicKeyFingerprint?: string | null;
+  pairingMethod?: BridgePairingMethod | null;
+  pairingRotationState?: BridgePairingRotationState | null;
+  pairedRevokedAt?: number | null;
 }
 
 export interface RoomControlSessionContext {
@@ -85,6 +115,7 @@ export interface RoomItem {
   text?: string | null;
   saved_path?: string | null;
   error_message?: string | null;
+  bridge_send_operation?: BridgeSendOperation | null;
 }
 
 export interface AppConfig {

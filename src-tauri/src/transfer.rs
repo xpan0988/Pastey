@@ -82,6 +82,14 @@ pub struct ActiveFileTransfer {
     kind: ActiveFileTransferKind,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgePeerTransferEndpoint {
+    pub peer_session_id: String,
+    pub host: String,
+    pub port: u16,
+    pub transport_public_key: String,
+}
+
 #[derive(Clone)]
 pub struct TerminalTransferReason {
     code: String,
@@ -423,18 +431,33 @@ pub async fn send_room_item(state: Arc<AppState>, room_id: &str, item_id: &str) 
     if room.status == RoomStatus::Burned {
         return Err(AppError::InvalidInput(ROOM_BURNED_MESSAGE.into()));
     }
-    let peer_host = room
-        .peer_host
-        .clone()
-        .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?;
-    let peer_port = room
-        .peer_port
-        .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?;
-    let peer_transport_public_key = room
-        .peer_transport_public_key
-        .clone()
-        .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?;
+    let endpoint = BridgePeerTransferEndpoint {
+        peer_session_id: storage::legacy_bridge_peer_session_id(room_id),
+        host: room
+            .peer_host
+            .clone()
+            .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?,
+        port: room
+            .peer_port
+            .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?,
+        transport_public_key: room
+            .peer_transport_public_key
+            .clone()
+            .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?,
+    };
+    send_room_item_to_bridge_peer_endpoint(state, room_id, item_id, endpoint).await
+}
 
+pub async fn send_room_item_to_bridge_peer_endpoint(
+    state: Arc<AppState>,
+    room_id: &str,
+    item_id: &str,
+    endpoint: BridgePeerTransferEndpoint,
+) -> AppResult<()> {
+    let room = storage::get_room_by_id(&state.paths, room_id)?;
+    if room.status == RoomStatus::Burned {
+        return Err(AppError::InvalidInput(ROOM_BURNED_MESSAGE.into()));
+    }
     let item = storage::get_room_item_by_id(&state.paths, item_id)?;
     let master_key = {
         let config = state.config.read();
@@ -442,7 +465,7 @@ pub async fn send_room_item(state: Arc<AppState>, room_id: &str, item_id: &str) 
     };
     let payload_key = storage::read_room_item_key(&item, &master_key)?;
     let snapshot = room_server_snapshot(&state, room_id)?;
-    let receiver_public_key = crypto::decode_key(&peer_transport_public_key)?;
+    let receiver_public_key = crypto::decode_key(&endpoint.transport_public_key)?;
     let (wrapped_session_key, transport_nonce, sender_public_key) =
         crypto::wrap_session_for_receiver(
             &payload_key,
@@ -476,7 +499,8 @@ pub async fn send_room_item(state: Arc<AppState>, room_id: &str, item_id: &str) 
         .map_err(|_| AppError::Network("Network connection lost.".into()))?;
     let response = client
         .post(format!(
-            "http://{peer_host}:{peer_port}/rooms/{room_id}/items"
+            "http://{}:{}/rooms/{room_id}/items",
+            endpoint.host, endpoint.port
         ))
         .json(&upload)
         .send()
@@ -510,18 +534,45 @@ pub async fn send_room_file(
     if room.status == RoomStatus::Burned {
         return Err(AppError::InvalidInput(ROOM_BURNED_MESSAGE.into()));
     }
-    let peer_host = room
-        .peer_host
-        .clone()
-        .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?;
-    let peer_port = room
-        .peer_port
-        .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?;
-    let peer_transport_public_key = room
-        .peer_transport_public_key
-        .clone()
-        .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?;
+    let endpoint = BridgePeerTransferEndpoint {
+        peer_session_id: storage::legacy_bridge_peer_session_id(room_id),
+        host: room
+            .peer_host
+            .clone()
+            .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?,
+        port: room
+            .peer_port
+            .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?,
+        transport_public_key: room
+            .peer_transport_public_key
+            .clone()
+            .ok_or_else(|| AppError::InvalidInput(PEER_DISCONNECTED_MESSAGE.into()))?,
+    };
+    send_room_file_to_bridge_peer_endpoint(
+        state,
+        room_id,
+        item_id,
+        file_path,
+        queue_item_id,
+        requested_window,
+        endpoint,
+    )
+    .await
+}
 
+pub async fn send_room_file_to_bridge_peer_endpoint(
+    state: Arc<AppState>,
+    room_id: &str,
+    item_id: &str,
+    file_path: &Path,
+    queue_item_id: Option<String>,
+    requested_window: Option<usize>,
+    endpoint: BridgePeerTransferEndpoint,
+) -> AppResult<()> {
+    let room = storage::get_room_by_id(&state.paths, room_id)?;
+    if room.status == RoomStatus::Burned {
+        return Err(AppError::InvalidInput(ROOM_BURNED_MESSAGE.into()));
+    }
     let metadata = tokio::fs::metadata(file_path)
         .await
         .map_err(|_| AppError::InvalidInput("Could not read selected file.".into()))?;
@@ -534,7 +585,7 @@ pub async fn send_room_file(
     };
     let payload_key = storage::read_room_item_key(&item, &master_key)?;
     let snapshot = room_server_snapshot(&state, room_id)?;
-    let receiver_public_key = crypto::decode_key(&peer_transport_public_key)?;
+    let receiver_public_key = crypto::decode_key(&endpoint.transport_public_key)?;
     let (wrapped_session_key, transport_nonce, sender_public_key) =
         crypto::wrap_session_for_receiver(
             &payload_key,
@@ -589,7 +640,7 @@ pub async fn send_room_file(
         .timeout(TRANSFER_REQUEST_TIMEOUT)
         .build()
         .map_err(|_| AppError::Network("Network connection lost.".into()))?;
-    let base_url = format!("http://{peer_host}:{peer_port}/rooms/{room_id}");
+    let base_url = format!("http://{}:{}/rooms/{room_id}", endpoint.host, endpoint.port);
     let start_url = format!("{base_url}/transfers/start");
     let chunk_url = format!("{base_url}/transfers/{transfer_id}/chunks");
     dev_log_sender_transfer_start(
