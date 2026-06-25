@@ -17,6 +17,7 @@ import {
   type TransferPlannerTask,
   type TransferPlannerTaskKind
 } from "./transferPlanner";
+import type { BridgeContentKind, BridgeRoute } from "./bridgeRouting";
 import type { RoomInfo } from "./types";
 
 export type TransferQueueItemStatus = "queued" | "preparing" | "sending" | "completed" | "failed" | "cancelled";
@@ -41,6 +42,13 @@ export interface TransferQueueInput {
   modifiedMs?: number;
   dedupeKey?: string;
   deleteWhenDone?: boolean;
+  bridgeRoute?: BridgeRoute;
+  bridgeOperationId?: string;
+  bridgeTargetKind?: BridgeRoute["target"]["kind"];
+  bridgeContentKind?: Extract<BridgeContentKind, "file" | "image" | "pasted_image">;
+  targetPeerSessionId?: string;
+  targetPeerDisplayName?: string;
+  targetCount?: number;
 }
 
 export interface TransferQueueItem {
@@ -60,6 +68,13 @@ export interface TransferQueueItem {
   errorMessage?: string;
   deleteWhenDone: boolean;
   cancelRequested: boolean;
+  bridgeRoute?: BridgeRoute;
+  bridgeOperationId?: string;
+  bridgeTargetKind?: BridgeRoute["target"]["kind"];
+  bridgeContentKind?: Extract<BridgeContentKind, "file" | "image" | "pasted_image">;
+  targetPeerSessionId?: string;
+  targetPeerDisplayName?: string;
+  targetCount?: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -248,6 +263,9 @@ export function enqueueTransferBatch(
 
     const itemId = createId("item");
     const hasCompleteMetadata = inputHasCompleteMetadata(input);
+    const baseDedupeKey = input.dedupeKey ?? (hasCompleteMetadata
+      ? fileIdentityKey(input.displayName ?? "", input.sizeBytes ?? 0, input.modifiedMs ?? 0)
+      : undefined);
     itemIds.push(itemId);
     nextItems[itemId] = {
       id: itemId,
@@ -258,13 +276,18 @@ export function enqueueTransferBatch(
       mimeType: input.mimeType,
       sizeBytes: input.sizeBytes,
       modifiedMs: input.modifiedMs,
-      dedupeKey: input.dedupeKey ?? (hasCompleteMetadata
-        ? fileIdentityKey(input.displayName ?? "", input.sizeBytes ?? 0, input.modifiedMs ?? 0)
-        : undefined),
+      dedupeKey: targetDedupeKey(baseDedupeKey, input.targetPeerSessionId),
       status: "queued",
       metadataStatus: hasCompleteMetadata ? "ready" : "unknown",
       deleteWhenDone: input.deleteWhenDone ?? false,
       cancelRequested: false,
+      bridgeRoute: input.bridgeRoute,
+      bridgeOperationId: input.bridgeOperationId,
+      bridgeTargetKind: input.bridgeTargetKind,
+      bridgeContentKind: input.bridgeContentKind,
+      targetPeerSessionId: input.targetPeerSessionId,
+      targetPeerDisplayName: input.targetPeerDisplayName,
+      targetCount: input.targetCount,
       createdAt: now,
       updatedAt: now
     };
@@ -1311,8 +1334,17 @@ function nonterminalDedupeKeys(state: TransferSchedulerState): Set<string> {
   return keys;
 }
 
-function inputDedupeKeys(input: Pick<TransferQueueInput, "path" | "dedupeKey">): string[] {
-  return [pathDedupeKey(input.path), input.dedupeKey].filter((key): key is string => Boolean(key));
+function inputDedupeKeys(input: Pick<TransferQueueInput, "path" | "dedupeKey" | "targetPeerSessionId">): string[] {
+  return [
+    targetDedupeKey(pathDedupeKey(input.path), input.targetPeerSessionId),
+    targetDedupeKey(input.dedupeKey, input.targetPeerSessionId)
+  ].filter((key): key is string => Boolean(key));
+}
+
+function targetDedupeKey(key: string | undefined, targetPeerSessionId: string | undefined): string | undefined {
+  if (!key) return undefined;
+  if (!targetPeerSessionId || key.endsWith(`:bridge-target:${targetPeerSessionId}`)) return key;
+  return `${key}:bridge-target:${targetPeerSessionId}`;
 }
 
 function inputHasCompleteMetadata(input: TransferQueueInput): boolean {

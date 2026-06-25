@@ -14,8 +14,10 @@ use crate::{
     error::{AppError, AppResult},
     link_benchmark, logging,
     models::{
-        AppConfig, JoinRequestPrompt, LocalRole, NearbyDevice, RoomInfo, RoomItem, RoomStatus,
-        StoredRoom,
+        AppConfig, BridgeDeliveryContentKind, BridgeDeliveryOutcome, BridgeDeliveryOutcomeStatus,
+        BridgeDeliveryTargetKind, BridgePeerLiveness, BridgeSendAggregateStatus,
+        BridgeSendOperation, BridgeSendTarget, JoinRequestPrompt, LocalRole, NearbyDevice,
+        RoomInfo, RoomItem, RoomStatus, StoredBridgePeerEndpoint, StoredRoom,
     },
     room_control::{
         ReceivedRoomControlEvent, RoomControlDeliveryReceipt, RoomControlSendError,
@@ -38,32 +40,85 @@ pub struct FileTransferMetadata {
     modified_ms: u64,
 }
 
-fn validate_selected_peer_bridge_route(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BridgeRouteTargetKind {
+    LegacyNone,
+    SelectedPeer,
+    SelectedPeers,
+    BroadcastBridge,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedBridgeRouteTargets {
+    target_kind: BridgeRouteTargetKind,
+    targets: Vec<ValidatedBridgeRouteTarget>,
+    endpoints: Vec<transfer::BridgePeerTransferEndpoint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedBridgeRouteTarget {
+    peer_session_id: String,
+    endpoint: Option<transfer::BridgePeerTransferEndpoint>,
+    route_error_code: Option<BridgeRouteErrorCode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BridgeRouteErrorCode {
+    NoRouteablePeer,
+    UnknownPeer,
+    PeerUnrouteable,
+    MalformedRoute,
+    RouteMismatch,
+    RouteExpired,
+}
+
+impl BridgeRouteErrorCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRouteablePeer => "no_routeable_peer",
+            Self::UnknownPeer => "unknown_peer",
+            Self::PeerUnrouteable => "peer_unrouteable",
+            Self::MalformedRoute => "malformed_route",
+            Self::RouteMismatch => "route_mismatch",
+            Self::RouteExpired => "route_expired",
+        }
+    }
+}
+
+fn bridge_route_error(code: BridgeRouteErrorCode, message: impl Into<String>) -> AppError {
+    AppError::InvalidInput(format!(
+        "[pastey:bridge-route-error code={}] {}",
+        code.as_str(),
+        message.into()
+    ))
+}
+
+fn validate_bridge_route_payload(
     bridge_route: Option<&Value>,
     room_id: &str,
     room: &StoredRoom,
+    peers: &[StoredBridgePeerEndpoint],
     expected_schema_version: &str,
     content_label: &str,
-) -> AppResult<()> {
+) -> AppResult<ValidatedBridgeRouteTargets> {
     let Some(route) = bridge_route else {
-        return Ok(());
+        return Ok(ValidatedBridgeRouteTargets {
+            target_kind: BridgeRouteTargetKind::LegacyNone,
+            targets: Vec::new(),
+            endpoints: Vec::new(),
+        });
     };
     if room.status != RoomStatus::Active {
-        return Err(AppError::InvalidInput(format!(
-            "Bridge {content_label} route requires an active room."
-        )));
+        return Err(bridge_route_error(
+            BridgeRouteErrorCode::RouteExpired,
+            format!("Bridge {content_label} route requires an active room."),
+        ));
     }
-    if room.peer_host.is_none()
-        || room.peer_port.is_none()
-        || room.peer_transport_public_key.is_none()
-    {
-        return Err(AppError::InvalidInput(format!(
-            "Bridge {content_label} route requires a connected selected peer."
-        )));
-    }
-
     let route = route.as_object().ok_or_else(|| {
-        AppError::InvalidInput(format!("Bridge {content_label} route must be an object."))
+        bridge_route_error(
+            BridgeRouteErrorCode::MalformedRoute,
+            format!("Bridge {content_label} route must be an object."),
+        )
     })?;
     require_exact_bridge_route_fields(
         route,
@@ -72,41 +127,354 @@ fn validate_selected_peer_bridge_route(
     )?;
     let schema_version = bridge_route_string_field(route, "schemaVersion", content_label)?;
     if schema_version != expected_schema_version {
-        return Err(AppError::InvalidInput(format!(
-            "Bridge {content_label} route schema version is unsupported."
-        )));
+        return Err(bridge_route_error(
+            BridgeRouteErrorCode::MalformedRoute,
+            format!("Bridge {content_label} route schema version is unsupported."),
+        ));
     }
     let bridge_session_id = bridge_route_string_field(route, "bridgeSessionId", content_label)?;
     let expected_bridge_session_id = format!("legacy-room:{room_id}");
     if bridge_session_id != expected_bridge_session_id {
-        return Err(AppError::InvalidInput(format!(
-            "Bridge {content_label} route session does not match the current room."
-        )));
+        return Err(bridge_route_error(
+            BridgeRouteErrorCode::RouteMismatch,
+            format!("Bridge {content_label} route session does not match the current room."),
+        ));
     }
 
     let target = route
         .get("target")
         .and_then(Value::as_object)
         .ok_or_else(|| {
-            AppError::InvalidInput(format!(
-                "Bridge {content_label} route target must be an object."
-            ))
+            bridge_route_error(
+                BridgeRouteErrorCode::MalformedRoute,
+                format!("Bridge {content_label} route target must be an object."),
+            )
         })?;
-    require_exact_bridge_route_fields(target, &["kind", "peerSessionId"], content_label)?;
     let target_kind = bridge_route_string_field(target, "kind", content_label)?;
-    if target_kind != "selected_peer" {
-        return Err(AppError::InvalidInput(format!(
-            "Bridge {content_label} route requires selected_peer target."
-        )));
+
+    match target_kind {
+        "selected_peer" => {
+            require_exact_bridge_route_fields(target, &["kind", "peerSessionId"], content_label)?;
+            let peer_session_id =
+                bridge_route_string_field(target, "peerSessionId", content_label)?;
+            let endpoint = resolve_routeable_bridge_peer(peers, peer_session_id, content_label)?;
+            Ok(ValidatedBridgeRouteTargets {
+                target_kind: BridgeRouteTargetKind::SelectedPeer,
+                targets: vec![ValidatedBridgeRouteTarget {
+                    peer_session_id: endpoint.peer_session_id.clone(),
+                    endpoint: Some(endpoint.clone()),
+                    route_error_code: None,
+                }],
+                endpoints: vec![endpoint],
+            })
+        }
+        "selected_peers" => {
+            require_exact_bridge_route_fields(target, &["kind", "peerSessionIds"], content_label)?;
+            let Some(peer_session_ids) = target.get("peerSessionIds").and_then(Value::as_array)
+            else {
+                return Err(bridge_route_error(
+                    BridgeRouteErrorCode::MalformedRoute,
+                    format!(
+                    "Bridge {content_label} route selected_peers target requires peerSessionIds."
+                ),
+                ));
+            };
+            let peer_session_ids = bridge_route_string_array(peer_session_ids, content_label)?;
+            if peer_session_ids.len() < 2 {
+                return Err(bridge_route_error(
+                    BridgeRouteErrorCode::MalformedRoute,
+                    format!(
+                    "Bridge {content_label} route selected_peers target requires two or more peers."
+                ),
+                ));
+            }
+            let unique: std::collections::BTreeSet<_> = peer_session_ids.iter().collect();
+            if unique.len() != peer_session_ids.len() {
+                return Err(bridge_route_error(
+                    BridgeRouteErrorCode::MalformedRoute,
+                    format!(
+                    "Bridge {content_label} route selected_peers target rejects duplicate peers."
+                ),
+                ));
+            }
+            let targets = peer_session_ids
+                .iter()
+                .map(|peer_session_id| {
+                    resolve_known_bridge_peer_target(peers, peer_session_id, content_label)
+                })
+                .collect::<AppResult<Vec<_>>>()?;
+            let endpoints = targets
+                .iter()
+                .filter_map(|target| target.endpoint.clone())
+                .collect::<Vec<_>>();
+            Ok(ValidatedBridgeRouteTargets {
+                target_kind: BridgeRouteTargetKind::SelectedPeers,
+                targets,
+                endpoints,
+            })
+        }
+        "broadcast_bridge" => {
+            require_exact_bridge_route_fields(target, &["kind", "explicit"], content_label)?;
+            if target.get("explicit").and_then(Value::as_bool) != Some(true) {
+                return Err(bridge_route_error(
+                    BridgeRouteErrorCode::MalformedRoute,
+                    format!("Bridge {content_label} route broadcast target must be explicit."),
+                ));
+            }
+            let routeable = peers
+                .iter()
+                .filter_map(|peer| routeable_endpoint_for_peer(peer).ok())
+                .collect::<Vec<_>>();
+            if routeable.is_empty() {
+                return Err(bridge_route_error(
+                    BridgeRouteErrorCode::NoRouteablePeer,
+                    format!(
+                    "Bridge {content_label} route broadcast target has no current routeable peers."
+                ),
+                ));
+            }
+            Ok(ValidatedBridgeRouteTargets {
+                target_kind: BridgeRouteTargetKind::BroadcastBridge,
+                targets: routeable
+                    .iter()
+                    .map(|endpoint| ValidatedBridgeRouteTarget {
+                        peer_session_id: endpoint.peer_session_id.clone(),
+                        endpoint: Some(endpoint.clone()),
+                        route_error_code: None,
+                    })
+                    .collect(),
+                endpoints: routeable,
+            })
+        }
+        _ => Err(bridge_route_error(
+            BridgeRouteErrorCode::MalformedRoute,
+            format!("Bridge {content_label} route target kind is unsupported."),
+        )),
     }
-    let peer_session_id = bridge_route_string_field(target, "peerSessionId", content_label)?;
-    let expected_peer_session_id = format!("legacy-room-peer:{room_id}");
-    if peer_session_id != expected_peer_session_id {
-        return Err(AppError::InvalidInput(format!(
-            "Bridge {content_label} route selected peer does not match the current room peer."
-        )));
+}
+
+fn resolve_routeable_bridge_peer(
+    peers: &[StoredBridgePeerEndpoint],
+    peer_session_id: &str,
+    content_label: &str,
+) -> AppResult<transfer::BridgePeerTransferEndpoint> {
+    let Some(peer) = peers
+        .iter()
+        .find(|peer| peer.peer_session_id == peer_session_id)
+    else {
+        return Err(bridge_route_error(
+            BridgeRouteErrorCode::UnknownPeer,
+            format!(
+                "Bridge {content_label} route target contains an unknown current-session peer."
+            ),
+        ));
+    };
+    routeable_endpoint_for_peer(peer).map_err(|_| {
+        bridge_route_error(
+            bridge_route_error_code_for_peer(peer),
+            format!("Bridge {content_label} route target is not currently routeable."),
+        )
+    })
+}
+
+fn resolve_known_bridge_peer_target(
+    peers: &[StoredBridgePeerEndpoint],
+    peer_session_id: &str,
+    content_label: &str,
+) -> AppResult<ValidatedBridgeRouteTarget> {
+    let Some(peer) = peers
+        .iter()
+        .find(|peer| peer.peer_session_id == peer_session_id)
+    else {
+        return Err(bridge_route_error(
+            BridgeRouteErrorCode::UnknownPeer,
+            format!(
+                "Bridge {content_label} route target contains an unknown current-session peer."
+            ),
+        ));
+    };
+
+    match routeable_endpoint_for_peer(peer) {
+        Ok(endpoint) => Ok(ValidatedBridgeRouteTarget {
+            peer_session_id: endpoint.peer_session_id.clone(),
+            endpoint: Some(endpoint),
+            route_error_code: None,
+        }),
+        Err(_) => Ok(ValidatedBridgeRouteTarget {
+            peer_session_id: peer.peer_session_id.clone(),
+            endpoint: None,
+            route_error_code: Some(bridge_route_error_code_for_peer(peer)),
+        }),
     }
-    Ok(())
+}
+
+fn bridge_route_error_code_for_peer(peer: &StoredBridgePeerEndpoint) -> BridgeRouteErrorCode {
+    match peer.liveness {
+        BridgePeerLiveness::Left | BridgePeerLiveness::Stale | BridgePeerLiveness::Expired => {
+            BridgeRouteErrorCode::RouteExpired
+        }
+        BridgePeerLiveness::Connected
+            if peer.endpoint_host.as_deref().unwrap_or_default().is_empty()
+                || peer.endpoint_port.is_none()
+                || peer
+                    .transport_public_key
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty() =>
+        {
+            BridgeRouteErrorCode::PeerUnrouteable
+        }
+        BridgePeerLiveness::Connected
+        | BridgePeerLiveness::Reconnecting
+        | BridgePeerLiveness::Disconnected => BridgeRouteErrorCode::PeerUnrouteable,
+    }
+}
+
+fn routeable_endpoint_for_peer(
+    peer: &StoredBridgePeerEndpoint,
+) -> AppResult<transfer::BridgePeerTransferEndpoint> {
+    if peer.liveness != BridgePeerLiveness::Connected {
+        return Err(AppError::InvalidInput(
+            "Bridge peer is not connected.".into(),
+        ));
+    }
+    let Some(host) = peer
+        .endpoint_host
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(AppError::InvalidInput(
+            "Bridge peer endpoint is missing.".into(),
+        ));
+    };
+    let Some(port) = peer.endpoint_port else {
+        return Err(AppError::InvalidInput(
+            "Bridge peer endpoint is missing.".into(),
+        ));
+    };
+    let Some(transport_public_key) = peer
+        .transport_public_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(AppError::InvalidInput(
+            "Bridge peer transport key is missing.".into(),
+        ));
+    };
+    Ok(transfer::BridgePeerTransferEndpoint {
+        peer_session_id: peer.peer_session_id.clone(),
+        host: host.to_string(),
+        port,
+        transport_public_key: transport_public_key.to_string(),
+    })
+}
+
+fn bridge_send_target_for_route(targets: &ValidatedBridgeRouteTargets) -> Option<BridgeSendTarget> {
+    match targets.target_kind {
+        BridgeRouteTargetKind::LegacyNone => None,
+        BridgeRouteTargetKind::SelectedPeer => {
+            targets
+                .targets
+                .first()
+                .map(|target| BridgeSendTarget::SelectedPeer {
+                    peer_session_ref: target.peer_session_id.clone(),
+                })
+        }
+        BridgeRouteTargetKind::SelectedPeers => Some(BridgeSendTarget::SelectedPeers {
+            peer_session_refs: targets
+                .targets
+                .iter()
+                .map(|target| target.peer_session_id.clone())
+                .collect(),
+        }),
+        BridgeRouteTargetKind::BroadcastBridge => {
+            Some(BridgeSendTarget::BroadcastBridge { explicit: true })
+        }
+    }
+}
+
+fn bridge_delivery_target_kind(target_kind: BridgeRouteTargetKind) -> BridgeDeliveryTargetKind {
+    match target_kind {
+        BridgeRouteTargetKind::LegacyNone | BridgeRouteTargetKind::SelectedPeer => {
+            BridgeDeliveryTargetKind::SelectedPeer
+        }
+        BridgeRouteTargetKind::SelectedPeers => BridgeDeliveryTargetKind::SelectedPeers,
+        BridgeRouteTargetKind::BroadcastBridge => BridgeDeliveryTargetKind::BroadcastBridge,
+    }
+}
+
+fn bridge_operation_id(content_label: &str, item_id: &str) -> String {
+    format!("bridge-send:{content_label}:{item_id}")
+}
+
+fn bridge_operation_timestamp() -> String {
+    storage::now_ts().to_string()
+}
+
+fn bridge_delivery_outcome(
+    operation_id: &str,
+    bridge_session_ref: &str,
+    peer_session_ref: &str,
+    target_kind: BridgeDeliveryTargetKind,
+    content_kind: BridgeDeliveryContentKind,
+    status: BridgeDeliveryOutcomeStatus,
+    error_code: Option<&str>,
+) -> BridgeDeliveryOutcome {
+    let now = bridge_operation_timestamp();
+    BridgeDeliveryOutcome {
+        operation_id: operation_id.to_string(),
+        bridge_session_ref: bridge_session_ref.to_string(),
+        peer_session_ref: peer_session_ref.to_string(),
+        target_kind,
+        content_kind,
+        status,
+        error_code: error_code.map(str::to_string),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+fn bridge_aggregate_status(outcomes: &[BridgeDeliveryOutcome]) -> BridgeSendAggregateStatus {
+    let delivered = outcomes
+        .iter()
+        .filter(|outcome| outcome.status == BridgeDeliveryOutcomeStatus::Delivered)
+        .count();
+    if delivered == outcomes.len() && !outcomes.is_empty() {
+        BridgeSendAggregateStatus::Completed
+    } else if delivered > 0 {
+        BridgeSendAggregateStatus::Partial
+    } else {
+        BridgeSendAggregateStatus::Failed
+    }
+}
+
+fn bridge_send_operation(
+    item_id: &str,
+    content_label: &str,
+    content_kind: BridgeDeliveryContentKind,
+    route_targets: &ValidatedBridgeRouteTargets,
+    outcomes: Vec<BridgeDeliveryOutcome>,
+) -> Option<BridgeSendOperation> {
+    let target = bridge_send_target_for_route(route_targets)?;
+    let now = bridge_operation_timestamp();
+    Some(BridgeSendOperation {
+        operation_id: bridge_operation_id(content_label, item_id),
+        bridge_session_ref: outcomes
+            .first()
+            .map(|outcome| outcome.bridge_session_ref.clone())
+            .unwrap_or_default(),
+        target,
+        resolved_peer_session_refs: route_targets
+            .targets
+            .iter()
+            .map(|target| target.peer_session_id.clone())
+            .collect(),
+        content_kind,
+        aggregate_status: bridge_aggregate_status(&outcomes),
+        outcomes,
+        created_at: now.clone(),
+        updated_at: now,
+    })
 }
 
 fn require_exact_bridge_route_fields(
@@ -115,9 +483,10 @@ fn require_exact_bridge_route_fields(
     content_label: &str,
 ) -> AppResult<()> {
     if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
-        return Err(AppError::InvalidInput(format!(
-            "Bridge {content_label} route contains unsupported or missing fields."
-        )));
+        return Err(bridge_route_error(
+            BridgeRouteErrorCode::MalformedRoute,
+            format!("Bridge {content_label} route contains unsupported or missing fields."),
+        ));
     }
     Ok(())
 }
@@ -133,8 +502,28 @@ fn bridge_route_string_field<'a>(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            AppError::InvalidInput(format!("Bridge {content_label} route {field} is invalid."))
+            bridge_route_error(
+                BridgeRouteErrorCode::MalformedRoute,
+                format!("Bridge {content_label} route {field} is invalid."),
+            )
         })
+}
+
+fn bridge_route_string_array(values: &[Value], content_label: &str) -> AppResult<Vec<String>> {
+    let mut peer_session_ids = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(peer_session_id) = value.as_str().map(str::trim).filter(|id| !id.is_empty())
+        else {
+            return Err(bridge_route_error(
+                BridgeRouteErrorCode::MalformedRoute,
+                format!(
+                "Bridge {content_label} route peerSessionIds must contain only non-empty strings."
+            ),
+            ));
+        };
+        peer_session_ids.push(peer_session_id.to_string());
+    }
+    Ok(peer_session_ids)
 }
 
 #[tauri::command]
@@ -158,7 +547,7 @@ pub async fn create_room(
             None,
         )?;
         transfer::start_room_server(state.inner().clone(), &room.id).await?;
-        storage::room_to_info(room, &master_key)
+        storage::room_to_info_with_bridge_peers(&state.paths, room, &master_key)
     })
     .await
 }
@@ -203,7 +592,7 @@ pub async fn join_room(code: String, state: State<'_, Arc<AppState>>) -> Result<
         )?;
 
         let updated = storage::get_room_by_id(&state.paths, &room.id)?;
-        storage::room_to_info(updated, &master_key)
+        storage::room_to_info_with_bridge_peers(&state.paths, updated, &master_key)
     })
     .await
 }
@@ -290,7 +679,7 @@ pub async fn request_nearby_join(
 
         logging::write_transfer_line("[pastey antenna] event=join_accepted");
         let updated = storage::get_room_by_id(&state.paths, &room.id)?;
-        storage::room_to_info(updated, &master_key)
+        storage::room_to_info_with_bridge_peers(&state.paths, updated, &master_key)
     })
     .await
 }
@@ -349,7 +738,7 @@ pub async fn accept_nearby_join(
         };
         discovery::send_join_response(&request, &response).await?;
         logging::write_transfer_line("[pastey antenna] event=join_accepted");
-        storage::room_to_info(room, &master_key)
+        storage::room_to_info_with_bridge_peers(&state.paths, room, &master_key)
     })
     .await
 }
@@ -415,7 +804,7 @@ pub async fn list_rooms(state: State<'_, Arc<AppState>>) -> Result<Vec<RoomInfo>
         let rooms = storage::list_rooms(&state.paths)?;
         rooms
             .into_iter()
-            .map(|room| storage::room_to_info(room, &master_key))
+            .map(|room| storage::room_to_info_with_bridge_peers(&state.paths, room, &master_key))
             .collect()
     })
     .await
@@ -432,7 +821,73 @@ pub async fn get_room(
             config::master_key(&config)?
         };
         let room = storage::get_room_by_id(&state.paths, &room_id)?;
-        storage::room_to_info(room, &master_key)
+        storage::room_to_info_with_bridge_peers(&state.paths, room, &master_key)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn pair_bridge_peer(
+    room_id: String,
+    peer_session_id: String,
+    display_label: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomInfo, String> {
+    run_async(async move {
+        let master_key = {
+            let config = state.config.read();
+            config::master_key(&config)?
+        };
+        let room = storage::get_room_by_id(&state.paths, &room_id)?;
+        let _ = storage::sync_legacy_bridge_peer_endpoint(&state.paths, &room)?;
+        storage::pair_bridge_peer(
+            &state.paths,
+            &room_id,
+            &peer_session_id,
+            display_label.as_deref(),
+        )?;
+        let room = storage::get_room_by_id(&state.paths, &room_id)?;
+        storage::room_to_info_with_bridge_peers(&state.paths, room, &master_key)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn revoke_bridge_peer_pairing(
+    room_id: String,
+    peer_session_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomInfo, String> {
+    run_async(async move {
+        let master_key = {
+            let config = state.config.read();
+            config::master_key(&config)?
+        };
+        storage::revoke_bridge_peer_pairing(&state.paths, &room_id, &peer_session_id)?;
+        let room = storage::get_room_by_id(&state.paths, &room_id)?;
+        storage::room_to_info_with_bridge_peers(&state.paths, room, &master_key)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mark_bridge_peer_pairing_rotation_required(
+    room_id: String,
+    peer_session_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomInfo, String> {
+    run_async(async move {
+        let master_key = {
+            let config = state.config.read();
+            config::master_key(&config)?
+        };
+        storage::mark_bridge_peer_pairing_rotation_required(
+            &state.paths,
+            &room_id,
+            &peer_session_id,
+        )?;
+        let room = storage::get_room_by_id(&state.paths, &room_id)?;
+        storage::room_to_info_with_bridge_peers(&state.paths, room, &master_key)
     })
     .await
 }
@@ -474,17 +929,116 @@ pub async fn send_text_to_room(
             config::master_key(&config)?
         };
         let room = storage::get_room_by_id(&state.paths, &room_id)?;
-        validate_selected_peer_bridge_route(
+        let _ = storage::sync_legacy_bridge_peer_endpoint(&state.paths, &room)?;
+        let peers = storage::list_bridge_peer_endpoints(&state.paths, &room_id)?;
+        let route_targets = validate_bridge_route_payload(
             bridge_route.as_ref(),
             &room_id,
             &room,
+            &peers,
             TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
             "text",
         )?;
         let item = storage::create_outgoing_text_item(&state.paths, &master_key, &room_id, &text)?;
-        transfer::send_room_item(state.inner().clone(), &room_id, &item.id).await?;
+        let mut bridge_operation = None;
+        match route_targets.target_kind {
+            BridgeRouteTargetKind::LegacyNone => {
+                transfer::send_room_item(state.inner().clone(), &room_id, &item.id).await?;
+            }
+            BridgeRouteTargetKind::SelectedPeer => {
+                let operation_id = bridge_operation_id("text", &item.id);
+                let bridge_session_ref = format!("legacy-room:{room_id}");
+                let endpoint = route_targets.endpoints.first().cloned().ok_or_else(|| {
+                    bridge_route_error(
+                        BridgeRouteErrorCode::NoRouteablePeer,
+                        "Bridge text route selected_peer target has no resolved endpoint.",
+                    )
+                })?;
+                transfer::send_room_item_to_bridge_peer_endpoint(
+                    state.inner().clone(),
+                    &room_id,
+                    &item.id,
+                    endpoint.clone(),
+                )
+                .await?;
+                let outcomes = vec![bridge_delivery_outcome(
+                    &operation_id,
+                    &bridge_session_ref,
+                    &endpoint.peer_session_id,
+                    bridge_delivery_target_kind(route_targets.target_kind),
+                    BridgeDeliveryContentKind::Text,
+                    BridgeDeliveryOutcomeStatus::Delivered,
+                    None,
+                )];
+                bridge_operation = bridge_send_operation(
+                    &item.id,
+                    "text",
+                    BridgeDeliveryContentKind::Text,
+                    &route_targets,
+                    outcomes,
+                );
+            }
+            BridgeRouteTargetKind::SelectedPeers | BridgeRouteTargetKind::BroadcastBridge => {
+                let operation_id = bridge_operation_id("text", &item.id);
+                let bridge_session_ref = format!("legacy-room:{room_id}");
+                let target_kind = bridge_delivery_target_kind(route_targets.target_kind);
+                let mut outcomes = Vec::new();
+                for target in route_targets.targets.iter().cloned() {
+                    if let Some(endpoint) = target.endpoint {
+                        let send_result = transfer::send_room_item_to_bridge_peer_endpoint(
+                            state.inner().clone(),
+                            &room_id,
+                            &item.id,
+                            endpoint.clone(),
+                        )
+                        .await;
+                        outcomes.push(bridge_delivery_outcome(
+                            &operation_id,
+                            &bridge_session_ref,
+                            &endpoint.peer_session_id,
+                            target_kind.clone(),
+                            BridgeDeliveryContentKind::Text,
+                            if send_result.is_ok() {
+                                BridgeDeliveryOutcomeStatus::Delivered
+                            } else {
+                                BridgeDeliveryOutcomeStatus::Failed
+                            },
+                            if send_result.is_ok() {
+                                None
+                            } else {
+                                Some("transport_error")
+                            },
+                        ));
+                    } else {
+                        outcomes.push(bridge_delivery_outcome(
+                            &operation_id,
+                            &bridge_session_ref,
+                            &target.peer_session_id,
+                            target_kind.clone(),
+                            BridgeDeliveryContentKind::Text,
+                            BridgeDeliveryOutcomeStatus::Rejected,
+                            Some(
+                                target
+                                    .route_error_code
+                                    .unwrap_or(BridgeRouteErrorCode::PeerUnrouteable)
+                                    .as_str(),
+                            ),
+                        ));
+                    }
+                }
+                bridge_operation = bridge_send_operation(
+                    &item.id,
+                    "text",
+                    BridgeDeliveryContentKind::Text,
+                    &route_targets,
+                    outcomes,
+                );
+            }
+        }
         let stored = storage::get_room_item_by_id(&state.paths, &item.id)?;
-        storage::room_item_to_info(&state.paths, &master_key, stored)
+        let mut info = storage::room_item_to_info(&state.paths, &master_key, stored)?;
+        info.bridge_send_operation = bridge_operation;
+        Ok(info)
     })
     .await
 }
@@ -511,13 +1065,25 @@ pub async fn send_file_to_room(
             config::master_key(&config)?
         };
         let room = storage::get_room_by_id(&state.paths, &room_id)?;
-        validate_selected_peer_bridge_route(
+        let _ = storage::sync_legacy_bridge_peer_endpoint(&state.paths, &room)?;
+        let peers = storage::list_bridge_peer_endpoints(&state.paths, &room_id)?;
+        let route_targets = validate_bridge_route_payload(
             bridge_route.as_ref(),
             &room_id,
             &room,
+            &peers,
             FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
             "file",
         )?;
+        let content_kind = if mime_type
+            .as_deref()
+            .map(|value| value.starts_with("image/"))
+            .unwrap_or(false)
+        {
+            BridgeDeliveryContentKind::Image
+        } else {
+            BridgeDeliveryContentKind::File
+        };
         let item = storage::create_outgoing_file_item_with_metadata(
             &state.paths,
             &master_key,
@@ -526,21 +1092,127 @@ pub async fn send_file_to_room(
             display_name,
             mime_type,
         )?;
-        if let Err(error) = transfer::send_room_file(
-            state.inner().clone(),
-            &room_id,
-            &item.id,
-            &file_path,
-            queue_item_id,
-            requested_window,
-        )
-        .await
-        {
-            let _ = storage::delete_room_item(&state.paths, &item.id);
-            return Err(error);
+        let mut bridge_operation = None;
+        match route_targets.target_kind {
+            BridgeRouteTargetKind::LegacyNone => {
+                if let Err(error) = transfer::send_room_file(
+                    state.inner().clone(),
+                    &room_id,
+                    &item.id,
+                    &file_path,
+                    queue_item_id,
+                    requested_window,
+                )
+                .await
+                {
+                    let _ = storage::delete_room_item(&state.paths, &item.id);
+                    return Err(error);
+                }
+            }
+            BridgeRouteTargetKind::SelectedPeer => {
+                let operation_id = bridge_operation_id("file", &item.id);
+                let bridge_session_ref = format!("legacy-room:{room_id}");
+                let endpoint = route_targets.endpoints.first().cloned().ok_or_else(|| {
+                    bridge_route_error(
+                        BridgeRouteErrorCode::NoRouteablePeer,
+                        "Bridge file route selected_peer target has no resolved endpoint.",
+                    )
+                })?;
+                if let Err(error) = transfer::send_room_file_to_bridge_peer_endpoint(
+                    state.inner().clone(),
+                    &room_id,
+                    &item.id,
+                    &file_path,
+                    queue_item_id,
+                    requested_window,
+                    endpoint.clone(),
+                )
+                .await
+                {
+                    let _ = storage::delete_room_item(&state.paths, &item.id);
+                    return Err(error);
+                }
+                let outcomes = vec![bridge_delivery_outcome(
+                    &operation_id,
+                    &bridge_session_ref,
+                    &endpoint.peer_session_id,
+                    bridge_delivery_target_kind(route_targets.target_kind),
+                    content_kind.clone(),
+                    BridgeDeliveryOutcomeStatus::Delivered,
+                    None,
+                )];
+                bridge_operation = bridge_send_operation(
+                    &item.id,
+                    "file",
+                    content_kind.clone(),
+                    &route_targets,
+                    outcomes,
+                );
+            }
+            BridgeRouteTargetKind::SelectedPeers | BridgeRouteTargetKind::BroadcastBridge => {
+                let operation_id = bridge_operation_id("file", &item.id);
+                let bridge_session_ref = format!("legacy-room:{room_id}");
+                let target_kind = bridge_delivery_target_kind(route_targets.target_kind);
+                let mut outcomes = Vec::new();
+                for target in route_targets.targets.iter().cloned() {
+                    if let Some(endpoint) = target.endpoint {
+                        let send_result = transfer::send_room_file_to_bridge_peer_endpoint(
+                            state.inner().clone(),
+                            &room_id,
+                            &item.id,
+                            &file_path,
+                            queue_item_id.clone(),
+                            requested_window,
+                            endpoint.clone(),
+                        )
+                        .await;
+                        outcomes.push(bridge_delivery_outcome(
+                            &operation_id,
+                            &bridge_session_ref,
+                            &endpoint.peer_session_id,
+                            target_kind.clone(),
+                            content_kind.clone(),
+                            if send_result.is_ok() {
+                                BridgeDeliveryOutcomeStatus::Delivered
+                            } else {
+                                BridgeDeliveryOutcomeStatus::Failed
+                            },
+                            if send_result.is_ok() {
+                                None
+                            } else {
+                                Some("transport_error")
+                            },
+                        ));
+                    } else {
+                        outcomes.push(bridge_delivery_outcome(
+                            &operation_id,
+                            &bridge_session_ref,
+                            &target.peer_session_id,
+                            target_kind.clone(),
+                            content_kind.clone(),
+                            BridgeDeliveryOutcomeStatus::Rejected,
+                            Some(
+                                target
+                                    .route_error_code
+                                    .unwrap_or(BridgeRouteErrorCode::PeerUnrouteable)
+                                    .as_str(),
+                            ),
+                        ));
+                    }
+                }
+                bridge_operation = bridge_send_operation(
+                    &item.id,
+                    "file",
+                    content_kind.clone(),
+                    &route_targets,
+                    outcomes,
+                );
+            }
         }
         let stored = storage::get_room_item_by_id(&state.paths, &item.id)?;
-        storage::room_item_to_info(&state.paths, &master_key, stored)
+        let mut info = storage::room_item_to_info(&state.paths, &master_key, stored)?;
+        info.bridge_send_operation = bridge_operation;
+        Ok(info)
     })
     .await
 }
@@ -1086,6 +1758,48 @@ mod tests {
         })
     }
 
+    fn bridge_route_peers() -> Vec<StoredBridgePeerEndpoint> {
+        vec![StoredBridgePeerEndpoint {
+            room_id: "room-1".into(),
+            peer_session_id: "legacy-room-peer:room-1".into(),
+            display_name: Some("Peer".into()),
+            endpoint_host: Some("127.0.0.1".into()),
+            endpoint_port: Some(9000),
+            transport_public_key: Some("peer-key".into()),
+            liveness: BridgePeerLiveness::Connected,
+            join_method: crate::models::BridgePeerJoinMethod::NearbyAccept,
+            durable_identity_id: None,
+            updated_at: 1,
+        }]
+    }
+
+    fn assert_route_error_code(
+        result: AppResult<impl std::fmt::Debug>,
+        code: BridgeRouteErrorCode,
+    ) {
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("code={}", code.as_str())),
+            "expected route error code {}, got {error}",
+            code.as_str()
+        );
+    }
+
+    fn second_bridge_route_peer() -> StoredBridgePeerEndpoint {
+        StoredBridgePeerEndpoint {
+            room_id: "room-1".into(),
+            peer_session_id: "legacy-room-peer:room-1:1".into(),
+            display_name: Some("Peer 2".into()),
+            endpoint_host: Some("127.0.0.2".into()),
+            endpoint_port: Some(9001),
+            transport_public_key: Some("peer-key-2".into()),
+            liveness: BridgePeerLiveness::Connected,
+            join_method: crate::models::BridgePeerJoinMethod::NearbyAccept,
+            durable_identity_id: None,
+            updated_at: 2,
+        }
+    }
+
     #[test]
     fn diagnostics_cache_respects_force_refresh_and_ttl() {
         let now = storage::now_ts();
@@ -1118,125 +1832,447 @@ mod tests {
     }
 
     #[test]
-    fn selected_peer_bridge_route_accepts_matching_text_file_and_legacy_no_route() {
+    fn bridge_route_payload_accepts_matching_selected_peer_text_file_and_legacy_no_route() {
         let room = bridge_route_room();
+        let peers = bridge_route_peers();
         let text_route = matching_bridge_route(TEXT_BRIDGE_ROUTE_SCHEMA_VERSION);
         let file_route = matching_bridge_route(FILE_BRIDGE_ROUTE_SCHEMA_VERSION);
 
-        assert!(validate_selected_peer_bridge_route(
-            Some(&text_route),
-            "room-1",
-            &room,
-            TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
-            "text"
-        )
-        .is_ok());
-        assert!(validate_selected_peer_bridge_route(
-            Some(&file_route),
-            "room-1",
-            &room,
-            FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
-            "file"
-        )
-        .is_ok());
-        assert!(validate_selected_peer_bridge_route(
-            None,
-            "room-1",
-            &room,
-            FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
-            "file"
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn selected_peer_bridge_route_rejects_mismatch_unknown_broadcast_selected_peers_and_malformed()
-    {
-        let room = bridge_route_room();
-        let cases = [
-            json!({
-                "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
-                "bridgeSessionId": "legacy-room:other",
-                "target": {
-                    "kind": "selected_peer",
-                    "peerSessionId": "legacy-room-peer:room-1"
-                }
-            }),
-            json!({
-                "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
-                "bridgeSessionId": "legacy-room:room-1",
-                "target": {
-                    "kind": "selected_peer",
-                    "peerSessionId": "legacy-room-peer:unknown"
-                }
-            }),
-            json!({
-                "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
-                "bridgeSessionId": "legacy-room:room-1",
-                "target": {
-                    "kind": "broadcast_bridge",
-                    "explicit": true
-                }
-            }),
-            json!({
-                "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
-                "bridgeSessionId": "legacy-room:room-1",
-                "target": {
-                    "kind": "selected_peers",
-                    "peerSessionIds": ["legacy-room-peer:room-1", "legacy-room-peer:other"]
-                }
-            }),
-            json!({
-                "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
-                "bridgeSessionId": "legacy-room:room-1"
-            }),
-            json!({
-                "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
-                "bridgeSessionId": "legacy-room:room-1",
-                "target": {
-                    "kind": "selected_peer",
-                    "peerSessionId": "legacy-room-peer:room-1"
-                },
-                "trust": true
-            }),
-        ];
-
-        for route in cases {
-            assert!(validate_selected_peer_bridge_route(
-                Some(&route),
+        assert_eq!(
+            validate_bridge_route_payload(
+                Some(&text_route),
                 "room-1",
                 &room,
+                &peers,
                 TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
                 "text"
             )
-            .is_err());
+            .unwrap()
+            .endpoints,
+            vec![transfer::BridgePeerTransferEndpoint {
+                peer_session_id: "legacy-room-peer:room-1".into(),
+                host: "127.0.0.1".into(),
+                port: 9000,
+                transport_public_key: "peer-key".into(),
+            }]
+        );
+        assert_eq!(
+            validate_bridge_route_payload(
+                Some(&file_route),
+                "room-1",
+                &room,
+                &peers,
+                FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
+                "file"
+            )
+            .unwrap()
+            .endpoints,
+            vec![transfer::BridgePeerTransferEndpoint {
+                peer_session_id: "legacy-room-peer:room-1".into(),
+                host: "127.0.0.1".into(),
+                port: 9000,
+                transport_public_key: "peer-key".into(),
+            }]
+        );
+        assert!(validate_bridge_route_payload(
+            None,
+            "room-1",
+            &room,
+            &peers,
+            FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "file"
+        )
+        .unwrap()
+        .endpoints
+        .is_empty());
+    }
+
+    #[test]
+    fn bridge_route_payload_resolves_explicit_broadcast_for_data_delivery() {
+        let room = bridge_route_room();
+        let peers = bridge_route_peers();
+        let broadcast = json!({
+            "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "bridgeSessionId": "legacy-room:room-1",
+            "target": {
+                "kind": "broadcast_bridge",
+                "explicit": true
+            }
+        });
+
+        let targets = validate_bridge_route_payload(
+            Some(&broadcast),
+            "room-1",
+            &room,
+            &peers,
+            TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "text",
+        )
+        .unwrap();
+        assert_eq!(targets.target_kind, BridgeRouteTargetKind::BroadcastBridge);
+        assert_eq!(targets.endpoints.len(), 1);
+        assert_eq!(
+            bridge_send_target_for_route(&targets),
+            Some(BridgeSendTarget::BroadcastBridge { explicit: true })
+        );
+    }
+
+    #[test]
+    fn bridge_route_payload_validates_selected_peers_against_endpoint_table() {
+        let room = bridge_route_room();
+        let mut peers = bridge_route_peers();
+        peers.push(second_bridge_route_peer());
+        let selected_peers = json!({
+            "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "bridgeSessionId": "legacy-room:room-1",
+            "target": {
+                "kind": "selected_peers",
+                "peerSessionIds": ["legacy-room-peer:room-1", "legacy-room-peer:room-1:1"]
+            }
+        });
+
+        let targets = validate_bridge_route_payload(
+            Some(&selected_peers),
+            "room-1",
+            &room,
+            &peers,
+            TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "text",
+        )
+        .unwrap();
+        assert_eq!(targets.target_kind, BridgeRouteTargetKind::SelectedPeers);
+        assert_eq!(targets.endpoints.len(), 2);
+        assert_eq!(
+            targets.endpoints[0].peer_session_id,
+            "legacy-room-peer:room-1"
+        );
+        assert_eq!(
+            targets.endpoints[1].peer_session_id,
+            "legacy-room-peer:room-1:1"
+        );
+        assert_eq!(
+            bridge_send_target_for_route(&targets),
+            Some(BridgeSendTarget::SelectedPeers {
+                peer_session_refs: vec![
+                    "legacy-room-peer:room-1".into(),
+                    "legacy-room-peer:room-1:1".into(),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn bridge_route_payload_selected_peers_keeps_known_stale_targets_as_rejected_outcomes() {
+        let room = bridge_route_room();
+        let mut peers = bridge_route_peers();
+        let mut stale_peer = second_bridge_route_peer();
+        stale_peer.liveness = BridgePeerLiveness::Stale;
+        stale_peer.endpoint_host = None;
+        stale_peer.endpoint_port = None;
+        stale_peer.transport_public_key = None;
+        peers.push(stale_peer);
+        let selected_peers = json!({
+            "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "bridgeSessionId": "legacy-room:room-1",
+            "target": {
+                "kind": "selected_peers",
+                "peerSessionIds": ["legacy-room-peer:room-1", "legacy-room-peer:room-1:1"]
+            }
+        });
+
+        let targets = validate_bridge_route_payload(
+            Some(&selected_peers),
+            "room-1",
+            &room,
+            &peers,
+            TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "text",
+        )
+        .unwrap();
+        assert_eq!(targets.target_kind, BridgeRouteTargetKind::SelectedPeers);
+        assert_eq!(targets.targets.len(), 2);
+        assert_eq!(targets.endpoints.len(), 1);
+        assert_eq!(
+            targets.targets[1].route_error_code,
+            Some(BridgeRouteErrorCode::RouteExpired)
+        );
+        assert_eq!(
+            bridge_send_target_for_route(&targets),
+            Some(BridgeSendTarget::SelectedPeers {
+                peer_session_refs: vec![
+                    "legacy-room-peer:room-1".into(),
+                    "legacy-room-peer:room-1:1".into(),
+                ],
+            })
+        );
+
+        let operation_id = bridge_operation_id("text", "item-1");
+        let bridge_session_ref = "legacy-room:room-1";
+        let outcomes = vec![
+            bridge_delivery_outcome(
+                &operation_id,
+                bridge_session_ref,
+                "legacy-room-peer:room-1",
+                BridgeDeliveryTargetKind::SelectedPeers,
+                BridgeDeliveryContentKind::Text,
+                BridgeDeliveryOutcomeStatus::Delivered,
+                None,
+            ),
+            bridge_delivery_outcome(
+                &operation_id,
+                bridge_session_ref,
+                "legacy-room-peer:room-1:1",
+                BridgeDeliveryTargetKind::SelectedPeers,
+                BridgeDeliveryContentKind::Text,
+                BridgeDeliveryOutcomeStatus::Rejected,
+                Some(BridgeRouteErrorCode::RouteExpired.as_str()),
+            ),
+        ];
+        let operation = bridge_send_operation(
+            "item-1",
+            "text",
+            BridgeDeliveryContentKind::Text,
+            &targets,
+            outcomes,
+        )
+        .unwrap();
+        assert_eq!(
+            operation.aggregate_status,
+            BridgeSendAggregateStatus::Partial
+        );
+        assert_eq!(
+            operation.resolved_peer_session_refs,
+            vec![
+                "legacy-room-peer:room-1".to_string(),
+                "legacy-room-peer:room-1:1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn bridge_route_payload_rejects_mismatch_unknown_malformed_and_unsupported_authority_fields_with_codes(
+    ) {
+        let room = bridge_route_room();
+        let peers = bridge_route_peers();
+        let cases = [
+            (
+                BridgeRouteErrorCode::RouteMismatch,
+                json!({
+                    "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+                    "bridgeSessionId": "legacy-room:other",
+                    "target": {
+                        "kind": "selected_peer",
+                        "peerSessionId": "legacy-room-peer:room-1"
+                    }
+                }),
+            ),
+            (
+                BridgeRouteErrorCode::UnknownPeer,
+                json!({
+                    "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+                    "bridgeSessionId": "legacy-room:room-1",
+                    "target": {
+                        "kind": "selected_peer",
+                        "peerSessionId": "legacy-room-peer:unknown"
+                    }
+                }),
+            ),
+            (
+                BridgeRouteErrorCode::MalformedRoute,
+                json!({
+                    "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+                    "bridgeSessionId": "legacy-room:room-1",
+                    "target": {
+                        "kind": "broadcast_bridge",
+                        "explicit": false
+                    }
+                }),
+            ),
+            (
+                BridgeRouteErrorCode::MalformedRoute,
+                json!({
+                    "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+                    "bridgeSessionId": "legacy-room:room-1",
+                    "target": {
+                        "kind": "selected_peers",
+                        "peerSessionIds": ["legacy-room-peer:room-1"]
+                    }
+                }),
+            ),
+            (
+                BridgeRouteErrorCode::MalformedRoute,
+                json!({
+                    "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+                    "bridgeSessionId": "legacy-room:room-1"
+                }),
+            ),
+            (
+                BridgeRouteErrorCode::MalformedRoute,
+                json!({
+                    "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+                    "bridgeSessionId": "legacy-room:room-1",
+                    "target": {
+                        "kind": "selected_peer",
+                        "peerSessionId": "legacy-room-peer:room-1"
+                    },
+                    "trust": true
+                }),
+            ),
+        ];
+
+        for (code, route) in cases {
+            assert_route_error_code(
+                validate_bridge_route_payload(
+                    Some(&route),
+                    "room-1",
+                    &room,
+                    &peers,
+                    TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+                    "text",
+                ),
+                code,
+            );
         }
     }
 
     #[test]
-    fn selected_peer_bridge_route_rejects_inactive_or_disconnected_peer() {
+    fn bridge_route_payload_rejects_inactive_disconnected_and_stale_peers_with_codes() {
         let route = matching_bridge_route(FILE_BRIDGE_ROUTE_SCHEMA_VERSION);
-        let mut room = bridge_route_room();
-        room.peer_host = None;
-        assert!(validate_selected_peer_bridge_route(
-            Some(&route),
-            "room-1",
-            &room,
-            FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
-            "file"
-        )
-        .is_err());
+        let room = bridge_route_room();
+        let mut disconnected_peers = bridge_route_peers();
+        disconnected_peers[0].liveness = BridgePeerLiveness::Disconnected;
+        assert_route_error_code(
+            validate_bridge_route_payload(
+                Some(&route),
+                "room-1",
+                &room,
+                &disconnected_peers,
+                FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
+                "file",
+            ),
+            BridgeRouteErrorCode::PeerUnrouteable,
+        );
+
+        let mut missing_endpoint = bridge_route_peers();
+        missing_endpoint[0].endpoint_host = None;
+        assert_route_error_code(
+            validate_bridge_route_payload(
+                Some(&route),
+                "room-1",
+                &room,
+                &missing_endpoint,
+                FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
+                "file",
+            ),
+            BridgeRouteErrorCode::PeerUnrouteable,
+        );
+
+        let mut stale_peer = bridge_route_peers();
+        stale_peer[0].liveness = BridgePeerLiveness::Stale;
+        assert_route_error_code(
+            validate_bridge_route_payload(
+                Some(&route),
+                "room-1",
+                &room,
+                &stale_peer,
+                FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
+                "file",
+            ),
+            BridgeRouteErrorCode::RouteExpired,
+        );
 
         let mut stale = bridge_route_room();
         stale.status = RoomStatus::PeerLeft;
-        assert!(validate_selected_peer_bridge_route(
-            Some(&route),
+        let peers = bridge_route_peers();
+        assert_route_error_code(
+            validate_bridge_route_payload(
+                Some(&route),
+                "room-1",
+                &stale,
+                &peers,
+                FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
+                "file",
+            ),
+            BridgeRouteErrorCode::RouteExpired,
+        );
+    }
+
+    #[test]
+    fn durable_identity_marker_does_not_change_route_validation_or_broadcast_resolution() {
+        let route = matching_bridge_route(FILE_BRIDGE_ROUTE_SCHEMA_VERSION);
+        let room = bridge_route_room();
+        let mut disconnected_peers = bridge_route_peers();
+        disconnected_peers[0].durable_identity_id = Some("paired-device:one".into());
+        disconnected_peers[0].liveness = BridgePeerLiveness::Disconnected;
+        assert_route_error_code(
+            validate_bridge_route_payload(
+                Some(&route),
+                "room-1",
+                &room,
+                &disconnected_peers,
+                FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
+                "file",
+            ),
+            BridgeRouteErrorCode::PeerUnrouteable,
+        );
+
+        let mut peers = bridge_route_peers();
+        let mut paired_stale = second_bridge_route_peer();
+        paired_stale.durable_identity_id = Some("paired-device:two".into());
+        paired_stale.liveness = BridgePeerLiveness::Stale;
+        paired_stale.endpoint_host = None;
+        paired_stale.endpoint_port = None;
+        paired_stale.transport_public_key = None;
+        peers.push(paired_stale);
+        let broadcast = json!({
+            "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "bridgeSessionId": "legacy-room:room-1",
+            "target": {
+                "kind": "broadcast_bridge",
+                "explicit": true
+            }
+        });
+        let targets = validate_bridge_route_payload(
+            Some(&broadcast),
             "room-1",
-            &stale,
-            FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
-            "file"
+            &room,
+            &peers,
+            TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "text",
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(targets.endpoints.len(), 1);
+        assert_eq!(
+            targets.endpoints[0].peer_session_id,
+            "legacy-room-peer:room-1"
+        );
+    }
+
+    #[test]
+    fn bridge_route_payload_does_not_fall_back_to_arbitrary_peer_when_validation_fails() {
+        let room = bridge_route_room();
+        let mut peers = bridge_route_peers();
+        peers.push(second_bridge_route_peer());
+        let unknown_selected_peer = json!({
+            "schemaVersion": TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "bridgeSessionId": "legacy-room:room-1",
+            "target": {
+                "kind": "selected_peer",
+                "peerSessionId": "legacy-room-peer:unknown"
+            }
+        });
+
+        assert_route_error_code(
+            validate_bridge_route_payload(
+                Some(&unknown_selected_peer),
+                "room-1",
+                &room,
+                &peers,
+                TEXT_BRIDGE_ROUTE_SCHEMA_VERSION,
+                "text",
+            ),
+            BridgeRouteErrorCode::UnknownPeer,
+        );
     }
 
     #[test]

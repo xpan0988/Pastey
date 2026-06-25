@@ -43,6 +43,16 @@ export type BridgeRouteValidationResult =
   | { valid: true; route: BridgeRoute; errors: [] }
   | { valid: false; errors: string[] };
 
+export type BridgeRouteErrorCode =
+  | "no_routeable_peer"
+  | "unknown_peer"
+  | "peer_unrouteable"
+  | "unsupported_selected_peers"
+  | "unsupported_broadcast"
+  | "malformed_route"
+  | "route_mismatch"
+  | "route_expired";
+
 export class BridgeRoutingPolicyError extends Error {
   readonly errors: readonly string[];
 
@@ -50,6 +60,16 @@ export class BridgeRoutingPolicyError extends Error {
     super(errors.join(" "));
     this.name = "BridgeRoutingPolicyError";
     this.errors = errors;
+  }
+}
+
+export class BridgeRouteCodedError extends Error {
+  readonly code: BridgeRouteErrorCode;
+
+  constructor(code: BridgeRouteErrorCode, message: string) {
+    super(`[pastey:bridge-route-error code=${code}] ${message}`);
+    this.name = "BridgeRouteCodedError";
+    this.code = code;
   }
 }
 
@@ -64,19 +84,19 @@ export const DEFAULT_BRIDGE_ROUTING_POLICIES: Readonly<Record<BridgeContentKind,
     contentKind: "file",
     allowSelectedPeer: true,
     allowSelectedPeers: true,
-    allowBroadcast: false,
+    allowBroadcast: true,
   },
   image: {
     contentKind: "image",
     allowSelectedPeer: true,
     allowSelectedPeers: true,
-    allowBroadcast: false,
+    allowBroadcast: true,
   },
   pasted_image: {
     contentKind: "pasted_image",
     allowSelectedPeer: true,
     allowSelectedPeers: true,
-    allowBroadcast: false,
+    allowBroadcast: true,
   },
   bridge_control_event: {
     contentKind: "bridge_control_event",
@@ -92,6 +112,46 @@ export const DEFAULT_BRIDGE_ROUTING_POLICIES: Readonly<Record<BridgeContentKind,
     requireExactSelectedPeer: true,
   },
 };
+
+const BRIDGE_ROUTE_ERROR_CODE_PATTERN = /\[pastey:bridge-route-error code=([a-z_]+)\]/;
+
+export function bridgeRouteError(code: BridgeRouteErrorCode, message: string): BridgeRouteCodedError {
+  return new BridgeRouteCodedError(code, message);
+}
+
+export function bridgeRouteErrorCodeFromMessage(error: unknown): BridgeRouteErrorCode | null {
+  if (error instanceof BridgeRouteCodedError) {
+    return error.code;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  const code = message.match(BRIDGE_ROUTE_ERROR_CODE_PATTERN)?.[1];
+  return isBridgeRouteErrorCode(code) ? code : inferBridgeRouteErrorCode(message);
+}
+
+export function formatBridgeRouteErrorForUser(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = bridgeRouteErrorCodeFromMessage(error);
+  switch (code) {
+    case "no_routeable_peer":
+      return "No routeable Bridge peer is available for this send.";
+    case "unknown_peer":
+      return "That Bridge peer is no longer in the current session.";
+    case "peer_unrouteable":
+      return "That Bridge peer is not currently routeable.";
+    case "unsupported_selected_peers":
+      return "Selected-peers delivery is not supported for this action.";
+    case "unsupported_broadcast":
+      return "Broadcast delivery is not supported for this action.";
+    case "malformed_route":
+      return "The Bridge route payload was malformed.";
+    case "route_mismatch":
+      return "The Bridge route does not match the current room.";
+    case "route_expired":
+      return "The Bridge route expired or the room is no longer active.";
+    default:
+      return message.replace(BRIDGE_ROUTE_ERROR_CODE_PATTERN, "").trim();
+  }
+}
 
 const ROUTE_REQUIRED_FIELDS = ["bridgeSessionId", "target"];
 const SELECTED_PEER_FIELDS = ["kind", "peerSessionId"];
@@ -328,4 +388,45 @@ function rejectUnsupportedAuthorityFields(value: Record<string, unknown>, label:
 
 function unique(values: readonly string[]): string[] {
   return Array.from(new Set(values));
+}
+
+function isBridgeRouteErrorCode(value: unknown): value is BridgeRouteErrorCode {
+  return typeof value === "string" && [
+    "no_routeable_peer",
+    "unknown_peer",
+    "peer_unrouteable",
+    "unsupported_selected_peers",
+    "unsupported_broadcast",
+    "malformed_route",
+    "route_mismatch",
+    "route_expired",
+  ].includes(value);
+}
+
+function inferBridgeRouteErrorCode(message: string): BridgeRouteErrorCode | null {
+  if (/No routeable remote Bridge peer|no current routeable peers/i.test(message)) {
+    return "no_routeable_peer";
+  }
+  if (/unknown current-session peer|known current-session peer|no longer in the current session/i.test(message)) {
+    return "unknown_peer";
+  }
+  if (/not currently routeable|must be connected|disconnected|stale|left/i.test(message)) {
+    return "peer_unrouteable";
+  }
+  if (/selected_peers|selected peers/i.test(message) && /not enabled|per-target outcome|exactly one selected Bridge peer/i.test(message)) {
+    return "unsupported_selected_peers";
+  }
+  if (/broadcast/i.test(message) && /not enabled|per-target outcome|exactly one selected Bridge peer/i.test(message)) {
+    return "unsupported_broadcast";
+  }
+  if (/does not match|active Bridge session|current room/i.test(message)) {
+    return "route_mismatch";
+  }
+  if (/expired|requires an active room|no longer active/i.test(message)) {
+    return "route_expired";
+  }
+  if (/route .*invalid|malformed|unsupported or missing|must be an object|unsupported field|schema version/i.test(message)) {
+    return "malformed_route";
+  }
+  return null;
 }

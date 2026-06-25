@@ -5,21 +5,26 @@ import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEve
 import {
   cancelTransfer,
   copyTextToClipboard,
+  markBridgePeerPairingRotationRequired,
+  pairBridgePeer,
   revealInFolder,
+  revokeBridgePeerPairing,
   sendTextToRoom,
   writeTempFile
 } from "../lib/tauri";
 import {
   deriveBridgeRoutingStateForRoom,
-  enqueueFilePathsWithBridgeRoute,
   enqueueTransferInputsWithBridgeRoute,
   routeStateLabel,
   sendTextToRoomWithBridgeRoute,
 } from "../lib/bridgeRoutingRuntime";
+import { bridgePeerSessionId, formatBridgeRouteErrorForUser, type BridgeRoute } from "../lib/bridgeRouting";
+import { legacyRoomToBridgePeerCollection } from "../lib/bridgeRoomAdapter";
+import { findBridgePeerBySessionId, getRouteableBridgePeers, type BridgePeerSession } from "../lib/bridgePeers";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
 import { fileTypeLabel, formatBytes, formatDuration, formatSpeed, formatTimestamp } from "../lib/format";
 import { fileIdentityKey, type RoomTransferQueueView, type TransferQueueBatch, type TransferQueueInput, type TransferQueueItem } from "../lib/transferScheduler";
-import type { FileTransferProgressEvent, RoomInfo, RoomItem } from "../lib/types";
+import type { FileTransferProgressEvent, RoomBridgePeerInfo, RoomInfo, RoomItem } from "../lib/types";
 import { AiSlotPreview } from "../components/AiSlotPreview";
 
 interface RoomPageProps {
@@ -37,6 +42,8 @@ interface RoomPageProps {
   agentBridgeEnabled: boolean;
 }
 
+type BridgeTargetSelectionMode = "selected_peer" | "selected_peers" | "broadcast_bridge";
+
 export function RoomPage({
   room,
   items,
@@ -45,7 +52,6 @@ export function RoomPage({
   onBack,
   onRefresh,
   onBurn,
-  onEnqueueFiles,
   onEnqueueTransferInputs,
   onCancelQueueItem,
   onCancelQueueBatch,
@@ -55,14 +61,57 @@ export function RoomPage({
   const [busy, setBusy] = useState<"text" | "burn" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [cancellingTransferId, setCancellingTransferId] = useState<string | null>(null);
+  const [pairingPeerId, setPairingPeerId] = useState<string | null>(null);
   const [composerDropActive, setComposerDropActive] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const roomUnavailable = room.status === "burned" || busy === "burn";
   const bridgeRouteState = useMemo(() => deriveBridgeRoutingStateForRoom(room), [room]);
-  const canSend = room.peer_connected && bridgeRouteState.status === "ready_selected_peer" && busy === null && !roomUnavailable;
+  const bridgePeerCollection = useMemo(() => {
+    try {
+      return legacyRoomToBridgePeerCollection(room);
+    } catch {
+      return null;
+    }
+  }, [room]);
+  const routeablePeers = useMemo(
+    () => bridgePeerCollection ? [...getRouteableBridgePeers(bridgePeerCollection)] : [],
+    [bridgePeerCollection],
+  );
+  const [targetMode, setTargetMode] = useState<BridgeTargetSelectionMode>("selected_peer");
+  const [selectedPeerIds, setSelectedPeerIds] = useState<string[]>([]);
+  const selectedBridgeRoute = useMemo(
+    () => buildSelectedBridgeRoute(bridgePeerCollection?.bridgeSessionId ?? `legacy-room:${room.id}`, routeablePeers, targetMode, selectedPeerIds),
+    [bridgePeerCollection?.bridgeSessionId, room.id, routeablePeers, selectedPeerIds, targetMode],
+  );
+  const selectedTargetCount = selectedBridgeRoute
+    ? resolvedPeersForRoute(selectedBridgeRoute, routeablePeers).length
+    : 0;
+  const canSend = room.peer_connected && selectedBridgeRoute !== null && busy === null && !roomUnavailable;
   const bridgeRouteError = bridgeRouteState.status === "ready_selected_peer"
     ? null
-    : bridgeRouteState.errors[0] ?? routeStateLabel(bridgeRouteState);
+    : formatBridgeRouteErrorForUser(bridgeRouteState.errors[0] ?? routeStateLabel(bridgeRouteState));
+  const currentSessionPeerCount = room.peers?.length ?? 0;
+  const routeablePeerCount = routeablePeers.length;
+  const unavailablePeerCount = Math.max(0, currentSessionPeerCount - routeablePeerCount);
+  const roomPeerBySessionId = useMemo(() => {
+    const peers = new Map<string, RoomBridgePeerInfo>();
+    for (const peer of room.peers ?? []) {
+      peers.set(peer.peerSessionId, peer);
+    }
+    return peers;
+  }, [room.peers]);
+
+  useEffect(() => {
+    if (routeablePeers.length === 0) {
+      setSelectedPeerIds([]);
+      return;
+    }
+    setSelectedPeerIds((current) => {
+      const routeableIds = new Set(routeablePeers.map((peer) => peer.peerSessionId));
+      const next = current.filter((peerId) => routeableIds.has(bridgePeerSessionId(peerId)));
+      return next.length > 0 ? next : [routeablePeers[0].peerSessionId];
+    });
+  }, [routeablePeers]);
 
   useEffect(() => {
     composerRef.current?.focus();
@@ -105,7 +154,11 @@ export function RoomPage({
           }
           if (event.payload.paths.length > 0) {
             console.info("[pastey queue] event=file_drop_received room_id=%s file_count=%d", room.id, event.payload.paths.length);
-            enqueueFilePathsWithBridgeRoute(room, event.payload.paths, onEnqueueFiles);
+            try {
+              enqueueSelectedRouteFiles(event.payload.paths);
+            } catch (err) {
+              setError(formatBridgeRouteErrorForUser(err));
+            }
           }
           return;
         }
@@ -130,11 +183,14 @@ export function RoomPage({
     setCancellingTransferId(null);
 
     try {
-      await sendTextToRoomWithBridgeRoute(room, text, sendTextToRoom);
+      if (!selectedBridgeRoute) {
+        throw new Error("No routeable Bridge peer is available for this send.");
+      }
+      await sendTextToRoomWithBridgeRoute(room, text, sendTextToRoom, selectedBridgeRoute);
       setText("");
       await onRefresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(formatBridgeRouteErrorForUser(err));
     } finally {
       setBusy(null);
     }
@@ -155,13 +211,21 @@ export function RoomPage({
 
     if (typeof selected === "string") {
       console.info("[pastey queue] event=file_input_selected room_id=%s file_count=1", room.id);
-      enqueueFilePathsWithBridgeRoute(room, [selected], onEnqueueFiles);
+      try {
+        enqueueSelectedRouteFiles([selected]);
+      } catch (err) {
+        setError(formatBridgeRouteErrorForUser(err));
+      }
       return;
     }
 
     if (Array.isArray(selected) && selected.length > 0) {
       console.info("[pastey queue] event=file_input_selected room_id=%s file_count=%d", room.id, selected.length);
-      enqueueFilePathsWithBridgeRoute(room, selected, onEnqueueFiles);
+      try {
+        enqueueSelectedRouteFiles(selected);
+      } catch (err) {
+        setError(formatBridgeRouteErrorForUser(err));
+      }
     }
   }
 
@@ -175,19 +239,20 @@ export function RoomPage({
     try {
       const buffer = await file.arrayBuffer();
       tempPath = await writeTempFile(file.name, Array.from(new Uint8Array(buffer)));
-      enqueueTransferInputsWithBridgeRoute(room, [{
+      const inputs = transferInputsForSelectedRoute([{
         path: tempPath,
         displayName: file.name,
         mimeType: file.type || "image/png",
         sizeBytes: file.size,
         dedupeKey: fileKey,
         deleteWhenDone: true
-      }], "pasted_image", onEnqueueTransferInputs);
+      }], "pasted_image");
+      enqueueTransferInputsWithBridgeRoute(room, inputs, "pasted_image", onEnqueueTransferInputs, selectedBridgeRoute ?? undefined);
     } catch (err) {
       if (tempPath) {
         setError("Unable to queue image from clipboard.");
       } else {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(formatBridgeRouteErrorForUser(err));
       }
     }
   }
@@ -233,6 +298,41 @@ export function RoomPage({
     event.stopPropagation();
   }
 
+  function enqueueSelectedRouteFiles(paths: string[]) {
+    const inputs = transferInputsForSelectedRoute(paths.map((path) => ({ path })), "file");
+    enqueueTransferInputsWithBridgeRoute(room, inputs, "file", onEnqueueTransferInputs, selectedBridgeRoute ?? undefined);
+  }
+
+  function transferInputsForSelectedRoute(
+    inputs: TransferQueueInput[],
+    contentKind: "file" | "image" | "pasted_image",
+  ): TransferQueueInput[] {
+    if (!selectedBridgeRoute) {
+      throw new Error("No routeable Bridge peer is available for this send.");
+    }
+    const peers = resolvedPeersForRoute(selectedBridgeRoute, routeablePeers);
+    if (peers.length === 0) {
+      throw new Error("No routeable Bridge peer is available for this send.");
+    }
+    const operationId = `bridge-queue:${room.id}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    return inputs.flatMap((input) => peers.map((peer) => ({
+      ...input,
+      bridgeRoute: {
+        bridgeSessionId: selectedBridgeRoute.bridgeSessionId,
+        target: {
+          kind: "selected_peer",
+          peerSessionId: peer.peerSessionId,
+        },
+      },
+      bridgeOperationId: operationId,
+      bridgeTargetKind: selectedBridgeRoute.target.kind,
+      bridgeContentKind: contentKind,
+      targetPeerSessionId: peer.peerSessionId,
+      targetPeerDisplayName: peer.displayName,
+      targetCount: peers.length,
+    })));
+  }
+
   async function handleCopyCode() {
     if (room.room_code) {
       await copyTextToClipboard(room.room_code);
@@ -273,6 +373,45 @@ export function RoomPage({
       await onRefresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handlePairPeer(peer: BridgePeerSession) {
+    setError(null);
+    setPairingPeerId(peer.peerSessionId);
+    try {
+      await pairBridgePeer(room.id, peer.peerSessionId, peer.displayName);
+      await onRefresh();
+    } catch (err) {
+      setError(formatBridgeRouteErrorForUser(err));
+    } finally {
+      setPairingPeerId(null);
+    }
+  }
+
+  async function handleRevokePeerPairing(peer: BridgePeerSession) {
+    setError(null);
+    setPairingPeerId(peer.peerSessionId);
+    try {
+      await revokeBridgePeerPairing(room.id, peer.peerSessionId);
+      await onRefresh();
+    } catch (err) {
+      setError(formatBridgeRouteErrorForUser(err));
+    } finally {
+      setPairingPeerId(null);
+    }
+  }
+
+  async function handleMarkPairingRotationRequired(peer: BridgePeerSession) {
+    setError(null);
+    setPairingPeerId(peer.peerSessionId);
+    try {
+      await markBridgePeerPairingRotationRequired(room.id, peer.peerSessionId);
+      await onRefresh();
+    } catch (err) {
+      setError(formatBridgeRouteErrorForUser(err));
+    } finally {
+      setPairingPeerId(null);
     }
   }
 
@@ -333,6 +472,11 @@ export function RoomPage({
             <strong>{headerStatus}</strong>
             <span className="muted">{room.peer_device_name ?? "No peer device yet"}</span>
             <span className="muted">{routeStateLabel(bridgeRouteState)}</span>
+            <span className="muted">
+              {currentSessionPeerCount > 0
+                ? `${routeablePeerCount}/${currentSessionPeerCount} current-session peers routeable`
+                : "No current-session peers yet"}
+            </span>
           </div>
           <div className="meta-card">
             <span className="meta-label">Lifecycle</span>
@@ -382,6 +526,102 @@ export function RoomPage({
       </section>
 
       <section className="panel composer-panel">
+        <div className="subtle-stack tight">
+          <div className="row spread gap">
+            <span className="meta-label">Bridge target</span>
+            <span className="muted">
+              {routeablePeerCount} routeable · {selectedTargetCount} selected
+            </span>
+          </div>
+          <div className="row gap wrap">
+            <button
+              className={targetMode === "selected_peer" ? "primary-button compact-button" : "ghost-button compact-button"}
+              onClick={() => setTargetMode("selected_peer")}
+              disabled={routeablePeerCount === 0}
+            >
+              Peer
+            </button>
+            <button
+              className={targetMode === "selected_peers" ? "primary-button compact-button" : "ghost-button compact-button"}
+              onClick={() => setTargetMode("selected_peers")}
+              disabled={routeablePeerCount < 2}
+            >
+              Peers
+            </button>
+            <button
+              className={targetMode === "broadcast_bridge" ? "primary-button compact-button" : "ghost-button compact-button"}
+              onClick={() => setTargetMode("broadcast_bridge")}
+              disabled={routeablePeerCount === 0}
+            >
+              Broadcast
+            </button>
+          </div>
+          {targetMode === "broadcast_bridge" ? (
+            <span className="muted">Broadcast will send to {routeablePeerCount} current-session routeable peers.</span>
+          ) : (
+            <div className="row gap wrap">
+              {routeablePeers.map((peer) => {
+                const checked = selectedPeerIds.includes(peer.peerSessionId);
+                const roomPeer = roomPeerBySessionId.get(peer.peerSessionId);
+                const isPairingBusy = pairingPeerId === peer.peerSessionId;
+                return (
+                  <div key={peer.peerSessionId} className="row gap wrap">
+                    <label className="muted">
+                      <input
+                        type={targetMode === "selected_peer" ? "radio" : "checkbox"}
+                        checked={checked}
+                        onChange={() => {
+                          if (targetMode === "selected_peer") {
+                            setSelectedPeerIds([peer.peerSessionId]);
+                          } else {
+                            setSelectedPeerIds((current) => checked
+                              ? current.filter((peerId) => peerId !== peer.peerSessionId)
+                              : [...current, peer.peerSessionId]);
+                          }
+                        }}
+                      />
+                      {" "}
+                      {peer.displayName}
+                    </label>
+                    <span className="muted">{pairedPeerStatusLabel(roomPeer)}</span>
+                    {roomPeer?.durableIdentityId ? (
+                      <>
+                        <button
+                          type="button"
+                          className="ghost-button compact-button"
+                          onClick={() => void handleMarkPairingRotationRequired(peer)}
+                          disabled={isPairingBusy || roomPeer.pairingRotationState === "rotation_required"}
+                        >
+                          Rotation required
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-button compact-button"
+                          onClick={() => void handleRevokePeerPairing(peer)}
+                          disabled={isPairingBusy}
+                        >
+                          Revoke pairing
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="ghost-button compact-button"
+                        onClick={() => void handlePairPeer(peer)}
+                        disabled={isPairingBusy}
+                      >
+                        Pair
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {unavailablePeerCount > 0 ? (
+            <span className="muted">{unavailablePeerCount} current-session peer{unavailablePeerCount === 1 ? "" : "s"} unavailable or route-expired.</span>
+          ) : null}
+        </div>
         <div
           className={`composer-row ${composerDropActive ? "drop-active" : ""}`}
           onDragOver={handleComposerDragOver}
@@ -438,6 +678,70 @@ export function RoomPage({
   );
 }
 
+function buildSelectedBridgeRoute(
+  bridgeSessionId: string,
+  routeablePeers: readonly BridgePeerSession[],
+  targetMode: BridgeTargetSelectionMode,
+  selectedPeerIds: readonly string[],
+): BridgeRoute | null {
+  if (targetMode === "broadcast_bridge") {
+    return routeablePeers.length > 0
+      ? { bridgeSessionId, target: { kind: "broadcast_bridge", explicit: true } }
+      : null;
+  }
+  const routeableIds = new Set(routeablePeers.map((peer) => peer.peerSessionId));
+  const selectedIds = selectedPeerIds
+    .map((peerId) => bridgePeerSessionId(peerId))
+    .filter((peerId) => routeableIds.has(peerId));
+  if (targetMode === "selected_peer") {
+    const peerSessionId = selectedIds[0] ?? routeablePeers[0]?.peerSessionId;
+    return peerSessionId
+      ? { bridgeSessionId, target: { kind: "selected_peer", peerSessionId } }
+      : null;
+  }
+  return selectedIds.length >= 2
+    ? { bridgeSessionId, target: { kind: "selected_peers", peerSessionIds: selectedIds } }
+    : null;
+}
+
+function resolvedPeersForRoute(route: BridgeRoute, routeablePeers: readonly BridgePeerSession[]): BridgePeerSession[] {
+  if (route.target.kind === "broadcast_bridge") {
+    return [...routeablePeers];
+  }
+  if (route.target.kind === "selected_peer") {
+    const peer = findBridgePeerBySessionId({
+      bridgeSessionId: route.bridgeSessionId,
+      peers: routeablePeers,
+    }, route.target.peerSessionId);
+    return peer ? [peer] : [];
+  }
+  return route.target.peerSessionIds
+    .map((peerSessionId) => findBridgePeerBySessionId({
+      bridgeSessionId: route.bridgeSessionId,
+      peers: routeablePeers,
+    }, peerSessionId))
+    .filter((peer): peer is BridgePeerSession => Boolean(peer));
+}
+
+function pairedPeerStatusLabel(peer?: RoomBridgePeerInfo): string {
+  if (!peer?.durableIdentityId) {
+    return "known device not paired";
+  }
+  const parts = ["paired"];
+  if (peer.pairingRotationState === "rotation_required") {
+    parts.push("rotation required");
+  } else if (peer.pairingRotationState === "rotation_deferred") {
+    parts.push("rotation deferred");
+  } else if (peer.pairingRotationState === "rotation_unsupported") {
+    parts.push("rotation unsupported");
+  }
+  const fingerprint = peer.pairingPublicKeyFingerprint?.slice(0, 18);
+  if (fingerprint) {
+    parts.push(`fingerprint ${fingerprint}`);
+  }
+  return parts.join(" · ");
+}
+
 interface QueuePanelProps {
   queue: RoomTransferQueueView;
   onCancelItem: (itemId: string) => Promise<void>;
@@ -457,6 +761,7 @@ function QueuePanel({ queue, onCancelItem, onCancelBatch }: QueuePanelProps) {
   const failedCount = panelItems.filter((item) => item.status === "failed").length;
   const queuedCount = panelItems.filter((item) => item.status === "queued").length;
   const cancelledCount = panelItems.filter((item) => item.status === "cancelled").length;
+  const bridgeOperations = bridgeQueueOperationSummaries(panelItems);
   const visibleActiveItems = activeItems.slice(0, 4);
   const remainingActiveCount = Math.max(0, activeCount - visibleActiveItems.length);
   const visibleItems = panelItems
@@ -472,6 +777,13 @@ function QueuePanel({ queue, onCancelItem, onCancelBatch }: QueuePanelProps) {
           <span className="muted">
             {panelItems.length} files · {activeCount} active · {queuedCount} queued · {completedCount} done · {failedCount} failed · {cancelledCount} cancelled
           </span>
+          {bridgeOperations.map((operation) => (
+            <span key={operation.operationId} className="muted">
+              {operation.label}: {operation.completed}/{operation.total} delivered
+              {operation.failed > 0 ? ` · ${operation.failed} failed` : ""}
+              {operation.cancelled > 0 ? ` · ${operation.cancelled} cancelled` : ""}
+            </span>
+          ))}
         </div>
         {activeBatch?.status === "running" ? (
           <button className="ghost-button compact-button" onClick={() => void onCancelBatch(activeBatch.id)}>
@@ -520,6 +832,8 @@ function QueueItemRow({
         <strong>{item.displayName ?? fileNameFromPath(item.path)}</strong>
         <span className="muted">
           {queueItemStatusLabel(item)}
+          {item.targetPeerDisplayName ? ` · to ${item.targetPeerDisplayName}` : ""}
+          {item.targetCount && item.targetCount > 1 ? ` · ${item.targetCount} targets` : ""}
           {typeof item.sizeBytes === "number" ? ` · ${formatBytes(item.sizeBytes)}` : ""}
         </span>
         {item.errorMessage ? <span className="transfer-error">{item.errorMessage}</span> : null}
@@ -531,6 +845,33 @@ function QueueItemRow({
       ) : null}
     </div>
   );
+}
+
+function bridgeQueueOperationSummaries(items: readonly TransferQueueItem[]): Array<{
+  operationId: string;
+  label: string;
+  total: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+}> {
+  const groups = new Map<string, TransferQueueItem[]>();
+  for (const item of items) {
+    if (!item.bridgeOperationId) continue;
+    groups.set(item.bridgeOperationId, [...(groups.get(item.bridgeOperationId) ?? []), item]);
+  }
+  return [...groups.entries()].map(([operationId, operationItems]) => ({
+    operationId,
+    label: operationItems[0]?.bridgeTargetKind === "broadcast_bridge"
+      ? "Broadcast"
+      : operationItems[0]?.bridgeTargetKind === "selected_peers"
+        ? "Selected peers"
+        : "Selected peer",
+    total: operationItems.length,
+    completed: operationItems.filter((item) => item.status === "completed").length,
+    failed: operationItems.filter((item) => item.status === "failed").length,
+    cancelled: operationItems.filter((item) => item.status === "cancelled").length,
+  }));
 }
 
 function queueStatusLabel(batch?: TransferQueueBatch): string {
@@ -561,6 +902,23 @@ function queueItemStatusLabel(item: TransferQueueItem): string {
       return "Cancelled";
     default:
       return "Queued";
+  }
+}
+
+function bridgeSendOperationLabel(status: string, targetCount: number): string {
+  switch (status) {
+    case "completed":
+      return targetCount === 1 ? "Delivered to selected peer" : `Delivered to ${targetCount} peers`;
+    case "partial":
+      return `Partially delivered to ${targetCount} peers`;
+    case "failed":
+      return `Delivery failed for ${targetCount} peer${targetCount === 1 ? "" : "s"}`;
+    case "cancelled":
+      return "Delivery cancelled";
+    case "unsupported":
+      return "Delivery target unsupported";
+    default:
+      return targetCount === 1 ? "Delivery pending" : `Delivery pending for ${targetCount} peers`;
   }
 }
 
@@ -654,6 +1012,9 @@ function MessageRow({ item, onCopyText, onReveal }: MessageRowProps) {
         {item.payload_type === "text" ? (
           <>
             <div className="message-text">{item.text}</div>
+            {item.bridge_send_operation ? (
+              <span className="muted">{bridgeSendOperationLabel(item.bridge_send_operation.aggregateStatus, item.bridge_send_operation.outcomes.length)}</span>
+            ) : null}
             {item.text ? (
               <button className="text-button inline-action" onClick={() => void onCopyText(item.text ?? "")}>
                 Copy
@@ -671,6 +1032,9 @@ function MessageRow({ item, onCopyText, onReveal }: MessageRowProps) {
               {item.status === "interrupted" ? " • interrupted" : ""}
               {item.status === "failed" ? " • failed" : ""}
             </span>
+            {item.bridge_send_operation ? (
+              <span className="muted">{bridgeSendOperationLabel(item.bridge_send_operation.aggregateStatus, item.bridge_send_operation.outcomes.length)}</span>
+            ) : null}
             {item.error_message ? <span className="transfer-error">{item.error_message}</span> : null}
             {imagePreview ? <img className="image-preview chat-image" src={imagePreview} alt={item.display_name ?? "Preview"} /> : null}
             {item.saved_path ? (

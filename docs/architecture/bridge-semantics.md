@@ -51,7 +51,9 @@ Accepted peer and session-verified peer do not mean:
 - approval for Agent Bridge capability execution;
 - permission to reuse consent across requests or sessions.
 
-Durable trusted device and durable peer identity are reserved terms for a future explicit durable identity system. Do not use "trusted" loosely for current Bridge membership.
+A paired device is a durable recognition record created by explicit pairing from a current-session peer. It can carry a display label, pairing public-key fingerprint, pairing method, timestamps, revocation state, and key-rotation state. It is not a routeable peer by itself.
+
+Use "paired" or "known device" for this display/recognition state. Do not use "trusted" loosely for current Bridge membership or paired-device display.
 
 ## Bridge Items And Control Events
 
@@ -89,9 +91,17 @@ Leave means the local peer exits the current Bridge session. It does not delete 
 
 Disconnect means current-session delivery is unavailable or interrupted. It is not proof that a durable peer identity changed, and it is not a durable workflow state.
 
+Reconnect is current-session route replacement, not durable identity continuity. If endpoint host, endpoint port, or transport public key changes, Pastey treats the reconnected peer as a fresh current-session route with a new `peer_session_id`; the old peer row becomes stale and unrouteable. Reconnect never creates durable trust, reusable consent, automatic approval, or capability execution authority.
+
+Durable pairing may associate the newly connected row with an existing paired identity when the pairing fingerprint still matches. That association is display metadata only. It does not let old selected-peer routes bind to the new session, does not revive queue children, and does not preserve Agent Bridge consent.
+
+Revocation marks the durable paired identity revoked and clears active peer display association for that identity. It does not delete user-owned Inbox output, rewrite delivery history, change liveness, create routeability, or grant/revoke execution authority.
+
+Key rotation is represented by a bounded `rotation_state`. A rotation-required paired identity remains display metadata only. Fingerprint/key mismatch does not silently preserve paired association or authority; endpoint transport key changes still follow the current-session reconnect rule above.
+
 Burn means the local Bridge session state is cleared according to the implemented cleanup path. Current behavior removes local encrypted payloads, transient received files, partial files, Bridge items, and active receiver transfer state for that session. Files already saved to Inbox are user-owned output and are not deleted by Burn.
 
-Startup recovery may clear stale active transfer state and partial files so interrupted current-session work does not revive as active work. It does not reconstruct durable Bridge history.
+Startup recovery may clear stale active transfer state and partial files so interrupted current-session work does not revive as active work. It marks previous connected route rows expired and clears endpoint/key data. It does not reconstruct durable Bridge history.
 
 ## Agent Bridge Authority Boundary
 
@@ -100,3 +110,5 @@ Agent Bridge capability execution authority is separate from Bridge membership.
 Nearby accept, 8-digit code join, accepted peer status, session verification, encrypted delivery, and Bridge membership never authorize capability execution. Capability execution still requires explicit per-request consent, host validation, PolicyGate review, bounded executor semantics, and replay/expiry checks.
 
 Bridge membership can provide the current-session communication context for asking. It does not provide authority to act.
+
+Durable pairing does not change that boundary. Paired status, reconnect status, delivery outcomes, and route existence are not consent, execution authority, durable trust, reusable approval, or permission to run tools.

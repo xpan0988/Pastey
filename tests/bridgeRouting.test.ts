@@ -5,12 +5,14 @@ import {
   DEFAULT_BRIDGE_ROUTING_POLICIES,
   assertRouteAllowedForContentKind,
   bridgePeerSessionId,
+  bridgeRouteError,
+  bridgeRouteErrorCodeFromMessage,
+  formatBridgeRouteErrorForUser,
   getExplicitTargetPeerIds,
   isBroadcastRoute,
   normalizeBridgeTarget,
   validateBridgeRoute,
   type BridgeRoute,
-  type BridgeRoutingPolicy,
 } from "../src/lib/bridgeRouting";
 
 const BRIDGE_SESSION = "bridge-session:current";
@@ -84,29 +86,15 @@ test("text allows broadcast", () => {
   assert.doesNotThrow(() => assertRouteAllowedForContentKind(broadcast, "text"));
 });
 
-test("file, image, and pasted image broadcast requires explicit policy", () => {
+test("file, image, and pasted image allow explicit ordinary data broadcast", () => {
   const broadcast = route({ kind: "broadcast_bridge", explicit: true });
-  const explicitFileBroadcastPolicy: BridgeRoutingPolicy = {
-    ...DEFAULT_BRIDGE_ROUTING_POLICIES.file,
-    allowBroadcast: true,
-  };
-  const explicitImageBroadcastPolicy: BridgeRoutingPolicy = {
-    ...DEFAULT_BRIDGE_ROUTING_POLICIES.image,
-    allowBroadcast: true,
-  };
-  const explicitPastedImageBroadcastPolicy: BridgeRoutingPolicy = {
-    ...DEFAULT_BRIDGE_ROUTING_POLICIES.pasted_image,
-    allowBroadcast: true,
-  };
 
-  assertPolicyRejects(() => assertRouteAllowedForContentKind(broadcast, "file"), "does not allow broadcast");
-  assertPolicyRejects(() => assertRouteAllowedForContentKind(broadcast, "image"), "does not allow broadcast");
-  assertPolicyRejects(() => assertRouteAllowedForContentKind(broadcast, "pasted_image"), "does not allow broadcast");
-  assert.doesNotThrow(() => assertRouteAllowedForContentKind(broadcast, "file", explicitFileBroadcastPolicy));
-  assert.doesNotThrow(() => assertRouteAllowedForContentKind(broadcast, "image", explicitImageBroadcastPolicy));
-  assert.doesNotThrow(() =>
-    assertRouteAllowedForContentKind(broadcast, "pasted_image", explicitPastedImageBroadcastPolicy)
-  );
+  assert.equal(DEFAULT_BRIDGE_ROUTING_POLICIES.file.allowBroadcast, true);
+  assert.equal(DEFAULT_BRIDGE_ROUTING_POLICIES.image.allowBroadcast, true);
+  assert.equal(DEFAULT_BRIDGE_ROUTING_POLICIES.pasted_image.allowBroadcast, true);
+  assert.doesNotThrow(() => assertRouteAllowedForContentKind(broadcast, "file"));
+  assert.doesNotThrow(() => assertRouteAllowedForContentKind(broadcast, "image"));
+  assert.doesNotThrow(() => assertRouteAllowedForContentKind(broadcast, "pasted_image"));
 });
 
 test("bridge control event rejects broadcast", () => {
@@ -157,4 +145,41 @@ test("route validation does not create consent, trust, or authority", () => {
   if (!withAuthority.valid) {
     assert.ok(withAuthority.errors.some((error) => error.includes("routing is not consent")));
   }
+});
+
+test("route error mapper distinguishes boundary failure classes", () => {
+  assert.equal(
+    formatBridgeRouteErrorForUser(bridgeRouteError("no_routeable_peer", "No routeable remote Bridge peer is available.")),
+    "No routeable Bridge peer is available for this send.",
+  );
+  assert.equal(
+    formatBridgeRouteErrorForUser("[pastey:bridge-route-error code=unknown_peer] Bridge text route target contains an unknown current-session peer."),
+    "That Bridge peer is no longer in the current session.",
+  );
+  assert.equal(
+    formatBridgeRouteErrorForUser("[pastey:bridge-route-error code=peer_unrouteable] Bridge file route target is not currently routeable."),
+    "That Bridge peer is not currently routeable.",
+  );
+  assert.equal(
+    formatBridgeRouteErrorForUser("[pastey:bridge-route-error code=unsupported_selected_peers] fan-out disabled"),
+    "Selected-peers delivery is not supported for this action.",
+  );
+  assert.equal(
+    formatBridgeRouteErrorForUser("[pastey:bridge-route-error code=unsupported_broadcast] fan-out disabled"),
+    "Broadcast delivery is not supported for this action.",
+  );
+  assert.equal(
+    formatBridgeRouteErrorForUser("[pastey:bridge-route-error code=malformed_route] bad shape"),
+    "The Bridge route payload was malformed.",
+  );
+  assert.equal(
+    formatBridgeRouteErrorForUser("[pastey:bridge-route-error code=route_mismatch] wrong room"),
+    "The Bridge route does not match the current room.",
+  );
+  assert.equal(
+    formatBridgeRouteErrorForUser("[pastey:bridge-route-error code=route_expired] inactive room"),
+    "The Bridge route expired or the room is no longer active.",
+  );
+  assert.equal(bridgeRouteErrorCodeFromMessage("Bridge route target must be connected."), "peer_unrouteable");
+  assert.equal(bridgeRouteErrorCodeFromMessage("Bridge peer route expired for this current-session peer."), "route_expired");
 });

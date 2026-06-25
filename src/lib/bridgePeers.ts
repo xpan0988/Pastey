@@ -14,7 +14,7 @@ export { bridgePeerSessionId } from "./bridgeRouting";
 
 export type BridgePeerDisplayName = string & { readonly __bridgePeerDisplayName: unique symbol };
 export type BridgePeerJoinMethod = "nearby_accept" | "manual_code";
-export type BridgePeerLiveness = "connected" | "disconnected" | "left" | "stale";
+export type BridgePeerLiveness = "connected" | "reconnecting" | "disconnected" | "left" | "stale" | "expired";
 
 export interface BridgePeerSession {
   readonly bridgeSessionId: string;
@@ -135,7 +135,7 @@ export function normalizeBridgePeerSession(value: unknown): BridgePeerSessionNor
   if (value.joinMethod !== "nearby_accept" && value.joinMethod !== "manual_code") {
     errors.push("Bridge peer joinMethod must be nearby_accept or manual_code.");
   }
-  if (!["connected", "disconnected", "left", "stale"].includes(String(value.liveness))) {
+  if (!["connected", "reconnecting", "disconnected", "left", "stale", "expired"].includes(String(value.liveness))) {
     errors.push("Bridge peer liveness is unsupported.");
   }
   if (value.accepted !== true) {
@@ -157,7 +157,7 @@ export function normalizeBridgePeerSession(value: unknown): BridgePeerSessionNor
     peerSessionId !== null &&
     displayName !== null &&
     (value.joinMethod === "nearby_accept" || value.joinMethod === "manual_code") &&
-    ["connected", "disconnected", "left", "stale"].includes(String(value.liveness))
+    ["connected", "reconnecting", "disconnected", "left", "stale", "expired"].includes(String(value.liveness))
     ? {
         ok: true,
         peer: {
@@ -363,7 +363,11 @@ function peerRouteabilityErrors(peer: BridgePeerSession, options: RouteablePeerO
     errors.push("Bridge peer route target must be current-session accepted and session-verified.");
   }
   if (peer.liveness !== "connected") {
-    errors.push("Bridge peer route target must be connected.");
+    errors.push(
+      peer.liveness === "left" || peer.liveness === "stale" || peer.liveness === "expired"
+        ? "Bridge peer route expired for this current-session peer."
+        : "Bridge peer route target must be connected.",
+    );
   }
   if (peer.isLocalSelf === true && options.allowLocalSelf !== true) {
     errors.push("Bridge peer route target must be remote unless local self is explicitly allowed.");

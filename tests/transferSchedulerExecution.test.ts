@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   DEFAULT_TRANSFER_PLANNER_POLICY
 } from "../src/lib/transferPlanner";
+import { bridgePeerSessionId } from "../src/lib/bridgeRouting";
 import {
   activeCancellableTransferIds,
   cancelBatchLocally,
@@ -50,6 +51,45 @@ function readyInput(name: string, sizeBytes: number, path = `/tmp/${name}`, modi
 function queuedItems(state: TransferSchedulerState): TransferQueueItem[] {
   return Object.values(state.items).sort((left, right) => left.createdAt - right.createdAt);
 }
+
+test("bridge multi-target file enqueue creates target-distinct child queue items", () => {
+  const state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    {
+      ...readyInput("shared.bin", 128),
+      path: "/tmp/shared.bin",
+      bridgeOperationId: "bridge-op-1",
+      bridgeTargetKind: "selected_peers",
+      bridgeContentKind: "file",
+      targetPeerSessionId: "peer:a",
+      targetPeerDisplayName: "A",
+      targetCount: 2,
+      bridgeRoute: {
+        bridgeSessionId: "legacy-room:room-1",
+        target: { kind: "selected_peer", peerSessionId: bridgePeerSessionId("peer:a") },
+      },
+    },
+    {
+      ...readyInput("shared.bin", 128),
+      path: "/tmp/shared.bin",
+      bridgeOperationId: "bridge-op-1",
+      bridgeTargetKind: "selected_peers",
+      bridgeContentKind: "file",
+      targetPeerSessionId: "peer:b",
+      targetPeerDisplayName: "B",
+      targetCount: 2,
+      bridgeRoute: {
+        bridgeSessionId: "legacy-room:room-1",
+        target: { kind: "selected_peer", peerSessionId: bridgePeerSessionId("peer:b") },
+      },
+    },
+  ]);
+
+  const items = queuedItems(state);
+  assert.equal(items.length, 2);
+  assert.deepEqual(items.map((item) => item.targetPeerSessionId), ["peer:a", "peer:b"]);
+  assert.deepEqual(new Set(items.map((item) => item.bridgeOperationId)), new Set(["bridge-op-1"]));
+  assert.notEqual(items[0].dedupeKey, items[1].dedupeKey);
+});
 
 test("huge-only queue starts one transfer", () => {
   const state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [

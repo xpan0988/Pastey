@@ -10,6 +10,56 @@ This is the active validation and logging guide for Pastey transfer and orchestr
 - Single-machine dual-instance smoke: local lifecycle and logging smoke when two physical machines are unavailable. It can validate Bridge join, send/receive lifecycle, planner logs, MicroFlowGroup logs, runtime-window logs, and interruption evidence.
 - Two-machine LAN/release build: required for real throughput, cross-device behavior, Wi-Fi/Ethernet behavior, OS differences, release artifact behavior, and final product confidence.
 
+## Layer 4 Bridge Route Validation
+
+Layer 4 route validation is the current Bridge boundary for ordinary data delivery. It covers selected peer, selected peers, and explicit broadcast for text, file, image, and pasted-image sends. Bridge control and Agent Bridge capability events remain selected-peer only.
+
+Current implemented validation:
+
+- Frontend text send, file/image enqueue, pasted-image enqueue, and queued file dispatch require an explicit route derived from the current Room/Bridge state.
+- `send_text_to_room` and `send_file_to_room` accept optional route payloads with text/file schema versions, `bridgeSessionId`, and an explicit target.
+- Rust validates route payload shape, schema version, room/session match, known current-session peer id, duplicate selected-peers entries, liveness, endpoint host/port, and transport public key against `bridge_peers`.
+- Selected-peer, selected-peers, and broadcast data delivery resolves endpoint/key data from `bridge_peers`; it does not use an arbitrary fallback peer when route validation fails.
+- Selected-peer delivery fails closed when its requested peer is unknown, stale, expired, disconnected, reconnecting, or otherwise unrouteable.
+- Selected-peers delivery rejects malformed, duplicate, and unknown targets before delivery. Known stale, expired, disconnected, reconnecting, or otherwise unrouteable targets become rejected per-target outcomes while routeable selected targets can still complete.
+- Broadcast resolves the current routeable peer set at send/enqueue time and fails closed when no routeable peers exist.
+- Text fan-out returns per-target `BridgeDeliveryOutcome` entries inside `BridgeSendOperation`.
+- File/image/pasted-image fan-out creates per-target queue children with one shared `bridgeOperationId`; each child uses the existing selected-peer file transfer path.
+- Reconnect with changed endpoint host, endpoint port, or transport public key creates a new current-session `peer_session_id`; the old row is marked stale and endpoint/key data is cleared.
+- Leave, burn, peer-burn, reconnect replacement, and startup recovery clear endpoint/key data and mark old `bridge_peers` rows unrouteable, so old selected-peer routes fail closed.
+- Startup recovery marks previously connected rows expired and does not reconstruct durable Bridge history.
+- Durable paired-device records are stored in `bridge_durable_identities` and may be linked to current-session `bridge_peers` rows for display only.
+- Explicit pairing creates or updates a durable identity from a connected current-session peer. Revocation marks that identity revoked and clears active display association. Rotation is represented by bounded state such as `rotation_required`.
+- Durable pairing does not change liveness, route validation, selected-peers resolution, broadcast target resolution, reconnect route replacement, queue child lifecycle, consent, or execution authority.
+- Route failures carry stable route error codes for UI mapping: `no_routeable_peer`, `unknown_peer`, `peer_unrouteable`, `unsupported_selected_peers`, `unsupported_broadcast`, `malformed_route`, `route_mismatch`, and `route_expired`.
+
+Current deferred behavior:
+
+- durable route metadata or durable route recovery;
+- full cryptographic paired-key rotation beyond the bounded runtime state;
+- room-control/capability selected-peers or broadcast;
+- durable trust, reusable consent, automatic approval, provider execution, shell/file/network execution, MCP/tool runtime, or Agent Bridge capability broadcast.
+
+Validation focus:
+
+- Rust command tests cover valid selected-peer routes, selected-peers endpoint resolution, selected-peers rejected stale target outcomes, broadcast route resolution, unknown peers, malformed payloads, stale/unrouteable/disconnected peers, durable identity markers not changing route validation or broadcast resolution, route mismatch/expiry, and no fallback after failed validation.
+- Rust storage tests cover durable identity creation/storage, explicit pairing, revocation, rotation-required state, reconnect same-fingerprint display association with new peer session id, fingerprint/key mismatch not silently preserving association, reconnect replacing endpoint/key bindings with a new peer session id, leave, burn, peer-burn, and startup recovery invalidating current-session endpoint rows.
+- TypeScript routing tests cover frontend route derivation, selected-peers and broadcast data payloads, local route-error mapping, route-expired stale child rejection without fallback to a reconnected peer, queue dispatch child metadata, Agent Bridge/control selected-peer-only rejection, durable identity normalization/revocation/rotation without authority, safe pairing UI wording, and per-target outcome type definitions.
+- Transfer scheduler tests cover target-distinct child queue items for the same file path and shared operation id.
+
+Run focused Layer 4 validation with:
+
+```sh
+rtk prograph context "Layer 4 durable pairing runtime paired identity current-session Bridge routeability reconnect revocation key rotation Agent Bridge authority boundary" --repo /Users/xiyuanpan/Pastey
+npm run build
+cd src-tauri && cargo test
+node scripts/run-transfer-planner-tests.mjs
+node scripts/replay-transfer-planner-scenarios.mjs
+node scripts/run-cl4-contention-smoke.mjs
+```
+
+Also run the existing bundled/focused Bridge route TypeScript tests for `bridgeRouting`, `bridgeRoutingRuntime`, `bridgePeers`, `bridgeRoomAdapter`, and `bridgeIdentity`.
+
 ## Planner Replay
 
 ```sh

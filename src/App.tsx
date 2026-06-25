@@ -66,6 +66,7 @@ import {
   type TransferPlannerPolicy
 } from "./lib/transferPlanner";
 import { sendFileToRoomWithBridgeRoute } from "./lib/bridgeRoutingRuntime";
+import { formatBridgeRouteErrorForUser } from "./lib/bridgeRouting";
 import { mergeTransferEvent } from "./lib/transferState";
 import {
   createRuntimeDataWindowTargetState,
@@ -824,7 +825,14 @@ function App() {
       if (!roomForRoute) {
         throw new Error("No current Room state is available for Bridge file route derivation.");
       }
-      await sendFileToRoomWithBridgeRoute(roomForRoute, item.path, sendOptions, sendFileToRoom);
+      await sendFileToRoomWithBridgeRoute(
+        roomForRoute,
+        item.path,
+        sendOptions,
+        sendFileToRoom,
+        item.bridgeRoute,
+        item.bridgeContentKind ?? "file",
+      );
       updateSchedulerState((current) => markQueueItemCompleted(current, itemId));
       runtimeTerminalStatus = "completed";
       void scheduleActiveTransferWindowRebalance({ itemId, status: "completed" });
@@ -832,7 +840,7 @@ function App() {
       return "completed";
     } catch (err) {
       const latestItem = schedulerRef.current.items[itemId];
-      const message = err instanceof Error ? err.message : String(err);
+      const message = formatBridgeRouteErrorForUser(err);
       let terminalStatus: "cancelled" | "failed" | null = null;
       updateSchedulerState((current) => {
         if (latestItem?.cancelRequested) {
@@ -1130,12 +1138,15 @@ function App() {
     }
 
     const displayName = item.displayName?.trim() ? item.displayName : metadata.display_name;
+    const baseDedupeKey = item.dedupeKey ?? fileIdentityKey(displayName, metadata.size_bytes, metadata.modified_ms);
     const prepared: PreparedQueueMetadata = {
       displayName,
       mimeType: item.mimeType ?? metadata.mime_type,
       sizeBytes: metadata.size_bytes,
       modifiedMs: metadata.modified_ms,
-      dedupeKey: item.dedupeKey ?? fileIdentityKey(displayName, metadata.size_bytes, metadata.modified_ms)
+      dedupeKey: item.targetPeerSessionId
+        ? targetQueueDedupeKey(baseDedupeKey, item.targetPeerSessionId)
+        : baseDedupeKey
     };
 
     console.info(
@@ -1147,6 +1158,11 @@ function App() {
     );
     updateSchedulerState((current) => markQueueItemMetadataReady(current, itemId, prepared));
     return prepared;
+  }
+
+  function targetQueueDedupeKey(baseDedupeKey: string, targetPeerSessionId: string): string {
+    const suffix = `:bridge-target:${targetPeerSessionId}`;
+    return baseDedupeKey.endsWith(suffix) ? baseDedupeKey : `${baseDedupeKey}${suffix}`;
   }
 
   function cachedQueueItemMetadata(item: TransferSchedulerState["items"][string] | undefined): PreparedQueueMetadata | null {
