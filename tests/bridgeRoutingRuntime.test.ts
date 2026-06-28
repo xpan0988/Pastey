@@ -41,6 +41,7 @@ const CONTROL_SESSION: RoomControlSessionContext = {
   roomId: "room-1",
   localSessionRef: "local-session-1",
   peerSessionRef: "peer-session-1",
+  peerRouteRef: "legacy-room-peer:room-1",
   peerConnected: true,
 };
 
@@ -490,11 +491,11 @@ test("room-control capability helper derives exact selected-peer route for activ
   const route = assertCapabilityEventHasSelectedPeerRoute(CONTROL_SESSION, controlEvent());
   const controlRoute = assertControlEventHasSelectedPeerRoute(CONTROL_SESSION, controlEvent({ kind: "capability_execute_request" }));
 
-  assert.equal(route.bridgeSessionId, CONTROL_SESSION.roomId);
+  assert.equal(route.bridgeSessionId, `legacy-room:${CONTROL_SESSION.roomId}`);
   assert.equal(route.target.kind, "selected_peer");
   assert.equal(controlRoute.target.kind, "selected_peer");
   if (route.target.kind !== "selected_peer") return;
-  assert.equal(route.target.peerSessionId, CONTROL_SESSION.peerSessionRef);
+  assert.equal(route.target.peerSessionId, CONTROL_SESSION.peerRouteRef);
 });
 
 test("room-control capability helper blocks no route and mismatched event targets", () => {
@@ -566,7 +567,7 @@ test("route derivation does not mutate Room state or create durable authority fi
   assert.equal(serialized.includes("consent"), false);
 });
 
-test("production integration sends text and file route payloads without route-bearing control payloads", () => {
+test("production integration sends data and selected-peer-only control route payloads", () => {
   const roomPage = readFileSync("src/pages/RoomPage.tsx", "utf8");
   const app = readFileSync("src/App.tsx", "utf8");
   const controlPanel = readFileSync("src/components/agentBridge/RoomControlPanel.tsx", "utf8");
@@ -586,11 +587,12 @@ test("production integration sends text and file route payloads without route-be
   assert.match(app, /No current Room state is available for Bridge file route derivation/);
   assert.doesNotMatch(app, /else \{\s*await sendFileToRoom\(item\.roomId/s);
   assert.match(controlPanel, /assertCapabilityEventHasSelectedPeerRoute\(session, event\)/);
+  assert.match(controlPanel, /bridgeRoutePayload\(route, "pastey-bridge-control-route\/v1"\)/);
   assert.match(tauri, /invoke\("send_text_to_room", \{/);
   assert.match(tauri, /bridgeRoute: bridgeRoute \?\? null/);
   assert.match(tauri, /invoke\("send_file_to_room", \{/);
-  assert.doesNotMatch(controlWrapper, /bridgeRoute/);
-  assert.doesNotMatch(tauri, /selectedPeers|broadcast/);
+  assert.match(controlWrapper, /bridgeRoute: bridgeRoute \?\? null/);
+  assert.doesNotMatch(controlWrapper, /selectedPeers|broadcast/);
   assert.match(scheduler, /bridgeOperationId/);
   assert.match(scheduler, /targetPeerSessionId/);
   assert.doesNotMatch(scheduler, /durable|trust|consent|history/);

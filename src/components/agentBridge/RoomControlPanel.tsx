@@ -52,7 +52,10 @@ import {
   listReceivedRoomControlEvents,
   sendRoomControlEvent,
 } from "../../lib/tauri";
-import { assertCapabilityEventHasSelectedPeerRoute } from "../../lib/bridgeRoutingRuntime";
+import {
+  assertCapabilityEventHasSelectedPeerRoute,
+  bridgeRoutePayload,
+} from "../../lib/bridgeRoutingRuntime";
 import type {
   ReceivedRoomControlEvent,
   RoomControlSessionContext,
@@ -716,14 +719,18 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
     if (roomId !== session.roomId) {
       throw new Error("Agent Bridge capability send requires the active Bridge session.");
     }
-    assertCapabilityEventHasSelectedPeerRoute(session, event);
+    const route = assertCapabilityEventHasSelectedPeerRoute(session, event);
     setOutgoingControlWindowDemand(ROOM_CONTROL_ACTIVE_SEND_SOURCE, true);
     try {
       const applied = await waitForRuntimeDataWindowTarget(7);
       if (!applied) {
         throw new Error("Runtime data window target 7 was not applied before control delivery.");
       }
-      return await sendRoomControlEvent(roomId, event);
+      return await sendRoomControlEvent(
+        roomId,
+        event,
+        bridgeRoutePayload(route, "pastey-bridge-control-route/v1"),
+      );
     } finally {
       setOutgoingControlWindowDemand(ROOM_CONTROL_ACTIVE_SEND_SOURCE, false);
     }

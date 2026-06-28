@@ -69,19 +69,20 @@ Bridge control-event delivery proves only that the transport accepted or exposed
 
 ## Routing Terms
 
-Future multi-device Bridge support should distinguish these routing modes:
+Bridge routing distinguishes these modes:
 
 - Send to selected peer: route one item or control event to one explicitly selected accepted peer.
 - Send to selected peers: route one item or control event to an explicit selected subset of accepted peers.
 - Broadcast to Bridge: route one item or event to all currently accepted peers in the Bridge session.
 
-Suggested defaults for future multi-device behavior:
+Current production behavior:
 
-- Text can default to broadcast.
-- File and image transfer should default to selected peer, with optional broadcast.
-- Control and capability events should default to selected peer and should not be broadcast without explicit design and validation.
+- Ordinary text, file, image, and pasted-image sends support selected peer, selected peers, and explicit broadcast.
+- Multi-target file-like sends create current-session queue children.
+- Bridge control events and Agent Bridge capability events remain selected-peer only.
+- Control/capability selected-peers and broadcast are rejected unless a future design explicitly validates that event kind, threat model, replay behavior, rate limits, and UI disclosure.
 
-The current implementation may still be primarily two-peer in production paths. Do not describe multi-peer routing as complete unless the runtime and validation evidence exist.
+Do not describe durable route recovery, durable trust, or control/capability fan-out as complete unless the runtime and validation evidence exist.
 
 The owning route model terms are `BridgeTarget`, `BridgeRoute`, `BridgePeerSelection`, and `BridgeBroadcastPolicy`; see [bridge-routing.md](bridge-routing.md).
 

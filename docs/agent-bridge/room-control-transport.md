@@ -50,7 +50,11 @@ The inbox is a current-session receive buffer, not a durable event log. It is us
 
 The TypeScript `ControlQueueState` models outbound and inbound status transitions for preview, acknowledgement, denial, invalid, expired, execution request, and execution result paths.
 
-Outbound production sends now require an exact selected-peer Bridge route before `sendRoomControlEvent` runs. The frontend assertion binds the event's `roomRef`, `sourceDeviceRef`, and `targetPeerRef` to the active current-session room-control session. This does not change the Tauri payload shape or Rust endpoint resolution; the current backend transport still sends to the one stored peer endpoint/key for the room.
+Outbound production sends require an exact selected-peer Bridge route before `sendRoomControlEvent` runs. The frontend assertion binds the event's `roomRef`, `sourceDeviceRef`, and `targetPeerRef` to the active current-session room-control session, then forwards a `pastey-bridge-control-route/v1` payload to Tauri.
+
+The Rust backend treats that selected-peer route as authoritative. `src-tauri/src/room_control.rs` resolves the target endpoint and transport key from the current-session `bridge_peers` row, validates the route room/session and event source/target refs, and fails closed for unknown, stale, expired, disconnected, reconnecting, missing-endpoint, or route-mismatched peers. It does not fall back to arbitrary legacy room endpoint fields after route validation fails.
+
+Control and capability transport remains single-target. `selected_peers` and `broadcast_bridge` route payloads are rejected for room-control and Agent Bridge capability events. Ordinary text/file/image/pasted-image multi-target delivery is separate and remains the only implemented fan-out path.
 
 Delivery receipt means the transport accepted or exposed the event. It does not mean:
 
@@ -67,7 +71,7 @@ Outgoing local control demand reserves scheduler capacity by lowering the data t
 
 This is a Layer 3 capacity policy for a Layer 4/5 control transport. It does not create a separate execution lane, and it does not grant capability authority.
 
-Control events should default to selected-peer routing in future multi-device Bridge support. They should not be broadcast to a Bridge unless a future design explicitly validates that event kind, threat model, replay behavior, rate limits, and UI disclosure.
+Control events continue to default to selected-peer routing. They should not be broadcast to a Bridge unless a future design explicitly validates that event kind, threat model, replay behavior, rate limits, and UI disclosure.
 
 See [../transfer/scheduler.md](../transfer/scheduler.md) for scheduler details and [../transfer/validation.md](../transfer/validation.md) for the automated contention harness.
 
@@ -76,7 +80,7 @@ See [../transfer/scheduler.md](../transfer/scheduler.md) for scheduler details a
 Relevant validation includes:
 
 - TypeScript room-control event and queue tests.
-- Rust `src-tauri/src/room_control.rs` tests.
+- Rust `src-tauri/src/room_control.rs` route, event, inbox, and receipt tests.
 - Rust control-key wrapping and transfer-window tests.
 - `rtk node scripts/run-cl4-contention-smoke.mjs`, which exercises the production demand reducer, planner allocations, real Rust runtime-window update primitive, and room-control transport test suites.
 

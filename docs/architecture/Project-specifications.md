@@ -187,7 +187,7 @@ Completion criteria:
 | Layer 1 | `src-tauri/src/discovery.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/storage.rs`, `src-tauri/src/crypto.rs`, `src-tauri/src/transfer.rs`, `src-tauri/src/chunk_frame.rs` | Rust transport, storage, discovery, binary frame, encryption, finalize, runtime-window tests | `docs/transfer/validation.md` records same-machine smoke boundaries and two-machine requirements | Production runtime |
 | Layer 2 | `src-tauri/src/diagnostics.rs`, `src-tauri/src/device_profile.rs`, `src-tauri/src/capability_probe.rs`, `src-tauri/src/link_benchmark.rs`, `src/pages/SettingsPage.tsx` | Device profile, capability probe, diagnostics DTO, and benchmark tests | Developer Tools current-session diagnostics | Production runtime, Developer Tools visible |
 | Layer 3 | `src/lib/transferPlanner.ts`, `src/lib/transferScheduler.ts`, `src/App.tsx`, `src/lib/agentBridge/controlWindowRuntime.ts`, `src-tauri/src/transfer.rs` | Planner/scheduler/MicroFlowGroup tests plus `scripts/run-cl4-contention-smoke.mjs` | Transfer validation guide and logged smoke interpretation | Production runtime with automated harness |
-| Layer 4 | `src-tauri/src/storage.rs`, `src-tauri/src/room_control.rs`, `src/lib/agentBridge/roomControlEvent.ts`, `src/lib/agentBridge/controlQueue.ts` | Room lifecycle/storage tests, room-control Rust tests, control-event validation tests | Session-scoped Bridge/control flow documented in Agent Bridge and transfer docs. Legacy implementation term: room. | Production runtime, session-scoped |
+| Layer 4 | `src-tauri/src/storage.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/room_control.rs`, `src/lib/bridgeRoutingRuntime.ts`, `src/lib/agentBridge/roomControlEvent.ts`, `src/lib/agentBridge/controlQueue.ts` | Bridge route, storage, room-control Rust tests, routing/runtime TypeScript tests, control-event validation tests, `scripts/run-layer4-validation-matrix.mjs` | Session-scoped Bridge routing/control flow documented in Bridge, Agent Bridge, and transfer docs. Legacy implementation term: room. | Production runtime with automated matrix; manual/release smoke pending |
 | Layer 5 | `src/lib/ai/*`, `src/lib/agentBridge/peerConsent.ts`, `src/lib/agentBridge/helloPeerExecution.ts`, `src/lib/agentBridge/logging.ts`, `src/components/agentBridge/RoomControlPanel.tsx` | Provider, context, validator, PolicyGate, preview, consent, execution, logging, and room-control tests | Bridge-scoped UI and redacted lifecycle logs. Legacy implementation term: room-scoped. | Production runtime, narrow capability slice |
 
 ## Current Completion Assessment
@@ -199,7 +199,7 @@ These scores are against the canonical definitions in this document, not against
 | Layer 1 - Secure LAN transport | 86% | 90% | Mature operational core | High | Durable identity, broader release/two-device validation, independent security review, whole-file hash contract |
 | Layer 2 - Device intelligence | 76% | 82% | Advisory diagnostics implemented; recommendation UX partial | High | User-visible recommended roles, peer benchmark UI, explicit planner-hint contract if consumed later, broader device matrix |
 | Layer 3 - Smart orchestration | 84% | 88% | Operational orchestration core | High | Deficit/history-aware adaptation, broader end-to-end contention validation, future capability-routing policy |
-| Layer 4 - Multi-device Bridge sessions and peer identity | 55% | 72% | Session-scoped Bridge/control foundation | High | Route target model implementation, accepted-peer collection, reconnect semantics, multi-peer routing validation, optional durable peer identity if explicitly designed |
+| Layer 4 - Multi-device Bridge sessions and peer identity | 72% | 86% | Session-scoped Bridge routing/control core | High | Full cryptographic paired-key rotation, durable route recovery if explicitly designed, broader release/two-device validation, independent security review |
 | Layer 5 - Agent-assisted device workspace | 52% | 78% | Narrow capability slice implemented | High | Capability registry, second capability, multi-step task orchestration, local LLM scheduling, MCP/tool integration, durable peer-identity dependency if needed |
 
 No layer is `100%`. The largest gap between full vision and implementation remains Layer 5: the Hello Peer path proves the safety shape, not the whole workspace vision.
@@ -238,9 +238,9 @@ Future completion reports must cite production code, tests, scripts/harnesses, c
 | PolicyGate | Deny-first host/receiver decision point that validates whether a capability request may proceed to user consent. |
 | Execution consent | One explicit user authorization for one exact bounded capability execution request. Consent is consumed and is not reusable trust. |
 | Audit log | Redacted lifecycle mirror for debugging and review. It is not runtime state, authorization, or reconstructable payload data. |
-| Selected-peer routing | Future multi-device routing mode that sends to one explicitly selected accepted peer. |
-| Selected-peers routing | Future multi-device routing mode that sends to an explicit selected subset of accepted peers. |
-| Broadcast routing | Future multi-device routing mode that sends to all currently accepted peers in the Bridge session. Text can default to broadcast; file/image should default to selected peer with optional broadcast; control/capability events should default to selected peer and should not be broadcast without explicit design and validation. |
+| Selected-peer routing | Current-session routing mode that sends one ordinary data item or one control event to one explicitly selected accepted peer. |
+| Selected-peers routing | Current-session routing mode that sends ordinary data to an explicit selected subset of accepted peers. Control/capability selected-peers remains intentionally unsupported. |
+| Broadcast routing | Current-session routing mode that sends ordinary data to all currently routeable accepted peers at send/enqueue time. Control/capability broadcast remains intentionally unsupported. |
 
 ## Documentation Ownership Map
 
@@ -248,7 +248,7 @@ Future completion reports must cite production code, tests, scripts/harnesses, c
 | --- | --- |
 | Five-layer definitions, layer boundaries, scoring | `docs/architecture/Project-specifications.md` |
 | Bridge semantics, peer terminology, lifecycle, authority boundary | `docs/architecture/bridge-semantics.md` |
-| Bridge routing model and single-peer assumptions audit | `docs/architecture/bridge-routing.md` |
+| Bridge routing model and Layer 4 runtime status | `docs/architecture/bridge-routing.md` |
 | Secure transport architecture | `docs/transfer/architecture.md` |
 | Scheduler, runtime windows, MicroFlowGroup | `docs/transfer/scheduler.md` |
 | Transfer validation and harnesses | `docs/transfer/validation.md` |
