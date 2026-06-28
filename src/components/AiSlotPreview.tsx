@@ -6,6 +6,7 @@ import {
   acknowledgeCapabilityPreview,
   buildCapabilityRequestPreviewEnvelope,
   buildHelloPeerRequestFromPendingAction,
+  buildHelloStdoutRequestFromPendingAction,
   buildMockAiContextSnapshot,
   cancelPendingAiAction,
   checkAndRecordCapabilityPreview,
@@ -20,12 +21,13 @@ import {
   validateAiActionPlan,
   validateCapabilityRequestPreviewEnvelope,
   validateHelloPeerRequest,
+  validateHelloStdoutRequest,
   type AiActionPlan,
   type AiGenerateResult,
   type AiPolicyResult,
   type CapabilityPreviewSessionState,
   type CapabilityRequestPreviewEnvelope,
-  type HelloPeerRequest,
+  type CapabilityRequest,
   type PendingAiAction
 } from "../lib/ai";
 import { AgentBridgeOverview } from "./agentBridge/AgentBridgeOverview";
@@ -48,7 +50,7 @@ interface AiSlotPreviewResult {
 }
 
 interface HelloPeerOutboundPreviewState {
-  request?: HelloPeerRequest;
+  request?: CapabilityRequest;
   validationStatus: "accepted" | "rejected";
   errors: string[];
 }
@@ -90,7 +92,7 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
         contextPolicy: MOCK_AI_CONTEXT_POLICY,
         allowedActionKinds: context.allowedActions,
         outputSchema: "ai-action-plan/v1",
-        userRequest: "Ask the visible trusted peer to run the restricted Hello Peer demo."
+        userRequest: "Ask the visible trusted peer to run the restricted Hello Stdout demo."
       });
       showGeneratedResult(generated, mockProvider.config.displayName, context);
       logAgentBridgeLifecycle({ eventKind: "advisory_generated", roomRefShort: room.id });
@@ -124,7 +126,7 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
         contextPolicy: CLOUD_STRICT_AI_CONTEXT_POLICY,
         allowedActionKinds: context.allowedActions,
         outputSchema: "ai-action-plan/v1",
-        userRequest: "Propose the restricted Hello Peer advisory for the visible trusted mock peer."
+        userRequest: "Propose the restricted Hello Stdout advisory for the visible trusted mock peer."
       });
       showGeneratedResult(generated, provider.config.displayName, context);
       logAgentBridgeLifecycle({ eventKind: "advisory_generated", roomRefShort: room.id });
@@ -197,7 +199,9 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
 
   function buildOutboundRequestPreview() {
     if (!pendingAction) return;
-    const buildResult = buildHelloPeerRequestFromPendingAction(pendingAction);
+    const buildResult = pendingAction.actionPlan.kind === "request_peer_hello_stdout_demo"
+      ? buildHelloStdoutRequestFromPendingAction(pendingAction)
+      : buildHelloPeerRequestFromPendingAction(pendingAction);
     if (!buildResult.ok) {
       setOutboundPreview({
         validationStatus: "rejected",
@@ -205,7 +209,9 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
       });
       return;
     }
-    const validation = validateHelloPeerRequest(buildResult.request);
+    const validation = buildResult.request.capability === "runtime.hello_stdout/v1"
+      ? validateHelloStdoutRequest(buildResult.request)
+      : validateHelloPeerRequest(buildResult.request);
     setEnvelopePreview(null);
     setInboundPreview(null);
     setOutboundPreview({
@@ -324,7 +330,7 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
         <div className="diagnostics-panel-header">
           <div>
             <strong>Agent Bridge</strong>
-            <p className="muted">Peer: {room.peer_device_name ?? "Waiting for peer"} · current-session bounded Hello Peer workflow.</p>
+            <p className="muted">Peer: {room.peer_device_name ?? "Waiting for peer"} · current-session bounded Agent Bridge workflow.</p>
           </div>
         </div>
         <div className="agent-bridge-safety-summary">
@@ -477,7 +483,7 @@ function getNextWorkflowAction({
       label: "Build request preview",
       disabled: false,
       onAction: buildOutboundRequestPreview,
-      summary: "Build the validated Hello Peer request preview."
+      summary: "Build the validated capability request preview."
     };
   }
   if (outboundPreview?.request && !envelopePreview?.envelope) {
@@ -527,7 +533,7 @@ function CapabilityEnvelopePreview({
         <strong>Preview-only capability request.</strong>
         <span>Sending this preview does not allow execution.</span>
         <span>The peer can only view, acknowledge, or deny this preview.</span>
-        <span>Only the fixed bounded Hello Peer executor exists; this preview does not execute.</span>
+        <span>Only fixed bounded host-owned executors exist; this preview does not execute.</span>
         <span>No stdout, exit code, or runtime output can be produced in this phase.</span>
         <span>Preview-only room-control transport is available. The ordinary room text path is not a capability-preview channel.</span>
       </div>
@@ -589,7 +595,8 @@ function CapabilityEnvelopeDetails({ envelope }: { envelope: CapabilityRequestPr
         <PreviewBlock title="Source device" value={envelope.sourceDeviceRef} />
         <PreviewBlock title="Target peer" value={envelope.targetPeerRef} />
         <PreviewBlock title="Capability" value={envelope.request.capability} />
-        <PreviewBlock title="Message" value={envelope.request.input.message} />
+        {"message" in envelope.request.input ? <PreviewBlock title="Message" value={envelope.request.input.message} /> : null}
+        {"expectedStdout" in envelope.request.input ? <PreviewBlock title="Expected stdout" value={envelope.request.input.expectedStdout} /> : null}
         <PreviewBlock title="Request ID" value={envelope.request.requestId} />
         <PreviewBlock title="Request payload hash" value={envelope.request.requestPayloadHash} />
         <PreviewBlock title="Expires" value={new Date(envelope.expiresAt).toLocaleString()} />
@@ -616,7 +623,7 @@ function HelloPeerOutboundPreview({
     <div className="ai-slot-pending-card">
       <div className="ai-slot-pending-header">
         <div>
-          <strong>Hello Peer outbound request preview</strong>
+          <strong>{request?.capability === "runtime.hello_stdout/v1" ? "Hello Stdout outbound request preview" : "Hello Peer outbound request preview"}</strong>
           <p className="muted">Builds and validates a local request object only.</p>
         </div>
         <span className="ai-slot-pending-status">preview_only</span>
@@ -628,7 +635,7 @@ function HelloPeerOutboundPreview({
         <span>Request ID, nonce, expiry, and hash prepare future replay defenses but do not provide transport security yet.</span>
       </div>
       <div className="benchmark-controls">
-        <button className="secondary-button" onClick={onBuild}>Build Hello Peer Request Preview</button>
+        <button className="secondary-button" onClick={onBuild}>Build Capability Request Preview</button>
       </div>
       {preview ? (
         <>
@@ -646,8 +653,10 @@ function HelloPeerOutboundPreview({
             <PreviewBlock title="Source device" value={request.sourceDeviceRef} />
             <PreviewBlock title="Target peer" value={request.targetPeerRef} />
             <PreviewBlock title="Capability" value={request.capability} />
-            <PreviewBlock title="Runtime preference" value={request.runtimePreference.join(", ")} />
-            <PreviewBlock title="Message" value={request.input.message} />
+            {"runtimePreference" in request ? <PreviewBlock title="Runtime preference" value={request.runtimePreference.join(", ")} /> : null}
+            {"runtimeKind" in request ? <PreviewBlock title="Runtime kind" value={request.runtimeKind} /> : null}
+            {"message" in request.input ? <PreviewBlock title="Message" value={request.input.message} /> : null}
+            {"expectedStdout" in request.input ? <PreviewBlock title="Expected stdout" value={request.input.expectedStdout} /> : null}
             <PreviewBlock title="Pending payload hash" value={request.pendingPayloadHash} />
             <PreviewBlock title="Request payload hash" value={request.requestPayloadHash} />
             <PreviewBlock title="Transport status" value={request.transportStatus} />

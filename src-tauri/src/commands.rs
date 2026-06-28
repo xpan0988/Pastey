@@ -12,6 +12,7 @@ use crate::{
     device_profile::{self, ProfileProbeMode},
     diagnostics, discovery,
     error::{AppError, AppResult},
+    hello_stdout::{self, HelloStdoutExecutionRequest, HelloStdoutExecutionResult},
     link_benchmark, logging,
     models::{
         AppConfig, BridgeDeliveryContentKind, BridgeDeliveryOutcome, BridgeDeliveryOutcomeStatus,
@@ -1232,6 +1233,13 @@ pub async fn send_room_control_event(
     )
     .await
     .map_err(RoomControlSendError::from_app_error)
+}
+
+#[tauri::command]
+pub async fn execute_hello_stdout_capability(
+    request: HelloStdoutExecutionRequest,
+) -> Result<HelloStdoutExecutionResult, String> {
+    hello_stdout::execute_hello_stdout(request).map_err(|error| error.message())
 }
 
 #[tauri::command]

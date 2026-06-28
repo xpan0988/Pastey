@@ -18,7 +18,7 @@ export interface AgentBridgeLogEvent {
   transportResult?: string;
   runtimeDataWindowTarget?: 7 | 8;
   errorCode?: string;
-  executionResult?: "hello_peer_template_succeeded";
+  executionResult?: "hello_peer_template_succeeded" | "hello_stdout_succeeded";
 }
 
 export type AgentBridgeLogEventKind =
@@ -112,6 +112,10 @@ const ERROR_CODES = new Set([
   "malformed_request",
   "execution_timeout",
   "invalid_bounded_output",
+  "runtime_unavailable",
+  "nonzero_exit",
+  "stdout_mismatch",
+  "output_truncated",
   "policy_rejected",
   "oversized",
   "malformed_receipt",

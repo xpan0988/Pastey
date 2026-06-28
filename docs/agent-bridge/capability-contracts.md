@@ -2,11 +2,14 @@
 
 This document owns the current Layer 5 capability contract for Pastey Agent Bridge. For the broader safety architecture, see [architecture-and-safety.md](architecture-and-safety.md). For transport details, see [room-control-transport.md](room-control-transport.md). For Bridge membership and peer terminology, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For target routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md).
 
-## Implemented Capability
+## Implemented Capabilities
 
-The only implemented capability is the fixed Hello Peer capability.
+The implemented capabilities are fixed, host-owned demonstration capabilities:
 
-It uses:
+- `runtime.execute_hello_template`, the legacy fixed Hello Peer template;
+- `runtime.hello_stdout/v1`, a fixed Hello Stdout capability backed by a Rust host helper.
+
+They use:
 
 - advisory provider output;
 - host-side request construction;
@@ -15,10 +18,43 @@ It uses:
 - explicit Allow once or Deny;
 - exact one-time consent binding;
 - host-built execution request;
-- fixed in-process executor;
+- fixed host-owned executors;
 - typed execution result.
 
-It does not execute model-authored code, shell commands, file operations, network calls, or arbitrary tool calls.
+They do not execute model-authored code, shell commands, file operations, network calls, arbitrary arguments, arbitrary environment variables, arbitrary file paths, or arbitrary tool calls.
+
+`runtime.execute_hello_template` returns the exact fixed Hello Peer result `hello peer!`.
+
+`runtime.hello_stdout/v1` asks the receiver to run a host-owned Rust helper that returns typed stdout metadata. Its successful result must contain:
+
+- `capability: runtime.hello_stdout/v1`;
+- `runtimeKind: rust_host_helper`;
+- `stdout: hello peer`;
+- empty `stderr`;
+- `exitCode: 0`;
+- bounded `durationMs`;
+- `timedOut: false`;
+- bounded truncation flags.
+
+## Static Capability Registry
+
+The implemented registry is static and host-owned. It lives in `src/lib/ai/capabilityRegistry.ts` and currently contains only the two capabilities listed above. It is not plugin loading, not provider-configurable, and not a generic executor table.
+
+Each registry entry defines:
+
+- capability id and version;
+- provider action kind;
+- preview, consent grant, execution request, and result schema names;
+- selected-peer route policy;
+- exact allow-once consent policy;
+- executor kind;
+- provider-forbidden fields, including command/script/path/env/network fields and result-only stdout/stderr/exit fields;
+- audit redaction policy;
+- UI labels.
+
+The registry is used to keep provider validation, PolicyGate, pending action hashing, preview dispatch, room-control event dispatch, consent binding, and UI labels aligned. It does not replace capability-specific schemas or validators. Unknown capability ids, unknown versions, and unknown schema names reject fail-closed.
+
+The shared lifecycle envelope schema is `pastey-agent-bridge-capability-envelope/v1`. It is a compatibility view over the existing typed preview/control payloads and includes capability id/version, request id, room/source/target refs, selected-peer route policy, exact allow-once consent policy, created/expiry times, payload hash, typed payload, and bounded room-control transport metadata. Existing payload schemas remain capability-specific.
 
 ## Preview Contract
 
@@ -33,6 +69,7 @@ Selected-peers and broadcast capability routes are not implemented and are rejec
 Production evidence:
 
 - `src/lib/ai/helloPeerRequest.ts`
+- `src/lib/ai/helloStdoutRequest.ts`
 - `src/lib/ai/capabilityPreviewEnvelope.ts`
 - `src/lib/agentBridge/roomControlEvent.ts`
 - `src-tauri/src/room_control.rs`
@@ -47,17 +84,24 @@ Production evidence:
 - `src/components/agentBridge/RoomControlPanel.tsx`
 - `src/lib/agentBridge/controlQueue.ts`
 
-Consent is not reusable trust. Accepted Bridge peer status, session verification, and a future successful delivery must not substitute for consent. A future capability must not inherit authority from Hello Peer consent.
+Consent is not reusable trust. Accepted Bridge peer status, session verification, and a future successful delivery must not substitute for consent. A capability must not inherit authority from consent granted to another capability.
 
 ## Execution Contract
 
 The sender can queue an execution request only after a matched allow-once acknowledgement. The receiver revalidates the consent binding and consumes it once before execution.
 
-The current executor is `runtime.execute_hello_template` and returns exactly the fixed Hello Peer result. It has no shell, process, file, network, or generic runtime access.
+The current executors are:
+
+- `runtime.execute_hello_template`, which returns exactly the fixed Hello Peer result;
+- `runtime.hello_stdout/v1`, which calls the Tauri `execute_hello_stdout_capability` command and returns typed stdout/stderr/exit metadata from a host-owned Rust helper.
+
+Neither executor accepts command text, script text, runtime arguments, file paths, environment variables, network targets, shell interpolation, or model-authored execution material.
 
 Production evidence:
 
 - `src/lib/agentBridge/helloPeerExecution.ts`
+- `src/lib/agentBridge/helloStdoutExecution.ts`
+- `src-tauri/src/hello_stdout.rs`
 - `src/lib/agentBridge/roomControlEvent.ts`
 - `src-tauri/src/room_control.rs`
 
@@ -70,6 +114,7 @@ Execution result events return typed success or bounded error data through the s
 Every new capability must define:
 
 - capability name and version;
+- static registry entry;
 - preview schema;
 - unsafe-field rejection rules;
 - PolicyGate criteria;

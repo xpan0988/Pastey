@@ -6,67 +6,43 @@ import {
   type CapabilityExecutionResultRoomControlEvent,
   type CapabilityPreviewAckRoomControlEvent,
   type CapabilityPreviewRoomControlEvent,
-  type HelloPeerExecutionRequest,
-  type HelloPeerExecutionResult,
+  type HelloStdoutExecutionRequest,
+  type HelloStdoutExecutionResult,
   type RoomControlEventBuildResult,
 } from "./roomControlEvent";
 import {
   validatePeerConsentRecord,
   type PeerConsentRecord,
 } from "./peerConsent";
+import type { PeerConsentConsumptionState } from "./helloPeerExecution";
 import {
-  HELLO_TEMPLATE_CAPABILITY,
-  HELLO_TEMPLATE_MESSAGE
+  HELLO_STDOUT_CAPABILITY,
+  HELLO_STDOUT_EXPECTED_STDOUT,
+  HELLO_STDOUT_RUNTIME_KIND
 } from "../ai/capabilityRegistry";
 
-export interface PeerConsentConsumptionState {
-  consumedConsentIds: string[];
-  consumedRequestIds: string[];
-  consumedExecutionIds: string[];
-}
-
-export type HelloPeerExecutionBuildResult =
-  | { ok: true; request: HelloPeerExecutionRequest; event: CapabilityExecuteRequestRoomControlEvent }
+export type HelloStdoutExecutionBuildResult =
+  | { ok: true; request: HelloStdoutExecutionRequest; event: CapabilityExecuteRequestRoomControlEvent }
   | { ok: false; errors: string[] };
 
-export type HelloPeerExecutionPolicyResult = {
+export type HelloStdoutHostExecutor = (
+  request: HelloStdoutExecutionRequest,
+) => Promise<HelloStdoutExecutionResult>;
+
+export type HelloStdoutExecutionPolicyResult = {
   state: PeerConsentConsumptionState;
-  result: HelloPeerExecutionResult;
+  result: HelloStdoutExecutionResult;
   resultEvent: CapabilityExecutionResultRoomControlEvent;
   executed: boolean;
 };
 
-const EXECUTION_TIMEOUT_MS = 1_000;
-const MAX_OUTPUT_BYTES = 64;
 let executionSequence = 0;
 
-export function createPeerConsentConsumptionState(): PeerConsentConsumptionState {
-  return {
-    consumedConsentIds: [],
-    consumedRequestIds: [],
-    consumedExecutionIds: [],
-  };
-}
-
-export function preservePeerConsentConsumptionState(
-  state: PeerConsentConsumptionState,
-  previousSessionIdentity: string | null,
-  nextSessionIdentity: string | null,
-): PeerConsentConsumptionState {
-  return previousSessionIdentity === nextSessionIdentity
-    ? state
-    : createPeerConsentConsumptionState();
-}
-
-export function executeHelloPeerTemplate(): "hello peer!" {
-  return HELLO_TEMPLATE_MESSAGE;
-}
-
-export function buildHelloPeerExecutionRequest(
+export function buildHelloStdoutExecutionRequest(
   preview: CapabilityPreviewRoomControlEvent,
   acknowledgement: CapabilityPreviewAckRoomControlEvent,
   options: { now?: Date; ttlMs?: number; executionId?: string; eventId?: string } = {},
-): HelloPeerExecutionBuildResult {
+): HelloStdoutExecutionBuildResult {
   const now = options.now ?? new Date();
   const errors: string[] = [];
   const previewValidation = validateRoomControlEvent(preview, { now });
@@ -88,10 +64,14 @@ export function buildHelloPeerExecutionRequest(
     consent.envelopeId !== preview.payload.envelopeId ||
     consent.requestId !== preview.payload.request.requestId ||
     consent.requestPayloadHash !== preview.payload.request.requestPayloadHash ||
-    consent.capability !== HELLO_TEMPLATE_CAPABILITY ||
-    consent.exactMessage !== HELLO_TEMPLATE_MESSAGE
+    consent.capability !== HELLO_STDOUT_CAPABILITY ||
+    !("expectedStdout" in consent) ||
+    consent.expectedStdout !== HELLO_STDOUT_EXPECTED_STDOUT
   ) {
     errors.push("Execution request consent grant does not match the exact preview/ack chain.");
+  }
+  if (preview.payload.request.capability !== HELLO_STDOUT_CAPABILITY) {
+    errors.push("Hello Stdout execution request requires a Hello Stdout preview.");
   }
   if (consent && Date.parse(consent.expiresAt) <= now.getTime()) {
     errors.push("Execution request consent grant is expired.");
@@ -100,8 +80,8 @@ export function buildHelloPeerExecutionRequest(
     return { ok: false, errors: unique(errors) };
   }
   const ttlMs = options.ttlMs ?? 60_000;
-  const request: HelloPeerExecutionRequest = {
-    schemaVersion: "pastey-hello-peer-execution-request/v1",
+  const request: HelloStdoutExecutionRequest = {
+    schemaVersion: "pastey-runtime-hello-stdout-execution-request/v1",
     executionId: options.executionId ?? createExecutionId(now),
     consentId: consent.consentId,
     sourcePreviewEventId: consent.sourcePreviewEventId,
@@ -111,8 +91,8 @@ export function buildHelloPeerExecutionRequest(
     roomRef: preview.roomRef,
     sourceDeviceRef: preview.sourceDeviceRef,
     targetPeerRef: preview.targetPeerRef,
-    capability: HELLO_TEMPLATE_CAPABILITY,
-    exactMessage: HELLO_TEMPLATE_MESSAGE,
+    capability: HELLO_STDOUT_CAPABILITY,
+    expectedStdout: HELLO_STDOUT_EXPECTED_STDOUT,
     createdAt: now.toISOString(),
     expiresAt: new Date(Math.min(now.getTime() + ttlMs, Date.parse(consent.expiresAt))).toISOString(),
   };
@@ -126,32 +106,32 @@ export function buildHelloPeerExecutionRequest(
   return { ok: true, request, event: event.event };
 }
 
-export function executeInboundHelloPeerRequest(
+export async function executeInboundHelloStdoutRequest(
   event: CapabilityExecuteRequestRoomControlEvent,
   consent: PeerConsentRecord | undefined,
   state: PeerConsentConsumptionState,
+  executor: HelloStdoutHostExecutor,
   context: {
     roomRef: string;
     sourceDeviceRef: string;
     targetPeerRef: string;
     now?: Date;
-    nowMs?: () => number;
     resultEventId?: string;
   },
-): HelloPeerExecutionPolicyResult {
+): Promise<HelloStdoutExecutionPolicyResult> {
   const now = context.now ?? new Date();
-  const request = event.payload as HelloPeerExecutionRequest;
+  const request = event.payload as HelloStdoutExecutionRequest;
   const validation = validateRoomControlEvent(event, {
     now,
     expectedRoomRef: context.roomRef,
     expectedSourceDeviceRef: context.sourceDeviceRef,
     expectedTargetPeerRef: context.targetPeerRef,
   });
-  let status: HelloPeerExecutionResult["status"] = "rejected";
+  let status: HelloStdoutExecutionResult["status"] = "rejected";
   let errorCode = "policy_rejected";
   let executed = false;
 
-  if (!validation.valid || validation.value.kind !== "capability_execute_request" || request.capability !== HELLO_TEMPLATE_CAPABILITY) {
+  if (!validation.valid || validation.value.kind !== "capability_execute_request" || request.capability !== HELLO_STDOUT_CAPABILITY) {
     errorCode = "malformed_request";
   } else if (
     state.consumedExecutionIds.includes(request.executionId) ||
@@ -173,49 +153,29 @@ export function executeInboundHelloPeerRequest(
       errorCode = "consent_binding_mismatch";
     } else {
       const consumed = consume(state, request);
-      const start = context.nowMs?.() ?? Date.now();
-      const output = executeHelloPeerTemplate();
-      const elapsed = (context.nowMs?.() ?? Date.now()) - start;
-      executed = true;
-      if (elapsed > EXECUTION_TIMEOUT_MS) {
-        status = "failed";
-        errorCode = "execution_timeout";
-      } else if (
-        output !== HELLO_TEMPLATE_MESSAGE ||
-        new TextEncoder().encode(output).byteLength > MAX_OUTPUT_BYTES
-      ) {
-        status = "failed";
-        errorCode = "invalid_bounded_output";
-      } else {
-        status = "succeeded";
-        const result = successResult(request, now);
+      try {
+        executed = true;
+        const result = await executor(request);
         return buildPolicyResult(event, consumed, result, true, context.resultEventId, now);
+      } catch {
+        return buildPolicyResult(
+          event,
+          consumed,
+          failureResult(request, "failed", "runtime_unavailable", now),
+          true,
+          context.resultEventId,
+          now,
+        );
       }
-      return buildPolicyResult(event, consumed, failureResult(request, status, errorCode, now), executed, context.resultEventId, now);
     }
   }
-  return buildPolicyResult(event, state, failureResult(request, status, errorCode, now), false, context.resultEventId, now);
+  return buildPolicyResult(event, state, failureResult(request, status, errorCode, now), executed, context.resultEventId, now);
 }
 
-export function matchExecutionResultToRequest(
-  result: CapabilityExecutionResultRoomControlEvent,
-  request: CapabilityExecuteRequestRoomControlEvent,
-  now = new Date(),
-): boolean {
-  const validation = validateRoomControlEvent(result, { now });
-  return validation.valid
-    && validation.value.kind === "capability_execution_result"
-    && result.roomRef === request.roomRef
-    && result.sourceDeviceRef === request.targetPeerRef
-    && result.targetPeerRef === request.sourceDeviceRef
-    && result.payload.executionId === request.payload.executionId
-    && result.payload.requestId === request.payload.requestId
-    && result.payload.consentId === request.payload.consentId;
-}
-
-function requestMatchesConsent(request: HelloPeerExecutionRequest, consent: PeerConsentRecord): boolean {
+function requestMatchesConsent(request: HelloStdoutExecutionRequest, consent: PeerConsentRecord): boolean {
   const binding = consent.binding;
-  return request.consentId === binding.consentId
+  return binding.capability === HELLO_STDOUT_CAPABILITY
+    && request.consentId === binding.consentId
     && request.sourcePreviewEventId === binding.sourceEventId
     && request.envelopeId === binding.envelopeId
     && request.requestId === binding.requestId
@@ -224,13 +184,13 @@ function requestMatchesConsent(request: HelloPeerExecutionRequest, consent: Peer
     && request.sourceDeviceRef === binding.sourceDeviceRef
     && request.targetPeerRef === binding.targetPeerRef
     && request.capability === binding.capability
-    && request.exactMessage === binding.exactMessage
+    && request.expectedStdout === binding.expectedStdout
     && Date.parse(request.expiresAt) <= Date.parse(binding.expiresAt);
 }
 
 function consume(
   state: PeerConsentConsumptionState,
-  request: HelloPeerExecutionRequest,
+  request: HelloStdoutExecutionRequest,
 ): PeerConsentConsumptionState {
   return {
     consumedConsentIds: [...state.consumedConsentIds, request.consentId],
@@ -239,30 +199,27 @@ function consume(
   };
 }
 
-function successResult(request: HelloPeerExecutionRequest, now: Date): HelloPeerExecutionResult {
-  return {
-    schemaVersion: "pastey-hello-peer-execution-result/v1",
-    executionId: request.executionId,
-    requestId: request.requestId,
-    consentId: request.consentId,
-    status: "succeeded",
-    output: HELLO_TEMPLATE_MESSAGE,
-    createdAt: now.toISOString(),
-  };
-}
-
 function failureResult(
-  request: HelloPeerExecutionRequest,
-  status: Exclude<HelloPeerExecutionResult["status"], "succeeded">,
+  request: HelloStdoutExecutionRequest,
+  status: Exclude<HelloStdoutExecutionResult["status"], "succeeded">,
   errorCode: string,
   now: Date,
-): HelloPeerExecutionResult {
+): HelloStdoutExecutionResult {
   return {
-    schemaVersion: "pastey-hello-peer-execution-result/v1",
+    schemaVersion: "pastey-runtime-hello-stdout-execution-result/v1",
     executionId: request.executionId,
     requestId: request.requestId,
     consentId: request.consentId,
+    capability: HELLO_STDOUT_CAPABILITY,
+    runtimeKind: HELLO_STDOUT_RUNTIME_KIND,
     status,
+    stdout: "",
+    stderr: "",
+    exitCode: 1,
+    durationMs: 0,
+    timedOut: false,
+    stdoutTruncated: false,
+    stderrTruncated: false,
     errorCode,
     createdAt: now.toISOString(),
   };
@@ -271,25 +228,25 @@ function failureResult(
 function buildPolicyResult(
   requestEvent: CapabilityExecuteRequestRoomControlEvent,
   state: PeerConsentConsumptionState,
-  result: HelloPeerExecutionResult,
+  result: HelloStdoutExecutionResult,
   executed: boolean,
   eventId: string | undefined,
   now: Date,
-): HelloPeerExecutionPolicyResult {
+): HelloStdoutExecutionPolicyResult {
   const built: RoomControlEventBuildResult = buildCapabilityExecutionResultControlEvent(
     result,
     requestEvent,
     { now, eventId },
   );
   if (!built.ok || built.event.kind !== "capability_execution_result") {
-    throw new Error("Bounded execution result construction failed.");
+    throw new Error("Bounded Hello Stdout execution result construction failed.");
   }
   return { state, result, resultEvent: built.event, executed };
 }
 
 function createExecutionId(now: Date): string {
   executionSequence += 1;
-  return `hello-peer-execution-${globalThis.crypto?.randomUUID?.() ?? `${now.getTime()}-${executionSequence}`}`;
+  return `hello-stdout-execution-${globalThis.crypto?.randomUUID?.() ?? `${now.getTime()}-${executionSequence}`}`;
 }
 
 function unique(values: string[]): string[] {

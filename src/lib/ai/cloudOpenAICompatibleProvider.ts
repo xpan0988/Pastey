@@ -45,7 +45,8 @@ schemaVersion must be ai-action-plan/v1. confidence must be low, medium, or high
 Model output is an untrusted proposal and never grants execution permission.
 Allowed action kinds are supplied by the host.
 Do not include shell commands, arbitrary code, scripts, paths, secrets, raw logs, file contents, peer filesystem search, hidden transfer, scheduler mutation, or MicroFlowGroup mutation.
-For Hello Peer, only propose request_peer_hello_demo with capability runtime.execute_hello_template, exact message hello peer!, requiresUserConfirmation true, and constraints templateOnly true, noRawShell true, filesystem none, network false, finite timeoutMs, and finite maxStdoutBytes.
+For legacy Hello Peer, only propose request_peer_hello_demo with capability runtime.execute_hello_template, exact message hello peer!, requiresUserConfirmation true, and constraints templateOnly true, noRawShell true, filesystem none, network false, finite timeoutMs, and finite maxStdoutBytes.
+For Hello Stdout, only propose request_peer_hello_stdout_demo with capability runtime.hello_stdout/v1, exact message hello peer, requiresUserConfirmation true, and constraints templateOnly true, noRawShell true, filesystem none, network false, timeoutMs 1000, maxStdoutBytes 64, and maxStderrBytes 256.
 Do not include fields outside the action-plan schema.`;
 
 export class CloudOpenAICompatibleProvider implements AiProvider {

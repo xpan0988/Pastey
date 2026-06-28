@@ -1,4 +1,8 @@
 import { isRecord, validateAiActionPlan } from "./actionPlanValidator";
+import {
+  getAgentBridgeCapabilityContractByActionKind,
+  type AgentBridgeCapabilityContract
+} from "./capabilityRegistry";
 import type {
   AiActionPlan,
   AiPolicyResult,
@@ -7,17 +11,7 @@ import type {
 } from "./types";
 
 const DEFAULT_PENDING_TTL_MS = 2 * 60 * 1_000;
-const HELLO_CAPABILITY = "runtime.execute_hello_template";
-const HELLO_MESSAGE = "hello peer!";
 const HELLO_INPUT_FIELDS = ["targetPeerRef", "capability", "message", "constraints"];
-const HELLO_CONSTRAINT_FIELDS = [
-  "templateOnly",
-  "noRawShell",
-  "filesystem",
-  "network",
-  "timeoutMs",
-  "maxStdoutBytes"
-];
 let pendingSequence = 0;
 
 interface CreatePendingAiActionOptions {
@@ -74,31 +68,25 @@ export function buildPendingAiActionCanonicalPayload(
   pendingId: string,
   expiresAt: string
 ): PendingAiActionCanonicalPayload {
-  if (plan.schemaVersion !== "ai-action-plan/v1" || plan.kind !== "request_peer_hello_demo") {
-    throw new Error("Pending AI action supports only the validated Hello Peer advisory.");
+  const contract = getAgentBridgeCapabilityContractByActionKind(plan.kind);
+  if (plan.schemaVersion !== "ai-action-plan/v1" || !contract) {
+    throw new Error("Pending AI action supports only validated Agent Bridge capability advisories.");
   }
   if (!isRecord(plan.proposedInput) || !isRecord(plan.proposedInput.constraints)) {
-    throw new Error("Pending AI action requires a complete Hello Peer proposedInput.");
+    throw new Error(`Pending AI action requires a complete ${contract.ui.label} proposedInput.`);
   }
-  requireExactFields(plan.proposedInput, HELLO_INPUT_FIELDS, "Hello Peer proposedInput");
-  requireExactFields(plan.proposedInput.constraints, HELLO_CONSTRAINT_FIELDS, "Hello Peer constraints");
+  requireExactFields(plan.proposedInput, HELLO_INPUT_FIELDS, `${contract.ui.label} proposedInput`);
+  requireExactFields(plan.proposedInput.constraints, [...contract.constraintFields], `${contract.ui.label} constraints`);
 
   const { targetPeerRef, capability, message, constraints } = plan.proposedInput;
   if (typeof targetPeerRef !== "string" || targetPeerRef.trim().length === 0) {
     throw new Error("Pending AI action requires a target peer reference.");
   }
-  if (capability !== HELLO_CAPABILITY || message !== HELLO_MESSAGE) {
-    throw new Error("Pending AI action requires the fixed Hello Peer capability and message.");
+  if (capability !== contract.capability || message !== contract.providerInputValue) {
+    throw new Error(`Pending AI action requires the fixed ${contract.ui.label} capability and message.`);
   }
-  if (
-    constraints.templateOnly !== true
-    || constraints.noRawShell !== true
-    || (constraints.filesystem !== "none" && constraints.filesystem !== "temp-only")
-    || constraints.network !== false
-    || !isPositiveFiniteNumber(constraints.timeoutMs)
-    || !isPositiveFiniteNumber(constraints.maxStdoutBytes)
-  ) {
-    throw new Error("Pending AI action requires the bounded Hello Peer constraints.");
+  if (!constraintsMatchContract(constraints, contract)) {
+    throw new Error(`Pending AI action requires the bounded ${contract.ui.label} constraints.`);
   }
   if (!Number.isFinite(new Date(expiresAt).getTime())) {
     throw new Error("Pending AI action requires a valid expiry.");
@@ -108,8 +96,8 @@ export function buildPendingAiActionCanonicalPayload(
     schemaVersion: plan.schemaVersion,
     kind: plan.kind,
     targetPeerRef,
-    capability,
-    message,
+    capability: contract.capability,
+    message: contract.providerInputValue,
     constraints: cloneJson(constraints),
     references: [...(plan.references ?? [])]
       .map((reference) => cloneJson(reference))
@@ -117,6 +105,19 @@ export function buildPendingAiActionCanonicalPayload(
     pendingId,
     expiresAt
   };
+}
+
+function constraintsMatchContract(
+  constraints: Record<string, unknown>,
+  contract: AgentBridgeCapabilityContract,
+): boolean {
+  return constraints.templateOnly === true
+    && constraints.noRawShell === true
+    && (constraints.filesystem === "none" || (contract.allowTempOnlyFilesystem && constraints.filesystem === "temp-only"))
+    && constraints.network === false
+    && isPositiveFiniteNumber(constraints.timeoutMs)
+    && isPositiveFiniteNumber(constraints.maxStdoutBytes)
+    && (!contract.constraintFields.includes("maxStderrBytes") || isPositiveFiniteNumber(constraints.maxStderrBytes));
 }
 
 export function hashPendingAiActionPayload(payload: PendingAiActionCanonicalPayload): string {

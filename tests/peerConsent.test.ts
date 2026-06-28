@@ -5,8 +5,10 @@ import test from "node:test";
 import {
   buildCapabilityRequestPreviewEnvelope,
   buildHelloPeerRequestFromPendingAction,
+  buildHelloStdoutRequestFromPendingAction,
   buildMockAiContextSnapshot,
   buildMockHelloPeerPlan,
+  buildMockHelloStdoutPlan,
   confirmPendingAiAction,
   createPendingAiAction,
   evaluateAiPolicy,
@@ -77,6 +79,47 @@ function previewEvent(eventId = "preview-event"): CapabilityPreviewRoomControlEv
   return { ...controlEvent.event, eventId };
 }
 
+function stdoutPreviewEvent(eventId = "stdout-preview-event"): CapabilityPreviewRoomControlEvent {
+  const plan = buildMockHelloStdoutPlan();
+  const policy = evaluateAiPolicy(plan, buildMockAiContextSnapshot());
+  const pending = confirmPendingAiAction(
+    createPendingAiAction(plan, policy, {
+      now: new Date("2026-06-12T23:59:00.000Z"),
+      ttlMs: 300_000,
+      pendingId: `pending-${eventId}`,
+    }),
+    new Date("2026-06-12T23:59:30.000Z"),
+  );
+  const request = buildHelloStdoutRequestFromPendingAction(pending, {
+    now: NOW,
+    ttlMs: 120_000,
+    requestId: `request-${eventId}`,
+    nonce: `nonce-${eventId}`,
+    sourceDeviceRef: SOURCE,
+  });
+  assert.equal(request.ok, true);
+  if (!request.ok) throw new Error("Expected request.");
+  const envelope = buildCapabilityRequestPreviewEnvelope(request.request, {
+    roomRef: "mock-room-preview",
+    now: NOW,
+    ttlMs: 120_000,
+    envelopeId: `envelope-${eventId}`,
+  });
+  assert.equal(envelope.ok, true, envelope.ok ? "" : envelope.errors.join(" "));
+  if (!envelope.ok) throw new Error("Expected envelope.");
+  const controlEvent = buildSessionBoundCapabilityPreviewControlEvent(envelope.envelope, {
+    roomId: ROOM,
+    localSessionRef: SOURCE,
+    peerSessionRef: TARGET,
+    peerConnected: true,
+  }, { now: NOW });
+  assert.equal(controlEvent.ok, true, controlEvent.ok ? "" : controlEvent.errors.join(" "));
+  if (!controlEvent.ok || controlEvent.event.kind !== "capability_preview") {
+    throw new Error("Expected preview event.");
+  }
+  return { ...controlEvent.event, eventId };
+}
+
 function review(event = previewEvent(), session = createPeerConsentSessionState()) {
   return evaluatePeerCapabilityPreview(event, {
     roomRef: ROOM,
@@ -104,6 +147,56 @@ test("valid exact Hello Peer preview becomes reviewable", () => {
   assert.equal(result.binding.requestPayloadHash, previewEvent().payload.request.requestPayloadHash);
   assert.equal(result.binding.previewOnly, true);
   assert.ok(Date.parse(result.binding.expiresAt) <= Date.parse(previewEvent().expiresAt));
+});
+
+test("valid exact Hello Stdout preview becomes reviewable with stdout binding", () => {
+  const source = stdoutPreviewEvent();
+  const result = review(source);
+  assert.equal(result.status, "reviewable");
+  if (result.status !== "reviewable") return;
+  assert.equal(result.binding.capability, "runtime.hello_stdout/v1");
+  assert.equal(result.binding.expectedStdout, "hello peer");
+  assert.equal("exactMessage" in result.binding, false);
+  const allowed = allowPeerCapabilityOnce(result.binding, createPeerConsentSessionState(), {
+    now: DECISION_TIME,
+  });
+  assert.equal(allowed.ok, true);
+  if (!allowed.ok) return;
+  const status = buildPeerConsentStatusEvent(source, allowed.record, {
+    now: DECISION_TIME,
+    eventId: "stdout-status",
+  });
+  assert.equal(status.ok, true);
+  if (!status.ok || status.event.kind !== "capability_preview_ack") return;
+  assert.equal(status.event.payload.consent?.capability, "runtime.hello_stdout/v1");
+  assert.equal("expectedStdout" in status.event.payload.consent!, true);
+});
+
+test("consent binding cannot transfer between capability ids or versions", () => {
+  const stdout = review(stdoutPreviewEvent());
+  assert.equal(stdout.status, "reviewable");
+  if (stdout.status !== "reviewable") return;
+  const allowed = allowPeerCapabilityOnce(stdout.binding, createPeerConsentSessionState(), {
+    now: DECISION_TIME,
+  });
+  assert.equal(allowed.ok, true);
+  if (!allowed.ok) return;
+
+  assert.equal(validatePeerConsentRecord({
+    ...allowed.record,
+    binding: {
+      ...allowed.record.binding,
+      capability: "runtime.execute_hello_template",
+      exactMessage: "hello peer!",
+    },
+  }, { now: DECISION_TIME }).valid, false);
+  assert.equal(validatePeerConsentRecord({
+    ...allowed.record,
+    binding: {
+      ...allowed.record.binding,
+      capability: "runtime.hello_stdout/v2",
+    },
+  }, { now: DECISION_TIME }).valid, false);
 });
 
 test("PolicyGate rejects wrong capability, message, expiry, binding mismatch, unsafe fields, and decided request", () => {

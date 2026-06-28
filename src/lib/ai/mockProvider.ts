@@ -38,6 +38,34 @@ export function buildMockHelloPeerPlan(): AiActionPlan {
   };
 }
 
+export function buildMockHelloStdoutPlan(): AiActionPlan {
+  return {
+    schemaVersion: "ai-action-plan/v1",
+    kind: "request_peer_hello_stdout_demo",
+    title: "Ask peer to run Hello Stdout demo",
+    explanation: "The peer advertises a restricted hello-stdout capability. This plan asks Pastey to request that peer to run a host-owned Rust helper after local and peer confirmation.",
+    confidence: "high",
+    requiresUserConfirmation: true,
+    references: [
+      { kind: "peer", ref: "mock-peer-1" }
+    ],
+    proposedInput: {
+      targetPeerRef: "mock-peer-1",
+      capability: "runtime.hello_stdout/v1",
+      message: "hello peer",
+      constraints: {
+        templateOnly: true,
+        noRawShell: true,
+        filesystem: "none",
+        network: false,
+        timeoutMs: 1_000,
+        maxStdoutBytes: 64,
+        maxStderrBytes: 256
+      }
+    }
+  };
+}
+
 export class MockProvider implements AiProvider {
   readonly config = MOCK_AI_PROVIDER_CONFIG;
 
@@ -47,7 +75,7 @@ export class MockProvider implements AiProvider {
       providerId: this.config.providerId,
       model: this.config.model,
       rawText: "Mock advisory plan generated locally. No model or network call occurred.",
-      parsedPlan: buildMockHelloPeerPlan(),
+      parsedPlan: buildMockHelloStdoutPlan(),
       usage: {
         inputTokens: 0,
         outputTokens: 0

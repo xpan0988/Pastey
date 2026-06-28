@@ -24,7 +24,8 @@ export type AiActionKind =
   | "suggest_transfer"
   | "draft_text_message"
   | "explain_microflowgroup_mode"
-  | "request_peer_hello_demo";
+  | "request_peer_hello_demo"
+  | "request_peer_hello_stdout_demo";
 
 export type AiConfidence = "low" | "medium" | "high";
 

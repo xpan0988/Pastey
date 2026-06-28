@@ -41,7 +41,7 @@ Current deferred behavior:
 - durable route metadata or durable route recovery;
 - full cryptographic paired-key rotation beyond the bounded runtime state;
 - room-control/capability selected-peers or broadcast;
-- durable trust, reusable consent, automatic approval, provider execution, shell/file/network execution, MCP/tool runtime, or Agent Bridge capability broadcast.
+- durable trust, reusable consent, automatic approval, provider execution, shell/file/network execution, MCP/tool runtime, dynamic capability/plugin registration, or Agent Bridge capability broadcast.
 
 Validation focus:
 
@@ -49,6 +49,7 @@ Validation focus:
 - Rust room-control tests cover selected-peer control route resolution through `bridge_peers`, stale/disconnected/missing endpoint rejection, route mismatch, no fallback, selected-peers and broadcast rejection, durable display metadata not satisfying target binding, reconnect invalidating old peer-session binding, receipt-as-transport-only semantics, and exact Hello Peer event validation.
 - Rust storage tests cover durable identity creation/storage, explicit pairing, revocation, rotation-required state, reconnect same-fingerprint display association with new peer session id, fingerprint/key mismatch not silently preserving association, reconnect replacing endpoint/key bindings with a new peer session id, leave, burn, peer-burn, and startup recovery invalidating current-session endpoint rows.
 - TypeScript routing tests cover frontend route derivation, selected-peers and broadcast data payloads, local route-error mapping, route-expired stale child rejection without fallback to a reconnected peer, queue dispatch child metadata, Agent Bridge/control selected-peer-only rejection, durable identity normalization/revocation/rotation without authority, safe pairing UI wording, and per-target outcome type definitions.
+- TypeScript Agent Bridge tests cover the static capability registry, shared capability envelope view, provider forbidden-field rejection, unknown capability/version rejection, exact consent binding, and no transfer of consent between the two implemented capabilities.
 - Transfer scheduler tests cover target-distinct child queue items for the same file path and shared operation id.
 
 ## Layer 4 Validation Matrix
@@ -70,7 +71,8 @@ This matrix is automated evidence for the current Layer 4 runtime before manual 
 | selected-peers | room-control event | any peer state | reject unsupported | Rust room-control selected-peers rejection; TS control route rejection tests | Yes, fan-out rejection smoke |
 | broadcast | room-control event | any peer state | reject unsupported | Rust room-control broadcast rejection; TS control route rejection tests | Yes, fan-out rejection smoke |
 | selected-peer | Agent Bridge capability preview | connected peer, exact room/session/request target | consent required; delivery receipt does not create consent | Rust receipt/control validation tests; TS room-control event, transport, control queue, peer consent tests | Yes, Hello Peer selected-peer smoke |
-| selected-peer | Agent Bridge execution request/result | exact selected peer/session/request with allow-once consent | one execution; consent consumed; result returned | TS Hello Peer execution tests; Rust exact event validation | Yes, Hello Peer selected-peer smoke |
+| selected-peer | Agent Bridge capability registry/envelope | registered `runtime.execute_hello_template` or `runtime.hello_stdout/v1`; unknown id/version/schema | registered contracts dispatch to typed validators; unknown entries reject fail-closed | TS AI slot registry/shared-envelope tests; room-control schema dispatch tests | No extra before manual smoke |
+| selected-peer | Agent Bridge execution request/result | exact selected peer/session/request with allow-once consent | one execution; consent consumed; result returned | TS Hello Peer and Hello Stdout execution tests; Rust exact event validation | Yes, Hello Peer/Hello Stdout selected-peer smoke |
 | selected-peers | Agent Bridge capability/execution | any peer state | reject unsupported; no capability fan-out | TS route-policy tests; Rust room-control selected-peers rejection | Yes, fan-out rejection smoke |
 | broadcast | Agent Bridge capability/execution | any peer state | reject unsupported; no capability broadcast | TS route-policy tests; Rust room-control broadcast rejection | Yes, fan-out rejection smoke |
 | selected-peer | ordinary/control/capability | durable paired identity only, revoked identity, or paired display without current connected row | reject fail-closed or no routeability; pairing is display only | Rust storage/room-control durable-display tests; TS bridge identity tests | Yes, paired/revoked display smoke |
@@ -101,7 +103,7 @@ Manual smoke is intentionally pending until the automated matrix is green. Run i
 - two-machine broadcast file/image and pasted-image where practical;
 - disconnect/reconnect route expiry with old selected-peer route failing closed;
 - paired and revoked display metadata remaining non-routeable/non-authoritative;
-- Agent Bridge Hello Peer exact selected-peer consent and one-time execution;
+- Agent Bridge Hello Peer and Hello Stdout exact selected-peer consent and one-time execution;
 - selected-peers and broadcast rejection for room-control/capability paths.
 
 Manual smoke remains release/product confidence evidence, not automated validation.
