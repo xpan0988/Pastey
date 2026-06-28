@@ -157,6 +157,100 @@ test("invalid embedded capability preview envelope is rejected", () => {
   assert.ok(validation.errors.some((error) => error.includes("Embedded preview envelope")));
 });
 
+test("Hello Stdout execution result allows bounded stdout only in the result payload", () => {
+  const event: RoomControlEvent = {
+    schemaVersion: "pastey-room-control-event/v1",
+    eventId: "hello-stdout-result-event",
+    kind: "capability_execution_result",
+    roomRef: "room-control-room",
+    sourceDeviceRef: "mock-peer-1",
+    targetPeerRef: "room-control-source",
+    createdAt: NOW.toISOString(),
+    expiresAt: new Date("2026-06-11T00:02:00.000Z").toISOString(),
+    previewOnly: false,
+    payload: {
+      schemaVersion: "pastey-runtime-hello-stdout-execution-result/v1",
+      executionId: "hello-stdout-execution",
+      requestId: "hello-stdout-request",
+      consentId: "hello-stdout-consent",
+      capability: "runtime.hello_stdout/v1",
+      runtimeKind: "rust_host_helper",
+      status: "succeeded",
+      stdout: "hello peer",
+      stderr: "",
+      exitCode: 0,
+      durationMs: 1,
+      timedOut: false,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      createdAt: NOW.toISOString()
+    }
+  };
+  assert.equal(validateRoomControlEvent(event, { now: NOW }).valid, true);
+  assert.equal(validateRoomControlEvent({
+    ...event,
+    stdout: "top-level still unsafe"
+  }, { now: NOW }).valid, false);
+  assert.equal(validateRoomControlEvent({
+    ...event,
+    payload: { ...event.payload, command: "echo hacked" }
+  }, { now: NOW }).valid, false);
+});
+
+test("registered capability dispatch rejects unknown id, unknown version, and schema mismatch", () => {
+  const preview = deterministicPreviewControlEvent();
+  assert.equal(validateRoomControlEvent({
+    ...preview,
+    payload: {
+      ...preview.payload,
+      request: {
+        ...preview.payload.request,
+        capability: "runtime.unknown/v1"
+      }
+    }
+  }, { now: NOW }).valid, false);
+  assert.equal(validateRoomControlEvent({
+    ...preview,
+    payload: {
+      ...preview.payload,
+      request: {
+        ...preview.payload.request,
+        capability: "runtime.hello_stdout/v2"
+      }
+    }
+  }, { now: NOW }).valid, false);
+
+  const result = {
+    schemaVersion: "pastey-room-control-event/v1",
+    eventId: "schema-mismatch-result",
+    kind: "capability_execution_result",
+    roomRef: "room-control-room",
+    sourceDeviceRef: "mock-peer-1",
+    targetPeerRef: "room-control-source",
+    createdAt: NOW.toISOString(),
+    expiresAt: new Date("2026-06-11T00:02:00.000Z").toISOString(),
+    previewOnly: false,
+    payload: {
+      schemaVersion: "pastey-runtime-hello-stdout-execution-result/v2",
+      executionId: "execution",
+      requestId: "request",
+      consentId: "consent",
+      capability: "runtime.hello_stdout/v1",
+      runtimeKind: "rust_host_helper",
+      status: "succeeded",
+      stdout: "hello peer",
+      stderr: "",
+      exitCode: 0,
+      durationMs: 1,
+      timedOut: false,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      createdAt: NOW.toISOString()
+    }
+  };
+  assert.equal(validateRoomControlEvent(result, { now: NOW }).valid, false);
+});
+
 test("room, target, and source mismatch are rejected", () => {
   const event = deterministicPreviewControlEvent();
 

@@ -5,8 +5,10 @@ import test from "node:test";
 import {
   buildCapabilityRequestPreviewEnvelope,
   buildHelloPeerRequestFromPendingAction,
+  buildHelloStdoutRequestFromPendingAction,
   buildMockAiContextSnapshot,
   buildMockHelloPeerPlan,
+  buildMockHelloStdoutPlan,
   confirmPendingAiAction,
   createPendingAiAction,
   evaluateAiPolicy,
@@ -14,6 +16,7 @@ import {
 import {
   allowPeerCapabilityOnce,
   buildHelloPeerExecutionRequest,
+  buildHelloStdoutExecutionRequest,
   buildPeerConsentStatusEvent,
   buildSessionBoundCapabilityPreviewControlEvent,
   checkAndRecordRoomControlEvent,
@@ -26,10 +29,12 @@ import {
   evaluatePeerCapabilityPreview,
   executeHelloPeerTemplate,
   executeInboundHelloPeerRequest,
+  executeInboundHelloStdoutRequest,
   hasOutgoingControlWindowDemand,
   matchExecutionResultToRequest,
   preservePeerConsentConsumptionState,
   validateHelloPeerExecutionResult,
+  validateHelloStdoutExecutionResult,
   validateRoomControlEvent,
   type CapabilityExecuteRequestRoomControlEvent,
   type CapabilityPreviewAckRoomControlEvent,
@@ -117,6 +122,78 @@ function chain(): {
   return { preview: preview.event, consent: consent.record, ack: ack.event, request: execution.event };
 }
 
+function stdoutChain(): {
+  preview: CapabilityPreviewRoomControlEvent;
+  consent: PeerConsentRecord;
+  ack: CapabilityPreviewAckRoomControlEvent;
+  request: CapabilityExecuteRequestRoomControlEvent;
+} {
+  const plan = buildMockHelloStdoutPlan();
+  const policy = evaluateAiPolicy(plan, buildMockAiContextSnapshot());
+  const pending = confirmPendingAiAction(
+    createPendingAiAction(plan, policy, {
+      now: new Date("2026-06-12T23:59:00.000Z"),
+      ttlMs: 300_000,
+      pendingId: "stdout-pending",
+    }),
+    new Date("2026-06-12T23:59:30.000Z"),
+  );
+  const request = buildHelloStdoutRequestFromPendingAction(pending, {
+    now: NOW,
+    ttlMs: 120_000,
+    requestId: "stdout-request",
+    nonce: "stdout-nonce",
+    sourceDeviceRef: SOURCE,
+  });
+  assert.equal(request.ok, true);
+  if (!request.ok) throw new Error("Expected request.");
+  const envelope = buildCapabilityRequestPreviewEnvelope(request.request, {
+    roomRef: ROOM,
+    now: NOW,
+    ttlMs: 120_000,
+    envelopeId: "stdout-envelope",
+  });
+  assert.equal(envelope.ok, true);
+  if (!envelope.ok) throw new Error("Expected envelope.");
+  const preview = buildSessionBoundCapabilityPreviewControlEvent(envelope.envelope, {
+    roomId: ROOM,
+    localSessionRef: SOURCE,
+    peerSessionRef: TARGET,
+    peerConnected: true,
+  }, { now: NOW });
+  assert.equal(preview.ok, true);
+  if (!preview.ok || preview.event.kind !== "capability_preview") throw new Error("Expected preview.");
+  const review = evaluatePeerCapabilityPreview(preview.event, {
+    roomRef: ROOM,
+    sourceDeviceRef: SOURCE,
+    targetPeerRef: TARGET,
+    session: createPeerConsentSessionState(),
+    now: ALLOWED_AT,
+    consentId: "stdout-consent",
+  });
+  assert.equal(review.status, "reviewable");
+  if (review.status !== "reviewable") throw new Error("Expected review.");
+  const consent = allowPeerCapabilityOnce(review.binding, createPeerConsentSessionState(), {
+    now: ALLOWED_AT,
+  });
+  assert.equal(consent.ok, true);
+  if (!consent.ok) throw new Error("Expected consent.");
+  const ack = buildPeerConsentStatusEvent(preview.event, consent.record, {
+    now: ALLOWED_AT,
+    eventId: "stdout-ack",
+  });
+  assert.equal(ack.ok, true);
+  if (!ack.ok || ack.event.kind !== "capability_preview_ack") throw new Error("Expected ack.");
+  const execution = buildHelloStdoutExecutionRequest(preview.event, ack.event, {
+    now: EXECUTE_AT,
+    executionId: "stdout-execution",
+    eventId: "stdout-execution-event",
+  });
+  assert.equal(execution.ok, true);
+  if (!execution.ok) throw new Error("Expected execution request.");
+  return { preview: preview.event, consent: consent.record, ack: ack.event, request: execution.event };
+}
+
 test("allowed-once ack builds one exact bounded execution request", () => {
   const value = chain();
   assert.equal(value.request.payload.capability, "runtime.execute_hello_template");
@@ -128,6 +205,97 @@ test("allowed-once ack builds one exact bounded execution request", () => {
   for (const field of ["command", "script", "code", "path", "stdin", "environment", "arguments"]) {
     assert.equal(field in value.request.payload, false);
   }
+});
+
+test("allowed-once ack builds one exact Hello Stdout execution request", () => {
+  const value = stdoutChain();
+  assert.equal(value.request.payload.capability, "runtime.hello_stdout/v1");
+  assert.equal(value.request.payload.expectedStdout, "hello peer");
+  assert.equal(value.request.payload.consentId, value.consent.binding.consentId);
+  assert.equal(value.request.payload.requestPayloadHash, value.consent.binding.requestPayloadHash);
+  assert.equal(value.request.previewOnly, false);
+  assert.equal(validateRoomControlEvent(value.request, { now: EXECUTE_AT }).valid, true);
+  for (const field of ["command", "script", "code", "path", "stdin", "environment", "arguments"]) {
+    assert.equal(field in value.request.payload, false);
+  }
+});
+
+test("receiver consumes Hello Stdout consent once and returns typed stdout result", async () => {
+  const value = stdoutChain();
+  const first = await executeInboundHelloStdoutRequest(
+    value.request,
+    value.consent,
+    createPeerConsentConsumptionState(),
+    async (request) => ({
+      schemaVersion: "pastey-runtime-hello-stdout-execution-result/v1",
+      executionId: request.executionId,
+      requestId: request.requestId,
+      consentId: request.consentId,
+      capability: "runtime.hello_stdout/v1",
+      runtimeKind: "rust_host_helper",
+      status: "succeeded",
+      stdout: "hello peer",
+      stderr: "",
+      exitCode: 0,
+      durationMs: 1,
+      timedOut: false,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      createdAt: EXECUTE_AT.toISOString(),
+    }),
+    { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
+  );
+  assert.equal(first.executed, true);
+  assert.equal(first.result.status, "succeeded");
+  assert.equal(first.result.stdout, "hello peer");
+  assert.equal(first.result.exitCode, 0);
+  assert.equal(validateHelloStdoutExecutionResult(first.result).length, 0);
+  assert.deepEqual(first.state.consumedConsentIds, ["stdout-consent"]);
+  const second = await executeInboundHelloStdoutRequest(
+    value.request,
+    value.consent,
+    first.state,
+    async () => {
+      throw new Error("executor must not be called twice");
+    },
+    { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
+  );
+  assert.equal(second.executed, false);
+  assert.equal(second.result.status, "already_consumed");
+});
+
+test("Hello Stdout rejects legacy consent and unsafe result shapes", async () => {
+  const stdout = stdoutChain();
+  const legacy = chain();
+  const rejected = await executeInboundHelloStdoutRequest(
+    stdout.request,
+    legacy.consent,
+    createPeerConsentConsumptionState(),
+    async () => {
+      throw new Error("executor must not run with mismatched consent");
+    },
+    { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
+  );
+  assert.equal(rejected.executed, false);
+  assert.equal(rejected.result.errorCode, "consent_binding_mismatch");
+  assert.notEqual(validateHelloStdoutExecutionResult({
+    schemaVersion: "pastey-runtime-hello-stdout-execution-result/v1",
+    executionId: "bad",
+    requestId: "bad",
+    consentId: "bad",
+    capability: "runtime.hello_stdout/v1",
+    runtimeKind: "rust_host_helper",
+    status: "succeeded",
+    stdout: "hello peer",
+    stderr: "",
+    exitCode: 0,
+    durationMs: 1,
+    timedOut: false,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    command: "echo hacked",
+    createdAt: EXECUTE_AT.toISOString(),
+  }).length, 0);
 });
 
 test("denied, expired, or mismatched consent grant cannot build an execution request", () => {

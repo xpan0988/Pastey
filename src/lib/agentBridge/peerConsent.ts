@@ -1,10 +1,20 @@
 import { isRecord } from "../ai/actionPlanValidator";
 import {
+  getAgentBridgeCapabilityContract,
+  HELLO_STDOUT_CAPABILITY,
+  HELLO_STDOUT_EXPECTED_STDOUT,
+  HELLO_TEMPLATE_CAPABILITY,
+  HELLO_TEMPLATE_MESSAGE,
+  type AgentBridgeCapabilityContract
+} from "../ai/capabilityRegistry";
+import {
   buildCapabilityPreviewStatusControlEvent,
   validateRoomControlEvent,
   type CapabilityPreviewRoomControlEvent,
   type CapabilityPreviewStatusRoomControlEvent,
+  type CapabilityConsentGrant,
   type HelloPeerConsentGrant,
+  type HelloStdoutConsentGrant,
   type RoomControlEvent,
 } from "./roomControlEvent";
 import {
@@ -16,7 +26,7 @@ import {
 export type PeerConsentDecision = "allow_once" | "deny";
 export type PeerConsentStatus = "allowed_once" | "denied" | "expired" | "invalid";
 
-export interface PeerConsentBinding {
+interface PeerConsentBindingBase {
   readonly schemaVersion: "pastey-peer-consent-binding/v1";
   readonly consentId: string;
   readonly sourceEventId: string;
@@ -26,12 +36,22 @@ export interface PeerConsentBinding {
   readonly roomRef: string;
   readonly sourceDeviceRef: string;
   readonly targetPeerRef: string;
-  readonly capability: "runtime.execute_hello_template";
-  readonly exactMessage: "hello peer!";
   readonly previewOnly: true;
   readonly createdAt: string;
   readonly expiresAt: string;
 }
+
+export interface HelloPeerConsentBinding extends PeerConsentBindingBase {
+  readonly capability: "runtime.execute_hello_template";
+  readonly exactMessage: "hello peer!";
+}
+
+export interface HelloStdoutConsentBinding extends PeerConsentBindingBase {
+  readonly capability: "runtime.hello_stdout/v1";
+  readonly expectedStdout: "hello peer";
+}
+
+export type PeerConsentBinding = HelloPeerConsentBinding | HelloStdoutConsentBinding;
 
 export interface PeerConsentRecord {
   readonly binding: PeerConsentBinding;
@@ -75,8 +95,6 @@ export interface PeerPolicyContext {
 }
 
 const CONSENT_BINDING_SCHEMA = "pastey-peer-consent-binding/v1";
-const HELLO_CAPABILITY = "runtime.execute_hello_template";
-const HELLO_MESSAGE = "hello peer!";
 const DEFAULT_MAX_CONSENT_LIFETIME_MS = 2 * 60 * 1_000;
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_REASON_LENGTH = 512;
@@ -92,6 +110,22 @@ const BINDING_FIELDS = [
   "targetPeerRef",
   "capability",
   "exactMessage",
+  "previewOnly",
+  "createdAt",
+  "expiresAt",
+];
+const HELLO_STDOUT_BINDING_FIELDS = [
+  "schemaVersion",
+  "consentId",
+  "sourceEventId",
+  "envelopeId",
+  "requestId",
+  "requestPayloadHash",
+  "roomRef",
+  "sourceDeviceRef",
+  "targetPeerRef",
+  "capability",
+  "expectedStdout",
   "previewOnly",
   "createdAt",
   "expiresAt",
@@ -138,11 +172,11 @@ export function evaluatePeerCapabilityPreview(
   const preview = validation.value;
   const request = preview.payload.request;
   const errors: string[] = [];
-  if (request.capability !== HELLO_CAPABILITY) {
-    errors.push(`Peer PolicyGate capability must be exactly ${HELLO_CAPABILITY}.`);
-  }
-  if (request.input.message !== HELLO_MESSAGE) {
-    errors.push(`Peer PolicyGate message must be exactly ${HELLO_MESSAGE}.`);
+  const contract = getAgentBridgeCapabilityContract(request.capability);
+  if (!contract) {
+    errors.push("Peer PolicyGate capability is not supported.");
+  } else if (!requestInputMatchesContract(request.input, contract)) {
+    errors.push(`Peer PolicyGate ${contract.typedBindingField} must be exactly ${contract.typedBindingValue}.`);
   }
   if (preview.previewOnly !== true || preview.payload.previewOnly !== true) {
     errors.push("Peer PolicyGate requires previewOnly true.");
@@ -178,6 +212,9 @@ export function evaluatePeerCapabilityPreview(
   if (errors.length > 0) {
     return { status: "rejected", errors: unique(errors) };
   }
+  if (!contract) {
+    return { status: "rejected", errors: ["Peer PolicyGate capability is not supported."] };
+  }
 
   const expiresAtMs = Math.min(
     Date.parse(preview.expiresAt),
@@ -185,7 +222,7 @@ export function evaluatePeerCapabilityPreview(
     Date.parse(request.expiresAt),
     now.getTime() + maxLifetimeMs,
   );
-  const binding: PeerConsentBinding = Object.freeze({
+  const baseBinding = {
     schemaVersion: CONSENT_BINDING_SCHEMA,
     consentId: context.consentId ?? createConsentId(now),
     sourceEventId: preview.eventId,
@@ -195,12 +232,23 @@ export function evaluatePeerCapabilityPreview(
     roomRef: preview.roomRef,
     sourceDeviceRef: preview.sourceDeviceRef,
     targetPeerRef: preview.targetPeerRef,
-    capability: HELLO_CAPABILITY,
-    exactMessage: HELLO_MESSAGE,
     previewOnly: true,
     createdAt: now.toISOString(),
     expiresAt: new Date(expiresAtMs).toISOString(),
-  });
+  } as const;
+  const binding: PeerConsentBinding = Object.freeze(
+    contract.capability === HELLO_STDOUT_CAPABILITY
+      ? {
+          ...baseBinding,
+          capability: HELLO_STDOUT_CAPABILITY,
+          expectedStdout: contract.typedBindingValue as "hello peer",
+        }
+      : {
+          ...baseBinding,
+          capability: HELLO_TEMPLATE_CAPABILITY,
+          exactMessage: contract.typedBindingValue as "hello peer!",
+        }
+  );
   const bindingErrors = validatePeerConsentBinding(binding, now);
   return bindingErrors.length === 0
     ? {
@@ -316,18 +364,31 @@ export function buildPeerConsentStatusEvent(
   return { ok: true, event: result.event, record: validation.value };
 }
 
-function consentGrantFromRecord(record: PeerConsentRecord): HelloPeerConsentGrant {
-  return {
-    schemaVersion: "pastey-hello-peer-consent-grant/v1",
+function consentGrantFromRecord(record: PeerConsentRecord): CapabilityConsentGrant {
+  const base = {
     consentId: record.binding.consentId,
     sourcePreviewEventId: record.binding.sourceEventId,
     envelopeId: record.binding.envelopeId,
     requestId: record.binding.requestId,
     requestPayloadHash: record.binding.requestPayloadHash,
-    capability: record.binding.capability,
-    exactMessage: record.binding.exactMessage,
     expiresAt: record.binding.expiresAt,
   };
+  if (record.binding.capability === HELLO_STDOUT_CAPABILITY) {
+    const grant: HelloStdoutConsentGrant = {
+      ...base,
+      schemaVersion: "pastey-runtime-hello-stdout-consent-grant/v1",
+      capability: HELLO_STDOUT_CAPABILITY,
+      expectedStdout: record.binding.expectedStdout,
+    };
+    return grant;
+  }
+  const grant: HelloPeerConsentGrant = {
+    ...base,
+    schemaVersion: "pastey-hello-peer-consent-grant/v1",
+    capability: HELLO_TEMPLATE_CAPABILITY,
+    exactMessage: record.binding.exactMessage,
+  };
+  return grant;
 }
 
 export function applyInboundPeerStatusToOutboundQueue(
@@ -406,7 +467,14 @@ function validatePeerConsentBinding(value: unknown, now: Date): string[] {
   if (!isRecord(value)) {
     return ["Peer consent binding must be an object."];
   }
-  requireExactFields(value, BINDING_FIELDS, [], "Peer consent binding", errors);
+  const isHelloStdout = value.capability === HELLO_STDOUT_CAPABILITY;
+  requireExactFields(
+    value,
+    isHelloStdout ? HELLO_STDOUT_BINDING_FIELDS : BINDING_FIELDS,
+    [],
+    "Peer consent binding",
+    errors
+  );
   if (value.schemaVersion !== CONSENT_BINDING_SCHEMA) {
     errors.push(`Peer consent binding schemaVersion must be ${CONSENT_BINDING_SCHEMA}.`);
   }
@@ -422,11 +490,17 @@ function validatePeerConsentBinding(value: unknown, now: Date): string[] {
   ]) {
     requireBoundedString(value[field], field, errors);
   }
-  if (value.capability !== HELLO_CAPABILITY) {
-    errors.push(`Peer consent capability must be exactly ${HELLO_CAPABILITY}.`);
-  }
-  if (value.exactMessage !== HELLO_MESSAGE) {
-    errors.push(`Peer consent message must be exactly ${HELLO_MESSAGE}.`);
+  if (isHelloStdout) {
+    if (value.expectedStdout !== HELLO_STDOUT_EXPECTED_STDOUT) {
+      errors.push(`Peer consent expectedStdout must be exactly ${HELLO_STDOUT_EXPECTED_STDOUT}.`);
+    }
+  } else {
+    if (value.capability !== HELLO_TEMPLATE_CAPABILITY) {
+      errors.push(`Peer consent capability must be exactly ${HELLO_TEMPLATE_CAPABILITY}.`);
+    }
+    if (value.exactMessage !== HELLO_TEMPLATE_MESSAGE) {
+      errors.push(`Peer consent message must be exactly ${HELLO_TEMPLATE_MESSAGE}.`);
+    }
   }
   if (value.previewOnly !== true) {
     errors.push("Peer consent binding requires previewOnly true.");
@@ -438,6 +512,19 @@ function validatePeerConsentBinding(value: unknown, now: Date): string[] {
     errors.push("Peer consent binding is expired.");
   }
   return errors;
+}
+
+function requestInputMatchesContract(
+  input: unknown,
+  contract: AgentBridgeCapabilityContract,
+): boolean {
+  if (!isRecord(input)) {
+    return false;
+  }
+  if (contract.typedBindingField === "exactMessage") {
+    return input.message === contract.typedBindingValue;
+  }
+  return input.expectedStdout === contract.typedBindingValue;
 }
 
 function requireExactFields(

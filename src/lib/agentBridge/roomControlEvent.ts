@@ -3,6 +3,17 @@ import {
   validateCapabilityRequestPreviewEnvelope,
   type CapabilityRequestPreviewEnvelope
 } from "../ai/capabilityPreviewEnvelope";
+import {
+  getAgentBridgeCapabilityContract,
+  getAgentBridgeCapabilityContractByConsentGrantSchema,
+  getAgentBridgeCapabilityContractByExecutionRequestSchema,
+  getAgentBridgeCapabilityContractByExecutionResultSchema,
+  HELLO_STDOUT_CAPABILITY,
+  HELLO_STDOUT_EXPECTED_STDOUT,
+  HELLO_TEMPLATE_CAPABILITY,
+  HELLO_TEMPLATE_MESSAGE,
+  normalizeCapabilityFieldName
+} from "../ai/capabilityRegistry";
 
 export type RoomControlEventKind =
   | "capability_preview"
@@ -50,7 +61,7 @@ export interface CapabilityPreviewAckRoomControlEvent extends RoomControlEventBa
   previewOnly: true;
   payload: CapabilityPreviewStatusPayload & {
     status: "acknowledged_preview_only";
-    consent?: HelloPeerConsentGrant;
+    consent?: CapabilityConsentGrant;
   };
 }
 
@@ -96,6 +107,20 @@ export interface HelloPeerConsentGrant {
   expiresAt: string;
 }
 
+export interface HelloStdoutConsentGrant {
+  schemaVersion: "pastey-runtime-hello-stdout-consent-grant/v1";
+  consentId: string;
+  sourcePreviewEventId: string;
+  envelopeId: string;
+  requestId: string;
+  requestPayloadHash: string;
+  capability: "runtime.hello_stdout/v1";
+  expectedStdout: "hello peer";
+  expiresAt: string;
+}
+
+export type CapabilityConsentGrant = HelloPeerConsentGrant | HelloStdoutConsentGrant;
+
 export interface HelloPeerExecutionRequest {
   schemaVersion: "pastey-hello-peer-execution-request/v1";
   executionId: string;
@@ -109,6 +134,23 @@ export interface HelloPeerExecutionRequest {
   targetPeerRef: string;
   capability: "runtime.execute_hello_template";
   exactMessage: "hello peer!";
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface HelloStdoutExecutionRequest {
+  schemaVersion: "pastey-runtime-hello-stdout-execution-request/v1";
+  executionId: string;
+  consentId: string;
+  sourcePreviewEventId: string;
+  envelopeId: string;
+  requestId: string;
+  requestPayloadHash: string;
+  roomRef: string;
+  sourceDeviceRef: string;
+  targetPeerRef: string;
+  capability: "runtime.hello_stdout/v1";
+  expectedStdout: "hello peer";
   createdAt: string;
   expiresAt: string;
 }
@@ -131,18 +173,43 @@ export interface HelloPeerExecutionResult {
   createdAt: string;
 }
 
+export type HelloStdoutExecutionResultStatus = HelloPeerExecutionResultStatus;
+export type HelloStdoutRuntimeKind = "rust_host_helper";
+
+export interface HelloStdoutExecutionResult {
+  schemaVersion: "pastey-runtime-hello-stdout-execution-result/v1";
+  executionId: string;
+  requestId: string;
+  consentId: string;
+  capability: "runtime.hello_stdout/v1";
+  runtimeKind: HelloStdoutRuntimeKind;
+  status: HelloStdoutExecutionResultStatus;
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  durationMs: number;
+  timedOut: boolean;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  errorCode?: string;
+  createdAt: string;
+}
+
+export type CapabilityExecutionRequest = HelloPeerExecutionRequest | HelloStdoutExecutionRequest;
+export type CapabilityExecutionResult = HelloPeerExecutionResult | HelloStdoutExecutionResult;
+
 export interface CapabilityExecuteRequestRoomControlEvent extends RoomControlEventBase {
   kind: "capability_execute_request";
   targetPeerRef: string;
   previewOnly: false;
-  payload: HelloPeerExecutionRequest;
+  payload: CapabilityExecutionRequest;
 }
 
 export interface CapabilityExecutionResultRoomControlEvent extends RoomControlEventBase {
   kind: "capability_execution_result";
   targetPeerRef: string;
   previewOnly: false;
-  payload: HelloPeerExecutionResult;
+  payload: CapabilityExecutionResult;
 }
 
 export type RoomControlEvent =
@@ -197,7 +264,7 @@ interface BuildCapabilityPreviewStatusControlEventOptions {
   ttlMs?: number;
   eventId?: string;
   reason?: string;
-  consent?: HelloPeerConsentGrant;
+  consent?: CapabilityConsentGrant;
 }
 
 interface BuildExecutionControlEventOptions {
@@ -247,6 +314,17 @@ const CONSENT_GRANT_FIELDS = [
   "exactMessage",
   "expiresAt"
 ];
+const HELLO_STDOUT_CONSENT_GRANT_FIELDS = [
+  "schemaVersion",
+  "consentId",
+  "sourcePreviewEventId",
+  "envelopeId",
+  "requestId",
+  "requestPayloadHash",
+  "capability",
+  "expectedStdout",
+  "expiresAt"
+];
 const EXECUTION_REQUEST_FIELDS = [
   "schemaVersion",
   "executionId",
@@ -263,6 +341,22 @@ const EXECUTION_REQUEST_FIELDS = [
   "createdAt",
   "expiresAt"
 ];
+const HELLO_STDOUT_EXECUTION_REQUEST_FIELDS = [
+  "schemaVersion",
+  "executionId",
+  "consentId",
+  "sourcePreviewEventId",
+  "envelopeId",
+  "requestId",
+  "requestPayloadHash",
+  "roomRef",
+  "sourceDeviceRef",
+  "targetPeerRef",
+  "capability",
+  "expectedStdout",
+  "createdAt",
+  "expiresAt"
+];
 const EXECUTION_RESULT_REQUIRED_FIELDS = [
   "schemaVersion",
   "executionId",
@@ -272,6 +366,24 @@ const EXECUTION_RESULT_REQUIRED_FIELDS = [
   "createdAt"
 ];
 const EXECUTION_RESULT_OPTIONAL_FIELDS = ["output", "errorCode"];
+const HELLO_STDOUT_EXECUTION_RESULT_REQUIRED_FIELDS = [
+  "schemaVersion",
+  "executionId",
+  "requestId",
+  "consentId",
+  "capability",
+  "runtimeKind",
+  "status",
+  "stdout",
+  "stderr",
+  "exitCode",
+  "durationMs",
+  "timedOut",
+  "stdoutTruncated",
+  "stderrTruncated",
+  "createdAt"
+];
+const HELLO_STDOUT_EXECUTION_RESULT_OPTIONAL_FIELDS = ["errorCode"];
 const ROOM_CONTROL_EVENT_KINDS = new Set<RoomControlEventKind>([
   "capability_preview",
   "capability_preview_ack",
@@ -317,13 +429,17 @@ const UNSAFE_OR_EXECUTION_FIELDS = new Set([
   "exitCode",
   "process",
   "spawn"
-].map(normalizeFieldName));
-const HELLO_CAPABILITY = "runtime.execute_hello_template";
-const HELLO_MESSAGE = "hello peer!";
+].map(normalizeCapabilityFieldName));
 const CONSENT_GRANT_SCHEMA = "pastey-hello-peer-consent-grant/v1";
+const HELLO_STDOUT_CONSENT_GRANT_SCHEMA = "pastey-runtime-hello-stdout-consent-grant/v1";
 const EXECUTION_REQUEST_SCHEMA = "pastey-hello-peer-execution-request/v1";
+const HELLO_STDOUT_EXECUTION_REQUEST_SCHEMA = "pastey-runtime-hello-stdout-execution-request/v1";
 const EXECUTION_RESULT_SCHEMA = "pastey-hello-peer-execution-result/v1";
+const HELLO_STDOUT_EXECUTION_RESULT_SCHEMA = "pastey-runtime-hello-stdout-execution-result/v1";
 const MAX_EXECUTION_ERROR_CODE_LENGTH = 64;
+const MAX_HELLO_STDOUT_STDOUT_BYTES = 64;
+const MAX_HELLO_STDOUT_STDERR_BYTES = 256;
+const MAX_HELLO_STDOUT_DURATION_MS = 60_000;
 let eventSequence = 0;
 
 export function buildCapabilityPreviewControlEvent(
@@ -420,12 +536,12 @@ export function buildCapabilityPreviewStatusControlEvent(
 }
 
 export function buildCapabilityExecuteRequestControlEvent(
-  request: HelloPeerExecutionRequest,
+  request: CapabilityExecutionRequest,
   options: BuildExecutionControlEventOptions = {}
 ): RoomControlEventBuildResult {
   const now = options.now ?? new Date();
   const ttlMs = options.ttlMs ?? DEFAULT_CONTROL_EVENT_TTL_MS;
-  const errors = validateHelloPeerExecutionRequest(request, now);
+  const errors = validateCapabilityExecutionRequest(request, now);
   validateBuilderInputs(now, ttlMs, request.roomRef, request.sourceDeviceRef, request.targetPeerRef, errors);
   if (errors.length > 0) {
     return { ok: false, errors: unique(errors) };
@@ -449,13 +565,13 @@ export function buildCapabilityExecuteRequestControlEvent(
 }
 
 export function buildCapabilityExecutionResultControlEvent(
-  result: HelloPeerExecutionResult,
+  result: CapabilityExecutionResult,
   requestEvent: CapabilityExecuteRequestRoomControlEvent,
   options: BuildExecutionControlEventOptions = {}
 ): RoomControlEventBuildResult {
   const now = options.now ?? new Date();
   const ttlMs = options.ttlMs ?? DEFAULT_CONTROL_EVENT_TTL_MS;
-  const errors = validateHelloPeerExecutionResult(result);
+  const errors = validateCapabilityExecutionResult(result);
   validateBuilderInputs(
     now,
     ttlMs,
@@ -506,7 +622,7 @@ export function validateRoomControlEvent(
     "Room control event",
     errors
   );
-  for (const path of findUnsafeOrExecutionFieldPaths(value)) {
+  for (const path of findUnsafeOrExecutionFieldPaths(value, "$", [], value)) {
     errors.push(`Unsafe or execution-like field is not allowed in room control event: ${path}.`);
   }
   if (serializedByteLength(value) > MAX_ROOM_CONTROL_EVENT_BYTES) {
@@ -693,7 +809,7 @@ function validateStatusEvent(
     if (kind !== "capability_preview_ack") {
       errors.push("Only a capability preview acknowledgement may contain a consent grant.");
     }
-    errors.push(...validateHelloPeerConsentGrant(value.payload.consent));
+    errors.push(...validateCapabilityConsentGrant(value.payload.consent));
   }
   if (value.payload.status !== STATUS_BY_KIND[kind]) {
     errors.push(`Room control event kind ${kind} requires status ${STATUS_BY_KIND[kind]}.`);
@@ -708,7 +824,7 @@ function validateExecutionRequestEvent(
   if (value.previewOnly !== false) {
     errors.push("Execution request event requires previewOnly false.");
   }
-  const requestErrors = validateHelloPeerExecutionRequest(value.payload, now);
+  const requestErrors = validateCapabilityExecutionRequest(value.payload, now);
   errors.push(...requestErrors);
   if (!isRecord(value.payload)) {
     return;
@@ -736,7 +852,22 @@ function validateExecutionResultEvent(
   if (value.previewOnly !== false) {
     errors.push("Execution result event requires previewOnly false.");
   }
-  errors.push(...validateHelloPeerExecutionResult(value.payload));
+  errors.push(...validateCapabilityExecutionResult(value.payload));
+}
+
+export function validateCapabilityConsentGrant(value: unknown): string[] {
+  if (!isRecord(value)) {
+    return ["Capability consent grant must be an object."];
+  }
+  const contract = getAgentBridgeCapabilityContract(value.capability)
+    ?? getAgentBridgeCapabilityContractByConsentGrantSchema(value.schemaVersion);
+  if (contract?.capability === HELLO_STDOUT_CAPABILITY) {
+    return validateHelloStdoutConsentGrant(value);
+  }
+  if (contract?.capability === HELLO_TEMPLATE_CAPABILITY) {
+    return validateHelloPeerConsentGrant(value);
+  }
+  return ["Capability consent grant capability is not registered."];
 }
 
 export function validateHelloPeerConsentGrant(value: unknown): string[] {
@@ -760,6 +891,44 @@ export function validateHelloPeerConsentGrant(value: unknown): string[] {
   validateFixedHelloCapabilityAndMessage(value, "Hello Peer consent grant", errors);
   requireDateString(value.expiresAt, "consent.expiresAt", errors);
   return unique(errors);
+}
+
+export function validateHelloStdoutConsentGrant(value: unknown): string[] {
+  const errors: string[] = [];
+  if (!isRecord(value)) {
+    return ["Hello Stdout consent grant must be an object."];
+  }
+  requireExactFields(value, HELLO_STDOUT_CONSENT_GRANT_FIELDS, [], "Hello Stdout consent grant", errors);
+  if (value.schemaVersion !== HELLO_STDOUT_CONSENT_GRANT_SCHEMA) {
+    errors.push(`Hello Stdout consent grant schemaVersion must be ${HELLO_STDOUT_CONSENT_GRANT_SCHEMA}.`);
+  }
+  for (const field of [
+    "consentId",
+    "sourcePreviewEventId",
+    "envelopeId",
+    "requestId",
+    "requestPayloadHash"
+  ]) {
+    requireBoundedString(value[field], `consent.${field}`, MAX_IDENTIFIER_LENGTH, errors);
+  }
+  validateFixedHelloStdoutCapabilityAndExpectedStdout(value, "Hello Stdout consent grant", errors);
+  requireDateString(value.expiresAt, "consent.expiresAt", errors);
+  return unique(errors);
+}
+
+export function validateCapabilityExecutionRequest(value: unknown, now = new Date()): string[] {
+  if (!isRecord(value)) {
+    return ["Capability execution request must be an object."];
+  }
+  const contract = getAgentBridgeCapabilityContract(value.capability)
+    ?? getAgentBridgeCapabilityContractByExecutionRequestSchema(value.schemaVersion);
+  if (contract?.capability === HELLO_STDOUT_CAPABILITY) {
+    return validateHelloStdoutExecutionRequest(value, now);
+  }
+  if (contract?.capability === HELLO_TEMPLATE_CAPABILITY) {
+    return validateHelloPeerExecutionRequest(value, now);
+  }
+  return ["Capability execution request capability is not registered."];
 }
 
 export function validateHelloPeerExecutionRequest(value: unknown, now = new Date()): string[] {
@@ -789,6 +958,47 @@ export function validateHelloPeerExecutionRequest(value: unknown, now = new Date
   return unique(errors);
 }
 
+export function validateHelloStdoutExecutionRequest(value: unknown, now = new Date()): string[] {
+  const errors: string[] = [];
+  if (!isRecord(value)) {
+    return ["Hello Stdout execution request must be an object."];
+  }
+  requireExactFields(value, HELLO_STDOUT_EXECUTION_REQUEST_FIELDS, [], "Hello Stdout execution request", errors);
+  if (value.schemaVersion !== HELLO_STDOUT_EXECUTION_REQUEST_SCHEMA) {
+    errors.push(`Hello Stdout execution request schemaVersion must be ${HELLO_STDOUT_EXECUTION_REQUEST_SCHEMA}.`);
+  }
+  for (const field of [
+    "executionId",
+    "consentId",
+    "sourcePreviewEventId",
+    "envelopeId",
+    "requestId",
+    "requestPayloadHash",
+    "roomRef",
+    "sourceDeviceRef",
+    "targetPeerRef"
+  ]) {
+    requireBoundedString(value[field], field, MAX_IDENTIFIER_LENGTH, errors);
+  }
+  validateFixedHelloStdoutCapabilityAndExpectedStdout(value, "Hello Stdout execution request", errors);
+  validateDates(value.createdAt, value.expiresAt, now, errors);
+  return unique(errors);
+}
+
+export function validateCapabilityExecutionResult(value: unknown): string[] {
+  if (!isRecord(value)) {
+    return ["Capability execution result must be an object."];
+  }
+  const contract = getAgentBridgeCapabilityContractByExecutionResultSchema(value.schemaVersion);
+  if (contract?.capability === HELLO_STDOUT_CAPABILITY) {
+    return validateHelloStdoutExecutionResult(value);
+  }
+  if (contract?.capability === HELLO_TEMPLATE_CAPABILITY) {
+    return validateHelloPeerExecutionResult(value);
+  }
+  return ["Capability execution result schema is not registered."];
+}
+
 export function validateHelloPeerExecutionResult(value: unknown): string[] {
   const errors: string[] = [];
   if (!isRecord(value)) {
@@ -812,8 +1022,8 @@ export function validateHelloPeerExecutionResult(value: unknown): string[] {
   }
   requireDateString(value.createdAt, "createdAt", errors);
   if (value.status === "succeeded") {
-    if (value.output !== HELLO_MESSAGE) {
-      errors.push(`Successful Hello Peer execution output must be exactly ${HELLO_MESSAGE}.`);
+    if (value.output !== HELLO_TEMPLATE_MESSAGE) {
+      errors.push(`Successful Hello Peer execution output must be exactly ${HELLO_TEMPLATE_MESSAGE}.`);
     }
     if (value.errorCode !== undefined) {
       errors.push("Successful Hello Peer execution result must not contain errorCode.");
@@ -830,16 +1040,85 @@ export function validateHelloPeerExecutionResult(value: unknown): string[] {
   return unique(errors);
 }
 
+export function validateHelloStdoutExecutionResult(value: unknown): string[] {
+  const errors: string[] = [];
+  if (!isRecord(value)) {
+    return ["Hello Stdout execution result must be an object."];
+  }
+  requireExactFields(
+    value,
+    HELLO_STDOUT_EXECUTION_RESULT_REQUIRED_FIELDS,
+    HELLO_STDOUT_EXECUTION_RESULT_OPTIONAL_FIELDS,
+    "Hello Stdout execution result",
+    errors
+  );
+  if (value.schemaVersion !== HELLO_STDOUT_EXECUTION_RESULT_SCHEMA) {
+    errors.push(`Hello Stdout execution result schemaVersion must be ${HELLO_STDOUT_EXECUTION_RESULT_SCHEMA}.`);
+  }
+  for (const field of ["executionId", "requestId", "consentId"]) {
+    requireBoundedString(value[field], field, MAX_IDENTIFIER_LENGTH, errors);
+  }
+  if (value.capability !== HELLO_STDOUT_CAPABILITY) {
+    errors.push(`Hello Stdout execution result capability must be exactly ${HELLO_STDOUT_CAPABILITY}.`);
+  }
+  if (value.runtimeKind !== "rust_host_helper") {
+    errors.push("Hello Stdout execution result runtimeKind must be rust_host_helper.");
+  }
+  if (!["succeeded", "rejected", "expired", "already_consumed", "failed"].includes(String(value.status))) {
+    errors.push("Hello Stdout execution result contains an unsupported status.");
+  }
+  requireDateString(value.createdAt, "createdAt", errors);
+  validateBoundedStringBytes(value.stdout, "stdout", MAX_HELLO_STDOUT_STDOUT_BYTES, errors);
+  validateBoundedStringBytes(value.stderr, "stderr", MAX_HELLO_STDOUT_STDERR_BYTES, errors);
+  validateNonNegativeInteger(value.exitCode, "exitCode", errors);
+  validateNonNegativeInteger(value.durationMs, "durationMs", errors, MAX_HELLO_STDOUT_DURATION_MS);
+  for (const field of ["timedOut", "stdoutTruncated", "stderrTruncated"]) {
+    if (typeof value[field] !== "boolean") {
+      errors.push(`Hello Stdout execution result requires boolean ${field}.`);
+    }
+  }
+  if (value.status === "succeeded") {
+    if (value.stdout !== HELLO_STDOUT_EXPECTED_STDOUT) {
+      errors.push(`Successful Hello Stdout execution stdout must be exactly ${HELLO_STDOUT_EXPECTED_STDOUT}.`);
+    }
+    if (value.stderr !== "" || value.exitCode !== 0 || value.timedOut !== false) {
+      errors.push("Successful Hello Stdout execution result must have empty stderr, exitCode 0, and timedOut false.");
+    }
+    if (value.errorCode !== undefined) {
+      errors.push("Successful Hello Stdout execution result must not contain errorCode.");
+    }
+  } else {
+    requireBoundedString(value.errorCode, "errorCode", MAX_EXECUTION_ERROR_CODE_LENGTH, errors);
+  }
+  if (serializedByteLength(value) > 2048) {
+    errors.push("Hello Stdout execution result exceeds 2048 bytes.");
+  }
+  return unique(errors);
+}
+
 function validateFixedHelloCapabilityAndMessage(
   value: Record<string, unknown>,
   label: string,
   errors: string[]
 ) {
-  if (value.capability !== HELLO_CAPABILITY) {
-    errors.push(`${label} capability must be exactly ${HELLO_CAPABILITY}.`);
+  if (value.capability !== HELLO_TEMPLATE_CAPABILITY) {
+    errors.push(`${label} capability must be exactly ${HELLO_TEMPLATE_CAPABILITY}.`);
   }
-  if (value.exactMessage !== HELLO_MESSAGE) {
-    errors.push(`${label} message must be exactly ${HELLO_MESSAGE}.`);
+  if (value.exactMessage !== HELLO_TEMPLATE_MESSAGE) {
+    errors.push(`${label} message must be exactly ${HELLO_TEMPLATE_MESSAGE}.`);
+  }
+}
+
+function validateFixedHelloStdoutCapabilityAndExpectedStdout(
+  value: Record<string, unknown>,
+  label: string,
+  errors: string[]
+) {
+  if (value.capability !== HELLO_STDOUT_CAPABILITY) {
+    errors.push(`${label} capability must be exactly ${HELLO_STDOUT_CAPABILITY}.`);
+  }
+  if (value.expectedStdout !== HELLO_STDOUT_EXPECTED_STDOUT) {
+    errors.push(`${label} expectedStdout must be exactly ${HELLO_STDOUT_EXPECTED_STDOUT}.`);
   }
 }
 
@@ -917,19 +1196,53 @@ function validateOptionalBoundedString(value: unknown, label: string, maxLength:
   requireBoundedString(value, label, maxLength, errors);
 }
 
-function findUnsafeOrExecutionFieldPaths(value: unknown, path = "$", found: string[] = []): string[] {
+function validateBoundedStringBytes(value: unknown, label: string, maxBytes: number, errors: string[]) {
+  if (typeof value !== "string") {
+    errors.push(`Hello Stdout execution result requires string ${label}.`);
+    return;
+  }
+  if (new TextEncoder().encode(value).byteLength > maxBytes) {
+    errors.push(`Hello Stdout execution result ${label} exceeds ${maxBytes} bytes.`);
+  }
+}
+
+function validateNonNegativeInteger(value: unknown, label: string, errors: string[], max?: number) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || (max !== undefined && value > max)) {
+    errors.push(`Hello Stdout execution result requires bounded non-negative integer ${label}.`);
+  }
+}
+
+function findUnsafeOrExecutionFieldPaths(
+  value: unknown,
+  path = "$",
+  found: string[] = [],
+  root: unknown = value
+): string[] {
   if (Array.isArray(value)) {
-    value.forEach((entry, index) => findUnsafeOrExecutionFieldPaths(entry, `${path}[${index}]`, found));
+    value.forEach((entry, index) => findUnsafeOrExecutionFieldPaths(entry, `${path}[${index}]`, found, root));
   } else if (isRecord(value)) {
     for (const [key, entry] of Object.entries(value)) {
       const entryPath = `${path}.${key}`;
-      if (UNSAFE_OR_EXECUTION_FIELDS.has(normalizeFieldName(key))) {
+      if (
+        UNSAFE_OR_EXECUTION_FIELDS.has(normalizeCapabilityFieldName(key))
+        && !isAllowedHelloStdoutResultField(root, entryPath, key)
+      ) {
         found.push(entryPath);
       }
-      findUnsafeOrExecutionFieldPaths(entry, entryPath, found);
+      findUnsafeOrExecutionFieldPaths(entry, entryPath, found, root);
     }
   }
   return found;
+}
+
+function isAllowedHelloStdoutResultField(root: unknown, path: string, key: string): boolean {
+  if (!isRecord(root) || root.kind !== "capability_execution_result" || !isRecord(root.payload)) {
+    return false;
+  }
+  if (root.payload.schemaVersion !== HELLO_STDOUT_EXECUTION_RESULT_SCHEMA) {
+    return false;
+  }
+  return path === `$.payload.${key}` && ["stdout", "stderr", "exitCode"].includes(key);
 }
 
 function normalizeTotalWindows(value?: number): number {
@@ -937,10 +1250,6 @@ function normalizeTotalWindows(value?: number): number {
     return 8;
   }
   return Math.max(1, Math.floor(value as number));
-}
-
-function normalizeFieldName(value: string): string {
-  return value.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 }
 
 function serializedByteLength(value: unknown): number {

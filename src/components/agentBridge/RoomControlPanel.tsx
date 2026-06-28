@@ -5,6 +5,7 @@ import {
   buildCapabilityPreviewControlEvent,
   buildCapabilityPreviewStatusControlEvent,
   buildHelloPeerExecutionRequest,
+  buildHelloStdoutExecutionRequest,
   buildSessionBoundCapabilityPreviewControlEvent,
   buildPeerConsentStatusEvent,
   allowPeerCapabilityOnce,
@@ -18,6 +19,7 @@ import {
   enqueueRoomControlEvent,
   evaluatePeerCapabilityPreview,
   executeInboundHelloPeerRequest,
+  executeInboundHelloStdoutRequest,
   getRuntimeControlWindowStatus,
   hasOutgoingControlWindowDemand,
   logAgentBridgeLifecycle,
@@ -48,6 +50,7 @@ import {
   type RoomControlSendState,
 } from "../../lib/agentBridge";
 import {
+  executeHelloStdoutCapability,
   getRoomControlSessionContext,
   listReceivedRoomControlEvents,
   sendRoomControlEvent,
@@ -369,7 +372,7 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
     setQueue(result.state);
     setTransportBusy(false);
     if (result.ok && result.action === "selected_inbound") {
-      handleSelectedInbound(result.state, result.item);
+      await handleSelectedInbound(result.state, result.item);
     } else if (result.ok) {
       logAgentBridgeLifecycle({
         eventKind: result.item.event.kind === "capability_execute_request"
@@ -393,7 +396,7 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
     }
   }
 
-  function handleSelectedInbound(state: ControlQueueState, item: ControlQueueItem) {
+  async function handleSelectedInbound(state: ControlQueueState, item: ControlQueueItem) {
     if (!session) {
       setMessages(["Peer PolicyGate requires an active current room session."]);
       return;
@@ -422,6 +425,7 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
         return;
       }
       setQueue(awaiting.state);
+      const isHelloStdoutPreview = item.event.payload.request.capability === "runtime.hello_stdout/v1";
       setPeerReview({
         queueId: item.queueId,
         event: item.event,
@@ -429,7 +433,7 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
         status: "awaiting_peer_decision",
       });
       setMessages([
-        "Peer PolicyGate accepted this exact Hello Peer preview for review.",
+        `Peer PolicyGate accepted this exact ${isHelloStdoutPreview ? "Hello Stdout" : "Hello Peer"} preview for review.`,
         "Allow once or Deny requires an explicit receiver action. No capability was executed.",
       ]);
       logAgentBridgeLifecycle({ eventKind: "peer_review_started", roomRefShort: session.roomId, eventIdShort: item.event.eventId, requestIdShort: item.event.payload.request.requestId });
@@ -441,22 +445,35 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       const consent = peerConsentRecords.find(
         (record) => record.binding.consentId === executionRequestEvent.payload.consentId
       );
+      const isHelloStdout = executionRequestEvent.payload.capability === "runtime.hello_stdout/v1";
       logAgentBridgeLifecycle({
         eventKind: "hello_peer_execution_started",
         roomRefShort: session.roomId,
         requestIdShort: executionRequestEvent.payload.requestId,
         executionIdShort: executionRequestEvent.payload.executionId,
       });
-      const execution = executeInboundHelloPeerRequest(
-        executionRequestEvent,
-        consent,
-        consumptionState,
-        {
-          roomRef: session.roomId,
-          sourceDeviceRef: session.peerSessionRef,
-          targetPeerRef: session.localSessionRef,
-        },
-      );
+      const execution = isHelloStdout
+        ? await executeInboundHelloStdoutRequest(
+            executionRequestEvent,
+            consent,
+            consumptionState,
+            executeHelloStdoutCapability,
+            {
+              roomRef: session.roomId,
+              sourceDeviceRef: session.peerSessionRef,
+              targetPeerRef: session.localSessionRef,
+            },
+          )
+        : executeInboundHelloPeerRequest(
+            executionRequestEvent,
+            consent,
+            consumptionState,
+            {
+              roomRef: session.roomId,
+              sourceDeviceRef: session.peerSessionRef,
+              targetPeerRef: session.localSessionRef,
+            },
+          );
       const requestStatus = execution.result.status === "succeeded"
         ? "execution_consumed"
         : execution.result.status === "already_consumed"
@@ -466,7 +483,9 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
             : "execution_rejected";
       const completed = markControlQueueItemStatus(state, item.queueId, requestStatus, {
         reason: execution.result.status === "succeeded"
-          ? "Exact one-time consent consumed. Hello Peer demo executed once."
+          ? isHelloStdout
+            ? "Exact one-time consent consumed. Hello Stdout demo executed once."
+            : "Exact one-time consent consumed. Hello Peer demo executed once."
           : `Execution request rejected: ${execution.result.errorCode ?? execution.result.status}.`,
       });
       if (!completed.ok) {
@@ -499,7 +518,9 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
         executionIdShort: item.event.payload.executionId,
         consentResult: execution.state.consumedConsentIds.includes(item.event.payload.consentId) ? "consumed" : "not_consumed",
         errorCode: execution.result.errorCode,
-        executionResult: execution.result.status === "succeeded" ? "hello_peer_template_succeeded" : undefined,
+        executionResult: execution.result.status === "succeeded"
+          ? isHelloStdout ? "hello_stdout_succeeded" : "hello_peer_template_succeeded"
+          : undefined,
       });
       if (consent && execution.state.consumedConsentIds.includes(consent.binding.consentId)) {
         setPeerReview((current) =>
@@ -511,7 +532,9 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       setQueue(outboundResult.state);
       setMessages([
         execution.result.status === "succeeded"
-          ? "Hello Peer demo executed once. Exact one-time consent was consumed."
+          ? isHelloStdout
+            ? "Hello Stdout demo executed once. Exact one-time consent was consumed."
+            : "Hello Peer demo executed once. Exact one-time consent was consumed."
           : `Execution request rejected: ${execution.result.errorCode ?? execution.result.status}.`,
         "Bounded execution result queued for one explicit Process next action.",
       ]);
@@ -535,7 +558,7 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       const matched = requestItem
         ? markControlQueueItemStatus(state, requestItem.queueId, outboundStatus, {
             reason: executionResultEvent.payload.status === "succeeded"
-              ? "Peer returned the fixed bounded Hello Peer result."
+              ? "Peer returned the fixed bounded result."
               : `Peer returned ${executionResultEvent.payload.errorCode ?? executionResultEvent.payload.status}.`,
           })
         : { ok: false as const, state, errors: ["No matching outbound execution request was found."] };
@@ -551,7 +574,7 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       }
       setMessages(matched.ok
         ? [executionResultEvent.payload.status === "succeeded"
-            ? "Peer returned the fixed bounded result: hello peer!"
+            ? `Peer returned the fixed bounded result: ${"stdout" in executionResultEvent.payload ? executionResultEvent.payload.stdout : executionResultEvent.payload.output}`
             : `Peer execution result: ${executionResultEvent.payload.errorCode ?? executionResultEvent.payload.status}.`]
         : matched.errors);
       return;
@@ -673,7 +696,9 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       setMessages(["The exact source preview for this Allow once acknowledgement is unavailable."]);
       return;
     }
-    const built = buildHelloPeerExecutionRequest(preview.event, senderExecutionAck);
+    const built = preview.event.payload.request.capability === "runtime.hello_stdout/v1"
+      ? buildHelloStdoutExecutionRequest(preview.event, senderExecutionAck)
+      : buildHelloPeerExecutionRequest(preview.event, senderExecutionAck);
     if (!built.ok) {
       setMessages(built.errors);
       return;
@@ -686,7 +711,9 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
     setQueue(queued.state);
     setSenderExecutionAck(null);
     setMessages([
-      "Hello Peer execution request queued. Nothing executes until Process next sends it and the receiver PolicyGate accepts it.",
+      preview.event.payload.request.capability === "runtime.hello_stdout/v1"
+        ? "Hello Stdout execution request queued. Nothing executes until Process next sends it and the receiver PolicyGate accepts it."
+        : "Hello Peer execution request queued. Nothing executes until Process next sends it and the receiver PolicyGate accepts it.",
     ]);
     logAgentBridgeLifecycle({
       eventKind: "execution_request_queued",
@@ -867,14 +894,18 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
         && Date.parse(senderExecutionAck.payload.consent.expiresAt) > controlDemandNowMs ? (
         <div className="agent-bridge-next-item" data-testid="agent-bridge-execution-request-card">
           <span className="agent-bridge-status-label">Peer allowed once</span>
-          <strong>Exact Hello Peer request approved</strong>
+          <strong>{senderExecutionAck.payload.consent.capability === "runtime.hello_stdout/v1"
+            ? "Exact Hello Stdout request approved"
+            : "Exact Hello Peer request approved"}</strong>
           <span className="muted">No execution has occurred. This action is explicit and can be used once.</span>
           <button
             className="primary-button"
             data-testid="agent-bridge-request-hello-execution"
             onClick={requestHelloPeerExecution}
           >
-            Request Hello Peer execution
+            {senderExecutionAck.payload.consent.capability === "runtime.hello_stdout/v1"
+              ? "Request Hello Stdout execution"
+              : "Request Hello Peer execution"}
           </button>
         </div>
       ) : null}
@@ -882,7 +913,11 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
         <div className="agent-bridge-next-item" data-testid="agent-bridge-execution-result-card">
           <span className="agent-bridge-status-label">Bounded execution result</span>
           <strong>{latestExecutionResult.payload.status}</strong>
-          {latestExecutionResult.payload.output ? <span>{latestExecutionResult.payload.output}</span> : null}
+          {"stdout" in latestExecutionResult.payload ? <span>stdout: {latestExecutionResult.payload.stdout}</span> : null}
+          {"stderr" in latestExecutionResult.payload && latestExecutionResult.payload.stderr ? <span>stderr: {latestExecutionResult.payload.stderr}</span> : null}
+          {"exitCode" in latestExecutionResult.payload ? <span>exit {latestExecutionResult.payload.exitCode}</span> : null}
+          {"durationMs" in latestExecutionResult.payload ? <span>{latestExecutionResult.payload.durationMs}ms</span> : null}
+          {"output" in latestExecutionResult.payload && latestExecutionResult.payload.output ? <span>{latestExecutionResult.payload.output}</span> : null}
           {latestExecutionResult.payload.errorCode ? <span>{latestExecutionResult.payload.errorCode}</span> : null}
         </div>
       ) : null}
@@ -982,14 +1017,18 @@ function PeerConsentReviewCard({
   onDeny: () => void;
 }) {
   const expired = review.status === "expired" || Date.parse(review.binding.expiresAt) <= nowMs;
+  const isHelloStdout = review.binding.capability === "runtime.hello_stdout/v1";
+  const capabilityDetail = "expectedStdout" in review.binding
+    ? `Expected stdout: ${review.binding.expectedStdout}`
+    : `Exact message: ${review.binding.exactMessage}`;
   return (
     <div className="agent-bridge-next-item" data-testid="agent-bridge-peer-consent-review">
       <span className="agent-bridge-status-label">Peer PolicyGate review</span>
-      <strong>Hello Peer demo</strong>
+      <strong>{isHelloStdout ? "Hello Stdout demo" : "Hello Peer demo"}</strong>
       <span className="agent-bridge-compact-ref" title={review.binding.sourceDeviceRef}>
         Source: {shortRef(review.binding.sourceDeviceRef)}
       </span>
-      <span>Exact message: hello peer!</span>
+      <span>{capabilityDetail}</span>
       <time dateTime={review.binding.expiresAt}>
         Expires {new Date(review.binding.expiresAt).toLocaleTimeString()}
       </time>
@@ -1018,7 +1057,9 @@ function PeerConsentReviewCard({
           {review.status === "allowed_once"
             ? "Allowed once. Waiting for the peer's explicit execution request."
             : review.status === "consumed"
-              ? "One-time consent consumed. Hello Peer demo executed once."
+              ? isHelloStdout
+                ? "One-time consent consumed. Hello Stdout demo executed once."
+                : "One-time consent consumed. Hello Peer demo executed once."
             : review.status === "denied"
               ? "Denied."
               : review.status === "expired"

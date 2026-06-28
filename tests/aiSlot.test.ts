@@ -6,8 +6,10 @@ import {
   buildCapabilityRequestPreviewEnvelope,
   buildOpenAICompatibleChatRequest,
   buildHelloPeerRequestFromPendingAction,
+  buildHelloStdoutRequestFromPendingAction,
   buildMockAiContextSnapshot,
   buildMockHelloPeerPlan,
+  buildMockHelloStdoutPlan,
   canonicalizeHelloPeerRequestForHash,
   CloudOpenAICompatibleProvider,
   CLOUD_STRICT_AI_CONTEXT_POLICY,
@@ -17,7 +19,12 @@ import {
   createCapabilityPreviewSessionState,
   createPendingAiAction,
   denyCapabilityPreview,
+  deriveCapabilitySharedPreviewEnvelope,
   evaluateAiPolicy,
+  getAgentBridgeCapabilityContract,
+  getAgentBridgeCapabilityContractByActionKind,
+  getAgentBridgeCapabilityContractByVersion,
+  listAgentBridgeCapabilityContracts,
   hashPendingAiActionPayload,
   hashStableSerializedValue,
   MOCK_AI_CONTEXT_POLICY,
@@ -25,6 +32,7 @@ import {
   validateAiActionPlan,
   validateCapabilityRequestPreviewEnvelope,
   validateHelloPeerRequest,
+  validateHelloStdoutRequest,
   type AiActionPlan,
   type AiContextSnapshot,
   type AiGenerateRequest,
@@ -140,8 +148,81 @@ test("MockProvider returns a safe advisory plan", async () => {
   });
 
   assert.equal(result.providerId, mockProvider.config.providerId);
-  assert.equal(result.parsedPlan?.kind, "request_peer_hello_demo");
+  assert.equal(result.parsedPlan?.kind, "request_peer_hello_stdout_demo");
   assert.equal(validateAiActionPlan(result.parsedPlan).valid, true);
+});
+
+test("safe Hello Stdout mock plan validates and builds a preview-only request", () => {
+  const plan = buildMockHelloStdoutPlan();
+  const context = buildMockAiContextSnapshot();
+  const validation = validateAiActionPlan(plan);
+  assert.equal(validation.valid, true);
+  if (!validation.valid) return;
+  const policy = evaluateAiPolicy(validation.value, context);
+  assert.equal(policy.status, "accepted");
+  const pending = confirmPendingAiAction(createPendingAiAction(validation.value, policy, {
+    now: new Date("2026-06-11T00:00:00.000Z"),
+    ttlMs: 120_000,
+    pendingId: "hello-stdout-pending"
+  }), new Date("2026-06-11T00:00:30.000Z"));
+  const request = buildHelloStdoutRequestFromPendingAction(pending, {
+    now: new Date("2026-06-11T00:01:00.000Z"),
+    requestId: "hello-stdout-request",
+    nonce: "hello-stdout-nonce",
+    sourceDeviceRef: "source-device"
+  });
+  assert.equal(request.ok, true);
+  if (!request.ok) return;
+  assert.equal(request.request.capability, "runtime.hello_stdout/v1");
+  assert.equal(request.request.input.expectedStdout, "hello peer");
+  assert.equal(validateHelloStdoutRequest(request.request, { now: new Date("2026-06-11T00:01:00.000Z") }).valid, true);
+  assert.equal("command" in request.request, false);
+});
+
+test("Agent Bridge capability registry resolves both bounded capabilities", () => {
+  const contracts = listAgentBridgeCapabilityContracts();
+  assert.equal(contracts.length, 2);
+  assert.equal(getAgentBridgeCapabilityContract("runtime.execute_hello_template")?.providerActionKind, "request_peer_hello_demo");
+  assert.equal(getAgentBridgeCapabilityContract("runtime.hello_stdout/v1")?.providerActionKind, "request_peer_hello_stdout_demo");
+  assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_hello_demo")?.capability, "runtime.execute_hello_template");
+  assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_hello_stdout_demo")?.capability, "runtime.hello_stdout/v1");
+  assert.equal(getAgentBridgeCapabilityContract("runtime.unknown/v1"), undefined);
+  assert.equal(getAgentBridgeCapabilityContractByVersion("runtime.hello_stdout/v1", "v2"), undefined);
+  for (const contract of contracts) {
+    assert.equal(contract.routePolicy, "selected-peer");
+    assert.equal(contract.consentPolicy, "exact-allow-once");
+  }
+});
+
+test("shared capability envelope preserves exact selected-peer preview metadata", () => {
+  const result = deterministicCapabilityPreviewEnvelope();
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  const shared = deriveCapabilitySharedPreviewEnvelope(result.envelope);
+
+  assert.equal(shared.schemaVersion, "pastey-agent-bridge-capability-envelope/v1");
+  assert.equal(shared.capability, "runtime.execute_hello_template");
+  assert.equal(shared.capabilityVersion, "legacy");
+  assert.equal(shared.routePolicy, "selected-peer");
+  assert.equal(shared.consentPolicy, "exact-allow-once");
+  assert.equal(shared.requestId, result.envelope.request.requestId);
+  assert.equal(shared.payloadHash, result.envelope.request.requestPayloadHash);
+  assert.equal(shared.typedPayload, result.envelope.request);
+  assert.equal(shared.transport.kind, "room-control");
+  assert.equal(shared.transport.previewOnly, true);
+});
+
+test("provider output cannot include runtime or result payload fields", () => {
+  for (const forbiddenField of ["command", "script", "path", "env", "networkTarget", "stdout", "stderr", "exitCode"]) {
+    const input = mockInput();
+    input[forbiddenField] = forbiddenField === "exitCode" ? 0 : "unsafe";
+
+    const validation = validateAiActionPlan(planWithInput(input));
+
+    assert.equal(validation.valid, false, `${forbiddenField} should reject`);
+    assert.ok(validation.errors.some((error) => error.includes("Unsafe field")));
+  }
 });
 
 test("cloud provider request builder excludes secrets and unknown context fields", () => {

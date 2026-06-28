@@ -10,6 +10,8 @@ Bridge control events are typed current-session values transported through the B
 
 Legacy implementation term: typed `RoomControlEvent` values transported through the room server.
 
+Agent Bridge capability payloads also have a shared lifecycle envelope view, `pastey-agent-bridge-capability-envelope/v1`, derived from the existing typed preview/control payloads. It records capability id/version, selected-peer route policy, exact allow-once consent policy, source/target refs, expiry, payload hash, and bounded transport metadata. This shared envelope does not replace the per-capability schemas validated by `RoomControlEvent`.
+
 Production paths:
 
 - TypeScript event schema and validation: `src/lib/agentBridge/roomControlEvent.ts`.
@@ -55,6 +57,8 @@ Outbound production sends require an exact selected-peer Bridge route before `se
 The Rust backend treats that selected-peer route as authoritative. `src-tauri/src/room_control.rs` resolves the target endpoint and transport key from the current-session `bridge_peers` row, validates the route room/session and event source/target refs, and fails closed for unknown, stale, expired, disconnected, reconnecting, missing-endpoint, or route-mismatched peers. It does not fall back to arbitrary legacy room endpoint fields after route validation fails.
 
 Control and capability transport remains single-target. `selected_peers` and `broadcast_bridge` route payloads are rejected for room-control and Agent Bridge capability events. Ordinary text/file/image/pasted-image multi-target delivery is separate and remains the only implemented fan-out path.
+
+`runtime.hello_stdout/v1` uses the same selected-peer control transport as the fixed Hello Peer template. Its typed stdout result is a capability execution result payload, not ordinary Bridge text, and delivery of that result remains separate from consent or future authority.
 
 Delivery receipt means the transport accepted or exposed the event. It does not mean:
 

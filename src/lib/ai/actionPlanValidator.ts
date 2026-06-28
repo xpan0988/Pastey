@@ -5,6 +5,10 @@ import type {
   AiConfidence,
   ValidationResult
 } from "./types";
+import {
+  AGENT_BRIDGE_CAPABILITY_ACTION_KINDS,
+  findForbiddenProviderFieldPaths
+} from "./capabilityRegistry";
 
 const ACTION_KINDS = new Set<AiActionKind>([
   "explain_status",
@@ -16,7 +20,7 @@ const ACTION_KINDS = new Set<AiActionKind>([
   "suggest_transfer",
   "draft_text_message",
   "explain_microflowgroup_mode",
-  "request_peer_hello_demo"
+  ...AGENT_BRIDGE_CAPABILITY_ACTION_KINDS
 ]);
 
 const CONFIDENCE_VALUES = new Set<AiConfidence>(["low", "medium", "high"]);
@@ -32,25 +36,6 @@ const TOP_LEVEL_FIELDS = new Set([
   "proposedInput"
 ]);
 const REFERENCE_FIELDS = new Set(["kind", "ref"]);
-const UNSAFE_FIELD_NAMES = new Set([
-  "command",
-  "cmd",
-  "shell",
-  "script",
-  "code",
-  "path",
-  "absolutepath",
-  "filepath",
-  "filesystemtree",
-  "rawlogs",
-  "secret",
-  "token",
-  "apikey",
-  "roomkey",
-  "roomcode",
-  "transportkey"
-]);
-
 export function validateAiActionPlan(value: unknown): ValidationResult<AiActionPlan> {
   const errors: string[] = [];
   if (!isRecord(value)) {
@@ -106,9 +91,7 @@ export function validateAiActionPlan(value: unknown): ValidationResult<AiActionP
 }
 
 export function findUnsafeFieldPaths(value: unknown): string[] {
-  const paths: string[] = [];
-  visitValue(value, "$", paths);
-  return paths;
+  return findForbiddenProviderFieldPaths(value);
 }
 
 function validateReference(value: unknown, index: number, errors: string[]) {
@@ -127,27 +110,6 @@ function validateReference(value: unknown, index: number, errors: string[]) {
   if (!isNonEmptyString(value.ref)) {
     errors.push(`references[${index}].ref must be a non-empty string.`);
   }
-}
-
-function visitValue(value: unknown, path: string, paths: string[]) {
-  if (Array.isArray(value)) {
-    value.forEach((entry, index) => visitValue(entry, `${path}[${index}]`, paths));
-    return;
-  }
-  if (!isRecord(value)) {
-    return;
-  }
-  for (const [key, entry] of Object.entries(value)) {
-    const entryPath = `${path}.${key}`;
-    if (UNSAFE_FIELD_NAMES.has(normalizeFieldName(key))) {
-      paths.push(entryPath);
-    }
-    visitValue(entry, entryPath, paths);
-  }
-}
-
-function normalizeFieldName(value: string): string {
-  return value.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {

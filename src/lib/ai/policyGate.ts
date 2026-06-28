@@ -1,17 +1,12 @@
 import { findUnsafeFieldPaths, isRecord } from "./actionPlanValidator";
+import {
+  getAgentBridgeCapabilityContractByActionKind,
+  normalizeCapabilityFieldName,
+  type AgentBridgeCapabilityContract
+} from "./capabilityRegistry";
 import type { AiActionPlan, AiContextSnapshot, AiPolicyResult } from "./types";
 
-const HELLO_CAPABILITY = "runtime.execute_hello_template";
-const HELLO_MESSAGE = "hello peer!";
 const HELLO_INPUT_FIELDS = new Set(["targetPeerRef", "capability", "message", "constraints"]);
-const HELLO_CONSTRAINT_FIELDS = new Set([
-  "templateOnly",
-  "noRawShell",
-  "filesystem",
-  "network",
-  "timeoutMs",
-  "maxStdoutBytes"
-]);
 const POLICY_FORBIDDEN_FIELDS = new Set([
   "hiddenTransfer",
   "automaticTransfer",
@@ -23,7 +18,7 @@ const POLICY_FORBIDDEN_FIELDS = new Set([
   "microFlowGroupMutation",
   "transferWindowMutation",
   "runtimeWindowMutation"
-].map(normalizeFieldName));
+].map(normalizeCapabilityFieldName));
 
 export function evaluateAiPolicy(plan: AiActionPlan, context: AiContextSnapshot): AiPolicyResult {
   const reasons: string[] = [];
@@ -32,14 +27,15 @@ export function evaluateAiPolicy(plan: AiActionPlan, context: AiContextSnapshot)
   if (!context.allowedActions.includes(plan.kind)) {
     reasons.push(`Action kind ${plan.kind} is not allowed by the current context.`);
   }
-  if (plan.kind !== "request_peer_hello_demo") {
+  const contract = getAgentBridgeCapabilityContractByActionKind(plan.kind);
+  if (!contract) {
     reasons.push(`Action kind ${plan.kind} is not enabled by the AI Slot v0 PolicyGate.`);
   }
   if (!plan.requiresUserConfirmation) {
-    reasons.push("Hello Peer requires explicit local user confirmation.");
+    reasons.push("Agent Bridge capability requests require explicit local user confirmation.");
   }
   if (!context.room?.hasActiveRoom || !context.room.trustedRoom) {
-    reasons.push("Hello Peer requires a current trusted room.");
+    reasons.push("Agent Bridge capability requests require a current trusted room.");
   }
 
   for (const unsafePath of findUnsafeFieldPaths(plan)) {
@@ -51,7 +47,7 @@ export function evaluateAiPolicy(plan: AiActionPlan, context: AiContextSnapshot)
 
   const input = plan.proposedInput;
   if (!isRecord(input)) {
-    reasons.push("Hello Peer requires a proposedInput object.");
+    reasons.push("Agent Bridge capability requests require a proposedInput object.");
     return policyResult(plan, reasons, warnings);
   }
   rejectUnsupportedFields(input, HELLO_INPUT_FIELDS, "proposedInput", reasons);
@@ -66,44 +62,54 @@ export function evaluateAiPolicy(plan: AiActionPlan, context: AiContextSnapshot)
     : undefined;
   if (!peer || !peer.visible || !peer.trusted) {
     reasons.push("Target peer must be current, visible, and trusted.");
-  } else if (!peer.capabilities?.includes(HELLO_CAPABILITY)) {
-    reasons.push(`Target peer does not advertise ${HELLO_CAPABILITY}.`);
+  } else if (contract && !peer.capabilities?.includes(contract.capability)) {
+    reasons.push(`Target peer does not advertise ${contract.capability}.`);
   }
 
-  if (input.capability !== HELLO_CAPABILITY) {
-    reasons.push(`Hello Peer capability must be exactly ${HELLO_CAPABILITY}.`);
+  if (contract && input.capability !== contract.capability) {
+    reasons.push(`${contract.ui.label} capability must be exactly ${contract.capability}.`);
   }
-  if (input.message !== HELLO_MESSAGE) {
-    reasons.push(`Hello Peer message must be exactly ${HELLO_MESSAGE}.`);
+  if (contract && input[contract.providerInputField] !== contract.providerInputValue) {
+    reasons.push(`${contract.ui.label} ${contract.providerInputField} must be exactly ${contract.providerInputValue}.`);
   }
 
-  validateConstraints(input.constraints, reasons);
+  if (contract) {
+    validateConstraints(input.constraints, contract, reasons);
+  }
   return policyResult(plan, reasons, warnings);
 }
 
-function validateConstraints(value: unknown, reasons: string[]) {
+function validateConstraints(
+  value: unknown,
+  contract: AgentBridgeCapabilityContract,
+  reasons: string[]
+) {
   if (!isRecord(value)) {
-    reasons.push("Hello Peer requires a constraints object.");
+    reasons.push(`${contract.ui.label} requires a constraints object.`);
     return;
   }
-  rejectUnsupportedFields(value, HELLO_CONSTRAINT_FIELDS, "constraints", reasons);
+  const allowedFields = new Set(contract.constraintFields);
+  rejectUnsupportedFields(value, allowedFields, "constraints", reasons);
   if (value.templateOnly !== true) {
-    reasons.push("Hello Peer constraints must require templateOnly.");
+    reasons.push(`${contract.ui.label} constraints must require templateOnly.`);
   }
   if (value.noRawShell !== true) {
-    reasons.push("Hello Peer constraints must require noRawShell.");
+    reasons.push(`${contract.ui.label} constraints must require noRawShell.`);
   }
-  if (value.filesystem !== "none" && value.filesystem !== "temp-only") {
-    reasons.push("Hello Peer filesystem constraint must be none or temp-only.");
+  if (value.filesystem !== "none" && (!contract.allowTempOnlyFilesystem || value.filesystem !== "temp-only")) {
+    reasons.push(`${contract.ui.label} filesystem constraint must be ${contract.allowTempOnlyFilesystem ? "none or temp-only" : "none"}.`);
   }
   if (value.network !== false) {
-    reasons.push("Hello Peer constraints must disable network access.");
+    reasons.push(`${contract.ui.label} constraints must disable network access.`);
   }
   if (!isPositiveFiniteNumber(value.timeoutMs)) {
-    reasons.push("Hello Peer timeoutMs must be a positive finite number.");
+    reasons.push(`${contract.ui.label} timeoutMs must be a positive finite number.`);
   }
   if (!isPositiveFiniteNumber(value.maxStdoutBytes)) {
-    reasons.push("Hello Peer maxStdoutBytes must be a positive finite number.");
+    reasons.push(`${contract.ui.label} maxStdoutBytes must be a positive finite number.`);
+  }
+  if (allowedFields.has("maxStderrBytes") && !isPositiveFiniteNumber(value.maxStderrBytes)) {
+    reasons.push(`${contract.ui.label} maxStderrBytes must be a positive finite number.`);
   }
 }
 
@@ -145,15 +151,11 @@ function visitValue(value: unknown, path: string, paths: string[]) {
   }
   for (const [key, entry] of Object.entries(value)) {
     const entryPath = `${path}.${key}`;
-    if (POLICY_FORBIDDEN_FIELDS.has(normalizeFieldName(key))) {
+    if (POLICY_FORBIDDEN_FIELDS.has(normalizeCapabilityFieldName(key))) {
       paths.push(entryPath);
     }
     visitValue(entry, entryPath, paths);
   }
-}
-
-function normalizeFieldName(value: string): string {
-  return value.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 }
 
 function isPositiveFiniteNumber(value: unknown): value is number {

@@ -1,8 +1,22 @@
 import { isRecord } from "./actionPlanValidator";
 import {
+  findForbiddenProviderFieldPaths,
+  getAgentBridgeCapabilityContract,
+  getAgentBridgeCapabilityContractByPreviewSchema,
+  SHARED_CAPABILITY_ENVELOPE_SCHEMA,
+  type AgentBridgeCapabilityEnvelope
+} from "./capabilityRegistry";
+import {
   validateHelloPeerRequest,
   type HelloPeerRequest
 } from "./helloPeerRequest";
+import {
+  validateHelloStdoutRequest,
+  type HelloStdoutRequest
+} from "./helloStdoutRequest";
+
+export type CapabilityRequest = HelloPeerRequest | HelloStdoutRequest;
+export type CapabilitySharedPreviewEnvelope = AgentBridgeCapabilityEnvelope<CapabilityRequest>;
 
 export type CapabilityPreviewStatus =
   | "outbound_preview"
@@ -21,7 +35,7 @@ export interface CapabilityRequestPreviewEnvelope {
   roomRef: string;
   sourceDeviceRef: string;
   targetPeerRef: string;
-  request: HelloPeerRequest;
+  request: CapabilityRequest;
   previewOnly: true;
   status: CapabilityPreviewStatus;
 }
@@ -80,43 +94,16 @@ const ENVELOPE_FIELDS = [
   "previewOnly",
   "status"
 ];
-const UNSAFE_OR_EXECUTION_FIELDS = new Set([
-  "command",
-  "cmd",
-  "shell",
-  "script",
-  "code",
-  "path",
-  "absolutePath",
-  "filePath",
-  "filesystemTree",
-  "rawLogs",
-  "secret",
-  "token",
-  "apiKey",
-  "roomKey",
-  "roomCode",
-  "transportKey",
-  "hiddenTransfer",
-  "peerFilesystemSearch",
-  "stdout",
-  "stderr",
-  "exitCode",
-  "executed",
-  "execution",
-  "completed",
-  "succeeded"
-].map(normalizeFieldName));
 let envelopeSequence = 0;
 
 export function buildCapabilityRequestPreviewEnvelope(
-  request: HelloPeerRequest,
+  request: CapabilityRequest,
   options: BuildCapabilityPreviewOptions
 ): CapabilityPreviewBuildResult {
   const errors: string[] = [];
   const now = options.now ?? new Date();
   const ttlMs = options.ttlMs ?? DEFAULT_ENVELOPE_TTL_MS;
-  const requestValidation = validateHelloPeerRequest(request, { now });
+  const requestValidation = validateCapabilityRequest(request, { now });
   if (!requestValidation.valid) {
     errors.push(...requestValidation.errors);
   }
@@ -187,13 +174,13 @@ export function validateCapabilityRequestPreviewEnvelope(
   }
   validateDates(value.createdAt, value.expiresAt, now, errors);
 
-  const requestValidation = validateHelloPeerRequest(value.request, { now });
+  const requestValidation = validateCapabilityRequest(value.request, { now });
   if (!requestValidation.valid) {
     errors.push(...requestValidation.errors.map((error) => `Embedded request: ${error}`));
   } else {
     const request = requestValidation.value;
     if (request.transportStatus !== "preview_only") {
-      errors.push("Embedded Hello Peer request must remain preview_only.");
+      errors.push("Embedded capability request must remain preview_only.");
     }
     if (value.targetPeerRef !== request.targetPeerRef) {
       errors.push("Capability preview envelope target must match the embedded request target.");
@@ -217,6 +204,57 @@ export function validateCapabilityRequestPreviewEnvelope(
   return errors.length === 0
     ? { valid: true, value: value as unknown as CapabilityRequestPreviewEnvelope, errors: [] }
     : { valid: false, errors: [...new Set(errors)] };
+}
+
+function validateCapabilityRequest(
+  value: unknown,
+  options: { now?: Date }
+) {
+  if (!isRecord(value)) {
+    return validateHelloPeerRequest(value, options);
+  }
+  const contract = getAgentBridgeCapabilityContract(value.capability)
+    ?? getAgentBridgeCapabilityContractByPreviewSchema(value.schemaVersion);
+  if (contract?.capability === "runtime.hello_stdout/v1") {
+    return validateHelloStdoutRequest(value, options);
+  }
+  if (contract?.capability === "runtime.execute_hello_template") {
+    return validateHelloPeerRequest(value, options);
+  }
+  return {
+    valid: false as const,
+    errors: ["Embedded request capability is not registered."]
+  };
+}
+
+export function deriveCapabilitySharedPreviewEnvelope(
+  envelope: CapabilityRequestPreviewEnvelope
+): CapabilitySharedPreviewEnvelope {
+  const contract = getAgentBridgeCapabilityContract(envelope.request.capability);
+  if (!contract) {
+    throw new Error("Cannot derive shared envelope for an unregistered capability.");
+  }
+  return {
+    schemaVersion: SHARED_CAPABILITY_ENVELOPE_SCHEMA,
+    capability: contract.capability,
+    capabilityVersion: contract.version,
+    requestId: envelope.request.requestId,
+    roomRef: envelope.roomRef,
+    sourceDeviceRef: envelope.sourceDeviceRef,
+    targetPeerRef: envelope.targetPeerRef,
+    routePolicy: contract.routePolicy,
+    consentPolicy: contract.consentPolicy,
+    createdAt: envelope.createdAt,
+    expiresAt: envelope.expiresAt,
+    payloadHash: envelope.request.requestPayloadHash,
+    typedPayload: envelope.request,
+    transport: {
+      kind: "room-control",
+      route: contract.routePolicy,
+      previewOnly: envelope.previewOnly,
+      maxPayloadBytes: 64 * 1024,
+    },
+  };
 }
 
 export function createCapabilityPreviewSessionState(): CapabilityPreviewSessionState {
@@ -281,17 +319,8 @@ function validateDates(createdAt: unknown, expiresAt: unknown, now: Date, errors
   }
 }
 
-function findUnsafeOrExecutionFieldPaths(value: unknown, path = "$", found: string[] = []): string[] {
-  if (Array.isArray(value)) {
-    value.forEach((entry, index) => findUnsafeOrExecutionFieldPaths(entry, `${path}[${index}]`, found));
-  } else if (isRecord(value)) {
-    for (const [key, entry] of Object.entries(value)) {
-      const entryPath = `${path}.${key}`;
-      if (UNSAFE_OR_EXECUTION_FIELDS.has(normalizeFieldName(key))) found.push(entryPath);
-      findUnsafeOrExecutionFieldPaths(entry, entryPath, found);
-    }
-  }
-  return found;
+function findUnsafeOrExecutionFieldPaths(value: unknown): string[] {
+  return findForbiddenProviderFieldPaths(value);
 }
 
 function requireExactFields(value: Record<string, unknown>, expectedFields: string[], label: string, errors: string[]) {
@@ -308,10 +337,6 @@ function requireNonEmptyString(value: unknown, label: string, errors: string[]) 
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
-}
-
-function normalizeFieldName(value: string): string {
-  return value.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 }
 
 function createEnvelopeId(now: Date): string {

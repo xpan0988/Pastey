@@ -13,6 +13,13 @@ Current implemented provider paths:
 
 Provider output is always untrusted advisory data. It must pass host-side validation and PolicyGate before it can become a local pending action or Bridge control preview.
 
+The current provider allowlist is backed by the static capability registry in `src/lib/ai/capabilityRegistry.ts`. It may propose fixed demonstration requests only:
+
+- `request_peer_hello_demo` for `runtime.execute_hello_template`;
+- `request_peer_hello_stdout_demo` for `runtime.hello_stdout/v1`.
+
+Provider output may identify the selected peer, registered capability, fixed message, and fixed constraints. It must not include command text, script text, runtime arguments, environment variables, file paths, current working directories, network targets, stdout/stderr/exit values, or execution request/result payloads. The host builds those payloads after validation and consent.
+
 ## Context Controls
 
 Context snapshots are built in `src/lib/ai/contextSnapshot.ts`.

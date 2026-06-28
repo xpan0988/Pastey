@@ -1,8 +1,9 @@
 import { isRecord } from "./actionPlanValidator";
 import {
   findForbiddenProviderFieldPaths,
-  HELLO_TEMPLATE_CAPABILITY,
-  HELLO_TEMPLATE_MESSAGE
+  HELLO_STDOUT_CAPABILITY,
+  HELLO_STDOUT_EXPECTED_STDOUT,
+  HELLO_STDOUT_RUNTIME_KIND
 } from "./capabilityRegistry";
 import {
   buildPendingAiActionCanonicalPayload,
@@ -13,51 +14,46 @@ import {
 } from "./pendingAction";
 import type { PendingAiAction } from "./types";
 
-export type HelloPeerRuntime =
-  | "python"
-  | "node"
-  | "sh"
-  | "powershell"
-  | "rust"
-  | "unknown";
+export type HelloStdoutRuntimeKind = "rust_host_helper";
 
-export interface HelloPeerRequestConstraints {
+export interface HelloStdoutRequestConstraints {
   templateOnly: true;
   noRawShell: true;
-  filesystem: "none" | "temp-only";
+  filesystem: "none";
   network: false;
   timeoutMs: number;
   maxStdoutBytes: number;
+  maxStderrBytes: number;
 }
 
-export interface HelloPeerRequest {
-  schemaVersion: "pastey-capability-request/v1";
+export interface HelloStdoutRequest {
+  schemaVersion: "pastey-runtime-hello-stdout-request/v1";
   requestId: string;
   nonce: string;
   createdAt: string;
   expiresAt: string;
   sourceDeviceRef: string;
   targetPeerRef: string;
-  capability: "runtime.execute_hello_template";
-  runtimePreference: HelloPeerRuntime[];
+  capability: "runtime.hello_stdout/v1";
+  runtimeKind: HelloStdoutRuntimeKind;
   input: {
-    message: "hello peer!";
+    expectedStdout: "hello peer";
   };
-  constraints: HelloPeerRequestConstraints;
+  constraints: HelloStdoutRequestConstraints;
   pendingPayloadHash: string;
   requestPayloadHash: string;
   transportStatus: "preview_only";
 }
 
-export type HelloPeerRequestBuildResult =
-  | { ok: true; request: HelloPeerRequest }
+export type HelloStdoutRequestBuildResult =
+  | { ok: true; request: HelloStdoutRequest }
   | { ok: false; errors: string[] };
 
-export type HelloPeerRequestValidationResult =
-  | { valid: true; value: HelloPeerRequest; errors: [] }
+export type HelloStdoutRequestValidationResult =
+  | { valid: true; value: HelloStdoutRequest; errors: [] }
   | { valid: false; errors: string[] };
 
-interface BuildHelloPeerRequestOptions {
+interface BuildHelloStdoutRequestOptions {
   now?: Date;
   ttlMs?: number;
   sourceDeviceRef?: string;
@@ -65,20 +61,25 @@ interface BuildHelloPeerRequestOptions {
   requestId?: string;
 }
 
-interface ValidateHelloPeerRequestOptions {
+interface ValidateHelloStdoutRequestOptions {
   now?: Date;
 }
 
 const DEFAULT_REQUEST_TTL_MS = 2 * 60 * 1_000;
-const DEFAULT_RUNTIME_PREFERENCE: HelloPeerRuntime[] = [
-  "python",
-  "node",
-  "powershell",
-  "sh",
-  "rust",
-  "unknown"
-];
-const KNOWN_RUNTIMES = new Set<HelloPeerRuntime>(DEFAULT_RUNTIME_PREFERENCE);
+export {
+  HELLO_STDOUT_CAPABILITY,
+  HELLO_STDOUT_EXPECTED_STDOUT,
+  HELLO_STDOUT_RUNTIME_KIND
+};
+export const DEFAULT_HELLO_STDOUT_CONSTRAINTS: HelloStdoutRequestConstraints = {
+  templateOnly: true,
+  noRawShell: true,
+  filesystem: "none",
+  network: false,
+  timeoutMs: 1_000,
+  maxStdoutBytes: 64,
+  maxStderrBytes: 256
+};
 const REQUEST_FIELDS = [
   "schemaVersion",
   "requestId",
@@ -88,45 +89,47 @@ const REQUEST_FIELDS = [
   "sourceDeviceRef",
   "targetPeerRef",
   "capability",
-  "runtimePreference",
+  "runtimeKind",
   "input",
   "constraints",
   "pendingPayloadHash",
   "requestPayloadHash",
   "transportStatus"
 ];
+const INPUT_FIELDS = ["expectedStdout"];
 const CONSTRAINT_FIELDS = [
   "templateOnly",
   "noRawShell",
   "filesystem",
   "network",
   "timeoutMs",
-  "maxStdoutBytes"
+  "maxStdoutBytes",
+  "maxStderrBytes"
 ];
 let requestSequence = 0;
 
-export function buildHelloPeerRequestFromPendingAction(
+export function buildHelloStdoutRequestFromPendingAction(
   pending: PendingAiAction,
-  options: BuildHelloPeerRequestOptions = {}
-): HelloPeerRequestBuildResult {
+  options: BuildHelloStdoutRequestOptions = {}
+): HelloStdoutRequestBuildResult {
   const errors: string[] = [];
   const now = options.now ?? new Date();
   const ttlMs = options.ttlMs ?? DEFAULT_REQUEST_TTL_MS;
 
   if (pending.status !== "confirmed_local_only") {
-    errors.push("Hello Peer request preview requires a confirmed_local_only pending action.");
+    errors.push("Hello Stdout request preview requires a confirmed_local_only pending action.");
   }
   if (pending.policyResult.status !== "accepted" || !pending.policyResult.requiresUserConfirmation) {
-    errors.push("Hello Peer request preview requires the accepted confirmation-bound PolicyGate result.");
+    errors.push("Hello Stdout request preview requires the accepted confirmation-bound PolicyGate result.");
   }
   if (!Number.isFinite(now.getTime()) || !Number.isFinite(ttlMs) || ttlMs <= 0) {
-    errors.push("Hello Peer request preview requires a valid time and positive finite TTL.");
+    errors.push("Hello Stdout request preview requires a valid time and positive finite TTL.");
   }
   if (isPendingAiActionExpired(pending, now)) {
-    errors.push("Hello Peer request preview cannot be built from an expired pending action.");
+    errors.push("Hello Stdout request preview cannot be built from an expired pending action.");
   }
-  if (pending.actionPlan.kind !== "request_peer_hello_demo") {
-    errors.push("Hello Peer request preview requires request_peer_hello_demo.");
+  if (pending.actionPlan.kind !== "request_peer_hello_stdout_demo") {
+    errors.push("Hello Stdout request preview requires request_peer_hello_stdout_demo.");
   }
 
   let rebuiltPendingPayload;
@@ -152,64 +155,64 @@ export function buildHelloPeerRequestFromPendingAction(
 
   const createdAt = now.toISOString();
   const expiresAtMs = Math.min(now.getTime() + ttlMs, new Date(pending.expiresAt).getTime());
-  const requestId = options.requestId ?? createPreviewIdentifier("hello-peer-request", now);
-  const nonce = options.nonce ?? createPreviewIdentifier("hello-peer-nonce", now);
+  const requestId = options.requestId ?? createPreviewIdentifier("hello-stdout-request", now);
+  const nonce = options.nonce ?? createPreviewIdentifier("hello-stdout-nonce", now);
   const sourceDeviceRef = options.sourceDeviceRef ?? "local-device-preview";
-  const requestWithoutHash: Omit<HelloPeerRequest, "requestPayloadHash"> = {
-    schemaVersion: "pastey-capability-request/v1",
+  const requestWithoutHash: Omit<HelloStdoutRequest, "requestPayloadHash"> = {
+    schemaVersion: "pastey-runtime-hello-stdout-request/v1",
     requestId,
     nonce,
     createdAt,
     expiresAt: new Date(expiresAtMs).toISOString(),
     sourceDeviceRef,
     targetPeerRef: rebuiltPendingPayload.targetPeerRef,
-    capability: HELLO_TEMPLATE_CAPABILITY,
-    runtimePreference: [...DEFAULT_RUNTIME_PREFERENCE],
+    capability: HELLO_STDOUT_CAPABILITY,
+    runtimeKind: HELLO_STDOUT_RUNTIME_KIND,
     input: {
-      message: HELLO_TEMPLATE_MESSAGE
+      expectedStdout: HELLO_STDOUT_EXPECTED_STDOUT
     },
     constraints: cloneConstraints(rebuiltPendingPayload.constraints),
     pendingPayloadHash: pending.payloadHash,
     transportStatus: "preview_only"
   };
-  const request: HelloPeerRequest = {
+  const request: HelloStdoutRequest = {
     ...requestWithoutHash,
-    requestPayloadHash: hashHelloPeerRequestPayload(requestWithoutHash)
+    requestPayloadHash: hashHelloStdoutRequestPayload(requestWithoutHash)
   };
-  const validation = validateHelloPeerRequest(request, { now });
+  const validation = validateHelloStdoutRequest(request, { now });
 
   return validation.valid
     ? { ok: true, request: validation.value }
     : { ok: false, errors: validation.errors };
 }
 
-export function canonicalizeHelloPeerRequestForHash(
-  request: Omit<HelloPeerRequest, "requestPayloadHash">
+export function canonicalizeHelloStdoutRequestForHash(
+  request: Omit<HelloStdoutRequest, "requestPayloadHash">
 ): string {
   return stableSerialize(request);
 }
 
-export function hashHelloPeerRequestPayload(
-  request: Omit<HelloPeerRequest, "requestPayloadHash">
+export function hashHelloStdoutRequestPayload(
+  request: Omit<HelloStdoutRequest, "requestPayloadHash">
 ): string {
-  return hashDeterministicString(canonicalizeHelloPeerRequestForHash(request));
+  return hashDeterministicString(canonicalizeHelloStdoutRequestForHash(request));
 }
 
-export function validateHelloPeerRequest(
+export function validateHelloStdoutRequest(
   value: unknown,
-  options: ValidateHelloPeerRequestOptions = {}
-): HelloPeerRequestValidationResult {
+  options: ValidateHelloStdoutRequestOptions = {}
+): HelloStdoutRequestValidationResult {
   const errors: string[] = [];
   if (!isRecord(value)) {
-    return { valid: false, errors: ["Hello Peer request must be an object."] };
+    return { valid: false, errors: ["Hello Stdout request must be an object."] };
   }
 
-  requireExactFields(value, REQUEST_FIELDS, "Hello Peer request", errors);
+  requireExactFields(value, REQUEST_FIELDS, "Hello Stdout request", errors);
   for (const path of findUnsafeFieldPaths(value)) {
-    errors.push(`Unsafe field is not allowed in Hello Peer request: ${path}.`);
+    errors.push(`Unsafe field is not allowed in Hello Stdout request: ${path}.`);
   }
-  if (value.schemaVersion !== "pastey-capability-request/v1") {
-    errors.push("Hello Peer request schemaVersion must be pastey-capability-request/v1.");
+  if (value.schemaVersion !== "pastey-runtime-hello-stdout-request/v1") {
+    errors.push("Hello Stdout request schemaVersion must be pastey-runtime-hello-stdout-request/v1.");
   }
   requireNonEmptyString(value.requestId, "requestId", errors);
   requireNonEmptyString(value.nonce, "nonce", errors);
@@ -219,26 +222,28 @@ export function validateHelloPeerRequest(
   requireNonEmptyString(value.requestPayloadHash, "requestPayloadHash", errors);
   validateDates(value.createdAt, value.expiresAt, options.now ?? new Date(), errors);
 
-  if (value.capability !== HELLO_TEMPLATE_CAPABILITY) {
-    errors.push(`Hello Peer request capability must be exactly ${HELLO_TEMPLATE_CAPABILITY}.`);
+  if (value.capability !== HELLO_STDOUT_CAPABILITY) {
+    errors.push(`Hello Stdout request capability must be exactly ${HELLO_STDOUT_CAPABILITY}.`);
+  }
+  if (value.runtimeKind !== HELLO_STDOUT_RUNTIME_KIND) {
+    errors.push(`Hello Stdout request runtimeKind must be exactly ${HELLO_STDOUT_RUNTIME_KIND}.`);
   }
   if (value.transportStatus !== "preview_only") {
-    errors.push("Hello Peer request transportStatus must be preview_only.");
+    errors.push("Hello Stdout request transportStatus must be preview_only.");
   }
-  validateRuntimePreference(value.runtimePreference, errors);
   validateInput(value.input, errors);
   validateConstraints(value.constraints, errors);
 
   if (errors.length === 0) {
     const { requestPayloadHash, ...requestWithoutHash } = value;
-    const expectedHash = hashHelloPeerRequestPayload(requestWithoutHash as Omit<HelloPeerRequest, "requestPayloadHash">);
+    const expectedHash = hashHelloStdoutRequestPayload(requestWithoutHash as Omit<HelloStdoutRequest, "requestPayloadHash">);
     if (requestPayloadHash !== expectedHash) {
-      errors.push("Hello Peer request payload hash does not match the canonical preview payload.");
+      errors.push("Hello Stdout request payload hash does not match the canonical preview payload.");
     }
   }
 
   return errors.length === 0
-    ? { valid: true, value: value as unknown as HelloPeerRequest, errors: [] }
+    ? { valid: true, value: value as unknown as HelloStdoutRequest, errors: [] }
     : { valid: false, errors: [...new Set(errors)] };
 }
 
@@ -246,65 +251,57 @@ function validateDates(createdAt: unknown, expiresAt: unknown, now: Date, errors
   const createdAtMs = typeof createdAt === "string" ? new Date(createdAt).getTime() : Number.NaN;
   const expiresAtMs = typeof expiresAt === "string" ? new Date(expiresAt).getTime() : Number.NaN;
   if (!Number.isFinite(createdAtMs)) {
-    errors.push("Hello Peer request requires a valid createdAt timestamp.");
+    errors.push("Hello Stdout request requires a valid createdAt timestamp.");
   }
   if (!Number.isFinite(expiresAtMs)) {
-    errors.push("Hello Peer request requires a valid expiresAt timestamp.");
+    errors.push("Hello Stdout request requires a valid expiresAt timestamp.");
   } else if (expiresAtMs <= now.getTime()) {
-    errors.push("Hello Peer request is expired.");
+    errors.push("Hello Stdout request is expired.");
   }
   if (Number.isFinite(createdAtMs) && Number.isFinite(expiresAtMs) && expiresAtMs <= createdAtMs) {
-    errors.push("Hello Peer request expiresAt must be after createdAt.");
-  }
-}
-
-function validateRuntimePreference(value: unknown, errors: string[]) {
-  if (!Array.isArray(value) || value.length === 0) {
-    errors.push("Hello Peer request requires at least one runtime preference.");
-    return;
-  }
-  if (value.some((runtime) => typeof runtime !== "string" || !KNOWN_RUNTIMES.has(runtime as HelloPeerRuntime))) {
-    errors.push("Hello Peer request contains an unknown runtime preference.");
+    errors.push("Hello Stdout request expiresAt must be after createdAt.");
   }
 }
 
 function validateInput(value: unknown, errors: string[]) {
   if (!isRecord(value)) {
-    errors.push("Hello Peer request requires an input object.");
+    errors.push("Hello Stdout request requires an input object.");
     return;
   }
-  requireExactFields(value, ["message"], "Hello Peer input", errors);
-  if (value.message !== HELLO_TEMPLATE_MESSAGE) {
-    errors.push(`Hello Peer request message must be exactly ${HELLO_TEMPLATE_MESSAGE}.`);
+  requireExactFields(value, INPUT_FIELDS, "Hello Stdout input", errors);
+  if (value.expectedStdout !== HELLO_STDOUT_EXPECTED_STDOUT) {
+    errors.push(`Hello Stdout request expectedStdout must be exactly ${HELLO_STDOUT_EXPECTED_STDOUT}.`);
   }
 }
 
 function validateConstraints(value: unknown, errors: string[]) {
   if (!isRecord(value)) {
-    errors.push("Hello Peer request requires a constraints object.");
+    errors.push("Hello Stdout request requires a constraints object.");
     return;
   }
-  requireExactFields(value, CONSTRAINT_FIELDS, "Hello Peer constraints", errors);
-  if (value.templateOnly !== true) errors.push("Hello Peer request requires templateOnly.");
-  if (value.noRawShell !== true) errors.push("Hello Peer request requires noRawShell.");
-  if (value.filesystem !== "none" && value.filesystem !== "temp-only") {
-    errors.push("Hello Peer request filesystem must be none or temp-only.");
-  }
-  if (value.network !== false) errors.push("Hello Peer request must disable network access.");
-  if (!isPositiveFiniteNumber(value.timeoutMs)) errors.push("Hello Peer request timeoutMs must be positive and finite.");
+  requireExactFields(value, CONSTRAINT_FIELDS, "Hello Stdout constraints", errors);
+  if (value.templateOnly !== true) errors.push("Hello Stdout request requires templateOnly.");
+  if (value.noRawShell !== true) errors.push("Hello Stdout request requires noRawShell.");
+  if (value.filesystem !== "none") errors.push("Hello Stdout request filesystem must be none.");
+  if (value.network !== false) errors.push("Hello Stdout request must disable network access.");
+  if (!isPositiveFiniteNumber(value.timeoutMs)) errors.push("Hello Stdout request timeoutMs must be positive and finite.");
   if (!isPositiveFiniteNumber(value.maxStdoutBytes)) {
-    errors.push("Hello Peer request maxStdoutBytes must be positive and finite.");
+    errors.push("Hello Stdout request maxStdoutBytes must be positive and finite.");
+  }
+  if (!isPositiveFiniteNumber(value.maxStderrBytes)) {
+    errors.push("Hello Stdout request maxStderrBytes must be positive and finite.");
   }
 }
 
-function cloneConstraints(value: Record<string, unknown>): HelloPeerRequestConstraints {
+function cloneConstraints(value: Record<string, unknown>): HelloStdoutRequestConstraints {
   return {
     templateOnly: value.templateOnly as true,
     noRawShell: value.noRawShell as true,
-    filesystem: value.filesystem as "none" | "temp-only",
+    filesystem: value.filesystem as "none",
     network: value.network as false,
     timeoutMs: value.timeoutMs as number,
-    maxStdoutBytes: value.maxStdoutBytes as number
+    maxStdoutBytes: value.maxStdoutBytes as number,
+    maxStderrBytes: value.maxStderrBytes as number
   };
 }
 
@@ -318,7 +315,7 @@ function requireExactFields(value: Record<string, unknown>, expectedFields: stri
 
 function requireNonEmptyString(value: unknown, label: string, errors: string[]) {
   if (typeof value !== "string" || value.trim().length === 0) {
-    errors.push(`Hello Peer request requires ${label}.`);
+    errors.push(`Hello Stdout request requires ${label}.`);
   }
 }
 

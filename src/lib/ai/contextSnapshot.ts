@@ -29,7 +29,7 @@ export function buildMockAiContextSnapshot(): AiContextSnapshot {
       peerRef: "mock-peer-1",
       visible: true,
       trusted: true,
-      capabilities: ["runtime.execute_hello_template"]
+      capabilities: ["runtime.execute_hello_template", "runtime.hello_stdout/v1"]
     }],
     scheduler: {
       microFlowGroupMode: "unknown"
@@ -42,7 +42,7 @@ export function buildMockAiContextSnapshot(): AiContextSnapshot {
       level: "info",
       message: "AI Slot v0 mock context is ready."
     },
-    allowedActions: ["request_peer_hello_demo"]
+    allowedActions: ["request_peer_hello_demo", "request_peer_hello_stdout_demo"]
   };
 }
 

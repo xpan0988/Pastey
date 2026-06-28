@@ -13,7 +13,13 @@ import type {
   RoomInfo,
   RoomItem
 } from "./types";
-import { validateRoomControlEvent, type RoomControlEvent } from "./agentBridge";
+import {
+  validateHelloStdoutExecutionRequest,
+  validateRoomControlEvent,
+  type HelloStdoutExecutionRequest,
+  type HelloStdoutExecutionResult,
+  type RoomControlEvent
+} from "./agentBridge";
 import type {
   ControlBridgeRoutePayload,
   FileBridgeRoutePayload,
@@ -150,6 +156,16 @@ export async function sendRoomControlEvent(
     event: validation.value,
     bridgeRoute: bridgeRoute ?? null,
   });
+}
+
+export async function executeHelloStdoutCapability(
+  request: HelloStdoutExecutionRequest,
+): Promise<HelloStdoutExecutionResult> {
+  const errors = validateHelloStdoutExecutionRequest(request);
+  if (errors.length > 0) {
+    throw new Error(errors.join(" "));
+  }
+  return invoke("execute_hello_stdout_capability", { request });
 }
 
 export async function getRoomControlSessionContext(

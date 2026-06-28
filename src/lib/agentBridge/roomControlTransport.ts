@@ -12,9 +12,13 @@ import {
 } from "./controlQueue";
 import {
   hashHelloPeerRequestPayload,
+  hashHelloStdoutRequestPayload,
+  HELLO_STDOUT_CAPABILITY,
   validateCapabilityRequestPreviewEnvelope,
+  type CapabilityRequest,
   type CapabilityRequestPreviewEnvelope,
   type HelloPeerRequest,
+  type HelloStdoutRequest,
 } from "../ai";
 import type {
   RoomControlDeliveryReceipt,
@@ -341,15 +345,11 @@ export function buildSessionBoundCapabilityPreviewControlEvent(
 ): RoomControlEventBuildResult {
   const { requestPayloadHash: _requestPayloadHash, ...requestWithoutHash } =
     envelope.request;
-  const reboundRequestWithoutHash: Omit<HelloPeerRequest, "requestPayloadHash"> = {
+  const request = rebuildCapabilityRequestHash({
     ...requestWithoutHash,
     sourceDeviceRef: session.localSessionRef,
     targetPeerRef: session.peerSessionRef,
-  };
-  const request: HelloPeerRequest = {
-    ...reboundRequestWithoutHash,
-    requestPayloadHash: hashHelloPeerRequestPayload(reboundRequestWithoutHash),
-  };
+  } as Omit<CapabilityRequest, "requestPayloadHash">);
   const reboundEnvelope: CapabilityRequestPreviewEnvelope = {
     ...envelope,
     roomRef: session.roomId,
@@ -371,4 +371,21 @@ export function buildSessionBoundCapabilityPreviewControlEvent(
     targetPeerRef: session.peerSessionRef,
     now: options.now,
   });
+}
+
+function rebuildCapabilityRequestHash(
+  requestWithoutHash: Omit<CapabilityRequest, "requestPayloadHash">,
+): CapabilityRequest {
+  if (requestWithoutHash.capability === HELLO_STDOUT_CAPABILITY) {
+    const rebound = requestWithoutHash as Omit<HelloStdoutRequest, "requestPayloadHash">;
+    return {
+      ...rebound,
+      requestPayloadHash: hashHelloStdoutRequestPayload(rebound),
+    };
+  }
+  const rebound = requestWithoutHash as Omit<HelloPeerRequest, "requestPayloadHash">;
+  return {
+    ...rebound,
+    requestPayloadHash: hashHelloPeerRequestPayload(rebound),
+  };
 }
