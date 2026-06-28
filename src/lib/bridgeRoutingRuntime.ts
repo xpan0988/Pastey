@@ -75,6 +75,7 @@ interface BridgeRoutePayload<TSchemaVersion extends string> {
 
 export type TextBridgeRoutePayload = BridgeRoutePayload<"pastey-bridge-text-route/v1">;
 export type FileBridgeRoutePayload = BridgeRoutePayload<"pastey-bridge-file-route/v1">;
+export type ControlBridgeRoutePayload = BridgeRoutePayload<"pastey-bridge-control-route/v1">;
 
 export type TextRoomSender = (
   roomId: string,
@@ -388,10 +389,10 @@ function assertSessionBoundControlRoute(
   }
 
   const route = deriveAuthoritativeSelectedPeerRoute({
-    bridgeSessionId: session.roomId,
+    bridgeSessionId: `legacy-room:${session.roomId}`,
     target: {
       kind: "selected_peer",
-      peerSessionId: bridgePeerSessionId(session.peerSessionRef),
+      peerSessionId: bridgePeerSessionId(session.peerRouteRef ?? session.peerSessionRef),
     },
   }, contentKind);
   return route;

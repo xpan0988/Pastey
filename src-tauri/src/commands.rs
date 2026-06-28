@@ -1221,11 +1221,17 @@ pub async fn send_file_to_room(
 pub async fn send_room_control_event(
     room_id: String,
     event: Value,
+    bridge_route: Option<Value>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<RoomControlDeliveryReceipt, RoomControlSendError> {
-    crate::room_control::send_room_control_event(state.inner().clone(), &room_id, event)
-        .await
-        .map_err(RoomControlSendError::from_app_error)
+    crate::room_control::send_room_control_event(
+        state.inner().clone(),
+        &room_id,
+        event,
+        bridge_route,
+    )
+    .await
+    .map_err(RoomControlSendError::from_app_error)
 }
 
 #[tauri::command]

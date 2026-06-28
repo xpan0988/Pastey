@@ -26,7 +26,9 @@ The preview request is built from a validated pending action and converted into 
 
 Legacy implementation term: active room/peer context.
 
-Capability preview, execution request, and execution result events must bind to an exact selected peer/session/request. Broadcast is not the default route for capability events.
+Capability preview, acknowledgement, denial, execution request, and execution result events must bind to one exact selected peer/session/request. The event `roomRef`, `sourceDeviceRef`, and `targetPeerRef` must match the active room-control session, and outbound transport must carry a selected-peer control route that resolves through the current-session `bridge_peers` row for that peer.
+
+Selected-peers and broadcast capability routes are not implemented and are rejected. Durable paired-device display metadata, accepted Bridge membership, logs, delivery receipts, and prior delivery outcomes do not satisfy capability target binding.
 
 Production evidence:
 

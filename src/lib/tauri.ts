@@ -14,7 +14,11 @@ import type {
   RoomItem
 } from "./types";
 import { validateRoomControlEvent, type RoomControlEvent } from "./agentBridge";
-import type { FileBridgeRoutePayload, TextBridgeRoutePayload } from "./bridgeRoutingRuntime";
+import type {
+  ControlBridgeRoutePayload,
+  FileBridgeRoutePayload,
+  TextBridgeRoutePayload,
+} from "./bridgeRoutingRuntime";
 
 interface SendFileOptions {
   displayName?: string;
@@ -133,6 +137,7 @@ export async function sendTextToRoom(
 export async function sendRoomControlEvent(
   roomId: string,
   event: RoomControlEvent,
+  bridgeRoute?: ControlBridgeRoutePayload,
 ): Promise<RoomControlDeliveryReceipt> {
   const validation = validateRoomControlEvent(event, {
     expectedRoomRef: roomId,
@@ -140,7 +145,11 @@ export async function sendRoomControlEvent(
   if (!validation.valid) {
     throw new Error(validation.errors.join(" "));
   }
-  return invoke("send_room_control_event", { roomId, event: validation.value });
+  return invoke("send_room_control_event", {
+    roomId,
+    event: validation.value,
+    bridgeRoute: bridgeRoute ?? null,
+  });
 }
 
 export async function getRoomControlSessionContext(

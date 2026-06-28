@@ -20,7 +20,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::{
     crypto,
     error::{AppError, AppResult},
-    models::RoomStatus,
+    models::{BridgePeerLiveness, RoomStatus, StoredBridgePeerEndpoint},
     storage,
     transfer::RoomServerContext,
     AppState,
@@ -41,6 +41,7 @@ const CONTROL_TRANSPORT_SCHEMA: &str = "pastey-room-control-transport/v1";
 const CONTROL_RECEIPT_ENVELOPE_SCHEMA: &str = "pastey-room-control-receipt-envelope/v1";
 const CONTROL_DELIVERY_SCHEMA: &str = "pastey-room-control-delivery/v1";
 const ROOM_CONTROL_SCHEMA: &str = "pastey-room-control-event/v1";
+const CONTROL_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-control-route/v1";
 
 const ALLOWED_EVENT_KINDS: &[&str] = &[
     "capability_preview",
@@ -188,6 +189,7 @@ pub struct RoomControlSessionContext {
     pub room_id: String,
     pub local_session_ref: String,
     pub peer_session_ref: String,
+    pub peer_route_ref: String,
     pub peer_connected: bool,
 }
 
@@ -212,6 +214,209 @@ struct ValidatedControlEvent {
     event: Value,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RoomControlRouteEndpoint {
+    peer_session_id: String,
+    host: String,
+    port: u16,
+    transport_public_key: String,
+}
+
+fn bridge_session_ref(room_id: &str) -> String {
+    format!("legacy-room:{room_id}")
+}
+
+fn room_control_route_error(code: &str, message: impl Into<String>) -> AppError {
+    AppError::InvalidInput(format!(
+        "[pastey:bridge-route-error code={code}] {}",
+        message.into()
+    ))
+}
+
+fn resolve_default_room_control_peer(
+    peers: &[StoredBridgePeerEndpoint],
+) -> AppResult<RoomControlRouteEndpoint> {
+    let routeable = peers
+        .iter()
+        .filter_map(|peer| routeable_room_control_peer(peer).ok())
+        .collect::<Vec<_>>();
+    match routeable.as_slice() {
+        [peer] => Ok(peer.clone()),
+        [] => Err(AppError::InvalidInput("Peer is unavailable.".into())),
+        _ => Err(room_control_route_error(
+            "unsupported_selected_peers",
+            "Room control requires one selected Bridge peer route.",
+        )),
+    }
+}
+
+fn resolve_room_control_route(
+    bridge_route: Option<&Value>,
+    room_id: &str,
+    room: &crate::models::StoredRoom,
+    peers: &[StoredBridgePeerEndpoint],
+) -> AppResult<RoomControlRouteEndpoint> {
+    if room.status != RoomStatus::Active {
+        return Err(room_control_route_error(
+            "route_expired",
+            "Room control route requires an active room.",
+        ));
+    }
+    let Some(route) = bridge_route else {
+        return Err(room_control_route_error(
+            "malformed_route",
+            "Room control selected-peer route is required.",
+        ));
+    };
+    let route = route.as_object().ok_or_else(|| {
+        room_control_route_error("malformed_route", "Room control route must be an object.")
+    })?;
+    require_exact_control_route_fields(route, &["schemaVersion", "bridgeSessionId", "target"])?;
+    if control_route_string_field(route, "schemaVersion")? != CONTROL_BRIDGE_ROUTE_SCHEMA_VERSION {
+        return Err(room_control_route_error(
+            "malformed_route",
+            "Room control route schema version is unsupported.",
+        ));
+    }
+    if control_route_string_field(route, "bridgeSessionId")? != bridge_session_ref(room_id) {
+        return Err(room_control_route_error(
+            "route_mismatch",
+            "Room control route session does not match the current room.",
+        ));
+    }
+    let target = route
+        .get("target")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            room_control_route_error("malformed_route", "Room control route target is invalid.")
+        })?;
+    match control_route_string_field(target, "kind")? {
+        "selected_peer" => {
+            require_exact_control_route_fields(target, &["kind", "peerSessionId"])?;
+            let peer_session_id = control_route_string_field(target, "peerSessionId")?;
+            let Some(peer) = peers
+                .iter()
+                .find(|peer| peer.peer_session_id == peer_session_id)
+            else {
+                return Err(room_control_route_error(
+                    "unknown_peer",
+                    "Room control route target is not in the current session.",
+                ));
+            };
+            routeable_room_control_peer(peer).map_err(|_| {
+                room_control_route_error(
+                    room_control_route_error_code_for_peer(peer),
+                    "Room control route target is not currently routeable.",
+                )
+            })
+        }
+        "selected_peers" => Err(room_control_route_error(
+            "unsupported_selected_peers",
+            "Room control selected-peers delivery is not supported.",
+        )),
+        "broadcast_bridge" => Err(room_control_route_error(
+            "unsupported_broadcast",
+            "Room control broadcast delivery is not supported.",
+        )),
+        _ => Err(room_control_route_error(
+            "malformed_route",
+            "Room control route target kind is unsupported.",
+        )),
+    }
+}
+
+fn resolve_inbound_room_control_peer(
+    peers: &[StoredBridgePeerEndpoint],
+    source_host: &str,
+    sender_public_key: &str,
+) -> AppResult<RoomControlRouteEndpoint> {
+    let mut matches = peers
+        .iter()
+        .filter(|peer| {
+            peer.endpoint_host.as_deref() == Some(source_host)
+                && peer.transport_public_key.as_deref() == Some(sender_public_key)
+        })
+        .filter_map(|peer| routeable_room_control_peer(peer).ok())
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        Ok(matches.remove(0))
+    } else {
+        Err(room_control_route_error(
+            "route_mismatch",
+            "Room control sender is not an exact current-session Bridge peer.",
+        ))
+    }
+}
+
+fn routeable_room_control_peer(
+    peer: &StoredBridgePeerEndpoint,
+) -> AppResult<RoomControlRouteEndpoint> {
+    if peer.liveness != BridgePeerLiveness::Connected {
+        return Err(AppError::InvalidInput(
+            "Room control peer is not connected.".into(),
+        ));
+    }
+    let host = peer
+        .endpoint_host
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("Room control peer endpoint is missing.".into()))?;
+    let port = peer
+        .endpoint_port
+        .ok_or_else(|| AppError::InvalidInput("Room control peer endpoint is missing.".into()))?;
+    let transport_public_key = peer
+        .transport_public_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("Room control peer key is missing.".into()))?;
+    Ok(RoomControlRouteEndpoint {
+        peer_session_id: peer.peer_session_id.clone(),
+        host: host.to_string(),
+        port,
+        transport_public_key: transport_public_key.to_string(),
+    })
+}
+
+fn room_control_route_error_code_for_peer(peer: &StoredBridgePeerEndpoint) -> &'static str {
+    match peer.liveness {
+        BridgePeerLiveness::Left | BridgePeerLiveness::Stale | BridgePeerLiveness::Expired => {
+            "route_expired"
+        }
+        BridgePeerLiveness::Connected => "peer_unrouteable",
+        BridgePeerLiveness::Reconnecting | BridgePeerLiveness::Disconnected => "peer_unrouteable",
+    }
+}
+
+fn require_exact_control_route_fields(
+    object: &Map<String, Value>,
+    expected: &[&str],
+) -> AppResult<()> {
+    if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
+        return Err(room_control_route_error(
+            "malformed_route",
+            "Room control route contains unsupported or missing fields.",
+        ));
+    }
+    Ok(())
+}
+
+fn control_route_string_field<'a>(
+    object: &'a Map<String, Value>,
+    field: &str,
+) -> AppResult<&'a str> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            room_control_route_error(
+                "malformed_route",
+                format!("Room control route {field} is invalid."),
+            )
+        })
+}
+
 pub fn room_control_session_context(
     state: &Arc<AppState>,
     room_id: &str,
@@ -220,9 +425,9 @@ pub fn room_control_session_context(
     if room.status != RoomStatus::Active {
         return Err(AppError::InvalidInput("Room is not active.".into()));
     }
-    let peer_key = room
-        .peer_transport_public_key
-        .ok_or_else(|| AppError::InvalidInput("Peer is unavailable.".into()))?;
+    let _ = storage::sync_legacy_bridge_peer_endpoint(&state.paths, &room)?;
+    let peers = storage::list_bridge_peer_endpoints(&state.paths, room_id)?;
+    let peer = resolve_default_room_control_peer(&peers)?;
     let local_key = state
         .active_servers
         .lock()
@@ -232,8 +437,9 @@ pub fn room_control_session_context(
     Ok(RoomControlSessionContext {
         room_id: room_id.to_string(),
         local_session_ref: session_ref(&local_key),
-        peer_session_ref: session_ref(&peer_key),
-        peer_connected: room.peer_host.is_some() && room.peer_port.is_some(),
+        peer_session_ref: session_ref(&peer.transport_public_key),
+        peer_route_ref: peer.peer_session_id,
+        peer_connected: true,
     })
 }
 
@@ -241,20 +447,15 @@ pub async fn send_room_control_event(
     state: Arc<AppState>,
     room_id: &str,
     event: Value,
+    bridge_route: Option<Value>,
 ) -> AppResult<RoomControlDeliveryReceipt> {
     let room = storage::get_room_by_id(&state.paths, room_id)?;
     if room.status != RoomStatus::Active {
         return Err(AppError::InvalidInput("Room is not active.".into()));
     }
-    let peer_host = room
-        .peer_host
-        .ok_or_else(|| AppError::InvalidInput("Peer is unavailable.".into()))?;
-    let peer_port = room
-        .peer_port
-        .ok_or_else(|| AppError::InvalidInput("Peer is unavailable.".into()))?;
-    let peer_key = room
-        .peer_transport_public_key
-        .ok_or_else(|| AppError::InvalidInput("Peer is unavailable.".into()))?;
+    let _ = storage::sync_legacy_bridge_peer_endpoint(&state.paths, &room)?;
+    let peers = storage::list_bridge_peer_endpoints(&state.paths, room_id)?;
+    let peer = resolve_room_control_route(bridge_route.as_ref(), room_id, &room, &peers)?;
     let (local_secret, local_key) = {
         let servers = state.active_servers.lock();
         let server = servers
@@ -266,7 +467,7 @@ pub async fn send_room_control_event(
         event,
         room_id,
         &session_ref(&local_key),
-        &session_ref(&peer_key),
+        &session_ref(&peer.transport_public_key),
         OffsetDateTime::now_utc(),
     )?;
     let plaintext = serde_json::to_vec(&validated.event)?;
@@ -277,7 +478,7 @@ pub async fn send_room_control_event(
     }
     let event_key = crypto::random_key();
     let (ciphertext, event_nonce) = crypto::encrypt_bytes(&plaintext, &event_key)?;
-    let receiver_key = crypto::decode_key(&peer_key)?;
+    let receiver_key = crypto::decode_key(&peer.transport_public_key)?;
     let (wrapped_event_key, key_wrap_nonce, sender_public_key) =
         crypto::wrap_control_key_for_receiver(&event_key, &local_secret, &receiver_key)?;
     let envelope = EncryptedRoomControlEnvelope {
@@ -302,7 +503,8 @@ pub async fn send_room_control_event(
         .map_err(|_| AppError::Network("Room control transport unavailable.".into()))?;
     let response = client
         .post(format!(
-            "http://{peer_host}:{peer_port}/rooms/{room_id}/control-events"
+            "http://{}:{}/rooms/{room_id}/control-events",
+            peer.host, peer.port
         ))
         .header(header::CONTENT_TYPE.as_str(), CONTROL_CONTENT_TYPE)
         .header(header::ACCEPT.as_str(), CONTROL_RECEIPT_CONTENT_TYPE)
@@ -389,13 +591,11 @@ pub async fn receive_room_control_event_handler(
         Ok(_) => return control_error(StatusCode::GONE, "room_unavailable", "Room unavailable."),
         Err(_) => return control_error(StatusCode::NOT_FOUND, "room_not_found", "Room not found."),
     };
-    if room.peer_host.as_deref() != Some(&source.ip().to_string()) {
-        return control_error(
-            StatusCode::FORBIDDEN,
-            "session_mismatch",
-            "Room session mismatch.",
-        );
-    }
+    let _ = storage::sync_legacy_bridge_peer_endpoint(&ctx.state.paths, &room);
+    let peers = match storage::list_bridge_peer_endpoints(&ctx.state.paths, &room_id) {
+        Ok(peers) => peers,
+        Err(_) => return control_error(StatusCode::GONE, "room_unavailable", "Room unavailable."),
+    };
     if headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -435,7 +635,7 @@ pub async fn receive_room_control_event_handler(
         }
     };
     if envelope.schema_version != CONTROL_TRANSPORT_SCHEMA
-        || room.peer_transport_public_key.as_deref() != Some(&envelope.sender_public_key)
+        || envelope.sender_public_key.trim().is_empty()
     {
         return control_error(
             StatusCode::FORBIDDEN,
@@ -443,6 +643,20 @@ pub async fn receive_room_control_event_handler(
             "Room session mismatch.",
         );
     }
+    let inbound_peer = match resolve_inbound_room_control_peer(
+        &peers,
+        &source.ip().to_string(),
+        &envelope.sender_public_key,
+    ) {
+        Ok(peer) => peer,
+        Err(_) => {
+            return control_error(
+                StatusCode::FORBIDDEN,
+                "session_mismatch",
+                "Room session mismatch.",
+            )
+        }
+    };
     let (local_secret, local_key) = {
         let servers = ctx.state.active_servers.lock();
         let Some(server) = servers.get(&room_id) else {
@@ -515,7 +729,7 @@ pub async fn receive_room_control_event_handler(
     let validated = match validate_control_event(
         event,
         &room_id,
-        &session_ref(&envelope.sender_public_key),
+        &session_ref(&inbound_peer.transport_public_key),
         &session_ref(&local_key),
         OffsetDateTime::now_utc(),
     ) {
@@ -1135,6 +1349,60 @@ fn now_iso() -> String {
 mod tests {
     use super::*;
 
+    fn route_peer(peer_session_id: &str) -> StoredBridgePeerEndpoint {
+        StoredBridgePeerEndpoint {
+            room_id: "room".into(),
+            peer_session_id: peer_session_id.into(),
+            display_name: Some("Peer".into()),
+            endpoint_host: Some("127.0.0.1".into()),
+            endpoint_port: Some(9000),
+            transport_public_key: Some("target-key".into()),
+            liveness: BridgePeerLiveness::Connected,
+            join_method: crate::models::BridgePeerJoinMethod::NearbyAccept,
+            durable_identity_id: None,
+            updated_at: 1,
+        }
+    }
+
+    fn route_room() -> crate::models::StoredRoom {
+        crate::models::StoredRoom {
+            id: "room".into(),
+            room_code_hash: "hash".into(),
+            created_at: 1,
+            expires_at: 2,
+            status: RoomStatus::Active,
+            local_role: crate::models::LocalRole::Creator,
+            peer_device_name: Some("Peer".into()),
+            auto_burn_after_expiry: false,
+            wrapped_room_code: "wrapped".into(),
+            code_nonce: "nonce".into(),
+            peer_host: Some("legacy-host".into()),
+            peer_port: Some(1000),
+            peer_transport_public_key: Some("legacy-key".into()),
+            local_burned_at: None,
+            peer_burned_at: None,
+        }
+    }
+
+    fn selected_route(peer_session_id: &str) -> Value {
+        serde_json::json!({
+            "schemaVersion": CONTROL_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "bridgeSessionId": "legacy-room:room",
+            "target": {
+                "kind": "selected_peer",
+                "peerSessionId": peer_session_id
+            }
+        })
+    }
+
+    fn assert_control_route_error(result: AppResult<RoomControlRouteEndpoint>, code: &str) {
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("code={code}")),
+            "expected route error code {code}, got {error}"
+        );
+    }
+
     fn preview_event(event_id: &str, envelope_id: &str, request_id: &str) -> Value {
         let now = OffsetDateTime::now_utc();
         let created_at = now.format(&Rfc3339).unwrap();
@@ -1248,6 +1516,181 @@ mod tests {
                 "createdAt": now.format(&Rfc3339).unwrap()
             }
         })
+    }
+
+    #[test]
+    fn selected_peer_room_control_route_resolves_through_bridge_peers() {
+        let room = route_room();
+        let peers = vec![route_peer("legacy-room-peer:room")];
+        let target = resolve_room_control_route(
+            Some(&selected_route("legacy-room-peer:room")),
+            "room",
+            &room,
+            &peers,
+        )
+        .unwrap();
+
+        assert_eq!(target.peer_session_id, "legacy-room-peer:room");
+        assert_eq!(target.host, "127.0.0.1");
+        assert_eq!(target.port, 9000);
+        assert_eq!(target.transport_public_key, "target-key");
+        assert_ne!(target.host, "legacy-host");
+        assert_ne!(target.transport_public_key, "legacy-key");
+    }
+
+    #[test]
+    fn selected_peer_room_control_route_rejects_stale_disconnected_and_missing_endpoint() {
+        let room = route_room();
+        for (peer, code) in [
+            {
+                let mut peer = route_peer("legacy-room-peer:room");
+                peer.liveness = BridgePeerLiveness::Stale;
+                peer.endpoint_host = None;
+                peer.endpoint_port = None;
+                peer.transport_public_key = None;
+                (peer, "route_expired")
+            },
+            {
+                let mut peer = route_peer("legacy-room-peer:room");
+                peer.liveness = BridgePeerLiveness::Disconnected;
+                (peer, "peer_unrouteable")
+            },
+            {
+                let mut peer = route_peer("legacy-room-peer:room");
+                peer.endpoint_host = None;
+                (peer, "peer_unrouteable")
+            },
+        ] {
+            assert_control_route_error(
+                resolve_room_control_route(
+                    Some(&selected_route("legacy-room-peer:room")),
+                    "room",
+                    &room,
+                    &[peer],
+                ),
+                code,
+            );
+        }
+    }
+
+    #[test]
+    fn room_control_route_rejects_mismatch_unknown_and_no_arbitrary_fallback() {
+        let room = route_room();
+        let mut peers = vec![route_peer("legacy-room-peer:room")];
+        peers.push(route_peer("legacy-room-peer:room:reconnect:1"));
+        let unknown = selected_route("legacy-room-peer:unknown");
+        assert_control_route_error(
+            resolve_room_control_route(Some(&unknown), "room", &room, &peers),
+            "unknown_peer",
+        );
+
+        let mismatch = serde_json::json!({
+            "schemaVersion": CONTROL_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "bridgeSessionId": "legacy-room:other",
+            "target": {
+                "kind": "selected_peer",
+                "peerSessionId": "legacy-room-peer:room"
+            }
+        });
+        assert_control_route_error(
+            resolve_room_control_route(Some(&mismatch), "room", &room, &peers),
+            "route_mismatch",
+        );
+
+        assert_control_route_error(
+            resolve_room_control_route(None, "room", &room, &peers),
+            "malformed_route",
+        );
+    }
+
+    #[test]
+    fn room_control_route_rejects_selected_peers_and_broadcast() {
+        let room = route_room();
+        let peers = vec![route_peer("legacy-room-peer:room")];
+        let selected_peers = serde_json::json!({
+            "schemaVersion": CONTROL_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "bridgeSessionId": "legacy-room:room",
+            "target": {
+                "kind": "selected_peers",
+                "peerSessionIds": ["legacy-room-peer:room", "legacy-room-peer:room:1"]
+            }
+        });
+        let broadcast = serde_json::json!({
+            "schemaVersion": CONTROL_BRIDGE_ROUTE_SCHEMA_VERSION,
+            "bridgeSessionId": "legacy-room:room",
+            "target": {
+                "kind": "broadcast_bridge",
+                "explicit": true
+            }
+        });
+
+        assert_control_route_error(
+            resolve_room_control_route(Some(&selected_peers), "room", &room, &peers),
+            "unsupported_selected_peers",
+        );
+        assert_control_route_error(
+            resolve_room_control_route(Some(&broadcast), "room", &room, &peers),
+            "unsupported_broadcast",
+        );
+    }
+
+    #[test]
+    fn durable_identity_display_does_not_satisfy_room_control_target_binding() {
+        let room = route_room();
+        let mut old_paired = route_peer("legacy-room-peer:room");
+        old_paired.durable_identity_id = Some("paired-device:one".into());
+        old_paired.liveness = BridgePeerLiveness::Stale;
+        old_paired.endpoint_host = None;
+        old_paired.endpoint_port = None;
+        old_paired.transport_public_key = None;
+        let mut current = route_peer("legacy-room-peer:room:reconnect:1");
+        current.durable_identity_id = Some("paired-device:one".into());
+        current.updated_at = 2;
+        let peers = vec![old_paired, current];
+
+        assert_control_route_error(
+            resolve_room_control_route(
+                Some(&selected_route("legacy-room-peer:room")),
+                "room",
+                &room,
+                &peers,
+            ),
+            "route_expired",
+        );
+        assert_eq!(
+            resolve_room_control_route(
+                Some(&selected_route("legacy-room-peer:room:reconnect:1")),
+                "room",
+                &room,
+                &peers,
+            )
+            .unwrap()
+            .peer_session_id,
+            "legacy-room-peer:room:reconnect:1"
+        );
+    }
+
+    #[test]
+    fn inbound_room_control_sender_must_match_current_session_peer_row() {
+        let mut old = route_peer("legacy-room-peer:room");
+        old.liveness = BridgePeerLiveness::Stale;
+        old.endpoint_host = None;
+        old.transport_public_key = None;
+        let mut current = route_peer("legacy-room-peer:room:reconnect:1");
+        current.endpoint_host = Some("127.0.0.2".into());
+        current.transport_public_key = Some("new-target-key".into());
+        let peers = vec![old, current];
+
+        assert_control_route_error(
+            resolve_inbound_room_control_peer(&peers, "127.0.0.1", "target-key"),
+            "route_mismatch",
+        );
+        assert_eq!(
+            resolve_inbound_room_control_peer(&peers, "127.0.0.2", "new-target-key")
+                .unwrap()
+                .peer_session_id,
+            "legacy-room-peer:room:reconnect:1"
+        );
     }
 
     #[test]

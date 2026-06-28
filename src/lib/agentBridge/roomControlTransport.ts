@@ -106,7 +106,7 @@ export function roomControlSessionIdentity(
   session: RoomControlSessionContext | null,
 ): string | null {
   return session
-    ? `${session.roomId}:${session.localSessionRef}:${session.peerSessionRef}`
+    ? `${session.roomId}:${session.localSessionRef}:${session.peerSessionRef}:${session.peerRouteRef ?? ""}`
     : null;
 }
 

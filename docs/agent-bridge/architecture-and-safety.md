@@ -12,7 +12,7 @@ The current product reality is a fixed Hello Peer vertical slice. It proves the 
 4. The local PolicyGate decides whether the plan may enter pending confirmation.
 5. The local user explicitly confirms sending a Hello Peer preview.
 6. The preview becomes a typed capability preview envelope.
-7. The envelope is sent through the encrypted Bridge control transport. Legacy implementation term: room-control transport.
+7. The envelope is sent through the encrypted selected-peer Bridge control transport. Legacy implementation term: room-control transport.
 8. The receiver validates replay, expiry, queue bounds, and PolicyGate rules.
 9. The receiver can choose Allow once or Deny.
 10. A matched allow-once decision permits exactly one execution request for the same capability, request, peer, and Bridge/session binding.
@@ -49,7 +49,8 @@ The current product reality is a fixed Hello Peer vertical slice. It proves the 
 - Consent is consumed once and is not reusable trust.
 - Accepted Bridge peer status is not durable trust or execution authority.
 - Nearby accept, 8-digit code join, and session verification never authorize capability execution.
-- Capability events must bind to an exact selected peer/session/request and must not use broadcast by default.
+- Capability events must bind to an exact selected peer/session/request. Backend transport resolves that selected peer through the current-session `bridge_peers` row and rejects selected-peers or broadcast routes.
+- Durable paired-device metadata, delivery receipts, logs, and Bridge membership do not create capability authority.
 - Logs mirror lifecycle but are not queue state, consent state, execution state, or authority.
 
 ## Trust Boundaries
@@ -75,13 +76,13 @@ The current Agent Bridge implementation does not provide:
 - multi-step autonomous task graphs;
 - a general capability registry;
 - reusable trust;
-- durable device identity;
+- durable device identity as trust, routeability, consent, auto-join, or execution authority;
 - MCP integration;
 - local LLM scheduling;
 - file/tool capabilities beyond Hello Peer;
 - cross-Bridge or cross-device automatic delegation.
 
-Those features require new Layer 4 identity/routing work and new Layer 5 capability contracts before they can be treated as implemented.
+Those features require new authority-bearing Layer 4 identity/routing semantics and new Layer 5 capability contracts before they can be treated as implemented. The current durable paired-device runtime is display/recognition metadata only.
 
 ## Current Completion Status
 
