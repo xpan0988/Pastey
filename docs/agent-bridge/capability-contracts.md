@@ -4,10 +4,11 @@ This document owns the current Layer 5 capability contract for Pastey Agent Brid
 
 ## Implemented Capabilities
 
-The implemented capabilities are fixed, host-owned demonstration capabilities:
+The implemented capabilities are fixed, host-owned bounded capabilities:
 
 - `runtime.execute_hello_template`, the legacy fixed Hello Peer template;
-- `runtime.hello_stdout/v1`, a fixed Hello Stdout capability backed by a Rust host helper.
+- `runtime.hello_stdout/v1`, a fixed Hello Stdout capability backed by a Rust host helper;
+- `filesystem.find_file_candidates/v1`, a receiver-side metadata-only file-candidate search over approved local scope labels.
 
 They use:
 
@@ -21,7 +22,7 @@ They use:
 - fixed host-owned executors;
 - typed execution result.
 
-They do not execute model-authored code, shell commands, file operations, network calls, arbitrary arguments, arbitrary environment variables, arbitrary file paths, or arbitrary tool calls.
+They do not execute model-authored code, shell commands, arbitrary process operations, network calls, arbitrary arguments, arbitrary environment variables, arbitrary file paths, arbitrary tool calls, or automatic file transfers. The file-candidate capability performs a bounded receiver-owned filesystem metadata traversal only after explicit receiver Allow once.
 
 `runtime.execute_hello_template` returns the exact fixed Hello Peer result `hello peer!`.
 
@@ -38,7 +39,7 @@ They do not execute model-authored code, shell commands, file operations, networ
 
 ## Static Capability Registry
 
-The implemented registry is static and host-owned. It lives in `src/lib/ai/capabilityRegistry.ts` and currently contains only the two capabilities listed above. It is not plugin loading, not provider-configurable, and not a generic executor table.
+The registry is static and host-owned. It lives in `src/lib/ai/capabilityRegistry.ts` and currently contains the implemented capabilities listed above. It is not plugin loading, not provider-configurable, and not a generic executor table.
 
 Each registry entry defines:
 
@@ -56,6 +57,113 @@ The registry is used to keep provider validation, PolicyGate, pending action has
 
 The shared lifecycle envelope schema is `pastey-agent-bridge-capability-envelope/v1`. It is a compatibility view over the existing typed preview/control payloads and includes capability id/version, request id, room/source/target refs, selected-peer route policy, exact allow-once consent policy, created/expiry times, payload hash, typed payload, and bounded room-control transport metadata. Existing payload schemas remain capability-specific.
 
+## Workspace Capability: `filesystem.find_file_candidates/v1`
+
+`filesystem.find_file_candidates/v1` is the first implemented read-only workspace capability. It lets a sender ask one selected peer to search approved receiver-local scope labels for filename/metadata matches. It returns a bounded list of redacted candidate metadata only.
+
+The user intent is: help find a file named `xxx` on another device and send it back. The implemented capability covers candidate discovery only. A later file transfer requires a separate approved capability, such as a future `filesystem.prepare_file_transfer/v1`, and must require separate explicit consent. Search consent does not authorize file transfer.
+
+The advisory action kind is `request_peer_file_candidates`. Provider output must use this shape:
+
+```json
+{
+  "schemaVersion": "ai-action-plan/v1",
+  "kind": "request_peer_file_candidates",
+  "title": "Find file candidates on the selected peer",
+  "explanation": "Search the selected peer for filename or metadata matches and return a bounded candidate list. No file contents will be read and no file will be sent automatically.",
+  "confidence": "medium",
+  "requiresUserConfirmation": true,
+  "references": [{ "kind": "peer", "ref": "selected-peer-ref" }],
+  "proposedInput": {
+    "capability": "filesystem.find_file_candidates/v1",
+    "targetPeerRef": "selected-peer-ref",
+    "query": {
+      "rawUserRequest": "help me find a file named xxx and send it to me",
+      "filenameHint": "xxx",
+      "extensions": [],
+      "searchMode": "filename_metadata_only"
+    },
+    "scopePolicy": {
+      "allowedScopes": ["downloads", "desktop", "documents", "pastey_shared"],
+      "allowFullDisk": false,
+      "includeFileContents": false,
+      "includeAbsolutePaths": false,
+      "includeHiddenFiles": false
+    },
+    "limits": {
+      "maxCandidates": 10,
+      "maxSearchMs": 5000,
+      "maxDepth": 6
+    },
+    "safety": {
+      "returnRedactedPaths": true,
+      "noAutoTransfer": true,
+      "requireReceiverConsent": true,
+      "selectedPeerOnly": true
+    }
+  }
+}
+```
+
+Current host validation requires:
+
+- `schemaVersion: ai-action-plan/v1`;
+- `kind: request_peer_file_candidates`;
+- `requiresUserConfirmation: true`;
+- `capability: filesystem.find_file_candidates/v1`;
+- one selected `targetPeerRef`;
+- `searchMode: filename_metadata_only`;
+- `allowedScopes` drawn only from `downloads`, `desktop`, `documents`, and `pastey_shared`;
+- `allowFullDisk`, `includeFileContents`, `includeAbsolutePaths`, and `includeHiddenFiles` all false;
+- `maxCandidates` from `1` to `20`;
+- `maxSearchMs` from `500` to `10000`;
+- `maxDepth` from `1` to `8`;
+- `returnRedactedPaths`, `noAutoTransfer`, `requireReceiverConsent`, and `selectedPeerOnly` all true.
+
+Unsafe provider fields reject fail-closed, including command/script/code fields, absolute paths, cwd/env/runtime arguments, network targets, stdout/stderr/exit fields, file contents, selected-peers/broadcast intent, hidden transfer requests, scheduler or MicroFlowGroup mutation, and durable-trust or trusted-executor claims.
+
+The host-built preview and receiver result contracts preserve these additional boundaries:
+
+- receiver Allow once is required before any search;
+- results contain metadata candidates only, not file contents;
+- paths are redacted labels, not absolute paths;
+- candidate ids are current-request scoped and not reusable authority;
+- delivery of candidates is not consent to transfer;
+- selected-peers and broadcast remain unsupported;
+- durable pairing display metadata does not authorize search or transfer.
+
+The capability-specific schemas are:
+
+- preview request: `filesystem-find-file-candidates-request/v1`;
+- consent grant: `filesystem-find-file-candidates-consent-grant/v1`;
+- execution request: `filesystem-find-file-candidates-execution-request/v1`;
+- execution result: `filesystem-find-file-candidates-result/v1`.
+
+The execution request is host-built after a matched allow-once acknowledgement. It carries the validated query, scope labels, limits, selected-peer route policy, consent policy, and payload hash. It does not carry real paths, shell commands, scripts, environment variables, runtime arguments, file contents, or transfer instructions.
+
+The receiver-side executor is a Rust/Tauri host-owned executor with `executorKind: filesystem_find_candidates_host`. The receiver host maps only these safe labels to local directories when available:
+
+- `downloads`;
+- `desktop`;
+- `documents`;
+- `pastey_shared`.
+
+Unavailable scopes are skipped and reported in `scopesSkipped`. `pastey_shared` is skipped when the app-owned shared directory does not exist. Hidden files and hidden directories are skipped. Symlinks are skipped. Traversal stays under the resolved scope root and skips entries whose canonicalization fails. Matching is filename-only with exact, case-insensitive, and substring matching; extension hints may narrow results. Directories are not returned as candidates.
+
+The result contains:
+
+- `schemaVersion: filesystem-find-file-candidates-result/v1`;
+- `capability: filesystem.find_file_candidates/v1`;
+- `requestId`;
+- `status`;
+- `queryEcho`;
+- redacted metadata candidates with opaque `candidateId`, `displayName`, `redactedLocation`, `extension`, `mimeFamily`, `sizeBytes`, `modifiedAt`, `matchReason`, and `confidence`;
+- omitted/truncation metadata;
+- bounded `durationMs`;
+- bounded `errorCode`.
+
+Candidate IDs are display/result identifiers only. They are not paths, durable file handles, transfer grants, or reusable authorization tokens. The current implementation does not persist a candidate-to-path store and does not pass candidates into the transfer queue.
+
 ## Preview Contract
 
 The preview request is built from a validated pending action and converted into a capability preview envelope. The envelope is bounded, typed, current-session, and tied to the active Bridge/peer context.
@@ -70,6 +178,8 @@ Production evidence:
 
 - `src/lib/ai/helloPeerRequest.ts`
 - `src/lib/ai/helloStdoutRequest.ts`
+- `src/lib/ai/fileCandidateRequest.ts`
+- `src/lib/ai/fileCandidateAdvisory.ts`
 - `src/lib/ai/capabilityPreviewEnvelope.ts`
 - `src/lib/agentBridge/roomControlEvent.ts`
 - `src-tauri/src/room_control.rs`
@@ -94,14 +204,17 @@ The current executors are:
 
 - `runtime.execute_hello_template`, which returns exactly the fixed Hello Peer result;
 - `runtime.hello_stdout/v1`, which calls the Tauri `execute_hello_stdout_capability` command and returns typed stdout/stderr/exit metadata from a host-owned Rust helper.
+- `filesystem.find_file_candidates/v1`, which calls the Tauri `execute_file_candidate_search_capability` command and returns bounded redacted file metadata candidates from a host-owned Rust executor.
 
-Neither executor accepts command text, script text, runtime arguments, file paths, environment variables, network targets, shell interpolation, or model-authored execution material.
+No executor accepts command text, script text, runtime arguments, arbitrary file paths, environment variables, network targets, shell interpolation, or model-authored execution material. The file-candidate executor accepts only validated safe scope labels and bounded metadata-search limits; it never reads file contents and never starts a transfer.
 
 Production evidence:
 
 - `src/lib/agentBridge/helloPeerExecution.ts`
 - `src/lib/agentBridge/helloStdoutExecution.ts`
+- `src/lib/agentBridge/fileCandidateExecution.ts`
 - `src-tauri/src/hello_stdout.rs`
+- `src-tauri/src/file_candidates.rs`
 - `src/lib/agentBridge/roomControlEvent.ts`
 - `src-tauri/src/room_control.rs`
 

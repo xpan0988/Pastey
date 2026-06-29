@@ -9,6 +9,7 @@ mod device_profile;
 mod diagnostics;
 mod discovery;
 mod error;
+mod file_candidates;
 mod hello_stdout;
 mod link_benchmark;
 mod logging;
@@ -31,8 +32,9 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 use crate::{
     commands::{
         accept_nearby_join, burn_room, cancel_transfer, check_for_updates, copy_last_error,
-        copy_text_to_clipboard, create_room, delete_temp_file, execute_hello_stdout_capability,
-        get_config, get_device_capabilities, get_device_profile, get_file_transfer_metadata,
+        copy_text_to_clipboard, create_room, delete_temp_file,
+        execute_file_candidate_search_capability, execute_hello_stdout_capability, get_config,
+        get_device_capabilities, get_device_profile, get_file_transfer_metadata,
         get_last_benchmark_results, get_room, get_room_control_session_context, join_room,
         leave_room, list_nearby_devices, list_received_room_control_events, list_room_items,
         list_rooms, log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
@@ -174,6 +176,7 @@ fn main() {
             send_file_to_room,
             send_room_control_event,
             execute_hello_stdout_capability,
+            execute_file_candidate_search_capability,
             get_room_control_session_context,
             list_received_room_control_events,
             cancel_transfer,

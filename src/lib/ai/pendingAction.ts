@@ -1,8 +1,13 @@
 import { isRecord, validateAiActionPlan } from "./actionPlanValidator";
 import {
   getAgentBridgeCapabilityContractByActionKind,
+  FILE_CANDIDATES_CAPABILITY,
   type AgentBridgeCapabilityContract
 } from "./capabilityRegistry";
+import {
+  buildFileCandidateCanonicalConstraints,
+  validateFileCandidateAdvisoryInput
+} from "./fileCandidateAdvisory";
 import type {
   AiActionPlan,
   AiPolicyResult,
@@ -72,8 +77,14 @@ export function buildPendingAiActionCanonicalPayload(
   if (plan.schemaVersion !== "ai-action-plan/v1" || !contract) {
     throw new Error("Pending AI action supports only validated Agent Bridge capability advisories.");
   }
+  if (contract.providerInputShape === "file_candidate_advisory") {
+    return buildFileCandidatePendingPayload(plan, contract, pendingId, expiresAt);
+  }
   if (!isRecord(plan.proposedInput) || !isRecord(plan.proposedInput.constraints)) {
     throw new Error(`Pending AI action requires a complete ${contract.ui.label} proposedInput.`);
+  }
+  if (contract.providerInputValue === undefined) {
+    throw new Error("Pending AI action requires a fixed provider input value.");
   }
   requireExactFields(plan.proposedInput, HELLO_INPUT_FIELDS, `${contract.ui.label} proposedInput`);
   requireExactFields(plan.proposedInput.constraints, [...contract.constraintFields], `${contract.ui.label} constraints`);
@@ -99,6 +110,42 @@ export function buildPendingAiActionCanonicalPayload(
     capability: contract.capability,
     message: contract.providerInputValue,
     constraints: cloneJson(constraints),
+    references: [...(plan.references ?? [])]
+      .map((reference) => cloneJson(reference))
+      .sort((left, right) => `${left.kind}:${left.ref}`.localeCompare(`${right.kind}:${right.ref}`)),
+    pendingId,
+    expiresAt
+  };
+}
+
+function buildFileCandidatePendingPayload(
+  plan: AiActionPlan,
+  contract: AgentBridgeCapabilityContract,
+  pendingId: string,
+  expiresAt: string,
+): PendingAiActionCanonicalPayload {
+  const validation = validateFileCandidateAdvisoryInput(plan.proposedInput);
+  if (!validation.valid) {
+    throw new Error(`Pending AI action requires a valid ${contract.ui.label} proposedInput.`);
+  }
+  if (contract.capability !== FILE_CANDIDATES_CAPABILITY) {
+    throw new Error("Pending AI action file candidate contract mismatch.");
+  }
+  if (!Number.isFinite(new Date(expiresAt).getTime())) {
+    throw new Error("Pending AI action requires a valid expiry.");
+  }
+  const input = validation.value;
+  return {
+    schemaVersion: plan.schemaVersion,
+    kind: plan.kind,
+    targetPeerRef: input.targetPeerRef,
+    capability: contract.capability,
+    message: input.query.filenameHint,
+    constraints: buildFileCandidateCanonicalConstraints(input),
+    query: cloneJson(input.query),
+    scopePolicy: cloneJson(input.scopePolicy),
+    limits: cloneJson(input.limits),
+    safety: cloneJson(input.safety),
     references: [...(plan.references ?? [])]
       .map((reference) => cloneJson(reference))
       .sort((left, right) => `${left.kind}:${left.ref}`.localeCompare(`${right.kind}:${right.ref}`)),

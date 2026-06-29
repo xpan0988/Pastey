@@ -14,8 +14,12 @@ import {
   validateHelloStdoutRequest,
   type HelloStdoutRequest
 } from "./helloStdoutRequest";
+import {
+  validateFileCandidateRequest,
+  type FileCandidateRequest
+} from "./fileCandidateRequest";
 
-export type CapabilityRequest = HelloPeerRequest | HelloStdoutRequest;
+export type CapabilityRequest = HelloPeerRequest | HelloStdoutRequest | FileCandidateRequest;
 export type CapabilitySharedPreviewEnvelope = AgentBridgeCapabilityEnvelope<CapabilityRequest>;
 
 export type CapabilityPreviewStatus =
@@ -215,6 +219,9 @@ function validateCapabilityRequest(
   }
   const contract = getAgentBridgeCapabilityContract(value.capability)
     ?? getAgentBridgeCapabilityContractByPreviewSchema(value.schemaVersion);
+  if (contract?.capability === "filesystem.find_file_candidates/v1") {
+    return validateFileCandidateRequest(value, options);
+  }
   if (contract?.capability === "runtime.hello_stdout/v1") {
     return validateHelloStdoutRequest(value, options);
   }

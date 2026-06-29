@@ -13,10 +13,13 @@ import {
 import {
   hashHelloPeerRequestPayload,
   hashHelloStdoutRequestPayload,
+  hashFileCandidateRequestPayload,
+  FILE_CANDIDATES_CAPABILITY,
   HELLO_STDOUT_CAPABILITY,
   validateCapabilityRequestPreviewEnvelope,
   type CapabilityRequest,
   type CapabilityRequestPreviewEnvelope,
+  type FileCandidateRequest,
   type HelloPeerRequest,
   type HelloStdoutRequest,
 } from "../ai";
@@ -376,6 +379,21 @@ export function buildSessionBoundCapabilityPreviewControlEvent(
 function rebuildCapabilityRequestHash(
   requestWithoutHash: Omit<CapabilityRequest, "requestPayloadHash">,
 ): CapabilityRequest {
+  if (requestWithoutHash.capability === FILE_CANDIDATES_CAPABILITY) {
+    const rebound = requestWithoutHash as Omit<FileCandidateRequest, "requestPayloadHash">;
+    const input = {
+      ...rebound.input,
+      targetPeerRef: rebound.targetPeerRef,
+    };
+    const request = {
+      ...rebound,
+      input,
+    };
+    return {
+      ...request,
+      requestPayloadHash: hashFileCandidateRequestPayload(request),
+    };
+  }
   if (requestWithoutHash.capability === HELLO_STDOUT_CAPABILITY) {
     const rebound = requestWithoutHash as Omit<HelloStdoutRequest, "requestPayloadHash">;
     return {

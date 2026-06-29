@@ -5,5 +5,6 @@ export * from "./controlWindowRuntime";
 export * from "./peerConsent";
 export * from "./helloPeerExecution";
 export * from "./helloStdoutExecution";
+export * from "./fileCandidateExecution";
 export * from "./config";
 export * from "./logging";

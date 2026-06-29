@@ -4,7 +4,18 @@ Detailed update and release history for Pastey.
 
 ## Unreleased
 
-- No unreleased changes recorded.
+### Added
+
+- Added a static Agent Bridge capability registry and shared capability envelope for the existing Hello Peer / Hello Stdout capability lifecycle.
+- Added the Layer 5 workspace capability `filesystem.find_file_candidates/v1`, including `request_peer_file_candidates` action validation, PolicyGate bounds, selected-peer preview/execution wiring, receiver Allow once, a bounded Rust/Tauri metadata-only search executor, and typed redacted candidate results.
+
+### Documentation
+
+- Consolidated Agent Bridge capability contracts, provider behavior, Layer 5 workspace status, and validation guidance around the implemented file-candidate metadata search capability.
+
+### Unchanged
+
+- No file-candidate transfer handoff, automatic file sending, shell/process execution, generic tool runtime, or MCP runtime is implemented.
 
 ## 1.9.0 — Agent Bridge capability slice — 2026-06-18
 

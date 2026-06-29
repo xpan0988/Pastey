@@ -197,6 +197,69 @@ test("Hello Stdout execution result allows bounded stdout only in the result pay
   }, { now: NOW }).valid, false);
 });
 
+test("file candidate execution result allows only redacted metadata candidates", () => {
+  const event: RoomControlEvent = {
+    schemaVersion: "pastey-room-control-event/v1",
+    eventId: "file-candidate-result-event",
+    kind: "capability_execution_result",
+    roomRef: "room-control-room",
+    sourceDeviceRef: "mock-peer-1",
+    targetPeerRef: "room-control-source",
+    createdAt: NOW.toISOString(),
+    expiresAt: new Date("2026-06-11T00:02:00.000Z").toISOString(),
+    previewOnly: false,
+    payload: {
+      schemaVersion: "filesystem-find-file-candidates-result/v1",
+      capability: "filesystem.find_file_candidates/v1",
+      executionId: "file-candidate-execution",
+      requestId: "file-candidate-request",
+      consentId: "file-candidate-consent",
+      status: "completed",
+      queryEcho: {
+        filenameHint: "report.pdf",
+        extensions: ["pdf"],
+        searchMode: "filename_metadata_only",
+      },
+      candidates: [{
+        candidateId: "file-candidate-request-opaque-1",
+        displayName: "report.pdf",
+        redactedLocation: "~/Downloads/report.pdf",
+        extension: "pdf",
+        mimeFamily: "document",
+        sizeBytes: 1234,
+        modifiedAt: NOW.toISOString(),
+        matchReason: "filename_exact_match",
+        confidence: "high",
+      }],
+      omitted: {
+        tooManyMatches: false,
+        hiddenFilesSkipped: true,
+        symlinksSkipped: true,
+        scopesSkipped: [],
+      },
+      durationMs: 12,
+      truncated: false,
+      errorCode: null,
+      createdAt: NOW.toISOString(),
+    }
+  };
+  assert.equal(validateRoomControlEvent(event, { now: NOW }).valid, true);
+  assert.equal(validateRoomControlEvent({
+    ...event,
+    payload: {
+      ...event.payload,
+      candidates: [{ ...event.payload.candidates[0], redactedLocation: "/Users/alice/report.pdf" }]
+    }
+  }, { now: NOW }).valid, false);
+  assert.equal(validateRoomControlEvent({
+    ...event,
+    payload: {
+      ...event.payload,
+      candidates: [{ ...event.payload.candidates[0], candidateId: "/Users/alice/report.pdf" }]
+    }
+  }, { now: NOW }).valid, false);
+});
+
 test("registered capability dispatch rejects unknown id, unknown version, and schema mismatch", () => {
   const preview = deterministicPreviewControlEvent();
   assert.equal(validateRoomControlEvent({

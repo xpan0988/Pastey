@@ -1,5 +1,6 @@
 import { isRecord } from "../ai/actionPlanValidator";
 import {
+  FILE_CANDIDATES_CAPABILITY,
   getAgentBridgeCapabilityContract,
   HELLO_STDOUT_CAPABILITY,
   HELLO_STDOUT_EXPECTED_STDOUT,
@@ -7,12 +8,14 @@ import {
   HELLO_TEMPLATE_MESSAGE,
   type AgentBridgeCapabilityContract
 } from "../ai/capabilityRegistry";
+import { validateFileCandidateAdvisoryInput } from "../ai/fileCandidateAdvisory";
 import {
   buildCapabilityPreviewStatusControlEvent,
   validateRoomControlEvent,
   type CapabilityPreviewRoomControlEvent,
   type CapabilityPreviewStatusRoomControlEvent,
   type CapabilityConsentGrant,
+  type FileCandidateConsentGrant,
   type HelloPeerConsentGrant,
   type HelloStdoutConsentGrant,
   type RoomControlEvent,
@@ -51,7 +54,13 @@ export interface HelloStdoutConsentBinding extends PeerConsentBindingBase {
   readonly expectedStdout: "hello peer";
 }
 
-export type PeerConsentBinding = HelloPeerConsentBinding | HelloStdoutConsentBinding;
+export interface FileCandidateConsentBinding extends PeerConsentBindingBase {
+  readonly capability: "filesystem.find_file_candidates/v1";
+  readonly filenameHint: string;
+  readonly searchMode: "filename_metadata_only";
+}
+
+export type PeerConsentBinding = HelloPeerConsentBinding | HelloStdoutConsentBinding | FileCandidateConsentBinding;
 
 export interface PeerConsentRecord {
   readonly binding: PeerConsentBinding;
@@ -130,6 +139,23 @@ const HELLO_STDOUT_BINDING_FIELDS = [
   "createdAt",
   "expiresAt",
 ];
+const FILE_CANDIDATE_BINDING_FIELDS = [
+  "schemaVersion",
+  "consentId",
+  "sourceEventId",
+  "envelopeId",
+  "requestId",
+  "requestPayloadHash",
+  "roomRef",
+  "sourceDeviceRef",
+  "targetPeerRef",
+  "capability",
+  "filenameHint",
+  "searchMode",
+  "previewOnly",
+  "createdAt",
+  "expiresAt",
+];
 let consentSequence = 0;
 
 export function createPeerConsentSessionState(): PeerConsentSessionState {
@@ -171,6 +197,7 @@ export function evaluatePeerCapabilityPreview(
 
   const preview = validation.value;
   const request = preview.payload.request;
+  const fileCandidateRequest = request.capability === FILE_CANDIDATES_CAPABILITY ? request : null;
   const errors: string[] = [];
   const contract = getAgentBridgeCapabilityContract(request.capability);
   if (!contract) {
@@ -237,7 +264,14 @@ export function evaluatePeerCapabilityPreview(
     expiresAt: new Date(expiresAtMs).toISOString(),
   } as const;
   const binding: PeerConsentBinding = Object.freeze(
-    contract.capability === HELLO_STDOUT_CAPABILITY
+    contract.capability === FILE_CANDIDATES_CAPABILITY && fileCandidateRequest
+      ? {
+          ...baseBinding,
+          capability: FILE_CANDIDATES_CAPABILITY,
+          filenameHint: fileCandidateRequest.input.query.filenameHint,
+          searchMode: fileCandidateRequest.input.query.searchMode,
+        }
+      : contract.capability === HELLO_STDOUT_CAPABILITY
       ? {
           ...baseBinding,
           capability: HELLO_STDOUT_CAPABILITY,
@@ -382,6 +416,16 @@ function consentGrantFromRecord(record: PeerConsentRecord): CapabilityConsentGra
     };
     return grant;
   }
+  if (record.binding.capability === FILE_CANDIDATES_CAPABILITY) {
+    const grant: FileCandidateConsentGrant = {
+      ...base,
+      schemaVersion: "filesystem-find-file-candidates-consent-grant/v1",
+      capability: FILE_CANDIDATES_CAPABILITY,
+      filenameHint: record.binding.filenameHint,
+      searchMode: record.binding.searchMode,
+    };
+    return grant;
+  }
   const grant: HelloPeerConsentGrant = {
     ...base,
     schemaVersion: "pastey-hello-peer-consent-grant/v1",
@@ -468,9 +512,10 @@ function validatePeerConsentBinding(value: unknown, now: Date): string[] {
     return ["Peer consent binding must be an object."];
   }
   const isHelloStdout = value.capability === HELLO_STDOUT_CAPABILITY;
+  const isFileCandidate = value.capability === FILE_CANDIDATES_CAPABILITY;
   requireExactFields(
     value,
-    isHelloStdout ? HELLO_STDOUT_BINDING_FIELDS : BINDING_FIELDS,
+    isFileCandidate ? FILE_CANDIDATE_BINDING_FIELDS : isHelloStdout ? HELLO_STDOUT_BINDING_FIELDS : BINDING_FIELDS,
     [],
     "Peer consent binding",
     errors
@@ -490,7 +535,14 @@ function validatePeerConsentBinding(value: unknown, now: Date): string[] {
   ]) {
     requireBoundedString(value[field], field, errors);
   }
-  if (isHelloStdout) {
+  if (isFileCandidate) {
+    if (value.filenameHint === undefined || typeof value.filenameHint !== "string" || value.filenameHint.trim().length === 0 || value.filenameHint.length > 128) {
+      errors.push("Peer consent file candidate filenameHint must be bounded.");
+    }
+    if (value.searchMode !== "filename_metadata_only") {
+      errors.push("Peer consent file candidate searchMode must be filename_metadata_only.");
+    }
+  } else if (isHelloStdout) {
     if (value.expectedStdout !== HELLO_STDOUT_EXPECTED_STDOUT) {
       errors.push(`Peer consent expectedStdout must be exactly ${HELLO_STDOUT_EXPECTED_STDOUT}.`);
     }
@@ -520,6 +572,9 @@ function requestInputMatchesContract(
 ): boolean {
   if (!isRecord(input)) {
     return false;
+  }
+  if (contract.capability === FILE_CANDIDATES_CAPABILITY) {
+    return validateFileCandidateAdvisoryInput(input).valid;
   }
   if (contract.typedBindingField === "exactMessage") {
     return input.message === contract.typedBindingValue;

@@ -66,6 +66,48 @@ export function buildMockHelloStdoutPlan(): AiActionPlan {
   };
 }
 
+export function buildMockFileCandidatePlan(): AiActionPlan {
+  return {
+    schemaVersion: "ai-action-plan/v1",
+    kind: "request_peer_file_candidates",
+    title: "Find file candidates on the selected peer",
+    explanation: "Search the selected peer for filename or metadata matches and return a bounded candidate list. No file contents will be read and no file will be sent automatically.",
+    confidence: "medium",
+    requiresUserConfirmation: true,
+    references: [
+      { kind: "peer", ref: "mock-peer-1" }
+    ],
+    proposedInput: {
+      capability: "filesystem.find_file_candidates/v1",
+      targetPeerRef: "mock-peer-1",
+      query: {
+        rawUserRequest: "help me find a file named report and send it to me",
+        filenameHint: "report",
+        extensions: [],
+        searchMode: "filename_metadata_only"
+      },
+      scopePolicy: {
+        allowedScopes: ["downloads", "desktop", "documents", "pastey_shared"],
+        allowFullDisk: false,
+        includeFileContents: false,
+        includeAbsolutePaths: false,
+        includeHiddenFiles: false
+      },
+      limits: {
+        maxCandidates: 10,
+        maxSearchMs: 5_000,
+        maxDepth: 6
+      },
+      safety: {
+        returnRedactedPaths: true,
+        noAutoTransfer: true,
+        requireReceiverConsent: true,
+        selectedPeerOnly: true
+      }
+    }
+  };
+}
+
 export class MockProvider implements AiProvider {
   readonly config = MOCK_AI_PROVIDER_CONFIG;
 

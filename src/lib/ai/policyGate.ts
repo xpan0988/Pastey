@@ -4,9 +4,9 @@ import {
   normalizeCapabilityFieldName,
   type AgentBridgeCapabilityContract
 } from "./capabilityRegistry";
+import { validateFileCandidateAdvisoryInput } from "./fileCandidateAdvisory";
 import type { AiActionPlan, AiContextSnapshot, AiPolicyResult } from "./types";
 
-const HELLO_INPUT_FIELDS = new Set(["targetPeerRef", "capability", "message", "constraints"]);
 const POLICY_FORBIDDEN_FIELDS = new Set([
   "hiddenTransfer",
   "automaticTransfer",
@@ -19,6 +19,7 @@ const POLICY_FORBIDDEN_FIELDS = new Set([
   "transferWindowMutation",
   "runtimeWindowMutation"
 ].map(normalizeCapabilityFieldName));
+const FIXED_MESSAGE_INPUT_FIELDS = new Set(["targetPeerRef", "capability", "message", "constraints"]);
 
 export function evaluateAiPolicy(plan: AiActionPlan, context: AiContextSnapshot): AiPolicyResult {
   const reasons: string[] = [];
@@ -50,11 +51,15 @@ export function evaluateAiPolicy(plan: AiActionPlan, context: AiContextSnapshot)
     reasons.push("Agent Bridge capability requests require a proposedInput object.");
     return policyResult(plan, reasons, warnings);
   }
-  rejectUnsupportedFields(input, HELLO_INPUT_FIELDS, "proposedInput", reasons);
+  if (contract?.providerInputShape === "file_candidate_advisory") {
+    validateFileCandidateAdvisoryPolicyInput(input, reasons);
+  } else {
+    rejectUnsupportedFields(input, FIXED_MESSAGE_INPUT_FIELDS, "proposedInput", reasons);
+  }
 
   const targetPeerRef = input.targetPeerRef;
   if (typeof targetPeerRef !== "string" || targetPeerRef.trim().length === 0) {
-    reasons.push("Hello Peer requires a targetPeerRef.");
+    reasons.push("Agent Bridge capability requests require a targetPeerRef.");
   }
 
   const peer = typeof targetPeerRef === "string"
@@ -62,21 +67,31 @@ export function evaluateAiPolicy(plan: AiActionPlan, context: AiContextSnapshot)
     : undefined;
   if (!peer || !peer.visible || !peer.trusted) {
     reasons.push("Target peer must be current, visible, and trusted.");
-  } else if (contract && !peer.capabilities?.includes(contract.capability)) {
+  } else if (contract?.requiresPeerCapabilityAdvertisement && !peer.capabilities?.includes(contract.capability)) {
     reasons.push(`Target peer does not advertise ${contract.capability}.`);
   }
 
   if (contract && input.capability !== contract.capability) {
     reasons.push(`${contract.ui.label} capability must be exactly ${contract.capability}.`);
   }
-  if (contract && input[contract.providerInputField] !== contract.providerInputValue) {
-    reasons.push(`${contract.ui.label} ${contract.providerInputField} must be exactly ${contract.providerInputValue}.`);
+  if (contract?.providerInputShape === "fixed_message") {
+    const providerInputField = contract.providerInputField ?? "message";
+    if (input[providerInputField] !== contract.providerInputValue) {
+      reasons.push(`${contract.ui.label} ${providerInputField} must be exactly ${contract.providerInputValue}.`);
+    }
   }
 
-  if (contract) {
+  if (contract?.providerInputShape === "fixed_message") {
     validateConstraints(input.constraints, contract, reasons);
   }
   return policyResult(plan, reasons, warnings);
+}
+
+function validateFileCandidateAdvisoryPolicyInput(input: Record<string, unknown>, reasons: string[]) {
+  const validation = validateFileCandidateAdvisoryInput(input);
+  if (!validation.valid) {
+    reasons.push(...validation.errors);
+  }
 }
 
 function validateConstraints(
