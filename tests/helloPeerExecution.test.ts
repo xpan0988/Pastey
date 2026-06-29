@@ -4,9 +4,11 @@ import test from "node:test";
 
 import {
   buildCapabilityRequestPreviewEnvelope,
+  buildFileCandidateRequestFromPendingAction,
   buildHelloPeerRequestFromPendingAction,
   buildHelloStdoutRequestFromPendingAction,
   buildMockAiContextSnapshot,
+  buildMockFileCandidatePlan,
   buildMockHelloPeerPlan,
   buildMockHelloStdoutPlan,
   confirmPendingAiAction,
@@ -15,6 +17,7 @@ import {
 } from "../src/lib/ai";
 import {
   allowPeerCapabilityOnce,
+  buildFileCandidateExecutionRequest,
   buildHelloPeerExecutionRequest,
   buildHelloStdoutExecutionRequest,
   buildPeerConsentStatusEvent,
@@ -28,6 +31,7 @@ import {
   enqueueRoomControlEvent,
   evaluatePeerCapabilityPreview,
   executeHelloPeerTemplate,
+  executeInboundFileCandidateRequest,
   executeInboundHelloPeerRequest,
   executeInboundHelloStdoutRequest,
   hasOutgoingControlWindowDemand,
@@ -41,6 +45,10 @@ import {
   type CapabilityPreviewRoomControlEvent,
   type PeerConsentRecord,
 } from "../src/lib/agentBridge";
+import type {
+  FileCandidateExecutionRequest,
+  FileCandidateExecutionResult,
+} from "../src/lib/ai";
 
 const NOW = new Date("2026-06-13T00:00:00.000Z");
 const ALLOWED_AT = new Date("2026-06-13T00:00:10.000Z");
@@ -73,7 +81,7 @@ function chain(): {
     sourceDeviceRef: SOURCE,
     targetPeerRef: TARGET,
   });
-  assert.equal(request.ok, true);
+  assert.equal(request.ok, true, request.ok ? undefined : request.errors.join(" "));
   if (!request.ok) throw new Error("Expected request.");
   const envelope = buildCapabilityRequestPreviewEnvelope(request.request, {
     roomRef: ROOM,
@@ -81,7 +89,7 @@ function chain(): {
     ttlMs: 120_000,
     envelopeId: "envelope",
   });
-  assert.equal(envelope.ok, true);
+  assert.equal(envelope.ok, true, envelope.ok ? undefined : envelope.errors.join(" "));
   if (!envelope.ok) throw new Error("Expected envelope.");
   const preview = buildSessionBoundCapabilityPreviewControlEvent(envelope.envelope, {
     roomId: ROOM,
@@ -89,7 +97,7 @@ function chain(): {
     peerSessionRef: TARGET,
     peerConnected: true,
   }, { now: NOW });
-  assert.equal(preview.ok, true);
+  assert.equal(preview.ok, true, preview.ok ? undefined : preview.errors.join(" "));
   if (!preview.ok || preview.event.kind !== "capability_preview") throw new Error("Expected preview.");
   const review = evaluatePeerCapabilityPreview(preview.event, {
     roomRef: ROOM,
@@ -120,6 +128,76 @@ function chain(): {
   assert.equal(execution.ok, true);
   if (!execution.ok) throw new Error("Expected execution request.");
   return { preview: preview.event, consent: consent.record, ack: ack.event, request: execution.event };
+}
+
+function fileCandidateChain(): {
+  preview: CapabilityPreviewRoomControlEvent;
+  consent: PeerConsentRecord;
+  ack: CapabilityPreviewAckRoomControlEvent;
+  request: CapabilityExecuteRequestRoomControlEvent;
+} {
+  const plan = buildMockFileCandidatePlan();
+  const policy = evaluateAiPolicy(plan, buildMockAiContextSnapshot());
+  const pending = confirmPendingAiAction(
+    createPendingAiAction(plan, policy, {
+      now: new Date("2026-06-12T23:59:00.000Z"),
+      ttlMs: 300_000,
+      pendingId: "file-candidate-pending",
+    }),
+    new Date("2026-06-12T23:59:30.000Z"),
+  );
+  const request = buildFileCandidateRequestFromPendingAction(pending, {
+    now: NOW,
+    ttlMs: 120_000,
+    requestId: "file-candidate-request",
+    nonce: "file-candidate-nonce",
+    sourceDeviceRef: SOURCE,
+  });
+  assert.equal(request.ok, true, request.ok ? undefined : request.errors.join(" "));
+  if (!request.ok) throw new Error("Expected file candidate request.");
+  const envelope = buildCapabilityRequestPreviewEnvelope(request.request, {
+    roomRef: ROOM,
+    now: NOW,
+    ttlMs: 120_000,
+    envelopeId: "file-candidate-envelope",
+  });
+  assert.equal(envelope.ok, true, envelope.ok ? undefined : envelope.errors.join(" "));
+  if (!envelope.ok) throw new Error("Expected file candidate envelope.");
+  const preview = buildSessionBoundCapabilityPreviewControlEvent(envelope.envelope, {
+    roomId: ROOM,
+    localSessionRef: SOURCE,
+    peerSessionRef: TARGET,
+    peerConnected: true,
+  }, { now: NOW });
+  assert.equal(preview.ok, true, preview.ok ? undefined : preview.errors.join(" "));
+  if (!preview.ok || preview.event.kind !== "capability_preview") throw new Error("Expected file candidate preview.");
+  const review = evaluatePeerCapabilityPreview(preview.event, {
+    roomRef: ROOM,
+    sourceDeviceRef: SOURCE,
+    targetPeerRef: TARGET,
+    session: createPeerConsentSessionState(),
+    now: ALLOWED_AT,
+    consentId: "file-candidate-consent",
+  });
+  assert.equal(review.status, "reviewable", review.status === "rejected" ? review.errors.join(" ") : undefined);
+  if (review.status !== "reviewable") throw new Error("Expected review.");
+  const allowed = allowPeerCapabilityOnce(review.binding, createPeerConsentSessionState(), { now: ALLOWED_AT });
+  assert.equal(allowed.ok, true, allowed.ok ? undefined : allowed.errors.join(" "));
+  if (!allowed.ok) throw new Error("Expected allow once.");
+  const ack = buildPeerConsentStatusEvent(preview.event, allowed.record, {
+    now: ALLOWED_AT,
+    eventId: "file-candidate-ack",
+  });
+  assert.equal(ack.ok, true, ack.ok ? undefined : ack.errors.join(" "));
+  if (!ack.ok || ack.event.kind !== "capability_preview_ack") throw new Error("Expected ack.");
+  const execution = buildFileCandidateExecutionRequest(preview.event, ack.event, {
+    now: EXECUTE_AT,
+    executionId: "file-candidate-execution",
+    eventId: "file-candidate-execute-event",
+  });
+  assert.equal(execution.ok, true, execution.ok ? undefined : execution.errors.join(" "));
+  if (!execution.ok) throw new Error("Expected execution request.");
+  return { preview: preview.event, consent: allowed.record, ack: ack.event, request: execution.event };
 }
 
 function stdoutChain(): {
@@ -264,6 +342,73 @@ test("receiver consumes Hello Stdout consent once and returns typed stdout resul
   assert.equal(second.result.status, "already_consumed");
 });
 
+test("receiver consumes file candidate consent once and returns redacted metadata candidates", async () => {
+  const value = fileCandidateChain();
+  const executor = async (request: FileCandidateExecutionRequest): Promise<FileCandidateExecutionResult> => ({
+    schemaVersion: "filesystem-find-file-candidates-result/v1",
+    capability: "filesystem.find_file_candidates/v1",
+    executionId: request.executionId,
+    requestId: request.requestId,
+    consentId: request.consentId,
+    status: "completed",
+    queryEcho: {
+      filenameHint: request.input.query.filenameHint,
+      extensions: [...request.input.query.extensions],
+      searchMode: request.input.query.searchMode,
+    },
+    candidates: [{
+      candidateId: "file-candidate-request-opaque-1",
+      displayName: "report.pdf",
+      redactedLocation: "~/Downloads/report.pdf",
+      extension: "pdf",
+      mimeFamily: "document",
+      sizeBytes: 1234,
+      modifiedAt: EXECUTE_AT.toISOString(),
+      matchReason: "filename_exact_match",
+      confidence: "high",
+    }],
+    omitted: {
+      tooManyMatches: false,
+      hiddenFilesSkipped: true,
+      symlinksSkipped: true,
+      scopesSkipped: [],
+    },
+    durationMs: 12,
+    truncated: false,
+    errorCode: null,
+    createdAt: EXECUTE_AT.toISOString(),
+  });
+
+  const first = await executeInboundFileCandidateRequest(
+    value.request,
+    value.consent,
+    createPeerConsentConsumptionState(),
+    executor,
+    { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
+  );
+  assert.equal(first.executed, true);
+  assert.equal(first.result.status, "completed");
+  assert.equal(first.result.candidates.length, 1);
+  assert.equal(first.result.candidates[0].redactedLocation.startsWith("/"), false);
+  assert.equal(first.result.candidates[0].candidateId.includes("/"), false);
+  assert.deepEqual(first.state.consumedConsentIds, ["file-candidate-consent"]);
+  assert.equal(validateRoomControlEvent(first.resultEvent, { now: EXECUTE_AT }).valid, true);
+  assert.equal(matchExecutionResultToRequest(first.resultEvent, value.request, EXECUTE_AT), true);
+
+  const second = await executeInboundFileCandidateRequest(
+    value.request,
+    value.consent,
+    first.state,
+    async () => {
+      throw new Error("executor must not be called twice");
+    },
+    { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
+  );
+  assert.equal(second.executed, false);
+  assert.equal(second.result.status, "already_consumed");
+  assert.equal(second.result.errorCode, "already_consumed");
+});
+
 test("Hello Stdout rejects legacy consent and unsafe result shapes", async () => {
   const stdout = stdoutChain();
   const legacy = chain();
@@ -296,6 +441,15 @@ test("Hello Stdout rejects legacy consent and unsafe result shapes", async () =>
     command: "echo hacked",
     createdAt: EXECUTE_AT.toISOString(),
   }).length, 0);
+});
+
+test("file candidate consent cannot transfer to Hello capabilities", () => {
+  const file = fileCandidateChain();
+  const hello = chain();
+
+  assert.equal(buildHelloPeerExecutionRequest(file.preview, file.ack).ok, false);
+  assert.equal(buildHelloStdoutExecutionRequest(file.preview, file.ack).ok, false);
+  assert.equal(buildFileCandidateExecutionRequest(hello.preview, hello.ack).ok, false);
 });
 
 test("denied, expired, or mismatched consent grant cannot build an execution request", () => {

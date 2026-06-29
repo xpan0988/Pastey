@@ -4,6 +4,7 @@ import {
   type CapabilityRequestPreviewEnvelope
 } from "../ai/capabilityPreviewEnvelope";
 import {
+  FILE_CANDIDATES_CAPABILITY,
   getAgentBridgeCapabilityContract,
   getAgentBridgeCapabilityContractByConsentGrantSchema,
   getAgentBridgeCapabilityContractByExecutionRequestSchema,
@@ -14,6 +15,12 @@ import {
   HELLO_TEMPLATE_MESSAGE,
   normalizeCapabilityFieldName
 } from "../ai/capabilityRegistry";
+import {
+  validateFileCandidateExecutionRequest,
+  validateFileCandidateExecutionResult,
+  type FileCandidateExecutionRequest,
+  type FileCandidateExecutionResult,
+} from "../ai/fileCandidateRequest";
 
 export type RoomControlEventKind =
   | "capability_preview"
@@ -119,7 +126,20 @@ export interface HelloStdoutConsentGrant {
   expiresAt: string;
 }
 
-export type CapabilityConsentGrant = HelloPeerConsentGrant | HelloStdoutConsentGrant;
+export interface FileCandidateConsentGrant {
+  schemaVersion: "filesystem-find-file-candidates-consent-grant/v1";
+  consentId: string;
+  sourcePreviewEventId: string;
+  envelopeId: string;
+  requestId: string;
+  requestPayloadHash: string;
+  capability: "filesystem.find_file_candidates/v1";
+  filenameHint: string;
+  searchMode: "filename_metadata_only";
+  expiresAt: string;
+}
+
+export type CapabilityConsentGrant = HelloPeerConsentGrant | HelloStdoutConsentGrant | FileCandidateConsentGrant;
 
 export interface HelloPeerExecutionRequest {
   schemaVersion: "pastey-hello-peer-execution-request/v1";
@@ -195,8 +215,14 @@ export interface HelloStdoutExecutionResult {
   createdAt: string;
 }
 
-export type CapabilityExecutionRequest = HelloPeerExecutionRequest | HelloStdoutExecutionRequest;
-export type CapabilityExecutionResult = HelloPeerExecutionResult | HelloStdoutExecutionResult;
+export type CapabilityExecutionRequest =
+  | HelloPeerExecutionRequest
+  | HelloStdoutExecutionRequest
+  | FileCandidateExecutionRequest;
+export type CapabilityExecutionResult =
+  | HelloPeerExecutionResult
+  | HelloStdoutExecutionResult
+  | FileCandidateExecutionResult;
 
 export interface CapabilityExecuteRequestRoomControlEvent extends RoomControlEventBase {
   kind: "capability_execute_request";
@@ -325,6 +351,18 @@ const HELLO_STDOUT_CONSENT_GRANT_FIELDS = [
   "expectedStdout",
   "expiresAt"
 ];
+const FILE_CANDIDATE_CONSENT_GRANT_FIELDS = [
+  "schemaVersion",
+  "consentId",
+  "sourcePreviewEventId",
+  "envelopeId",
+  "requestId",
+  "requestPayloadHash",
+  "capability",
+  "filenameHint",
+  "searchMode",
+  "expiresAt"
+];
 const EXECUTION_REQUEST_FIELDS = [
   "schemaVersion",
   "executionId",
@@ -436,6 +474,7 @@ const EXECUTION_REQUEST_SCHEMA = "pastey-hello-peer-execution-request/v1";
 const HELLO_STDOUT_EXECUTION_REQUEST_SCHEMA = "pastey-runtime-hello-stdout-execution-request/v1";
 const EXECUTION_RESULT_SCHEMA = "pastey-hello-peer-execution-result/v1";
 const HELLO_STDOUT_EXECUTION_RESULT_SCHEMA = "pastey-runtime-hello-stdout-execution-result/v1";
+const FILE_CANDIDATE_CONSENT_GRANT_SCHEMA = "filesystem-find-file-candidates-consent-grant/v1";
 const MAX_EXECUTION_ERROR_CODE_LENGTH = 64;
 const MAX_HELLO_STDOUT_STDOUT_BYTES = 64;
 const MAX_HELLO_STDOUT_STDERR_BYTES = 256;
@@ -861,6 +900,9 @@ export function validateCapabilityConsentGrant(value: unknown): string[] {
   }
   const contract = getAgentBridgeCapabilityContract(value.capability)
     ?? getAgentBridgeCapabilityContractByConsentGrantSchema(value.schemaVersion);
+  if (contract?.capability === FILE_CANDIDATES_CAPABILITY) {
+    return validateFileCandidateConsentGrant(value);
+  }
   if (contract?.capability === HELLO_STDOUT_CAPABILITY) {
     return validateHelloStdoutConsentGrant(value);
   }
@@ -916,12 +958,44 @@ export function validateHelloStdoutConsentGrant(value: unknown): string[] {
   return unique(errors);
 }
 
+export function validateFileCandidateConsentGrant(value: unknown): string[] {
+  const errors: string[] = [];
+  if (!isRecord(value)) {
+    return ["File candidate consent grant must be an object."];
+  }
+  requireExactFields(value, FILE_CANDIDATE_CONSENT_GRANT_FIELDS, [], "File candidate consent grant", errors);
+  if (value.schemaVersion !== FILE_CANDIDATE_CONSENT_GRANT_SCHEMA) {
+    errors.push(`File candidate consent grant schemaVersion must be ${FILE_CANDIDATE_CONSENT_GRANT_SCHEMA}.`);
+  }
+  for (const field of [
+    "consentId",
+    "sourcePreviewEventId",
+    "envelopeId",
+    "requestId",
+    "requestPayloadHash"
+  ]) {
+    requireBoundedString(value[field], `consent.${field}`, MAX_IDENTIFIER_LENGTH, errors);
+  }
+  if (value.capability !== FILE_CANDIDATES_CAPABILITY) {
+    errors.push(`File candidate consent grant capability must be exactly ${FILE_CANDIDATES_CAPABILITY}.`);
+  }
+  requireBoundedString(value.filenameHint, "consent.filenameHint", 128, errors);
+  if (value.searchMode !== "filename_metadata_only") {
+    errors.push("File candidate consent grant searchMode must be filename_metadata_only.");
+  }
+  requireDateString(value.expiresAt, "consent.expiresAt", errors);
+  return unique(errors);
+}
+
 export function validateCapabilityExecutionRequest(value: unknown, now = new Date()): string[] {
   if (!isRecord(value)) {
     return ["Capability execution request must be an object."];
   }
   const contract = getAgentBridgeCapabilityContract(value.capability)
     ?? getAgentBridgeCapabilityContractByExecutionRequestSchema(value.schemaVersion);
+  if (contract?.capability === FILE_CANDIDATES_CAPABILITY) {
+    return validateFileCandidateExecutionRequest(value, { now }).errors;
+  }
   if (contract?.capability === HELLO_STDOUT_CAPABILITY) {
     return validateHelloStdoutExecutionRequest(value, now);
   }
@@ -990,6 +1064,9 @@ export function validateCapabilityExecutionResult(value: unknown): string[] {
     return ["Capability execution result must be an object."];
   }
   const contract = getAgentBridgeCapabilityContractByExecutionResultSchema(value.schemaVersion);
+  if (contract?.capability === FILE_CANDIDATES_CAPABILITY) {
+    return validateFileCandidateExecutionResult(value).errors;
+  }
   if (contract?.capability === HELLO_STDOUT_CAPABILITY) {
     return validateHelloStdoutExecutionResult(value);
   }

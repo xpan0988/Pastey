@@ -5,6 +5,7 @@ import {
   MOCK_AI_CONTEXT_POLICY,
   acknowledgeCapabilityPreview,
   buildCapabilityRequestPreviewEnvelope,
+  buildFileCandidateRequestFromPendingAction,
   buildHelloPeerRequestFromPendingAction,
   buildHelloStdoutRequestFromPendingAction,
   buildMockAiContextSnapshot,
@@ -20,6 +21,7 @@ import {
   mockProvider,
   validateAiActionPlan,
   validateCapabilityRequestPreviewEnvelope,
+  validateFileCandidateRequest,
   validateHelloPeerRequest,
   validateHelloStdoutRequest,
   type AiActionPlan,
@@ -199,9 +201,11 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
 
   function buildOutboundRequestPreview() {
     if (!pendingAction) return;
-    const buildResult = pendingAction.actionPlan.kind === "request_peer_hello_stdout_demo"
-      ? buildHelloStdoutRequestFromPendingAction(pendingAction)
-      : buildHelloPeerRequestFromPendingAction(pendingAction);
+    const buildResult = pendingAction.actionPlan.kind === "request_peer_file_candidates"
+      ? buildFileCandidateRequestFromPendingAction(pendingAction)
+      : pendingAction.actionPlan.kind === "request_peer_hello_stdout_demo"
+        ? buildHelloStdoutRequestFromPendingAction(pendingAction)
+        : buildHelloPeerRequestFromPendingAction(pendingAction);
     if (!buildResult.ok) {
       setOutboundPreview({
         validationStatus: "rejected",
@@ -209,9 +213,11 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
       });
       return;
     }
-    const validation = buildResult.request.capability === "runtime.hello_stdout/v1"
-      ? validateHelloStdoutRequest(buildResult.request)
-      : validateHelloPeerRequest(buildResult.request);
+    const validation = buildResult.request.capability === "filesystem.find_file_candidates/v1"
+      ? validateFileCandidateRequest(buildResult.request)
+      : buildResult.request.capability === "runtime.hello_stdout/v1"
+        ? validateHelloStdoutRequest(buildResult.request)
+        : validateHelloPeerRequest(buildResult.request);
     setEnvelopePreview(null);
     setInboundPreview(null);
     setOutboundPreview({
@@ -603,8 +609,8 @@ function CapabilityEnvelopeDetails({ envelope }: { envelope: CapabilityRequestPr
         <PreviewBlock title="Preview status" value={envelope.status} />
       </div>
       <div className="ai-slot-canonical-payload">
-        <strong>Preview constraints</strong>
-        <pre>{JSON.stringify(envelope.request.constraints, null, 2)}</pre>
+        <strong>Preview bounds</strong>
+        <pre>{JSON.stringify(requestBounds(envelope.request), null, 2)}</pre>
       </div>
     </>
   );
@@ -618,12 +624,17 @@ function HelloPeerOutboundPreview({
   onBuild: () => void;
 }) {
   const request = preview?.request;
+  const title = request?.capability === "filesystem.find_file_candidates/v1"
+    ? "File candidate outbound request preview"
+    : request?.capability === "runtime.hello_stdout/v1"
+      ? "Hello Stdout outbound request preview"
+      : "Hello Peer outbound request preview";
 
   return (
     <div className="ai-slot-pending-card">
       <div className="ai-slot-pending-header">
         <div>
-          <strong>{request?.capability === "runtime.hello_stdout/v1" ? "Hello Stdout outbound request preview" : "Hello Peer outbound request preview"}</strong>
+          <strong>{title}</strong>
           <p className="muted">Builds and validates a local request object only.</p>
         </div>
         <span className="ai-slot-pending-status">preview_only</span>
@@ -655,20 +666,34 @@ function HelloPeerOutboundPreview({
             <PreviewBlock title="Capability" value={request.capability} />
             {"runtimePreference" in request ? <PreviewBlock title="Runtime preference" value={request.runtimePreference.join(", ")} /> : null}
             {"runtimeKind" in request ? <PreviewBlock title="Runtime kind" value={request.runtimeKind} /> : null}
+            {"executorKind" in request ? <PreviewBlock title="Executor kind" value={request.executorKind} /> : null}
             {"message" in request.input ? <PreviewBlock title="Message" value={request.input.message} /> : null}
             {"expectedStdout" in request.input ? <PreviewBlock title="Expected stdout" value={request.input.expectedStdout} /> : null}
+            {"query" in request.input ? <PreviewBlock title="Filename hint" value={request.input.query.filenameHint} /> : null}
             <PreviewBlock title="Pending payload hash" value={request.pendingPayloadHash} />
             <PreviewBlock title="Request payload hash" value={request.requestPayloadHash} />
             <PreviewBlock title="Transport status" value={request.transportStatus} />
           </div>
           <div className="ai-slot-canonical-payload">
-            <strong>Outbound preview constraints</strong>
-            <pre>{JSON.stringify(request.constraints, null, 2)}</pre>
+            <strong>Outbound preview bounds</strong>
+            <pre>{JSON.stringify(requestBounds(request), null, 2)}</pre>
           </div>
         </>
       ) : null}
     </div>
   );
+}
+
+function requestBounds(request: CapabilityRequest): unknown {
+  if ("constraints" in request) {
+    return request.constraints;
+  }
+  return {
+    query: request.input.query,
+    scopePolicy: request.input.scopePolicy,
+    limits: request.input.limits,
+    safety: request.input.safety,
+  };
 }
 
 function PendingActionCard({

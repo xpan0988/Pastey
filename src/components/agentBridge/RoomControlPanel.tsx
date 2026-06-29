@@ -4,6 +4,7 @@ import type { CapabilityRequestPreviewEnvelope } from "../../lib/ai";
 import {
   buildCapabilityPreviewControlEvent,
   buildCapabilityPreviewStatusControlEvent,
+  buildFileCandidateExecutionRequest,
   buildHelloPeerExecutionRequest,
   buildHelloStdoutExecutionRequest,
   buildSessionBoundCapabilityPreviewControlEvent,
@@ -18,6 +19,7 @@ import {
   enqueueInboundRoomControlEvents,
   enqueueRoomControlEvent,
   evaluatePeerCapabilityPreview,
+  executeInboundFileCandidateRequest,
   executeInboundHelloPeerRequest,
   executeInboundHelloStdoutRequest,
   getRuntimeControlWindowStatus,
@@ -50,6 +52,7 @@ import {
   type RoomControlSendState,
 } from "../../lib/agentBridge";
 import {
+  executeFileCandidateSearchCapability,
   executeHelloStdoutCapability,
   getRoomControlSessionContext,
   listReceivedRoomControlEvents,
@@ -425,7 +428,7 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
         return;
       }
       setQueue(awaiting.state);
-      const isHelloStdoutPreview = item.event.payload.request.capability === "runtime.hello_stdout/v1";
+      const previewLabel = capabilityLabel(item.event.payload.request.capability);
       setPeerReview({
         queueId: item.queueId,
         event: item.event,
@@ -433,7 +436,7 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
         status: "awaiting_peer_decision",
       });
       setMessages([
-        `Peer PolicyGate accepted this exact ${isHelloStdoutPreview ? "Hello Stdout" : "Hello Peer"} preview for review.`,
+        `Peer PolicyGate accepted this exact ${previewLabel} preview for review.`,
         "Allow once or Deny requires an explicit receiver action. No capability was executed.",
       ]);
       logAgentBridgeLifecycle({ eventKind: "peer_review_started", roomRefShort: session.roomId, eventIdShort: item.event.eventId, requestIdShort: item.event.payload.request.requestId });
@@ -446,14 +449,27 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
         (record) => record.binding.consentId === executionRequestEvent.payload.consentId
       );
       const isHelloStdout = executionRequestEvent.payload.capability === "runtime.hello_stdout/v1";
+      const isFileCandidate = executionRequestEvent.payload.capability === "filesystem.find_file_candidates/v1";
       logAgentBridgeLifecycle({
         eventKind: "hello_peer_execution_started",
         roomRefShort: session.roomId,
         requestIdShort: executionRequestEvent.payload.requestId,
         executionIdShort: executionRequestEvent.payload.executionId,
       });
-      const execution = isHelloStdout
-        ? await executeInboundHelloStdoutRequest(
+      const execution = isFileCandidate
+        ? await executeInboundFileCandidateRequest(
+            executionRequestEvent,
+            consent,
+            consumptionState,
+            executeFileCandidateSearchCapability,
+            {
+              roomRef: session.roomId,
+              sourceDeviceRef: session.peerSessionRef,
+              targetPeerRef: session.localSessionRef,
+            },
+          )
+        : isHelloStdout
+          ? await executeInboundHelloStdoutRequest(
             executionRequestEvent,
             consent,
             consumptionState,
@@ -464,7 +480,7 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
               targetPeerRef: session.localSessionRef,
             },
           )
-        : executeInboundHelloPeerRequest(
+          : executeInboundHelloPeerRequest(
             executionRequestEvent,
             consent,
             consumptionState,
@@ -474,7 +490,8 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
               targetPeerRef: session.localSessionRef,
             },
           );
-      const requestStatus = execution.result.status === "succeeded"
+      const succeeded = execution.result.status === "succeeded" || execution.result.status === "completed";
+      const requestStatus = succeeded
         ? "execution_consumed"
         : execution.result.status === "already_consumed"
           ? "already_consumed"
@@ -483,7 +500,10 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
             : "execution_rejected";
       const completed = markControlQueueItemStatus(state, item.queueId, requestStatus, {
         reason: execution.result.status === "succeeded"
-          ? isHelloStdout
+          || execution.result.status === "completed"
+          ? isFileCandidate
+            ? "Exact one-time consent consumed. File candidate search executed once."
+            : isHelloStdout
             ? "Exact one-time consent consumed. Hello Stdout demo executed once."
             : "Exact one-time consent consumed. Hello Peer demo executed once."
           : `Execution request rejected: ${execution.result.errorCode ?? execution.result.status}.`,
@@ -512,14 +532,14 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
         });
       }
       logAgentBridgeLifecycle({
-        eventKind: execution.result.status === "succeeded" ? "hello_peer_execution_succeeded" : "hello_peer_execution_rejected",
+        eventKind: succeeded ? "hello_peer_execution_succeeded" : "hello_peer_execution_rejected",
         roomRefShort: session.roomId,
         requestIdShort: item.event.payload.requestId,
         executionIdShort: item.event.payload.executionId,
         consentResult: execution.state.consumedConsentIds.includes(item.event.payload.consentId) ? "consumed" : "not_consumed",
-        errorCode: execution.result.errorCode,
-        executionResult: execution.result.status === "succeeded"
-          ? isHelloStdout ? "hello_stdout_succeeded" : "hello_peer_template_succeeded"
+        errorCode: execution.result.errorCode ?? undefined,
+        executionResult: succeeded
+          ? isFileCandidate ? undefined : isHelloStdout ? "hello_stdout_succeeded" : "hello_peer_template_succeeded"
           : undefined,
       });
       if (consent && execution.state.consumedConsentIds.includes(consent.binding.consentId)) {
@@ -531,8 +551,10 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       }
       setQueue(outboundResult.state);
       setMessages([
-        execution.result.status === "succeeded"
-          ? isHelloStdout
+        succeeded
+          ? isFileCandidate
+            ? `File candidate search completed with ${"candidates" in execution.result ? execution.result.candidates.length : 0} redacted candidate(s). Exact one-time consent was consumed.`
+            : isHelloStdout
             ? "Hello Stdout demo executed once. Exact one-time consent was consumed."
             : "Hello Peer demo executed once. Exact one-time consent was consumed."
           : `Execution request rejected: ${execution.result.errorCode ?? execution.result.status}.`,
@@ -696,9 +718,11 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       setMessages(["The exact source preview for this Allow once acknowledgement is unavailable."]);
       return;
     }
-    const built = preview.event.payload.request.capability === "runtime.hello_stdout/v1"
-      ? buildHelloStdoutExecutionRequest(preview.event, senderExecutionAck)
-      : buildHelloPeerExecutionRequest(preview.event, senderExecutionAck);
+    const built = preview.event.payload.request.capability === "filesystem.find_file_candidates/v1"
+      ? buildFileCandidateExecutionRequest(preview.event, senderExecutionAck)
+      : preview.event.payload.request.capability === "runtime.hello_stdout/v1"
+        ? buildHelloStdoutExecutionRequest(preview.event, senderExecutionAck)
+        : buildHelloPeerExecutionRequest(preview.event, senderExecutionAck);
     if (!built.ok) {
       setMessages(built.errors);
       return;
@@ -711,9 +735,7 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
     setQueue(queued.state);
     setSenderExecutionAck(null);
     setMessages([
-      preview.event.payload.request.capability === "runtime.hello_stdout/v1"
-        ? "Hello Stdout execution request queued. Nothing executes until Process next sends it and the receiver PolicyGate accepts it."
-        : "Hello Peer execution request queued. Nothing executes until Process next sends it and the receiver PolicyGate accepts it.",
+      `${capabilityLabel(preview.event.payload.request.capability)} execution request queued. Nothing executes until Process next sends it and the receiver PolicyGate accepts it.`,
     ]);
     logAgentBridgeLifecycle({
       eventKind: "execution_request_queued",
@@ -894,18 +916,18 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
         && Date.parse(senderExecutionAck.payload.consent.expiresAt) > controlDemandNowMs ? (
         <div className="agent-bridge-next-item" data-testid="agent-bridge-execution-request-card">
           <span className="agent-bridge-status-label">Peer allowed once</span>
-          <strong>{senderExecutionAck.payload.consent.capability === "runtime.hello_stdout/v1"
-            ? "Exact Hello Stdout request approved"
-            : "Exact Hello Peer request approved"}</strong>
+          <strong>Exact {capabilityLabel(senderExecutionAck.payload.consent.capability)} request approved</strong>
           <span className="muted">No execution has occurred. This action is explicit and can be used once.</span>
           <button
             className="primary-button"
             data-testid="agent-bridge-request-hello-execution"
             onClick={requestHelloPeerExecution}
           >
-            {senderExecutionAck.payload.consent.capability === "runtime.hello_stdout/v1"
-              ? "Request Hello Stdout execution"
-              : "Request Hello Peer execution"}
+            {senderExecutionAck.payload.consent.capability === "filesystem.find_file_candidates/v1"
+              ? "Request file candidate search"
+              : senderExecutionAck.payload.consent.capability === "runtime.hello_stdout/v1"
+                ? "Request Hello Stdout execution"
+                : "Request Hello Peer execution"}
           </button>
         </div>
       ) : null}
@@ -918,6 +940,15 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
           {"exitCode" in latestExecutionResult.payload ? <span>exit {latestExecutionResult.payload.exitCode}</span> : null}
           {"durationMs" in latestExecutionResult.payload ? <span>{latestExecutionResult.payload.durationMs}ms</span> : null}
           {"output" in latestExecutionResult.payload && latestExecutionResult.payload.output ? <span>{latestExecutionResult.payload.output}</span> : null}
+          {"candidates" in latestExecutionResult.payload ? (
+            <ul>
+              {latestExecutionResult.payload.candidates.map((candidate) => (
+                <li key={candidate.candidateId}>
+                  {candidate.displayName} / {candidate.redactedLocation} / {candidate.sizeBytes} bytes / {candidate.matchReason} / {candidate.confidence}
+                </li>
+              ))}
+            </ul>
+          ) : null}
           {latestExecutionResult.payload.errorCode ? <span>{latestExecutionResult.payload.errorCode}</span> : null}
         </div>
       ) : null}
@@ -1018,13 +1049,16 @@ function PeerConsentReviewCard({
 }) {
   const expired = review.status === "expired" || Date.parse(review.binding.expiresAt) <= nowMs;
   const isHelloStdout = review.binding.capability === "runtime.hello_stdout/v1";
-  const capabilityDetail = "expectedStdout" in review.binding
+  const isFileCandidate = review.binding.capability === "filesystem.find_file_candidates/v1";
+  const capabilityDetail = "filenameHint" in review.binding
+    ? `Filename hint: ${review.binding.filenameHint}; search mode: ${review.binding.searchMode}`
+    : "expectedStdout" in review.binding
     ? `Expected stdout: ${review.binding.expectedStdout}`
     : `Exact message: ${review.binding.exactMessage}`;
   return (
     <div className="agent-bridge-next-item" data-testid="agent-bridge-peer-consent-review">
       <span className="agent-bridge-status-label">Peer PolicyGate review</span>
-      <strong>{isHelloStdout ? "Hello Stdout demo" : "Hello Peer demo"}</strong>
+      <strong>{capabilityLabel(review.binding.capability)}</strong>
       <span className="agent-bridge-compact-ref" title={review.binding.sourceDeviceRef}>
         Source: {shortRef(review.binding.sourceDeviceRef)}
       </span>
@@ -1033,7 +1067,9 @@ function PeerConsentReviewCard({
         Expires {new Date(review.binding.expiresAt).toLocaleTimeString()}
       </time>
       <span className="muted">
-        Allow once applies only to this exact request and does not execute it yet.
+        {isFileCandidate
+          ? "Allow once applies only to this exact bounded filename/metadata search. No file contents are read and no file is sent automatically."
+          : "Allow once applies only to this exact request and does not execute it yet."}
       </span>
       {review.status === "awaiting_peer_decision" && !expired ? (
         <div className="benchmark-controls">
@@ -1059,6 +1095,8 @@ function PeerConsentReviewCard({
             : review.status === "consumed"
               ? isHelloStdout
                 ? "One-time consent consumed. Hello Stdout demo executed once."
+                : isFileCandidate
+                  ? "One-time consent consumed. File candidate search executed once."
                 : "One-time consent consumed. Hello Peer demo executed once."
             : review.status === "denied"
               ? "Denied."
@@ -1144,6 +1182,16 @@ function shortRef(value: string): string {
   if (!value) return "None";
   if (value.length <= 16) return value;
   return `${value.slice(0, 7)}…${value.slice(-7)}`;
+}
+
+function capabilityLabel(capability: string): string {
+  if (capability === "filesystem.find_file_candidates/v1") {
+    return "File candidate search";
+  }
+  if (capability === "runtime.hello_stdout/v1") {
+    return "Hello Stdout";
+  }
+  return "Hello Peer";
 }
 
 function capitalize(value: string): string {

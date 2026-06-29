@@ -3,6 +3,8 @@ export * from "./capabilityRegistry";
 export * from "./capabilityPreviewEnvelope";
 export * from "./cloudOpenAICompatibleProvider";
 export * from "./contextSnapshot";
+export * from "./fileCandidateAdvisory";
+export * from "./fileCandidateRequest";
 export * from "./helloPeerRequest";
 export * from "./helloStdoutRequest";
 export * from "./mockProvider";

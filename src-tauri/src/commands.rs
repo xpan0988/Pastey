@@ -12,6 +12,7 @@ use crate::{
     device_profile::{self, ProfileProbeMode},
     diagnostics, discovery,
     error::{AppError, AppResult},
+    file_candidates::{self, FileCandidateExecutionRequest, FileCandidateExecutionResult},
     hello_stdout::{self, HelloStdoutExecutionRequest, HelloStdoutExecutionResult},
     link_benchmark, logging,
     models::{
@@ -1240,6 +1241,15 @@ pub async fn execute_hello_stdout_capability(
     request: HelloStdoutExecutionRequest,
 ) -> Result<HelloStdoutExecutionResult, String> {
     hello_stdout::execute_hello_stdout(request).map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub async fn execute_file_candidate_search_capability(
+    request: FileCandidateExecutionRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<FileCandidateExecutionResult, String> {
+    file_candidates::execute_file_candidate_search(request, &state.paths)
+        .map_err(|error| error.message())
 }
 
 #[tauri::command]

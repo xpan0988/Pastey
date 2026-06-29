@@ -153,6 +153,7 @@ Responsibilities:
 - Deny-first PolicyGate behavior.
 - Explicit local and receiver-side consent.
 - Bounded capability execution and typed result return.
+- Read-only workspace capabilities that preserve advisory model output, explicit receiver consent, and bounded host-owned execution.
 - Audit logging that mirrors lifecycle without becoming state or authority.
 
 Non-responsibilities:
@@ -167,7 +168,8 @@ Completion criteria:
 
 - Provider support, redaction, validation, policy, consent, execution, result, and audit are all wired through a real Bridge control path. Legacy implementation term: room-control path.
 - Each capability has a fixed schema, host-owned executor, explicit consent binding, replay protection, and tests.
-- Broader workspace completion requires more than the fixed Hello Peer/Hello Stdout slices and minimal static registry: broad capability coverage, multi-step/task orchestration, local model scheduling or equivalent local-provider story, and explicit durable peer identity integration if a capability depends on durable trust.
+- Advisory-only workspace capability scaffolds may exist before execution. They do not count as implemented receiver capabilities until preview, receiver consent, execution/result, and validation are complete.
+- Broader workspace completion requires more than the fixed Hello Peer/Hello Stdout slices, minimal static registry, and file-candidate metadata search: approved transfer handoff, broad capability coverage, multi-step/task orchestration, local model scheduling or equivalent local-provider story, and explicit durable peer identity integration if a capability depends on durable trust.
 
 ## Inter-Layer Dependencies
 
@@ -188,7 +190,7 @@ Completion criteria:
 | Layer 2 | `src-tauri/src/diagnostics.rs`, `src-tauri/src/device_profile.rs`, `src-tauri/src/capability_probe.rs`, `src-tauri/src/link_benchmark.rs`, `src/pages/SettingsPage.tsx` | Device profile, capability probe, diagnostics DTO, and benchmark tests | Developer Tools current-session diagnostics | Production runtime, Developer Tools visible |
 | Layer 3 | `src/lib/transferPlanner.ts`, `src/lib/transferScheduler.ts`, `src/App.tsx`, `src/lib/agentBridge/controlWindowRuntime.ts`, `src-tauri/src/transfer.rs` | Planner/scheduler/MicroFlowGroup tests plus `scripts/run-cl4-contention-smoke.mjs` | Transfer validation guide and logged smoke interpretation | Production runtime with automated harness |
 | Layer 4 | `src-tauri/src/storage.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/room_control.rs`, `src/lib/bridgeRoutingRuntime.ts`, `src/lib/agentBridge/roomControlEvent.ts`, `src/lib/agentBridge/controlQueue.ts` | Bridge route, storage, room-control Rust tests, routing/runtime TypeScript tests, control-event validation tests, `scripts/run-layer4-validation-matrix.mjs` | Session-scoped Bridge routing/control flow documented in Bridge, Agent Bridge, and transfer docs. Legacy implementation term: room. | Production runtime with automated matrix; manual/release smoke pending |
-| Layer 5 | `src/lib/ai/*`, `src/lib/agentBridge/peerConsent.ts`, `src/lib/agentBridge/helloPeerExecution.ts`, `src/lib/agentBridge/helloStdoutExecution.ts`, `src-tauri/src/hello_stdout.rs`, `src/lib/agentBridge/logging.ts`, `src/components/agentBridge/RoomControlPanel.tsx` | Provider, context, static registry, validator, PolicyGate, preview, consent, execution, logging, and room-control tests | Bridge-scoped UI and redacted lifecycle logs. Legacy implementation term: room-scoped. | Production runtime, narrow capability slice with static registry |
+| Layer 5 | `src/lib/ai/*`, `src/lib/agentBridge/peerConsent.ts`, `src/lib/agentBridge/helloPeerExecution.ts`, `src/lib/agentBridge/helloStdoutExecution.ts`, `src/lib/agentBridge/fileCandidateExecution.ts`, `src-tauri/src/hello_stdout.rs`, `src-tauri/src/file_candidates.rs`, `src/lib/agentBridge/logging.ts`, `src/components/agentBridge/RoomControlPanel.tsx` | Provider, context, static registry, validator, PolicyGate, preview, consent, execution, logging, room-control tests, Hello tests, and file-candidate advisory/executor tests | Bridge-scoped UI and redacted lifecycle logs. Legacy implementation term: room-scoped. | Production runtime, narrow capability slice with static registry and first read-only workspace capability |
 
 ## Current Completion Assessment
 
@@ -200,9 +202,9 @@ These scores are against the canonical definitions in this document, not against
 | Layer 2 - Device intelligence | 76% | 82% | Advisory diagnostics implemented; recommendation UX partial | High | User-visible recommended roles, peer benchmark UI, explicit planner-hint contract if consumed later, broader device matrix |
 | Layer 3 - Smart orchestration | 84% | 88% | Operational orchestration core | High | Deficit/history-aware adaptation, broader end-to-end contention validation, future capability-routing policy |
 | Layer 4 - Multi-device Bridge sessions and peer identity | 72% | 86% | Session-scoped Bridge routing/control core | High | Full cryptographic paired-key rotation, durable route recovery if explicitly designed, broader release/two-device validation, independent security review |
-| Layer 5 - Agent-assisted device workspace | 54% | 80% | Narrow capability slice implemented | High | Broad capability coverage, multi-step task orchestration, local LLM scheduling, MCP/tool integration, durable peer-identity dependency if needed |
+| Layer 5 - Agent-assisted device workspace | 60% | 84% | Narrow capability slice plus read-only workspace search | High | Approved transfer handoff, broad capability coverage, multi-step task orchestration, local LLM scheduling, MCP/tool integration, durable peer-identity dependency if needed |
 
-No layer is `100%`. The largest gap between full vision and implementation remains Layer 5: the fixed Hello Peer/Hello Stdout paths prove the safety shape, not the whole workspace vision.
+No layer is `100%`. The largest gap between full vision and implementation remains Layer 5: the fixed Hello Peer/Hello Stdout paths prove the safety shape, and file-candidate search proves bounded read-only workspace discovery, but Pastey still lacks approved transfer handoff, broad capability coverage, and multi-step workspace orchestration.
 
 ## Completion Scoring Scale
 

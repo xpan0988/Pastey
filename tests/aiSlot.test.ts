@@ -4,9 +4,11 @@ import test from "node:test";
 import {
   acknowledgeCapabilityPreview,
   buildCapabilityRequestPreviewEnvelope,
+  buildFileCandidateRequestFromPendingAction,
   buildOpenAICompatibleChatRequest,
   buildHelloPeerRequestFromPendingAction,
   buildHelloStdoutRequestFromPendingAction,
+  buildMockFileCandidatePlan,
   buildMockAiContextSnapshot,
   buildMockHelloPeerPlan,
   buildMockHelloStdoutPlan,
@@ -31,6 +33,8 @@ import {
   mockProvider,
   validateAiActionPlan,
   validateCapabilityRequestPreviewEnvelope,
+  validateFileCandidateAdvisoryInput,
+  validateFileCandidateRequest,
   validateHelloPeerRequest,
   validateHelloStdoutRequest,
   type AiActionPlan,
@@ -179,13 +183,18 @@ test("safe Hello Stdout mock plan validates and builds a preview-only request", 
   assert.equal("command" in request.request, false);
 });
 
-test("Agent Bridge capability registry resolves both bounded capabilities", () => {
+test("Agent Bridge capability registry resolves implemented capabilities", () => {
   const contracts = listAgentBridgeCapabilityContracts();
-  assert.equal(contracts.length, 2);
+  assert.equal(contracts.length, 3);
+  assert.equal(contracts.filter((contract) => contract.lifecycle === "implemented").length, 3);
+  assert.equal(contracts.filter((contract) => contract.lifecycle === "planned_advisory_only").length, 0);
   assert.equal(getAgentBridgeCapabilityContract("runtime.execute_hello_template")?.providerActionKind, "request_peer_hello_demo");
   assert.equal(getAgentBridgeCapabilityContract("runtime.hello_stdout/v1")?.providerActionKind, "request_peer_hello_stdout_demo");
+  assert.equal(getAgentBridgeCapabilityContract("filesystem.find_file_candidates/v1")?.providerActionKind, "request_peer_file_candidates");
+  assert.equal(getAgentBridgeCapabilityContract("filesystem.find_file_candidates/v1")?.executorKind, "filesystem_find_candidates_host");
   assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_hello_demo")?.capability, "runtime.execute_hello_template");
   assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_hello_stdout_demo")?.capability, "runtime.hello_stdout/v1");
+  assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_file_candidates")?.capability, "filesystem.find_file_candidates/v1");
   assert.equal(getAgentBridgeCapabilityContract("runtime.unknown/v1"), undefined);
   assert.equal(getAgentBridgeCapabilityContractByVersion("runtime.hello_stdout/v1", "v2"), undefined);
   for (const contract of contracts) {
@@ -211,6 +220,122 @@ test("shared capability envelope preserves exact selected-peer preview metadata"
   assert.equal(shared.typedPayload, result.envelope.request);
   assert.equal(shared.transport.kind, "room-control");
   assert.equal(shared.transport.previewOnly, true);
+});
+
+test("safe file candidate advisory validates, passes PolicyGate, and builds a preview request", () => {
+  const plan = buildMockFileCandidatePlan();
+  const validation = validateAiActionPlan(plan);
+  assert.equal(validation.valid, true);
+  if (!validation.valid) return;
+  assert.equal(validateFileCandidateAdvisoryInput(validation.value.proposedInput).valid, true);
+
+  const policy = evaluateAiPolicy(validation.value, buildMockAiContextSnapshot());
+  assert.equal(policy.status, "accepted");
+
+  const pending = createPendingAiAction(validation.value, policy, {
+    now: new Date("2026-06-11T00:00:00.000Z"),
+    ttlMs: 120_000,
+    pendingId: "file-candidate-pending"
+  });
+  assert.equal(pending.canonicalPayload.capability, "filesystem.find_file_candidates/v1");
+  assert.equal(pending.canonicalPayload.query?.searchMode, "filename_metadata_only");
+  assert.equal(pending.canonicalPayload.scopePolicy?.includeFileContents, false);
+  assert.equal(pending.canonicalPayload.safety?.noAutoTransfer, true);
+  const confirmed = confirmPendingAiAction(pending, new Date("2026-06-11T00:00:30.000Z"));
+  const preview = buildFileCandidateRequestFromPendingAction(confirmed, {
+    now: new Date("2026-06-11T00:01:00.000Z"),
+    requestId: "file-candidate-request",
+    nonce: "file-candidate-nonce",
+  });
+  assert.equal(preview.ok, true);
+  if (!preview.ok) return;
+  assert.equal(preview.request.capability, "filesystem.find_file_candidates/v1");
+  assert.equal(preview.request.executorKind, "filesystem_find_candidates_host");
+  assert.equal(preview.request.input.query.searchMode, "filename_metadata_only");
+  assert.equal(preview.request.input.scopePolicy.includeFileContents, false);
+  assert.equal(validateFileCandidateRequest(preview.request, { now: new Date("2026-06-11T00:01:00.000Z") }).valid, true);
+  const helloPreview = buildHelloPeerRequestFromPendingAction(confirmed, {
+    now: new Date("2026-06-11T00:01:00.000Z"),
+    requestId: "file-candidate-should-not-build-hello",
+    nonce: "file-candidate-hello-nonce",
+  });
+  assert.equal(helloPreview.ok, false);
+});
+
+test("file candidate advisory rejects unsafe provider output and authority expansion", () => {
+  const cases: Array<[string, (input: Record<string, unknown>) => void, string]> = [
+    ["absolute path", (input) => {
+      const query = input.query as Record<string, unknown>;
+      query.filenameHint = "/Users/alice/secrets.txt";
+      input.absolutePath = "/Users/alice/secrets.txt";
+    }, "Unsafe field"],
+    ["full disk", (input) => {
+      const scope = input.scopePolicy as Record<string, unknown>;
+      scope.allowFullDisk = true;
+    }, "allowFullDisk false"],
+    ["file contents", (input) => {
+      const scope = input.scopePolicy as Record<string, unknown>;
+      scope.includeFileContents = true;
+    }, "includeFileContents false"],
+    ["absolute paths in result", (input) => {
+      const scope = input.scopePolicy as Record<string, unknown>;
+      scope.includeAbsolutePaths = true;
+    }, "includeAbsolutePaths false"],
+    ["auto transfer", (input) => {
+      const safety = input.safety as Record<string, unknown>;
+      safety.noAutoTransfer = false;
+    }, "noAutoTransfer true"],
+    ["broadcast intent", (input) => {
+      const safety = input.safety as Record<string, unknown>;
+      safety.selectedPeerOnly = false;
+    }, "selectedPeerOnly true"],
+    ["selected-peers field", (input) => {
+      input.selectedPeers = ["mock-peer-1", "mock-peer-2"];
+    }, "Unsafe field"],
+    ["durable trust claim", (input) => {
+      input.durableTrust = true;
+    }, "Unsafe field"],
+    ["shell field", (input) => {
+      input.shell = "find . -name report";
+    }, "Unsafe field"],
+    ["cwd field", (input) => {
+      input.cwd = "/tmp";
+    }, "Unsafe field"],
+    ["env field", (input) => {
+      input.env = { HOME: "/Users/alice" };
+    }, "Unsafe field"],
+    ["network target", (input) => {
+      input.networkTarget = "https://example.invalid";
+    }, "Unsafe field"],
+    ["stdout result field", (input) => {
+      input.stdout = "report.pdf";
+    }, "Unsafe field"],
+    ["unsupported scope", (input) => {
+      const scope = input.scopePolicy as Record<string, unknown>;
+      scope.allowedScopes = ["root"];
+    }, "unsupported scope"],
+    ["unbounded candidate count", (input) => {
+      const limits = input.limits as Record<string, unknown>;
+      limits.maxCandidates = 100;
+    }, "maxCandidates"],
+  ];
+
+  for (const [label, mutate, expected] of cases) {
+    const plan = buildMockFileCandidatePlan();
+    const input = structuredClone(plan.proposedInput ?? {});
+    mutate(input);
+    const candidate = { ...plan, proposedInput: input };
+    const validation = validateAiActionPlan(candidate);
+    const policy = validation.valid
+      ? evaluateAiPolicy(validation.value, buildMockAiContextSnapshot())
+      : undefined;
+    assert.equal(validation.valid && policy?.status === "accepted", false, label);
+    const combined = [
+      ...(validation.valid ? [] : validation.errors),
+      ...(policy?.reasons ?? []),
+    ].join("\n");
+    assert.match(combined, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), label);
+  }
 });
 
 test("provider output cannot include runtime or result payload fields", () => {

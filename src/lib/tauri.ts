@@ -14,6 +14,11 @@ import type {
   RoomItem
 } from "./types";
 import {
+  validateFileCandidateExecutionRequest,
+  type FileCandidateExecutionRequest,
+  type FileCandidateExecutionResult,
+} from "./ai";
+import {
   validateHelloStdoutExecutionRequest,
   validateRoomControlEvent,
   type HelloStdoutExecutionRequest,
@@ -166,6 +171,16 @@ export async function executeHelloStdoutCapability(
     throw new Error(errors.join(" "));
   }
   return invoke("execute_hello_stdout_capability", { request });
+}
+
+export async function executeFileCandidateSearchCapability(
+  request: FileCandidateExecutionRequest,
+): Promise<FileCandidateExecutionResult> {
+  const validation = validateFileCandidateExecutionRequest(request);
+  if (!validation.valid) {
+    throw new Error(validation.errors.join(" "));
+  }
+  return invoke("execute_file_candidate_search_capability", { request });
 }
 
 export async function getRoomControlSessionContext(

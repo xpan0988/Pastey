@@ -95,6 +95,20 @@ node scripts/run-layer4-validation-matrix.mjs
 
 `scripts/run-layer4-validation-matrix.mjs` runs the focused Bridge route, Bridge identity, room-control, control queue, peer consent, Hello Peer, transfer scheduler, storage, and room-control Rust suites used by the table above. It does not launch the GUI, require two physical machines, or write tracked generated files.
 
+## Layer 5 Workspace Capability Validation Plan
+
+The first workspace capability direction is `filesystem.find_file_candidates/v1`. Current validation covers advisory JSON validation, PolicyGate boundaries, selected-peer consent, receiver-side bounded metadata search, and redacted candidate result shape. It does not validate approved file-transfer handoff because that capability is not implemented.
+
+| Area | Current expected behavior | Automated coverage | Future implementation/manual validation |
+| --- | --- | --- | --- |
+| Safe advisory shape | `request_peer_file_candidates` validates with one selected peer, filename/metadata-only mode, bounded scopes, bounded limits, and explicit no-auto-transfer safety | AI slot tests for safe file-candidate advisory, static registry lookup, pending payload hash, and preview construction | Real-provider prompt regression tests |
+| Unsafe provider fields | command/script/code, cwd/env, network target, stdout/stderr/exit, absolute path, selected-peers/broadcast, durable trust, hidden transfer, and mutation fields reject fail-closed | AI slot negative tests for unsafe provider output and authority expansion | Provider prompt regression tests for real configured providers |
+| Scope and result boundaries | full disk, file contents, absolute paths, hidden files, unbounded depth/time/candidate count reject; receiver search skips unavailable scopes, hidden entries, and symlinks | AI slot file-candidate validation tests, room-control event result validation tests, and Rust executor tests with synthetic files and redacted candidate metadata | Broader platform/device-directory matrix |
+| Consent and route policy | selected-peer only; delivery is not consent; durable pairing does not authorize search; Allow once is consumed once | Existing Layer 4 control/capability route matrix plus AI advisory selected-peer policy tests and peer-consent/execution tests | Two-device Agent Bridge smoke for preview/search/result flow |
+| Transfer handoff | no automatic transfer and no `filesystem.prepare_file_transfer/v1` implementation | Advisory tests assert `noAutoTransfer: true`; no Rust/Tauri transfer command changes | Separate future capability and manual smoke for receiver-approved file transfer |
+
+Candidate selection and approved transfer handoff remain future implementation and validation work. The current executor returns redacted metadata candidates only.
+
 ## Manual Smoke Checklist (Pending)
 
 Manual smoke is intentionally pending until the automated matrix is green. Run it separately and record evidence with exact build/profile details:
@@ -104,6 +118,7 @@ Manual smoke is intentionally pending until the automated matrix is green. Run i
 - disconnect/reconnect route expiry with old selected-peer route failing closed;
 - paired and revoked display metadata remaining non-routeable/non-authoritative;
 - Agent Bridge Hello Peer and Hello Stdout exact selected-peer consent and one-time execution;
+- Agent Bridge file-candidate selected-peer preview, Allow once, redacted metadata result, and no transfer handoff;
 - selected-peers and broadcast rejection for room-control/capability paths.
 
 Manual smoke remains release/product confidence evidence, not automated validation.

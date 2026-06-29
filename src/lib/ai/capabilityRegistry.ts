@@ -2,30 +2,40 @@ import type { AiActionKind } from "./types";
 
 export type AgentBridgeCapabilityId =
   | "runtime.execute_hello_template"
-  | "runtime.hello_stdout/v1";
+  | "runtime.hello_stdout/v1"
+  | "filesystem.find_file_candidates/v1";
 
 export type AgentBridgeCapabilityVersion = "legacy" | "v1";
 export type AgentBridgeRoutePolicy = "selected-peer";
 export type AgentBridgeConsentPolicy = "exact-allow-once";
-export type AgentBridgeExecutorKind = "ts_in_process_fixed_template" | "rust_host_helper";
+export type AgentBridgeExecutorKind =
+  | "ts_in_process_fixed_template"
+  | "rust_host_helper"
+  | "filesystem_find_candidates_host"
+  | "none";
 export type AgentBridgeAuditRedactionPolicy = "metadata_only";
+export type AgentBridgeCapabilityLifecycle = "implemented" | "planned_advisory_only";
+export type AgentBridgeProviderInputShape = "fixed_message" | "file_candidate_advisory";
 
 export interface AgentBridgeCapabilityContract {
   readonly capability: AgentBridgeCapabilityId;
   readonly version: AgentBridgeCapabilityVersion;
-  readonly providerActionKind: Extract<AiActionKind, "request_peer_hello_demo" | "request_peer_hello_stdout_demo">;
-  readonly previewRequestSchema: string;
-  readonly consentGrantSchema: string;
-  readonly executionRequestSchema: string;
-  readonly executionResultSchema: string;
+  readonly lifecycle: AgentBridgeCapabilityLifecycle;
+  readonly providerActionKind: Extract<AiActionKind, "request_peer_hello_demo" | "request_peer_hello_stdout_demo" | "request_peer_file_candidates">;
+  readonly providerInputShape: AgentBridgeProviderInputShape;
+  readonly previewRequestSchema?: string;
+  readonly consentGrantSchema?: string;
+  readonly executionRequestSchema?: string;
+  readonly executionResultSchema?: string;
   readonly routePolicy: AgentBridgeRoutePolicy;
   readonly consentPolicy: AgentBridgeConsentPolicy;
   readonly executorKind: AgentBridgeExecutorKind;
   readonly auditRedactionPolicy: AgentBridgeAuditRedactionPolicy;
-  readonly providerInputField: "message";
-  readonly providerInputValue: string;
-  readonly typedBindingField: "exactMessage" | "expectedStdout";
-  readonly typedBindingValue: string;
+  readonly requiresPeerCapabilityAdvertisement: boolean;
+  readonly providerInputField?: "message";
+  readonly providerInputValue?: string;
+  readonly typedBindingField?: "exactMessage" | "expectedStdout";
+  readonly typedBindingValue?: string;
   readonly constraintFields: readonly string[];
   readonly allowTempOnlyFilesystem: boolean;
   readonly forbiddenProviderFields: readonly string[];
@@ -61,9 +71,11 @@ export interface AgentBridgeCapabilityEnvelope<TPayload = unknown> {
 
 export const HELLO_TEMPLATE_CAPABILITY = "runtime.execute_hello_template" as const;
 export const HELLO_STDOUT_CAPABILITY = "runtime.hello_stdout/v1" as const;
+export const FILE_CANDIDATES_CAPABILITY = "filesystem.find_file_candidates/v1" as const;
 export const HELLO_TEMPLATE_MESSAGE = "hello peer!";
 export const HELLO_STDOUT_EXPECTED_STDOUT = "hello peer";
 export const HELLO_STDOUT_RUNTIME_KIND = "rust_host_helper";
+export const FILE_CANDIDATES_EXECUTOR_KIND = "filesystem_find_candidates_host" as const;
 export const SHARED_CAPABILITY_ENVELOPE_SCHEMA = "pastey-agent-bridge-capability-envelope/v1";
 export const SELECTED_PEER_ROUTE_POLICY: AgentBridgeRoutePolicy = "selected-peer";
 export const EXACT_ALLOW_ONCE_CONSENT_POLICY: AgentBridgeConsentPolicy = "exact-allow-once";
@@ -94,6 +106,14 @@ const BASE_FORBIDDEN_PROVIDER_FIELDS = [
   "transportKey",
   "hiddenTransfer",
   "peerFilesystemSearch",
+  "selectedPeers",
+  "targetPeerRefs",
+  "broadcast",
+  "broadcastBridge",
+  "durableTrust",
+  "trustedExecutor",
+  "autoTransfer",
+  "automaticTransfer",
   "executed",
   "execution",
   "completed",
@@ -104,11 +124,13 @@ const BASE_FORBIDDEN_PROVIDER_FIELDS = [
 
 const RESULT_ONLY_FIELDS = ["stdout", "stderr", "exitCode", "durationMs", "timedOut"] as const;
 
-export const AGENT_BRIDGE_CAPABILITY_REGISTRY = Object.freeze([
+export const AGENT_BRIDGE_CAPABILITY_REGISTRY: readonly AgentBridgeCapabilityContract[] = Object.freeze([
   Object.freeze({
     capability: HELLO_TEMPLATE_CAPABILITY,
     version: "legacy",
+    lifecycle: "implemented",
     providerActionKind: "request_peer_hello_demo",
+    providerInputShape: "fixed_message",
     previewRequestSchema: "pastey-capability-request/v1",
     consentGrantSchema: "pastey-hello-peer-consent-grant/v1",
     executionRequestSchema: "pastey-hello-peer-execution-request/v1",
@@ -117,6 +139,7 @@ export const AGENT_BRIDGE_CAPABILITY_REGISTRY = Object.freeze([
     consentPolicy: EXACT_ALLOW_ONCE_CONSENT_POLICY,
     executorKind: "ts_in_process_fixed_template",
     auditRedactionPolicy: "metadata_only",
+    requiresPeerCapabilityAdvertisement: true,
     providerInputField: "message",
     providerInputValue: HELLO_TEMPLATE_MESSAGE,
     typedBindingField: "exactMessage",
@@ -134,7 +157,9 @@ export const AGENT_BRIDGE_CAPABILITY_REGISTRY = Object.freeze([
   Object.freeze({
     capability: HELLO_STDOUT_CAPABILITY,
     version: "v1",
+    lifecycle: "implemented",
     providerActionKind: "request_peer_hello_stdout_demo",
+    providerInputShape: "fixed_message",
     previewRequestSchema: "pastey-runtime-hello-stdout-request/v1",
     consentGrantSchema: "pastey-runtime-hello-stdout-consent-grant/v1",
     executionRequestSchema: "pastey-runtime-hello-stdout-execution-request/v1",
@@ -143,6 +168,7 @@ export const AGENT_BRIDGE_CAPABILITY_REGISTRY = Object.freeze([
     consentPolicy: EXACT_ALLOW_ONCE_CONSENT_POLICY,
     executorKind: "rust_host_helper",
     auditRedactionPolicy: "metadata_only",
+    requiresPeerCapabilityAdvertisement: true,
     providerInputField: "message",
     providerInputValue: HELLO_STDOUT_EXPECTED_STDOUT,
     typedBindingField: "expectedStdout",
@@ -165,7 +191,32 @@ export const AGENT_BRIDGE_CAPABILITY_REGISTRY = Object.freeze([
       resultLabel: "Hello Stdout result",
     },
   }),
-] satisfies readonly AgentBridgeCapabilityContract[]);
+  Object.freeze({
+    capability: FILE_CANDIDATES_CAPABILITY,
+    version: "v1",
+    lifecycle: "implemented",
+    providerActionKind: "request_peer_file_candidates",
+    providerInputShape: "file_candidate_advisory",
+    previewRequestSchema: "filesystem-find-file-candidates-request/v1",
+    consentGrantSchema: "filesystem-find-file-candidates-consent-grant/v1",
+    executionRequestSchema: "filesystem-find-file-candidates-execution-request/v1",
+    executionResultSchema: "filesystem-find-file-candidates-result/v1",
+    routePolicy: SELECTED_PEER_ROUTE_POLICY,
+    consentPolicy: EXACT_ALLOW_ONCE_CONSENT_POLICY,
+    executorKind: FILE_CANDIDATES_EXECUTOR_KIND,
+    auditRedactionPolicy: "metadata_only",
+    requiresPeerCapabilityAdvertisement: true,
+    constraintFields: [],
+    allowTempOnlyFilesystem: false,
+    forbiddenProviderFields: BASE_FORBIDDEN_PROVIDER_FIELDS,
+    resultOnlyFields: RESULT_ONLY_FIELDS,
+    ui: {
+      label: "Find File Candidates",
+      shortLabel: "File Candidates",
+      resultLabel: "File candidate result",
+    },
+  }),
+]);
 
 export const AGENT_BRIDGE_CAPABILITY_ACTION_KINDS = AGENT_BRIDGE_CAPABILITY_REGISTRY
   .map((contract) => contract.providerActionKind);
@@ -249,7 +300,7 @@ function getContractBySchema(
   schemaVersion: unknown,
 ): AgentBridgeCapabilityContract | undefined {
   return typeof schemaVersion === "string"
-    ? AGENT_BRIDGE_CAPABILITY_REGISTRY.find((contract) => contract[key] === schemaVersion)
+    ? AGENT_BRIDGE_CAPABILITY_REGISTRY.find((contract) => contract[key] !== undefined && contract[key] === schemaVersion)
     : undefined;
 }
 
