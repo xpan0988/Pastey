@@ -6,9 +6,9 @@ use crate::{
     room_control,
 };
 
-const REQUEST_SCHEMA: &str = "pastey-runtime-hello-stdout-execution-request/v1";
-const RESULT_SCHEMA: &str = "pastey-runtime-hello-stdout-execution-result/v1";
-const CAPABILITY: &str = "runtime.hello_stdout/v1";
+const REQUEST_SCHEMA: &str = "pastey-runtime-hello-stdout-execution-request-v1";
+const RESULT_SCHEMA: &str = "pastey-runtime-hello-stdout-execution-result-v1";
+const CAPABILITY: &str = "runtime.hello_stdout";
 const EXPECTED_STDOUT: &str = "hello peer";
 const RUNTIME_KIND: &str = "rust_host_helper";
 const MAX_IDENTIFIER_LENGTH: usize = 256;
@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn rejects_mutated_capability_request() {
         let mut request = request();
-        request.capability = "runtime.shell/v1".into();
+        request.capability = "runtime.shell".into();
 
         assert!(execute_hello_stdout(request).is_err());
     }

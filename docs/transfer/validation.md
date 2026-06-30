@@ -1,6 +1,6 @@
 # Transfer Validation
 
-This is the active validation and logging guide for Pastey transfer and orchestration work. It covers planner replay, deterministic fixtures, automated contention evidence, single-machine dual-instance smoke, sender log identification, and release-build LAN boundaries. For scheduler theory, see [scheduler.md](scheduler.md).
+This is the active validation and logging guide for Pastey transfer and orchestration work. It covers planner replay, deterministic fixtures, automated contention evidence, single-machine dual-instance smoke, sender log identification, and release-build LAN boundaries. For scheduler theory, see [scheduler.md](scheduler.md). For protocol, schema, capability, provider action, and executor naming rules used by validation matrices, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md).
 
 ## Validation Layers
 
@@ -71,7 +71,7 @@ This matrix is automated evidence for the current Layer 4 runtime before manual 
 | selected-peers | room-control event | any peer state | reject unsupported | Rust room-control selected-peers rejection; TS control route rejection tests | Yes, fan-out rejection smoke |
 | broadcast | room-control event | any peer state | reject unsupported | Rust room-control broadcast rejection; TS control route rejection tests | Yes, fan-out rejection smoke |
 | selected-peer | Agent Bridge capability preview | connected peer, exact room/session/request target | consent required; delivery receipt does not create consent | Rust receipt/control validation tests; TS room-control event, transport, control queue, peer consent tests | Yes, Hello Peer selected-peer smoke |
-| selected-peer | Agent Bridge capability registry/envelope | registered `runtime.execute_hello_template` or `runtime.hello_stdout/v1`; unknown id/version/schema | registered contracts dispatch to typed validators; unknown entries reject fail-closed | TS AI slot registry/shared-envelope tests; room-control schema dispatch tests | No extra before manual smoke |
+| selected-peer | Agent Bridge capability registry/envelope | registered `runtime.execute_hello_template` or `runtime.hello_stdout`; unknown id/version/schema | registered contracts dispatch to typed validators; unknown entries reject fail-closed | TS AI slot registry/shared-envelope tests; room-control schema dispatch tests | No extra before manual smoke |
 | selected-peer | Agent Bridge execution request/result | exact selected peer/session/request with allow-once consent | one execution; consent consumed; result returned | TS Hello Peer and Hello Stdout execution tests; Rust exact event validation | Yes, Hello Peer/Hello Stdout selected-peer smoke |
 | selected-peers | Agent Bridge capability/execution | any peer state | reject unsupported; no capability fan-out | TS route-policy tests; Rust room-control selected-peers rejection | Yes, fan-out rejection smoke |
 | broadcast | Agent Bridge capability/execution | any peer state | reject unsupported; no capability broadcast | TS route-policy tests; Rust room-control broadcast rejection | Yes, fan-out rejection smoke |
@@ -97,17 +97,30 @@ node scripts/run-layer4-validation-matrix.mjs
 
 ## Layer 5 Workspace Capability Validation Plan
 
-The first workspace capability direction is `filesystem.find_file_candidates/v1`. Current validation covers advisory JSON validation, PolicyGate boundaries, selected-peer consent, receiver-side bounded metadata search, and redacted candidate result shape. It does not validate approved file-transfer handoff because that capability is not implemented.
+The first workspace capability direction is `filesystem.find_file_candidates`. Current validation covers advisory JSON validation, PolicyGate boundaries, selected-peer consent, receiver-side bounded metadata search, and redacted candidate result shape. It does not validate approved file-transfer handoff because that capability is not implemented.
+
+Existing transfer and MicroFlowGroup fixtures live under `tests/fixtures/transfer-corpus/`. They are intentionally size, throughput, queue contention, interruption, and scheduler-behavior fixtures. They are not reused for file-candidate executor validation because they do not naturally cover filename matching modes, extension filters, safe scope labels, hidden entries, symlink skipping, directory-depth limits, redacted locations, opaque candidate ids, or metadata-only behavior.
+
+File-candidate validation uses a separate tiny corpus under `tests/fixtures/file-candidates/`. The Rust executor tests copy `app-data/shared/` into a temporary app-data root so the real `pastey_shared -> app_data/shared` scope resolution path is exercised without reading user directories. Symlink behavior is created dynamically in the Rust test on Unix-like platforms and skipped on platforms where the symlink test is not compiled.
 
 | Area | Current expected behavior | Automated coverage | Future implementation/manual validation |
 | --- | --- | --- | --- |
 | Safe advisory shape | `request_peer_file_candidates` validates with one selected peer, filename/metadata-only mode, bounded scopes, bounded limits, and explicit no-auto-transfer safety | AI slot tests for safe file-candidate advisory, static registry lookup, pending payload hash, and preview construction | Real-provider prompt regression tests |
 | Unsafe provider fields | command/script/code, cwd/env, network target, stdout/stderr/exit, absolute path, selected-peers/broadcast, durable trust, hidden transfer, and mutation fields reject fail-closed | AI slot negative tests for unsafe provider output and authority expansion | Provider prompt regression tests for real configured providers |
-| Scope and result boundaries | full disk, file contents, absolute paths, hidden files, unbounded depth/time/candidate count reject; receiver search skips unavailable scopes, hidden entries, and symlinks | AI slot file-candidate validation tests, room-control event result validation tests, and Rust executor tests with synthetic files and redacted candidate metadata | Broader platform/device-directory matrix |
-| Consent and route policy | selected-peer only; delivery is not consent; durable pairing does not authorize search; Allow once is consumed once | Existing Layer 4 control/capability route matrix plus AI advisory selected-peer policy tests and peer-consent/execution tests | Two-device Agent Bridge smoke for preview/search/result flow |
-| Transfer handoff | no automatic transfer and no `filesystem.prepare_file_transfer/v1` implementation | Advisory tests assert `noAutoTransfer: true`; no Rust/Tauri transfer command changes | Separate future capability and manual smoke for receiver-approved file transfer |
+| Scope and result boundaries | full disk, file contents, absolute paths, hidden files, unbounded depth/time/candidate count reject; receiver search skips unavailable scopes, hidden entries, symlinks, and directories | AI slot file-candidate validation tests, room-control event result validation tests, dedicated file-candidate fixture tests, and Rust executor tests with redacted candidate metadata | Broader platform/device-directory matrix |
+| Consent and route policy | selected-peer only; delivery is not consent; durable pairing does not authorize search; Allow once is consumed once | Existing Layer 4 control/capability route matrix plus AI advisory selected-peer policy tests, peer-consent/execution tests, and `scripts/run-file-candidate-tests.mjs` | Two-device Agent Bridge smoke for preview/search/result flow |
+| Transfer handoff | no automatic transfer and no candidate-payload request capability implementation | Advisory tests assert `noAutoTransfer: true`; no Rust/Tauri transfer command changes | Separate future capability, likely `transfer.request_candidate_payload`, and manual smoke for receiver-approved payload transfer |
 
 Candidate selection and approved transfer handoff remain future implementation and validation work. The current executor returns redacted metadata candidates only.
+
+Run focused file-candidate validation with:
+
+```sh
+node scripts/run-file-candidate-tests.mjs
+cd src-tauri && cargo test file_candidates
+```
+
+The focused Rust filter covers exact, case-insensitive, and substring filename matches; extension filtering; candidate limits; max depth; hidden file and hidden directory skipping; symlink skipping on Unix; missing and invalid scopes; redacted locations; opaque candidate IDs; directories not being returned; weird filenames; and absence of file-content leakage. Timeout behavior is intentionally not tested with sleeps because it would be timing-flaky; candidate and depth bounds provide deterministic stopping evidence.
 
 ## Manual Smoke Checklist (Pending)
 
@@ -131,6 +144,8 @@ rtk node scripts/replay-transfer-planner-scenarios.mjs
 ```
 
 Planner replay prints fixed and dynamic live-policy results, including group counts, grouped children, requested-window totals, held reasons, contention, and dynamic capacity clamps.
+
+MicroFlowGroup validation also covers the payload-abstraction boundary: small payloads with different MIME families can share the same group when room, lane, size class, and runtime policy match. MIME family, extension, and display-name metadata remain available to UI and candidate-discovery validation, but they must not split scheduler grouping buckets or appear in MicroFlowGroup group ids.
 
 Replay is algorithm evidence only. It does not validate files, Tauri startup, Bridge join, receive/finalize, Inbox, network behavior, or release-build throughput.
 

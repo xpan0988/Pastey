@@ -18,7 +18,7 @@ export const CLOUD_STRICT_AI_CONTEXT_POLICY: AiContextPolicy = {
 
 export function buildMockAiContextSnapshot(): AiContextSnapshot {
   return {
-    schemaVersion: "ai-context-snapshot/v1",
+    schemaVersion: "ai-context-snapshot-v1",
     generatedAt: new Date().toISOString(),
     room: {
       hasActiveRoom: true,
@@ -31,8 +31,8 @@ export function buildMockAiContextSnapshot(): AiContextSnapshot {
       trusted: true,
       capabilities: [
         "runtime.execute_hello_template",
-        "runtime.hello_stdout/v1",
-        "filesystem.find_file_candidates/v1"
+        "runtime.hello_stdout",
+        "filesystem.find_file_candidates"
       ]
     }],
     scheduler: {
@@ -52,7 +52,7 @@ export function buildMockAiContextSnapshot(): AiContextSnapshot {
 
 export function buildCloudSafeAiContextSnapshot(snapshot: AiContextSnapshot): AiContextSnapshot {
   return {
-    schemaVersion: "ai-context-snapshot/v1",
+    schemaVersion: "ai-context-snapshot-v1",
     generatedAt: snapshot.generatedAt,
     room: snapshot.room ? {
       hasActiveRoom: snapshot.room.hasActiveRoom,

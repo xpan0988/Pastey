@@ -125,6 +125,21 @@ test("many tiny files create one serial micro group with one planner window", ()
   assert.equal(result.requestedWindowTotal, 1);
 });
 
+test("micro groups do not split small payloads by MIME family", () => {
+  const result = planWeightedTransfers([
+    fileTask({ id: "p0", sizeBytes: 128 * 1024, mimeType: "image/png", createdAt: 1 }),
+    fileTask({ id: "p1", sizeBytes: 128 * 1024, mimeType: "application/pdf", createdAt: 2 }),
+    fileTask({ id: "p2", sizeBytes: 128 * 1024, mimeType: "video/mp4", createdAt: 3 }),
+    fileTask({ id: "p3", sizeBytes: 128 * 1024, mimeType: "text/plain", createdAt: 4 })
+  ], { microGroupMode: "fixed" });
+
+  assert.equal(result.microGroupPlans.length, 1);
+  assert.equal(result.microGroupPlans[0].groupId, "micro-group:room-1:small_file:tiny:p0");
+  assert.deepEqual(result.microGroupPlans[0].childTaskIds, ["p0", "p1", "p2", "p3"]);
+  assert.equal(result.microGroupPlans[0].reason, "grouped 4 small payload tasks using fixed one-window policy");
+  assert.doesNotMatch(result.microGroupPlans[0].groupId, /image|application|video|text|document|media/);
+});
+
 test("twenty sub-one-megabyte files create a serial micro group without child runnable plans", () => {
   const tasks = Array.from({ length: 20 }, (_, index) => (
     fileTask({ id: `sub-mib-${index}`, sizeBytes: (100 + index * 30) * 1024, createdAt: index })

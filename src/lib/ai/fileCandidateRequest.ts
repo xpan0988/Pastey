@@ -17,10 +17,10 @@ import {
 } from "./pendingAction";
 import type { PendingAiAction } from "./types";
 
-export const FILE_CANDIDATES_REQUEST_SCHEMA = "filesystem-find-file-candidates-request/v1";
-export const FILE_CANDIDATES_EXECUTION_REQUEST_SCHEMA = "filesystem-find-file-candidates-execution-request/v1";
-export const FILE_CANDIDATES_RESULT_SCHEMA = "filesystem-find-file-candidates-result/v1";
-export const FILE_CANDIDATES_CONSENT_GRANT_SCHEMA = "filesystem-find-file-candidates-consent-grant/v1";
+export const FILE_CANDIDATES_REQUEST_SCHEMA = "filesystem-find-file-candidates-request-v1";
+export const FILE_CANDIDATES_EXECUTION_REQUEST_SCHEMA = "filesystem-find-file-candidates-execution-request-v1";
+export const FILE_CANDIDATES_RESULT_SCHEMA = "filesystem-find-file-candidates-result-v1";
+export const FILE_CANDIDATES_CONSENT_GRANT_SCHEMA = "filesystem-find-file-candidates-consent-grant-v1";
 
 export type FileCandidateMatchReason =
   | "filename_exact_match"

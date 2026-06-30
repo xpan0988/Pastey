@@ -21,11 +21,11 @@ Production paths:
 
 ## Weighted Planner Model
 
-The pure planner classifies queued and active file-like tasks, then returns deterministic runnable, active, held, lane-budget, requested-window, and debug reports.
+The pure planner classifies queued and active small-payload/data tasks, then returns deterministic runnable, active, held, lane-budget, requested-window, and debug reports.
 
 The global planner budget represents tested outgoing binary-v1 runtime capacity. The normal data target is `8`. Real local outgoing Bridge control demand changes the effective data target to `7`, then restores `8` after the quiet period. Each selected runnable or active transfer receives at least window `1`, and the sum of active plus runnable requested windows must not exceed the current data target.
 
-Lane and size metadata affect classification, priority, eligibility, and diagnostics. The file-like requested-window split is batch-relative and size-weighted across selected transfers.
+Lane and payload byte-size facts affect classification, priority, eligibility, and diagnostics. MIME family, file extension, and receiver file-format concerns remain metadata/UI hints and do not affect MicroFlowGroup grouping or requested-window allocation. The requested-window split is batch-relative and size-weighted across selected transfers.
 
 Examples:
 
@@ -63,7 +63,7 @@ Env and Developer Tools transfer-window overrides are debugging authorities and 
 
 ## Live MicroFlowGroup Modes
 
-`MicroFlowGroup` is a scheduler-level resource abstraction. It lets several eligible tiny file-like queue items share one logical planner window while preserving each child as an ordinary single-file transfer.
+`MicroFlowGroup` is a scheduler-level resource abstraction. It lets several eligible tiny payload queue items share one logical planner window while preserving each child as an ordinary single-file transfer.
 
 Both `fixed` and `dynamic` modes use the same serial execution path:
 
@@ -80,12 +80,12 @@ Fixed mode preserves the threshold-based fallback behavior:
 - metadata-ready with known size;
 - active Bridge session only;
 - non-cancelled and nonterminal;
-- file-like kinds only: `file`, `image`, and `pasted_image`;
+- payload-backed queue kinds only: `file`, `image`, and `pasted_image`;
 - default child size no larger than `1 MiB`;
 - default total group size no larger than `4 MiB`;
 - default item count no more than `32`;
 - at least two eligible children;
-- same Bridge session, lane, size class, file-like safety class, and broad MIME family.
+- same Bridge session, lane, size class, and payload-like scheduler class.
 
 Dynamic mode is the current default live one-window service policy:
 
@@ -132,9 +132,11 @@ There is no automatic target-specific reconnect retry in the scheduler. A user c
 
 ## Device Intelligence Boundary
 
-Layer 2 may provide current-session observations, recommended roles, and planning hints. Layer 3 decides whether and how to use those hints.
+Layer 2 provides current-session facts: device profile fields, capability availability, benchmark measurements, liveness, and endpoint/provider availability where implemented. It does not recommend peers, rank devices, produce planner hints, or tell the scheduler what to do.
 
-The current scheduler does not consume `DeviceProfile`, `DeviceCapabilities`, internal `recommended_roles`, or `LinkBenchmarkResult` values to select requested windows, choose MicroFlowGroup mode, determine grouping eligibility, rebalance runtime windows, or route transfers. That is not a Layer 2 incompletion by itself; it is the current Layer 3 policy boundary.
+Layer 3 owns scheduler policy. The current scheduler uses explicit user intent, queue state, data/control class, payload byte size, runtime capacity, control workload, terminal state, and observed runtime transfer facts to select requested windows, choose MicroFlowGroup mode, determine grouping eligibility, rebalance runtime windows, or route transfers. It does not obey Layer 2 planner hints or recommendations.
+
+A future candidate-payload request capability, likely `transfer.request_candidate_payload`, would need explicit Layer 5 consent, Layer 4 route/consent validation, and Layer 3 queue/handoff validation. That is future work, not current scheduler behavior.
 
 ## Validation
 

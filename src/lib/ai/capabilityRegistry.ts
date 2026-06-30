@@ -2,8 +2,8 @@ import type { AiActionKind } from "./types";
 
 export type AgentBridgeCapabilityId =
   | "runtime.execute_hello_template"
-  | "runtime.hello_stdout/v1"
-  | "filesystem.find_file_candidates/v1";
+  | "runtime.hello_stdout"
+  | "filesystem.find_file_candidates";
 
 export type AgentBridgeCapabilityVersion = "legacy" | "v1";
 export type AgentBridgeRoutePolicy = "selected-peer";
@@ -11,10 +11,9 @@ export type AgentBridgeConsentPolicy = "exact-allow-once";
 export type AgentBridgeExecutorKind =
   | "ts_in_process_fixed_template"
   | "rust_host_helper"
-  | "filesystem_find_candidates_host"
-  | "none";
+  | "filesystem_find_candidates_host";
 export type AgentBridgeAuditRedactionPolicy = "metadata_only";
-export type AgentBridgeCapabilityLifecycle = "implemented" | "planned_advisory_only";
+export type AgentBridgeCapabilityLifecycle = "implemented";
 export type AgentBridgeProviderInputShape = "fixed_message" | "file_candidate_advisory";
 
 export interface AgentBridgeCapabilityContract {
@@ -48,7 +47,7 @@ export interface AgentBridgeCapabilityContract {
 }
 
 export interface AgentBridgeCapabilityEnvelope<TPayload = unknown> {
-  readonly schemaVersion: "pastey-agent-bridge-capability-envelope/v1";
+  readonly schemaVersion: "pastey-agent-bridge-capability-envelope-v1";
   readonly capability: AgentBridgeCapabilityId;
   readonly capabilityVersion: AgentBridgeCapabilityVersion;
   readonly requestId: string;
@@ -70,13 +69,13 @@ export interface AgentBridgeCapabilityEnvelope<TPayload = unknown> {
 }
 
 export const HELLO_TEMPLATE_CAPABILITY = "runtime.execute_hello_template" as const;
-export const HELLO_STDOUT_CAPABILITY = "runtime.hello_stdout/v1" as const;
-export const FILE_CANDIDATES_CAPABILITY = "filesystem.find_file_candidates/v1" as const;
+export const HELLO_STDOUT_CAPABILITY = "runtime.hello_stdout" as const;
+export const FILE_CANDIDATES_CAPABILITY = "filesystem.find_file_candidates" as const;
 export const HELLO_TEMPLATE_MESSAGE = "hello peer!";
 export const HELLO_STDOUT_EXPECTED_STDOUT = "hello peer";
 export const HELLO_STDOUT_RUNTIME_KIND = "rust_host_helper";
 export const FILE_CANDIDATES_EXECUTOR_KIND = "filesystem_find_candidates_host" as const;
-export const SHARED_CAPABILITY_ENVELOPE_SCHEMA = "pastey-agent-bridge-capability-envelope/v1";
+export const SHARED_CAPABILITY_ENVELOPE_SCHEMA = "pastey-agent-bridge-capability-envelope-v1";
 export const SELECTED_PEER_ROUTE_POLICY: AgentBridgeRoutePolicy = "selected-peer";
 export const EXACT_ALLOW_ONCE_CONSENT_POLICY: AgentBridgeConsentPolicy = "exact-allow-once";
 
@@ -131,10 +130,10 @@ export const AGENT_BRIDGE_CAPABILITY_REGISTRY: readonly AgentBridgeCapabilityCon
     lifecycle: "implemented",
     providerActionKind: "request_peer_hello_demo",
     providerInputShape: "fixed_message",
-    previewRequestSchema: "pastey-capability-request/v1",
-    consentGrantSchema: "pastey-hello-peer-consent-grant/v1",
-    executionRequestSchema: "pastey-hello-peer-execution-request/v1",
-    executionResultSchema: "pastey-hello-peer-execution-result/v1",
+    previewRequestSchema: "pastey-hello-peer-request-v1",
+    consentGrantSchema: "pastey-hello-peer-consent-grant-v1",
+    executionRequestSchema: "pastey-hello-peer-execution-request-v1",
+    executionResultSchema: "pastey-hello-peer-execution-result-v1",
     routePolicy: SELECTED_PEER_ROUTE_POLICY,
     consentPolicy: EXACT_ALLOW_ONCE_CONSENT_POLICY,
     executorKind: "ts_in_process_fixed_template",
@@ -160,10 +159,10 @@ export const AGENT_BRIDGE_CAPABILITY_REGISTRY: readonly AgentBridgeCapabilityCon
     lifecycle: "implemented",
     providerActionKind: "request_peer_hello_stdout_demo",
     providerInputShape: "fixed_message",
-    previewRequestSchema: "pastey-runtime-hello-stdout-request/v1",
-    consentGrantSchema: "pastey-runtime-hello-stdout-consent-grant/v1",
-    executionRequestSchema: "pastey-runtime-hello-stdout-execution-request/v1",
-    executionResultSchema: "pastey-runtime-hello-stdout-execution-result/v1",
+    previewRequestSchema: "pastey-runtime-hello-stdout-request-v1",
+    consentGrantSchema: "pastey-runtime-hello-stdout-consent-grant-v1",
+    executionRequestSchema: "pastey-runtime-hello-stdout-execution-request-v1",
+    executionResultSchema: "pastey-runtime-hello-stdout-execution-result-v1",
     routePolicy: SELECTED_PEER_ROUTE_POLICY,
     consentPolicy: EXACT_ALLOW_ONCE_CONSENT_POLICY,
     executorKind: "rust_host_helper",
@@ -197,10 +196,10 @@ export const AGENT_BRIDGE_CAPABILITY_REGISTRY: readonly AgentBridgeCapabilityCon
     lifecycle: "implemented",
     providerActionKind: "request_peer_file_candidates",
     providerInputShape: "file_candidate_advisory",
-    previewRequestSchema: "filesystem-find-file-candidates-request/v1",
-    consentGrantSchema: "filesystem-find-file-candidates-consent-grant/v1",
-    executionRequestSchema: "filesystem-find-file-candidates-execution-request/v1",
-    executionResultSchema: "filesystem-find-file-candidates-result/v1",
+    previewRequestSchema: "filesystem-find-file-candidates-request-v1",
+    consentGrantSchema: "filesystem-find-file-candidates-consent-grant-v1",
+    executionRequestSchema: "filesystem-find-file-candidates-execution-request-v1",
+    executionResultSchema: "filesystem-find-file-candidates-result-v1",
     routePolicy: SELECTED_PEER_ROUTE_POLICY,
     consentPolicy: EXACT_ALLOW_ONCE_CONSENT_POLICY,
     executorKind: FILE_CANDIDATES_EXECUTOR_KIND,

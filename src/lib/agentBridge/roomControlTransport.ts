@@ -191,7 +191,7 @@ export async function sendCurrentRoomControlEvent(
   try {
     const receipt = await sender(event);
     if (
-      receipt.schemaVersion !== "pastey-room-control-delivery/v1"
+      receipt.schemaVersion !== "pastey-room-control-delivery-v1"
       || receipt.eventId !== event.eventId
       || receipt.acceptedForLocalInbox !== true
     ) {

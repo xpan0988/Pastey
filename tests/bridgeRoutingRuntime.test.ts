@@ -114,7 +114,7 @@ test("text send wrapper derives selected-peer route payload for Tauri", async ()
     roomId: ROOM.id,
     text: "hello",
     bridgeRoute: {
-      schemaVersion: "pastey-bridge-text-route/v1",
+      schemaVersion: "pastey-bridge-text-route-v1",
       bridgeSessionId: "legacy-room:room-1",
       target: {
         kind: "selected_peer",
@@ -152,7 +152,7 @@ test("text send wrapper sends explicit selected-peers and broadcast payloads", a
       roomId: ROOM.id,
       text: "hello",
       bridgeRoute: {
-        schemaVersion: "pastey-bridge-text-route/v1",
+        schemaVersion: "pastey-bridge-text-route-v1",
         bridgeSessionId: "legacy-room:room-1",
         target: { kind: "selected_peers", peerSessionIds: ["peer:a", "peer:b"] },
       },
@@ -161,7 +161,7 @@ test("text send wrapper sends explicit selected-peers and broadcast payloads", a
       roomId: ROOM.id,
       text: "all",
       bridgeRoute: {
-        schemaVersion: "pastey-bridge-text-route/v1",
+        schemaVersion: "pastey-bridge-text-route-v1",
         bridgeSessionId: "legacy-room:room-1",
         target: { kind: "broadcast_bridge", explicit: true },
       },
@@ -277,18 +277,18 @@ test("route payload model can represent selected-peer selected-peers and broadca
   assert.equal(broadcast.valid, true, broadcast.valid ? "" : broadcast.errors.join(" "));
   if (!selectedPeer.valid || !selectedPeers.valid || !broadcast.valid) return;
 
-  assert.deepEqual(bridgeRoutePayload(selectedPeer.route, "pastey-bridge-text-route/v1"), {
-    schemaVersion: "pastey-bridge-text-route/v1",
+  assert.deepEqual(bridgeRoutePayload(selectedPeer.route, "pastey-bridge-text-route-v1"), {
+    schemaVersion: "pastey-bridge-text-route-v1",
     bridgeSessionId: "bridge:one",
     target: { kind: "selected_peer", peerSessionId: "peer:a" },
   });
-  assert.deepEqual(bridgeRoutePayload(selectedPeers.route, "pastey-bridge-text-route/v1"), {
-    schemaVersion: "pastey-bridge-text-route/v1",
+  assert.deepEqual(bridgeRoutePayload(selectedPeers.route, "pastey-bridge-text-route-v1"), {
+    schemaVersion: "pastey-bridge-text-route-v1",
     bridgeSessionId: "bridge:one",
     target: { kind: "selected_peers", peerSessionIds: ["peer:a", "peer:b"] },
   });
-  assert.deepEqual(bridgeRoutePayload(broadcast.route, "pastey-bridge-text-route/v1"), {
-    schemaVersion: "pastey-bridge-text-route/v1",
+  assert.deepEqual(bridgeRoutePayload(broadcast.route, "pastey-bridge-text-route-v1"), {
+    schemaVersion: "pastey-bridge-text-route-v1",
     bridgeSessionId: "bridge:one",
     target: { kind: "broadcast_bridge", explicit: true },
   });
@@ -331,7 +331,7 @@ test("file send wrapper derives selected-peer route payload for Tauri", async ()
     options: {
       ...options,
       bridgeRoute: {
-        schemaVersion: "pastey-bridge-file-route/v1",
+        schemaVersion: "pastey-bridge-file-route-v1",
         bridgeSessionId: "legacy-room:room-1",
         target: {
           kind: "selected_peer",
@@ -587,7 +587,7 @@ test("production integration sends data and selected-peer-only control route pay
   assert.match(app, /No current Room state is available for Bridge file route derivation/);
   assert.doesNotMatch(app, /else \{\s*await sendFileToRoom\(item\.roomId/s);
   assert.match(controlPanel, /assertCapabilityEventHasSelectedPeerRoute\(session, event\)/);
-  assert.match(controlPanel, /bridgeRoutePayload\(route, "pastey-bridge-control-route\/v1"\)/);
+  assert.match(controlPanel, /bridgeRoutePayload\(route, "pastey-bridge-control-route-v1"\)/);
   assert.match(tauri, /invoke\("send_text_to_room", \{/);
   assert.match(tauri, /bridgeRoute: bridgeRoute \?\? null/);
   assert.match(tauri, /invoke\("send_file_to_room", \{/);

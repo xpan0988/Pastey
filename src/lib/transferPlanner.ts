@@ -713,7 +713,6 @@ function pushMicroFlowGroup(
     first.task.roomId,
     first.lane,
     first.sizeClass,
-    broadMimeFamily(first.task.mimeType),
     childTaskIds[0]
   ].join(":");
   const priority = sorted.reduce((highest, candidate) => (
@@ -740,7 +739,7 @@ function pushMicroFlowGroup(
     lane: first.lane,
     childTaskIds,
     totalBytes,
-    reason: `grouped ${childTaskIds.length} file-like tasks using ${policy.microGroupMode} one-window policy`,
+    reason: `grouped ${childTaskIds.length} small payload tasks using ${policy.microGroupMode} one-window policy`,
     candidate: {
       task,
       lane: first.lane,
@@ -773,17 +772,8 @@ function microFlowGroupKey(candidate: ClassifiedTask): string {
     candidate.task.roomId,
     candidate.lane,
     candidate.sizeClass,
-    "file_like",
-    broadMimeFamily(candidate.task.mimeType)
+    "payload_like"
   ].join(":");
-}
-
-function broadMimeFamily(mimeType?: string | null): string {
-  const trimmed = mimeType?.trim().toLowerCase();
-  if (!trimmed || !trimmed.includes("/")) {
-    return "unknown";
-  }
-  return trimmed.split("/", 1)[0] || "unknown";
 }
 
 function createMicroGroupPlan(

@@ -38,7 +38,7 @@ export type CapabilityPreviewControlStatus =
   | "expired";
 
 export interface RoomControlEventBase {
-  schemaVersion: "pastey-room-control-event/v1";
+  schemaVersion: "pastey-room-control-event-v1";
   eventId: string;
   kind: RoomControlEventKind;
   roomRef: string;
@@ -103,7 +103,7 @@ export type CapabilityPreviewStatusRoomControlEvent =
   | CapabilityPreviewExpiredRoomControlEvent;
 
 export interface HelloPeerConsentGrant {
-  schemaVersion: "pastey-hello-peer-consent-grant/v1";
+  schemaVersion: "pastey-hello-peer-consent-grant-v1";
   consentId: string;
   sourcePreviewEventId: string;
   envelopeId: string;
@@ -115,25 +115,25 @@ export interface HelloPeerConsentGrant {
 }
 
 export interface HelloStdoutConsentGrant {
-  schemaVersion: "pastey-runtime-hello-stdout-consent-grant/v1";
+  schemaVersion: "pastey-runtime-hello-stdout-consent-grant-v1";
   consentId: string;
   sourcePreviewEventId: string;
   envelopeId: string;
   requestId: string;
   requestPayloadHash: string;
-  capability: "runtime.hello_stdout/v1";
+  capability: "runtime.hello_stdout";
   expectedStdout: "hello peer";
   expiresAt: string;
 }
 
 export interface FileCandidateConsentGrant {
-  schemaVersion: "filesystem-find-file-candidates-consent-grant/v1";
+  schemaVersion: "filesystem-find-file-candidates-consent-grant-v1";
   consentId: string;
   sourcePreviewEventId: string;
   envelopeId: string;
   requestId: string;
   requestPayloadHash: string;
-  capability: "filesystem.find_file_candidates/v1";
+  capability: "filesystem.find_file_candidates";
   filenameHint: string;
   searchMode: "filename_metadata_only";
   expiresAt: string;
@@ -142,7 +142,7 @@ export interface FileCandidateConsentGrant {
 export type CapabilityConsentGrant = HelloPeerConsentGrant | HelloStdoutConsentGrant | FileCandidateConsentGrant;
 
 export interface HelloPeerExecutionRequest {
-  schemaVersion: "pastey-hello-peer-execution-request/v1";
+  schemaVersion: "pastey-hello-peer-execution-request-v1";
   executionId: string;
   consentId: string;
   sourcePreviewEventId: string;
@@ -159,7 +159,7 @@ export interface HelloPeerExecutionRequest {
 }
 
 export interface HelloStdoutExecutionRequest {
-  schemaVersion: "pastey-runtime-hello-stdout-execution-request/v1";
+  schemaVersion: "pastey-runtime-hello-stdout-execution-request-v1";
   executionId: string;
   consentId: string;
   sourcePreviewEventId: string;
@@ -169,7 +169,7 @@ export interface HelloStdoutExecutionRequest {
   roomRef: string;
   sourceDeviceRef: string;
   targetPeerRef: string;
-  capability: "runtime.hello_stdout/v1";
+  capability: "runtime.hello_stdout";
   expectedStdout: "hello peer";
   createdAt: string;
   expiresAt: string;
@@ -183,7 +183,7 @@ export type HelloPeerExecutionResultStatus =
   | "failed";
 
 export interface HelloPeerExecutionResult {
-  schemaVersion: "pastey-hello-peer-execution-result/v1";
+  schemaVersion: "pastey-hello-peer-execution-result-v1";
   executionId: string;
   requestId: string;
   consentId: string;
@@ -197,11 +197,11 @@ export type HelloStdoutExecutionResultStatus = HelloPeerExecutionResultStatus;
 export type HelloStdoutRuntimeKind = "rust_host_helper";
 
 export interface HelloStdoutExecutionResult {
-  schemaVersion: "pastey-runtime-hello-stdout-execution-result/v1";
+  schemaVersion: "pastey-runtime-hello-stdout-execution-result-v1";
   executionId: string;
   requestId: string;
   consentId: string;
-  capability: "runtime.hello_stdout/v1";
+  capability: "runtime.hello_stdout";
   runtimeKind: HelloStdoutRuntimeKind;
   status: HelloStdoutExecutionResultStatus;
   stdout: string;
@@ -310,7 +310,7 @@ interface CheckRoomControlEventOptions {
   now?: Date;
 }
 
-const ROOM_CONTROL_SCHEMA_VERSION = "pastey-room-control-event/v1";
+const ROOM_CONTROL_SCHEMA_VERSION = "pastey-room-control-event-v1";
 const DEFAULT_CONTROL_EVENT_TTL_MS = 2 * 60 * 1_000;
 const MAX_ROOM_CONTROL_EVENT_BYTES = 64 * 1024;
 const MAX_IDENTIFIER_LENGTH = 256;
@@ -468,13 +468,13 @@ const UNSAFE_OR_EXECUTION_FIELDS = new Set([
   "process",
   "spawn"
 ].map(normalizeCapabilityFieldName));
-const CONSENT_GRANT_SCHEMA = "pastey-hello-peer-consent-grant/v1";
-const HELLO_STDOUT_CONSENT_GRANT_SCHEMA = "pastey-runtime-hello-stdout-consent-grant/v1";
-const EXECUTION_REQUEST_SCHEMA = "pastey-hello-peer-execution-request/v1";
-const HELLO_STDOUT_EXECUTION_REQUEST_SCHEMA = "pastey-runtime-hello-stdout-execution-request/v1";
-const EXECUTION_RESULT_SCHEMA = "pastey-hello-peer-execution-result/v1";
-const HELLO_STDOUT_EXECUTION_RESULT_SCHEMA = "pastey-runtime-hello-stdout-execution-result/v1";
-const FILE_CANDIDATE_CONSENT_GRANT_SCHEMA = "filesystem-find-file-candidates-consent-grant/v1";
+const CONSENT_GRANT_SCHEMA = "pastey-hello-peer-consent-grant-v1";
+const HELLO_STDOUT_CONSENT_GRANT_SCHEMA = "pastey-runtime-hello-stdout-consent-grant-v1";
+const EXECUTION_REQUEST_SCHEMA = "pastey-hello-peer-execution-request-v1";
+const HELLO_STDOUT_EXECUTION_REQUEST_SCHEMA = "pastey-runtime-hello-stdout-execution-request-v1";
+const EXECUTION_RESULT_SCHEMA = "pastey-hello-peer-execution-result-v1";
+const HELLO_STDOUT_EXECUTION_RESULT_SCHEMA = "pastey-runtime-hello-stdout-execution-result-v1";
+const FILE_CANDIDATE_CONSENT_GRANT_SCHEMA = "filesystem-find-file-candidates-consent-grant-v1";
 const MAX_EXECUTION_ERROR_CODE_LENGTH = 64;
 const MAX_HELLO_STDOUT_STDOUT_BYTES = 64;
 const MAX_HELLO_STDOUT_STDERR_BYTES = 256;

@@ -30,7 +30,7 @@ export type PeerConsentDecision = "allow_once" | "deny";
 export type PeerConsentStatus = "allowed_once" | "denied" | "expired" | "invalid";
 
 interface PeerConsentBindingBase {
-  readonly schemaVersion: "pastey-peer-consent-binding/v1";
+  readonly schemaVersion: "pastey-peer-consent-binding-v1";
   readonly consentId: string;
   readonly sourceEventId: string;
   readonly envelopeId: string;
@@ -50,12 +50,12 @@ export interface HelloPeerConsentBinding extends PeerConsentBindingBase {
 }
 
 export interface HelloStdoutConsentBinding extends PeerConsentBindingBase {
-  readonly capability: "runtime.hello_stdout/v1";
+  readonly capability: "runtime.hello_stdout";
   readonly expectedStdout: "hello peer";
 }
 
 export interface FileCandidateConsentBinding extends PeerConsentBindingBase {
-  readonly capability: "filesystem.find_file_candidates/v1";
+  readonly capability: "filesystem.find_file_candidates";
   readonly filenameHint: string;
   readonly searchMode: "filename_metadata_only";
 }
@@ -103,7 +103,7 @@ export interface PeerPolicyContext {
   maxConsentLifetimeMs?: number;
 }
 
-const CONSENT_BINDING_SCHEMA = "pastey-peer-consent-binding/v1";
+const CONSENT_BINDING_SCHEMA = "pastey-peer-consent-binding-v1";
 const DEFAULT_MAX_CONSENT_LIFETIME_MS = 2 * 60 * 1_000;
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_REASON_LENGTH = 512;
@@ -410,7 +410,7 @@ function consentGrantFromRecord(record: PeerConsentRecord): CapabilityConsentGra
   if (record.binding.capability === HELLO_STDOUT_CAPABILITY) {
     const grant: HelloStdoutConsentGrant = {
       ...base,
-      schemaVersion: "pastey-runtime-hello-stdout-consent-grant/v1",
+      schemaVersion: "pastey-runtime-hello-stdout-consent-grant-v1",
       capability: HELLO_STDOUT_CAPABILITY,
       expectedStdout: record.binding.expectedStdout,
     };
@@ -419,7 +419,7 @@ function consentGrantFromRecord(record: PeerConsentRecord): CapabilityConsentGra
   if (record.binding.capability === FILE_CANDIDATES_CAPABILITY) {
     const grant: FileCandidateConsentGrant = {
       ...base,
-      schemaVersion: "filesystem-find-file-candidates-consent-grant/v1",
+      schemaVersion: "filesystem-find-file-candidates-consent-grant-v1",
       capability: FILE_CANDIDATES_CAPABILITY,
       filenameHint: record.binding.filenameHint,
       searchMode: record.binding.searchMode,
@@ -428,7 +428,7 @@ function consentGrantFromRecord(record: PeerConsentRecord): CapabilityConsentGra
   }
   const grant: HelloPeerConsentGrant = {
     ...base,
-    schemaVersion: "pastey-hello-peer-consent-grant/v1",
+    schemaVersion: "pastey-hello-peer-consent-grant-v1",
     capability: HELLO_TEMPLATE_CAPABILITY,
     exactMessage: record.binding.exactMessage,
   };

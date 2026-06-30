@@ -27,14 +27,14 @@ export interface HelloStdoutRequestConstraints {
 }
 
 export interface HelloStdoutRequest {
-  schemaVersion: "pastey-runtime-hello-stdout-request/v1";
+  schemaVersion: "pastey-runtime-hello-stdout-request-v1";
   requestId: string;
   nonce: string;
   createdAt: string;
   expiresAt: string;
   sourceDeviceRef: string;
   targetPeerRef: string;
-  capability: "runtime.hello_stdout/v1";
+  capability: "runtime.hello_stdout";
   runtimeKind: HelloStdoutRuntimeKind;
   input: {
     expectedStdout: "hello peer";
@@ -159,7 +159,7 @@ export function buildHelloStdoutRequestFromPendingAction(
   const nonce = options.nonce ?? createPreviewIdentifier("hello-stdout-nonce", now);
   const sourceDeviceRef = options.sourceDeviceRef ?? "local-device-preview";
   const requestWithoutHash: Omit<HelloStdoutRequest, "requestPayloadHash"> = {
-    schemaVersion: "pastey-runtime-hello-stdout-request/v1",
+    schemaVersion: "pastey-runtime-hello-stdout-request-v1",
     requestId,
     nonce,
     createdAt,
@@ -211,8 +211,8 @@ export function validateHelloStdoutRequest(
   for (const path of findUnsafeFieldPaths(value)) {
     errors.push(`Unsafe field is not allowed in Hello Stdout request: ${path}.`);
   }
-  if (value.schemaVersion !== "pastey-runtime-hello-stdout-request/v1") {
-    errors.push("Hello Stdout request schemaVersion must be pastey-runtime-hello-stdout-request/v1.");
+  if (value.schemaVersion !== "pastey-runtime-hello-stdout-request-v1") {
+    errors.push("Hello Stdout request schemaVersion must be pastey-runtime-hello-stdout-request-v1.");
   }
   requireNonEmptyString(value.requestId, "requestId", errors);
   requireNonEmptyString(value.nonce, "nonce", errors);

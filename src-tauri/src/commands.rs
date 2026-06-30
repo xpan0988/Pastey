@@ -30,8 +30,8 @@ use crate::{
 
 const RELEASES_URL: &str = "https://github.com/xpan0988/Pastey/releases";
 const DIAGNOSTICS_CACHE_TTL_SECONDS: i64 = 60;
-const TEXT_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-text-route/v1";
-const FILE_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-file-route/v1";
+const TEXT_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-text-route-v1";
+const FILE_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-file-route-v1";
 
 #[derive(Serialize)]
 pub struct FileTransferMetadata {

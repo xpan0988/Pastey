@@ -74,7 +74,7 @@ function deterministicPreviewControlEvent(
 test("safe capability preview envelope builds and validates a RoomControlEvent", () => {
   const event = deterministicPreviewControlEvent();
 
-  assert.equal(event.schemaVersion, "pastey-room-control-event/v1");
+  assert.equal(event.schemaVersion, "pastey-room-control-event-v1");
   assert.equal(event.kind, "capability_preview");
   assert.equal(event.previewOnly, true);
   assert.equal(event.payload.envelopeId, "room-control-envelope");
@@ -128,7 +128,7 @@ test("wrong schema and missing event fields are rejected", () => {
   const event = deterministicPreviewControlEvent();
   assert.equal(validateRoomControlEvent({
     ...event,
-    schemaVersion: "pastey-room-control-event/v2"
+    schemaVersion: "pastey-room-control-event-v2"
   }, { now: NOW }).valid, false);
 
   const missingEventId = structuredClone(event) as unknown as Record<string, unknown>;
@@ -159,7 +159,7 @@ test("invalid embedded capability preview envelope is rejected", () => {
 
 test("Hello Stdout execution result allows bounded stdout only in the result payload", () => {
   const event: RoomControlEvent = {
-    schemaVersion: "pastey-room-control-event/v1",
+    schemaVersion: "pastey-room-control-event-v1",
     eventId: "hello-stdout-result-event",
     kind: "capability_execution_result",
     roomRef: "room-control-room",
@@ -169,11 +169,11 @@ test("Hello Stdout execution result allows bounded stdout only in the result pay
     expiresAt: new Date("2026-06-11T00:02:00.000Z").toISOString(),
     previewOnly: false,
     payload: {
-      schemaVersion: "pastey-runtime-hello-stdout-execution-result/v1",
+      schemaVersion: "pastey-runtime-hello-stdout-execution-result-v1",
       executionId: "hello-stdout-execution",
       requestId: "hello-stdout-request",
       consentId: "hello-stdout-consent",
-      capability: "runtime.hello_stdout/v1",
+      capability: "runtime.hello_stdout",
       runtimeKind: "rust_host_helper",
       status: "succeeded",
       stdout: "hello peer",
@@ -199,7 +199,7 @@ test("Hello Stdout execution result allows bounded stdout only in the result pay
 
 test("file candidate execution result allows only redacted metadata candidates", () => {
   const event: RoomControlEvent = {
-    schemaVersion: "pastey-room-control-event/v1",
+    schemaVersion: "pastey-room-control-event-v1",
     eventId: "file-candidate-result-event",
     kind: "capability_execution_result",
     roomRef: "room-control-room",
@@ -209,8 +209,8 @@ test("file candidate execution result allows only redacted metadata candidates",
     expiresAt: new Date("2026-06-11T00:02:00.000Z").toISOString(),
     previewOnly: false,
     payload: {
-      schemaVersion: "filesystem-find-file-candidates-result/v1",
-      capability: "filesystem.find_file_candidates/v1",
+      schemaVersion: "filesystem-find-file-candidates-result-v1",
+      capability: "filesystem.find_file_candidates",
       executionId: "file-candidate-execution",
       requestId: "file-candidate-request",
       consentId: "file-candidate-consent",
@@ -260,7 +260,7 @@ test("file candidate execution result allows only redacted metadata candidates",
   }, { now: NOW }).valid, false);
 });
 
-test("registered capability dispatch rejects unknown id, unknown version, and schema mismatch", () => {
+test("registered capability dispatch rejects unknown id, capability/schema mismatch, and schema version mismatch", () => {
   const preview = deterministicPreviewControlEvent();
   assert.equal(validateRoomControlEvent({
     ...preview,
@@ -268,7 +268,7 @@ test("registered capability dispatch rejects unknown id, unknown version, and sc
       ...preview.payload,
       request: {
         ...preview.payload.request,
-        capability: "runtime.unknown/v1"
+        capability: "runtime.unknown"
       }
     }
   }, { now: NOW }).valid, false);
@@ -278,13 +278,13 @@ test("registered capability dispatch rejects unknown id, unknown version, and sc
       ...preview.payload,
       request: {
         ...preview.payload.request,
-        capability: "runtime.hello_stdout/v2"
+        capability: "runtime.hello_stdout"
       }
     }
   }, { now: NOW }).valid, false);
 
   const result = {
-    schemaVersion: "pastey-room-control-event/v1",
+    schemaVersion: "pastey-room-control-event-v1",
     eventId: "schema-mismatch-result",
     kind: "capability_execution_result",
     roomRef: "room-control-room",
@@ -294,11 +294,11 @@ test("registered capability dispatch rejects unknown id, unknown version, and sc
     expiresAt: new Date("2026-06-11T00:02:00.000Z").toISOString(),
     previewOnly: false,
     payload: {
-      schemaVersion: "pastey-runtime-hello-stdout-execution-result/v2",
+      schemaVersion: "pastey-runtime-hello-stdout-execution-result-v2",
       executionId: "execution",
       requestId: "request",
       consentId: "consent",
-      capability: "runtime.hello_stdout/v1",
+      capability: "runtime.hello_stdout",
       runtimeKind: "rust_host_helper",
       status: "succeeded",
       stdout: "hello peer",

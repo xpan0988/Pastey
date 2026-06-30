@@ -1039,8 +1039,7 @@ export function summarizeMicroFlowGroupPlanning(
         item.roomId,
         lane,
         sizeClass,
-        "file_like",
-        broadMimeFamily(item.mimeType)
+        "payload_like"
       ].join(":");
       eligibleBuckets.set(key, (eligibleBuckets.get(key) ?? 0) + 1);
     }
@@ -1269,14 +1268,6 @@ function transferPlannerTaskKind(item: TransferQueueItem): TransferPlannerTaskKi
     return "image";
   }
   return "file";
-}
-
-function broadMimeFamily(mimeType?: string | null): string {
-  const trimmed = mimeType?.trim().toLowerCase();
-  if (!trimmed || !trimmed.includes("/")) {
-    return "unknown";
-  }
-  return trimmed.split("/", 1)[0] || "unknown";
 }
 
 function microGroupSkipReason(input: {

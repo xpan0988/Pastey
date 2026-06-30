@@ -1,6 +1,6 @@
 # Agent Bridge Architecture And Safety
 
-Agent Bridge is the Layer 5 narrow capability path for model-assisted planning, host validation, explicit consent, bounded execution, result return, and redacted audit. For the project-wide layer contract, see [../architecture/Project-specifications.md](../architecture/Project-specifications.md). For Bridge membership and authority boundaries, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md).
+Agent Bridge is the Layer 5 narrow capability path for model-assisted planning, host validation, explicit consent, bounded execution, result return, and redacted audit. For the project-wide layer contract, see [../architecture/Project-specifications.md](../architecture/Project-specifications.md). For naming rules covering capability IDs, schema versions, provider actions, executors, and future capabilities, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md). For Bridge membership and authority boundaries, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md).
 
 The current product reality is a narrow bounded-capability vertical slice plus the first read-only workspace capability. The Hello capabilities prove fixed execution; the file-candidate capability proves receiver-consented metadata discovery without file transfer authority.
 
@@ -19,7 +19,7 @@ The current product reality is a narrow bounded-capability vertical slice plus t
 11. The receiver consumes the consent once, runs the fixed host-owned executor, and returns a typed result.
 12. Both sides write redacted lifecycle audit logs.
 
-For `filesystem.find_file_candidates/v1`, the flow stops after returning redacted metadata candidates. Pastey does not hand off a selected candidate to transfer, send files automatically, or expose real receiver paths to the sender or provider.
+For `filesystem.find_file_candidates`, the flow stops after returning redacted metadata candidates. Pastey does not hand off a selected candidate to transfer, send files automatically, or expose real receiver paths to the sender or provider.
 
 ## Implemented Production Paths
 
@@ -66,15 +66,15 @@ The capability registry is a static contract table for known bounded capabilitie
 
 The current implementation does not allow provider-crafted execution requests. Execution requests are built by the host after a matched receiver acknowledgement. The receiver revalidates the binding before execution.
 
-`runtime.hello_stdout/v1` is not a shell, process, Python, Node, or generic command runtime. It is a single Rust host helper that returns typed stdout metadata for the fixed output `hello peer`.
+`runtime.hello_stdout` is not a shell, process, Python, Node, or generic command runtime. It is a single Rust host helper that returns typed stdout metadata for the fixed output `hello peer`.
 
-`filesystem.find_file_candidates/v1` is not remote file access. It is a bounded metadata candidate-discovery capability. Model output may propose a filename hint and safe limits, but it does not authorize filesystem traversal by itself. Traversal happens only on the receiver after selected-peer routing, local sender confirmation, receiver Allow once, exact consent binding, and execution-request validation. The executor does not read file contents, return absolute paths, search hidden files, search full disk, start automatic transfer, or create reusable access to a peer.
+`filesystem.find_file_candidates` is not remote file access. It is a bounded metadata candidate-discovery capability. Model output may propose a filename hint and safe limits, but it does not authorize filesystem traversal by itself. Traversal happens only on the receiver after selected-peer routing, local sender confirmation, receiver Allow once, exact consent binding, and execution-request validation. The executor does not read file contents, return absolute paths, search hidden files, search full disk, start automatic transfer, or create reusable access to a peer.
 
 ## Workspace Capability Roadmap
 
 The next Layer 5 direction is Agent-assisted device workspace: helping a user ask a selected peer for bounded help, such as finding candidate files, without turning Pastey into a remote shell or file browser.
 
-The first workspace capability is `filesystem.find_file_candidates/v1`. Its current flow is:
+The first workspace capability is `filesystem.find_file_candidates`. Its current flow is:
 
 1. Provider proposes `request_peer_file_candidates` as advisory JSON only.
 2. Host validation rejects unsafe fields, full-disk search, contents, absolute paths, selected-peers/broadcast, and auto-transfer.

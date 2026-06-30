@@ -93,7 +93,7 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
         context,
         contextPolicy: MOCK_AI_CONTEXT_POLICY,
         allowedActionKinds: context.allowedActions,
-        outputSchema: "ai-action-plan/v1",
+        outputSchema: "ai-action-plan-v1",
         userRequest: "Ask the visible trusted peer to run the restricted Hello Stdout demo."
       });
       showGeneratedResult(generated, mockProvider.config.displayName, context);
@@ -127,7 +127,7 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
         context,
         contextPolicy: CLOUD_STRICT_AI_CONTEXT_POLICY,
         allowedActionKinds: context.allowedActions,
-        outputSchema: "ai-action-plan/v1",
+        outputSchema: "ai-action-plan-v1",
         userRequest: "Propose the restricted Hello Stdout advisory for the visible trusted mock peer."
       });
       showGeneratedResult(generated, provider.config.displayName, context);
@@ -213,9 +213,9 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
       });
       return;
     }
-    const validation = buildResult.request.capability === "filesystem.find_file_candidates/v1"
+    const validation = buildResult.request.capability === "filesystem.find_file_candidates"
       ? validateFileCandidateRequest(buildResult.request)
-      : buildResult.request.capability === "runtime.hello_stdout/v1"
+      : buildResult.request.capability === "runtime.hello_stdout"
         ? validateHelloStdoutRequest(buildResult.request)
         : validateHelloPeerRequest(buildResult.request);
     setEnvelopePreview(null);
@@ -624,9 +624,9 @@ function HelloPeerOutboundPreview({
   onBuild: () => void;
 }) {
   const request = preview?.request;
-  const title = request?.capability === "filesystem.find_file_candidates/v1"
+  const title = request?.capability === "filesystem.find_file_candidates"
     ? "File candidate outbound request preview"
-    : request?.capability === "runtime.hello_stdout/v1"
+    : request?.capability === "runtime.hello_stdout"
       ? "Hello Stdout outbound request preview"
       : "Hello Peer outbound request preview";
 

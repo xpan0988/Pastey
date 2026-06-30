@@ -49,7 +49,6 @@ pub enum CapabilitySource {
 pub struct DeviceCapabilities {
     pub runtimes: Vec<RuntimeCapability>,
     pub gpu_acceleration: GpuAcceleration,
-    pub recommended_roles: Vec<String>,
     pub updated_at: i64,
 }
 
@@ -204,25 +203,6 @@ mod tests {
         assert_eq!(profile.cpu_physical_core_count, None);
         assert_eq!(profile.cpu_logical_processor_count, None);
         assert_eq!(profile.cpu_core_count, Some(10));
-    }
-
-    #[test]
-    fn recommended_roles_remain_serialized_for_internal_routing() {
-        let capabilities = DeviceCapabilities {
-            runtimes: Vec::new(),
-            gpu_acceleration: GpuAcceleration {
-                cuda_available: false,
-                metal_available: true,
-                gpu_names: vec!["Apple GPU".into()],
-                vram_gb: None,
-            },
-            recommended_roles: vec!["approval_node".into()],
-            updated_at: 1_770_000_000,
-        };
-
-        let json = serde_json::to_string(&capabilities).unwrap();
-
-        assert!(json.contains("\"recommended_roles\":[\"approval_node\"]"));
     }
 
     #[test]

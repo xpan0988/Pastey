@@ -63,7 +63,7 @@ export interface AiContextPolicy {
 }
 
 export interface AiContextSnapshot {
-  schemaVersion: "ai-context-snapshot/v1";
+  schemaVersion: "ai-context-snapshot-v1";
   generatedAt: string;
   room?: {
     hasActiveRoom: boolean;
@@ -96,7 +96,7 @@ export interface AiActionReference {
 }
 
 export interface AiActionPlan {
-  schemaVersion: "ai-action-plan/v1";
+  schemaVersion: "ai-action-plan-v1";
   kind: AiActionKind;
   title: string;
   explanation: string;
@@ -112,7 +112,7 @@ export interface AiGenerateRequest {
   context: AiContextSnapshot;
   contextPolicy: AiContextPolicy;
   allowedActionKinds: AiActionKind[];
-  outputSchema: "ai-action-plan/v1";
+  outputSchema: "ai-action-plan-v1";
   userRequest: string;
 }
 
@@ -150,7 +150,7 @@ export type PendingAiActionStatus =
   | "expired";
 
 export interface PendingAiActionCanonicalPayload {
-  schemaVersion: "ai-action-plan/v1";
+  schemaVersion: "ai-action-plan-v1";
   kind: AiActionKind;
   targetPeerRef: string;
   capability: string;

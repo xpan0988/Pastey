@@ -70,7 +70,7 @@ function transportEvent(): RoomControlEvent {
 
 function acceptedReceipt(eventId: string): RoomControlDeliveryReceipt {
   return {
-    schemaVersion: "pastey-room-control-delivery/v1",
+    schemaVersion: "pastey-room-control-delivery-v1",
     eventId,
     acceptedForLocalInbox: true,
     receivedAt: "2026-06-12T00:00:01.000Z",

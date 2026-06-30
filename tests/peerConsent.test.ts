@@ -154,7 +154,7 @@ test("valid exact Hello Stdout preview becomes reviewable with stdout binding", 
   const result = review(source);
   assert.equal(result.status, "reviewable");
   if (result.status !== "reviewable") return;
-  assert.equal(result.binding.capability, "runtime.hello_stdout/v1");
+  assert.equal(result.binding.capability, "runtime.hello_stdout");
   assert.equal(result.binding.expectedStdout, "hello peer");
   assert.equal("exactMessage" in result.binding, false);
   const allowed = allowPeerCapabilityOnce(result.binding, createPeerConsentSessionState(), {
@@ -168,11 +168,11 @@ test("valid exact Hello Stdout preview becomes reviewable with stdout binding", 
   });
   assert.equal(status.ok, true);
   if (!status.ok || status.event.kind !== "capability_preview_ack") return;
-  assert.equal(status.event.payload.consent?.capability, "runtime.hello_stdout/v1");
+  assert.equal(status.event.payload.consent?.capability, "runtime.hello_stdout");
   assert.equal("expectedStdout" in status.event.payload.consent!, true);
 });
 
-test("consent binding cannot transfer between capability ids or versions", () => {
+test("consent binding cannot transfer between capability ids", () => {
   const stdout = review(stdoutPreviewEvent());
   assert.equal(stdout.status, "reviewable");
   if (stdout.status !== "reviewable") return;
@@ -194,7 +194,7 @@ test("consent binding cannot transfer between capability ids or versions", () =>
     ...allowed.record,
     binding: {
       ...allowed.record.binding,
-      capability: "runtime.hello_stdout/v2",
+      capability: "runtime.hello_stdout_next",
     },
   }, { now: DECISION_TIME }).valid, false);
 });

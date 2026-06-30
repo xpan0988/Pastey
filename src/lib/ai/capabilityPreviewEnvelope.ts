@@ -32,7 +32,7 @@ export type CapabilityPreviewStatus =
   | "invalid";
 
 export interface CapabilityRequestPreviewEnvelope {
-  schemaVersion: "pastey-capability-preview/v1";
+  schemaVersion: "pastey-capability-preview-v1";
   envelopeId: string;
   createdAt: string;
   expiresAt: string;
@@ -132,7 +132,7 @@ export function buildCapabilityRequestPreviewEnvelope(
 
   const requestExpiry = new Date(request.expiresAt).getTime();
   const envelope: CapabilityRequestPreviewEnvelope = {
-    schemaVersion: "pastey-capability-preview/v1",
+    schemaVersion: "pastey-capability-preview-v1",
     envelopeId: options.envelopeId ?? createEnvelopeId(now),
     createdAt: now.toISOString(),
     expiresAt: new Date(Math.min(now.getTime() + ttlMs, requestExpiry)).toISOString(),
@@ -163,8 +163,8 @@ export function validateCapabilityRequestPreviewEnvelope(
   for (const path of findUnsafeOrExecutionFieldPaths(value)) {
     errors.push(`Unsafe or execution-like field is not allowed in capability preview envelope: ${path}.`);
   }
-  if (value.schemaVersion !== "pastey-capability-preview/v1") {
-    errors.push("Capability preview envelope schemaVersion must be pastey-capability-preview/v1.");
+  if (value.schemaVersion !== "pastey-capability-preview-v1") {
+    errors.push("Capability preview envelope schemaVersion must be pastey-capability-preview-v1.");
   }
   requireNonEmptyString(value.envelopeId, "envelopeId", errors);
   requireNonEmptyString(value.roomRef, "roomRef", errors);
@@ -219,10 +219,10 @@ function validateCapabilityRequest(
   }
   const contract = getAgentBridgeCapabilityContract(value.capability)
     ?? getAgentBridgeCapabilityContractByPreviewSchema(value.schemaVersion);
-  if (contract?.capability === "filesystem.find_file_candidates/v1") {
+  if (contract?.capability === "filesystem.find_file_candidates") {
     return validateFileCandidateRequest(value, options);
   }
-  if (contract?.capability === "runtime.hello_stdout/v1") {
+  if (contract?.capability === "runtime.hello_stdout") {
     return validateHelloStdoutRequest(value, options);
   }
   if (contract?.capability === "runtime.execute_hello_template") {
