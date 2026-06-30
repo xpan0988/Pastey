@@ -74,7 +74,7 @@ function cloudRequest(context = buildMockAiContextSnapshot()): AiGenerateRequest
     context,
     contextPolicy: CLOUD_STRICT_AI_CONTEXT_POLICY,
     allowedActionKinds: context.allowedActions,
-    outputSchema: "ai-action-plan/v1",
+    outputSchema: "ai-action-plan-v1",
     userRequest: "Generate the safe Hello Peer advisory."
   };
 }
@@ -147,7 +147,7 @@ test("MockProvider returns a safe advisory plan", async () => {
     context,
     contextPolicy: MOCK_AI_CONTEXT_POLICY,
     allowedActionKinds: context.allowedActions,
-    outputSchema: "ai-action-plan/v1",
+    outputSchema: "ai-action-plan-v1",
     userRequest: "Generate the safe Hello Peer advisory."
   });
 
@@ -177,7 +177,7 @@ test("safe Hello Stdout mock plan validates and builds a preview-only request", 
   });
   assert.equal(request.ok, true);
   if (!request.ok) return;
-  assert.equal(request.request.capability, "runtime.hello_stdout/v1");
+  assert.equal(request.request.capability, "runtime.hello_stdout");
   assert.equal(request.request.input.expectedStdout, "hello peer");
   assert.equal(validateHelloStdoutRequest(request.request, { now: new Date("2026-06-11T00:01:00.000Z") }).valid, true);
   assert.equal("command" in request.request, false);
@@ -186,17 +186,16 @@ test("safe Hello Stdout mock plan validates and builds a preview-only request", 
 test("Agent Bridge capability registry resolves implemented capabilities", () => {
   const contracts = listAgentBridgeCapabilityContracts();
   assert.equal(contracts.length, 3);
-  assert.equal(contracts.filter((contract) => contract.lifecycle === "implemented").length, 3);
-  assert.equal(contracts.filter((contract) => contract.lifecycle === "planned_advisory_only").length, 0);
+  assert.ok(contracts.every((contract) => contract.lifecycle === "implemented"));
   assert.equal(getAgentBridgeCapabilityContract("runtime.execute_hello_template")?.providerActionKind, "request_peer_hello_demo");
-  assert.equal(getAgentBridgeCapabilityContract("runtime.hello_stdout/v1")?.providerActionKind, "request_peer_hello_stdout_demo");
-  assert.equal(getAgentBridgeCapabilityContract("filesystem.find_file_candidates/v1")?.providerActionKind, "request_peer_file_candidates");
-  assert.equal(getAgentBridgeCapabilityContract("filesystem.find_file_candidates/v1")?.executorKind, "filesystem_find_candidates_host");
+  assert.equal(getAgentBridgeCapabilityContract("runtime.hello_stdout")?.providerActionKind, "request_peer_hello_stdout_demo");
+  assert.equal(getAgentBridgeCapabilityContract("filesystem.find_file_candidates")?.providerActionKind, "request_peer_file_candidates");
+  assert.equal(getAgentBridgeCapabilityContract("filesystem.find_file_candidates")?.executorKind, "filesystem_find_candidates_host");
   assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_hello_demo")?.capability, "runtime.execute_hello_template");
-  assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_hello_stdout_demo")?.capability, "runtime.hello_stdout/v1");
-  assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_file_candidates")?.capability, "filesystem.find_file_candidates/v1");
-  assert.equal(getAgentBridgeCapabilityContract("runtime.unknown/v1"), undefined);
-  assert.equal(getAgentBridgeCapabilityContractByVersion("runtime.hello_stdout/v1", "v2"), undefined);
+  assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_hello_stdout_demo")?.capability, "runtime.hello_stdout");
+  assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_file_candidates")?.capability, "filesystem.find_file_candidates");
+  assert.equal(getAgentBridgeCapabilityContract("runtime.unknown"), undefined);
+  assert.equal(getAgentBridgeCapabilityContractByVersion("runtime.hello_stdout", "v2"), undefined);
   for (const contract of contracts) {
     assert.equal(contract.routePolicy, "selected-peer");
     assert.equal(contract.consentPolicy, "exact-allow-once");
@@ -210,7 +209,7 @@ test("shared capability envelope preserves exact selected-peer preview metadata"
 
   const shared = deriveCapabilitySharedPreviewEnvelope(result.envelope);
 
-  assert.equal(shared.schemaVersion, "pastey-agent-bridge-capability-envelope/v1");
+  assert.equal(shared.schemaVersion, "pastey-agent-bridge-capability-envelope-v1");
   assert.equal(shared.capability, "runtime.execute_hello_template");
   assert.equal(shared.capabilityVersion, "legacy");
   assert.equal(shared.routePolicy, "selected-peer");
@@ -237,7 +236,7 @@ test("safe file candidate advisory validates, passes PolicyGate, and builds a pr
     ttlMs: 120_000,
     pendingId: "file-candidate-pending"
   });
-  assert.equal(pending.canonicalPayload.capability, "filesystem.find_file_candidates/v1");
+  assert.equal(pending.canonicalPayload.capability, "filesystem.find_file_candidates");
   assert.equal(pending.canonicalPayload.query?.searchMode, "filename_metadata_only");
   assert.equal(pending.canonicalPayload.scopePolicy?.includeFileContents, false);
   assert.equal(pending.canonicalPayload.safety?.noAutoTransfer, true);
@@ -249,7 +248,7 @@ test("safe file candidate advisory validates, passes PolicyGate, and builds a pr
   });
   assert.equal(preview.ok, true);
   if (!preview.ok) return;
-  assert.equal(preview.request.capability, "filesystem.find_file_candidates/v1");
+  assert.equal(preview.request.capability, "filesystem.find_file_candidates");
   assert.equal(preview.request.executorKind, "filesystem_find_candidates_host");
   assert.equal(preview.request.input.query.searchMode, "filename_metadata_only");
   assert.equal(preview.request.input.scopePolicy.includeFileContents, false);
@@ -579,7 +578,7 @@ test("confirmed local pending action builds a HelloPeerRequest preview", () => {
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
-  assert.equal(result.request.schemaVersion, "pastey-capability-request/v1");
+  assert.equal(result.request.schemaVersion, "pastey-hello-peer-request-v1");
   assert.equal(result.request.transportStatus, "preview_only");
   assert.equal(result.request.pendingPayloadHash, confirmedPendingAction().payloadHash);
   assert.equal(result.request.capability, "runtime.execute_hello_template");
@@ -747,7 +746,7 @@ test("HelloPeerRequest validator rejects wrong schema and expired request", () =
 
   assert.equal(validateHelloPeerRequest({
     ...result.request,
-    schemaVersion: "pastey-capability-request/v2"
+    schemaVersion: "pastey-hello-peer-request-v2"
   }, {
     now: new Date("2026-06-11T00:01:00.000Z")
   }).valid, false);
@@ -789,7 +788,7 @@ test("safe HelloPeerRequest builds a capability preview envelope", () => {
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
-  assert.equal(result.envelope.schemaVersion, "pastey-capability-preview/v1");
+  assert.equal(result.envelope.schemaVersion, "pastey-capability-preview-v1");
   assert.equal(result.envelope.previewOnly, true);
   assert.equal(result.envelope.status, "outbound_preview");
   assert.equal(result.envelope.roomRef, "room-preview-test");

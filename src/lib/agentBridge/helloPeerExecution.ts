@@ -101,7 +101,7 @@ export function buildHelloPeerExecutionRequest(
   }
   const ttlMs = options.ttlMs ?? 60_000;
   const request: HelloPeerExecutionRequest = {
-    schemaVersion: "pastey-hello-peer-execution-request/v1",
+    schemaVersion: "pastey-hello-peer-execution-request-v1",
     executionId: options.executionId ?? createExecutionId(now),
     consentId: consent.consentId,
     sourcePreviewEventId: consent.sourcePreviewEventId,
@@ -241,7 +241,7 @@ function consume(
 
 function successResult(request: HelloPeerExecutionRequest, now: Date): HelloPeerExecutionResult {
   return {
-    schemaVersion: "pastey-hello-peer-execution-result/v1",
+    schemaVersion: "pastey-hello-peer-execution-result-v1",
     executionId: request.executionId,
     requestId: request.requestId,
     consentId: request.consentId,
@@ -258,7 +258,7 @@ function failureResult(
   now: Date,
 ): HelloPeerExecutionResult {
   return {
-    schemaVersion: "pastey-hello-peer-execution-result/v1",
+    schemaVersion: "pastey-hello-peer-execution-result-v1",
     executionId: request.executionId,
     requestId: request.requestId,
     consentId: request.consentId,

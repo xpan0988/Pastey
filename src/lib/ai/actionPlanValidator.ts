@@ -48,8 +48,8 @@ export function validateAiActionPlan(value: unknown): ValidationResult<AiActionP
     }
   }
 
-  if (value.schemaVersion !== "ai-action-plan/v1") {
-    errors.push("schemaVersion must be ai-action-plan/v1.");
+  if (value.schemaVersion !== "ai-action-plan-v1") {
+    errors.push("schemaVersion must be ai-action-plan-v1.");
   }
   if (!isString(value.kind) || !ACTION_KINDS.has(value.kind as AiActionKind)) {
     errors.push("kind must be a known AI action kind.");

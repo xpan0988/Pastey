@@ -15,14 +15,14 @@ Current layer status:
 | Layer | Definition | Current status |
 | --- | --- | --- |
 | Layer 1 - Secure LAN transport | Moves data securely and reliably over the LAN. | Mature operational core |
-| Layer 2 - Device intelligence | Observes, describes, and recommends based on current-session device and link conditions. | Advisory diagnostics implemented; recommendation UX partial |
+| Layer 2 - Device intelligence | Observes and describes current-session device, capability, liveness, and benchmark facts. | Factual diagnostics implemented |
 | Layer 3 - Smart orchestration | Plans and schedules data/control work and runtime capacity. | Operational orchestration core |
 | Layer 4 - Multi-device Bridge sessions and peer identity | Owns current-session Bridge membership, selected-peer routing, selected-peers routing, broadcast routing, provenance, replay boundaries, reconnect semantics, and current-session control-plane delivery. | Session-scoped Bridge/control foundation |
-| Layer 5 - Agent-assisted device workspace | Owns model-assisted planning, validation, consent, bounded execution, result orchestration, and audit. | Narrow Hello Peer capability slice implemented |
+| Layer 5 - Agent-assisted device workspace | Owns model-assisted planning, validation, consent, bounded execution, result orchestration, and audit. | Narrow capability slice plus read-only workspace search |
 
 Important boundaries:
 
-- Device recommendation is not a scheduler command.
+- Device facts are not scheduler commands.
 - Encrypted session is not durable device identity.
 - Accepted Bridge peer status is not durable trust or execution authority.
 - Transport delivery is not consent.
@@ -41,13 +41,14 @@ Bridge sessions can be burned. Burning removes that session's local encrypted pa
 
 ## Agent Bridge
 
-Agent Bridge is Bridge-scoped and safety-first. The current implementation supports a deterministic mock provider, an experimental OpenAI-compatible cloud provider against redacted context, and one fixed Hello Peer capability path.
+Agent Bridge is Bridge-scoped and safety-first. The current implementation supports a deterministic mock provider, an experimental OpenAI-compatible cloud provider against redacted context, fixed Hello Peer / Hello Stdout capabilities, and the bounded read-only `filesystem.find_file_candidates` workspace capability.
 
-The model proposes; the host validates; the sender chooses whether to ask; the receiver can Allow once or Deny; a fixed bounded executor acts; typed results return through Bridge control events. Nearby accept, 8-digit code join, accepted peer status, and encrypted delivery never grant execution authority. There is no shell, process, file, network, generic runtime, reusable trust, arbitrary tool execution, durable peer identity, or local LLM scheduling in the current product.
+The model proposes; the host validates; the sender chooses whether to ask; the receiver can Allow once or Deny; a bounded host-owned executor acts; typed results return through Bridge control events. File-candidate search returns redacted metadata only: no file contents are read, no absolute paths are returned, candidate IDs are not paths or transfer authority, and no file is sent automatically. Nearby accept, 8-digit code join, accepted peer status, encrypted delivery, and durable pairing display metadata never grant execution authority. There is no shell, process, network, generic runtime, reusable trust, arbitrary tool execution, durable peer identity, transfer handoff, or local LLM scheduling in the current product.
 
 ## Documentation
 
 - [Project layout specification](docs/architecture/Project-specifications.md)
+- [Naming conventions](docs/architecture/naming-conventions.md)
 - [Bridge semantics](docs/architecture/bridge-semantics.md)
 - [Bridge routing semantics](docs/architecture/bridge-routing.md)
 - [Transfer architecture](docs/transfer/architecture.md)

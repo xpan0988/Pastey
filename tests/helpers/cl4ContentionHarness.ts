@@ -45,7 +45,7 @@ export interface Cl4ScenarioReport {
 }
 
 export interface Cl4ContentionReport {
-  schemaVersion: "pastey-cl4-contention-report/v1";
+  schemaVersion: "pastey-cl4-contention-report-v1";
   integrationBoundary: string;
   generatedAt: string;
   runtimeEvidence?: Record<string, unknown>;
@@ -341,7 +341,7 @@ export function runCl4ContentionScenarios(generatedAt = new Date().toISOString()
   ];
   assert.ok(scenarios.every((scenario) => scenario.passed));
   return {
-    schemaVersion: "pastey-cl4-contention-report/v1",
+    schemaVersion: "pastey-cl4-contention-report-v1",
     integrationBoundary:
       "Production TypeScript CL-4 demand/target reducer and transfer planner; focused Rust update_active_transfer_window evidence runs separately.",
     generatedAt,

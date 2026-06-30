@@ -15,9 +15,9 @@ use crate::{
     storage::AppPaths,
 };
 
-const REQUEST_SCHEMA: &str = "filesystem-find-file-candidates-execution-request/v1";
-const RESULT_SCHEMA: &str = "filesystem-find-file-candidates-result/v1";
-const CAPABILITY: &str = "filesystem.find_file_candidates/v1";
+const REQUEST_SCHEMA: &str = "filesystem-find-file-candidates-execution-request-v1";
+const RESULT_SCHEMA: &str = "filesystem-find-file-candidates-result-v1";
+const CAPABILITY: &str = "filesystem.find_file_candidates";
 const EXECUTOR_KIND: &str = "filesystem_find_candidates_host";
 const MAX_IDENTIFIER_LENGTH: usize = 256;
 const MAX_FILENAME_HINT_LENGTH: usize = 128;
@@ -604,7 +604,7 @@ fn validate_result(result: &FileCandidateExecutionResult) -> AppResult<()> {
 mod tests {
     use super::*;
 
-    fn request(_root: &Path) -> FileCandidateExecutionRequest {
+    fn request() -> FileCandidateExecutionRequest {
         let now = OffsetDateTime::now_utc();
         FileCandidateExecutionRequest {
             schema_version: REQUEST_SCHEMA.to_string(),
@@ -652,6 +652,24 @@ mod tests {
         }
     }
 
+    fn request_for(
+        filename_hint: &str,
+        extensions: &[&str],
+        max_candidates: usize,
+        max_depth: u8,
+    ) -> FileCandidateExecutionRequest {
+        let mut request = request();
+        request.input.query.raw_user_request = format!("find {filename_hint}");
+        request.input.query.filename_hint = filename_hint.to_string();
+        request.input.query.extensions = extensions
+            .iter()
+            .map(|extension| extension.to_string())
+            .collect();
+        request.input.limits.max_candidates = max_candidates;
+        request.input.limits.max_depth = max_depth;
+        request
+    }
+
     fn paths(root: PathBuf) -> AppPaths {
         AppPaths {
             app_data_dir: root.clone(),
@@ -664,20 +682,216 @@ mod tests {
         }
     }
 
+    fn fixture_source() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root")
+            .join("tests/fixtures/file-candidates/app-data")
+    }
+
+    fn copy_dir_recursive(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir_recursive(&source_path, &destination_path);
+            } else {
+                fs::copy(&source_path, &destination_path).unwrap();
+            }
+        }
+    }
+
+    fn fixture_paths() -> (PathBuf, AppPaths) {
+        let root = std::env::temp_dir().join(format!("pastey_file_candidates_{}", Uuid::new_v4()));
+        copy_dir_recursive(&fixture_source(), &root);
+        let paths = paths(root.clone());
+        (root, paths)
+    }
+
     #[test]
     fn searches_pastey_shared_without_returning_absolute_paths() {
-        let root = std::env::temp_dir().join(format!("pastey_file_candidates_{}", Uuid::new_v4()));
-        let shared = root.join("shared").join("nested");
-        fs::create_dir_all(&shared).unwrap();
-        fs::write(shared.join("report.pdf"), b"contents not read").unwrap();
-
-        let result = execute_file_candidate_search(request(&root), &paths(root.clone())).unwrap();
+        let (root, app_paths) = fixture_paths();
+        let result = execute_file_candidate_search(
+            request_for("exact-target.pdf", &["pdf"], 10, 6),
+            &app_paths,
+        )
+        .unwrap();
 
         assert_eq!(result.status, "completed");
         assert_eq!(result.candidates.len(), 1);
-        assert_eq!(result.candidates[0].display_name, "report.pdf");
+        assert_eq!(result.candidates[0].display_name, "exact-target.pdf");
         assert!(!result.candidates[0].redacted_location.starts_with('/'));
         assert!(!result.candidates[0].candidate_id.contains('/'));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matches_exact_case_insensitive_and_substring_names() {
+        let (root, app_paths) = fixture_paths();
+
+        let exact = execute_file_candidate_search(
+            request_for("exact-target.pdf", &["pdf"], 10, 6),
+            &app_paths,
+        )
+        .unwrap();
+        assert_eq!(exact.candidates[0].match_reason, "filename_exact_match");
+
+        let case_insensitive = execute_file_candidate_search(
+            request_for("exact-target-caps.pdf", &["pdf"], 10, 6),
+            &app_paths,
+        )
+        .unwrap();
+        assert_eq!(
+            case_insensitive.candidates[0].display_name,
+            "Exact-Target-CAPS.PDF"
+        );
+        assert_eq!(
+            case_insensitive.candidates[0].match_reason,
+            "filename_case_insensitive_match"
+        );
+
+        let substring =
+            execute_file_candidate_search(request_for("notes", &["txt"], 10, 6), &app_paths)
+                .unwrap();
+        assert_eq!(substring.candidates[0].display_name, "target-notes.txt");
+        assert_eq!(
+            substring.candidates[0].match_reason,
+            "filename_substring_match"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extension_filter_and_candidate_limit_are_enforced() {
+        let (root, app_paths) = fixture_paths();
+
+        let markdown =
+            execute_file_candidate_search(request_for("target", &["md"], 10, 6), &app_paths)
+                .unwrap();
+        assert!(!markdown.candidates.is_empty());
+        assert!(markdown
+            .candidates
+            .iter()
+            .all(|candidate| candidate.extension == "md"));
+
+        let limited =
+            execute_file_candidate_search(request_for("target", &["txt"], 2, 6), &app_paths)
+                .unwrap();
+        assert_eq!(limited.candidates.len(), 2);
+        assert!(limited.omitted.too_many_matches);
+        assert!(!limited.truncated);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn max_depth_hidden_entries_and_directories_are_not_returned() {
+        let (root, app_paths) = fixture_paths();
+        fs::create_dir_all(root.join("shared/target-folder")).unwrap();
+
+        let too_shallow = execute_file_candidate_search(
+            request_for("target-deep.pdf", &["pdf"], 10, 2),
+            &app_paths,
+        )
+        .unwrap();
+        assert!(too_shallow.candidates.is_empty());
+
+        let deep = execute_file_candidate_search(
+            request_for("target-deep.pdf", &["pdf"], 10, 6),
+            &app_paths,
+        )
+        .unwrap();
+        assert_eq!(deep.candidates.len(), 1);
+        assert_eq!(deep.candidates[0].display_name, "target-deep.pdf");
+
+        let hidden =
+            execute_file_candidate_search(request_for("hidden", &[], 10, 6), &app_paths).unwrap();
+        assert!(hidden.candidates.is_empty());
+        assert!(hidden.omitted.hidden_files_skipped);
+
+        let directory =
+            execute_file_candidate_search(request_for("target-folder", &[], 10, 6), &app_paths)
+                .unwrap();
+        assert!(directory.candidates.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_entries_are_skipped() {
+        use std::os::unix::fs::symlink;
+
+        let (root, app_paths) = fixture_paths();
+        symlink(
+            root.join("shared/exact-target.pdf"),
+            root.join("shared/link-target.pdf"),
+        )
+        .unwrap();
+
+        let result = execute_file_candidate_search(
+            request_for("link-target.pdf", &["pdf"], 10, 6),
+            &app_paths,
+        )
+        .unwrap();
+        assert!(result.candidates.is_empty());
+        assert!(result.omitted.symlinks_skipped);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_and_invalid_scopes_fail_closed_without_fallback() {
+        let missing_root =
+            std::env::temp_dir().join(format!("pastey_file_candidates_missing_{}", Uuid::new_v4()));
+        fs::create_dir_all(&missing_root).unwrap();
+        let missing = execute_file_candidate_search(
+            request_for("target", &[], 10, 6),
+            &paths(missing_root.clone()),
+        )
+        .unwrap();
+        assert_eq!(missing.status, "failed");
+        assert_eq!(missing.error_code.as_deref(), Some("no_searchable_scopes"));
+        assert_eq!(missing.omitted.scopes_skipped, vec!["pastey_shared"]);
+
+        let mut invalid = request_for("target", &[], 10, 6);
+        invalid.input.scope_policy.allowed_scopes = vec!["full_disk".into()];
+        assert!(execute_file_candidate_search(invalid, &paths(missing_root.clone())).is_err());
+
+        let _ = fs::remove_dir_all(missing_root);
+    }
+
+    #[test]
+    fn redacted_locations_candidate_ids_and_results_do_not_leak_paths_or_contents() {
+        let (root, app_paths) = fixture_paths();
+        let result = execute_file_candidate_search(
+            request_for("content-marker.txt", &["txt"], 10, 6),
+            &app_paths,
+        )
+        .unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        let candidate = &result.candidates[0];
+        let root_text = root.to_string_lossy();
+        assert!(!candidate.redacted_location.starts_with('/'));
+        assert!(!candidate.redacted_location.contains(root_text.as_ref()));
+        assert!(!candidate.candidate_id.contains('/'));
+        assert!(!candidate.candidate_id.contains('\\'));
+        assert!(!candidate.candidate_id.contains(root_text.as_ref()));
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("SECRET_FILE_CONTENT_SHOULD_NOT_RETURN"));
+
+        let weird =
+            execute_file_candidate_search(request_for("weird", &["txt"], 10, 6), &app_paths)
+                .unwrap();
+        assert_eq!(weird.candidates.len(), 1);
+        assert_eq!(
+            weird.candidates[0].display_name,
+            "target weird [draft] #1.txt"
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -685,7 +899,7 @@ mod tests {
     fn rejects_full_disk_and_file_content_requests() {
         let root =
             std::env::temp_dir().join(format!("pastey_file_candidates_reject_{}", Uuid::new_v4()));
-        let mut request = request(&root);
+        let mut request = request();
         request.input.scope_policy.allow_full_disk = true;
         assert!(execute_file_candidate_search(request, &paths(root)).is_err());
     }

@@ -448,8 +448,8 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       const consent = peerConsentRecords.find(
         (record) => record.binding.consentId === executionRequestEvent.payload.consentId
       );
-      const isHelloStdout = executionRequestEvent.payload.capability === "runtime.hello_stdout/v1";
-      const isFileCandidate = executionRequestEvent.payload.capability === "filesystem.find_file_candidates/v1";
+      const isHelloStdout = executionRequestEvent.payload.capability === "runtime.hello_stdout";
+      const isFileCandidate = executionRequestEvent.payload.capability === "filesystem.find_file_candidates";
       logAgentBridgeLifecycle({
         eventKind: "hello_peer_execution_started",
         roomRefShort: session.roomId,
@@ -718,9 +718,9 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       setMessages(["The exact source preview for this Allow once acknowledgement is unavailable."]);
       return;
     }
-    const built = preview.event.payload.request.capability === "filesystem.find_file_candidates/v1"
+    const built = preview.event.payload.request.capability === "filesystem.find_file_candidates"
       ? buildFileCandidateExecutionRequest(preview.event, senderExecutionAck)
-      : preview.event.payload.request.capability === "runtime.hello_stdout/v1"
+      : preview.event.payload.request.capability === "runtime.hello_stdout"
         ? buildHelloStdoutExecutionRequest(preview.event, senderExecutionAck)
         : buildHelloPeerExecutionRequest(preview.event, senderExecutionAck);
     if (!built.ok) {
@@ -778,7 +778,7 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       return await sendRoomControlEvent(
         roomId,
         event,
-        bridgeRoutePayload(route, "pastey-bridge-control-route/v1"),
+        bridgeRoutePayload(route, "pastey-bridge-control-route-v1"),
       );
     } finally {
       setOutgoingControlWindowDemand(ROOM_CONTROL_ACTIVE_SEND_SOURCE, false);
@@ -923,9 +923,9 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
             data-testid="agent-bridge-request-hello-execution"
             onClick={requestHelloPeerExecution}
           >
-            {senderExecutionAck.payload.consent.capability === "filesystem.find_file_candidates/v1"
+            {senderExecutionAck.payload.consent.capability === "filesystem.find_file_candidates"
               ? "Request file candidate search"
-              : senderExecutionAck.payload.consent.capability === "runtime.hello_stdout/v1"
+              : senderExecutionAck.payload.consent.capability === "runtime.hello_stdout"
                 ? "Request Hello Stdout execution"
                 : "Request Hello Peer execution"}
           </button>
@@ -1048,8 +1048,8 @@ function PeerConsentReviewCard({
   onDeny: () => void;
 }) {
   const expired = review.status === "expired" || Date.parse(review.binding.expiresAt) <= nowMs;
-  const isHelloStdout = review.binding.capability === "runtime.hello_stdout/v1";
-  const isFileCandidate = review.binding.capability === "filesystem.find_file_candidates/v1";
+  const isHelloStdout = review.binding.capability === "runtime.hello_stdout";
+  const isFileCandidate = review.binding.capability === "filesystem.find_file_candidates";
   const capabilityDetail = "filenameHint" in review.binding
     ? `Filename hint: ${review.binding.filenameHint}; search mode: ${review.binding.searchMode}`
     : "expectedStdout" in review.binding
@@ -1185,10 +1185,10 @@ function shortRef(value: string): string {
 }
 
 function capabilityLabel(capability: string): string {
-  if (capability === "filesystem.find_file_candidates/v1") {
+  if (capability === "filesystem.find_file_candidates") {
     return "File candidate search";
   }
-  if (capability === "runtime.hello_stdout/v1") {
+  if (capability === "runtime.hello_stdout") {
     return "Hello Stdout";
   }
   return "Hello Peer";

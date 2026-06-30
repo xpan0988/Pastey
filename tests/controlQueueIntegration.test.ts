@@ -122,7 +122,7 @@ function enqueueOutbound(): ControlQueueState {
 
 function receipt(eventId: string): RoomControlDeliveryReceipt {
   return {
-    schemaVersion: "pastey-room-control-delivery/v1",
+    schemaVersion: "pastey-room-control-delivery-v1",
     eventId,
     acceptedForLocalInbox: true,
     receivedAt: LATER.toISOString(),

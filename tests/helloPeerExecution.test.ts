@@ -287,7 +287,7 @@ test("allowed-once ack builds one exact bounded execution request", () => {
 
 test("allowed-once ack builds one exact Hello Stdout execution request", () => {
   const value = stdoutChain();
-  assert.equal(value.request.payload.capability, "runtime.hello_stdout/v1");
+  assert.equal(value.request.payload.capability, "runtime.hello_stdout");
   assert.equal(value.request.payload.expectedStdout, "hello peer");
   assert.equal(value.request.payload.consentId, value.consent.binding.consentId);
   assert.equal(value.request.payload.requestPayloadHash, value.consent.binding.requestPayloadHash);
@@ -305,11 +305,11 @@ test("receiver consumes Hello Stdout consent once and returns typed stdout resul
     value.consent,
     createPeerConsentConsumptionState(),
     async (request) => ({
-      schemaVersion: "pastey-runtime-hello-stdout-execution-result/v1",
+      schemaVersion: "pastey-runtime-hello-stdout-execution-result-v1",
       executionId: request.executionId,
       requestId: request.requestId,
       consentId: request.consentId,
-      capability: "runtime.hello_stdout/v1",
+      capability: "runtime.hello_stdout",
       runtimeKind: "rust_host_helper",
       status: "succeeded",
       stdout: "hello peer",
@@ -345,8 +345,8 @@ test("receiver consumes Hello Stdout consent once and returns typed stdout resul
 test("receiver consumes file candidate consent once and returns redacted metadata candidates", async () => {
   const value = fileCandidateChain();
   const executor = async (request: FileCandidateExecutionRequest): Promise<FileCandidateExecutionResult> => ({
-    schemaVersion: "filesystem-find-file-candidates-result/v1",
-    capability: "filesystem.find_file_candidates/v1",
+    schemaVersion: "filesystem-find-file-candidates-result-v1",
+    capability: "filesystem.find_file_candidates",
     executionId: request.executionId,
     requestId: request.requestId,
     consentId: request.consentId,
@@ -424,11 +424,11 @@ test("Hello Stdout rejects legacy consent and unsafe result shapes", async () =>
   assert.equal(rejected.executed, false);
   assert.equal(rejected.result.errorCode, "consent_binding_mismatch");
   assert.notEqual(validateHelloStdoutExecutionResult({
-    schemaVersion: "pastey-runtime-hello-stdout-execution-result/v1",
+    schemaVersion: "pastey-runtime-hello-stdout-execution-result-v1",
     executionId: "bad",
     requestId: "bad",
     consentId: "bad",
-    capability: "runtime.hello_stdout/v1",
+    capability: "runtime.hello_stdout",
     runtimeKind: "rust_host_helper",
     status: "succeeded",
     stdout: "hello peer",

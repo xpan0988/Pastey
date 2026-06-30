@@ -13,7 +13,7 @@ export const MOCK_AI_PROVIDER_CONFIG: AiProviderConfig = {
 
 export function buildMockHelloPeerPlan(): AiActionPlan {
   return {
-    schemaVersion: "ai-action-plan/v1",
+    schemaVersion: "ai-action-plan-v1",
     kind: "request_peer_hello_demo",
     title: "Ask peer to run Hello Peer demo",
     explanation: "The peer advertises a restricted hello-template capability. This plan asks Pastey to request that peer to output exactly 'hello peer!' through a fixed template after local and peer confirmation.",
@@ -40,7 +40,7 @@ export function buildMockHelloPeerPlan(): AiActionPlan {
 
 export function buildMockHelloStdoutPlan(): AiActionPlan {
   return {
-    schemaVersion: "ai-action-plan/v1",
+    schemaVersion: "ai-action-plan-v1",
     kind: "request_peer_hello_stdout_demo",
     title: "Ask peer to run Hello Stdout demo",
     explanation: "The peer advertises a restricted hello-stdout capability. This plan asks Pastey to request that peer to run a host-owned Rust helper after local and peer confirmation.",
@@ -51,7 +51,7 @@ export function buildMockHelloStdoutPlan(): AiActionPlan {
     ],
     proposedInput: {
       targetPeerRef: "mock-peer-1",
-      capability: "runtime.hello_stdout/v1",
+      capability: "runtime.hello_stdout",
       message: "hello peer",
       constraints: {
         templateOnly: true,
@@ -68,7 +68,7 @@ export function buildMockHelloStdoutPlan(): AiActionPlan {
 
 export function buildMockFileCandidatePlan(): AiActionPlan {
   return {
-    schemaVersion: "ai-action-plan/v1",
+    schemaVersion: "ai-action-plan-v1",
     kind: "request_peer_file_candidates",
     title: "Find file candidates on the selected peer",
     explanation: "Search the selected peer for filename or metadata matches and return a bounded candidate list. No file contents will be read and no file will be sent automatically.",
@@ -78,7 +78,7 @@ export function buildMockFileCandidatePlan(): AiActionPlan {
       { kind: "peer", ref: "mock-peer-1" }
     ],
     proposedInput: {
-      capability: "filesystem.find_file_candidates/v1",
+      capability: "filesystem.find_file_candidates",
       targetPeerRef: "mock-peer-1",
       query: {
         rawUserRequest: "help me find a file named report and send it to me",

@@ -37,26 +37,26 @@ const MAX_BURST_EVENTS: usize = 8;
 const CONTROL_CONTENT_TYPE: &str = "application/vnd.pastey.room-control-envelope+json";
 const CONTROL_RECEIPT_CONTENT_TYPE: &str = "application/vnd.pastey.room-control-receipt+json";
 const CONTROL_ERROR_CONTENT_TYPE: &str = "application/vnd.pastey.room-control-error+json";
-const CONTROL_TRANSPORT_SCHEMA: &str = "pastey-room-control-transport/v1";
-const CONTROL_RECEIPT_ENVELOPE_SCHEMA: &str = "pastey-room-control-receipt-envelope/v1";
-const CONTROL_DELIVERY_SCHEMA: &str = "pastey-room-control-delivery/v1";
-const ROOM_CONTROL_SCHEMA: &str = "pastey-room-control-event/v1";
-const CONTROL_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-control-route/v1";
-const HELLO_STDOUT_CAPABILITY: &str = "runtime.hello_stdout/v1";
+const CONTROL_TRANSPORT_SCHEMA: &str = "pastey-room-control-transport-v1";
+const CONTROL_RECEIPT_ENVELOPE_SCHEMA: &str = "pastey-room-control-receipt-envelope-v1";
+const CONTROL_DELIVERY_SCHEMA: &str = "pastey-room-control-delivery-v1";
+const ROOM_CONTROL_SCHEMA: &str = "pastey-room-control-event-v1";
+const CONTROL_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-control-route-v1";
+const HELLO_STDOUT_CAPABILITY: &str = "runtime.hello_stdout";
 const HELLO_STDOUT_EXPECTED_STDOUT: &str = "hello peer";
-const FILE_CANDIDATES_CAPABILITY: &str = "filesystem.find_file_candidates/v1";
+const FILE_CANDIDATES_CAPABILITY: &str = "filesystem.find_file_candidates";
 const FILE_CANDIDATES_EXECUTOR_KIND: &str = "filesystem_find_candidates_host";
-const HELLO_STDOUT_REQUEST_SCHEMA: &str = "pastey-runtime-hello-stdout-request/v1";
-const HELLO_STDOUT_CONSENT_SCHEMA: &str = "pastey-runtime-hello-stdout-consent-grant/v1";
+const HELLO_STDOUT_REQUEST_SCHEMA: &str = "pastey-runtime-hello-stdout-request-v1";
+const HELLO_STDOUT_CONSENT_SCHEMA: &str = "pastey-runtime-hello-stdout-consent-grant-v1";
 const HELLO_STDOUT_EXECUTION_REQUEST_SCHEMA: &str =
-    "pastey-runtime-hello-stdout-execution-request/v1";
+    "pastey-runtime-hello-stdout-execution-request-v1";
 const HELLO_STDOUT_EXECUTION_RESULT_SCHEMA: &str =
-    "pastey-runtime-hello-stdout-execution-result/v1";
-const FILE_CANDIDATES_REQUEST_SCHEMA: &str = "filesystem-find-file-candidates-request/v1";
-const FILE_CANDIDATES_CONSENT_SCHEMA: &str = "filesystem-find-file-candidates-consent-grant/v1";
+    "pastey-runtime-hello-stdout-execution-result-v1";
+const FILE_CANDIDATES_REQUEST_SCHEMA: &str = "filesystem-find-file-candidates-request-v1";
+const FILE_CANDIDATES_CONSENT_SCHEMA: &str = "filesystem-find-file-candidates-consent-grant-v1";
 const FILE_CANDIDATES_EXECUTION_REQUEST_SCHEMA: &str =
-    "filesystem-find-file-candidates-execution-request/v1";
-const FILE_CANDIDATES_EXECUTION_RESULT_SCHEMA: &str = "filesystem-find-file-candidates-result/v1";
+    "filesystem-find-file-candidates-execution-request-v1";
+const FILE_CANDIDATES_EXECUTION_RESULT_SCHEMA: &str = "filesystem-find-file-candidates-result-v1";
 
 const ALLOWED_EVENT_KINDS: &[&str] = &[
     "capability_preview",
@@ -926,7 +926,7 @@ fn validate_control_event(
                 "status",
             ],
         )?;
-        if string_field(payload, "schemaVersion")? != "pastey-capability-preview/v1"
+        if string_field(payload, "schemaVersion")? != "pastey-capability-preview-v1"
             || payload.get("previewOnly") != Some(&Value::Bool(true))
             || string_field(payload, "status")? != "outbound_preview"
             || string_field(payload, "roomRef")? != expected_room
@@ -1435,7 +1435,7 @@ fn validate_execution_request_payload(
             "expiresAt",
         ],
     )?;
-    if schema != "pastey-hello-peer-execution-request/v1"
+    if schema != "pastey-hello-peer-execution-request-v1"
         || string_field(payload, "roomRef")? != expected_room
         || string_field(payload, "sourceDeviceRef")? != expected_source
         || string_field(payload, "targetPeerRef")? != expected_target
@@ -1477,7 +1477,7 @@ fn validate_hello_peer_execution_result_payload(payload: &Map<String, Value>) ->
             "Invalid execution result payload.".into(),
         ));
     }
-    if string_field(payload, "schemaVersion")? != "pastey-hello-peer-execution-result/v1" {
+    if string_field(payload, "schemaVersion")? != "pastey-hello-peer-execution-result-v1" {
         return Err(AppError::InvalidInput(
             "Invalid execution result payload.".into(),
         ));
@@ -1762,7 +1762,7 @@ fn validate_consent_grant_payload(consent: &Map<String, Value>) -> AppResult<()>
             "expiresAt",
         ],
     )?;
-    if schema != "pastey-hello-peer-consent-grant/v1"
+    if schema != "pastey-hello-peer-consent-grant-v1"
         || capability != "runtime.execute_hello_template"
         || string_field(consent, "exactMessage")? != "hello peer!"
     {
@@ -2257,7 +2257,7 @@ mod tests {
             "expiresAt": expires_at,
             "previewOnly": true,
             "payload": {
-                "schemaVersion": "pastey-capability-preview/v1",
+                "schemaVersion": "pastey-capability-preview-v1",
                 "envelopeId": envelope_id,
                 "createdAt": created_at,
                 "expiresAt": expires_at,
@@ -2313,7 +2313,7 @@ mod tests {
             "expiresAt": expires_at,
             "previewOnly": false,
             "payload": {
-                "schemaVersion": "pastey-hello-peer-execution-request/v1",
+                "schemaVersion": "pastey-hello-peer-execution-request-v1",
                 "executionId": execution_id,
                 "consentId": "consent",
                 "sourcePreviewEventId": "preview",
@@ -2344,7 +2344,7 @@ mod tests {
             "expiresAt": (now + time::Duration::seconds(60)).format(&Rfc3339).unwrap(),
             "previewOnly": false,
             "payload": {
-                "schemaVersion": "pastey-hello-peer-execution-result/v1",
+                "schemaVersion": "pastey-hello-peer-execution-result-v1",
                 "executionId": execution_id,
                 "requestId": "request",
                 "consentId": "consent",

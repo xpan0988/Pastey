@@ -64,7 +64,7 @@ export interface RoomControlSessionContext {
 }
 
 export interface RoomControlDeliveryReceipt {
-  schemaVersion: "pastey-room-control-delivery/v1";
+  schemaVersion: "pastey-room-control-delivery-v1";
   eventId: string;
   acceptedForLocalInbox: true;
   receivedAt: string;
@@ -167,7 +167,6 @@ export interface DeviceCapabilities {
     gpu_names: string[];
     vram_gb?: number | null;
   };
-  recommended_roles: string[];
   updated_at: number;
 }
 

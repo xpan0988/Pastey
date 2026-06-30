@@ -257,6 +257,28 @@ test("single eligible tiny queue item explains no micro group", () => {
   assert.equal(diagnostics.microGroupSkipReason, "not_enough_eligible_children");
 });
 
+test("micro group diagnostics do not split eligible buckets by MIME family", () => {
+  const state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
+    { ...readyInput("image-source.png", 128 * 1024, "/tmp/image-source.png", 1), mimeType: "image/png" },
+    { ...readyInput("document-source.pdf", 128 * 1024, "/tmp/document-source.pdf", 2), mimeType: "application/pdf" },
+    { ...readyInput("media-source.mp4", 128 * 1024, "/tmp/media-source.mp4", 3), mimeType: "video/mp4" }
+  ]);
+
+  const { microGroupPlans } = planRunnableTransferLaunches(state, activeRooms, new Set(), new Map(), false, {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    microGroupMode: "fixed"
+  });
+  const diagnostics = summarizeMicroFlowGroupPlanning(state, activeRooms, new Set(), {
+    ...DEFAULT_TRANSFER_PLANNER_POLICY,
+    microGroupMode: "fixed"
+  });
+
+  assert.equal(microGroupPlans.length, 1);
+  assert.equal(microGroupPlans[0].childItemIds.length, 3);
+  assert.equal(diagnostics.eligibleTinyCandidates, 3);
+  assert.equal(diagnostics.largestEligibleBucket, 3);
+});
+
 test("dynamic micro group diagnostics clamp huge-file quantum conservatively", () => {
   const state = enqueueTransferBatch(
     createTransferSchedulerState(),

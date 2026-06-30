@@ -81,7 +81,7 @@ export function buildHelloStdoutExecutionRequest(
   }
   const ttlMs = options.ttlMs ?? 60_000;
   const request: HelloStdoutExecutionRequest = {
-    schemaVersion: "pastey-runtime-hello-stdout-execution-request/v1",
+    schemaVersion: "pastey-runtime-hello-stdout-execution-request-v1",
     executionId: options.executionId ?? createExecutionId(now),
     consentId: consent.consentId,
     sourcePreviewEventId: consent.sourcePreviewEventId,
@@ -206,7 +206,7 @@ function failureResult(
   now: Date,
 ): HelloStdoutExecutionResult {
   return {
-    schemaVersion: "pastey-runtime-hello-stdout-execution-result/v1",
+    schemaVersion: "pastey-runtime-hello-stdout-execution-result-v1",
     executionId: request.executionId,
     requestId: request.requestId,
     consentId: request.consentId,

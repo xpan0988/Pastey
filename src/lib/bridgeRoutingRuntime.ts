@@ -73,9 +73,9 @@ interface BridgeRoutePayload<TSchemaVersion extends string> {
   readonly target: BridgeRoutePayloadTarget;
 }
 
-export type TextBridgeRoutePayload = BridgeRoutePayload<"pastey-bridge-text-route/v1">;
-export type FileBridgeRoutePayload = BridgeRoutePayload<"pastey-bridge-file-route/v1">;
-export type ControlBridgeRoutePayload = BridgeRoutePayload<"pastey-bridge-control-route/v1">;
+export type TextBridgeRoutePayload = BridgeRoutePayload<"pastey-bridge-text-route-v1">;
+export type FileBridgeRoutePayload = BridgeRoutePayload<"pastey-bridge-file-route-v1">;
+export type ControlBridgeRoutePayload = BridgeRoutePayload<"pastey-bridge-control-route-v1">;
 
 export type TextRoomSender = (
   roomId: string,
@@ -212,7 +212,7 @@ export async function sendTextToRoomWithBridgeRoute(
   explicitRoute?: BridgeRoute,
 ): Promise<RoomItem> {
   const route = deriveAuthoritativeDataRouteForRoom(room, "text", explicitRoute);
-  return sender(room.id, text, bridgeRoutePayload(route, "pastey-bridge-text-route/v1"));
+  return sender(room.id, text, bridgeRoutePayload(route, "pastey-bridge-text-route-v1"));
 }
 
 export async function sendFileToRoomWithBridgeRoute(
@@ -226,7 +226,7 @@ export async function sendFileToRoomWithBridgeRoute(
   const route = deriveAuthoritativeDataRouteForRoom(room, contentKind, explicitRoute);
   return sender(room.id, path, {
     ...options,
-    bridgeRoute: bridgeRoutePayload(route, "pastey-bridge-file-route/v1"),
+    bridgeRoute: bridgeRoutePayload(route, "pastey-bridge-file-route-v1"),
   });
 }
 

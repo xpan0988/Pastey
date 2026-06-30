@@ -31,7 +31,7 @@ export interface HelloPeerRequestConstraints {
 }
 
 export interface HelloPeerRequest {
-  schemaVersion: "pastey-capability-request/v1";
+  schemaVersion: "pastey-hello-peer-request-v1";
   requestId: string;
   nonce: string;
   createdAt: string;
@@ -156,7 +156,7 @@ export function buildHelloPeerRequestFromPendingAction(
   const nonce = options.nonce ?? createPreviewIdentifier("hello-peer-nonce", now);
   const sourceDeviceRef = options.sourceDeviceRef ?? "local-device-preview";
   const requestWithoutHash: Omit<HelloPeerRequest, "requestPayloadHash"> = {
-    schemaVersion: "pastey-capability-request/v1",
+    schemaVersion: "pastey-hello-peer-request-v1",
     requestId,
     nonce,
     createdAt,
@@ -208,8 +208,8 @@ export function validateHelloPeerRequest(
   for (const path of findUnsafeFieldPaths(value)) {
     errors.push(`Unsafe field is not allowed in Hello Peer request: ${path}.`);
   }
-  if (value.schemaVersion !== "pastey-capability-request/v1") {
-    errors.push("Hello Peer request schemaVersion must be pastey-capability-request/v1.");
+  if (value.schemaVersion !== "pastey-hello-peer-request-v1") {
+    errors.push("Hello Peer request schemaVersion must be pastey-hello-peer-request-v1.");
   }
   requireNonEmptyString(value.requestId, "requestId", errors);
   requireNonEmptyString(value.nonce, "nonce", errors);

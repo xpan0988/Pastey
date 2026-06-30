@@ -2,8 +2,7 @@ use std::process::Command;
 
 use crate::{
     diagnostics::{
-        CapabilitySource, DeviceCapabilities, DeviceProfile, GpuAcceleration, PowerState,
-        RuntimeCapability,
+        CapabilitySource, DeviceCapabilities, DeviceProfile, GpuAcceleration, RuntimeCapability,
     },
     storage,
 };
@@ -104,12 +103,10 @@ pub fn probe_device_capabilities_with_mode(
         gpu_names,
         vram_gb: None,
     };
-    let recommended_roles = recommended_roles(profile, &gpu_acceleration, &runtimes);
 
     DeviceCapabilities {
         runtimes,
         gpu_acceleration,
-        recommended_roles,
         updated_at: storage::now_ts(),
     }
 }
@@ -161,49 +158,10 @@ fn metal_available() -> bool {
     cfg!(target_os = "macos")
 }
 
-fn recommended_roles(
-    profile: &DeviceProfile,
-    gpu: &GpuAcceleration,
-    runtimes: &[RuntimeCapability],
-) -> Vec<String> {
-    let plugged_in = profile.power_state == PowerState::PluggedIn;
-    let on_battery = profile.power_state == PowerState::OnBattery;
-    let has_gpu = gpu.cuda_available || gpu.metal_available || !gpu.gpu_names.is_empty();
-    let high_ram = profile.memory_total_gb.unwrap_or(0) >= 32;
-    let has_build_tools = runtimes
-        .iter()
-        .any(|runtime| runtime.name == "rust/cargo" && runtime.available)
-        || runtimes
-            .iter()
-            .any(|runtime| runtime.name == "node" && runtime.available);
-
-    let mut roles = Vec::new();
-    if gpu.cuda_available && plugged_in && has_gpu {
-        roles.push("gpu_worker".to_string());
-    }
-    if high_ram && plugged_in {
-        roles.push("large_file_receiver".to_string());
-        if has_build_tools {
-            roles.push("build_machine".to_string());
-        }
-    }
-    if plugged_in && high_ram {
-        roles.push("storage_node".to_string());
-    }
-    if on_battery {
-        roles.push("mobile_input".to_string());
-        roles.push("approval_node".to_string());
-    }
-    if roles.is_empty() {
-        roles.push("approval_node".to_string());
-    }
-
-    roles
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::PowerState;
 
     fn profile(power_state: PowerState, memory_total_gb: Option<u64>) -> DeviceProfile {
         DeviceProfile {
@@ -260,9 +218,7 @@ mod tests {
         );
 
         assert!(capabilities.runtimes.is_empty());
-        assert!(capabilities
-            .recommended_roles
-            .contains(&"approval_node".to_string()));
+        assert_eq!(capabilities.gpu_acceleration.gpu_names, vec!["Apple GPU"]);
     }
 
     #[test]
@@ -282,39 +238,16 @@ mod tests {
     }
 
     #[test]
-    fn battery_devices_are_not_given_heavy_roles() {
+    fn capability_probe_returns_factual_capabilities() {
         let capabilities = probe_device_capabilities_with_mode(
-            &profile(PowerState::OnBattery, Some(24)),
+            &profile(PowerState::PluggedIn, Some(64)),
             CapabilityProbeMode::Full,
         );
 
-        assert!(capabilities
-            .recommended_roles
-            .contains(&"mobile_input".to_string()));
-        assert!(!capabilities
-            .recommended_roles
-            .contains(&"large_file_receiver".to_string()));
-    }
-
-    #[test]
-    fn high_ram_plugged_device_can_receive_large_files() {
-        let roles = recommended_roles(
-            &profile(PowerState::PluggedIn, Some(64)),
-            &GpuAcceleration {
-                cuda_available: false,
-                metal_available: false,
-                gpu_names: Vec::new(),
-                vram_gb: None,
-            },
-            &[RuntimeCapability {
-                name: "node".into(),
-                available: true,
-                version: Some("v24.0.0".into()),
-                source: CapabilitySource::Command,
-            }],
+        assert_eq!(
+            capabilities.gpu_acceleration.metal_available,
+            cfg!(target_os = "macos")
         );
-
-        assert!(roles.contains(&"large_file_receiver".to_string()));
-        assert!(roles.contains(&"build_machine".to_string()));
+        assert!(capabilities.updated_at > 0);
     }
 }

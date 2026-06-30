@@ -16,12 +16,12 @@ Provider output is always untrusted advisory data. It must pass host-side valida
 The current provider allowlist is backed by the static capability registry in `src/lib/ai/capabilityRegistry.ts`. It may propose only these bounded advisory actions:
 
 - `request_peer_hello_demo` for `runtime.execute_hello_template`;
-- `request_peer_hello_stdout_demo` for `runtime.hello_stdout/v1`;
-- `request_peer_file_candidates` for `filesystem.find_file_candidates/v1`.
+- `request_peer_hello_stdout_demo` for `runtime.hello_stdout`;
+- `request_peer_file_candidates` for `filesystem.find_file_candidates`.
 
 Provider output may identify the selected peer, registered capability, fixed message or filename hint, and fixed constraints. It must not include command text, script text, runtime arguments, environment variables, file paths, current working directories, network targets, stdout/stderr/exit values, file contents, hidden transfer requests, selected-peers/broadcast intent, durable trust claims, or execution request/result payloads. The host builds those payloads after validation and consent.
 
-For `filesystem.find_file_candidates/v1`, provider output is only an advisory proposal for bounded candidate metadata discovery. It cannot by itself cause local or peer filesystem traversal, cannot return real candidates, cannot provide real paths, and cannot start a transfer. The host may build a selected-peer preview only after validation and local confirmation; the receiver may run the bounded metadata search only after explicit Allow once.
+For `filesystem.find_file_candidates`, provider output is only an advisory proposal for bounded candidate metadata discovery. It cannot by itself cause local or peer filesystem traversal, cannot return real candidates, cannot provide real paths, and cannot start a transfer. The host may build a selected-peer preview only after validation and local confirmation; the receiver may run the bounded metadata search only after explicit Allow once.
 
 ## Context Controls
 

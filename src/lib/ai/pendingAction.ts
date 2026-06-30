@@ -74,7 +74,7 @@ export function buildPendingAiActionCanonicalPayload(
   expiresAt: string
 ): PendingAiActionCanonicalPayload {
   const contract = getAgentBridgeCapabilityContractByActionKind(plan.kind);
-  if (plan.schemaVersion !== "ai-action-plan/v1" || !contract) {
+  if (plan.schemaVersion !== "ai-action-plan-v1" || !contract) {
     throw new Error("Pending AI action supports only validated Agent Bridge capability advisories.");
   }
   if (contract.providerInputShape === "file_candidate_advisory") {

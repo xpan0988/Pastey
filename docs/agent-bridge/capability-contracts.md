@@ -1,14 +1,14 @@
 # Capability Contracts
 
-This document owns the current Layer 5 capability contract for Pastey Agent Bridge. For the broader safety architecture, see [architecture-and-safety.md](architecture-and-safety.md). For transport details, see [room-control-transport.md](room-control-transport.md). For Bridge membership and peer terminology, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For target routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md).
+This document owns the current Layer 5 capability contract for Pastey Agent Bridge. For the broader safety architecture, see [architecture-and-safety.md](architecture-and-safety.md). For transport details, see [room-control-transport.md](room-control-transport.md). For Bridge membership and peer terminology, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For target routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md). For capability IDs, schema versions, provider action kinds, executor kinds, and future capability naming, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md).
 
 ## Implemented Capabilities
 
 The implemented capabilities are fixed, host-owned bounded capabilities:
 
 - `runtime.execute_hello_template`, the legacy fixed Hello Peer template;
-- `runtime.hello_stdout/v1`, a fixed Hello Stdout capability backed by a Rust host helper;
-- `filesystem.find_file_candidates/v1`, a receiver-side metadata-only file-candidate search over approved local scope labels.
+- `runtime.hello_stdout`, a fixed Hello Stdout capability backed by a Rust host helper;
+- `filesystem.find_file_candidates`, a receiver-side metadata-only file-candidate search over approved local scope labels.
 
 They use:
 
@@ -26,9 +26,9 @@ They do not execute model-authored code, shell commands, arbitrary process opera
 
 `runtime.execute_hello_template` returns the exact fixed Hello Peer result `hello peer!`.
 
-`runtime.hello_stdout/v1` asks the receiver to run a host-owned Rust helper that returns typed stdout metadata. Its successful result must contain:
+`runtime.hello_stdout` asks the receiver to run a host-owned Rust helper that returns typed stdout metadata. Its successful result must contain:
 
-- `capability: runtime.hello_stdout/v1`;
+- `capability: runtime.hello_stdout`;
 - `runtimeKind: rust_host_helper`;
 - `stdout: hello peer`;
 - empty `stderr`;
@@ -55,19 +55,19 @@ Each registry entry defines:
 
 The registry is used to keep provider validation, PolicyGate, pending action hashing, preview dispatch, room-control event dispatch, consent binding, and UI labels aligned. It does not replace capability-specific schemas or validators. Unknown capability ids, unknown versions, and unknown schema names reject fail-closed.
 
-The shared lifecycle envelope schema is `pastey-agent-bridge-capability-envelope/v1`. It is a compatibility view over the existing typed preview/control payloads and includes capability id/version, request id, room/source/target refs, selected-peer route policy, exact allow-once consent policy, created/expiry times, payload hash, typed payload, and bounded room-control transport metadata. Existing payload schemas remain capability-specific.
+The shared lifecycle envelope schema is `pastey-agent-bridge-capability-envelope-v1`. It is a compatibility view over the existing typed preview/control payloads and includes capability id/version, request id, room/source/target refs, selected-peer route policy, exact allow-once consent policy, created/expiry times, payload hash, typed payload, and bounded room-control transport metadata. Existing payload schemas remain capability-specific.
 
-## Workspace Capability: `filesystem.find_file_candidates/v1`
+## Workspace Capability: `filesystem.find_file_candidates`
 
-`filesystem.find_file_candidates/v1` is the first implemented read-only workspace capability. It lets a sender ask one selected peer to search approved receiver-local scope labels for filename/metadata matches. It returns a bounded list of redacted candidate metadata only.
+`filesystem.find_file_candidates` is the first implemented read-only workspace capability. It lets a sender ask one selected peer to search approved receiver-local scope labels for filename/metadata matches. It returns a bounded list of redacted candidate metadata only.
 
-The user intent is: help find a file named `xxx` on another device and send it back. The implemented capability covers candidate discovery only. A later file transfer requires a separate approved capability, such as a future `filesystem.prepare_file_transfer/v1`, and must require separate explicit consent. Search consent does not authorize file transfer.
+The user intent is: help find a file named `xxx` on another device and send it back. The implemented capability covers candidate discovery only. A later candidate-payload transfer requires a separate approved capability, likely named `transfer.request_candidate_payload`, and must require separate explicit consent. Search consent does not authorize payload transfer.
 
 The advisory action kind is `request_peer_file_candidates`. Provider output must use this shape:
 
 ```json
 {
-  "schemaVersion": "ai-action-plan/v1",
+  "schemaVersion": "ai-action-plan-v1",
   "kind": "request_peer_file_candidates",
   "title": "Find file candidates on the selected peer",
   "explanation": "Search the selected peer for filename or metadata matches and return a bounded candidate list. No file contents will be read and no file will be sent automatically.",
@@ -75,7 +75,7 @@ The advisory action kind is `request_peer_file_candidates`. Provider output must
   "requiresUserConfirmation": true,
   "references": [{ "kind": "peer", "ref": "selected-peer-ref" }],
   "proposedInput": {
-    "capability": "filesystem.find_file_candidates/v1",
+    "capability": "filesystem.find_file_candidates",
     "targetPeerRef": "selected-peer-ref",
     "query": {
       "rawUserRequest": "help me find a file named xxx and send it to me",
@@ -107,10 +107,10 @@ The advisory action kind is `request_peer_file_candidates`. Provider output must
 
 Current host validation requires:
 
-- `schemaVersion: ai-action-plan/v1`;
+- `schemaVersion: ai-action-plan-v1`;
 - `kind: request_peer_file_candidates`;
 - `requiresUserConfirmation: true`;
-- `capability: filesystem.find_file_candidates/v1`;
+- `capability: filesystem.find_file_candidates`;
 - one selected `targetPeerRef`;
 - `searchMode: filename_metadata_only`;
 - `allowedScopes` drawn only from `downloads`, `desktop`, `documents`, and `pastey_shared`;
@@ -134,10 +134,10 @@ The host-built preview and receiver result contracts preserve these additional b
 
 The capability-specific schemas are:
 
-- preview request: `filesystem-find-file-candidates-request/v1`;
-- consent grant: `filesystem-find-file-candidates-consent-grant/v1`;
-- execution request: `filesystem-find-file-candidates-execution-request/v1`;
-- execution result: `filesystem-find-file-candidates-result/v1`.
+- preview request: `filesystem-find-file-candidates-request-v1`;
+- consent grant: `filesystem-find-file-candidates-consent-grant-v1`;
+- execution request: `filesystem-find-file-candidates-execution-request-v1`;
+- execution result: `filesystem-find-file-candidates-result-v1`.
 
 The execution request is host-built after a matched allow-once acknowledgement. It carries the validated query, scope labels, limits, selected-peer route policy, consent policy, and payload hash. It does not carry real paths, shell commands, scripts, environment variables, runtime arguments, file contents, or transfer instructions.
 
@@ -152,8 +152,8 @@ Unavailable scopes are skipped and reported in `scopesSkipped`. `pastey_shared` 
 
 The result contains:
 
-- `schemaVersion: filesystem-find-file-candidates-result/v1`;
-- `capability: filesystem.find_file_candidates/v1`;
+- `schemaVersion: filesystem-find-file-candidates-result-v1`;
+- `capability: filesystem.find_file_candidates`;
 - `requestId`;
 - `status`;
 - `queryEcho`;
@@ -203,8 +203,8 @@ The sender can queue an execution request only after a matched allow-once acknow
 The current executors are:
 
 - `runtime.execute_hello_template`, which returns exactly the fixed Hello Peer result;
-- `runtime.hello_stdout/v1`, which calls the Tauri `execute_hello_stdout_capability` command and returns typed stdout/stderr/exit metadata from a host-owned Rust helper.
-- `filesystem.find_file_candidates/v1`, which calls the Tauri `execute_file_candidate_search_capability` command and returns bounded redacted file metadata candidates from a host-owned Rust executor.
+- `runtime.hello_stdout`, which calls the Tauri `execute_hello_stdout_capability` command and returns typed stdout/stderr/exit metadata from a host-owned Rust helper.
+- `filesystem.find_file_candidates`, which calls the Tauri `execute_file_candidate_search_capability` command and returns bounded redacted file metadata candidates from a host-owned Rust executor.
 
 No executor accepts command text, script text, runtime arguments, arbitrary file paths, environment variables, network targets, shell interpolation, or model-authored execution material. The file-candidate executor accepts only validated safe scope labels and bounded metadata-search limits; it never reads file contents and never starts a transfer.
 

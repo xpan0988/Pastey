@@ -4,6 +4,8 @@ This directory contains source-controlled manifests for deterministic local tran
 
 For the full transfer validation workflow, including single-machine dual-instance launch, sender log identification, and log summary extraction, see [../../../docs/transfer/validation.md](../../../docs/transfer/validation.md).
 
+These fixtures are not the file-candidate search corpus. `filesystem.find_file_candidates` uses the tiny filename/depth/redaction corpus in `tests/fixtures/file-candidates/`.
+
 ## Generate Payload Files
 
 Run from the repo root:

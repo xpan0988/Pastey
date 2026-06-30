@@ -4,6 +4,8 @@ This document is the canonical definition of Pastey's project layout and layer b
 
 It is both the architecture contract and the completion-scoring standard for Pastey. Source code is the primary evidence. Tests, automated harnesses, current documentation, runtime paths, and recorded manual smoke results are supporting evidence.
 
+For architecture, schema, protocol, Agent Bridge capability, provider action, executor, and future capability naming rules, see [naming-conventions.md](naming-conventions.md).
+
 ## Purpose And Authority
 
 Use this document to decide:
@@ -18,7 +20,7 @@ Non-canonical documents should link here instead of restating the five-layer mod
 
 ## Boundary Invariants
 
-- Device recommendation != scheduler command.
+- Device facts != scheduler command.
 - Encrypted session != durable device identity.
 - Accepted Bridge peer != durable trusted device.
 - Bridge membership != execution authority.
@@ -36,7 +38,7 @@ These are product constraints, not style preferences. Ambiguity should fail clos
 | Layer | Canonical definition |
 | --- | --- |
 | Layer 1 - Secure LAN transport | Moves data securely and reliably over the LAN. |
-| Layer 2 - Device intelligence | Observes, describes, and recommends based on current-session device and link conditions. It is advisory-first and is not required to take automatic control of Layer 3. |
+| Layer 2 - Device intelligence | Observes and describes current-session device, capability, liveness, local endpoint/provider availability, and benchmark facts. It does not rank peers, recommend devices, or produce scheduler preferences. |
 | Layer 3 - Smart orchestration | Plans and schedules data/control work, allocates runtime capacity, manages MicroFlowGroup behavior, and performs hot runtime-window adjustment. |
 | Layer 4 - Multi-device Bridge sessions and peer identity | Owns current-session Bridge membership, selected-peer routing, selected-peers routing, broadcast routing, current-session provenance, replay boundaries, reconnect semantics, and current-session control-plane delivery. Future optional durable identity is a separate concern. Bridge membership never equals execution authority or reusable trust. |
 | Layer 5 - Agent-assisted device workspace | Owns model-assisted planning, host validation, PolicyGate, explicit consent, bounded capability execution, result orchestration, and audit. The model proposes; the host validates; the user authorizes; a bounded executor acts. |
@@ -74,23 +76,22 @@ Completion criteria:
 Responsibilities:
 
 - Observe the current device and current-session link conditions.
-- Describe capability and benchmark facts in an explainable way.
-- Recommend advisory roles or planning hints.
+- Describe capability, liveness, endpoint availability, and benchmark facts in an explainable way.
 - Keep device intelligence local-first and current-session unless a future durable profile is explicitly designed.
 
 Non-responsibilities:
 
 - Directly commanding the scheduler.
+- Producing planner hints, scheduler preferences, peer rankings, best-device suggestions, or user coaching.
 - Granting trust, authority, or execution permission.
 - Hidden long-term profiling.
 - Replacing Layer 3 planning decisions.
 
 Completion criteria:
 
-- `DeviceProfile`, `DeviceCapabilities`, `LinkBenchmark`, and recommended-role hints exist in production runtime.
+- `DeviceProfile`, `DeviceCapabilities`, and `LinkBenchmark` facts exist in production runtime.
 - Current-session observations are visible or explainable to the user.
-- Recommendations are advisory and do not imply authority.
-- If Layer 3 consumes hints later, that consumption is explicit, bounded, and test-covered.
+- Layer 2 data remains factual and is not consumed as a scheduler command.
 
 ### Layer 3 - Smart Orchestration
 
@@ -175,9 +176,9 @@ Completion criteria:
 
 | From | Depends on | Rule |
 | --- | --- | --- |
-| Layer 2 | Layer 1 | Benchmarks and peer observations may use transport paths, but recommendations remain advisory. |
+| Layer 2 | Layer 1 | Benchmarks and peer observations may use transport paths, but Layer 2 outputs remain factual. |
 | Layer 3 | Layer 1 | Scheduler capacity maps onto real binary-v1 runtime sender windows. |
-| Layer 3 | Layer 2 | Layer 3 may use Layer 2 hints only through explicit planning policy; current completion does not require automatic control. |
+| Layer 3 | Layer 2 | Layer 3 may observe factual Layer 2 measurements, but scheduler policy is owned by Layer 3 and does not obey Layer 2 recommendations. |
 | Layer 4 | Layer 1 | Bridge sessions, route delivery, and control events require encrypted session transport but must not call that durable identity. |
 | Layer 5 | Layer 4 | Capability transport and consent are Bridge-scoped and must bind to an exact selected peer/session/request. Accepted Bridge membership alone never authorizes execution. |
 | Layer 5 | Layer 3 | Agent/control work may reserve runtime capacity; execution authority still comes from Layer 5 consent. |
@@ -199,7 +200,7 @@ These scores are against the canonical definitions in this document, not against
 | Layer | Canonical completion | Implemented-scope maturity | Status label | Confidence | Main remaining gaps |
 | --- | ---: | ---: | --- | --- | --- |
 | Layer 1 - Secure LAN transport | 86% | 90% | Mature operational core | High | Durable identity, broader release/two-device validation, independent security review, whole-file hash contract |
-| Layer 2 - Device intelligence | 76% | 82% | Advisory diagnostics implemented; recommendation UX partial | High | User-visible recommended roles, peer benchmark UI, explicit planner-hint contract if consumed later, broader device matrix |
+| Layer 2 - Device intelligence | 74% | 84% | Factual diagnostics and capability facts implemented | High | Broader device matrix, peer benchmark UI, local provider availability facts if surfaced later |
 | Layer 3 - Smart orchestration | 84% | 88% | Operational orchestration core | High | Deficit/history-aware adaptation, broader end-to-end contention validation, future capability-routing policy |
 | Layer 4 - Multi-device Bridge sessions and peer identity | 72% | 86% | Session-scoped Bridge routing/control core | High | Full cryptographic paired-key rotation, durable route recovery if explicitly designed, broader release/two-device validation, independent security review |
 | Layer 5 - Agent-assisted device workspace | 60% | 84% | Narrow capability slice plus read-only workspace search | High | Approved transfer handoff, broad capability coverage, multi-step task orchestration, local LLM scheduling, MCP/tool integration, durable peer-identity dependency if needed |
@@ -268,9 +269,9 @@ Duplicated definitions in non-canonical documents should be replaced with links 
 Use the highest layer that owns the product responsibility:
 
 - New frame formats, encryption, discovery, transfer recovery, or sender window primitives belong to Layer 1.
-- New current-session observations, benchmarks, capability summaries, or advisory recommendations belong to Layer 2.
+- New current-session observations, benchmarks, capability summaries, liveness facts, or endpoint/provider availability facts belong to Layer 2.
 - New queue, capacity, fairness, MicroFlowGroup, or runtime-window policies belong to Layer 3.
 - New current-session accepted-peer collections, BridgeTarget/BridgeRoute behavior, selected-peer routing, selected-peers routing, broadcast routing, current-session provenance, replay boundaries, reconnect, explicit export, or cross-session record semantics belong to Layer 4. Future durable peer identity also belongs to Layer 4, but only as a separate explicit durable identity system.
 - New model planning, validation, PolicyGate, consent, capability execution, result orchestration, or audit behavior belongs to Layer 5.
 
-When a feature crosses layers, document both the owner and the dependency. For example, a future "choose best peer for execution" feature would need Layer 2 observations, Layer 3 planning, Layer 4 identity/routing, and Layer 5 consent/execution, but Layer 5 would still own execution authority.
+When a feature crosses layers, document both the owner and the dependency. For example, a future "choose best peer for execution" feature would need Layer 2 factual observations, Layer 3 planning policy, Layer 4 identity/routing, and Layer 5 consent/execution, but Layer 2 would still not produce the recommendation and Layer 5 would still own execution authority.
