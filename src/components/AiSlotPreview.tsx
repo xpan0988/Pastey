@@ -4,6 +4,7 @@ import {
   CLOUD_STRICT_AI_CONTEXT_POLICY,
   MOCK_AI_CONTEXT_POLICY,
   acknowledgeCapabilityPreview,
+  buildCandidatePayloadRequestFromPendingAction,
   buildCapabilityRequestPreviewEnvelope,
   buildFileCandidateRequestFromPendingAction,
   buildHelloPeerRequestFromPendingAction,
@@ -20,6 +21,7 @@ import {
   markCapabilityPreviewReceived,
   mockProvider,
   validateAiActionPlan,
+  validateCandidatePayloadRequest,
   validateCapabilityRequestPreviewEnvelope,
   validateFileCandidateRequest,
   validateHelloPeerRequest,
@@ -40,6 +42,7 @@ import {
   useAgentBridgeRuntimeConfig,
 } from "../lib/agentBridge";
 import type { RoomInfo } from "../lib/types";
+import type { TransferQueueInput } from "../lib/transferScheduler";
 
 interface AiSlotPreviewResult {
   provider: string;
@@ -63,7 +66,13 @@ interface CapabilityEnvelopePreviewState {
   errors: string[];
 }
 
-export function AiSlotPreview({ room }: { room: RoomInfo }) {
+export function AiSlotPreview({
+  room,
+  onEnqueueCandidatePayloadHandoff,
+}: {
+  room: RoomInfo;
+  onEnqueueCandidatePayloadHandoff?: (input: TransferQueueInput) => boolean;
+}) {
   const [result, setResult] = useState<AiSlotPreviewResult | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingAiAction | null>(null);
   const [outboundPreview, setOutboundPreview] = useState<HelloPeerOutboundPreviewState | null>(null);
@@ -201,7 +210,9 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
 
   function buildOutboundRequestPreview() {
     if (!pendingAction) return;
-    const buildResult = pendingAction.actionPlan.kind === "request_peer_file_candidates"
+    const buildResult = pendingAction.actionPlan.kind === "request_peer_candidate_payload"
+      ? buildCandidatePayloadRequestFromPendingAction(pendingAction)
+      : pendingAction.actionPlan.kind === "request_peer_file_candidates"
       ? buildFileCandidateRequestFromPendingAction(pendingAction)
       : pendingAction.actionPlan.kind === "request_peer_hello_stdout_demo"
         ? buildHelloStdoutRequestFromPendingAction(pendingAction)
@@ -213,7 +224,9 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
       });
       return;
     }
-    const validation = buildResult.request.capability === "filesystem.find_file_candidates"
+    const validation = buildResult.request.capability === "transfer.request_candidate_payload"
+      ? validateCandidatePayloadRequest(buildResult.request)
+      : buildResult.request.capability === "filesystem.find_file_candidates"
       ? validateFileCandidateRequest(buildResult.request)
       : buildResult.request.capability === "runtime.hello_stdout"
         ? validateHelloStdoutRequest(buildResult.request)
@@ -353,7 +366,11 @@ export function AiSlotPreview({ room }: { room: RoomInfo }) {
           secondaryActionLabel={nextAction.secondaryLabel}
           onSecondaryAction={nextAction.onSecondaryAction}
         />
-        <RoomControlPanel room={room} envelope={envelopePreview?.envelope} />
+        <RoomControlPanel
+          room={room}
+          envelope={envelopePreview?.envelope}
+          onEnqueueCandidatePayloadHandoff={onEnqueueCandidatePayloadHandoff}
+        />
         <AgentBridgeAdvancedDiagnostics>
           {result ? (
             <>
@@ -624,7 +641,9 @@ function HelloPeerOutboundPreview({
   onBuild: () => void;
 }) {
   const request = preview?.request;
-  const title = request?.capability === "filesystem.find_file_candidates"
+  const title = request?.capability === "transfer.request_candidate_payload"
+    ? "Candidate payload request preview"
+    : request?.capability === "filesystem.find_file_candidates"
     ? "File candidate outbound request preview"
     : request?.capability === "runtime.hello_stdout"
       ? "Hello Stdout outbound request preview"
@@ -670,6 +689,7 @@ function HelloPeerOutboundPreview({
             {"message" in request.input ? <PreviewBlock title="Message" value={request.input.message} /> : null}
             {"expectedStdout" in request.input ? <PreviewBlock title="Expected stdout" value={request.input.expectedStdout} /> : null}
             {"query" in request.input ? <PreviewBlock title="Filename hint" value={request.input.query.filenameHint} /> : null}
+            {"candidateId" in request.input ? <PreviewBlock title="Candidate" value={request.input.candidateDisplayName} /> : null}
             <PreviewBlock title="Pending payload hash" value={request.pendingPayloadHash} />
             <PreviewBlock title="Request payload hash" value={request.requestPayloadHash} />
             <PreviewBlock title="Transport status" value={request.transportStatus} />
@@ -687,6 +707,17 @@ function HelloPeerOutboundPreview({
 function requestBounds(request: CapabilityRequest): unknown {
   if ("constraints" in request) {
     return request.constraints;
+  }
+  if ("candidateId" in request.input) {
+    return {
+      sourceCapability: request.input.sourceCapability,
+      sourceRequestId: request.input.sourceRequestId,
+      candidateId: request.input.candidateId,
+      candidateKind: request.input.candidateKind,
+      metadataOnly: true,
+      noPathAuthority: true,
+      noAutoTransfer: true,
+    };
   }
   return {
     query: request.input.query,

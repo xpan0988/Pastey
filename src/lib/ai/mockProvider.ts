@@ -108,6 +108,35 @@ export function buildMockFileCandidatePlan(): AiActionPlan {
   };
 }
 
+export function buildMockCandidatePayloadPlan(): AiActionPlan {
+  return {
+    schemaVersion: "ai-action-plan-v1",
+    kind: "request_peer_candidate_payload",
+    title: "Request selected candidate payload",
+    explanation: "Ask the selected peer for a second explicit consent decision for one previously discovered file candidate. This does not send bytes or queue a transfer.",
+    confidence: "medium",
+    requiresUserConfirmation: true,
+    references: [
+      { kind: "peer", ref: "mock-peer-1" },
+      { kind: "transfer", ref: "file-candidate-request" }
+    ],
+    proposedInput: {
+      capability: "transfer.request_candidate_payload",
+      targetPeerRef: "mock-peer-1",
+      sourceCapability: "filesystem.find_file_candidates",
+      sourceRequestId: "file-candidate-request",
+      candidateId: "file-candidate-request-opaque-1",
+      candidateDisplayName: "exact-target.pdf",
+      candidateKind: "filesystem_file",
+      redactedLocation: "Pastey Shared/exact-target.pdf",
+      sizeBytes: 21,
+      modifiedAt: "2026-06-29T00:00:20.000Z",
+      mimeFamily: "document",
+      extension: "pdf"
+    }
+  };
+}
+
 export class MockProvider implements AiProvider {
   readonly config = MOCK_AI_PROVIDER_CONFIG;
 

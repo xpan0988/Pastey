@@ -1,5 +1,6 @@
 import { isRecord } from "../ai/actionPlanValidator";
 import {
+  CANDIDATE_PAYLOAD_CAPABILITY,
   FILE_CANDIDATES_CAPABILITY,
   getAgentBridgeCapabilityContract,
   HELLO_STDOUT_CAPABILITY,
@@ -8,6 +9,7 @@ import {
   HELLO_TEMPLATE_MESSAGE,
   type AgentBridgeCapabilityContract
 } from "../ai/capabilityRegistry";
+import { validateCandidatePayloadRequestInput } from "../ai/candidatePayloadAdvisory";
 import { validateFileCandidateAdvisoryInput } from "../ai/fileCandidateAdvisory";
 import {
   buildCapabilityPreviewStatusControlEvent,
@@ -15,6 +17,7 @@ import {
   type CapabilityPreviewRoomControlEvent,
   type CapabilityPreviewStatusRoomControlEvent,
   type CapabilityConsentGrant,
+  type CandidatePayloadConsentGrant,
   type FileCandidateConsentGrant,
   type HelloPeerConsentGrant,
   type HelloStdoutConsentGrant,
@@ -60,7 +63,20 @@ export interface FileCandidateConsentBinding extends PeerConsentBindingBase {
   readonly searchMode: "filename_metadata_only";
 }
 
-export type PeerConsentBinding = HelloPeerConsentBinding | HelloStdoutConsentBinding | FileCandidateConsentBinding;
+export interface CandidatePayloadConsentBinding extends PeerConsentBindingBase {
+  readonly capability: "transfer.request_candidate_payload";
+  readonly sourceCapability: "filesystem.find_file_candidates";
+  readonly sourceRequestId: string;
+  readonly candidateId: string;
+  readonly candidateKind: "filesystem_file";
+  readonly candidateDisplayName: string;
+}
+
+export type PeerConsentBinding =
+  | HelloPeerConsentBinding
+  | HelloStdoutConsentBinding
+  | FileCandidateConsentBinding
+  | CandidatePayloadConsentBinding;
 
 export interface PeerConsentRecord {
   readonly binding: PeerConsentBinding;
@@ -156,6 +172,26 @@ const FILE_CANDIDATE_BINDING_FIELDS = [
   "createdAt",
   "expiresAt",
 ];
+const CANDIDATE_PAYLOAD_BINDING_FIELDS = [
+  "schemaVersion",
+  "consentId",
+  "sourceEventId",
+  "envelopeId",
+  "requestId",
+  "requestPayloadHash",
+  "roomRef",
+  "sourceDeviceRef",
+  "targetPeerRef",
+  "capability",
+  "sourceCapability",
+  "sourceRequestId",
+  "candidateId",
+  "candidateKind",
+  "candidateDisplayName",
+  "previewOnly",
+  "createdAt",
+  "expiresAt",
+];
 let consentSequence = 0;
 
 export function createPeerConsentSessionState(): PeerConsentSessionState {
@@ -198,6 +234,7 @@ export function evaluatePeerCapabilityPreview(
   const preview = validation.value;
   const request = preview.payload.request;
   const fileCandidateRequest = request.capability === FILE_CANDIDATES_CAPABILITY ? request : null;
+  const candidatePayloadRequest = request.capability === CANDIDATE_PAYLOAD_CAPABILITY ? request : null;
   const errors: string[] = [];
   const contract = getAgentBridgeCapabilityContract(request.capability);
   if (!contract) {
@@ -264,7 +301,17 @@ export function evaluatePeerCapabilityPreview(
     expiresAt: new Date(expiresAtMs).toISOString(),
   } as const;
   const binding: PeerConsentBinding = Object.freeze(
-    contract.capability === FILE_CANDIDATES_CAPABILITY && fileCandidateRequest
+    contract.capability === CANDIDATE_PAYLOAD_CAPABILITY && candidatePayloadRequest
+      ? {
+          ...baseBinding,
+          capability: CANDIDATE_PAYLOAD_CAPABILITY,
+          sourceCapability: candidatePayloadRequest.input.sourceCapability,
+          sourceRequestId: candidatePayloadRequest.input.sourceRequestId,
+          candidateId: candidatePayloadRequest.input.candidateId,
+          candidateKind: candidatePayloadRequest.input.candidateKind,
+          candidateDisplayName: candidatePayloadRequest.input.candidateDisplayName,
+        }
+      : contract.capability === FILE_CANDIDATES_CAPABILITY && fileCandidateRequest
       ? {
           ...baseBinding,
           capability: FILE_CANDIDATES_CAPABILITY,
@@ -426,6 +473,19 @@ function consentGrantFromRecord(record: PeerConsentRecord): CapabilityConsentGra
     };
     return grant;
   }
+  if (record.binding.capability === CANDIDATE_PAYLOAD_CAPABILITY) {
+    const grant: CandidatePayloadConsentGrant = {
+      ...base,
+      schemaVersion: "transfer-request-candidate-payload-consent-grant-v1",
+      capability: CANDIDATE_PAYLOAD_CAPABILITY,
+      sourceCapability: record.binding.sourceCapability,
+      sourceRequestId: record.binding.sourceRequestId,
+      candidateId: record.binding.candidateId,
+      candidateKind: record.binding.candidateKind,
+      candidateDisplayName: record.binding.candidateDisplayName,
+    };
+    return grant;
+  }
   const grant: HelloPeerConsentGrant = {
     ...base,
     schemaVersion: "pastey-hello-peer-consent-grant-v1",
@@ -513,9 +573,16 @@ function validatePeerConsentBinding(value: unknown, now: Date): string[] {
   }
   const isHelloStdout = value.capability === HELLO_STDOUT_CAPABILITY;
   const isFileCandidate = value.capability === FILE_CANDIDATES_CAPABILITY;
+  const isCandidatePayload = value.capability === CANDIDATE_PAYLOAD_CAPABILITY;
   requireExactFields(
     value,
-    isFileCandidate ? FILE_CANDIDATE_BINDING_FIELDS : isHelloStdout ? HELLO_STDOUT_BINDING_FIELDS : BINDING_FIELDS,
+    isCandidatePayload
+      ? CANDIDATE_PAYLOAD_BINDING_FIELDS
+      : isFileCandidate
+        ? FILE_CANDIDATE_BINDING_FIELDS
+        : isHelloStdout
+          ? HELLO_STDOUT_BINDING_FIELDS
+          : BINDING_FIELDS,
     [],
     "Peer consent binding",
     errors
@@ -535,7 +602,20 @@ function validatePeerConsentBinding(value: unknown, now: Date): string[] {
   ]) {
     requireBoundedString(value[field], field, errors);
   }
-  if (isFileCandidate) {
+  if (isCandidatePayload) {
+    if (value.sourceCapability !== FILE_CANDIDATES_CAPABILITY) {
+      errors.push(`Peer consent candidate payload sourceCapability must be exactly ${FILE_CANDIDATES_CAPABILITY}.`);
+    }
+    if (value.candidateKind !== "filesystem_file") {
+      errors.push("Peer consent candidate payload candidateKind must be filesystem_file.");
+    }
+    for (const field of ["sourceRequestId", "candidateId", "candidateDisplayName"]) {
+      requireBoundedString(value[field], field, errors);
+    }
+    if (typeof value.candidateId === "string" && looksLikePath(value.candidateId)) {
+      errors.push("Peer consent candidate payload candidateId must be opaque and not path-like.");
+    }
+  } else if (isFileCandidate) {
     if (value.filenameHint === undefined || typeof value.filenameHint !== "string" || value.filenameHint.trim().length === 0 || value.filenameHint.length > 128) {
       errors.push("Peer consent file candidate filenameHint must be bounded.");
     }
@@ -576,6 +656,9 @@ function requestInputMatchesContract(
   if (contract.capability === FILE_CANDIDATES_CAPABILITY) {
     return validateFileCandidateAdvisoryInput(input).valid;
   }
+  if (contract.capability === CANDIDATE_PAYLOAD_CAPABILITY) {
+    return validateCandidatePayloadRequestInput(input).valid;
+  }
   if (contract.typedBindingField === "exactMessage") {
     return input.message === contract.typedBindingValue;
   }
@@ -609,6 +692,10 @@ function requireDate(value: unknown, label: string, errors: string[]) {
 
 function stableBinding(value: unknown): string {
   return JSON.stringify(value, Object.keys(isRecord(value) ? value : {}).sort());
+}
+
+function looksLikePath(value: string): boolean {
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) || value.includes("/") || value.includes("\\");
 }
 
 function createConsentId(now: Date): string {

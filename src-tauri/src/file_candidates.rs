@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     time::Instant,
@@ -25,6 +25,11 @@ const MAX_CANDIDATES: usize = 20;
 const MIN_SEARCH_MS: u64 = 500;
 const MAX_SEARCH_MS: u64 = 10_000;
 const MAX_DEPTH: u8 = 8;
+const CANDIDATE_PAYLOAD_REQUEST_SCHEMA: &str =
+    "transfer-request-candidate-payload-execution-request-v1";
+const CANDIDATE_PAYLOAD_CAPABILITY: &str = "transfer.request_candidate_payload";
+const CANDIDATE_PAYLOAD_EXECUTOR_KIND: &str = "transfer_candidate_payload_host";
+const CANDIDATE_PAYLOAD_STORE_TTL_SECONDS: i64 = 10 * 60;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -149,10 +154,125 @@ struct SearchScope {
     root: PathBuf,
 }
 
-pub fn execute_file_candidate_search(
+#[derive(Clone, Debug)]
+struct DiscoveredFileCandidate {
+    public: FileCandidateMetadata,
+    local_path: PathBuf,
+    scope_root: PathBuf,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct CandidatePayloadStoreKey {
+    pub source_capability: String,
+    pub source_request_id: String,
+    pub candidate_id: String,
+    pub candidate_kind: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CandidatePayloadStoreEntry {
+    local_path: PathBuf,
+    scope_root: PathBuf,
+    display_name: String,
+    size_bytes: u64,
+    modified_at: String,
+    extension: String,
+    mime_family: String,
+    _redacted_location: String,
+    _discovered_at: String,
+    expires_at: String,
+    source_request_id: String,
+    candidate_id: String,
+    candidate_kind: String,
+    room_ref: String,
+    source_device_ref: String,
+    target_peer_ref: String,
+}
+
+#[derive(Default)]
+pub struct CandidatePayloadStore {
+    entries: HashMap<CandidatePayloadStoreKey, CandidatePayloadStoreEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidatePayloadExecutionRequest {
+    pub schema_version: String,
+    pub execution_id: String,
+    pub consent_id: String,
+    pub source_preview_event_id: String,
+    pub envelope_id: String,
+    pub request_id: String,
+    pub request_payload_hash: String,
+    pub room_ref: String,
+    pub source_device_ref: String,
+    pub target_peer_ref: String,
+    pub capability: String,
+    pub executor_kind: String,
+    pub source_capability: String,
+    pub source_request_id: String,
+    pub candidate_id: String,
+    pub candidate_kind: String,
+    pub candidate_display_name: String,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidatePayloadResolution {
+    pub source_capability: String,
+    pub source_request_id: String,
+    pub candidate_id: String,
+    pub candidate_kind: String,
+    pub resolved: bool,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidatePayloadLocalResolution {
+    #[serde(flatten)]
+    pub resolution: CandidatePayloadResolution,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_local_source: Option<String>,
+}
+
+#[cfg(test)]
+fn execute_file_candidate_search(
     request: FileCandidateExecutionRequest,
     paths: &AppPaths,
 ) -> AppResult<FileCandidateExecutionResult> {
+    let (result, _) = execute_file_candidate_search_internal(request, paths)?;
+    Ok(result)
+}
+
+pub fn execute_file_candidate_search_and_store(
+    request: FileCandidateExecutionRequest,
+    paths: &AppPaths,
+    store: &mut CandidatePayloadStore,
+) -> AppResult<FileCandidateExecutionResult> {
+    let (result, discovered) = execute_file_candidate_search_internal(request.clone(), paths)?;
+    if result.status == "completed" {
+        store.store_discovered_candidates(&request, discovered)?;
+    }
+    Ok(result)
+}
+
+fn execute_file_candidate_search_internal(
+    request: FileCandidateExecutionRequest,
+    paths: &AppPaths,
+) -> AppResult<(FileCandidateExecutionResult, Vec<DiscoveredFileCandidate>)> {
     validate_request(&request)?;
     let started = Instant::now();
     let mut omitted = FileCandidateOmitted {
@@ -167,7 +287,7 @@ pub fn execute_file_candidate_search(
         &mut omitted,
     );
     if scopes.is_empty() {
-        return result(
+        return result_with_discovered(
             &request,
             "failed",
             Vec::new(),
@@ -178,19 +298,19 @@ pub fn execute_file_candidate_search(
         );
     }
 
-    let mut candidates = Vec::new();
+    let mut discovered = Vec::new();
     let timeout_ms = request.input.limits.max_search_ms;
     for scope in scopes {
-        search_scope(&request, &scope, started, &mut candidates, &mut omitted)?;
-        if candidates.len() >= request.input.limits.max_candidates {
+        search_scope(&request, &scope, started, &mut discovered, &mut omitted)?;
+        if discovered.len() >= request.input.limits.max_candidates {
             omitted.too_many_matches = true;
             break;
         }
         if elapsed_ms(started) > timeout_ms {
-            return result(
+            return result_with_discovered(
                 &request,
                 "failed",
-                candidates,
+                discovered,
                 omitted,
                 started,
                 true,
@@ -199,12 +319,12 @@ pub fn execute_file_candidate_search(
         }
     }
 
-    let truncated = candidates.len() > request.input.limits.max_candidates;
-    candidates.truncate(request.input.limits.max_candidates);
-    result(
+    let truncated = discovered.len() > request.input.limits.max_candidates;
+    discovered.truncate(request.input.limits.max_candidates);
+    result_with_discovered(
         &request,
         "completed",
-        candidates,
+        discovered,
         omitted,
         started,
         truncated,
@@ -216,7 +336,7 @@ fn search_scope(
     request: &FileCandidateExecutionRequest,
     scope: &SearchScope,
     started: Instant,
-    candidates: &mut Vec<FileCandidateMetadata>,
+    candidates: &mut Vec<DiscoveredFileCandidate>,
     omitted: &mut FileCandidateOmitted,
 ) -> AppResult<()> {
     let root = match scope.root.canonicalize() {
@@ -294,7 +414,7 @@ fn search_scope(
                 .ok()
                 .and_then(|modified| OffsetDateTime::from(modified).format(&Rfc3339).ok())
                 .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-            candidates.push(FileCandidateMetadata {
+            let public = FileCandidateMetadata {
                 candidate_id: format!("file-candidate-{}-{}", request.request_id, Uuid::new_v4()),
                 display_name: display_name.clone(),
                 redacted_location: redacted_location(&scope.display_prefix, &path, &root),
@@ -304,6 +424,11 @@ fn search_scope(
                 modified_at,
                 confidence: confidence_for_match(match_reason).to_string(),
                 match_reason: match_reason.to_string(),
+            };
+            candidates.push(DiscoveredFileCandidate {
+                public,
+                local_path: canonical,
+                scope_root: root.clone(),
             });
         }
     }
@@ -557,6 +682,25 @@ fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
+fn result_with_discovered(
+    request: &FileCandidateExecutionRequest,
+    status: &str,
+    discovered: Vec<DiscoveredFileCandidate>,
+    omitted: FileCandidateOmitted,
+    started: Instant,
+    truncated: bool,
+    error_code: Option<&str>,
+) -> AppResult<(FileCandidateExecutionResult, Vec<DiscoveredFileCandidate>)> {
+    let candidates = discovered
+        .iter()
+        .map(|candidate| candidate.public.clone())
+        .collect();
+    let result = result(
+        request, status, candidates, omitted, started, truncated, error_code,
+    )?;
+    Ok((result, discovered))
+}
+
 fn result(
     request: &FileCandidateExecutionRequest,
     status: &str,
@@ -598,6 +742,246 @@ fn validate_result(result: &FileCandidateExecutionResult) -> AppResult<()> {
         .as_object()
         .ok_or_else(|| AppError::InvalidInput("Invalid file candidate result.".into()))?;
     room_control::validate_file_candidate_execution_result_payload(object)
+}
+
+impl CandidatePayloadStore {
+    fn store_discovered_candidates(
+        &mut self,
+        request: &FileCandidateExecutionRequest,
+        candidates: Vec<DiscoveredFileCandidate>,
+    ) -> AppResult<()> {
+        self.prune_expired(OffsetDateTime::now_utc());
+        let discovered_at = OffsetDateTime::now_utc();
+        let expires_at =
+            discovered_at + time::Duration::seconds(CANDIDATE_PAYLOAD_STORE_TTL_SECONDS);
+        let discovered_at = format_time(discovered_at)?;
+        let expires_at = format_time(expires_at)?;
+        for candidate in candidates {
+            let public = candidate.public;
+            let key = CandidatePayloadStoreKey {
+                source_capability: CAPABILITY.to_string(),
+                source_request_id: request.request_id.clone(),
+                candidate_id: public.candidate_id.clone(),
+                candidate_kind: "filesystem_file".to_string(),
+            };
+            let entry = CandidatePayloadStoreEntry {
+                local_path: candidate.local_path,
+                scope_root: candidate.scope_root,
+                display_name: public.display_name,
+                size_bytes: public.size_bytes,
+                modified_at: public.modified_at,
+                extension: public.extension,
+                mime_family: public.mime_family,
+                _redacted_location: public.redacted_location,
+                _discovered_at: discovered_at.clone(),
+                expires_at: expires_at.clone(),
+                source_request_id: request.request_id.clone(),
+                candidate_id: key.candidate_id.clone(),
+                candidate_kind: key.candidate_kind.clone(),
+                room_ref: request.room_ref.clone(),
+                source_device_ref: request.source_device_ref.clone(),
+                target_peer_ref: request.target_peer_ref.clone(),
+            };
+            self.entries.insert(key, entry);
+        }
+        Ok(())
+    }
+
+    fn prune_expired(&mut self, now: OffsetDateTime) {
+        self.entries
+            .retain(|_, entry| parse_time(&entry.expires_at).is_ok_and(|expires| expires > now));
+    }
+
+    #[cfg(test)]
+    fn insert_for_test(
+        &mut self,
+        key: CandidatePayloadStoreKey,
+        entry: CandidatePayloadStoreEntry,
+    ) {
+        self.entries.insert(key, entry);
+    }
+}
+
+#[cfg(test)]
+fn resolve_candidate_payload(
+    request: CandidatePayloadExecutionRequest,
+    store: &mut CandidatePayloadStore,
+) -> AppResult<CandidatePayloadResolution> {
+    Ok(resolve_candidate_payload_for_handoff(request, store)?.resolution)
+}
+
+pub fn resolve_candidate_payload_for_handoff(
+    request: CandidatePayloadExecutionRequest,
+    store: &mut CandidatePayloadStore,
+) -> AppResult<CandidatePayloadLocalResolution> {
+    validate_candidate_payload_request(&request)?;
+    let now = OffsetDateTime::now_utc();
+    if request.candidate_kind != "filesystem_file" {
+        return Ok(local_resolution(
+            &request,
+            false,
+            "unsupported_kind",
+            None,
+            None,
+        ));
+    }
+    let key = CandidatePayloadStoreKey {
+        source_capability: request.source_capability.clone(),
+        source_request_id: request.source_request_id.clone(),
+        candidate_id: request.candidate_id.clone(),
+        candidate_kind: request.candidate_kind.clone(),
+    };
+    let Some(entry) = store.entries.get(&key) else {
+        return Ok(local_resolution(&request, false, "not_found", None, None));
+    };
+    if parse_time(&entry.expires_at).is_ok_and(|expires| expires <= now) {
+        store.entries.remove(&key);
+        return Ok(local_resolution(&request, false, "expired", None, None));
+    }
+    if entry.source_request_id != request.source_request_id
+        || entry.candidate_id != request.candidate_id
+        || entry.candidate_kind != request.candidate_kind
+        || entry.room_ref != request.room_ref
+        || entry.source_device_ref != request.source_device_ref
+        || entry.target_peer_ref != request.target_peer_ref
+    {
+        return Ok(local_resolution(
+            &request,
+            false,
+            "binding_mismatch",
+            None,
+            None,
+        ));
+    }
+    let symlink_metadata = match fs::symlink_metadata(&entry.local_path) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(local_resolution(&request, false, "not_found", None, None)),
+    };
+    if symlink_metadata.file_type().is_symlink()
+        || symlink_metadata.is_dir()
+        || !symlink_metadata.is_file()
+    {
+        return Ok(local_resolution(&request, false, "changed", None, None));
+    }
+    let canonical = match entry.local_path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => return Ok(local_resolution(&request, false, "changed", None, None)),
+    };
+    if !canonical.starts_with(&entry.scope_root) {
+        return Ok(local_resolution(&request, false, "changed", None, None));
+    }
+    if symlink_metadata.len() != entry.size_bytes {
+        return Ok(local_resolution(&request, false, "changed", None, None));
+    }
+    let modified_at = symlink_metadata
+        .modified()
+        .ok()
+        .and_then(|modified| OffsetDateTime::from(modified).format(&Rfc3339).ok())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+    if modified_at != entry.modified_at {
+        return Ok(local_resolution(&request, false, "changed", None, None));
+    }
+    Ok(local_resolution(
+        &request,
+        true,
+        "resolved",
+        Some(entry),
+        canonical.to_str().map(|value| value.to_string()),
+    ))
+}
+
+fn validate_candidate_payload_request(request: &CandidatePayloadExecutionRequest) -> AppResult<()> {
+    if request.schema_version != CANDIDATE_PAYLOAD_REQUEST_SCHEMA
+        || request.capability != CANDIDATE_PAYLOAD_CAPABILITY
+        || request.executor_kind != CANDIDATE_PAYLOAD_EXECUTOR_KIND
+        || request.source_capability != CAPABILITY
+    {
+        return Err(AppError::InvalidInput(
+            "Invalid candidate payload execution request.".into(),
+        ));
+    }
+    for value in [
+        &request.execution_id,
+        &request.consent_id,
+        &request.source_preview_event_id,
+        &request.envelope_id,
+        &request.request_id,
+        &request.request_payload_hash,
+        &request.room_ref,
+        &request.source_device_ref,
+        &request.target_peer_ref,
+        &request.source_request_id,
+        &request.candidate_id,
+        &request.candidate_display_name,
+    ] {
+        if value.trim().is_empty() || value.len() > MAX_IDENTIFIER_LENGTH {
+            return Err(AppError::InvalidInput(
+                "Invalid candidate payload execution request identifier.".into(),
+            ));
+        }
+    }
+    if looks_like_path(&request.candidate_id) {
+        return Err(AppError::InvalidInput(
+            "Candidate payload candidateId must be opaque.".into(),
+        ));
+    }
+    let created = parse_time(&request.created_at)?;
+    let expires = parse_time(&request.expires_at)?;
+    if expires <= created || expires <= OffsetDateTime::now_utc() {
+        return Err(AppError::InvalidInput(
+            "Invalid candidate payload execution request time.".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolution(
+    request: &CandidatePayloadExecutionRequest,
+    resolved: bool,
+    reason: &str,
+    entry: Option<&CandidatePayloadStoreEntry>,
+) -> CandidatePayloadResolution {
+    CandidatePayloadResolution {
+        source_capability: CAPABILITY.to_string(),
+        source_request_id: request.source_request_id.clone(),
+        candidate_id: request.candidate_id.clone(),
+        candidate_kind: request.candidate_kind.clone(),
+        resolved,
+        reason: reason.to_string(),
+        display_name: entry.map(|entry| entry.display_name.clone()),
+        size_bytes: entry.map(|entry| entry.size_bytes),
+        modified_at: entry.map(|entry| entry.modified_at.clone()),
+        mime_family: entry.map(|entry| entry.mime_family.clone()),
+        extension: entry.map(|entry| entry.extension.clone()),
+    }
+}
+
+fn local_resolution(
+    request: &CandidatePayloadExecutionRequest,
+    resolved: bool,
+    reason: &str,
+    entry: Option<&CandidatePayloadStoreEntry>,
+    receiver_local_source: Option<String>,
+) -> CandidatePayloadLocalResolution {
+    CandidatePayloadLocalResolution {
+        resolution: resolution(request, resolved, reason, entry),
+        receiver_local_source,
+    }
+}
+
+fn format_time(value: OffsetDateTime) -> AppResult<String> {
+    value
+        .format(&Rfc3339)
+        .map_err(|_| AppError::InvalidInput("Failed to format candidate payload time.".into()))
+}
+
+fn parse_time(value: &str) -> AppResult<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| AppError::InvalidInput("Invalid candidate payload time.".into()))
+}
+
+fn looks_like_path(value: &str) -> bool {
+    value.starts_with('/') || value.contains('\\') || value.contains('/')
 }
 
 #[cfg(test)]
@@ -710,6 +1094,75 @@ mod tests {
         (root, paths)
     }
 
+    fn payload_request_for(
+        source_request_id: &str,
+        candidate: &FileCandidateMetadata,
+    ) -> CandidatePayloadExecutionRequest {
+        let now = OffsetDateTime::now_utc();
+        CandidatePayloadExecutionRequest {
+            schema_version: CANDIDATE_PAYLOAD_REQUEST_SCHEMA.to_string(),
+            execution_id: "candidate-payload-execution-1".into(),
+            consent_id: "candidate-payload-consent-1".into(),
+            source_preview_event_id: "candidate-payload-preview-1".into(),
+            envelope_id: "candidate-payload-envelope-1".into(),
+            request_id: "candidate-payload-request-1".into(),
+            request_payload_hash: "candidate-payload-hash-1".into(),
+            room_ref: "room-1".into(),
+            source_device_ref: "source-1".into(),
+            target_peer_ref: "target-1".into(),
+            capability: CANDIDATE_PAYLOAD_CAPABILITY.to_string(),
+            executor_kind: CANDIDATE_PAYLOAD_EXECUTOR_KIND.to_string(),
+            source_capability: CAPABILITY.to_string(),
+            source_request_id: source_request_id.into(),
+            candidate_id: candidate.candidate_id.clone(),
+            candidate_kind: "filesystem_file".into(),
+            candidate_display_name: candidate.display_name.clone(),
+            created_at: now.format(&Rfc3339).unwrap(),
+            expires_at: (now + time::Duration::minutes(1)).format(&Rfc3339).unwrap(),
+        }
+    }
+
+    fn stored_entry_for(
+        path: &Path,
+        root: &Path,
+        candidate: &FileCandidateMetadata,
+    ) -> CandidatePayloadStoreEntry {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        CandidatePayloadStoreEntry {
+            local_path: path.to_path_buf(),
+            scope_root: root.to_path_buf(),
+            display_name: candidate.display_name.clone(),
+            size_bytes: metadata.len(),
+            modified_at: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| OffsetDateTime::from(modified).format(&Rfc3339).ok())
+                .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
+            extension: candidate.extension.clone(),
+            mime_family: candidate.mime_family.clone(),
+            _redacted_location: candidate.redacted_location.clone(),
+            _discovered_at: OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
+            expires_at: (OffsetDateTime::now_utc() + time::Duration::minutes(1))
+                .format(&Rfc3339)
+                .unwrap(),
+            source_request_id: "request-1".into(),
+            candidate_id: candidate.candidate_id.clone(),
+            candidate_kind: "filesystem_file".into(),
+            room_ref: "room-1".into(),
+            source_device_ref: "source-1".into(),
+            target_peer_ref: "target-1".into(),
+        }
+    }
+
+    fn store_key(candidate: &FileCandidateMetadata) -> CandidatePayloadStoreKey {
+        CandidatePayloadStoreKey {
+            source_capability: CAPABILITY.to_string(),
+            source_request_id: "request-1".into(),
+            candidate_id: candidate.candidate_id.clone(),
+            candidate_kind: "filesystem_file".into(),
+        }
+    }
+
     #[test]
     fn searches_pastey_shared_without_returning_absolute_paths() {
         let (root, app_paths) = fixture_paths();
@@ -724,6 +1177,210 @@ mod tests {
         assert_eq!(result.candidates[0].display_name, "exact-target.pdf");
         assert!(!result.candidates[0].redacted_location.starts_with('/'));
         assert!(!result.candidates[0].candidate_id.contains('/'));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn candidate_payload_store_resolves_exact_discovery_candidate_without_path_exposure() {
+        let (root, app_paths) = fixture_paths();
+        let mut store = CandidatePayloadStore::default();
+        let result = execute_file_candidate_search_and_store(
+            request_for("exact-target.pdf", &["pdf"], 10, 6),
+            &app_paths,
+            &mut store,
+        )
+        .unwrap();
+        let candidate = result.candidates.first().expect("candidate");
+        let resolution =
+            resolve_candidate_payload(payload_request_for("request-1", candidate), &mut store)
+                .unwrap();
+
+        assert!(resolution.resolved);
+        assert_eq!(resolution.reason, "resolved");
+        assert_eq!(resolution.source_request_id, "request-1");
+        assert_eq!(resolution.candidate_id, candidate.candidate_id);
+        assert_eq!(resolution.display_name.as_deref(), Some("exact-target.pdf"));
+        assert_eq!(resolution.size_bytes, Some(candidate.size_bytes));
+        let serialized = serde_json::to_string(&resolution).unwrap();
+        assert!(!serialized.contains(root.to_string_lossy().as_ref()));
+        assert!(!serialized.contains("localPath"));
+        assert!(!serialized.contains("absolutePath"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn candidate_payload_resolution_rejects_wrong_source_candidate_and_kind() {
+        let (root, app_paths) = fixture_paths();
+        let mut store = CandidatePayloadStore::default();
+        let result = execute_file_candidate_search_and_store(
+            request_for("exact-target.pdf", &["pdf"], 10, 6),
+            &app_paths,
+            &mut store,
+        )
+        .unwrap();
+        let candidate = result.candidates.first().expect("candidate");
+
+        let wrong_source =
+            resolve_candidate_payload(payload_request_for("other-request", candidate), &mut store)
+                .unwrap();
+        assert!(!wrong_source.resolved);
+        assert_eq!(wrong_source.reason, "not_found");
+
+        let mut wrong_candidate = payload_request_for("request-1", candidate);
+        wrong_candidate.candidate_id = "other-candidate".into();
+        let wrong_candidate = resolve_candidate_payload(wrong_candidate, &mut store).unwrap();
+        assert!(!wrong_candidate.resolved);
+        assert_eq!(wrong_candidate.reason, "not_found");
+
+        let mut wrong_kind = payload_request_for("request-1", candidate);
+        wrong_kind.candidate_kind = "filesystem_directory".into();
+        let wrong_kind = resolve_candidate_payload(wrong_kind, &mut store).unwrap();
+        assert!(!wrong_kind.resolved);
+        assert_eq!(wrong_kind.reason, "unsupported_kind");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn candidate_payload_resolution_expires_and_rejects_changed_or_deleted_files() {
+        let (root, app_paths) = fixture_paths();
+        let target = root.join("shared/exact-target.pdf");
+        let result = execute_file_candidate_search(
+            request_for("exact-target.pdf", &["pdf"], 10, 6),
+            &app_paths,
+        )
+        .unwrap();
+        let candidate = result.candidates.first().expect("candidate");
+        let key = store_key(candidate);
+
+        let mut expired_store = CandidatePayloadStore::default();
+        let mut expired_entry = stored_entry_for(
+            &target,
+            &root.join("shared").canonicalize().unwrap(),
+            candidate,
+        );
+        expired_entry.expires_at = (OffsetDateTime::now_utc() - time::Duration::minutes(1))
+            .format(&Rfc3339)
+            .unwrap();
+        expired_store.insert_for_test(key.clone(), expired_entry);
+        let expired = resolve_candidate_payload(
+            payload_request_for("request-1", candidate),
+            &mut expired_store,
+        )
+        .unwrap();
+        assert!(!expired.resolved);
+        assert_eq!(expired.reason, "expired");
+
+        let mut changed_store = CandidatePayloadStore::default();
+        changed_store.insert_for_test(
+            key.clone(),
+            stored_entry_for(
+                &target,
+                &root.join("shared").canonicalize().unwrap(),
+                candidate,
+            ),
+        );
+        fs::write(&target, b"changed-size").unwrap();
+        let changed = resolve_candidate_payload(
+            payload_request_for("request-1", candidate),
+            &mut changed_store,
+        )
+        .unwrap();
+        assert!(!changed.resolved);
+        assert_eq!(changed.reason, "changed");
+
+        fs::write(&target, b"same-length!").unwrap();
+        let mut modified_store = CandidatePayloadStore::default();
+        let mut modified_entry = stored_entry_for(
+            &target,
+            &root.join("shared").canonicalize().unwrap(),
+            candidate,
+        );
+        modified_entry.modified_at = "1970-01-01T00:00:00Z".into();
+        modified_store.insert_for_test(key.clone(), modified_entry);
+        let modified = resolve_candidate_payload(
+            payload_request_for("request-1", candidate),
+            &mut modified_store,
+        )
+        .unwrap();
+        assert!(!modified.resolved);
+        assert_eq!(modified.reason, "changed");
+
+        let mut deleted_store = CandidatePayloadStore::default();
+        deleted_store.insert_for_test(
+            key,
+            stored_entry_for(
+                &target,
+                &root.join("shared").canonicalize().unwrap(),
+                candidate,
+            ),
+        );
+        fs::remove_file(&target).unwrap();
+        let deleted = resolve_candidate_payload(
+            payload_request_for("request-1", candidate),
+            &mut deleted_store,
+        )
+        .unwrap();
+        assert!(!deleted.resolved);
+        assert_eq!(deleted.reason, "not_found");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn candidate_payload_resolution_rejects_directory_entries() {
+        let (root, app_paths) = fixture_paths();
+        let result = execute_file_candidate_search(
+            request_for("exact-target.pdf", &["pdf"], 10, 6),
+            &app_paths,
+        )
+        .unwrap();
+        let candidate = result.candidates.first().expect("candidate");
+        let directory = root.join("shared");
+        let mut store = CandidatePayloadStore::default();
+        store.insert_for_test(
+            store_key(candidate),
+            stored_entry_for(&directory, &directory.canonicalize().unwrap(), candidate),
+        );
+        let rejected =
+            resolve_candidate_payload(payload_request_for("request-1", candidate), &mut store)
+                .unwrap();
+        assert!(!rejected.resolved);
+        assert_eq!(rejected.reason, "changed");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_payload_resolution_rejects_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let (root, app_paths) = fixture_paths();
+        let result = execute_file_candidate_search(
+            request_for("exact-target.pdf", &["pdf"], 10, 6),
+            &app_paths,
+        )
+        .unwrap();
+        let candidate = result.candidates.first().expect("candidate");
+        let link = root.join("shared/candidate-link.pdf");
+        symlink(root.join("shared/exact-target.pdf"), &link).unwrap();
+        let mut store = CandidatePayloadStore::default();
+        store.insert_for_test(
+            store_key(candidate),
+            stored_entry_for(
+                &link,
+                &root.join("shared").canonicalize().unwrap(),
+                candidate,
+            ),
+        );
+        let rejected =
+            resolve_candidate_payload(payload_request_for("request-1", candidate), &mut store)
+                .unwrap();
+        assert!(!rejected.resolved);
+        assert_eq!(rejected.reason, "changed");
+
         let _ = fs::remove_dir_all(root);
     }
 

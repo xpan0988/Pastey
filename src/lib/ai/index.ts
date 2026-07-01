@@ -1,4 +1,6 @@
 export * from "./actionPlanValidator";
+export * from "./candidatePayloadAdvisory";
+export * from "./candidatePayloadRequest";
 export * from "./capabilityRegistry";
 export * from "./capabilityPreviewEnvelope";
 export * from "./cloudOpenAICompatibleProvider";

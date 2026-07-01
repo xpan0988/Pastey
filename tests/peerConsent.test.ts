@@ -367,5 +367,5 @@ test("receiver UI exposes only explicit one-time review controls and bounded sen
   assert.match(panel, /Peer allowed this exact preview once\. No execution has occurred\./);
   assert.match(panel, /Peer denied the preview\. No retry will be attempted\./);
   assert.doesNotMatch(panel, /Always allow|Remember this peer|Trust room|Execute now|Approve all/);
-  assert.ok(app.indexOf("<RoomControlPanel room={room} envelope={envelopePreview?.envelope} />") >= 0);
+  assert.match(app, /<RoomControlPanel[\s\S]*room=\{room\}[\s\S]*envelope=\{envelopePreview\?\.envelope\}[\s\S]*onEnqueueCandidatePayloadHandoff=\{onEnqueueCandidatePayloadHandoff\}/);
 });

@@ -4,6 +4,7 @@ import {
   type CapabilityRequestPreviewEnvelope
 } from "../ai/capabilityPreviewEnvelope";
 import {
+  CANDIDATE_PAYLOAD_CAPABILITY,
   FILE_CANDIDATES_CAPABILITY,
   getAgentBridgeCapabilityContract,
   getAgentBridgeCapabilityContractByConsentGrantSchema,
@@ -21,6 +22,13 @@ import {
   type FileCandidateExecutionRequest,
   type FileCandidateExecutionResult,
 } from "../ai/fileCandidateRequest";
+import {
+  CANDIDATE_PAYLOAD_CONSENT_GRANT_SCHEMA,
+  validateCandidatePayloadExecutionRequest,
+  validateCandidatePayloadExecutionResult,
+  type CandidatePayloadExecutionRequest,
+  type CandidatePayloadExecutionResult,
+} from "../ai/candidatePayloadRequest";
 
 export type RoomControlEventKind =
   | "capability_preview"
@@ -139,7 +147,27 @@ export interface FileCandidateConsentGrant {
   expiresAt: string;
 }
 
-export type CapabilityConsentGrant = HelloPeerConsentGrant | HelloStdoutConsentGrant | FileCandidateConsentGrant;
+export interface CandidatePayloadConsentGrant {
+  schemaVersion: "transfer-request-candidate-payload-consent-grant-v1";
+  consentId: string;
+  sourcePreviewEventId: string;
+  envelopeId: string;
+  requestId: string;
+  requestPayloadHash: string;
+  capability: "transfer.request_candidate_payload";
+  sourceCapability: "filesystem.find_file_candidates";
+  sourceRequestId: string;
+  candidateId: string;
+  candidateKind: "filesystem_file";
+  candidateDisplayName: string;
+  expiresAt: string;
+}
+
+export type CapabilityConsentGrant =
+  | HelloPeerConsentGrant
+  | HelloStdoutConsentGrant
+  | FileCandidateConsentGrant
+  | CandidatePayloadConsentGrant;
 
 export interface HelloPeerExecutionRequest {
   schemaVersion: "pastey-hello-peer-execution-request-v1";
@@ -218,11 +246,13 @@ export interface HelloStdoutExecutionResult {
 export type CapabilityExecutionRequest =
   | HelloPeerExecutionRequest
   | HelloStdoutExecutionRequest
-  | FileCandidateExecutionRequest;
+  | FileCandidateExecutionRequest
+  | CandidatePayloadExecutionRequest;
 export type CapabilityExecutionResult =
   | HelloPeerExecutionResult
   | HelloStdoutExecutionResult
-  | FileCandidateExecutionResult;
+  | FileCandidateExecutionResult
+  | CandidatePayloadExecutionResult;
 
 export interface CapabilityExecuteRequestRoomControlEvent extends RoomControlEventBase {
   kind: "capability_execute_request";
@@ -363,6 +393,21 @@ const FILE_CANDIDATE_CONSENT_GRANT_FIELDS = [
   "searchMode",
   "expiresAt"
 ];
+const CANDIDATE_PAYLOAD_CONSENT_GRANT_FIELDS = [
+  "schemaVersion",
+  "consentId",
+  "sourcePreviewEventId",
+  "envelopeId",
+  "requestId",
+  "requestPayloadHash",
+  "capability",
+  "sourceCapability",
+  "sourceRequestId",
+  "candidateId",
+  "candidateKind",
+  "candidateDisplayName",
+  "expiresAt"
+];
 const EXECUTION_REQUEST_FIELDS = [
   "schemaVersion",
   "executionId",
@@ -462,6 +507,12 @@ const UNSAFE_OR_EXECUTION_FIELDS = new Set([
   "transportKey",
   "hiddenTransfer",
   "peerFilesystemSearch",
+  "contents",
+  "fileContents",
+  "transferQueueId",
+  "transferQueueItemId",
+  "autoSend",
+  "sendFile",
   "stdout",
   "stderr",
   "exitCode",
@@ -903,6 +954,9 @@ export function validateCapabilityConsentGrant(value: unknown): string[] {
   if (contract?.capability === FILE_CANDIDATES_CAPABILITY) {
     return validateFileCandidateConsentGrant(value);
   }
+  if (contract?.capability === CANDIDATE_PAYLOAD_CAPABILITY) {
+    return validateCandidatePayloadConsentGrant(value);
+  }
   if (contract?.capability === HELLO_STDOUT_CAPABILITY) {
     return validateHelloStdoutConsentGrant(value);
   }
@@ -987,6 +1041,43 @@ export function validateFileCandidateConsentGrant(value: unknown): string[] {
   return unique(errors);
 }
 
+export function validateCandidatePayloadConsentGrant(value: unknown): string[] {
+  const errors: string[] = [];
+  if (!isRecord(value)) {
+    return ["Candidate payload consent grant must be an object."];
+  }
+  requireExactFields(value, CANDIDATE_PAYLOAD_CONSENT_GRANT_FIELDS, [], "Candidate payload consent grant", errors);
+  if (value.schemaVersion !== CANDIDATE_PAYLOAD_CONSENT_GRANT_SCHEMA) {
+    errors.push(`Candidate payload consent grant schemaVersion must be ${CANDIDATE_PAYLOAD_CONSENT_GRANT_SCHEMA}.`);
+  }
+  for (const field of [
+    "consentId",
+    "sourcePreviewEventId",
+    "envelopeId",
+    "requestId",
+    "requestPayloadHash",
+    "sourceRequestId",
+    "candidateId",
+    "candidateDisplayName"
+  ]) {
+    requireBoundedString(value[field], `consent.${field}`, MAX_IDENTIFIER_LENGTH, errors);
+  }
+  if (value.capability !== CANDIDATE_PAYLOAD_CAPABILITY) {
+    errors.push(`Candidate payload consent grant capability must be exactly ${CANDIDATE_PAYLOAD_CAPABILITY}.`);
+  }
+  if (value.sourceCapability !== FILE_CANDIDATES_CAPABILITY) {
+    errors.push(`Candidate payload consent grant sourceCapability must be exactly ${FILE_CANDIDATES_CAPABILITY}.`);
+  }
+  if (value.candidateKind !== "filesystem_file") {
+    errors.push("Candidate payload consent grant candidateKind must be filesystem_file.");
+  }
+  if (typeof value.candidateId === "string" && looksLikePath(value.candidateId)) {
+    errors.push("Candidate payload consent grant candidateId must be opaque and not path-like.");
+  }
+  requireDateString(value.expiresAt, "consent.expiresAt", errors);
+  return unique(errors);
+}
+
 export function validateCapabilityExecutionRequest(value: unknown, now = new Date()): string[] {
   if (!isRecord(value)) {
     return ["Capability execution request must be an object."];
@@ -995,6 +1086,9 @@ export function validateCapabilityExecutionRequest(value: unknown, now = new Dat
     ?? getAgentBridgeCapabilityContractByExecutionRequestSchema(value.schemaVersion);
   if (contract?.capability === FILE_CANDIDATES_CAPABILITY) {
     return validateFileCandidateExecutionRequest(value, { now }).errors;
+  }
+  if (contract?.capability === CANDIDATE_PAYLOAD_CAPABILITY) {
+    return validateCandidatePayloadExecutionRequest(value, { now }).errors;
   }
   if (contract?.capability === HELLO_STDOUT_CAPABILITY) {
     return validateHelloStdoutExecutionRequest(value, now);
@@ -1066,6 +1160,9 @@ export function validateCapabilityExecutionResult(value: unknown): string[] {
   const contract = getAgentBridgeCapabilityContractByExecutionResultSchema(value.schemaVersion);
   if (contract?.capability === FILE_CANDIDATES_CAPABILITY) {
     return validateFileCandidateExecutionResult(value).errors;
+  }
+  if (contract?.capability === CANDIDATE_PAYLOAD_CAPABILITY) {
+    return validateCandidatePayloadExecutionResult(value).errors;
   }
   if (contract?.capability === HELLO_STDOUT_CAPABILITY) {
     return validateHelloStdoutExecutionResult(value);
@@ -1320,6 +1417,10 @@ function isAllowedHelloStdoutResultField(root: unknown, path: string, key: strin
     return false;
   }
   return path === `$.payload.${key}` && ["stdout", "stderr", "exitCode"].includes(key);
+}
+
+function looksLikePath(value: string): boolean {
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) || value.includes("/") || value.includes("\\");
 }
 
 function normalizeTotalWindows(value?: number): number {

@@ -1,6 +1,6 @@
 # pastey
 
-`pastey` is a local-first desktop utility for moving text, files, and images directly between your own Windows and macOS devices on the same LAN.
+`pastey` is a local-first desktop utility for moving text, files, and images directly between your own Windows, macOS, and Linux devices on the same LAN.
 
 Pastey is built for ephemeral local handoff: nearby devices echo back when ready, payloads follow an encrypted format-agnostic transfer path, and Bridge session state can be burned when it is no longer useful. There is no account system, cloud relay, remote storage, or analytics pipeline.
 
@@ -79,6 +79,23 @@ Download the [latest release](https://github.com/xpan0988/Pastey/releases/latest
 2. Run the installer.
 3. Launch `pastey` from the Start menu.
 
+### Linux
+
+Linux release artifacts are validated against Ubuntu 24.04 x86_64.
+
+AppImage:
+
+```bash
+chmod +x pastey_*.AppImage
+./pastey_*.AppImage
+```
+
+Debian package:
+
+```bash
+sudo apt install ./pastey_*.deb
+```
+
 ## Run In Development
 
 ```bash
@@ -134,6 +151,7 @@ Logs rotate at 5 MB and keep the last two rotated files. Agent Bridge lifecycle 
 
 - macOS may ask for network access permission the first time you run active LAN transfers.
 - Windows Defender Firewall may prompt for local network access when the temporary transfer server starts.
+- Linux release validation currently targets Ubuntu 24.04 x86_64.
 - Global shortcut defaults to `Ctrl+Shift+V` on Windows and `Cmd+Shift+V` on macOS.
 
 ## Current Limitations

@@ -8,7 +8,8 @@ The implemented capabilities are fixed, host-owned bounded capabilities:
 
 - `runtime.execute_hello_template`, the legacy fixed Hello Peer template;
 - `runtime.hello_stdout`, a fixed Hello Stdout capability backed by a Rust host helper;
-- `filesystem.find_file_candidates`, a receiver-side metadata-only file-candidate search over approved local scope labels.
+- `filesystem.find_file_candidates`, a receiver-side metadata-only file-candidate search over approved local scope labels;
+- `transfer.request_candidate_payload`, a second-consent scaffold for one previously discovered file candidate.
 
 They use:
 
@@ -22,7 +23,7 @@ They use:
 - fixed host-owned executors;
 - typed execution result.
 
-They do not execute model-authored code, shell commands, arbitrary process operations, network calls, arbitrary arguments, arbitrary environment variables, arbitrary file paths, arbitrary tool calls, or automatic file transfers. The file-candidate capability performs a bounded receiver-owned filesystem metadata traversal only after explicit receiver Allow once.
+They do not execute model-authored code, shell commands, arbitrary process operations, network calls, arbitrary arguments, arbitrary environment variables, arbitrary file paths, arbitrary tool calls, or automatic file transfers. The file-candidate capability performs a bounded receiver-owned filesystem metadata traversal only after explicit receiver Allow once. It also records an in-memory, receiver-local candidate store so a later candidate-payload request can resolve the selected candidate without exposing the local path. The candidate-payload capability validates a second consent boundary, performs receiver-local metadata resolution, and can enqueue the resolved file into the existing transfer queue. Queue handoff does not mean transfer completion; the existing transfer pipeline owns byte transfer, progress, and completion.
 
 `runtime.execute_hello_template` returns the exact fixed Hello Peer result `hello peer!`.
 
@@ -61,7 +62,7 @@ The shared lifecycle envelope schema is `pastey-agent-bridge-capability-envelope
 
 `filesystem.find_file_candidates` is the first implemented read-only workspace capability. It lets a sender ask one selected peer to search approved receiver-local scope labels for filename/metadata matches. It returns a bounded list of redacted candidate metadata only.
 
-The user intent is: help find a file named `xxx` on another device and send it back. The implemented capability covers candidate discovery only. A later candidate-payload transfer requires a separate approved capability, likely named `transfer.request_candidate_payload`, and must require separate explicit consent. Search consent does not authorize payload transfer.
+The user intent is: help find a file named `xxx` on another device and send it back. The implemented capability covers candidate discovery only. Requesting a selected candidate payload now has a separate `transfer.request_candidate_payload` second-consent scaffold, but that scaffold does not transfer bytes or queue handoff. Search consent does not authorize payload transfer.
 
 The advisory action kind is `request_peer_file_candidates`. Provider output must use this shape:
 
@@ -162,7 +163,74 @@ The result contains:
 - bounded `durationMs`;
 - bounded `errorCode`.
 
-Candidate IDs are display/result identifiers only. They are not paths, durable file handles, transfer grants, or reusable authorization tokens. The current implementation does not persist a candidate-to-path store and does not pass candidates into the transfer queue.
+Candidate IDs are display/result identifiers only. They are not paths, durable file handles, transfer grants, or reusable authorization tokens. Discovery consent is not payload transfer consent.
+
+On successful execution, the receiver stores each returned filesystem candidate in a receiver-local, in-memory, TTL-bounded candidate store. The store is cleared on app restart and is keyed by:
+
+```ts
+{
+  sourceCapability: "filesystem.find_file_candidates",
+  sourceRequestId: string,
+  candidateId: string,
+  candidateKind: "filesystem_file"
+}
+```
+
+The stored value includes the receiver-local source path and metadata needed for later revalidation, but the local path is never returned to the sender, AI provider, room-control payloads, frontend result payloads, docs, or logs. Candidate IDs remain display/result identifiers only. They are not paths, durable file handles, transfer grants, or reusable authorization tokens.
+
+## Transfer Scaffold: `transfer.request_candidate_payload`
+
+`transfer.request_candidate_payload` establishes the second consent boundary for one selected candidate returned by `filesystem.find_file_candidates`. It can queue a resolved `filesystem_file` candidate into the existing transfer queue after receiver Allow once. It does not create a new data plane.
+
+Core rule:
+
+```text
+Discovery consent is not payload transfer consent.
+```
+
+The advisory action kind is `request_peer_candidate_payload`. Provider output may identify:
+
+- one selected `targetPeerRef`;
+- `sourceCapability: filesystem.find_file_candidates`;
+- the prior `sourceRequestId`;
+- an opaque `candidateId`;
+- display/audit metadata such as `candidateDisplayName`, `candidateKind: filesystem_file`, optional redacted location, size, modified time, MIME family, and extension.
+
+Provider output must not include receiver absolute paths, file contents, transfer queue ids, handoff ids, selected-peers or broadcast routing, auto-send instructions, shell/process fields, network targets, or durable-trust claims.
+
+The registry entry is:
+
+```ts
+capability: "transfer.request_candidate_payload"
+version: "v1"
+routePolicy: "selected-peer"
+consentPolicy: "exact-allow-once"
+auditRedactionPolicy: "metadata_only"
+executorKind: "transfer_candidate_payload_host"
+```
+
+The capability-specific schemas are:
+
+- preview request: `transfer-request-candidate-payload-request-v1`;
+- consent grant: `transfer-request-candidate-payload-consent-grant-v1`;
+- execution request: `transfer-request-candidate-payload-execution-request-v1`;
+- execution result: `transfer-request-candidate-payload-result-v1`.
+
+Allow once binds the exact room/session/source/target refs, preview event id, envelope id, request id, request payload hash, capability, source discovery request id, candidate id, candidate kind, candidate display name, and expiry. A `filesystem.find_file_candidates` consent grant cannot authorize this capability. A `transfer.request_candidate_payload` consent grant cannot authorize discovery, Hello capabilities, future handoff requests, or reusable transfer authority.
+
+Execution validates and consumes the exact one-time consent, then asks the receiver-local Rust store to resolve the selected candidate by exact `sourceRequestId + candidateId + candidateKind` binding. Resolution re-stats the local source and rejects missing, expired, changed, directory, symlink, unsupported-kind, and binding-mismatch cases. If resolution succeeds, the receiver frontend enqueues the resolved local file source into the existing transfer scheduler with selected-peer route metadata and Agent Bridge audit metadata. This handoff reuses the existing transfer queue, scheduler, routing, and binary-v1 transfer path.
+
+When the existing transfer queue accepts the handoff, execution returns:
+
+- `status: handoff_queued`;
+- candidate display metadata only;
+- optional `candidateResolution` metadata with `resolved: true` and `reason: resolved`;
+- `transferredBytes: 0`;
+- `handoffQueued: true`;
+- `transferStatus: queued`;
+- `errorCode: null`.
+
+`handoff_queued` means only that the existing transfer queue accepted the payload source. It does not mean transfer started or completed, and `transferredBytes` remains `0` at handoff time. When the local candidate cannot be safely resolved or queued, execution returns a bounded metadata-only result such as `candidate_not_found`, `candidate_expired`, `candidate_changed`, `handoff_failed`, or `rejected`. The result schema still rejects local path fields, file contents, transfer queue ids, handoff ids, and sender-visible queue internals. There is no payload reading before queue handoff, no auto-send after discovery, and no new transfer protocol.
 
 ## Preview Contract
 
@@ -180,6 +248,8 @@ Production evidence:
 - `src/lib/ai/helloStdoutRequest.ts`
 - `src/lib/ai/fileCandidateRequest.ts`
 - `src/lib/ai/fileCandidateAdvisory.ts`
+- `src/lib/ai/candidatePayloadRequest.ts`
+- `src/lib/ai/candidatePayloadAdvisory.ts`
 - `src/lib/ai/capabilityPreviewEnvelope.ts`
 - `src/lib/agentBridge/roomControlEvent.ts`
 - `src-tauri/src/room_control.rs`
@@ -205,6 +275,7 @@ The current executors are:
 - `runtime.execute_hello_template`, which returns exactly the fixed Hello Peer result;
 - `runtime.hello_stdout`, which calls the Tauri `execute_hello_stdout_capability` command and returns typed stdout/stderr/exit metadata from a host-owned Rust helper.
 - `filesystem.find_file_candidates`, which calls the Tauri `execute_file_candidate_search_capability` command and returns bounded redacted file metadata candidates from a host-owned Rust executor.
+- `transfer.request_candidate_payload`, which validates the second consent boundary, resolves a selected candidate through the receiver-local in-memory store, and queues the resolved file through the existing transfer scheduler without exposing paths in room-control results.
 
 No executor accepts command text, script text, runtime arguments, arbitrary file paths, environment variables, network targets, shell interpolation, or model-authored execution material. The file-candidate executor accepts only validated safe scope labels and bounded metadata-search limits; it never reads file contents and never starts a transfer.
 
@@ -213,6 +284,7 @@ Production evidence:
 - `src/lib/agentBridge/helloPeerExecution.ts`
 - `src/lib/agentBridge/helloStdoutExecution.ts`
 - `src/lib/agentBridge/fileCandidateExecution.ts`
+- `src/lib/agentBridge/candidatePayloadExecution.ts`
 - `src-tauri/src/hello_stdout.rs`
 - `src-tauri/src/file_candidates.rs`
 - `src/lib/agentBridge/roomControlEvent.ts`

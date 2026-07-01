@@ -9,11 +9,15 @@ const artifactSearchPaths = [
   bundleRoot,
   path.join(bundleRoot, "macos"),
   path.join(bundleRoot, "dmg"),
+  path.join(bundleRoot, "appimage"),
+  path.join(bundleRoot, "deb"),
   path.join(bundleRoot, "msi"),
   path.join(bundleRoot, "nsis")
 ];
 
 const thresholds = {
+  ".appimage": 200 * 1024 * 1024,
+  ".deb": 150 * 1024 * 1024,
   ".dmg": 100 * 1024 * 1024,
   ".app": 200 * 1024 * 1024,
   ".msi": 150 * 1024 * 1024,
@@ -173,7 +177,7 @@ async function walkArtifacts(currentPath, artifacts, seen) {
   }
 
   const extension = path.extname(currentPath).toLowerCase();
-  if ([".dmg", ".msi", ".exe"].includes(extension)) {
+  if ([".appimage", ".deb", ".dmg", ".msi", ".exe"].includes(extension)) {
     if (!seen.has(currentPath)) {
       seen.add(currentPath);
       artifacts.push({

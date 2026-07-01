@@ -3,7 +3,8 @@ import type { AiActionKind } from "./types";
 export type AgentBridgeCapabilityId =
   | "runtime.execute_hello_template"
   | "runtime.hello_stdout"
-  | "filesystem.find_file_candidates";
+  | "filesystem.find_file_candidates"
+  | "transfer.request_candidate_payload";
 
 export type AgentBridgeCapabilityVersion = "legacy" | "v1";
 export type AgentBridgeRoutePolicy = "selected-peer";
@@ -11,16 +12,17 @@ export type AgentBridgeConsentPolicy = "exact-allow-once";
 export type AgentBridgeExecutorKind =
   | "ts_in_process_fixed_template"
   | "rust_host_helper"
-  | "filesystem_find_candidates_host";
+  | "filesystem_find_candidates_host"
+  | "transfer_candidate_payload_host";
 export type AgentBridgeAuditRedactionPolicy = "metadata_only";
 export type AgentBridgeCapabilityLifecycle = "implemented";
-export type AgentBridgeProviderInputShape = "fixed_message" | "file_candidate_advisory";
+export type AgentBridgeProviderInputShape = "fixed_message" | "file_candidate_advisory" | "candidate_payload_request";
 
 export interface AgentBridgeCapabilityContract {
   readonly capability: AgentBridgeCapabilityId;
   readonly version: AgentBridgeCapabilityVersion;
   readonly lifecycle: AgentBridgeCapabilityLifecycle;
-  readonly providerActionKind: Extract<AiActionKind, "request_peer_hello_demo" | "request_peer_hello_stdout_demo" | "request_peer_file_candidates">;
+  readonly providerActionKind: Extract<AiActionKind, "request_peer_hello_demo" | "request_peer_hello_stdout_demo" | "request_peer_file_candidates" | "request_peer_candidate_payload">;
   readonly providerInputShape: AgentBridgeProviderInputShape;
   readonly previewRequestSchema?: string;
   readonly consentGrantSchema?: string;
@@ -71,10 +73,12 @@ export interface AgentBridgeCapabilityEnvelope<TPayload = unknown> {
 export const HELLO_TEMPLATE_CAPABILITY = "runtime.execute_hello_template" as const;
 export const HELLO_STDOUT_CAPABILITY = "runtime.hello_stdout" as const;
 export const FILE_CANDIDATES_CAPABILITY = "filesystem.find_file_candidates" as const;
+export const CANDIDATE_PAYLOAD_CAPABILITY = "transfer.request_candidate_payload" as const;
 export const HELLO_TEMPLATE_MESSAGE = "hello peer!";
 export const HELLO_STDOUT_EXPECTED_STDOUT = "hello peer";
 export const HELLO_STDOUT_RUNTIME_KIND = "rust_host_helper";
 export const FILE_CANDIDATES_EXECUTOR_KIND = "filesystem_find_candidates_host" as const;
+export const CANDIDATE_PAYLOAD_EXECUTOR_KIND = "transfer_candidate_payload_host" as const;
 export const SHARED_CAPABILITY_ENVELOPE_SCHEMA = "pastey-agent-bridge-capability-envelope-v1";
 export const SELECTED_PEER_ROUTE_POLICY: AgentBridgeRoutePolicy = "selected-peer";
 export const EXACT_ALLOW_ONCE_CONSENT_POLICY: AgentBridgeConsentPolicy = "exact-allow-once";
@@ -96,8 +100,10 @@ const BASE_FORBIDDEN_PROVIDER_FIELDS = [
   "networkTarget",
   "url",
   "filesystemTree",
-  "rawLogs",
-  "secret",
+    "rawLogs",
+    "contents",
+    "fileContents",
+    "secret",
   "token",
   "apiKey",
   "roomKey",
@@ -111,9 +117,14 @@ const BASE_FORBIDDEN_PROVIDER_FIELDS = [
   "broadcastBridge",
   "durableTrust",
   "trustedExecutor",
-  "autoTransfer",
-  "automaticTransfer",
-  "executed",
+    "autoTransfer",
+    "automaticTransfer",
+    "autoSend",
+    "sendFile",
+    "transferQueueId",
+    "transferQueueItemId",
+    "handoffId",
+    "executed",
   "execution",
   "completed",
   "succeeded",
@@ -213,6 +224,31 @@ export const AGENT_BRIDGE_CAPABILITY_REGISTRY: readonly AgentBridgeCapabilityCon
       label: "Find File Candidates",
       shortLabel: "File Candidates",
       resultLabel: "File candidate result",
+    },
+  }),
+  Object.freeze({
+    capability: CANDIDATE_PAYLOAD_CAPABILITY,
+    version: "v1",
+    lifecycle: "implemented",
+    providerActionKind: "request_peer_candidate_payload",
+    providerInputShape: "candidate_payload_request",
+    previewRequestSchema: "transfer-request-candidate-payload-request-v1",
+    consentGrantSchema: "transfer-request-candidate-payload-consent-grant-v1",
+    executionRequestSchema: "transfer-request-candidate-payload-execution-request-v1",
+    executionResultSchema: "transfer-request-candidate-payload-result-v1",
+    routePolicy: SELECTED_PEER_ROUTE_POLICY,
+    consentPolicy: EXACT_ALLOW_ONCE_CONSENT_POLICY,
+    executorKind: CANDIDATE_PAYLOAD_EXECUTOR_KIND,
+    auditRedactionPolicy: "metadata_only",
+    requiresPeerCapabilityAdvertisement: true,
+    constraintFields: [],
+    allowTempOnlyFilesystem: false,
+    forbiddenProviderFields: BASE_FORBIDDEN_PROVIDER_FIELDS,
+    resultOnlyFields: RESULT_ONLY_FIELDS,
+    ui: {
+      label: "Request Candidate Payload",
+      shortLabel: "Candidate Payload",
+      resultLabel: "Candidate payload request result",
     },
   }),
 ]);

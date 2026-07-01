@@ -69,7 +69,7 @@ The current transfer stack does not implement:
 
 - durable route recovery or auto-join from paired-device identity;
 - whole-file hash exchange beyond authenticated chunks and finalize metadata;
-- Linux/mobile release support;
+- mobile release support;
 - cloud relay, WebRTC, TURN, or internet transfer;
 - binary-v2 stream multiplexing;
 - archive/folder bundle transfer;

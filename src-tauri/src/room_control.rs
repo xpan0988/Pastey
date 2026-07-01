@@ -57,6 +57,15 @@ const FILE_CANDIDATES_CONSENT_SCHEMA: &str = "filesystem-find-file-candidates-co
 const FILE_CANDIDATES_EXECUTION_REQUEST_SCHEMA: &str =
     "filesystem-find-file-candidates-execution-request-v1";
 const FILE_CANDIDATES_EXECUTION_RESULT_SCHEMA: &str = "filesystem-find-file-candidates-result-v1";
+const CANDIDATE_PAYLOAD_CAPABILITY: &str = "transfer.request_candidate_payload";
+const CANDIDATE_PAYLOAD_EXECUTOR_KIND: &str = "transfer_candidate_payload_host";
+const CANDIDATE_PAYLOAD_REQUEST_SCHEMA: &str = "transfer-request-candidate-payload-request-v1";
+const CANDIDATE_PAYLOAD_CONSENT_SCHEMA: &str =
+    "transfer-request-candidate-payload-consent-grant-v1";
+const CANDIDATE_PAYLOAD_EXECUTION_REQUEST_SCHEMA: &str =
+    "transfer-request-candidate-payload-execution-request-v1";
+const CANDIDATE_PAYLOAD_EXECUTION_RESULT_SCHEMA: &str =
+    "transfer-request-candidate-payload-result-v1";
 
 const ALLOWED_EVENT_KINDS: &[&str] = &[
     "capability_preview",
@@ -77,8 +86,12 @@ const UNSAFE_FIELDS: &[&str] = &[
     "path",
     "absolutepath",
     "filepath",
+    "localpath",
+    "realpath",
     "filesystemtree",
     "rawlogs",
+    "contents",
+    "filecontents",
     "secret",
     "token",
     "apikey",
@@ -87,6 +100,11 @@ const UNSAFE_FIELDS: &[&str] = &[
     "transportkey",
     "hiddentransfer",
     "peerfilesystemsearch",
+    "transferqueueid",
+    "transferqueueitemid",
+    "handoffid",
+    "autosend",
+    "sendfile",
     "stdout",
     "stderr",
     "exitcode",
@@ -1226,9 +1244,62 @@ fn require_exact_fields(object: &Map<String, Value>, fields: &[&str]) -> AppResu
     Ok(())
 }
 
+fn require_fields_with_optional(
+    object: &Map<String, Value>,
+    required: &[&str],
+    optional: &[&str],
+) -> AppResult<()> {
+    let allowed: HashSet<&str> = required.iter().chain(optional.iter()).copied().collect();
+    if required.iter().any(|field| !object.contains_key(*field))
+        || object.keys().any(|field| !allowed.contains(field.as_str()))
+    {
+        return Err(AppError::InvalidInput(
+            "Invalid room control event fields.".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_preview_request_payload(request: &Map<String, Value>) -> AppResult<()> {
     let schema = request.get("schemaVersion").and_then(Value::as_str);
     let capability = request.get("capability").and_then(Value::as_str);
+    if schema == Some(CANDIDATE_PAYLOAD_REQUEST_SCHEMA)
+        || capability == Some(CANDIDATE_PAYLOAD_CAPABILITY)
+    {
+        require_exact_fields(
+            request,
+            &[
+                "schemaVersion",
+                "requestId",
+                "nonce",
+                "createdAt",
+                "expiresAt",
+                "sourceDeviceRef",
+                "targetPeerRef",
+                "capability",
+                "executorKind",
+                "input",
+                "pendingPayloadHash",
+                "requestPayloadHash",
+                "transportStatus",
+            ],
+        )?;
+        if schema != Some(CANDIDATE_PAYLOAD_REQUEST_SCHEMA)
+            || capability != Some(CANDIDATE_PAYLOAD_CAPABILITY)
+            || string_field(request, "executorKind")? != CANDIDATE_PAYLOAD_EXECUTOR_KIND
+            || string_field(request, "transportStatus")? != "preview_only"
+        {
+            return Err(AppError::InvalidInput("Invalid preview request.".into()));
+        }
+        let input = request
+            .get("input")
+            .and_then(Value::as_object)
+            .ok_or_else(|| AppError::InvalidInput("Invalid preview request input.".into()))?;
+        validate_candidate_payload_input(input)?;
+        let _ = bounded_string_field(request, "pendingPayloadHash", 256)?;
+        let _ = bounded_string_field(request, "requestPayloadHash", 256)?;
+        return Ok(());
+    }
     if schema == Some(FILE_CANDIDATES_REQUEST_SCHEMA)
         || capability == Some(FILE_CANDIDATES_CAPABILITY)
     {
@@ -1341,6 +1412,59 @@ fn validate_execution_request_payload(
 ) -> AppResult<()> {
     let schema = string_field(payload, "schemaVersion")?;
     let capability = string_field(payload, "capability")?;
+    if schema == CANDIDATE_PAYLOAD_EXECUTION_REQUEST_SCHEMA
+        || capability == CANDIDATE_PAYLOAD_CAPABILITY
+    {
+        require_exact_fields(
+            payload,
+            &[
+                "schemaVersion",
+                "executionId",
+                "consentId",
+                "sourcePreviewEventId",
+                "envelopeId",
+                "requestId",
+                "requestPayloadHash",
+                "roomRef",
+                "sourceDeviceRef",
+                "targetPeerRef",
+                "capability",
+                "executorKind",
+                "sourceCapability",
+                "sourceRequestId",
+                "candidateId",
+                "candidateKind",
+                "candidateDisplayName",
+                "createdAt",
+                "expiresAt",
+            ],
+        )?;
+        if schema != CANDIDATE_PAYLOAD_EXECUTION_REQUEST_SCHEMA
+            || string_field(payload, "roomRef")? != expected_room
+            || string_field(payload, "sourceDeviceRef")? != expected_source
+            || string_field(payload, "targetPeerRef")? != expected_target
+            || capability != CANDIDATE_PAYLOAD_CAPABILITY
+            || string_field(payload, "executorKind")? != CANDIDATE_PAYLOAD_EXECUTOR_KIND
+            || string_field(payload, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
+            || string_field(payload, "candidateKind")? != "filesystem_file"
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid execution request payload.".into(),
+            ));
+        }
+        let candidate_id = bounded_string_field(payload, "candidateId", 256)?;
+        if candidate_id.contains('/')
+            || candidate_id.contains('\\')
+            || is_absolute_path_like(&candidate_id)
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid execution request payload.".into(),
+            ));
+        }
+        let _ = bounded_string_field(payload, "sourceRequestId", 256)?;
+        let _ = bounded_string_field(payload, "candidateDisplayName", 256)?;
+        return Ok(());
+    }
     if schema == FILE_CANDIDATES_EXECUTION_REQUEST_SCHEMA
         || capability == FILE_CANDIDATES_CAPABILITY
     {
@@ -1450,6 +1574,9 @@ fn validate_execution_request_payload(
 }
 
 fn validate_execution_result_payload(payload: &Map<String, Value>) -> AppResult<()> {
+    if string_field(payload, "schemaVersion")? == CANDIDATE_PAYLOAD_EXECUTION_RESULT_SCHEMA {
+        return validate_candidate_payload_execution_result_payload(payload);
+    }
     if string_field(payload, "schemaVersion")? == FILE_CANDIDATES_EXECUTION_RESULT_SCHEMA {
         return validate_file_candidate_execution_result_payload(payload);
     }
@@ -1696,9 +1823,161 @@ pub fn validate_file_candidate_execution_result_payload(
     Ok(())
 }
 
+pub fn validate_candidate_payload_execution_result_payload(
+    payload: &Map<String, Value>,
+) -> AppResult<()> {
+    require_fields_with_optional(
+        payload,
+        &[
+            "schemaVersion",
+            "capability",
+            "executionId",
+            "requestId",
+            "consentId",
+            "status",
+            "candidate",
+            "transferredBytes",
+            "handoffQueued",
+            "errorCode",
+            "createdAt",
+        ],
+        &["candidateResolution", "transferStatus"],
+    )?;
+    if string_field(payload, "schemaVersion")? != CANDIDATE_PAYLOAD_EXECUTION_RESULT_SCHEMA
+        || string_field(payload, "capability")? != CANDIDATE_PAYLOAD_CAPABILITY
+    {
+        return Err(AppError::InvalidInput(
+            "Invalid execution result payload.".into(),
+        ));
+    }
+    for field in ["executionId", "requestId", "consentId"] {
+        let _ = bounded_string_field(payload, field, 256)?;
+    }
+    let _ = OffsetDateTime::parse(string_field(payload, "createdAt")?, &Rfc3339)
+        .map_err(|_| AppError::InvalidInput("Invalid execution result time.".into()))?;
+    let status = string_field(payload, "status")?;
+    if ![
+        "handoff_queued",
+        "handoff_failed",
+        "candidate_resolved_handoff_not_implemented",
+        "candidate_not_found",
+        "candidate_expired",
+        "candidate_changed",
+        "handoff_not_implemented",
+        "rejected",
+        "expired",
+        "already_consumed",
+        "failed",
+    ]
+    .contains(&status)
+    {
+        return Err(AppError::InvalidInput(
+            "Invalid execution result payload.".into(),
+        ));
+    }
+    validate_candidate_payload_result_candidate(
+        payload
+            .get("candidate")
+            .and_then(Value::as_object)
+            .ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?,
+    )?;
+    if let Some(resolution) = payload.get("candidateResolution") {
+        validate_candidate_payload_resolution(
+            resolution.as_object().ok_or_else(|| {
+                AppError::InvalidInput("Invalid execution result payload.".into())
+            })?,
+        )?;
+    }
+    if integer_field(payload, "transferredBytes")? != 0 {
+        return Err(AppError::InvalidInput(
+            "Invalid execution result payload.".into(),
+        ));
+    }
+    if status == "handoff_queued" {
+        if payload.get("handoffQueued") != Some(&Value::Bool(true))
+            || payload.get("transferStatus").and_then(Value::as_str) != Some("queued")
+            || !payload.get("errorCode").is_some_and(Value::is_null)
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid execution result payload.".into(),
+            ));
+        }
+    } else {
+        if payload.get("handoffQueued") != Some(&Value::Bool(false))
+            || payload.get("transferStatus").is_some()
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid execution result payload.".into(),
+            ));
+        }
+    }
+    if status != "handoff_queued"
+        && [
+            "candidate_resolved_handoff_not_implemented",
+            "candidate_not_found",
+            "candidate_expired",
+            "candidate_changed",
+            "handoff_not_implemented",
+        ]
+        .contains(&status)
+    {
+        if !payload.get("errorCode").is_some_and(Value::is_null) {
+            return Err(AppError::InvalidInput(
+                "Invalid execution result payload.".into(),
+            ));
+        }
+    } else if !payload
+        .get("errorCode")
+        .and_then(Value::as_str)
+        .is_some_and(is_candidate_payload_error_code)
+    {
+        return Err(AppError::InvalidInput(
+            "Invalid execution result payload.".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_consent_grant_payload(consent: &Map<String, Value>) -> AppResult<()> {
     let schema = string_field(consent, "schemaVersion")?;
     let capability = string_field(consent, "capability")?;
+    if schema == CANDIDATE_PAYLOAD_CONSENT_SCHEMA || capability == CANDIDATE_PAYLOAD_CAPABILITY {
+        require_exact_fields(
+            consent,
+            &[
+                "schemaVersion",
+                "consentId",
+                "sourcePreviewEventId",
+                "envelopeId",
+                "requestId",
+                "requestPayloadHash",
+                "capability",
+                "sourceCapability",
+                "sourceRequestId",
+                "candidateId",
+                "candidateKind",
+                "candidateDisplayName",
+                "expiresAt",
+            ],
+        )?;
+        if schema != CANDIDATE_PAYLOAD_CONSENT_SCHEMA
+            || capability != CANDIDATE_PAYLOAD_CAPABILITY
+            || string_field(consent, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
+            || string_field(consent, "candidateKind")? != "filesystem_file"
+        {
+            return Err(AppError::InvalidInput("Invalid consent grant.".into()));
+        }
+        let candidate_id = bounded_string_field(consent, "candidateId", 256)?;
+        if candidate_id.contains('/')
+            || candidate_id.contains('\\')
+            || is_absolute_path_like(&candidate_id)
+        {
+            return Err(AppError::InvalidInput("Invalid consent grant.".into()));
+        }
+        let _ = bounded_string_field(consent, "sourceRequestId", 256)?;
+        let _ = bounded_string_field(consent, "candidateDisplayName", 256)?;
+        return Ok(());
+    }
     if schema == FILE_CANDIDATES_CONSENT_SCHEMA || capability == FILE_CANDIDATES_CAPABILITY {
         require_exact_fields(
             consent,
@@ -1777,6 +2056,62 @@ fn is_hello_stdout_execution_result_event(kind: &str, payload: &Map<String, Valu
             .get("schemaVersion")
             .and_then(Value::as_str)
             .is_some_and(|schema| schema == HELLO_STDOUT_EXECUTION_RESULT_SCHEMA)
+}
+
+fn validate_candidate_payload_input(input: &Map<String, Value>) -> AppResult<()> {
+    require_fields_with_optional(
+        input,
+        &[
+            "sourceCapability",
+            "sourceRequestId",
+            "candidateId",
+            "candidateDisplayName",
+            "candidateKind",
+        ],
+        &[
+            "redactedLocation",
+            "sizeBytes",
+            "modifiedAt",
+            "mimeFamily",
+            "extension",
+        ],
+    )?;
+    if string_field(input, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
+        || string_field(input, "candidateKind")? != "filesystem_file"
+    {
+        return Err(AppError::InvalidInput(
+            "Invalid candidate payload input.".into(),
+        ));
+    }
+    let candidate_id = bounded_string_field(input, "candidateId", 256)?;
+    if candidate_id.contains('/')
+        || candidate_id.contains('\\')
+        || is_absolute_path_like(&candidate_id)
+    {
+        return Err(AppError::InvalidInput(
+            "Invalid candidate payload input.".into(),
+        ));
+    }
+    let _ = bounded_string_field(input, "sourceRequestId", 256)?;
+    let _ = bounded_string_field(input, "candidateDisplayName", 255)?;
+    if let Some(redacted_location) = input.get("redactedLocation") {
+        let Some(redacted_location) = redacted_location.as_str() else {
+            return Err(AppError::InvalidInput(
+                "Invalid candidate payload input.".into(),
+            ));
+        };
+        if redacted_location.is_empty()
+            || redacted_location.len() > 512
+            || is_absolute_path_like(redacted_location)
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid candidate payload input.".into(),
+            ));
+        }
+    }
+    validate_optional_non_negative_integer(input, "sizeBytes", "Invalid candidate payload input.")?;
+    validate_optional_rfc3339(input, "modifiedAt", "Invalid candidate payload input.")?;
+    validate_optional_mime_and_extension(input)
 }
 
 fn validate_file_candidate_input(
@@ -2056,6 +2391,151 @@ fn validate_file_candidate_result_candidates(candidates: &[Value]) -> AppResult<
     Ok(())
 }
 
+fn validate_candidate_payload_result_candidate(candidate: &Map<String, Value>) -> AppResult<()> {
+    require_fields_with_optional(
+        candidate,
+        &["candidateId", "candidateKind", "candidateDisplayName"],
+        &["sizeBytes", "mimeFamily", "extension"],
+    )?;
+    validate_candidate_payload_metadata_common(candidate, false)
+}
+
+fn validate_candidate_payload_resolution(resolution: &Map<String, Value>) -> AppResult<()> {
+    require_fields_with_optional(
+        resolution,
+        &[
+            "sourceCapability",
+            "sourceRequestId",
+            "candidateId",
+            "candidateKind",
+            "resolved",
+            "reason",
+        ],
+        &[
+            "displayName",
+            "sizeBytes",
+            "modifiedAt",
+            "mimeFamily",
+            "extension",
+        ],
+    )?;
+    if string_field(resolution, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
+        || resolution
+            .get("resolved")
+            .and_then(Value::as_bool)
+            .is_none()
+        || ![
+            "resolved",
+            "not_found",
+            "expired",
+            "changed",
+            "binding_mismatch",
+            "unsupported_kind",
+        ]
+        .contains(&string_field(resolution, "reason")?)
+    {
+        return Err(AppError::InvalidInput(
+            "Invalid execution result payload.".into(),
+        ));
+    }
+    let _ = bounded_string_field(resolution, "sourceRequestId", 256)?;
+    validate_candidate_payload_metadata_common(resolution, true)
+}
+
+fn validate_candidate_payload_metadata_common(
+    value: &Map<String, Value>,
+    resolution_shape: bool,
+) -> AppResult<()> {
+    let candidate_id = bounded_string_field(value, "candidateId", 256)?;
+    if candidate_id.contains('/')
+        || candidate_id.contains('\\')
+        || is_absolute_path_like(&candidate_id)
+    {
+        return Err(AppError::InvalidInput(
+            "Invalid execution result payload.".into(),
+        ));
+    }
+    if string_field(value, "candidateKind")? != "filesystem_file" {
+        return Err(AppError::InvalidInput(
+            "Invalid execution result payload.".into(),
+        ));
+    }
+    let display_field = if resolution_shape {
+        "displayName"
+    } else {
+        "candidateDisplayName"
+    };
+    if value.contains_key(display_field) {
+        let display_name = bounded_string_field(value, display_field, 255)?;
+        if display_name.contains('/')
+            || display_name.contains('\\')
+            || is_absolute_path_like(&display_name)
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid execution result payload.".into(),
+            ));
+        }
+    } else if !resolution_shape {
+        return Err(AppError::InvalidInput(
+            "Invalid execution result payload.".into(),
+        ));
+    }
+    validate_optional_non_negative_integer(
+        value,
+        "sizeBytes",
+        "Invalid execution result payload.",
+    )?;
+    validate_optional_rfc3339(value, "modifiedAt", "Invalid execution result payload.")?;
+    validate_optional_mime_and_extension(value)
+}
+
+fn validate_optional_non_negative_integer(
+    value: &Map<String, Value>,
+    field: &str,
+    message: &str,
+) -> AppResult<()> {
+    if value.contains_key(field) && integer_field(value, field)? < 0 {
+        return Err(AppError::InvalidInput(message.into()));
+    }
+    Ok(())
+}
+
+fn validate_optional_rfc3339(
+    value: &Map<String, Value>,
+    field: &str,
+    message: &str,
+) -> AppResult<()> {
+    if value.contains_key(field) {
+        let _ = OffsetDateTime::parse(string_field(value, field)?, &Rfc3339)
+            .map_err(|_| AppError::InvalidInput(message.into()))?;
+    }
+    Ok(())
+}
+
+fn validate_optional_mime_and_extension(value: &Map<String, Value>) -> AppResult<()> {
+    if value.contains_key("mimeFamily")
+        && !["document", "image", "archive", "media", "code", "unknown"]
+            .contains(&string_field(value, "mimeFamily")?)
+    {
+        return Err(AppError::InvalidInput(
+            "Invalid execution result payload.".into(),
+        ));
+    }
+    if value.contains_key("extension") {
+        let extension = string_field(value, "extension")?;
+        if extension.len() > 16
+            || extension
+                .chars()
+                .any(|character| !character.is_ascii_alphanumeric())
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid execution result payload.".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_file_candidate_omitted(omitted: &Map<String, Value>) -> AppResult<()> {
     require_exact_fields(
         omitted,
@@ -2108,6 +2588,24 @@ fn is_file_candidate_error_code(value: &str) -> bool {
         "executor_unavailable",
         "unsafe_request_rejected",
         "internal_filesystem_error",
+        "policy_rejected",
+    ]
+    .contains(&value)
+}
+
+fn is_candidate_payload_error_code(value: &str) -> bool {
+    [
+        "missing_consent",
+        "consent_not_allowed_once",
+        "consent_expired",
+        "invalid_consent",
+        "consent_binding_mismatch",
+        "already_consumed",
+        "malformed_request",
+        "unsupported_route",
+        "unsafe_request_rejected",
+        "handoff_not_implemented",
+        "handoff_failed",
         "policy_rejected",
     ]
     .contains(&value)

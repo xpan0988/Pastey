@@ -1347,6 +1347,30 @@ function App() {
     });
   }
 
+  function enqueueAgentBridgeCandidatePayloadHandoff(roomId: string, input: TransferQueueInput): boolean {
+    console.info(
+      "[pastey queue] event=agent_bridge_candidate_payload_handoff_enqueue_attempt room_id=%s candidate_id=%s",
+      roomId,
+      input.agentBridgeMetadata?.candidateId ?? "unknown"
+    );
+    const next = enqueueTransferBatch(schedulerRef.current, roomId, [input]);
+    if (next === schedulerRef.current) {
+      console.info(
+        "[pastey queue] event=agent_bridge_candidate_payload_handoff_enqueue_rejected room_id=%s reason=no_new_items",
+        roomId
+      );
+      return false;
+    }
+    updateSchedulerState(() => next);
+    console.info(
+      "[pastey queue] event=agent_bridge_candidate_payload_handoff_queued room_id=%s candidate_id=%s label=%s",
+      roomId,
+      input.agentBridgeMetadata?.candidateId ?? "unknown",
+      input.agentBridgeMetadata?.label ?? "Agent Bridge candidate payload request"
+    );
+    return true;
+  }
+
   async function handleCancelQueueItem(itemId: string) {
     const item = schedulerRef.current.items[itemId];
     const transferId = item?.status === "sending" ? item.activeTransferId : undefined;
@@ -1483,6 +1507,7 @@ function App() {
             onBurn={handleBurnRoom}
             onEnqueueFiles={enqueueRoomFiles}
             onEnqueueTransferInputs={enqueueRoomTransferInputs}
+            onEnqueueCandidatePayloadHandoff={enqueueAgentBridgeCandidatePayloadHandoff}
             onCancelQueueItem={handleCancelQueueItem}
             onCancelQueueBatch={handleCancelQueueBatch}
             agentBridgeEnabled={config.dev_tools_enabled}

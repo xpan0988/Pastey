@@ -82,6 +82,12 @@ npm run build
 npm run build:checked
 ```
 
+On Linux release hosts, use the explicit Linux bundle audit:
+
+```bash
+npm run build:checked:linux
+```
+
 `npm run check:version` verifies that `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.lock` match the authoritative `src-tauri/Cargo.toml` version. On tag builds, it also checks the Git tag version.
 
 ## Commit, Tag, And Push
@@ -104,4 +110,4 @@ The script does not push automatically. After reviewing the commit and tag, run:
 git push origin main --tags
 ```
 
-Pushing a tag triggers the GitHub Actions release build. The version check compares the tag version against the internal app version before the release build continues.
+Pushing a tag triggers the GitHub Actions release build for macOS Apple Silicon, Windows, and Linux x86_64. The version check compares the tag version against the internal app version before the release build continues.

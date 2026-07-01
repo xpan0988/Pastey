@@ -1,9 +1,14 @@
 import { isRecord, validateAiActionPlan } from "./actionPlanValidator";
 import {
+  CANDIDATE_PAYLOAD_CAPABILITY,
   getAgentBridgeCapabilityContractByActionKind,
   FILE_CANDIDATES_CAPABILITY,
   type AgentBridgeCapabilityContract
 } from "./capabilityRegistry";
+import {
+  buildCandidatePayloadCanonicalConstraints,
+  validateCandidatePayloadAdvisoryInput,
+} from "./candidatePayloadAdvisory";
 import {
   buildFileCandidateCanonicalConstraints,
   validateFileCandidateAdvisoryInput
@@ -80,6 +85,9 @@ export function buildPendingAiActionCanonicalPayload(
   if (contract.providerInputShape === "file_candidate_advisory") {
     return buildFileCandidatePendingPayload(plan, contract, pendingId, expiresAt);
   }
+  if (contract.providerInputShape === "candidate_payload_request") {
+    return buildCandidatePayloadPendingPayload(plan, contract, pendingId, expiresAt);
+  }
   if (!isRecord(plan.proposedInput) || !isRecord(plan.proposedInput.constraints)) {
     throw new Error(`Pending AI action requires a complete ${contract.ui.label} proposedInput.`);
   }
@@ -146,6 +154,51 @@ function buildFileCandidatePendingPayload(
     scopePolicy: cloneJson(input.scopePolicy),
     limits: cloneJson(input.limits),
     safety: cloneJson(input.safety),
+    references: [...(plan.references ?? [])]
+      .map((reference) => cloneJson(reference))
+      .sort((left, right) => `${left.kind}:${left.ref}`.localeCompare(`${right.kind}:${right.ref}`)),
+    pendingId,
+    expiresAt
+  };
+}
+
+function buildCandidatePayloadPendingPayload(
+  plan: AiActionPlan,
+  contract: AgentBridgeCapabilityContract,
+  pendingId: string,
+  expiresAt: string,
+): PendingAiActionCanonicalPayload {
+  const validation = validateCandidatePayloadAdvisoryInput(plan.proposedInput);
+  if (!validation.valid) {
+    throw new Error(`Pending AI action requires a valid ${contract.ui.label} proposedInput.`);
+  }
+  if (contract.capability !== CANDIDATE_PAYLOAD_CAPABILITY) {
+    throw new Error("Pending AI action candidate payload contract mismatch.");
+  }
+  if (!Number.isFinite(new Date(expiresAt).getTime())) {
+    throw new Error("Pending AI action requires a valid expiry.");
+  }
+  const input = validation.value;
+  const candidate = {
+    sourceCapability: input.sourceCapability,
+    sourceRequestId: input.sourceRequestId,
+    candidateId: input.candidateId,
+    candidateDisplayName: input.candidateDisplayName,
+    candidateKind: input.candidateKind,
+    ...(input.redactedLocation !== undefined ? { redactedLocation: input.redactedLocation } : {}),
+    ...(input.sizeBytes !== undefined ? { sizeBytes: input.sizeBytes } : {}),
+    ...(input.modifiedAt !== undefined ? { modifiedAt: input.modifiedAt } : {}),
+    ...(input.mimeFamily !== undefined ? { mimeFamily: input.mimeFamily } : {}),
+    ...(input.extension !== undefined ? { extension: input.extension } : {}),
+  };
+  return {
+    schemaVersion: plan.schemaVersion,
+    kind: plan.kind,
+    targetPeerRef: input.targetPeerRef,
+    capability: contract.capability,
+    message: input.candidateDisplayName,
+    constraints: buildCandidatePayloadCanonicalConstraints(input),
+    candidate,
     references: [...(plan.references ?? [])]
       .map((reference) => cloneJson(reference))
       .sort((left, right) => `${left.kind}:${left.ref}`.localeCompare(`${right.kind}:${right.ref}`)),

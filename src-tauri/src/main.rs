@@ -39,10 +39,10 @@ use crate::{
         leave_room, list_nearby_devices, list_received_room_control_events, list_room_items,
         list_rooms, log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
         mark_join_prompt_rendered, open_logs_folder, pair_bridge_peer, pending_join_requests,
-        reject_nearby_join, request_nearby_join, reveal_in_folder, revoke_bridge_peer_pairing,
-        run_loopback_benchmark, run_peer_link_benchmark, send_file_to_room,
-        send_room_control_event, send_text_to_room, update_config, update_transfer_window,
-        write_temp_file,
+        reject_nearby_join, request_nearby_join, resolve_candidate_payload_capability,
+        reveal_in_folder, revoke_bridge_peer_pairing, run_loopback_benchmark,
+        run_peer_link_benchmark, send_file_to_room, send_room_control_event, send_text_to_room,
+        update_config, update_transfer_window, write_temp_file,
     },
     config::StoredConfig,
     error::{AppError, AppResult},
@@ -67,6 +67,7 @@ pub struct AppState {
     pub latest_device_capabilities: Mutex<Option<diagnostics::DeviceCapabilities>>,
     pub latest_benchmark_results: Mutex<HashMap<String, diagnostics::LinkBenchmarkResult>>,
     pub room_control: Mutex<room_control::RoomControlRuntimeState>,
+    pub candidate_payload_store: Mutex<file_candidates::CandidatePayloadStore>,
 }
 
 pub struct ActiveRoomServer {
@@ -125,6 +126,9 @@ fn main() {
                 latest_device_capabilities: Mutex::new(None),
                 latest_benchmark_results: Mutex::new(HashMap::new()),
                 room_control: Mutex::new(room_control::RoomControlRuntimeState::default()),
+                candidate_payload_store: Mutex::new(
+                    file_candidates::CandidatePayloadStore::default(),
+                ),
             });
 
             app.manage(state.clone());
@@ -177,6 +181,7 @@ fn main() {
             send_room_control_event,
             execute_hello_stdout_capability,
             execute_file_candidate_search_capability,
+            resolve_candidate_payload_capability,
             get_room_control_session_context,
             list_received_room_control_events,
             cancel_transfer,

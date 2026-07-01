@@ -23,7 +23,7 @@ test("Settings retains configuration only and Room owns the workflow", () => {
 
 test("Room control consumes the active Room directly and has no independent room selector", () => {
   const panel = readFileSync("src/components/agentBridge/RoomControlPanel.tsx", "utf8");
-  assert.match(panel, /export function RoomControlPanel\(\{ room, envelope \}/);
+  assert.match(panel, /export function RoomControlPanel\(\{ room, envelope, onEnqueueCandidatePayloadHandoff \}/);
   assert.match(panel, /getRoomControlSessionContext\(room\.id\)/);
   assert.doesNotMatch(panel, /listRooms|selectedRoomId|activeRooms/);
   assert.match(panel, /data-testid="agent-bridge-peer-consent-review"/);

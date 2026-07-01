@@ -12,7 +12,10 @@ use crate::{
     device_profile::{self, ProfileProbeMode},
     diagnostics, discovery,
     error::{AppError, AppResult},
-    file_candidates::{self, FileCandidateExecutionRequest, FileCandidateExecutionResult},
+    file_candidates::{
+        self, CandidatePayloadExecutionRequest, CandidatePayloadLocalResolution,
+        FileCandidateExecutionRequest, FileCandidateExecutionResult,
+    },
     hello_stdout::{self, HelloStdoutExecutionRequest, HelloStdoutExecutionResult},
     link_benchmark, logging,
     models::{
@@ -1248,7 +1251,18 @@ pub async fn execute_file_candidate_search_capability(
     request: FileCandidateExecutionRequest,
     state: State<'_, Arc<AppState>>,
 ) -> Result<FileCandidateExecutionResult, String> {
-    file_candidates::execute_file_candidate_search(request, &state.paths)
+    let mut store = state.candidate_payload_store.lock();
+    file_candidates::execute_file_candidate_search_and_store(request, &state.paths, &mut store)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub async fn resolve_candidate_payload_capability(
+    request: CandidatePayloadExecutionRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CandidatePayloadLocalResolution, String> {
+    let mut store = state.candidate_payload_store.lock();
+    file_candidates::resolve_candidate_payload_for_handoff(request, &mut store)
         .map_err(|error| error.message())
 }
 

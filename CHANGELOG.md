@@ -8,11 +8,12 @@ Detailed update and release history for Pastey.
 
 - Added a static Agent Bridge capability registry and shared capability envelope for the existing Hello Peer / Hello Stdout capability lifecycle.
 - Added the Layer 5 workspace capability `filesystem.find_file_candidates`, including `request_peer_file_candidates` action validation, PolicyGate bounds, selected-peer preview/execution wiring, receiver Allow once, a bounded Rust/Tauri metadata-only search executor, and typed redacted candidate results.
+- Added the Layer 5 candidate-payload second-consent handoff path `transfer.request_candidate_payload`, including `request_peer_candidate_payload` action validation, selected-peer preview, capability-specific Allow once grant, exact execution-request binding, one-time consent consumption, receiver-local in-memory candidate resolution, existing transfer-queue handoff, Agent Bridge queue audit metadata, and typed `handoff_queued` results with zero transferred bytes at handoff time.
 
 ### Documentation
 
 - Added `docs/architecture/naming-conventions.md` as the canonical naming guide for schema versions, capability IDs, registry versions, protocol names, provider action kinds, executor kinds, and future candidate-payload capability naming.
-- Consolidated Agent Bridge capability contracts, provider behavior, Layer 5 workspace status, and validation guidance around the implemented file-candidate metadata search capability.
+- Consolidated Agent Bridge capability contracts, provider behavior, Layer 5 workspace status, candidate-payload second-consent boundaries, receiver-local candidate resolution, queue handoff, manual smoke expectations, and validation guidance around the implemented file-candidate metadata search capability and payload handoff path.
 
 ### Changed
 
@@ -24,7 +25,7 @@ Detailed update and release history for Pastey.
 
 ### Unchanged
 
-- No file-candidate transfer handoff, automatic file sending, shell/process execution, generic tool runtime, or MCP runtime is implemented.
+- No automatic file sending after discovery, shell/process execution, generic tool runtime, MCP runtime, new data plane, or binary-v1 protocol change is implemented. The receiver-local candidate store is in-memory only, clears on app restart, and does not make candidate ids paths or transfer authority.
 
 ## 1.9.0 — Agent Bridge capability slice — 2026-06-18
 
