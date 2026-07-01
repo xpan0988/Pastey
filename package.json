@@ -10,9 +10,11 @@
     "tauri:dev-fast": "npm run tauri -- dev -- --profile dev-fast",
     "build": "tsc && vite build",
     "tauri:build": "npm run tauri -- build",
+    "tauri:build:linux": "npm run tauri -- build --bundles appimage,deb",
     "check:version": "node scripts/check-version-consistency.mjs",
     "release:version": "node scripts/release-version.mjs",
     "build:checked": "npm run check:version && npm run tauri:build && node scripts/check-build-size.mjs",
+    "build:checked:linux": "npm run check:version && npm run tauri:build:linux && node scripts/check-build-size.mjs",
     "preview": "vite preview",
     "tauri": "cross-env CI=true tauri"
   },

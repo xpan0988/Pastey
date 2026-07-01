@@ -258,9 +258,10 @@ test("legacy local queue budget helper remains independent from runtime demand c
 
 test("receiver room-control queue UI is not gated by an outbound advisory plan", () => {
   const source = readFileSync("src/components/AiSlotPreview.tsx", "utf8");
-  const panel = source.indexOf("<RoomControlPanel room={room} envelope={envelopePreview?.envelope} />");
+  const panel = source.indexOf("<RoomControlPanel");
   const advisoryResultGate = source.indexOf("{result ? (");
   assert.ok(panel >= 0);
+  assert.match(source, /onEnqueueCandidatePayloadHandoff=\{onEnqueueCandidatePayloadHandoff\}/);
   assert.ok(advisoryResultGate >= 0);
   assert.ok(panel < advisoryResultGate);
 });

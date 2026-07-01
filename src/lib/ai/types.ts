@@ -26,7 +26,8 @@ export type AiActionKind =
   | "explain_microflowgroup_mode"
   | "request_peer_hello_demo"
   | "request_peer_hello_stdout_demo"
-  | "request_peer_file_candidates";
+  | "request_peer_file_candidates"
+  | "request_peer_candidate_payload";
 
 export type AiConfidence = "low" | "medium" | "high";
 
@@ -160,6 +161,7 @@ export interface PendingAiActionCanonicalPayload {
   scopePolicy?: Record<string, unknown>;
   limits?: Record<string, unknown>;
   safety?: Record<string, unknown>;
+  candidate?: Record<string, unknown>;
   references: AiActionReference[];
   pendingId: string;
   expiresAt: string;

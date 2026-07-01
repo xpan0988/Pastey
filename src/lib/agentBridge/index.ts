@@ -6,5 +6,6 @@ export * from "./peerConsent";
 export * from "./helloPeerExecution";
 export * from "./helloStdoutExecution";
 export * from "./fileCandidateExecution";
+export * from "./candidatePayloadExecution";
 export * from "./config";
 export * from "./logging";

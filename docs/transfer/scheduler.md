@@ -136,7 +136,7 @@ Layer 2 provides current-session facts: device profile fields, capability availa
 
 Layer 3 owns scheduler policy. The current scheduler uses explicit user intent, queue state, data/control class, payload byte size, runtime capacity, control workload, terminal state, and observed runtime transfer facts to select requested windows, choose MicroFlowGroup mode, determine grouping eligibility, rebalance runtime windows, or route transfers. It does not obey Layer 2 planner hints or recommendations.
 
-A future candidate-payload request capability, likely `transfer.request_candidate_payload`, would need explicit Layer 5 consent, Layer 4 route/consent validation, and Layer 3 queue/handoff validation. That is future work, not current scheduler behavior.
+The current `transfer.request_candidate_payload` path validates a Layer 5 second-consent boundary, resolves a selected candidate through a receiver-local in-memory store, and creates a normal Layer 3 queue item through the existing transfer scheduler. The queue item carries Agent Bridge audit metadata such as `origin: agent_bridge_candidate_payload` and the label `Agent Bridge candidate payload request`, but that metadata does not include receiver absolute paths or file contents. `handoff_queued` means the queue accepted the payload source; it does not mean transfer started or completed. Actual byte transfer, runtime-window selection, MicroFlowGroup behavior, progress, cancellation, and completion remain existing scheduler and binary-v1 pipeline responsibilities.
 
 ## Validation
 

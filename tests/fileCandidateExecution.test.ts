@@ -294,7 +294,7 @@ test("Hello consent cannot authorize file-candidate search and file consent cann
   assert.equal(rejected.result.errorCode, "consent_binding_mismatch");
 
   assert.equal(buildHelloPeerExecutionRequest(file.preview, file.ack).ok, false);
-  assert.notEqual(file.consent.binding.capability, "filesystem.prepare_file_transfer");
+  assert.notEqual(file.consent.binding.capability, "transfer.request_candidate_payload");
 });
 
 test("unsafe provider fields and selected-peers or broadcast intent reject before preview", () => {

@@ -18,7 +18,7 @@ export interface AgentBridgeLogEvent {
   transportResult?: string;
   runtimeDataWindowTarget?: 7 | 8;
   errorCode?: string;
-  executionResult?: "hello_peer_template_succeeded" | "hello_stdout_succeeded";
+  executionResult?: "hello_peer_template_succeeded" | "hello_stdout_succeeded" | "candidate_payload_handoff_queued";
 }
 
 export type AgentBridgeLogEventKind =

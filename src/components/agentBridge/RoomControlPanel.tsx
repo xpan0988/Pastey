@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
-import type { CapabilityRequestPreviewEnvelope } from "../../lib/ai";
+import type { CandidatePayloadExecutionRequest, CapabilityRequestPreviewEnvelope } from "../../lib/ai";
 import {
   buildCapabilityPreviewControlEvent,
   buildCapabilityPreviewStatusControlEvent,
+  buildCandidatePayloadExecutionRequest,
   buildFileCandidateExecutionRequest,
   buildHelloPeerExecutionRequest,
   buildHelloStdoutExecutionRequest,
@@ -19,6 +20,7 @@ import {
   enqueueInboundRoomControlEvents,
   enqueueRoomControlEvent,
   evaluatePeerCapabilityPreview,
+  executeInboundCandidatePayloadRequest,
   executeInboundFileCandidateRequest,
   executeInboundHelloPeerRequest,
   executeInboundHelloStdoutRequest,
@@ -37,6 +39,8 @@ import {
   setOutgoingControlWindowDemand,
   subscribeRuntimeControlWindowStatus,
   waitForRuntimeDataWindowTarget,
+  type CandidatePayloadHandoffResult,
+  type CandidatePayloadLocalResolution,
   type CapabilityPreviewControlStatus,
   type CapabilityPreviewRoomControlEvent,
   type CapabilityPreviewAckRoomControlEvent,
@@ -51,17 +55,20 @@ import {
   type RoomControlEvent,
   type RoomControlSendState,
 } from "../../lib/agentBridge";
+import { bridgePeerSessionId } from "../../lib/bridgeRouting";
 import {
   executeFileCandidateSearchCapability,
   executeHelloStdoutCapability,
   getRoomControlSessionContext,
   listReceivedRoomControlEvents,
+  resolveCandidatePayloadCapability,
   sendRoomControlEvent,
 } from "../../lib/tauri";
 import {
   assertCapabilityEventHasSelectedPeerRoute,
   bridgeRoutePayload,
 } from "../../lib/bridgeRoutingRuntime";
+import type { TransferQueueInput } from "../../lib/transferScheduler";
 import type {
   ReceivedRoomControlEvent,
   RoomControlSessionContext,
@@ -71,6 +78,7 @@ import type {
 interface RoomControlPanelProps {
   room: RoomInfo;
   envelope?: CapabilityRequestPreviewEnvelope;
+  onEnqueueCandidatePayloadHandoff?: (input: TransferQueueInput) => boolean;
 }
 
 interface PeerReviewState {
@@ -84,7 +92,7 @@ interface PeerReviewState {
 const ROOM_CONTROL_QUEUE_DEMAND_SOURCE = "agent-bridge-room-control-queue";
 const ROOM_CONTROL_ACTIVE_SEND_SOURCE = "agent-bridge-room-control-active-send";
 
-export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
+export function RoomControlPanel({ room, envelope, onEnqueueCandidatePayloadHandoff }: RoomControlPanelProps) {
   const [queue, setQueue] = useState<ControlQueueState>(createControlQueueState);
   const [messages, setMessages] = useState<string[]>([]);
   const [session, setSession] = useState<RoomControlSessionContext | null>(null);
@@ -450,13 +458,27 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       );
       const isHelloStdout = executionRequestEvent.payload.capability === "runtime.hello_stdout";
       const isFileCandidate = executionRequestEvent.payload.capability === "filesystem.find_file_candidates";
+      const isCandidatePayload = executionRequestEvent.payload.capability === "transfer.request_candidate_payload";
       logAgentBridgeLifecycle({
         eventKind: "hello_peer_execution_started",
         roomRefShort: session.roomId,
         requestIdShort: executionRequestEvent.payload.requestId,
         executionIdShort: executionRequestEvent.payload.executionId,
       });
-      const execution = isFileCandidate
+      const execution = isCandidatePayload
+        ? await executeInboundCandidatePayloadRequest(
+            executionRequestEvent,
+            consent,
+            consumptionState,
+            resolveCandidatePayloadCapability,
+            enqueueCandidatePayloadHandoff,
+            {
+              roomRef: session.roomId,
+              sourceDeviceRef: session.peerSessionRef,
+              targetPeerRef: session.localSessionRef,
+            },
+          )
+        : isFileCandidate
         ? await executeInboundFileCandidateRequest(
             executionRequestEvent,
             consent,
@@ -490,7 +512,9 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
               targetPeerRef: session.localSessionRef,
             },
           );
-      const succeeded = execution.result.status === "succeeded" || execution.result.status === "completed";
+      const succeeded = execution.result.status === "succeeded"
+        || execution.result.status === "completed"
+        || execution.result.status === "handoff_queued";
       const requestStatus = succeeded
         ? "execution_consumed"
         : execution.result.status === "already_consumed"
@@ -501,7 +525,9 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       const completed = markControlQueueItemStatus(state, item.queueId, requestStatus, {
         reason: execution.result.status === "succeeded"
           || execution.result.status === "completed"
-          ? isFileCandidate
+          ? isCandidatePayload
+            ? "Exact one-time consent consumed. Candidate payload handoff queued."
+            : isFileCandidate
             ? "Exact one-time consent consumed. File candidate search executed once."
             : isHelloStdout
             ? "Exact one-time consent consumed. Hello Stdout demo executed once."
@@ -539,7 +565,9 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
         consentResult: execution.state.consumedConsentIds.includes(item.event.payload.consentId) ? "consumed" : "not_consumed",
         errorCode: execution.result.errorCode ?? undefined,
         executionResult: succeeded
-          ? isFileCandidate ? undefined : isHelloStdout ? "hello_stdout_succeeded" : "hello_peer_template_succeeded"
+          ? isCandidatePayload
+            ? "candidate_payload_handoff_queued"
+            : isFileCandidate ? undefined : isHelloStdout ? "hello_stdout_succeeded" : "hello_peer_template_succeeded"
           : undefined,
       });
       if (consent && execution.state.consumedConsentIds.includes(consent.binding.consentId)) {
@@ -554,6 +582,8 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
         succeeded
           ? isFileCandidate
             ? `File candidate search completed with ${"candidates" in execution.result ? execution.result.candidates.length : 0} redacted candidate(s). Exact one-time consent was consumed.`
+            : isCandidatePayload
+            ? "Candidate payload handoff queued. Existing transfer pipeline owns progress and completion."
             : isHelloStdout
             ? "Hello Stdout demo executed once. Exact one-time consent was consumed."
             : "Hello Peer demo executed once. Exact one-time consent was consumed."
@@ -571,6 +601,7 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
           && matchExecutionResultToRequest(executionResultEvent, candidate.event)
       );
       const outboundStatus = executionResultEvent.payload.status === "succeeded"
+        || executionResultEvent.payload.status === "handoff_queued"
         ? "execution_succeeded"
         : executionResultEvent.payload.status === "already_consumed"
           ? "already_consumed"
@@ -580,7 +611,8 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       const matched = requestItem
         ? markControlQueueItemStatus(state, requestItem.queueId, outboundStatus, {
             reason: executionResultEvent.payload.status === "succeeded"
-              ? "Peer returned the fixed bounded result."
+              || executionResultEvent.payload.status === "handoff_queued"
+              ? "Peer returned the bounded execution result."
               : `Peer returned ${executionResultEvent.payload.errorCode ?? executionResultEvent.payload.status}.`,
           })
         : { ok: false as const, state, errors: ["No matching outbound execution request was found."] };
@@ -597,6 +629,8 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       setMessages(matched.ok
         ? [executionResultEvent.payload.status === "succeeded"
             ? `Peer returned the fixed bounded result: ${"stdout" in executionResultEvent.payload ? executionResultEvent.payload.stdout : executionResultEvent.payload.output}`
+            : executionResultEvent.payload.status === "handoff_queued"
+            ? "Peer queued the approved candidate payload handoff. Transfer completion remains in the existing pipeline."
             : `Peer execution result: ${executionResultEvent.payload.errorCode ?? executionResultEvent.payload.status}.`]
         : matched.errors);
       return;
@@ -631,6 +665,81 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
               : `Peer returned ${inboundStatus}. No execution occurred.`,
         ]
       : applied.errors);
+  }
+
+  async function enqueueCandidatePayloadHandoff(
+    request: CandidatePayloadExecutionRequest,
+    resolution: CandidatePayloadLocalResolution,
+  ): Promise<CandidatePayloadHandoffResult> {
+    if (!session || request.capability !== "transfer.request_candidate_payload") {
+      return { queued: false, errorCode: "unsupported_route" };
+    }
+    if (!onEnqueueCandidatePayloadHandoff || !resolution.receiverLocalSource) {
+      return { queued: false, errorCode: "handoff_failed" };
+    }
+    const modifiedMs = typeof resolution.modifiedAt === "string"
+      ? Date.parse(resolution.modifiedAt)
+      : Number.NaN;
+    if (
+      resolution.candidateKind !== "filesystem_file" ||
+      typeof resolution.sizeBytes !== "number" ||
+      !Number.isFinite(modifiedMs)
+    ) {
+      return { queued: false, errorCode: "handoff_failed" };
+    }
+    try {
+      const targetPeerSessionId = session.peerRouteRef ?? session.peerSessionRef;
+      const queued = onEnqueueCandidatePayloadHandoff({
+        path: resolution.receiverLocalSource,
+        displayName: resolution.displayName ?? request.candidateDisplayName,
+        mimeType: "application/octet-stream",
+        sizeBytes: resolution.sizeBytes,
+        modifiedMs,
+        dedupeKey: [
+          "agent-bridge-candidate-payload",
+          request.sourceRequestId,
+          request.candidateId,
+          request.candidateKind,
+          resolution.sizeBytes,
+          modifiedMs,
+        ].join(":"),
+        bridgeRoute: {
+          bridgeSessionId: `legacy-room:${session.roomId}`,
+          target: {
+            kind: "selected_peer",
+            peerSessionId: bridgePeerSessionId(targetPeerSessionId),
+          },
+        },
+        bridgeOperationId: `agent-bridge-candidate:${request.requestId}:${request.executionId}`,
+        bridgeTargetKind: "selected_peer",
+        bridgeContentKind: "file",
+        targetPeerSessionId,
+        targetPeerDisplayName: room.peer_device_name ?? "selected peer",
+        targetCount: 1,
+        agentBridgeMetadata: {
+          origin: "agent_bridge_candidate_payload",
+          label: "Agent Bridge candidate payload request",
+          note: "Queued from approved candidate payload request.",
+          sourceCapability: "filesystem.find_file_candidates",
+          requestCapability: "transfer.request_candidate_payload",
+          sourceRequestId: request.sourceRequestId,
+          candidateId: request.candidateId,
+          candidateKind: "filesystem_file",
+          candidateDisplayName: resolution.displayName ?? request.candidateDisplayName,
+          requestedByPeerRef: request.sourceDeviceRef,
+          approvedByPeerRef: request.targetPeerRef,
+          consentId: request.consentId,
+          agentBridgeRequestId: request.requestId,
+          handoffCreatedAt: new Date().toISOString(),
+          sizeBytes: resolution.sizeBytes,
+          extension: resolution.extension,
+          mimeFamily: resolution.mimeFamily,
+        },
+      });
+      return queued ? { queued: true } : { queued: false, errorCode: "handoff_failed" };
+    } catch {
+      return { queued: false, errorCode: "unsupported_route" };
+    }
   }
 
   function decidePeerPreview(decision: "allow_once" | "deny") {
@@ -718,11 +827,13 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
       setMessages(["The exact source preview for this Allow once acknowledgement is unavailable."]);
       return;
     }
-    const built = preview.event.payload.request.capability === "filesystem.find_file_candidates"
-      ? buildFileCandidateExecutionRequest(preview.event, senderExecutionAck)
-      : preview.event.payload.request.capability === "runtime.hello_stdout"
-        ? buildHelloStdoutExecutionRequest(preview.event, senderExecutionAck)
-        : buildHelloPeerExecutionRequest(preview.event, senderExecutionAck);
+    const built = preview.event.payload.request.capability === "transfer.request_candidate_payload"
+      ? buildCandidatePayloadExecutionRequest(preview.event, senderExecutionAck)
+      : preview.event.payload.request.capability === "filesystem.find_file_candidates"
+        ? buildFileCandidateExecutionRequest(preview.event, senderExecutionAck)
+        : preview.event.payload.request.capability === "runtime.hello_stdout"
+          ? buildHelloStdoutExecutionRequest(preview.event, senderExecutionAck)
+          : buildHelloPeerExecutionRequest(preview.event, senderExecutionAck);
     if (!built.ok) {
       setMessages(built.errors);
       return;
@@ -925,9 +1036,11 @@ export function RoomControlPanel({ room, envelope }: RoomControlPanelProps) {
           >
             {senderExecutionAck.payload.consent.capability === "filesystem.find_file_candidates"
               ? "Request file candidate search"
-              : senderExecutionAck.payload.consent.capability === "runtime.hello_stdout"
-                ? "Request Hello Stdout execution"
-                : "Request Hello Peer execution"}
+              : senderExecutionAck.payload.consent.capability === "transfer.request_candidate_payload"
+                ? "Request candidate payload scaffold"
+                : senderExecutionAck.payload.consent.capability === "runtime.hello_stdout"
+                  ? "Request Hello Stdout execution"
+                  : "Request Hello Peer execution"}
           </button>
         </div>
       ) : null}
@@ -1050,8 +1163,11 @@ function PeerConsentReviewCard({
   const expired = review.status === "expired" || Date.parse(review.binding.expiresAt) <= nowMs;
   const isHelloStdout = review.binding.capability === "runtime.hello_stdout";
   const isFileCandidate = review.binding.capability === "filesystem.find_file_candidates";
+  const isCandidatePayload = review.binding.capability === "transfer.request_candidate_payload";
   const capabilityDetail = "filenameHint" in review.binding
     ? `Filename hint: ${review.binding.filenameHint}; search mode: ${review.binding.searchMode}`
+    : "candidateId" in review.binding
+    ? `Candidate: ${review.binding.candidateDisplayName}; source request: ${shortRef(review.binding.sourceRequestId)}`
     : "expectedStdout" in review.binding
     ? `Expected stdout: ${review.binding.expectedStdout}`
     : `Exact message: ${review.binding.exactMessage}`;
@@ -1069,6 +1185,8 @@ function PeerConsentReviewCard({
       <span className="muted">
         {isFileCandidate
           ? "Allow once applies only to this exact bounded filename/metadata search. No file contents are read and no file is sent automatically."
+          : isCandidatePayload
+            ? "Allow once applies only to this exact candidate payload request scaffold. No bytes are sent and no transfer is queued."
           : "Allow once applies only to this exact request and does not execute it yet."}
       </span>
       {review.status === "awaiting_peer_decision" && !expired ? (
@@ -1097,6 +1215,8 @@ function PeerConsentReviewCard({
                 ? "One-time consent consumed. Hello Stdout demo executed once."
                 : isFileCandidate
                   ? "One-time consent consumed. File candidate search executed once."
+                  : isCandidatePayload
+                    ? "One-time consent consumed. Candidate payload handoff is not implemented."
                 : "One-time consent consumed. Hello Peer demo executed once."
             : review.status === "denied"
               ? "Denied."
@@ -1187,6 +1307,9 @@ function shortRef(value: string): string {
 function capabilityLabel(capability: string): string {
   if (capability === "filesystem.find_file_candidates") {
     return "File candidate search";
+  }
+  if (capability === "transfer.request_candidate_payload") {
+    return "Candidate payload request";
   }
   if (capability === "runtime.hello_stdout") {
     return "Hello Stdout";

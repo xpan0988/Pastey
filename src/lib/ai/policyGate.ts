@@ -4,6 +4,7 @@ import {
   normalizeCapabilityFieldName,
   type AgentBridgeCapabilityContract
 } from "./capabilityRegistry";
+import { validateCandidatePayloadAdvisoryInput } from "./candidatePayloadAdvisory";
 import { validateFileCandidateAdvisoryInput } from "./fileCandidateAdvisory";
 import type { AiActionPlan, AiContextSnapshot, AiPolicyResult } from "./types";
 
@@ -53,6 +54,8 @@ export function evaluateAiPolicy(plan: AiActionPlan, context: AiContextSnapshot)
   }
   if (contract?.providerInputShape === "file_candidate_advisory") {
     validateFileCandidateAdvisoryPolicyInput(input, reasons);
+  } else if (contract?.providerInputShape === "candidate_payload_request") {
+    validateCandidatePayloadAdvisoryPolicyInput(input, reasons);
   } else {
     rejectUnsupportedFields(input, FIXED_MESSAGE_INPUT_FIELDS, "proposedInput", reasons);
   }
@@ -89,6 +92,13 @@ export function evaluateAiPolicy(plan: AiActionPlan, context: AiContextSnapshot)
 
 function validateFileCandidateAdvisoryPolicyInput(input: Record<string, unknown>, reasons: string[]) {
   const validation = validateFileCandidateAdvisoryInput(input);
+  if (!validation.valid) {
+    reasons.push(...validation.errors);
+  }
+}
+
+function validateCandidatePayloadAdvisoryPolicyInput(input: Record<string, unknown>, reasons: string[]) {
+  const validation = validateCandidatePayloadAdvisoryInput(input);
   if (!validation.valid) {
     reasons.push(...validation.errors);
   }

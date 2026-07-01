@@ -37,6 +37,7 @@ interface RoomPageProps {
   onBurn: (roomId: string) => Promise<void>;
   onEnqueueFiles: (roomId: string, paths: string[]) => void;
   onEnqueueTransferInputs: (roomId: string, inputs: TransferQueueInput[]) => void;
+  onEnqueueCandidatePayloadHandoff: (roomId: string, input: TransferQueueInput) => boolean;
   onCancelQueueItem: (itemId: string) => Promise<void>;
   onCancelQueueBatch: (batchId: string) => Promise<void>;
   agentBridgeEnabled: boolean;
@@ -53,6 +54,7 @@ export function RoomPage({
   onRefresh,
   onBurn,
   onEnqueueTransferInputs,
+  onEnqueueCandidatePayloadHandoff,
   onCancelQueueItem,
   onCancelQueueBatch,
   agentBridgeEnabled
@@ -492,6 +494,7 @@ export function RoomPage({
         <AiSlotPreview
           key={`${room.id}:${room.peer_connected}:${room.peer_device_name ?? "none"}`}
           room={room}
+          onEnqueueCandidatePayloadHandoff={(input) => onEnqueueCandidatePayloadHandoff(room.id, input)}
         />
       ) : null}
 
@@ -836,6 +839,9 @@ function QueueItemRow({
           {item.targetCount && item.targetCount > 1 ? ` · ${item.targetCount} targets` : ""}
           {typeof item.sizeBytes === "number" ? ` · ${formatBytes(item.sizeBytes)}` : ""}
         </span>
+        {item.agentBridgeMetadata?.origin === "agent_bridge_candidate_payload" ? (
+          <span className="muted">Queued from approved candidate payload request.</span>
+        ) : null}
         {item.errorMessage ? <span className="transfer-error">{item.errorMessage}</span> : null}
       </div>
       {canCancel ? (

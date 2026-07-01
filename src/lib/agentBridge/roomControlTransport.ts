@@ -14,9 +14,12 @@ import {
   hashHelloPeerRequestPayload,
   hashHelloStdoutRequestPayload,
   hashFileCandidateRequestPayload,
+  hashCandidatePayloadRequestPayload,
+  CANDIDATE_PAYLOAD_CAPABILITY,
   FILE_CANDIDATES_CAPABILITY,
   HELLO_STDOUT_CAPABILITY,
   validateCapabilityRequestPreviewEnvelope,
+  type CandidatePayloadRequest,
   type CapabilityRequest,
   type CapabilityRequestPreviewEnvelope,
   type FileCandidateRequest,
@@ -392,6 +395,13 @@ function rebuildCapabilityRequestHash(
     return {
       ...request,
       requestPayloadHash: hashFileCandidateRequestPayload(request),
+    };
+  }
+  if (requestWithoutHash.capability === CANDIDATE_PAYLOAD_CAPABILITY) {
+    const rebound = requestWithoutHash as Omit<CandidatePayloadRequest, "requestPayloadHash">;
+    return {
+      ...rebound,
+      requestPayloadHash: hashCandidatePayloadRequestPayload(rebound),
     };
   }
   if (requestWithoutHash.capability === HELLO_STDOUT_CAPABILITY) {

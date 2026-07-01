@@ -3,12 +3,14 @@ import test from "node:test";
 
 import {
   acknowledgeCapabilityPreview,
+  buildCandidatePayloadRequestFromPendingAction,
   buildCapabilityRequestPreviewEnvelope,
   buildFileCandidateRequestFromPendingAction,
   buildOpenAICompatibleChatRequest,
   buildHelloPeerRequestFromPendingAction,
   buildHelloStdoutRequestFromPendingAction,
   buildMockFileCandidatePlan,
+  buildMockCandidatePayloadPlan,
   buildMockAiContextSnapshot,
   buildMockHelloPeerPlan,
   buildMockHelloStdoutPlan,
@@ -32,6 +34,7 @@ import {
   MOCK_AI_CONTEXT_POLICY,
   mockProvider,
   validateAiActionPlan,
+  validateCandidatePayloadRequest,
   validateCapabilityRequestPreviewEnvelope,
   validateFileCandidateAdvisoryInput,
   validateFileCandidateRequest,
@@ -185,15 +188,18 @@ test("safe Hello Stdout mock plan validates and builds a preview-only request", 
 
 test("Agent Bridge capability registry resolves implemented capabilities", () => {
   const contracts = listAgentBridgeCapabilityContracts();
-  assert.equal(contracts.length, 3);
+  assert.equal(contracts.length, 4);
   assert.ok(contracts.every((contract) => contract.lifecycle === "implemented"));
   assert.equal(getAgentBridgeCapabilityContract("runtime.execute_hello_template")?.providerActionKind, "request_peer_hello_demo");
   assert.equal(getAgentBridgeCapabilityContract("runtime.hello_stdout")?.providerActionKind, "request_peer_hello_stdout_demo");
   assert.equal(getAgentBridgeCapabilityContract("filesystem.find_file_candidates")?.providerActionKind, "request_peer_file_candidates");
   assert.equal(getAgentBridgeCapabilityContract("filesystem.find_file_candidates")?.executorKind, "filesystem_find_candidates_host");
+  assert.equal(getAgentBridgeCapabilityContract("transfer.request_candidate_payload")?.providerActionKind, "request_peer_candidate_payload");
+  assert.equal(getAgentBridgeCapabilityContract("transfer.request_candidate_payload")?.executorKind, "transfer_candidate_payload_host");
   assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_hello_demo")?.capability, "runtime.execute_hello_template");
   assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_hello_stdout_demo")?.capability, "runtime.hello_stdout");
   assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_file_candidates")?.capability, "filesystem.find_file_candidates");
+  assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_candidate_payload")?.capability, "transfer.request_candidate_payload");
   assert.equal(getAgentBridgeCapabilityContract("runtime.unknown"), undefined);
   assert.equal(getAgentBridgeCapabilityContractByVersion("runtime.hello_stdout", "v2"), undefined);
   for (const contract of contracts) {
@@ -259,6 +265,37 @@ test("safe file candidate advisory validates, passes PolicyGate, and builds a pr
     nonce: "file-candidate-hello-nonce",
   });
   assert.equal(helloPreview.ok, false);
+});
+
+test("safe candidate payload advisory validates, passes PolicyGate, and builds a preview request", () => {
+  const plan = buildMockCandidatePayloadPlan();
+  const validation = validateAiActionPlan(plan);
+  assert.equal(validation.valid, true);
+  if (!validation.valid) return;
+
+  const policy = evaluateAiPolicy(validation.value, buildMockAiContextSnapshot());
+  assert.equal(policy.status, "accepted");
+
+  const pending = createPendingAiAction(validation.value, policy, {
+    now: new Date("2026-06-11T00:00:00.000Z"),
+    ttlMs: 120_000,
+    pendingId: "candidate-payload-pending"
+  });
+  assert.equal(pending.canonicalPayload.capability, "transfer.request_candidate_payload");
+  assert.equal(pending.canonicalPayload.candidate?.sourceCapability, "filesystem.find_file_candidates");
+  assert.equal(pending.canonicalPayload.constraints.noAutoTransfer, true);
+  const confirmed = confirmPendingAiAction(pending, new Date("2026-06-11T00:00:30.000Z"));
+  const preview = buildCandidatePayloadRequestFromPendingAction(confirmed, {
+    now: new Date("2026-06-11T00:01:00.000Z"),
+    requestId: "candidate-payload-request",
+    nonce: "candidate-payload-nonce",
+  });
+  assert.equal(preview.ok, true, preview.ok ? undefined : preview.errors.join(" "));
+  if (!preview.ok) return;
+  assert.equal(preview.request.capability, "transfer.request_candidate_payload");
+  assert.equal(preview.request.executorKind, "transfer_candidate_payload_host");
+  assert.equal(preview.request.input.sourceCapability, "filesystem.find_file_candidates");
+  assert.equal(validateCandidatePayloadRequest(preview.request, { now: new Date("2026-06-11T00:01:00.000Z") }).valid, true);
 });
 
 test("file candidate advisory rejects unsafe provider output and authority expansion", () => {

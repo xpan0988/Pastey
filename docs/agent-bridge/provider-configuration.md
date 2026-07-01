@@ -17,11 +17,14 @@ The current provider allowlist is backed by the static capability registry in `s
 
 - `request_peer_hello_demo` for `runtime.execute_hello_template`;
 - `request_peer_hello_stdout_demo` for `runtime.hello_stdout`;
-- `request_peer_file_candidates` for `filesystem.find_file_candidates`.
+- `request_peer_file_candidates` for `filesystem.find_file_candidates`;
+- `request_peer_candidate_payload` for `transfer.request_candidate_payload`.
 
 Provider output may identify the selected peer, registered capability, fixed message or filename hint, and fixed constraints. It must not include command text, script text, runtime arguments, environment variables, file paths, current working directories, network targets, stdout/stderr/exit values, file contents, hidden transfer requests, selected-peers/broadcast intent, durable trust claims, or execution request/result payloads. The host builds those payloads after validation and consent.
 
 For `filesystem.find_file_candidates`, provider output is only an advisory proposal for bounded candidate metadata discovery. It cannot by itself cause local or peer filesystem traversal, cannot return real candidates, cannot provide real paths, and cannot start a transfer. The host may build a selected-peer preview only after validation and local confirmation; the receiver may run the bounded metadata search only after explicit Allow once.
+
+For `transfer.request_candidate_payload`, provider output is only an advisory proposal to request a second consent decision for one previously discovered candidate. It may include the prior discovery request id, opaque candidate id, and display/audit metadata. It cannot provide receiver absolute paths, file contents, transfer queue ids, handoff ids, auto-send instructions, selected-peers/broadcast routing, or future transfer authority. The current path can resolve the selected candidate through the receiver-local in-memory store and queue the payload through the existing transfer scheduler with zero transferred bytes at handoff time.
 
 ## Context Controls
 
@@ -62,4 +65,4 @@ This split keeps model configuration separate from Bridge-scoped authority. Acce
 
 Pastey does not currently launch or manage `llama-cli`, `llama-server`, Ollama, LM Studio, or other local model processes. The practical local-model workaround is to point the existing OpenAI-compatible provider base URL at a user-managed localhost server that speaks the configured chat-completions shape.
 
-Pastey does not currently provide local LLM scheduling, model routing, MCP tools, persistent provider credentials, cloud relay, provider-managed execution, or approved transfer handoff from file candidates. Those require new design and validation before they can be claimed as Layer 5 completion.
+Pastey does not currently provide local LLM scheduling, model routing, MCP tools, persistent provider credentials, cloud relay, provider-managed execution, payload reading, or approved transfer handoff from file candidates. Those require new design and validation before they can be claimed as Layer 5 completion.

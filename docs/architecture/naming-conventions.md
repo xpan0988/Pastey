@@ -47,10 +47,10 @@ Good examples:
 
 Bad examples:
 
-- `ai-action-plan/v1`;
-- `filesystem.find_file_candidates/v1`;
-- `filesystem-find-file-candidates-result/v1`;
-- `pastey-capability-request/v1`.
+- slash-version schema names;
+- dotted capability IDs used as schema names;
+- endpoint-style schema names;
+- broad `pastey-capability-request` names for capability-specific payloads.
 
 Avoid broad schema names such as `pastey-capability-request-v1` when the payload is specific to one capability. Prefer a capability-specific schema such as `pastey-hello-peer-request-v1`.
 
@@ -74,9 +74,9 @@ Good examples:
 
 Bad examples:
 
-- `runtime.hello_stdout/v1`;
-- `filesystem.find_file_candidates/v1`;
-- `filesystem.prepare_file_transfer/v1`;
+- slash-version capability IDs;
+- capability IDs that embed registry versions;
+- filesystem-namespaced transfer authority IDs;
 - `pastey-runtime-hello-stdout-request-v1` as a capability ID.
 
 ## Registry Versions
@@ -93,7 +93,7 @@ version: "v1"
 Incorrect:
 
 ```ts
-capability: "filesystem.find_file_candidates/v1",
+capability: "filesystem.find_file_candidates.v1",
 version: "v1"
 ```
 
@@ -123,17 +123,13 @@ Rules:
 Good examples:
 
 - `request_peer_file_candidates`;
+- `request_peer_candidate_payload`;
 - `request_peer_hello_demo`;
 - `request_peer_hello_stdout_demo`.
 
-Future provider action kind examples:
-
-- `request_peer_candidate_file`;
-- `request_peer_file_from_candidate`.
-
 Avoid vague or over-authoritative names:
 
-- `prepare_file_transfer`;
+- prepare-style transfer names;
 - `do_transfer`;
 - `execute_file`.
 
@@ -152,17 +148,12 @@ Good examples:
 
 - `rust_host_helper`;
 - `filesystem_find_candidates_host`;
+- `transfer_candidate_payload_host`;
 - `ts_in_process_fixed_template`.
 
 ## Future Candidate-Payload Transfer Naming
 
-Do not use:
-
-```text
-filesystem.prepare_file_transfer
-filesystem.prepare_file_transfer-v1
-filesystem.prepare_file_transfer/v1
-```
+Avoid filesystem-namespaced or prepare-style transfer names for candidate payload requests.
 
 Reasons:
 
@@ -192,7 +183,7 @@ Reasons:
 - It separates search consent from send consent.
 - It can later hand off to the existing transfer pipeline only after receiver Allow once.
 
-Potential schema names for that future capability:
+Current schema names for that scaffold:
 
 ```text
 transfer-request-candidate-payload-request-v1
@@ -201,7 +192,7 @@ transfer-request-candidate-payload-execution-request-v1
 transfer-request-candidate-payload-result-v1
 ```
 
-This document does not implement `transfer.request_candidate_payload`.
+`transfer.request_candidate_payload` is currently a second-consent queue-handoff path. It validates request/consent/execution/result contracts, resolves selected candidates through the receiver-local in-memory store, and enqueues the resolved file through the existing transfer scheduler. `handoff_queued` does not mean transfer completion, and the result schema still does not expose local paths, file contents, queue ids, or handoff ids.
 
 ## Namespace Guidance
 
@@ -227,9 +218,9 @@ Rules:
 
 ## Anti-Patterns
 
-- Embedding `/v1` in capability IDs.
+- Embedding slash-version suffixes in capability IDs.
 - Mixing capability IDs and schemaVersion names.
-- Using endpoint-like `/v1` for internal contracts.
+- Using endpoint-like version suffixes for internal contracts.
 - Using vague verbs such as `prepare`, `handle`, `process`, or `do`.
 - Naming a future capability before its consent and executor boundaries are defined.
 - Reusing broad names like `pastey-capability-request-v1` for capability-specific schemas.
@@ -241,12 +232,10 @@ Use this checklist for future PRs that add or rename schemas, capabilities, prov
 
 - Capability ID has no version.
 - Registry has explicit `version`.
-- `schemaVersion` uses `-vN`, not `/vN`.
+- `schemaVersion` uses `-vN`, not endpoint-style suffixes.
 - Provider action kind has no version.
 - Executor kind has no version.
 - Docs use the same names as code.
 - Tests assert exact names.
-- `rg 'schemaVersion.*\/v1'` returns no internal schema matches.
-- `rg 'capability.*\/v1'` returns no internal capability ID matches.
-- Outside this document's explicit anti-examples, remaining `/v1` entries are only external URLs, third-party lockfiles, or historical changelog entries.
+- Internal schema and capability grep checks return no endpoint-style version matches.
 - No new capability overclaims authority in its name.

@@ -2,7 +2,7 @@
 
 Agent Bridge is the Layer 5 narrow capability path for model-assisted planning, host validation, explicit consent, bounded execution, result return, and redacted audit. For the project-wide layer contract, see [../architecture/Project-specifications.md](../architecture/Project-specifications.md). For naming rules covering capability IDs, schema versions, provider actions, executors, and future capabilities, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md). For Bridge membership and authority boundaries, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md).
 
-The current product reality is a narrow bounded-capability vertical slice plus the first read-only workspace capability. The Hello capabilities prove fixed execution; the file-candidate capability proves receiver-consented metadata discovery without file transfer authority.
+The current product reality is a narrow bounded-capability vertical slice, the first read-only workspace capability, and a candidate-payload second-consent handoff path. The Hello capabilities prove fixed execution; the file-candidate capability proves receiver-consented metadata discovery without file transfer authority; the candidate-payload path proves that discovery consent does not become payload transfer consent.
 
 ## Current Flow
 
@@ -19,7 +19,7 @@ The current product reality is a narrow bounded-capability vertical slice plus t
 11. The receiver consumes the consent once, runs the fixed host-owned executor, and returns a typed result.
 12. Both sides write redacted lifecycle audit logs.
 
-For `filesystem.find_file_candidates`, the flow stops after returning redacted metadata candidates. Pastey does not hand off a selected candidate to transfer, send files automatically, or expose real receiver paths to the sender or provider.
+For `filesystem.find_file_candidates`, the receiver returns redacted metadata candidates and records a receiver-local, in-memory, TTL-bounded candidate store. For `transfer.request_candidate_payload`, the flow validates and consumes a separate exact Allow once, resolves the selected candidate locally against that store, and queues the resolved local file source through the existing transfer queue. Pastey does not send files automatically after discovery, create a new data plane, or expose real receiver paths to the sender or provider.
 
 ## Implemented Production Paths
 
@@ -32,13 +32,14 @@ For `filesystem.find_file_candidates`, the flow stops after returning redacted m
 - Local PolicyGate: `src/lib/ai/policyGate.ts`.
 - Pending local confirmation: `src/lib/ai/pendingAction.ts`.
 - File-candidate advisory and request construction: `src/lib/ai/fileCandidateAdvisory.ts` and `src/lib/ai/fileCandidateRequest.ts`.
+- Candidate-payload advisory and request construction: `src/lib/ai/candidatePayloadAdvisory.ts` and `src/lib/ai/candidatePayloadRequest.ts`.
 - Hello Peer request construction: `src/lib/ai/helloPeerRequest.ts`.
 - Hello Stdout request construction: `src/lib/ai/helloStdoutRequest.ts`.
 - Capability preview envelope: `src/lib/ai/capabilityPreviewEnvelope.ts`.
 - Bridge control events: `src/lib/agentBridge/roomControlEvent.ts`. Legacy implementation term: `RoomControlEvent`.
 - Control queue state: `src/lib/agentBridge/controlQueue.ts`.
 - Receiver consent: `src/lib/agentBridge/peerConsent.ts`.
-- Fixed/bounded executors: `src/lib/agentBridge/helloPeerExecution.ts`, `src/lib/agentBridge/helloStdoutExecution.ts`, `src/lib/agentBridge/fileCandidateExecution.ts`, `src-tauri/src/hello_stdout.rs`, and `src-tauri/src/file_candidates.rs`.
+- Fixed/bounded executors and scaffolds: `src/lib/agentBridge/helloPeerExecution.ts`, `src/lib/agentBridge/helloStdoutExecution.ts`, `src/lib/agentBridge/fileCandidateExecution.ts`, `src/lib/agentBridge/candidatePayloadExecution.ts`, `src-tauri/src/hello_stdout.rs`, and `src-tauri/src/file_candidates.rs`.
 - Redacted logging: `src/lib/agentBridge/logging.ts`.
 - Bridge-scoped UI: `src/components/agentBridge/RoomControlPanel.tsx` and `src/components/AiSlotPreview.tsx`.
 - Runtime room-control endpoint: `src-tauri/src/room_control.rs`.
@@ -70,6 +71,8 @@ The current implementation does not allow provider-crafted execution requests. E
 
 `filesystem.find_file_candidates` is not remote file access. It is a bounded metadata candidate-discovery capability. Model output may propose a filename hint and safe limits, but it does not authorize filesystem traversal by itself. Traversal happens only on the receiver after selected-peer routing, local sender confirmation, receiver Allow once, exact consent binding, and execution-request validation. The executor does not read file contents, return absolute paths, search hidden files, search full disk, start automatic transfer, or create reusable access to a peer.
 
+`transfer.request_candidate_payload` is not transfer completion. It is a second-consent handoff path for one selected metadata candidate from a prior discovery result. Model output may propose the opaque candidate id and display metadata, but candidate ids are not paths and not transfer authority. The path validates selected-peer routing and exact Allow once, consumes that consent once, resolves the candidate only through the receiver-local in-memory store, and returns `handoff_queued` only after the existing transfer queue accepts the payload source. `handoff_queued` still reports `transferredBytes: 0`; transfer progress and completion remain owned by the existing transfer pipeline.
+
 ## Workspace Capability Roadmap
 
 The next Layer 5 direction is Agent-assisted device workspace: helping a user ask a selected peer for bounded help, such as finding candidate files, without turning Pastey into a remote shell or file browser.
@@ -81,9 +84,11 @@ The first workspace capability is `filesystem.find_file_candidates`. Its current
 3. Local user confirms whether to send a selected-peer preview.
 4. Receiver explicitly allows once or denies.
 5. Receiver-side search returns bounded redacted metadata candidates only.
-6. Any file transfer remains a separate future capability and separate consent decision.
+6. Receiver records a TTL-bounded in-memory candidate store for the returned candidates.
+7. A selected candidate payload request requires a second capability and separate consent decision.
+8. The current candidate-payload path resolves the selected candidate locally and queues it through the existing transfer scheduler.
 
-Current implementation covers steps 1 through 5. It does not implement candidate selection or approved transfer handoff.
+Current implementation covers steps 1 through 8. It implements receiver-local candidate storage, metadata-only resolution, and queue handoff into the existing transfer pipeline. It does not implement auto-send after discovery, a new data plane, a generic executor, or broad natural-language automation.
 
 ## Logging And Audit
 
@@ -105,7 +110,7 @@ The current Agent Bridge implementation does not provide:
 - durable device identity as trust, routeability, consent, auto-join, or execution authority;
 - MCP integration;
 - local LLM scheduling;
-- executable file/tool capabilities beyond the fixed Hello Peer, Hello Stdout, and bounded file-candidate metadata search paths;
+- executable file/tool capabilities beyond the fixed Hello Peer, Hello Stdout, bounded file-candidate metadata search path, and candidate-payload queue handoff path;
 - automatic file transfer handoff;
 - cross-Bridge or cross-device automatic delegation.
 

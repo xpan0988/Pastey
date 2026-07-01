@@ -97,7 +97,9 @@ node scripts/run-layer4-validation-matrix.mjs
 
 ## Layer 5 Workspace Capability Validation Plan
 
-The first workspace capability direction is `filesystem.find_file_candidates`. Current validation covers advisory JSON validation, PolicyGate boundaries, selected-peer consent, receiver-side bounded metadata search, and redacted candidate result shape. It does not validate approved file-transfer handoff because that capability is not implemented.
+The first workspace capability direction is `filesystem.find_file_candidates`. Current validation covers advisory JSON validation, PolicyGate boundaries, selected-peer consent, receiver-side bounded metadata search, and redacted candidate result shape.
+
+The first candidate payload direction is `transfer.request_candidate_payload`. Current validation covers the second-consent handoff path: advisory validation, selected-peer preview, capability-specific Allow once grant, exact execution-request binding, replay rejection, receiver-local candidate-store resolution, existing transfer queue handoff, and `handoff_queued` result shape. It does not claim transfer completion at handoff time because byte progress and completion remain owned by the existing transfer pipeline.
 
 Existing transfer and MicroFlowGroup fixtures live under `tests/fixtures/transfer-corpus/`. They are intentionally size, throughput, queue contention, interruption, and scheduler-behavior fixtures. They are not reused for file-candidate executor validation because they do not naturally cover filename matching modes, extension filters, safe scope labels, hidden entries, symlink skipping, directory-depth limits, redacted locations, opaque candidate ids, or metadata-only behavior.
 
@@ -109,15 +111,18 @@ File-candidate validation uses a separate tiny corpus under `tests/fixtures/file
 | Unsafe provider fields | command/script/code, cwd/env, network target, stdout/stderr/exit, absolute path, selected-peers/broadcast, durable trust, hidden transfer, and mutation fields reject fail-closed | AI slot negative tests for unsafe provider output and authority expansion | Provider prompt regression tests for real configured providers |
 | Scope and result boundaries | full disk, file contents, absolute paths, hidden files, unbounded depth/time/candidate count reject; receiver search skips unavailable scopes, hidden entries, symlinks, and directories | AI slot file-candidate validation tests, room-control event result validation tests, dedicated file-candidate fixture tests, and Rust executor tests with redacted candidate metadata | Broader platform/device-directory matrix |
 | Consent and route policy | selected-peer only; delivery is not consent; durable pairing does not authorize search; Allow once is consumed once | Existing Layer 4 control/capability route matrix plus AI advisory selected-peer policy tests, peer-consent/execution tests, and `scripts/run-file-candidate-tests.mjs` | Two-device Agent Bridge smoke for preview/search/result flow |
-| Transfer handoff | no automatic transfer and no candidate-payload request capability implementation | Advisory tests assert `noAutoTransfer: true`; no Rust/Tauri transfer command changes | Separate future capability, likely `transfer.request_candidate_payload`, and manual smoke for receiver-approved payload transfer |
+| Candidate payload second consent and local resolution | discovery consent does not authorize payload request; candidate payload consent does not authorize discovery, Hello, or reusable transfer authority; selected-peers and broadcast reject; candidate resolution is exact, receiver-local, in-memory, and metadata-only | `scripts/run-candidate-payload-tests.mjs` covers exact consent binding, replay rejection, unsafe fields, path-like candidate IDs, local resolution, queue handoff result, and no public queue/path identifiers; `cargo test candidate_payload` covers store insert, exact key resolution, expiry, changed/deleted file rejection, directory/symlink rejection, and path non-serialization | Two-device manual smoke for real app queue handoff and transfer progress |
+| Transfer handoff | after second Allow once, a resolved `filesystem_file` candidate enters the existing transfer queue with Agent Bridge audit metadata; `handoff_queued` is not transfer completion | Candidate-payload tests assert `transferredBytes: 0`, `handoffQueued: true`, and `transferStatus: queued`; transfer scheduler tests cover normal queue entry, selected-peer route metadata, path-free audit metadata, mixed small/large contention, ordinary transfer coexistence, and MicroFlowGroup behavior without MIME-family grouping | Manual smoke for receiver-approved payload transfer completion through the existing pipeline |
 
-Candidate selection and approved transfer handoff remain future implementation and validation work. The current executor returns redacted metadata candidates only.
+Approved transfer handoff is implemented only as queue handoff into the existing transfer pipeline. The current file-candidate executor returns redacted metadata candidates and stores receiver-local resolution records. The current candidate-payload executor resolves locally, queues through the existing scheduler when safe, and still returns zero transferred bytes at handoff time.
 
 Run focused file-candidate validation with:
 
 ```sh
 node scripts/run-file-candidate-tests.mjs
+node scripts/run-candidate-payload-tests.mjs
 cd src-tauri && cargo test file_candidates
+cd src-tauri && cargo test candidate_payload
 ```
 
 The focused Rust filter covers exact, case-insensitive, and substring filename matches; extension filtering; candidate limits; max depth; hidden file and hidden directory skipping; symlink skipping on Unix; missing and invalid scopes; redacted locations; opaque candidate IDs; directories not being returned; weird filenames; and absence of file-content leakage. Timeout behavior is intentionally not tested with sleeps because it would be timing-flaky; candidate and depth bounds provide deterministic stopping evidence.
@@ -131,10 +136,42 @@ Manual smoke is intentionally pending until the automated matrix is green. Run i
 - disconnect/reconnect route expiry with old selected-peer route failing closed;
 - paired and revoked display metadata remaining non-routeable/non-authoritative;
 - Agent Bridge Hello Peer and Hello Stdout exact selected-peer consent and one-time execution;
-- Agent Bridge file-candidate selected-peer preview, Allow once, redacted metadata result, and no transfer handoff;
+- Agent Bridge file-candidate selected-peer preview, Allow once, and redacted metadata result;
+- Device A requests file candidates from Device B;
+- Device B allows search once;
+- Device A sees redacted candidates only;
+- Device A requests the selected candidate payload;
+- Device B allows payload request once;
+- Device B resolves the local candidate;
+- handoff is queued with the label `Queued from approved candidate payload request.`;
+- existing transfer pipeline starts or handles the payload;
+- sender never sees the receiver absolute path;
+- replay of the old consent fails;
+- reconnect invalidates stale route/session;
+- deny path does not enqueue;
+- expired candidate does not enqueue;
+- changed or deleted candidate does not enqueue;
+- large payload does not bypass scheduler;
+- small payload participates in normal scheduling and MicroFlowGroup behavior when eligible;
 - selected-peers and broadcast rejection for room-control/capability paths.
 
-Manual smoke remains release/product confidence evidence, not automated validation.
+Manual smoke remains release/product confidence evidence, not automated validation. Record the observed boundary precisely: `handoff_queued` means the queue accepted the payload; transfer completion remains existing pipeline responsibility.
+
+## Deterministic Find-And-Send Workflow
+
+The implemented deterministic flow is:
+
+1. User intent can produce a `filesystem.find_file_candidates` advisory.
+2. The sender confirms the preview locally.
+3. The receiver allows search once.
+4. Candidates return as redacted metadata.
+5. A selected candidate can produce a `transfer.request_candidate_payload` advisory or UI-built preview.
+6. The receiver allows the payload request once.
+7. The receiver resolves the candidate locally.
+8. The receiver queues the handoff through the existing transfer scheduler.
+9. The existing transfer pipeline handles bytes, progress, and completion.
+
+Broad natural-language automation is not implemented. The model does not auto-select candidates, merge search and payload consent, see receiver absolute paths, see file contents, execute generic tools, or become authoritative over host validation.
 
 
 ## Planner Replay
@@ -269,4 +306,4 @@ Those results are useful implementation evidence, but they do not replace curren
 
 `dev-fast` is a developer build profile for quicker Rust/Tauri iteration. It is appropriate for local smoke and scheduler/runtime diagnostics, not final performance or release-size claims.
 
-Linux remains feasibility-only unless release packaging and validation are added. The current release/validation confidence is for macOS and Windows desktop targets.
+Linux release support currently targets Ubuntu 24.04 x86_64 with AppImage and deb artifacts. Treat other Linux distributions, architectures, and package formats as unvalidated until they have matching local and release-artifact smoke evidence.
