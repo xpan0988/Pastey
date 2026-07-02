@@ -1,5 +1,7 @@
 use std::{
+    collections::{HashMap, HashSet},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    process::Command,
     sync::Arc,
     time::Duration,
 };
@@ -30,7 +32,7 @@ use crate::{
 
 const DISCOVERY_PORT: u16 = 48392;
 const BEACON_INTERVAL_SECS: u64 = 2;
-const BEACON_TTL_SECS: i64 = 6;
+const BEACON_TTL_SECS: i64 = 12;
 const JOIN_REQUEST_TIMEOUT_SECS: u64 = 30;
 const JOIN_REQUEST_CONNECT_TIMEOUT_SECS: u64 = 5;
 const JOIN_REQUEST_EVENT: &str = "pastey://join-request";
@@ -72,6 +74,25 @@ pub struct NearbyBeacon {
     pub room_offer_id: String,
     pub expires_at: i64,
     pub availability: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiscoveryInterface {
+    name: String,
+    ipv4: Ipv4Addr,
+    broadcast: Option<Ipv4Addr>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BeaconUpdateDiagnostics {
+    is_new: bool,
+    availability_changed: bool,
+    source_changed: bool,
+    previous_availability: Option<String>,
+    previous_source: Option<SocketAddr>,
+    last_seen_at: i64,
+    expires_at: i64,
+    compatible: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,6 +175,10 @@ fn bind_discovery_socket() -> AppResult<UdpSocket> {
     socket
         .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT).into())
         .map_err(|error| AppError::Network(format!("unable to bind discovery socket: {error}")))?;
+    logging::write_transfer_line(&format!(
+        "[pastey antenna] event=discovery_socket_bound bind=0.0.0.0:{DISCOVERY_PORT} so_reuseaddr=true so_reuseport={} ipv4=true ipv6=false",
+        cfg!(unix)
+    ));
     socket.set_nonblocking(true).map_err(|error| {
         AppError::Network(format!(
             "unable to set discovery socket nonblocking: {error}"
@@ -229,6 +254,31 @@ pub async fn start_antenna(state: Arc<AppState>) {
         ));
         return;
     }
+    let bind_addr = socket
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    let interfaces = discovery_interfaces();
+    let broadcast_targets = broadcast_targets(&interfaces);
+    logging::write_transfer_line(&format!(
+        "[pastey antenna] event=beacon_socket_config bind={bind_addr} udp_port={DISCOVERY_PORT} ipv4=true ipv6=false so_broadcast=true targets={:?} interfaces={:?}",
+        broadcast_targets
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        interfaces
+            .iter()
+            .map(|interface| format!(
+                "{}:{}/{}",
+                interface.name,
+                interface.ipv4,
+                interface
+                    .broadcast
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|| "no_broadcast".into())
+            ))
+            .collect::<Vec<_>>()
+    ));
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     state.antenna_handle.lock().replace(crate::DiscoveryHandle {
@@ -249,8 +299,26 @@ pub async fn start_antenna(state: Arc<AppState>) {
                     let Ok(bytes) = serde_json::to_vec(&beacon) else {
                         continue;
                     };
-                    if socket.send_to(&bytes, ("255.255.255.255", DISCOVERY_PORT)).await.is_ok() {
-                        logging::write_transfer_line("[pastey antenna] event=beacon_sent");
+                    let mut sent = 0usize;
+                    let mut failed = 0usize;
+                    for target in &broadcast_targets {
+                        let target_addr = SocketAddrV4::new(*target, DISCOVERY_PORT);
+                        match socket.send_to(&bytes, target_addr).await {
+                            Ok(_) => sent += 1,
+                            Err(error) => {
+                                failed += 1;
+                                logging::write_error_line(&format!(
+                                    "[pastey antenna] event=beacon_send_failed target={target_addr} error={:?}",
+                                    error.to_string()
+                                ));
+                            }
+                        }
+                    }
+                    if sent > 0 {
+                        logging::write_transfer_line(&format!(
+                            "[pastey antenna] event=beacon_sent targets_sent={sent} targets_failed={failed} peer_identity_key={}",
+                            diagnostic_ref(&beacon.device_id)
+                        ));
                     }
                 }
             }
@@ -288,7 +356,7 @@ pub fn list_nearby_devices(state: &Arc<AppState>) -> Vec<NearbyDevice> {
         .map(|record| {
             let mut device = record.device.clone();
             device.last_seen_seconds_ago =
-                now.saturating_sub(record.expires_at - BEACON_TTL_SECS) as u64;
+                now.saturating_sub(last_seen_at_from_record(record)) as u64;
             device
         })
         .collect::<Vec<_>>();
@@ -528,32 +596,30 @@ fn handle_beacon(state: Arc<AppState>, value: Value, source: SocketAddr) {
     if beacon.device_id == local_device_id(&state) {
         return;
     }
-    if !beacon_is_fresh(&beacon, storage::now_ts()) {
-        logging::write_transfer_line("[pastey antenna] event=stale_beacon_ignored");
-        return;
-    }
-
-    let device = NearbyDevice {
-        device_id: beacon.device_id.clone(),
-        display_name: beacon.display_name,
-        platform: beacon.platform,
-        app_version: beacon.app_version.clone(),
-        availability: beacon.availability,
-        capabilities: beacon.capabilities,
-        last_seen_seconds_ago: 0,
-        compatible: major_version(&beacon.app_version) == major_version(env!("CARGO_PKG_VERSION")),
+    let received_at = storage::now_ts();
+    let sender_expires_in = beacon.expires_at - received_at;
+    let peer_identity_key = diagnostic_ref(&beacon.device_id);
+    let listen_port = beacon.listen_port;
+    let diagnostics = {
+        let mut records = state.nearby_devices.lock();
+        upsert_nearby_device(&mut records, beacon, source, received_at)
     };
-    state.nearby_devices.lock().insert(
-        beacon.device_id,
-        NearbyDeviceRecord {
-            device,
-            source,
-            join_request_port: beacon.listen_port,
-            expires_at: beacon.expires_at,
-        },
-    );
+    let transition_reason = if diagnostics.is_new {
+        "new_peer"
+    } else if diagnostics.availability_changed {
+        "availability_changed"
+    } else if diagnostics.source_changed {
+        "endpoint_changed"
+    } else {
+        "refresh"
+    };
     logging::write_transfer_line(&format!(
-        "[pastey antenna] event=beacon_received source={source}"
+        "[pastey antenna] event=beacon_received source={source} peer_identity_key={peer_identity_key} listen_port={listen_port} last_seen_at={} local_expires_at={} sender_expires_in={sender_expires_in} transition_reason={transition_reason} previous_availability={:?} previous_source={:?} compatible={}",
+        diagnostics.last_seen_at,
+        diagnostics.expires_at,
+        diagnostics.previous_availability,
+        diagnostics.previous_source,
+        diagnostics.compatible
     ));
 }
 
@@ -653,17 +719,215 @@ fn join_request_url(source: SocketAddr, listen_port: u16) -> String {
 
 fn expire_nearby_devices(state: &Arc<AppState>) {
     let now = storage::now_ts();
-    state.nearby_devices.lock().retain(|_, record| {
+    state.nearby_devices.lock().retain(|device_id, record| {
         let fresh = record.expires_at > now;
         if !fresh {
-            logging::write_transfer_line("[pastey antenna] event=beacon_expired");
+            let last_seen_at = last_seen_at_from_record(record);
+            logging::write_transfer_line(&format!(
+                "[pastey antenna] event=availability_transition peer_identity_key={} previous_availability={:?} next_availability=Expired reason=ttl_elapsed last_seen_at={last_seen_at} expired_at={} now={now}",
+                diagnostic_ref(device_id),
+                record.device.availability,
+                record.expires_at
+            ));
         }
         fresh
     });
 }
 
-fn beacon_is_fresh(beacon: &NearbyBeacon, now: i64) -> bool {
-    beacon.expires_at > now
+fn upsert_nearby_device(
+    records: &mut HashMap<String, NearbyDeviceRecord>,
+    beacon: NearbyBeacon,
+    source: SocketAddr,
+    received_at: i64,
+) -> BeaconUpdateDiagnostics {
+    let previous = records.get(&beacon.device_id);
+    let previous_availability = previous.map(|record| record.device.availability.clone());
+    let previous_source = previous.map(|record| record.source);
+    let availability_changed = previous
+        .map(|record| record.device.availability != beacon.availability)
+        .unwrap_or(false);
+    let source_changed = previous
+        .map(|record| record.source != source || record.join_request_port != beacon.listen_port)
+        .unwrap_or(false);
+    let compatible = major_version(&beacon.app_version) == major_version(env!("CARGO_PKG_VERSION"));
+    let expires_at = received_beacon_expires_at(received_at);
+    let device_id = beacon.device_id.clone();
+    let device = NearbyDevice {
+        device_id: device_id.clone(),
+        display_name: beacon.display_name,
+        platform: beacon.platform,
+        app_version: beacon.app_version,
+        availability: beacon.availability,
+        capabilities: beacon.capabilities,
+        last_seen_seconds_ago: 0,
+        compatible,
+    };
+
+    records.insert(
+        device_id,
+        NearbyDeviceRecord {
+            device,
+            source,
+            join_request_port: beacon.listen_port,
+            expires_at,
+        },
+    );
+
+    BeaconUpdateDiagnostics {
+        is_new: previous_availability.is_none(),
+        availability_changed,
+        source_changed,
+        previous_availability,
+        previous_source,
+        last_seen_at: received_at,
+        expires_at,
+        compatible,
+    }
+}
+
+fn received_beacon_expires_at(received_at: i64) -> i64 {
+    received_at + BEACON_TTL_SECS
+}
+
+fn last_seen_at_from_record(record: &NearbyDeviceRecord) -> i64 {
+    record.expires_at - BEACON_TTL_SECS
+}
+
+fn broadcast_targets(interfaces: &[DiscoveryInterface]) -> Vec<Ipv4Addr> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    add_broadcast_target(Ipv4Addr::BROADCAST, &mut seen, &mut targets);
+
+    for interface in interfaces {
+        if let Some(broadcast) = interface.broadcast {
+            add_broadcast_target(broadcast, &mut seen, &mut targets);
+        }
+    }
+
+    targets
+}
+
+fn add_broadcast_target(
+    target: Ipv4Addr,
+    seen: &mut HashSet<Ipv4Addr>,
+    targets: &mut Vec<Ipv4Addr>,
+) {
+    if target.is_unspecified() || target.is_loopback() {
+        return;
+    }
+    if seen.insert(target) {
+        targets.push(target);
+    }
+}
+
+fn discovery_interfaces() -> Vec<DiscoveryInterface> {
+    parse_ip_addr_output(&command_stdout(
+        &["ip", "/sbin/ip", "/usr/sbin/ip"],
+        &["-o", "-4", "addr", "show", "up"],
+    ))
+    .or_else(|| parse_ifconfig_output(&command_stdout(&["ifconfig", "/sbin/ifconfig"], &[])))
+    .unwrap_or_default()
+}
+
+fn command_stdout(commands: &[&str], args: &[&str]) -> Option<String> {
+    for command in commands {
+        let Ok(output) = Command::new(command).args(args).output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        if let Ok(stdout) = String::from_utf8(output.stdout) {
+            return Some(stdout);
+        }
+    }
+    None
+}
+
+fn parse_ip_addr_output(output: &Option<String>) -> Option<Vec<DiscoveryInterface>> {
+    let output = output.as_ref()?;
+    let mut interfaces = Vec::new();
+
+    for line in output.lines() {
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 4 || parts.get(2) != Some(&"inet") {
+            continue;
+        }
+        let name = parts
+            .get(1)
+            .map(|value| value.trim_end_matches(':').to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let Some(ipv4) = parts
+            .get(3)
+            .and_then(|cidr| cidr.split('/').next())
+            .and_then(parse_ipv4)
+        else {
+            continue;
+        };
+        if ipv4.is_loopback() {
+            continue;
+        }
+        let broadcast = parts
+            .windows(2)
+            .find_map(|window| (window[0] == "brd").then(|| window[1]))
+            .and_then(parse_ipv4);
+        interfaces.push(DiscoveryInterface {
+            name,
+            ipv4,
+            broadcast,
+        });
+    }
+
+    Some(interfaces)
+}
+
+fn parse_ifconfig_output(output: &Option<String>) -> Option<Vec<DiscoveryInterface>> {
+    let output = output.as_ref()?;
+    let mut interfaces = Vec::new();
+    let mut current_name = String::from("unknown");
+
+    for line in output.lines() {
+        let starts_with_whitespace = line.chars().next().is_some_and(char::is_whitespace);
+        if !starts_with_whitespace && line.contains(':') {
+            current_name = line
+                .split(':')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("unknown")
+                .to_string();
+            continue;
+        }
+
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+        let Some(inet_index) = parts.iter().position(|part| *part == "inet") else {
+            continue;
+        };
+        let Some(ipv4) = parts.get(inet_index + 1).and_then(|part| parse_ipv4(part)) else {
+            continue;
+        };
+        if ipv4.is_loopback() {
+            continue;
+        }
+        let broadcast = parts
+            .windows(2)
+            .find_map(|window| (window[0] == "broadcast").then(|| window[1]))
+            .and_then(parse_ipv4);
+        interfaces.push(DiscoveryInterface {
+            name: current_name.clone(),
+            ipv4,
+            broadcast,
+        });
+    }
+
+    Some(interfaces)
+}
+
+fn parse_ipv4(value: &str) -> Option<Ipv4Addr> {
+    value.parse::<Ipv4Addr>().ok()
+}
+
+fn diagnostic_ref(value: &str) -> String {
+    value.chars().take(12).collect()
 }
 
 pub fn pending_join_prompt(request: &PendingJoinRequest) -> JoinRequestPrompt {
@@ -682,6 +946,8 @@ pub fn platform_name() -> &'static str {
         "macOS"
     } else if cfg!(target_os = "windows") {
         "Windows"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
     } else {
         "Desktop"
     }
@@ -783,24 +1049,121 @@ mod tests {
     }
 
     #[test]
-    fn beacon_expiry_rejects_stale_devices() {
-        let mut beacon = NearbyBeacon {
-            kind: "nearby_beacon".into(),
-            device_id: "device".into(),
-            display_name: "Windows PC".into(),
-            platform: "Windows".into(),
-            app_version: "1.4.0".into(),
-            capabilities: vec!["large_file".into()],
-            listen_port: 43123,
-            room_offer_id: "offer".into(),
-            expires_at: 10,
-            availability: "Available".into(),
-        };
+    fn received_beacon_ttl_tolerates_heartbeat_jitter() {
+        let received_at = 100;
+        let expires_at = received_beacon_expires_at(received_at);
 
-        assert!(beacon_is_fresh(&beacon, 9));
-        assert!(!beacon_is_fresh(&beacon, 10));
-        beacon.expires_at = 11;
-        assert!(beacon_is_fresh(&beacon, 10));
+        assert!(BEACON_TTL_SECS >= (BEACON_INTERVAL_SECS as i64 * 5));
+        assert_eq!(expires_at, 112);
+        assert!(expires_at > received_at + 8);
+    }
+
+    #[test]
+    fn repeated_beacons_update_existing_peer_without_flicker() {
+        let mut records = HashMap::new();
+        let source: SocketAddr = "192.168.1.10:48392".parse().unwrap();
+        let mut beacon = test_beacon("device-one", "Available", 12);
+
+        let first = upsert_nearby_device(&mut records, beacon.clone(), source, 100);
+        assert!(first.is_new);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records["device-one"].expires_at, 112);
+
+        beacon.expires_at = -999;
+        let second = upsert_nearby_device(&mut records, beacon, source, 104);
+        assert!(!second.is_new);
+        assert!(!second.availability_changed);
+        assert!(!second.source_changed);
+        assert_eq!(records.len(), 1);
+        assert_eq!(last_seen_at_from_record(&records["device-one"]), 104);
+        assert_eq!(records["device-one"].expires_at, 116);
+    }
+
+    #[test]
+    fn device_identity_is_stable_across_endpoint_changes() {
+        let mut records = HashMap::new();
+        let source: SocketAddr = "192.168.1.10:48392".parse().unwrap();
+        let mut beacon = test_beacon("device-one", "Available", 12);
+        upsert_nearby_device(&mut records, beacon.clone(), source, 100);
+
+        let new_source: SocketAddr = "192.168.1.11:48392".parse().unwrap();
+        beacon.listen_port = 50123;
+        let update = upsert_nearby_device(&mut records, beacon, new_source, 102);
+
+        assert!(!update.is_new);
+        assert!(update.source_changed);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records["device-one"].source, new_source);
+        assert_eq!(records["device-one"].join_request_port, 50123);
+    }
+
+    #[test]
+    fn broadcast_targets_include_limited_and_interface_broadcasts() {
+        let interfaces = vec![
+            DiscoveryInterface {
+                name: "en0".into(),
+                ipv4: "192.168.1.20".parse().unwrap(),
+                broadcast: Some("192.168.1.255".parse().unwrap()),
+            },
+            DiscoveryInterface {
+                name: "wlan0".into(),
+                ipv4: "10.0.0.9".parse().unwrap(),
+                broadcast: Some("10.0.0.255".parse().unwrap()),
+            },
+        ];
+
+        let targets = broadcast_targets(&interfaces);
+
+        assert_eq!(
+            targets,
+            vec![
+                Ipv4Addr::BROADCAST,
+                "192.168.1.255".parse().unwrap(),
+                "10.0.0.255".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_linux_ip_addr_broadcast_interfaces() {
+        let output = Some(
+            "2: enp0s1    inet 192.168.1.20/24 brd 192.168.1.255 scope global dynamic enp0s1\n\
+             1: lo    inet 127.0.0.1/8 scope host lo\n"
+                .to_string(),
+        );
+
+        let interfaces = parse_ip_addr_output(&output).unwrap();
+
+        assert_eq!(
+            interfaces,
+            vec![DiscoveryInterface {
+                name: "enp0s1".into(),
+                ipv4: "192.168.1.20".parse().unwrap(),
+                broadcast: Some("192.168.1.255".parse().unwrap()),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_macos_ifconfig_broadcast_interfaces() {
+        let output = Some(
+            "en0: flags=8863<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+            \tinet 192.168.1.30 netmask 0xffffff00 broadcast 192.168.1.255\n\
+             lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\
+            \tinet 127.0.0.1 netmask 0xff000000\n"
+                .to_string(),
+        );
+
+        let interfaces = parse_ifconfig_output(&output).unwrap();
+
+        assert_eq!(
+            interfaces,
+            vec![DiscoveryInterface {
+                name: "en0".into(),
+                ipv4: "192.168.1.30".parse().unwrap(),
+                broadcast: Some("192.168.1.255".parse().unwrap()),
+            }]
+        );
     }
 
     #[test]
@@ -811,5 +1174,20 @@ mod tests {
             join_request_url(source, 43123),
             "http://192.168.1.9:43123/nearby/join-request"
         );
+    }
+
+    fn test_beacon(device_id: &str, availability: &str, expires_at: i64) -> NearbyBeacon {
+        NearbyBeacon {
+            kind: "nearby_beacon".into(),
+            device_id: device_id.into(),
+            display_name: "Linux Box".into(),
+            platform: "Linux".into(),
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            capabilities: vec!["large_file".into(), "nearby_join".into()],
+            listen_port: 43123,
+            room_offer_id: "offer".into(),
+            expires_at,
+            availability: availability.into(),
+        }
     }
 }
