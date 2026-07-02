@@ -109,10 +109,10 @@ fn os_version() -> Option<String> {
     }
 }
 
-fn cpu_info(mode: ProfileProbeMode) -> CpuInfo {
+fn cpu_info(_mode: ProfileProbeMode) -> CpuInfo {
     #[cfg(target_os = "macos")]
     {
-        let hardware = if mode == ProfileProbeMode::Full {
+        let hardware = if _mode == ProfileProbeMode::Full {
             fixed_command_text("/usr/sbin/system_profiler", &["SPHardwareDataType"])
                 .or_else(|| fixed_command_text("system_profiler", &["SPHardwareDataType"]))
         } else {
@@ -148,7 +148,7 @@ fn cpu_info(mode: ProfileProbeMode) -> CpuInfo {
 
     #[cfg(target_os = "windows")]
     {
-        windows_cpu_info(mode)
+        windows_cpu_info(_mode)
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -230,10 +230,10 @@ fn memory_total_gb(_mode: ProfileProbeMode) -> Option<u64> {
     }
 }
 
-fn gpu_names(mode: ProfileProbeMode) -> Vec<String> {
+fn gpu_names(_mode: ProfileProbeMode) -> Vec<String> {
     #[cfg(target_os = "macos")]
     {
-        if mode == ProfileProbeMode::Quick {
+        if _mode == ProfileProbeMode::Quick {
             return if std::env::consts::ARCH == "aarch64" {
                 vec!["Apple GPU".into()]
             } else {
@@ -254,7 +254,7 @@ fn gpu_names(mode: ProfileProbeMode) -> Vec<String> {
 
     #[cfg(target_os = "windows")]
     {
-        if mode == ProfileProbeMode::Quick {
+        if _mode == ProfileProbeMode::Quick {
             return Vec::new();
         }
 

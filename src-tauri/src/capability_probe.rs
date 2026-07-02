@@ -244,6 +244,23 @@ mod tests {
             CapabilityProbeMode::Full,
         );
 
+        assert!(!capabilities.runtimes.is_empty());
+        assert!(capabilities
+            .runtimes
+            .iter()
+            .any(|runtime| runtime.name == "python"));
+        assert!(capabilities
+            .runtimes
+            .iter()
+            .any(|runtime| runtime.name == "node"));
+        assert!(capabilities
+            .runtimes
+            .iter()
+            .any(|runtime| runtime.name == "git"));
+        assert!(capabilities
+            .runtimes
+            .iter()
+            .any(|runtime| runtime.name == "rust/cargo"));
         assert_eq!(
             capabilities.gpu_acceleration.metal_available,
             cfg!(target_os = "macos")

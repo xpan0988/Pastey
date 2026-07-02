@@ -33,6 +33,7 @@ interface DiagnosticsSnapshot {
 
 let cachedDiagnostics: DiagnosticsSnapshot | null = null;
 let diagnosticsRequest: Promise<DiagnosticsSnapshot> | null = null;
+let diagnosticsRequestSequence = 0;
 
 export function SettingsPage({ config, onConfigChange, onJoinWithCode }: SettingsPageProps) {
   const [windowValue, setWindowValue] = useState(windowSelectionFromConfig(config.transfer_window_override, PRESET_WINDOWS));
@@ -148,16 +149,21 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
     setDiagnosticMessage(null);
     setDiagnosticsLoading(true);
     const request = !forceRefresh && diagnosticsRequest ? diagnosticsRequest : loadDiagnosticsSnapshot(forceRefresh);
+    const requestSequence = ++diagnosticsRequestSequence;
     diagnosticsRequest = request;
     try {
       const { profile, capabilities, benchmark } = await request;
+      if (requestSequence !== diagnosticsRequestSequence) return;
       setDeviceProfile(profile);
       setDeviceCapabilities(capabilities);
       setLastBenchmark(benchmark);
     } catch (err) {
+      if (requestSequence !== diagnosticsRequestSequence) return;
       setDiagnosticMessage(err instanceof Error ? err.message : String(err));
     } finally {
-      setDiagnosticsLoading(false);
+      if (requestSequence === diagnosticsRequestSequence) {
+        setDiagnosticsLoading(false);
+      }
       if (diagnosticsRequest === request) {
         diagnosticsRequest = null;
       }
@@ -416,9 +422,14 @@ function gpuTitle(capabilities: DeviceCapabilities): string {
 }
 
 function availableRuntimeTitle(capabilities: DeviceCapabilities): string {
-  const names = capabilities.runtimes.filter((runtime) => runtime.available).map((runtime) => runtime.name);
-  if (names.length) return names.slice(0, 4).join(", ");
-  return capabilities.runtimes.length ? "None detected" : "Unknown";
+  const names = capabilities.runtimes
+    .filter((runtime) => runtime.available)
+    .map((runtime) => {
+      const version = runtime.version?.trim();
+      return version ? `${runtime.name} (${version})` : runtime.name;
+    });
+  if (names.length) return names.join(", ");
+  return capabilities.runtimes.length ? "None detected" : "Not probed";
 }
 
 function benchmarkModeDescription(mode: BenchmarkMode): string {
@@ -444,7 +455,7 @@ function platformDeviceFallback(profile: DeviceProfile): string {
 async function loadDiagnosticsSnapshot(forceRefresh: boolean): Promise<DiagnosticsSnapshot> {
   const [profileResult, capabilitiesResult, benchmarkResult] = await Promise.allSettled([
     getDeviceProfile({ forceRefresh }),
-    getDeviceCapabilities({ forceRefresh }),
+    getDeviceCapabilities({ forceRefresh, probeMode: "full" }),
     getLastBenchmarkResults()
   ]);
   const profile = profileResult.status === "fulfilled" ? profileResult.value : cachedDiagnostics?.profile ?? null;

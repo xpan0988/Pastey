@@ -170,6 +170,7 @@ export interface DeviceCapabilities {
   updated_at: number;
 }
 
+export type CapabilityProbeMode = "quick" | "full";
 export type BenchmarkMode = "raw_memory" | "pastey_pipeline";
 export type LinkQuality = "Poor" | "Fair" | "Good" | "Excellent";
 

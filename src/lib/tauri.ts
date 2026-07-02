@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppConfig,
   BenchmarkMode,
+  CapabilityProbeMode,
   DeviceCapabilities,
   DeviceProfile,
   JoinRequestPrompt,
@@ -264,9 +265,10 @@ export async function getDeviceProfile(options?: { forceRefresh?: boolean }): Pr
   });
 }
 
-export async function getDeviceCapabilities(options?: { forceRefresh?: boolean }): Promise<DeviceCapabilities> {
+export async function getDeviceCapabilities(options?: { forceRefresh?: boolean; probeMode?: CapabilityProbeMode }): Promise<DeviceCapabilities> {
   return invoke("get_device_capabilities", {
-    forceRefresh: options?.forceRefresh ?? false
+    forceRefresh: options?.forceRefresh ?? false,
+    probeMode: options?.probeMode ?? null
   });
 }
 
