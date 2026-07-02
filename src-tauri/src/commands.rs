@@ -1448,23 +1448,30 @@ pub async fn get_device_profile(
 #[tauri::command]
 pub async fn get_device_capabilities(
     force_refresh: Option<bool>,
+    probe_mode: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<diagnostics::DeviceCapabilities, String> {
     run_async(async move {
         let force_refresh = force_refresh.unwrap_or(false);
-        if let Some(capabilities) = cached_device_capabilities(&state, force_refresh) {
+        let capability_mode = diagnostics_capability_mode(force_refresh, probe_mode.as_deref())?;
+        if let Some(capabilities) =
+            cached_device_capabilities_for_mode(&state, force_refresh, capability_mode)
+        {
             return Ok(capabilities);
         }
 
         let _guard = state.diagnostics_refresh.lock().await;
-        if let Some(capabilities) = cached_device_capabilities(&state, force_refresh) {
+        if let Some(capabilities) =
+            cached_device_capabilities_for_mode(&state, force_refresh, capability_mode)
+        {
             return Ok(capabilities);
         }
 
         let config = state.config.read().clone();
-        let profile_mode = diagnostics_profile_mode(force_refresh);
-        let capability_mode = diagnostics_capability_mode(force_refresh);
-        let cached_profile = cached_profile_for_capability_probe(&state, force_refresh);
+        let profile_mode =
+            diagnostics_profile_mode(force_refresh || capability_mode == CapabilityProbeMode::Full);
+        let cached_profile =
+            cached_profile_for_capability_probe(&state, force_refresh, capability_mode);
         let (profile, capabilities) = tauri::async_runtime::spawn_blocking(move || {
             let profile = cached_profile.unwrap_or_else(|| {
                 device_profile::local_device_profile_with_mode(&config, profile_mode)
@@ -1638,19 +1645,42 @@ fn cached_device_capabilities(
         .filter(|capabilities| diagnostics_cache_is_fresh(capabilities.updated_at, force_refresh))
 }
 
+fn cached_device_capabilities_for_mode(
+    state: &Arc<AppState>,
+    force_refresh: bool,
+    mode: CapabilityProbeMode,
+) -> Option<diagnostics::DeviceCapabilities> {
+    cached_device_capabilities(state, force_refresh)
+        .filter(|capabilities| capability_cache_satisfies_mode(capabilities, mode))
+}
+
+fn capability_cache_satisfies_mode(
+    capabilities: &diagnostics::DeviceCapabilities,
+    mode: CapabilityProbeMode,
+) -> bool {
+    match mode {
+        CapabilityProbeMode::Quick => true,
+        CapabilityProbeMode::Full => !capabilities.runtimes.is_empty(),
+    }
+}
+
 fn cached_profile_for_capability_probe(
     state: &Arc<AppState>,
     force_refresh: bool,
+    mode: CapabilityProbeMode,
 ) -> Option<diagnostics::DeviceProfile> {
-    if should_reuse_cached_profile_for_capability_probe(force_refresh) {
+    if should_reuse_cached_profile_for_capability_probe(force_refresh, mode) {
         cached_device_profile(state, false)
     } else {
         None
     }
 }
 
-fn should_reuse_cached_profile_for_capability_probe(force_refresh: bool) -> bool {
-    !force_refresh
+fn should_reuse_cached_profile_for_capability_probe(
+    force_refresh: bool,
+    mode: CapabilityProbeMode,
+) -> bool {
+    !force_refresh && mode == CapabilityProbeMode::Quick
 }
 
 fn diagnostics_cache_is_fresh(updated_at: i64, force_refresh: bool) -> bool {
@@ -1667,12 +1697,25 @@ fn diagnostics_profile_mode(force_refresh: bool) -> ProfileProbeMode {
     }
 }
 
-fn diagnostics_capability_mode(force_refresh: bool) -> CapabilityProbeMode {
-    if force_refresh {
+fn diagnostics_capability_mode(
+    force_refresh: bool,
+    requested_mode: Option<&str>,
+) -> AppResult<CapabilityProbeMode> {
+    let requested_mode = match requested_mode {
+        Some("quick") => Some(CapabilityProbeMode::Quick),
+        Some("full") => Some(CapabilityProbeMode::Full),
+        Some(mode) => {
+            return Err(AppError::InvalidInput(format!(
+                "unsupported capability probe mode: {mode}"
+            )))
+        }
+        None => None,
+    };
+    Ok(if force_refresh {
         CapabilityProbeMode::Full
     } else {
-        CapabilityProbeMode::Quick
-    }
+        requested_mode.unwrap_or(CapabilityProbeMode::Quick)
+    })
 }
 
 fn log_field(value: Option<&str>) -> &str {
@@ -1856,17 +1899,90 @@ mod tests {
     fn diagnostics_normal_load_uses_quick_probe_modes() {
         assert_eq!(diagnostics_profile_mode(false), ProfileProbeMode::Quick);
         assert_eq!(
-            diagnostics_capability_mode(false),
+            diagnostics_capability_mode(false, None).unwrap(),
             CapabilityProbeMode::Quick
         );
         assert_eq!(diagnostics_profile_mode(true), ProfileProbeMode::Full);
-        assert_eq!(diagnostics_capability_mode(true), CapabilityProbeMode::Full);
+        assert_eq!(
+            diagnostics_capability_mode(true, None).unwrap(),
+            CapabilityProbeMode::Full
+        );
+    }
+
+    #[test]
+    fn diagnostics_can_request_full_capability_probe_without_force_refresh() {
+        assert_eq!(
+            diagnostics_capability_mode(false, Some("full")).unwrap(),
+            CapabilityProbeMode::Full
+        );
+        assert_eq!(
+            diagnostics_capability_mode(false, Some("quick")).unwrap(),
+            CapabilityProbeMode::Quick
+        );
+        assert!(diagnostics_capability_mode(false, Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn full_capability_probe_rejects_cached_quick_capabilities() {
+        let profile = diagnostics::DeviceProfile {
+            device_id: "device".into(),
+            device_name: "Pastey".into(),
+            platform: std::env::consts::OS.into(),
+            os_version: None,
+            arch: std::env::consts::ARCH.into(),
+            cpu_name: None,
+            cpu_physical_core_count: None,
+            cpu_logical_processor_count: None,
+            cpu_core_count: None,
+            memory_total_gb: None,
+            gpu_names: Vec::new(),
+            power_state: diagnostics::PowerState::Unknown,
+            battery_percent: None,
+            updated_at: storage::now_ts(),
+        };
+        let quick_capabilities = diagnostics::DeviceCapabilities {
+            runtimes: Vec::new(),
+            gpu_acceleration: diagnostics::GpuAcceleration {
+                cuda_available: false,
+                metal_available: false,
+                gpu_names: Vec::new(),
+                vram_gb: None,
+            },
+            updated_at: storage::now_ts(),
+        };
+        let full_capabilities = capability_probe::probe_device_capabilities_with_mode(
+            &profile,
+            CapabilityProbeMode::Full,
+        );
+
+        assert!(!capability_cache_satisfies_mode(
+            &quick_capabilities,
+            CapabilityProbeMode::Full
+        ));
+        assert!(capability_cache_satisfies_mode(
+            &full_capabilities,
+            CapabilityProbeMode::Full
+        ));
+        assert!(capability_cache_satisfies_mode(
+            &quick_capabilities,
+            CapabilityProbeMode::Quick
+        ));
     }
 
     #[test]
     fn forced_capability_refresh_does_not_reuse_cached_quick_profile() {
-        assert!(should_reuse_cached_profile_for_capability_probe(false));
-        assert!(!should_reuse_cached_profile_for_capability_probe(true));
+        assert!(should_reuse_cached_profile_for_capability_probe(
+            false,
+            CapabilityProbeMode::Quick
+        ));
+        assert!(!should_reuse_cached_profile_for_capability_probe(
+            false,
+            CapabilityProbeMode::Full
+        ));
+        assert!(!should_reuse_cached_profile_for_capability_probe(
+            true,
+            CapabilityProbeMode::Quick
+        ));
     }
 
     #[test]
