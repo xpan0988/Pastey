@@ -13,6 +13,11 @@ Detailed update and release history for Pastey.
 ### Documentation
 
 - Added `docs/architecture/naming-conventions.md` as the canonical naming guide for schema versions, capability IDs, registry versions, protocol names, provider action kinds, executor kinds, and future candidate-payload capability naming.
+- Added `docs/agent-bridge/capability-templates.md` as the design-first template and manifest architecture for future Layer 5 capability migration, including autonomy profiles, approval policy/reviewer boundaries, existing capability adapter mapping, migration phases, and proposed tests.
+- Added Phase 1-3 capability-template implementation scaffolding: static manifests for all existing Agent Bridge capabilities, additive template helper checks, a manifest test runner, and manifest-backed Hello Stdout execution binding without public contract changes.
+- Added the Phase 4 `filesystem.find_file_candidates` template wrapper for common lifecycle checks while preserving filesystem-specific validation, receiver-local candidate storage, Rust discovery behavior, and metadata-only public results.
+- Added the Phase 5 `transfer.request_candidate_payload` template wrapper for common lifecycle checks while preserving source discovery binding, receiver-local candidate resolution, existing queue handoff, Agent Bridge queue metadata, `handoff_queued` semantics, and metadata-only public results.
+- Added the Phase 6 deterministic candidate-payload workflow that chains existing discovery and payload capabilities only after host validation, local search confirmation, receiver search consent, explicit user candidate selection, receiver payload consent, and safe queue handoff.
 - Consolidated Agent Bridge capability contracts, provider behavior, Layer 5 workspace status, candidate-payload second-consent boundaries, receiver-local candidate resolution, queue handoff, manual smoke expectations, and validation guidance around the implemented file-candidate metadata search capability and payload handoff path.
 
 ### Changed
@@ -25,7 +30,7 @@ Detailed update and release history for Pastey.
 
 ### Unchanged
 
-- No automatic file sending after discovery, shell/process execution, generic tool runtime, MCP runtime, new data plane, or binary-v1 protocol change is implemented. The receiver-local candidate store is in-memory only, clears on app restart, and does not make candidate ids paths or transfer authority.
+- No automatic file sending after discovery, AI candidate auto-selection, trusted-session runtime behavior, shell/process execution, open-ended tool runtime, MCP runtime, new data plane, broad natural-language automation, or binary-v1 protocol change is implemented. The receiver-local candidate store is in-memory only, clears on app restart, and does not make candidate ids paths or transfer authority.
 
 ## 1.9.0 — Agent Bridge capability slice — 2026-06-18
 

@@ -74,6 +74,21 @@ async function failIfHandoffRuns() {
   throw new Error("handoff must not run");
 }
 
+function unresolvedCandidatePayload(
+  request: CandidatePayloadExecutionRequest,
+  reason: "not_found" | "expired" | "changed",
+): CandidatePayloadLocalResolution {
+  return {
+    sourceCapability: "filesystem.find_file_candidates",
+    sourceRequestId: request.sourceRequestId,
+    candidateId: request.candidateId,
+    candidateKind: request.candidateKind,
+    resolved: false,
+    reason,
+    displayName: request.candidateDisplayName,
+  };
+}
+
 function confirmedPending(plan: AiActionPlan, pendingId: string) {
   const policy = evaluateAiPolicy(plan, buildMockAiContextSnapshot());
   assert.equal(policy.status, "accepted", policy.status === "rejected" ? policy.reasons.join(" ") : undefined);
@@ -318,7 +333,17 @@ test("execution validates consent, resolves candidate metadata, queues handoff, 
     { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
   );
   assert.equal(executed.executed, true);
-  assert.equal(executed.result.status, "handoff_queued");
+  assert.deepEqual({
+    status: executed.result.status,
+    transferredBytes: executed.result.transferredBytes,
+    handoffQueued: executed.result.handoffQueued,
+    transferStatus: executed.result.transferStatus,
+  }, {
+    status: "handoff_queued",
+    transferredBytes: 0,
+    handoffQueued: true,
+    transferStatus: "queued",
+  });
   assert.equal(executed.result.candidateResolution?.resolved, true);
   assert.equal(executed.result.candidateResolution?.reason, "resolved");
   assert.equal(executed.result.transferredBytes, 0);
@@ -355,6 +380,75 @@ test("one-time consent rejects replay", async () => {
   assert.equal(replay.result.errorCode, "already_consumed");
 });
 
+test("expired consent, wrong request hash, wrong capability, and wrong source binding fail closed", async () => {
+  const chain = candidatePayloadChain();
+  const expiredConsent = {
+    ...chain.consent,
+    binding: {
+      ...chain.consent.binding,
+      expiresAt: new Date(EXECUTE_AT.getTime() - 1).toISOString(),
+    },
+  } as PeerConsentRecord;
+  const expired = await executeInboundCandidatePayloadRequest(
+    chain.request,
+    expiredConsent,
+    createPeerConsentConsumptionState(),
+    async () => {
+      throw new Error("resolver must not run with expired consent");
+    },
+    failIfHandoffRuns,
+    { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
+  );
+  assert.equal(expired.executed, false);
+  assert.equal(expired.result.status, "expired");
+  assert.equal(expired.result.errorCode, "consent_expired");
+
+  const wrongHashRequest = structuredClone(chain.request) as CapabilityExecuteRequestRoomControlEvent;
+  wrongHashRequest.payload.requestPayloadHash = "wrong-request-hash";
+  const wrongHash = await executeInboundCandidatePayloadRequest(
+    wrongHashRequest,
+    chain.consent,
+    createPeerConsentConsumptionState(),
+    async () => {
+      throw new Error("resolver must not run with a wrong request hash");
+    },
+    failIfHandoffRuns,
+    { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
+  );
+  assert.equal(wrongHash.executed, false);
+  assert.equal(wrongHash.result.errorCode, "consent_binding_mismatch");
+
+  const wrongCapabilityRequest = structuredClone(chain.request) as CapabilityExecuteRequestRoomControlEvent;
+  wrongCapabilityRequest.payload.capability = "runtime.hello_stdout" as CandidatePayloadExecutionRequest["capability"];
+  const wrongCapability = await executeInboundCandidatePayloadRequest(
+    wrongCapabilityRequest,
+    chain.consent,
+    createPeerConsentConsumptionState(),
+    async () => {
+      throw new Error("resolver must not run with a wrong capability");
+    },
+    failIfHandoffRuns,
+    { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
+  );
+  assert.equal(wrongCapability.executed, false);
+  assert.equal(wrongCapability.result.errorCode, "malformed_request");
+
+  const wrongSourceBindingRequest = structuredClone(chain.request) as CapabilityExecuteRequestRoomControlEvent;
+  wrongSourceBindingRequest.payload.sourceRequestId = "different-discovery-request";
+  const wrongSourceBinding = await executeInboundCandidatePayloadRequest(
+    wrongSourceBindingRequest,
+    chain.consent,
+    createPeerConsentConsumptionState(),
+    async () => {
+      throw new Error("resolver must not run with a wrong source discovery binding");
+    },
+    failIfHandoffRuns,
+    { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
+  );
+  assert.equal(wrongSourceBinding.executed, false);
+  assert.equal(wrongSourceBinding.result.errorCode, "consent_binding_mismatch");
+});
+
 test("file-candidate consent cannot authorize candidate payload request", async () => {
   const chain = candidatePayloadChain();
   const rejected = await executeInboundCandidatePayloadRequest(
@@ -389,6 +483,34 @@ test("candidate payload consent cannot authorize search, Hello, or future transf
   assert.equal(rejected.result.errorCode, "consent_binding_mismatch");
   assert.equal("transferQueueId" in chain.consent.binding, false);
   assert.equal("handoffId" in chain.consent.binding, false);
+});
+
+test("missing, expired, changed, or deleted candidates do not enqueue handoff", async () => {
+  for (const scenario of [
+    { label: "missing", reason: "not_found" as const, status: "candidate_not_found" },
+    { label: "expired", reason: "expired" as const, status: "candidate_expired" },
+    { label: "changed", reason: "changed" as const, status: "candidate_changed" },
+    { label: "deleted", reason: "not_found" as const, status: "candidate_not_found" },
+  ]) {
+    const chain = candidatePayloadChain();
+    let handoffCalls = 0;
+    const executed = await executeInboundCandidatePayloadRequest(
+      chain.request,
+      chain.consent,
+      createPeerConsentConsumptionState(),
+      async (request) => unresolvedCandidatePayload(request, scenario.reason),
+      async () => {
+        handoffCalls += 1;
+        return { queued: true as const };
+      },
+      { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
+    );
+    assert.equal(executed.executed, true, scenario.label);
+    assert.equal(executed.result.status, scenario.status, scenario.label);
+    assert.equal(executed.result.handoffQueued, false, scenario.label);
+    assert.equal(executed.result.transferredBytes, 0, scenario.label);
+    assert.equal(handoffCalls, 0, scenario.label);
+  }
 });
 
 test("selected-peers, broadcast, and unsafe provider fields reject", () => {
@@ -509,6 +631,8 @@ test("no auto-send exists and queued handoff still reports no transferred bytes 
   for (const field of [
     "absolutePath",
     "filePath",
+    "localPath",
+    "realPath",
     "path",
     "contents",
     "transferQueueId",

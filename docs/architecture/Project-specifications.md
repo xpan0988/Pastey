@@ -4,7 +4,7 @@ This document is the canonical definition of Pastey's project layout and layer b
 
 It is both the architecture contract and the completion-scoring standard for Pastey. Source code is the primary evidence. Tests, automated harnesses, current documentation, runtime paths, and recorded manual smoke results are supporting evidence.
 
-For architecture, schema, protocol, Agent Bridge capability, provider action, executor, and future capability naming rules, see [naming-conventions.md](naming-conventions.md).
+For architecture, schema, protocol, Agent Bridge capability, provider action, executor, template kind, and future capability naming rules, see [naming-conventions.md](naming-conventions.md). For Agent Bridge capability templates, manifests, autonomy profiles, approval policy, migration phases, and implementation status, see [../agent-bridge/capability-templates.md](../agent-bridge/capability-templates.md).
 
 ## Purpose And Authority
 
@@ -155,13 +155,16 @@ Responsibilities:
 - Explicit local and receiver-side consent.
 - Bounded capability execution and typed result return.
 - Read-only workspace capabilities that preserve advisory model output, explicit receiver consent, and bounded host-owned execution.
+- Deterministic capability workflows that chain existing capabilities only after host validation and explicit user decisions.
+- Future reusable capability templates and manifests that reduce duplicated lifecycle code while preserving explicit capability validators, route binding, consent binding, scope limits, and redacted result contracts.
 - Audit logging that mirrors lifecycle without becoming state or authority.
 
 Non-responsibilities:
 
 - Letting a model directly execute instructions.
 - Treating provider output as trusted code.
-- Generic shell/process/file/network execution without a new capability contract.
+- Open-ended shell/process/file/network execution without a new capability contract.
+- Auto-selecting candidates or auto-sending files from model output.
 - Reusable trust from one consent decision.
 - Durable peer identity; that belongs to Layer 4.
 
@@ -191,7 +194,7 @@ Completion criteria:
 | Layer 2 | `src-tauri/src/diagnostics.rs`, `src-tauri/src/device_profile.rs`, `src-tauri/src/capability_probe.rs`, `src-tauri/src/link_benchmark.rs`, `src/pages/SettingsPage.tsx` | Device profile, capability probe, diagnostics DTO, and benchmark tests | Developer Tools current-session diagnostics | Production runtime, Developer Tools visible |
 | Layer 3 | `src/lib/transferPlanner.ts`, `src/lib/transferScheduler.ts`, `src/App.tsx`, `src/lib/agentBridge/controlWindowRuntime.ts`, `src-tauri/src/transfer.rs` | Planner/scheduler/MicroFlowGroup tests plus `scripts/run-cl4-contention-smoke.mjs` | Transfer validation guide and logged smoke interpretation | Production runtime with automated harness |
 | Layer 4 | `src-tauri/src/storage.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/room_control.rs`, `src/lib/bridgeRoutingRuntime.ts`, `src/lib/agentBridge/roomControlEvent.ts`, `src/lib/agentBridge/controlQueue.ts` | Bridge route, storage, room-control Rust tests, routing/runtime TypeScript tests, control-event validation tests, `scripts/run-layer4-validation-matrix.mjs` | Session-scoped Bridge routing/control flow documented in Bridge, Agent Bridge, and transfer docs. Legacy implementation term: room. | Production runtime with automated matrix; manual/release smoke pending |
-| Layer 5 | `src/lib/ai/*`, `src/lib/agentBridge/peerConsent.ts`, `src/lib/agentBridge/helloPeerExecution.ts`, `src/lib/agentBridge/helloStdoutExecution.ts`, `src/lib/agentBridge/fileCandidateExecution.ts`, `src/lib/agentBridge/candidatePayloadExecution.ts`, `src-tauri/src/hello_stdout.rs`, `src-tauri/src/file_candidates.rs`, `src/lib/agentBridge/logging.ts`, `src/components/agentBridge/RoomControlPanel.tsx`, `src/lib/transferScheduler.ts` | Provider, context, static registry, validator, PolicyGate, preview, consent, execution, logging, room-control tests, Hello tests, file-candidate advisory/executor tests, candidate-payload consent/handoff tests, and transfer scheduler contention tests | Bridge-scoped UI and redacted lifecycle logs. Manual dual-device smoke remains pending. Legacy implementation term: room-scoped. | Production runtime, narrow capability slice with static registry, first read-only workspace capability, and candidate-payload queue handoff |
+| Layer 5 | `src/lib/ai/*`, `src/lib/agentBridge/capabilityManifest.ts`, `src/lib/agentBridge/capabilityTemplateHelpers.ts`, `src/lib/agentBridge/peerConsent.ts`, `src/lib/agentBridge/helloPeerExecution.ts`, `src/lib/agentBridge/helloStdoutExecution.ts`, `src/lib/agentBridge/fileCandidateExecution.ts`, `src/lib/agentBridge/candidatePayloadExecution.ts`, `src/lib/agentBridge/candidatePayloadWorkflow.ts`, `src-tauri/src/hello_stdout.rs`, `src-tauri/src/file_candidates.rs`, `src/lib/agentBridge/logging.ts`, `src/components/agentBridge/RoomControlPanel.tsx`, `src/lib/transferScheduler.ts` | Provider, context, static registry, static manifests, template helper checks, validator, PolicyGate, preview, consent, execution, deterministic workflow tests, logging, room-control tests, Hello tests, file-candidate advisory/executor tests, candidate-payload consent/handoff tests, and transfer scheduler contention tests | Bridge-scoped UI and redacted lifecycle logs. Manual dual-device smoke remains pending. Legacy implementation term: room-scoped. | Production runtime, narrow capability slice with static registry, template-wrapped common checks, first read-only workspace capability, deterministic candidate selection workflow, and candidate-payload queue handoff |
 
 ## Current Completion Assessment
 

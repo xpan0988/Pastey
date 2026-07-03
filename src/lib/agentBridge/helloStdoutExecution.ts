@@ -15,11 +15,16 @@ import {
   type PeerConsentRecord,
 } from "./peerConsent";
 import type { PeerConsentConsumptionState } from "./helloPeerExecution";
+import { HELLO_STDOUT_CAPABILITY_MANIFEST } from "./capabilityManifest";
 import {
-  HELLO_STDOUT_CAPABILITY,
-  HELLO_STDOUT_EXPECTED_STDOUT,
-  HELLO_STDOUT_RUNTIME_KIND
-} from "../ai/capabilityRegistry";
+  assertConsentNotExpired,
+  assertExactCapability,
+  bindRequestHash,
+} from "./capabilityTemplateHelpers";
+import { HELLO_STDOUT_EXPECTED_STDOUT } from "../ai/capabilityRegistry";
+
+const HELLO_STDOUT_CAPABILITY: "runtime.hello_stdout" = HELLO_STDOUT_CAPABILITY_MANIFEST.capability as "runtime.hello_stdout";
+const HELLO_STDOUT_RUNTIME_KIND: "rust_host_helper" = HELLO_STDOUT_CAPABILITY_MANIFEST.executorKind as "rust_host_helper";
 
 export type HelloStdoutExecutionBuildResult =
   | { ok: true; request: HelloStdoutExecutionRequest; event: CapabilityExecuteRequestRoomControlEvent }
@@ -63,17 +68,17 @@ export function buildHelloStdoutExecutionRequest(
     consent.sourcePreviewEventId !== preview.eventId ||
     consent.envelopeId !== preview.payload.envelopeId ||
     consent.requestId !== preview.payload.request.requestId ||
-    consent.requestPayloadHash !== preview.payload.request.requestPayloadHash ||
-    consent.capability !== HELLO_STDOUT_CAPABILITY ||
+    !matchesHash(preview.payload.request.requestPayloadHash, consent.requestPayloadHash) ||
+    !matchesCapability(HELLO_STDOUT_CAPABILITY, consent.capability) ||
     !("expectedStdout" in consent) ||
     consent.expectedStdout !== HELLO_STDOUT_EXPECTED_STDOUT
   ) {
     errors.push("Execution request consent grant does not match the exact preview/ack chain.");
   }
-  if (preview.payload.request.capability !== HELLO_STDOUT_CAPABILITY) {
+  if (!matchesCapability(HELLO_STDOUT_CAPABILITY, preview.payload.request.capability)) {
     errors.push("Hello Stdout execution request requires a Hello Stdout preview.");
   }
-  if (consent && Date.parse(consent.expiresAt) <= now.getTime()) {
+  if (consent && isExpired(consent.expiresAt, now)) {
     errors.push("Execution request consent grant is expired.");
   }
   if (errors.length > 0 || !consent) {
@@ -174,16 +179,17 @@ export async function executeInboundHelloStdoutRequest(
 
 function requestMatchesConsent(request: HelloStdoutExecutionRequest, consent: PeerConsentRecord): boolean {
   const binding = consent.binding;
-  return binding.capability === HELLO_STDOUT_CAPABILITY
+  return matchesCapability(HELLO_STDOUT_CAPABILITY, binding.capability)
     && request.consentId === binding.consentId
     && request.sourcePreviewEventId === binding.sourceEventId
     && request.envelopeId === binding.envelopeId
     && request.requestId === binding.requestId
-    && request.requestPayloadHash === binding.requestPayloadHash
+    && matchesHash(binding.requestPayloadHash, request.requestPayloadHash)
     && request.roomRef === binding.roomRef
     && request.sourceDeviceRef === binding.sourceDeviceRef
     && request.targetPeerRef === binding.targetPeerRef
-    && request.capability === binding.capability
+    && matchesCapability(binding.capability, request.capability)
+    && "expectedStdout" in binding
     && request.expectedStdout === binding.expectedStdout
     && Date.parse(request.expiresAt) <= Date.parse(binding.expiresAt);
 }
@@ -251,4 +257,31 @@ function createExecutionId(now: Date): string {
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
+}
+
+function matchesCapability(expected: string, actual: string): boolean {
+  try {
+    assertExactCapability({ expected, actual });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function matchesHash(expected: string, actual: string): boolean {
+  try {
+    bindRequestHash({ expected, actual });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isExpired(expiresAt: string, now: Date): boolean {
+  try {
+    assertConsentNotExpired(expiresAt, now.getTime());
+    return false;
+  } catch {
+    return true;
+  }
 }
