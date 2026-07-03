@@ -7,5 +7,8 @@ export * from "./helloPeerExecution";
 export * from "./helloStdoutExecution";
 export * from "./fileCandidateExecution";
 export * from "./candidatePayloadExecution";
+export * from "./candidatePayloadWorkflow";
+export * from "./capabilityManifest";
+export * from "./capabilityTemplateHelpers";
 export * from "./config";
 export * from "./logging";

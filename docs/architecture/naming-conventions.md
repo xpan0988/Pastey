@@ -1,6 +1,6 @@
 # Pastey Naming Conventions
 
-This document is the canonical naming guide for Pastey architecture, schemas, protocols, Agent Bridge capability contracts, provider action kinds, executor kinds, and future capability proposals. It is a naming specification only; it does not add runtime behavior.
+This document is the canonical naming guide for Pastey architecture, schemas, protocols, Agent Bridge capability contracts, provider action kinds, executor kinds, template kinds, and future capability proposals. It is a naming specification only; it does not add runtime behavior.
 
 When naming appears in code, tests, and docs, source code and tests are the final evidence for implemented behavior. Documentation should link here instead of repeating the full policy.
 
@@ -13,6 +13,7 @@ When naming appears in code, tests, and docs, source code and tests are the fina
 | Capability ID | no embedded version; use registry `version` field | `filesystem.find_file_candidates` |
 | Registry version | `"vN"` | `version: "v1"` |
 | Legacy capability | may remain unversioned | `runtime.execute_hello_template` |
+| Template kind | snake_case capability-family label | `candidate_payload_handoff` |
 
 ## Large Protocol And Wire Format Names
 
@@ -151,6 +152,29 @@ Good examples:
 - `transfer_candidate_payload_host`;
 - `ts_in_process_fixed_template`.
 
+## Template Kinds
+
+Template kinds describe reusable Agent Bridge lifecycle families. They are not capability IDs, schema versions, provider action kinds, executor kinds, or permission grants.
+
+Rules:
+
+- Use snake_case.
+- Do not include versions.
+- Name the repeated lifecycle/policy shape, not a concrete capability.
+- Keep template kinds internal and host-owned.
+- Do not let the provider choose template kinds.
+
+Current design examples:
+
+- `bounded_runtime_action`;
+- `metadata_discovery`;
+- `candidate_payload_handoff`;
+- `future_receiver_local_operation`.
+
+Template kind names must not imply unbounded authority. A template can centralize route, consent, request-hash, expiry, forbidden-field, redaction, and typed-result checks, but each concrete capability still needs an explicit manifest and capability-specific validators.
+
+Approval policy names use snake_case and do not grant authority by themselves. Current template implementation uses `never_auto_approve` for actions or prompts that must not be auto-approved.
+
 ## Future Candidate-Payload Transfer Naming
 
 Avoid filesystem-namespaced or prepare-style transfer names for candidate payload requests.
@@ -233,6 +257,7 @@ Use this checklist for future PRs that add or rename schemas, capabilities, prov
 - Capability ID has no version.
 - Registry has explicit `version`.
 - `schemaVersion` uses `-vN`, not endpoint-style suffixes.
+- Template kind, if present, is snake_case and names a lifecycle family rather than authority.
 - Provider action kind has no version.
 - Executor kind has no version.
 - Docs use the same names as code.

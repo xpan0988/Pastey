@@ -1,6 +1,6 @@
 # Capability Contracts
 
-This document owns the current Layer 5 capability contract for Pastey Agent Bridge. For the broader safety architecture, see [architecture-and-safety.md](architecture-and-safety.md). For transport details, see [room-control-transport.md](room-control-transport.md). For Bridge membership and peer terminology, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For target routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md). For capability IDs, schema versions, provider action kinds, executor kinds, and future capability naming, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md).
+This document owns the current Layer 5 capability contract for Pastey Agent Bridge. For the template and manifest implementation status, see [capability-templates.md](capability-templates.md). For the broader safety architecture, see [architecture-and-safety.md](architecture-and-safety.md). For transport details, see [room-control-transport.md](room-control-transport.md). For Bridge membership and peer terminology, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For target routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md). For capability IDs, schema versions, provider action kinds, executor kinds, and future capability naming, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md).
 
 ## Implemented Capabilities
 
@@ -9,7 +9,7 @@ The implemented capabilities are fixed, host-owned bounded capabilities:
 - `runtime.execute_hello_template`, the legacy fixed Hello Peer template;
 - `runtime.hello_stdout`, a fixed Hello Stdout capability backed by a Rust host helper;
 - `filesystem.find_file_candidates`, a receiver-side metadata-only file-candidate search over approved local scope labels;
-- `transfer.request_candidate_payload`, a second-consent scaffold for one previously discovered file candidate.
+- `transfer.request_candidate_payload`, a second-consent queue-handoff path for one previously discovered file candidate.
 
 They use:
 
@@ -40,7 +40,9 @@ They do not execute model-authored code, shell commands, arbitrary process opera
 
 ## Static Capability Registry
 
-The registry is static and host-owned. It lives in `src/lib/ai/capabilityRegistry.ts` and currently contains the implemented capabilities listed above. It is not plugin loading, not provider-configurable, and not a generic executor table.
+The registry is static and host-owned. It lives in `src/lib/ai/capabilityRegistry.ts` and currently contains the implemented capabilities listed above. It is not plugin loading, not provider-configurable, and not a universal executor table.
+
+The static manifest table in `src/lib/agentBridge/capabilityManifest.ts` describes template kind, data exposure policy, autonomy support, approval requirements, and safety flags for those same capabilities. It must preserve the same public IDs, schema strings, provider action kinds, executor kinds, validators, route policy, consent policy, room-control events, and tests. Existing registry entries and capability-specific validators remain authoritative.
 
 Each registry entry defines:
 
@@ -56,13 +58,15 @@ Each registry entry defines:
 
 The registry is used to keep provider validation, PolicyGate, pending action hashing, preview dispatch, room-control event dispatch, consent binding, and UI labels aligned. It does not replace capability-specific schemas or validators. Unknown capability ids, unknown versions, and unknown schema names reject fail-closed.
 
-The shared lifecycle envelope schema is `pastey-agent-bridge-capability-envelope-v1`. It is a compatibility view over the existing typed preview/control payloads and includes capability id/version, request id, room/source/target refs, selected-peer route policy, exact allow-once consent policy, created/expiry times, payload hash, typed payload, and bounded room-control transport metadata. Existing payload schemas remain capability-specific.
+The shared lifecycle envelope schema is `pastey-agent-bridge-capability-envelope-v1`. It is a compatibility view over the existing typed preview/control payloads and includes capability id/version, request id, room/source/target refs, selected-peer route policy, exact allow-once consent policy, created/expiry times, payload hash, typed payload, and bounded room-control transport metadata. Existing payload schemas remain capability-specific. Template helpers now provide additive checks around manifest naming, registry consistency, route fanout, exact capability/hash binding, expiry, and forbidden public fields. `runtime.hello_stdout`, `filesystem.find_file_candidates`, and `transfer.request_candidate_payload` use those helpers for common lifecycle checks. They do not replace capability-specific validators.
+
+The deterministic find-and-send workflow in `src/lib/agentBridge/candidatePayloadWorkflow.ts` chains the existing file-candidate discovery and candidate-payload handoff capabilities. It is not a new capability, not a generic tool surface, and not a trusted-session mode. It exposes only metadata-safe workflow state, requires explicit user candidate selection, and still requires receiver Allow once for payload handoff.
 
 ## Workspace Capability: `filesystem.find_file_candidates`
 
 `filesystem.find_file_candidates` is the first implemented read-only workspace capability. It lets a sender ask one selected peer to search approved receiver-local scope labels for filename/metadata matches. It returns a bounded list of redacted candidate metadata only.
 
-The user intent is: help find a file named `xxx` on another device and send it back. The implemented capability covers candidate discovery only. Requesting a selected candidate payload now has a separate `transfer.request_candidate_payload` second-consent scaffold, but that scaffold does not transfer bytes or queue handoff. Search consent does not authorize payload transfer.
+The user intent is: help find a file named `xxx` on another device and send it back. The implemented capability covers candidate discovery only. Requesting a selected candidate payload now has a separate `transfer.request_candidate_payload` second-consent path that can queue a resolved candidate into the existing transfer scheduler after receiver Allow once. Search consent does not authorize payload transfer.
 
 The advisory action kind is `request_peer_file_candidates`. Provider output must use this shape:
 
@@ -178,9 +182,11 @@ On successful execution, the receiver stores each returned filesystem candidate 
 
 The stored value includes the receiver-local source path and metadata needed for later revalidation, but the local path is never returned to the sender, AI provider, room-control payloads, frontend result payloads, docs, or logs. Candidate IDs remain display/result identifiers only. They are not paths, durable file handles, transfer grants, or reusable authorization tokens.
 
-## Transfer Scaffold: `transfer.request_candidate_payload`
+## Transfer Capability: `transfer.request_candidate_payload`
 
 `transfer.request_candidate_payload` establishes the second consent boundary for one selected candidate returned by `filesystem.find_file_candidates`. It can queue a resolved `filesystem_file` candidate into the existing transfer queue after receiver Allow once. It does not create a new data plane.
+
+The implementation now uses the static manifest and template helpers for common lifecycle checks: manifest-backed capability and executor constants, exact capability checks, request-hash binding, consent expiry checks, and forbidden public-field checks on results. Source discovery binding, candidate resolution, receiver-local store lookup, changed/deleted/expired candidate handling, queue handoff, queue metadata, result statuses, and transfer scheduler interaction remain capability-specific. Existing validators remain authoritative.
 
 Core rule:
 
@@ -230,7 +236,23 @@ When the existing transfer queue accepts the handoff, execution returns:
 - `transferStatus: queued`;
 - `errorCode: null`.
 
-`handoff_queued` means only that the existing transfer queue accepted the payload source. It does not mean transfer started or completed, and `transferredBytes` remains `0` at handoff time. When the local candidate cannot be safely resolved or queued, execution returns a bounded metadata-only result such as `candidate_not_found`, `candidate_expired`, `candidate_changed`, `handoff_failed`, or `rejected`. The result schema still rejects local path fields, file contents, transfer queue ids, handoff ids, and sender-visible queue internals. There is no payload reading before queue handoff, no auto-send after discovery, and no new transfer protocol.
+`handoff_queued` means only that the existing transfer queue accepted the payload source. It does not mean transfer started or completed, and `transferredBytes` remains `0` at handoff time. When the local candidate cannot be safely resolved or queued, execution returns a bounded metadata-only result such as `candidate_not_found`, `candidate_expired`, `candidate_changed`, `handoff_failed`, or `rejected`. The result schema still rejects local path fields, file contents, transfer queue ids, handoff ids, and sender-visible queue internals. There is no payload reading before queue handoff, no auto-send after discovery, no trusted-session runtime behavior, no broad natural-language automation, and no new transfer protocol.
+
+## Deterministic Find-And-Send Workflow
+
+The implemented workflow supports the narrow user intent "find the assignment pdf on my other device and send it here" by coordinating existing capabilities:
+
+1. AI advisory may propose `filesystem.find_file_candidates`.
+2. Host validation and PolicyGate remain authoritative.
+3. The sender confirms the search preview locally.
+4. The receiver allows search once.
+5. Search returns redacted candidate metadata only.
+6. The user manually selects one candidate.
+7. The host builds `transfer.request_candidate_payload` for that selected candidate.
+8. The receiver allows the payload request once.
+9. The receiver resolves the candidate locally and queues the existing transfer handoff.
+
+The workflow state records only safe metadata: state/event names, search summary, redacted candidates, selected candidate display metadata, payload preview summary, and queued handoff summary. It does not store or expose receiver absolute paths, file contents, transfer queue ids, handoff ids, or receiver-local resolver sources. AI output cannot select a candidate, skip preview, skip receiver consent, merge discovery and payload consent, or authorize payload handoff without user selection.
 
 ## Preview Contract
 
@@ -285,6 +307,7 @@ Production evidence:
 - `src/lib/agentBridge/helloStdoutExecution.ts`
 - `src/lib/agentBridge/fileCandidateExecution.ts`
 - `src/lib/agentBridge/candidatePayloadExecution.ts`
+- `src/lib/agentBridge/candidatePayloadWorkflow.ts`
 - `src-tauri/src/hello_stdout.rs`
 - `src-tauri/src/file_candidates.rs`
 - `src/lib/agentBridge/roomControlEvent.ts`
@@ -310,7 +333,8 @@ Every new capability must define:
 - replay and duplicate behavior;
 - queue and transport bounds;
 - target route requirements, including why broadcast is disallowed or explicitly validated;
+- template kind and manifest fields, if the template architecture has been implemented for that capability;
 - redacted audit fields;
 - tests across validator, consent, executor, Bridge control event, and UI state.
 
-New capabilities must also state which layer owns each dependency. A capability that needs durable peer trust cannot be complete until the relevant Layer 4 durable identity semantics exist. Bridge membership alone never grants execution authority.
+New capabilities must also state which layer owns each dependency. A capability that needs durable peer trust cannot be complete until the relevant Layer 4 durable identity semantics exist. Bridge membership alone never grants execution authority. Template reuse may reduce duplicated lifecycle code, but it cannot turn provider output into execution authority, cannot authorize arbitrary path/content access, and cannot replace host validation.

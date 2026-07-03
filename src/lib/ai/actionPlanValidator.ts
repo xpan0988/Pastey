@@ -36,6 +36,22 @@ const TOP_LEVEL_FIELDS = new Set([
   "proposedInput"
 ]);
 const REFERENCE_FIELDS = new Set(["kind", "ref"]);
+const PROVIDER_FORBIDDEN_MANIFEST_FIELDS = new Set([
+  "manifest",
+  "templateKind",
+  "providerActionKind",
+  "executorKind",
+  "routePolicy",
+  "consentPolicy",
+  "dataExposurePolicy",
+  "auditRedactionPolicy",
+  "schemaVersions",
+  "autonomySupport",
+  "approvalRequirements",
+  "approvalPolicy",
+  "approvalReviewer",
+].map(normalizeFieldName));
+
 export function validateAiActionPlan(value: unknown): ValidationResult<AiActionPlan> {
   const errors: string[] = [];
   if (!isRecord(value)) {
@@ -82,6 +98,9 @@ export function validateAiActionPlan(value: unknown): ValidationResult<AiActionP
   for (const unsafePath of findUnsafeFieldPaths(value)) {
     errors.push(`Unsafe field is not allowed: ${unsafePath}.`);
   }
+  for (const manifestPath of findProviderManifestFieldPaths(value)) {
+    errors.push(`Provider output must not define capability manifest fields: ${manifestPath}.`);
+  }
 
   if (errors.length > 0) {
     return { valid: false, errors: unique(errors) };
@@ -92,6 +111,12 @@ export function validateAiActionPlan(value: unknown): ValidationResult<AiActionP
 
 export function findUnsafeFieldPaths(value: unknown): string[] {
   return findForbiddenProviderFieldPaths(value);
+}
+
+export function findProviderManifestFieldPaths(value: unknown): string[] {
+  const found: string[] = [];
+  visitProviderFields(value, "$", found);
+  return found;
 }
 
 function validateReference(value: unknown, index: number, errors: string[]) {
@@ -126,4 +151,25 @@ function isNonEmptyString(value: unknown): value is string {
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
+}
+
+function visitProviderFields(value: unknown, path: string, found: string[]) {
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => visitProviderFields(entry, `${path}[${index}]`, found));
+    return;
+  }
+  if (!isRecord(value)) {
+    return;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    const entryPath = `${path}.${key}`;
+    if (PROVIDER_FORBIDDEN_MANIFEST_FIELDS.has(normalizeFieldName(key))) {
+      found.push(entryPath);
+    }
+    visitProviderFields(entry, entryPath, found);
+  }
+}
+
+function normalizeFieldName(value: string): string {
+  return value.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 }

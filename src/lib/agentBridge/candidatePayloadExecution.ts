@@ -13,11 +13,16 @@ import {
   type PeerConsentRecord,
 } from "./peerConsent";
 import type { PeerConsentConsumptionState } from "./helloPeerExecution";
+import { requireCapabilityManifest } from "./capabilityManifest";
 import {
-  CANDIDATE_PAYLOAD_CAPABILITY,
-  CANDIDATE_PAYLOAD_EXECUTOR_KIND,
   FILE_CANDIDATES_CAPABILITY,
 } from "../ai/capabilityRegistry";
+import {
+  assertConsentNotExpired,
+  assertExactCapability,
+  bindRequestHash,
+  rejectForbiddenPublicFields,
+} from "./capabilityTemplateHelpers";
 import {
   CANDIDATE_PAYLOAD_EXECUTION_REQUEST_SCHEMA,
   CANDIDATE_PAYLOAD_RESULT_SCHEMA,
@@ -26,6 +31,12 @@ import {
   type CandidatePayloadExecutionResult,
   type CandidatePayloadResolution,
 } from "../ai/candidatePayloadRequest";
+
+const CANDIDATE_PAYLOAD_CAPABILITY_MANIFEST = requireCapabilityManifest("transfer.request_candidate_payload");
+const CANDIDATE_PAYLOAD_CAPABILITY: "transfer.request_candidate_payload" =
+  CANDIDATE_PAYLOAD_CAPABILITY_MANIFEST.capability as "transfer.request_candidate_payload";
+const CANDIDATE_PAYLOAD_EXECUTOR_KIND: "transfer_candidate_payload_host" =
+  CANDIDATE_PAYLOAD_CAPABILITY_MANIFEST.executorKind as "transfer_candidate_payload_host";
 
 export type CandidatePayloadExecutionBuildResult =
   | { ok: true; request: CandidatePayloadExecutionRequest; event: CapabilityExecuteRequestRoomControlEvent }
@@ -85,8 +96,8 @@ export function buildCandidatePayloadExecutionRequest(
     consent.sourcePreviewEventId !== preview.eventId ||
     consent.envelopeId !== preview.payload.envelopeId ||
     consent.requestId !== preview.payload.request.requestId ||
-    consent.requestPayloadHash !== preview.payload.request.requestPayloadHash ||
-    consent.capability !== CANDIDATE_PAYLOAD_CAPABILITY ||
+    !matchesHash(preview.payload.request.requestPayloadHash, consent.requestPayloadHash) ||
+    !matchesCapability(CANDIDATE_PAYLOAD_CAPABILITY, consent.capability) ||
     !candidatePayloadRequest ||
     !("sourceCapability" in consent) ||
     consent.sourceCapability !== FILE_CANDIDATES_CAPABILITY ||
@@ -100,7 +111,7 @@ export function buildCandidatePayloadExecutionRequest(
   if (!candidatePayloadRequest) {
     errors.push("Candidate payload execution request requires a candidate payload preview.");
   }
-  if (consent && Date.parse(consent.expiresAt) <= now.getTime()) {
+  if (consent && isExpired(consent.expiresAt, now)) {
     errors.push("Candidate payload execution request consent grant is expired.");
   }
   if (errors.length > 0 || !consent || !candidatePayloadRequest) {
@@ -163,7 +174,11 @@ export async function executeInboundCandidatePayloadRequest(
   let status: CandidatePayloadExecutionResult["status"] = "rejected";
   let errorCode: NonNullable<CandidatePayloadExecutionResult["errorCode"]> = "policy_rejected";
 
-  if (!validation.valid || validation.value.kind !== "capability_execute_request" || request.capability !== CANDIDATE_PAYLOAD_CAPABILITY) {
+  if (
+    !validation.valid ||
+    validation.value.kind !== "capability_execute_request" ||
+    !matchesCapability(CANDIDATE_PAYLOAD_CAPABILITY, request.capability)
+  ) {
     errorCode = "malformed_request";
   } else if (
     state.consumedExecutionIds.includes(request.executionId) ||
@@ -223,16 +238,21 @@ export async function executeInboundCandidatePayloadRequest(
 
 function requestMatchesConsent(request: CandidatePayloadExecutionRequest, consent: PeerConsentRecord): boolean {
   const binding = consent.binding;
-  return binding.capability === CANDIDATE_PAYLOAD_CAPABILITY
+  return matchesCapability(CANDIDATE_PAYLOAD_CAPABILITY, binding.capability)
     && request.consentId === binding.consentId
     && request.sourcePreviewEventId === binding.sourceEventId
     && request.envelopeId === binding.envelopeId
     && request.requestId === binding.requestId
-    && request.requestPayloadHash === binding.requestPayloadHash
+    && matchesHash(binding.requestPayloadHash, request.requestPayloadHash)
     && request.roomRef === binding.roomRef
     && request.sourceDeviceRef === binding.sourceDeviceRef
     && request.targetPeerRef === binding.targetPeerRef
-    && request.capability === binding.capability
+    && matchesCapability(binding.capability, request.capability)
+    && "sourceCapability" in binding
+    && "sourceRequestId" in binding
+    && "candidateId" in binding
+    && "candidateKind" in binding
+    && "candidateDisplayName" in binding
     && request.sourceCapability === binding.sourceCapability
     && request.sourceRequestId === binding.sourceRequestId
     && request.candidateId === binding.candidateId
@@ -335,6 +355,7 @@ function buildPolicyResult(
   eventId: string | undefined,
   now: Date,
 ): CandidatePayloadExecutionPolicyResult {
+  rejectForbiddenPublicFields(result);
   const built: RoomControlEventBuildResult = buildCapabilityExecutionResultControlEvent(
     result,
     requestEvent,
@@ -353,4 +374,31 @@ function createExecutionId(now: Date): string {
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
+}
+
+function matchesCapability(expected: string, actual: string): boolean {
+  try {
+    assertExactCapability({ expected, actual });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function matchesHash(expected: string, actual: string): boolean {
+  try {
+    bindRequestHash({ expected, actual });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isExpired(expiresAt: string, now: Date): boolean {
+  try {
+    assertConsentNotExpired(expiresAt, now.getTime());
+    return false;
+  } catch {
+    return true;
+  }
 }

@@ -1,6 +1,6 @@
 # Agent Bridge Architecture And Safety
 
-Agent Bridge is the Layer 5 narrow capability path for model-assisted planning, host validation, explicit consent, bounded execution, result return, and redacted audit. For the project-wide layer contract, see [../architecture/Project-specifications.md](../architecture/Project-specifications.md). For naming rules covering capability IDs, schema versions, provider actions, executors, and future capabilities, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md). For Bridge membership and authority boundaries, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md).
+Agent Bridge is the Layer 5 narrow capability path for model-assisted planning, host validation, explicit consent, bounded execution, result return, and redacted audit. For the project-wide layer contract, see [../architecture/Project-specifications.md](../architecture/Project-specifications.md). For template and manifest implementation status, see [capability-templates.md](capability-templates.md). For naming rules covering capability IDs, schema versions, provider actions, executors, and future capabilities, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md). For Bridge membership and authority boundaries, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md).
 
 The current product reality is a narrow bounded-capability vertical slice, the first read-only workspace capability, and a candidate-payload second-consent handoff path. The Hello capabilities prove fixed execution; the file-candidate capability proves receiver-consented metadata discovery without file transfer authority; the candidate-payload path proves that discovery consent does not become payload transfer consent.
 
@@ -21,6 +21,8 @@ The current product reality is a narrow bounded-capability vertical slice, the f
 
 For `filesystem.find_file_candidates`, the receiver returns redacted metadata candidates and records a receiver-local, in-memory, TTL-bounded candidate store. For `transfer.request_candidate_payload`, the flow validates and consumes a separate exact Allow once, resolves the selected candidate locally against that store, and queues the resolved local file source through the existing transfer queue. Pastey does not send files automatically after discovery, create a new data plane, or expose real receiver paths to the sender or provider.
 
+The deterministic find-and-send workflow coordinates those existing capabilities only. It lets a natural-language intent start with advisory search planning, but the AI remains advisory, the host remains authoritative, the user must select the candidate, and the receiver must still Allow once for payload handoff.
+
 ## Implemented Production Paths
 
 - Provider and AI types: `src/lib/ai/types.ts`.
@@ -36,6 +38,7 @@ For `filesystem.find_file_candidates`, the receiver returns redacted metadata ca
 - Hello Peer request construction: `src/lib/ai/helloPeerRequest.ts`.
 - Hello Stdout request construction: `src/lib/ai/helloStdoutRequest.ts`.
 - Capability preview envelope: `src/lib/ai/capabilityPreviewEnvelope.ts`.
+- Static capability manifests and additive template helpers: `src/lib/agentBridge/capabilityManifest.ts` and `src/lib/agentBridge/capabilityTemplateHelpers.ts`.
 - Bridge control events: `src/lib/agentBridge/roomControlEvent.ts`. Legacy implementation term: `RoomControlEvent`.
 - Control queue state: `src/lib/agentBridge/controlQueue.ts`.
 - Receiver consent: `src/lib/agentBridge/peerConsent.ts`.
@@ -63,15 +66,17 @@ For `filesystem.find_file_candidates`, the receiver returns redacted metadata ca
 
 The model may propose a plan. The host validates the plan. The sender decides whether to ask a peer. The receiver decides whether to allow one execution. The executor is host-owned and fixed.
 
-The capability registry is a static contract table for known bounded capabilities. It centralizes capability ids, versions, provider action kinds, route/consent policy, schema names, forbidden provider fields, executor kind, audit policy, and UI labels. It does not load plugins, accept provider-defined capability entries, or dispatch arbitrary runtime names.
+The capability registry is a static contract table for known bounded capabilities. It centralizes capability ids, versions, provider action kinds, route/consent policy, schema names, forbidden provider fields, executor kind, audit policy, and UI labels. It does not load plugins, accept provider-supplied capability entries, or dispatch arbitrary runtime names. Static manifests and template helpers are now additive around these explicit entries; they must not become an open-ended tool surface or replace host validation.
 
 The current implementation does not allow provider-crafted execution requests. Execution requests are built by the host after a matched receiver acknowledgement. The receiver revalidates the binding before execution.
 
-`runtime.hello_stdout` is not a shell, process, Python, Node, or generic command runtime. It is a single Rust host helper that returns typed stdout metadata for the fixed output `hello peer`.
+`runtime.hello_stdout` is not a shell, process, Python, Node, or general command runtime. It is a single Rust host helper that returns typed stdout metadata for the fixed output `hello peer`. It is the first template-wrapped capability; the wrapper uses the static manifest and exact binding helpers without changing its public contract or Rust executor behavior.
 
-`filesystem.find_file_candidates` is not remote file access. It is a bounded metadata candidate-discovery capability. Model output may propose a filename hint and safe limits, but it does not authorize filesystem traversal by itself. Traversal happens only on the receiver after selected-peer routing, local sender confirmation, receiver Allow once, exact consent binding, and execution-request validation. The executor does not read file contents, return absolute paths, search hidden files, search full disk, start automatic transfer, or create reusable access to a peer.
+`filesystem.find_file_candidates` is not remote file access. It is a bounded metadata candidate-discovery capability. Model output may propose a filename hint and safe limits, but it does not authorize filesystem traversal by itself. Traversal happens only on the receiver after selected-peer routing, local sender confirmation, receiver Allow once, exact consent binding, and execution-request validation. It is now template-wrapped for manifest-backed constants, exact capability/request-hash binding, expiry checks, and forbidden public-field checks. Safe scopes, query bounds, filename and extension filters, depth and candidate limits, hidden-file and symlink behavior, candidate id opacity, receiver-local candidate storage, and Rust command validation remain capability-specific. The executor does not read file contents, return absolute paths, search hidden files, search the whole device, start automatic transfer, or create reusable access to a peer.
 
-`transfer.request_candidate_payload` is not transfer completion. It is a second-consent handoff path for one selected metadata candidate from a prior discovery result. Model output may propose the opaque candidate id and display metadata, but candidate ids are not paths and not transfer authority. The path validates selected-peer routing and exact Allow once, consumes that consent once, resolves the candidate only through the receiver-local in-memory store, and returns `handoff_queued` only after the existing transfer queue accepts the payload source. `handoff_queued` still reports `transferredBytes: 0`; transfer progress and completion remain owned by the existing transfer pipeline.
+`transfer.request_candidate_payload` is not transfer completion. It is a second-consent handoff path for one selected metadata candidate from a prior discovery result. Model output may propose the opaque candidate id and display metadata, but candidate ids are not paths and not transfer authority. It is now template-wrapped for manifest-backed constants, exact capability/request-hash binding, expiry checks, and forbidden public-field checks. Source discovery binding, receiver-local candidate lookup, changed/deleted/expired candidate handling, queue handoff, queue metadata, result statuses, and scheduler interaction remain capability-specific. The path validates selected-peer routing and exact Allow once, consumes that consent once, resolves the candidate only through the receiver-local in-memory store, and returns `handoff_queued` only after the existing transfer queue accepts the payload source. `handoff_queued` still reports `transferredBytes: 0`; transfer progress and completion remain owned by the existing transfer pipeline.
+
+`candidatePayloadWorkflow` is not automation authority. It is a deterministic host-owned coordinator for the existing discovery and candidate-payload capabilities. It records metadata-safe workflow state, requires explicit user candidate selection, builds only the existing `transfer.request_candidate_payload` preview, and preserves both receiver consent decisions. It does not add a capability id, expose paths or contents, auto-send, implement trusted-session behavior, or create a generic executor.
 
 ## Workspace Capability Roadmap
 
@@ -80,7 +85,7 @@ The next Layer 5 direction is Agent-assisted device workspace: helping a user as
 The first workspace capability is `filesystem.find_file_candidates`. Its current flow is:
 
 1. Provider proposes `request_peer_file_candidates` as advisory JSON only.
-2. Host validation rejects unsafe fields, full-disk search, contents, absolute paths, selected-peers/broadcast, and auto-transfer.
+2. Host validation rejects unsafe fields, whole-device search, contents, absolute paths, selected-peers/broadcast, and auto-transfer.
 3. Local user confirms whether to send a selected-peer preview.
 4. Receiver explicitly allows once or denies.
 5. Receiver-side search returns bounded redacted metadata candidates only.
@@ -88,7 +93,7 @@ The first workspace capability is `filesystem.find_file_candidates`. Its current
 7. A selected candidate payload request requires a second capability and separate consent decision.
 8. The current candidate-payload path resolves the selected candidate locally and queues it through the existing transfer scheduler.
 
-Current implementation covers steps 1 through 8. It implements receiver-local candidate storage, metadata-only resolution, and queue handoff into the existing transfer pipeline. It does not implement auto-send after discovery, a new data plane, a generic executor, or broad natural-language automation.
+Current implementation covers steps 1 through 8 and adds a deterministic workflow that can coordinate those steps after a user manually selects a candidate. It implements receiver-local candidate storage, metadata-only resolution, and queue handoff into the existing transfer pipeline. It does not implement auto-send after discovery, trusted-session runtime behavior, a new data plane, a universal executor, or broad natural-language automation.
 
 ## Logging And Audit
 
@@ -103,7 +108,7 @@ Logs are useful for debugging and audit review. They are never the source of tru
 The current Agent Bridge implementation does not provide:
 
 - arbitrary shell, process, file, or network execution;
-- a generic tool runtime;
+- an open-ended tool runtime;
 - multi-step autonomous task graphs;
 - dynamic capability/plugin registration;
 - reusable trust;

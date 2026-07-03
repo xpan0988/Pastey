@@ -247,11 +247,26 @@ test("safe file-candidate advisory builds preview, consent, execution request, a
   assert.equal(executed.executed, true);
   assert.equal(executed.result.status, "completed");
   assert.equal(executed.result.candidates.length, 1);
+  assert.deepEqual(executed.result.candidates[0], {
+    candidateId: "file-candidate-request-opaque-1",
+    displayName: "exact-target.pdf",
+    redactedLocation: "Pastey Shared/exact-target.pdf",
+    extension: "pdf",
+    mimeFamily: "document",
+    sizeBytes: 21,
+    modifiedAt: EXECUTE_AT.toISOString(),
+    matchReason: "filename_exact_match",
+    confidence: "high",
+  });
   assert.equal(validateFileCandidateExecutionResult(executed.result).valid, true);
   assert.equal(validateRoomControlEvent(executed.resultEvent, { now: EXECUTE_AT }).valid, true);
   assert.equal(matchExecutionResultToRequest(executed.resultEvent, chain.request, EXECUTE_AT), true);
   assert.equal("transferQueueItemId" in executed.result, false);
   assert.equal("sendFile" in executed.result, false);
+  assert.equal("absolutePath" in executed.result, false);
+  assert.equal("localPath" in executed.result, false);
+  assert.equal("contents" in executed.result, false);
+  assert.equal("handoffId" in executed.result, false);
 });
 
 test("file-candidate consent is consumed once and cannot replay", async () => {
@@ -350,4 +365,30 @@ test("file-candidate execution does not expose transfer handoff fields", () => {
   ]) {
     assert.equal(field in payload, false);
   }
+});
+
+test("template forbidden-field helper blocks unsafe host result before exposure", async () => {
+  const chain = fileCandidateChain();
+  const blocked = await executeInboundFileCandidateRequest(
+    chain.request,
+    chain.consent,
+    createPeerConsentConsumptionState(),
+    async (request) => ({
+      ...hostResult(request),
+      absolutePath: "/Users/example/secret.pdf",
+      contents: "secret",
+      transferQueueId: "queue-1",
+      handoffId: "handoff-1",
+    } as unknown as FileCandidateExecutionResult),
+    { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
+  );
+
+  assert.equal(blocked.executed, true);
+  assert.equal(blocked.result.status, "failed");
+  assert.equal(blocked.result.errorCode, "executor_unavailable");
+  assert.equal(blocked.result.candidates.length, 0);
+  assert.equal("absolutePath" in blocked.result, false);
+  assert.equal("contents" in blocked.result, false);
+  assert.equal("transferQueueId" in blocked.result, false);
+  assert.equal("handoffId" in blocked.result, false);
 });

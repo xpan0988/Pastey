@@ -13,16 +13,25 @@ import {
   type PeerConsentRecord,
 } from "./peerConsent";
 import type { PeerConsentConsumptionState } from "./helloPeerExecution";
+import { requireCapabilityManifest } from "./capabilityManifest";
 import {
-  FILE_CANDIDATES_CAPABILITY,
-  FILE_CANDIDATES_EXECUTOR_KIND,
-} from "../ai/capabilityRegistry";
+  assertConsentNotExpired,
+  assertExactCapability,
+  bindRequestHash,
+  rejectForbiddenPublicFields,
+} from "./capabilityTemplateHelpers";
 import {
   FILE_CANDIDATES_EXECUTION_REQUEST_SCHEMA,
   FILE_CANDIDATES_RESULT_SCHEMA,
   type FileCandidateExecutionRequest,
   type FileCandidateExecutionResult,
 } from "../ai/fileCandidateRequest";
+
+const FILE_CANDIDATES_CAPABILITY_MANIFEST = requireCapabilityManifest("filesystem.find_file_candidates");
+const FILE_CANDIDATES_CAPABILITY: "filesystem.find_file_candidates" =
+  FILE_CANDIDATES_CAPABILITY_MANIFEST.capability as "filesystem.find_file_candidates";
+const FILE_CANDIDATES_EXECUTOR_KIND: "filesystem_find_candidates_host" =
+  FILE_CANDIDATES_CAPABILITY_MANIFEST.executorKind as "filesystem_find_candidates_host";
 
 export type FileCandidateExecutionBuildResult =
   | { ok: true; request: FileCandidateExecutionRequest; event: CapabilityExecuteRequestRoomControlEvent }
@@ -69,8 +78,8 @@ export function buildFileCandidateExecutionRequest(
     consent.sourcePreviewEventId !== preview.eventId ||
     consent.envelopeId !== preview.payload.envelopeId ||
     consent.requestId !== preview.payload.request.requestId ||
-    consent.requestPayloadHash !== preview.payload.request.requestPayloadHash ||
-    consent.capability !== FILE_CANDIDATES_CAPABILITY ||
+    !matchesHash(preview.payload.request.requestPayloadHash, consent.requestPayloadHash) ||
+    !matchesCapability(FILE_CANDIDATES_CAPABILITY, consent.capability) ||
     !fileCandidateRequest ||
     !("filenameHint" in consent) ||
     consent.filenameHint !== fileCandidateRequest.input.query.filenameHint ||
@@ -81,7 +90,7 @@ export function buildFileCandidateExecutionRequest(
   if (!fileCandidateRequest) {
     errors.push("File candidate execution request requires a file candidate preview.");
   }
-  if (consent && Date.parse(consent.expiresAt) <= now.getTime()) {
+  if (consent && isExpired(consent.expiresAt, now)) {
     errors.push("File candidate execution request consent grant is expired.");
   }
   if (errors.length > 0 || !consent || !fileCandidateRequest) {
@@ -165,6 +174,7 @@ export async function executeInboundFileCandidateRequest(
       try {
         executed = true;
         const result = await executor(request);
+        rejectForbiddenPublicFields(result);
         return buildPolicyResult(event, consumed, result, true, context.resultEventId, now);
       } catch {
         return buildPolicyResult(
@@ -183,16 +193,18 @@ export async function executeInboundFileCandidateRequest(
 
 function requestMatchesConsent(request: FileCandidateExecutionRequest, consent: PeerConsentRecord): boolean {
   const binding = consent.binding;
-  return binding.capability === FILE_CANDIDATES_CAPABILITY
+  return matchesCapability(FILE_CANDIDATES_CAPABILITY, binding.capability)
     && request.consentId === binding.consentId
     && request.sourcePreviewEventId === binding.sourceEventId
     && request.envelopeId === binding.envelopeId
     && request.requestId === binding.requestId
-    && request.requestPayloadHash === binding.requestPayloadHash
+    && matchesHash(binding.requestPayloadHash, request.requestPayloadHash)
     && request.roomRef === binding.roomRef
     && request.sourceDeviceRef === binding.sourceDeviceRef
     && request.targetPeerRef === binding.targetPeerRef
-    && request.capability === binding.capability
+    && matchesCapability(binding.capability, request.capability)
+    && "filenameHint" in binding
+    && "searchMode" in binding
     && request.input.query.filenameHint === binding.filenameHint
     && request.input.query.searchMode === binding.searchMode
     && Date.parse(request.expiresAt) <= Date.parse(binding.expiresAt);
@@ -272,4 +284,31 @@ function createExecutionId(now: Date): string {
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
+}
+
+function matchesCapability(expected: string, actual: string): boolean {
+  try {
+    assertExactCapability({ expected, actual });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function matchesHash(expected: string, actual: string): boolean {
+  try {
+    bindRequestHash({ expected, actual });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isExpired(expiresAt: string, now: Date): boolean {
+  try {
+    assertConsentNotExpired(expiresAt, now.getTime());
+    return false;
+  } catch {
+    return true;
+  }
 }
