@@ -491,11 +491,14 @@ export function RoomPage({
       </section>
 
       {agentBridgeEnabled ? (
-        <AiSlotPreview
-          key={`${room.id}:${room.peer_connected}:${room.peer_device_name ?? "none"}`}
-          room={room}
-          onEnqueueCandidatePayloadHandoff={(input) => onEnqueueCandidatePayloadHandoff(room.id, input)}
-        />
+        <details className="advanced-diagnostics-shell" data-testid="room-advanced-diagnostics">
+          <summary>Advanced diagnostics</summary>
+          <AiSlotPreview
+            key={`${room.id}:${room.peer_connected}:${room.peer_device_name ?? "none"}`}
+            room={room}
+            onEnqueueCandidatePayloadHandoff={(input) => onEnqueueCandidatePayloadHandoff(room.id, input)}
+          />
+        </details>
       ) : null}
 
       <section className="panel chat-panel">
