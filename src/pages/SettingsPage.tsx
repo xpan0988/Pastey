@@ -1,6 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState, type ChangeEvent, type ReactNode } from "react";
-import { AgentBridgeSettings } from "../components/agentBridge/AgentBridgeSettings";
 import { prettifyShortcut } from "../lib/format";
 import {
   checkForUpdates,
@@ -54,9 +53,8 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
   }, [config.transfer_window_override]);
 
   useEffect(() => {
-    if (!config.dev_tools_enabled) return;
     void refreshDiagnostics(false);
-  }, [config.dev_tools_enabled]);
+  }, []);
 
   async function save(next: AppConfig) {
     const saved = await updateConfig(next);
@@ -188,57 +186,69 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
   }
 
   return (
-    <div className="page-stack">
-      <header className="page-header">
-        <div>
-          <h1>Settings</h1>
-          <p>Local preferences and device behavior</p>
-        </div>
-        <button className="page-menu-button" aria-label="More options">
-          ...
-        </button>
-      </header>
+    <div className="workstation-view settings-workstation" aria-label="Settings">
+      <div className="settings-card-grid">
+        <SettingsCard title="General" icon="gear">
+          <SettingsControlRow label="Device name" value={deviceProfile?.device_name || "This device"} />
+          <SettingsControlRow label="Theme" control={<DisabledSelect value="System" />} />
+          <SettingsControlRow label="Startup behavior" value="Not available yet" disabled />
+          <SettingsControlRow label="Downloads location" value={config.inbox_dir ? "Custom" : "Inbox"} actionLabel="Choose" onAction={chooseInbox} />
+          <SettingsControlRow label="Global shortcut" value={prettifyShortcut(config.shortcut)} />
+        </SettingsCard>
 
-      <SettingsGroup title="General" icon="gear">
-        <SettingsRow icon="folder" title="Downloads location" detail="Where received files are saved" value={config.inbox_dir ? "Custom" : "Inbox"} onAction={chooseInbox} />
-        <SettingsRow icon="bell" title="Notifications" detail="Alerts about transfers and devices" control={<Switch checked readOnly />} />
-        <SettingsRow icon="shortcut" title="Global shortcut" detail="Open Pastey quickly" value={prettifyShortcut(config.shortcut)} />
-      </SettingsGroup>
+        <SettingsCard title="Transfers" icon="drive">
+          <SettingsControlRow label="Max concurrent transfers" value="Not available yet" disabled />
+          <SettingsControlRow
+            label="Burn defaults"
+            control={<Switch checked={config.auto_burn_after_download} onChange={(event) => void save({ ...config, auto_burn_after_download: event.target.checked })} />}
+          />
+          <SettingsControlRow label="Receiver approval defaults" value="Not available yet" disabled />
+          <SettingsControlRow
+            label="Save received files"
+            control={<Switch checked={config.save_received_files_to_inbox} onChange={(event) => void save({ ...config, save_received_files_to_inbox: event.target.checked })} />}
+          />
+          <SettingsControlRow
+            label="Save received images"
+            control={<Switch checked={config.save_received_images_to_inbox} onChange={(event) => void save({ ...config, save_received_images_to_inbox: event.target.checked })} />}
+          />
+          <SettingsControlRow label="Compression" value="Not available yet" disabled />
+          <SettingsControlRow label="Bandwidth limit" value="Not available yet" disabled />
+        </SettingsCard>
 
-      <SettingsGroup title="Trust & Sharing" icon="shield">
-        <SettingsRow
-          icon="trusted"
-          title="Auto-accept trusted devices"
-          detail="Automatically accept from trusted devices"
-          control={<Switch checked={false} disabled readOnly />}
-        />
-        <SettingsRow
-          icon="approval"
-          title="Require approval for new devices"
-          detail="Review and approve new connections"
-          control={<Switch checked disabled readOnly />}
-        />
-        <SettingsRow icon="qr" title="Join with code" detail="Enter a code to connect a device" onAction={onJoinWithCode} />
-      </SettingsGroup>
+        <SettingsCard title="Security" icon="shield">
+          <SettingsControlRow label="Encryption status" value="Enabled" status="Secure" />
+          <SettingsControlRow label="Key verification" value="Room scoped" />
+          <SettingsControlRow label="Trusted peers" value="Current-session only" />
+          <SettingsControlRow label="Approval policy" value="Per request" />
+          <p className="settings-card-note">There is no generic runtime or reusable trust authority.</p>
+        </SettingsCard>
 
-      <SettingsGroup title="About" icon="info">
-        <SettingsRow icon="info" title="App version" detail="Pastey release" value={`pastey ${config.app_version}`} />
-        <SettingsRow icon="drive" title="Max file size" detail="Largest file allowed per transfer" value="10GB" />
-        <SettingsRow
-          icon="wrench"
-          title="Developer Tools"
-          detail="Show diagnostics, transfer window, and local benchmark tools."
-          control={<Switch checked={config.dev_tools_enabled} onChange={(event) => void saveDevToolsEnabled(event.target.checked)} />}
-        />
-      </SettingsGroup>
+        <SettingsCard title="Discovery" icon="nearby">
+          <SettingsControlRow label="Local network discovery" value="Enabled" status="Stable" />
+          <SettingsControlRow label="Join with code" actionLabel="Open" onAction={onJoinWithCode} />
+          <SettingsControlRow label="Presence TTL" value="Current discovery default" />
+          <SettingsControlRow
+            label="Diagnostics logging"
+            control={<Switch checked={config.dev_tools_enabled} onChange={(event) => void saveDevToolsEnabled(event.target.checked)} />}
+          />
+        </SettingsCard>
 
-      {config.dev_tools_enabled ? (
-        <SettingsGroup title="Developer Tools" icon="wrench">
-          <SettingsRow icon="window" title="MicroFlowGroup mode" detail={
-            config.micro_flow_group_mode === "fixed"
-              ? "Fixed: legacy threshold-based grouping"
-              : "Dynamic: contention-aware one-window grouping"
-          } control={
+        <SettingsCard title="Notifications" icon="bell">
+          <SettingsControlRow label="Transfer completed" value="Not available yet" disabled />
+          <SettingsControlRow label="Approval requests" value="Not available yet" disabled />
+          <SettingsControlRow label="Errors" value="Not available yet" disabled />
+        </SettingsCard>
+
+        <SettingsCard title="Advanced diagnostics" icon="wrench">
+          <SettingsControlRow
+            label="Diagnostics logging"
+            value={config.dev_tools_enabled ? "Enabled" : "Disabled"}
+            control={<Switch checked={config.dev_tools_enabled} onChange={(event) => void saveDevToolsEnabled(event.target.checked)} />}
+          />
+          <SettingsControlRow label="Local profile" value={diagnosticsLoading ? "Loading..." : deviceProfile ? deviceTitle(deviceProfile) : "Not loaded"} actionLabel="Refresh" onAction={() => refreshDiagnostics(true)} disabled={diagnosticsLoading} />
+          <SettingsControlRow label="Capability probe" value={deviceCapabilities ? availableRuntimeTitle(deviceCapabilities) : "Not probed"} />
+          <SettingsControlRow label="Last benchmark" value={lastBenchmark ? `${lastBenchmark.average_MBps.toFixed(1)} MB/s` : "Not run"} />
+          <SettingsControlRow label="Advanced transfer grouping" detail="Uses the existing transfer planner setting." control={
             <select
               value={config.micro_flow_group_mode}
               onChange={(event) => void saveMicroFlowGroupMode(event.target.value as AppConfig["micro_flow_group_mode"])}
@@ -247,19 +257,19 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
               <option value="fixed">Fixed</option>
             </select>
           } />
-          <SettingsRow icon="window" title="Transfer Window" detail="Binary transfer pipeline depth" control={
+          <SettingsControlRow label="Transfer window" detail="Existing binary transfer pipeline depth." control={
             <select value={windowValue} onChange={(event) => void saveTransferWindow(event.target.value)}>
-              <option value="default">Default / Auto (window 8)</option>
-              <option value="1">window 1</option>
-              <option value="2">window 2</option>
-              <option value="4">window 4</option>
-              <option value="8">window 8</option>
-              <option value="16">window 16</option>
-              <option value="custom">Custom window</option>
+              <option value="default">Default / Auto</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="4">4</option>
+              <option value="8">8</option>
+              <option value="16">16</option>
+              <option value="custom">Custom</option>
             </select>
           } />
           {windowValue === "custom" ? (
-            <SettingsRow icon="window" title="Custom window" detail="1 to 16" control={
+            <SettingsControlRow label="Custom window" detail="1 to 16" control={
               <input
                 type="number"
                 min={1}
@@ -275,100 +285,71 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
               />
             } />
           ) : null}
-          <SettingsRow icon="folder" title="App data path" detail="Local storage" value={config.app_data_path} />
-          <div className="settings-row diagnostics-panel-row">
-            <span className="settings-icon wrench" aria-hidden="true" />
-            <div className="diagnostics-panel">
-              <div className="diagnostics-panel-header">
-                <div>
-                  <strong>Device Diagnostics</strong>
-                  <p className="muted">Lightweight local profile, capabilities, and link checks.</p>
-                </div>
-                <button className="secondary-button" disabled={diagnosticsLoading} onClick={() => void refreshDiagnostics(true)}>
-                  {diagnosticsLoading ? "Loading..." : "Refresh profile"}
-                </button>
-              </div>
-              <p className="muted diagnostics-note">
-                Loopback tests stay on this device. They do not measure Wi-Fi, Ethernet, school network, or internet speed. Use peer benchmarks to measure device-to-device LAN speed.
-              </p>
-              {diagnosticMessage ? <p className="muted">{diagnosticMessage}</p> : null}
-              <div className="diagnostic-grid">
-                <DiagnosticBlock title="Device Profile" rows={[
-                  ["Device", deviceProfile ? deviceTitle(deviceProfile) : "Unknown"],
-                  ["Platform", deviceProfile ? platformTitle(deviceProfile) : "Unknown"],
-                  ["Power", deviceProfile ? powerTitle(deviceProfile) : "Unknown"]
-                ]} />
-                <DiagnosticBlock title="Capabilities" rows={[
-                  ["CPU", deviceProfile ? cpuTitle(deviceProfile) : "Unknown"],
-                  ["GPU", deviceCapabilities ? gpuTitle(deviceCapabilities) : "Unknown"],
-                  ["Runtimes", deviceCapabilities ? availableRuntimeTitle(deviceCapabilities) : "Unknown"]
-                ]} />
-                <DiagnosticBlock title="Last Benchmark" rows={[
-                  ["Mode", lastBenchmark ? benchmarkModeTitle(lastBenchmark.benchmark_mode) : "Unknown"],
-                  ["Quality", lastBenchmark ? lastBenchmark.link_quality : "Not run"],
-                  ["Average", lastBenchmark ? `${lastBenchmark.average_MBps.toFixed(1)} MB/s` : "Not run"],
-                  ["Latency", lastBenchmark?.latency_ms != null ? `${lastBenchmark.latency_ms.toFixed(1)} ms` : "Unknown"]
-                ]} />
-              </div>
-              <div className="benchmark-controls">
-                <select value={benchmarkMode} onChange={(event) => setBenchmarkMode(event.target.value as BenchmarkMode)}>
-                  <option value="raw_memory">Loopback raw memory</option>
-                  <option value="pastey_pipeline">Loopback Pastey pipeline</option>
-                </select>
-                <select value={benchmarkDuration} onChange={(event) => setBenchmarkDuration(Number(event.target.value))}>
-                  <option value={1}>Target 1s quick</option>
-                  <option value={5}>Target 5s standard</option>
-                  <option value={15}>Target 15s extended</option>
-                </select>
-                <button className="secondary-button" disabled={benchmarkRunning} onClick={() => void handleRunLoopbackBenchmark()}>
-                  {benchmarkRunning ? "Running..." : "Run local test"}
-                </button>
-              </div>
-              <p className="muted diagnostics-note">{benchmarkModeDescription(benchmarkMode)}</p>
+          <div className="settings-diagnostics-body">
+            <p className="muted diagnostics-note">
+              Loopback tests stay on this device. They do not measure Wi-Fi, Ethernet, school network, or internet speed.
+            </p>
+            {diagnosticMessage ? <p className="muted">{diagnosticMessage}</p> : null}
+            <div className="diagnostic-grid">
+              <DiagnosticBlock title="Device Profile" rows={[
+                ["Device", deviceProfile ? deviceTitle(deviceProfile) : "Unknown"],
+                ["Platform", deviceProfile ? platformTitle(deviceProfile) : "Unknown"],
+                ["Power", deviceProfile ? powerTitle(deviceProfile) : "Unknown"]
+              ]} />
+              <DiagnosticBlock title="Capabilities" rows={[
+                ["CPU", deviceProfile ? cpuTitle(deviceProfile) : "Unknown"],
+                ["GPU", deviceCapabilities ? gpuTitle(deviceCapabilities) : "Unknown"],
+                ["Runtimes", deviceCapabilities ? availableRuntimeTitle(deviceCapabilities) : "Unknown"]
+              ]} />
+              <DiagnosticBlock title="Last Benchmark" rows={[
+                ["Mode", lastBenchmark ? benchmarkModeTitle(lastBenchmark.benchmark_mode) : "Unknown"],
+                ["Quality", lastBenchmark ? lastBenchmark.link_quality : "Not run"],
+                ["Average", lastBenchmark ? `${lastBenchmark.average_MBps.toFixed(1)} MB/s` : "Not run"],
+                ["Latency", lastBenchmark?.latency_ms != null ? `${lastBenchmark.latency_ms.toFixed(1)} ms` : "Unknown"]
+              ]} />
             </div>
-          </div>
-          <AgentBridgeSettings />
-          <div className="settings-row diagnostics-row">
-            <span className="settings-icon wrench" aria-hidden="true" />
-            <div>
-              <strong>Diagnostics</strong>
-              <p className="muted">Logs, recent error, and update check.</p>
-              {logActionMessage ? <p className="muted">{logActionMessage}</p> : null}
+            <div className="benchmark-controls">
+              <select value={benchmarkMode} onChange={(event) => setBenchmarkMode(event.target.value as BenchmarkMode)}>
+                <option value="raw_memory">Loopback raw memory</option>
+                <option value="pastey_pipeline">Loopback Pastey pipeline</option>
+              </select>
+              <select value={benchmarkDuration} onChange={(event) => setBenchmarkDuration(Number(event.target.value))}>
+                <option value={1}>Target 1s quick</option>
+                <option value={5}>Target 5s standard</option>
+                <option value={15}>Target 15s extended</option>
+              </select>
+              <button className="secondary-button" disabled={benchmarkRunning} onClick={() => void handleRunLoopbackBenchmark()}>
+                {benchmarkRunning ? "Running..." : "Run local test"}
+              </button>
             </div>
+            <p className="muted diagnostics-note">{benchmarkModeDescription(benchmarkMode)}</p>
+            {logActionMessage ? <p className="muted">{logActionMessage}</p> : null}
             <div className="diagnostic-actions">
               <button className="secondary-button" onClick={() => void handleOpenLogsFolder()}>
-                Open Logs
+                Open logs
               </button>
               <button className="secondary-button" onClick={() => void handleCopyLastError()}>
-                Copy Error
+                Copy last error
               </button>
               <button className="secondary-button" onClick={() => void handleCheckForUpdates()}>
-                Check Updates
+                Check updates
               </button>
             </div>
           </div>
-        </SettingsGroup>
-      ) : null}
-
-      <div className="local-note-card">
-        <span className="settings-icon trusted" aria-hidden="true" />
-        <div>
-          <strong>Local-first by design</strong>
-          <p className="muted">Only local preferences live here. No cloud sync or account data.</p>
-        </div>
+        </SettingsCard>
       </div>
     </div>
   );
 }
 
-function SettingsGroup({ title, icon, children }: { title: string; icon: string; children: ReactNode }) {
+function SettingsCard({ title, icon, children }: { title: string; icon: string; children: ReactNode }) {
   return (
-    <section className="settings-group">
+    <section className="settings-workstation-card">
       <div className="settings-group-title">
         <span className={`section-icon ${icon}`} aria-hidden="true" />
         <h2>{title}</h2>
       </div>
-      <div className="settings-card">{children}</div>
+      <div className="settings-control-list">{children}</div>
     </section>
   );
 }
@@ -475,44 +456,54 @@ function diagnosticsSnapshotFresh(snapshot: DiagnosticsSnapshot): boolean {
   return Date.now() - snapshot.cachedAt <= DIAGNOSTICS_FRONTEND_TTL_MS;
 }
 
-function SettingsRow({
-  icon,
-  title,
+function SettingsControlRow({
+  label,
   detail,
   value,
   control,
-  onAction
+  actionLabel,
+  onAction,
+  status,
+  disabled,
 }: {
-  icon: string;
-  title: string;
-  detail: string;
+  label: string;
+  detail?: string;
   value?: string;
   control?: ReactNode;
+  actionLabel?: string;
   onAction?: () => void | Promise<void>;
+  status?: string;
+  disabled?: boolean;
 }) {
   const content = (
     <>
-      <span className={`settings-icon ${icon}`} aria-hidden="true" />
-      <div className="settings-row-copy">
-        <strong>{title}</strong>
-        <p className="muted">{detail}</p>
+      <div className="settings-control-copy">
+        <strong>{label}</strong>
+        {detail ? <p className="muted">{detail}</p> : null}
       </div>
-      <div className="settings-row-trailing">
+      <div className="settings-control-trailing">
+        {status ? <span className="status-chip success">{status}</span> : null}
         {control ? <div className="settings-control">{control}</div> : null}
         {value ? <span className="settings-value">{value}</span> : null}
-        {onAction || value ? (
-          <span aria-hidden="true">&gt;</span>
-        ) : null}
+        {onAction ? <span className="link-like-action">{actionLabel ?? "Open"}</span> : null}
       </div>
     </>
   );
 
   return onAction ? (
-    <button className="settings-row settings-row-button" onClick={() => void onAction()}>
+    <button className={`settings-control-row settings-control-button ${disabled ? "disabled" : ""}`} disabled={disabled} onClick={() => void onAction()}>
       {content}
     </button>
   ) : (
-    <div className="settings-row">{content}</div>
+    <div className={`settings-control-row ${disabled ? "disabled" : ""}`}>{content}</div>
+  );
+}
+
+function DisabledSelect({ value }: { value: string }) {
+  return (
+    <select value={value} disabled>
+      <option value={value}>{value}</option>
+    </select>
   );
 }
 

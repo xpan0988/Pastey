@@ -1186,7 +1186,7 @@ function PeerConsentReviewCard({
         {isFileCandidate
           ? "Allow once applies only to this exact bounded filename/metadata search. No file contents are read and no file is sent automatically."
           : isCandidatePayload
-            ? "Allow once applies only to this exact candidate payload request scaffold. No bytes are sent and no transfer is queued."
+            ? "Allow once applies only to this exact candidate payload request. No bytes are sent unless the approved request enters the transfer queue."
           : "Allow once applies only to this exact request and does not execute it yet."}
       </span>
       {review.status === "awaiting_peer_decision" && !expired ? (
@@ -1216,7 +1216,7 @@ function PeerConsentReviewCard({
                 : isFileCandidate
                   ? "One-time consent consumed. File candidate search executed once."
                   : isCandidatePayload
-                    ? "One-time consent consumed. Candidate payload handoff is not implemented."
+                    ? "One-time consent consumed for this candidate payload request."
                 : "One-time consent consumed. Hello Peer demo executed once."
             : review.status === "denied"
               ? "Denied."
