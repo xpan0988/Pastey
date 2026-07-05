@@ -1,10 +1,8 @@
 export type PrimaryView =
-  | "home"
-  | "send"
-  | "find"
-  | "approvals"
+  | "bridge"
   | "devices"
-  | "activity"
+  | "transfers"
+  | "inbox"
   | "settings";
 
 interface PrimarySidebarProps {
@@ -13,12 +11,10 @@ interface PrimarySidebarProps {
 }
 
 const NAV_ITEMS: Array<{ view: PrimaryView; label: string; icon: string }> = [
-  { view: "home", label: "Home", icon: "home" },
-  { view: "send", label: "Send", icon: "send" },
-  { view: "find", label: "Find from device", icon: "find" },
-  { view: "approvals", label: "Approvals", icon: "approvals" },
+  { view: "bridge", label: "Bridge", icon: "home" },
   { view: "devices", label: "Devices", icon: "devices" },
-  { view: "activity", label: "Activity", icon: "activity" },
+  { view: "transfers", label: "Transfers", icon: "activity" },
+  { view: "inbox", label: "Inbox", icon: "approvals" },
   { view: "settings", label: "Settings", icon: "settings" },
 ];
 

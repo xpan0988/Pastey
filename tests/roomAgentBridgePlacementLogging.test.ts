@@ -9,73 +9,93 @@ import {
   updateAgentBridgeRuntimeConfig,
 } from "../src/lib/agentBridge";
 
-test("desktop workstation shell defines seven primary views with Home selected by default", () => {
+test("desktop workstation shell defines Bridge-first primary views with Bridge selected by default", () => {
   const app = readFileSync("src/App.tsx", "utf8");
   const sidebar = readFileSync("src/components/PrimarySidebar.tsx", "utf8");
 
   assert.match(sidebar, /export type PrimaryView =/);
-  for (const label of ["Home", "Send", "Find from device", "Approvals", "Devices", "Activity", "Settings"]) {
+  for (const label of ["Bridge", "Devices", "Transfers", "Inbox", "Settings"]) {
     assert.match(sidebar, new RegExp(`label: "${label}"`));
   }
-  assert.match(app, /useState<PrimaryView>\("home"\)/);
-  for (const view of ["home", "send", "find", "approvals", "devices", "activity", "settings"]) {
+  for (const label of ["Home", "Find from device", "Approvals", "Activity"]) {
+    assert.doesNotMatch(sidebar, new RegExp(`label: "${label}"`));
+  }
+  assert.match(app, /useState<PrimaryView>\("bridge"\)/);
+  assert.match(app, /useState\(""\)/);
+  assert.match(app, /activeBridgeRoomId/);
+  assert.doesNotMatch(app, /selectedConnectionRoomId/);
+  for (const view of ["bridge", "devices", "transfers", "inbox", "settings"]) {
     assert.match(app, new RegExp(`activePrimaryView === "${view}"`));
   }
+  for (const view of ["home", "send", "find", "approvals", "activity"]) {
+    assert.doesNotMatch(app, new RegExp(`activePrimaryView === "${view}"`));
+  }
   assert.doesNotMatch(app, /<h1[^>]*>\s*(Home|Send|Find from another device|Approvals|Devices|Activity|Settings|Configure Pastey)\s*<\/h1>/);
-  assert.match(app, /<h2>Send to device<\/h2>/);
+  assert.match(app, /<h2>No active Bridge<\/h2>/);
 });
 
-test("Home dashboard renders quick actions and state summaries", () => {
+test("Bridge workspace folds summary Send Request queue Inbox and Transfers state together", () => {
   const app = readFileSync("src/App.tsx", "utf8");
-  const homeViewSource = app.slice(app.indexOf("function HomeView"), app.indexOf("function SendView"));
+  const bridgeViewSource = app.slice(app.indexOf("function BridgeView"), app.indexOf("function DevicesWorkbenchView"));
 
-  for (const label of ["Send files", "Find from another device", "Review approvals"]) {
-    assert.match(homeViewSource, new RegExp(label));
+  for (const label of ["Bridge", "Members", "Send files", "Request file", "Transfers", "Inbox"]) {
+    assert.match(bridgeViewSource, new RegExp(label));
   }
-  for (const summary of ["Available devices", "Active transfers", "Pending approvals", "Transfer queue", "Security summary"]) {
-    assert.match(homeViewSource, new RegExp(summary));
+  for (const summary of ["Queue", "Completed", "Needs review", "Bridge messages"]) {
+    assert.match(bridgeViewSource, new RegExp(summary));
   }
-  assert.match(homeViewSource, /onSelectView\("send"\)/);
-  assert.match(homeViewSource, /onSelectView\("find"\)/);
-  assert.match(homeViewSource, /onSelectView\("approvals"\)/);
+  assert.match(bridgeViewSource, /onSelectView\("devices"\)/);
+  assert.match(bridgeViewSource, /Request metadata-only search/);
+  assert.match(bridgeViewSource, /Request this candidate payload/);
+  assert.doesNotMatch(bridgeViewSource, /Create or manage rooms|Open room|Room ID|RoomPage/);
 });
 
-test("Send Devices and Activity views use existing state and user-facing labels", () => {
+test("Bridge Devices Transfers and Inbox views use existing state and user-facing labels", () => {
   const app = readFileSync("src/App.tsx", "utf8");
-  const sendViewSource = app.slice(app.indexOf("function SendView"), app.indexOf("function DevicesWorkbenchView"));
+  const bridgeViewSource = app.slice(app.indexOf("function BridgeView"), app.indexOf("function DevicesWorkbenchView"));
   const devicesViewSource = app.slice(app.indexOf("function DevicesWorkbenchView"), app.indexOf("type SafeSearchScope"));
-  const activityViewSource = app.slice(app.indexOf("function ActivityView"), app.indexOf("type ActivityFilter"));
+  const transfersViewSource = app.slice(app.indexOf("function TransfersView"), app.indexOf("type TransferViewFilter"));
+  const inboxViewSource = app.slice(app.indexOf("function InboxView"), app.indexOf("function TransfersView"));
 
-  assert.doesNotMatch(sendViewSource, /<RoomsPage|Create or manage rooms|room-management-disclosure|old RoomPage/);
-  assert.match(sendViewSource, /className=\{`send-drop-zone/);
-  assert.match(sendViewSource, /Choose files/);
-  assert.match(sendViewSource, /Files to send/);
-  assert.match(sendViewSource, /Transfer options/);
-  assert.match(sendViewSource, /OptionRow/);
-  assert.match(sendViewSource, /onEnqueueFiles/);
-  assert.match(sendViewSource, /onCancelQueueItem/);
-  assert.match(sendViewSource, /Not available yet for ordinary Send\./);
-  assert.match(sendViewSource, /disabled/);
+  assert.doesNotMatch(bridgeViewSource, /<RoomsPage|Create or manage rooms|room-management-disclosure|old RoomPage/);
+  assert.match(bridgeViewSource, /activeBridgeRoomId/);
+  assert.match(bridgeViewSource, /legacyRoomToBridgePeerCollection/);
+  assert.match(bridgeViewSource, /getRouteableBridgePeers/);
+  assert.match(bridgeViewSource, /selectedBridgeRoute/);
+  assert.match(bridgeViewSource, /bridgeTransferInputsForSelectedRoute/);
+  assert.match(bridgeViewSource, /onEnqueueTransferInputs\(bridgeRoom\.id, inputs\)/);
+  assert.match(bridgeViewSource, /selectedSinglePeer/);
+  assert.match(bridgeViewSource, /canRequestFile/);
+  assert.match(bridgeViewSource, /targetMode === "broadcast_bridge"/);
+  assert.match(bridgeViewSource, /Select exactly one peer before requesting file metadata\./);
   assert.doesNotMatch(devicesViewSource, /<DevicesPage/);
+  assert.doesNotMatch(devicesViewSource, /onOpenRoom|Open room|Room ID|RoomPage/);
   assert.match(devicesViewSource, /listNearbyDevices/);
   assert.match(devicesViewSource, /requestNearbyJoin/);
   assert.match(devicesViewSource, /joinRoom/);
+  assert.match(devicesViewSource, /onConnectionJoined\(room\)/);
+  assert.match(devicesViewSource, /onSelectView\("bridge"\)/);
+  assert.match(devicesViewSource, /Open in Bridge/);
+  assert.match(devicesViewSource, /Add to Bridge/);
   assert.match(devicesViewSource, /Discovered devices/);
   assert.match(devicesViewSource, /Selected device/);
   assert.match(devicesViewSource, /Capabilities summary/);
   assert.match(devicesViewSource, /Connection details/);
-  assert.match(devicesViewSource, /Quick actions/);
-  assert.match(devicesViewSource, /Send files/);
-  assert.match(devicesViewSource, /Find from device/);
-  assert.match(devicesViewSource, /View activity/);
-  for (const label of ["Metadata search request", "Candidate payload request", "Queued from approved request", "Peer approval", "Transfer completed", "Transfer cancelled", "Burned", "Failed"]) {
+  assert.match(devicesViewSource, /Bridge actions/);
+  assert.match(devicesViewSource, /View transfers/);
+  assert.doesNotMatch(devicesViewSource, /Find from device/);
+  assert.match(inboxViewSource, /Inbox/);
+  assert.match(inboxViewSource, /No requests waiting/);
+  for (const label of ["Metadata search request", "Candidate payload request", "Queued from approved request", "Connection request", "Transfer completed", "Transfer cancelled", "Burned", "Failed"]) {
     assert.match(app, new RegExp(label));
   }
   for (const filter of ["All", "Transfers", "Requests", "Errors"]) {
     assert.match(app, new RegExp(`label: "${filter}"`));
   }
-  assert.doesNotMatch(activityViewSource, /Last 24 hours|completed today|durable history/i);
-  assert.match(activityViewSource, /Full history is not stored yet\./);
+  assert.doesNotMatch(transfersViewSource, /Last 24 hours|completed today|durable history/i);
+  assert.match(transfersViewSource, /Full history is not stored yet\./);
+  assert.match(app, /const room = await acceptNearbyJoin\(request\.request_id\);[\s\S]*await handleConnectionJoined\(room\);/);
+  assert.doesNotMatch(app.slice(app.indexOf("async function handleAcceptJoinRequest"), app.indexOf("useEffect(() => {", app.indexOf("async function handleAcceptJoinRequest"))), /openRoom/);
 });
 
 test("desktop workstation shell top bar renders global status summaries", () => {
@@ -83,7 +103,7 @@ test("desktop workstation shell top bar renders global status summaries", () => 
   const app = readFileSync("src/App.tsx", "utf8");
 
   assert.match(topBar, /data-testid="top-status-bar"/);
-  for (const label of ["This device", "Peer discovery", "Approvals", "Queue"]) {
+  for (const label of ["This device", "Peer discovery", "Inbox", "Queue"]) {
     assert.match(topBar, new RegExp(`label="${label}"|label: "${label}"`));
   }
   assert.match(app, /approvalsCount: approvalCount/);
@@ -125,10 +145,11 @@ test("advanced diagnostics are visible and primary shell avoids internal terms",
   assert.doesNotMatch(app, /trusted_session/);
 });
 
-test("Find and Approvals copy preserves candidate-selection and consent boundaries", () => {
+test("Bridge and Inbox copy preserves candidate-selection and consent boundaries", () => {
   const app = readFileSync("src/App.tsx", "utf8");
   const css = readFileSync("src/styles.css", "utf8");
-  const findViewSource = app.slice(app.indexOf("function FindView"), app.indexOf("function ApprovalsView"));
+  const bridgeViewSource = app.slice(app.indexOf("function BridgeView"), app.indexOf("function DevicesWorkbenchView"));
+  const requestSource = bridgeViewSource.slice(bridgeViewSource.indexOf("function handleMetadataRequest"), bridgeViewSource.indexOf("function handlePayloadRequest"));
 
   assert.match(app, /Request metadata-only search/);
   assert.match(app, /Request this candidate payload/);
@@ -138,15 +159,15 @@ test("Find and Approvals copy preserves candidate-selection and consent boundari
     assert.match(app, new RegExp(scope));
   }
   assert.match(app, /Metadata-only searches and payload requests still require an explicit receiver decision/);
-  assert.match(findViewSource, /Results contain metadata only, never file contents or full local paths\./);
-  assert.match(findViewSource, /Receiver Allow once is required\./);
-  assert.match(findViewSource, /full-width-button/);
-  assert.match(findViewSource, /selectedByUser: true/);
-  assert.match(findViewSource, /disabled=\{!canRequestPayload\}/);
+  assert.match(bridgeViewSource, /Results contain metadata only, never file contents or full local paths\./);
+  assert.match(bridgeViewSource, /Receiver Allow once is required\./);
+  assert.match(bridgeViewSource, /selectedByUser: true/);
+  assert.match(bridgeViewSource, /disabled=\{!canRequestPayload\}/);
+  assert.match(bridgeViewSource, /selectedSinglePeer/);
   assert.match(css, /\.scope-chip-grid\s*\{[^}]*flex-wrap: wrap/s);
   assert.match(css, /\.scope-chip\s*\{[^}]*word-break: normal/s);
-  assert.doesNotMatch(findViewSource, /Send automatically|AI send file|Remote file access|Download automatically/);
-  assert.doesNotMatch(findViewSource, /saved_path|absolutePath|filePath|realPath|transferQueueId|handoffId|queue_item_id|\.path/);
+  assert.doesNotMatch(bridgeViewSource, /Send automatically|AI send file|Remote file access|Download automatically/);
+  assert.doesNotMatch(requestSource, /saved_path|absolutePath|filePath|realPath|transferQueueId|handoffId|queue_item_id|\.path/);
 });
 
 test("Settings is organized around user-facing sections and hides internals by default", () => {

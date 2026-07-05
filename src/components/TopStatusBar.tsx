@@ -31,7 +31,7 @@ export function TopStatusBar({
       />
       <StatusMetric
         icon="approvals"
-        label="Approvals"
+        label="Inbox"
         value={String(approvalsCount)}
         detail={approvalsCount === 1 ? "Pending" : "Pending"}
       />
