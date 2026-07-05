@@ -2744,10 +2744,15 @@ function ScopeChip({
   onChange: () => void;
 }) {
   return (
-    <label className="scope-chip">
-      <input type="checkbox" checked={checked} onChange={onChange} />
+    <button
+      type="button"
+      className={`scope-chip ${checked ? "checked" : ""}`}
+      aria-pressed={checked}
+      onClick={onChange}
+    >
+      <span className="scope-chip-check" aria-hidden="true" />
       <span>{label}</span>
-    </label>
+    </button>
   );
 }
 
