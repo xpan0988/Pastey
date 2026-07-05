@@ -633,13 +633,14 @@ p {
 
 .find-search-grid {
   display: grid;
-  grid-template-columns: minmax(220px, 0.8fr) minmax(260px, 1fr) minmax(320px, 1.4fr);
+  grid-template-columns: minmax(220px, 0.85fr) minmax(260px, 1fr);
   gap: 14px;
   align-items: end;
 }
 
 .safe-scope-card {
   display: grid;
+  grid-column: 1 / -1;
   gap: 8px;
   min-width: 0;
 }
@@ -654,8 +655,9 @@ p {
 .scope-chip {
   display: inline-flex;
   align-items: center;
+  justify-content: flex-start;
   gap: 8px;
-  flex: 0 1 auto;
+  flex: 0 1 168px;
   max-width: 100%;
   min-height: 38px;
   padding: 0 12px;
@@ -663,13 +665,44 @@ p {
   border-radius: 8px;
   background: #f7fbff;
   color: var(--ink);
+  text-align: left;
   font-weight: 650;
   white-space: normal;
   word-break: normal;
   overflow-wrap: normal;
 }
 
-.scope-chip span {
+.scope-chip.checked {
+  border-color: rgba(31, 111, 255, 0.42);
+  background: #f3f8ff;
+}
+
+.scope-chip-check {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  border: 1px solid rgba(31, 111, 255, 0.42);
+  border-radius: 999px;
+  background: #fff;
+}
+
+.scope-chip.checked .scope-chip-check {
+  border-color: #1f6fff;
+  background: #1f6fff;
+}
+
+.scope-chip.checked .scope-chip-check::before {
+  content: "";
+  width: 7px;
+  height: 4px;
+  border-left: 2px solid #fff;
+  border-bottom: 2px solid #fff;
+  transform: rotate(-45deg) translateY(-1px);
+}
+
+.scope-chip span:not(.scope-chip-check) {
   min-width: 0;
   white-space: normal;
   word-break: normal;

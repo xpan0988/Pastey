@@ -248,6 +248,10 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
           <SettingsControlRow label="Local profile" value={diagnosticsLoading ? "Loading..." : deviceProfile ? deviceTitle(deviceProfile) : "Not loaded"} actionLabel="Refresh" onAction={() => refreshDiagnostics(true)} disabled={diagnosticsLoading} />
           <SettingsControlRow label="Capability probe" value={deviceCapabilities ? availableRuntimeTitle(deviceCapabilities) : "Not probed"} />
           <SettingsControlRow label="Last benchmark" value={lastBenchmark ? `${lastBenchmark.average_MBps.toFixed(1)} MB/s` : "Not run"} />
+          {diagnosticMessage ? <p className="muted">{diagnosticMessage}</p> : null}
+        </SettingsCard>
+
+        <SettingsCard title="Transfer diagnostics" icon="drive">
           <SettingsControlRow label="Advanced transfer grouping" detail="Uses the existing transfer planner setting." control={
             <select
               value={config.micro_flow_group_mode}
@@ -285,29 +289,34 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
               />
             } />
           ) : null}
+        </SettingsCard>
+
+        <SettingsCard title="Device diagnostics" icon="nearby">
+          <p className="muted diagnostics-note">
+            Loopback tests stay on this device. They do not measure Wi-Fi, Ethernet, school network, or internet speed.
+          </p>
+          <div className="diagnostic-grid">
+            <DiagnosticBlock title="Device Profile" rows={[
+              ["Device", deviceProfile ? deviceTitle(deviceProfile) : "Unknown"],
+              ["Platform", deviceProfile ? platformTitle(deviceProfile) : "Unknown"],
+              ["Power", deviceProfile ? powerTitle(deviceProfile) : "Unknown"]
+            ]} />
+            <DiagnosticBlock title="Capabilities" rows={[
+              ["CPU", deviceProfile ? cpuTitle(deviceProfile) : "Unknown"],
+              ["GPU", deviceCapabilities ? gpuTitle(deviceCapabilities) : "Unknown"],
+              ["Runtimes", deviceCapabilities ? availableRuntimeTitle(deviceCapabilities) : "Unknown"]
+            ]} />
+            <DiagnosticBlock title="Last Benchmark" rows={[
+              ["Mode", lastBenchmark ? benchmarkModeTitle(lastBenchmark.benchmark_mode) : "Unknown"],
+              ["Quality", lastBenchmark ? lastBenchmark.link_quality : "Not run"],
+              ["Average", lastBenchmark ? `${lastBenchmark.average_MBps.toFixed(1)} MB/s` : "Not run"],
+              ["Latency", lastBenchmark?.latency_ms != null ? `${lastBenchmark.latency_ms.toFixed(1)} ms` : "Unknown"]
+            ]} />
+          </div>
+        </SettingsCard>
+
+        <SettingsCard title="Local diagnostic tools" icon="wrench">
           <div className="settings-diagnostics-body">
-            <p className="muted diagnostics-note">
-              Loopback tests stay on this device. They do not measure Wi-Fi, Ethernet, school network, or internet speed.
-            </p>
-            {diagnosticMessage ? <p className="muted">{diagnosticMessage}</p> : null}
-            <div className="diagnostic-grid">
-              <DiagnosticBlock title="Device Profile" rows={[
-                ["Device", deviceProfile ? deviceTitle(deviceProfile) : "Unknown"],
-                ["Platform", deviceProfile ? platformTitle(deviceProfile) : "Unknown"],
-                ["Power", deviceProfile ? powerTitle(deviceProfile) : "Unknown"]
-              ]} />
-              <DiagnosticBlock title="Capabilities" rows={[
-                ["CPU", deviceProfile ? cpuTitle(deviceProfile) : "Unknown"],
-                ["GPU", deviceCapabilities ? gpuTitle(deviceCapabilities) : "Unknown"],
-                ["Runtimes", deviceCapabilities ? availableRuntimeTitle(deviceCapabilities) : "Unknown"]
-              ]} />
-              <DiagnosticBlock title="Last Benchmark" rows={[
-                ["Mode", lastBenchmark ? benchmarkModeTitle(lastBenchmark.benchmark_mode) : "Unknown"],
-                ["Quality", lastBenchmark ? lastBenchmark.link_quality : "Not run"],
-                ["Average", lastBenchmark ? `${lastBenchmark.average_MBps.toFixed(1)} MB/s` : "Not run"],
-                ["Latency", lastBenchmark?.latency_ms != null ? `${lastBenchmark.latency_ms.toFixed(1)} ms` : "Unknown"]
-              ]} />
-            </div>
             <div className="benchmark-controls">
               <select value={benchmarkMode} onChange={(event) => setBenchmarkMode(event.target.value as BenchmarkMode)}>
                 <option value="raw_memory">Loopback raw memory</option>
