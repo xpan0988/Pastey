@@ -1607,12 +1607,12 @@ function App() {
           approvalCount={approvalCount}
           onSelectView={selectPrimaryView}
           onEnqueueTransferInputs={enqueueRoomTransferInputs}
-          onSetActiveBridge={setActiveBridgeRoomId}
         />
       ) : null}
       {activePrimaryView === "devices" ? (
         <DevicesWorkbenchView
           rooms={rooms}
+          appVersion={config.app_version}
           activeBridgeRoomId={activeBridgeRoomId}
           shouldFocus={focusToken > 0}
           onSelectConnection={setActiveBridgeRoomId}
@@ -1625,6 +1625,7 @@ function App() {
       ) : null}
       {activePrimaryView === "inbox" ? (
         <InboxView
+          roomItems={activeBridgeRoom ? roomItems : []}
           joinRequest={joinRequest}
           onAccept={(request) => void handleAcceptJoinRequest(request)}
           onReject={(request) => void handleRejectJoinRequest(request)}
@@ -1698,7 +1699,6 @@ function BridgeView({
   approvalCount,
   onSelectView,
   onEnqueueTransferInputs,
-  onSetActiveBridge,
 }: {
   rooms: RoomInfo[];
   activeBridgeRoom: RoomInfo | null;
@@ -1712,20 +1712,20 @@ function BridgeView({
   approvalCount: number;
   onSelectView: (view: PrimaryView) => void;
   onEnqueueTransferInputs: (roomId: string, inputs: TransferQueueInput[]) => void;
-  onSetActiveBridge: (roomId: string) => void;
 }) {
   const connectedBridges = rooms.filter((room) => room.peer_connected);
   const bridgeRoom = activeBridgeRoom ?? (!activeBridgeRoomId && connectedBridges.length === 1 ? connectedBridges[0] : null);
   const bridgeQueueItems = bridgeRoom ? queueItems.filter((item) => item.roomId === bridgeRoom.id) : [];
-  const bridgeTransfers = bridgeRoom ? transfers.filter((transfer) => transfer.room_id === bridgeRoom.id) : [];
   const bridgeActiveTransfers = bridgeRoom ? activeTransfers.filter((transfer) => transfer.room_id === bridgeRoom.id) : activeTransfers;
-  const completedTransfers = transfers.filter((transfer) => transfer.status === "completed");
-  const issueTransfers = transfers.filter((transfer) => (
-    transfer.status === "failed" ||
-    transfer.status === "cancelled" ||
-    transfer.status === "burned" ||
-    transfer.status === "interrupted"
-  ));
+  const bridgeReceivedItems = bridgeRoom ? roomItems.filter((item) => item.direction === "incoming") : [];
+  const bridgePendingIncomingCount = joinRequest ? 1 : 0;
+  const bridgeActiveCount = bridgeActiveTransfers.length + bridgeQueueItems.filter((item) =>
+    item.status === "preparing" ||
+    item.status === "sending"
+  ).length;
+  const bridgeQueuedCount = bridgeQueueItems.filter((item) => item.status === "queued").length;
+  const transfersSummaryText = `${bridgeActiveCount} active · ${bridgeQueuedCount} queued`;
+  const inboxSummaryText = `${bridgeReceivedItems.length} received · ${bridgePendingIncomingCount} pending`;
   const bridgePeerCollection = useMemo(() => {
     if (!bridgeRoom) return null;
     try {
@@ -1737,6 +1737,10 @@ function BridgeView({
   const routeablePeers = useMemo(
     () => bridgePeerCollection ? [...getRouteableBridgePeers(bridgePeerCollection)] : [],
     [bridgePeerCollection],
+  );
+  const bridgeMembers = useMemo(
+    () => routeablePeers.filter((peer) => peer.isLocalSelf !== true),
+    [routeablePeers],
   );
   const bridgeRouteState = useMemo(
     () => bridgeRoom ? deriveBridgeRoutingStateForRoom(bridgeRoom) : null,
@@ -1753,22 +1757,22 @@ function BridgeView({
   const [requestMessage, setRequestMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    if (routeablePeers.length === 0) {
+    if (bridgeMembers.length === 0) {
       setSelectedPeerIds([]);
       return;
     }
     setSelectedPeerIds((current) => {
-      const routeableIds = new Set(routeablePeers.map((peer) => peer.peerSessionId));
+      const routeableIds = new Set(bridgeMembers.map((peer) => peer.peerSessionId));
       const next = current.filter((peerId) => routeableIds.has(bridgePeerSessionId(peerId)));
-      return next.length > 0 ? next : [routeablePeers[0].peerSessionId];
+      return next.length > 0 ? next : [bridgeMembers[0].peerSessionId];
     });
-  }, [routeablePeers]);
+  }, [bridgeMembers]);
 
   const selectedBridgeRoute = useMemo(
-    () => buildSelectedBridgeRoute(bridgePeerCollection?.bridgeSessionId ?? `legacy-room:${bridgeRoom?.id ?? "none"}`, routeablePeers, targetMode, selectedPeerIds),
-    [bridgePeerCollection?.bridgeSessionId, bridgeRoom?.id, routeablePeers, selectedPeerIds, targetMode],
+    () => buildSelectedBridgeRoute(bridgePeerCollection?.bridgeSessionId ?? `legacy-room:${bridgeRoom?.id ?? "none"}`, bridgeMembers, targetMode, selectedPeerIds),
+    [bridgePeerCollection?.bridgeSessionId, bridgeRoom?.id, bridgeMembers, selectedPeerIds, targetMode],
   );
-  const selectedRoutePeers = selectedBridgeRoute ? resolvedPeersForRoute(selectedBridgeRoute, routeablePeers) : [];
+  const selectedRoutePeers = selectedBridgeRoute ? resolvedPeersForRoute(selectedBridgeRoute, bridgeMembers) : [];
   const selectedSinglePeer = selectedBridgeRoute?.target.kind === "selected_peer" ? selectedRoutePeers[0] ?? null : null;
   const canSendFiles = Boolean(bridgeRoom?.peer_connected && selectedBridgeRoute && selectedRoutePeers.length > 0);
   const canRequestFile = Boolean(bridgeRoom?.peer_connected && selectedSinglePeer && searchQuery.trim().length > 0 && safeScopes.length > 0);
@@ -1803,7 +1807,7 @@ function BridgeView({
       cancelled = true;
       if (unlisten) unlisten();
     };
-  }, [canSendFiles, bridgeRoom, selectedBridgeRoute, routeablePeers]);
+  }, [canSendFiles, bridgeRoom, selectedBridgeRoute, bridgeMembers]);
 
   function toggleScope(scope: SafeSearchScope) {
     setSafeScopes((current) =>
@@ -1920,28 +1924,22 @@ function BridgeView({
         <div className="task-card-header">
           <div>
             <span className="meta-label">Bridge</span>
-            <h2>{bridgeRoom.peer_device_name ?? "Waiting peer"}</h2>
+            <h2>{bridgeRoom.peer_device_name ?? "Active connection"}</h2>
             <p className="muted">
               {bridgeRouteState ? routeStateLabel(bridgeRouteState) : "No routeable peer"}.
               {" "}
-              {routeablePeers.length} member{routeablePeers.length === 1 ? "" : "s"} routeable.
+              {bridgeMembers.length} member{bridgeMembers.length === 1 ? "" : "s"} routeable.
             </p>
           </div>
           <StatusChip tone={bridgeRoom.peer_connected ? "success" : "neutral"}>
-            {bridgeRoom.peer_connected ? "Connected" : connectionStatusLabel(bridgeRoom)}
+            {bridgeConnectionStatusLabel(bridgeRoom)}
           </StatusChip>
         </div>
         <div className="bridge-selector-row">
-          <label className="field-label">
-            <span>Active Bridge</span>
-            <select value={bridgeRoom.id} onChange={(event) => onSetActiveBridge(event.target.value)}>
-              {rooms.map((room) => (
-                <option key={room.id} value={room.id}>
-                  {room.peer_device_name ?? "Waiting peer"} - {connectionStatusLabel(room)}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="summary-list">
+            <div className="summary-row"><span>Active Bridge</span><small>{bridgeConnectionStatusLabel(bridgeRoom)}</small></div>
+            <div className="summary-row"><span>Current members</span><small>{bridgeMembers.length}</small></div>
+          </div>
           <button type="button" className="secondary-button" onClick={() => onSelectView("devices")}>Manage devices</button>
         </div>
       </Card>
@@ -1953,13 +1951,13 @@ function BridgeView({
             <span className="muted">{selectedRoutePeers.length} selected</span>
           </div>
           <div className="segmented-control" aria-label="Bridge target">
-            <button type="button" className={targetMode === "selected_peer" ? "active" : ""} disabled={routeablePeers.length === 0} onClick={() => setTargetMode("selected_peer")}>Peer</button>
-            <button type="button" className={targetMode === "selected_peers" ? "active" : ""} disabled={routeablePeers.length < 2} onClick={() => setTargetMode("selected_peers")}>Peers</button>
-            <button type="button" className={targetMode === "broadcast_bridge" ? "active" : ""} disabled={routeablePeers.length === 0} onClick={() => setTargetMode("broadcast_bridge")}>All members</button>
+            <button type="button" className={targetMode === "selected_peer" ? "active" : ""} disabled={bridgeMembers.length === 0} onClick={() => setTargetMode("selected_peer")}>Peer</button>
+            <button type="button" className={targetMode === "selected_peers" ? "active" : ""} disabled={bridgeMembers.length < 2} onClick={() => setTargetMode("selected_peers")}>Peers</button>
+            <button type="button" className={targetMode === "broadcast_bridge" ? "active" : ""} disabled={bridgeMembers.length === 0} onClick={() => setTargetMode("broadcast_bridge")}>All members</button>
           </div>
           <div className="trusted-peer-grid">
-            {routeablePeers.length === 0 ? <span className="empty-inline">No connected members yet.</span> : null}
-            {routeablePeers.map((peer) => {
+            {bridgeMembers.length === 0 ? <span className="empty-inline">No connected members yet.</span> : null}
+            {bridgeMembers.map((peer) => {
               const checked = selectedPeerIds.includes(peer.peerSessionId) || targetMode === "broadcast_bridge";
               return (
                 <button
@@ -2060,6 +2058,10 @@ function BridgeView({
 
       <div className="workbench-grid three-column">
         <SummaryPanel title="Transfers" emptyLabel="No current transfer state.">
+          <div className="summary-row">
+            <span>{transfersSummaryText}</span>
+            <small>Current queue</small>
+          </div>
           {bridgeQueueItems.slice(0, 3).map((item) => (
             <div key={item.id} className="summary-row">
               <span>{queueItemLabel(item)}</span>
@@ -2073,40 +2075,32 @@ function BridgeView({
             </div>
           ))}
         </SummaryPanel>
-        <SummaryPanel title="Inbox" emptyLabel="No requests waiting.">
+        <SummaryPanel title="Inbox" emptyLabel="No received items in this session.">
+          <div className="summary-row">
+            <span>{inboxSummaryText}</span>
+            <small>Current session</small>
+          </div>
           {joinRequest ? (
             <div className="summary-row">
               <span>{joinRequest.device_name}</span>
-              <small>Connection request</small>
+              <small>Pending incoming request</small>
             </div>
           ) : null}
-        </SummaryPanel>
-        <SummaryPanel title="Bridge messages" emptyLabel="No current-session messages.">
-          {roomItems.slice(0, 4).map((item) => (
+          {bridgeReceivedItems.slice(0, 3).map((item) => (
             <div key={item.id} className="summary-row">
-              <span>{item.display_name ?? item.text ?? "Message"}</span>
-              <small>{item.direction}</small>
+              <span>{inboxItemTitle(item)}</span>
+              <small>{inboxItemKindLabel(item)}</small>
             </div>
           ))}
         </SummaryPanel>
-      </div>
-
-      <div className="workbench-grid three-column">
-        <Card>
-          <span className="meta-label">Queue</span>
-          <h2>{bridgeQueueItems.length}</h2>
-          <p className="muted">Items queued for this Bridge.</p>
-        </Card>
-        <Card>
-          <span className="meta-label">Completed</span>
-          <h2>{completedTransfers.length}</h2>
-          <p className="muted">Current-session transfer events only.</p>
-        </Card>
-        <Card>
-          <span className="meta-label">Needs review</span>
-          <h2>{issueTransfers.length}</h2>
-          <p className="muted">Failed, cancelled, burned, or interrupted current-session events.</p>
-        </Card>
+        <SummaryPanel title="Members" emptyLabel="No connected members yet.">
+          {bridgeMembers.slice(0, 4).map((peer) => (
+            <div key={peer.peerSessionId} className="summary-row">
+              <span>{peer.displayName}</span>
+              <small>{peer.liveness}</small>
+            </div>
+          ))}
+        </SummaryPanel>
       </div>
     </section>
   );
@@ -2185,6 +2179,7 @@ function bridgeTransferInputsForSelectedRoute(
 
 function DevicesWorkbenchView({
   rooms,
+  appVersion,
   activeBridgeRoomId,
   shouldFocus,
   onSelectConnection,
@@ -2192,6 +2187,7 @@ function DevicesWorkbenchView({
   onSelectView,
 }: {
   rooms: RoomInfo[];
+  appVersion: string;
   activeBridgeRoomId: string;
   shouldFocus: boolean;
   onSelectConnection: (roomId: string) => void;
@@ -2205,17 +2201,16 @@ function DevicesWorkbenchView({
   const [joiningDeviceId, setJoiningDeviceId] = useState<string | null>(null);
   const [deviceMessage, setDeviceMessage] = useState<string | null>(null);
   const joinInputRef = useRef<HTMLInputElement | null>(null);
-  const roomRows = rooms.map((room) => ({
-    kind: "room" as const,
-    id: `room:${room.id}`,
-    room,
-    name: room.peer_device_name ?? "Waiting peer",
-    status: connectionStatusLabel(room),
-    latency: room.peer_connected ? "Current session" : formatTimestamp(room.created_at),
-    capabilities: "Send, request, transfer queue",
-    osType: room.local_role === "creator" ? "Created here" : "Joined here",
-    action: "Select",
-  }));
+  const localDeviceRow = {
+    kind: "local" as const,
+    id: "local:this-device",
+    name: "This device",
+    status: "Ready",
+    latency: "This session",
+    capabilities: "Pastey workstation",
+    osType: `Pastey ${appVersion}`,
+    action: "Local",
+  };
   const nearbyRows = nearbyDevices.map((device) => ({
     kind: "nearby" as const,
     id: `nearby:${device.device_id}`,
@@ -2227,17 +2222,13 @@ function DevicesWorkbenchView({
     osType: `${device.platform} / Pastey ${device.app_version}`,
     action: device.compatible && device.availability === "Available" ? "Add to Bridge" : "Unavailable",
   }));
-  const deviceRows = [...nearbyRows, ...roomRows];
+  const deviceRows = [localDeviceRow, ...nearbyRows];
   const selectedConnectionRoom = activeBridgeRoomId
     ? rooms.find((room) => room.id === activeBridgeRoomId) ?? null
     : null;
   const selectedDevice = deviceRows.find((device) => device.id === selectedDeviceId)
-    ?? (selectedConnectionRoom ? deviceRows.find((device) => device.id === `room:${selectedConnectionRoom.id}`) : null)
     ?? deviceRows[0]
     ?? null;
-  const selectedRoom = selectedDevice?.kind === "room"
-    ? selectedDevice.room
-    : selectedConnectionRoom;
   const connectedCount = rooms.filter((room) => room.peer_connected).length;
   const trustedRooms = rooms.filter((room) => room.peer_device_name);
 
@@ -2280,14 +2271,13 @@ function DevicesWorkbenchView({
   }, []);
 
   useEffect(() => {
-    if (!selectedDeviceId && activeBridgeRoomId && deviceRows.some((device) => device.id === `room:${activeBridgeRoomId}`)) {
-      setSelectedDeviceId(`room:${activeBridgeRoomId}`);
+    if (selectedDeviceId && deviceRows.some((device) => device.id === selectedDeviceId)) {
       return;
     }
-    if (!selectedDeviceId && deviceRows[0]) {
+    if (deviceRows[0]) {
       setSelectedDeviceId(deviceRows[0].id);
     }
-  }, [deviceRows, activeBridgeRoomId, selectedDeviceId]);
+  }, [deviceRows, selectedDeviceId]);
 
   async function handleJoinRoom() {
     setBusy("join");
@@ -2296,7 +2286,6 @@ function DevicesWorkbenchView({
     try {
       const room = await joinRoom(joinCode);
       setJoinCode("");
-      setSelectedDeviceId(`room:${room.id}`);
       onConnectionJoined(room);
     } catch (err) {
       setDeviceMessage(err instanceof Error ? err.message : String(err));
@@ -2313,7 +2302,6 @@ function DevicesWorkbenchView({
     try {
       const room = await requestNearbyJoin(device.device_id);
       setDeviceMessage(null);
-      setSelectedDeviceId(`room:${room.id}`);
       onConnectionJoined(room);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -2328,7 +2316,7 @@ function DevicesWorkbenchView({
     <section className="workstation-view devices-workstation" aria-label="Devices">
       <section className="summary-card devices-table-card">
         <div className="section-row">
-          <h2>Discovered devices</h2>
+          <h2>Devices</h2>
           <button
             type="button"
             className="secondary-button compact-button"
@@ -2356,18 +2344,12 @@ function DevicesWorkbenchView({
             <span>OS / Type</span>
             <span>Actions</span>
           </div>
-          {deviceRows.length === 0 ? (
-            <div className="empty-state">
-              <strong>No devices discovered yet</strong>
-              <p className="muted">Use nearby discovery or join with code to connect a device.</p>
-            </div>
-          ) : null}
           {deviceRows.map((device) => (
             <DeviceRow
               key={device.id}
               selected={selectedDevice?.id === device.id}
               name={device.name}
-              subtitle={device.kind === "nearby" ? "Nearby device" : "Connected peer"}
+              subtitle={device.kind === "nearby" ? "Nearby device" : "Local device"}
               status={device.status}
               latency={device.latency}
               capabilities={device.capabilities}
@@ -2375,7 +2357,6 @@ function DevicesWorkbenchView({
               action={device.action}
               onClick={() => {
                 setSelectedDeviceId(device.id);
-                if (device.kind === "room") onSelectConnection(device.room.id);
               }}
             />
           ))}
@@ -2386,7 +2367,7 @@ function DevicesWorkbenchView({
       <section className="summary-card selected-device-card">
         <div className="section-row">
           <h2>Selected device</h2>
-          {selectedDevice ? <span className={`status-chip ${selectedDevice.status === "Available" || selectedDevice.status === "Connected" ? "success" : "neutral"}`}>{selectedDevice.status}</span> : null}
+          {selectedDevice ? <span className={`status-chip ${selectedDevice.status === "Available" || selectedDevice.status === "Connected" || selectedDevice.status === "Ready" ? "success" : "neutral"}`}>{selectedDevice.status}</span> : null}
         </div>
         {selectedDevice ? (
           <>
@@ -2399,7 +2380,7 @@ function DevicesWorkbenchView({
                 <h3>Capabilities summary</h3>
                 <div className="summary-list">
                   <div className="summary-row"><span>Capabilities</span><small>{selectedDevice.capabilities}</small></div>
-                  <div className="summary-row"><span>Request file</span><small>{selectedDevice.kind === "room" ? "Safe locations" : "Available after connection"}</small></div>
+                  <div className="summary-row"><span>Request file</span><small>{selectedDevice.kind === "nearby" ? "Available after connection" : "Available in Bridge"}</small></div>
                   <div className="summary-row"><span>Max transfer size</span><small>{selectedDevice.kind === "nearby" && selectedDevice.device.capabilities.includes("large_file") ? "Large files ready" : "10 GB"}</small></div>
                   <div className="summary-row"><span>Encryption</span><small>AES-256 (E2EE)</small></div>
                 </div>
@@ -2408,7 +2389,7 @@ function DevicesWorkbenchView({
                 <h3>Connection details</h3>
                 <div className="summary-list">
                   <div className="summary-row"><span>Connection</span><small>{selectedDevice.status}</small></div>
-                  <div className="summary-row"><span>Discovery</span><small>{selectedDevice.kind === "nearby" ? "Nearby broadcast" : "Connected session"}</small></div>
+                  <div className="summary-row"><span>Discovery</span><small>{selectedDevice.kind === "nearby" ? "Nearby broadcast" : "Local device"}</small></div>
                   <div className="summary-row"><span>Last seen</span><small>{selectedDevice.latency}</small></div>
                 </div>
               </section>
@@ -2418,10 +2399,10 @@ function DevicesWorkbenchView({
                   <button
                     type="button"
                     className="secondary-button"
-                    disabled={selectedDevice.kind === "nearby" || !selectedRoom}
+                    disabled={selectedDevice.kind === "nearby" || !selectedConnectionRoom}
                     onClick={() => {
-                      if (selectedRoom) {
-                        onSelectConnection(selectedRoom.id);
+                      if (selectedConnectionRoom) {
+                        onSelectConnection(selectedConnectionRoom.id);
                         onSelectView("bridge");
                       }
                     }}
@@ -2603,64 +2584,72 @@ function prepareCandidateSearchWorkflow(
 }
 
 function InboxView({
+  roomItems,
   joinRequest,
   onAccept,
   onReject,
 }: {
+  roomItems: RoomItem[];
   joinRequest: JoinRequestPrompt | null;
   onAccept: (request: JoinRequestPrompt) => void;
   onReject: (request: JoinRequestPrompt) => void;
 }) {
+  const receivedItems = roomItems.filter((item) => item.direction === "incoming");
+  const pendingIncomingCount = joinRequest ? 1 : 0;
+
   return (
     <section className="workstation-view inbox-workstation" aria-label="Inbox">
-      <Card className="approval-card">
-        {joinRequest ? (
-          <>
-            <div>
-              <span className="meta-label">Inbox</span>
-              <h2>{joinRequest.device_name}</h2>
-              <p className="muted">
-                {joinRequest.platform} - Pastey {joinRequest.app_version}. Review before allowing this connection once.
-              </p>
-            </div>
-            <div className="row gap">
-              <button className="ghost-button" onClick={() => onReject(joinRequest)}>Deny</button>
-              <button className="primary-button" onClick={() => onAccept(joinRequest)}>Allow once</button>
-            </div>
-          </>
-        ) : (
-          <>
-            <h2>No requests waiting</h2>
-            <p className="muted">
-              Metadata-only searches and payload requests still require an explicit receiver decision when they arrive.
-            </p>
-          </>
-        )}
-      </Card>
       <div className="workbench-grid two-column">
-        <Card className="approval-card">
-          <span className="meta-label">Metadata search request</span>
-          <h2>No live request</h2>
-          <p className="muted">
-            Search approvals are reviewed when a live peer request is available. Results contain metadata only, never file contents or full local paths.
-          </p>
-          <StatusChip tone="neutral">Non-actionable</StatusChip>
-        </Card>
-        <Card className="approval-card">
-          <span className="meta-label">Candidate payload request</span>
-          <h2>No live request</h2>
-          <p className="muted">
-            Candidate payload approval appears only for a concrete selected candidate. Allow once queues the approved request, not transfer completion.
-          </p>
-          <StatusChip tone="neutral">Non-actionable</StatusChip>
-        </Card>
-        <Card className="approval-card">
-          <span className="meta-label">Security facts</span>
-          <h2>Explicit consent</h2>
+        <Card className="inbox-card">
+          <div className="section-row">
+            <h2>Received items</h2>
+            <span className="muted">{receivedItems.length} current session</span>
+          </div>
           <div className="summary-list">
-            <div className="summary-row"><span>Allow once</span><small>One request only</small></div>
-            <div className="summary-row"><span>Metadata search</span><small>No contents</small></div>
-            <div className="summary-row"><span>Payload request</span><small>Selected candidate only</small></div>
+            {receivedItems.length === 0 ? (
+              <EmptyState
+                title="No received items in this session."
+                detail="Received files, images, text, and links appear here after they arrive in the active session."
+              />
+            ) : null}
+            {receivedItems.map((item) => (
+              <div key={item.id} className="summary-row">
+                <span>{inboxItemTitle(item)}</span>
+                <small>{inboxItemKindLabel(item)} · {item.status}</small>
+              </div>
+            ))}
+          </div>
+        </Card>
+        <Card className="inbox-card">
+          <div className="section-row">
+            <h2>Pending incoming</h2>
+            <StatusChip tone={pendingIncomingCount > 0 ? "warning" : "neutral"}>{pendingIncomingCount} pending</StatusChip>
+          </div>
+          {joinRequest ? (
+            <div className="summary-list">
+              <div className="summary-row">
+                <span>{joinRequest.device_name}</span>
+                <small>{joinRequest.platform} · Pastey {joinRequest.app_version}</small>
+              </div>
+              <ActionRow>
+                <button className="ghost-button" onClick={() => onReject(joinRequest)}>Deny</button>
+                <button className="primary-button" onClick={() => onAccept(joinRequest)}>Allow once</button>
+              </ActionRow>
+            </div>
+          ) : (
+            <EmptyState
+              title="No pending incoming requests."
+              detail="Connection, metadata-search, and candidate-payload requests appear here only when a live incoming request needs a decision."
+            />
+          )}
+        </Card>
+        <Card className="inbox-card">
+          <span className="meta-label">Current session</span>
+          <h2>Incoming boundary</h2>
+          <div className="summary-list">
+            <div className="summary-row"><span>Received content</span><small>{receivedItems.length}</small></div>
+            <div className="summary-row"><span>Incoming decisions</span><small>{pendingIncomingCount}</small></div>
+            <div className="summary-row"><span>Persistence</span><small>Current session only</small></div>
           </div>
         </Card>
       </div>
@@ -2786,6 +2775,24 @@ function transferEventTone(transfer: FileTransferProgressEvent): TransferEventVi
 function roomLabelById(rooms: RoomInfo[], roomId: string): string {
   const room = rooms.find((candidate) => candidate.id === roomId);
   return room?.peer_device_name ?? "Current connection";
+}
+
+function inboxItemTitle(item: RoomItem): string {
+  return item.display_name ?? item.text ?? "Received item";
+}
+
+function inboxItemKindLabel(item: RoomItem): string {
+  if (item.payload_type === "text") return "Received text";
+  if (item.mime_type?.startsWith("image/")) return "Received image";
+  return "Received file";
+}
+
+function bridgeConnectionStatusLabel(room: RoomInfo): string {
+  if (room.peer_connected) return "Connected";
+  if (room.peer_burned_at) return "Peer done";
+  if (room.status === "peer_left") return "Peer disconnected";
+  if (room.status === "burned") return "Burned";
+  return "Not connected";
 }
 
 function connectionStatusLabel(room: RoomInfo): string {
