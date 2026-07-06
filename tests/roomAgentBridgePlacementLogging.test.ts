@@ -41,9 +41,13 @@ test("Bridge workspace folds summary Send Request queue Inbox and Transfers stat
   for (const label of ["Bridge", "Members", "Send files", "Request file", "Transfers", "Inbox"]) {
     assert.match(bridgeViewSource, new RegExp(label));
   }
-  for (const summary of ["Queue", "Completed", "Needs review", "Bridge messages"]) {
+  for (const summary of ["transfersSummaryText", "inboxSummaryText", "No received items in this session", "Pending incoming request"]) {
     assert.match(bridgeViewSource, new RegExp(summary));
   }
+  assert.match(bridgeViewSource, /const bridgeMembers = useMemo\(/);
+  assert.match(bridgeViewSource, /routeablePeers\.filter\(\(peer\) => peer\.isLocalSelf !== true\)/);
+  assert.match(bridgeViewSource, /bridgeMembers\.map\(\(peer\) =>/);
+  assert.doesNotMatch(bridgeViewSource, /rooms\.map|nearbyRows|deviceRows|nearbyDevices|Nearby device|Busy|Waiting peer|Joined here|Bridge messages|Needs review/);
   assert.match(bridgeViewSource, /onSelectView\("devices"\)/);
   assert.match(bridgeViewSource, /Request metadata-only search/);
   assert.match(bridgeViewSource, /Request this candidate payload/);
@@ -77,7 +81,12 @@ test("Bridge Devices Transfers and Inbox views use existing state and user-facin
   assert.match(devicesViewSource, /onSelectView\("bridge"\)/);
   assert.match(devicesViewSource, /Open in Bridge/);
   assert.match(devicesViewSource, /Add to Bridge/);
-  assert.match(devicesViewSource, /Discovered devices/);
+  assert.match(devicesViewSource, /localDeviceRow/);
+  assert.match(devicesViewSource, /const deviceRows = \[localDeviceRow, \.\.\.nearbyRows\]/);
+  assert.match(devicesViewSource, /Nearby device/);
+  assert.match(devicesViewSource, /Local device/);
+  assert.match(devicesViewSource, /nearbyDeviceStatus/);
+  assert.doesNotMatch(devicesViewSource, /roomRows|kind: "room"|Waiting peer|Joined here|\.\.\.roomRows/);
   assert.match(devicesViewSource, /Selected device/);
   assert.match(devicesViewSource, /Capabilities summary/);
   assert.match(devicesViewSource, /Connection details/);
@@ -85,8 +94,14 @@ test("Bridge Devices Transfers and Inbox views use existing state and user-facin
   assert.match(devicesViewSource, /View transfers/);
   assert.doesNotMatch(devicesViewSource, /Find from device/);
   assert.match(inboxViewSource, /Inbox/);
-  assert.match(inboxViewSource, /No requests waiting/);
-  for (const label of ["Metadata search request", "Candidate payload request", "Queued from approved request", "Connection request", "Transfer completed", "Transfer cancelled", "Burned", "Failed"]) {
+  assert.match(inboxViewSource, /Received items/);
+  assert.match(inboxViewSource, /Pending incoming/);
+  assert.match(inboxViewSource, /No received items in this session\./);
+  assert.match(inboxViewSource, /roomItems\.filter\(\(item\) => item\.direction === "incoming"\)/);
+  assert.doesNotMatch(inboxViewSource, /Approvals|No requests waiting|Security facts|approval-card/);
+  assert.match(transfersViewSource, /buildTransferEvents\(rooms, transfers, queueItems\)/);
+  assert.doesNotMatch(transfersViewSource, /roomItems|receivedItems|Received items|Last 24 hours|completed today|durable history|chart/i);
+  for (const label of ["Request metadata-only search", "Candidate payload request", "Queued from approved request", "Transfer completed", "Transfer cancelled", "Burned", "Failed"]) {
     assert.match(app, new RegExp(label));
   }
   for (const filter of ["All", "Transfers", "Requests", "Errors"]) {
@@ -158,7 +173,7 @@ test("Bridge and Inbox copy preserves candidate-selection and consent boundaries
   for (const scope of ["Downloads", "Documents", "Desktop", "Pastey Shared"]) {
     assert.match(app, new RegExp(scope));
   }
-  assert.match(app, /Metadata-only searches and payload requests still require an explicit receiver decision/);
+  assert.match(app, /live incoming request needs a decision/);
   assert.match(bridgeViewSource, /Results contain metadata only, never file contents or full local paths\./);
   assert.match(bridgeViewSource, /Receiver Allow once is required\./);
   assert.match(bridgeViewSource, /selectedByUser: true/);
