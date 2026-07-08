@@ -97,6 +97,8 @@ node scripts/run-layer4-validation-matrix.mjs
 
 ## Layer 5 Workspace Capability Validation Plan
 
+Pastey 1.9.1 defines the current Layer 5 narrow product closure and smoke bugfix consolidation. Automated validation covers the fixed Transform + Return and Search + Return contracts, target binding, Deny terminal states, source-shape product wiring, candidate-payload boundaries, and scheduler handoff behavior. Manual smoke remains required for real two-device product confidence.
+
 The first workspace capability direction is `filesystem.find_file_candidates`. Current validation covers advisory JSON validation, PolicyGate boundaries, selected-peer consent, receiver-side bounded metadata search, and redacted candidate result shape.
 
 The first candidate payload direction is `transfer.request_candidate_payload`. Current validation covers the second-consent handoff path: advisory validation, selected-peer preview, capability-specific Allow once grant, exact execution-request binding, replay rejection, receiver-local candidate-store resolution, existing transfer queue handoff, and `handoff_queued` result shape. It does not claim transfer completion at handoff time because byte progress and completion remain owned by the existing transfer pipeline.
@@ -133,8 +135,19 @@ The focused Rust filter covers exact, case-insensitive, and substring filename m
 
 ## Manual Smoke Checklist (Pending)
 
-Manual smoke is intentionally pending until the automated matrix is green. Run it separately and record evidence with exact build/profile details:
+Manual smoke is intentionally separate from automated validation. Run it separately and record evidence with exact build/profile details:
 
+- Hello Stdout success through Bridge detail -> Ask Bridge Beta -> Run Hello Peer demo;
+- Hello Stdout Deny showing terminal Peer denied / Denied and no stdout result;
+- Request file search success with selected-peer-only metadata search and redacted candidates;
+- Request file search Deny showing terminal denial, no candidates, no payload request, and no transfer start;
+- candidate payload success with manual candidate selection, second Allow once, `handoff_queued`, and existing transfer pipeline progress/completion;
+- candidate payload Deny showing terminal denial, no `handoff_queued`, and no transfer start;
+- stale, expired, deleted, or changed candidate does not enqueue;
+- disconnect/timeout around preview, consent, execution, or transfer handoff fails closed;
+- Linux peer display does not appear as local "This Mac";
+- long sent/received text and stdout/result blocks can be viewed and copied in full;
+- metadata search exposes no receiver absolute path or file contents;
 - two-machine selected-peers ordinary text;
 - two-machine broadcast file/image and pasted-image where practical;
 - disconnect/reconnect route expiry with old selected-peer route failing closed;

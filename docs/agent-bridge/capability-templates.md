@@ -1,6 +1,6 @@
 # Capability Templates
 
-This document designs and tracks the template-based Layer 5 capability architecture for Pastey Agent Bridge. Phase 1 static manifests, Phase 2 additive helpers, the Phase 3 `runtime.hello_stdout` wrapper, the Phase 4 `filesystem.find_file_candidates` common-check wrapper, the Phase 5 `transfer.request_candidate_payload` common-check wrapper, and the Phase 6 deterministic candidate workflow are implemented for the current narrow capability set. Bridge-first product closure is implemented for Transform + Return via Hello Stdout and Search + Return via Request file. This is not full Agent Bridge or full Jarvis completion. The current implementation does not change public capability IDs, schema versions, provider action kinds, executor kinds, room-control event names, transfer queue APIs, `binary-v1`, or existing validators.
+This document designs and tracks the template-based Layer 5 capability architecture for Pastey Agent Bridge. Phase 1 static manifests, Phase 2 additive helpers, the Phase 3 `runtime.hello_stdout` wrapper, the Phase 4 `filesystem.find_file_candidates` common-check wrapper, the Phase 5 `transfer.request_candidate_payload` common-check wrapper, and the Phase 6 deterministic candidate workflow are implemented for the current narrow capability set. Pastey 1.9.1 completes the current Layer 5 narrow product closure for Transform + Return via Hello Stdout and Search + Return via Request file, then consolidates smoke bug fixes around target binding, Deny propagation, automatic active-operation refresh, device platform display, full content access, and product-status documentation. This is not full Agent Bridge or full Jarvis completion. The current implementation does not change public capability IDs, schema versions, provider action kinds, executor kinds, room-control event names, transfer queue APIs, `binary-v1`, or existing validators.
 
 For the current capability contracts, see [capability-contracts.md](capability-contracts.md). For the broader safety model, see [architecture-and-safety.md](architecture-and-safety.md). For capability ID, schema, provider action, executor, and template naming rules, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md).
 
@@ -381,12 +381,12 @@ Payload transfer remains bytes-oriented and uses the existing transfer queue, sc
 
 ## Product Closure Status
 
-Layer 5 narrow product closure is implemented for the current fixed capability set:
+Pastey 1.9.1 Layer 5 narrow product closure is implemented for the current fixed capability set:
 
 - `runtime.hello_stdout` proves Transform + Return through a fixed host-owned runtime. Bridge detail's Ask Bridge Beta flow requires exactly one selected peer, sender confirmation, receiver Allow once/Deny, fixed execution, and typed stdout return.
 - `filesystem.find_file_candidates` plus `transfer.request_candidate_payload` proves Search + Return. Bridge detail's Request file flow requires exactly one selected peer, metadata-only search consent, redacted candidates, manual candidate selection, second payload consent, receiver-side candidate revalidation, and queue handoff into the existing transfer pipeline.
 
-The shared product timeline is an operation lifecycle view backed by Pastey events and existing queue/transfer state. It is not a model reasoning trace, provider scratchpad, or task taxonomy.
+The shared `OperationTimeline` product component is an operation lifecycle view backed by Pastey events and existing queue/transfer state. It is not a model reasoning trace, provider scratchpad, or task taxonomy. Active Bridge detail operations auto-refresh while nonterminal; `Check for updates` is retained as fallback/debug affordance only.
 
 Remaining gaps include a global Activity detail drawer, broad two-device smoke validation, transfer-completion smoke for the handoff path, broader capability coverage, durable identity/trust work where explicitly needed, and multi-step orchestration.
 

@@ -6,6 +6,8 @@ It is both the architecture contract and the completion-scoring standard for Pas
 
 For architecture, schema, protocol, Agent Bridge capability, provider action, executor, template kind, and future capability naming rules, see [naming-conventions.md](naming-conventions.md). For Agent Bridge capability templates, manifests, autonomy profiles, approval policy, migration phases, and implementation status, see [../agent-bridge/capability-templates.md](../agent-bridge/capability-templates.md).
 
+Pastey 1.9.1 completes the current Layer 5 narrow product closure for the fixed capability set and is defined as Layer 5 narrow product closure and smoke bugfix consolidation. It covers Transform + Return through `runtime.hello_stdout`, and Search + Return through `filesystem.find_file_candidates` plus second-consent `transfer.request_candidate_payload` queue handoff. It also consolidates the shared `OperationTimeline`, canonical selected-peer target binding, terminal Deny states, automatic active-operation refresh with `Check for updates` as fallback, local/remote platform display fixes, full content view/copy affordances, and documentation corrections that distinguish narrow closure from full Agent/Jarvis completion.
+
 ## Purpose And Authority
 
 Use this document to decide:
@@ -174,7 +176,7 @@ Completion criteria:
 - Provider support, redaction, validation, policy, consent, execution, result, and audit are all wired through a real Bridge control path. Legacy implementation term: room-control path.
 - Each capability has a fixed schema, host-owned executor, explicit consent binding, replay protection, and tests.
 - Advisory-only workspace capability scaffolds may exist before execution. They do not count as implemented receiver capabilities until preview, receiver consent, execution/result, and validation are complete.
-- Layer 5 narrow product closure is implemented for the current fixed capability set: Hello Stdout proves Transform + Return through `runtime.hello_stdout`, and Request file proves Search + Return through `filesystem.find_file_candidates` plus second-consent `transfer.request_candidate_payload` queue handoff.
+- Pastey 1.9.1 Layer 5 narrow product closure is implemented for the current fixed capability set: Hello Stdout proves Transform + Return through `runtime.hello_stdout`, and Request file proves Search + Return through `filesystem.find_file_candidates` plus second-consent `transfer.request_candidate_payload` queue handoff.
 - Broader workspace completion requires more than the fixed Hello Peer/Hello Stdout slices, minimal static registry, file-candidate metadata search, candidate-payload queue handoff, and Bridge-first product panels: broad capability coverage, multi-step orchestration, local model scheduling or equivalent local-provider story, release/two-device validation, global Activity detail surfaces, and explicit durable peer identity integration if a capability depends on durable trust.
 
 ## Inter-Layer Dependencies
@@ -210,7 +212,7 @@ These scores are against the canonical definitions in this document, not against
 | Layer 4 - Multi-device Bridge sessions and peer identity | 72% | 86% | Session-scoped Bridge routing/control core | High | Full cryptographic paired-key rotation, durable route recovery if explicitly designed, broader release/two-device validation, independent security review |
 | Layer 5 - Agent-assisted device workspace | 68% | 88% | Narrow product closure for fixed Transform + Return and Search + Return | High | Manual/two-device validation, transfer-completion smoke, global Activity detail drawer, broad capability coverage, multi-step orchestration, local LLM scheduling, MCP/tool integration, durable peer-identity dependency if needed |
 
-No layer is `100%`. The largest gap between full vision and implementation remains Layer 5: the Bridge-first Hello Stdout product path proves fixed Transform + Return, Request file proves Search + Return through metadata-only discovery plus second-consent candidate-payload handoff, and `handoff_queued` remains queue acceptance rather than transfer completion. Pastey still lacks broad manual/two-device validation, global Activity detail surfaces, broad capability coverage, and multi-step workspace orchestration.
+No layer is `100%`. The largest gap between full vision and implementation remains Layer 5: Pastey 1.9.1 proves the Bridge-first Hello Stdout fixed Transform + Return product path and Request file Search + Return through metadata-only discovery plus second-consent candidate-payload handoff. `handoff_queued` remains queue acceptance rather than transfer completion. Pastey still lacks broad manual/two-device validation, a global Activity detail drawer, broad capability coverage, durable identity/trust integration where explicitly needed, and multi-step workspace orchestration.
 
 ## Completion Scoring Scale
 

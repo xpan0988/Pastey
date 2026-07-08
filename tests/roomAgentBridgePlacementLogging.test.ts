@@ -379,21 +379,34 @@ test("Layer 5 docs describe narrow product closure without full-agent overclaim"
   const contracts = readFileSync("docs/agent-bridge/capability-contracts.md", "utf8");
   const templates = readFileSync("docs/agent-bridge/capability-templates.md", "utf8");
   const provider = readFileSync("docs/agent-bridge/provider-configuration.md", "utf8");
-  const docs = [project, safety, contracts, templates, provider].join("\n");
+  const releaseWorkflow = readFileSync("docs/operations/release-workflow.md", "utf8");
+  const changelog = readFileSync("CHANGELOG.md", "utf8");
+  const docs = [project, safety, contracts, templates, provider, releaseWorkflow, changelog].join("\n");
 
-  assert.match(docs, /Layer 5 narrow product closure is implemented for the current fixed capability set/);
+  assert.match(docs, /Pastey 1\.9\.1 completes the current Layer 5 narrow product closure for the fixed capability set/);
+  assert.match(docs, /Layer 5 narrow product closure and smoke bugfix consolidation/);
   assert.match(docs, /Transform \+ Return/);
   assert.match(docs, /Search \+ Return/);
   assert.match(docs, /runtime\.hello_stdout/);
   assert.match(docs, /filesystem\.find_file_candidates/);
   assert.match(docs, /transfer\.request_candidate_payload/);
   assert.match(docs, /handoff_queued.*queue acceptance/s);
+  assert.match(docs, /Search consent does not authorize transfer/);
+  assert.match(docs, /Payload handoff requires second consent/);
+  assert.match(docs, /automatic refresh|auto-refresh|automatically refresh/i);
+  assert.match(docs, /Check for updates.*fallback/s);
+  assert.match(docs, /Full sent\/received text and stdout\/result content is accessible|full content view\/copy/i);
+  assert.match(docs, /Remote device platform labels|remote platform labels|remote Linux peers/i);
+  assert.match(docs, /1\.9\.1 Manual Smoke Checklist/);
+  assert.match(docs, /Candidate payload deny/);
+  assert.match(docs, /Linux peer display does not appear as local `This Mac`/);
   assert.match(docs, /global Activity detail/);
   assert.match(docs, /two-device smoke validation|Manual\/two-device validation|Manual dual-device smoke remains pending/);
   assert.match(docs, /not full Agent Bridge or full Jarvis completion/);
   assert.match(docs, /do not add task types, shell support, model-authored code execution, broad browsing, automatic transfer after search/);
   assert.doesNotMatch(docs, /is full Jarvis|full Jarvis is implemented|full Agent Bridge is implemented|approved transfer handoff from file candidates/);
   assert.doesNotMatch(docs, /provides shell support|supports arbitrary command|executes model-authored code|automatic transfer after search is implemented/i);
+  assert.doesNotMatch(docs, /docs\/operations\/releases\/1\.9\.1\.md|releases\/1\.9\.1/);
 });
 
 test("Room control consumes the active room state directly and has no independent room selector", () => {
