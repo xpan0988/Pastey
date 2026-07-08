@@ -90,23 +90,6 @@ npm run build:checked:linux
 
 `npm run check:version` verifies that `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.lock` match the authoritative `src-tauri/Cargo.toml` version. On tag builds, it also checks the Git tag version.
 
-## 1.9.1 Manual Smoke Checklist
-
-For Pastey 1.9.1 product confidence, record exact app version/build, platform pair, network, and observed result boundaries for:
-
-- Hello Stdout success.
-- Hello Stdout deny.
-- Request file search success.
-- Request file search deny.
-- Candidate payload success with `handoff_queued` and existing transfer pipeline progress/completion.
-- Candidate payload deny.
-- Stale, expired, deleted, or changed candidate does not enqueue.
-- Disconnect/timeout around preview, consent, execution, or handoff fails closed.
-- Linux peer display does not appear as local `This Mac`.
-- Long sent/received text remains fully viewable and copyable.
-- Stdout/result block remains fully viewable and copyable.
-- Metadata search exposes no receiver absolute path or file contents.
-
 ## Commit, Tag, And Push
 
 The release commit uses:
