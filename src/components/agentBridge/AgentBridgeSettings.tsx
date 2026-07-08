@@ -12,7 +12,7 @@ export function AgentBridgeSettings() {
         <div className="diagnostics-panel-header">
           <div>
             <strong>Agent Bridge</strong>
-            <p className="muted">Global runtime-memory configuration only. Room workflow lives in the active Room.</p>
+            <p className="muted">Global runtime-memory configuration only. Bridge workflow lives in the active Bridge.</p>
           </div>
           <label>
             Enabled

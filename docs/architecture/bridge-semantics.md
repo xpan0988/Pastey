@@ -2,7 +2,7 @@
 
 This document defines the product-level semantics for Pastey Bridge sessions. It is the canonical terminology reference for Bridge lifecycle, peer acceptance, and authority boundaries. For the target route/selection model and current single-peer audit, see [bridge-routing.md](bridge-routing.md).
 
-Legacy implementation term: Room. Existing code, storage, tests, and some file names may still use `Room`, `RoomItem`, `RoomControlEvent`, `RoomPage`, `room_id`, and room-control naming during the documentation-first migration. Those names describe the current implementation surface, not the final product concept.
+Legacy implementation term: Room. Existing code, storage, tests, and some file names may still use `Room`, `RoomItem`, `RoomControlEvent`, `room_id`, and room-control naming during the Bridge terminology migration. Those names describe the current implementation surface, not the final product concept.
 
 ## Core Definition
 

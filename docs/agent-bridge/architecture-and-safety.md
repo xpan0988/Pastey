@@ -6,7 +6,7 @@ The current product reality is a narrow bounded-capability vertical slice, the f
 
 ## Current Flow
 
-1. The Bridge UI builds a redacted current-session context snapshot. Legacy implementation term: Room UI.
+1. Bridge detail builds a redacted current-session context snapshot.
 2. A provider returns an advisory action plan.
 3. The host validates the plan with an allowlist and unsafe-field scan.
 4. The local PolicyGate decides whether the plan may enter pending confirmation.

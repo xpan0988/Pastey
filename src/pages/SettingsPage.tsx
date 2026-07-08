@@ -8,6 +8,7 @@ import {
   getDeviceProfile,
   getLastBenchmarkResults,
   openLogsFolder,
+  revealInFolder,
   runLoopbackBenchmark,
   updateConfig
 } from "../lib/tauri";
@@ -46,6 +47,7 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
   const [diagnosticMessage, setDiagnosticMessage] = useState<string | null>(null);
   const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
   const [benchmarkRunning, setBenchmarkRunning] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   useEffect(() => {
     setWindowValue(windowSelectionFromConfig(config.transfer_window_override, PRESET_WINDOWS));
@@ -105,6 +107,19 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
 
     if (typeof selected === "string") {
       await save({ ...config, inbox_dir: selected });
+    }
+  }
+
+  async function handleOpenReceivingFolder() {
+    setLogActionMessage(null);
+    if (!config.inbox_dir) {
+      setLogActionMessage("Choose a receiving folder first.");
+      return;
+    }
+    try {
+      await revealInFolder(config.inbox_dir);
+    } catch (err) {
+      setLogActionMessage(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -186,23 +201,23 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
   }
 
   return (
-    <div className="workstation-view settings-workstation" aria-label="Settings">
+    <div className="product-page settings-workstation" aria-label="Settings">
+      <header className="product-header">
+        <div>
+          <h1>Settings</h1>
+          <p>Configure how Pastey works across your devices.</p>
+        </div>
+      </header>
+
       <div className="settings-card-grid">
         <SettingsCard title="General" icon="gear">
           <SettingsControlRow label="Device name" value={deviceProfile?.device_name || "This device"} />
           <SettingsControlRow label="Theme" control={<DisabledSelect value="System" />} />
-          <SettingsControlRow label="Startup behavior" value="Not available yet" disabled />
-          <SettingsControlRow label="Downloads location" value={config.inbox_dir ? "Custom" : "Inbox"} actionLabel="Choose" onAction={chooseInbox} />
           <SettingsControlRow label="Global shortcut" value={prettifyShortcut(config.shortcut)} />
         </SettingsCard>
 
-        <SettingsCard title="Transfers" icon="drive">
-          <SettingsControlRow label="Max concurrent transfers" value="Not available yet" disabled />
-          <SettingsControlRow
-            label="Burn defaults"
-            control={<Switch checked={config.auto_burn_after_download} onChange={(event) => void save({ ...config, auto_burn_after_download: event.target.checked })} />}
-          />
-          <SettingsControlRow label="Receiver approval defaults" value="Not available yet" disabled />
+        <SettingsCard title="Receiving" icon="drive">
+          <SettingsControlRow label="Receiving folder" value={config.inbox_dir ? "Custom" : "Default"} actionLabel="Change" onAction={chooseInbox} />
           <SettingsControlRow
             label="Save received files"
             control={<Switch checked={config.save_received_files_to_inbox} onChange={(event) => void save({ ...config, save_received_files_to_inbox: event.target.checked })} />}
@@ -211,142 +226,143 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
             label="Save received images"
             control={<Switch checked={config.save_received_images_to_inbox} onChange={(event) => void save({ ...config, save_received_images_to_inbox: event.target.checked })} />}
           />
-          <SettingsControlRow label="Compression" value="Not available yet" disabled />
-          <SettingsControlRow label="Bandwidth limit" value="Not available yet" disabled />
+          <SettingsControlRow label="Open receiving folder" actionLabel="Open" onAction={handleOpenReceivingFolder} disabled={!config.inbox_dir} />
+        </SettingsCard>
+
+        <SettingsCard title="Transfers" icon="drive">
+          <SettingsControlRow label="Max concurrent transfers" value="Automatic" disabled />
+          <SettingsControlRow
+            label="Burn defaults"
+            control={<Switch checked={config.auto_burn_after_download} onChange={(event) => void save({ ...config, auto_burn_after_download: event.target.checked })} />}
+          />
+          <SettingsControlRow label="Transfer window" value={windowValue === "default" ? "Show progress" : `${windowValue} windows`} />
         </SettingsCard>
 
         <SettingsCard title="Security" icon="shield">
-          <SettingsControlRow label="Encryption status" value="Enabled" status="Secure" />
-          <SettingsControlRow label="Key verification" value="Room scoped" />
-          <SettingsControlRow label="Trusted peers" value="Current-session only" />
-          <SettingsControlRow label="Approval policy" value="Per request" />
-          <p className="settings-card-note">There is no generic runtime or reusable trust authority.</p>
+          <SettingsControlRow label="Encryption enabled" value="On" status="Secure" />
+          <SettingsControlRow label="Require approval" value="On" />
+          <SettingsControlRow label="Trusted devices" value="Managed from Devices" />
         </SettingsCard>
 
         <SettingsCard title="Discovery" icon="nearby">
-          <SettingsControlRow label="Local network discovery" value="Enabled" status="Stable" />
+          <SettingsControlRow label="Local network discovery" value="On" status="Ready" />
           <SettingsControlRow label="Join with code" actionLabel="Open" onAction={onJoinWithCode} />
-          <SettingsControlRow label="Presence TTL" value="Current discovery default" />
+        </SettingsCard>
+
+        <SettingsCard title="Labs" icon="bell">
           <SettingsControlRow
-            label="Diagnostics logging"
+            label="Ask Bridge Beta"
+            detail="Try upcoming Bridge actions."
             control={<Switch checked={config.dev_tools_enabled} onChange={(event) => void saveDevToolsEnabled(event.target.checked)} />}
           />
-        </SettingsCard>
-
-        <SettingsCard title="Notifications" icon="bell">
-          <SettingsControlRow label="Transfer completed" value="Not available yet" disabled />
-          <SettingsControlRow label="Approval requests" value="Not available yet" disabled />
-          <SettingsControlRow label="Errors" value="Not available yet" disabled />
-        </SettingsCard>
-
-        <SettingsCard title="Advanced diagnostics" icon="wrench">
-          <SettingsControlRow
-            label="Diagnostics logging"
-            value={config.dev_tools_enabled ? "Enabled" : "Disabled"}
-            control={<Switch checked={config.dev_tools_enabled} onChange={(event) => void saveDevToolsEnabled(event.target.checked)} />}
-          />
-          <SettingsControlRow label="Local profile" value={diagnosticsLoading ? "Loading..." : deviceProfile ? deviceTitle(deviceProfile) : "Not loaded"} actionLabel="Refresh" onAction={() => refreshDiagnostics(true)} disabled={diagnosticsLoading} />
-          <SettingsControlRow label="Capability probe" value={deviceCapabilities ? availableRuntimeTitle(deviceCapabilities) : "Not probed"} />
-          <SettingsControlRow label="Last benchmark" value={lastBenchmark ? `${lastBenchmark.average_MBps.toFixed(1)} MB/s` : "Not run"} />
-          {diagnosticMessage ? <p className="muted">{diagnosticMessage}</p> : null}
-        </SettingsCard>
-
-        <SettingsCard title="Transfer diagnostics" icon="drive">
-          <SettingsControlRow label="Advanced transfer grouping" detail="Uses the existing transfer planner setting." control={
-            <select
-              value={config.micro_flow_group_mode}
-              onChange={(event) => void saveMicroFlowGroupMode(event.target.value as AppConfig["micro_flow_group_mode"])}
-            >
-              <option value="dynamic">Dynamic</option>
-              <option value="fixed">Fixed</option>
-            </select>
-          } />
-          <SettingsControlRow label="Transfer window" detail="Existing binary transfer pipeline depth." control={
-            <select value={windowValue} onChange={(event) => void saveTransferWindow(event.target.value)}>
-              <option value="default">Default / Auto</option>
-              <option value="1">1</option>
-              <option value="2">2</option>
-              <option value="4">4</option>
-              <option value="8">8</option>
-              <option value="16">16</option>
-              <option value="custom">Custom</option>
-            </select>
-          } />
-          {windowValue === "custom" ? (
-            <SettingsControlRow label="Custom window" detail="1 to 16" control={
-              <input
-                type="number"
-                min={1}
-                max={16}
-                step={1}
-                value={customWindow}
-                placeholder={String(DEFAULT_WINDOW)}
-                onChange={(event) => setCustomWindow(event.target.value)}
-                onBlur={() => void saveCustomWindow()}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") event.currentTarget.blur();
-                }}
-              />
-            } />
-          ) : null}
-        </SettingsCard>
-
-        <SettingsCard title="Device diagnostics" icon="nearby">
-          <p className="muted diagnostics-note">
-            Loopback tests stay on this device. They do not measure Wi-Fi, Ethernet, school network, or internet speed.
-          </p>
-          <div className="diagnostic-grid">
-            <DiagnosticBlock title="Device Profile" rows={[
-              ["Device", deviceProfile ? deviceTitle(deviceProfile) : "Unknown"],
-              ["Platform", deviceProfile ? platformTitle(deviceProfile) : "Unknown"],
-              ["Power", deviceProfile ? powerTitle(deviceProfile) : "Unknown"]
-            ]} />
-            <DiagnosticBlock title="Capabilities" rows={[
-              ["CPU", deviceProfile ? cpuTitle(deviceProfile) : "Unknown"],
-              ["GPU", deviceCapabilities ? gpuTitle(deviceCapabilities) : "Unknown"],
-              ["Runtimes", deviceCapabilities ? availableRuntimeTitle(deviceCapabilities) : "Unknown"]
-            ]} />
-            <DiagnosticBlock title="Last Benchmark" rows={[
-              ["Mode", lastBenchmark ? benchmarkModeTitle(lastBenchmark.benchmark_mode) : "Unknown"],
-              ["Quality", lastBenchmark ? lastBenchmark.link_quality : "Not run"],
-              ["Average", lastBenchmark ? `${lastBenchmark.average_MBps.toFixed(1)} MB/s` : "Not run"],
-              ["Latency", lastBenchmark?.latency_ms != null ? `${lastBenchmark.latency_ms.toFixed(1)} ms` : "Unknown"]
-            ]} />
-          </div>
-        </SettingsCard>
-
-        <SettingsCard title="Local diagnostic tools" icon="wrench">
-          <div className="settings-diagnostics-body">
-            <div className="benchmark-controls">
-              <select value={benchmarkMode} onChange={(event) => setBenchmarkMode(event.target.value as BenchmarkMode)}>
-                <option value="raw_memory">Loopback raw memory</option>
-                <option value="pastey_pipeline">Loopback Pastey pipeline</option>
-              </select>
-              <select value={benchmarkDuration} onChange={(event) => setBenchmarkDuration(Number(event.target.value))}>
-                <option value={1}>Target 1s quick</option>
-                <option value={5}>Target 5s standard</option>
-                <option value={15}>Target 15s extended</option>
-              </select>
-              <button className="secondary-button" disabled={benchmarkRunning} onClick={() => void handleRunLoopbackBenchmark()}>
-                {benchmarkRunning ? "Running..." : "Run local test"}
-              </button>
-            </div>
-            <p className="muted diagnostics-note">{benchmarkModeDescription(benchmarkMode)}</p>
-            {logActionMessage ? <p className="muted">{logActionMessage}</p> : null}
-            <div className="diagnostic-actions">
-              <button className="secondary-button" onClick={() => void handleOpenLogsFolder()}>
-                Open logs
-              </button>
-              <button className="secondary-button" onClick={() => void handleCopyLastError()}>
-                Copy last error
-              </button>
-              <button className="secondary-button" onClick={() => void handleCheckForUpdates()}>
-                Check updates
-              </button>
-            </div>
-          </div>
         </SettingsCard>
       </div>
+
+      <section className="settings-advanced-section">
+        <button
+          type="button"
+          className="settings-advanced-toggle"
+          aria-expanded={advancedOpen}
+          onClick={() => setAdvancedOpen((open) => !open)}
+        >
+          <span>Advanced</span>
+          <small>Troubleshooting, reset, and more advanced options.</small>
+        </button>
+        {advancedOpen ? (
+          <div className="settings-card-grid">
+            <SettingsCard title="Diagnostics logging" icon="wrench">
+              <SettingsControlRow
+                label="Diagnostics logging"
+                value={config.dev_tools_enabled ? "Enabled" : "Disabled"}
+                control={<Switch checked={config.dev_tools_enabled} onChange={(event) => void saveDevToolsEnabled(event.target.checked)} />}
+              />
+              <SettingsControlRow label="Device diagnostics" value={diagnosticsLoading ? "Loading..." : deviceProfile ? deviceTitle(deviceProfile) : "Not loaded"} actionLabel="Refresh" onAction={() => refreshDiagnostics(true)} disabled={diagnosticsLoading} />
+              <SettingsControlRow label="Capability probe" value={deviceCapabilities ? availableRuntimeTitle(deviceCapabilities) : "Not probed"} />
+              <SettingsControlRow label="Logs folder" actionLabel="Open" onAction={handleOpenLogsFolder} />
+              {diagnosticMessage ? <p className="muted">{diagnosticMessage}</p> : null}
+            </SettingsCard>
+
+            <SettingsCard title="Transfer diagnostics" icon="drive">
+              <SettingsControlRow label="Transfer diagnostics" detail="Advanced transfer behavior setting." control={
+                <select
+                  value={config.micro_flow_group_mode}
+                  onChange={(event) => void saveMicroFlowGroupMode(event.target.value as AppConfig["micro_flow_group_mode"])}
+                >
+                  <option value="dynamic">Dynamic</option>
+                  <option value="fixed">Fixed</option>
+                </select>
+              } />
+              <SettingsControlRow label="Transfer window" detail="Advanced transfer pipeline depth." control={
+                <select value={windowValue} onChange={(event) => void saveTransferWindow(event.target.value)}>
+                  <option value="default">Default / Auto</option>
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="4">4</option>
+                  <option value="8">8</option>
+                  <option value="16">16</option>
+                  <option value="custom">Custom</option>
+                </select>
+              } />
+              {windowValue === "custom" ? (
+                <SettingsControlRow label="Custom window" detail="1 to 16" control={
+                  <input
+                    type="number"
+                    min={1}
+                    max={16}
+                    step={1}
+                    value={customWindow}
+                    placeholder={String(DEFAULT_WINDOW)}
+                    onChange={(event) => setCustomWindow(event.target.value)}
+                    onBlur={() => void saveCustomWindow()}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") event.currentTarget.blur();
+                    }}
+                  />
+                } />
+              ) : null}
+            </SettingsCard>
+
+            <SettingsCard title="Troubleshooting" icon="wrench">
+              <div className="diagnostic-grid">
+                <DiagnosticBlock title="Device" rows={[
+                  ["Device", deviceProfile ? deviceTitle(deviceProfile) : "Unknown"],
+                  ["Platform", deviceProfile ? platformTitle(deviceProfile) : "Unknown"],
+                  ["Power", deviceProfile ? powerTitle(deviceProfile) : "Unknown"]
+                ]} />
+                <DiagnosticBlock title="Last local test" rows={[
+                  ["Mode", lastBenchmark ? benchmarkModeTitle(lastBenchmark.benchmark_mode) : "Unknown"],
+                  ["Quality", lastBenchmark ? lastBenchmark.link_quality : "Not run"],
+                  ["Average", lastBenchmark ? `${lastBenchmark.average_MBps.toFixed(1)} MB/s` : "Not run"]
+                ]} />
+              </div>
+              <div className="benchmark-controls">
+                <select value={benchmarkMode} onChange={(event) => setBenchmarkMode(event.target.value as BenchmarkMode)}>
+                  <option value="raw_memory">Loopback raw memory</option>
+                  <option value="pastey_pipeline">Loopback Pastey pipeline</option>
+                </select>
+                <select value={benchmarkDuration} onChange={(event) => setBenchmarkDuration(Number(event.target.value))}>
+                  <option value={1}>Target 1s quick</option>
+                  <option value={5}>Target 5s standard</option>
+                  <option value={15}>Target 15s extended</option>
+                </select>
+                <button className="secondary-button" disabled={benchmarkRunning} onClick={() => void handleRunLoopbackBenchmark()}>
+                  {benchmarkRunning ? "Running..." : "Run local test"}
+                </button>
+              </div>
+              <p className="muted diagnostics-note">{benchmarkModeDescription(benchmarkMode)}</p>
+              {logActionMessage ? <p className="muted">{logActionMessage}</p> : null}
+              <div className="diagnostic-actions">
+                <button className="secondary-button" onClick={() => void handleCopyLastError()}>
+                  Copy last error
+                </button>
+                <button className="secondary-button" onClick={() => void handleCheckForUpdates()}>
+                  Check updates
+                </button>
+              </div>
+            </SettingsCard>
+          </div>
+        ) : null}
+      </section>
     </div>
   );
 }

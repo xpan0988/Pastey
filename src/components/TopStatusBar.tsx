@@ -25,19 +25,19 @@ export function TopStatusBar({
       />
       <StatusMetric
         icon="peers"
-        label="Peer discovery"
+        label="Bridges"
         value={peerDiscovery}
         detail={peerDiscoveryStatus}
       />
       <StatusMetric
         icon="approvals"
-        label="Inbox"
+        label="Pending"
         value={String(approvalsCount)}
         detail={approvalsCount === 1 ? "Pending" : "Pending"}
       />
       <StatusMetric
         icon="queue"
-        label="Queue"
+        label="Activity"
         value={String(queueCount)}
         detail={queueCount === 1 ? "Active" : "Active"}
       />
