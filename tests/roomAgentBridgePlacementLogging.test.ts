@@ -186,6 +186,21 @@ test("Bridge request-file product path uses real capability transport and handof
   assert.doesNotMatch(requestSource, /selected_peers|broadcast_bridge|autoTransfer|auto-send|fileContents|includeFileContents: true/);
 });
 
+test("Bridge request-file preview target binding uses the room-control selected peer ref", () => {
+  const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
+  const requestSource = pages.slice(pages.indexOf("function RequestFilePanel"), pages.indexOf("interface ActivityPageProps"));
+  const previewBuilder = pages.slice(pages.indexOf("function buildRequestFilePreviewEvent"), pages.indexOf("function createRequestFileProductState"));
+
+  assert.match(requestSource, /prepareCandidateSearchWorkflow\(query, scopes, session\.peerSessionRef\)/);
+  assert.match(requestSource, /prepareCandidateSearchWorkflow\(query \|\| "selected file", scopes, session\.peerSessionRef\)/);
+  assert.match(previewBuilder, /targetPeerRef: session\.peerSessionRef/);
+  assert.match(previewBuilder, /sourceDeviceRef: session\.localSessionRef/);
+  assert.match(requestSource, /assertCapabilityEventHasSelectedPeerRoute\(session, event\)/);
+  assert.match(requestSource, /bridgeRoutePayload\(selectedRoute, "pastey-bridge-control-route-v1"\)/);
+  assert.doesNotMatch(requestSource, /prepareCandidateSearchWorkflow\([^)]*selectedPeer\.peerSessionId/);
+  assert.doesNotMatch(requestSource + previewBuilder, /selected-peer-ref/);
+});
+
 test("Bridge request-file lifecycle shows candidate and handoff product events", () => {
   const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
   const timeline = readFileSync("src/components/OperationTimeline.tsx", "utf8");
@@ -196,10 +211,12 @@ test("Bridge request-file lifecycle shows candidate and handoff product events",
     "Host validated safe scopes",
     "You confirmed",
     "Peer approved search",
+    "Peer denied search",
     "Candidates returned",
     "Candidate selected",
     "Payload request sent",
     "Peer approved transfer",
+    "Peer denied transfer",
     "Handoff queued",
     "Transfer completed",
   ]) {
@@ -214,6 +231,73 @@ test("Bridge request-file lifecycle shows candidate and handoff product events",
   assert.match(timeline, /status: OperationTimelineStatus/);
   assert.match(requestSource, /request-file-advanced-details/);
   assert.doesNotMatch(requestSource + timeline, /chain-of-thought|model reasoning|raw internal prompt|reasoning trace|model thoughts|scratchpad/i);
+});
+
+test("Bridge product deny states are terminal and do not continue execution or handoff", () => {
+  const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
+  const helper = readFileSync("src/lib/agentBridge/helloStdoutProductFlow.ts", "utf8");
+  const helloSource = pages.slice(pages.indexOf("function BridgeDetailPage"), pages.indexOf("function HelloPeerDemoPanel"));
+  const requestSource = pages.slice(pages.indexOf("function RequestFilePanel"), pages.indexOf("interface ActivityPageProps"));
+
+  assert.match(helper, /"Peer denied"/);
+  assert.match(helloSource, /decisionEvent\.kind === "capability_preview_deny"[\s\S]*status: "denied"[\s\S]*mergeHelloSteps\(current\.steps, \["Peer denied"\]\)/);
+  assert.match(requestSource, /decisionEvent\.kind === "capability_preview_deny"[\s\S]*"Peer denied transfer"[\s\S]*"Peer denied search"[\s\S]*status: decisionCapability === "transfer\.request_candidate_payload" \? "payload_denied" : "search_denied"/);
+  assert.match(requestSource, /steps: mergeRequestFileSteps\(current\.steps, \[deniedStep\]\)/);
+  assert.doesNotMatch(helloSource, /capability_preview_deny[\s\S]{0,500}buildHelloStdoutExecutionRequest/);
+  assert.doesNotMatch(requestSource, /capability_preview_deny[\s\S]{0,500}buildCandidatePayloadExecutionRequest|capability_preview_deny[\s\S]{0,500}onEnqueueCandidatePayloadHandoff/);
+});
+
+test("Bridge product lifecycle refreshes automatically while panels are active", () => {
+  const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
+  const bridgeDetailSource = pages.slice(pages.indexOf("function BridgeDetailPage"), pages.indexOf("function HelloPeerDemoPanel"));
+  const requestSource = pages.slice(pages.indexOf("function RequestFilePanel"), pages.indexOf("interface ActivityPageProps"));
+
+  assert.match(bridgeDetailSource, /window\.setInterval\(refresh, 1600\)/);
+  assert.match(bridgeDetailSource, /window\.addEventListener\("focus", refresh\)/);
+  assert.match(bridgeDetailSource, /isHelloPeerTerminal\(helloFlow\.status\)/);
+  assert.match(bridgeDetailSource, /helloQueueRef\.current/);
+  assert.match(requestSource, /window\.setInterval\(refresh, 1600\)/);
+  assert.match(requestSource, /window\.addEventListener\("focus", refresh\)/);
+  assert.match(requestSource, /isRequestFileTerminal\(flow\.status\)/);
+  assert.match(requestSource, /queueRef\.current/);
+  assert.match(pages, /Check for updates/);
+  assert.doesNotMatch(bridgeDetailSource + requestSource, /setInterval[\s\S]{0,200}handleConfirmSearch|setInterval[\s\S]{0,200}confirmHelloPeerDemo|setInterval[\s\S]{0,200}buildRequestFilePreviewEvent/);
+});
+
+test("Bridge device labels keep local profile separate from remote peer metadata", () => {
+  const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
+  const devicesSource = pages.slice(pages.indexOf("export function DevicesProductPage"), pages.indexOf("function TargetSelector"));
+
+  assert.match(pages, /getDeviceProfile\(\{ forceRefresh: false \}\)/);
+  assert.match(pages, /function localDeviceLabel/);
+  assert.match(pages, /This Linux device/);
+  assert.match(pages, /This Windows device/);
+  assert.match(pages, /function remotePeerDisplayName/);
+  assert.match(pages, /return label && !isLocalOnlyDeviceLabel\(label\) \? label : "Nearby device"/);
+  assert.match(devicesSource, /nearbyDeviceSystemSummary\(device\)/);
+  assert.match(pages, /device\.platform/);
+  assert.match(pages, /device\.app_version/);
+  assert.doesNotMatch(pages, /<MemberChip title="This Mac"/);
+});
+
+test("Bridge activity and stdout expose full content while keeping previews visual-only", () => {
+  const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
+  const css = readFileSync("src/styles.css", "utf8");
+  const activitySource = pages.slice(pages.indexOf("interface ActivityListRow"), pages.indexOf("function ProductHeader"));
+  const helloPanel = pages.slice(pages.indexOf("function HelloPeerDemoPanel"), pages.indexOf("function RequestFilePanel"));
+
+  assert.match(activitySource, /fullText\?: string/);
+  assert.match(activitySource, /previewText\?: string/);
+  assert.match(activitySource, /contentPreview\(fullText\)/);
+  assert.match(activitySource, /View full/);
+  assert.match(activitySource, /Copy full text/);
+  assert.match(activitySource, /copyTextToClipboard\(fullText\)/);
+  assert.match(helloPanel, /Copy stdout/);
+  assert.match(helloPanel, /copyTextToClipboard\(result\.stdout\)/);
+  assert.match(css, /\.activity-full-text\.expanded[\s\S]*overflow: auto/);
+  assert.match(css, /\.hello-peer-result pre[\s\S]*overflow: auto/);
+  assert.doesNotMatch(activitySource, /fullText: .*slice\(/);
+  assert.doesNotMatch(activitySource, /fullText = .*trim/);
 });
 
 test("Settings is organized around user-facing sections and hides internals by default", () => {
@@ -280,7 +364,7 @@ test("Hello Peer product lifecycle displays Pastey events only", () => {
   const timeline = readFileSync("src/components/OperationTimeline.tsx", "utf8");
   const panelSource = pages.slice(pages.indexOf("function HelloPeerDemoPanel"), pages.indexOf("function RequestFilePanel"));
 
-  for (const step of ["Plan prepared", "Host validated", "You confirmed", "Peer requested", "Peer approved", "Runtime executed", "Result returned"]) {
+  for (const step of ["Plan prepared", "Host validated", "You confirmed", "Peer requested", "Peer approved", "Peer denied", "Runtime executed", "Result returned"]) {
     assert.match(helper, new RegExp(step));
   }
   assert.match(panelSource, /<OperationTimeline/);
