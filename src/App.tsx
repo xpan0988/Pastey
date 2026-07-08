@@ -1,38 +1,39 @@
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import type { MutableRefObject, ReactNode } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import type { MutableRefObject } from "react";
 import { AppShell } from "./components/AppShell";
 import type { PrimaryView } from "./components/PrimarySidebar";
-import { RoomPage } from "./pages/RoomPage";
+import {
+  ActivityPage,
+  BridgeDetailPage,
+  BridgePage,
+  DevicesProductPage,
+} from "./pages/BridgeProductPages";
 import { SettingsPage } from "./pages/SettingsPage";
-import { formatBytes, formatCode, formatTimestamp } from "./lib/format";
 import {
   acceptNearbyJoin,
   burnRoom,
   cancelTransfer,
+  createRoom,
   deleteTempFile,
   getConfig,
   getFileTransferMetadata,
   getRoom,
   joinRoom,
-  listNearbyDevices,
+  leaveRoom,
   listRoomItems,
   listRooms,
   logFrontendDiagnostic,
   markJoinPromptRendered,
   pendingJoinRequests,
   rejectNearbyJoin,
-  requestNearbyJoin,
   sendFileToRoom,
   updateTransferWindow
 } from "./lib/tauri";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "./lib/constants";
 import {
   activeCancellableTransferRequests,
-  cancelBatchLocally,
-  cancelQueueItem,
   clearQueuedItemsForRoom,
   completeMicroFlowGroupFromChildren,
   correlateTransferProgress,
@@ -72,42 +73,27 @@ import {
   type TransferPlannerPolicy
 } from "./lib/transferPlanner";
 import {
-  deriveBridgeRoutingStateForRoom,
-  routeStateLabel,
   sendFileToRoomWithBridgeRoute
 } from "./lib/bridgeRoutingRuntime";
-import { bridgePeerSessionId, formatBridgeRouteErrorForUser, type BridgeRoute } from "./lib/bridgeRouting";
-import { legacyRoomToBridgePeerCollection } from "./lib/bridgeRoomAdapter";
-import { findBridgePeerBySessionId, getRouteableBridgePeers, type BridgePeerSession } from "./lib/bridgePeers";
+import { formatBridgeRouteErrorForUser } from "./lib/bridgeRouting";
 import { mergeTransferEvent } from "./lib/transferState";
 import {
-  buildCandidatePayloadWorkflowPayloadPreview,
-  confirmCandidatePayloadWorkflowSearch,
   createRuntimeDataWindowTargetState,
-  createCandidatePayloadWorkflow,
   getControlWindowSessionRevision,
   getOutgoingControlWindowDemand,
   getRuntimeControlWindowStatus,
   logAgentBridgeLifecycle,
-  markCandidatePayloadWorkflowPayloadPendingConsent,
   publishRuntimeControlWindowStatus,
   reduceRuntimeDataWindowTarget,
-  startCandidatePayloadWorkflowFromSearchAdvisory,
   subscribeOutgoingControlWindowDemand,
   subscribeControlWindowSessionRevision,
-  type CandidatePayloadWorkflow,
-  type CandidatePayloadWorkflowCandidate,
   type RuntimeDataWindowTarget,
 } from "./lib/agentBridge";
-import {
-  buildMockAiContextSnapshot,
-  buildMockFileCandidatePlan,
-} from "./lib/ai";
 import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, NearbyDevice, RoomInfo, RoomItem } from "./lib/types";
 
 type View =
   | { screen: "primary" }
-  | { screen: "room"; roomId: string };
+  | { screen: "bridge-detail"; roomId: string };
 
 interface PreparedQueueMetadata {
   displayName: string;
@@ -144,6 +130,7 @@ function App() {
   const [currentRoom, setCurrentRoom] = useState<RoomInfo | null>(null);
   const [activeBridgeRoomId, setActiveBridgeRoomId] = useState("");
   const [roomItems, setRoomItems] = useState<RoomItem[]>([]);
+  const [activityRoomItems, setActivityRoomItems] = useState<RoomItem[]>([]);
   const [transfers, setTransfers] = useState<Record<string, FileTransferProgressEvent>>({});
   const [scheduler, setScheduler] = useState<TransferSchedulerState>(() => createTransferSchedulerState());
   const [joinRequest, setJoinRequest] = useState<JoinRequestPrompt | null>(null);
@@ -280,6 +267,23 @@ function App() {
 
     void load();
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadActivityItems() {
+      const activeRooms = rooms.filter((room) => room.status !== "burned");
+      const settled = await Promise.allSettled(activeRooms.map((room) => listRoomItems(room.id)));
+      if (cancelled) return;
+      setActivityRoomItems(settled.flatMap((result) => result.status === "fulfilled" ? result.value : []));
+    }
+
+    void loadActivityItems();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [rooms]);
 
   useEffect(() => {
     let cancelled = false;
@@ -589,11 +593,13 @@ function App() {
 
   async function openRoom(room: RoomInfo) {
     closedRoomIdsRef.current.delete(room.id);
-    setView({ screen: "room", roomId: room.id });
+    setActiveBridgeRoomId(room.id);
+    setView({ screen: "bridge-detail", roomId: room.id });
     try {
       const [nextRoom, nextItems] = await Promise.all([getRoom(room.id), listRoomItems(room.id)]);
       setCurrentRoom(nextRoom);
       setRoomItems(nextItems);
+      setActivityRoomItems((current) => mergeActivityItems(current, nextItems));
       await refreshRooms(room.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -601,12 +607,13 @@ function App() {
   }
 
   async function refreshCurrentRoom() {
-    const targetRoomId = view.screen === "room" ? view.roomId : activeBridgeRoomId;
+    const targetRoomId = view.screen === "bridge-detail" ? view.roomId : activeBridgeRoomId;
     if (!targetRoomId) return;
     try {
       const [nextRoom, nextItems] = await Promise.all([getRoom(targetRoomId), listRoomItems(targetRoomId)]);
       setCurrentRoom(nextRoom);
       setRoomItems(nextItems);
+      setActivityRoomItems((current) => mergeActivityItems(current, nextItems));
       const visibleRoom = await refreshRooms(targetRoomId);
       if (!visibleRoom) {
         setView({ screen: "primary" });
@@ -637,7 +644,7 @@ function App() {
 
   async function refreshRoomAfterQueueItem(roomId: string) {
     const currentView = viewRef.current;
-    if ((currentView.screen !== "room" || currentView.roomId !== roomId) && activeBridgeRoomId !== roomId) {
+    if ((currentView.screen !== "bridge-detail" || currentView.roomId !== roomId) && activeBridgeRoomId !== roomId) {
       await refreshRooms();
       return;
     }
@@ -646,6 +653,7 @@ function App() {
       const [nextRoom, nextItems] = await Promise.all([getRoom(roomId), listRoomItems(roomId)]);
       setCurrentRoom(nextRoom);
       setRoomItems(nextItems);
+      setActivityRoomItems((current) => mergeActivityItems(current, nextItems));
       const visibleRoom = await refreshRooms(roomId);
       if (!visibleRoom) {
         setView({ screen: "primary" });
@@ -806,19 +814,6 @@ function App() {
       terminal_reason: terminalReason
     });
     runtimeWindowStatsRef.current.delete(itemId);
-  }
-
-  function emitRuntimeWindowSummariesForBatch(
-    batchId: string,
-    terminalStatus: RuntimeWindowTerminalStatus,
-    terminalReason: string
-  ) {
-    for (const [itemId] of [...runtimeWindowStatsRef.current.entries()]) {
-      const item = schedulerRef.current.items[itemId];
-      if (item?.batchId === batchId) {
-        emitRuntimeWindowDiagnosticSummary(itemId, terminalStatus, terminalReason);
-      }
-    }
   }
 
   function emitRuntimeWindowSummariesForRoom(
@@ -1409,21 +1404,6 @@ function App() {
     return outcome;
   }
 
-  function enqueueRoomFiles(roomId: string, paths: string[]) {
-    console.info("[pastey queue] event=queue_enqueue_attempt room_id=%s file_count=%d", roomId, paths.length);
-    updateSchedulerState((current) => {
-      const next = enqueueTransferBatch(
-        current,
-        roomId,
-        paths.map((path) => ({ path }))
-      );
-      if (next === current) {
-        console.info("[pastey queue] event=queue_enqueue_rejected room_id=%s reason=no_new_items", roomId);
-      }
-      return next;
-    });
-  }
-
   function enqueueRoomTransferInputs(roomId: string, inputs: TransferQueueInput[]) {
     console.info("[pastey queue] event=queue_enqueue_attempt room_id=%s file_count=%d", roomId, inputs.length);
     updateSchedulerState((current) => {
@@ -1459,59 +1439,34 @@ function App() {
     return true;
   }
 
-  async function handleCancelQueueItem(itemId: string) {
-    const item = schedulerRef.current.items[itemId];
-    const transferId = item?.status === "sending" ? item.activeTransferId : undefined;
-    emitRuntimeWindowDiagnosticSummary(itemId, "cancelled", "queue_item_cancelled");
-    updateSchedulerState((current) => cancelQueueItem(current, itemId));
-
-    if (transferId && item) {
-      await cancelTransfer(transferId, {
-        source: "queue-item-cancel",
-        queueItemId: item.id,
-        batchId: item.batchId,
-        roomId: item.roomId
-      });
+  async function handleLeaveOrBurnBridge(room: RoomInfo, action: "leave" | "burn") {
+    emitRuntimeWindowSummariesForRoom(room.id, "interrupted", action === "leave" ? "bridge_left" : "bridge_burned");
+    updateSchedulerState((current) => clearQueuedItemsForRoom(current, room.id));
+    if (action === "leave") {
+      await leaveRoom(room.id);
+    } else {
+      await burnRoom(room.id);
     }
-  }
-
-  async function handleCancelQueueBatch(batchId: string) {
-    const transferRequests = Object.values(schedulerRef.current.items)
-      .filter((item) => item.batchId === batchId && item.status === "sending" && item.activeTransferId)
-      .map((item) => ({
-        transferId: item.activeTransferId as string,
-        itemId: item.id,
-        batchId: item.batchId,
-        roomId: item.roomId
-      }));
-
-    emitRuntimeWindowSummariesForBatch(batchId, "cancelled", "batch_cancelled");
-    updateSchedulerState((current) => cancelBatchLocally(current, batchId));
-
-    for (const request of transferRequests) {
-      await cancelTransfer(request.transferId, {
-        source: "queue-batch-cancel",
-        queueItemId: request.itemId,
-        batchId: request.batchId,
-        roomId: request.roomId
-      });
-    }
-  }
-
-  async function handleBurnRoom(roomId: string) {
-    emitRuntimeWindowSummariesForRoom(roomId, "interrupted", "room_burned");
-    updateSchedulerState((current) => clearQueuedItemsForRoom(current, roomId));
-    await burnRoom(roomId);
-    closedRoomIdsRef.current.add(roomId);
+    closedRoomIdsRef.current.add(room.id);
     setView({ screen: "primary" });
-    setActivePrimaryView("transfers");
-    if (activeBridgeRoomId === roomId) {
+    setActivePrimaryView("bridge");
+    if (activeBridgeRoomId === room.id) {
       setActiveBridgeRoomId("");
     }
     setCurrentRoom(null);
     setRoomItems([]);
-    setTransfers((current) => Object.fromEntries(Object.entries(current).filter(([, transfer]) => transfer.room_id !== roomId)));
+    setTransfers((current) => Object.fromEntries(Object.entries(current).filter(([, transfer]) => transfer.room_id !== room.id)));
     await refreshRooms();
+  }
+
+  async function handleCreateBridge() {
+    const room = await createRoom(config?.default_expiry_minutes ?? 15);
+    await openRoom(room);
+  }
+
+  async function handleJoinBridge(code: string) {
+    const room = await joinRoom(code);
+    await openRoom(room);
   }
 
   async function handleAcceptJoinRequest(request: JoinRequestPrompt) {
@@ -1541,15 +1496,9 @@ function App() {
 
   const transferEvents = Object.values(transfers);
   const schedulerItems = Object.values(scheduler.items);
-  const activeTransfers = transferEvents.filter(isActiveTransfer);
   const activeQueueItems = schedulerItems.filter(isActiveQueueItem);
   const approvalCount = joinRequest ? 1 : 0;
   const connectedRooms = rooms.filter((room) => room.peer_connected);
-  const activeBridgeRoom = activeBridgeRoomId
-    ? currentRoom?.id === activeBridgeRoomId
-      ? currentRoom
-      : rooms.find((room) => room.id === activeBridgeRoomId) ?? null
-    : null;
 
   function selectPrimaryView(nextView: PrimaryView) {
     setActivePrimaryView(nextView);
@@ -1572,63 +1521,55 @@ function App() {
     );
   }
 
-  const shellContent = view.screen === "room" && currentRoom ? (
-    <RoomPage
+  const shellContent = view.screen === "bridge-detail" && currentRoom ? (
+    <BridgeDetailPage
       room={currentRoom}
       items={roomItems}
       transfers={transferEvents.filter((transfer) => transfer.room_id === currentRoom.id)}
-      queue={selectRoomTransferQueue(scheduler, currentRoom.id)}
+      queueItems={selectRoomTransferQueue(scheduler, currentRoom.id).items}
       onBack={() => {
         setView({ screen: "primary" });
         void refreshRooms();
       }}
       onRefresh={refreshCurrentRoom}
-      onBurn={handleBurnRoom}
-      onEnqueueFiles={enqueueRoomFiles}
+      onLeaveOrBurn={handleLeaveOrBurnBridge}
       onEnqueueTransferInputs={enqueueRoomTransferInputs}
       onEnqueueCandidatePayloadHandoff={enqueueAgentBridgeCandidatePayloadHandoff}
-      onCancelQueueItem={handleCancelQueueItem}
-      onCancelQueueBatch={handleCancelQueueBatch}
-      agentBridgeEnabled={config.dev_tools_enabled}
+      onOpenActivity={() => {
+        setActivePrimaryView("activity");
+        setView({ screen: "primary" });
+      }}
+      askBridgeBetaEnabled={config.dev_tools_enabled}
     />
   ) : (
     <>
       {activePrimaryView === "bridge" ? (
-        <BridgeView
+        <BridgePage
           rooms={rooms}
-          activeBridgeRoom={activeBridgeRoom}
-          activeBridgeRoomId={activeBridgeRoomId}
-          roomItems={activeBridgeRoom ? roomItems : []}
-          transfers={transferEvents}
-          activeTransfers={activeTransfers}
+          roomItems={activityRoomItems}
           queueItems={schedulerItems}
-          activeQueueItems={activeQueueItems}
-          joinRequest={joinRequest}
-          approvalCount={approvalCount}
+          onCreateBridge={handleCreateBridge}
+          onOpenBridge={(room) => void openRoom(room)}
+          onJoinBridge={handleJoinBridge}
           onSelectView={selectPrimaryView}
-          onEnqueueTransferInputs={enqueueRoomTransferInputs}
         />
       ) : null}
       {activePrimaryView === "devices" ? (
-        <DevicesWorkbenchView
+        <DevicesProductPage
           rooms={rooms}
-          appVersion={config.app_version}
           activeBridgeRoomId={activeBridgeRoomId}
           shouldFocus={focusToken > 0}
-          onSelectConnection={setActiveBridgeRoomId}
+          onOpenBridge={(room) => void openRoom(room)}
+          onJoinBridge={handleJoinBridge}
           onConnectionJoined={(room) => void handleConnectionJoined(room)}
-          onSelectView={selectPrimaryView}
         />
       ) : null}
-      {activePrimaryView === "transfers" ? (
-        <TransfersView rooms={rooms} transfers={transferEvents} queueItems={schedulerItems} />
-      ) : null}
-      {activePrimaryView === "inbox" ? (
-        <InboxView
-          roomItems={activeBridgeRoom ? roomItems : []}
-          joinRequest={joinRequest}
-          onAccept={(request) => void handleAcceptJoinRequest(request)}
-          onReject={(request) => void handleRejectJoinRequest(request)}
+      {activePrimaryView === "activity" ? (
+        <ActivityPage
+          rooms={rooms}
+          roomItems={activityRoomItems}
+          transfers={transferEvents}
+          queueItems={schedulerItems}
         />
       ) : null}
       {activePrimaryView === "settings" ? (
@@ -1684,1378 +1625,16 @@ function App() {
   );
 }
 
-type BridgeTargetSelectionMode = "selected_peer" | "selected_peers" | "broadcast_bridge";
-
-function BridgeView({
-  rooms,
-  activeBridgeRoom,
-  activeBridgeRoomId,
-  roomItems,
-  transfers,
-  activeTransfers,
-  queueItems,
-  activeQueueItems,
-  joinRequest,
-  approvalCount,
-  onSelectView,
-  onEnqueueTransferInputs,
-}: {
-  rooms: RoomInfo[];
-  activeBridgeRoom: RoomInfo | null;
-  activeBridgeRoomId: string;
-  roomItems: RoomItem[];
-  transfers: FileTransferProgressEvent[];
-  activeTransfers: FileTransferProgressEvent[];
-  queueItems: TransferQueueItem[];
-  activeQueueItems: TransferQueueItem[];
-  joinRequest: JoinRequestPrompt | null;
-  approvalCount: number;
-  onSelectView: (view: PrimaryView) => void;
-  onEnqueueTransferInputs: (roomId: string, inputs: TransferQueueInput[]) => void;
-}) {
-  const connectedBridges = rooms.filter((room) => room.peer_connected);
-  const bridgeRoom = activeBridgeRoom ?? (!activeBridgeRoomId && connectedBridges.length === 1 ? connectedBridges[0] : null);
-  const bridgeQueueItems = bridgeRoom ? queueItems.filter((item) => item.roomId === bridgeRoom.id) : [];
-  const bridgeActiveTransfers = bridgeRoom ? activeTransfers.filter((transfer) => transfer.room_id === bridgeRoom.id) : activeTransfers;
-  const bridgeReceivedItems = bridgeRoom ? roomItems.filter((item) => item.direction === "incoming") : [];
-  const bridgePendingIncomingCount = joinRequest ? 1 : 0;
-  const bridgeActiveCount = bridgeActiveTransfers.length + bridgeQueueItems.filter((item) =>
-    item.status === "preparing" ||
-    item.status === "sending"
-  ).length;
-  const bridgeQueuedCount = bridgeQueueItems.filter((item) => item.status === "queued").length;
-  const transfersSummaryText = `${bridgeActiveCount} active · ${bridgeQueuedCount} queued`;
-  const inboxSummaryText = `${bridgeReceivedItems.length} received · ${bridgePendingIncomingCount} pending`;
-  const bridgePeerCollection = useMemo(() => {
-    if (!bridgeRoom) return null;
-    try {
-      return legacyRoomToBridgePeerCollection(bridgeRoom);
-    } catch {
-      return null;
-    }
-  }, [bridgeRoom]);
-  const routeablePeers = useMemo(
-    () => bridgePeerCollection ? [...getRouteableBridgePeers(bridgePeerCollection)] : [],
-    [bridgePeerCollection],
-  );
-  const bridgeMembers = useMemo(
-    () => routeablePeers.filter((peer) => peer.isLocalSelf !== true),
-    [routeablePeers],
-  );
-  const bridgeRouteState = useMemo(
-    () => bridgeRoom ? deriveBridgeRoutingStateForRoom(bridgeRoom) : null,
-    [bridgeRoom],
-  );
-  const [targetMode, setTargetMode] = useState<BridgeTargetSelectionMode>("selected_peer");
-  const [selectedPeerIds, setSelectedPeerIds] = useState<string[]>([]);
-  const [dropActive, setDropActive] = useState(false);
-  const [bridgeMessage, setBridgeMessage] = useState<string | null>(null);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [safeScopes, setSafeScopes] = useState<SafeSearchScope[]>(["downloads", "desktop", "documents", "pastey_shared"]);
-  const [workflow, setWorkflow] = useState<CandidatePayloadWorkflow>(() => createCandidatePayloadWorkflow());
-  const [selectedCandidateId, setSelectedCandidateId] = useState("");
-  const [requestMessage, setRequestMessage] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (bridgeMembers.length === 0) {
-      setSelectedPeerIds([]);
-      return;
-    }
-    setSelectedPeerIds((current) => {
-      const routeableIds = new Set(bridgeMembers.map((peer) => peer.peerSessionId));
-      const next = current.filter((peerId) => routeableIds.has(bridgePeerSessionId(peerId)));
-      return next.length > 0 ? next : [bridgeMembers[0].peerSessionId];
-    });
-  }, [bridgeMembers]);
-
-  const selectedBridgeRoute = useMemo(
-    () => buildSelectedBridgeRoute(bridgePeerCollection?.bridgeSessionId ?? `legacy-room:${bridgeRoom?.id ?? "none"}`, bridgeMembers, targetMode, selectedPeerIds),
-    [bridgePeerCollection?.bridgeSessionId, bridgeRoom?.id, bridgeMembers, selectedPeerIds, targetMode],
-  );
-  const selectedRoutePeers = selectedBridgeRoute ? resolvedPeersForRoute(selectedBridgeRoute, bridgeMembers) : [];
-  const selectedSinglePeer = selectedBridgeRoute?.target.kind === "selected_peer" ? selectedRoutePeers[0] ?? null : null;
-  const canSendFiles = Boolean(bridgeRoom?.peer_connected && selectedBridgeRoute && selectedRoutePeers.length > 0);
-  const canRequestFile = Boolean(bridgeRoom?.peer_connected && selectedSinglePeer && searchQuery.trim().length > 0 && safeScopes.length > 0);
-  const candidates = workflow.snapshot.candidates ?? [];
-  const canRequestPayload = Boolean(selectedSinglePeer && workflow.snapshot.state === "candidate_selection_required" && selectedCandidateId.length > 0);
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-
-    void getCurrentWebview()
-      .onDragDropEvent((event) => {
-        if (cancelled) return;
-        if (event.payload.type === "over") {
-          setDropActive(canSendFiles);
-          return;
-        }
-        if (event.payload.type === "drop") {
-          setDropActive(false);
-          if (event.payload.paths.length > 0) {
-            enqueueBridgeFiles(event.payload.paths);
-          }
-          return;
-        }
-        setDropActive(false);
-      })
-      .then((fn) => {
-        unlisten = fn;
-      });
-
-    return () => {
-      cancelled = true;
-      if (unlisten) unlisten();
-    };
-  }, [canSendFiles, bridgeRoom, selectedBridgeRoute, bridgeMembers]);
-
-  function toggleScope(scope: SafeSearchScope) {
-    setSafeScopes((current) =>
-      current.includes(scope)
-        ? current.filter((candidate) => candidate !== scope)
-        : [...current, scope]
-    );
+function mergeActivityItems(current: RoomItem[], nextItems: RoomItem[]): RoomItem[] {
+  const nextById = new Map(current.map((item) => [item.id, item]));
+  for (const item of nextItems) {
+    nextById.set(item.id, item);
   }
-
-  function enqueueBridgeFiles(paths: string[]) {
-    if (!bridgeRoom || !selectedBridgeRoute || selectedRoutePeers.length === 0 || !canSendFiles) {
-      setBridgeMessage("Select a connected Bridge member before adding files.");
-      return;
-    }
-    const inputs = bridgeTransferInputsForSelectedRoute(
-      paths.map((path) => ({ path })),
-      selectedBridgeRoute,
-      selectedRoutePeers,
-      bridgeRoom.id,
-      "file",
-    );
-    onEnqueueTransferInputs(bridgeRoom.id, inputs);
-    setBridgeMessage(`${paths.length} file${paths.length === 1 ? "" : "s"} added to Transfers.`);
-  }
-
-  async function handleChooseFiles() {
-    if (!bridgeRoom || !canSendFiles) {
-      setBridgeMessage("Select a connected Bridge member before adding files.");
-      return;
-    }
-    const selected = await open({ multiple: true, directory: false });
-    const paths = typeof selected === "string" ? [selected] : Array.isArray(selected) ? selected : [];
-    if (paths.length > 0) enqueueBridgeFiles(paths);
-  }
-
-  function handleMetadataRequest() {
-    if (!bridgeRoom || !selectedSinglePeer || !canRequestFile) return;
-    const prepared = prepareCandidateSearchWorkflow(searchQuery, safeScopes, selectedSinglePeer.peerSessionId);
-    const started = startCandidatePayloadWorkflowFromSearchAdvisory(
-      createCandidatePayloadWorkflow(),
-      prepared.plan,
-      prepared.context,
-    );
-    const nextWorkflow = started.ok ? started.workflow : started.workflow;
-    const confirmed = started.ok
-      ? confirmCandidatePayloadWorkflowSearch(started.workflow)
-      : null;
-    const workflowAfterRequest = confirmed?.ok ? confirmed.workflow : nextWorkflow;
-    setWorkflow(workflowAfterRequest);
-    setSelectedCandidateId("");
-    setRequestMessage(
-      confirmed?.ok
-        ? "Metadata-only request prepared. Receiver Allow once is required."
-        : started.ok
-          ? "Request preview prepared, but it could not be confirmed locally."
-          : started.errors.join(" ")
-    );
-  }
-
-  function handlePayloadRequest() {
-    if (!selectedSinglePeer || !selectedCandidateId) return;
-    const prepared = prepareCandidateSearchWorkflow(searchQuery || "selected candidate", safeScopes, selectedSinglePeer.peerSessionId);
-    const preview = buildCandidatePayloadWorkflowPayloadPreview(
-      workflow,
-      { candidateId: selectedCandidateId, selectedByUser: true },
-      prepared.context,
-    );
-    if (!preview.ok) {
-      setWorkflow(preview.workflow);
-      setRequestMessage(preview.errors.join(" "));
-      return;
-    }
-    const pending = markCandidatePayloadWorkflowPayloadPendingConsent(preview.workflow);
-    setWorkflow(pending.ok ? pending.workflow : preview.workflow);
-    setRequestMessage("Candidate payload request prepared. Receiver Allow once is required before anything is queued.");
-  }
-
-  if (!bridgeRoom) {
-    return (
-      <section className="workstation-view bridge-workstation" aria-label="Bridge">
-        <Card className="bridge-empty-card">
-          <span className="meta-label">Bridge</span>
-          <h2>No active Bridge</h2>
-          <p className="muted">Add or open a device connection to start sending files, requesting files, and reviewing queue state.</p>
-          <ActionRow>
-            <button type="button" className="primary-button" onClick={() => onSelectView("devices")}>Open Devices</button>
-            <button type="button" className="secondary-button" onClick={() => onSelectView("devices")}>Join with code</button>
-          </ActionRow>
-        </Card>
-        <div className="workbench-grid three-column">
-          <Card>
-            <span className="meta-label">Devices</span>
-            <h2>{connectedBridges.length}</h2>
-            <p className="muted">Connected peers ready for a Bridge.</p>
-          </Card>
-          <Card>
-            <span className="meta-label">Inbox</span>
-            <h2>{approvalCount}</h2>
-            <p className="muted">{joinRequest ? `${joinRequest.device_name} is waiting.` : "No requests waiting."}</p>
-          </Card>
-          <Card>
-            <span className="meta-label">Transfers</span>
-            <h2>{activeQueueItems.length}</h2>
-            <p className="muted">Current-session queued or active items.</p>
-          </Card>
-        </div>
-      </section>
-    );
-  }
-
-  return (
-    <section className="workstation-view bridge-workstation" aria-label="Bridge">
-      <Card className="bridge-overview-card">
-        <div className="task-card-header">
-          <div>
-            <span className="meta-label">Bridge</span>
-            <h2>{bridgeRoom.peer_device_name ?? "Active connection"}</h2>
-            <p className="muted">
-              {bridgeRouteState ? routeStateLabel(bridgeRouteState) : "No routeable peer"}.
-              {" "}
-              {bridgeMembers.length} member{bridgeMembers.length === 1 ? "" : "s"} routeable.
-            </p>
-          </div>
-          <StatusChip tone={bridgeRoom.peer_connected ? "success" : "neutral"}>
-            {bridgeConnectionStatusLabel(bridgeRoom)}
-          </StatusChip>
-        </div>
-        <div className="bridge-selector-row">
-          <div className="summary-list">
-            <div className="summary-row"><span>Active Bridge</span><small>{bridgeConnectionStatusLabel(bridgeRoom)}</small></div>
-            <div className="summary-row"><span>Current members</span><small>{bridgeMembers.length}</small></div>
-          </div>
-          <button type="button" className="secondary-button" onClick={() => onSelectView("devices")}>Manage devices</button>
-        </div>
-      </Card>
-
-      <div className="workbench-grid two-column">
-        <Card className="bridge-members-card">
-          <div className="section-row">
-            <h2>Members</h2>
-            <span className="muted">{selectedRoutePeers.length} selected</span>
-          </div>
-          <div className="segmented-control" aria-label="Bridge target">
-            <button type="button" className={targetMode === "selected_peer" ? "active" : ""} disabled={bridgeMembers.length === 0} onClick={() => setTargetMode("selected_peer")}>Peer</button>
-            <button type="button" className={targetMode === "selected_peers" ? "active" : ""} disabled={bridgeMembers.length < 2} onClick={() => setTargetMode("selected_peers")}>Peers</button>
-            <button type="button" className={targetMode === "broadcast_bridge" ? "active" : ""} disabled={bridgeMembers.length === 0} onClick={() => setTargetMode("broadcast_bridge")}>All members</button>
-          </div>
-          <div className="trusted-peer-grid">
-            {bridgeMembers.length === 0 ? <span className="empty-inline">No connected members yet.</span> : null}
-            {bridgeMembers.map((peer) => {
-              const checked = selectedPeerIds.includes(peer.peerSessionId) || targetMode === "broadcast_bridge";
-              return (
-                <button
-                  key={peer.peerSessionId}
-                  type="button"
-                  className={`trusted-peer-pill ${checked ? "selected" : ""}`}
-                  disabled={targetMode === "broadcast_bridge"}
-                  onClick={() => {
-                    if (targetMode === "selected_peer") {
-                      setSelectedPeerIds([peer.peerSessionId]);
-                    } else {
-                      setSelectedPeerIds((current) => checked
-                        ? current.filter((peerId) => peerId !== peer.peerSessionId)
-                        : [...current, peer.peerSessionId]);
-                    }
-                  }}
-                >
-                  <span>{peer.displayName}</span>
-                  <small>{peer.liveness}</small>
-                </button>
-              );
-            })}
-          </div>
-          <p className="muted">Request file requires one selected peer. Send files can target selected peers or all current members when routeable.</p>
-        </Card>
-
-        <Card className="bridge-action-card">
-          <div className="section-row">
-            <h2>Send files</h2>
-            <StatusChip tone={canSendFiles ? "success" : "neutral"}>{canSendFiles ? "Ready" : "Select member"}</StatusChip>
-          </div>
-          <div className={`send-drop-zone ${dropActive ? "drop-active" : ""}`}>
-            <strong>Drop files for this Bridge</strong>
-            <span className="muted">Files are queued through the existing transfer queue.</span>
-            <button type="button" className="primary-button" disabled={!canSendFiles} onClick={() => void handleChooseFiles()}>
-              Choose files
-            </button>
-            {bridgeMessage ? <p className="muted">{bridgeMessage}</p> : null}
-          </div>
-        </Card>
-      </div>
-
-      <Card className="find-search-card">
-        <div className="section-row">
-          <h2>Request file</h2>
-          <StatusChip tone={selectedSinglePeer ? "success" : "neutral"}>{selectedSinglePeer ? "Single peer" : "Peer required"}</StatusChip>
-        </div>
-        <div className="find-search-grid">
-          <label className="field-label">
-            <span>Search query</span>
-            <input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="report, invoice, photo name..." />
-          </label>
-          <div className="safe-scope-card">
-            <span className="field-label-text">Safe locations</span>
-            <div className="scope-chip-grid" aria-label="Safe locations">
-              {SAFE_SEARCH_SCOPES.map((scope) => (
-                <ScopeChip
-                  key={scope.value}
-                  label={scope.label}
-                  checked={safeScopes.includes(scope.value)}
-                  onChange={() => toggleScope(scope.value)}
-                />
-              ))}
-            </div>
-          </div>
-        </div>
-        <div className="find-request-row">
-          <button type="button" className="primary-button" disabled={!canRequestFile} onClick={handleMetadataRequest}>
-            Request metadata-only search
-          </button>
-          <p className="muted">
-            {selectedSinglePeer
-              ? "Receiver Allow once is required. Results contain metadata only, never file contents or full local paths."
-              : "Select exactly one peer before requesting file metadata."}
-          </p>
-        </div>
-        <div className="candidate-card-list">
-          {candidates.length === 0 ? (
-            <EmptyState title="No candidates yet" detail="Candidate cards appear only after the receiver approves metadata-only search and returns metadata." />
-          ) : null}
-          {candidates.map((candidate) => (
-            <CandidateMetadataCard
-              key={candidate.candidateId}
-              candidate={candidate}
-              selected={selectedCandidateId === candidate.candidateId}
-              onSelect={() => setSelectedCandidateId(candidate.candidateId)}
-            />
-          ))}
-        </div>
-        <ActionRow>
-          <button type="button" className="secondary-button" disabled={!canRequestPayload} onClick={handlePayloadRequest}>
-            Request this candidate payload
-          </button>
-          <span className="muted">Queued from approved candidate payload request means queued only, not completed.</span>
-        </ActionRow>
-        {requestMessage ? <p className="muted">{requestMessage}</p> : null}
-      </Card>
-
-      <div className="workbench-grid three-column">
-        <SummaryPanel title="Transfers" emptyLabel="No current transfer state.">
-          <div className="summary-row">
-            <span>{transfersSummaryText}</span>
-            <small>Current queue</small>
-          </div>
-          {bridgeQueueItems.slice(0, 3).map((item) => (
-            <div key={item.id} className="summary-row">
-              <span>{queueItemLabel(item)}</span>
-              <small>{queueItemStatusLabel(item)}</small>
-            </div>
-          ))}
-          {bridgeActiveTransfers.slice(0, 3).map((transfer) => (
-            <div key={transfer.transfer_id} className="summary-row">
-              <span>{transfer.file_name}</span>
-              <small>{transfer.status}</small>
-            </div>
-          ))}
-        </SummaryPanel>
-        <SummaryPanel title="Inbox" emptyLabel="No received items in this session.">
-          <div className="summary-row">
-            <span>{inboxSummaryText}</span>
-            <small>Current session</small>
-          </div>
-          {joinRequest ? (
-            <div className="summary-row">
-              <span>{joinRequest.device_name}</span>
-              <small>Pending incoming request</small>
-            </div>
-          ) : null}
-          {bridgeReceivedItems.slice(0, 3).map((item) => (
-            <div key={item.id} className="summary-row">
-              <span>{inboxItemTitle(item)}</span>
-              <small>{inboxItemKindLabel(item)}</small>
-            </div>
-          ))}
-        </SummaryPanel>
-        <SummaryPanel title="Members" emptyLabel="No connected members yet.">
-          {bridgeMembers.slice(0, 4).map((peer) => (
-            <div key={peer.peerSessionId} className="summary-row">
-              <span>{peer.displayName}</span>
-              <small>{peer.liveness}</small>
-            </div>
-          ))}
-        </SummaryPanel>
-      </div>
-    </section>
-  );
-}
-
-function buildSelectedBridgeRoute(
-  bridgeSessionId: string,
-  routeablePeers: readonly BridgePeerSession[],
-  targetMode: BridgeTargetSelectionMode,
-  selectedPeerIds: readonly string[],
-): BridgeRoute | null {
-  if (targetMode === "broadcast_bridge") {
-    return routeablePeers.length > 0
-      ? { bridgeSessionId, target: { kind: "broadcast_bridge", explicit: true } }
-      : null;
-  }
-  const routeableIds = new Set(routeablePeers.map((peer) => peer.peerSessionId));
-  const selectedIds = selectedPeerIds
-    .map((peerId) => bridgePeerSessionId(peerId))
-    .filter((peerId) => routeableIds.has(peerId));
-  if (targetMode === "selected_peer") {
-    const peerSessionId = selectedIds[0] ?? routeablePeers[0]?.peerSessionId;
-    return peerSessionId
-      ? { bridgeSessionId, target: { kind: "selected_peer", peerSessionId } }
-      : null;
-  }
-  return selectedIds.length >= 2
-    ? { bridgeSessionId, target: { kind: "selected_peers", peerSessionIds: selectedIds } }
-    : null;
-}
-
-function resolvedPeersForRoute(route: BridgeRoute, routeablePeers: readonly BridgePeerSession[]): BridgePeerSession[] {
-  if (route.target.kind === "broadcast_bridge") {
-    return [...routeablePeers];
-  }
-  if (route.target.kind === "selected_peer") {
-    const peer = findBridgePeerBySessionId({
-      bridgeSessionId: route.bridgeSessionId,
-      peers: routeablePeers,
-    }, route.target.peerSessionId);
-    return peer ? [peer] : [];
-  }
-  return route.target.peerSessionIds
-    .map((peerSessionId) => findBridgePeerBySessionId({
-      bridgeSessionId: route.bridgeSessionId,
-      peers: routeablePeers,
-    }, peerSessionId))
-    .filter((peer): peer is BridgePeerSession => Boolean(peer));
-}
-
-function bridgeTransferInputsForSelectedRoute(
-  inputs: TransferQueueInput[],
-  selectedBridgeRoute: BridgeRoute,
-  selectedRoutePeers: readonly BridgePeerSession[],
-  bridgeId: string,
-  contentKind: "file" | "image" | "pasted_image",
-): TransferQueueInput[] {
-  const operationId = `bridge-queue:${bridgeId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-  return inputs.flatMap((input) => selectedRoutePeers.map((peer) => ({
-    ...input,
-    bridgeRoute: {
-      bridgeSessionId: selectedBridgeRoute.bridgeSessionId,
-      target: {
-        kind: "selected_peer",
-        peerSessionId: peer.peerSessionId,
-      },
-    },
-    bridgeOperationId: operationId,
-    bridgeTargetKind: selectedBridgeRoute.target.kind,
-    bridgeContentKind: contentKind,
-    targetPeerSessionId: peer.peerSessionId,
-    targetPeerDisplayName: peer.displayName,
-    targetCount: selectedRoutePeers.length,
-  })));
-}
-
-function DevicesWorkbenchView({
-  rooms,
-  appVersion,
-  activeBridgeRoomId,
-  shouldFocus,
-  onSelectConnection,
-  onConnectionJoined,
-  onSelectView,
-}: {
-  rooms: RoomInfo[];
-  appVersion: string;
-  activeBridgeRoomId: string;
-  shouldFocus: boolean;
-  onSelectConnection: (roomId: string) => void;
-  onConnectionJoined: (room: RoomInfo) => void;
-  onSelectView: (view: PrimaryView) => void;
-}) {
-  const [nearbyDevices, setNearbyDevices] = useState<NearbyDevice[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState("");
-  const [joinCode, setJoinCode] = useState("");
-  const [busy, setBusy] = useState<"join" | "nearby" | "refresh" | null>(null);
-  const [joiningDeviceId, setJoiningDeviceId] = useState<string | null>(null);
-  const [deviceMessage, setDeviceMessage] = useState<string | null>(null);
-  const joinInputRef = useRef<HTMLInputElement | null>(null);
-  const localDeviceRow = {
-    kind: "local" as const,
-    id: "local:this-device",
-    name: "This device",
-    status: "Ready",
-    latency: "This session",
-    capabilities: "Pastey workstation",
-    osType: `Pastey ${appVersion}`,
-    action: "Local",
-  };
-  const nearbyRows = nearbyDevices.map((device) => ({
-    kind: "nearby" as const,
-    id: `nearby:${device.device_id}`,
-    device,
-    name: device.display_name,
-    status: nearbyDeviceStatus(device),
-    latency: device.last_seen_seconds_ago <= 2 ? "Ready now" : `Seen ${device.last_seen_seconds_ago}s ago`,
-    capabilities: nearbyCapabilitySummary(device),
-    osType: `${device.platform} / Pastey ${device.app_version}`,
-    action: device.compatible && device.availability === "Available" ? "Add to Bridge" : "Unavailable",
-  }));
-  const deviceRows = [localDeviceRow, ...nearbyRows];
-  const selectedConnectionRoom = activeBridgeRoomId
-    ? rooms.find((room) => room.id === activeBridgeRoomId) ?? null
-    : null;
-  const selectedDevice = deviceRows.find((device) => device.id === selectedDeviceId)
-    ?? deviceRows[0]
-    ?? null;
-  const connectedCount = rooms.filter((room) => room.peer_connected).length;
-  const trustedRooms = rooms.filter((room) => room.peer_device_name);
-
-  useEffect(() => {
-    if (shouldFocus) {
-      joinInputRef.current?.focus();
-      joinInputRef.current?.select();
-    }
-  }, [shouldFocus]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadNearby(reason: "initial" | "poll" | "refresh" = "poll") {
-      if (reason === "refresh") setBusy("refresh");
-      try {
-        const devices = await listNearbyDevices();
-        if (cancelled) return;
-        setNearbyDevices(devices);
-        setDeviceMessage(devices.length === 0 ? "No nearby devices found." : null);
-      } catch {
-        if (!cancelled) {
-          setNearbyDevices([]);
-          setDeviceMessage("Pastey cannot see nearby devices on this network.");
-        }
-      } finally {
-        if (!cancelled && reason === "refresh") setBusy(null);
-      }
-    }
-
-    void loadNearby("initial");
-    const interval = window.setInterval(() => {
-      void loadNearby("poll");
-    }, 2000);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (selectedDeviceId && deviceRows.some((device) => device.id === selectedDeviceId)) {
-      return;
-    }
-    if (deviceRows[0]) {
-      setSelectedDeviceId(deviceRows[0].id);
-    }
-  }, [deviceRows, selectedDeviceId]);
-
-  async function handleJoinRoom() {
-    setBusy("join");
-    setDeviceMessage(null);
-
-    try {
-      const room = await joinRoom(joinCode);
-      setJoinCode("");
-      onConnectionJoined(room);
-    } catch (err) {
-      setDeviceMessage(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function handleNearbyJoin(device: NearbyDevice) {
-    setBusy("nearby");
-    setJoiningDeviceId(device.device_id);
-    setDeviceMessage(`Waiting for ${device.display_name} to approve...`);
-
-    try {
-      const room = await requestNearbyJoin(device.device_id);
-      setDeviceMessage(null);
-      onConnectionJoined(room);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setDeviceMessage(networkHelpMessage(message));
-    } finally {
-      setJoiningDeviceId(null);
-      setBusy(null);
-    }
-  }
-
-  return (
-    <section className="workstation-view devices-workstation" aria-label="Devices">
-      <section className="summary-card devices-table-card">
-        <div className="section-row">
-          <h2>Devices</h2>
-          <button
-            type="button"
-            className="secondary-button compact-button"
-            disabled={busy !== null}
-            onClick={() => {
-              setBusy("refresh");
-              void listNearbyDevices()
-                .then((devices) => {
-                  setNearbyDevices(devices);
-                  setDeviceMessage(devices.length === 0 ? "No nearby devices found." : null);
-                })
-                .catch(() => setDeviceMessage("Pastey cannot see nearby devices on this network."))
-                .finally(() => setBusy(null));
-            }}
-          >
-            {busy === "refresh" ? "Scanning..." : "Rescan network"}
-          </button>
-        </div>
-        <div className="device-table" role="table" aria-label="Discovered devices">
-          <div className="device-table-header" role="row">
-            <span>Device</span>
-            <span>Status</span>
-            <span>Last seen / Latency</span>
-            <span>Capabilities</span>
-            <span>OS / Type</span>
-            <span>Actions</span>
-          </div>
-          {deviceRows.map((device) => (
-            <DeviceRow
-              key={device.id}
-              selected={selectedDevice?.id === device.id}
-              name={device.name}
-              subtitle={device.kind === "nearby" ? "Nearby device" : "Local device"}
-              status={device.status}
-              latency={device.latency}
-              capabilities={device.capabilities}
-              osType={device.osType}
-              action={device.action}
-              onClick={() => {
-                setSelectedDeviceId(device.id);
-              }}
-            />
-          ))}
-        </div>
-        {deviceMessage ? <p className="muted">{deviceMessage}</p> : null}
-      </section>
-
-      <section className="summary-card selected-device-card">
-        <div className="section-row">
-          <h2>Selected device</h2>
-          {selectedDevice ? <span className={`status-chip ${selectedDevice.status === "Available" || selectedDevice.status === "Connected" || selectedDevice.status === "Ready" ? "success" : "neutral"}`}>{selectedDevice.status}</span> : null}
-        </div>
-        {selectedDevice ? (
-          <>
-            <div className="selected-device-heading">
-              <strong>{selectedDevice.name}</strong>
-              <span className="muted">{selectedDevice.kind === "nearby" ? selectedDevice.osType : selectedDevice.latency}</span>
-            </div>
-            <div className="device-detail-grid">
-              <section>
-                <h3>Capabilities summary</h3>
-                <div className="summary-list">
-                  <div className="summary-row"><span>Capabilities</span><small>{selectedDevice.capabilities}</small></div>
-                  <div className="summary-row"><span>Request file</span><small>{selectedDevice.kind === "nearby" ? "Available after connection" : "Available in Bridge"}</small></div>
-                  <div className="summary-row"><span>Max transfer size</span><small>{selectedDevice.kind === "nearby" && selectedDevice.device.capabilities.includes("large_file") ? "Large files ready" : "10 GB"}</small></div>
-                  <div className="summary-row"><span>Encryption</span><small>AES-256 (E2EE)</small></div>
-                </div>
-              </section>
-              <section>
-                <h3>Connection details</h3>
-                <div className="summary-list">
-                  <div className="summary-row"><span>Connection</span><small>{selectedDevice.status}</small></div>
-                  <div className="summary-row"><span>Discovery</span><small>{selectedDevice.kind === "nearby" ? "Nearby broadcast" : "Local device"}</small></div>
-                  <div className="summary-row"><span>Last seen</span><small>{selectedDevice.latency}</small></div>
-                </div>
-              </section>
-              <section>
-                <h3>Bridge actions</h3>
-                <div className="device-action-list">
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    disabled={selectedDevice.kind === "nearby" || !selectedConnectionRoom}
-                    onClick={() => {
-                      if (selectedConnectionRoom) {
-                        onSelectConnection(selectedConnectionRoom.id);
-                        onSelectView("bridge");
-                      }
-                    }}
-                  >
-                    Open in Bridge
-                  </button>
-                  <button type="button" className="secondary-button" onClick={() => onSelectView("transfers")}>View transfers</button>
-                  {selectedDevice.kind === "nearby" ? (
-                    <button
-                      type="button"
-                      className="primary-button"
-                      disabled={busy !== null || selectedDevice.device.availability !== "Available" || !selectedDevice.device.compatible}
-                      onClick={() => void handleNearbyJoin(selectedDevice.device)}
-                    >
-                      {joiningDeviceId === selectedDevice.device.device_id ? "Waiting..." : "Add to Bridge"}
-                    </button>
-                  ) : null}
-                </div>
-              </section>
-            </div>
-          </>
-        ) : (
-          <p className="muted">No selected device yet. Nearby devices appear when discovery sees them.</p>
-        )}
-      </section>
-
-      <div className="workbench-grid two-column">
-        <section className="summary-card">
-          <h2>Paired / trusted peers</h2>
-          <div className="trusted-peer-grid">
-            {trustedRooms.length === 0 ? <span className="empty-inline">Trusted peer details are not available yet.</span> : null}
-            {trustedRooms.slice(0, 4).map((room) => (
-              <div key={room.id} className="trusted-peer-pill">
-                <span>{room.peer_device_name}</span>
-                <small>{room.peer_connected ? "Available" : "Recent"}</small>
-              </div>
-            ))}
-          </div>
-        </section>
-        <section className="summary-card">
-          <h2>Discovery / security summary</h2>
-          <div className="summary-list">
-            <div className="summary-row"><span>Nearby devices</span><small>{nearbyDevices.length}</small></div>
-            <div className="summary-row"><span>Connected peers</span><small>{connectedCount}</small></div>
-            <div className="summary-row"><span>Known connections</span><small>{rooms.length}</small></div>
-            <div className="summary-row"><span>Approval required</span><small>On</small></div>
-            <div className="summary-row"><span>Encryption</span><small>Enabled</small></div>
-          </div>
-        </section>
-      </div>
-
-      <section className="summary-card manual-join-card">
-        <div>
-          <h2>Join with code</h2>
-          <p className="muted">Connect manually with an existing connection code.</p>
-        </div>
-        <div className="join-code-controls compact">
-          <input
-            ref={joinInputRef}
-            inputMode="numeric"
-            aria-label="Connection code"
-            placeholder="4829-1736"
-            value={formatCode(joinCode)}
-            onChange={(event) => setJoinCode(event.target.value.replace(/[^\d]/g, "").slice(0, 8))}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && joinCode.length === 8 && busy === null) {
-                event.preventDefault();
-                void handleJoinRoom();
-              }
-            }}
-          />
-          <button className="secondary-button" onClick={handleJoinRoom} disabled={busy !== null || joinCode.length !== 8}>
-            {busy === "join" ? "Joining..." : "Join"}
-          </button>
-        </div>
-      </section>
-
-      <Card className="device-diagnostics-card">
-        <div className="section-row">
-          <h2>Advanced diagnostics</h2>
-          <StatusChip tone={busy === "refresh" ? "warning" : "neutral"}>{busy === "refresh" ? "Scanning" : "Ready"}</StatusChip>
-        </div>
-        <div className="summary-list">
-          <div className="summary-row"><span>Discovery polling</span><small>Every 2 seconds</small></div>
-          <div className="summary-row"><span>Nearby command</span><small>Existing discovery wrapper</small></div>
-          <div className="summary-row"><span>Last message</span><small>{deviceMessage ?? "None"}</small></div>
-        </div>
-      </Card>
-    </section>
-  );
-}
-
-type SafeSearchScope = "downloads" | "desktop" | "documents" | "pastey_shared";
-
-const SAFE_SEARCH_SCOPES: Array<{ value: SafeSearchScope; label: string }> = [
-  { value: "downloads", label: "Downloads" },
-  { value: "documents", label: "Documents" },
-  { value: "desktop", label: "Desktop" },
-  { value: "pastey_shared", label: "Pastey Shared" },
-];
-
-function CandidateMetadataCard({
-  candidate,
-  selected,
-  onSelect,
-}: {
-  candidate: CandidatePayloadWorkflowCandidate;
-  selected: boolean;
-  onSelect: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      className={`candidate-metadata-card ${selected ? "selected" : ""}`}
-      onClick={onSelect}
-    >
-      <span className="meta-label">Candidate metadata</span>
-      <strong>{candidate.candidateDisplayName}</strong>
-      <span>{formatBytes(candidate.sizeBytes)} - {candidate.extension || candidate.mimeFamily}</span>
-      <span>{candidate.redactedLocation}</span>
-      <span>Modified {formatTimestamp(Date.parse(candidate.modifiedAt))}</span>
-      <small>{candidate.matchReason} - {candidate.confidence}</small>
-    </button>
-  );
-}
-
-function prepareCandidateSearchWorkflow(
-  searchQuery: string,
-  safeScopes: SafeSearchScope[],
-  targetPeerRef: string,
-) {
-  const plan = buildMockFileCandidatePlan();
-  const proposedInput = plan.proposedInput ?? {};
-  const query = typeof proposedInput.query === "object" && proposedInput.query !== null ? proposedInput.query : {};
-  const context = buildMockAiContextSnapshot();
-  return {
-    plan: {
-      ...plan,
-      title: "Request metadata-only search",
-      explanation: "Ask the selected peer for metadata-only candidates. Receiver Allow once is required.",
-      references: [{ kind: "peer" as const, ref: targetPeerRef }],
-      proposedInput: {
-        ...proposedInput,
-        targetPeerRef,
-        query: {
-          ...query,
-          rawUserRequest: searchQuery,
-          filenameHint: searchQuery.trim(),
-          searchMode: "filename_metadata_only",
-        },
-        scopePolicy: {
-          allowedScopes: safeScopes,
-          allowFullDisk: false,
-          includeFileContents: false,
-          includeAbsolutePaths: false,
-          includeHiddenFiles: false,
-        },
-        safety: {
-          returnRedactedPaths: true,
-          noAutoTransfer: true,
-          requireReceiverConsent: true,
-          selectedPeerOnly: true,
-        },
-      },
-    },
-    context: {
-      ...context,
-      peers: [{
-        peerRef: targetPeerRef,
-        visible: true,
-        trusted: true,
-        capabilities: [
-          "filesystem.find_file_candidates",
-          "transfer.request_candidate_payload",
-        ],
-      }],
-    },
-  };
-}
-
-function InboxView({
-  roomItems,
-  joinRequest,
-  onAccept,
-  onReject,
-}: {
-  roomItems: RoomItem[];
-  joinRequest: JoinRequestPrompt | null;
-  onAccept: (request: JoinRequestPrompt) => void;
-  onReject: (request: JoinRequestPrompt) => void;
-}) {
-  const receivedItems = roomItems.filter((item) => item.direction === "incoming");
-  const pendingIncomingCount = joinRequest ? 1 : 0;
-
-  return (
-    <section className="workstation-view inbox-workstation" aria-label="Inbox">
-      <div className="workbench-grid two-column">
-        <Card className="inbox-card">
-          <div className="section-row">
-            <h2>Received items</h2>
-            <span className="muted">{receivedItems.length} current session</span>
-          </div>
-          <div className="summary-list">
-            {receivedItems.length === 0 ? (
-              <EmptyState
-                title="No received items in this session."
-                detail="Received files, images, text, and links appear here after they arrive in the active session."
-              />
-            ) : null}
-            {receivedItems.map((item) => (
-              <div key={item.id} className="summary-row">
-                <span>{inboxItemTitle(item)}</span>
-                <small>{inboxItemKindLabel(item)} · {item.status}</small>
-              </div>
-            ))}
-          </div>
-        </Card>
-        <Card className="inbox-card">
-          <div className="section-row">
-            <h2>Pending incoming</h2>
-            <StatusChip tone={pendingIncomingCount > 0 ? "warning" : "neutral"}>{pendingIncomingCount} pending</StatusChip>
-          </div>
-          {joinRequest ? (
-            <div className="summary-list">
-              <div className="summary-row">
-                <span>{joinRequest.device_name}</span>
-                <small>{joinRequest.platform} · Pastey {joinRequest.app_version}</small>
-              </div>
-              <ActionRow>
-                <button className="ghost-button" onClick={() => onReject(joinRequest)}>Deny</button>
-                <button className="primary-button" onClick={() => onAccept(joinRequest)}>Allow once</button>
-              </ActionRow>
-            </div>
-          ) : (
-            <EmptyState
-              title="No pending incoming requests."
-              detail="Connection, metadata-search, and candidate-payload requests appear here only when a live incoming request needs a decision."
-            />
-          )}
-        </Card>
-        <Card className="inbox-card">
-          <span className="meta-label">Current session</span>
-          <h2>Incoming boundary</h2>
-          <div className="summary-list">
-            <div className="summary-row"><span>Received content</span><small>{receivedItems.length}</small></div>
-            <div className="summary-row"><span>Incoming decisions</span><small>{pendingIncomingCount}</small></div>
-            <div className="summary-row"><span>Persistence</span><small>Current session only</small></div>
-          </div>
-        </Card>
-      </div>
-    </section>
-  );
-}
-
-function TransfersView({
-  rooms,
-  transfers,
-  queueItems,
-}: {
-  rooms: RoomInfo[];
-  transfers: FileTransferProgressEvent[];
-  queueItems: TransferQueueItem[];
-}) {
-  const [filter, setFilter] = useState<TransferViewFilter>("all");
-  const events = buildTransferEvents(rooms, transfers, queueItems);
-  const filteredEvents = events.filter((event) => {
-    if (filter === "all") return true;
-    if (filter === "transfers") return event.kind === "transfer";
-    if (filter === "agent") return event.kind === "agent";
-    return event.tone === "danger";
-  });
-
-  return (
-    <section className="workstation-view transfers-workstation" aria-label="Transfers">
-      <div className="segmented-control" aria-label="Transfer filters">
-        {TRANSFER_VIEW_FILTERS.map((item) => (
-          <button
-            key={item.value}
-            type="button"
-            className={filter === item.value ? "active" : ""}
-            onClick={() => setFilter(item.value)}
-          >
-            {item.label}
-          </button>
-        ))}
-      </div>
-
-      <div className="activity-event-list">
-        {filteredEvents.length === 0 ? (
-          <EmptyState title="No transfers for this filter" detail="Current-session transfer and queue items appear here." />
-        ) : null}
-        {filteredEvents.map((event) => (
-          <article key={event.id} className="activity-event-row">
-            <div>
-              <span className={`status-chip ${event.tone}`}>{event.label}</span>
-              <h2>{event.title}</h2>
-              <p className="muted">{event.detail}</p>
-            </div>
-            <small>{event.timeLabel}</small>
-          </article>
-        ))}
-      </div>
-      <p className="muted activity-note">Full history is not stored yet.</p>
-    </section>
-  );
-}
-
-type TransferViewFilter = "all" | "transfers" | "agent" | "errors";
-
-interface TransferEventView {
-  id: string;
-  kind: "transfer" | "agent" | "approval";
-  label: string;
-  title: string;
-  detail: string;
-  tone: "neutral" | "success" | "warning" | "danger";
-  timeLabel: string;
-}
-
-const TRANSFER_VIEW_FILTERS: Array<{ value: TransferViewFilter; label: string }> = [
-  { value: "all", label: "All" },
-  { value: "transfers", label: "Transfers" },
-  { value: "agent", label: "Requests" },
-  { value: "errors", label: "Errors" },
-];
-
-function buildTransferEvents(
-  rooms: RoomInfo[],
-  transfers: FileTransferProgressEvent[],
-  queueItems: TransferQueueItem[],
-): TransferEventView[] {
-  const transferEvents = transfers.map((transfer) => ({
-    id: `transfer-${transfer.transfer_id}`,
-    kind: "transfer" as const,
-    label: transferEventLabel(transfer),
-    title: transfer.file_name,
-    detail: `${transfer.direction === "incoming" ? "Incoming" : "Outgoing"} - ${formatBytes(transfer.transferred_bytes)} of ${formatBytes(transfer.file_size)}`,
-    tone: transferEventTone(transfer),
-    timeLabel: transfer.status,
-  }));
-  const queueEvents = queueItems.map((item) => ({
-    id: `queue-${item.id}`,
-    kind: item.agentBridgeMetadata ? "agent" as const : "transfer" as const,
-    label: item.agentBridgeMetadata ? "Candidate payload request" : "Transfer queue",
-    title: queueItemLabel(item),
-    detail: item.agentBridgeMetadata
-      ? `${roomLabelById(rooms, item.roomId)} - Queued from approved request`
-      : `${roomLabelById(rooms, item.roomId)} - ${queueItemStatusLabel(item)}`,
-    tone: item.status === "failed" ? "danger" as const : item.status === "completed" ? "success" as const : "neutral" as const,
-    timeLabel: formatTimestamp(item.updatedAt),
-  }));
-  return [...queueEvents, ...transferEvents].slice(0, 40);
-}
-
-function transferEventLabel(transfer: FileTransferProgressEvent): string {
-  if (transfer.status === "completed") return "Transfer completed";
-  if (transfer.status === "cancelled") return "Transfer cancelled";
-  if (transfer.status === "burned" || transfer.status === "interrupted") return "Burned";
-  if (transfer.status === "failed") return "Failed";
-  return "Transfer queue";
-}
-
-function transferEventTone(transfer: FileTransferProgressEvent): TransferEventView["tone"] {
-  if (transfer.status === "completed") return "success";
-  if (transfer.status === "failed" || transfer.status === "burned" || transfer.status === "interrupted") return "danger";
-  if (transfer.status === "cancelled") return "warning";
-  return "neutral";
-}
-
-function roomLabelById(rooms: RoomInfo[], roomId: string): string {
-  const room = rooms.find((candidate) => candidate.id === roomId);
-  return room?.peer_device_name ?? "Current connection";
-}
-
-function inboxItemTitle(item: RoomItem): string {
-  return item.display_name ?? item.text ?? "Received item";
-}
-
-function inboxItemKindLabel(item: RoomItem): string {
-  if (item.payload_type === "text") return "Received text";
-  if (item.mime_type?.startsWith("image/")) return "Received image";
-  return "Received file";
-}
-
-function bridgeConnectionStatusLabel(room: RoomInfo): string {
-  if (room.peer_connected) return "Connected";
-  if (room.peer_burned_at) return "Peer done";
-  if (room.status === "peer_left") return "Peer disconnected";
-  if (room.status === "burned") return "Burned";
-  return "Not connected";
-}
-
-function connectionStatusLabel(room: RoomInfo): string {
-  if (room.peer_connected) return "Connected";
-  if (room.peer_burned_at) return "Peer done";
-  if (room.status === "peer_left") return "Peer disconnected";
-  if (room.status === "burned") return "Burned";
-  return "Waiting";
-}
-
-function nearbyDeviceStatus(device: NearbyDevice): string {
-  if (!device.compatible) return "Update needed";
-  return device.availability;
-}
-
-function nearbyCapabilitySummary(device: NearbyDevice): string {
-  const capabilities = [];
-  if (device.capabilities.includes("large_file")) capabilities.push("Large files");
-  if (device.capabilities.includes("nearby_join")) capabilities.push("Nearby join");
-  if (device.compatible) capabilities.push("Send & receive");
-  return capabilities.length > 0 ? capabilities.join(", ") : "Discovery only";
-}
-
-function networkHelpMessage(message: string): string {
-  if (message.includes("rejected")) return "Join request rejected.";
-  if (message.includes("timed out")) return "Join request timed out.";
-  if (message.includes("No nearby")) return "No nearby devices found.";
-  if (message.includes("could not connect")) return "Device found, but Pastey could not connect to it.";
-  if (message.includes("block") || message.includes("Firewall")) return "This network may block local device connections.";
-  return message;
-}
-
-function Card({ className, children }: { className?: string; children: ReactNode }) {
-  return <section className={`summary-card${className ? ` ${className}` : ""}`}>{children}</section>;
-}
-
-function Section({
-  title,
-  trailing,
-  className,
-  children,
-}: {
-  title: string;
-  trailing?: ReactNode;
-  className?: string;
-  children: ReactNode;
-}) {
-  return (
-    <section className={className}>
-      <div className="section-row">
-        <h2>{title}</h2>
-        {trailing ? <span className="muted">{trailing}</span> : null}
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function StatusChip({
-  tone = "neutral",
-  children,
-}: {
-  tone?: "neutral" | "success" | "warning" | "danger";
-  children: ReactNode;
-}) {
-  return <span className={`status-chip ${tone}`}>{children}</span>;
-}
-
-function OptionRow({
-  label,
-  detail,
-  control,
-  disabled,
-}: {
-  label: string;
-  detail?: string;
-  control?: ReactNode;
-  disabled?: boolean;
-}) {
-  return (
-    <label className={`option-row-card ${disabled ? "disabled-option" : ""}`}>
-      <span>
-        <strong>{label}</strong>
-        {detail ? <small>{detail}</small> : null}
-      </span>
-      {control ? <span className="option-row-control">{control}</span> : null}
-    </label>
-  );
-}
-
-function ScopeChip({
-  label,
-  checked,
-  onChange,
-}: {
-  label: string;
-  checked: boolean;
-  onChange: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      className={`scope-chip ${checked ? "checked" : ""}`}
-      aria-pressed={checked}
-      onClick={onChange}
-    >
-      <span className="scope-chip-check" aria-hidden="true" />
-      <span>{label}</span>
-    </button>
-  );
-}
-
-function EmptyState({ title, detail }: { title: string; detail: string }) {
-  return (
-    <div className="empty-state compact-empty-card">
-      <strong>{title}</strong>
-      <p className="muted">{detail}</p>
-    </div>
-  );
-}
-
-function ActionRow({ children }: { children: ReactNode }) {
-  return <div className="action-row">{children}</div>;
-}
-
-function DeviceRow({
-  selected,
-  name,
-  subtitle,
-  status,
-  latency,
-  capabilities,
-  osType,
-  action,
-  onClick,
-}: {
-  selected: boolean;
-  name: string;
-  subtitle: string;
-  status: string;
-  latency: string;
-  capabilities: string;
-  osType: string;
-  action: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      className={`device-table-row ${selected ? "selected" : ""}`}
-      role="row"
-      onClick={onClick}
-    >
-      <span>
-        <strong>{name}</strong>
-        <small>{subtitle}</small>
-      </span>
-      <span>
-        <StatusChip tone={status === "Available" || status === "Connected" ? "success" : "neutral"}>{status}</StatusChip>
-      </span>
-      <span>{latency}</span>
-      <span>{capabilities}</span>
-      <span>{osType}</span>
-      <span>{action}</span>
-    </button>
-  );
-}
-
-function TransferRow({
-  title,
-  detail,
-  meta,
-  status,
-  tone,
-  actionLabel,
-  onAction,
-}: {
-  title: string;
-  detail: string;
-  meta: string;
-  status: string;
-  tone: "neutral" | "success" | "warning" | "danger";
-  actionLabel?: string;
-  onAction?: () => void;
-}) {
-  return (
-    <article className="transfer-row">
-      <div>
-        <strong>{title}</strong>
-        <span className="muted">{detail}</span>
-      </div>
-      <span className="muted">{meta}</span>
-      <StatusChip tone={tone}>{status}</StatusChip>
-      {onAction ? (
-        <button type="button" className="ghost-button compact-button" onClick={onAction}>
-          {actionLabel ?? "Open"}
-        </button>
-      ) : null}
-    </article>
-  );
-}
-
-function SummaryPanel({
-  title,
-  emptyLabel,
-  children,
-}: {
-  title: string;
-  emptyLabel: string;
-  children: ReactNode;
-}) {
-  const hasContent = Array.isArray(children) ? children.length > 0 : Boolean(children);
-
-  return (
-    <section className="summary-card">
-      <h2>{title}</h2>
-      <div className="summary-list">
-        {hasContent ? children : <span className="empty-inline">{emptyLabel}</span>}
-      </div>
-    </section>
-  );
-}
-
-function isActiveTransfer(transfer: FileTransferProgressEvent): boolean {
-  return transfer.status === "pending" || transfer.status === "transferring";
+  return [...nextById.values()].sort((a, b) => b.created_at - a.created_at);
 }
 
 function isActiveQueueItem(item: TransferQueueItem): boolean {
   return item.status === "queued" || item.status === "preparing" || item.status === "sending";
-}
-
-function queueItemLabel(item: TransferQueueItem): string {
-  if (item.agentBridgeMetadata) return "Queued from approved candidate payload request";
-  return item.displayName ?? "Queued transfer";
-}
-
-function queueItemStatusLabel(item: TransferQueueItem): string {
-  if (item.status === "queued" && item.agentBridgeMetadata) {
-    return "Queued only";
-  }
-  return item.status;
-}
-
-function findWorkflowStatusLabel(state: CandidatePayloadWorkflow["snapshot"]["state"]): string {
-  switch (state) {
-    case "idle":
-      return "Waiting for peer, query, and safe locations.";
-    case "search_preview_ready":
-      return "Metadata search preview ready.";
-    case "search_pending_receiver_consent":
-      return "Waiting for receiver Allow once for metadata search.";
-    case "search_completed_candidates_ready":
-    case "candidate_selection_required":
-      return "Candidate selection required.";
-    case "payload_preview_ready":
-      return "Candidate payload request preview ready.";
-    case "payload_pending_receiver_consent":
-      return "Waiting for receiver Allow once for candidate payload.";
-    case "handoff_queued":
-      return "Queued from approved candidate payload request.";
-    case "failed":
-      return "Needs review.";
-  }
 }
 
 function logPlannerLaunchSummary(

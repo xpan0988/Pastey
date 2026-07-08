@@ -108,32 +108,6 @@ export async function getRoom(roomId: string): Promise<RoomInfo> {
   return invoke("get_room", { roomId });
 }
 
-export async function pairBridgePeer(
-  roomId: string,
-  peerSessionId: string,
-  displayLabel?: string | null,
-): Promise<RoomInfo> {
-  return invoke("pair_bridge_peer", {
-    roomId,
-    peerSessionId,
-    displayLabel: displayLabel ?? null,
-  });
-}
-
-export async function revokeBridgePeerPairing(
-  roomId: string,
-  peerSessionId: string,
-): Promise<RoomInfo> {
-  return invoke("revoke_bridge_peer_pairing", { roomId, peerSessionId });
-}
-
-export async function markBridgePeerPairingRotationRequired(
-  roomId: string,
-  peerSessionId: string,
-): Promise<RoomInfo> {
-  return invoke("mark_bridge_peer_pairing_rotation_required", { roomId, peerSessionId });
-}
-
 export async function listRoomItems(roomId: string): Promise<RoomItem[]> {
   return invoke("list_room_items", { roomId });
 }
@@ -255,6 +229,10 @@ export async function burnRoom(roomId: string): Promise<boolean> {
   return invoke("burn_room", { roomId });
 }
 
+export async function leaveRoom(roomId: string): Promise<boolean> {
+  return invoke("leave_room", { roomId });
+}
+
 export async function getConfig(): Promise<AppConfig> {
   return invoke("get_config");
 }
@@ -278,22 +256,6 @@ export async function runLoopbackBenchmark(options?: {
   windowSize?: number | null;
 }): Promise<LinkBenchmarkResult> {
   return invoke("run_loopback_benchmark", {
-    mode: options?.mode ?? null,
-    durationSeconds: options?.durationSeconds ?? null,
-    windowSize: options?.windowSize ?? null
-  });
-}
-
-export async function runPeerLinkBenchmark(
-  roomId: string,
-  options?: {
-    mode?: BenchmarkMode;
-    durationSeconds?: number;
-    windowSize?: number | null;
-  }
-): Promise<LinkBenchmarkResult> {
-  return invoke("run_peer_link_benchmark", {
-    roomId,
     mode: options?.mode ?? null,
     durationSeconds: options?.durationSeconds ?? null,
     windowSize: options?.windowSize ?? null

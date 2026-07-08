@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -100,12 +99,4 @@ test("durable identity does not create Bridge membership or execution authority 
   assert.match(description, /not .*consent/);
   assert.match(description, /execution authority/);
   assert.equal(JSON.stringify(result.identity).includes("\"trust\":true"), false);
-});
-
-test("Room pairing UI uses display-only labels and avoids execution or trust wording", () => {
-  const source = readFileSync("src/pages/RoomPage.tsx", "utf8");
-  assert.match(source, /paired/);
-  assert.match(source, /rotation required/);
-  assert.match(source, /fingerprint/);
-  assert.doesNotMatch(source, /trusted device|auto-approved|safe executor|can execute/i);
 });

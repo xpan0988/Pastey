@@ -568,20 +568,33 @@ test("route derivation does not mutate Room state or create durable authority fi
 });
 
 test("production integration sends data and selected-peer-only control route payloads", () => {
-  const roomPage = readFileSync("src/pages/RoomPage.tsx", "utf8");
+  const bridgePages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
   const app = readFileSync("src/App.tsx", "utf8");
   const controlPanel = readFileSync("src/components/agentBridge/RoomControlPanel.tsx", "utf8");
   const tauri = readFileSync("src/lib/tauri.ts", "utf8");
   const scheduler = readFileSync("src/lib/transferScheduler.ts", "utf8");
   const outcomeTypes = readFileSync("src/lib/bridgeDeliveryOutcome.ts", "utf8");
+  const bridgeDetailSource = bridgePages.slice(
+    bridgePages.indexOf("export function BridgeDetailPage"),
+    bridgePages.indexOf("function RequestFilePanel"),
+  );
+  const targetSource = bridgePages.slice(
+    bridgePages.indexOf("function TargetSelector"),
+    bridgePages.indexOf("function useRouteablePeers"),
+  );
   const controlWrapper = tauri.slice(
     tauri.indexOf("export async function sendRoomControlEvent"),
     tauri.indexOf("export async function getRoomControlSessionContext"),
   );
 
-  assert.match(roomPage, /deriveBridgeRoutingStateForRoom\(room\)/);
-  assert.match(roomPage, /sendTextToRoomWithBridgeRoute\(room, text, sendTextToRoom, selectedBridgeRoute\)/);
-  assert.match(roomPage, /formatBridgeRouteErrorForUser\(err\)/);
+  assert.match(bridgePages, /legacyRoomToBridgePeerCollection\(room\)/);
+  assert.match(bridgePages, /getRouteableBridgePeers/);
+  assert.match(bridgeDetailSource, /sendTextToRoomWithBridgeRoute\(room, trimmed, sendTextToRoom, selectedRoute\)/);
+  assert.match(bridgeDetailSource, /enqueueTransferInputsWithBridgeRoute\(room, inputs, contentKind, onEnqueueTransferInputs, selectedRoute\)/);
+  assert.match(bridgeDetailSource, /formatBridgeRouteErrorForUser\(err\)/);
+  assert.match(targetSource, /value === "broadcast_bridge"/);
+  assert.match(targetSource, /value === "selected_peers"/);
+  assert.match(bridgePages, /selectedSinglePeer/);
   assert.match(app, /sendFileToRoomWithBridgeRoute\(\s*roomForRoute,\s*item\.path,\s*sendOptions,\s*sendFileToRoom,\s*item\.bridgeRoute,/s);
   assert.match(app, /formatBridgeRouteErrorForUser\(err\)/);
   assert.match(app, /No current Room state is available for Bridge file route derivation/);

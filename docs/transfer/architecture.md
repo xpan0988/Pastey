@@ -16,11 +16,11 @@ Current production paths include:
 - Payload encryption and key wrapping: `src-tauri/src/crypto.rs`.
 - Transfer runtime: `src-tauri/src/transfer.rs`.
 - Binary-v1 framing: `src-tauri/src/chunk_frame.rs`.
-- Frontend send wrappers and queue entry points: `src/lib/tauri.ts`, `src/App.tsx`, and `src/pages/RoomPage.tsx`.
+- Frontend send wrappers and queue entry points: `src/lib/tauri.ts`, `src/App.tsx`, and `src/pages/BridgeProductPages.tsx`.
 
 ## Transfer Flow
 
-Text send is route-authoritative before it reaches Tauri. The Room UI builds an ordinary data route for selected peer, selected peers, or explicit broadcast, includes a text-only `bridgeRoute` payload in `send_text_to_room`, and Rust validates that route against the current-session `bridge_peers` endpoint table before creating the outgoing item. After validation, text is converted to bytes, encrypted, persisted as a Bridge item, and sent to the endpoint/key resolved for each target. The returned item can include `BridgeSendOperation` with one `BridgeDeliveryOutcome` per resolved peer and an aggregate status of completed, partial, or failed.
+Text send is route-authoritative before it reaches Tauri. Bridge detail builds an ordinary data route for selected peer, selected peers, or explicit broadcast, includes a text-only `bridgeRoute` payload in `send_text_to_room`, and Rust validates that route against the current-session `bridge_peers` endpoint table before creating the outgoing item. After validation, text is converted to bytes, encrypted, persisted as a Bridge item, and sent to the endpoint/key resolved for each target. The returned item can include `BridgeSendOperation` with one `BridgeDeliveryOutcome` per resolved peer and an aggregate status of completed, partial, or failed.
 
 Queued file/image/pasted-image dispatch is also route-authoritative before it reaches Tauri. File picker, drag/drop, and pasted-image enqueue paths require a route before entering the queue. Selected-peers and explicit broadcast are resolved at enqueue time into per-target child queue items. Each child carries current-session in-memory route fields, target peer display data, and a shared `bridgeOperationId`; each child still dispatches through the existing single-file selected-peer transfer path. `App.tsx` passes the child selected-peer file `bridgeRoute` payload in `send_file_to_room`. Rust validates that route against `bridge_peers` before creating the outgoing file item and starting binary transfer to the selected peer endpoint/key.
 
@@ -28,7 +28,7 @@ The Tauri route payload shape expresses selected-peer, selected-peers, and expli
 
 Broadcast is explicit and current-session scoped. It is not durable group history and does not retroactively include peers that join later or remove peers that leave later from the original operation record. File/image broadcast shows the current target count before enqueue and creates one child per resolved target.
 
-Durable pairing is display/recognition metadata only. `bridge_durable_identities` can store a paired-device label, pairing fingerprint, pairing method, revocation state, and rotation state, while routeable endpoint host/port/key data remains only in current-session `bridge_peers` rows. Paired status can be shown in the Room target selector, but selected-peer, selected-peers, and broadcast delivery still resolve only current `connected` routeable rows. A paired identity alone cannot receive data, join a Bridge, revive old routes, or grant Agent Bridge consent.
+Durable pairing is display/recognition metadata only. `bridge_durable_identities` can store a paired-device label, pairing fingerprint, pairing method, revocation state, and rotation state, while routeable endpoint host/port/key data remains only in current-session `bridge_peers` rows. Paired status can be shown in the Bridge target selector, but selected-peer, selected-peers, and broadcast delivery still resolve only current `connected` routeable rows. A paired identity alone cannot receive data, join a Bridge, revive old routes, or grant Agent Bridge consent.
 
 Files and images are treated as opaque file-like byte streams. Large files are split into encrypted chunks, sent over the LAN peer endpoint, acknowledged per chunk, and finalized after the receiver verifies expected chunk count and total bytes. JSON/base64 remains the compatibility fallback where binary-v1 negotiation is unavailable.
 
