@@ -5,6 +5,7 @@ import {
   copyTextToClipboard,
   executeFileCandidateSearchCapability,
   executeHelloStdoutCapability,
+  getDeviceProfile,
   getRoomControlSessionContext,
   joinRoom,
   listReceivedRoomControlEvents,
@@ -108,6 +109,7 @@ import { formatBytes, formatCode, formatTimestamp } from "../lib/format";
 import type { TransferQueueInput, TransferQueueItem } from "../lib/transferScheduler";
 import type {
   FileTransferProgressEvent,
+  DeviceProfile,
   JoinRequestPrompt,
   NearbyDevice,
   RoomControlSessionContext,
@@ -180,10 +182,12 @@ const REQUEST_FILE_LIFECYCLE_STEPS = [
   "Host validated safe scopes",
   "You confirmed",
   "Peer approved search",
+  "Peer denied search",
   "Candidates returned",
   "Candidate selected",
   "Payload request sent",
   "Peer approved transfer",
+  "Peer denied transfer",
   "Handoff queued",
   "Transfer completed",
 ] as const;
@@ -409,6 +413,7 @@ export function BridgeDetailPage({
   const [helloSession, setHelloSession] = useState<RoomControlSessionContext | null>(null);
   const helloSessionRef = useRef<RoomControlSessionContext | null>(null);
   const [helloQueue, setHelloQueue] = useState<ControlQueueState>(createControlQueueState);
+  const helloQueueRef = useRef<ControlQueueState>(helloQueue);
   const [helloSendState, setHelloSendState] = useState<RoomControlSendState>(createIdleRoomControlSendState);
   const [helloPeerConsentSession, setHelloPeerConsentSession] =
     useState<PeerConsentSessionState>(createPeerConsentSessionState);
@@ -416,6 +421,7 @@ export function BridgeDetailPage({
   const [helloConsumptionState, setHelloConsumptionState] =
     useState<PeerConsentConsumptionState>(createPeerConsentConsumptionState);
   const [helloFlow, setHelloFlow] = useState<HelloPeerProductState>(() => createHelloPeerProductState());
+  const [localDeviceProfile, setLocalDeviceProfile] = useState<DeviceProfile | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const routeablePeers = useRouteablePeers(room);
   const remotePeers = routeablePeers.filter((peer) => peer.isLocalSelf !== true);
@@ -427,6 +433,24 @@ export function BridgeDetailPage({
   const selectedSinglePeer = selectedRoute?.target.kind === "selected_peer" ? selectedPeers[0] ?? null : null;
   const canSend = room.status === "active" && room.peer_connected && selectedRoute !== null && selectedPeers.length > 0 && busy === null;
   const canRunHelloPeerDemo = Boolean(askBridgeBetaEnabled && selectedSinglePeer && helloSession);
+
+  useEffect(() => {
+    helloQueueRef.current = helloQueue;
+  }, [helloQueue]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getDeviceProfile({ forceRefresh: false })
+      .then((profile) => {
+        if (!cancelled) setLocalDeviceProfile(profile);
+      })
+      .catch(() => {
+        if (!cancelled) setLocalDeviceProfile(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (remotePeers.length === 0) {
@@ -468,6 +492,22 @@ export function BridgeDetailPage({
       cancelled = true;
     };
   }, [room.id, room.peer_connected, room.status]);
+
+  useEffect(() => {
+    if (!askOpen || !helloSession || isHelloPeerTerminal(helloFlow.status)) return;
+    let cancelled = false;
+    const refresh = () => {
+      if (!cancelled) void refreshHelloPeerInbox();
+    };
+    refresh();
+    const interval = window.setInterval(refresh, 1600);
+    window.addEventListener("focus", refresh);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refresh);
+    };
+  }, [askOpen, helloSession, helloFlow.status]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -597,7 +637,9 @@ export function BridgeDetailPage({
   function applyHelloSession(nextSession: RoomControlSessionContext | null) {
     const previous = helloSessionRef.current;
     if (roomControlSessionIdentity(previous) !== roomControlSessionIdentity(nextSession)) {
-      setHelloQueue(createControlQueueState());
+      const freshQueue = createControlQueueState();
+      helloQueueRef.current = freshQueue;
+      setHelloQueue(freshQueue);
       setHelloSendState(createIdleRoomControlSendState());
       setHelloPeerConsentSession(createPeerConsentSessionState());
       setHelloPeerConsentRecords([]);
@@ -676,7 +718,7 @@ export function BridgeDetailPage({
     try {
       const events = await listReceivedRoomControlEvents(helloSession.roomId);
       const integrated = enqueueInboundRoomControlEvents(
-        helloQueue,
+        helloQueueRef.current,
         events.map((event) => event.event),
         {
           expectedRoomRef: helloSession.roomId,
@@ -744,7 +786,9 @@ export function BridgeDetailPage({
         ? "Allowed once. Pastey will run the fixed hello runtime after the sender requests execution."
         : "Denied. Nothing will run.",
       peerReview: null,
-      steps: decision === "allow_once" ? mergeHelloSteps(current.steps, ["Peer approved"]) : current.steps,
+      steps: decision === "allow_once"
+        ? mergeHelloSteps(current.steps, ["Peer approved"])
+        : mergeHelloSteps(current.steps, ["Peer denied"]),
     }));
     await pumpHelloPeerQueue(outbound.state);
   }
@@ -875,6 +919,7 @@ export function BridgeDetailPage({
           ...current,
           status: "denied",
           message: "The selected device denied the Hello Peer request.",
+          steps: mergeHelloSteps(current.steps, ["Peer denied"]),
         }));
         return marked.state;
       }
@@ -1053,10 +1098,10 @@ export function BridgeDetailPage({
       </header>
 
       <section className="members-strip" aria-label="Members">
-        <MemberChip title="This Mac" subtitle="This device" you />
+        <MemberChip title={localDeviceLabel(localDeviceProfile)} subtitle={localDeviceSubtitle(localDeviceProfile)} you />
         {remotePeers.length === 0 ? <span className="muted">No connected members yet.</span> : null}
         {remotePeers.map((peer) => (
-          <MemberChip key={peer.peerSessionId} title={peer.displayName} subtitle={memberStatus(peer)} />
+          <MemberChip key={peer.peerSessionId} title={remotePeerDisplayName(peer, room)} subtitle={remotePeerSubtitle(peer)} />
         ))}
       </section>
 
@@ -1254,7 +1299,12 @@ function HelloPeerDemoPanel({
         <div className="hello-peer-result" data-testid="bridge-hello-peer-result">
           <strong>{result.title}</strong>
           <pre>{`stdout: ${result.stdout}`}</pre>
-          <span>exitCode: {result.exitCode}</span>
+          <div className="button-row">
+            <span>exitCode: {result.exitCode}</span>
+            <button type="button" className="secondary-button compact-button" onClick={() => void copyTextToClipboard(result.stdout)}>
+              Copy stdout
+            </button>
+          </div>
         </div>
       ) : null}
     </Card>
@@ -1284,6 +1334,7 @@ function RequestFilePanel({
   const [session, setSession] = useState<RoomControlSessionContext | null>(null);
   const sessionRef = useRef<RoomControlSessionContext | null>(null);
   const [queue, setQueue] = useState<ControlQueueState>(createControlQueueState);
+  const queueRef = useRef<ControlQueueState>(queue);
   const [sendState, setSendState] = useState<RoomControlSendState>(createIdleRoomControlSendState);
   const [peerConsentSession, setPeerConsentSession] =
     useState<PeerConsentSessionState>(createPeerConsentSessionState);
@@ -1310,6 +1361,10 @@ function RequestFilePanel({
   }, [workflow]);
 
   useEffect(() => {
+    queueRef.current = queue;
+  }, [queue]);
+
+  useEffect(() => {
     let cancelled = false;
     if (!selectedPeer || room.status !== "active" || !room.peer_connected) {
       applySession(null);
@@ -1334,6 +1389,22 @@ function RequestFilePanel({
     };
   }, [room.id, room.status, room.peer_connected, selectedPeer?.peerSessionId]);
 
+  useEffect(() => {
+    if (!session || isRequestFileTerminal(flow.status)) return;
+    let cancelled = false;
+    const refresh = () => {
+      if (!cancelled) void refreshRequestFileInbox();
+    };
+    refresh();
+    const interval = window.setInterval(refresh, 1600);
+    window.addEventListener("focus", refresh);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refresh);
+    };
+  }, [session, flow.status]);
+
   function toggleScope(scope: SafeSearchScope) {
     setScopes((current) => current.includes(scope)
       ? current.filter((candidate) => candidate !== scope)
@@ -1343,7 +1414,9 @@ function RequestFilePanel({
   function applySession(nextSession: RoomControlSessionContext | null) {
     const previous = sessionRef.current;
     if (roomControlSessionIdentity(previous) !== roomControlSessionIdentity(nextSession)) {
-      setQueue(createControlQueueState());
+      const freshQueue = createControlQueueState();
+      queueRef.current = freshQueue;
+      setQueue(freshQueue);
       setSendState(createIdleRoomControlSendState());
       setPeerConsentSession(createPeerConsentSessionState());
       setPeerConsentRecords([]);
@@ -1372,7 +1445,7 @@ function RequestFilePanel({
       }));
       return;
     }
-    const prepared = prepareCandidateSearchWorkflow(query, scopes, selectedPeer.peerSessionId);
+    const prepared = prepareCandidateSearchWorkflow(query, scopes, session.peerSessionRef);
     const started = startCandidatePayloadWorkflowFromSearchAdvisory(createCandidatePayloadWorkflow(), prepared.plan, prepared.context);
     const confirmed = started.ok
       ? confirmCandidatePayloadWorkflowSearch(started.workflow, {
@@ -1447,7 +1520,7 @@ function RequestFilePanel({
     try {
       const events = await listReceivedRoomControlEvents(session.roomId);
       const integrated = enqueueInboundRoomControlEvents(
-        queue,
+        queueRef.current,
         events.map((event) => event.event),
         {
           expectedRoomRef: session.roomId,
@@ -1483,7 +1556,7 @@ function RequestFilePanel({
       }));
       return;
     }
-    const prepared = prepareCandidateSearchWorkflow(query || "selected file", scopes, selectedPeer.peerSessionId);
+    const prepared = prepareCandidateSearchWorkflow(query || "selected file", scopes, session.peerSessionRef);
     const preview = buildCandidatePayloadWorkflowPayloadPreview(
       workflowRef.current,
       { candidateId: selectedCandidateId, selectedByUser: true },
@@ -1564,6 +1637,9 @@ function RequestFilePanel({
     }
     setPeerConsentSession(decisionResult.state);
     setPeerConsentRecords((records) => [...records, decisionResult.record]);
+    const deniedStep = flow.peerReview.binding.capability === "transfer.request_candidate_payload"
+      ? "Peer denied transfer"
+      : "Peer denied search";
     setFlow((current) => ({
       ...current,
       status: decision === "allow_once"
@@ -1575,6 +1651,7 @@ function RequestFilePanel({
           : "search_denied",
       message: decision === "allow_once" ? "Allowed once. Waiting for the sender's execution request." : "Denied. Nothing will run.",
       peerReview: null,
+      steps: decision === "allow_once" ? current.steps : mergeRequestFileSteps(current.steps, [deniedStep]),
     }));
     await pumpRequestFileQueue(outbound.state);
   }
@@ -1684,12 +1761,16 @@ function RequestFilePanel({
       );
       const decisionCapability = decisionPreview?.event.payload.request.capability;
       if (decisionEvent.kind === "capability_preview_deny") {
+        const deniedStep = decisionCapability === "transfer.request_candidate_payload"
+          ? "Peer denied transfer"
+          : "Peer denied search";
         setFlow((current) => ({
           ...current,
           status: decisionCapability === "transfer.request_candidate_payload" ? "payload_denied" : "search_denied",
           message: decisionCapability === "transfer.request_candidate_payload"
             ? "The selected device denied the payload request."
             : "The selected device denied the metadata search.",
+          steps: mergeRequestFileSteps(current.steps, [deniedStep]),
         }));
         return marked.state;
       }
@@ -2127,6 +2208,13 @@ function mergeRequestFileSteps(
   ))];
 }
 
+function isRequestFileTerminal(status: RequestFileStatus): boolean {
+  return status === "search_denied"
+    || status === "payload_denied"
+    || status === "handoff_queued"
+    || status === "failed";
+}
+
 function requestFileStepsWithTransfer(
   current: readonly string[],
   queueItem: TransferQueueItem | null,
@@ -2361,6 +2449,7 @@ export function DevicesProductPage({
             <div key={device.device_id} className="simple-device-row">
               <div>
                 <strong>{device.display_name}</strong>
+                <span className="muted">{nearbyDeviceSystemSummary(device)}</span>
                 <span className={`status-line ${device.availability === "Available" && device.compatible ? "ready" : ""}`}>
                   <span aria-hidden="true" />
                   {device.compatible ? device.availability : "Update needed"}
@@ -2506,6 +2595,10 @@ function mergeHelloSteps(
   ))];
 }
 
+function isHelloPeerTerminal(status: HelloPeerDemoStatus): boolean {
+  return status === "completed" || status === "denied" || status === "failed";
+}
+
 function useRouteablePeers(room: RoomInfo): BridgePeerSession[] {
   return useMemo(() => {
     try {
@@ -2629,6 +2722,9 @@ interface ActivityListRow {
   tone: "success" | "neutral" | "warning" | "danger";
   progress?: number;
   savedPath?: string | null;
+  previewText?: string;
+  fullText?: string;
+  copyLabel?: string;
 }
 
 function recentActivityRows(room: RoomInfo, items: RoomItem[], transfers: FileTransferProgressEvent[], queueItems: TransferQueueItem[]): ActivityListRow[] {
@@ -2663,25 +2759,53 @@ function activityRows(
       status: queueStatusLabel(item.status),
       tone: item.status === "failed" ? "danger" : item.status === "queued" || item.status === "preparing" ? "warning" : "neutral",
     }));
-  const itemRows = roomItems.map((item): ActivityListRow => ({
-    id: `item:${item.id}`,
-    group: item.status === "failed" ? "failed" : item.direction === "incoming" ? "received" : "sent",
-    title: item.direction === "incoming" ? `You received ${itemTitle(item)}` : `You sent ${itemTitle(item)}`,
-    detail: item.direction === "incoming" ? "From device" : "To device",
-    bridge: bridgeCode(roomById.get(item.room_id)),
-    status: roomItemStatusLabel(item.status),
-    tone: item.status === "failed" ? "danger" : "success",
-    savedPath: item.saved_path,
-  }));
+  const itemRows = roomItems.map((item): ActivityListRow => {
+    const fullText = item.payload_type === "text" ? item.text ?? "" : "";
+    return {
+      id: `item:${item.id}`,
+      group: item.status === "failed" ? "failed" : item.direction === "incoming" ? "received" : "sent",
+      title: item.direction === "incoming" ? `You received ${itemTitle(item)}` : `You sent ${itemTitle(item)}`,
+      detail: item.direction === "incoming" ? "From device" : "To device",
+      bridge: bridgeCode(roomById.get(item.room_id)),
+      status: roomItemStatusLabel(item.status),
+      tone: item.status === "failed" ? "danger" : "success",
+      savedPath: item.saved_path,
+      previewText: fullText ? contentPreview(fullText) : undefined,
+      fullText: fullText || undefined,
+      copyLabel: fullText ? "Copy full text" : undefined,
+    };
+  });
   return [...transferRows, ...queueRows, ...itemRows].sort((a, b) => a.id < b.id ? 1 : -1);
 }
 
 function ActivityRow({ row, compact = false }: { row: ActivityListRow; compact?: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  const hasFullText = Boolean(row.fullText);
+  const previewText = row.previewText ?? row.fullText ?? "";
+  const fullText = row.fullText ?? "";
+  const canExpand = hasFullText && previewText !== fullText;
   return (
     <article className={`activity-row ${compact ? "compact" : ""}`}>
       <div>
         <strong>{row.title}</strong>
         <span className="muted">{row.detail} - Bridge {row.bridge}</span>
+        {hasFullText ? (
+          <pre className={`activity-full-text ${expanded ? "expanded" : ""}`}>
+            {expanded ? fullText : previewText}
+          </pre>
+        ) : null}
+        {hasFullText ? (
+          <div className="button-row activity-content-actions">
+            {canExpand ? (
+              <button type="button" className="text-button" onClick={() => setExpanded((current) => !current)}>
+                {expanded ? "View preview" : "View full"}
+              </button>
+            ) : null}
+            <button type="button" className="text-button" onClick={() => void copyTextToClipboard(fullText)}>
+              {row.copyLabel ?? "Copy"}
+            </button>
+          </div>
+        ) : null}
         {typeof row.progress === "number" ? (
           <div className="activity-progress" aria-label={`${row.progress}%`}>
             <span style={{ width: `${row.progress}%` }} />
@@ -2792,8 +2916,56 @@ function targetSummary(route: BridgeRoute | null, peers: BridgePeerSession[]): s
   return `To: ${peers[0]?.displayName ?? "selected device"}`;
 }
 
-function memberStatus(peer: BridgePeerSession): string {
-  return peer.liveness === "connected" ? "Connected" : peer.liveness;
+function localDeviceLabel(profile: DeviceProfile | null): string {
+  const platform = normalizePlatform(profile?.platform);
+  if (platform === "macos") return "This Mac";
+  if (platform === "linux") return "This Linux device";
+  if (platform === "windows") return "This Windows device";
+  return "This device";
+}
+
+function localDeviceSubtitle(profile: DeviceProfile | null): string {
+  if (!profile) return "This device";
+  return [formatPlatformLabel(profile.platform), profile.arch].filter(Boolean).join(" · ") || "This device";
+}
+
+function remotePeerDisplayName(peer: BridgePeerSession, room: RoomInfo): string {
+  const label = peer.displayName?.trim() || room.peer_device_name?.trim();
+  return label && !isLocalOnlyDeviceLabel(label) ? label : "Nearby device";
+}
+
+function remotePeerSubtitle(peer: BridgePeerSession): string {
+  return peer.liveness === "connected" ? "Connected" : peer.liveness || "Current session";
+}
+
+function nearbyDeviceSystemSummary(device: NearbyDevice): string {
+  const parts = [
+    formatPlatformLabel(device.platform) ?? "Nearby device",
+    device.app_version ? `Pastey ${device.app_version}` : null,
+    device.last_seen_seconds_ago <= 3 ? "Online" : `Last seen ${Math.max(0, Math.round(device.last_seen_seconds_ago))}s ago`,
+  ];
+  return parts.filter(Boolean).join(" · ");
+}
+
+function normalizePlatform(value?: string | null): "macos" | "linux" | "windows" | "unknown" {
+  const normalized = value?.trim().toLowerCase() ?? "";
+  if (normalized === "macos" || normalized === "darwin" || normalized === "mac") return "macos";
+  if (normalized === "linux") return "linux";
+  if (normalized === "windows" || normalized === "win32") return "windows";
+  return "unknown";
+}
+
+function formatPlatformLabel(value?: string | null): string | null {
+  const platform = normalizePlatform(value);
+  if (platform === "macos") return "macOS";
+  if (platform === "linux") return "Linux";
+  if (platform === "windows") return "Windows";
+  const raw = value?.trim();
+  return raw || null;
+}
+
+function isLocalOnlyDeviceLabel(label: string): boolean {
+  return /^this (mac|linux device|windows device|device)$/i.test(label.trim());
 }
 
 function lastActivityForBridge(room: RoomInfo, items: RoomItem[], queueItems: TransferQueueItem[]): string {
@@ -2805,8 +2977,14 @@ function lastActivityForBridge(room: RoomInfo, items: RoomItem[], queueItems: Tr
 
 function itemTitle(item: RoomItem): string {
   if (item.display_name?.trim()) return item.display_name;
-  if (item.text?.trim()) return item.text.trim().slice(0, 80);
+  if (item.text?.trim()) return contentPreview(item.text, 80);
   return item.payload_type === "text" ? "text" : "file";
+}
+
+function contentPreview(value: string, limit = 160): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= limit) return trimmed;
+  return `${trimmed.slice(0, limit)}...`;
 }
 
 function queueItemTitle(item: TransferQueueItem): string {

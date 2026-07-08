@@ -31,6 +31,7 @@ export const HELLO_PEER_LIFECYCLE_STEPS = [
   "You confirmed",
   "Peer requested",
   "Peer approved",
+  "Peer denied",
   "Runtime executed",
   "Result returned",
 ] as const;
