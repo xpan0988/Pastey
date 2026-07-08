@@ -6,7 +6,7 @@ Detailed update and release history for Pastey.
 
 - No unreleased user-facing changes are documented yet.
 
-## 1.9.1 - Layer 5 narrow product closure and smoke bugfix consolidation - 2026-07-09
+## 1.9.1 — Layer 5 narrow product closure — 2026-07-08
 
 ### Added
 
