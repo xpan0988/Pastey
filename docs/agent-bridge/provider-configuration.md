@@ -26,6 +26,13 @@ For `filesystem.find_file_candidates`, provider output is only an advisory propo
 
 For `transfer.request_candidate_payload`, provider output is only an advisory proposal to request a second consent decision for one previously discovered candidate. It may include the prior discovery request id, opaque candidate id, and display/audit metadata. It cannot provide receiver absolute paths, file contents, transfer queue ids, handoff ids, auto-send instructions, selected-peers/broadcast routing, or future transfer authority. The current path can resolve the selected candidate through the receiver-local in-memory store and queue the payload through the existing transfer scheduler with zero transferred bytes at handoff time.
 
+Bridge detail currently closes two narrow product loops over this provider contract:
+
+- Ask Bridge Beta uses `runtime.hello_stdout` for Transform + Return through a fixed host-owned runtime and typed stdout result.
+- Request file uses `filesystem.find_file_candidates` plus `transfer.request_candidate_payload` for Search + Return through metadata-only discovery, manual candidate selection, second consent, and queue handoff.
+
+These product paths do not add task types, shell support, model-authored code execution, broad browsing, automatic transfer after search, or durable trust authority.
+
 ## Context Controls
 
 Context snapshots are built in `src/lib/ai/contextSnapshot.ts`.
@@ -65,4 +72,4 @@ This split keeps model configuration separate from Bridge-scoped authority. Acce
 
 Pastey does not currently launch or manage `llama-cli`, `llama-server`, Ollama, LM Studio, or other local model processes. The practical local-model workaround is to point the existing OpenAI-compatible provider base URL at a user-managed localhost server that speaks the configured chat-completions shape.
 
-Pastey does not currently provide local LLM scheduling, model routing, MCP tools, persistent provider credentials, cloud relay, provider-managed execution, payload reading, or approved transfer handoff from file candidates. Those require new design and validation before they can be claimed as Layer 5 completion.
+Pastey does not currently provide local LLM scheduling, model routing, MCP tools, persistent provider credentials, cloud relay, provider-managed execution, payload reading, broad capability coverage, global Activity detail surfaces, or full Agent/Jarvis orchestration. Those require new design and validation before they can be claimed as broader Layer 5 completion. The current candidate-payload path can queue a selected file candidate only after second consent; `handoff_queued` remains queue acceptance, not transfer completion.
