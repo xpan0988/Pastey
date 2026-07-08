@@ -5,6 +5,7 @@ export * from "./controlWindowRuntime";
 export * from "./peerConsent";
 export * from "./helloPeerExecution";
 export * from "./helloStdoutExecution";
+export * from "./helloStdoutProductFlow";
 export * from "./fileCandidateExecution";
 export * from "./candidatePayloadExecution";
 export * from "./candidatePayloadWorkflow";

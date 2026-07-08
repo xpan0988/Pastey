@@ -2,7 +2,7 @@
 
 Agent Bridge is the Layer 5 narrow capability path for model-assisted planning, host validation, explicit consent, bounded execution, result return, and redacted audit. For the project-wide layer contract, see [../architecture/Project-specifications.md](../architecture/Project-specifications.md). For template and manifest implementation status, see [capability-templates.md](capability-templates.md). For naming rules covering capability IDs, schema versions, provider actions, executors, and future capabilities, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md). For Bridge membership and authority boundaries, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md).
 
-The current product reality is a narrow bounded-capability vertical slice, the first read-only workspace capability, and a candidate-payload second-consent handoff path. The Hello capabilities prove fixed execution; the file-candidate capability proves receiver-consented metadata discovery without file transfer authority; the candidate-payload path proves that discovery consent does not become payload transfer consent.
+The current product reality is a narrow bounded-capability vertical slice, the first read-only workspace capability, and a candidate-payload second-consent handoff path. Layer 5 narrow product closure is implemented for the current fixed capability set: Hello Stdout proves Transform + Return through a fixed host-owned runtime, and Request file proves Search + Return through metadata-only discovery plus second-consent candidate payload handoff. This does not claim full Agent Bridge, full Jarvis, broad capability coverage, or multi-step autonomous orchestration.
 
 ## Current Flow
 
@@ -17,11 +17,11 @@ The current product reality is a narrow bounded-capability vertical slice, the f
 9. The receiver can choose Allow once or Deny.
 10. A matched allow-once decision permits exactly one execution request for the same capability, request, peer, and Bridge/session binding.
 11. The receiver consumes the consent once, runs the fixed host-owned executor, and returns a typed result.
-12. Both sides write redacted lifecycle audit logs.
+12. The sender sees a typed product result or queue-handoff status, and both sides write redacted lifecycle audit logs.
 
 For `filesystem.find_file_candidates`, the receiver returns redacted metadata candidates and records a receiver-local, in-memory, TTL-bounded candidate store. For `transfer.request_candidate_payload`, the flow validates and consumes a separate exact Allow once, resolves the selected candidate locally against that store, and queues the resolved local file source through the existing transfer queue. Pastey does not send files automatically after discovery, create a new data plane, or expose real receiver paths to the sender or provider.
 
-The deterministic find-and-send workflow coordinates those existing capabilities only. It lets a natural-language intent start with advisory search planning, but the AI remains advisory, the host remains authoritative, the user must select the candidate, and the receiver must still Allow once for payload handoff.
+The deterministic candidate workflow coordinates those existing capabilities only. It lets a natural-language intent start with advisory search planning, but the AI remains advisory, the host remains authoritative, the user must select the candidate, and the receiver must still Allow once for payload handoff. `handoff_queued` means accepted into the existing transfer queue, not transfer completion.
 
 ## Implemented Production Paths
 
@@ -44,7 +44,8 @@ The deterministic find-and-send workflow coordinates those existing capabilities
 - Receiver consent: `src/lib/agentBridge/peerConsent.ts`.
 - Fixed/bounded executors and scaffolds: `src/lib/agentBridge/helloPeerExecution.ts`, `src/lib/agentBridge/helloStdoutExecution.ts`, `src/lib/agentBridge/fileCandidateExecution.ts`, `src/lib/agentBridge/candidatePayloadExecution.ts`, `src-tauri/src/hello_stdout.rs`, and `src-tauri/src/file_candidates.rs`.
 - Redacted logging: `src/lib/agentBridge/logging.ts`.
-- Bridge-scoped UI: `src/components/agentBridge/RoomControlPanel.tsx` and `src/components/AiSlotPreview.tsx`.
+- Bridge-first product UI: `src/pages/BridgeProductPages.tsx`, `src/lib/agentBridge/helloStdoutProductFlow.ts`, and `src/components/OperationTimeline.tsx`.
+- Developer/control UI: `src/components/agentBridge/RoomControlPanel.tsx` and `src/components/AiSlotPreview.tsx`.
 - Runtime room-control endpoint: `src-tauri/src/room_control.rs`.
 
 ## Safety Invariants
@@ -78,9 +79,18 @@ The current implementation does not allow provider-crafted execution requests. E
 
 `candidatePayloadWorkflow` is not automation authority. It is a deterministic host-owned coordinator for the existing discovery and candidate-payload capabilities. It records metadata-safe workflow state, requires explicit user candidate selection, builds only the existing `transfer.request_candidate_payload` preview, and preserves both receiver consent decisions. It does not add a capability id, expose paths or contents, auto-send, implement trusted-session behavior, or create a generic executor.
 
+## Product Closure Status
+
+The current Bridge detail product UI exposes two narrow closure paths:
+
+- Transform + Return: Ask Bridge Beta runs `runtime.hello_stdout` on exactly one selected peer after sender confirmation and receiver Allow once, then returns typed stdout `hello peer` and `exitCode: 0`.
+- Search + Return: Request file runs `filesystem.find_file_candidates` on exactly one selected peer after sender confirmation and receiver Allow once, shows redacted candidates, requires manual candidate selection, then sends `transfer.request_candidate_payload` through a second receiver Allow once before queue handoff.
+
+The shared operation timeline shown in Bridge detail visualizes Pastey lifecycle events only. It does not display model chain-of-thought, hidden prompts, provider scratchpads, raw internal prompts, or fake reasoning.
+
 ## Workspace Capability Roadmap
 
-The next Layer 5 direction is Agent-assisted device workspace: helping a user ask a selected peer for bounded help, such as finding candidate files, without turning Pastey into a remote shell or file browser.
+The current Layer 5 direction is Agent-assisted device workspace: helping a user ask a selected peer for bounded help, such as finding candidate files, without turning Pastey into a remote shell or file browser.
 
 The first workspace capability is `filesystem.find_file_candidates`. Its current flow is:
 
@@ -116,11 +126,11 @@ The current Agent Bridge implementation does not provide:
 - MCP integration;
 - local LLM scheduling;
 - executable file/tool capabilities beyond the fixed Hello Peer, Hello Stdout, bounded file-candidate metadata search path, and candidate-payload queue handoff path;
-- automatic file transfer handoff;
+- automatic file transfer after discovery;
 - cross-Bridge or cross-device automatic delegation.
 
 Those features require new authority-bearing Layer 4 identity/routing semantics and new Layer 5 capability contracts before they can be treated as implemented. The current durable paired-device runtime is display/recognition metadata only.
 
 ## Current Completion Status
 
-Against the canonical Layer 5 definition, Agent Bridge is a narrow capability slice with strong safety boundaries. The implemented scope is mature enough to demonstrate model proposal, host validation, consent, bounded execution, metadata-only workspace discovery, result return, and audit. The full Agent-assisted device workspace remains incomplete until Pastey has approved transfer handoff, broader capabilities, explicit durable peer identity integration where needed, and real multi-step orchestration.
+Against the canonical Layer 5 definition, Agent Bridge is a narrow capability slice with strong safety boundaries. The implemented scope is mature enough to demonstrate model proposal, host validation, consent, bounded execution, metadata-only workspace discovery, typed result return, second-consent queue handoff, and audit through Bridge-first product UI. The full Agent-assisted device workspace remains incomplete until Pastey has broader two-device smoke validation, transfer-completion smoke for the handoff path, broader capabilities, explicit durable peer identity integration where needed, global Activity detail surfaces, and real multi-step orchestration.

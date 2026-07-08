@@ -19,6 +19,7 @@ import {
   allowPeerCapabilityOnce,
   buildFileCandidateExecutionRequest,
   buildHelloPeerExecutionRequest,
+  buildHelloPeerStdoutProductPreview,
   buildHelloStdoutExecutionRequest,
   buildPeerConsentStatusEvent,
   buildSessionBoundCapabilityPreviewControlEvent,
@@ -34,6 +35,7 @@ import {
   executeInboundFileCandidateRequest,
   executeInboundHelloPeerRequest,
   executeInboundHelloStdoutRequest,
+  formatHelloPeerStdoutProductResult,
   hasOutgoingControlWindowDemand,
   matchExecutionResultToRequest,
   preservePeerConsentConsumptionState,
@@ -41,6 +43,7 @@ import {
   validateHelloStdoutExecutionResult,
   validateRoomControlEvent,
   type CapabilityExecuteRequestRoomControlEvent,
+  type CapabilityExecutionResultRoomControlEvent,
   type CapabilityPreviewAckRoomControlEvent,
   type CapabilityPreviewRoomControlEvent,
   type PeerConsentRecord,
@@ -340,6 +343,66 @@ test("receiver consumes Hello Stdout consent once and returns typed stdout resul
   );
   assert.equal(second.executed, false);
   assert.equal(second.result.status, "already_consumed");
+});
+
+test("Hello Peer product preview uses runtime.hello_stdout helpers and selected-peer session refs", () => {
+  const built = buildHelloPeerStdoutProductPreview({
+    roomId: ROOM,
+    localSessionRef: SOURCE,
+    peerSessionRef: TARGET,
+    peerConnected: true,
+  }, {
+    now: NOW,
+    ttlMs: 120_000,
+  });
+  assert.equal(built.ok, true, built.ok ? undefined : built.errors.join(" "));
+  if (!built.ok) return;
+  assert.equal(built.preview.plan.kind, "request_peer_hello_stdout_demo");
+  assert.equal(built.preview.request.capability, "runtime.hello_stdout");
+  assert.equal(built.preview.request.sourceDeviceRef, SOURCE);
+  assert.equal(built.preview.request.targetPeerRef, TARGET);
+  assert.equal(built.preview.envelope.request.capability, "runtime.hello_stdout");
+  assert.equal(built.preview.previewEvent.kind, "capability_preview");
+  assert.equal(built.preview.previewEvent.sourceDeviceRef, SOURCE);
+  assert.equal(built.preview.previewEvent.targetPeerRef, TARGET);
+  assert.equal(built.preview.previewEvent.payload.request.input.expectedStdout, "hello peer");
+  for (const field of ["command", "script", "code", "cwd", "env", "path", "network"]) {
+    assert.equal(field in built.preview.previewEvent.payload.request, false);
+  }
+});
+
+test("Hello Peer product result display accepts only typed Hello Stdout success", async () => {
+  const value = stdoutChain();
+  const executed = await executeInboundHelloStdoutRequest(
+    value.request,
+    value.consent,
+    createPeerConsentConsumptionState(),
+    async (request) => ({
+      schemaVersion: "pastey-runtime-hello-stdout-execution-result-v1",
+      executionId: request.executionId,
+      requestId: request.requestId,
+      consentId: request.consentId,
+      capability: "runtime.hello_stdout",
+      runtimeKind: "rust_host_helper",
+      status: "succeeded",
+      stdout: "hello peer",
+      stderr: "",
+      exitCode: 0,
+      durationMs: 1,
+      timedOut: false,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      createdAt: EXECUTE_AT.toISOString(),
+    }),
+    { roomRef: ROOM, sourceDeviceRef: SOURCE, targetPeerRef: TARGET, now: EXECUTE_AT },
+  );
+  assert.equal(formatHelloPeerStdoutProductResult(executed.resultEvent)?.title, "Hello Peer completed");
+  assert.equal(formatHelloPeerStdoutProductResult(executed.resultEvent)?.stdout, "hello peer");
+  assert.equal(formatHelloPeerStdoutProductResult(executed.resultEvent)?.exitCode, 0);
+  assert.equal(formatHelloPeerStdoutProductResult({
+    ...executed.resultEvent,
+    payload: { ...executed.resultEvent.payload, stdout: "hello peer!" },
+  } as CapabilityExecutionResultRoomControlEvent), null);
 });
 
 test("receiver consumes file candidate consent once and returns redacted metadata candidates", async () => {

@@ -144,9 +144,11 @@ test("Bridge request-file copy preserves selected-device and consent boundaries"
   const css = readFileSync("src/styles.css", "utf8");
   const requestSource = pages.slice(pages.indexOf("function RequestFilePanel"), pages.indexOf("interface ActivityPageProps"));
 
-  assert.match(requestSource, /Request search/);
+  assert.match(requestSource, /Search selected device/);
+  assert.match(requestSource, /Confirm search preview/);
+  assert.match(requestSource, /Choose candidate/);
   assert.match(requestSource, /Request selected file/);
-  assert.match(requestSource, /Request file requires one selected device\./);
+  assert.match(pages, /Request file requires one selected device\./);
   for (const scope of ["Downloads", "Documents", "Desktop", "Pastey Shared"]) {
     assert.match(pages, new RegExp(scope));
   }
@@ -156,7 +158,62 @@ test("Bridge request-file copy preserves selected-device and consent boundaries"
   assert.match(css, /\.scope-chip-grid\s*\{[^}]*flex-wrap: wrap/s);
   assert.match(css, /\.scope-chip\s*\{[^}]*word-break: normal/s);
   assert.doesNotMatch(requestSource, /Send automatically|AI send file|Remote file access|Download automatically/);
-  assert.doesNotMatch(requestSource, /saved_path|absolutePath|filePath|realPath|transferQueueId|handoffId|queue_item_id|\.path/);
+  assert.doesNotMatch(requestSource, /saved_path|absolutePath|filePath|realPath|transferQueueId|handoffId/);
+});
+
+test("Bridge request-file product path uses real capability transport and handoff", () => {
+  const app = readFileSync("src/App.tsx", "utf8");
+  const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
+  const requestSource = pages.slice(pages.indexOf("function RequestFilePanel"), pages.indexOf("interface ActivityPageProps"));
+
+  assert.match(app, /onEnqueueCandidatePayloadHandoff=\{enqueueAgentBridgeCandidatePayloadHandoff\}/);
+  assert.match(pages, /onEnqueueCandidatePayloadHandoff=\{onEnqueueCandidatePayloadHandoff\}/);
+  assert.doesNotMatch(pages, /onEnqueueCandidatePayloadHandoff=\{\(\) => false\}/);
+  assert.match(requestSource, /buildCapabilityRequestPreviewEnvelope/);
+  assert.match(requestSource, /buildSessionBoundCapabilityPreviewControlEvent/);
+  assert.match(requestSource, /buildFileCandidateExecutionRequest/);
+  assert.match(requestSource, /executeInboundFileCandidateRequest/);
+  assert.match(requestSource, /executeFileCandidateSearchCapability/);
+  assert.match(requestSource, /receiveCandidatePayloadWorkflowSearchResult/);
+  assert.match(requestSource, /buildCandidatePayloadExecutionRequest/);
+  assert.match(requestSource, /executeInboundCandidatePayloadRequest/);
+  assert.match(requestSource, /resolveCandidatePayloadCapability/);
+  assert.match(requestSource, /receiveCandidatePayloadWorkflowHandoffResult/);
+  assert.match(requestSource, /onEnqueueCandidatePayloadHandoff\(room\.id/);
+  assert.match(requestSource, /route\?\.target\.kind !== "selected_peer"/);
+  assert.match(requestSource, /"filesystem\.find_file_candidates"/);
+  assert.match(requestSource, /"transfer\.request_candidate_payload"/);
+  assert.doesNotMatch(requestSource, /selected_peers|broadcast_bridge|autoTransfer|auto-send|fileContents|includeFileContents: true/);
+});
+
+test("Bridge request-file lifecycle shows candidate and handoff product events", () => {
+  const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
+  const timeline = readFileSync("src/components/OperationTimeline.tsx", "utf8");
+  const requestSource = pages.slice(pages.indexOf("function RequestFilePanel"), pages.indexOf("interface ActivityPageProps"));
+
+  for (const label of [
+    "Search prepared",
+    "Host validated safe scopes",
+    "You confirmed",
+    "Peer approved search",
+    "Candidates returned",
+    "Candidate selected",
+    "Payload request sent",
+    "Peer approved transfer",
+    "Handoff queued",
+    "Transfer completed",
+  ]) {
+    assert.match(pages, new RegExp(label));
+  }
+  for (const row of ["Waiting for approval", "Candidates found", "Denied", "Handoff queued", "Transfer started", "Transfer complete", "Failed"]) {
+    assert.match(requestSource, new RegExp(row));
+  }
+  assert.match(requestSource, /<OperationTimeline/);
+  assert.match(requestSource, /requestFileLifecycleRows/);
+  assert.match(timeline, /export interface OperationTimelineStep/);
+  assert.match(timeline, /status: OperationTimelineStatus/);
+  assert.match(requestSource, /request-file-advanced-details/);
+  assert.doesNotMatch(requestSource + timeline, /chain-of-thought|model reasoning|raw internal prompt|reasoning trace|model thoughts|scratchpad/i);
 });
 
 test("Settings is organized around user-facing sections and hides internals by default", () => {
@@ -191,6 +248,68 @@ test("Settings retains configuration only and Bridge detail owns the workflow", 
   assert.match(config, /API key \(runtime memory only\)/);
   assert.match(config, /Lifecycle logging/);
   assert.doesNotMatch(config, /Generate advisory|Process next|Allow once|Request Hello Peer execution/);
+});
+
+test("Ask Bridge Beta exposes Hello Peer demo over the existing Hello Stdout product path", () => {
+  const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
+  const helper = readFileSync("src/lib/agentBridge/helloStdoutProductFlow.ts", "utf8");
+  const bridgeDetailSource = pages.slice(pages.indexOf("export function BridgeDetailPage"), pages.indexOf("function RequestFilePanel"));
+  const panelSource = pages.slice(pages.indexOf("function HelloPeerDemoPanel"), pages.indexOf("function RequestFilePanel"));
+
+  assert.match(bridgeDetailSource, /HELLO_PEER_DEMO_ACTION_LABEL/);
+  assert.match(helper, /Run Hello Peer demo/);
+  assert.match(panelSource, /HELLO_PEER_DEMO_ACTION_LABEL/);
+  assert.match(helper, /Ask the selected device to run Pastey's built-in hello runtime and return stdout\./);
+  assert.match(panelSource, /HELLO_PEER_DEMO_DESCRIPTION/);
+  assert.match(panelSource, /HELLO_PEER_REQUIRES_ONE_SELECTED_DEVICE/);
+  assert.match(panelSource, /Confirmation preview/);
+  assert.match(panelSource, /runtime\.hello_stdout/);
+  assert.match(panelSource, /Expected stdout: hello peer/);
+  assert.match(panelSource, /stdout: \$\{result\.stdout\}/);
+  assert.match(panelSource, /exitCode: \{result\.exitCode\}/);
+  assert.match(helper, /buildHelloStdoutRequestFromPendingAction/);
+  assert.match(helper, /buildCapabilityRequestPreviewEnvelope/);
+  assert.match(helper, /buildSessionBoundCapabilityPreviewControlEvent/);
+  assert.match(helper, /"runtime\.hello_stdout"/);
+  assert.doesNotMatch(bridgeDetailSource + panelSource + helper, /<RoomControlPanel|request_peer_hello_demo|runtime\.execute_hello_template|filesystem\.find_file_candidates|transfer\.request_candidate_payload/);
+});
+
+test("Hello Peer product lifecycle displays Pastey events only", () => {
+  const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
+  const helper = readFileSync("src/lib/agentBridge/helloStdoutProductFlow.ts", "utf8");
+  const timeline = readFileSync("src/components/OperationTimeline.tsx", "utf8");
+  const panelSource = pages.slice(pages.indexOf("function HelloPeerDemoPanel"), pages.indexOf("function RequestFilePanel"));
+
+  for (const step of ["Plan prepared", "Host validated", "You confirmed", "Peer requested", "Peer approved", "Runtime executed", "Result returned"]) {
+    assert.match(helper, new RegExp(step));
+  }
+  assert.match(panelSource, /<OperationTimeline/);
+  assert.match(panelSource, /buildOperationTimelineSteps\(HELLO_PEER_LIFECYCLE_STEPS, flow\.steps\)/);
+  assert.match(timeline, /Operation details/);
+  assert.doesNotMatch(panelSource + timeline, /chain-of-thought|raw internal prompt|model reasoning|reasoning trace|model thoughts|scratchpad|prompt:/i);
+});
+
+test("Layer 5 docs describe narrow product closure without full-agent overclaim", () => {
+  const project = readFileSync("docs/architecture/Project-specifications.md", "utf8");
+  const safety = readFileSync("docs/agent-bridge/architecture-and-safety.md", "utf8");
+  const contracts = readFileSync("docs/agent-bridge/capability-contracts.md", "utf8");
+  const templates = readFileSync("docs/agent-bridge/capability-templates.md", "utf8");
+  const provider = readFileSync("docs/agent-bridge/provider-configuration.md", "utf8");
+  const docs = [project, safety, contracts, templates, provider].join("\n");
+
+  assert.match(docs, /Layer 5 narrow product closure is implemented for the current fixed capability set/);
+  assert.match(docs, /Transform \+ Return/);
+  assert.match(docs, /Search \+ Return/);
+  assert.match(docs, /runtime\.hello_stdout/);
+  assert.match(docs, /filesystem\.find_file_candidates/);
+  assert.match(docs, /transfer\.request_candidate_payload/);
+  assert.match(docs, /handoff_queued.*queue acceptance/s);
+  assert.match(docs, /global Activity detail/);
+  assert.match(docs, /two-device smoke validation|Manual\/two-device validation|Manual dual-device smoke remains pending/);
+  assert.match(docs, /not full Agent Bridge or full Jarvis completion/);
+  assert.match(docs, /do not add task types, shell support, model-authored code execution, broad browsing, automatic transfer after search/);
+  assert.doesNotMatch(docs, /is full Jarvis|full Jarvis is implemented|full Agent Bridge is implemented|approved transfer handoff from file candidates/);
+  assert.doesNotMatch(docs, /provides shell support|supports arbitrary command|executes model-authored code|automatic transfer after search is implemented/i);
 });
 
 test("Room control consumes the active room state directly and has no independent room selector", () => {

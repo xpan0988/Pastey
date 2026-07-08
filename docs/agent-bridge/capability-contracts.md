@@ -60,7 +60,14 @@ The registry is used to keep provider validation, PolicyGate, pending action has
 
 The shared lifecycle envelope schema is `pastey-agent-bridge-capability-envelope-v1`. It is a compatibility view over the existing typed preview/control payloads and includes capability id/version, request id, room/source/target refs, selected-peer route policy, exact allow-once consent policy, created/expiry times, payload hash, typed payload, and bounded room-control transport metadata. Existing payload schemas remain capability-specific. Template helpers now provide additive checks around manifest naming, registry consistency, route fanout, exact capability/hash binding, expiry, and forbidden public fields. `runtime.hello_stdout`, `filesystem.find_file_candidates`, and `transfer.request_candidate_payload` use those helpers for common lifecycle checks. They do not replace capability-specific validators.
 
-The deterministic find-and-send workflow in `src/lib/agentBridge/candidatePayloadWorkflow.ts` chains the existing file-candidate discovery and candidate-payload handoff capabilities. It is not a new capability, not a generic tool surface, and not a trusted-session mode. It exposes only metadata-safe workflow state, requires explicit user candidate selection, and still requires receiver Allow once for payload handoff.
+The deterministic candidate workflow in `src/lib/agentBridge/candidatePayloadWorkflow.ts` chains the existing file-candidate discovery and candidate-payload handoff capabilities. It is not a new capability, not a generic tool surface, and not a trusted-session mode. It exposes only metadata-safe workflow state, requires explicit user candidate selection, and still requires receiver Allow once for payload handoff.
+
+The current Bridge-first product closure uses these same contracts without adding new capability ids or task types:
+
+- Transform + Return via `runtime.hello_stdout`: Ask Bridge Beta prepares one selected-peer preview, receiver Allow once/Deny remains exact, the fixed host-owned runtime returns typed stdout, and the sender sees `stdout: hello peer` plus `exitCode: 0`.
+- Search + Return via `filesystem.find_file_candidates` plus `transfer.request_candidate_payload`: Request file prepares a metadata-only selected-peer search preview, returns redacted candidates after receiver Allow once, requires manual candidate selection, then requires a second receiver Allow once before candidate payload handoff can be queued.
+
+The product timeline is an operation lifecycle view. It shows Pastey lifecycle events such as confirmation, peer approval, candidates returned, handoff queued, transfer started, and transfer complete. It does not show model chain-of-thought, hidden prompts, provider scratchpads, or raw internal reasoning.
 
 ## Workspace Capability: `filesystem.find_file_candidates`
 
@@ -266,6 +273,8 @@ Selected-peers and broadcast capability routes are not implemented and are rejec
 
 Production evidence:
 
+- `src/pages/BridgeProductPages.tsx`
+- `src/components/OperationTimeline.tsx`
 - `src/lib/ai/helloPeerRequest.ts`
 - `src/lib/ai/helloStdoutRequest.ts`
 - `src/lib/ai/fileCandidateRequest.ts`
@@ -283,6 +292,7 @@ Receiver consent is explicit and exact. Allow once binds to the previewed capabi
 Production evidence:
 
 - `src/lib/agentBridge/peerConsent.ts`
+- `src/pages/BridgeProductPages.tsx`
 - `src/components/agentBridge/RoomControlPanel.tsx`
 - `src/lib/agentBridge/controlQueue.ts`
 
@@ -303,6 +313,7 @@ No executor accepts command text, script text, runtime arguments, arbitrary file
 
 Production evidence:
 
+- `src/lib/agentBridge/helloStdoutProductFlow.ts`
 - `src/lib/agentBridge/helloPeerExecution.ts`
 - `src/lib/agentBridge/helloStdoutExecution.ts`
 - `src/lib/agentBridge/fileCandidateExecution.ts`

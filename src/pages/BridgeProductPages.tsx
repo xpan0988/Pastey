@@ -3,14 +3,22 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
 import {
   copyTextToClipboard,
+  executeFileCandidateSearchCapability,
+  executeHelloStdoutCapability,
+  getRoomControlSessionContext,
   joinRoom,
+  listReceivedRoomControlEvents,
   listNearbyDevices,
   requestNearbyJoin,
   revealInFolder,
+  resolveCandidatePayloadCapability,
+  sendRoomControlEvent,
   sendTextToRoom,
   writeTempFile,
 } from "../lib/tauri";
 import {
+  assertCapabilityEventHasSelectedPeerRoute,
+  bridgeRoutePayload,
   enqueueTransferInputsWithBridgeRoute,
   sendTextToRoomWithBridgeRoute,
 } from "../lib/bridgeRoutingRuntime";
@@ -21,19 +29,80 @@ import {
 } from "../lib/bridgeRouting";
 import { legacyRoomToBridgePeerCollection } from "../lib/bridgeRoomAdapter";
 import {
+  OperationTimeline,
+  type OperationTimelineRow,
+  type OperationTimelineStatus,
+  type OperationTimelineStep,
+} from "../components/OperationTimeline";
+import {
   findBridgePeerBySessionId,
   getRouteableBridgePeers,
   type BridgePeerSession,
 } from "../lib/bridgePeers";
 import {
+  buildCandidatePayloadExecutionRequest,
   buildCandidatePayloadWorkflowPayloadPreview,
+  buildFileCandidateExecutionRequest,
+  buildHelloPeerStdoutProductPreview,
+  buildHelloStdoutExecutionRequest,
+  buildPeerConsentStatusEvent,
+  buildSessionBoundCapabilityPreviewControlEvent,
   confirmCandidatePayloadWorkflowSearch,
   createCandidatePayloadWorkflow,
+  createControlQueueState,
+  createIdleRoomControlSendState,
+  createPeerConsentConsumptionState,
+  createPeerConsentSessionState,
+  denyPeerCapability,
   markCandidatePayloadWorkflowPayloadPendingConsent,
+  markCandidatePayloadWorkflowPayloadAllowed,
+  markCandidatePayloadWorkflowSearchAllowed,
   startCandidatePayloadWorkflowFromSearchAdvisory,
+  receiveCandidatePayloadWorkflowHandoffResult,
+  receiveCandidatePayloadWorkflowSearchResult,
+  allowPeerCapabilityOnce,
+  applyInboundPeerStatusToOutboundQueue,
+  enqueueInboundRoomControlEvents,
+  enqueueRoomControlEvent,
+  evaluatePeerCapabilityPreview,
+  executeInboundCandidatePayloadRequest,
+  executeInboundFileCandidateRequest,
+  executeInboundHelloStdoutRequest,
+  formatHelloPeerStdoutProductResult,
+  HELLO_PEER_DEMO_ACTION_LABEL,
+  HELLO_PEER_DEMO_DESCRIPTION,
+  HELLO_PEER_LIFECYCLE_STEPS,
+  HELLO_PEER_REQUIRES_ONE_SELECTED_DEVICE,
+  markControlQueueItemStatus,
+  matchExecutionResultToRequest,
+  processNextControlQueueItem,
+  roomControlSessionIdentity,
+  type CapabilityExecuteRequestRoomControlEvent,
+  type CapabilityExecutionResultRoomControlEvent,
+  type CapabilityPreviewAckRoomControlEvent,
+  type CapabilityPreviewRoomControlEvent,
+  type CandidatePayloadHandoffResult,
+  type CandidatePayloadLocalResolution,
   type CandidatePayloadWorkflow,
+  type ControlQueueItem,
+  type ControlQueueState,
+  type PeerConsentBinding,
+  type PeerConsentRecord,
+  type PeerConsentSessionState,
+  type PeerConsentConsumptionState,
+  type RoomControlEvent,
+  type RoomControlSendState,
 } from "../lib/agentBridge";
-import { buildMockAiContextSnapshot, buildMockFileCandidatePlan } from "../lib/ai";
+import {
+  buildCapabilityRequestPreviewEnvelope,
+  buildMockAiContextSnapshot,
+  buildMockFileCandidatePlan,
+  type CandidatePayloadExecutionRequest,
+  type CandidatePayloadExecutionResult,
+  type CandidatePayloadRequest,
+  type FileCandidateExecutionResult,
+  type FileCandidateRequest,
+} from "../lib/ai";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
 import { formatBytes, formatCode, formatTimestamp } from "../lib/format";
 import type { TransferQueueInput, TransferQueueItem } from "../lib/transferScheduler";
@@ -41,6 +110,7 @@ import type {
   FileTransferProgressEvent,
   JoinRequestPrompt,
   NearbyDevice,
+  RoomControlSessionContext,
   RoomInfo,
   RoomItem,
 } from "../lib/types";
@@ -48,6 +118,75 @@ import type {
 type PrimaryRoute = "bridge" | "activity" | "devices" | "settings";
 type BridgeTargetSelectionMode = "selected_peer" | "selected_peers" | "broadcast_bridge";
 type SafeSearchScope = "downloads" | "desktop" | "documents" | "pastey_shared";
+type HelloPeerDemoStatus =
+  | "idle"
+  | "preview_ready"
+  | "peer_requested"
+  | "awaiting_peer"
+  | "peer_approved"
+  | "denied"
+  | "executing"
+  | "completed"
+  | "failed";
+
+interface HelloPeerProductState {
+  status: HelloPeerDemoStatus;
+  message: string | null;
+  steps: string[];
+  preview: CapabilityPreviewRoomControlEvent | null;
+  peerReview: HelloPeerReviewState | null;
+  senderAck: CapabilityPreviewAckRoomControlEvent | null;
+  result: CapabilityExecutionResultRoomControlEvent | null;
+}
+
+interface HelloPeerReviewState {
+  queueId: string;
+  event: CapabilityPreviewRoomControlEvent;
+  binding: PeerConsentBinding;
+  record?: PeerConsentRecord;
+}
+
+type RequestFileStatus =
+  | "idle"
+  | "search_preview_ready"
+  | "waiting_search_approval"
+  | "awaiting_peer"
+  | "search_denied"
+  | "candidates_found"
+  | "payload_request_sent"
+  | "payload_denied"
+  | "handoff_queued"
+  | "failed";
+
+interface RequestFileProductState {
+  status: RequestFileStatus;
+  message: string | null;
+  steps: string[];
+  searchPreview: CapabilityPreviewRoomControlEvent | null;
+  payloadPreview: CapabilityPreviewRoomControlEvent | null;
+  peerReview: RequestFileReviewState | null;
+  latestResult: CapabilityExecutionResultRoomControlEvent | null;
+}
+
+interface RequestFileReviewState {
+  queueId: string;
+  event: CapabilityPreviewRoomControlEvent;
+  binding: PeerConsentBinding;
+}
+
+const REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE = "Request file requires one selected device.";
+const REQUEST_FILE_LIFECYCLE_STEPS = [
+  "Search prepared",
+  "Host validated safe scopes",
+  "You confirmed",
+  "Peer approved search",
+  "Candidates returned",
+  "Candidate selected",
+  "Payload request sent",
+  "Peer approved transfer",
+  "Handoff queued",
+  "Transfer completed",
+] as const;
 
 const SAFE_SEARCH_SCOPES: Array<{ value: SafeSearchScope; label: string }> = [
   { value: "downloads", label: "Downloads" },
@@ -256,6 +395,7 @@ export function BridgeDetailPage({
   onRefresh,
   onLeaveOrBurn,
   onEnqueueTransferInputs,
+  onEnqueueCandidatePayloadHandoff,
   onOpenActivity,
 }: BridgeDetailPageProps) {
   const [text, setText] = useState("");
@@ -266,6 +406,16 @@ export function BridgeDetailPage({
   const [selectedPeerIds, setSelectedPeerIds] = useState<string[]>([]);
   const [requestOpen, setRequestOpen] = useState(false);
   const [askOpen, setAskOpen] = useState(false);
+  const [helloSession, setHelloSession] = useState<RoomControlSessionContext | null>(null);
+  const helloSessionRef = useRef<RoomControlSessionContext | null>(null);
+  const [helloQueue, setHelloQueue] = useState<ControlQueueState>(createControlQueueState);
+  const [helloSendState, setHelloSendState] = useState<RoomControlSendState>(createIdleRoomControlSendState);
+  const [helloPeerConsentSession, setHelloPeerConsentSession] =
+    useState<PeerConsentSessionState>(createPeerConsentSessionState);
+  const [helloPeerConsentRecords, setHelloPeerConsentRecords] = useState<PeerConsentRecord[]>([]);
+  const [helloConsumptionState, setHelloConsumptionState] =
+    useState<PeerConsentConsumptionState>(createPeerConsentConsumptionState);
+  const [helloFlow, setHelloFlow] = useState<HelloPeerProductState>(() => createHelloPeerProductState());
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const routeablePeers = useRouteablePeers(room);
   const remotePeers = routeablePeers.filter((peer) => peer.isLocalSelf !== true);
@@ -276,6 +426,7 @@ export function BridgeDetailPage({
   const selectedPeers = selectedRoute ? resolvedPeersForRoute(selectedRoute, remotePeers) : [];
   const selectedSinglePeer = selectedRoute?.target.kind === "selected_peer" ? selectedPeers[0] ?? null : null;
   const canSend = room.status === "active" && room.peer_connected && selectedRoute !== null && selectedPeers.length > 0 && busy === null;
+  const canRunHelloPeerDemo = Boolean(askBridgeBetaEnabled && selectedSinglePeer && helloSession);
 
   useEffect(() => {
     if (remotePeers.length === 0) {
@@ -292,6 +443,31 @@ export function BridgeDetailPage({
   useEffect(() => {
     composerRef.current?.focus();
   }, [room.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!room.peer_connected || room.status !== "active") {
+      applyHelloSession(null);
+      return;
+    }
+    void getRoomControlSessionContext(room.id)
+      .then((session) => {
+        if (!cancelled) applyHelloSession(session);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          applyHelloSession(null);
+          setHelloFlow((current) => ({
+            ...current,
+            status: "failed",
+            message: err instanceof Error ? err.message : String(err),
+          }));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [room.id, room.peer_connected, room.status]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -418,6 +594,436 @@ export function BridgeDetailPage({
     }
   }
 
+  function applyHelloSession(nextSession: RoomControlSessionContext | null) {
+    const previous = helloSessionRef.current;
+    if (roomControlSessionIdentity(previous) !== roomControlSessionIdentity(nextSession)) {
+      setHelloQueue(createControlQueueState());
+      setHelloSendState(createIdleRoomControlSendState());
+      setHelloPeerConsentSession(createPeerConsentSessionState());
+      setHelloPeerConsentRecords([]);
+      setHelloConsumptionState(createPeerConsentConsumptionState());
+      setHelloFlow(createHelloPeerProductState());
+    }
+    helloSessionRef.current = nextSession;
+    setHelloSession(nextSession);
+  }
+
+  function prepareHelloPeerDemo() {
+    if (!askBridgeBetaEnabled) {
+      setHelloFlow((current) => ({
+        ...current,
+        status: "failed",
+        message: "Enable Labs in Settings to use Ask Bridge Beta.",
+      }));
+      return;
+    }
+    if (!selectedSinglePeer || !helloSession || selectedRoute?.target.kind !== "selected_peer") {
+      setHelloFlow((current) => ({
+        ...current,
+        status: "idle",
+        message: HELLO_PEER_REQUIRES_ONE_SELECTED_DEVICE,
+      }));
+      return;
+    }
+    const preview = buildHelloPeerStdoutProductPreview(helloSession);
+    if (!preview.ok) {
+      setHelloFlow((current) => ({
+        ...current,
+        status: "failed",
+        message: preview.errors.join(" "),
+      }));
+      return;
+    }
+    setHelloFlow({
+      status: "preview_ready",
+      message: `Ready to ask ${selectedSinglePeer.displayName} for stdout.`,
+      steps: ["Plan prepared", "Host validated"],
+      preview: preview.preview.previewEvent,
+      peerReview: null,
+      senderAck: null,
+      result: null,
+    });
+  }
+
+  async function confirmHelloPeerDemo() {
+    if (!helloFlow.preview) {
+      prepareHelloPeerDemo();
+      return;
+    }
+    const queued = enqueueRoomControlEvent(helloQueue, helloFlow.preview, "outbound");
+    if (!queued.ok) {
+      setHelloFlow((current) => ({ ...current, status: "failed", message: queued.errors.join(" ") }));
+      return;
+    }
+    setHelloFlow((current) => ({
+      ...current,
+      status: "peer_requested",
+      message: "Hello Peer request is being sent to the selected device.",
+      steps: mergeHelloSteps(current.steps, ["You confirmed", "Peer requested"]),
+    }));
+    await pumpHelloPeerQueue(queued.state);
+  }
+
+  async function refreshHelloPeerInbox() {
+    if (!helloSession) {
+      setHelloFlow((current) => ({
+        ...current,
+        status: "failed",
+        message: "Hello Peer requires an active Bridge session.",
+      }));
+      return;
+    }
+    try {
+      const events = await listReceivedRoomControlEvents(helloSession.roomId);
+      const integrated = enqueueInboundRoomControlEvents(
+        helloQueue,
+        events.map((event) => event.event),
+        {
+          expectedRoomRef: helloSession.roomId,
+          expectedSourceDeviceRef: helloSession.peerSessionRef,
+          expectedTargetPeerRef: helloSession.localSessionRef,
+        },
+      );
+      await pumpHelloPeerQueue(integrated.state);
+    } catch (err) {
+      setHelloFlow((current) => ({
+        ...current,
+        status: "failed",
+        message: err instanceof Error ? err.message : String(err),
+      }));
+    }
+  }
+
+  async function decideHelloPeerReview(decision: "allow_once" | "deny") {
+    if (!helloFlow.peerReview) {
+      setHelloFlow((current) => ({
+        ...current,
+        message: "No Hello Peer request is waiting for this device.",
+      }));
+      return;
+    }
+    const now = new Date();
+    const decisionResult = decision === "allow_once"
+      ? allowPeerCapabilityOnce(helloFlow.peerReview.binding, helloPeerConsentSession, { now })
+      : denyPeerCapability(helloFlow.peerReview.binding, helloPeerConsentSession, { now });
+    if (!decisionResult.ok) {
+      setHelloFlow((current) => ({ ...current, status: "failed", message: decisionResult.errors.join(" ") }));
+      return;
+    }
+    const statusEvent = buildPeerConsentStatusEvent(helloFlow.peerReview.event, decisionResult.record, { now });
+    if (!statusEvent.ok) {
+      setHelloFlow((current) => ({ ...current, status: "failed", message: statusEvent.errors.join(" ") }));
+      return;
+    }
+    const reviewed = markControlQueueItemStatus(
+      helloQueue,
+      helloFlow.peerReview.queueId,
+      decision === "allow_once" ? "allowed_once" : "denied",
+      {
+        now,
+        reason: decision === "allow_once"
+          ? "Allowed once for this exact Hello Peer request."
+          : "Denied by receiver.",
+      },
+    );
+    if (!reviewed.ok) {
+      setHelloFlow((current) => ({ ...current, status: "failed", message: reviewed.errors.join(" ") }));
+      return;
+    }
+    const outbound = enqueueRoomControlEvent(reviewed.state, statusEvent.event, "outbound", { now });
+    if (!outbound.ok) {
+      setHelloFlow((current) => ({ ...current, status: "failed", message: outbound.errors.join(" ") }));
+      return;
+    }
+    setHelloPeerConsentSession(decisionResult.state);
+    setHelloPeerConsentRecords((records) => [...records, decisionResult.record]);
+    setHelloFlow((current) => ({
+      ...current,
+      status: decision === "allow_once" ? "peer_approved" : "denied",
+      message: decision === "allow_once"
+        ? "Allowed once. Pastey will run the fixed hello runtime after the sender requests execution."
+        : "Denied. Nothing will run.",
+      peerReview: null,
+      steps: decision === "allow_once" ? mergeHelloSteps(current.steps, ["Peer approved"]) : current.steps,
+    }));
+    await pumpHelloPeerQueue(outbound.state);
+  }
+
+  async function pumpHelloPeerQueue(startQueue: ControlQueueState) {
+    let nextQueue = startQueue;
+    for (let index = 0; index < 8; index += 1) {
+      const result = await processNextControlQueueItem(
+        nextQueue,
+        (event) => sendHelloPeerControlEvent(event),
+        {
+          onState: (state) => {
+            nextQueue = state;
+            setHelloQueue(state);
+          },
+          onSendState: setHelloSendState,
+        },
+      );
+      nextQueue = result.state;
+      setHelloQueue(nextQueue);
+      if (!result.ok) {
+        if (result.action !== "no_selectable_item") {
+          setHelloFlow((current) => ({ ...current, status: "failed", message: result.message }));
+        }
+        return;
+      }
+      if (result.action === "selected_inbound") {
+        nextQueue = await handleHelloPeerInbound(nextQueue, result.item);
+        setHelloQueue(nextQueue);
+        if (helloFlow.peerReview && result.item.event.kind === "capability_preview") {
+          return;
+        }
+      } else if (result.item.event.kind === "capability_preview") {
+        setHelloFlow((current) => ({
+          ...current,
+          status: "awaiting_peer",
+          message: "Request sent. Waiting for the selected device to allow once or deny.",
+          steps: mergeHelloSteps(current.steps, ["Peer requested"]),
+        }));
+      }
+    }
+  }
+
+  async function handleHelloPeerInbound(
+    state: ControlQueueState,
+    item: ControlQueueItem,
+  ): Promise<ControlQueueState> {
+    if (!helloSession) return state;
+
+    if (item.event.kind === "capability_preview") {
+      const previewEvent = item.event as CapabilityPreviewRoomControlEvent;
+      if (previewEvent.payload.request.capability !== "runtime.hello_stdout") {
+        const invalid = markControlQueueItemStatus(state, item.queueId, "invalid", {
+          reason: "Ask Bridge Beta product flow accepts only runtime.hello_stdout.",
+        });
+        setHelloFlow((current) => ({
+          ...current,
+          status: "failed",
+          message: "Unknown capability request rejected.",
+        }));
+        return invalid.state;
+      }
+      const policy = evaluatePeerCapabilityPreview(previewEvent, {
+        roomRef: helloSession.roomId,
+        sourceDeviceRef: helloSession.peerSessionRef,
+        targetPeerRef: helloSession.localSessionRef,
+        session: helloPeerConsentSession,
+      });
+      if (policy.status === "rejected") {
+        const invalid = markControlQueueItemStatus(state, item.queueId, "invalid", {
+          reason: policy.errors.join(" ").slice(0, 512),
+        });
+        setHelloFlow((current) => ({
+          ...current,
+          status: "failed",
+          message: policy.errors.join(" "),
+        }));
+        return invalid.state;
+      }
+      const awaiting = markControlQueueItemStatus(state, item.queueId, "awaiting_peer_decision", {
+        reason: "Receiver PolicyGate accepted this exact Hello Peer preview.",
+      });
+      if (!awaiting.ok) {
+        setHelloFlow((current) => ({ ...current, status: "failed", message: awaiting.errors.join(" ") }));
+        return state;
+      }
+      setHelloFlow((current) => ({
+        ...current,
+        status: "awaiting_peer",
+        message: "This device received a Hello Peer request.",
+        peerReview: {
+          queueId: item.queueId,
+          event: previewEvent,
+          binding: policy.binding,
+        },
+        steps: mergeHelloSteps(current.steps, ["Peer requested"]),
+      }));
+      return awaiting.state;
+    }
+
+    if (item.event.kind === "capability_preview_ack" || item.event.kind === "capability_preview_deny") {
+      const decisionEvent = item.event;
+      const applied = applyInboundPeerStatusToOutboundQueue(state, decisionEvent);
+      if (!applied.ok) {
+        setHelloFlow((current) => ({
+          ...current,
+          status: "failed",
+          message: applied.errors.join(" "),
+        }));
+        return state;
+      }
+      const marked = markControlQueueItemStatus(
+        applied.state,
+        item.queueId,
+        decisionEvent.payload.status,
+        { reason: "Peer returned a Hello Peer decision." },
+      );
+      if (!marked.ok) {
+        setHelloFlow((current) => ({
+          ...current,
+          status: "failed",
+          message: marked.errors.join(" "),
+        }));
+        return state;
+      }
+      if (decisionEvent.kind === "capability_preview_deny") {
+        setHelloFlow((current) => ({
+          ...current,
+          status: "denied",
+          message: "The selected device denied the Hello Peer request.",
+        }));
+        return marked.state;
+      }
+      const ackEvent = decisionEvent as CapabilityPreviewAckRoomControlEvent;
+      if (!ackEvent.payload.consent) return marked.state;
+      const requestItem = marked.state.outbound.find(
+        (candidate): candidate is ControlQueueItem & { event: CapabilityPreviewRoomControlEvent } =>
+          candidate.event.kind === "capability_preview"
+          && candidate.event.eventId === ackEvent.payload.consent?.sourcePreviewEventId,
+      );
+      if (!requestItem) {
+        setHelloFlow((current) => ({
+          ...current,
+          status: "failed",
+          message: "The exact Hello Peer preview for this Allow once response is unavailable.",
+        }));
+        return marked.state;
+      }
+      const execution = buildHelloStdoutExecutionRequest(requestItem.event, ackEvent);
+      if (!execution.ok) {
+        setHelloFlow((current) => ({ ...current, status: "failed", message: execution.errors.join(" ") }));
+        return marked.state;
+      }
+      const queued = enqueueRoomControlEvent(marked.state, execution.event, "outbound");
+      if (!queued.ok) {
+        setHelloFlow((current) => ({ ...current, status: "failed", message: queued.errors.join(" ") }));
+        return marked.state;
+      }
+      setHelloFlow((current) => ({
+        ...current,
+        status: "peer_approved",
+        message: "The selected device allowed once. Requesting the fixed runtime now.",
+        senderAck: ackEvent,
+        steps: mergeHelloSteps(current.steps, ["Peer approved"]),
+      }));
+      return queued.state;
+    }
+
+    if (item.event.kind === "capability_execute_request") {
+      return executeHelloPeerInboundRequest(state, item as ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent });
+    }
+
+    if (item.event.kind === "capability_execution_result") {
+      const resultEvent = item.event;
+      const requestItem = state.outbound.find(
+        (candidate): candidate is ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent } =>
+          candidate.event.kind === "capability_execute_request"
+          && matchExecutionResultToRequest(resultEvent, candidate.event),
+      );
+      const matched = requestItem
+        ? markControlQueueItemStatus(state, requestItem.queueId, resultEvent.payload.status === "succeeded" ? "execution_succeeded" : "execution_rejected", {
+            reason: resultEvent.payload.status === "succeeded"
+              ? "Peer returned the bounded Hello Peer result."
+              : `Peer returned ${resultEvent.payload.errorCode ?? resultEvent.payload.status}.`,
+          })
+        : { ok: false as const, state, errors: ["No matching Hello Peer execution request was found."] };
+      const inbound = markControlQueueItemStatus(
+        matched.ok ? matched.state : state,
+        item.queueId,
+        matched.ok ? "execution_succeeded" : "invalid",
+        { reason: matched.ok ? "Matched bounded Hello Peer result." : matched.errors.join(" ") },
+      );
+      const formatted = formatHelloPeerStdoutProductResult(resultEvent);
+      setHelloFlow((current) => ({
+        ...current,
+        status: formatted ? "completed" : "failed",
+        message: formatted ? formatted.title : resultEvent.payload.errorCode ?? resultEvent.payload.status,
+        result: resultEvent,
+        steps: formatted ? mergeHelloSteps(current.steps, ["Result returned"]) : current.steps,
+      }));
+      return inbound.state;
+    }
+
+    return state;
+  }
+
+  async function executeHelloPeerInboundRequest(
+    state: ControlQueueState,
+    item: ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent },
+  ): Promise<ControlQueueState> {
+    if (!helloSession) return state;
+    if (item.event.payload.capability !== "runtime.hello_stdout") {
+      const invalid = markControlQueueItemStatus(state, item.queueId, "invalid", {
+        reason: "Ask Bridge Beta product flow executes only runtime.hello_stdout.",
+      });
+      return invalid.state;
+    }
+    const consent = helloPeerConsentRecords.find(
+      (record) => record.binding.consentId === item.event.payload.consentId,
+    );
+    setHelloFlow((current) => ({
+      ...current,
+      status: "executing",
+      message: "Running Pastey's fixed hello runtime.",
+    }));
+    const execution = await executeInboundHelloStdoutRequest(
+      item.event,
+      consent,
+      helloConsumptionState,
+      executeHelloStdoutCapability,
+      {
+        roomRef: helloSession.roomId,
+        sourceDeviceRef: helloSession.peerSessionRef,
+        targetPeerRef: helloSession.localSessionRef,
+      },
+    );
+    const completed = markControlQueueItemStatus(
+      state,
+      item.queueId,
+      execution.result.status === "succeeded" ? "execution_consumed" : "execution_rejected",
+      {
+        reason: execution.result.status === "succeeded"
+          ? "Exact one-time consent consumed. Hello Peer demo executed once."
+          : `Execution request rejected: ${execution.result.errorCode ?? execution.result.status}.`,
+      },
+    );
+    if (!completed.ok) {
+      setHelloFlow((current) => ({ ...current, status: "failed", message: completed.errors.join(" ") }));
+      return state;
+    }
+    const outbound = enqueueRoomControlEvent(completed.state, execution.resultEvent, "outbound");
+    if (!outbound.ok) {
+      setHelloFlow((current) => ({ ...current, status: "failed", message: outbound.errors.join(" ") }));
+      return completed.state;
+    }
+    setHelloConsumptionState(execution.state);
+    setHelloFlow((current) => ({
+      ...current,
+      status: execution.result.status === "succeeded" ? "executing" : "failed",
+      message: execution.result.status === "succeeded"
+        ? "Runtime executed. Returning result to the sender."
+        : `Execution request rejected: ${execution.result.errorCode ?? execution.result.status}.`,
+      steps: execution.result.status === "succeeded" ? mergeHelloSteps(current.steps, ["Runtime executed"]) : current.steps,
+    }));
+    return outbound.state;
+  }
+
+  async function sendHelloPeerControlEvent(event: RoomControlEvent) {
+    if (!helloSession) {
+      throw new Error("Hello Peer requires an active selected-peer Bridge session.");
+    }
+    const route = assertCapabilityEventHasSelectedPeerRoute(helloSession, event);
+    return sendRoomControlEvent(
+      helloSession.roomId,
+      event,
+      bridgeRoutePayload(route, "pastey-bridge-control-route-v1"),
+    );
+  }
+
   const status = bridgeStatus(room);
   const recent = recentActivityRows(room, items, transfers, queueItems).slice(0, 3);
 
@@ -497,7 +1103,7 @@ export function BridgeDetailPage({
         </button>
         <button type="button" className={`bridge-action-panel ${askBridgeBetaEnabled ? "" : "disabled"}`} onClick={() => setAskOpen((open) => !open)}>
           <strong>Ask Bridge Beta</strong>
-          <span>Ask the selected device to find, prepare, or send something.</span>
+          <span>{HELLO_PEER_DEMO_DESCRIPTION}</span>
         </button>
       </div>
 
@@ -506,29 +1112,27 @@ export function BridgeDetailPage({
           room={room}
           selectedPeer={selectedSinglePeer}
           route={selectedRoute}
-          onEnqueueCandidatePayloadHandoff={() => false}
+          queueItems={queueItems}
+          transfers={transfers}
+          onEnqueueCandidatePayloadHandoff={onEnqueueCandidatePayloadHandoff}
         />
       ) : null}
 
       {askOpen ? (
-        <Card>
-          <div className="section-row">
-            <div>
-              <h2>Ask Bridge Beta</h2>
-              <p className="muted">Ask the selected device to find, prepare, or send something.</p>
-            </div>
-            <StatusChip tone={askBridgeBetaEnabled && selectedSinglePeer ? "success" : "neutral"}>
-              {askBridgeBetaEnabled ? "Beta" : "Disabled"}
-            </StatusChip>
-          </div>
-          <p className="muted">
-            {askBridgeBetaEnabled
-              ? selectedSinglePeer
-                ? `Selected device: ${selectedSinglePeer.displayName}.`
-                : "Ask Bridge Beta requires one selected device."
-              : "Enable Labs in Settings to use Ask Bridge Beta."}
-          </p>
-        </Card>
+        <HelloPeerDemoPanel
+          enabled={askBridgeBetaEnabled}
+          selectedPeer={selectedSinglePeer}
+          selectedRoute={selectedRoute}
+          canRun={canRunHelloPeerDemo}
+          flow={helloFlow}
+          sendState={helloSendState}
+          onPrepare={prepareHelloPeerDemo}
+          onConfirm={() => void confirmHelloPeerDemo()}
+          onCancel={() => setHelloFlow(createHelloPeerProductState())}
+          onRefresh={() => void refreshHelloPeerInbox()}
+          onAllowOnce={() => void decideHelloPeerReview("allow_once")}
+          onDeny={() => void decideHelloPeerReview("deny")}
+        />
       ) : null}
 
       <Card className="recent-activity-card">
@@ -545,22 +1149,190 @@ export function BridgeDetailPage({
   );
 }
 
-function RequestFilePanel({
+function HelloPeerDemoPanel({
+  enabled,
   selectedPeer,
+  selectedRoute,
+  canRun,
+  flow,
+  sendState,
+  onPrepare,
+  onConfirm,
+  onCancel,
+  onRefresh,
+  onAllowOnce,
+  onDeny,
+}: {
+  enabled: boolean;
+  selectedPeer: BridgePeerSession | null;
+  selectedRoute: BridgeRoute | null;
+  canRun: boolean;
+  flow: HelloPeerProductState;
+  sendState: RoomControlSendState;
+  onPrepare: () => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+  onRefresh: () => void;
+  onAllowOnce: () => void;
+  onDeny: () => void;
+}) {
+  const requiresOnePeer = !selectedPeer || selectedRoute?.target.kind !== "selected_peer";
+  const result = flow.result ? formatHelloPeerStdoutProductResult(flow.result) : null;
+  return (
+    <Card className="hello-peer-panel">
+      <div className="section-row">
+        <div>
+          <h2>Ask Bridge Beta</h2>
+          <p className="muted">{HELLO_PEER_DEMO_DESCRIPTION}</p>
+        </div>
+        <StatusChip tone={enabled && selectedPeer ? "success" : "neutral"}>
+          {enabled ? "Beta" : "Disabled"}
+        </StatusChip>
+      </div>
+
+      <div className="hello-peer-action-row">
+        <div>
+          <strong>{HELLO_PEER_DEMO_ACTION_LABEL}</strong>
+          <p className="muted">
+            {enabled
+              ? requiresOnePeer
+                ? HELLO_PEER_REQUIRES_ONE_SELECTED_DEVICE
+                : `Selected device: ${selectedPeer.displayName}.`
+              : "Enable Labs in Settings to use Ask Bridge Beta."}
+          </p>
+        </div>
+        <button type="button" className="primary-button" disabled={!canRun} onClick={onPrepare}>
+          {HELLO_PEER_DEMO_ACTION_LABEL}
+        </button>
+      </div>
+
+      {flow.status === "preview_ready" && flow.preview ? (
+        <div className="hello-peer-preview" role="status">
+          <span className="agent-bridge-status-label">Confirmation preview</span>
+          <strong>Run Pastey's built-in hello runtime on {selectedPeer?.displayName ?? "the selected device"}</strong>
+          <span className="muted">Capability: runtime.hello_stdout. Expected stdout: hello peer.</span>
+          <div className="button-row">
+            <button type="button" className="primary-button" onClick={onConfirm}>Confirm and send</button>
+            <button type="button" className="secondary-button" onClick={onCancel}>Cancel</button>
+          </div>
+        </div>
+      ) : null}
+
+      {flow.peerReview ? (
+        <div className="hello-peer-preview" data-testid="bridge-hello-peer-review">
+          <span className="agent-bridge-status-label">Hello Peer request</span>
+          <strong>Allow this device to run Pastey's built-in hello runtime once?</strong>
+          <span className="muted">Expected stdout: hello peer. This does not grant shell, paths, environment, or network access.</span>
+          <div className="button-row">
+            <button type="button" className="primary-button" onClick={onAllowOnce}>Allow once</button>
+            <button type="button" className="secondary-button" onClick={onDeny}>Deny</button>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="hello-peer-status-row">
+        <button type="button" className="secondary-button" onClick={onRefresh}>
+          Check for updates
+        </button>
+        <span className="muted">
+          {sendState.status === "sending"
+            ? "Sending..."
+            : sendState.status === "accepted"
+              ? "Latest request delivered."
+              : sendState.status === "rejected"
+                ? sendState.message
+                : flow.message ?? "Ready."}
+        </span>
+      </div>
+
+      <OperationTimeline
+        label="Hello Peer lifecycle"
+        steps={buildOperationTimelineSteps(HELLO_PEER_LIFECYCLE_STEPS, flow.steps)}
+      />
+
+      {result ? (
+        <div className="hello-peer-result" data-testid="bridge-hello-peer-result">
+          <strong>{result.title}</strong>
+          <pre>{`stdout: ${result.stdout}`}</pre>
+          <span>exitCode: {result.exitCode}</span>
+        </div>
+      ) : null}
+    </Card>
+  );
+}
+
+function RequestFilePanel({
+  room,
+  selectedPeer,
+  route,
+  queueItems,
+  transfers,
+  onEnqueueCandidatePayloadHandoff,
 }: {
   room: RoomInfo;
   selectedPeer: BridgePeerSession | null;
   route: BridgeRoute | null;
+  queueItems: TransferQueueItem[];
+  transfers: FileTransferProgressEvent[];
   onEnqueueCandidatePayloadHandoff: (roomId: string, input: TransferQueueInput) => boolean;
 }) {
   const [query, setQuery] = useState("");
   const [scopes, setScopes] = useState<SafeSearchScope[]>(["downloads", "desktop", "documents", "pastey_shared"]);
   const [workflow, setWorkflow] = useState<CandidatePayloadWorkflow>(() => createCandidatePayloadWorkflow());
+  const workflowRef = useRef<CandidatePayloadWorkflow>(workflow);
   const [selectedCandidateId, setSelectedCandidateId] = useState("");
-  const [message, setMessage] = useState<string | null>(selectedPeer ? null : "Request file requires one selected device.");
+  const [session, setSession] = useState<RoomControlSessionContext | null>(null);
+  const sessionRef = useRef<RoomControlSessionContext | null>(null);
+  const [queue, setQueue] = useState<ControlQueueState>(createControlQueueState);
+  const [sendState, setSendState] = useState<RoomControlSendState>(createIdleRoomControlSendState);
+  const [peerConsentSession, setPeerConsentSession] =
+    useState<PeerConsentSessionState>(createPeerConsentSessionState);
+  const [peerConsentRecords, setPeerConsentRecords] = useState<PeerConsentRecord[]>([]);
+  const [consumptionState, setConsumptionState] =
+    useState<PeerConsentConsumptionState>(createPeerConsentConsumptionState);
+  const [flow, setFlow] = useState<RequestFileProductState>(() => createRequestFileProductState());
   const candidates = workflow.snapshot.candidates ?? [];
-  const canRequestSearch = Boolean(selectedPeer && query.trim() && scopes.length > 0);
-  const canRequestFile = Boolean(selectedPeer && selectedCandidateId && workflow.snapshot.state === "candidate_selection_required");
+  const requiresOnePeer = !selectedPeer || route?.target.kind !== "selected_peer";
+  const canRequestSearch = Boolean(!requiresOnePeer && session && query.trim() && scopes.length > 0);
+  const canConfirmSearch = Boolean(flow.searchPreview && flow.status === "search_preview_ready");
+  const canRequestFile = Boolean(!requiresOnePeer && session && selectedCandidateId && workflow.snapshot.state === "candidate_selection_required");
+  const selectedCandidate = candidates.find((candidate) => candidate.candidateId === selectedCandidateId) ?? null;
+  const relatedQueueItem = selectedCandidateId
+    ? queueItems.find((item) => item.agentBridgeMetadata?.candidateId === selectedCandidateId) ?? null
+    : null;
+  const relatedTransfer = relatedQueueItem
+    ? transfers.find((transfer) => transfer.queue_item_id === relatedQueueItem.id || transfer.item_id === relatedQueueItem.id) ?? null
+    : null;
+  const displaySteps = requestFileStepsWithTransfer(flow.steps, relatedQueueItem, relatedTransfer);
+
+  useEffect(() => {
+    workflowRef.current = workflow;
+  }, [workflow]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedPeer || room.status !== "active" || !room.peer_connected) {
+      applySession(null);
+      return;
+    }
+    void getRoomControlSessionContext(room.id)
+      .then((nextSession) => {
+        if (!cancelled) applySession(nextSession);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          applySession(null);
+          setFlow((current) => ({
+            ...current,
+            status: "failed",
+            message: err instanceof Error ? err.message : String(err),
+          }));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [room.id, room.status, room.peer_connected, selectedPeer?.peerSessionId]);
 
   function toggleScope(scope: SafeSearchScope) {
     setScopes((current) => current.includes(scope)
@@ -568,42 +1340,636 @@ function RequestFilePanel({
       : [...current, scope]);
   }
 
-  function handleRequestSearch() {
-    if (!selectedPeer) {
-      setMessage("Request file requires one selected device.");
+  function applySession(nextSession: RoomControlSessionContext | null) {
+    const previous = sessionRef.current;
+    if (roomControlSessionIdentity(previous) !== roomControlSessionIdentity(nextSession)) {
+      setQueue(createControlQueueState());
+      setSendState(createIdleRoomControlSendState());
+      setPeerConsentSession(createPeerConsentSessionState());
+      setPeerConsentRecords([]);
+      setConsumptionState(createPeerConsentConsumptionState());
+      const fresh = createCandidatePayloadWorkflow();
+      workflowRef.current = fresh;
+      setWorkflow(fresh);
+      setSelectedCandidateId("");
+      setFlow(createRequestFileProductState());
+    }
+    sessionRef.current = nextSession;
+    setSession(nextSession);
+  }
+
+  function applyWorkflow(nextWorkflow: CandidatePayloadWorkflow) {
+    workflowRef.current = nextWorkflow;
+    setWorkflow(nextWorkflow);
+  }
+
+  function handlePrepareSearch() {
+    if (requiresOnePeer || !selectedPeer || !session) {
+      setFlow((current) => ({
+        ...current,
+        status: "idle",
+        message: REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE,
+      }));
       return;
     }
     const prepared = prepareCandidateSearchWorkflow(query, scopes, selectedPeer.peerSessionId);
     const started = startCandidatePayloadWorkflowFromSearchAdvisory(createCandidatePayloadWorkflow(), prepared.plan, prepared.context);
-    const confirmed = started.ok ? confirmCandidatePayloadWorkflowSearch(started.workflow) : null;
-    setWorkflow(confirmed?.ok ? confirmed.workflow : started.workflow);
+    const confirmed = started.ok
+      ? confirmCandidatePayloadWorkflowSearch(started.workflow, {
+          sourceDeviceRef: session.localSessionRef,
+        })
+      : null;
+    if (!started.ok) {
+      applyWorkflow(started.workflow);
+      setFlow((current) => ({
+        ...current,
+        status: "failed",
+        message: started.errors.join(" "),
+      }));
+      return;
+    }
+    if (!confirmed?.ok) {
+      applyWorkflow(confirmed?.workflow ?? started.workflow);
+      setFlow((current) => ({
+        ...current,
+        status: "failed",
+        message: confirmed?.errors.join(" ") ?? "Search preview could not be confirmed.",
+      }));
+      return;
+    }
+    const preview = buildRequestFilePreviewEvent(confirmed.request, session);
+    if (!preview.ok) {
+      applyWorkflow(confirmed.workflow);
+      setFlow((current) => ({ ...current, status: "failed", message: preview.errors.join(" ") }));
+      return;
+    }
+    applyWorkflow(confirmed.workflow);
     setSelectedCandidateId("");
-    setMessage(confirmed?.ok
-      ? "Request search is ready. The selected device must approve before results appear."
-      : started.ok
-        ? "Request search is ready."
-        : started.errors.join(" "));
+    setFlow({
+      status: "search_preview_ready",
+      message: "Search preview ready. Confirm before asking the selected device.",
+      steps: ["Search prepared", "Host validated safe scopes"],
+      searchPreview: preview.event,
+      payloadPreview: null,
+      peerReview: null,
+      latestResult: null,
+    });
   }
 
-  function handleRequestSelectedFile() {
-    if (!selectedPeer || !selectedCandidateId) {
-      setMessage("Choose one result first.");
+  async function handleConfirmSearch() {
+    if (!flow.searchPreview) {
+      handlePrepareSearch();
+      return;
+    }
+    const queued = enqueueRoomControlEvent(queue, flow.searchPreview, "outbound");
+    if (!queued.ok) {
+      setFlow((current) => ({ ...current, status: "failed", message: queued.errors.join(" ") }));
+      return;
+    }
+    setFlow((current) => ({
+      ...current,
+      status: "waiting_search_approval",
+      message: "Waiting for the selected device to approve metadata search.",
+      steps: mergeRequestFileSteps(current.steps, ["You confirmed"]),
+    }));
+    await pumpRequestFileQueue(queued.state);
+  }
+
+  async function refreshRequestFileInbox() {
+    if (!session) {
+      setFlow((current) => ({
+        ...current,
+        status: "failed",
+        message: REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE,
+      }));
+      return;
+    }
+    try {
+      const events = await listReceivedRoomControlEvents(session.roomId);
+      const integrated = enqueueInboundRoomControlEvents(
+        queue,
+        events.map((event) => event.event),
+        {
+          expectedRoomRef: session.roomId,
+          expectedSourceDeviceRef: session.peerSessionRef,
+          expectedTargetPeerRef: session.localSessionRef,
+        },
+      );
+      await pumpRequestFileQueue(integrated.state);
+    } catch (err) {
+      setFlow((current) => ({
+        ...current,
+        status: "failed",
+        message: err instanceof Error ? err.message : String(err),
+      }));
+    }
+  }
+
+  function handleSelectCandidate(candidateId: string) {
+    setSelectedCandidateId(candidateId);
+    setFlow((current) => ({
+      ...current,
+      message: "Candidate selected. Request selected file when ready.",
+      steps: mergeRequestFileSteps(current.steps, ["Candidate selected"]),
+    }));
+  }
+
+  async function handleRequestSelectedFile() {
+    if (requiresOnePeer || !selectedPeer || !session || !selectedCandidateId) {
+      setFlow((current) => ({
+        ...current,
+        status: current.status,
+        message: selectedCandidateId ? REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE : "Choose candidate first.",
+      }));
       return;
     }
     const prepared = prepareCandidateSearchWorkflow(query || "selected file", scopes, selectedPeer.peerSessionId);
     const preview = buildCandidatePayloadWorkflowPayloadPreview(
-      workflow,
+      workflowRef.current,
       { candidateId: selectedCandidateId, selectedByUser: true },
       prepared.context,
+      { sourceDeviceRef: session.localSessionRef },
     );
     if (!preview.ok) {
-      setWorkflow(preview.workflow);
-      setMessage(preview.errors.join(" "));
+      applyWorkflow(preview.workflow);
+      setFlow((current) => ({ ...current, status: "failed", message: preview.errors.join(" ") }));
+      return;
+    }
+    const previewEvent = buildRequestFilePreviewEvent(preview.request, session);
+    if (!previewEvent.ok) {
+      applyWorkflow(preview.workflow);
+      setFlow((current) => ({ ...current, status: "failed", message: previewEvent.errors.join(" ") }));
       return;
     }
     const pending = markCandidatePayloadWorkflowPayloadPendingConsent(preview.workflow);
-    setWorkflow(pending.ok ? pending.workflow : preview.workflow);
-    setMessage("Request selected file is ready. The selected device must approve before sending starts.");
+    if (!pending.ok) {
+      applyWorkflow(pending.workflow);
+      setFlow((current) => ({ ...current, status: "failed", message: pending.errors.join(" ") }));
+      return;
+    }
+    const queued = enqueueRoomControlEvent(queue, previewEvent.event, "outbound");
+    if (!queued.ok) {
+      applyWorkflow(pending.workflow);
+      setFlow((current) => ({ ...current, status: "failed", message: queued.errors.join(" ") }));
+      return;
+    }
+    applyWorkflow(pending.workflow);
+    setFlow((current) => ({
+      ...current,
+      status: "payload_request_sent",
+      message: "Payload request sent. Waiting for second receiver consent.",
+      payloadPreview: previewEvent.event,
+      steps: mergeRequestFileSteps(current.steps, ["Candidate selected", "Payload request sent"]),
+    }));
+    await pumpRequestFileQueue(queued.state);
+  }
+
+  async function decideRequestFileReview(decision: "allow_once" | "deny") {
+    if (!flow.peerReview) {
+      setFlow((current) => ({ ...current, message: "No Request file approval is waiting on this device." }));
+      return;
+    }
+    const now = new Date();
+    const decisionResult = decision === "allow_once"
+      ? allowPeerCapabilityOnce(flow.peerReview.binding, peerConsentSession, { now })
+      : denyPeerCapability(flow.peerReview.binding, peerConsentSession, { now });
+    if (!decisionResult.ok) {
+      setFlow((current) => ({ ...current, status: "failed", message: decisionResult.errors.join(" ") }));
+      return;
+    }
+    const statusEvent = buildPeerConsentStatusEvent(flow.peerReview.event, decisionResult.record, { now });
+    if (!statusEvent.ok) {
+      setFlow((current) => ({ ...current, status: "failed", message: statusEvent.errors.join(" ") }));
+      return;
+    }
+    const reviewed = markControlQueueItemStatus(
+      queue,
+      flow.peerReview.queueId,
+      decision === "allow_once" ? "allowed_once" : "denied",
+      {
+        now,
+        reason: decision === "allow_once"
+          ? "Allowed once for this exact Request file capability."
+          : "Denied by receiver.",
+      },
+    );
+    if (!reviewed.ok) {
+      setFlow((current) => ({ ...current, status: "failed", message: reviewed.errors.join(" ") }));
+      return;
+    }
+    const outbound = enqueueRoomControlEvent(reviewed.state, statusEvent.event, "outbound", { now });
+    if (!outbound.ok) {
+      setFlow((current) => ({ ...current, status: "failed", message: outbound.errors.join(" ") }));
+      return;
+    }
+    setPeerConsentSession(decisionResult.state);
+    setPeerConsentRecords((records) => [...records, decisionResult.record]);
+    setFlow((current) => ({
+      ...current,
+      status: decision === "allow_once"
+        ? current.peerReview?.binding.capability === "transfer.request_candidate_payload"
+          ? "payload_request_sent"
+          : "waiting_search_approval"
+        : current.peerReview?.binding.capability === "transfer.request_candidate_payload"
+          ? "payload_denied"
+          : "search_denied",
+      message: decision === "allow_once" ? "Allowed once. Waiting for the sender's execution request." : "Denied. Nothing will run.",
+      peerReview: null,
+    }));
+    await pumpRequestFileQueue(outbound.state);
+  }
+
+  async function pumpRequestFileQueue(startQueue: ControlQueueState) {
+    let nextQueue = startQueue;
+    for (let index = 0; index < 10; index += 1) {
+      const result = await processNextControlQueueItem(
+        nextQueue,
+        (event) => sendRequestFileControlEvent(event),
+        {
+          onState: (state) => {
+            nextQueue = state;
+            setQueue(state);
+          },
+          onSendState: setSendState,
+        },
+      );
+      nextQueue = result.state;
+      setQueue(nextQueue);
+      if (!result.ok) {
+        if (result.action !== "no_selectable_item") {
+          setFlow((current) => ({ ...current, status: "failed", message: result.message }));
+        }
+        return;
+      }
+      if (result.action === "selected_inbound") {
+        nextQueue = await handleRequestFileInbound(nextQueue, result.item);
+        setQueue(nextQueue);
+        if (result.item.event.kind === "capability_preview") return;
+      }
+    }
+  }
+
+  async function handleRequestFileInbound(
+    state: ControlQueueState,
+    item: ControlQueueItem,
+  ): Promise<ControlQueueState> {
+    if (!session) return state;
+
+    if (item.event.kind === "capability_preview") {
+      const previewEvent = item.event as CapabilityPreviewRoomControlEvent;
+      const capability = previewEvent.payload.request.capability;
+      if (capability !== "filesystem.find_file_candidates" && capability !== "transfer.request_candidate_payload") {
+        const invalid = markControlQueueItemStatus(state, item.queueId, "invalid", {
+          reason: "Request file accepts only file-candidate search or candidate-payload requests.",
+        });
+        setFlow((current) => ({ ...current, status: "failed", message: "Unknown capability request rejected." }));
+        return invalid.state;
+      }
+      const policy = evaluatePeerCapabilityPreview(previewEvent, {
+        roomRef: session.roomId,
+        sourceDeviceRef: session.peerSessionRef,
+        targetPeerRef: session.localSessionRef,
+        session: peerConsentSession,
+      });
+      if (policy.status === "rejected") {
+        const invalid = markControlQueueItemStatus(state, item.queueId, "invalid", {
+          reason: policy.errors.join(" ").slice(0, 512),
+        });
+        setFlow((current) => ({ ...current, status: "failed", message: policy.errors.join(" ") }));
+        return invalid.state;
+      }
+      const awaiting = markControlQueueItemStatus(state, item.queueId, "awaiting_peer_decision", {
+        reason: "Receiver PolicyGate accepted this exact Request file preview.",
+      });
+      if (!awaiting.ok) {
+        setFlow((current) => ({ ...current, status: "failed", message: awaiting.errors.join(" ") }));
+        return state;
+      }
+      setFlow((current) => ({
+        ...current,
+        status: "awaiting_peer",
+        message: capability === "transfer.request_candidate_payload"
+          ? "This device received a selected-candidate payload request."
+          : "This device received a metadata-only search request.",
+        peerReview: {
+          queueId: item.queueId,
+          event: previewEvent,
+          binding: policy.binding,
+        },
+      }));
+      return awaiting.state;
+    }
+
+    if (item.event.kind === "capability_preview_ack" || item.event.kind === "capability_preview_deny") {
+      const decisionEvent = item.event;
+      const applied = applyInboundPeerStatusToOutboundQueue(state, decisionEvent);
+      if (!applied.ok) {
+        setFlow((current) => ({ ...current, status: "failed", message: applied.errors.join(" ") }));
+        return state;
+      }
+      const marked = markControlQueueItemStatus(
+        applied.state,
+        item.queueId,
+        decisionEvent.payload.status,
+        { reason: "Peer returned a Request file decision." },
+      );
+      if (!marked.ok) {
+        setFlow((current) => ({ ...current, status: "failed", message: marked.errors.join(" ") }));
+        return state;
+      }
+      const decisionPreview = marked.state.outbound.find(
+        (candidate): candidate is ControlQueueItem & { event: CapabilityPreviewRoomControlEvent } =>
+          candidate.event.kind === "capability_preview" &&
+          candidate.event.payload.request.requestId === decisionEvent.payload.requestId,
+      );
+      const decisionCapability = decisionPreview?.event.payload.request.capability;
+      if (decisionEvent.kind === "capability_preview_deny") {
+        setFlow((current) => ({
+          ...current,
+          status: decisionCapability === "transfer.request_candidate_payload" ? "payload_denied" : "search_denied",
+          message: decisionCapability === "transfer.request_candidate_payload"
+            ? "The selected device denied the payload request."
+            : "The selected device denied the metadata search.",
+        }));
+        return marked.state;
+      }
+      const ackEvent = decisionEvent as CapabilityPreviewAckRoomControlEvent;
+      if (!ackEvent.payload.consent) return marked.state;
+      const requestItem = marked.state.outbound.find(
+        (candidate): candidate is ControlQueueItem & { event: CapabilityPreviewRoomControlEvent } =>
+          candidate.event.kind === "capability_preview"
+          && candidate.event.eventId === ackEvent.payload.consent?.sourcePreviewEventId,
+      );
+      if (!requestItem) {
+        setFlow((current) => ({ ...current, status: "failed", message: "The exact Request file preview for this Allow once response is unavailable." }));
+        return marked.state;
+      }
+      const capability = requestItem.event.payload.request.capability;
+      const execution = capability === "filesystem.find_file_candidates"
+        ? buildFileCandidateExecutionRequest(requestItem.event, ackEvent)
+        : capability === "transfer.request_candidate_payload"
+          ? buildCandidatePayloadExecutionRequest(requestItem.event, ackEvent)
+          : { ok: false as const, errors: ["Request file received an unsupported capability acknowledgement."] };
+      if (!execution.ok) {
+        setFlow((current) => ({ ...current, status: "failed", message: execution.errors.join(" ") }));
+        return marked.state;
+      }
+      const queued = enqueueRoomControlEvent(marked.state, execution.event, "outbound");
+      if (!queued.ok) {
+        setFlow((current) => ({ ...current, status: "failed", message: queued.errors.join(" ") }));
+        return marked.state;
+      }
+      if (capability === "filesystem.find_file_candidates") {
+        const allowed = markCandidatePayloadWorkflowSearchAllowed(workflowRef.current);
+        if (allowed.ok) applyWorkflow(allowed.workflow);
+      } else {
+        const allowed = markCandidatePayloadWorkflowPayloadAllowed(workflowRef.current);
+        if (allowed.ok) applyWorkflow(allowed.workflow);
+      }
+      setFlow((current) => ({
+        ...current,
+        status: capability === "filesystem.find_file_candidates" ? "waiting_search_approval" : "payload_request_sent",
+        message: capability === "filesystem.find_file_candidates"
+          ? "Peer approved search. Running metadata-only search."
+          : "Peer approved transfer. Requesting handoff.",
+        steps: capability === "filesystem.find_file_candidates"
+          ? mergeRequestFileSteps(current.steps, ["Peer approved search"])
+          : mergeRequestFileSteps(current.steps, ["Peer approved transfer"]),
+      }));
+      return queued.state;
+    }
+
+    if (item.event.kind === "capability_execute_request") {
+      const capability = item.event.payload.capability;
+      if (capability === "filesystem.find_file_candidates") {
+        return executeRequestFileSearch(state, item as ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent });
+      }
+      if (capability === "transfer.request_candidate_payload") {
+        return executeRequestFilePayload(state, item as ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent });
+      }
+    }
+
+    if (item.event.kind === "capability_execution_result") {
+      return receiveRequestFileResult(state, item as ControlQueueItem & { event: CapabilityExecutionResultRoomControlEvent });
+    }
+
+    return state;
+  }
+
+  async function executeRequestFileSearch(
+    state: ControlQueueState,
+    item: ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent },
+  ): Promise<ControlQueueState> {
+    if (!session) return state;
+    const consent = peerConsentRecords.find((record) => record.binding.consentId === item.event.payload.consentId);
+    const execution = await executeInboundFileCandidateRequest(
+      item.event,
+      consent,
+      consumptionState,
+      executeFileCandidateSearchCapability,
+      {
+        roomRef: session.roomId,
+        sourceDeviceRef: session.peerSessionRef,
+        targetPeerRef: session.localSessionRef,
+      },
+    );
+    return enqueueRequestFileExecutionResult(state, item, execution.state, execution.resultEvent, execution.result.status === "completed"
+      ? "Exact search consent consumed. Metadata-only candidates returned."
+      : `Search rejected: ${execution.result.errorCode ?? execution.result.status}.`);
+  }
+
+  async function executeRequestFilePayload(
+    state: ControlQueueState,
+    item: ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent },
+  ): Promise<ControlQueueState> {
+    if (!session) return state;
+    const consent = peerConsentRecords.find((record) => record.binding.consentId === item.event.payload.consentId);
+    const execution = await executeInboundCandidatePayloadRequest(
+      item.event,
+      consent,
+      consumptionState,
+      resolveCandidatePayloadCapability,
+      enqueueCandidatePayloadHandoff,
+      {
+        roomRef: session.roomId,
+        sourceDeviceRef: session.peerSessionRef,
+        targetPeerRef: session.localSessionRef,
+      },
+    );
+    return enqueueRequestFileExecutionResult(state, item, execution.state, execution.resultEvent, execution.result.status === "handoff_queued"
+      ? "Exact payload consent consumed. Handoff queued."
+      : `Payload request rejected: ${execution.result.errorCode ?? execution.result.status}.`);
+  }
+
+  function enqueueRequestFileExecutionResult(
+    state: ControlQueueState,
+    item: ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent },
+    nextConsumption: PeerConsentConsumptionState,
+    resultEvent: CapabilityExecutionResultRoomControlEvent,
+    reason: string,
+  ): ControlQueueState {
+    const completed = markControlQueueItemStatus(
+      state,
+      item.queueId,
+      resultEvent.payload.status === "completed" || resultEvent.payload.status === "handoff_queued"
+        ? "execution_consumed"
+        : "execution_rejected",
+      { reason },
+    );
+    if (!completed.ok) {
+      setFlow((current) => ({ ...current, status: "failed", message: completed.errors.join(" ") }));
+      return state;
+    }
+    const outbound = enqueueRoomControlEvent(completed.state, resultEvent, "outbound");
+    if (!outbound.ok) {
+      setFlow((current) => ({ ...current, status: "failed", message: outbound.errors.join(" ") }));
+      return completed.state;
+    }
+    setConsumptionState(nextConsumption);
+    return outbound.state;
+  }
+
+  function receiveRequestFileResult(
+    state: ControlQueueState,
+    item: ControlQueueItem & { event: CapabilityExecutionResultRoomControlEvent },
+  ): ControlQueueState {
+    const resultEvent = item.event;
+    const requestItem = state.outbound.find(
+      (candidate): candidate is ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent } =>
+        candidate.event.kind === "capability_execute_request"
+        && matchExecutionResultToRequest(resultEvent, candidate.event),
+    );
+    const resultStatus = resultEvent.payload.status === "completed" || resultEvent.payload.status === "handoff_queued"
+      ? "execution_succeeded"
+      : resultEvent.payload.status === "already_consumed"
+        ? "already_consumed"
+        : resultEvent.payload.status === "failed"
+          ? "execution_failed"
+          : "execution_rejected";
+    const matched = requestItem
+      ? markControlQueueItemStatus(state, requestItem.queueId, resultStatus, {
+          reason: resultStatus === "execution_succeeded"
+            ? "Peer returned Request file result."
+            : `Peer returned ${resultEvent.payload.errorCode ?? resultEvent.payload.status}.`,
+        })
+      : { ok: false as const, state, errors: ["No matching Request file execution request was found."] };
+    const inbound = markControlQueueItemStatus(
+      matched.ok ? matched.state : state,
+      item.queueId,
+      matched.ok ? resultStatus : "invalid",
+      { reason: matched.ok ? "Matched Request file result." : matched.errors.join(" ") },
+    );
+
+    if ("capability" in resultEvent.payload && resultEvent.payload.capability === "filesystem.find_file_candidates") {
+      const received = receiveCandidatePayloadWorkflowSearchResult(
+        workflowRef.current,
+        resultEvent.payload as FileCandidateExecutionResult,
+      );
+      applyWorkflow(received.workflow);
+      setFlow((current) => ({
+        ...current,
+        status: received.ok ? "candidates_found" : "failed",
+        message: received.ok
+          ? `${received.workflow.snapshot.candidates?.length ?? 0} redacted candidate(s) returned.`
+          : received.errors.join(" "),
+        latestResult: resultEvent,
+        steps: received.ok ? mergeRequestFileSteps(current.steps, ["Candidates returned"]) : current.steps,
+      }));
+    } else if ("capability" in resultEvent.payload && resultEvent.payload.capability === "transfer.request_candidate_payload") {
+      const received = receiveCandidatePayloadWorkflowHandoffResult(
+        workflowRef.current,
+        resultEvent.payload as CandidatePayloadExecutionResult,
+      );
+      applyWorkflow(received.workflow);
+      setFlow((current) => ({
+        ...current,
+        status: received.ok ? "handoff_queued" : "failed",
+        message: received.ok
+          ? "Handoff queued. Existing transfer pipeline owns progress and completion."
+          : received.errors.join(" "),
+        latestResult: resultEvent,
+        steps: received.ok ? mergeRequestFileSteps(current.steps, ["Handoff queued"]) : current.steps,
+      }));
+    }
+    return inbound.state;
+  }
+
+  async function enqueueCandidatePayloadHandoff(
+    request: CandidatePayloadExecutionRequest,
+    resolution: CandidatePayloadLocalResolution,
+  ): Promise<CandidatePayloadHandoffResult> {
+    if (!session || request.capability !== "transfer.request_candidate_payload" || !resolution.receiverLocalSource) {
+      return { queued: false, errorCode: "unsupported_route" };
+    }
+    const modifiedMs = typeof resolution.modifiedAt === "string" ? Date.parse(resolution.modifiedAt) : Number.NaN;
+    if (
+      resolution.candidateKind !== "filesystem_file" ||
+      typeof resolution.sizeBytes !== "number" ||
+      !Number.isFinite(modifiedMs)
+    ) {
+      return { queued: false, errorCode: "handoff_failed" };
+    }
+    const targetPeerSessionId = session.peerRouteRef ?? session.peerSessionRef;
+    const queued = onEnqueueCandidatePayloadHandoff(room.id, {
+      path: resolution.receiverLocalSource,
+      displayName: resolution.displayName ?? request.candidateDisplayName,
+      mimeType: "application/octet-stream",
+      sizeBytes: resolution.sizeBytes,
+      modifiedMs,
+      dedupeKey: [
+        "agent-bridge-candidate-payload",
+        request.sourceRequestId,
+        request.candidateId,
+        request.candidateKind,
+        resolution.sizeBytes,
+        modifiedMs,
+      ].join(":"),
+      bridgeRoute: {
+        bridgeSessionId: `legacy-room:${session.roomId}`,
+        target: {
+          kind: "selected_peer",
+          peerSessionId: bridgePeerSessionId(targetPeerSessionId),
+        },
+      },
+      bridgeOperationId: `agent-bridge-candidate:${request.requestId}:${request.executionId}`,
+      bridgeTargetKind: "selected_peer",
+      bridgeContentKind: "file",
+      targetPeerSessionId,
+      targetPeerDisplayName: selectedPeer?.displayName ?? room.peer_device_name ?? "selected peer",
+      targetCount: 1,
+      agentBridgeMetadata: {
+        origin: "agent_bridge_candidate_payload",
+        label: "Agent Bridge candidate payload request",
+        note: "Queued from approved candidate payload request.",
+        sourceCapability: "filesystem.find_file_candidates",
+        requestCapability: "transfer.request_candidate_payload",
+        sourceRequestId: request.sourceRequestId,
+        candidateId: request.candidateId,
+        candidateKind: "filesystem_file",
+        candidateDisplayName: resolution.displayName ?? request.candidateDisplayName,
+        requestedByPeerRef: request.sourceDeviceRef,
+        approvedByPeerRef: request.targetPeerRef,
+        consentId: request.consentId,
+        agentBridgeRequestId: request.requestId,
+        handoffCreatedAt: new Date().toISOString(),
+        sizeBytes: resolution.sizeBytes,
+        extension: resolution.extension,
+        mimeFamily: resolution.mimeFamily,
+      },
+    });
+    return queued ? { queued: true } : { queued: false, errorCode: "handoff_failed" };
+  }
+
+  async function sendRequestFileControlEvent(event: RoomControlEvent) {
+    if (!session) {
+      throw new Error("Request file requires an active selected-peer Bridge session.");
+    }
+    const selectedRoute = assertCapabilityEventHasSelectedPeerRoute(session, event);
+    return sendRoomControlEvent(
+      session.roomId,
+      event,
+      bridgeRoutePayload(selectedRoute, "pastey-bridge-control-route-v1"),
+    );
   }
 
   return (
@@ -611,9 +1977,9 @@ function RequestFilePanel({
       <div className="section-row">
         <div>
           <h2>Request file</h2>
-          <p className="muted">{selectedPeer ? `From ${selectedPeer.displayName}` : "Request file requires one selected device."}</p>
+          <p className="muted">{selectedPeer && !requiresOnePeer ? `From ${selectedPeer.displayName}` : REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE}</p>
         </div>
-        <StatusChip tone={selectedPeer ? "success" : "neutral"}>{selectedPeer ? "Selected" : "Choose device"}</StatusChip>
+        <StatusChip tone={selectedPeer && !requiresOnePeer ? "success" : "neutral"}>{selectedPeer && !requiresOnePeer ? "Selected" : "Choose device"}</StatusChip>
       </div>
       <div className="find-search-grid">
         <label className="field-label">
@@ -638,21 +2004,48 @@ function RequestFilePanel({
         </div>
       </div>
       <div className="button-row">
-        <button type="button" className="primary-button" disabled={!canRequestSearch} onClick={handleRequestSearch}>
-          Request search
+        <button type="button" className="primary-button" disabled={!canRequestSearch} onClick={handlePrepareSearch}>
+          Search selected device
         </button>
-        <button type="button" className="secondary-button" disabled={!canRequestFile} onClick={handleRequestSelectedFile}>
+        <button type="button" className="secondary-button" disabled={!canRequestFile} onClick={() => void handleRequestSelectedFile()}>
           Request selected file
         </button>
       </div>
+      {canConfirmSearch ? (
+        <div className="request-file-preview" role="status">
+          <span className="agent-bridge-status-label">Search preview</span>
+          <strong>Search selected device</strong>
+          <span className="muted">Metadata only. Safe scopes: {scopes.map((scope) => SAFE_SEARCH_SCOPES.find((entry) => entry.value === scope)?.label ?? scope).join(", ")}.</span>
+          <div className="button-row">
+            <button type="button" className="primary-button" onClick={() => void handleConfirmSearch()}>Confirm search preview</button>
+            <button type="button" className="secondary-button" onClick={() => setFlow(createRequestFileProductState())}>Cancel</button>
+          </div>
+        </div>
+      ) : null}
+      {flow.peerReview ? (
+        <div className="request-file-preview" data-testid="request-file-peer-review">
+          <span className="agent-bridge-status-label">Approval needed</span>
+          <strong>{flow.peerReview.binding.capability === "transfer.request_candidate_payload" ? "Allow selected candidate handoff once?" : "Allow metadata search once?"}</strong>
+          <span className="muted">
+            {flow.peerReview.binding.capability === "transfer.request_candidate_payload"
+              ? "This is separate from search consent. Pastey revalidates the selected candidate before queue handoff."
+              : "Search returns redacted metadata only and does not authorize transfer."}
+          </span>
+          <div className="button-row">
+            <button type="button" className="primary-button" onClick={() => void decideRequestFileReview("allow_once")}>Allow once</button>
+            <button type="button" className="secondary-button" onClick={() => void decideRequestFileReview("deny")}>Deny</button>
+          </div>
+        </div>
+      ) : null}
       {candidates.length > 0 ? (
         <div className="candidate-card-list">
+          <h3>Choose candidate</h3>
           {candidates.map((candidate) => (
             <button
               key={candidate.candidateId}
               type="button"
               className={`candidate-metadata-card ${selectedCandidateId === candidate.candidateId ? "selected" : ""}`}
-              onClick={() => setSelectedCandidateId(candidate.candidateId)}
+              onClick={() => handleSelectCandidate(candidate.candidateId)}
             >
               <strong>{candidate.candidateDisplayName}</strong>
               <span>{formatBytes(candidate.sizeBytes)} - {candidate.extension || candidate.mimeFamily}</span>
@@ -661,9 +2054,159 @@ function RequestFilePanel({
           ))}
         </div>
       ) : null}
-      {message ? <p className="muted">{message}</p> : null}
+      <div className="request-file-status-row">
+        <button type="button" className="secondary-button" onClick={() => void refreshRequestFileInbox()}>
+          Check for updates
+        </button>
+        <span className="muted">
+          {sendState.status === "sending"
+            ? "Sending capability event..."
+            : sendState.status === "accepted"
+              ? "Latest capability event delivered."
+              : sendState.status === "rejected"
+                ? sendState.message
+                : flow.message ?? (requiresOnePeer ? REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE : "Ready.")}
+        </span>
+      </div>
+      <OperationTimeline
+        label="Request file lifecycle"
+        steps={buildOperationTimelineSteps(REQUEST_FILE_LIFECYCLE_STEPS, displaySteps)}
+        rows={requestFileLifecycleRows(flow, selectedCandidate, relatedQueueItem, relatedTransfer)}
+      />
+      <details className="request-file-advanced-details">
+        <summary>Advanced details</summary>
+        <div className="agent-bridge-definition-list">
+          <FullValue label="Search capability" value={workflow.snapshot.search?.capability ?? "Not prepared"} />
+          <FullValue label="Search request" value={workflow.searchRequest?.requestId ?? "None"} />
+          <FullValue label="Payload capability" value={workflow.snapshot.payload?.capability ?? "Not prepared"} />
+          <FullValue label="Payload request" value={workflow.payloadRequest?.requestId ?? "None"} />
+          <FullValue label="Selected candidate" value={selectedCandidateId || "None"} />
+        </div>
+      </details>
     </Card>
   );
+}
+
+function buildRequestFilePreviewEvent(
+  request: FileCandidateRequest | CandidatePayloadRequest,
+  session: RoomControlSessionContext,
+): { ok: true; event: CapabilityPreviewRoomControlEvent } | { ok: false; errors: string[] } {
+  const envelope = buildCapabilityRequestPreviewEnvelope(request, {
+    roomRef: session.roomId,
+    sourceDeviceRef: session.localSessionRef,
+    targetPeerRef: session.peerSessionRef,
+  });
+  if (!envelope.ok) {
+    return { ok: false, errors: envelope.errors };
+  }
+  const preview = buildSessionBoundCapabilityPreviewControlEvent(envelope.envelope, session);
+  if (!preview.ok || preview.event.kind !== "capability_preview") {
+    return { ok: false, errors: preview.ok ? ["Request file preview builder produced the wrong event kind."] : preview.errors };
+  }
+  return { ok: true, event: preview.event };
+}
+
+function createRequestFileProductState(): RequestFileProductState {
+  return {
+    status: "idle",
+    message: null,
+    steps: [],
+    searchPreview: null,
+    payloadPreview: null,
+    peerReview: null,
+    latestResult: null,
+  };
+}
+
+function mergeRequestFileSteps(
+  current: readonly string[],
+  next: readonly string[],
+): string[] {
+  return [...new Set([...current, ...next].filter((step) =>
+    (REQUEST_FILE_LIFECYCLE_STEPS as readonly string[]).includes(step)
+  ))];
+}
+
+function requestFileStepsWithTransfer(
+  current: readonly string[],
+  queueItem: TransferQueueItem | null,
+  transfer: FileTransferProgressEvent | null,
+): string[] {
+  const next = [...current];
+  if (queueItem) next.push("Handoff queued");
+  if (queueItem?.status === "completed" || transfer?.status === "completed") {
+    next.push("Transfer completed");
+  }
+  return mergeRequestFileSteps([], next);
+}
+
+function buildOperationTimelineSteps(
+  orderedLabels: readonly string[],
+  completedLabels: readonly string[],
+): OperationTimelineStep[] {
+  return orderedLabels
+    .filter((label) => completedLabels.includes(label))
+    .map((label, index, visibleLabels) => ({
+      id: normalizeOperationTimelineId(label),
+      label,
+      status: index === visibleLabels.length - 1 ? "active" : "complete",
+    }));
+}
+
+function requestFileLifecycleRows(
+  flow: RequestFileProductState,
+  candidate: NonNullable<CandidatePayloadWorkflow["snapshot"]["candidates"]>[number] | null,
+  queueItem: TransferQueueItem | null,
+  transfer: FileTransferProgressEvent | null,
+): OperationTimelineRow[] {
+  const rows: OperationTimelineRow[] = [];
+  if (flow.status === "waiting_search_approval" || flow.status === "payload_request_sent" || flow.status === "awaiting_peer") {
+    rows.push(operationTimelineRow("Waiting for approval", "active", flow.message ?? "Receiver consent is required."));
+  }
+  if (flow.status === "candidates_found") {
+    rows.push(operationTimelineRow("Candidates found", "complete", flow.message ?? "Redacted metadata returned."));
+  }
+  if (flow.status === "search_denied" || flow.status === "payload_denied") {
+    rows.push(operationTimelineRow("Denied", "denied", flow.message ?? "The selected device denied the request."));
+  }
+  if (flow.status === "handoff_queued" || queueItem) {
+    rows.push(operationTimelineRow(
+      "Handoff queued",
+      "complete",
+      candidate ? `${candidate.candidateDisplayName} is in the existing transfer queue.` : "Existing transfer pipeline owns progress.",
+    ));
+  }
+  if (queueItem?.status === "sending" || transfer?.status === "transferring") {
+    rows.push(operationTimelineRow(
+      "Transfer started",
+      "active",
+      transfer ? `${formatBytes(transfer.transferred_bytes)} of ${formatBytes(transfer.file_size)}` : queueItem?.displayName ?? "Sending.",
+    ));
+  }
+  if (queueItem?.status === "completed" || transfer?.status === "completed") {
+    rows.push(operationTimelineRow("Transfer complete", "complete", queueItem?.displayName ?? transfer?.file_name ?? "Completed."));
+  }
+  if (flow.status === "failed" || queueItem?.status === "failed" || transfer?.status === "failed") {
+    rows.push(operationTimelineRow("Failed", "failed", flow.message ?? queueItem?.errorMessage ?? transfer?.error_message ?? "Request file failed."));
+  }
+  return rows;
+}
+
+function operationTimelineRow(
+  label: string,
+  status: OperationTimelineStatus,
+  detail: string,
+): OperationTimelineRow {
+  return {
+    id: `${normalizeOperationTimelineId(label)}:${normalizeOperationTimelineId(detail)}`,
+    label,
+    status,
+    detail,
+  };
+}
+
+function normalizeOperationTimelineId(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "operation";
 }
 
 interface ActivityPageProps {
@@ -942,6 +2485,27 @@ function TargetSelector({
   );
 }
 
+function createHelloPeerProductState(): HelloPeerProductState {
+  return {
+    status: "idle",
+    message: null,
+    steps: [],
+    preview: null,
+    peerReview: null,
+    senderAck: null,
+    result: null,
+  };
+}
+
+function mergeHelloSteps(
+  current: readonly string[],
+  next: readonly string[],
+): string[] {
+  return [...new Set([...current, ...next].filter((step) =>
+    (HELLO_PEER_LIFECYCLE_STEPS as readonly string[]).includes(step)
+  ))];
+}
+
 function useRouteablePeers(room: RoomInfo): BridgePeerSession[] {
   return useMemo(() => {
     try {
@@ -1154,6 +2718,15 @@ function Card({ className = "", children }: { className?: string; children: Reac
 
 function StatusChip({ tone, children }: { tone: "success" | "neutral" | "warning" | "danger"; children: ReactNode }) {
   return <span className={`status-chip ${tone}`}>{children}</span>;
+}
+
+function FullValue({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <strong>{label}</strong>
+      <span title={value}>{value}</span>
+    </div>
+  );
 }
 
 function MemberChip({ title, subtitle, you = false }: { title: string; subtitle: string; you?: boolean }) {
