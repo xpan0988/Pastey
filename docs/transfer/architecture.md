@@ -32,6 +32,8 @@ Durable pairing is display/recognition metadata only. `bridge_durable_identities
 
 Files and images are treated as opaque file-like byte streams. Large files are split into encrypted chunks, sent over the LAN peer endpoint, acknowledged per chunk, and finalized after the receiver verifies expected chunk count and total bytes. JSON/base64 remains the compatibility fallback where binary-v1 negotiation is unavailable.
 
+Pastey 1.9.1's Request file flow can hand a receiver-approved candidate payload to this same transfer stack through `transfer.request_candidate_payload`. That handoff is selected-peer only, requires a second receiver Allow once after metadata search, revalidates the receiver-local candidate, and queues an ordinary transfer source into the existing pipeline. `handoff_queued` means queue acceptance only; bytes, progress, cancellation, and completion remain owned by the existing transfer pipeline.
+
 ## Encryption And Identity Boundary
 
 Payload bytes use ChaCha20-Poly1305 authenticated encryption. Runtime transport keys are wrapped through the Bridge session/key exchange path. Legacy implementation term: room session/key exchange. A corrupted encrypted chunk fails authentication.

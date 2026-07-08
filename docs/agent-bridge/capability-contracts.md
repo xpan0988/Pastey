@@ -62,12 +62,12 @@ The shared lifecycle envelope schema is `pastey-agent-bridge-capability-envelope
 
 The deterministic candidate workflow in `src/lib/agentBridge/candidatePayloadWorkflow.ts` chains the existing file-candidate discovery and candidate-payload handoff capabilities. It is not a new capability, not a generic tool surface, and not a trusted-session mode. It exposes only metadata-safe workflow state, requires explicit user candidate selection, and still requires receiver Allow once for payload handoff.
 
-The current Bridge-first product closure uses these same contracts without adding new capability ids or task types:
+Pastey 1.9.1 uses these same contracts for the Bridge-first narrow product closure without adding new capability ids or task types:
 
 - Transform + Return via `runtime.hello_stdout`: Ask Bridge Beta prepares one selected-peer preview, receiver Allow once/Deny remains exact, the fixed host-owned runtime returns typed stdout, and the sender sees `stdout: hello peer` plus `exitCode: 0`.
 - Search + Return via `filesystem.find_file_candidates` plus `transfer.request_candidate_payload`: Request file prepares a metadata-only selected-peer search preview, returns redacted candidates after receiver Allow once, requires manual candidate selection, then requires a second receiver Allow once before candidate payload handoff can be queued.
 
-The product timeline is an operation lifecycle view. It shows Pastey lifecycle events such as confirmation, peer approval, candidates returned, handoff queued, transfer started, and transfer complete. It does not show model chain-of-thought, hidden prompts, provider scratchpads, or raw internal reasoning.
+The product timeline is an operation lifecycle view. It shows Pastey lifecycle events such as confirmation, peer approval, peer denial, candidates returned, candidate selected, payload request sent, handoff queued, transfer started, and transfer complete. It does not show model chain-of-thought, hidden prompts, provider scratchpads, or raw internal reasoning. Deny is terminal: it does not continue to runtime execution, candidate payload handoff, transfer start, or automatic retry.
 
 ## Workspace Capability: `filesystem.find_file_candidates`
 

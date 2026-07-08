@@ -26,12 +26,14 @@ For `filesystem.find_file_candidates`, provider output is only an advisory propo
 
 For `transfer.request_candidate_payload`, provider output is only an advisory proposal to request a second consent decision for one previously discovered candidate. It may include the prior discovery request id, opaque candidate id, and display/audit metadata. It cannot provide receiver absolute paths, file contents, transfer queue ids, handoff ids, auto-send instructions, selected-peers/broadcast routing, or future transfer authority. The current path can resolve the selected candidate through the receiver-local in-memory store and queue the payload through the existing transfer scheduler with zero transferred bytes at handoff time.
 
-Bridge detail currently closes two narrow product loops over this provider contract:
+Pastey 1.9.1 closes two narrow Bridge-detail product loops over this provider contract:
 
 - Ask Bridge Beta uses `runtime.hello_stdout` for Transform + Return through a fixed host-owned runtime and typed stdout result.
 - Request file uses `filesystem.find_file_candidates` plus `transfer.request_candidate_payload` for Search + Return through metadata-only discovery, manual candidate selection, second consent, and queue handoff.
 
 These product paths do not add task types, shell support, model-authored code execution, broad browsing, automatic transfer after search, or durable trust authority.
+
+Provider output remains advisory in 1.9.1. The product UI owns local confirmation, active-operation refresh, terminal Deny display, redacted candidate rendering, manual candidate selection, stdout/result display, and full-content copy/view affordances. None of those UI fixes allow a provider to author execution requests, choose a cwd/env/path/network target, auto-select a payload candidate, or bypass the second receiver consent.
 
 ## Context Controls
 

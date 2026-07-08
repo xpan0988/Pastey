@@ -60,6 +60,8 @@ Control and capability transport remains single-target. `selected_peers` and `br
 
 `runtime.hello_stdout` uses the same selected-peer control transport as the fixed Hello Peer template. Its typed stdout result is a capability execution result payload, not ordinary Bridge text, and delivery of that result remains separate from consent or future authority.
 
+Pastey 1.9.1 product paths use this same selected-peer transport for both Transform + Return and Search + Return. Request file search and candidate payload requests use the canonical room-control selected peer ref for the embedded request target and preview envelope target. Denial status events are terminal product lifecycle events, not failures that retry or continue to execution. Active Bridge detail panels poll the current-session inbox while nonterminal and refresh once on focus; the `Check for updates` button is fallback only.
+
 Delivery receipt means the transport accepted or exposed the event. It does not mean:
 
 - the peer consented;
