@@ -13,9 +13,10 @@ Detailed update and release history for Pastey.
 - Added a static Agent Bridge capability registry and shared capability envelope for the existing Hello Peer / Hello Stdout capability lifecycle.
 - Added the Layer 5 workspace capability `filesystem.find_file_candidates`, including `request_peer_file_candidates` action validation, PolicyGate bounds, selected-peer preview/execution wiring, receiver Allow once, a bounded Rust/Tauri metadata-only search executor, and typed redacted candidate results.
 - Added the Layer 5 candidate-payload second-consent handoff path `transfer.request_candidate_payload`, including `request_peer_candidate_payload` action validation, selected-peer preview, capability-specific Allow once grant, exact execution-request binding, one-time consent consumption, receiver-local in-memory candidate resolution, existing transfer-queue handoff, Agent Bridge queue audit metadata, and typed `handoff_queued` results with zero transferred bytes at handoff time.
-- Added Bridge-first Transform + Return product closure via Ask Bridge Beta, the fixed `runtime.hello_stdout` runtime, receiver Allow once / Deny, and typed stdout result return.
-- Added Bridge-first Search + Return product closure via Request file, `filesystem.find_file_candidates`, manual candidate selection, second-consent `transfer.request_candidate_payload`, and existing transfer-pipeline handoff.
-- Added the shared `OperationTimeline` product abstraction for Pastey lifecycle steps in Hello Stdout and Request file.
+- Added Ask Bridge natural-v1 as the single Layer 5 natural-language product entry. Provider/model output is reduced to Search / Transform / Return; Search and Search -> Return are supported, while Search -> Transform -> Return is recognized but safely unsupported/future until bounded transform runtime exists.
+- Folded Request file into Ask Bridge as a Search / Return plan using `filesystem.find_file_candidates`, manual candidate selection, second-consent `transfer.request_candidate_payload`, and existing transfer-pipeline handoff.
+- Kept `runtime.hello_stdout` as diagnostic/test-only fixed runtime coverage and removed the user-facing Hello demo product path.
+- Added the shared `OperationTimeline` product abstraction for Pastey lifecycle steps in Ask Bridge Search / Return.
 
 ### Documentation
 
@@ -30,8 +31,8 @@ Detailed update and release history for Pastey.
 ### Changed
 
 - Removed MIME-family bucketing from MicroFlowGroup grouping and diagnostics so small payload scheduling is based on scheduler/runtime facts rather than file format labels.
-- Fixed Request file product target binding so embedded capability requests and preview envelopes use the canonical room-control selected peer ref without weakening validation.
-- Made Hello Stdout, file-candidate search, and candidate-payload Deny decisions terminal product lifecycle states.
+- Fixed Ask Bridge Search / Return target binding so embedded capability requests and preview envelopes use the canonical room-control selected peer ref without weakening validation.
+- Made file-candidate search, candidate-payload Deny decisions, and diagnostic Hello denials terminal lifecycle states.
 - Added automatic refresh/polling for active nonterminal Bridge detail Layer 5 operations while retaining `Check for updates` as fallback only.
 - Corrected local and remote platform labeling so remote Linux peers do not inherit local `This Mac` display.
 - Made long sent/received text and stdout/result blocks fully viewable and copyable while keeping truncation preview-only.
@@ -43,7 +44,7 @@ Detailed update and release history for Pastey.
 
 ### Unchanged
 
-- No automatic file sending after discovery, AI candidate auto-selection, trusted-session runtime behavior, shell/process execution, open-ended tool runtime, MCP runtime, new data plane, broad natural-language automation, or binary-v1 protocol change is implemented. The receiver-local candidate store is in-memory only, clears on app restart, and does not make candidate ids paths or transfer authority.
+- No automatic file sending after Search, AI candidate auto-selection, trusted-session runtime behavior, shell/process execution, model-authored code, cwd/env/network target, open-ended tool runtime, MCP runtime, new data plane, broad natural-language automation, or binary-v1 protocol change is implemented. The receiver-local candidate store is in-memory only, clears on app restart, and does not make candidate ids paths or transfer authority.
 
 ## 1.9.0 — Agent Bridge capability slice — 2026-06-18
 

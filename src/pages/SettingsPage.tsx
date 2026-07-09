@@ -1,6 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState, type ChangeEvent, type ReactNode } from "react";
 import { prettifyShortcut } from "../lib/format";
+import { AgentBridgeSettings } from "../components/agentBridge/AgentBridgeSettings";
 import {
   checkForUpdates,
   copyLastError,
@@ -280,6 +281,10 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
               <SettingsControlRow label="Capability probe" value={deviceCapabilities ? availableRuntimeTitle(deviceCapabilities) : "Not probed"} />
               <SettingsControlRow label="Logs folder" actionLabel="Open" onAction={handleOpenLogsFolder} />
               {diagnosticMessage ? <p className="muted">{diagnosticMessage}</p> : null}
+            </SettingsCard>
+
+            <SettingsCard title="Ask Bridge provider" icon="wrench">
+              <AgentBridgeSettings />
             </SettingsCard>
 
             <SettingsCard title="Transfer diagnostics" icon="drive">

@@ -150,7 +150,7 @@ Agent Bridge capability events must bind to one exact selected peer, Bridge sess
 
 They must not use selected-peers or broadcast routes. Existing bounded Agent Bridge capability semantics remain unchanged: model output is advisory, host validation and PolicyGate are required, execution requests are host-built, and capability execution requires explicit per-request consent.
 
-Pastey 1.9.1 fixes the Request file product target binding by using the canonical room-control selected peer ref consistently for the action plan input, pending canonical payload, embedded `filesystem.find_file_candidates` / `transfer.request_candidate_payload` requests, preview envelope target, and selected-peer control route. This keeps validation strict; the preview envelope target must still match the embedded request target, and selected-peers/broadcast control or capability routes still fail closed.
+Pastey 1.9.1 fixes Ask Bridge Search / Return target binding by using the canonical room-control selected peer ref consistently for the natural-v1 plan input, pending canonical payload, embedded `filesystem.find_file_candidates` / `transfer.request_candidate_payload` requests, preview envelope target, and selected-peer control route. This keeps validation strict; the preview envelope target must still match the embedded request target, and selected-peers/broadcast control or capability routes still fail closed.
 
 ## Lifecycle Interaction
 

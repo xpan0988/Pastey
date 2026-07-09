@@ -531,7 +531,7 @@ export function RoomControlPanel({ room, envelope, onEnqueueCandidatePayloadHand
             ? "Exact one-time consent consumed. File candidate search executed once."
             : isHelloStdout
             ? "Exact one-time consent consumed. Hello Stdout demo executed once."
-            : "Exact one-time consent consumed. Hello Peer demo executed once."
+            : "Exact one-time consent consumed. Hello diagnostic executed once."
           : `Execution request rejected: ${execution.result.errorCode ?? execution.result.status}.`,
       });
       if (!completed.ok) {
@@ -586,7 +586,7 @@ export function RoomControlPanel({ room, envelope, onEnqueueCandidatePayloadHand
             ? "Candidate payload handoff queued. Existing transfer pipeline owns progress and completion."
             : isHelloStdout
             ? "Hello Stdout demo executed once. Exact one-time consent was consumed."
-            : "Hello Peer demo executed once. Exact one-time consent was consumed."
+            : "Hello diagnostic executed once. Exact one-time consent was consumed."
           : `Execution request rejected: ${execution.result.errorCode ?? execution.result.status}.`,
         "Bounded execution result queued for one explicit Process next action.",
       ]);
@@ -1035,9 +1035,9 @@ export function RoomControlPanel({ room, envelope, onEnqueueCandidatePayloadHand
             onClick={requestHelloPeerExecution}
           >
             {senderExecutionAck.payload.consent.capability === "filesystem.find_file_candidates"
-              ? "Request file candidate search"
+              ? "Run Ask Bridge Search"
               : senderExecutionAck.payload.consent.capability === "transfer.request_candidate_payload"
-                ? "Request candidate payload scaffold"
+                ? "Request selected candidate Return"
                 : senderExecutionAck.payload.consent.capability === "runtime.hello_stdout"
                   ? "Request Hello Stdout execution"
                   : "Request Hello Peer execution"}
@@ -1217,7 +1217,7 @@ function PeerConsentReviewCard({
                   ? "One-time consent consumed. File candidate search executed once."
                   : isCandidatePayload
                     ? "One-time consent consumed for this candidate payload request."
-                : "One-time consent consumed. Hello Peer demo executed once."
+                : "One-time consent consumed. Hello diagnostic executed once."
             : review.status === "denied"
               ? "Denied."
               : review.status === "expired"

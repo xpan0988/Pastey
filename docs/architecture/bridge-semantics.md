@@ -116,9 +116,10 @@ Durable pairing does not change that boundary. Paired status, reconnect status, 
 
 ## Pastey 1.9.1 Product Boundary
 
-Pastey 1.9.1 completes the current Layer 5 narrow product closure for the fixed capability set while preserving the Bridge authority boundary. Ask Bridge Beta and Request file are Bridge-detail product flows, not a revival of old Room UI as the product surface.
+Pastey 1.9.1 completes the current Layer 5 narrow product closure for the fixed capability set while preserving the Bridge authority boundary. Ask Bridge natural-v1 is the single Layer 5 natural-language product flow, not a revival of old Room UI as the product surface.
 
-- Transform + Return uses exactly one selected device, sender confirmation, receiver Allow once/Deny, the fixed `runtime.hello_stdout` executor, and typed stdout return.
-- Search + Return uses exactly one selected device, sender-confirmed metadata search, receiver Allow once/Deny, redacted candidates, manual candidate selection, a second receiver Allow once/Deny for `transfer.request_candidate_payload`, receiver-side candidate revalidation, and queue handoff.
+- Search uses exactly one selected device, sender confirmation before any peer request, receiver Allow once/Deny, and redacted metadata candidates only.
+- Return uses manual candidate selection, a second receiver Allow once/Deny for `transfer.request_candidate_payload`, receiver-side candidate revalidation, and queue handoff.
+- Transform may be parsed and previewed in Search -> Transform -> Return, but unsupported transforms fail closed / show unsupported future state until bounded transform runtime exists. `runtime.hello_stdout` remains diagnostic/test-only and no longer appears as user-facing product UI.
 - Search consent does not authorize transfer, and `handoff_queued` means queue acceptance only.
 - Remote device platform labels, including Linux peer display, are current-session display metadata only. They are not durable identity, routeability, consent, or execution authority.

@@ -64,10 +64,14 @@ The deterministic candidate workflow in `src/lib/agentBridge/candidatePayloadWor
 
 Pastey 1.9.1 uses these same contracts for the Bridge-first narrow product closure without adding new capability ids or task types:
 
-- Transform + Return via `runtime.hello_stdout`: Ask Bridge Beta prepares one selected-peer preview, receiver Allow once/Deny remains exact, the fixed host-owned runtime returns typed stdout, and the sender sees `stdout: hello peer` plus `exitCode: 0`.
-- Search + Return via `filesystem.find_file_candidates` plus `transfer.request_candidate_payload`: Request file prepares a metadata-only selected-peer search preview, returns redacted candidates after receiver Allow once, requires manual candidate selection, then requires a second receiver Allow once before candidate payload handoff can be queued.
+Ask Bridge natural-v1 is the user-facing Layer 5 product contract. The only product-level permission primitives are `Search`, `Transform`, and `Return`; concrete capabilities are implementation details behind those primitives.
 
-The product timeline is an operation lifecycle view. It shows Pastey lifecycle events such as confirmation, peer approval, peer denial, candidates returned, candidate selected, payload request sent, handoff queued, transfer started, and transfer complete. It does not show model chain-of-thought, hidden prompts, provider scratchpads, or raw internal reasoning. Deny is terminal: it does not continue to runtime execution, candidate payload handoff, transfer start, or automatic retry.
+- Search via `filesystem.find_file_candidates`: Ask Bridge prepares a metadata-only selected-peer search preview, receiver Allow once/Deny remains exact, and the result returns redacted metadata candidates only. Search consent does not authorize payload transfer.
+- Return via `transfer.request_candidate_payload`: after Search results return, the user manually selects one candidate. Return then requires a separate receiver Allow once before candidate payload handoff can be queued.
+- Transform: bounded host-owned capability execution only. Search -> Transform -> Return may be parsed and previewed in natural-v1, but unsupported transforms fail closed / show unsupported future state. No shell, arbitrary command, model-authored code, cwd/env/network target, broad filesystem browsing, or provider-authored executor is allowed.
+- `runtime.hello_stdout`: diagnostic/test-only fixed host runtime coverage. It is no longer a user-facing product UI path.
+
+The product timeline is an operation lifecycle view. It shows Pastey lifecycle events such as confirmation, peer approval, peer denial, candidates returned, candidate selected, payload request sent, handoff queued, transfer started, and transfer complete. It does not show model chain-of-thought, hidden prompts, provider scratchpads, model thoughts, or raw internal reasoning. Deny is terminal: it does not continue to runtime execution, candidate payload handoff, transfer start, or automatic retry.
 
 ## Workspace Capability: `filesystem.find_file_candidates`
 

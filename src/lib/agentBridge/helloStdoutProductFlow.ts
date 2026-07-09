@@ -20,7 +20,7 @@ import {
   type CapabilityPreviewRoomControlEvent,
 } from "./roomControlEvent";
 
-export const HELLO_PEER_DEMO_ACTION_LABEL = "Run Hello Peer demo";
+export const HELLO_PEER_DEMO_ACTION_LABEL = "Run Hello diagnostic";
 export const HELLO_PEER_DEMO_DESCRIPTION =
   "Ask the selected device to run Pastey's built-in hello runtime and return stdout.";
 export const HELLO_PEER_REQUIRES_ONE_SELECTED_DEVICE = "Hello Peer requires one selected device.";

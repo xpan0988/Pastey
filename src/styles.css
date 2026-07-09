@@ -1237,14 +1237,14 @@ p {
   letter-spacing: 0;
 }
 
-.request-file-advanced-details {
+.ask-bridge-advanced-details {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;
   padding: 12px 14px;
 }
 
-.request-file-advanced-details summary {
+.ask-bridge-advanced-details summary {
   cursor: pointer;
   font-weight: 760;
 }

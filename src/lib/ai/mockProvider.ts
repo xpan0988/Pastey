@@ -15,7 +15,7 @@ export function buildMockHelloPeerPlan(): AiActionPlan {
   return {
     schemaVersion: "ai-action-plan-v1",
     kind: "request_peer_hello_demo",
-    title: "Ask peer to run Hello Peer demo",
+    title: "Ask peer to run Hello diagnostic",
     explanation: "The peer advertises a restricted hello-template capability. This plan asks Pastey to request that peer to output exactly 'hello peer!' through a fixed template after local and peer confirmation.",
     confidence: "high",
     requiresUserConfirmation: true,

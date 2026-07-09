@@ -96,7 +96,7 @@ function route(registry: ReturnType<typeof createRoomControlProductRegistry>, ev
   });
 }
 
-test("Hello success followed by Request file search stays product-scoped in one Bridge session", () => {
+test("Hello success followed by Ask Bridge search stays product-scoped in one Bridge session", () => {
   const hello = helloPreview();
   const file = filePreview();
   let registry = registerOutboundCapabilityPreview(
@@ -115,7 +115,7 @@ test("Hello success followed by Request file search stays product-scoped in one 
   assert.equal(fileRouted.requestFile.length, 1);
 });
 
-test("Hello deny followed by Request file search does not leak the deny into Request file", () => {
+test("Hello deny followed by Ask Bridge search does not leak the deny into Search", () => {
   const hello = helloPreview();
   const file = filePreview();
   let registry = registerOutboundCapabilityPreview(
@@ -145,7 +145,7 @@ test("outbound preview registry survives panel close/reopen until expiry", () =>
   assert.equal(reopened.requestFile.length, 1);
 });
 
-test("Request file result remains routable after the panel closes and reopens", () => {
+test("Ask Bridge search result remains routable after the panel closes and reopens", () => {
   const resultEvent = {
     schemaVersion: "pastey-room-control-event-v1",
     eventId: "file-result-event",
