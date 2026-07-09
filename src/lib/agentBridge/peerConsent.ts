@@ -500,7 +500,7 @@ export function applyInboundPeerStatusToOutboundQueue(
   statusEvent: CapabilityPreviewStatusRoomControlEvent,
   options: { now?: Date } = {},
 ): ControlQueueTransitionResult {
-  const matching = state.outbound.find((item) =>
+  const matches = state.outbound.filter((item) =>
     item.event.kind === "capability_preview" &&
     item.event.payload.envelopeId === statusEvent.payload.envelopeId &&
     item.event.payload.request.requestId === statusEvent.payload.requestId &&
@@ -508,8 +508,21 @@ export function applyInboundPeerStatusToOutboundQueue(
     item.event.sourceDeviceRef === statusEvent.targetPeerRef &&
     item.event.targetPeerRef === statusEvent.sourceDeviceRef
   );
-  if (!matching) {
+  if (matches.length !== 1) {
     return { ok: false, state, errors: ["No matching outbound capability preview was found."] };
+  }
+  const matching = matches[0];
+  if (matching.event.kind !== "capability_preview") {
+    return { ok: false, state, errors: ["No matching outbound capability preview was found."] };
+  }
+  if (statusEvent.kind === "capability_preview_ack" && statusEvent.payload.consent) {
+    const consent = statusEvent.payload.consent;
+    if (
+      consent.sourcePreviewEventId !== matching.event.eventId
+      || consent.capability !== matching.event.payload.request.capability
+    ) {
+      return { ok: false, state, errors: ["Peer status did not match the exact outbound capability preview."] };
+    }
   }
   return markControlQueueItemStatus(state, matching.queueId, statusEvent.payload.status, {
     now: options.now,

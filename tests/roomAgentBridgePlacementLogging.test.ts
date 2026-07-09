@@ -8,6 +8,8 @@ import {
   shortAgentBridgeRef,
   updateAgentBridgeRuntimeConfig,
 } from "../src/lib/agentBridge";
+import "./roomControlProductRegistry.test";
+import "./bridgeDetailPolling.test";
 
 test("desktop workstation shell defines Bridge-first primary views with Bridge selected by default", () => {
   const app = readFileSync("src/App.tsx", "utf8");
@@ -247,34 +249,34 @@ test("Bridge product deny states are terminal and do not continue execution or h
   assert.doesNotMatch(requestSource, /capability_preview_deny[\s\S]{0,500}buildCandidatePayloadExecutionRequest|capability_preview_deny[\s\S]{0,500}onEnqueueCandidatePayloadHandoff/);
 });
 
-test("Bridge product lifecycle uses the manual pump path for serialized automatic inbox refresh until terminal state", () => {
+test("Bridge product lifecycle uses one idempotent session pump for automatic and manual refresh", () => {
   const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
   const bridgeDetailSource = pages.slice(pages.indexOf("function BridgeDetailPage"), pages.indexOf("function HelloPeerDemoPanel"));
   const requestSource = pages.slice(pages.indexOf("function RequestFilePanel"), pages.indexOf("interface ActivityPageProps"));
 
-  assert.match(bridgeDetailSource, /window\.setInterval\(refresh, 1600\)/);
-  assert.match(bridgeDetailSource, /const refresh = \(\) => \{[\s\S]*refreshHelloPeerInbox\(\)/);
+  assert.equal(bridgeDetailSource.match(/window\.setInterval/g)?.length, 1);
+  assert.match(bridgeDetailSource, /bridgePollingIntervalMs\(roomControlPollingActive\)/);
+  assert.match(bridgeDetailSource, /intervalMs === null \? null : window\.setInterval\(refresh, intervalMs\)/);
+  assert.match(bridgeDetailSource, /const refresh = \(\) => \{[\s\S]*refreshBridgeControlInbox\(\)/);
   assert.match(bridgeDetailSource, /window\.addEventListener\("focus", refresh\)/);
   assert.match(bridgeDetailSource, /isHelloPeerTerminal\(helloFlow\.status\)/);
   assert.match(bridgeDetailSource, /helloQueueRef\.current/);
-  assert.match(bridgeDetailSource, /helloRefreshInFlightRef\.current/);
+  assert.match(bridgeDetailSource, /refreshInFlightRef\.current/);
   assert.match(bridgeDetailSource, /helloPumpInFlightRef\.current/);
+  assert.match(bridgeDetailSource, /routeRoomControlInboxEvents/);
+  assert.match(bridgeDetailSource, /roomControlRegistryRef\.current = routed\.registry/);
   assert.match(bridgeDetailSource, /function applyHelloQueue[\s\S]*helloQueueRef\.current = nextQueue/);
-  assert.match(bridgeDetailSource, /onRefresh=\{\(\) => void refreshHelloPeerInbox\(\)\}/);
-  assert.doesNotMatch(bridgeDetailSource, /if \(!askOpen \|\|/);
-  assert.match(requestSource, /window\.setInterval\(refresh, 1600\)/);
-  assert.match(requestSource, /const refresh = \(\) => \{[\s\S]*refreshRequestFileInbox\(\)/);
-  assert.match(requestSource, /window\.addEventListener\("focus", refresh\)/);
-  assert.match(requestSource, /isRequestFileTerminal\(flow\.status\)/);
+  assert.match(bridgeDetailSource, /onRefresh=\{\(\) => void refreshBridgeControlInbox\(\)\}/);
+  assert.doesNotMatch(requestSource, /setInterval|addEventListener\("focus"/);
+  assert.match(requestSource, /isRequestFilePollingActive\(flow\.status\)/);
+  assert.match(requestSource, /inboxEvents/);
   assert.match(requestSource, /queueRef\.current/);
-  assert.match(requestSource, /refreshInFlightRef\.current/);
   assert.match(requestSource, /pumpInFlightRef\.current/);
   assert.match(requestSource, /function applyQueue[\s\S]*queueRef\.current = nextQueue/);
-  assert.match(requestSource, /onClick=\{\(\) => void refreshRequestFileInbox\(\)\}/);
+  assert.match(requestSource, /onClick=\{onRefresh\}/);
   assert.match(bridgeDetailSource, /<div hidden=\{!requestOpen\}>[\s\S]*onIncomingReview=\{\(\) => setRequestOpen\(true\)\}/);
   assert.match(requestSource, /onIncomingReview\(\)/);
   assert.match(pages, /Check for updates/);
-  assert.doesNotMatch(bridgeDetailSource + requestSource, /setInterval[\s\S]{0,200}handleConfirmSearch|setInterval[\s\S]{0,200}confirmHelloPeerDemo|setInterval[\s\S]{0,200}buildRequestFilePreviewEvent/);
 });
 
 test("Bridge product transport failures remain terminal and never claim delivery", () => {

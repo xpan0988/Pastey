@@ -354,6 +354,25 @@ test("sender matches ack or deny without execution, completion, or retry", () =>
     if (!applied.ok) continue;
     assert.equal(applied.item.status, decision === "allow" ? "acknowledged_preview_only" : "denied");
     assert.doesNotMatch(applied.item.reason ?? "", /executed|completed|retrying/i);
+    if (status.event.kind === "capability_preview_ack" && status.event.payload.consent) {
+      const wrongPreview = {
+        ...status.event,
+        payload: {
+          ...status.event.payload,
+          consent: {
+            ...status.event.payload.consent,
+            sourcePreviewEventId: "different-preview-event",
+          },
+        },
+      };
+      const rejected = applyInboundPeerStatusToOutboundQueue(
+        delivered.state,
+        wrongPreview,
+        { now: DECISION_TIME },
+      );
+      assert.equal(rejected.ok, false);
+      assert.match(rejected.errors.join(" "), /exact outbound capability preview/);
+    }
   }
 });
 
