@@ -104,7 +104,7 @@ const SEND_ERROR_MESSAGES: Record<RoomControlSendErrorCode, string> = {
   rate_limited: "Rejected: peer control-event rate limit reached.",
   oversized: "Rejected: room-control event is oversized.",
   malformed_receipt: "Transport failed: malformed delivery receipt.",
-  transport_error: "Transport failed.",
+  transport_error: "Transport failed: the selected device did not accept the room-control request.",
   unknown: "Room-control send failed.",
 };
 

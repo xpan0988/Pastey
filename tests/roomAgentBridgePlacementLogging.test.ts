@@ -195,7 +195,7 @@ test("Bridge request-file preview target binding uses the room-control selected 
   assert.match(requestSource, /prepareCandidateSearchWorkflow\(query \|\| "selected file", scopes, session\.peerSessionRef\)/);
   assert.match(previewBuilder, /targetPeerRef: session\.peerSessionRef/);
   assert.match(previewBuilder, /sourceDeviceRef: session\.localSessionRef/);
-  assert.match(requestSource, /assertCapabilityEventHasSelectedPeerRoute\(session, event\)/);
+  assert.match(requestSource, /assertCapabilityEventHasSelectedPeerRoute\(currentSession, event\)/);
   assert.match(requestSource, /bridgeRoutePayload\(selectedRoute, "pastey-bridge-control-route-v1"\)/);
   assert.doesNotMatch(requestSource, /prepareCandidateSearchWorkflow\([^)]*selectedPeer\.peerSessionId/);
   assert.doesNotMatch(requestSource + previewBuilder, /selected-peer-ref/);
@@ -247,21 +247,42 @@ test("Bridge product deny states are terminal and do not continue execution or h
   assert.doesNotMatch(requestSource, /capability_preview_deny[\s\S]{0,500}buildCandidatePayloadExecutionRequest|capability_preview_deny[\s\S]{0,500}onEnqueueCandidatePayloadHandoff/);
 });
 
-test("Bridge product lifecycle refreshes automatically while panels are active", () => {
+test("Bridge product lifecycle uses the manual pump path for serialized automatic inbox refresh until terminal state", () => {
   const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
   const bridgeDetailSource = pages.slice(pages.indexOf("function BridgeDetailPage"), pages.indexOf("function HelloPeerDemoPanel"));
   const requestSource = pages.slice(pages.indexOf("function RequestFilePanel"), pages.indexOf("interface ActivityPageProps"));
 
   assert.match(bridgeDetailSource, /window\.setInterval\(refresh, 1600\)/);
+  assert.match(bridgeDetailSource, /const refresh = \(\) => \{[\s\S]*refreshHelloPeerInbox\(\)/);
   assert.match(bridgeDetailSource, /window\.addEventListener\("focus", refresh\)/);
   assert.match(bridgeDetailSource, /isHelloPeerTerminal\(helloFlow\.status\)/);
   assert.match(bridgeDetailSource, /helloQueueRef\.current/);
+  assert.match(bridgeDetailSource, /helloRefreshInFlightRef\.current/);
+  assert.match(bridgeDetailSource, /helloPumpInFlightRef\.current/);
+  assert.match(bridgeDetailSource, /function applyHelloQueue[\s\S]*helloQueueRef\.current = nextQueue/);
+  assert.match(bridgeDetailSource, /onRefresh=\{\(\) => void refreshHelloPeerInbox\(\)\}/);
+  assert.doesNotMatch(bridgeDetailSource, /if \(!askOpen \|\|/);
   assert.match(requestSource, /window\.setInterval\(refresh, 1600\)/);
+  assert.match(requestSource, /const refresh = \(\) => \{[\s\S]*refreshRequestFileInbox\(\)/);
   assert.match(requestSource, /window\.addEventListener\("focus", refresh\)/);
   assert.match(requestSource, /isRequestFileTerminal\(flow\.status\)/);
   assert.match(requestSource, /queueRef\.current/);
+  assert.match(requestSource, /refreshInFlightRef\.current/);
+  assert.match(requestSource, /pumpInFlightRef\.current/);
+  assert.match(requestSource, /function applyQueue[\s\S]*queueRef\.current = nextQueue/);
+  assert.match(requestSource, /onClick=\{\(\) => void refreshRequestFileInbox\(\)\}/);
+  assert.match(bridgeDetailSource, /<div hidden=\{!requestOpen\}>[\s\S]*onIncomingReview=\{\(\) => setRequestOpen\(true\)\}/);
+  assert.match(requestSource, /onIncomingReview\(\)/);
   assert.match(pages, /Check for updates/);
   assert.doesNotMatch(bridgeDetailSource + requestSource, /setInterval[\s\S]{0,200}handleConfirmSearch|setInterval[\s\S]{0,200}confirmHelloPeerDemo|setInterval[\s\S]{0,200}buildRequestFilePreviewEvent/);
+});
+
+test("Bridge product transport failures remain terminal and never claim delivery", () => {
+  const transport = readFileSync("src/lib/agentBridge/roomControlTransport.ts", "utf8");
+  assert.match(transport, /Transport failed: the selected device did not accept the room-control request\./);
+  assert.match(transport, /"transport_rejected"/);
+  assert.match(transport, /if \(sendState\.status === "accepted"\)[\s\S]*"transport_delivered"/);
+  assert.doesNotMatch(transport, /sendState\.status === "rejected"[\s\S]{0,300}"transport_delivered"/);
 });
 
 test("Bridge device labels keep local profile separate from remote peer metadata", () => {

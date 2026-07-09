@@ -390,6 +390,18 @@ The shared `OperationTimeline` product component is an operation lifecycle view 
 
 Remaining gaps include a global Activity detail drawer, broad two-device smoke validation, transfer-completion smoke for the handoff path, broader capability coverage, durable identity/trust work where explicitly needed, and multi-step orchestration.
 
+### 1.9.1 Manual Smoke Checklist
+
+The automated contracts cover the fixed Hello Peer success/deny chains, Request file search and payload approval/deny boundaries, transport rejection state, serialized automatic refresh, receiver inbox inclusion, and duplicate-send prevention. A real two-device rerun remains required for release evidence:
+
+- Hello Peer: sender confirm, automatic receiver review, Allow once, and automatic `stdout: hello peer` / `exitCode: 0` result.
+- Hello Peer deny: automatic sender Denied state with no execution result.
+- Request file: metadata search approval and deny, followed by separately consented candidate-payload approval and Candidate payload deny.
+- Candidate payload success: `handoff_queued` means queue acceptance only; transfer progress and completion remain owned by the existing transfer pipeline.
+- Failure: an unavailable or rejecting peer produces a transport failure and never a delivered state.
+- `Check for updates` remains a fallback; normal sender and receiver progression should require no manual refresh.
+- Device labeling: a remote Linux peer display does not appear as local `This Mac`.
+
 ## Migration Plan
 
 ### Phase 0: docs/spec only
