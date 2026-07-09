@@ -10,6 +10,7 @@ export * from "./fileCandidateRequest";
 export * from "./helloPeerRequest";
 export * from "./helloStdoutRequest";
 export * from "./mockProvider";
+export * from "./naturalV1Plan";
 export * from "./pendingAction";
 export * from "./policyGate";
 export * from "./types";

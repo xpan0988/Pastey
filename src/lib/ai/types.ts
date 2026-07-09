@@ -113,7 +113,7 @@ export interface AiGenerateRequest {
   context: AiContextSnapshot;
   contextPolicy: AiContextPolicy;
   allowedActionKinds: AiActionKind[];
-  outputSchema: "ai-action-plan-v1";
+  outputSchema: "ai-action-plan-v1" | "ask-bridge-natural-v1";
   userRequest: string;
 }
 
@@ -122,7 +122,7 @@ export interface AiGenerateResult {
   providerId: string;
   model: string;
   rawText?: string;
-  parsedPlan?: AiActionPlan;
+  parsedPlan?: unknown;
   usage?: {
     inputTokens?: number;
     outputTokens?: number;

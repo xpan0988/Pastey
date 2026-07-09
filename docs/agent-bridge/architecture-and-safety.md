@@ -2,7 +2,7 @@
 
 Agent Bridge is the Layer 5 narrow capability path for model-assisted planning, host validation, explicit consent, bounded execution, result return, and redacted audit. For the project-wide layer contract, see [../architecture/Project-specifications.md](../architecture/Project-specifications.md). For template and manifest implementation status, see [capability-templates.md](capability-templates.md). For naming rules covering capability IDs, schema versions, provider actions, executors, and future capabilities, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md). For Bridge membership and authority boundaries, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md).
 
-The current product reality is Pastey 1.9.1: Layer 5 narrow product closure and smoke bugfix consolidation for the fixed capability set. Hello Stdout proves Transform + Return through a fixed host-owned runtime, and Request file proves Search + Return through metadata-only discovery plus second-consent candidate payload handoff. This does not claim full Agent Bridge, full Jarvis, broad capability coverage, or multi-step autonomous orchestration.
+The current product reality is Pastey 1.9.1 with Ask Bridge natural-v1: Layer 5 narrow product closure and smoke bugfix consolidation for Search and Search -> Return. Ask Bridge is the single natural-language Layer 5 entry. It reduces provider/model output to the product primitives `Search`, `Transform`, and `Return`; concrete capabilities are implementation details behind those primitives. Search -> Transform -> Return can be parsed and previewed, but unsupported transforms fail closed / show unsupported future state until bounded transform runtime exists. Hello Stdout / `runtime.hello_stdout` is diagnostic/test-only and no longer user-facing product UI. This does not claim full Agent Bridge, full Jarvis, broad capability coverage, or multi-step autonomous orchestration.
 
 ## Current Flow
 
@@ -21,7 +21,7 @@ The current product reality is Pastey 1.9.1: Layer 5 narrow product closure and 
 
 For `filesystem.find_file_candidates`, the receiver returns redacted metadata candidates and records a receiver-local, in-memory, TTL-bounded candidate store. For `transfer.request_candidate_payload`, the flow validates and consumes a separate exact Allow once, resolves the selected candidate locally against that store, and queues the resolved local file source through the existing transfer queue. Pastey does not send files automatically after discovery, create a new data plane, or expose real receiver paths to the sender or provider.
 
-The deterministic candidate workflow coordinates those existing capabilities only. It lets a natural-language intent start with advisory search planning, but the AI remains advisory, the host remains authoritative, the user must select the candidate, and the receiver must still Allow once for payload handoff. `handoff_queued` means accepted into the existing transfer queue, not transfer completion.
+The deterministic candidate workflow coordinates those existing capabilities only. It lets a natural-language Ask Bridge intent start with advisory Search planning, but the AI remains advisory, the host remains authoritative, the user must confirm the plan before any peer request is sent, the user must select the candidate, and the receiver must still Allow once for payload Return. Search consent does not authorize payload transfer. `handoff_queued` means accepted into the existing transfer queue, not transfer completion.
 
 ## Implemented Production Paths
 
@@ -71,7 +71,7 @@ The capability registry is a static contract table for known bounded capabilitie
 
 The current implementation does not allow provider-crafted execution requests. Execution requests are built by the host after a matched receiver acknowledgement. The receiver revalidates the binding before execution.
 
-`runtime.hello_stdout` is not a shell, process, Python, Node, or general command runtime. It is a single Rust host helper that returns typed stdout metadata for the fixed output `hello peer`. It is the first template-wrapped capability; the wrapper uses the static manifest and exact binding helpers without changing its public contract or Rust executor behavior.
+`runtime.hello_stdout` is not a shell, process, Python, Node, or general command runtime. It is a single Rust host helper that returns typed stdout metadata for the fixed output `hello peer`. It remains available for diagnostics/tests and template coverage only; it is not exposed as user-facing Ask Bridge product UI. The wrapper uses the static manifest and exact binding helpers without changing its public contract or Rust executor behavior.
 
 `filesystem.find_file_candidates` is not remote file access. It is a bounded metadata candidate-discovery capability. Model output may propose a filename hint and safe limits, but it does not authorize filesystem traversal by itself. Traversal happens only on the receiver after selected-peer routing, local sender confirmation, receiver Allow once, exact consent binding, and execution-request validation. It is now template-wrapped for manifest-backed constants, exact capability/request-hash binding, expiry checks, and forbidden public-field checks. Safe scopes, query bounds, filename and extension filters, depth and candidate limits, hidden-file and symlink behavior, candidate id opacity, receiver-local candidate storage, and Rust command validation remain capability-specific. The executor does not read file contents, return absolute paths, search hidden files, search the whole device, start automatic transfer, or create reusable access to a peer.
 
@@ -81,14 +81,16 @@ The current implementation does not allow provider-crafted execution requests. E
 
 ## Product Closure Status
 
-The current Bridge detail product UI exposes two narrow closure paths:
+The current Bridge detail product UI exposes Ask Bridge natural-v1 as the single Layer 5 entry:
 
-- Transform + Return: Ask Bridge Beta runs `runtime.hello_stdout` on exactly one selected peer after sender confirmation and receiver Allow once, then returns typed stdout `hello peer` and `exitCode: 0`.
-- Search + Return: Request file runs `filesystem.find_file_candidates` on exactly one selected peer after sender confirmation and receiver Allow once, shows redacted candidates, requires manual candidate selection, then sends `transfer.request_candidate_payload` through a second receiver Allow once before queue handoff.
+- Search: Ask Bridge runs `filesystem.find_file_candidates` on exactly one selected peer after sender confirmation and receiver Allow once, then shows redacted candidates only.
+- Search -> Return: after candidates return, the user manually selects one candidate, then Ask Bridge sends `transfer.request_candidate_payload` through a second receiver Allow once before queue handoff.
+- Search -> Transform -> Return: Ask Bridge may parse and preview this shape, but unsupported transforms fail closed / show unsupported future state until bounded transform runtime exists.
+- Hello Stdout / `runtime.hello_stdout`: diagnostic/test-only fixed host runtime coverage, not user-facing product UI.
 
 The shared operation timeline shown in Bridge detail visualizes Pastey lifecycle events only. It does not display model chain-of-thought, hidden prompts, provider scratchpads, raw internal prompts, or fake reasoning.
 
-Pastey 1.9.1 also consolidates the product smoke fixes around those flows: Request file uses the canonical room-control selected peer ref for embedded requests and preview envelopes, Deny is a terminal lifecycle state, active Bridge detail operations auto-refresh while `Check for updates` remains a fallback, remote platform labels are display metadata only, and long sent/received text plus stdout/result blocks remain fully accessible through detail or copy actions. Preview truncation is UI-only.
+Pastey 1.9.1 also consolidates the product smoke fixes around those flows: Ask Bridge uses the canonical room-control selected peer ref for embedded requests and preview envelopes, Deny is a terminal lifecycle state, active Bridge detail operations auto-refresh while `Check for updates` remains a fallback, remote platform labels are display metadata only, and long sent/received text remains fully accessible through detail or copy actions. Preview truncation is UI-only.
 
 ## Workspace Capability Roadmap
 

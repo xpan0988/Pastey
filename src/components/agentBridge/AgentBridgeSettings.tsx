@@ -1,10 +1,41 @@
+import { useState } from "react";
 import {
   updateAgentBridgeRuntimeConfig,
   useAgentBridgeRuntimeConfig,
 } from "../../lib/agentBridge/config";
+import { checkAskBridgeNaturalV1ProviderHealth as runNaturalV1ProviderHealthCheck } from "../../lib/ai";
 
 export function AgentBridgeSettings() {
   const config = useAgentBridgeRuntimeConfig();
+  const [healthMessage, setHealthMessage] = useState<string | null>(null);
+  const [checkingHealth, setCheckingHealth] = useState(false);
+
+  async function checkProviderHealth() {
+    setCheckingHealth(true);
+    setHealthMessage(null);
+    try {
+      const result = await runNaturalV1ProviderHealthCheck({
+        providerId: "pastey-cloud-openai-compatible-natural-v1-health",
+        displayName: "CloudOpenAICompatibleProvider",
+        kind: "cloud_openai_compatible",
+        apiShape: "openai_compatible_chat",
+        baseUrl: config.cloudBaseUrl,
+        model: config.cloudModel,
+        apiKeyRef: config.cloudApiKey ? "runtime-memory-only" : undefined,
+        timeoutMs: 30_000,
+        maxOutputTokens: 512,
+        enabled: config.providerKind === "cloud",
+      }, {
+        apiKey: config.cloudApiKey,
+      });
+      setHealthMessage(result.ok
+        ? result.message
+        : `${result.message}${result.errors.length > 0 ? ` ${result.errors.join(" ")}` : ""}`);
+    } finally {
+      setCheckingHealth(false);
+    }
+  }
+
   return (
     <div className="settings-row diagnostics-panel-row" data-testid="agent-bridge-settings">
       <span className="settings-icon wrench" aria-hidden="true" />
@@ -41,6 +72,9 @@ export function AgentBridgeSettings() {
               <label>Base URL<input value={config.cloudBaseUrl} onChange={(event) => updateAgentBridgeRuntimeConfig({ cloudBaseUrl: event.target.value })} /></label>
               <label>Model<input value={config.cloudModel} onChange={(event) => updateAgentBridgeRuntimeConfig({ cloudModel: event.target.value })} /></label>
               <label>API key (runtime memory only)<input type="password" autoComplete="off" value={config.cloudApiKey} onChange={(event) => updateAgentBridgeRuntimeConfig({ cloudApiKey: event.target.value })} /></label>
+              <button type="button" className="secondary-button" disabled={checkingHealth} onClick={() => void checkProviderHealth()}>
+                {checkingHealth ? "Checking..." : "Check provider"}
+              </button>
             </>
           ) : null}
           <label>
@@ -58,6 +92,7 @@ export function AgentBridgeSettings() {
             </select>
           </label>
         </div>
+        {healthMessage ? <p className="muted">{healthMessage}</p> : null}
         <p className="muted">Logs are bounded, structured, redacted audit mirrors only. They are never state, consent, authority, or trust.</p>
       </div>
     </div>

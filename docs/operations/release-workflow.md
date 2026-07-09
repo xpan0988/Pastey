@@ -2,7 +2,7 @@
 
 Pastey uses `src-tauri/Cargo.toml` as the authoritative app version. All other app/package version files should be derived from it during a release bump.
 
-Detailed product update history lives in [../../CHANGELOG.md](../../CHANGELOG.md). Pastey 1.9.1 is defined there and in the canonical architecture docs as Layer 5 narrow product closure and smoke bugfix consolidation; it must not be described as full Agent Bridge or full Jarvis completion.
+Detailed product update history lives in [../../CHANGELOG.md](../../CHANGELOG.md). Pastey 1.9.1 is defined there and in the canonical architecture docs as Layer 5 narrow product closure and smoke bugfix consolidation; it must not be described as full Agent Bridge or full Jarvis completion. Release notes for this line should describe Ask Bridge natural-v1 as the single natural-language Layer 5 entry, with Request file folded into Search / Return, Hello Stdout kept diagnostic/test-only, provider output advisory-only, and Search consent separate from payload Return consent.
 
 ## Bump Version
 

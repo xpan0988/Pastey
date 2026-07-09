@@ -1,6 +1,6 @@
 # Capability Templates
 
-This document designs and tracks the template-based Layer 5 capability architecture for Pastey Agent Bridge. Phase 1 static manifests, Phase 2 additive helpers, the Phase 3 `runtime.hello_stdout` wrapper, the Phase 4 `filesystem.find_file_candidates` common-check wrapper, the Phase 5 `transfer.request_candidate_payload` common-check wrapper, and the Phase 6 deterministic candidate workflow are implemented for the current narrow capability set. Pastey 1.9.1 completes the current Layer 5 narrow product closure for Transform + Return via Hello Stdout and Search + Return via Request file, then consolidates smoke bug fixes around target binding, Deny propagation, automatic active-operation refresh, device platform display, full content access, and product-status documentation. This is not full Agent Bridge or full Jarvis completion. The current implementation does not change public capability IDs, schema versions, provider action kinds, executor kinds, room-control event names, transfer queue APIs, `binary-v1`, or existing validators.
+This document designs and tracks the template-based Layer 5 capability architecture for Pastey Agent Bridge. Phase 1 static manifests, Phase 2 additive helpers, the Phase 3 `runtime.hello_stdout` wrapper, the Phase 4 `filesystem.find_file_candidates` common-check wrapper, the Phase 5 `transfer.request_candidate_payload` common-check wrapper, and the Phase 6 deterministic candidate workflow are implemented for the current narrow capability set. Pastey 1.9.1 completes the current Layer 5 narrow product closure through Ask Bridge natural-v1 Search / Return, folds Request file into that plan model, keeps Hello Stdout diagnostic/test-only, and consolidates smoke bug fixes around target binding, Deny propagation, automatic active-operation refresh, device platform display, full content access, and product-status documentation. This is not full Agent Bridge or full Jarvis completion. The current implementation does not change public capability IDs, schema versions, provider action kinds, executor kinds, room-control event names, transfer queue APIs, `binary-v1`, or existing validators.
 
 For the current capability contracts, see [capability-contracts.md](capability-contracts.md). For the broader safety model, see [architecture-and-safety.md](architecture-and-safety.md). For capability ID, schema, provider action, executor, and template naming rules, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md).
 
@@ -381,10 +381,13 @@ Payload transfer remains bytes-oriented and uses the existing transfer queue, sc
 
 ## Product Closure Status
 
-Pastey 1.9.1 Layer 5 narrow product closure is implemented for the current fixed capability set:
+Pastey 1.9.1 Layer 5 narrow product closure is implemented through Ask Bridge natural-v1:
 
-- `runtime.hello_stdout` proves Transform + Return through a fixed host-owned runtime. Bridge detail's Ask Bridge Beta flow requires exactly one selected peer, sender confirmation, receiver Allow once/Deny, fixed execution, and typed stdout return.
-- `filesystem.find_file_candidates` plus `transfer.request_candidate_payload` proves Search + Return. Bridge detail's Request file flow requires exactly one selected peer, metadata-only search consent, redacted candidates, manual candidate selection, second payload consent, receiver-side candidate revalidation, and queue handoff into the existing transfer pipeline.
+- Ask Bridge is the single natural-language Layer 5 entry.
+- Request file is folded into Ask Bridge as a `Search` / `Return` plan, not a separate primary product model.
+- `filesystem.find_file_candidates` plus `transfer.request_candidate_payload` implements Search / Return behind the product primitives. It requires exactly one selected peer, metadata-only search consent, redacted candidates, manual candidate selection, second payload consent, receiver-side candidate revalidation, and queue handoff into the existing transfer pipeline.
+- Search -> Transform -> Return may be parsed and previewed in natural-v1, but unsupported transforms fail closed / show unsupported future state until bounded transform runtime exists.
+- `runtime.hello_stdout` remains diagnostic/test-only fixed runtime coverage and is no longer user-facing product UI.
 
 The shared `OperationTimeline` product component is an operation lifecycle view backed by Pastey events and existing queue/transfer state. It is not a model reasoning trace, provider scratchpad, or task taxonomy. Active Bridge detail operations auto-refresh while nonterminal; `Check for updates` is retained as fallback/debug affordance only.
 
@@ -392,11 +395,11 @@ Remaining gaps include a global Activity detail drawer, broad two-device smoke v
 
 ### 1.9.1 Manual Smoke Checklist
 
-The automated contracts cover the fixed Hello Peer success/deny chains, Request file search and payload approval/deny boundaries, transport rejection state, serialized automatic refresh, receiver inbox inclusion, and duplicate-send prevention. A real two-device rerun remains required for release evidence:
+The automated contracts cover Ask Bridge Search and Return approval/deny boundaries, diagnostic Hello success/deny chains, transport rejection state, serialized automatic refresh, receiver inbox inclusion, and duplicate-send prevention. A real two-device rerun remains required for release evidence:
 
-- Hello Peer: sender confirm, automatic receiver review, Allow once, and automatic `stdout: hello peer` / `exitCode: 0` result.
-- Hello Peer deny: automatic sender Denied state with no execution result.
-- Request file: metadata search approval and deny, followed by separately consented candidate-payload approval and Candidate payload deny.
+- Ask Bridge Search: natural-language input, Search / Transform / Return preview, sender confirmation before any peer request, metadata search approval and deny.
+- Ask Bridge Return: manual candidate selection, separate candidate-payload approval and Candidate payload deny.
+- Hello diagnostics: fixed Hello Peer / Hello Stdout tests remain diagnostic/test-only and are not product UI smoke steps.
 - Candidate payload success: `handoff_queued` means queue acceptance only; transfer progress and completion remain owned by the existing transfer pipeline.
 - Failure: an unavailable or rejecting peer produces a transport failure and never a delivered state.
 - `Check for updates` remains a fallback; normal sender and receiver progression should require no manual refresh.

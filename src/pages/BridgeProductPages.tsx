@@ -4,7 +4,6 @@ import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNo
 import {
   copyTextToClipboard,
   executeFileCandidateSearchCapability,
-  executeHelloStdoutCapability,
   getDeviceProfile,
   getRoomControlSessionContext,
   joinRoom,
@@ -54,8 +53,6 @@ import {
   buildCandidatePayloadExecutionRequest,
   buildCandidatePayloadWorkflowPayloadPreview,
   buildFileCandidateExecutionRequest,
-  buildHelloPeerStdoutProductPreview,
-  buildHelloStdoutExecutionRequest,
   buildPeerConsentStatusEvent,
   buildSessionBoundCapabilityPreviewControlEvent,
   confirmCandidatePayloadWorkflowSearch,
@@ -78,16 +75,11 @@ import {
   evaluatePeerCapabilityPreview,
   executeInboundCandidatePayloadRequest,
   executeInboundFileCandidateRequest,
-  executeInboundHelloStdoutRequest,
-  formatHelloPeerStdoutProductResult,
-  HELLO_PEER_DEMO_ACTION_LABEL,
-  HELLO_PEER_DEMO_DESCRIPTION,
-  HELLO_PEER_LIFECYCLE_STEPS,
-  HELLO_PEER_REQUIRES_ONE_SELECTED_DEVICE,
   markControlQueueItemStatus,
   matchExecutionResultToRequest,
   processNextControlQueueItem,
   roomControlSessionIdentity,
+  useAgentBridgeRuntimeConfig,
   type CapabilityExecuteRequestRoomControlEvent,
   type CapabilityExecutionResultRoomControlEvent,
   type CapabilityPreviewAckRoomControlEvent,
@@ -107,7 +99,14 @@ import {
 import {
   buildCapabilityRequestPreviewEnvelope,
   buildMockAiContextSnapshot,
-  buildMockFileCandidatePlan,
+  buildNaturalV1SearchAdvisoryInput,
+  CloudOpenAICompatibleProvider,
+  CLOUD_STRICT_AI_CONTEXT_POLICY,
+  generateMockAskBridgeNaturalV1Plan,
+  validateAskBridgeNaturalV1Plan,
+  type AiActionPlan,
+  type AskBridgeNaturalV1Plan,
+  type AiGenerateResult,
   type CandidatePayloadExecutionRequest,
   type CandidatePayloadExecutionResult,
   type CandidatePayloadRequest,
@@ -130,33 +129,6 @@ import type {
 type PrimaryRoute = "bridge" | "activity" | "devices" | "settings";
 type BridgeTargetSelectionMode = "selected_peer" | "selected_peers" | "broadcast_bridge";
 type SafeSearchScope = "downloads" | "desktop" | "documents" | "pastey_shared";
-type HelloPeerDemoStatus =
-  | "idle"
-  | "preview_ready"
-  | "peer_requested"
-  | "awaiting_peer"
-  | "peer_approved"
-  | "denied"
-  | "executing"
-  | "completed"
-  | "failed";
-
-interface HelloPeerProductState {
-  status: HelloPeerDemoStatus;
-  message: string | null;
-  steps: string[];
-  preview: CapabilityPreviewRoomControlEvent | null;
-  peerReview: HelloPeerReviewState | null;
-  senderAck: CapabilityPreviewAckRoomControlEvent | null;
-  result: CapabilityExecutionResultRoomControlEvent | null;
-}
-
-interface HelloPeerReviewState {
-  queueId: string;
-  event: CapabilityPreviewRoomControlEvent;
-  binding: PeerConsentBinding;
-  record?: PeerConsentRecord;
-}
 
 type RequestFileStatus =
   | "idle"
@@ -186,7 +158,7 @@ interface RequestFileReviewState {
   binding: PeerConsentBinding;
 }
 
-const REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE = "Request file requires one selected device.";
+const REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE = "Ask Bridge requires one selected device.";
 const REQUEST_FILE_LIFECYCLE_STEPS = [
   "Search prepared",
   "Host validated safe scopes",
@@ -418,25 +390,13 @@ export function BridgeDetailPage({
   const [dropActive, setDropActive] = useState(false);
   const [targetMode, setTargetMode] = useState<BridgeTargetSelectionMode>("selected_peer");
   const [selectedPeerIds, setSelectedPeerIds] = useState<string[]>([]);
-  const [requestOpen, setRequestOpen] = useState(false);
-  const [askOpen, setAskOpen] = useState(false);
-  const [helloSession, setHelloSession] = useState<RoomControlSessionContext | null>(null);
-  const helloSessionRef = useRef<RoomControlSessionContext | null>(null);
-  const [helloQueue, setHelloQueue] = useState<ControlQueueState>(createControlQueueState);
-  const helloQueueRef = useRef<ControlQueueState>(helloQueue);
+  const [controlSession, setControlSession] = useState<RoomControlSessionContext | null>(null);
+  const controlSessionRef = useRef<RoomControlSessionContext | null>(null);
   const roomControlRegistryRef = useRef<RoomControlProductRegistry>(createRoomControlProductRegistry());
   const refreshInFlightRef = useRef(false);
   const refreshBridgeControlInboxRef = useRef<() => Promise<void>>(async () => {});
-  const helloPumpInFlightRef = useRef(false);
   const [requestInboxBatch, setRequestInboxBatch] = useState<RoomControlEvent[]>([]);
   const [requestPollingActive, setRequestPollingActive] = useState(false);
-  const [helloSendState, setHelloSendState] = useState<RoomControlSendState>(createIdleRoomControlSendState);
-  const [helloPeerConsentSession, setHelloPeerConsentSession] =
-    useState<PeerConsentSessionState>(createPeerConsentSessionState);
-  const [helloPeerConsentRecords, setHelloPeerConsentRecords] = useState<PeerConsentRecord[]>([]);
-  const [helloConsumptionState, setHelloConsumptionState] =
-    useState<PeerConsentConsumptionState>(createPeerConsentConsumptionState);
-  const [helloFlow, setHelloFlow] = useState<HelloPeerProductState>(() => createHelloPeerProductState());
   const [localDeviceProfile, setLocalDeviceProfile] = useState<DeviceProfile | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const enqueueDroppedFilesRef = useRef<(paths: string[]) => void>(() => {});
@@ -455,7 +415,7 @@ export function BridgeDetailPage({
   );
   const selectedSinglePeer = selectedRoute?.target.kind === "selected_peer" ? selectedPeers[0] ?? null : null;
   const canSend = room.status === "active" && room.peer_connected && selectedRoute !== null && selectedPeers.length > 0 && busy === null;
-  const canRunHelloPeerDemo = Boolean(askBridgeBetaEnabled && selectedSinglePeer && helloSession);
+  const bridgeConfig = useAgentBridgeRuntimeConfig();
 
   useEffect(() => {
     let cancelled = false;
@@ -488,21 +448,17 @@ export function BridgeDetailPage({
   useEffect(() => {
     let cancelled = false;
     if (!room.peer_connected || room.status !== "active") {
-      applyHelloSession(null);
+      applyControlSession(null);
       return;
     }
     void getRoomControlSessionContext(room.id)
       .then((session) => {
-        if (!cancelled) applyHelloSession(session);
+        if (!cancelled) applyControlSession(session);
       })
       .catch((err) => {
         if (!cancelled) {
-          applyHelloSession(null);
-          setHelloFlow((current) => ({
-            ...current,
-            status: "failed",
-            message: err instanceof Error ? err.message : String(err),
-          }));
+          applyControlSession(null);
+          setError(err instanceof Error ? err.message : String(err));
         }
       });
     return () => {
@@ -510,12 +466,11 @@ export function BridgeDetailPage({
     };
   }, [room.id, room.peer_connected, room.status]);
 
-  const helloPollingActive = askBridgeBetaEnabled && !isHelloPeerTerminal(helloFlow.status) && helloFlow.status !== "idle" && helloFlow.status !== "preview_ready";
-  const roomControlPollingActive = helloPollingActive || requestPollingActive;
+  const roomControlPollingActive = requestPollingActive;
   refreshBridgeControlInboxRef.current = refreshBridgeControlInbox;
 
   useEffect(() => {
-    if (!helloSession) return;
+    if (!controlSession) return;
     let cancelled = false;
     const refresh = () => {
       if (!cancelled) void refreshBridgeControlInboxRef.current();
@@ -529,7 +484,7 @@ export function BridgeDetailPage({
       if (interval !== null) window.clearInterval(interval);
       window.removeEventListener("focus", refresh);
     };
-  }, [helloSession, roomControlPollingActive]);
+  }, [controlSession, roomControlPollingActive]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -662,106 +617,30 @@ export function BridgeDetailPage({
     }
   }
 
-  function applyHelloSession(nextSession: RoomControlSessionContext | null) {
-    const previous = helloSessionRef.current;
+  function applyControlSession(nextSession: RoomControlSessionContext | null) {
+    const previous = controlSessionRef.current;
     if (roomControlSessionIdentity(previous) !== roomControlSessionIdentity(nextSession)) {
-      const freshQueue = createControlQueueState();
-      helloQueueRef.current = freshQueue;
-      setHelloQueue(freshQueue);
-      setHelloSendState(createIdleRoomControlSendState());
-      setHelloPeerConsentSession(createPeerConsentSessionState());
-      setHelloPeerConsentRecords([]);
-      setHelloConsumptionState(createPeerConsentConsumptionState());
-      setHelloFlow(createHelloPeerProductState());
       roomControlRegistryRef.current = createRoomControlProductRegistry();
       setRequestInboxBatch([]);
     }
-    helloSessionRef.current = nextSession;
-    setHelloSession(nextSession);
-  }
-
-  function applyHelloQueue(nextQueue: ControlQueueState) {
-    helloQueueRef.current = nextQueue;
-    setHelloQueue(nextQueue);
+    controlSessionRef.current = nextSession;
+    setControlSession(nextSession);
   }
 
   function registerProductPreview(
     event: CapabilityPreviewRoomControlEvent,
-    owner: "hello_peer" | "request_file",
   ) {
     roomControlRegistryRef.current = registerOutboundCapabilityPreview(
       roomControlRegistryRef.current,
       event,
-      owner,
+      "request_file",
     );
   }
 
-  function prepareHelloPeerDemo() {
-    if (!askBridgeBetaEnabled) {
-      setHelloFlow((current) => ({
-        ...current,
-        status: "failed",
-        message: "Enable Labs in Settings to use Ask Bridge Beta.",
-      }));
-      return;
-    }
-    if (!selectedSinglePeer || !helloSession || selectedRoute?.target.kind !== "selected_peer") {
-      setHelloFlow((current) => ({
-        ...current,
-        status: "idle",
-        message: HELLO_PEER_REQUIRES_ONE_SELECTED_DEVICE,
-      }));
-      return;
-    }
-    const preview = buildHelloPeerStdoutProductPreview(helloSession);
-    if (!preview.ok) {
-      setHelloFlow((current) => ({
-        ...current,
-        status: "failed",
-        message: preview.errors.join(" "),
-      }));
-      return;
-    }
-    setHelloFlow({
-      status: "preview_ready",
-      message: `Ready to ask ${selectedSinglePeer.displayName} for stdout.`,
-      steps: ["Plan prepared", "Host validated"],
-      preview: preview.preview.previewEvent,
-      peerReview: null,
-      senderAck: null,
-      result: null,
-    });
-  }
-
-  async function confirmHelloPeerDemo() {
-    if (!helloFlow.preview) {
-      prepareHelloPeerDemo();
-      return;
-    }
-    registerProductPreview(helloFlow.preview, "hello_peer");
-    const queued = enqueueRoomControlEvent(helloQueueRef.current, helloFlow.preview, "outbound");
-    if (!queued.ok) {
-      setHelloFlow((current) => ({ ...current, status: "failed", message: queued.errors.join(" ") }));
-      return;
-    }
-    setHelloFlow((current) => ({
-      ...current,
-      status: "peer_requested",
-      message: "Hello Peer request is being sent to the selected device.",
-      steps: mergeHelloSteps(current.steps, ["You confirmed", "Peer requested"]),
-    }));
-    applyHelloQueue(queued.state);
-    await pumpHelloPeerQueue();
-  }
-
   async function refreshBridgeControlInbox() {
-    const currentSession = helloSessionRef.current;
+    const currentSession = controlSessionRef.current;
     if (!currentSession) {
-      setHelloFlow((current) => ({
-        ...current,
-        status: "failed",
-        message: "Hello Peer requires an active Bridge session.",
-      }));
+      setError("Ask Bridge requires an active selected-peer Bridge session.");
       return;
     }
     if (refreshInFlightRef.current) return;
@@ -783,374 +662,11 @@ export function BridgeDetailPage({
           [...current, ...routed.requestFile].slice(-256)
         );
       }
-      if (routed.helloPeer.length === 0) return;
-      const integrated = enqueueInboundRoomControlEvents(
-        helloQueueRef.current,
-        routed.helloPeer,
-        {
-          expectedRoomRef: currentSession.roomId,
-          expectedSourceDeviceRef: currentSession.peerSessionRef,
-          expectedTargetPeerRef: currentSession.localSessionRef,
-        },
-      );
-      applyHelloQueue(integrated.state);
-      await pumpHelloPeerQueue();
     } catch (err) {
-      setHelloFlow((current) => ({
-        ...current,
-        status: "failed",
-        message: err instanceof Error ? err.message : String(err),
-      }));
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       refreshInFlightRef.current = false;
     }
-  }
-
-  async function decideHelloPeerReview(decision: "allow_once" | "deny") {
-    if (!helloFlow.peerReview) {
-      setHelloFlow((current) => ({
-        ...current,
-        message: "No Hello Peer request is waiting for this device.",
-      }));
-      return;
-    }
-    const now = new Date();
-    const decisionResult = decision === "allow_once"
-      ? allowPeerCapabilityOnce(helloFlow.peerReview.binding, helloPeerConsentSession, { now })
-      : denyPeerCapability(helloFlow.peerReview.binding, helloPeerConsentSession, { now });
-    if (!decisionResult.ok) {
-      setHelloFlow((current) => ({ ...current, status: "failed", message: decisionResult.errors.join(" ") }));
-      return;
-    }
-    const statusEvent = buildPeerConsentStatusEvent(helloFlow.peerReview.event, decisionResult.record, { now });
-    if (!statusEvent.ok) {
-      setHelloFlow((current) => ({ ...current, status: "failed", message: statusEvent.errors.join(" ") }));
-      return;
-    }
-    const reviewed = markControlQueueItemStatus(
-      helloQueueRef.current,
-      helloFlow.peerReview.queueId,
-      decision === "allow_once" ? "allowed_once" : "denied",
-      {
-        now,
-        reason: decision === "allow_once"
-          ? "Allowed once for this exact Hello Peer request."
-          : "Denied by receiver.",
-      },
-    );
-    if (!reviewed.ok) {
-      setHelloFlow((current) => ({ ...current, status: "failed", message: reviewed.errors.join(" ") }));
-      return;
-    }
-    const outbound = enqueueRoomControlEvent(reviewed.state, statusEvent.event, "outbound", { now });
-    if (!outbound.ok) {
-      setHelloFlow((current) => ({ ...current, status: "failed", message: outbound.errors.join(" ") }));
-      return;
-    }
-    setHelloPeerConsentSession(decisionResult.state);
-    setHelloPeerConsentRecords((records) => [...records, decisionResult.record]);
-    setHelloFlow((current) => ({
-      ...current,
-      status: decision === "allow_once" ? "peer_approved" : "denied",
-      message: decision === "allow_once"
-        ? "Allowed once. Pastey will run the fixed hello runtime after the sender requests execution."
-        : "Denied. Nothing will run.",
-      peerReview: null,
-      steps: decision === "allow_once"
-        ? mergeHelloSteps(current.steps, ["Peer approved"])
-        : mergeHelloSteps(current.steps, ["Peer denied"]),
-    }));
-    applyHelloQueue(outbound.state);
-    await pumpHelloPeerQueue();
-  }
-
-  async function pumpHelloPeerQueue() {
-    if (helloPumpInFlightRef.current) return;
-    helloPumpInFlightRef.current = true;
-    try {
-      let nextQueue = helloQueueRef.current;
-      for (let index = 0; index < 8; index += 1) {
-        const result = await processNextControlQueueItem(
-          nextQueue,
-          (event) => sendHelloPeerControlEvent(event),
-          {
-            onState: (state) => {
-              nextQueue = state;
-              applyHelloQueue(state);
-            },
-            onSendState: setHelloSendState,
-          },
-        );
-        nextQueue = result.state;
-        applyHelloQueue(nextQueue);
-        if (!result.ok) {
-          if (result.action !== "no_selectable_item") {
-            setHelloFlow((current) => ({ ...current, status: "failed", message: result.message }));
-          }
-          return;
-        }
-        if (result.action === "selected_inbound") {
-          nextQueue = await handleHelloPeerInbound(nextQueue, result.item);
-          applyHelloQueue(nextQueue);
-          if (result.item.event.kind === "capability_preview") return;
-        } else if (result.item.event.kind === "capability_preview") {
-          setHelloFlow((current) => ({
-            ...current,
-            status: "awaiting_peer",
-            message: "Request sent. Waiting for the selected device to allow once or deny.",
-            steps: mergeHelloSteps(current.steps, ["Peer requested"]),
-          }));
-        } else if (result.item.event.kind === "capability_execution_result") {
-          setHelloFlow((current) => ({
-            ...current,
-            status: "completed",
-            message: "Result returned to the requesting device.",
-            steps: mergeHelloSteps(current.steps, ["Result returned"]),
-          }));
-        }
-      }
-    } finally {
-      helloPumpInFlightRef.current = false;
-    }
-  }
-
-  async function handleHelloPeerInbound(
-    state: ControlQueueState,
-    item: ControlQueueItem,
-  ): Promise<ControlQueueState> {
-    if (!helloSession) return state;
-
-    if (item.event.kind === "capability_preview") {
-      const previewEvent = item.event as CapabilityPreviewRoomControlEvent;
-      if (previewEvent.payload.request.capability !== "runtime.hello_stdout") {
-        const invalid = markControlQueueItemStatus(state, item.queueId, "invalid", {
-          reason: "Ask Bridge Beta product flow accepts only runtime.hello_stdout.",
-        });
-        setHelloFlow((current) => ({
-          ...current,
-          status: "failed",
-          message: "Unknown capability request rejected.",
-        }));
-        return invalid.state;
-      }
-      const policy = evaluatePeerCapabilityPreview(previewEvent, {
-        roomRef: helloSession.roomId,
-        sourceDeviceRef: helloSession.peerSessionRef,
-        targetPeerRef: helloSession.localSessionRef,
-        session: helloPeerConsentSession,
-      });
-      if (policy.status === "rejected") {
-        const invalid = markControlQueueItemStatus(state, item.queueId, "invalid", {
-          reason: policy.errors.join(" ").slice(0, 512),
-        });
-        setHelloFlow((current) => ({
-          ...current,
-          status: "failed",
-          message: policy.errors.join(" "),
-        }));
-        return invalid.state;
-      }
-      const awaiting = markControlQueueItemStatus(state, item.queueId, "awaiting_peer_decision", {
-        reason: "Receiver PolicyGate accepted this exact Hello Peer preview.",
-      });
-      if (!awaiting.ok) {
-        setHelloFlow((current) => ({ ...current, status: "failed", message: awaiting.errors.join(" ") }));
-        return state;
-      }
-      setHelloFlow((current) => ({
-        ...current,
-        status: "awaiting_peer",
-        message: "This device received a Hello Peer request.",
-        peerReview: {
-          queueId: item.queueId,
-          event: previewEvent,
-          binding: policy.binding,
-        },
-        steps: mergeHelloSteps(current.steps, ["Peer requested"]),
-      }));
-      setAskOpen(true);
-      return awaiting.state;
-    }
-
-    if (item.event.kind === "capability_preview_ack" || item.event.kind === "capability_preview_deny") {
-      const decisionEvent = item.event;
-      const applied = applyInboundPeerStatusToOutboundQueue(state, decisionEvent);
-      if (!applied.ok) {
-        setHelloFlow((current) => ({
-          ...current,
-          status: "failed",
-          message: applied.errors.join(" "),
-        }));
-        return state;
-      }
-      const marked = markControlQueueItemStatus(
-        applied.state,
-        item.queueId,
-        decisionEvent.payload.status,
-        { reason: "Peer returned a Hello Peer decision." },
-      );
-      if (!marked.ok) {
-        setHelloFlow((current) => ({
-          ...current,
-          status: "failed",
-          message: marked.errors.join(" "),
-        }));
-        return state;
-      }
-      if (decisionEvent.kind === "capability_preview_deny") {
-        setHelloFlow((current) => ({
-          ...current,
-          status: "denied",
-          message: "The selected device denied the Hello Peer request.",
-          steps: mergeHelloSteps(current.steps, ["Peer denied"]),
-        }));
-        return marked.state;
-      }
-      const ackEvent = decisionEvent as CapabilityPreviewAckRoomControlEvent;
-      if (!ackEvent.payload.consent) return marked.state;
-      const requestItem = marked.state.outbound.find(
-        (candidate): candidate is ControlQueueItem & { event: CapabilityPreviewRoomControlEvent } =>
-          candidate.event.kind === "capability_preview"
-          && candidate.event.eventId === ackEvent.payload.consent?.sourcePreviewEventId,
-      );
-      if (!requestItem) {
-        setHelloFlow((current) => ({
-          ...current,
-          status: "failed",
-          message: "The exact Hello Peer preview for this Allow once response is unavailable.",
-        }));
-        return marked.state;
-      }
-      const execution = buildHelloStdoutExecutionRequest(requestItem.event, ackEvent);
-      if (!execution.ok) {
-        setHelloFlow((current) => ({ ...current, status: "failed", message: execution.errors.join(" ") }));
-        return marked.state;
-      }
-      const queued = enqueueRoomControlEvent(marked.state, execution.event, "outbound");
-      if (!queued.ok) {
-        setHelloFlow((current) => ({ ...current, status: "failed", message: queued.errors.join(" ") }));
-        return marked.state;
-      }
-      setHelloFlow((current) => ({
-        ...current,
-        status: "peer_approved",
-        message: "The selected device allowed once. Requesting the fixed runtime now.",
-        senderAck: ackEvent,
-        steps: mergeHelloSteps(current.steps, ["Peer approved"]),
-      }));
-      return queued.state;
-    }
-
-    if (item.event.kind === "capability_execute_request") {
-      return executeHelloPeerInboundRequest(state, item as ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent });
-    }
-
-    if (item.event.kind === "capability_execution_result") {
-      const resultEvent = item.event;
-      const requestItem = state.outbound.find(
-        (candidate): candidate is ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent } =>
-          candidate.event.kind === "capability_execute_request"
-          && matchExecutionResultToRequest(resultEvent, candidate.event),
-      );
-      const matched = requestItem
-        ? markControlQueueItemStatus(state, requestItem.queueId, resultEvent.payload.status === "succeeded" ? "execution_succeeded" : "execution_rejected", {
-            reason: resultEvent.payload.status === "succeeded"
-              ? "Peer returned the bounded Hello Peer result."
-              : `Peer returned ${resultEvent.payload.errorCode ?? resultEvent.payload.status}.`,
-          })
-        : { ok: false as const, state, errors: ["No matching Hello Peer execution request was found."] };
-      const inbound = markControlQueueItemStatus(
-        matched.ok ? matched.state : state,
-        item.queueId,
-        matched.ok ? "execution_succeeded" : "invalid",
-        { reason: matched.ok ? "Matched bounded Hello Peer result." : matched.errors.join(" ") },
-      );
-      const formatted = formatHelloPeerStdoutProductResult(resultEvent);
-      setHelloFlow((current) => ({
-        ...current,
-        status: formatted ? "completed" : "failed",
-        message: formatted ? formatted.title : resultEvent.payload.errorCode ?? resultEvent.payload.status,
-        result: resultEvent,
-        steps: formatted ? mergeHelloSteps(current.steps, ["Result returned"]) : current.steps,
-      }));
-      return inbound.state;
-    }
-
-    return state;
-  }
-
-  async function executeHelloPeerInboundRequest(
-    state: ControlQueueState,
-    item: ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent },
-  ): Promise<ControlQueueState> {
-    if (!helloSession) return state;
-    if (item.event.payload.capability !== "runtime.hello_stdout") {
-      const invalid = markControlQueueItemStatus(state, item.queueId, "invalid", {
-        reason: "Ask Bridge Beta product flow executes only runtime.hello_stdout.",
-      });
-      return invalid.state;
-    }
-    const consent = helloPeerConsentRecords.find(
-      (record) => record.binding.consentId === item.event.payload.consentId,
-    );
-    setHelloFlow((current) => ({
-      ...current,
-      status: "executing",
-      message: "Running Pastey's fixed hello runtime.",
-    }));
-    const execution = await executeInboundHelloStdoutRequest(
-      item.event,
-      consent,
-      helloConsumptionState,
-      executeHelloStdoutCapability,
-      {
-        roomRef: helloSession.roomId,
-        sourceDeviceRef: helloSession.peerSessionRef,
-        targetPeerRef: helloSession.localSessionRef,
-      },
-    );
-    const completed = markControlQueueItemStatus(
-      state,
-      item.queueId,
-      execution.result.status === "succeeded" ? "execution_consumed" : "execution_rejected",
-      {
-        reason: execution.result.status === "succeeded"
-          ? "Exact one-time consent consumed. Hello Peer demo executed once."
-          : `Execution request rejected: ${execution.result.errorCode ?? execution.result.status}.`,
-      },
-    );
-    if (!completed.ok) {
-      setHelloFlow((current) => ({ ...current, status: "failed", message: completed.errors.join(" ") }));
-      return state;
-    }
-    const outbound = enqueueRoomControlEvent(completed.state, execution.resultEvent, "outbound");
-    if (!outbound.ok) {
-      setHelloFlow((current) => ({ ...current, status: "failed", message: outbound.errors.join(" ") }));
-      return completed.state;
-    }
-    setHelloConsumptionState(execution.state);
-    setHelloFlow((current) => ({
-      ...current,
-      status: execution.result.status === "succeeded" ? "executing" : "failed",
-      message: execution.result.status === "succeeded"
-        ? "Runtime executed. Returning result to the sender."
-        : `Execution request rejected: ${execution.result.errorCode ?? execution.result.status}.`,
-      steps: execution.result.status === "succeeded" ? mergeHelloSteps(current.steps, ["Runtime executed"]) : current.steps,
-    }));
-    return outbound.state;
-  }
-
-  async function sendHelloPeerControlEvent(event: RoomControlEvent) {
-    const currentSession = helloSessionRef.current;
-    if (!currentSession) {
-      throw new Error("Hello Peer requires an active selected-peer Bridge session.");
-    }
-    const route = assertCapabilityEventHasSelectedPeerRoute(currentSession, event);
-    return sendRoomControlEvent(
-      currentSession.roomId,
-      event,
-      bridgeRoutePayload(route, "pastey-bridge-control-route-v1"),
-    );
   }
 
   const status = bridgeStatus(room);
@@ -1225,49 +741,20 @@ export function BridgeDetailPage({
         </div>
       </Card>
 
-      <div className="secondary-action-grid">
-        <button type="button" className="bridge-action-panel" onClick={() => setRequestOpen((open) => !open)}>
-          <strong>Request file</strong>
-          <span>Ask the other device to send you a file.</span>
-        </button>
-        <button type="button" className={`bridge-action-panel ${askBridgeBetaEnabled ? "" : "disabled"}`} onClick={() => setAskOpen((open) => !open)}>
-          <strong>Ask Bridge Beta</strong>
-          <span>{HELLO_PEER_DEMO_DESCRIPTION}</span>
-        </button>
-      </div>
-
-      <div hidden={!requestOpen}>
-        <RequestFilePanel
-          room={room}
-          selectedPeer={selectedSinglePeer}
-          route={selectedRoute}
-          queueItems={queueItems}
-          transfers={transfers}
-          onEnqueueCandidatePayloadHandoff={onEnqueueCandidatePayloadHandoff}
-          onIncomingReview={() => setRequestOpen(true)}
-          inboxEvents={requestInboxBatch}
-          onRefresh={() => void refreshBridgeControlInbox()}
-          onPollingActiveChange={setRequestPollingActive}
-          onRegisterPreview={(event) => registerProductPreview(event, "request_file")}
-        />
-      </div>
-
-      {askOpen ? (
-        <HelloPeerDemoPanel
-          enabled={askBridgeBetaEnabled}
-          selectedPeer={selectedSinglePeer}
-          selectedRoute={selectedRoute}
-          canRun={canRunHelloPeerDemo}
-          flow={helloFlow}
-          sendState={helloSendState}
-          onPrepare={prepareHelloPeerDemo}
-          onConfirm={() => void confirmHelloPeerDemo()}
-          onCancel={() => setHelloFlow(createHelloPeerProductState())}
-          onRefresh={() => void refreshBridgeControlInbox()}
-          onAllowOnce={() => void decideHelloPeerReview("allow_once")}
-          onDeny={() => void decideHelloPeerReview("deny")}
-        />
-      ) : null}
+      <AskBridgePanel
+        enabled={askBridgeBetaEnabled}
+        config={bridgeConfig}
+        room={room}
+        selectedPeer={selectedSinglePeer}
+        route={selectedRoute}
+        queueItems={queueItems}
+        transfers={transfers}
+        onEnqueueCandidatePayloadHandoff={onEnqueueCandidatePayloadHandoff}
+        inboxEvents={requestInboxBatch}
+        onRefresh={() => void refreshBridgeControlInbox()}
+        onPollingActiveChange={setRequestPollingActive}
+        onRegisterPreview={registerProductPreview}
+      />
 
       <Card className="recent-activity-card">
         <div className="section-row">
@@ -1283,150 +770,37 @@ export function BridgeDetailPage({
   );
 }
 
-function HelloPeerDemoPanel({
+function AskBridgePanel({
   enabled,
-  selectedPeer,
-  selectedRoute,
-  canRun,
-  flow,
-  sendState,
-  onPrepare,
-  onConfirm,
-  onCancel,
-  onRefresh,
-  onAllowOnce,
-  onDeny,
-}: {
-  enabled: boolean;
-  selectedPeer: BridgePeerSession | null;
-  selectedRoute: BridgeRoute | null;
-  canRun: boolean;
-  flow: HelloPeerProductState;
-  sendState: RoomControlSendState;
-  onPrepare: () => void;
-  onConfirm: () => void;
-  onCancel: () => void;
-  onRefresh: () => void;
-  onAllowOnce: () => void;
-  onDeny: () => void;
-}) {
-  const requiresOnePeer = !selectedPeer || selectedRoute?.target.kind !== "selected_peer";
-  const result = flow.result ? formatHelloPeerStdoutProductResult(flow.result) : null;
-  return (
-    <Card className="hello-peer-panel">
-      <div className="section-row">
-        <div>
-          <h2>Ask Bridge Beta</h2>
-          <p className="muted">{HELLO_PEER_DEMO_DESCRIPTION}</p>
-        </div>
-        <StatusChip tone={enabled && selectedPeer ? "success" : "neutral"}>
-          {enabled ? "Beta" : "Disabled"}
-        </StatusChip>
-      </div>
-
-      <div className="hello-peer-action-row">
-        <div>
-          <strong>{HELLO_PEER_DEMO_ACTION_LABEL}</strong>
-          <p className="muted">
-            {enabled
-              ? requiresOnePeer
-                ? HELLO_PEER_REQUIRES_ONE_SELECTED_DEVICE
-                : `Selected device: ${selectedPeer.displayName}.`
-              : "Enable Labs in Settings to use Ask Bridge Beta."}
-          </p>
-        </div>
-        <button type="button" className="primary-button" disabled={!canRun} onClick={onPrepare}>
-          {HELLO_PEER_DEMO_ACTION_LABEL}
-        </button>
-      </div>
-
-      {flow.status === "preview_ready" && flow.preview ? (
-        <div className="hello-peer-preview" role="status">
-          <span className="agent-bridge-status-label">Confirmation preview</span>
-          <strong>Run Pastey's built-in hello runtime on {selectedPeer?.displayName ?? "the selected device"}</strong>
-          <span className="muted">Capability: runtime.hello_stdout. Expected stdout: hello peer.</span>
-          <div className="button-row">
-            <button type="button" className="primary-button" onClick={onConfirm}>Confirm and send</button>
-            <button type="button" className="secondary-button" onClick={onCancel}>Cancel</button>
-          </div>
-        </div>
-      ) : null}
-
-      {flow.peerReview ? (
-        <div className="hello-peer-preview" data-testid="bridge-hello-peer-review">
-          <span className="agent-bridge-status-label">Hello Peer request</span>
-          <strong>Allow this device to run Pastey's built-in hello runtime once?</strong>
-          <span className="muted">Expected stdout: hello peer. This does not grant shell, paths, environment, or network access.</span>
-          <div className="button-row">
-            <button type="button" className="primary-button" onClick={onAllowOnce}>Allow once</button>
-            <button type="button" className="secondary-button" onClick={onDeny}>Deny</button>
-          </div>
-        </div>
-      ) : null}
-
-      <div className="hello-peer-status-row">
-        <button type="button" className="secondary-button" onClick={onRefresh}>
-          Check for updates
-        </button>
-        <span className="muted">
-          {sendState.status === "sending"
-            ? "Sending..."
-            : sendState.status === "accepted"
-              ? "Latest request delivered."
-              : sendState.status === "rejected"
-                ? sendState.message
-                : flow.message ?? "Ready."}
-        </span>
-      </div>
-
-      <OperationTimeline
-        label="Hello Peer lifecycle"
-        steps={buildOperationTimelineSteps(HELLO_PEER_LIFECYCLE_STEPS, flow.steps)}
-      />
-
-      {result ? (
-        <div className="hello-peer-result" data-testid="bridge-hello-peer-result">
-          <strong>{result.title}</strong>
-          <pre>{`stdout: ${result.stdout}`}</pre>
-          <div className="button-row">
-            <span>exitCode: {result.exitCode}</span>
-            <button type="button" className="secondary-button compact-button" onClick={() => void copyTextToClipboard(result.stdout)}>
-              Copy stdout
-            </button>
-          </div>
-        </div>
-      ) : null}
-    </Card>
-  );
-}
-
-function RequestFilePanel({
+  config,
   room,
   selectedPeer,
   route,
   queueItems,
   transfers,
   onEnqueueCandidatePayloadHandoff,
-  onIncomingReview,
   inboxEvents,
   onRefresh,
   onPollingActiveChange,
   onRegisterPreview,
 }: {
+  enabled: boolean;
+  config: ReturnType<typeof useAgentBridgeRuntimeConfig>;
   room: RoomInfo;
   selectedPeer: BridgePeerSession | null;
   route: BridgeRoute | null;
   queueItems: TransferQueueItem[];
   transfers: FileTransferProgressEvent[];
   onEnqueueCandidatePayloadHandoff: (roomId: string, input: TransferQueueInput) => boolean;
-  onIncomingReview: () => void;
   inboxEvents: readonly RoomControlEvent[];
   onRefresh: () => void;
   onPollingActiveChange: (active: boolean) => void;
   onRegisterPreview: (event: CapabilityPreviewRoomControlEvent) => void;
 }) {
-  const [query, setQuery] = useState("");
-  const [scopes, setScopes] = useState<SafeSearchScope[]>(["downloads", "desktop", "documents", "pastey_shared"]);
+  const [naturalInput, setNaturalInput] = useState("");
+  const [naturalPlan, setNaturalPlan] = useState<AskBridgeNaturalV1Plan | null>(null);
+  const [providerMessage, setProviderMessage] = useState<string | null>(null);
+  const [planning, setPlanning] = useState(false);
   const [workflow, setWorkflow] = useState<CandidatePayloadWorkflow>(() => createCandidatePayloadWorkflow());
   const workflowRef = useRef<CandidatePayloadWorkflow>(workflow);
   const [selectedCandidateId, setSelectedCandidateId] = useState("");
@@ -1444,7 +818,8 @@ function RequestFilePanel({
   const [flow, setFlow] = useState<RequestFileProductState>(() => createRequestFileProductState());
   const candidates = workflow.snapshot.candidates ?? [];
   const requiresOnePeer = !selectedPeer || route?.target.kind !== "selected_peer";
-  const canRequestSearch = Boolean(!requiresOnePeer && session && query.trim() && scopes.length > 0);
+  const hasSupportedSearchPlan = naturalPlan?.status === "supported" && naturalPlan.steps[0]?.primitive === "Search";
+  const canRequestSearch = Boolean(enabled && !requiresOnePeer && session && hasSupportedSearchPlan);
   const canConfirmSearch = Boolean(flow.searchPreview && flow.status === "search_preview_ready");
   const canRequestFile = Boolean(!requiresOnePeer && session && selectedCandidateId && workflow.snapshot.state === "candidate_selection_required");
   const selectedCandidate = candidates.find((candidate) => candidate.candidateId === selectedCandidateId) ?? null;
@@ -1506,12 +881,6 @@ function RequestFilePanel({
     void pumpRequestFileQueue();
   }, [inboxEvents, session]);
 
-  function toggleScope(scope: SafeSearchScope) {
-    setScopes((current) => current.includes(scope)
-      ? current.filter((candidate) => candidate !== scope)
-      : [...current, scope]);
-  }
-
   function applySession(nextSession: RoomControlSessionContext | null) {
     const previous = sessionRef.current;
     if (roomControlSessionIdentity(previous) !== roomControlSessionIdentity(nextSession)) {
@@ -1527,6 +896,8 @@ function RequestFilePanel({
       setWorkflow(fresh);
       setSelectedCandidateId("");
       setFlow(createRequestFileProductState());
+      setNaturalPlan(null);
+      setProviderMessage(null);
     }
     sessionRef.current = nextSession;
     setSession(nextSession);
@@ -1542,6 +913,56 @@ function RequestFilePanel({
     setQueue(nextQueue);
   }
 
+  async function handlePlanNaturalInput() {
+    if (!enabled) {
+      setFlow((current) => ({ ...current, status: "idle", message: "Enable Labs in Settings to use Ask Bridge." }));
+      return;
+    }
+    const trimmed = naturalInput.trim();
+    if (!trimmed) {
+      setFlow((current) => ({ ...current, status: "idle", message: "Type what you want Ask Bridge to search for." }));
+      return;
+    }
+    setPlanning(true);
+    setProviderMessage(null);
+    try {
+      const generated = config.providerKind === "cloud" && config.cloudBaseUrl.trim() && config.cloudModel.trim() && config.cloudApiKey.trim()
+        ? await generateCloudNaturalPlan(trimmed, config)
+        : await generateMockAskBridgeNaturalV1Plan(trimmed);
+      const validation = validateAskBridgeNaturalV1Plan(generated.parsedPlan);
+      if (!validation.valid) {
+        setNaturalPlan(null);
+        setFlow((current) => ({
+          ...current,
+          status: "failed",
+          message: validation.errors.join(" "),
+        }));
+        setProviderMessage("Provider plan failed closed. No peer request was sent.");
+        return;
+      }
+      setNaturalPlan(validation.value);
+      setProviderMessage(generated.error
+        ? `${generated.error.code}: ${generated.error.message}. Deterministic planning is still available.`
+        : config.providerKind === "cloud" && config.cloudApiKey.trim()
+          ? "Provider advisory validated locally. No peer request has been sent."
+          : "Deterministic planner used locally. No model or network call occurred.");
+      setFlow((current) => ({
+        ...current,
+        status: validation.value.status === "supported" ? "idle" : "failed",
+        message: validation.value.status === "supported"
+          ? "Search / Return plan ready. Confirm before any peer request is sent."
+          : validation.value.unsupportedReason ?? "Transform is recognized but unsupported in natural-v1.",
+        steps: [],
+        searchPreview: null,
+        payloadPreview: null,
+        latestResult: null,
+      }));
+      setSelectedCandidateId("");
+    } finally {
+      setPlanning(false);
+    }
+  }
+
   function handlePrepareSearch() {
     if (requiresOnePeer || !selectedPeer || !session) {
       setFlow((current) => ({
@@ -1551,7 +972,19 @@ function RequestFilePanel({
       }));
       return;
     }
-    const prepared = prepareCandidateSearchWorkflow(query, scopes, session.peerSessionRef);
+    if (!naturalPlan) {
+      setFlow((current) => ({ ...current, status: "idle", message: "Preview a Search / Return plan first." }));
+      return;
+    }
+    if (naturalPlan.status !== "supported") {
+      setFlow((current) => ({
+        ...current,
+        status: "failed",
+        message: naturalPlan.unsupportedReason ?? "This Ask Bridge plan is unsupported.",
+      }));
+      return;
+    }
+    const prepared = prepareCandidateSearchWorkflow(naturalPlan, session.peerSessionRef);
     const started = startCandidatePayloadWorkflowFromSearchAdvisory(createCandidatePayloadWorkflow(), prepared.plan, prepared.context);
     const confirmed = started.ok
       ? confirmCandidatePayloadWorkflowSearch(started.workflow, {
@@ -1586,7 +1019,7 @@ function RequestFilePanel({
     setSelectedCandidateId("");
     setFlow({
       status: "search_preview_ready",
-      message: "Search preview ready. Confirm before asking the selected device.",
+      message: "Search preview ready. Confirm plan before asking the selected device.",
       steps: ["Search prepared", "Host validated safe scopes"],
       searchPreview: preview.event,
       payloadPreview: null,
@@ -1634,7 +1067,13 @@ function RequestFilePanel({
       }));
       return;
     }
-    const prepared = prepareCandidateSearchWorkflow(query || "selected file", scopes, session.peerSessionRef);
+    const prepared = naturalPlan
+      ? prepareCandidateSearchWorkflow(naturalPlan, session.peerSessionRef)
+      : null;
+    if (!prepared) {
+      setFlow((current) => ({ ...current, status: "failed", message: "Search / Return plan is unavailable." }));
+      return;
+    }
     const preview = buildCandidatePayloadWorkflowPayloadPreview(
       workflowRef.current,
       { candidateId: selectedCandidateId, selectedByUser: true },
@@ -1679,7 +1118,7 @@ function RequestFilePanel({
 
   async function decideRequestFileReview(decision: "allow_once" | "deny") {
     if (!flow.peerReview) {
-      setFlow((current) => ({ ...current, message: "No Request file approval is waiting on this device." }));
+      setFlow((current) => ({ ...current, message: "No Ask Bridge approval is waiting on this device." }));
       return;
     }
     const now = new Date();
@@ -1702,7 +1141,7 @@ function RequestFilePanel({
       {
         now,
         reason: decision === "allow_once"
-          ? "Allowed once for this exact Request file capability."
+          ? "Allowed once for this exact Ask Bridge capability."
           : "Denied by receiver.",
       },
     );
@@ -1784,7 +1223,7 @@ function RequestFilePanel({
       const capability = previewEvent.payload.request.capability;
       if (capability !== "filesystem.find_file_candidates" && capability !== "transfer.request_candidate_payload") {
         const invalid = markControlQueueItemStatus(state, item.queueId, "invalid", {
-          reason: "Request file accepts only file-candidate search or candidate-payload requests.",
+          reason: "Ask Bridge accepts only Search or Return requests.",
         });
         setFlow((current) => ({ ...current, status: "failed", message: "Unknown capability request rejected." }));
         return invalid.state;
@@ -1803,7 +1242,7 @@ function RequestFilePanel({
         return invalid.state;
       }
       const awaiting = markControlQueueItemStatus(state, item.queueId, "awaiting_peer_decision", {
-        reason: "Receiver PolicyGate accepted this exact Request file preview.",
+        reason: "Receiver PolicyGate accepted this exact Ask Bridge preview.",
       });
       if (!awaiting.ok) {
         setFlow((current) => ({ ...current, status: "failed", message: awaiting.errors.join(" ") }));
@@ -1821,7 +1260,6 @@ function RequestFilePanel({
           binding: policy.binding,
         },
       }));
-      onIncomingReview();
       return awaiting.state;
     }
 
@@ -1836,7 +1274,7 @@ function RequestFilePanel({
         applied.state,
         item.queueId,
         decisionEvent.payload.status,
-        { reason: "Peer returned a Request file decision." },
+        { reason: "Peer returned an Ask Bridge decision." },
       );
       if (!marked.ok) {
         setFlow((current) => ({ ...current, status: "failed", message: marked.errors.join(" ") }));
@@ -1870,7 +1308,7 @@ function RequestFilePanel({
           && candidate.event.eventId === ackEvent.payload.consent?.sourcePreviewEventId,
       );
       if (!requestItem) {
-        setFlow((current) => ({ ...current, status: "failed", message: "The exact Request file preview for this Allow once response is unavailable." }));
+        setFlow((current) => ({ ...current, status: "failed", message: "The exact Ask Bridge preview for this Allow once response is unavailable." }));
         return marked.state;
       }
       const capability = requestItem.event.payload.request.capability;
@@ -1878,7 +1316,7 @@ function RequestFilePanel({
         ? buildFileCandidateExecutionRequest(requestItem.event, ackEvent)
         : capability === "transfer.request_candidate_payload"
           ? buildCandidatePayloadExecutionRequest(requestItem.event, ackEvent)
-          : { ok: false as const, errors: ["Request file received an unsupported capability acknowledgement."] };
+          : { ok: false as const, errors: ["Ask Bridge received an unsupported capability acknowledgement."] };
       if (!execution.ok) {
         setFlow((current) => ({ ...current, status: "failed", message: execution.errors.join(" ") }));
         return marked.state;
@@ -2006,7 +1444,7 @@ function RequestFilePanel({
         ? "Handoff queued. Existing transfer pipeline owns progress and completion."
         : resultEvent.payload.status === "completed"
           ? "Metadata-only search result returned to the requesting device."
-          : `Request file execution failed: ${resultEvent.payload.errorCode ?? resultEvent.payload.status}.`,
+          : `Ask Bridge execution failed: ${resultEvent.payload.errorCode ?? resultEvent.payload.status}.`,
       latestResult: resultEvent,
     }));
     return outbound.state;
@@ -2032,15 +1470,15 @@ function RequestFilePanel({
     const matched = requestItem
       ? markControlQueueItemStatus(state, requestItem.queueId, resultStatus, {
           reason: resultStatus === "execution_succeeded"
-            ? "Peer returned Request file result."
+            ? "Peer returned Ask Bridge result."
             : `Peer returned ${resultEvent.payload.errorCode ?? resultEvent.payload.status}.`,
         })
-      : { ok: false as const, state, errors: ["No matching Request file execution request was found."] };
+      : { ok: false as const, state, errors: ["No matching Ask Bridge execution request was found."] };
     const inbound = markControlQueueItemStatus(
       matched.ok ? matched.state : state,
       item.queueId,
       matched.ok ? resultStatus : "invalid",
-      { reason: matched.ok ? "Matched Request file result." : matched.errors.join(" ") },
+      { reason: matched.ok ? "Matched Ask Bridge result." : matched.errors.join(" ") },
     );
 
     if ("capability" in resultEvent.payload && resultEvent.payload.capability === "filesystem.find_file_candidates") {
@@ -2146,7 +1584,7 @@ function RequestFilePanel({
   async function sendRequestFileControlEvent(event: RoomControlEvent) {
     const currentSession = sessionRef.current;
     if (!currentSession) {
-      throw new Error("Request file requires an active selected-peer Bridge session.");
+      throw new Error("Ask Bridge requires an active selected-peer Bridge session.");
     }
     const selectedRoute = assertCapabilityEventHasSelectedPeerRoute(currentSession, event);
     return sendRoomControlEvent(
@@ -2157,51 +1595,56 @@ function RequestFilePanel({
   }
 
   return (
-    <Card className="request-file-panel">
+    <Card className="request-file-panel" data-testid="ask-bridge-natural-v1">
       <div className="section-row">
         <div>
-          <h2>Request file</h2>
-          <p className="muted">{selectedPeer && !requiresOnePeer ? `From ${selectedPeer.displayName}` : REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE}</p>
+          <h2>Ask Bridge</h2>
+          <p className="muted">{selectedPeer && !requiresOnePeer ? `Selected device: ${selectedPeer.displayName}` : REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE}</p>
         </div>
-        <StatusChip tone={selectedPeer && !requiresOnePeer ? "success" : "neutral"}>{selectedPeer && !requiresOnePeer ? "Selected" : "Choose device"}</StatusChip>
+        <StatusChip tone={enabled && selectedPeer && !requiresOnePeer ? "success" : "neutral"}>{enabled ? "natural-v1" : "Disabled"}</StatusChip>
       </div>
       <div className="find-search-grid">
         <label className="field-label">
-          <span>What should the device look for?</span>
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="notes, screenshot, invoice..." />
+          <span>Ask Bridge</span>
+          <textarea
+            value={naturalInput}
+            onChange={(event) => setNaturalInput(event.target.value)}
+            placeholder="Find the report PDF on my other device and return it to me..."
+            aria-label="Ask Bridge natural-language request"
+            data-testid="ask-bridge-natural-input"
+          />
         </label>
-        <div className="safe-scope-card">
-          <span className="field-label-text">Safe locations</span>
-          <div className="scope-chip-grid">
-            {SAFE_SEARCH_SCOPES.map((scope) => (
-              <button
-                key={scope.value}
-                type="button"
-                className={`scope-chip ${scopes.includes(scope.value) ? "checked" : ""}`}
-                onClick={() => toggleScope(scope.value)}
-              >
-                <span className="scope-chip-check" aria-hidden="true" />
-                <span>{scope.label}</span>
-              </button>
-            ))}
-          </div>
-        </div>
       </div>
       <div className="button-row">
+        <button type="button" className="secondary-button" disabled={!enabled || planning || !naturalInput.trim()} onClick={() => void handlePlanNaturalInput()}>
+          {planning ? "Previewing..." : "Preview plan"}
+        </button>
         <button type="button" className="primary-button" disabled={!canRequestSearch} onClick={handlePrepareSearch}>
-          Search selected device
+          Confirm Search plan
         </button>
         <button type="button" className="secondary-button" disabled={!canRequestFile} onClick={() => void handleRequestSelectedFile()}>
-          Request selected file
+          Return selected file
         </button>
       </div>
+      {naturalPlan ? (
+        <div className="request-file-preview" role="status" data-testid="ask-bridge-plan-preview">
+          <span className="agent-bridge-status-label">Search / Transform / Return</span>
+          <strong>{naturalPlan.steps.map((step) => step.primitive).join(" -> ")}</strong>
+          <span className="muted">
+            {naturalPlan.status === "supported"
+              ? "Search returns metadata candidates only. Return waits for manual selection and second consent."
+              : naturalPlan.unsupportedReason}
+          </span>
+        </div>
+      ) : null}
+      {providerMessage ? <p className="muted">{providerMessage}</p> : null}
       {canConfirmSearch ? (
         <div className="request-file-preview" role="status">
           <span className="agent-bridge-status-label">Search preview</span>
           <strong>Search selected device</strong>
-          <span className="muted">Metadata only. Safe scopes: {scopes.map((scope) => SAFE_SEARCH_SCOPES.find((entry) => entry.value === scope)?.label ?? scope).join(", ")}.</span>
+          <span className="muted">Metadata only. Safe scopes: {searchScopesForPlan(naturalPlan).map((scope) => SAFE_SEARCH_SCOPES.find((entry) => entry.value === scope)?.label ?? scope).join(", ")}.</span>
           <div className="button-row">
-            <button type="button" className="primary-button" onClick={() => void handleConfirmSearch()}>Confirm search preview</button>
+            <button type="button" className="primary-button" onClick={() => void handleConfirmSearch()}>Confirm Search</button>
             <button type="button" className="secondary-button" onClick={() => setFlow(createRequestFileProductState())}>Cancel</button>
           </div>
         </div>
@@ -2209,7 +1652,7 @@ function RequestFilePanel({
       {flow.peerReview ? (
         <div className="request-file-preview" data-testid="request-file-peer-review">
           <span className="agent-bridge-status-label">Approval needed</span>
-          <strong>{flow.peerReview.binding.capability === "transfer.request_candidate_payload" ? "Allow selected candidate handoff once?" : "Allow metadata search once?"}</strong>
+          <strong>{flow.peerReview.binding.capability === "transfer.request_candidate_payload" ? "Allow Return of selected file once?" : "Allow Search once?"}</strong>
           <span className="muted">
             {flow.peerReview.binding.capability === "transfer.request_candidate_payload"
               ? "This is separate from search consent. Pastey revalidates the selected candidate before queue handoff."
@@ -2253,11 +1696,11 @@ function RequestFilePanel({
         </span>
       </div>
       <OperationTimeline
-        label="Request file lifecycle"
+        label="Ask Bridge lifecycle"
         steps={buildOperationTimelineSteps(REQUEST_FILE_LIFECYCLE_STEPS, displaySteps)}
         rows={requestFileLifecycleRows(flow, selectedCandidate, relatedQueueItem, relatedTransfer)}
       />
-      <details className="request-file-advanced-details">
+      <details className="ask-bridge-advanced-details">
         <summary>Advanced details</summary>
         <div className="agent-bridge-definition-list">
           <FullValue label="Search capability" value={workflow.snapshot.search?.capability ?? "Not prepared"} />
@@ -2285,7 +1728,7 @@ function buildRequestFilePreviewEvent(
   }
   const preview = buildSessionBoundCapabilityPreviewControlEvent(envelope.envelope, session);
   if (!preview.ok || preview.event.kind !== "capability_preview") {
-    return { ok: false, errors: preview.ok ? ["Request file preview builder produced the wrong event kind."] : preview.errors };
+    return { ok: false, errors: preview.ok ? ["Ask Bridge preview builder produced the wrong event kind."] : preview.errors };
   }
   return { ok: true, event: preview.event };
 }
@@ -2386,7 +1829,7 @@ function requestFileLifecycleRows(
     rows.push(operationTimelineRow("Transfer complete", "complete", queueItem?.displayName ?? transfer?.file_name ?? "Completed."));
   }
   if (flow.status === "failed" || queueItem?.status === "failed" || transfer?.status === "failed") {
-    rows.push(operationTimelineRow("Failed", "failed", flow.message ?? queueItem?.errorMessage ?? transfer?.error_message ?? "Request file failed."));
+    rows.push(operationTimelineRow("Failed", "failed", flow.message ?? queueItem?.errorMessage ?? transfer?.error_message ?? "Ask Bridge failed."));
   }
   return rows;
 }
@@ -2685,31 +2128,6 @@ function TargetSelector({
   );
 }
 
-function createHelloPeerProductState(): HelloPeerProductState {
-  return {
-    status: "idle",
-    message: null,
-    steps: [],
-    preview: null,
-    peerReview: null,
-    senderAck: null,
-    result: null,
-  };
-}
-
-function mergeHelloSteps(
-  current: readonly string[],
-  next: readonly string[],
-): string[] {
-  return [...new Set([...current, ...next].filter((step) =>
-    (HELLO_PEER_LIFECYCLE_STEPS as readonly string[]).includes(step)
-  ))];
-}
-
-function isHelloPeerTerminal(status: HelloPeerDemoStatus): boolean {
-  return status === "completed" || status === "denied" || status === "failed";
-}
-
 function useRouteablePeers(room: RoomInfo): BridgePeerSession[] {
   const cacheRef = useRef<{ identity: string; peers: BridgePeerSession[] } | null>(null);
   const identity = bridgeRoomRoutingIdentity(room);
@@ -2799,41 +2217,55 @@ function transferInputsForSelectedRoute(
   })));
 }
 
-function prepareCandidateSearchWorkflow(searchQuery: string, safeScopes: SafeSearchScope[], targetPeerRef: string) {
-  const plan = buildMockFileCandidatePlan();
-  const proposedInput = plan.proposedInput ?? {};
-  const query = typeof proposedInput.query === "object" && proposedInput.query !== null ? proposedInput.query : {};
+async function generateCloudNaturalPlan(
+  userRequest: string,
+  config: ReturnType<typeof useAgentBridgeRuntimeConfig>,
+): Promise<AiGenerateResult> {
+  const provider = new CloudOpenAICompatibleProvider({
+    providerId: "pastey-cloud-openai-compatible-natural-v1",
+    displayName: "CloudOpenAICompatibleProvider",
+    kind: "cloud_openai_compatible",
+    apiShape: "openai_compatible_chat",
+    baseUrl: config.cloudBaseUrl,
+    model: config.cloudModel,
+    apiKeyRef: config.cloudApiKey ? "runtime-memory-only" : undefined,
+    timeoutMs: 30_000,
+    maxOutputTokens: 512,
+    enabled: true,
+  }, {
+    apiKey: config.cloudApiKey,
+  });
+  const generated = await provider.generate({
+    requestId: `ask-bridge-natural-cloud-${Date.now()}`,
+    providerId: provider.config.providerId,
+    context: buildMockAiContextSnapshot(),
+    contextPolicy: CLOUD_STRICT_AI_CONTEXT_POLICY,
+    allowedActionKinds: [],
+    outputSchema: "ask-bridge-natural-v1",
+    userRequest,
+  });
+  if (!generated.error) return generated;
+  const fallback = await generateMockAskBridgeNaturalV1Plan(userRequest);
+  return {
+    ...fallback,
+    error: generated.error,
+  };
+}
+
+function prepareCandidateSearchWorkflow(plan: AskBridgeNaturalV1Plan, targetPeerRef: string) {
+  const proposedInput = buildNaturalV1SearchAdvisoryInput(plan, targetPeerRef) ?? {};
   const context = buildMockAiContextSnapshot();
   return {
     plan: {
-      ...plan,
-      title: "Request file search",
-      explanation: "Ask the selected device to look in safe locations.",
+      schemaVersion: "ai-action-plan-v1",
+      kind: "request_peer_file_candidates",
+      title: "Ask Bridge Search",
+      explanation: "Ask the selected device to search safe scopes and return redacted metadata candidates only.",
+      confidence: "medium",
+      requiresUserConfirmation: true,
       references: [{ kind: "peer" as const, ref: targetPeerRef }],
-      proposedInput: {
-        ...proposedInput,
-        targetPeerRef,
-        query: {
-          ...query,
-          rawUserRequest: searchQuery,
-          filenameHint: searchQuery.trim(),
-          searchMode: "filename_metadata_only",
-        },
-        scopePolicy: {
-          allowedScopes: safeScopes,
-          allowFullDisk: false,
-          includeFileContents: false,
-          includeAbsolutePaths: false,
-          includeHiddenFiles: false,
-        },
-        safety: {
-          returnRedactedPaths: true,
-          noAutoTransfer: true,
-          requireReceiverConsent: true,
-          selectedPeerOnly: true,
-        },
-      },
-    },
+      proposedInput,
+    } satisfies AiActionPlan,
     context: {
       ...context,
       peers: [{
@@ -2844,6 +2276,11 @@ function prepareCandidateSearchWorkflow(searchQuery: string, safeScopes: SafeSea
       }],
     },
   };
+}
+
+function searchScopesForPlan(plan: AskBridgeNaturalV1Plan | null): SafeSearchScope[] {
+  const search = plan?.steps.find((step) => step.primitive === "Search");
+  return search?.primitive === "Search" ? search.safeScopes : ["downloads", "desktop", "documents", "pastey_shared"];
 }
 
 interface ActivityListRow {

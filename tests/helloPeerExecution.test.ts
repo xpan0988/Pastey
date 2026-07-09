@@ -708,7 +708,7 @@ test("UI exposes explicit bounded execution controls outside chat and no generic
   assert.match(panel, /data-testid="agent-bridge-request-hello-execution"/);
   assert.match(panel, /Request Hello Peer execution/);
   assert.match(panel, /data-testid="agent-bridge-execution-result-card"/);
-  assert.match(panel, /One-time consent consumed\. Hello Peer demo executed once\./);
+  assert.match(panel, /One-time consent consumed\. Hello diagnostic executed once\./);
   assert.match(panel, /item\.event\.kind === "capability_preview_ack" && item\.event\.payload\.consent/);
   assert.match(panel, /Date\.parse\(senderExecutionAck\.payload\.consent\.expiresAt\) > controlDemandNowMs/);
   assert.doesNotMatch(panel, /Run again|Always allow|command input|script editor|working directory|environment field/);

@@ -14,6 +14,9 @@ import {
   buildMockAiContextSnapshot,
   buildMockHelloPeerPlan,
   buildMockHelloStdoutPlan,
+  buildDeterministicAskBridgeNaturalV1Plan,
+  buildMockAskBridgeNaturalV1Plan,
+  checkAskBridgeNaturalV1ProviderHealth,
   canonicalizeHelloPeerRequestForHash,
   CloudOpenAICompatibleProvider,
   CLOUD_STRICT_AI_CONTEXT_POLICY,
@@ -33,6 +36,7 @@ import {
   hashStableSerializedValue,
   MOCK_AI_CONTEXT_POLICY,
   mockProvider,
+  validateAskBridgeNaturalV1Plan,
   validateAiActionPlan,
   validateCandidatePayloadRequest,
   validateCapabilityRequestPreviewEnvelope,
@@ -157,6 +161,67 @@ test("MockProvider returns a safe advisory plan", async () => {
   assert.equal(result.providerId, mockProvider.config.providerId);
   assert.equal(result.parsedPlan?.kind, "request_peer_hello_stdout_demo");
   assert.equal(validateAiActionPlan(result.parsedPlan).valid, true);
+});
+
+test("natural-v1 deterministic planner creates Search and Search Return plans", () => {
+  const search = buildDeterministicAskBridgeNaturalV1Plan("Find the assignment PDF on the selected device.");
+  const searchReturn = buildDeterministicAskBridgeNaturalV1Plan("Find the assignment PDF and return it to me.");
+
+  assert.equal(validateAskBridgeNaturalV1Plan(search).valid, true);
+  assert.deepEqual(search.steps.map((step) => step.primitive), ["Search"]);
+  assert.equal(search.steps[0]?.primitive === "Search" ? search.steps[0].extensions.includes("pdf") : false, true);
+
+  assert.equal(validateAskBridgeNaturalV1Plan(searchReturn).valid, true);
+  assert.deepEqual(searchReturn.steps.map((step) => step.primitive), ["Search", "Return"]);
+  const returnStep = searchReturn.steps[1];
+  assert.equal(returnStep?.primitive === "Return" ? returnStep.requiresSecondConsent : false, true);
+});
+
+test("natural-v1 recognizes Transform Return as unsupported until bounded runtime exists", () => {
+  const plan = buildDeterministicAskBridgeNaturalV1Plan("Find the notes and summarize them before returning the result.");
+  const validation = validateAskBridgeNaturalV1Plan(plan);
+
+  assert.equal(validation.valid, true);
+  assert.equal(plan.status, "unsupported_future");
+  assert.deepEqual(plan.steps.map((step) => step.primitive), ["Search", "Transform", "Return"]);
+  assert.match(plan.unsupportedReason ?? "", /bounded transform runtime is not implemented/);
+});
+
+test("natural-v1 provider plans reject unsafe execution and fanout fields", () => {
+  const unsafe = {
+    ...buildMockAskBridgeNaturalV1Plan(),
+    command: "find . -name report.pdf",
+    steps: [{
+      primitive: "Search",
+      filenameHint: "report",
+      extensions: ["pdf"],
+      safeScopes: ["downloads"],
+      cwd: "/Users/alice",
+    }],
+  };
+  const validation = validateAskBridgeNaturalV1Plan(unsafe);
+
+  assert.equal(validation.valid, false);
+  assert.match(validation.errors.join("\n"), /Unsafe provider field|Forbidden natural-v1 field/);
+});
+
+test("natural-v1 provider health check validates advisory output only", async () => {
+  let calls = 0;
+  let capturedBody = "";
+  const result = await checkAskBridgeNaturalV1ProviderHealth(CLOUD_CONFIG, {
+    apiKey: "runtime-secret",
+    fetchImpl: async (_input, init) => {
+      calls += 1;
+      capturedBody = String(init?.body ?? "");
+      return jsonResponse(JSON.stringify(buildMockAskBridgeNaturalV1Plan()));
+    },
+  });
+
+  assert.equal(calls, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.validationStatus, "accepted");
+  assert.equal(capturedBody.includes("runtime-secret"), false);
+  assert.match(capturedBody, /ask-bridge-natural-v1/);
 });
 
 test("safe Hello Stdout mock plan validates and builds a preview-only request", () => {

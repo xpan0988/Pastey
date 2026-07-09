@@ -97,13 +97,13 @@ node scripts/run-layer4-validation-matrix.mjs
 
 ## Layer 5 Workspace Capability Validation Plan
 
-Pastey 1.9.1 defines the current Layer 5 narrow product closure and smoke bugfix consolidation. Automated validation covers the fixed Transform + Return and Search + Return contracts, target binding, Deny terminal states, source-shape product wiring, candidate-payload boundaries, and scheduler handoff behavior. Manual smoke remains required for real two-device product confidence.
+Pastey 1.9.1 defines the current Layer 5 narrow product closure and smoke bugfix consolidation through Ask Bridge natural-v1. Automated validation covers Search and Search -> Return contracts, parsed-but-unsupported Search -> Transform -> Return behavior, target binding, Deny terminal states, source-shape product wiring, candidate-payload boundaries, provider health-check validation, and scheduler handoff behavior. `runtime.hello_stdout` remains diagnostic/test-only. Manual smoke remains required for real two-device product confidence.
 
 The first workspace capability direction is `filesystem.find_file_candidates`. Current validation covers advisory JSON validation, PolicyGate boundaries, selected-peer consent, receiver-side bounded metadata search, and redacted candidate result shape.
 
 The first candidate payload direction is `transfer.request_candidate_payload`. Current validation covers the second-consent handoff path: advisory validation, selected-peer preview, capability-specific Allow once grant, exact execution-request binding, replay rejection, receiver-local candidate-store resolution, existing transfer queue handoff, and `handoff_queued` result shape. It does not claim transfer completion at handoff time because byte progress and completion remain owned by the existing transfer pipeline.
 
-The deterministic find-and-send workflow direction is `candidatePayloadWorkflow`. Current validation covers advisory search start, local search confirmation, receiver search consent, redacted candidate results, explicit user candidate selection, payload preview creation, receiver payload consent, candidate resolution, queue handoff, and `handoff_queued` result shape. It does not auto-select candidates, auto-send files, merge discovery and payload consent, expose paths or contents, or add a new transfer path.
+The deterministic Ask Bridge Search / Return workflow direction is `candidatePayloadWorkflow`. Current validation covers natural-language Search plan creation, local plan confirmation before any peer request, receiver search consent, redacted candidate results, explicit user candidate selection, payload preview creation, receiver payload consent, candidate resolution, queue handoff, and `handoff_queued` result shape. It does not auto-select candidates, auto-send files, merge discovery and payload consent, expose paths or contents, or add a new transfer path.
 
 Existing transfer and MicroFlowGroup fixtures live under `tests/fixtures/transfer-corpus/`. They are intentionally size, throughput, queue contention, interruption, and scheduler-behavior fixtures. They are not reused for file-candidate executor validation because they do not naturally cover filename matching modes, extension filters, safe scope labels, hidden entries, symlink skipping, directory-depth limits, redacted locations, opaque candidate ids, or metadata-only behavior.
 
@@ -116,7 +116,7 @@ File-candidate validation uses a separate tiny corpus under `tests/fixtures/file
 | Scope and result boundaries | whole-device search, file contents, absolute paths, hidden files, unbounded depth/time/candidate count reject; receiver search skips unavailable scopes, hidden entries, symlinks, and directories | AI slot file-candidate validation tests, room-control event result validation tests, dedicated file-candidate fixture tests, and Rust executor tests with redacted candidate metadata | Broader platform/device-directory matrix |
 | Consent and route policy | selected-peer only; delivery is not consent; durable pairing does not authorize search; Allow once is consumed once | Existing Layer 4 control/capability route matrix plus AI advisory selected-peer policy tests, peer-consent/execution tests, and `scripts/run-file-candidate-tests.mjs` | Two-device Agent Bridge smoke for preview/search/result flow |
 | Candidate payload second consent and local resolution | discovery consent does not authorize payload request; candidate payload consent does not authorize discovery, Hello, or reusable transfer authority; selected-peers and broadcast reject; candidate resolution is exact, receiver-local, in-memory, and metadata-only | `scripts/run-candidate-payload-tests.mjs` covers exact consent binding, replay rejection, unsafe fields, path-like candidate IDs, local resolution, queue handoff result, and no public queue/path identifiers; `cargo test candidate_payload` covers store insert, exact key resolution, expiry, changed/deleted file rejection, directory/symlink rejection, and path non-serialization | Two-device manual smoke for real app queue handoff and transfer progress |
-| Deterministic find-and-send workflow | natural-language intent can only start discovery; user must select a candidate before payload preview; receiver still allows payload once; denied, expired, changed, deleted, wrong-bound, and replayed paths do not enqueue | `scripts/run-candidate-payload-workflow-tests.mjs` covers search-only start, no jump to payload, no AI auto-selection, exact candidate binding, no path/content workflow state, successful `handoff_queued`, denial, unresolved candidates, and replay rejection | Two-device manual smoke for end-to-end UI candidate selection and transfer progress |
+| Ask Bridge natural-v1 workflow | natural-language intent can only create Search / Transform / Return plans; supported plans require local confirmation before peer request; user must select a candidate before Return preview; receiver still allows payload once; denied, expired, changed, deleted, wrong-bound, and replayed paths do not enqueue | `scripts/run-ai-slot-tests.mjs` covers natural-v1 Search, Search -> Return, unsupported Transform, invalid provider plans, and advisory-only health check; `scripts/run-candidate-payload-workflow-tests.mjs` covers search-only start, no jump to payload, no AI auto-selection, exact candidate binding, no path/content workflow state, successful `handoff_queued`, denial, unresolved candidates, and replay rejection | Two-device manual smoke for end-to-end UI candidate selection and transfer progress |
 | Transfer handoff | after second Allow once, a resolved `filesystem_file` candidate enters the existing transfer queue with Agent Bridge audit metadata; `handoff_queued` is not transfer completion | Candidate-payload tests assert `transferredBytes: 0`, `handoffQueued: true`, and `transferStatus: queued`; transfer scheduler tests cover normal queue entry, selected-peer route metadata, path-free audit metadata, mixed small/large contention, ordinary transfer coexistence, and MicroFlowGroup behavior without MIME-family grouping | Manual smoke for receiver-approved payload transfer completion through the existing pipeline |
 
 Approved transfer handoff is implemented only as queue handoff into the existing transfer pipeline. The current file-candidate executor returns redacted metadata candidates and stores receiver-local resolution records. The current candidate-payload executor resolves locally, queues through the existing scheduler when safe, and still returns zero transferred bytes at handoff time.
@@ -137,22 +137,22 @@ The focused Rust filter covers exact, case-insensitive, and substring filename m
 
 Manual smoke is intentionally separate from automated validation. Run it separately and record evidence with exact build/profile details:
 
-- Hello Stdout success through Bridge detail -> Ask Bridge Beta -> Run Hello Peer demo;
-- Hello Stdout Deny showing terminal Peer denied / Denied and no stdout result;
-- Request file search success with selected-peer-only metadata search and redacted candidates;
-- Request file search Deny showing terminal denial, no candidates, no payload request, and no transfer start;
+- Ask Bridge natural-language input creates a Search plan and requires sender confirmation before any peer request is sent;
+- Ask Bridge natural-language input creates a Search -> Return plan; Search returns redacted metadata candidates only;
+- Ask Bridge Search -> Transform -> Return is recognized but shows unsupported/future and does not execute;
+- Ask Bridge Search Deny showing terminal denial, no candidates, no payload request, and no transfer start;
 - candidate payload success with manual candidate selection, second Allow once, `handoff_queued`, and existing transfer pipeline progress/completion;
 - candidate payload Deny showing terminal denial, no `handoff_queued`, and no transfer start;
 - stale, expired, deleted, or changed candidate does not enqueue;
 - disconnect/timeout around preview, consent, execution, or transfer handoff fails closed;
 - Linux peer display does not appear as local "This Mac";
-- long sent/received text and stdout/result blocks can be viewed and copied in full;
+- long sent/received text can be viewed and copied in full;
 - metadata search exposes no receiver absolute path or file contents;
 - two-machine selected-peers ordinary text;
 - two-machine broadcast file/image and pasted-image where practical;
 - disconnect/reconnect route expiry with old selected-peer route failing closed;
 - paired and revoked display metadata remaining non-routeable/non-authoritative;
-- Agent Bridge Hello Peer and Hello Stdout exact selected-peer consent and one-time execution;
+- Agent Bridge Hello Peer and Hello Stdout exact selected-peer consent and one-time execution remain diagnostic/test-only, not product UI;
 - Agent Bridge file-candidate selected-peer preview, Allow once, and redacted metadata result;
 - Device A requests file candidates from Device B;
 - Device B allows search once;
@@ -174,21 +174,22 @@ Manual smoke is intentionally separate from automated validation. Run it separat
 
 Manual smoke remains release/product confidence evidence, not automated validation. Record the observed boundary precisely: `handoff_queued` means the queue accepted the payload; transfer completion remains existing pipeline responsibility.
 
-## Deterministic Find-And-Send Workflow
+## Ask Bridge Natural-V1 Search / Return Workflow
 
 The implemented deterministic flow is:
 
-1. User intent can produce a `filesystem.find_file_candidates` advisory.
-2. The sender confirms the preview locally.
-3. The receiver allows search once.
-4. Candidates return as redacted metadata.
-5. A selected candidate can produce a `transfer.request_candidate_payload` advisory or UI-built preview.
-6. The receiver allows the payload request once.
-7. The receiver resolves the candidate locally.
-8. The receiver queues the handoff through the existing transfer scheduler.
-9. The existing transfer pipeline handles bytes, progress, and completion.
+1. User natural-language input can produce a Search / Transform / Return plan.
+2. Supported Search or Search -> Return plans can produce a `filesystem.find_file_candidates` advisory.
+3. The sender confirms the preview locally before any peer request is sent.
+4. The receiver allows search once.
+5. Candidates return as redacted metadata.
+6. A manually selected candidate can produce a `transfer.request_candidate_payload` advisory or UI-built Return preview.
+7. The receiver allows the payload request once.
+8. The receiver resolves the candidate locally.
+9. The receiver queues the handoff through the existing transfer scheduler.
+10. The existing transfer pipeline handles bytes, progress, and completion.
 
-The minimal deterministic natural-language workflow is implemented only as a host-owned coordinator around existing capabilities. Broad natural-language automation is not implemented. The model does not auto-select candidates, merge search and payload consent, see receiver absolute paths, see file contents, execute arbitrary tools, or become authoritative over host validation.
+The minimal deterministic natural-language workflow is implemented only as a host-owned coordinator around existing capabilities. Broad natural-language automation is not implemented. The model does not auto-select candidates, merge search and payload consent, see receiver absolute paths, see file contents, execute arbitrary tools, provide shell/cwd/env/network fields, or become authoritative over host validation.
 
 
 ## Planner Replay
