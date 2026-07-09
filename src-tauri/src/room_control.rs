@@ -360,15 +360,11 @@ fn resolve_room_control_route(
 
 fn resolve_inbound_room_control_peer(
     peers: &[StoredBridgePeerEndpoint],
-    source_host: &str,
     sender_public_key: &str,
 ) -> AppResult<RoomControlRouteEndpoint> {
     let mut matches = peers
         .iter()
-        .filter(|peer| {
-            peer.endpoint_host.as_deref() == Some(source_host)
-                && peer.transport_public_key.as_deref() == Some(sender_public_key)
-        })
+        .filter(|peer| peer.transport_public_key.as_deref() == Some(sender_public_key))
         .filter_map(|peer| routeable_room_control_peer(peer).ok())
         .collect::<Vec<_>>();
     if matches.len() == 1 {
@@ -611,7 +607,7 @@ pub fn clear_room_control_state(state: &Arc<AppState>, room_id: &str) {
 
 pub async fn receive_room_control_event_handler(
     AxumPath(room_id): AxumPath<String>,
-    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    ConnectInfo(_source): ConnectInfo<SocketAddr>,
     State(ctx): State<RoomServerContext>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
@@ -676,11 +672,8 @@ pub async fn receive_room_control_event_handler(
             "Room session mismatch.",
         );
     }
-    let inbound_peer = match resolve_inbound_room_control_peer(
-        &peers,
-        &source.ip().to_string(),
-        &envelope.sender_public_key,
-    ) {
+    let inbound_peer = match resolve_inbound_room_control_peer(&peers, &envelope.sender_public_key)
+    {
         Ok(peer) => peer,
         Err(_) => {
             return control_error(
@@ -3038,7 +3031,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_room_control_sender_must_match_current_session_peer_row() {
+    fn inbound_room_control_sender_uses_unique_current_session_key_not_observed_ip() {
         let mut old = route_peer("legacy-room-peer:room");
         old.liveness = BridgePeerLiveness::Stale;
         old.endpoint_host = None;
@@ -3049,11 +3042,11 @@ mod tests {
         let peers = vec![old, current];
 
         assert_control_route_error(
-            resolve_inbound_room_control_peer(&peers, "127.0.0.1", "target-key"),
+            resolve_inbound_room_control_peer(&peers, "target-key"),
             "route_mismatch",
         );
         assert_eq!(
-            resolve_inbound_room_control_peer(&peers, "127.0.0.2", "new-target-key")
+            resolve_inbound_room_control_peer(&peers, "new-target-key")
                 .unwrap()
                 .peer_session_id,
             "legacy-room-peer:room:reconnect:1"

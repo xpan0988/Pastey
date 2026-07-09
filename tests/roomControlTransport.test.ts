@@ -127,6 +127,10 @@ test("duplicate/replay, expiry, peer unavailable, and malformed receipt are visi
   assert.equal(mapRoomControlSendError({ code: "expired" }, "event", NOW).errorCode, "expired");
   assert.equal(mapRoomControlSendError({ code: "peer_unavailable" }, "event", NOW).errorCode, "peer_unavailable");
   assert.equal(mapRoomControlSendError({ code: "malformed_receipt" }, "event", NOW).errorCode, "malformed_receipt");
+  assert.equal(
+    mapRoomControlSendError({ code: "transport_error" }, "event", NOW).message,
+    "Transport failed: the selected device did not accept the room-control request.",
+  );
 });
 
 test("malformed receipt produces one visible terminal failure", async () => {
