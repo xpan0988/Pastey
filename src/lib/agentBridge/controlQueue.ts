@@ -331,7 +331,7 @@ export function markControlQueueItemStatus(
 
 export function enqueueInboundRoomControlEvents(
   state: ControlQueueState,
-  events: unknown[],
+  events: readonly unknown[],
   options: {
     now?: Date;
     expectedRoomRef?: string;

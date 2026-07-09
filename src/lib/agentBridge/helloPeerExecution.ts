@@ -210,7 +210,17 @@ export function matchExecutionResultToRequest(
     && result.targetPeerRef === request.sourceDeviceRef
     && result.payload.executionId === request.payload.executionId
     && result.payload.requestId === request.payload.requestId
-    && result.payload.consentId === request.payload.consentId;
+    && result.payload.consentId === request.payload.consentId
+    && executionResultCapability(result) === request.payload.capability;
+}
+
+function executionResultCapability(
+  result: CapabilityExecutionResultRoomControlEvent,
+): CapabilityExecuteRequestRoomControlEvent["payload"]["capability"] | null {
+  if ("capability" in result.payload) return result.payload.capability;
+  return result.payload.schemaVersion === "pastey-hello-peer-execution-result-v1"
+    ? "runtime.execute_hello_template"
+    : null;
 }
 
 function requestMatchesConsent(request: HelloPeerExecutionRequest, consent: PeerConsentRecord): boolean {
