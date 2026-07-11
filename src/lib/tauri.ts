@@ -16,7 +16,9 @@ import type {
 } from "./types";
 import {
   validateCandidatePayloadExecutionRequest,
+  validateArtifactTransformExecutionRequest,
   validateFileCandidateExecutionRequest,
+  type ArtifactTransformExecutionRequest,
   type CandidatePayloadExecutionRequest,
   type CandidatePayloadResolution,
   type FileCandidateExecutionRequest,
@@ -170,6 +172,17 @@ export async function resolveCandidatePayloadCapability(
     throw new Error(validation.errors.join(" "));
   }
   return invoke("resolve_candidate_payload_capability", { request });
+}
+
+export async function claimCandidateArtifactTransformCapability(
+  request: ArtifactTransformExecutionRequest,
+): Promise<"claimed" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed"> {
+  const validation = validateArtifactTransformExecutionRequest(request);
+  if (!validation.valid) throw new Error(validation.errors.join(" "));
+  const result = await invoke<{ status: "claimed" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed" }>("claim_candidate_artifact_transform_capability", {
+    request,
+  });
+  return result.status;
 }
 
 export async function getRoomControlSessionContext(

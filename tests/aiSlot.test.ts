@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -36,6 +37,8 @@ import {
   hashStableSerializedValue,
   MOCK_AI_CONTEXT_POLICY,
   mockProvider,
+  NATURAL_V1_PROVIDER_INSTRUCTIONS,
+  scanProviderOutputRisk,
   validateAskBridgeNaturalV1Plan,
   validateAiActionPlan,
   validateCandidatePayloadRequest,
@@ -86,6 +89,16 @@ function cloudRequest(context = buildMockAiContextSnapshot()): AiGenerateRequest
   };
 }
 
+function naturalCloudRequest(context = buildMockAiContextSnapshot()): AiGenerateRequest {
+  return {
+    ...cloudRequest(context),
+    requestId: "cloud-natural-request",
+    outputSchema: "ask-bridge-natural-v1",
+    allowedActionKinds: [],
+    userRequest: "Find the assignment PDF on the selected device and return it to me."
+  };
+}
+
 function jsonResponse(content: string): Response {
   return new Response(JSON.stringify({
     choices: [{ message: { content } }],
@@ -104,6 +117,13 @@ async function generateCloudPlan(plan: unknown) {
     fetchImpl: async () => jsonResponse(JSON.stringify(plan))
   });
   return provider.generate(cloudRequest());
+}
+
+async function generateCloudNaturalPlan(plan: unknown) {
+  const provider = new CloudOpenAICompatibleProvider(CLOUD_CONFIG, {
+    fetchImpl: async () => jsonResponse(JSON.stringify(plan))
+  });
+  return provider.generate(naturalCloudRequest());
 }
 
 function confirmedPendingAction() {
@@ -177,14 +197,22 @@ test("natural-v1 deterministic planner creates Search and Search Return plans", 
   assert.equal(returnStep?.primitive === "Return" ? returnStep.requiresSecondConsent : false, true);
 });
 
-test("natural-v1 recognizes Transform Return as unsupported until bounded runtime exists", () => {
+test("natural-v1 supports only selected-artifact Transform and keeps typed result separate from file Return", () => {
   const plan = buildDeterministicAskBridgeNaturalV1Plan("Find the notes and summarize them before returning the result.");
   const validation = validateAskBridgeNaturalV1Plan(plan);
 
   assert.equal(validation.valid, true);
-  assert.equal(plan.status, "unsupported_future");
+  assert.equal(plan.status, "supported");
   assert.deepEqual(plan.steps.map((step) => step.primitive), ["Search", "Transform", "Return"]);
-  assert.match(plan.unsupportedReason ?? "", /bounded transform runtime is not implemented/);
+  assert.equal(plan.steps[1]?.primitive === "Transform" ? plan.steps[1].transformKind : "", "selected_artifact_output");
+  assert.equal(plan.steps[2]?.primitive === "Return" ? plan.steps[2].returnKind : "", "typed_transform_result");
+  assert.equal(plan.steps[2]?.primitive === "Return" ? plan.steps[2].requiresSecondConsent : true, false);
+
+  const unsupported = structuredClone(plan) as typeof plan;
+  if (unsupported.steps[1]?.primitive === "Transform") unsupported.steps[1] = { primitive: "Transform", transformKind: "python" };
+  unsupported.status = "unsupported_future";
+  unsupported.unsupportedReason = "Unsupported Transform kind.";
+  assert.equal(validateAskBridgeNaturalV1Plan(unsupported).valid, true);
 });
 
 test("natural-v1 provider plans reject unsafe execution and fanout fields", () => {
@@ -224,6 +252,142 @@ test("natural-v1 provider health check validates advisory output only", async ()
   assert.match(capturedBody, /ask-bridge-natural-v1/);
 });
 
+test("natural-v1 provider instruction pack is canonical and used by cloud provider", () => {
+  const body = buildOpenAICompatibleChatRequest(CLOUD_CONFIG, naturalCloudRequest());
+  const systemMessage = body.messages[0];
+  assert.equal(systemMessage?.role, "system");
+  assert.equal(systemMessage?.content, NATURAL_V1_PROVIDER_INSTRUCTIONS);
+  assert.match(NATURAL_V1_PROVIDER_INSTRUCTIONS, /Output only ask-bridge-natural-v1 JSON/);
+  assert.match(NATURAL_V1_PROVIDER_INSTRUCTIONS, /advisory only/);
+  assert.match(NATURAL_V1_PROVIDER_INSTRUCTIONS, /Host validation/);
+  assert.match(NATURAL_V1_PROVIDER_INSTRUCTIONS, /chain-of-thought/);
+  assert.match(NATURAL_V1_PROVIDER_INSTRUCTIONS, /selected_peers/);
+  assert.match(NATURAL_V1_PROVIDER_INSTRUCTIONS, /unsupported_future/);
+
+  const cloudProviderSource = readFileSync("src/lib/ai/cloudOpenAICompatibleProvider.ts", "utf8");
+  const instructionSource = readFileSync("src/lib/ai/providerInstructionPack.ts", "utf8");
+  assert.match(cloudProviderSource, /NATURAL_V1_PROVIDER_INSTRUCTIONS/);
+  assert.equal(cloudProviderSource.includes(["NATURAL", "V1", "SYSTEM", "PROMPT"].join("_")), false);
+  assert.doesNotMatch(cloudProviderSource, /You are the advisory-only Pastey Ask Bridge natural-v1 planner/);
+  assert.doesNotMatch(instructionSource, /readFileSync|from "node:fs"|from 'node:fs'|fetch\(|Markdown.*prompt|CLAUDE\.md|AGENTS\.md/);
+});
+
+test("natural-v1 cloud provider keeps parsing advisory JSON and rejects malformed JSON", async () => {
+  const result = await generateCloudNaturalPlan(buildMockAskBridgeNaturalV1Plan());
+  assert.equal(result.error, undefined);
+  assert.equal(validateAskBridgeNaturalV1Plan(result.parsedPlan).valid, true);
+
+  const provider = new CloudOpenAICompatibleProvider(CLOUD_CONFIG, {
+    fetchImpl: async () => jsonResponse("not valid json")
+  });
+  const malformed = await provider.generate(naturalCloudRequest());
+  assert.equal(malformed.parsedPlan, undefined);
+  assert.equal(malformed.error?.code, "provider_json_parse_failed");
+});
+
+test("natural-v1 provider risk scanner rejects forbidden top-level and nested fields", () => {
+  const safe = buildMockAskBridgeNaturalV1Plan();
+  assert.equal(scanProviderOutputRisk(safe).failClosed, false);
+  assert.equal(validateAskBridgeNaturalV1Plan(safe).valid, true);
+
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["top-level shell", { shell: "find . -name report.pdf" }],
+    ["nested command", { steps: [{ ...safe.steps[0], command: "find . -name report.pdf" }] }],
+    ["nested cwd", { steps: [{ ...safe.steps[0], options: { cwd: "/Users/alice" } }] }],
+    ["nested env", { steps: [{ ...safe.steps[0], options: { env: { HOME: "/Users/alice" } } }] }],
+    ["nested network", { steps: [{ ...safe.steps[0], network: "https://example.invalid" }] }],
+    ["file path", { steps: [{ ...safe.steps[0], filePath: "/Users/alice/report.pdf" }] }],
+    ["file content", { steps: [{ ...safe.steps[0], fileContent: "secret bytes" }] }],
+    ["content", { content: "secret bytes" }],
+    ["queue id", { queueId: "queue-1" }],
+    ["handoff id", { steps: [{ ...safe.steps[0], handoffId: "handoff-1" }] }],
+    ["target peer refs", { targetPeerRefs: ["peer-a"] }],
+  ];
+
+  for (const [label, mutation] of cases) {
+    const candidate = {
+      ...safe,
+      ...mutation,
+      steps: mutation.steps ?? safe.steps,
+    };
+    const scan = scanProviderOutputRisk(candidate);
+    const validation = validateAskBridgeNaturalV1Plan(candidate);
+    assert.equal(scan.failClosed, true, label);
+    assert.equal(validation.valid, false, label);
+    assert.match(validation.errors.join("\n"), /Provider risk scanner rejected natural-v1 output|Forbidden natural-v1 field|Unsafe provider field/, label);
+  }
+});
+
+test("natural-v1 provider risk scanner rejects fanout variants and authority claims", () => {
+  const safe = buildMockAskBridgeNaturalV1Plan();
+  const cases: Array<[string, Record<string, unknown>, RegExp]> = [
+    ["selected_peers", { selected_peers: ["peer-a", "peer-b"] }, /selected_peers/],
+    ["selectedPeers", { selectedPeers: ["peer-a", "peer-b"] }, /selectedPeers/],
+    ["broadcast", { broadcast: true }, /broadcast/],
+    ["auto transfer", { autoTransfer: true }, /autoTransfer/],
+    ["handoff queued", { handoffQueued: true }, /handoffQueued/],
+    ["already executed", { alreadyExecuted: true }, /alreadyExecuted/],
+    ["execution result", { executionResult: { status: "done" } }, /executionResult/],
+    ["consent granted", { consentGranted: true }, /consentGranted/],
+    ["user approved", { userApproved: true }, /userApproved/],
+    ["receiver approved", { receiverApproved: true }, /receiverApproved/],
+    ["claim string", { title: "I already executed it and consent was granted." }, /claims execution|claims consent/],
+  ];
+
+  for (const [label, mutation, expected] of cases) {
+    const candidate = {
+      ...safe,
+      ...mutation,
+    };
+    const scan = scanProviderOutputRisk(candidate);
+    const validation = validateAskBridgeNaturalV1Plan(candidate);
+    assert.equal(scan.failClosed, true, label);
+    assert.equal(validation.valid, false, label);
+    assert.match([
+      ...scan.findings.map((finding) => `${finding.path} ${finding.reason}`),
+      ...(validation.valid ? [] : validation.errors),
+    ].join("\n"), expected, label);
+  }
+});
+
+test("natural-v1 provider risk scanner rejects hidden reasoning fields and path-like values", () => {
+  const safe = buildMockAskBridgeNaturalV1Plan();
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["chain of thought", { chainOfThought: "private reasoning" }],
+    ["scratchpad", { steps: [{ ...safe.steps[0], scratchpad: "private" }] }],
+    ["reasoning trace", { reasoningTrace: "private" }],
+    ["model thoughts", { modelThoughts: "private" }],
+    ["absolute path value", { title: "Find /Users/alice/secrets/report.pdf" }],
+    ["network value", { title: "Fetch https://example.invalid/report.pdf" }],
+    ["string reasoning marker", { title: "Reasoning trace: hidden work" }],
+  ];
+
+  for (const [label, mutation] of cases) {
+    const candidate = {
+      ...safe,
+      ...mutation,
+      steps: mutation.steps ?? safe.steps,
+    };
+    const validation = validateAskBridgeNaturalV1Plan(candidate);
+    assert.equal(scanProviderOutputRisk(candidate).failClosed, true, label);
+    assert.equal(validation.valid, false, label);
+  }
+});
+
+test("natural-v1 scanner cannot approve execution or override validator rejection", () => {
+  const invalid = {
+    ...buildMockAskBridgeNaturalV1Plan(),
+    schemaVersion: "ask-bridge-natural-v2",
+  };
+  const scan = scanProviderOutputRisk(invalid);
+  const validation = validateAskBridgeNaturalV1Plan(invalid);
+
+  assert.equal(scan.failClosed, false);
+  assert.equal(scan.findings.length, 0);
+  assert.equal(validation.valid, false);
+  assert.match(validation.errors.join("\n"), /schemaVersion/);
+});
+
 test("safe Hello Stdout mock plan validates and builds a preview-only request", () => {
   const plan = buildMockHelloStdoutPlan();
   const context = buildMockAiContextSnapshot();
@@ -253,7 +417,7 @@ test("safe Hello Stdout mock plan validates and builds a preview-only request", 
 
 test("Agent Bridge capability registry resolves implemented capabilities", () => {
   const contracts = listAgentBridgeCapabilityContracts();
-  assert.equal(contracts.length, 4);
+  assert.equal(contracts.length, 5);
   assert.ok(contracts.every((contract) => contract.lifecycle === "implemented"));
   assert.equal(getAgentBridgeCapabilityContract("runtime.execute_hello_template")?.providerActionKind, "request_peer_hello_demo");
   assert.equal(getAgentBridgeCapabilityContract("runtime.hello_stdout")?.providerActionKind, "request_peer_hello_stdout_demo");
@@ -261,9 +425,12 @@ test("Agent Bridge capability registry resolves implemented capabilities", () =>
   assert.equal(getAgentBridgeCapabilityContract("filesystem.find_file_candidates")?.executorKind, "filesystem_find_candidates_host");
   assert.equal(getAgentBridgeCapabilityContract("transfer.request_candidate_payload")?.providerActionKind, "request_peer_candidate_payload");
   assert.equal(getAgentBridgeCapabilityContract("transfer.request_candidate_payload")?.executorKind, "transfer_candidate_payload_host");
+  assert.equal(getAgentBridgeCapabilityContract("artifact.transform_selected")?.providerActionKind, "request_peer_artifact_transform");
+  assert.equal(getAgentBridgeCapabilityContract("artifact.transform_selected")?.executorKind, "sandbox_transform_unavailable");
   assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_hello_demo")?.capability, "runtime.execute_hello_template");
   assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_hello_stdout_demo")?.capability, "runtime.hello_stdout");
   assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_file_candidates")?.capability, "filesystem.find_file_candidates");
+  assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_artifact_transform")?.capability, "artifact.transform_selected");
   assert.equal(getAgentBridgeCapabilityContractByActionKind("request_peer_candidate_payload")?.capability, "transfer.request_candidate_payload");
   assert.equal(getAgentBridgeCapabilityContract("runtime.unknown"), undefined);
   assert.equal(getAgentBridgeCapabilityContractByVersion("runtime.hello_stdout", "v2"), undefined);

@@ -1,4 +1,5 @@
 import { buildCloudSafeAiContextSnapshot } from "./contextSnapshot";
+import { NATURAL_V1_PROVIDER_INSTRUCTIONS } from "./providerInstructionPack";
 import type {
   AiGenerateRequest,
   AiGenerateResult,
@@ -50,18 +51,6 @@ For Hello Stdout, only propose request_peer_hello_stdout_demo with capability ru
 For file candidate discovery, only propose request_peer_file_candidates with capability filesystem.find_file_candidates, one targetPeerRef, searchMode filename_metadata_only, allowedScopes limited to downloads desktop documents pastey_shared, allowFullDisk false, includeFileContents false, includeAbsolutePaths false, includeHiddenFiles false, noAutoTransfer true, requireReceiverConsent true, selectedPeerOnly true, maxCandidates 1-20, maxSearchMs 500-10000, and maxDepth 1-8.
 For candidate payload requests, only propose request_peer_candidate_payload with capability transfer.request_candidate_payload, one targetPeerRef, sourceCapability filesystem.find_file_candidates, sourceRequestId, opaque candidateId, candidateDisplayName, candidateKind filesystem_file, and optional display metadata only. Do not include paths, contents, transfer queue ids, handoff ids, auto-send, selected-peers, or broadcast.
 Do not include fields outside the action-plan schema.`;
-
-const NATURAL_V1_SYSTEM_PROMPT = `You are the advisory-only Pastey Ask Bridge natural-v1 planner.
-Return only one JSON object conforming to ask-bridge-natural-v1.
-The only product-level primitives are Search, Transform, and Return.
-Supported step chains are exactly Search, Search -> Return, or Search -> Transform -> Return.
-Search may contain only filenameHint, extensions, and safeScopes. It returns redacted metadata candidates only.
-Return may contain only destination this_device or selected_peer, candidate manual_selection_required, and requiresSecondConsent true.
-Transform may contain only transformKind. Mark any Transform plan as status unsupported_future with an unsupportedReason because bounded transform runtime is not implemented.
-The top-level object may contain only schemaVersion, title, status, requiresUserConfirmation, steps, and unsupportedReason.
-schemaVersion must be ask-bridge-natural-v1. requiresUserConfirmation must be true.
-Never include shell, command, code, script, cwd, env, network, URL, paths, file contents, selected_peers, broadcast, auto-transfer, transfer queue ids, handoff ids, or execution results.
-Model output is advisory only and never sends room-control events, executes capabilities, selects candidates, or authorizes transfer.`;
 
 export class CloudOpenAICompatibleProvider implements AiProvider {
   readonly config: CloudOpenAICompatibleProviderConfig;
@@ -157,7 +146,7 @@ export function buildOpenAICompatibleChatRequest(
       {
         role: "system",
         content: request.outputSchema === "ask-bridge-natural-v1"
-          ? NATURAL_V1_SYSTEM_PROMPT
+          ? NATURAL_V1_PROVIDER_INSTRUCTIONS
           : ADVISORY_SYSTEM_PROMPT
       },
       {

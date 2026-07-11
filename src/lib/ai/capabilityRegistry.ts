@@ -4,7 +4,8 @@ export type AgentBridgeCapabilityId =
   | "runtime.execute_hello_template"
   | "runtime.hello_stdout"
   | "filesystem.find_file_candidates"
-  | "transfer.request_candidate_payload";
+  | "transfer.request_candidate_payload"
+  | "artifact.transform_selected";
 
 export type AgentBridgeCapabilityVersion = "legacy" | "v1";
 export type AgentBridgeRoutePolicy = "selected-peer";
@@ -13,16 +14,17 @@ export type AgentBridgeExecutorKind =
   | "ts_in_process_fixed_template"
   | "rust_host_helper"
   | "filesystem_find_candidates_host"
-  | "transfer_candidate_payload_host";
+  | "transfer_candidate_payload_host"
+  | "sandbox_transform_unavailable";
 export type AgentBridgeAuditRedactionPolicy = "metadata_only";
 export type AgentBridgeCapabilityLifecycle = "implemented";
-export type AgentBridgeProviderInputShape = "fixed_message" | "file_candidate_advisory" | "candidate_payload_request";
+export type AgentBridgeProviderInputShape = "fixed_message" | "file_candidate_advisory" | "candidate_payload_request" | "artifact_transform_request";
 
 export interface AgentBridgeCapabilityContract {
   readonly capability: AgentBridgeCapabilityId;
   readonly version: AgentBridgeCapabilityVersion;
   readonly lifecycle: AgentBridgeCapabilityLifecycle;
-  readonly providerActionKind: Extract<AiActionKind, "request_peer_hello_demo" | "request_peer_hello_stdout_demo" | "request_peer_file_candidates" | "request_peer_candidate_payload">;
+  readonly providerActionKind: Extract<AiActionKind, "request_peer_hello_demo" | "request_peer_hello_stdout_demo" | "request_peer_file_candidates" | "request_peer_candidate_payload" | "request_peer_artifact_transform">;
   readonly providerInputShape: AgentBridgeProviderInputShape;
   readonly previewRequestSchema?: string;
   readonly consentGrantSchema?: string;
@@ -74,11 +76,13 @@ export const HELLO_TEMPLATE_CAPABILITY = "runtime.execute_hello_template" as con
 export const HELLO_STDOUT_CAPABILITY = "runtime.hello_stdout" as const;
 export const FILE_CANDIDATES_CAPABILITY = "filesystem.find_file_candidates" as const;
 export const CANDIDATE_PAYLOAD_CAPABILITY = "transfer.request_candidate_payload" as const;
+export const ARTIFACT_TRANSFORM_CAPABILITY = "artifact.transform_selected" as const;
 export const HELLO_TEMPLATE_MESSAGE = "hello peer!";
 export const HELLO_STDOUT_EXPECTED_STDOUT = "hello peer";
 export const HELLO_STDOUT_RUNTIME_KIND = "rust_host_helper";
 export const FILE_CANDIDATES_EXECUTOR_KIND = "filesystem_find_candidates_host" as const;
 export const CANDIDATE_PAYLOAD_EXECUTOR_KIND = "transfer_candidate_payload_host" as const;
+export const ARTIFACT_TRANSFORM_EXECUTOR_KIND = "sandbox_transform_unavailable" as const;
 export const SHARED_CAPABILITY_ENVELOPE_SCHEMA = "pastey-agent-bridge-capability-envelope-v1";
 export const SELECTED_PEER_ROUTE_POLICY: AgentBridgeRoutePolicy = "selected-peer";
 export const EXACT_ALLOW_ONCE_CONSENT_POLICY: AgentBridgeConsentPolicy = "exact-allow-once";
@@ -97,7 +101,14 @@ const BASE_FORBIDDEN_PROVIDER_FIELDS = [
   "environment",
   "args",
   "arguments",
+  "argv",
+  "stdin",
+  "workingDirectory",
+  "runtime",
+  "interpreter",
+  "compiler",
   "networkTarget",
+  "proxy",
   "url",
   "filesystemTree",
     "rawLogs",
@@ -250,6 +261,27 @@ export const AGENT_BRIDGE_CAPABILITY_REGISTRY: readonly AgentBridgeCapabilityCon
       shortLabel: "Candidate Payload",
       resultLabel: "Candidate payload request result",
     },
+  }),
+  Object.freeze({
+    capability: ARTIFACT_TRANSFORM_CAPABILITY,
+    version: "v1",
+    lifecycle: "implemented",
+    providerActionKind: "request_peer_artifact_transform",
+    providerInputShape: "artifact_transform_request",
+    previewRequestSchema: "artifact-transform-selected-request-v1",
+    consentGrantSchema: "artifact-transform-selected-consent-grant-v1",
+    executionRequestSchema: "artifact-transform-selected-execution-request-v1",
+    executionResultSchema: "artifact-transform-selected-result-v1",
+    routePolicy: SELECTED_PEER_ROUTE_POLICY,
+    consentPolicy: EXACT_ALLOW_ONCE_CONSENT_POLICY,
+    executorKind: ARTIFACT_TRANSFORM_EXECUTOR_KIND,
+    auditRedactionPolicy: "metadata_only",
+    requiresPeerCapabilityAdvertisement: true,
+    constraintFields: [],
+    allowTempOnlyFilesystem: false,
+    forbiddenProviderFields: BASE_FORBIDDEN_PROVIDER_FIELDS,
+    resultOnlyFields: RESULT_ONLY_FIELDS,
+    ui: { label: "Transform Selected Artifact", shortLabel: "Transform", resultLabel: "Transform result" },
   }),
 ]);
 

@@ -381,13 +381,9 @@ Payload transfer remains bytes-oriented and uses the existing transfer queue, sc
 
 ## Product Closure Status
 
-Pastey 1.9.1 Layer 5 narrow product closure is implemented through Ask Bridge natural-v1:
+Pastey 1.9.1 Layer 5 narrow product closure is implemented through Ask Bridge natural-v1. This template document tracks manifests and shared helper migration; the canonical natural-v1 safety model lives in [architecture-and-safety.md](architecture-and-safety.md), provider instruction pack guidance lives in [provider-configuration.md](provider-configuration.md), and validation/smoke invariants live in [../transfer/validation.md](../transfer/validation.md).
 
-- Ask Bridge is the single natural-language Layer 5 entry.
-- Request file is folded into Ask Bridge as a `Search` / `Return` plan, not a separate primary product model.
-- `filesystem.find_file_candidates` plus `transfer.request_candidate_payload` implements Search / Return behind the product primitives. It requires exactly one selected peer, metadata-only search consent, redacted candidates, manual candidate selection, second payload consent, receiver-side candidate revalidation, and queue handoff into the existing transfer pipeline.
-- Search -> Transform -> Return may be parsed and previewed in natural-v1, but unsupported transforms fail closed / show unsupported future state until bounded transform runtime exists.
-- `runtime.hello_stdout` remains diagnostic/test-only fixed runtime coverage and is no longer user-facing product UI.
+In short: Ask Bridge is the single natural-language Layer 5 entry, Request file is folded into Search / Return, Search uses `filesystem.find_file_candidates`, Return uses second-consent `transfer.request_candidate_payload`, Transform remains unsupported/future, and `runtime.hello_stdout` remains diagnostic/test-only.
 
 The shared `OperationTimeline` product component is an operation lifecycle view backed by Pastey events and existing queue/transfer state. It is not a model reasoning trace, provider scratchpad, or task taxonomy. Active Bridge detail operations auto-refresh while nonterminal; `Check for updates` is retained as fallback/debug affordance only.
 

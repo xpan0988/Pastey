@@ -29,6 +29,15 @@ import {
   type CandidatePayloadExecutionRequest,
   type CandidatePayloadExecutionResult,
 } from "../ai/candidatePayloadRequest";
+import {
+  ARTIFACT_TRANSFORM_CAPABILITY,
+  ARTIFACT_TRANSFORM_CONSENT_GRANT_SCHEMA,
+  ARTIFACT_TRANSFORM_RESULT_SCHEMA,
+  validateArtifactTransformExecutionRequest,
+  validateArtifactTransformExecutionResult,
+  type ArtifactTransformExecutionRequest,
+  type ArtifactTransformExecutionResult,
+} from "../ai/artifactTransformRequest";
 
 export type RoomControlEventKind =
   | "capability_preview"
@@ -163,11 +172,28 @@ export interface CandidatePayloadConsentGrant {
   expiresAt: string;
 }
 
+export interface ArtifactTransformConsentGrant {
+  schemaVersion: typeof ARTIFACT_TRANSFORM_CONSENT_GRANT_SCHEMA;
+  consentId: string;
+  sourcePreviewEventId: string;
+  envelopeId: string;
+  requestId: string;
+  requestPayloadHash: string;
+  capability: typeof ARTIFACT_TRANSFORM_CAPABILITY;
+  sourceCapability: "filesystem.find_file_candidates";
+  sourceRequestId: string;
+  candidateId: string;
+  candidateKind: "filesystem_file";
+  resultContract: "typed_transform_result";
+  expiresAt: string;
+}
+
 export type CapabilityConsentGrant =
   | HelloPeerConsentGrant
   | HelloStdoutConsentGrant
   | FileCandidateConsentGrant
-  | CandidatePayloadConsentGrant;
+  | CandidatePayloadConsentGrant
+  | ArtifactTransformConsentGrant;
 
 export interface HelloPeerExecutionRequest {
   schemaVersion: "pastey-hello-peer-execution-request-v1";
@@ -247,12 +273,14 @@ export type CapabilityExecutionRequest =
   | HelloPeerExecutionRequest
   | HelloStdoutExecutionRequest
   | FileCandidateExecutionRequest
-  | CandidatePayloadExecutionRequest;
+  | CandidatePayloadExecutionRequest
+  | ArtifactTransformExecutionRequest;
 export type CapabilityExecutionResult =
   | HelloPeerExecutionResult
   | HelloStdoutExecutionResult
   | FileCandidateExecutionResult
-  | CandidatePayloadExecutionResult;
+  | CandidatePayloadExecutionResult
+  | ArtifactTransformExecutionResult;
 
 export interface CapabilityExecuteRequestRoomControlEvent extends RoomControlEventBase {
   kind: "capability_execute_request";
@@ -408,6 +436,10 @@ const CANDIDATE_PAYLOAD_CONSENT_GRANT_FIELDS = [
   "candidateDisplayName",
   "expiresAt"
 ];
+const ARTIFACT_TRANSFORM_CONSENT_GRANT_FIELDS = [
+  "schemaVersion", "consentId", "sourcePreviewEventId", "envelopeId", "requestId", "requestPayloadHash",
+  "capability", "sourceCapability", "sourceRequestId", "candidateId", "candidateKind", "resultContract", "expiresAt",
+];
 const EXECUTION_REQUEST_FIELDS = [
   "schemaVersion",
   "executionId",
@@ -494,6 +526,17 @@ const UNSAFE_OR_EXECUTION_FIELDS = new Set([
   "shell",
   "script",
   "code",
+  "args",
+  "arguments",
+  "argv",
+  "stdin",
+  "workingDirectory",
+  "runtime",
+  "interpreter",
+  "compiler",
+  "env",
+  "environment",
+  "proxy",
   "path",
   "absolutePath",
   "filePath",
@@ -957,6 +1000,7 @@ export function validateCapabilityConsentGrant(value: unknown): string[] {
   if (contract?.capability === CANDIDATE_PAYLOAD_CAPABILITY) {
     return validateCandidatePayloadConsentGrant(value);
   }
+  if (contract?.capability === ARTIFACT_TRANSFORM_CAPABILITY) return validateArtifactTransformConsentGrant(value);
   if (contract?.capability === HELLO_STDOUT_CAPABILITY) {
     return validateHelloStdoutConsentGrant(value);
   }
@@ -1078,6 +1122,18 @@ export function validateCandidatePayloadConsentGrant(value: unknown): string[] {
   return unique(errors);
 }
 
+export function validateArtifactTransformConsentGrant(value: unknown): string[] {
+  const errors: string[] = [];
+  if (!isRecord(value)) return ["Artifact Transform consent grant must be an object."];
+  requireExactFields(value, ARTIFACT_TRANSFORM_CONSENT_GRANT_FIELDS, [], "Artifact Transform consent grant", errors);
+  if (value.schemaVersion !== ARTIFACT_TRANSFORM_CONSENT_GRANT_SCHEMA || value.capability !== ARTIFACT_TRANSFORM_CAPABILITY) errors.push("Artifact Transform consent grant has an invalid fixed contract.");
+  for (const field of ["consentId", "sourcePreviewEventId", "envelopeId", "requestId", "requestPayloadHash", "sourceRequestId", "candidateId"]) requireBoundedString(value[field], `consent.${field}`, MAX_IDENTIFIER_LENGTH, errors);
+  if (value.sourceCapability !== FILE_CANDIDATES_CAPABILITY || value.candidateKind !== "filesystem_file" || value.resultContract !== "typed_transform_result") errors.push("Artifact Transform consent grant has an invalid source or result contract.");
+  if (typeof value.candidateId === "string" && looksLikePath(value.candidateId)) errors.push("Artifact Transform consent grant candidateId must be opaque.");
+  requireDateString(value.expiresAt, "consent.expiresAt", errors);
+  return unique(errors);
+}
+
 export function validateCapabilityExecutionRequest(value: unknown, now = new Date()): string[] {
   if (!isRecord(value)) {
     return ["Capability execution request must be an object."];
@@ -1090,6 +1146,7 @@ export function validateCapabilityExecutionRequest(value: unknown, now = new Dat
   if (contract?.capability === CANDIDATE_PAYLOAD_CAPABILITY) {
     return validateCandidatePayloadExecutionRequest(value, { now }).errors;
   }
+  if (contract?.capability === ARTIFACT_TRANSFORM_CAPABILITY) return validateArtifactTransformExecutionRequest(value, { now }).errors;
   if (contract?.capability === HELLO_STDOUT_CAPABILITY) {
     return validateHelloStdoutExecutionRequest(value, now);
   }
@@ -1164,6 +1221,7 @@ export function validateCapabilityExecutionResult(value: unknown): string[] {
   if (contract?.capability === CANDIDATE_PAYLOAD_CAPABILITY) {
     return validateCandidatePayloadExecutionResult(value).errors;
   }
+  if (contract?.capability === ARTIFACT_TRANSFORM_CAPABILITY) return validateArtifactTransformExecutionResult(value).errors;
   if (contract?.capability === HELLO_STDOUT_CAPABILITY) {
     return validateHelloStdoutExecutionResult(value);
   }
@@ -1399,7 +1457,7 @@ function findUnsafeOrExecutionFieldPaths(
       const entryPath = `${path}.${key}`;
       if (
         UNSAFE_OR_EXECUTION_FIELDS.has(normalizeCapabilityFieldName(key))
-        && !isAllowedHelloStdoutResultField(root, entryPath, key)
+        && !isAllowedExecutionResultField(root, entryPath, key)
       ) {
         found.push(entryPath);
       }
@@ -1409,14 +1467,16 @@ function findUnsafeOrExecutionFieldPaths(
   return found;
 }
 
-function isAllowedHelloStdoutResultField(root: unknown, path: string, key: string): boolean {
+function isAllowedExecutionResultField(root: unknown, path: string, key: string): boolean {
   if (!isRecord(root) || root.kind !== "capability_execution_result" || !isRecord(root.payload)) {
     return false;
   }
-  if (root.payload.schemaVersion !== HELLO_STDOUT_EXECUTION_RESULT_SCHEMA) {
-    return false;
+  if (root.payload.schemaVersion === HELLO_STDOUT_EXECUTION_RESULT_SCHEMA) {
+    return path === `$.payload.${key}` && ["stdout", "stderr", "exitCode"].includes(key);
   }
-  return path === `$.payload.${key}` && ["stdout", "stderr", "exitCode"].includes(key);
+  return root.payload.schemaVersion === ARTIFACT_TRANSFORM_RESULT_SCHEMA
+    && path === `$.payload.result.output.${key}`
+    && ["stdout", "stderr", "exitCode"].includes(key);
 }
 
 function looksLikePath(value: string): boolean {

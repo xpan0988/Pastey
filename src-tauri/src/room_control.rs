@@ -66,6 +66,10 @@ const CANDIDATE_PAYLOAD_EXECUTION_REQUEST_SCHEMA: &str =
     "transfer-request-candidate-payload-execution-request-v1";
 const CANDIDATE_PAYLOAD_EXECUTION_RESULT_SCHEMA: &str =
     "transfer-request-candidate-payload-result-v1";
+const ARTIFACT_TRANSFORM_CAPABILITY: &str = "artifact.transform_selected";
+const ARTIFACT_TRANSFORM_CONSENT_SCHEMA: &str = "artifact-transform-selected-consent-grant-v1";
+const ARTIFACT_TRANSFORM_EXECUTION_REQUEST_SCHEMA: &str = "artifact-transform-selected-execution-request-v1";
+const ARTIFACT_TRANSFORM_EXECUTION_RESULT_SCHEMA: &str = "artifact-transform-selected-result-v1";
 
 const ALLOWED_EVENT_KINDS: &[&str] = &[
     "capability_preview",
@@ -83,6 +87,17 @@ const UNSAFE_FIELDS: &[&str] = &[
     "shell",
     "script",
     "code",
+    "args",
+    "arguments",
+    "argv",
+    "stdin",
+    "workingdirectory",
+    "runtime",
+    "interpreter",
+    "compiler",
+    "env",
+    "environment",
+    "proxy",
     "path",
     "absolutepath",
     "filepath",
@@ -911,7 +926,7 @@ fn validate_control_event(
         .get("payload")
         .and_then(Value::as_object)
         .ok_or_else(|| AppError::InvalidInput("Invalid room control event payload.".into()))?;
-    if !is_hello_stdout_execution_result_event(&kind, payload) && contains_unsafe_field(&event) {
+    if !is_result_event_with_bounded_process_output(&kind, payload) && contains_unsafe_field(&event) {
         return Err(AppError::InvalidInput(
             "Room control event contains unsafe fields.".into(),
         ));
@@ -1256,6 +1271,25 @@ fn require_fields_with_optional(
 fn validate_preview_request_payload(request: &Map<String, Value>) -> AppResult<()> {
     let schema = request.get("schemaVersion").and_then(Value::as_str);
     let capability = request.get("capability").and_then(Value::as_str);
+    if schema == Some("artifact-transform-selected-request-v1") || capability == Some(ARTIFACT_TRANSFORM_CAPABILITY) {
+        require_exact_fields(request, &[
+            "schemaVersion", "requestId", "nonce", "createdAt", "expiresAt", "sourceDeviceRef", "targetPeerRef",
+            "capability", "sourceCapability", "sourceRequestId", "candidateId", "candidateKind", "resultContract",
+            "requestPayloadHash", "transportStatus",
+        ])?;
+        if schema != Some("artifact-transform-selected-request-v1") || capability != Some(ARTIFACT_TRANSFORM_CAPABILITY)
+            || string_field(request, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
+            || string_field(request, "candidateKind")? != "filesystem_file"
+            || string_field(request, "resultContract")? != "typed_transform_result"
+            || string_field(request, "transportStatus")? != "preview_only" {
+            return Err(AppError::InvalidInput("Invalid preview request.".into()));
+        }
+        for field in ["requestId", "nonce", "sourceDeviceRef", "targetPeerRef", "sourceRequestId", "candidateId", "requestPayloadHash"] {
+            let value = bounded_string_field(request, field, 256)?;
+            if field == "candidateId" && (value.contains('/') || value.contains('\\') || is_absolute_path_like(&value)) { return Err(AppError::InvalidInput("Invalid preview request.".into())); }
+        }
+        return Ok(());
+    }
     if schema == Some(CANDIDATE_PAYLOAD_REQUEST_SCHEMA)
         || capability == Some(CANDIDATE_PAYLOAD_CAPABILITY)
     {
@@ -1405,6 +1439,30 @@ fn validate_execution_request_payload(
 ) -> AppResult<()> {
     let schema = string_field(payload, "schemaVersion")?;
     let capability = string_field(payload, "capability")?;
+    if schema == ARTIFACT_TRANSFORM_EXECUTION_REQUEST_SCHEMA || capability == ARTIFACT_TRANSFORM_CAPABILITY {
+        require_exact_fields(payload, &[
+            "schemaVersion", "executionId", "consentId", "sourcePreviewEventId", "envelopeId", "requestId",
+            "requestPayloadHash", "roomRef", "sourceDeviceRef", "targetPeerRef", "capability", "sourceCapability",
+            "sourceRequestId", "candidateId", "candidateKind", "resultContract", "createdAt", "expiresAt",
+        ])?;
+        if schema != ARTIFACT_TRANSFORM_EXECUTION_REQUEST_SCHEMA
+            || capability != ARTIFACT_TRANSFORM_CAPABILITY
+            || string_field(payload, "roomRef")? != expected_room
+            || string_field(payload, "sourceDeviceRef")? != expected_source
+            || string_field(payload, "targetPeerRef")? != expected_target
+            || string_field(payload, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
+            || string_field(payload, "candidateKind")? != "filesystem_file"
+            || string_field(payload, "resultContract")? != "typed_transform_result" {
+            return Err(AppError::InvalidInput("Invalid execution request payload.".into()));
+        }
+        for field in ["executionId", "consentId", "sourcePreviewEventId", "envelopeId", "requestId", "requestPayloadHash", "sourceRequestId", "candidateId"] {
+            let value = bounded_string_field(payload, field, 256)?;
+            if field == "candidateId" && (value.contains('/') || value.contains('\\') || is_absolute_path_like(&value)) {
+                return Err(AppError::InvalidInput("Invalid execution request payload.".into()));
+            }
+        }
+        return Ok(());
+    }
     if schema == CANDIDATE_PAYLOAD_EXECUTION_REQUEST_SCHEMA
         || capability == CANDIDATE_PAYLOAD_CAPABILITY
     {
@@ -1567,6 +1625,9 @@ fn validate_execution_request_payload(
 }
 
 fn validate_execution_result_payload(payload: &Map<String, Value>) -> AppResult<()> {
+    if string_field(payload, "schemaVersion")? == ARTIFACT_TRANSFORM_EXECUTION_RESULT_SCHEMA {
+        return validate_artifact_transform_execution_result_payload(payload);
+    }
     if string_field(payload, "schemaVersion")? == CANDIDATE_PAYLOAD_EXECUTION_RESULT_SCHEMA {
         return validate_candidate_payload_execution_result_payload(payload);
     }
@@ -1577,6 +1638,38 @@ fn validate_execution_result_payload(payload: &Map<String, Value>) -> AppResult<
         return validate_hello_stdout_execution_result_payload(payload);
     }
     validate_hello_peer_execution_result_payload(payload)
+}
+
+pub fn validate_artifact_transform_execution_result_payload(payload: &Map<String, Value>) -> AppResult<()> {
+    require_fields_with_optional(
+        payload,
+        &["schemaVersion", "capability", "executionId", "requestId", "consentId", "status", "createdAt"],
+        &["result", "errorCode"],
+    )?;
+    if string_field(payload, "schemaVersion")? != ARTIFACT_TRANSFORM_EXECUTION_RESULT_SCHEMA
+        || string_field(payload, "capability")? != ARTIFACT_TRANSFORM_CAPABILITY {
+        return Err(AppError::InvalidInput("Invalid execution result payload.".into()));
+    }
+    for field in ["executionId", "requestId", "consentId"] { let _ = bounded_string_field(payload, field, 256)?; }
+    let _ = OffsetDateTime::parse(string_field(payload, "createdAt")?, &Rfc3339)
+        .map_err(|_| AppError::InvalidInput("Invalid execution result time.".into()))?;
+    let status = string_field(payload, "status")?;
+    if status == "completed" {
+        if payload.contains_key("errorCode") { return Err(AppError::InvalidInput("Invalid execution result payload.".into())); }
+        let result = payload.get("result").and_then(Value::as_object).ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?;
+        require_exact_fields(result, &["kind", "output"])?;
+        if string_field(result, "kind")? != "typed_transform_result" { return Err(AppError::InvalidInput("Invalid execution result payload.".into())); }
+        let output = result.get("output").and_then(Value::as_object).ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?;
+        require_exact_fields(output, &["kind", "stdout", "stderr", "exitCode", "durationMs", "timedOut", "stdoutTruncated", "stderrTruncated"])?;
+        if string_field(output, "kind")? != "process_output" || bounded_string_bytes(output, "stdout", 16 * 1024).is_err() || bounded_string_bytes(output, "stderr", 16 * 1024).is_err() || integer_field(output, "exitCode")? < 0 || !(0..=60_000).contains(&integer_field(output, "durationMs")?) || output.get("timedOut") != Some(&Value::Bool(false)) || output.get("stdoutTruncated").and_then(Value::as_bool).is_none() || output.get("stderrTruncated").and_then(Value::as_bool).is_none() {
+            return Err(AppError::InvalidInput("Invalid execution result payload.".into()));
+        }
+    } else if !["failed", "timed_out", "rejected", "expired", "already_consumed"].contains(&status)
+        || payload.contains_key("result")
+        || !payload.get("errorCode").and_then(Value::as_str).is_some_and(is_artifact_transform_error_code) {
+        return Err(AppError::InvalidInput("Invalid execution result payload.".into()));
+    }
+    Ok(())
 }
 
 fn validate_hello_peer_execution_result_payload(payload: &Map<String, Value>) -> AppResult<()> {
@@ -1934,6 +2027,23 @@ pub fn validate_candidate_payload_execution_result_payload(
 fn validate_consent_grant_payload(consent: &Map<String, Value>) -> AppResult<()> {
     let schema = string_field(consent, "schemaVersion")?;
     let capability = string_field(consent, "capability")?;
+    if schema == ARTIFACT_TRANSFORM_CONSENT_SCHEMA || capability == ARTIFACT_TRANSFORM_CAPABILITY {
+        require_exact_fields(consent, &[
+            "schemaVersion", "consentId", "sourcePreviewEventId", "envelopeId", "requestId", "requestPayloadHash",
+            "capability", "sourceCapability", "sourceRequestId", "candidateId", "candidateKind", "resultContract", "expiresAt",
+        ])?;
+        if schema != ARTIFACT_TRANSFORM_CONSENT_SCHEMA || capability != ARTIFACT_TRANSFORM_CAPABILITY
+            || string_field(consent, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
+            || string_field(consent, "candidateKind")? != "filesystem_file"
+            || string_field(consent, "resultContract")? != "typed_transform_result" {
+            return Err(AppError::InvalidInput("Invalid consent grant.".into()));
+        }
+        for field in ["consentId", "sourcePreviewEventId", "envelopeId", "requestId", "requestPayloadHash", "sourceRequestId", "candidateId"] {
+            let value = bounded_string_field(consent, field, 256)?;
+            if field == "candidateId" && (value.contains('/') || value.contains('\\') || is_absolute_path_like(&value)) { return Err(AppError::InvalidInput("Invalid consent grant.".into())); }
+        }
+        return Ok(());
+    }
     if schema == CANDIDATE_PAYLOAD_CONSENT_SCHEMA || capability == CANDIDATE_PAYLOAD_CAPABILITY {
         require_exact_fields(
             consent,
@@ -2043,12 +2153,16 @@ fn validate_consent_grant_payload(consent: &Map<String, Value>) -> AppResult<()>
     Ok(())
 }
 
-fn is_hello_stdout_execution_result_event(kind: &str, payload: &Map<String, Value>) -> bool {
+fn is_result_event_with_bounded_process_output(kind: &str, payload: &Map<String, Value>) -> bool {
     kind == "capability_execution_result"
         && payload
             .get("schemaVersion")
             .and_then(Value::as_str)
-            .is_some_and(|schema| schema == HELLO_STDOUT_EXECUTION_RESULT_SCHEMA)
+            .is_some_and(|schema| schema == HELLO_STDOUT_EXECUTION_RESULT_SCHEMA || schema == ARTIFACT_TRANSFORM_EXECUTION_RESULT_SCHEMA)
+}
+
+fn is_artifact_transform_error_code(value: &str) -> bool {
+    matches!(value, "sandbox_unavailable" | "malformed_request" | "missing_consent" | "consent_not_allowed_once" | "consent_expired" | "invalid_consent" | "consent_binding_mismatch" | "already_consumed" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed" | "policy_rejected" | "executor_failed" | "invalid_executor_result" | "timed_out")
 }
 
 fn validate_candidate_payload_input(input: &Map<String, Value>) -> AppResult<()> {

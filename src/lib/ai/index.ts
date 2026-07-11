@@ -1,4 +1,5 @@
 export * from "./actionPlanValidator";
+export * from "./artifactTransformRequest";
 export * from "./candidatePayloadAdvisory";
 export * from "./candidatePayloadRequest";
 export * from "./capabilityRegistry";
@@ -13,4 +14,6 @@ export * from "./mockProvider";
 export * from "./naturalV1Plan";
 export * from "./pendingAction";
 export * from "./policyGate";
+export * from "./providerInstructionPack";
+export * from "./providerRiskScanner";
 export * from "./types";

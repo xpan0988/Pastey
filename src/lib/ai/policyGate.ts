@@ -5,6 +5,7 @@ import {
   type AgentBridgeCapabilityContract
 } from "./capabilityRegistry";
 import { validateCandidatePayloadAdvisoryInput } from "./candidatePayloadAdvisory";
+import { validateArtifactTransformRequestInput } from "./artifactTransformRequest";
 import { validateFileCandidateAdvisoryInput } from "./fileCandidateAdvisory";
 import type { AiActionPlan, AiContextSnapshot, AiPolicyResult } from "./types";
 
@@ -56,6 +57,9 @@ export function evaluateAiPolicy(plan: AiActionPlan, context: AiContextSnapshot)
     validateFileCandidateAdvisoryPolicyInput(input, reasons);
   } else if (contract?.providerInputShape === "candidate_payload_request") {
     validateCandidatePayloadAdvisoryPolicyInput(input, reasons);
+  } else if (contract?.providerInputShape === "artifact_transform_request") {
+    const validation = validateArtifactTransformRequestInput(input);
+    if (!validation.valid) reasons.push(...validation.errors);
   } else {
     rejectUnsupportedFields(input, FIXED_MESSAGE_INPUT_FIELDS, "proposedInput", reasons);
   }

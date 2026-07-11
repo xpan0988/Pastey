@@ -1167,7 +1167,7 @@ function PeerConsentReviewCard({
   const capabilityDetail = "filenameHint" in review.binding
     ? `Filename hint: ${review.binding.filenameHint}; search mode: ${review.binding.searchMode}`
     : "candidateId" in review.binding
-    ? `Candidate: ${review.binding.candidateDisplayName}; source request: ${shortRef(review.binding.sourceRequestId)}`
+    ? `Candidate: ${"candidateDisplayName" in review.binding ? review.binding.candidateDisplayName : review.binding.candidateId}; source request: ${shortRef(review.binding.sourceRequestId)}`
     : "expectedStdout" in review.binding
     ? `Expected stdout: ${review.binding.expectedStdout}`
     : `Exact message: ${review.binding.exactMessage}`;

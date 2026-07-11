@@ -1,6 +1,7 @@
 import { isRecord } from "../ai/actionPlanValidator";
 import {
   CANDIDATE_PAYLOAD_CAPABILITY,
+  ARTIFACT_TRANSFORM_CAPABILITY,
   FILE_CANDIDATES_CAPABILITY,
   getAgentBridgeCapabilityContract,
   HELLO_STDOUT_CAPABILITY,
@@ -9,6 +10,7 @@ import {
   HELLO_TEMPLATE_MESSAGE,
   type AgentBridgeCapabilityContract
 } from "../ai/capabilityRegistry";
+import { validateArtifactTransformRequest, type ArtifactTransformRequest } from "../ai/artifactTransformRequest";
 import { validateCandidatePayloadRequestInput } from "../ai/candidatePayloadAdvisory";
 import { validateFileCandidateAdvisoryInput } from "../ai/fileCandidateAdvisory";
 import {
@@ -72,11 +74,21 @@ export interface CandidatePayloadConsentBinding extends PeerConsentBindingBase {
   readonly candidateDisplayName: string;
 }
 
+export interface ArtifactTransformConsentBinding extends PeerConsentBindingBase {
+  readonly capability: "artifact.transform_selected";
+  readonly sourceCapability: "filesystem.find_file_candidates";
+  readonly sourceRequestId: string;
+  readonly candidateId: string;
+  readonly candidateKind: "filesystem_file";
+  readonly resultContract: "typed_transform_result";
+}
+
 export type PeerConsentBinding =
   | HelloPeerConsentBinding
   | HelloStdoutConsentBinding
   | FileCandidateConsentBinding
-  | CandidatePayloadConsentBinding;
+  | CandidatePayloadConsentBinding
+  | ArtifactTransformConsentBinding;
 
 export interface PeerConsentRecord {
   readonly binding: PeerConsentBinding;
@@ -192,6 +204,11 @@ const CANDIDATE_PAYLOAD_BINDING_FIELDS = [
   "createdAt",
   "expiresAt",
 ];
+const ARTIFACT_TRANSFORM_BINDING_FIELDS = [
+  "schemaVersion", "consentId", "sourceEventId", "envelopeId", "requestId", "requestPayloadHash",
+  "roomRef", "sourceDeviceRef", "targetPeerRef", "capability", "sourceCapability", "sourceRequestId",
+  "candidateId", "candidateKind", "resultContract", "previewOnly", "createdAt", "expiresAt",
+];
 let consentSequence = 0;
 
 export function createPeerConsentSessionState(): PeerConsentSessionState {
@@ -235,11 +252,13 @@ export function evaluatePeerCapabilityPreview(
   const request = preview.payload.request;
   const fileCandidateRequest = request.capability === FILE_CANDIDATES_CAPABILITY ? request : null;
   const candidatePayloadRequest = request.capability === CANDIDATE_PAYLOAD_CAPABILITY ? request : null;
+  const artifactTransformRequest = request.capability === ARTIFACT_TRANSFORM_CAPABILITY ? request as ArtifactTransformRequest : null;
+  const contractInput = request.capability === ARTIFACT_TRANSFORM_CAPABILITY ? request : ("input" in request ? request.input : null);
   const errors: string[] = [];
   const contract = getAgentBridgeCapabilityContract(request.capability);
   if (!contract) {
     errors.push("Peer PolicyGate capability is not supported.");
-  } else if (!requestInputMatchesContract(request.input, contract)) {
+  } else if (!requestInputMatchesContract(contractInput, contract)) {
     errors.push(`Peer PolicyGate ${contract.typedBindingField} must be exactly ${contract.typedBindingValue}.`);
   }
   if (preview.previewOnly !== true || preview.payload.previewOnly !== true) {
@@ -301,7 +320,17 @@ export function evaluatePeerCapabilityPreview(
     expiresAt: new Date(expiresAtMs).toISOString(),
   } as const;
   const binding: PeerConsentBinding = Object.freeze(
-    contract.capability === CANDIDATE_PAYLOAD_CAPABILITY && candidatePayloadRequest
+    contract.capability === ARTIFACT_TRANSFORM_CAPABILITY && artifactTransformRequest
+      ? {
+          ...baseBinding,
+          capability: ARTIFACT_TRANSFORM_CAPABILITY,
+          sourceCapability: artifactTransformRequest.sourceCapability,
+          sourceRequestId: artifactTransformRequest.sourceRequestId,
+          candidateId: artifactTransformRequest.candidateId,
+          candidateKind: artifactTransformRequest.candidateKind,
+          resultContract: artifactTransformRequest.resultContract,
+        }
+      : contract.capability === CANDIDATE_PAYLOAD_CAPABILITY && candidatePayloadRequest
       ? {
           ...baseBinding,
           capability: CANDIDATE_PAYLOAD_CAPABILITY,
@@ -486,6 +515,18 @@ function consentGrantFromRecord(record: PeerConsentRecord): CapabilityConsentGra
     };
     return grant;
   }
+  if (record.binding.capability === ARTIFACT_TRANSFORM_CAPABILITY) {
+    return {
+      ...base,
+      schemaVersion: "artifact-transform-selected-consent-grant-v1",
+      capability: ARTIFACT_TRANSFORM_CAPABILITY,
+      sourceCapability: record.binding.sourceCapability,
+      sourceRequestId: record.binding.sourceRequestId,
+      candidateId: record.binding.candidateId,
+      candidateKind: record.binding.candidateKind,
+      resultContract: record.binding.resultContract,
+    } as CapabilityConsentGrant;
+  }
   const grant: HelloPeerConsentGrant = {
     ...base,
     schemaVersion: "pastey-hello-peer-consent-grant-v1",
@@ -587,9 +628,12 @@ function validatePeerConsentBinding(value: unknown, now: Date): string[] {
   const isHelloStdout = value.capability === HELLO_STDOUT_CAPABILITY;
   const isFileCandidate = value.capability === FILE_CANDIDATES_CAPABILITY;
   const isCandidatePayload = value.capability === CANDIDATE_PAYLOAD_CAPABILITY;
+  const isArtifactTransform = value.capability === ARTIFACT_TRANSFORM_CAPABILITY;
   requireExactFields(
     value,
-    isCandidatePayload
+    isArtifactTransform
+      ? ARTIFACT_TRANSFORM_BINDING_FIELDS
+      : isCandidatePayload
       ? CANDIDATE_PAYLOAD_BINDING_FIELDS
       : isFileCandidate
         ? FILE_CANDIDATE_BINDING_FIELDS
@@ -615,7 +659,13 @@ function validatePeerConsentBinding(value: unknown, now: Date): string[] {
   ]) {
     requireBoundedString(value[field], field, errors);
   }
-  if (isCandidatePayload) {
+  if (isArtifactTransform) {
+    if (value.sourceCapability !== FILE_CANDIDATES_CAPABILITY || value.candidateKind !== "filesystem_file" || value.resultContract !== "typed_transform_result") {
+      errors.push("Peer consent Artifact Transform binding has an invalid fixed source or result contract.");
+    }
+    for (const field of ["sourceRequestId", "candidateId"]) requireBoundedString(value[field], field, errors);
+    if (typeof value.candidateId === "string" && looksLikePath(value.candidateId)) errors.push("Peer consent Artifact Transform candidateId must be opaque.");
+  } else if (isCandidatePayload) {
     if (value.sourceCapability !== FILE_CANDIDATES_CAPABILITY) {
       errors.push(`Peer consent candidate payload sourceCapability must be exactly ${FILE_CANDIDATES_CAPABILITY}.`);
     }
@@ -671,6 +721,9 @@ function requestInputMatchesContract(
   }
   if (contract.capability === CANDIDATE_PAYLOAD_CAPABILITY) {
     return validateCandidatePayloadRequestInput(input).valid;
+  }
+  if (contract.capability === ARTIFACT_TRANSFORM_CAPABILITY) {
+    return validateArtifactTransformRequest(input).valid;
   }
   if (contract.typedBindingField === "exactMessage") {
     return input.message === contract.typedBindingValue;

@@ -22,12 +22,17 @@ import {
   validateCandidatePayloadRequest,
   type CandidatePayloadRequest,
 } from "./candidatePayloadRequest";
+import {
+  validateArtifactTransformRequest,
+  type ArtifactTransformRequest,
+} from "./artifactTransformRequest";
 
 export type CapabilityRequest =
   | HelloPeerRequest
   | HelloStdoutRequest
   | FileCandidateRequest
-  | CandidatePayloadRequest;
+  | CandidatePayloadRequest
+  | ArtifactTransformRequest;
 export type CapabilitySharedPreviewEnvelope = AgentBridgeCapabilityEnvelope<CapabilityRequest>;
 
 export type CapabilityPreviewStatus =
@@ -233,6 +238,9 @@ function validateCapabilityRequest(
   if (contract?.capability === "transfer.request_candidate_payload") {
     return validateCandidatePayloadRequest(value, options);
   }
+  if (contract?.capability === "artifact.transform_selected") {
+    return validateArtifactTransformRequest(value, options);
+  }
   if (contract?.capability === "runtime.hello_stdout") {
     return validateHelloStdoutRequest(value, options);
   }
@@ -338,7 +346,15 @@ function validateDates(createdAt: unknown, expiresAt: unknown, now: Date, errors
 }
 
 function findUnsafeOrExecutionFieldPaths(value: unknown): string[] {
-  return findForbiddenProviderFieldPaths(value);
+  const forbidden = findForbiddenProviderFieldPaths(value);
+  if (!isRecord(value) || !isRecord(value.request) || value.request.capability !== "artifact.transform_selected") return forbidden;
+  const hostBoundTransformFields = new Set([
+    "$.request.sourceRequestId",
+    "$.request.candidateId",
+    "$.request.candidateKind",
+    "$.request.resultContract",
+  ]);
+  return forbidden.filter((path) => !hostBoundTransformFields.has(path));
 }
 
 function requireExactFields(value: Record<string, unknown>, expectedFields: string[], label: string, errors: string[]) {
