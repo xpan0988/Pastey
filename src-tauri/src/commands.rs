@@ -13,7 +13,7 @@ use crate::{
     diagnostics, discovery,
     error::{AppError, AppResult},
     file_candidates::{
-        self, CandidatePayloadExecutionRequest, CandidatePayloadLocalResolution,
+        self, ArtifactTransformClaimRequest, ArtifactTransformClaimResult, CandidatePayloadExecutionRequest, CandidatePayloadLocalResolution,
         FileCandidateExecutionRequest, FileCandidateExecutionResult,
     },
     hello_stdout::{self, HelloStdoutExecutionRequest, HelloStdoutExecutionResult},
@@ -1263,6 +1263,16 @@ pub async fn resolve_candidate_payload_capability(
 ) -> Result<CandidatePayloadLocalResolution, String> {
     let mut store = state.candidate_payload_store.lock();
     file_candidates::resolve_candidate_payload_for_handoff(request, &mut store)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub async fn claim_candidate_artifact_transform_capability(
+    request: ArtifactTransformClaimRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ArtifactTransformClaimResult, String> {
+    let mut store = state.candidate_payload_store.lock();
+    file_candidates::claim_candidate_for_artifact_transform(request, &mut store)
         .map_err(|error| error.message())
 }
 

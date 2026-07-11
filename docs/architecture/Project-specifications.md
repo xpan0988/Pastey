@@ -6,7 +6,9 @@ It is both the architecture contract and the completion-scoring standard for Pas
 
 For architecture, schema, protocol, Agent Bridge capability, provider action, executor, template kind, and future capability naming rules, see [naming-conventions.md](naming-conventions.md). For Agent Bridge capability templates, manifests, autonomy profiles, approval policy, migration phases, and implementation status, see [../agent-bridge/capability-templates.md](../agent-bridge/capability-templates.md).
 
-Pastey 1.9.1 completes the current Layer 5 narrow product closure for the fixed capability set and is now framed by Ask Bridge natural-v1. Ask Bridge is the single natural-language Layer 5 entry and reduces model/provider output to `Search`, `Transform`, and `Return`. The implemented product path is Search and Search -> Return through `filesystem.find_file_candidates` plus second-consent `transfer.request_candidate_payload` queue handoff. Search -> Transform -> Return can be parsed and previewed, but unsupported transforms fail closed / show unsupported future state until bounded transform runtime exists. `runtime.hello_stdout` is no longer user-facing product UI and remains diagnostic/test-only. This release also consolidates the shared `OperationTimeline`, canonical selected-peer target binding, terminal Deny states, automatic active-operation refresh with `Check for updates` as fallback, local/remote platform display fixes, full content view/copy affordances, and documentation corrections that distinguish narrow closure from full Agent/Jarvis completion.
+Pastey 1.9.1 completes the current Layer 5 narrow product closure for the fixed capability set and is now framed by Ask Bridge natural-v1. Natural-v1 reduces provider/model output to `Search`, `Transform`, and `Return`. Search and Search -> Return use `filesystem.find_file_candidates` plus second-consent `transfer.request_candidate_payload` queue handoff. The sole supported Transform is `selected_artifact_output`, mapped by host code to `artifact.transform_selected` after manual selection and returning only `typed_transform_result` under Transform consent. Production has no verified sandbox and returns `sandbox_unavailable`; it has no direct-process fallback. Other Transform kinds remain `unsupported_future`. `runtime.hello_stdout` is diagnostic/test-only.
+
+Version suffixes such as `v1` are reserved for substantial product/module or protocol milestones, such as `binary-v1` and natural-v1. Do not add `v1` suffixes to helper modules, provider wrappers, provider instruction packs, safety cleanups, documentation notes, or implementation details.
 
 ## Purpose And Authority
 
@@ -159,7 +161,8 @@ Responsibilities:
 - Read-only workspace capabilities that preserve advisory model output, explicit receiver consent, and bounded host-owned execution.
 - Deterministic capability workflows that chain existing capabilities only after host validation and explicit user decisions.
 - Future reusable capability templates and manifests that reduce duplicated lifecycle code while preserving explicit capability validators, route binding, consent binding, scope limits, and redacted result contracts.
-- Ask Bridge natural-v1 product closure that exposes Search, Search -> Return, and parsed-but-unsupported Search -> Transform -> Return without adding a growing task taxonomy.
+- Ask Bridge natural-v1 product closure that exposes Search, Search -> Return, and the single host-built selected-artifact Transform contract without adding a growing task taxonomy.
+- Natural-v1 provider instruction pack and static risk scanner support, with provider instructions treated as guidance and validator/consent/executor boundaries treated as enforcement.
 - Audit logging that mirrors lifecycle without becoming state or authority.
 
 Non-responsibilities:
@@ -168,6 +171,8 @@ Non-responsibilities:
 - Treating provider output as trusted code.
 - Open-ended shell/process/file/network execution without a new capability contract.
 - Auto-selecting candidates or auto-sending files from model output.
+- Treating provider instructions, docs, Markdown, or a model judge as execution authority.
+- Claiming multi-provider adapter support before adapter-specific request envelopes and shared natural-v1 validation tests exist.
 - Reusable trust from one consent decision.
 - Durable peer identity; that belongs to Layer 4.
 
@@ -176,7 +181,7 @@ Completion criteria:
 - Provider support, redaction, validation, policy, consent, execution, result, and audit are all wired through a real Bridge control path. Legacy implementation term: room-control path.
 - Each capability has a fixed schema, host-owned executor, explicit consent binding, replay protection, and tests.
 - Advisory-only workspace capability scaffolds may exist before execution. They do not count as implemented receiver capabilities until preview, receiver consent, execution/result, and validation are complete.
-- Pastey 1.9.1 Layer 5 narrow product closure is implemented through Ask Bridge natural-v1: Search and Search -> Return use `filesystem.find_file_candidates` plus second-consent `transfer.request_candidate_payload` queue handoff. Request file is folded into Ask Bridge as a Search / Return plan. Hello Stdout / `runtime.hello_stdout` remains diagnostic/test-only rather than user-facing product UI.
+- Pastey 1.9.1 Layer 5 narrow product closure is implemented through Ask Bridge natural-v1: Search and Search -> Return use `filesystem.find_file_candidates` plus second-consent `transfer.request_candidate_payload`; selected-artifact Transform uses exact `artifact.transform_selected` consent/claim/result contracts but returns `sandbox_unavailable` until a verified sandbox exists. Request file remains a Search / Return plan. Hello Stdout / `runtime.hello_stdout` remains diagnostic/test-only.
 - Broader workspace completion requires more than the fixed Hello Peer/Hello Stdout slices, minimal static registry, file-candidate metadata search, candidate-payload queue handoff, and Bridge-first product panels: broad capability coverage, multi-step orchestration, local model scheduling or equivalent local-provider story, release/two-device validation, global Activity detail surfaces, and explicit durable peer identity integration if a capability depends on durable trust.
 
 ## Inter-Layer Dependencies

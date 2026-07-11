@@ -1,5 +1,7 @@
 import {
   CANDIDATE_PAYLOAD_CAPABILITY,
+  ARTIFACT_TRANSFORM_CAPABILITY,
+  ARTIFACT_TRANSFORM_EXECUTOR_KIND,
   CANDIDATE_PAYLOAD_EXECUTOR_KIND,
   EXACT_ALLOW_ONCE_CONSENT_POLICY,
   FILE_CANDIDATES_CAPABILITY,
@@ -57,7 +59,8 @@ export interface CapabilityManifest {
     | "request_peer_hello_demo"
     | "request_peer_hello_stdout_demo"
     | "request_peer_file_candidates"
-    | "request_peer_candidate_payload">;
+    | "request_peer_candidate_payload"
+    | "request_peer_artifact_transform">;
   readonly executorKind: AgentBridgeExecutorKind;
   readonly routePolicy: AgentBridgeRoutePolicy | "local-only";
   readonly consentPolicy: AgentBridgeConsentPolicy | "none" | "session-bound-policy";
@@ -193,6 +196,26 @@ export const AGENT_BRIDGE_CAPABILITY_MANIFESTS: readonly CapabilityManifest[] = 
       consentGrant: "transfer-request-candidate-payload-consent-grant-v1",
       executionRequest: "transfer-request-candidate-payload-execution-request-v1",
       result: "transfer-request-candidate-payload-result-v1",
+    },
+    autonomySupport: DEFAULT_AUTONOMY_SUPPORT,
+    approvalRequirements: DEFAULT_APPROVAL_REQUIREMENTS,
+    safety: DEFAULT_SELECTED_PEER_SAFETY,
+  }),
+  Object.freeze({
+    capability: ARTIFACT_TRANSFORM_CAPABILITY,
+    version: "v1",
+    templateKind: "future_receiver_local_operation",
+    providerActionKind: "request_peer_artifact_transform",
+    executorKind: ARTIFACT_TRANSFORM_EXECUTOR_KIND,
+    routePolicy: SELECTED_PEER_ROUTE_POLICY,
+    consentPolicy: EXACT_ALLOW_ONCE_CONSENT_POLICY,
+    dataExposurePolicy: "local_only_source",
+    auditRedactionPolicy: "metadata_only",
+    schemaVersions: {
+      request: "artifact-transform-selected-request-v1",
+      consentGrant: "artifact-transform-selected-consent-grant-v1",
+      executionRequest: "artifact-transform-selected-execution-request-v1",
+      result: "artifact-transform-selected-result-v1",
     },
     autonomySupport: DEFAULT_AUTONOMY_SUPPORT,
     approvalRequirements: DEFAULT_APPROVAL_REQUIREMENTS,

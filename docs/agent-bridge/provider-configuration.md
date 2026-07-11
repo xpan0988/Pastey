@@ -1,6 +1,6 @@
 # Provider Configuration
 
-Provider configuration owns the current Agent Bridge model-provider behavior, context controls, and Settings ownership. For execution safety, see [architecture-and-safety.md](architecture-and-safety.md).
+Provider configuration owns the current Agent Bridge model-provider behavior, context controls, Settings ownership, and natural-v1 provider instruction guidance. For execution safety, see [architecture-and-safety.md](architecture-and-safety.md). For validation and smoke invariants, see [../transfer/validation.md](../transfer/validation.md).
 
 ## Supported Provider Paths
 
@@ -11,34 +11,39 @@ Current implemented provider paths:
 - `MockProvider` in `src/lib/ai/mockProvider.ts`, deterministic and local.
 - `CloudOpenAICompatibleProvider` in `src/lib/ai/cloudOpenAICompatibleProvider.ts`, using an OpenAI-compatible chat-completions shape against a configured base URL and model.
 
-Provider output is always untrusted advisory data. In the Ask Bridge product surface, model/provider output is first reduced to the natural-v1 product primitives `Search`, `Transform`, and `Return`. It must pass host-side validation before it can become a local pending action or Bridge control preview.
+Provider output is always untrusted advisory data. In the Ask Bridge product surface, model/provider output is first reduced to the natural-v1 product primitives `Search`, `Transform`, and `Return`. It must pass host-side validation before it can become a local pending action or Bridge control preview. The high-level natural-v1 safety model is canonical in [architecture-and-safety.md](architecture-and-safety.md).
 
-The current low-level provider allowlist is backed by the static capability registry in `src/lib/ai/capabilityRegistry.ts`. Those capability actions are implementation details behind natural-v1:
+The current low-level provider allowlist is backed by the static capability registry in `src/lib/ai/capabilityRegistry.ts`. Those capability actions are implementation details behind natural-v1 and are not provider-selectable capability semantics:
 
 - `request_peer_hello_demo` for `runtime.execute_hello_template`;
 - `request_peer_hello_stdout_demo` for `runtime.hello_stdout`;
 - `request_peer_file_candidates` for `filesystem.find_file_candidates`;
 - `request_peer_candidate_payload` for `transfer.request_candidate_payload`.
 
-Natural-v1 provider output may identify only a product plan made from `Search`, `Transform`, and `Return`. Search may contain filename metadata hints, extensions, and safe scopes. Return may refer only to a manually selected candidate and must require separate payload consent. Transform is bounded host-owned capability execution only; unsupported transforms in natural-v1 must validate as unsupported/future and must not execute. Provider output must not include command text, script text, runtime arguments, environment variables, file paths, current working directories, network fields, stdout/stderr/exit values, file contents, hidden transfer requests, selected-peers/broadcast intent, durable trust claims, or execution request/result payloads. The host builds concrete capability payloads after validation and consent.
+Ask Bridge is now the single natural-language entry for Layer 5. Request file is folded into Ask Bridge as a `Search` / `Return` plan, not a separate primary product model. Provider output remains advisory; the product UI owns natural-language input, Search / Transform / Return preview, local confirmation, active-operation refresh, terminal Deny display, redacted candidate rendering, and manual candidate selection.
 
-For `filesystem.find_file_candidates`, provider output is only an advisory proposal for bounded candidate metadata discovery. It cannot by itself cause local or peer filesystem traversal, cannot return real candidates, cannot provide real paths, and cannot start a transfer. The host may build a selected-peer preview only after validation and local confirmation; the receiver may run the bounded metadata search only after explicit Allow once.
+## Natural-V1 Provider Instructions
 
-For `transfer.request_candidate_payload`, provider output is only an advisory proposal to request a second consent decision for one previously discovered candidate. It may include the prior discovery request id, opaque candidate id, and display/audit metadata. It cannot provide receiver absolute paths, file contents, transfer queue ids, handoff ids, auto-send instructions, selected-peers/broadcast routing, or future transfer authority. The current path can resolve the selected candidate through the receiver-local in-memory store and queue the payload through the existing transfer scheduler with zero transferred bytes at handoff time.
+The provider instruction pack is a supporting piece under natural-v1, not a separate versioned module. The canonical code source is `src/lib/ai/providerInstructionPack.ts`; provider adapters import it rather than carrying their own natural-v1 instructions. It must not be loaded from arbitrary Markdown, user files, remote file contents, workspace docs, or provider-returned text.
 
-Ask Bridge is now the single natural-language entry for Layer 5. Request file is folded into Ask Bridge as a `Search` / `Return` plan, not a separate primary product model. The concrete capabilities behind this plan remain implementation details:
+Provider instructions guide model behavior only. They describe the shared Search / Transform / Return JSON contract and the sole supported Transform intent `selected_artifact_output`; every other Transform kind is `unsupported_future`. Provider output is advisory only and must not contain capability IDs, peer/session fields, candidate IDs/source request IDs, result contracts, shell, command, code, script, arguments, stdin, cwd, env, runtime, compiler, interpreter, network, URL/proxy, paths, file contents, selected-peers/broadcast intent, auto-transfer, queue/handoff ids, consent claims, execution claims, result fields, chain-of-thought, scratchpads, or reasoning traces. The host validator remains enforcement.
 
-- `filesystem.find_file_candidates` implements `Search` through metadata-only discovery, receiver Allow once/Deny, and redacted candidates.
-- `transfer.request_candidate_payload` implements `Return` only after manual candidate selection and a separate receiver Allow once/Deny.
-- `runtime.hello_stdout` is no longer user-facing product UI. It remains diagnostic/test-only fixed host runtime coverage.
+## Provider Adapter Guidance
 
-These product paths do not add task types, shell support, model-authored code execution, broad browsing, automatic transfer after search, or durable trust authority.
+Future provider adapters should share the same natural-v1 Search / Transform / Return JSON contract. Provider differences must stay mechanical:
 
-Provider output remains advisory. The product UI owns natural-language input, Search / Transform / Return preview, local confirmation, active-operation refresh, terminal Deny display, redacted candidate rendering, and manual candidate selection. OperationTimeline shows Pastey lifecycle events, not model reasoning, chain-of-thought, provider scratchpads, or hidden prompts. None of these UI paths allow a provider to author execution requests, choose a cwd/env/path/network target, auto-select a payload candidate, or bypass the second receiver consent.
+- request/message envelope;
+- system instruction placement;
+- JSON mode, structured output, or response MIME support;
+- refusal and error shape;
+- streaming versus non-streaming response handling;
+- token and context limits.
+
+Do not add provider-specific capability semantics. Do not implement Anthropic-compatible, Gemini-compatible, DeepSeek-compatible, or additional provider adapters until adapter-specific request envelopes and real-provider smoke coverage are designed around the shared provider instruction pack, static risk scanner, and natural-v1 validator.
 
 ## Provider Health Check
 
-When cloud API configuration exists, Settings can run a safe natural-v1 provider health check. It sends a minimal advisory-only prompt, expects `Search` / `Transform` / `Return` JSON, runs the same host validator, and reports only validation status. It does not send room-control events, execute capabilities, select candidates, log secrets, or grant transfer authority. If API configuration is missing or unavailable, deterministic/mock natural-v1 planning remains available locally.
+When cloud API configuration exists, Settings can run a safe natural-v1 provider health check. It sends a minimal advisory-only prompt, expects `Search` / `Transform` / `Return` JSON, runs the same host validator, and reports only validation status. It does not send room-control events, execute capabilities, select candidates, log secrets, grant consent, claim execution, or grant transfer authority. If API configuration is missing or unavailable, deterministic/mock natural-v1 planning remains available locally.
 
 ## Context Controls
 
@@ -79,4 +84,4 @@ This split keeps model configuration separate from Bridge-scoped authority. Acce
 
 Pastey does not currently launch or manage `llama-cli`, `llama-server`, Ollama, LM Studio, or other local model processes. The practical local-model workaround is to point the existing OpenAI-compatible provider base URL at a user-managed localhost server that speaks the configured chat-completions shape.
 
-Pastey does not currently provide local LLM scheduling, model routing, MCP tools, persistent provider credentials, cloud relay, provider-managed execution, payload reading, broad capability coverage, global Activity detail surfaces, or full Agent/Jarvis orchestration. Those require new design and validation before they can be claimed as broader Layer 5 completion. The current candidate-payload path can queue a selected file candidate only after second consent; `handoff_queued` remains queue acceptance, not transfer completion.
+Pastey does not currently provide multi-provider adapters beyond the current OpenAI-compatible shape, local LLM scheduling, model routing, MCP tools, persistent provider credentials, cloud relay, provider-managed execution, payload reading, broad capability coverage, global Activity detail surfaces, or full Agent/Jarvis orchestration. Those require new design and validation before they can be claimed as broader Layer 5 completion. The current candidate-payload path can queue a selected file candidate only after second consent; `handoff_queued` remains queue acceptance, not transfer completion.

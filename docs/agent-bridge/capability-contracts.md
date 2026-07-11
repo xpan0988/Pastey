@@ -62,14 +62,7 @@ The shared lifecycle envelope schema is `pastey-agent-bridge-capability-envelope
 
 The deterministic candidate workflow in `src/lib/agentBridge/candidatePayloadWorkflow.ts` chains the existing file-candidate discovery and candidate-payload handoff capabilities. It is not a new capability, not a generic tool surface, and not a trusted-session mode. It exposes only metadata-safe workflow state, requires explicit user candidate selection, and still requires receiver Allow once for payload handoff.
 
-Pastey 1.9.1 uses these same contracts for the Bridge-first narrow product closure without adding new capability ids or task types:
-
-Ask Bridge natural-v1 is the user-facing Layer 5 product contract. The only product-level permission primitives are `Search`, `Transform`, and `Return`; concrete capabilities are implementation details behind those primitives.
-
-- Search via `filesystem.find_file_candidates`: Ask Bridge prepares a metadata-only selected-peer search preview, receiver Allow once/Deny remains exact, and the result returns redacted metadata candidates only. Search consent does not authorize payload transfer.
-- Return via `transfer.request_candidate_payload`: after Search results return, the user manually selects one candidate. Return then requires a separate receiver Allow once before candidate payload handoff can be queued.
-- Transform: bounded host-owned capability execution only. Search -> Transform -> Return may be parsed and previewed in natural-v1, but unsupported transforms fail closed / show unsupported future state. No shell, arbitrary command, model-authored code, cwd/env/network target, broad filesystem browsing, or provider-authored executor is allowed.
-- `runtime.hello_stdout`: diagnostic/test-only fixed host runtime coverage. It is no longer a user-facing product UI path.
+Pastey 1.9.1 uses these same contracts for the Bridge-first narrow product closure without adding new capability ids or task types. Ask Bridge natural-v1 is the user-facing Layer 5 product contract: Search maps to `filesystem.find_file_candidates`, Return maps to second-consent `transfer.request_candidate_payload`, and Transform remains unsupported/future until a bounded transform runtime exists. The full natural-v1 safety model is owned by [architecture-and-safety.md](architecture-and-safety.md); provider setup and provider instruction pack guidance are owned by [provider-configuration.md](provider-configuration.md).
 
 The product timeline is an operation lifecycle view. It shows Pastey lifecycle events such as confirmation, peer approval, peer denial, candidates returned, candidate selected, payload request sent, handoff queued, transfer started, and transfer complete. It does not show model chain-of-thought, hidden prompts, provider scratchpads, model thoughts, or raw internal reasoning. Deny is terminal: it does not continue to runtime execution, candidate payload handoff, transfer start, or automatic retry.
 

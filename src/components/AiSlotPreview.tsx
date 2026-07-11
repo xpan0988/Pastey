@@ -610,6 +610,7 @@ function InboundCapabilityPreview({
 }
 
 function CapabilityEnvelopeDetails({ envelope }: { envelope: CapabilityRequestPreviewEnvelope }) {
+  const input = "input" in envelope.request ? envelope.request.input : null;
   return (
     <>
       <div className="diagnostic-grid">
@@ -618,8 +619,8 @@ function CapabilityEnvelopeDetails({ envelope }: { envelope: CapabilityRequestPr
         <PreviewBlock title="Source device" value={envelope.sourceDeviceRef} />
         <PreviewBlock title="Target peer" value={envelope.targetPeerRef} />
         <PreviewBlock title="Capability" value={envelope.request.capability} />
-        {"message" in envelope.request.input ? <PreviewBlock title="Message" value={envelope.request.input.message} /> : null}
-        {"expectedStdout" in envelope.request.input ? <PreviewBlock title="Expected stdout" value={envelope.request.input.expectedStdout} /> : null}
+        {input && "message" in input ? <PreviewBlock title="Message" value={input.message} /> : null}
+        {input && "expectedStdout" in input ? <PreviewBlock title="Expected stdout" value={input.expectedStdout} /> : null}
         <PreviewBlock title="Request ID" value={envelope.request.requestId} />
         <PreviewBlock title="Request payload hash" value={envelope.request.requestPayloadHash} />
         <PreviewBlock title="Expires" value={new Date(envelope.expiresAt).toLocaleString()} />
@@ -686,11 +687,11 @@ function HelloPeerOutboundPreview({
             {"runtimePreference" in request ? <PreviewBlock title="Runtime preference" value={request.runtimePreference.join(", ")} /> : null}
             {"runtimeKind" in request ? <PreviewBlock title="Runtime kind" value={request.runtimeKind} /> : null}
             {"executorKind" in request ? <PreviewBlock title="Executor kind" value={request.executorKind} /> : null}
-            {"message" in request.input ? <PreviewBlock title="Message" value={request.input.message} /> : null}
-            {"expectedStdout" in request.input ? <PreviewBlock title="Expected stdout" value={request.input.expectedStdout} /> : null}
-            {"query" in request.input ? <PreviewBlock title="Filename hint" value={request.input.query.filenameHint} /> : null}
-            {"candidateId" in request.input ? <PreviewBlock title="Candidate" value={request.input.candidateDisplayName} /> : null}
-            <PreviewBlock title="Pending payload hash" value={request.pendingPayloadHash} />
+            {"input" in request && "message" in request.input ? <PreviewBlock title="Message" value={request.input.message} /> : null}
+            {"input" in request && "expectedStdout" in request.input ? <PreviewBlock title="Expected stdout" value={request.input.expectedStdout} /> : null}
+            {"input" in request && "query" in request.input ? <PreviewBlock title="Filename hint" value={request.input.query.filenameHint} /> : null}
+            {"input" in request && "candidateId" in request.input ? <PreviewBlock title="Candidate" value={request.input.candidateDisplayName} /> : null}
+            {"pendingPayloadHash" in request ? <PreviewBlock title="Pending payload hash" value={request.pendingPayloadHash} /> : null}
             <PreviewBlock title="Request payload hash" value={request.requestPayloadHash} />
             <PreviewBlock title="Transport status" value={request.transportStatus} />
           </div>
@@ -707,6 +708,9 @@ function HelloPeerOutboundPreview({
 function requestBounds(request: CapabilityRequest): unknown {
   if ("constraints" in request) {
     return request.constraints;
+  }
+  if (!("input" in request)) {
+    return { sourceCapability: request.sourceCapability, sourceRequestId: request.sourceRequestId, candidateId: request.candidateId, candidateKind: request.candidateKind, resultContract: request.resultContract, metadataOnly: true };
   }
   if ("candidateId" in request.input) {
     return {

@@ -2,7 +2,15 @@
 
 Agent Bridge is the Layer 5 narrow capability path for model-assisted planning, host validation, explicit consent, bounded execution, result return, and redacted audit. For the project-wide layer contract, see [../architecture/Project-specifications.md](../architecture/Project-specifications.md). For template and manifest implementation status, see [capability-templates.md](capability-templates.md). For naming rules covering capability IDs, schema versions, provider actions, executors, and future capabilities, see [../architecture/naming-conventions.md](../architecture/naming-conventions.md). For Bridge membership and authority boundaries, see [../architecture/bridge-semantics.md](../architecture/bridge-semantics.md). For routing semantics, see [../architecture/bridge-routing.md](../architecture/bridge-routing.md).
 
-The current product reality is Pastey 1.9.1 with Ask Bridge natural-v1: Layer 5 narrow product closure and smoke bugfix consolidation for Search and Search -> Return. Ask Bridge is the single natural-language Layer 5 entry. It reduces provider/model output to the product primitives `Search`, `Transform`, and `Return`; concrete capabilities are implementation details behind those primitives. Search -> Transform -> Return can be parsed and previewed, but unsupported transforms fail closed / show unsupported future state until bounded transform runtime exists. Hello Stdout / `runtime.hello_stdout` is diagnostic/test-only and no longer user-facing product UI. This does not claim full Agent Bridge, full Jarvis, broad capability coverage, or multi-step autonomous orchestration.
+The current product reality is Pastey 1.9.1 with Ask Bridge natural-v1: Layer 5 narrow product closure for Search, Search -> Return, and one host-built bounded Transform contract. Ask Bridge is the single natural-language Layer 5 entry. Natural-v1 reduces provider/model output to `Search`, `Transform`, and `Return`; concrete capabilities are implementation details behind those primitives. Only `Transform { transformKind: "selected_artifact_output" }` is supported, and it returns only `typed_transform_result` under that Transform Allow once grant. Other Transform kinds remain `unsupported_future`. Production has no verified sandbox and returns bounded `sandbox_unavailable`; it does not launch a runtime or fallback process. Hello Stdout / `runtime.hello_stdout` is diagnostic/test-only and no longer user-facing product UI.
+
+## Natural-V1 Safety Model
+
+Provider instructions guide model behavior; they do not enforce safety. The natural-v1 JSON schema is the provider output contract. The host validator, PolicyGate, sender confirmation, receiver Allow once/Deny, second receiver consent for Return, and bounded capability executors are the enforcement and authority boundaries.
+
+Model/provider output can never grant consent, claim that execution already happened, select a candidate by itself, author capability IDs, peer/session bindings, candidate bindings, result contracts, shell/command/arguments/stdin/cwd/env/runtime/compiler/interpreter/network/path/content fields, choose selected-peers or broadcast control routing, or bypass the selected-file second payload consent. Pastey host code constructs `artifact.transform_selected` only after manual selection.
+
+The product timeline and lifecycle logs show Pastey events, not chain-of-thought, reasoning traces, hidden prompts, provider scratchpads, or fake model reasoning.
 
 ## Current Flow
 
@@ -77,7 +85,9 @@ The current implementation does not allow provider-crafted execution requests. E
 
 `transfer.request_candidate_payload` is not transfer completion. It is a second-consent handoff path for one selected metadata candidate from a prior discovery result. Search consent does not authorize transfer. Payload handoff requires second consent. Model output may propose the opaque candidate id and display metadata, but candidate ids are not paths and not transfer authority. It is now template-wrapped for manifest-backed constants, exact capability/request-hash binding, expiry checks, and forbidden public-field checks. Source discovery binding, receiver-local candidate lookup, changed/deleted/expired candidate handling, queue handoff, queue metadata, result statuses, and scheduler interaction remain capability-specific. The path validates selected-peer routing and exact Allow once, consumes that consent once, resolves the candidate only through the receiver-local in-memory store, and returns `handoff_queued` only after the existing transfer queue accepts the payload source. `handoff_queued` still reports `transferredBytes: 0`; transfer progress and completion remain owned by the existing transfer pipeline.
 
-`candidatePayloadWorkflow` is not automation authority. It is a deterministic host-owned coordinator for the existing discovery and candidate-payload capabilities. It records metadata-safe workflow state, requires explicit user candidate selection, builds only the existing `transfer.request_candidate_payload` preview, and preserves both receiver consent decisions. It does not add a capability id, expose paths or contents, auto-send, implement trusted-session behavior, or create a generic executor.
+`artifact.transform_selected` is a separate selected-candidate operation, not payload transfer and not a generic executor. Its exact Allow once grant binds room/session, source and target sessions, request hash, discovery request, candidate ID/kind, and `typed_transform_result`. The receiver atomically claims the selected candidate, revalidates file identity, and retains any digest locally. It returns no path, digest, content, runtime, or queue information. Without a verified sandbox it returns `sandbox_unavailable` and does not execute or hand off a file.
+
+`candidatePayloadWorkflow` is not automation authority. It is a deterministic host-owned coordinator for the existing discovery and candidate-payload capabilities. It records metadata-safe workflow state, requires explicit user candidate selection, builds only the existing `transfer.request_candidate_payload` preview, and preserves both receiver consent decisions. It does not add a capability id, expose paths or contents, auto-send, implement trusted-session behavior, create a generic executor, or treat provider instructions as enforcement.
 
 ## Product Closure Status
 
@@ -85,10 +95,10 @@ The current Bridge detail product UI exposes Ask Bridge natural-v1 as the single
 
 - Search: Ask Bridge runs `filesystem.find_file_candidates` on exactly one selected peer after sender confirmation and receiver Allow once, then shows redacted candidates only.
 - Search -> Return: after candidates return, the user manually selects one candidate, then Ask Bridge sends `transfer.request_candidate_payload` through a second receiver Allow once before queue handoff.
-- Search -> Transform -> Return: Ask Bridge may parse and preview this shape, but unsupported transforms fail closed / show unsupported future state until bounded transform runtime exists.
+- Search -> Transform -> Return: only `selected_artifact_output` is supported; it requests `artifact.transform_selected` after manual selection and returns a bounded typed result. Production rejects it as `sandbox_unavailable` until a verified sandbox exists; other Transform kinds remain `unsupported_future`.
 - Hello Stdout / `runtime.hello_stdout`: diagnostic/test-only fixed host runtime coverage, not user-facing product UI.
 
-The shared operation timeline shown in Bridge detail visualizes Pastey lifecycle events only. It does not display model chain-of-thought, hidden prompts, provider scratchpads, raw internal prompts, or fake reasoning.
+The shared operation timeline shown in Bridge detail visualizes Pastey lifecycle events only. It does not display model chain-of-thought, hidden prompts, provider scratchpads, raw internal prompts, reasoning traces, or fake reasoning.
 
 Pastey 1.9.1 also consolidates the product smoke fixes around those flows: Ask Bridge uses the canonical room-control selected peer ref for embedded requests and preview envelopes, Deny is a terminal lifecycle state, active Bridge detail operations auto-refresh while `Check for updates` remains a fallback, remote platform labels are display metadata only, and long sent/received text remains fully accessible through detail or copy actions. Preview truncation is UI-only.
 
@@ -124,6 +134,8 @@ The current Agent Bridge implementation does not provide:
 - arbitrary shell, process, file, or network execution;
 - an open-ended tool runtime;
 - multi-step autonomous task graphs;
+- model/provider consent or execution claims;
+- a model judge or sub-agent that can approve execution;
 - dynamic capability/plugin registration;
 - reusable trust;
 - durable device identity as trust, routeability, consent, auto-join, or execution authority;

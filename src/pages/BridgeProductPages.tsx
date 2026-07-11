@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
 import {
   copyTextToClipboard,
+  claimCandidateArtifactTransformCapability,
   executeFileCandidateSearchCapability,
   getDeviceProfile,
   getRoomControlSessionContext,
@@ -51,6 +52,7 @@ import {
 } from "../lib/agentBridge/bridgeDetailPolling";
 import {
   buildCandidatePayloadExecutionRequest,
+  buildArtifactTransformExecutionRequest,
   buildCandidatePayloadWorkflowPayloadPreview,
   buildFileCandidateExecutionRequest,
   buildPeerConsentStatusEvent,
@@ -74,11 +76,13 @@ import {
   enqueueRoomControlEvent,
   evaluatePeerCapabilityPreview,
   executeInboundCandidatePayloadRequest,
+  executeInboundArtifactTransformRequest,
   executeInboundFileCandidateRequest,
   markControlQueueItemStatus,
   matchExecutionResultToRequest,
   processNextControlQueueItem,
   roomControlSessionIdentity,
+  unavailableTransformExecutor,
   useAgentBridgeRuntimeConfig,
   type CapabilityExecuteRequestRoomControlEvent,
   type CapabilityExecutionResultRoomControlEvent,
@@ -98,6 +102,7 @@ import {
 } from "../lib/agentBridge";
 import {
   buildCapabilityRequestPreviewEnvelope,
+  buildArtifactTransformRequest,
   buildMockAiContextSnapshot,
   buildNaturalV1SearchAdvisoryInput,
   CloudOpenAICompatibleProvider,
@@ -110,6 +115,8 @@ import {
   type CandidatePayloadExecutionRequest,
   type CandidatePayloadExecutionResult,
   type CandidatePayloadRequest,
+  type ArtifactTransformExecutionResult,
+  type ArtifactTransformRequest,
   type FileCandidateExecutionResult,
   type FileCandidateRequest,
 } from "../lib/ai";
@@ -140,6 +147,9 @@ type RequestFileStatus =
   | "payload_request_sent"
   | "payload_denied"
   | "handoff_queued"
+  | "transform_request_sent"
+  | "transform_denied"
+  | "transform_unavailable"
   | "failed";
 
 interface RequestFileProductState {
@@ -172,6 +182,15 @@ const REQUEST_FILE_LIFECYCLE_STEPS = [
   "Peer denied transfer",
   "Handoff queued",
   "Transfer completed",
+  "Transform prepared",
+  "Sender confirmed",
+  "Peer requested",
+  "Peer approved Transform",
+  "Peer denied Transform",
+  "Candidate revalidated",
+  "Transform started",
+  "Typed result returned",
+  "Transform unavailable",
 ] as const;
 
 const SAFE_SEARCH_SCOPES: Array<{ value: SafeSearchScope; label: string }> = [
@@ -822,6 +841,11 @@ function AskBridgePanel({
   const canRequestSearch = Boolean(enabled && !requiresOnePeer && session && hasSupportedSearchPlan);
   const canConfirmSearch = Boolean(flow.searchPreview && flow.status === "search_preview_ready");
   const canRequestFile = Boolean(!requiresOnePeer && session && selectedCandidateId && workflow.snapshot.state === "candidate_selection_required");
+  const isTransformPlan = naturalPlan?.status === "supported"
+    && naturalPlan.steps.some((step) => step.primitive === "Transform" && step.transformKind === "selected_artifact_output")
+    && naturalPlan.steps.some((step) => step.primitive === "Return" && step.returnKind === "typed_transform_result");
+  const isSelectedFileReturnPlan = naturalPlan?.status === "supported"
+    && naturalPlan.steps.some((step) => step.primitive === "Return" && step.returnKind === "selected_file");
   const selectedCandidate = candidates.find((candidate) => candidate.candidateId === selectedCandidateId) ?? null;
   const relatedQueueItem = selectedCandidateId
     ? queueItems.find((item) => item.agentBridgeMetadata?.candidateId === selectedCandidateId) ?? null
@@ -950,7 +974,7 @@ function AskBridgePanel({
         ...current,
         status: validation.value.status === "supported" ? "idle" : "failed",
         message: validation.value.status === "supported"
-          ? "Search / Return plan ready. Confirm before any peer request is sent."
+          ? `${validation.value.steps.map((step) => step.primitive).join(" / ")} plan ready. Confirm before any peer request is sent.`
           : validation.value.unsupportedReason ?? "Transform is recognized but unsupported in natural-v1.",
         steps: [],
         searchPreview: null,
@@ -973,7 +997,7 @@ function AskBridgePanel({
       return;
     }
     if (!naturalPlan) {
-      setFlow((current) => ({ ...current, status: "idle", message: "Preview a Search / Return plan first." }));
+      setFlow((current) => ({ ...current, status: "idle", message: "Preview a Search, Transform, or Return plan first." }));
       return;
     }
     if (naturalPlan.status !== "supported") {
@@ -1059,6 +1083,10 @@ function AskBridgePanel({
   }
 
   async function handleRequestSelectedFile() {
+    if (!isSelectedFileReturnPlan) {
+      setFlow((current) => ({ ...current, status: "failed", message: "This Ask Bridge plan returns a typed Transform result, not a selected file." }));
+      return;
+    }
     if (requiresOnePeer || !selectedPeer || !session || !selectedCandidateId) {
       setFlow((current) => ({
         ...current,
@@ -1116,6 +1144,46 @@ function AskBridgePanel({
     await pumpRequestFileQueue();
   }
 
+  async function handleRequestTransform() {
+    if (requiresOnePeer || !session || !selectedCandidate || !isTransformPlan) {
+      setFlow((current) => ({ ...current, status: "failed", message: selectedCandidate ? "Select a supported Transform plan first." : "Choose candidate first." }));
+      return;
+    }
+    const built = buildArtifactTransformRequest({
+      sourceCapability: "filesystem.find_file_candidates",
+      sourceRequestId: selectedCandidate.sourceRequestId,
+      candidateId: selectedCandidate.candidateId,
+      candidateKind: "filesystem_file",
+      resultContract: "typed_transform_result",
+      targetPeerRef: session.peerSessionRef,
+      sourceDeviceRef: session.localSessionRef,
+    });
+    if (!built.ok) {
+      setFlow((current) => ({ ...current, status: "failed", message: built.errors.join(" ") }));
+      return;
+    }
+    const preview = buildRequestFilePreviewEvent(built.request, session);
+    if (!preview.ok) {
+      setFlow((current) => ({ ...current, status: "failed", message: preview.errors.join(" ") }));
+      return;
+    }
+    onRegisterPreview(preview.event);
+    const queued = enqueueRoomControlEvent(queueRef.current, preview.event, "outbound");
+    if (!queued.ok) {
+      setFlow((current) => ({ ...current, status: "failed", message: queued.errors.join(" ") }));
+      return;
+    }
+    setFlow((current) => ({
+      ...current,
+      status: "transform_request_sent",
+      message: "Transform prepared. Waiting for selected-device approval.",
+      payloadPreview: preview.event,
+      steps: mergeRequestFileSteps(current.steps, ["Transform prepared", "Sender confirmed", "Peer requested"]),
+    }));
+    applyQueue(queued.state);
+    await pumpRequestFileQueue();
+  }
+
   async function decideRequestFileReview(decision: "allow_once" | "deny") {
     if (!flow.peerReview) {
       setFlow((current) => ({ ...current, message: "No Ask Bridge approval is waiting on this device." }));
@@ -1156,16 +1224,22 @@ function AskBridgePanel({
     }
     setPeerConsentSession(decisionResult.state);
     setPeerConsentRecords((records) => [...records, decisionResult.record]);
-    const deniedStep = flow.peerReview.binding.capability === "transfer.request_candidate_payload"
+    const deniedStep = flow.peerReview.binding.capability === "artifact.transform_selected"
+      ? "Peer denied Transform"
+      : flow.peerReview.binding.capability === "transfer.request_candidate_payload"
       ? "Peer denied transfer"
       : "Peer denied search";
     setFlow((current) => ({
       ...current,
       status: decision === "allow_once"
-        ? current.peerReview?.binding.capability === "transfer.request_candidate_payload"
+        ? current.peerReview?.binding.capability === "artifact.transform_selected"
+          ? "transform_request_sent"
+          : current.peerReview?.binding.capability === "transfer.request_candidate_payload"
           ? "payload_request_sent"
           : "waiting_search_approval"
-        : current.peerReview?.binding.capability === "transfer.request_candidate_payload"
+        : current.peerReview?.binding.capability === "artifact.transform_selected"
+          ? "transform_denied"
+          : current.peerReview?.binding.capability === "transfer.request_candidate_payload"
           ? "payload_denied"
           : "search_denied",
       message: decision === "allow_once" ? "Allowed once. Waiting for the sender's execution request." : "Denied. Nothing will run.",
@@ -1221,9 +1295,9 @@ function AskBridgePanel({
     if (item.event.kind === "capability_preview") {
       const previewEvent = item.event as CapabilityPreviewRoomControlEvent;
       const capability = previewEvent.payload.request.capability;
-      if (capability !== "filesystem.find_file_candidates" && capability !== "transfer.request_candidate_payload") {
+      if (capability !== "filesystem.find_file_candidates" && capability !== "transfer.request_candidate_payload" && capability !== "artifact.transform_selected") {
         const invalid = markControlQueueItemStatus(state, item.queueId, "invalid", {
-          reason: "Ask Bridge accepts only Search or Return requests.",
+          reason: "Ask Bridge accepts only Search, Transform, or Return requests.",
         });
         setFlow((current) => ({ ...current, status: "failed", message: "Unknown capability request rejected." }));
         return invalid.state;
@@ -1251,7 +1325,9 @@ function AskBridgePanel({
       setFlow((current) => ({
         ...current,
         status: "awaiting_peer",
-        message: capability === "transfer.request_candidate_payload"
+        message: capability === "artifact.transform_selected"
+          ? "This device received a selected-artifact Transform request."
+          : capability === "transfer.request_candidate_payload"
           ? "This device received a selected-candidate payload request."
           : "This device received a metadata-only search request.",
         peerReview: {
@@ -1287,6 +1363,15 @@ function AskBridgePanel({
       );
       const decisionCapability = decisionPreview?.event.payload.request.capability;
       if (decisionEvent.kind === "capability_preview_deny") {
+        if (decisionCapability === "artifact.transform_selected") {
+          setFlow((current) => ({
+            ...current,
+            status: "transform_denied",
+            message: "The selected device denied Transform.",
+            steps: mergeRequestFileSteps(current.steps, ["Peer denied Transform"]),
+          }));
+          return marked.state;
+        }
         const deniedStep = decisionCapability === "transfer.request_candidate_payload"
           ? "Peer denied transfer"
           : "Peer denied search";
@@ -1316,6 +1401,8 @@ function AskBridgePanel({
         ? buildFileCandidateExecutionRequest(requestItem.event, ackEvent)
         : capability === "transfer.request_candidate_payload"
           ? buildCandidatePayloadExecutionRequest(requestItem.event, ackEvent)
+          : capability === "artifact.transform_selected"
+            ? buildArtifactTransformExecutionRequest(requestItem.event, ackEvent)
           : { ok: false as const, errors: ["Ask Bridge received an unsupported capability acknowledgement."] };
       if (!execution.ok) {
         setFlow((current) => ({ ...current, status: "failed", message: execution.errors.join(" ") }));
@@ -1329,19 +1416,23 @@ function AskBridgePanel({
       if (capability === "filesystem.find_file_candidates") {
         const allowed = markCandidatePayloadWorkflowSearchAllowed(workflowRef.current);
         if (allowed.ok) applyWorkflow(allowed.workflow);
-      } else {
+      } else if (capability === "transfer.request_candidate_payload") {
         const allowed = markCandidatePayloadWorkflowPayloadAllowed(workflowRef.current);
         if (allowed.ok) applyWorkflow(allowed.workflow);
       }
       setFlow((current) => ({
         ...current,
-        status: capability === "filesystem.find_file_candidates" ? "waiting_search_approval" : "payload_request_sent",
+        status: capability === "artifact.transform_selected" ? "transform_request_sent" : capability === "filesystem.find_file_candidates" ? "waiting_search_approval" : "payload_request_sent",
         message: capability === "filesystem.find_file_candidates"
           ? "Peer approved search. Running metadata-only search."
-          : "Peer approved transfer. Requesting handoff.",
+          : capability === "artifact.transform_selected"
+            ? "Peer approved Transform. Revalidating the selected artifact."
+            : "Peer approved transfer. Requesting handoff.",
         steps: capability === "filesystem.find_file_candidates"
           ? mergeRequestFileSteps(current.steps, ["Peer approved search"])
-          : mergeRequestFileSteps(current.steps, ["Peer approved transfer"]),
+          : capability === "artifact.transform_selected"
+            ? mergeRequestFileSteps(current.steps, ["Peer approved Transform"])
+            : mergeRequestFileSteps(current.steps, ["Peer approved transfer"]),
       }));
       return queued.state;
     }
@@ -1353,6 +1444,9 @@ function AskBridgePanel({
       }
       if (capability === "transfer.request_candidate_payload") {
         return executeRequestFilePayload(state, item as ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent });
+      }
+      if (capability === "artifact.transform_selected") {
+        return executeRequestTransform(state, item as ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent });
       }
     }
 
@@ -1408,6 +1502,32 @@ function AskBridgePanel({
       : `Payload request rejected: ${execution.result.errorCode ?? execution.result.status}.`);
   }
 
+  async function executeRequestTransform(
+    state: ControlQueueState,
+    item: ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent },
+  ): Promise<ControlQueueState> {
+    if (!session) return state;
+    const consent = peerConsentRecords.find((record) => record.binding.consentId === item.event.payload.consentId);
+    setFlow((current) => ({ ...current, steps: mergeRequestFileSteps(current.steps, ["Candidate revalidated", "Transform started"]) }));
+    const execution = await executeInboundArtifactTransformRequest(
+      item.event,
+      consent,
+      consumptionState,
+      claimCandidateArtifactTransformCapability,
+      unavailableTransformExecutor,
+      { roomRef: session.roomId, sourceDeviceRef: session.peerSessionRef, targetPeerRef: session.localSessionRef },
+    );
+    return enqueueRequestFileExecutionResult(
+      state,
+      item,
+      execution.state,
+      execution.resultEvent,
+      execution.result.errorCode === "sandbox_unavailable"
+        ? "Transform was rejected because no verified sandbox is available."
+        : `Transform rejected: ${execution.result.errorCode ?? execution.result.status}.`,
+    );
+  }
+
   function enqueueRequestFileExecutionResult(
     state: ControlQueueState,
     item: ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent },
@@ -1433,14 +1553,19 @@ function AskBridgePanel({
       return completed.state;
     }
     setConsumptionState(nextConsumption);
+    const isTransformResult = "capability" in resultEvent.payload && resultEvent.payload.capability === "artifact.transform_selected";
     setFlow((current) => ({
       ...current,
-      status: resultEvent.payload.status === "handoff_queued"
+      status: isTransformResult
+        ? resultEvent.payload.errorCode === "sandbox_unavailable" ? "transform_unavailable" : "failed"
+        : resultEvent.payload.status === "handoff_queued"
         ? "handoff_queued"
         : resultEvent.payload.status === "completed"
           ? "idle"
           : "failed",
-      message: resultEvent.payload.status === "handoff_queued"
+      message: isTransformResult
+        ? "Transform is unavailable: Pastey has no verified sandbox and did not run anything."
+        : resultEvent.payload.status === "handoff_queued"
         ? "Handoff queued. Existing transfer pipeline owns progress and completion."
         : resultEvent.payload.status === "completed"
           ? "Metadata-only search result returned to the requesting device."
@@ -1510,6 +1635,19 @@ function AskBridgePanel({
           : received.errors.join(" "),
         latestResult: resultEvent,
         steps: received.ok ? mergeRequestFileSteps(current.steps, ["Handoff queued"]) : current.steps,
+      }));
+    } else if ("capability" in resultEvent.payload && resultEvent.payload.capability === "artifact.transform_selected") {
+      const transform = resultEvent.payload as ArtifactTransformExecutionResult;
+      setFlow((current) => ({
+        ...current,
+        status: transform.status === "completed" ? "idle" : transform.errorCode === "sandbox_unavailable" ? "transform_unavailable" : "failed",
+        message: transform.status === "completed"
+          ? "Typed Transform result returned."
+          : transform.errorCode === "sandbox_unavailable"
+            ? "Transform unavailable: no verified sandbox ran anything."
+            : `Transform rejected: ${transform.errorCode ?? transform.status}.`,
+        latestResult: resultEvent,
+        steps: transform.status === "completed" ? mergeRequestFileSteps(current.steps, ["Typed result returned"]) : mergeRequestFileSteps(current.steps, ["Transform unavailable"]),
       }));
     }
     return inbound.state;
@@ -1625,6 +1763,9 @@ function AskBridgePanel({
         <button type="button" className="secondary-button" disabled={!canRequestFile} onClick={() => void handleRequestSelectedFile()}>
           Return selected file
         </button>
+        <button type="button" className="secondary-button" disabled={!canRequestFile || !isTransformPlan} onClick={() => void handleRequestTransform()}>
+          Transform selected artifact
+        </button>
       </div>
       {naturalPlan ? (
         <div className="request-file-preview" role="status" data-testid="ask-bridge-plan-preview">
@@ -1715,7 +1856,7 @@ function AskBridgePanel({
 }
 
 function buildRequestFilePreviewEvent(
-  request: FileCandidateRequest | CandidatePayloadRequest,
+  request: FileCandidateRequest | CandidatePayloadRequest | ArtifactTransformRequest,
   session: RoomControlSessionContext,
 ): { ok: true; event: CapabilityPreviewRoomControlEvent } | { ok: false; errors: string[] } {
   const envelope = buildCapabilityRequestPreviewEnvelope(request, {
@@ -1758,6 +1899,8 @@ function isRequestFileTerminal(status: RequestFileStatus): boolean {
   return status === "search_denied"
     || status === "payload_denied"
     || status === "handoff_queued"
+    || status === "transform_denied"
+    || status === "transform_unavailable"
     || status === "failed";
 }
 
@@ -1766,6 +1909,7 @@ function isRequestFilePollingActive(status: RequestFileStatus): boolean {
     status === "waiting_search_approval"
     || status === "awaiting_peer"
     || status === "payload_request_sent"
+    || status === "transform_request_sent"
   );
 }
 

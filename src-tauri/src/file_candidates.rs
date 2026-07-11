@@ -187,6 +187,8 @@ pub struct CandidatePayloadStoreEntry {
     room_ref: String,
     source_device_ref: String,
     target_peer_ref: String,
+    transform_claim_request_id: Option<String>,
+    transform_digest: Option<String>,
 }
 
 #[derive(Default)]
@@ -246,6 +248,34 @@ pub struct CandidatePayloadLocalResolution {
     pub resolution: CandidatePayloadResolution,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver_local_source: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactTransformClaimRequest {
+    pub schema_version: String,
+    pub execution_id: String,
+    pub consent_id: String,
+    pub source_preview_event_id: String,
+    pub envelope_id: String,
+    pub request_id: String,
+    pub request_payload_hash: String,
+    pub room_ref: String,
+    pub source_device_ref: String,
+    pub target_peer_ref: String,
+    pub capability: String,
+    pub source_capability: String,
+    pub source_request_id: String,
+    pub candidate_id: String,
+    pub candidate_kind: String,
+    pub result_contract: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactTransformClaimResult {
+    pub status: String,
 }
 
 #[cfg(test)]
@@ -781,6 +811,8 @@ impl CandidatePayloadStore {
                 room_ref: request.room_ref.clone(),
                 source_device_ref: request.source_device_ref.clone(),
                 target_peer_ref: request.target_peer_ref.clone(),
+                transform_claim_request_id: None,
+                transform_digest: None,
             };
             self.entries.insert(key, entry);
         }
@@ -800,6 +832,74 @@ impl CandidatePayloadStore {
     ) {
         self.entries.insert(key, entry);
     }
+}
+
+/// Claims a selected candidate for the exact Transform request. This command never returns a path,
+/// digest, file content, or executable handle.
+pub fn claim_candidate_for_artifact_transform(
+    request: ArtifactTransformClaimRequest,
+    store: &mut CandidatePayloadStore,
+) -> AppResult<ArtifactTransformClaimResult> {
+    if request.source_capability != CAPABILITY
+        || request.schema_version != "artifact-transform-selected-execution-request-v1"
+        || request.capability != "artifact.transform_selected"
+        || request.candidate_kind != "filesystem_file"
+        || request.result_contract != "typed_transform_result"
+        || request.execution_id.trim().is_empty()
+        || request.consent_id.trim().is_empty()
+        || request.source_preview_event_id.trim().is_empty()
+        || request.envelope_id.trim().is_empty()
+        || request.request_id.trim().is_empty()
+        || request.request_payload_hash.trim().is_empty()
+        || request.source_request_id.trim().is_empty()
+        || request.candidate_id.trim().is_empty()
+        || parse_time(&request.expires_at).is_err()
+        || parse_time(&request.expires_at)? <= OffsetDateTime::now_utc()
+    {
+        return Err(AppError::InvalidInput("Invalid Artifact Transform claim request.".into()));
+    }
+    let key = CandidatePayloadStoreKey {
+        source_capability: request.source_capability.clone(),
+        source_request_id: request.source_request_id.clone(),
+        candidate_id: request.candidate_id.clone(),
+        candidate_kind: request.candidate_kind.clone(),
+    };
+    let now = OffsetDateTime::now_utc();
+    let Some(entry) = store.entries.get_mut(&key) else {
+        return Ok(ArtifactTransformClaimResult { status: "candidate_not_found".into() });
+    };
+    if parse_time(&entry.expires_at).is_ok_and(|expires| expires <= now) {
+        return Ok(ArtifactTransformClaimResult { status: "candidate_expired".into() });
+    }
+    if entry.room_ref != request.room_ref || entry.source_device_ref != request.source_device_ref || entry.target_peer_ref != request.target_peer_ref {
+        return Ok(ArtifactTransformClaimResult { status: "candidate_not_found".into() });
+    }
+    if entry.transform_claim_request_id.is_some() {
+        return Ok(ArtifactTransformClaimResult { status: "candidate_claimed".into() });
+    }
+    let metadata = match fs::symlink_metadata(&entry.local_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+        _ => return Ok(ArtifactTransformClaimResult { status: "candidate_changed".into() }),
+    };
+    let canonical = match entry.local_path.canonicalize() {
+        Ok(path) if path.starts_with(&entry.scope_root) => path,
+        _ => return Ok(ArtifactTransformClaimResult { status: "candidate_changed".into() }),
+    };
+    if metadata.len() != entry.size_bytes || canonical != entry.local_path {
+        return Ok(ArtifactTransformClaimResult { status: "candidate_changed".into() });
+    }
+    let modified_at = metadata.modified().ok().and_then(|modified| OffsetDateTime::from(modified).format(&Rfc3339).ok()).unwrap_or_else(|| "1970-01-01T00:00:00Z".into());
+    if modified_at != entry.modified_at {
+        return Ok(ArtifactTransformClaimResult { status: "candidate_changed".into() });
+    }
+    let bytes = match fs::read(&canonical) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(ArtifactTransformClaimResult { status: "candidate_changed".into() }),
+    };
+    // Digest is receiver-local and retained only so a future sandbox backend can revalidate it.
+    entry.transform_digest = Some(blake3::hash(&bytes).to_hex().to_string());
+    entry.transform_claim_request_id = Some(request.request_id);
+    Ok(ArtifactTransformClaimResult { status: "claimed".into() })
 }
 
 #[cfg(test)]
@@ -1122,6 +1222,29 @@ mod tests {
         }
     }
 
+    fn transform_claim_for(candidate: &FileCandidateMetadata) -> ArtifactTransformClaimRequest {
+        let now = OffsetDateTime::now_utc();
+        ArtifactTransformClaimRequest {
+            schema_version: "artifact-transform-selected-execution-request-v1".into(),
+            execution_id: "transform-execution-1".into(),
+            consent_id: "transform-consent-1".into(),
+            source_preview_event_id: "transform-preview-1".into(),
+            envelope_id: "transform-envelope-1".into(),
+            request_id: "transform-request-1".into(),
+            request_payload_hash: "transform-hash-1".into(),
+            room_ref: "room-1".into(),
+            source_device_ref: "source-1".into(),
+            target_peer_ref: "target-1".into(),
+            capability: "artifact.transform_selected".into(),
+            source_capability: CAPABILITY.into(),
+            source_request_id: "request-1".into(),
+            candidate_id: candidate.candidate_id.clone(),
+            candidate_kind: "filesystem_file".into(),
+            result_contract: "typed_transform_result".into(),
+            expires_at: (now + time::Duration::minutes(1)).format(&Rfc3339).unwrap(),
+        }
+    }
+
     fn stored_entry_for(
         path: &Path,
         root: &Path,
@@ -1151,6 +1274,8 @@ mod tests {
             room_ref: "room-1".into(),
             source_device_ref: "source-1".into(),
             target_peer_ref: "target-1".into(),
+            transform_claim_request_id: None,
+            transform_digest: None,
         }
     }
 
@@ -1206,6 +1331,39 @@ mod tests {
         assert!(!serialized.contains("localPath"));
         assert!(!serialized.contains("absolutePath"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_transform_claim_is_atomic_and_keeps_digest_private() {
+        let (root, app_paths) = fixture_paths();
+        let mut store = CandidatePayloadStore::default();
+        let result = execute_file_candidate_search_and_store(
+            request_for("exact-target.pdf", &["pdf"], 10, 6), &app_paths, &mut store,
+        ).unwrap();
+        let candidate = result.candidates.first().expect("candidate");
+        let first = claim_candidate_for_artifact_transform(transform_claim_for(candidate), &mut store).unwrap();
+        assert_eq!(first.status, "claimed");
+        let duplicate = claim_candidate_for_artifact_transform(transform_claim_for(candidate), &mut store).unwrap();
+        assert_eq!(duplicate.status, "candidate_claimed");
+        assert_eq!(serde_json::to_string(&first).unwrap().contains(root.to_string_lossy().as_ref()), false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_transform_claim_rejects_changed_or_missing_candidate() {
+        let (root, app_paths) = fixture_paths();
+        let mut store = CandidatePayloadStore::default();
+        let result = execute_file_candidate_search_and_store(
+            request_for("exact-target.pdf", &["pdf"], 10, 6), &app_paths, &mut store,
+        ).unwrap();
+        let candidate = result.candidates.first().expect("candidate");
+        fs::write(root.join("shared/exact-target.pdf"), b"replacement").unwrap();
+        let changed = claim_candidate_for_artifact_transform(transform_claim_for(candidate), &mut store).unwrap();
+        assert_eq!(changed.status, "candidate_changed");
+        let mut missing = transform_claim_for(candidate);
+        missing.candidate_id = "other-candidate".into();
+        assert_eq!(claim_candidate_for_artifact_transform(missing, &mut store).unwrap().status, "candidate_not_found");
         let _ = fs::remove_dir_all(root);
     }
 

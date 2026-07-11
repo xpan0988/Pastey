@@ -100,6 +100,7 @@ export function buildCandidatePayloadExecutionRequest(
     !matchesCapability(CANDIDATE_PAYLOAD_CAPABILITY, consent.capability) ||
     !candidatePayloadRequest ||
     !("sourceCapability" in consent) ||
+    !("candidateDisplayName" in consent) ||
     consent.sourceCapability !== FILE_CANDIDATES_CAPABILITY ||
     consent.sourceRequestId !== candidatePayloadRequest.input.sourceRequestId ||
     consent.candidateId !== candidatePayloadRequest.input.candidateId ||
@@ -252,6 +253,7 @@ function requestMatchesConsent(request: CandidatePayloadExecutionRequest, consen
     && "sourceRequestId" in binding
     && "candidateId" in binding
     && "candidateKind" in binding
+    && "candidateDisplayName" in binding
     && "candidateDisplayName" in binding
     && request.sourceCapability === binding.sourceCapability
     && request.sourceRequestId === binding.sourceRequestId

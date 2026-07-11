@@ -1,6 +1,7 @@
 import { CloudOpenAICompatibleProvider, type FetchLike } from "./cloudOpenAICompatibleProvider";
 import { buildMockAiContextSnapshot, CLOUD_STRICT_AI_CONTEXT_POLICY, MOCK_AI_CONTEXT_POLICY } from "./contextSnapshot";
 import { findUnsafeFieldPaths, isRecord } from "./actionPlanValidator";
+import { scanProviderOutputRisk } from "./providerRiskScanner";
 import type { AiGenerateResult, CloudOpenAICompatibleProviderConfig } from "./types";
 
 export type AskBridgePrimitive = "Search" | "Transform" | "Return";
@@ -16,14 +17,14 @@ export interface AskBridgeNaturalV1SearchStep {
 
 export interface AskBridgeNaturalV1TransformStep {
   primitive: "Transform";
-  transformKind: string;
+  transformKind: "selected_artifact_output";
 }
 
 export interface AskBridgeNaturalV1ReturnStep {
   primitive: "Return";
   destination: "this_device" | "selected_peer";
-  candidate: "manual_selection_required";
-  requiresSecondConsent: true;
+  returnKind: "selected_file" | "typed_transform_result";
+  requiresSecondConsent: boolean;
 }
 
 export type AskBridgeNaturalV1Step =
@@ -64,7 +65,7 @@ const TOP_LEVEL_FIELDS = new Set([
 const STEP_COMMON_FIELDS = new Set(["primitive"]);
 const SEARCH_FIELDS = new Set(["primitive", "filenameHint", "extensions", "safeScopes"]);
 const TRANSFORM_FIELDS = new Set(["primitive", "transformKind"]);
-const RETURN_FIELDS = new Set(["primitive", "destination", "candidate", "requiresSecondConsent"]);
+const RETURN_FIELDS = new Set(["primitive", "destination", "returnKind", "requiresSecondConsent"]);
 const SAFE_SCOPES = new Set<AskBridgeSafeScope>(["downloads", "desktop", "documents", "pastey_shared"]);
 const FORBIDDEN_NATURAL_FIELD_NAMES = new Set([
   "command",
@@ -78,6 +79,15 @@ const FORBIDDEN_NATURAL_FIELD_NAMES = new Set([
   "cwd",
   "env",
   "environment",
+  "args",
+  "arguments",
+  "argv",
+  "stdin",
+  "workingDirectory",
+  "runtime",
+  "interpreter",
+  "compiler",
+  "proxy",
   "network",
   "networkTarget",
   "url",
@@ -90,6 +100,15 @@ const FORBIDDEN_NATURAL_FIELD_NAMES = new Set([
   "autoSend",
   "transferQueueId",
   "handoffId",
+  "sourceRequestId",
+  "candidateId",
+  "candidateKind",
+  "resultContract",
+  "stdout",
+  "stderr",
+  "exitCode",
+  "durationMs",
+  "timedOut",
 ].map(normalizeFieldName));
 const KNOWN_EXTENSIONS = new Set([
   "pdf",
@@ -125,6 +144,12 @@ export function validateAskBridgeNaturalV1Plan(value: unknown): AskBridgeNatural
   }
   for (const unsafePath of findForbiddenNaturalFieldPaths(value)) {
     errors.push(`Forbidden natural-v1 field is not allowed: ${unsafePath}.`);
+  }
+  const riskScan = scanProviderOutputRisk(value);
+  for (const finding of riskScan.findings) {
+    if (finding.severity === "fail_closed") {
+      errors.push(`Provider risk scanner rejected natural-v1 output at ${finding.path}: ${finding.reason}.`);
+    }
   }
   if (value.schemaVersion !== "ask-bridge-natural-v1") errors.push("natural-v1 schemaVersion must be ask-bridge-natural-v1.");
   if (!isBoundedString(value.title, 1, 120)) errors.push("natural-v1 title must be a bounded string.");
@@ -163,8 +188,8 @@ export function buildDeterministicAskBridgeNaturalV1Plan(userRequest: string): A
     steps.push({
       primitive: "Return",
       destination: "this_device",
-      candidate: "manual_selection_required",
-      requiresSecondConsent: true,
+      returnKind: wantsTransform ? "typed_transform_result" : "selected_file",
+      requiresSecondConsent: !wantsTransform,
     });
   }
   return {
@@ -174,12 +199,10 @@ export function buildDeterministicAskBridgeNaturalV1Plan(userRequest: string): A
       : wantsReturn
         ? "Search and Return"
         : "Search",
-    status: wantsTransform ? "unsupported_future" : "supported",
+    status: "supported",
     requiresUserConfirmation: true,
     steps,
-    unsupportedReason: wantsTransform
-      ? "Search -> Transform -> Return is recognized in natural-v1, but bounded transform runtime is not implemented yet."
-      : undefined,
+    unsupportedReason: undefined,
   };
 }
 
@@ -327,19 +350,18 @@ function validateStep(value: unknown, index: number, errors: string[]) {
     }
   } else if (value.primitive === "Transform") {
     requireExactFields(value, TRANSFORM_FIELDS, `steps[${index}]`, errors);
-    if (!isBoundedString(value.transformKind, 1, 80)) {
-      errors.push(`natural-v1 steps[${index}].transformKind must be bounded.`);
-    }
+    if (!isBoundedString(value.transformKind, 1, 80)) errors.push(`natural-v1 steps[${index}].transformKind must be bounded.`);
   } else if (value.primitive === "Return") {
     requireExactFields(value, RETURN_FIELDS, `steps[${index}]`, errors);
     if (value.destination !== "this_device" && value.destination !== "selected_peer") {
       errors.push(`natural-v1 steps[${index}].destination is unsupported.`);
     }
-    if (value.candidate !== "manual_selection_required") {
-      errors.push(`natural-v1 steps[${index}].candidate must require manual selection.`);
-    }
-    if (value.requiresSecondConsent !== true) {
-      errors.push(`natural-v1 steps[${index}].requiresSecondConsent must be true.`);
+    if (value.returnKind === "selected_file") {
+      if (value.requiresSecondConsent !== true) errors.push(`natural-v1 steps[${index}].selected_file requires second consent.`);
+    } else if (value.returnKind === "typed_transform_result") {
+      if (value.requiresSecondConsent !== false) errors.push(`natural-v1 steps[${index}].typed_transform_result is covered by Transform consent.`);
+    } else {
+      errors.push(`natural-v1 steps[${index}].returnKind is unsupported.`);
     }
   } else {
     requireExactFields(value, STEP_COMMON_FIELDS, `steps[${index}]`, errors);
@@ -357,8 +379,17 @@ function validatePrimitiveOrder(
   if (key !== "Search" && key !== "Search -> Return" && key !== "Search -> Transform -> Return") {
     errors.push("natural-v1 supports only Search, Search -> Return, and Search -> Transform -> Return.");
   }
-  if (primitives.includes("Transform") && status !== "unsupported_future") {
-    errors.push("natural-v1 Transform plans must be marked unsupported_future until bounded transform runtime exists.");
+  if (key === "Search -> Transform -> Return") {
+    const transform = steps[1] as Record<string, unknown>;
+    const resultReturn = steps[2] as Record<string, unknown>;
+    if (transform.transformKind !== "selected_artifact_output" || resultReturn.returnKind !== "typed_transform_result") {
+      if (status !== "unsupported_future") errors.push("Unsupported Transform plans must be marked unsupported_future.");
+    } else if (status !== "supported") {
+      errors.push("selected_artifact_output Transform plans must be marked supported.");
+    }
+  }
+  if (status === "unsupported_future" && !primitives.includes("Transform")) {
+    errors.push("natural-v1 unsupported_future is reserved for unsupported Transform plans.");
   }
 }
 
@@ -394,9 +425,9 @@ function extractFilenameHint(value: string, extensions: readonly string[]): stri
   return (words.slice(0, 4).join(" ") || "file").slice(0, 128);
 }
 
-function extractTransformKind(value: string): string {
-  const match = value.match(/\b(convert|transform|summari[sz]e|extract|resize|translate|compress|redact)\b/i);
-  return (match?.[1] ?? "transform").toLowerCase();
+function extractTransformKind(value: string): "selected_artifact_output" {
+  void value;
+  return "selected_artifact_output";
 }
 
 const STOP_WORDS = new Set([
