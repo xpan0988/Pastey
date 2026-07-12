@@ -493,6 +493,28 @@ pub async fn send_room_control_event(
     event: Value,
     bridge_route: Option<Value>,
 ) -> AppResult<RoomControlDeliveryReceipt> {
+    send_room_control_event_internal(state, room_id, event, bridge_route, false).await
+}
+
+/// Only the receiver-host Transform finalizer may send a Transform execution
+/// result. Generic frontend room-control send is deliberately barred.
+pub async fn send_authoritative_transform_result_event(
+    state: Arc<AppState>,
+    room_id: &str,
+    event: Value,
+    bridge_route: Option<Value>,
+) -> AppResult<RoomControlDeliveryReceipt> {
+    send_room_control_event_internal(state, room_id, event, bridge_route, true).await
+}
+
+async fn send_room_control_event_internal(
+    state: Arc<AppState>,
+    room_id: &str,
+    event: Value,
+    bridge_route: Option<Value>,
+    transform_result_authorized: bool,
+) -> AppResult<RoomControlDeliveryReceipt> {
+    require_transform_result_authority(&event, transform_result_authorized)?;
     let room = storage::get_room_by_id(&state.paths, room_id)?;
     if room.status != RoomStatus::Active {
         return Err(AppError::InvalidInput("Room is not active.".into()));
@@ -602,6 +624,20 @@ pub async fn send_room_control_event(
     Ok(receipt)
 }
 
+fn require_transform_result_authority(event: &Value, transform_result_authorized: bool) -> AppResult<()> {
+    if is_transform_execution_result_event(event) && !transform_result_authorized {
+        return Err(AppError::InvalidInput("transform_result_requires_authoritative_finalization".into()));
+    }
+    Ok(())
+}
+
+fn is_transform_execution_result_event(event: &Value) -> bool {
+    event.as_object().is_some_and(|event|
+        event.get("kind").and_then(Value::as_str) == Some("capability_execution_result")
+            && event.get("payload").and_then(Value::as_object).and_then(|payload| payload.get("capability")).and_then(Value::as_str) == Some(ARTIFACT_TRANSFORM_CAPABILITY)
+    )
+}
+
 pub fn list_received_room_control_events(
     state: &Arc<AppState>,
     room_id: &str,
@@ -614,6 +650,48 @@ pub fn list_received_room_control_events(
         .get(room_id)
         .map(|room| room.inbox.iter().cloned().collect())
         .unwrap_or_default())
+}
+
+/// Derives a Transform consent seed exclusively from an authenticated inbox
+/// preview and the current receiver-side room session. No renderer-provided
+/// grant binding is accepted here.
+pub fn authenticated_transform_preview_consent_seed(
+    state: &Arc<AppState>,
+    room_id: &str,
+    source_preview_event_id: &str,
+) -> AppResult<crate::file_candidates::ArtifactTransformConsentRegistration> {
+    let context = room_control_session_context(state, room_id)?;
+    let rooms = state.room_control.lock();
+    let room = rooms.rooms.get(room_id).ok_or_else(|| AppError::InvalidInput("Unknown Transform preview room.".into()))?;
+    let preview = room.inbox.iter().find(|received|
+        received.event_id == source_preview_event_id
+            && received.kind == "capability_preview"
+            && received.room_ref == room_id
+            && received.source_device_ref == context.peer_session_ref
+            && received.target_peer_ref == context.local_session_ref
+    ).ok_or_else(|| AppError::InvalidInput("Authenticated Transform preview not found.".into()))?;
+    let payload = preview.event.get("payload").and_then(Value::as_object).ok_or_else(|| AppError::InvalidInput("Invalid Transform preview payload.".into()))?;
+    let request = payload.get("request").and_then(Value::as_object).ok_or_else(|| AppError::InvalidInput("Invalid Transform preview request.".into()))?;
+    if string_field(request, "capability")? != ARTIFACT_TRANSFORM_CAPABILITY
+        || string_field(request, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
+        || string_field(request, "candidateKind")? != "filesystem_file"
+        || string_field(request, "resultContract")? != "typed_transform_result"
+    { return Err(AppError::InvalidInput("Invalid Transform preview request.".into())); }
+    let event_expires = OffsetDateTime::parse(string_field(preview.event.as_object().ok_or_else(|| AppError::InvalidInput("Invalid Transform preview event.".into()))?, "expiresAt")?, &Rfc3339)
+        .map_err(|_| AppError::InvalidInput("Invalid Transform preview expiry.".into()))?;
+    let request_expires = OffsetDateTime::parse(string_field(request, "expiresAt")?, &Rfc3339)
+        .map_err(|_| AppError::InvalidInput("Invalid Transform request expiry.".into()))?;
+    let expires_at = std::cmp::min(event_expires, request_expires).format(&Rfc3339)
+        .map_err(|_| AppError::InvalidInput("Invalid Transform prompt expiry.".into()))?;
+    Ok(crate::file_candidates::ArtifactTransformConsentRegistration {
+        consent_id: "pending".into(), source_preview_event_id: source_preview_event_id.into(),
+        envelope_id: string_field(payload, "envelopeId")?.into(), request_id: string_field(request, "requestId")?.into(),
+        request_payload_hash: string_field(request, "requestPayloadHash")?.into(), room_ref: room_id.into(),
+        source_device_ref: context.peer_session_ref, target_peer_ref: context.local_session_ref,
+        capability: ARTIFACT_TRANSFORM_CAPABILITY.into(), source_capability: FILE_CANDIDATES_CAPABILITY.into(),
+        source_request_id: string_field(request, "sourceRequestId")?.into(), candidate_id: string_field(request, "candidateId")?.into(),
+        candidate_kind: "filesystem_file".into(), result_contract: "typed_transform_result".into(), expires_at, decision: "allow_once".into(),
+    })
 }
 
 pub fn clear_room_control_state(state: &Arc<AppState>, room_id: &str) {
@@ -1661,7 +1739,7 @@ pub fn validate_artifact_transform_execution_result_payload(payload: &Map<String
         if string_field(result, "kind")? != "typed_transform_result" { return Err(AppError::InvalidInput("Invalid execution result payload.".into())); }
         let output = result.get("output").and_then(Value::as_object).ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?;
         require_exact_fields(output, &["kind", "stdout", "stderr", "exitCode", "durationMs", "timedOut", "stdoutTruncated", "stderrTruncated"])?;
-        if string_field(output, "kind")? != "process_output" || bounded_string_bytes(output, "stdout", 16 * 1024).is_err() || bounded_string_bytes(output, "stderr", 16 * 1024).is_err() || integer_field(output, "exitCode")? < 0 || !(0..=60_000).contains(&integer_field(output, "durationMs")?) || output.get("timedOut") != Some(&Value::Bool(false)) || output.get("stdoutTruncated").and_then(Value::as_bool).is_none() || output.get("stderrTruncated").and_then(Value::as_bool).is_none() {
+        if string_field(output, "kind")? != "process_output" || !valid_artifact_transform_output_text(output, "stdout", "stdoutTruncated") || !valid_artifact_transform_output_text(output, "stderr", "stderrTruncated") || !(0..=255).contains(&integer_field(output, "exitCode")?) || !(0..=60_000).contains(&integer_field(output, "durationMs")?) || output.get("timedOut") != Some(&Value::Bool(false)) {
             return Err(AppError::InvalidInput("Invalid execution result payload.".into()));
         }
     } else if !["failed", "timed_out", "rejected", "expired", "already_consumed"].contains(&status)
@@ -2162,7 +2240,7 @@ fn is_result_event_with_bounded_process_output(kind: &str, payload: &Map<String,
 }
 
 fn is_artifact_transform_error_code(value: &str) -> bool {
-    matches!(value, "sandbox_unavailable" | "malformed_request" | "missing_consent" | "consent_not_allowed_once" | "consent_expired" | "invalid_consent" | "consent_binding_mismatch" | "already_consumed" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed" | "policy_rejected" | "executor_failed" | "invalid_executor_result" | "timed_out")
+    matches!(value, "sandbox_unavailable" | "malformed_request" | "missing_consent" | "consent_not_allowed_once" | "consent_expired" | "invalid_consent" | "consent_binding_mismatch" | "already_consumed" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed" | "policy_rejected" | "executor_failed" | "invalid_executor_result" | "result_contains_private_host_data" | "timed_out")
 }
 
 fn validate_candidate_payload_input(input: &Map<String, Value>) -> AppResult<()> {
@@ -2747,6 +2825,13 @@ fn bounded_string_bytes(object: &Map<String, Value>, field: &str, max: usize) ->
         ));
     }
     Ok(())
+}
+
+fn valid_artifact_transform_output_text(object: &Map<String, Value>, field: &str, truncated_field: &str) -> bool {
+    let Ok(value) = string_field(object, field) else { return false; };
+    let Some(truncated) = object.get(truncated_field).and_then(Value::as_bool) else { return false; };
+    value.len() <= 16 * 1024
+        && (!truncated || value.len() == 16 * 1024)
 }
 
 fn integer_field(object: &Map<String, Value>, field: &str) -> AppResult<i64> {
@@ -3407,5 +3492,22 @@ mod tests {
             .code,
             "inbox_full"
         );
+    }
+
+    #[test]
+    fn generic_transform_execution_result_requires_authoritative_finalization() {
+        for status in ["completed", "failed", "timed_out", "rejected"] {
+            let transform_result = serde_json::json!({
+                "kind": "capability_execution_result",
+                "payload": { "capability": "artifact.transform_selected", "status": status }
+            });
+            assert!(matches!(require_transform_result_authority(&transform_result, false), Err(AppError::InvalidInput(message)) if message == "transform_result_requires_authoritative_finalization"));
+            assert!(require_transform_result_authority(&transform_result, true).is_ok());
+        }
+        let unrelated = serde_json::json!({
+            "kind": "capability_execution_result",
+            "payload": { "capability": "filesystem.find_file_candidates" }
+        });
+        assert!(require_transform_result_authority(&unrelated, false).is_ok());
     }
 }

@@ -258,7 +258,7 @@ export function evaluatePeerCapabilityPreview(
   const contract = getAgentBridgeCapabilityContract(request.capability);
   if (!contract) {
     errors.push("Peer PolicyGate capability is not supported.");
-  } else if (!requestInputMatchesContract(contractInput, contract)) {
+  } else if (!requestInputMatchesContract(contractInput, contract, now)) {
     errors.push(`Peer PolicyGate ${contract.typedBindingField} must be exactly ${contract.typedBindingValue}.`);
   }
   if (preview.previewOnly !== true || preview.payload.previewOnly !== true) {
@@ -712,6 +712,7 @@ function validatePeerConsentBinding(value: unknown, now: Date): string[] {
 function requestInputMatchesContract(
   input: unknown,
   contract: AgentBridgeCapabilityContract,
+  now: Date,
 ): boolean {
   if (!isRecord(input)) {
     return false;
@@ -723,7 +724,7 @@ function requestInputMatchesContract(
     return validateCandidatePayloadRequestInput(input).valid;
   }
   if (contract.capability === ARTIFACT_TRANSFORM_CAPABILITY) {
-    return validateArtifactTransformRequest(input).valid;
+    return validateArtifactTransformRequest(input, { now }).valid;
   }
   if (contract.typedBindingField === "exactMessage") {
     return input.message === contract.typedBindingValue;

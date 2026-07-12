@@ -37,6 +37,13 @@ const TEXT_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-text-route-v1";
 const FILE_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-file-route-v1";
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformFinalizationDelivery {
+    terminal_category: String,
+    sent: bool,
+}
+
+#[derive(Serialize)]
 pub struct FileTransferMetadata {
     path: String,
     display_name: String,
@@ -1267,13 +1274,105 @@ pub async fn resolve_candidate_payload_capability(
 }
 
 #[tauri::command]
-pub async fn claim_candidate_artifact_transform_capability(
+pub async fn begin_transform_operation(
     request: ArtifactTransformClaimRequest,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ArtifactTransformClaimResult, String> {
     let mut store = state.candidate_payload_store.lock();
-    file_candidates::claim_candidate_for_artifact_transform(request, &mut store)
+    let mut authority = state.transform_authority.lock();
+    file_candidates::begin_artifact_transform_operation(request, &mut store, &mut authority)
         .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub async fn create_transform_consent_prompt(
+    room_id: String,
+    source_preview_event_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<file_candidates::TransformConsentPromptInfo, String> {
+    let seed = crate::room_control::authenticated_transform_preview_consent_seed(&state, &room_id, &source_preview_event_id)
+        .map_err(|error| error.message())?;
+    let mut authority = state.transform_authority.lock();
+    file_candidates::create_pending_transform_consent_prompt(seed, &mut authority)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub async fn resolve_transform_consent_prompt(
+    room_id: String,
+    pending_consent_prompt_id: String,
+    decision: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<file_candidates::TransformConsentPromptInfo, String> {
+    let context = crate::room_control::room_control_session_context(&state, &room_id).map_err(|error| error.message())?;
+    let mut authority = state.transform_authority.lock();
+    file_candidates::resolve_pending_transform_consent_prompt(
+        &pending_consent_prompt_id, &decision, &room_id, &context.peer_session_ref, &context.local_session_ref, &mut authority,
+    ).map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub async fn revalidate_transform_operation(
+    request: ArtifactTransformClaimRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ArtifactTransformClaimResult, String> {
+    let mut store = state.candidate_payload_store.lock();
+    let mut authority = state.transform_authority.lock();
+    file_candidates::revalidate_artifact_transform_operation(&request, &mut store, &mut authority)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub async fn abort_transform_operation(
+    request: ArtifactTransformClaimRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ArtifactTransformClaimResult, String> {
+    let mut store = state.candidate_payload_store.lock();
+    let mut authority = state.transform_authority.lock();
+    file_candidates::abort_artifact_transform_operation(&request, &mut store, &mut authority)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub async fn finalize_and_send_transform_result(
+    request: ArtifactTransformClaimRequest,
+    raw_result: Value,
+    state: State<'_, Arc<AppState>>,
+) -> Result<TransformFinalizationDelivery, String> {
+    let outcome = {
+        let mut store = state.candidate_payload_store.lock();
+        let mut authority = state.transform_authority.lock();
+        file_candidates::sanitize_and_finalize_transform_operation(&request, raw_result, &mut store, &mut authority)
+            .map_err(|error| error.message())?
+    };
+    let Some(result) = outcome.result else {
+        return Ok(TransformFinalizationDelivery { terminal_category: outcome.terminal_category, sent: false });
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let event = serde_json::json!({
+        "schemaVersion": "pastey-room-control-event-v1",
+        "eventId": format!("transform-result-{}", uuid::Uuid::new_v4()),
+        "kind": "capability_execution_result",
+        "roomRef": request.room_ref,
+        "sourceDeviceRef": request.target_peer_ref,
+        "targetPeerRef": request.source_device_ref,
+        "createdAt": now.format(&time::format_description::well_known::Rfc3339).map_err(|_| "Invalid Transform result time.")?,
+        "expiresAt": (now + time::Duration::seconds(60)).format(&time::format_description::well_known::Rfc3339).map_err(|_| "Invalid Transform result expiry.")?,
+        "previewOnly": false,
+        "payload": result,
+    });
+    crate::room_control::send_authoritative_transform_result_event(state.inner().clone(), &request.room_ref, event, None)
+        .await.map_err(|error| error.message())?;
+    Ok(TransformFinalizationDelivery { terminal_category: outcome.terminal_category, sent: true })
+}
+
+#[tauri::command]
+pub async fn get_transform_operation_status(
+    request: ArtifactTransformClaimRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ArtifactTransformClaimResult, String> {
+    let authority = state.transform_authority.lock();
+    Ok(file_candidates::artifact_transform_operation_status(&request, &authority))
 }
 
 #[tauri::command]

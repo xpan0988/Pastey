@@ -14,7 +14,7 @@ export type ArtifactTransformErrorCode =
   | "sandbox_unavailable" | "malformed_request" | "missing_consent" | "consent_not_allowed_once"
   | "consent_expired" | "invalid_consent" | "consent_binding_mismatch" | "already_consumed"
   | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed"
-  | "policy_rejected" | "executor_failed" | "invalid_executor_result" | "timed_out";
+  | "policy_rejected" | "executor_failed" | "invalid_executor_result" | "result_contains_private_host_data" | "timed_out";
 
 export interface ArtifactTransformRequestInput {
   sourceCapability: "filesystem.find_file_candidates";
@@ -85,7 +85,7 @@ const MAX_DURATION_MS = 60_000;
 const REQUEST_FIELDS = ["schemaVersion", "requestId", "nonce", "createdAt", "expiresAt", "sourceDeviceRef", "targetPeerRef", "capability", "sourceCapability", "sourceRequestId", "candidateId", "candidateKind", "resultContract", "requestPayloadHash", "transportStatus"];
 const EXECUTION_FIELDS = ["schemaVersion", "executionId", "consentId", "sourcePreviewEventId", "envelopeId", "requestId", "requestPayloadHash", "roomRef", "sourceDeviceRef", "targetPeerRef", "capability", "sourceCapability", "sourceRequestId", "candidateId", "candidateKind", "resultContract", "createdAt", "expiresAt"];
 const RESULT_FIELDS = ["schemaVersion", "capability", "executionId", "requestId", "consentId", "status", "createdAt"];
-const ERROR_CODES = new Set<ArtifactTransformErrorCode>(["sandbox_unavailable", "malformed_request", "missing_consent", "consent_not_allowed_once", "consent_expired", "invalid_consent", "consent_binding_mismatch", "already_consumed", "candidate_not_found", "candidate_expired", "candidate_changed", "candidate_claimed", "policy_rejected", "executor_failed", "invalid_executor_result", "timed_out"]);
+const ERROR_CODES = new Set<ArtifactTransformErrorCode>(["sandbox_unavailable", "malformed_request", "missing_consent", "consent_not_allowed_once", "consent_expired", "invalid_consent", "consent_binding_mismatch", "already_consumed", "candidate_not_found", "candidate_expired", "candidate_changed", "candidate_claimed", "policy_rejected", "executor_failed", "invalid_executor_result", "result_contains_private_host_data", "timed_out"]);
 let sequence = 0;
 
 export function buildArtifactTransformRequest(input: ArtifactTransformRequestInput & { targetPeerRef: string; sourceDeviceRef: string; now?: Date; ttlMs?: number; requestId?: string; nonce?: string }): { ok: true; request: ArtifactTransformRequest } | { ok: false; errors: string[] } {
@@ -161,7 +161,24 @@ export function validateArtifactTransformExecutionResult(value: unknown): { vali
 }
 
 function validateInput(value: Record<string, unknown>, errors: string[]) { if (value.sourceCapability !== "filesystem.find_file_candidates" || value.candidateKind !== "filesystem_file" || value.resultContract !== "typed_transform_result") errors.push("Artifact Transform input has an invalid fixed source or result contract."); for (const field of ["sourceRequestId", "candidateId"]) bounded(value[field], field, MAX_ID, errors); if (typeof value.candidateId === "string" && /[\\/]|^file:/i.test(value.candidateId)) errors.push("Artifact Transform candidateId must be opaque."); }
-function validateTypedResult(value: unknown, errors: string[]) { if (!isRecord(value)) { errors.push("Completed Artifact Transform result requires result."); return; } exact(value, ["kind", "output"], errors, "Typed Transform result"); if (value.kind !== "typed_transform_result" || !isRecord(value.output)) { errors.push("Typed Transform result is invalid."); return; } const output = value.output; exact(output, ["kind", "stdout", "stderr", "exitCode", "durationMs", "timedOut", "stdoutTruncated", "stderrTruncated"], errors, "Typed Transform output"); if (output.kind !== "process_output") errors.push("Typed Transform output kind is invalid."); for (const field of ["stdout", "stderr"]) if (typeof output[field] !== "string" || byteLength(output[field] as string) > MAX_OUTPUT_BYTES) errors.push(`Typed Transform ${field} is invalid.`); if (!Number.isInteger(output.exitCode) || (output.exitCode as number) < 0) errors.push("Typed Transform exitCode is invalid."); if (!Number.isInteger(output.durationMs) || (output.durationMs as number) < 0 || (output.durationMs as number) > MAX_DURATION_MS) errors.push("Typed Transform durationMs is invalid."); for (const field of ["timedOut", "stdoutTruncated", "stderrTruncated"]) if (typeof output[field] !== "boolean") errors.push(`Typed Transform ${field} is invalid.`); if (output.timedOut !== false) errors.push("Completed Artifact Transform result cannot be timed out."); }
+function validateTypedResult(value: unknown, errors: string[]) {
+  if (!isRecord(value)) { errors.push("Completed Artifact Transform result requires result."); return; }
+  exact(value, ["kind", "output"], errors, "Typed Transform result");
+  if (value.kind !== "typed_transform_result" || !isRecord(value.output)) { errors.push("Typed Transform result is invalid."); return; }
+  const output = value.output;
+  exact(output, ["kind", "stdout", "stderr", "exitCode", "durationMs", "timedOut", "stdoutTruncated", "stderrTruncated"], errors, "Typed Transform output");
+  if (output.kind !== "process_output") errors.push("Typed Transform output kind is invalid.");
+  for (const field of ["stdout", "stderr"] as const) {
+    const text = output[field];
+    if (typeof text !== "string" || byteLength(text) > MAX_OUTPUT_BYTES) errors.push(`Typed Transform ${field} is invalid.`);
+    const truncated = output[`${field}Truncated`];
+    if (truncated === true && typeof text === "string" && byteLength(text) !== MAX_OUTPUT_BYTES) errors.push(`Typed Transform ${field} truncation flag is inconsistent.`);
+  }
+  if (!Number.isInteger(output.exitCode) || (output.exitCode as number) < 0 || (output.exitCode as number) > 255) errors.push("Typed Transform exitCode is invalid.");
+  if (!Number.isInteger(output.durationMs) || (output.durationMs as number) < 0 || (output.durationMs as number) > MAX_DURATION_MS) errors.push("Typed Transform durationMs is invalid.");
+  for (const field of ["timedOut", "stdoutTruncated", "stderrTruncated"]) if (typeof output[field] !== "boolean") errors.push(`Typed Transform ${field} is invalid.`);
+  if (output.timedOut !== false) errors.push("Completed Artifact Transform result cannot be timed out.");
+}
 function exact(value: Record<string, unknown>, fields: string[], errors: string[], label: string, optional: string[] = []) { const allowed = new Set([...fields, ...optional]); if (fields.some((field) => !(field in value)) || Object.keys(value).some((field) => !allowed.has(field))) errors.push(`${label} contains missing or unsupported fields.`); }
 function bounded(value: unknown, label: string, max: number, errors: string[]) { if (typeof value !== "string" || !value.trim() || value.length > max) errors.push(`${label} must be a bounded string.`); }
 function dates(created: unknown, expires: unknown, now: Date, errors: string[]) { const createdMs = typeof created === "string" ? Date.parse(created) : NaN; const expiresMs = typeof expires === "string" ? Date.parse(expires) : NaN; if (!Number.isFinite(createdMs) || !Number.isFinite(expiresMs) || expiresMs <= createdMs || expiresMs <= now.getTime()) errors.push("Artifact Transform request expiry is invalid."); }

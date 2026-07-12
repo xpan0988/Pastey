@@ -3,7 +3,6 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
 import {
   copyTextToClipboard,
-  claimCandidateArtifactTransformCapability,
   executeFileCandidateSearchCapability,
   getDeviceProfile,
   getRoomControlSessionContext,
@@ -11,6 +10,7 @@ import {
   listReceivedRoomControlEvents,
   listNearbyDevices,
   requestNearbyJoin,
+  resolveTransformConsentPrompt,
   revealInFolder,
   resolveCandidatePayloadCapability,
   sendRoomControlEvent,
@@ -82,6 +82,7 @@ import {
   matchExecutionResultToRequest,
   processNextControlQueueItem,
   roomControlSessionIdentity,
+  unavailableTransformLeaseHost,
   unavailableTransformExecutor,
   useAgentBridgeRuntimeConfig,
   type CapabilityExecuteRequestRoomControlEvent,
@@ -166,6 +167,7 @@ interface RequestFileReviewState {
   queueId: string;
   event: CapabilityPreviewRoomControlEvent;
   binding: PeerConsentBinding;
+  transformPromptId?: string;
 }
 
 const REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE = "Ask Bridge requires one selected device.";
@@ -1190,12 +1192,37 @@ function AskBridgePanel({
       return;
     }
     const now = new Date();
-    const decisionResult = decision === "allow_once"
+    const initialDecision = decision === "allow_once"
       ? allowPeerCapabilityOnce(flow.peerReview.binding, peerConsentSession, { now })
       : denyPeerCapability(flow.peerReview.binding, peerConsentSession, { now });
-    if (!decisionResult.ok) {
-      setFlow((current) => ({ ...current, status: "failed", message: decisionResult.errors.join(" ") }));
+    if (!initialDecision.ok) {
+      setFlow((current) => ({ ...current, status: "failed", message: initialDecision.errors.join(" ") }));
       return;
+    }
+    let decisionResult = initialDecision;
+    if (decisionResult.record.binding.capability === "artifact.transform_selected") {
+      if (!flow.peerReview.transformPromptId || !session) {
+        setFlow((current) => ({ ...current, status: "failed", message: "Receiver-owned Transform consent prompt is unavailable." }));
+        return;
+      }
+      try {
+        const resolved = await resolveTransformConsentPrompt(session.roomId, flow.peerReview.transformPromptId, decision);
+        const binding = { ...decisionResult.record.binding, consentId: resolved.consentId } as PeerConsentBinding;
+        const record: PeerConsentRecord = {
+          ...decisionResult.record,
+          binding,
+          decidedAt: resolved.decidedAt ?? decisionResult.record.decidedAt,
+          status: resolved.status === "allowed_once" ? "allowed_once" : resolved.status === "denied" ? "denied" : "invalid",
+        };
+        decisionResult = {
+          ok: true,
+          record,
+          state: { ...decisionResult.state, consentIds: [...new Set([...decisionResult.state.consentIds, resolved.consentId])] },
+        };
+      } catch {
+        setFlow((current) => ({ ...current, status: "failed", message: "Receiver could not resolve the exact Transform consent prompt." }));
+        return;
+      }
     }
     const statusEvent = buildPeerConsentStatusEvent(flow.peerReview.event, decisionResult.record, { now });
     if (!statusEvent.ok) {
@@ -1322,12 +1349,25 @@ function AskBridgePanel({
         setFlow((current) => ({ ...current, status: "failed", message: awaiting.errors.join(" ") }));
         return state;
       }
+      if (capability === "artifact.transform_selected") {
+        // Production has no verified sandbox. Reject before creating a Rust prompt,
+        // reservation, operation, or lease; future available wiring creates the
+        // receiver-owned prompt from the authenticated inbox record at this point.
+        const unavailable = markControlQueueItemStatus(awaiting.state, item.queueId, "invalid", {
+          reason: "Transform is unavailable because no verified sandbox is available.",
+        });
+        setFlow((current) => ({
+          ...current,
+          status: "failed",
+          message: "Transform was rejected because no verified sandbox is available.",
+          steps: mergeRequestFileSteps(current.steps, ["Transform prepared", "Peer requested"]),
+        }));
+        return unavailable.state;
+      }
       setFlow((current) => ({
         ...current,
         status: "awaiting_peer",
-        message: capability === "artifact.transform_selected"
-          ? "This device received a selected-artifact Transform request."
-          : capability === "transfer.request_candidate_payload"
+        message: capability === "transfer.request_candidate_payload"
           ? "This device received a selected-candidate payload request."
           : "This device received a metadata-only search request.",
         peerReview: {
@@ -1508,23 +1548,35 @@ function AskBridgePanel({
   ): Promise<ControlQueueState> {
     if (!session) return state;
     const consent = peerConsentRecords.find((record) => record.binding.consentId === item.event.payload.consentId);
-    setFlow((current) => ({ ...current, steps: mergeRequestFileSteps(current.steps, ["Candidate revalidated", "Transform started"]) }));
     const execution = await executeInboundArtifactTransformRequest(
       item.event,
       consent,
       consumptionState,
-      claimCandidateArtifactTransformCapability,
+      unavailableTransformLeaseHost,
       unavailableTransformExecutor,
       { roomRef: session.roomId, sourceDeviceRef: session.peerSessionRef, targetPeerRef: session.localSessionRef },
     );
+    const lifecycleSteps = [
+      ...(execution.lifecycle.includes("revalidated") ? ["Candidate revalidated"] : []),
+      ...(execution.lifecycle.includes("executor_started") ? ["Transform started"] : []),
+    ] as const;
+    if (lifecycleSteps.length) {
+      setFlow((current) => ({ ...current, steps: mergeRequestFileSteps(current.steps, lifecycleSteps) }));
+    }
+    if (!execution.resultEvent) {
+      const completed = markControlQueueItemStatus(state, item.queueId, "execution_consumed", {
+        reason: `Receiver-host Transform terminal state: ${execution.terminalCategory ?? "rejected"}.`,
+      });
+      return completed.state;
+    }
     return enqueueRequestFileExecutionResult(
       state,
       item,
       execution.state,
       execution.resultEvent,
-      execution.result.errorCode === "sandbox_unavailable"
+      execution.result?.errorCode === "sandbox_unavailable"
         ? "Transform was rejected because no verified sandbox is available."
-        : `Transform rejected: ${execution.result.errorCode ?? execution.result.status}.`,
+        : `Transform rejected: ${execution.result?.errorCode ?? execution.result?.status ?? execution.terminalCategory ?? "rejected"}.`,
     );
   }
 
