@@ -17,6 +17,7 @@ import type {
 import {
   validateCandidatePayloadExecutionRequest,
   validateArtifactTransformExecutionRequest,
+  type ArtifactTransformExecutionResult,
   validateFileCandidateExecutionRequest,
   type ArtifactTransformExecutionRequest,
   type CandidatePayloadExecutionRequest,
@@ -37,6 +38,27 @@ import type {
   FileBridgeRoutePayload,
   TextBridgeRoutePayload,
 } from "./bridgeRoutingRuntime";
+
+export interface TransformConsentPromptInfo {
+  pendingConsentPromptId: string;
+  consentId: string;
+  roomRef: string;
+  sourcePreviewEventId: string;
+  expiresAt: string;
+  status: "pending" | "allowed_once" | "denied" | "expired";
+  decidedAt?: string;
+}
+
+export interface ArtifactTransformRawExecutorResult {
+  status: "completed" | "failed" | "timed_out" | "rejected";
+  result?: ArtifactTransformExecutionResult["result"];
+  errorCode?: "executor_failed" | "invalid_executor_result" | "policy_rejected" | "timed_out";
+}
+
+export interface TransformFinalizationDelivery {
+  terminalCategory: "completed" | "failed" | "timed_out" | "rejected";
+  sent: boolean;
+}
 
 interface SendFileOptions {
   displayName?: string;
@@ -174,15 +196,65 @@ export async function resolveCandidatePayloadCapability(
   return invoke("resolve_candidate_payload_capability", { request });
 }
 
-export async function claimCandidateArtifactTransformCapability(
+export async function beginTransformOperation(
   request: ArtifactTransformExecutionRequest,
-): Promise<"claimed" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed"> {
+): Promise<"leased" | "already_leased" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed"> {
   const validation = validateArtifactTransformExecutionRequest(request);
   if (!validation.valid) throw new Error(validation.errors.join(" "));
-  const result = await invoke<{ status: "claimed" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed" }>("claim_candidate_artifact_transform_capability", {
+  const result = await invoke<{ status: "leased" | "already_leased" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed" }>("begin_transform_operation", {
     request,
   });
   return result.status;
+}
+
+export async function revalidateTransformOperation(
+  request: ArtifactTransformExecutionRequest,
+): Promise<"revalidated" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed" | "invalid_consent"> {
+  const validation = validateArtifactTransformExecutionRequest(request);
+  if (!validation.valid) throw new Error(validation.errors.join(" "));
+  const result = await invoke<{ status: "revalidated" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed" | "invalid_consent" }>("revalidate_transform_operation", { request });
+  return result.status;
+}
+
+/** Pre-start cleanup only: the receiver host releases the exact request lease and preserves a still-valid grant for retry. */
+export async function abortTransformOperation(request: ArtifactTransformExecutionRequest): Promise<"released" | "candidate_not_found" | "candidate_claimed"> {
+  const validation = validateArtifactTransformExecutionRequest(request);
+  if (!validation.valid) throw new Error(validation.errors.join(" "));
+  const result = await invoke<{ status: "released" | "candidate_not_found" | "candidate_claimed" }>("abort_transform_operation", { request });
+  return result.status;
+}
+
+/** Rust validates and sanitizes before this result can become room-control or UI state. */
+/** The only frontend-callable path that can ask Rust to finalize and transport a Transform result. */
+export async function finalizeAndSendTransformResult(
+  request: ArtifactTransformExecutionRequest,
+  rawResult: ArtifactTransformRawExecutorResult,
+): Promise<TransformFinalizationDelivery> {
+  const validation = validateArtifactTransformExecutionRequest(request);
+  if (!validation.valid) throw new Error(validation.errors.join(" "));
+  return invoke<TransformFinalizationDelivery>("finalize_and_send_transform_result", { request, rawResult });
+}
+
+export async function getTransformOperationStatus(request: ArtifactTransformExecutionRequest): Promise<string> {
+  const validation = validateArtifactTransformExecutionRequest(request);
+  if (!validation.valid) throw new Error(validation.errors.join(" "));
+  const result = await invoke<{ status: string }>("get_transform_operation_status", { request });
+  return result.status;
+}
+
+export async function createTransformConsentPrompt(
+  roomId: string,
+  sourcePreviewEventId: string,
+): Promise<TransformConsentPromptInfo> {
+  return invoke<TransformConsentPromptInfo>("create_transform_consent_prompt", { roomId, sourcePreviewEventId });
+}
+
+export async function resolveTransformConsentPrompt(
+  roomId: string,
+  pendingConsentPromptId: string,
+  decision: "allow_once" | "deny",
+): Promise<TransformConsentPromptInfo> {
+  return invoke<TransformConsentPromptInfo>("resolve_transform_consent_prompt", { roomId, pendingConsentPromptId, decision });
 }
 
 export async function getRoomControlSessionContext(

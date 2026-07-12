@@ -39,7 +39,7 @@ use crate::{
         leave_room, list_nearby_devices, list_received_room_control_events, list_room_items,
         list_rooms, log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
         mark_join_prompt_rendered, open_logs_folder, pair_bridge_peer, pending_join_requests,
-        reject_nearby_join, request_nearby_join, resolve_candidate_payload_capability, claim_candidate_artifact_transform_capability,
+        reject_nearby_join, request_nearby_join, resolve_candidate_payload_capability, begin_transform_operation, create_transform_consent_prompt, resolve_transform_consent_prompt, revalidate_transform_operation, abort_transform_operation, finalize_and_send_transform_result, get_transform_operation_status,
         reveal_in_folder, revoke_bridge_peer_pairing, run_loopback_benchmark,
         run_peer_link_benchmark, send_file_to_room, send_room_control_event, send_text_to_room,
         update_config, update_transfer_window, write_temp_file,
@@ -68,6 +68,7 @@ pub struct AppState {
     pub latest_benchmark_results: Mutex<HashMap<String, diagnostics::LinkBenchmarkResult>>,
     pub room_control: Mutex<room_control::RoomControlRuntimeState>,
     pub candidate_payload_store: Mutex<file_candidates::CandidatePayloadStore>,
+    pub(crate) transform_authority: Mutex<file_candidates::TransformAuthorityStore>,
 }
 
 pub struct ActiveRoomServer {
@@ -108,6 +109,9 @@ fn main() {
             let config = config::load_or_create(&paths, shortcut_label)?;
             let effective_inbox_dir = config::effective_inbox_dir(&paths, &config);
             storage::run_startup_recovery(&paths, &effective_inbox_dir)?;
+            let transform_authority = file_candidates::TransformAuthorityStore::load(
+                paths.app_data_dir.join("transform-operation-journal.json"),
+            );
             let state = Arc::new(AppState {
                 app_handle: app.handle().clone(),
                 paths,
@@ -129,6 +133,7 @@ fn main() {
                 candidate_payload_store: Mutex::new(
                     file_candidates::CandidatePayloadStore::default(),
                 ),
+                transform_authority: Mutex::new(transform_authority),
             });
 
             app.manage(state.clone());
@@ -182,7 +187,13 @@ fn main() {
             execute_hello_stdout_capability,
             execute_file_candidate_search_capability,
             resolve_candidate_payload_capability,
-            claim_candidate_artifact_transform_capability,
+            begin_transform_operation,
+            create_transform_consent_prompt,
+            resolve_transform_consent_prompt,
+            revalidate_transform_operation,
+            abort_transform_operation,
+            finalize_and_send_transform_result,
+            get_transform_operation_status,
             get_room_control_session_context,
             list_received_room_control_events,
             cancel_transfer,

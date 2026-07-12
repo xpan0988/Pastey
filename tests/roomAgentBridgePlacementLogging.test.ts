@@ -393,7 +393,7 @@ test("Layer 5 docs describe narrow product closure without full-agent overclaim"
   const changelog = readFileSync("CHANGELOG.md", "utf8");
   const docs = [project, safety, contracts, templates, provider, releaseWorkflow, changelog].join("\n");
 
-  assert.match(docs, /Pastey 1\.9\.1 completes the current Layer 5 narrow product closure for the fixed capability set/);
+  assert.match(docs, /Pastey 1\.9\.1 implements bounded natural-v1 Transform contracts/);
   assert.match(docs, /Layer 5 narrow product closure and smoke bugfix consolidation/);
   assert.match(docs, /Ask Bridge natural-v1/);
   assert.match(docs, /Search \/ Transform \/ Return/);
