@@ -69,7 +69,7 @@ Canonical links, hreflang metadata, and the language switcher preserve the corre
 - Current validation has observed roughly 75–80% of a practical LAN ceiling. This is an observed range, not a guarantee.
 - Actual throughput depends on Wi-Fi/Ethernet quality, device I/O, CPU, system load, and runtime conditions.
 
-See [`../docs/transfer/architecture.md`](../docs/transfer/architecture.md) for current implementation boundaries and [`../docs/transfer/validation.md`](../docs/transfer/validation.md) for validation layers.
+See [`../docs/layers/layer-1-transfer.md`](../docs/layers/layer-1-transfer.md) for current implementation boundaries and [`../docs/development.md`](../docs/development.md) for validation layers.
 
 ## Design QA
 

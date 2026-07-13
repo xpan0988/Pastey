@@ -2863,6 +2863,7 @@ dependencies = [
  "hex",
  "hkdf",
  "http",
+ "libc",
  "mime_guess",
  "parking_lot",
  "rand 0.8.6",

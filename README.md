@@ -1,64 +1,33 @@
-# pastey
+# Pastey
 
-`pastey` is a local-first desktop utility for moving text, files, and images directly between your own Windows, macOS, and Linux devices on the same LAN.
+Pastey is a local-first desktop transfer and device workspace for moving text, files, and images directly between your Windows, macOS, and Linux devices on the same LAN. It uses encrypted local transport—no account system, cloud relay, remote storage, or analytics pipeline.
 
-Pastey is built for ephemeral local handoff: nearby devices echo back when ready, payloads follow an encrypted format-agnostic transfer path, and Bridge session state can be burned when it is no longer useful. There is no account system, cloud relay, remote storage, or analytics pipeline.
+Bridge sessions are ephemeral. Devices join through nearby discovery or an 8-digit code; current session state can be burned when it is no longer useful. SQLite stores metadata, while payload bytes and decryption remain local to participating devices.
 
-It is built with Tauri v2, React + TypeScript, Rust, SQLite metadata storage, local encrypted payload storage, temporary local HTTP transfer endpoints, and UDP LAN discovery.
+## Five-layer overview
 
-## Current Architecture
+- Layer 1 — encrypted and reliable LAN transfer
+- Layer 2 — factual device and link intelligence
+- Layer 3 — transfer and control orchestration
+- Layer 4 — Bridge sessions, peers, routing, and control transport
+- Layer 5 — AI-assisted planning and bounded Transform workflows
 
-The canonical project architecture and layer boundaries live in [docs/architecture/Project-specifications.md](docs/architecture/Project-specifications.md). When older planning documents or diagrams conflict with that file, the specification takes precedence.
+Layers 1–4 form the non-AI Pastey core. Transfer, device, orchestration, Bridge, Search, and selected-file Return foundations are substantially implemented. Layer 5 natural-v1 planning and bounded Transform authority are implemented.
 
-Current layer status:
+Ask Bridge uses one natural-language surface built around **Search / Transform / Return**. The model is advisory only; the host validates, the sender confirms, and the receiver can Allow once or Deny. Search returns redacted candidate metadata. A selected-file Return requires a second receiver consent and queues the existing transfer path.
 
-| Layer | Definition | Current status |
-| --- | --- | --- |
-| Layer 1 - Secure LAN transport | Moves data securely and reliably over the LAN. | Mature operational core |
-| Layer 2 - Device intelligence | Observes and describes current-session device, capability, liveness, and benchmark facts. | Factual diagnostics implemented |
-| Layer 3 - Smart orchestration | Plans and schedules data/control work and runtime capacity. | Operational orchestration core |
-| Layer 4 - Multi-device Bridge sessions and peer identity | Owns current-session Bridge membership, selected-peer routing, selected-peers routing, broadcast routing, provenance, replay boundaries, reconnect semantics, and current-session control-plane delivery. | Session-scoped Bridge/control foundation |
-| Layer 5 - Agent-assisted device workspace | Owns model-assisted planning, validation, consent, bounded execution, result orchestration, and audit. | Narrow capability slice plus read-only workspace search |
-
-Important boundaries:
-
-- Device facts are not scheduler commands.
-- Encrypted session is not durable device identity.
-- Accepted Bridge peer status is not durable trust or execution authority.
-- Transport delivery is not consent.
-- Consent is not reusable trust.
-- Model output is not executable instruction.
-- Logs are not runtime state or authorization.
-- Bridge semantics do not escape the Bridge session.
-
-## What Pastey Does
-
-One device opens an encrypted local Bridge session and shows an 8-digit code. Another device on the same LAN enters the code, discovers the sender, and becomes an accepted peer for that current Bridge session. Existing implementation names may still say Room, but the product concept is Bridge.
-
-Payload bytes stay local to the participating devices. SQLite stores metadata only. Original source file paths are not stored in the database, and receiver-side decryption happens locally after download.
-
-Bridge sessions can be burned. Burning removes that session's local encrypted payloads, transient received files, partial files, Bridge items, and active receiver transfer state. Files already saved to Inbox are user-owned output and are not deleted by Burn.
-
-## Agent Bridge
-
-Agent Bridge is Bridge-scoped and safety-first. The current implementation supports a deterministic mock provider, an experimental OpenAI-compatible cloud provider against redacted context, fixed Hello Peer / Hello Stdout capabilities, and the bounded read-only `filesystem.find_file_candidates` workspace capability.
-
-The model proposes; the host validates; the sender chooses whether to ask; the receiver can Allow once or Deny; a bounded host-owned executor acts; typed results return through Bridge control events. File-candidate search returns redacted metadata only: no file contents are read, no absolute paths are returned, candidate IDs are not paths or transfer authority, and no file is sent automatically. Nearby accept, 8-digit code join, accepted peer status, encrypted delivery, and durable pairing display metadata never grant execution authority. There is no shell, process, network, generic runtime, reusable trust, arbitrary tool execution, durable peer identity, transfer handoff, or local LLM scheduling in the current product.
+Real Transform execution remains unavailable in production. Descriptor-based staging, the static Linux capability probe, and the Stage 2B behavioral-verifier foundation are implemented. Live Linux isolation verification has not yet completed. Production remains bound to `sandbox_unavailable` with no direct-process fallback.
 
 ## Documentation
 
-- [Project layout specification](docs/architecture/Project-specifications.md)
-- [Naming conventions](docs/architecture/naming-conventions.md)
-- [Bridge semantics](docs/architecture/bridge-semantics.md)
-- [Bridge routing semantics](docs/architecture/bridge-routing.md)
-- [Transfer architecture](docs/transfer/architecture.md)
-- [Transfer scheduler](docs/transfer/scheduler.md)
-- [Transfer validation](docs/transfer/validation.md)
-- [Agent Bridge architecture and safety](docs/agent-bridge/architecture-and-safety.md)
-- [Bridge control transport](docs/agent-bridge/room-control-transport.md)
-- [Capability contracts](docs/agent-bridge/capability-contracts.md)
-- [Provider configuration](docs/agent-bridge/provider-configuration.md)
-- [Release workflow](docs/operations/release-workflow.md)
+- [Architecture and layer map](docs/architecture.md)
+- [Layer 1 — transfer](docs/layers/layer-1-transfer.md)
+- [Layer 2 — device intelligence](docs/layers/layer-2-device-intelligence.md)
+- [Layer 3 — orchestration](docs/layers/layer-3-orchestration.md)
+- [Layer 4 — Bridge](docs/layers/layer-4-bridge.md)
+- [Layer 5 — agent workspace](docs/layers/layer-5-agent.md)
+- [Reference](docs/reference.md)
+- [Development and release](docs/development.md)
 - [Product website](site/README.md)
 - [Changelog](CHANGELOG.md)
 
@@ -136,7 +105,7 @@ npm run release:version -- X.Y.Z "Release Title"
 git push origin main --tags
 ```
 
-See [docs/operations/release-workflow.md](docs/operations/release-workflow.md) for the full release workflow.
+See [docs/development.md](docs/development.md) for the full release workflow.
 
 ## Logs
 

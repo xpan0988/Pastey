@@ -18,6 +18,7 @@ mod room_control;
 mod storage;
 mod transfer;
 mod transfer_tuning;
+mod transform_sandbox;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -105,6 +106,12 @@ fn main() {
             let shortcut_label = default_shortcut_label();
             let paths = storage::init_app_paths(&app.handle())?;
             logging::init(paths.logs_dir.clone());
+            if let Err(error) = transform_sandbox::cleanup_orphaned_transform_staging(&paths.app_data_dir) {
+                logging::write_error_line(&format!(
+                    "[pastey:transform-staging] event=orphan_cleanup_startup_failed error={}",
+                    error.message()
+                ));
+            }
             storage::init_database(&paths)?;
             let config = config::load_or_create(&paths, shortcut_label)?;
             let effective_inbox_dir = config::effective_inbox_dir(&paths, &config);

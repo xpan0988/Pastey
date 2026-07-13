@@ -2,7 +2,7 @@
 
 This directory contains source-controlled manifests for deterministic local transfer-test file clusters. The manifests describe file names, sizes, content patterns, MIME hints, and the scheduler meaning of each scenario. They do not contain generated binary payloads.
 
-For the full transfer validation workflow, including single-machine dual-instance launch, sender log identification, and log summary extraction, see [../../../docs/transfer/validation.md](../../../docs/transfer/validation.md).
+For the full transfer validation workflow, including single-machine dual-instance launch, sender log identification, and log summary extraction, see [../../../docs/development.md](../../../docs/development.md).
 
 These fixtures are not the file-candidate search corpus. `filesystem.find_file_candidates` uses the tiny filename/depth/redaction corpus in `tests/fixtures/file-candidates/`.
 

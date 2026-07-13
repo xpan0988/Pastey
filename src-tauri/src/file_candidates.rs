@@ -14,6 +14,7 @@ use crate::{
     error::{AppError, AppResult},
     room_control,
     storage::AppPaths,
+    transform_sandbox,
 };
 
 const REQUEST_SCHEMA: &str = "filesystem-find-file-candidates-execution-request-v1";
@@ -193,6 +194,7 @@ pub struct CandidatePayloadStoreEntry {
     target_peer_ref: String,
     transform_lease: Option<ArtifactTransformClaimRequest>,
     transform_digest: Option<String>,
+    transform_source_identity: Option<transform_sandbox::staging::SourceIdentity>,
     transform_lease_marker: Option<String>,
 }
 
@@ -1469,6 +1471,7 @@ impl CandidatePayloadStore {
                 target_peer_ref: request.target_peer_ref.clone(),
                 transform_lease: None,
                 transform_digest: None,
+                transform_source_identity: None,
                 transform_lease_marker: None,
             };
             self.entries.insert(key, entry);
@@ -1558,12 +1561,17 @@ fn claim_candidate_for_artifact_transform(
     if modified_at != entry.modified_at {
         return Ok(ArtifactTransformClaimResult { status: "candidate_changed".into() });
     }
-    let bytes = match fs::read(&canonical) {
-        Ok(bytes) => bytes,
+    let identity = match transform_sandbox::capture_source_identity(
+        &canonical,
+        &entry.scope_root,
+        transform_sandbox::DETERMINISTIC_STAGED_INPUT_TEST.maximum_input_bytes,
+    ) {
+        Ok(identity) => identity,
         Err(_) => return Ok(ArtifactTransformClaimResult { status: "candidate_changed".into() }),
     };
-    // Digest is receiver-local and is consumed by revalidation immediately before future staging.
-    entry.transform_digest = Some(blake3::hash(&bytes).to_hex().to_string());
+    // Descriptor-derived identity is receiver-local and consumed only by a future private adapter.
+    entry.transform_digest = Some(identity.digest.clone());
+    entry.transform_source_identity = Some(identity);
     entry.transform_lease_marker = Some(format!("transform-lease-{}", Uuid::new_v4()));
     entry.transform_lease = Some(request);
     Ok(ArtifactTransformClaimResult { status: "leased".into() })
@@ -1603,14 +1611,57 @@ fn revalidate_candidate_for_artifact_transform(
         _ => return Ok(ArtifactTransformClaimResult { status: "candidate_changed".into() }),
     };
     if metadata.len() != entry.size_bytes { return Ok(ArtifactTransformClaimResult { status: "candidate_changed".into() }); }
-    let bytes = match fs::read(canonical) {
-        Ok(bytes) => bytes,
+    let identity = match transform_sandbox::capture_source_identity(
+        &canonical,
+        &entry.scope_root,
+        transform_sandbox::DETERMINISTIC_STAGED_INPUT_TEST.maximum_input_bytes,
+    ) {
+        Ok(identity) => identity,
         Err(_) => return Ok(ArtifactTransformClaimResult { status: "candidate_changed".into() }),
     };
-    if entry.transform_digest.as_deref() != Some(blake3::hash(&bytes).to_hex().as_str()) {
+    if entry.transform_source_identity.as_ref() != Some(&identity) {
         return Ok(ArtifactTransformClaimResult { status: "candidate_changed".into() });
     }
     Ok(ArtifactTransformClaimResult { status: "revalidated".into() })
+}
+
+/// Rust-private Stage 1 hook for a future verified adapter. Current production
+/// admission deliberately never calls this while its adapter is unavailable.
+#[allow(dead_code)]
+pub(crate) fn prepare_staged_snapshot(
+    request: &ArtifactTransformClaimRequest,
+    paths: &AppPaths,
+    store: &CandidatePayloadStore,
+    authority: &TransformAuthorityStore,
+) -> AppResult<transform_sandbox::StagedSnapshot> {
+    let Some(operation) = authority.operations.get(&request.request_id) else {
+        return Err(AppError::InvalidInput("Missing Transform operation.".into()));
+    };
+    if operation.request != *request || operation.state != TransformOperationState::Revalidated {
+        return Err(AppError::InvalidInput("Transform operation is not staged-admissible.".into()));
+    }
+    let key = CandidatePayloadStoreKey {
+        source_capability: request.source_capability.clone(),
+        source_request_id: request.source_request_id.clone(),
+        candidate_id: request.candidate_id.clone(),
+        candidate_kind: request.candidate_kind.clone(),
+    };
+    let entry = store.entries.get(&key).ok_or_else(|| {
+        AppError::InvalidInput("Missing Transform candidate lease.".into())
+    })?;
+    if entry.transform_lease.as_ref() != Some(request) {
+        return Err(AppError::InvalidInput("Transform candidate is not leased.".into()));
+    }
+    let identity = entry.transform_source_identity.as_ref().ok_or_else(|| {
+        AppError::InvalidInput("Missing Transform source identity.".into())
+    })?;
+    transform_sandbox::prepare_staged_snapshot(
+        &paths.app_data_dir,
+        &entry.local_path,
+        &entry.scope_root,
+        identity,
+        transform_sandbox::DETERMINISTIC_STAGED_INPUT_TEST,
+    )
 }
 
 /// Releases only the exact pre-execution lease. A distinct request cannot release it.
@@ -1628,6 +1679,7 @@ fn release_candidate_artifact_transform_lease(
     if entry.transform_lease.as_ref() != Some(request) { return Ok(ArtifactTransformClaimResult { status: "candidate_claimed".into() }); }
     entry.transform_lease = None;
     entry.transform_digest = None;
+    entry.transform_source_identity = None;
     entry.transform_lease_marker = None;
     Ok(ArtifactTransformClaimResult { status: "released".into() })
 }
@@ -2093,6 +2145,7 @@ mod tests {
             target_peer_ref: "target-1".into(),
             transform_lease: None,
             transform_digest: None,
+            transform_source_identity: None,
             transform_lease_marker: None,
         }
     }
@@ -2189,6 +2242,54 @@ mod tests {
         replacement_request.request_id = "transform-request-2".into();
         replacement_request.execution_id = "transform-execution-2".into();
         assert_eq!(claim_candidate_for_artifact_transform(replacement_request, &mut store).unwrap().status, "candidate_changed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staged_transform_snapshot_is_private_and_keeps_the_lease_until_future_terminal_cleanup() {
+        let (root, app_paths) = fixture_paths();
+        let mut candidates = CandidatePayloadStore::default();
+        let result = execute_file_candidate_search_and_store(
+            request_for("exact-target.pdf", &["pdf"], 10, 6),
+            &app_paths,
+            &mut candidates,
+        )
+        .unwrap();
+        let request = transform_claim_for(result.candidates.first().unwrap());
+        let mut authority = TransformAuthorityStore::default();
+        register_artifact_transform_consent(transform_consent_for(&request), &mut authority).unwrap();
+        assert_eq!(
+            begin_artifact_transform_operation(request.clone(), &mut candidates, &mut authority)
+                .unwrap()
+                .status,
+            "leased"
+        );
+        assert_eq!(
+            revalidate_artifact_transform_operation(&request, &mut candidates, &mut authority)
+                .unwrap()
+                .status,
+            "revalidated"
+        );
+        let snapshot = prepare_staged_snapshot(&request, &app_paths, &candidates, &authority).unwrap();
+        assert_eq!(snapshot.input_path.file_name().unwrap(), "artifact");
+        assert!(!snapshot.root.to_string_lossy().contains("exact-target.pdf"));
+        assert_ne!(snapshot.input_path.parent(), Some(snapshot.work_dir.as_path()));
+        assert_eq!(
+            candidates
+                .entries
+                .get(&store_key(result.candidates.first().unwrap()))
+                .unwrap()
+                .transform_lease
+                .as_ref(),
+            Some(&request)
+        );
+        transform_sandbox::cleanup_staged_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            abort_artifact_transform_operation(&request, &mut candidates, &mut authority)
+                .unwrap()
+                .status,
+            "released"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

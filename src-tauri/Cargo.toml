@@ -17,6 +17,7 @@ futures-util = "0.3"
 hex = "0.4"
 hkdf = "0.12"
 http = "1"
+libc = "0.2"
 mime_guess = "2.0"
 parking_lot = "0.12"
 rand = "0.8"
@@ -43,6 +44,14 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+transform-sandbox-verification = []
+
+[[bin]]
+name = "pastey-transform-sandbox-probe"
+path = "src/transform_sandbox/linux/test_probe.rs"
+required-features = ["transform-sandbox-verification"]
+test = false
+bench = false
 
 [profile.dev-fast]
 inherits = "dev"

@@ -3,30 +3,23 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 test("Layer 4 validation matrix documents required route and authority boundaries", () => {
-  const validation = readFileSync("docs/transfer/validation.md", "utf8");
-  const routing = readFileSync("docs/architecture/bridge-routing.md", "utf8");
+  const development = readFileSync("docs/development.md", "utf8");
+  const bridge = readFileSync("docs/layers/layer-4-bridge.md", "utf8");
 
-  assert.match(validation, /## Layer 4 Validation Matrix/);
-  assert.match(validation, /selected-peer \| ordinary text/);
-  assert.match(validation, /selected-peers \| ordinary text/);
-  assert.match(validation, /broadcast \| ordinary text/);
-  assert.match(validation, /file\/image\/pasted-image/);
-  assert.match(validation, /room-control event/);
-  assert.match(validation, /Agent Bridge capability preview/);
-  assert.match(validation, /Agent Bridge execution request\/result/);
-  assert.match(validation, /durable paired identity only/);
-  assert.match(validation, /delivery receipt does not create consent/);
-  assert.match(validation, /Manual Smoke Checklist \(Pending\)/);
+  assert.match(development, /## Transfer and Layer 4 validation/);
+  assert.match(development, /run-layer4-validation-matrix/);
+  assert.match(development, /single-machine dual-instance smoke/);
+  assert.match(development, /two-device smoke/);
 
-  assert.match(routing, /## Layer 4 Runtime Status/);
-  assert.match(routing, /Current-session peer table/);
-  assert.match(routing, /Ordinary data selected-peer/);
-  assert.match(routing, /Ordinary data selected-peers/);
-  assert.match(routing, /Ordinary data broadcast/);
-  assert.match(routing, /Room-control selected-peer backend route/);
-  assert.match(routing, /Control\/capability fan-out/);
-  assert.match(routing, /Full cryptographic paired-key rotation/);
-  assert.match(routing, /Two-machine\/release validation/);
+  assert.match(bridge, /selected peer/);
+  assert.match(bridge, /selected peers/);
+  assert.match(bridge, /broadcast to Bridge/);
+  assert.match(bridge, /File, image, and pasted-image/);
+  assert.match(bridge, /Control and capability events remain exact selected-peer only/);
+  assert.match(bridge, /delivery receipt says only/);
+  assert.match(bridge, /display\/recognition metadata only/);
+  assert.match(bridge, /Full cryptographic paired-key rotation is not implemented/);
+  assert.match(bridge, /Two-device\/package validation remains a required manual\/release check/);
 });
 
 test("Layer 4 validation runner keeps matrix evidence grouped by invariant", () => {

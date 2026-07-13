@@ -2746,6 +2746,11 @@ mod tests {
 
     #[test]
     fn unavailable_adapter_preflight_is_pre_mutation_and_pre_start() {
+        let staging_probe_root = std::env::temp_dir().join(format!(
+            "pastey_transform_unavailable_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&staging_probe_root).unwrap();
         let request = ArtifactTransformClaimRequest {
             schema_version: "artifact-transform-selected-execution-request-v1".into(),
             execution_id: "execution-1".into(),
@@ -2777,5 +2782,7 @@ mod tests {
         assert_eq!(adapter.prepares.load(Ordering::SeqCst), 1);
         assert_eq!(adapter.starts.load(Ordering::SeqCst), 0);
         assert_eq!(adapter.results.load(Ordering::SeqCst), 0);
+        assert!(!staging_probe_root.join("transform-staging").exists());
+        let _ = std::fs::remove_dir_all(staging_probe_root);
     }
 }
