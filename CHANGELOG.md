@@ -20,8 +20,8 @@ Detailed update and release history for Pastey.
 
 ### Documentation
 
-- Added `docs/architecture/naming-conventions.md` as the canonical naming guide for schema versions, capability IDs, registry versions, protocol names, provider action kinds, executor kinds, and future candidate-payload capability naming.
-- Added `docs/agent-bridge/capability-templates.md` as the design-first template and manifest architecture for future Layer 5 capability migration, including autonomy profiles, approval policy/reviewer boundaries, existing capability adapter mapping, migration phases, and proposed tests.
+- Added the naming guide later consolidated into `docs/reference.md`, covering schema versions, capability IDs, registry versions, protocol names, provider action kinds, executor kinds, and candidate-payload capability naming.
+- Added the design-first capability-template and manifest architecture later consolidated into the Layer 5 and reference documentation, including autonomy profiles, approval policy/reviewer boundaries, existing capability adapter mapping, migration phases, and proposed tests.
 - Added Phase 1-3 capability-template implementation scaffolding: static manifests for all existing Agent Bridge capabilities, additive template helper checks, a manifest test runner, and manifest-backed Hello Stdout execution binding without public contract changes.
 - Added the Phase 4 `filesystem.find_file_candidates` template wrapper for common lifecycle checks while preserving filesystem-specific validation, receiver-local candidate storage, Rust discovery behavior, and metadata-only public results.
 - Added the Phase 5 `transfer.request_candidate_payload` template wrapper for common lifecycle checks while preserving source discovery binding, receiver-local candidate resolution, existing queue handoff, Agent Bridge queue metadata, `handoff_queued` semantics, and metadata-only public results.
@@ -76,7 +76,7 @@ Detailed update and release history for Pastey.
 
 ### Documentation
 
-- Established the canonical project-layout specification and completion-scoring rules in `docs/architecture/Project-specifications.md`.
+- Established the project-layout specification and completion-scoring rules later consolidated into `docs/architecture.md` and the layer documents.
 - Consolidated Agent Bridge documentation into current architecture/safety, room-control transport, capability-contract, and provider-configuration documents.
 - Simplified the docs tree so stale phase reports and duplicate status narratives are removed; Git history remains the archive.
 
