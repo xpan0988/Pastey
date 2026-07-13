@@ -17,7 +17,6 @@ import type {
 import {
   validateCandidatePayloadExecutionRequest,
   validateArtifactTransformExecutionRequest,
-  type ArtifactTransformExecutionResult,
   validateFileCandidateExecutionRequest,
   type ArtifactTransformExecutionRequest,
   type CandidatePayloadExecutionRequest,
@@ -47,17 +46,6 @@ export interface TransformConsentPromptInfo {
   expiresAt: string;
   status: "pending" | "allowed_once" | "denied" | "expired";
   decidedAt?: string;
-}
-
-export interface ArtifactTransformRawExecutorResult {
-  status: "completed" | "failed" | "timed_out" | "rejected";
-  result?: ArtifactTransformExecutionResult["result"];
-  errorCode?: "executor_failed" | "invalid_executor_result" | "policy_rejected" | "timed_out";
-}
-
-export interface TransformFinalizationDelivery {
-  terminalCategory: "completed" | "failed" | "timed_out" | "rejected";
-  sent: boolean;
 }
 
 interface SendFileOptions {
@@ -222,17 +210,6 @@ export async function abortTransformOperation(request: ArtifactTransformExecutio
   if (!validation.valid) throw new Error(validation.errors.join(" "));
   const result = await invoke<{ status: "released" | "candidate_not_found" | "candidate_claimed" }>("abort_transform_operation", { request });
   return result.status;
-}
-
-/** Rust validates and sanitizes before this result can become room-control or UI state. */
-/** The only frontend-callable path that can ask Rust to finalize and transport a Transform result. */
-export async function finalizeAndSendTransformResult(
-  request: ArtifactTransformExecutionRequest,
-  rawResult: ArtifactTransformRawExecutorResult,
-): Promise<TransformFinalizationDelivery> {
-  const validation = validateArtifactTransformExecutionRequest(request);
-  if (!validation.valid) throw new Error(validation.errors.join(" "));
-  return invoke<TransformFinalizationDelivery>("finalize_and_send_transform_result", { request, rawResult });
 }
 
 export async function getTransformOperationStatus(request: ArtifactTransformExecutionRequest): Promise<string> {

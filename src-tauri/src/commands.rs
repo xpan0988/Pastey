@@ -43,6 +43,20 @@ pub struct TransformFinalizationDelivery {
     sent: bool,
 }
 
+/// Bounded receiver-host metadata returned to TypeScript. It intentionally
+/// contains no executor output, private marker, path, digest, or lease data.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformHostExecutionOutcome {
+    executed: bool,
+    lifecycle: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    delivery_status: String,
+}
+
 #[derive(Serialize)]
 pub struct FileTransferMetadata {
     path: String,
@@ -1333,11 +1347,12 @@ pub async fn abort_transform_operation(
         .map_err(|error| error.message())
 }
 
-#[tauri::command]
-pub async fn finalize_and_send_transform_result(
+/// Rust-private finalization and transport. Raw executor output enters here
+/// only from a Rust-private sandbox adapter.
+pub(crate) async fn finalize_and_send_transform_result(
+    state: Arc<AppState>,
     request: ArtifactTransformClaimRequest,
     raw_result: Value,
-    state: State<'_, Arc<AppState>>,
 ) -> Result<TransformFinalizationDelivery, String> {
     let outcome = {
         let mut store = state.candidate_payload_store.lock();
@@ -1361,9 +1376,151 @@ pub async fn finalize_and_send_transform_result(
         "previewOnly": false,
         "payload": result,
     });
-    crate::room_control::send_authoritative_transform_result_event(state.inner().clone(), &request.room_ref, event, None)
+    crate::room_control::send_authoritative_transform_result_event(state, &request.room_ref, event, None)
         .await.map_err(|error| error.message())?;
     Ok(TransformFinalizationDelivery { terminal_category: outcome.terminal_category, sent: true })
+}
+
+/// Rust-private lifecycle for a future verified sandbox adapter. The adapter
+/// acknowledges a real start before the durable operation is marked started;
+/// raw output then flows directly into Rust sanitation and transport.
+pub(crate) async fn execute_transform_with_adapter(
+    state: Arc<AppState>,
+    request: ArtifactTransformClaimRequest,
+    adapter: &dyn file_candidates::TransformSandboxAdapter,
+) -> Result<TransformHostExecutionOutcome, String> {
+    if let Some(outcome) = prepare_transform_adapter(&request, adapter)? {
+        return Ok(outcome);
+    }
+
+    let claimed = {
+        let mut store = state.candidate_payload_store.lock();
+        let mut authority = state.transform_authority.lock();
+        file_candidates::begin_artifact_transform_operation(request.clone(), &mut store, &mut authority)
+            .map_err(|error| error.message())?
+    };
+    if claimed.status != "leased" && claimed.status != "already_leased" {
+        return Ok(pre_start_transform_outcome(claimed.status, vec!["prepared".into()]));
+    }
+
+    let revalidated = {
+        let mut store = state.candidate_payload_store.lock();
+        let mut authority = state.transform_authority.lock();
+        file_candidates::revalidate_artifact_transform_operation(&request, &mut store, &mut authority)
+            .map_err(|error| error.message())?
+    };
+    if revalidated.status != "revalidated" {
+        return Ok(pre_start_transform_outcome(revalidated.status, vec!["prepared".into(), "claimed".into()]));
+    }
+
+    match adapter.start(&request) {
+        Ok(()) => {}
+        Err(_) => {
+            let mut store = state.candidate_payload_store.lock();
+            let mut authority = state.transform_authority.lock();
+            let _ = file_candidates::abort_artifact_transform_operation(&request, &mut store, &mut authority);
+            return Ok(pre_start_transform_outcome("executor_failed".into(), vec!["prepared".into(), "claimed".into(), "revalidated".into()]));
+        }
+    }
+
+    let started = {
+        let mut store = state.candidate_payload_store.lock();
+        let mut authority = state.transform_authority.lock();
+        file_candidates::mark_artifact_transform_operation_started(&request, &mut store, &mut authority)
+    };
+    let started = match started {
+        Ok(started) => started,
+        Err(_) => {
+            // The adapter has already acknowledged start. Preserve that fact
+            // rather than misreporting a durable-journal failure as pre-start.
+            return Ok(TransformHostExecutionOutcome {
+                executed: true,
+                lifecycle: vec!["prepared".into(), "claimed".into(), "revalidated".into(), "executor_started".into()],
+                terminal_category: None,
+                error_code: Some("start_record_failed".into()),
+                delivery_status: "not_sent".into(),
+            });
+        }
+    };
+    if started.status != "started" {
+        return Ok(TransformHostExecutionOutcome {
+            executed: true,
+            lifecycle: vec!["prepared".into(), "claimed".into(), "revalidated".into(), "executor_started".into()],
+            terminal_category: None,
+            error_code: Some("start_record_failed".into()),
+            delivery_status: "not_sent".into(),
+        });
+    }
+
+    // Result collection is post-start work. A collection failure is recorded
+    // as a bounded failed execution and must never become retryable.
+    let raw_result = adapter.collect_result(&request).unwrap_or_else(|_| file_candidates::ArtifactTransformRawExecutorResult {
+        status: "failed".into(),
+        result: None,
+        error_code: Some("executor_failed".into()),
+    });
+
+    match finalize_and_send_transform_result(state, request, serde_json::to_value(raw_result).map_err(|_| "Invalid Transform adapter result.")?).await {
+        Ok(delivery) => Ok(TransformHostExecutionOutcome {
+            executed: true,
+            lifecycle: if delivery.terminal_category == "completed" { vec!["prepared".into(), "claimed".into(), "revalidated".into(), "executor_started".into(), "completed".into()] } else { vec!["prepared".into(), "claimed".into(), "revalidated".into(), "executor_started".into()] },
+            terminal_category: Some(delivery.terminal_category),
+            error_code: None,
+            delivery_status: if delivery.sent { "sent".into() } else { "replay".into() },
+        }),
+        Err(_) => Ok(TransformHostExecutionOutcome {
+            executed: true,
+            lifecycle: vec!["prepared".into(), "claimed".into(), "revalidated".into(), "executor_started".into()],
+            terminal_category: None,
+            error_code: Some("result_transport_failed".into()),
+            delivery_status: "not_sent".into(),
+        }),
+    }
+}
+
+/// The availability gate takes no receiver state, so an unavailable adapter
+/// cannot reserve consent, acquire a lease, or create a journal record.
+fn prepare_transform_adapter(
+    request: &ArtifactTransformClaimRequest,
+    adapter: &dyn file_candidates::TransformSandboxAdapter,
+) -> Result<Option<TransformHostExecutionOutcome>, String> {
+    file_candidates::validate_artifact_transform_claim_request(&request)
+        .map_err(|error| error.message())?;
+    if matches!(adapter.prepare(&request), file_candidates::TransformSandboxPreparation::Unavailable) {
+        return Ok(Some(TransformHostExecutionOutcome {
+            executed: false,
+            lifecycle: vec!["prepared".into()],
+            terminal_category: None,
+            error_code: Some("sandbox_unavailable".into()),
+            delivery_status: "not_sent".into(),
+        }));
+    }
+    Ok(None)
+}
+
+fn pre_start_transform_outcome(error_code: String, lifecycle: Vec<String>) -> TransformHostExecutionOutcome {
+    TransformHostExecutionOutcome {
+        executed: false,
+        lifecycle,
+        terminal_category: None,
+        error_code: Some(error_code),
+        delivery_status: "not_sent".into(),
+    }
+}
+
+/// Frontend-safe production entry point. The unavailable adapter returns before
+/// any ledger, lease, journal, identity, start, or result mutation.
+#[tauri::command]
+pub async fn execute_transform_with_receiver_host(
+    request: ArtifactTransformClaimRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<TransformHostExecutionOutcome, String> {
+    execute_transform_with_adapter(
+        state.inner().clone(),
+        request,
+        &file_candidates::UnavailableTransformSandboxAdapter,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1916,6 +2073,7 @@ fn resolve_user_path(input: &str) -> AppResult<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn bridge_route_room() -> StoredRoom {
         StoredRoom {
@@ -2561,5 +2719,63 @@ mod tests {
             "[pastey:runtime-window] event=summary display_name=C:\\Users\\me\\secret.txt"
         )
         .is_err());
+    }
+
+    struct UnavailableProbeAdapter {
+        prepares: AtomicUsize,
+        starts: AtomicUsize,
+        results: AtomicUsize,
+    }
+
+    impl file_candidates::TransformSandboxAdapter for UnavailableProbeAdapter {
+        fn prepare(&self, _request: &ArtifactTransformClaimRequest) -> file_candidates::TransformSandboxPreparation {
+            self.prepares.fetch_add(1, Ordering::SeqCst);
+            file_candidates::TransformSandboxPreparation::Unavailable
+        }
+
+        fn start(&self, _request: &ArtifactTransformClaimRequest) -> AppResult<()> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Err(AppError::InvalidInput("unexpected sandbox start".into()))
+        }
+
+        fn collect_result(&self, _request: &ArtifactTransformClaimRequest) -> AppResult<file_candidates::ArtifactTransformRawExecutorResult> {
+            self.results.fetch_add(1, Ordering::SeqCst);
+            Err(AppError::InvalidInput("unexpected result collection".into()))
+        }
+    }
+
+    #[test]
+    fn unavailable_adapter_preflight_is_pre_mutation_and_pre_start() {
+        let request = ArtifactTransformClaimRequest {
+            schema_version: "artifact-transform-selected-execution-request-v1".into(),
+            execution_id: "execution-1".into(),
+            consent_id: "consent-1".into(),
+            source_preview_event_id: "preview-1".into(),
+            envelope_id: "envelope-1".into(),
+            request_id: "request-1".into(),
+            request_payload_hash: "hash-1".into(),
+            room_ref: "room-1".into(),
+            source_device_ref: "source-1".into(),
+            target_peer_ref: "target-1".into(),
+            capability: "artifact.transform_selected".into(),
+            source_capability: "filesystem.find_file_candidates".into(),
+            source_request_id: "search-1".into(),
+            candidate_id: "candidate-1".into(),
+            candidate_kind: "filesystem_file".into(),
+            result_contract: "typed_transform_result".into(),
+            expires_at: (time::OffsetDateTime::now_utc() + time::Duration::minutes(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        };
+        let adapter = UnavailableProbeAdapter { prepares: AtomicUsize::new(0), starts: AtomicUsize::new(0), results: AtomicUsize::new(0) };
+
+        let outcome = prepare_transform_adapter(&request, &adapter).unwrap().expect("unavailable outcome");
+
+        assert!(!outcome.executed);
+        assert_eq!(outcome.lifecycle, vec!["prepared"]);
+        assert_eq!(outcome.error_code.as_deref(), Some("sandbox_unavailable"));
+        assert_eq!(adapter.prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.results.load(Ordering::SeqCst), 0);
     }
 }

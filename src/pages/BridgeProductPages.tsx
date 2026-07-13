@@ -82,8 +82,7 @@ import {
   matchExecutionResultToRequest,
   processNextControlQueueItem,
   roomControlSessionIdentity,
-  unavailableTransformLeaseHost,
-  unavailableTransformExecutor,
+  rustTransformReceiverHost,
   useAgentBridgeRuntimeConfig,
   type CapabilityExecuteRequestRoomControlEvent,
   type CapabilityExecutionResultRoomControlEvent,
@@ -1552,8 +1551,7 @@ function AskBridgePanel({
       item.event,
       consent,
       consumptionState,
-      unavailableTransformLeaseHost,
-      unavailableTransformExecutor,
+      rustTransformReceiverHost,
       { roomRef: session.roomId, sourceDeviceRef: session.peerSessionRef, targetPeerRef: session.localSessionRef },
     );
     const lifecycleSteps = [
@@ -1563,21 +1561,17 @@ function AskBridgePanel({
     if (lifecycleSteps.length) {
       setFlow((current) => ({ ...current, steps: mergeRequestFileSteps(current.steps, lifecycleSteps) }));
     }
-    if (!execution.resultEvent) {
-      const completed = markControlQueueItemStatus(state, item.queueId, "execution_consumed", {
-        reason: `Receiver-host Transform terminal state: ${execution.terminalCategory ?? "rejected"}.`,
-      });
-      return completed.state;
-    }
-    return enqueueRequestFileExecutionResult(
+    const completed = markControlQueueItemStatus(
       state,
-      item,
-      execution.state,
-      execution.resultEvent,
-      execution.result?.errorCode === "sandbox_unavailable"
-        ? "Transform was rejected because no verified sandbox is available."
-        : `Transform rejected: ${execution.result?.errorCode ?? execution.result?.status ?? execution.terminalCategory ?? "rejected"}.`,
+      item.queueId,
+      execution.executed ? "execution_consumed" : "invalid",
+      {
+        reason: execution.errorCode === "sandbox_unavailable"
+          ? "Transform was rejected because no verified sandbox is available."
+          : `Receiver-host Transform terminal state: ${execution.terminalCategory ?? execution.errorCode ?? "rejected"}.`,
+      },
     );
+    return completed.state;
   }
 
   function enqueueRequestFileExecutionResult(
