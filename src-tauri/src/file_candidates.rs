@@ -280,7 +280,7 @@ struct TransformOperationRecord {
 
 /// The only executor-facing Transform result input. It deliberately excludes
 /// request, consent, room, path, identity, lease, and authority fields.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ArtifactTransformRawExecutorResult {
     pub status: String,
@@ -288,6 +288,44 @@ pub struct ArtifactTransformRawExecutorResult {
     pub result: Option<TypedTransformResult>,
     #[serde(default)]
     pub error_code: Option<String>,
+}
+
+/// Receiver-host-private seam for a future verified sandbox. Its raw result
+/// never crosses the Tauri boundary; the Rust operation journal remains the
+/// authority for admission, start, finalization, and replay.
+pub(crate) trait TransformSandboxAdapter: Send + Sync {
+    fn prepare(&self, request: &ArtifactTransformClaimRequest) -> TransformSandboxPreparation;
+    /// Returns only once the sandbox has genuinely acknowledged start. Rust
+    /// records the durable start transition immediately after this call.
+    fn start(&self, request: &ArtifactTransformClaimRequest) -> AppResult<()>;
+    /// Raw executor output stays within Rust and is requested only after the
+    /// private operation has transitioned to `started`.
+    fn collect_result(&self, request: &ArtifactTransformClaimRequest) -> AppResult<ArtifactTransformRawExecutorResult>;
+}
+
+pub(crate) enum TransformSandboxPreparation {
+    /// Constructed only by a future verified Rust sandbox adapter. The current
+    /// production adapter is deliberately unavailable and never mutates state.
+    #[allow(dead_code)]
+    Ready,
+    Unavailable,
+}
+
+/// The only production adapter until a verified sandbox is installed.
+pub(crate) struct UnavailableTransformSandboxAdapter;
+
+impl TransformSandboxAdapter for UnavailableTransformSandboxAdapter {
+    fn prepare(&self, _request: &ArtifactTransformClaimRequest) -> TransformSandboxPreparation {
+        TransformSandboxPreparation::Unavailable
+    }
+
+    fn start(&self, _request: &ArtifactTransformClaimRequest) -> AppResult<()> {
+        Err(AppError::InvalidInput("sandbox_unavailable".into()))
+    }
+
+    fn collect_result(&self, _request: &ArtifactTransformClaimRequest) -> AppResult<ArtifactTransformRawExecutorResult> {
+        Err(AppError::InvalidInput("sandbox_unavailable".into()))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -569,8 +607,7 @@ pub fn revalidate_artifact_transform_operation(
 
 /// Receiver-host-private transition for a future sandbox adapter after a real
 /// executor-start acknowledgement. It is intentionally not a Tauri command.
-#[cfg(test)]
-fn mark_artifact_transform_operation_started(
+pub(crate) fn mark_artifact_transform_operation_started(
     request: &ArtifactTransformClaimRequest,
     store: &mut CandidatePayloadStore,
     authority: &mut TransformAuthorityStore,
@@ -874,6 +911,27 @@ pub struct ArtifactTransformClaimRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ArtifactTransformClaimResult {
     pub status: String,
+}
+
+/// Validates the closed host-built request before an adapter is even queried.
+pub(crate) fn validate_artifact_transform_claim_request(request: &ArtifactTransformClaimRequest) -> AppResult<()> {
+    if request.schema_version != "artifact-transform-selected-execution-request-v1"
+        || request.capability != "artifact.transform_selected"
+        || request.source_capability != CAPABILITY
+        || request.candidate_kind != "filesystem_file"
+        || request.result_contract != "typed_transform_result"
+        || [
+            &request.execution_id, &request.consent_id, &request.source_preview_event_id,
+            &request.envelope_id, &request.request_id, &request.request_payload_hash,
+            &request.room_ref, &request.source_device_ref, &request.target_peer_ref,
+            &request.source_request_id, &request.candidate_id,
+        ].iter().any(|value| !valid_transform_identifier(value))
+        || request.candidate_id.contains('/') || request.candidate_id.contains('\\')
+        || parse_time(&request.expires_at).is_err() || parse_time(&request.expires_at)? <= OffsetDateTime::now_utc()
+    {
+        return Err(AppError::InvalidInput("Invalid Artifact Transform request.".into()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1950,6 +2008,24 @@ mod tests {
         })
     }
 
+    struct DeterministicTestTransformAdapter {
+        raw: ArtifactTransformRawExecutorResult,
+    }
+
+    impl TransformSandboxAdapter for DeterministicTestTransformAdapter {
+        fn prepare(&self, _request: &ArtifactTransformClaimRequest) -> TransformSandboxPreparation {
+            TransformSandboxPreparation::Ready
+        }
+
+        fn start(&self, _request: &ArtifactTransformClaimRequest) -> AppResult<()> {
+            Ok(())
+        }
+
+        fn collect_result(&self, _request: &ArtifactTransformClaimRequest) -> AppResult<ArtifactTransformRawExecutorResult> {
+            Ok(self.raw.clone())
+        }
+    }
+
     fn started_transform_fixture() -> (PathBuf, CandidatePayloadStore, TransformAuthorityStore, ArtifactTransformClaimRequest) {
         let (root, app_paths) = fixture_paths();
         let mut candidates = CandidatePayloadStore::default();
@@ -1961,6 +2037,29 @@ mod tests {
         assert_eq!(revalidate_artifact_transform_operation(&request, &mut candidates, &mut authority).unwrap().status, "revalidated");
         assert_eq!(mark_artifact_transform_operation_started(&request, &mut candidates, &mut authority).unwrap().status, "started");
         (root, candidates, authority, request)
+    }
+
+    #[test]
+    fn rust_private_adapter_lifecycle_keeps_raw_result_inside_rust() {
+        let (root, app_paths) = fixture_paths();
+        let mut candidates = CandidatePayloadStore::default();
+        let search = execute_file_candidate_search_and_store(request_for("exact-target.pdf", &["pdf"], 10, 6), &app_paths, &mut candidates).unwrap();
+        let request = transform_claim_for(search.candidates.first().unwrap());
+        let mut authority = TransformAuthorityStore::default();
+        register_artifact_transform_consent(transform_consent_for(&request), &mut authority).unwrap();
+        let adapter = DeterministicTestTransformAdapter {
+            raw: serde_json::from_value(completed_raw_result()).unwrap(),
+        };
+        assert!(matches!(adapter.prepare(&request), TransformSandboxPreparation::Ready));
+        assert_eq!(begin_artifact_transform_operation(request.clone(), &mut candidates, &mut authority).unwrap().status, "leased");
+        assert_eq!(revalidate_artifact_transform_operation(&request, &mut candidates, &mut authority).unwrap().status, "revalidated");
+        adapter.start(&request).unwrap();
+        assert_eq!(mark_artifact_transform_operation_started(&request, &mut candidates, &mut authority).unwrap().status, "started");
+        let raw = adapter.collect_result(&request).unwrap();
+        let finalized = sanitize_and_finalize_transform_operation(&request, serde_json::to_value(raw).unwrap(), &mut candidates, &mut authority).unwrap();
+        assert_eq!(finalized.terminal_category, "completed");
+        assert!(sanitize_and_finalize_transform_operation(&request, completed_raw_result(), &mut candidates, &mut authority).unwrap().result.is_none());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn stored_entry_for(
