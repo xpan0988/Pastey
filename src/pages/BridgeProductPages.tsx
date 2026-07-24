@@ -3,31 +3,39 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
 import {
   copyTextToClipboard,
-  executeFileCandidateSearchCapability,
+  approveBridgePlan,
+  bridgePlanReceiverReviewStatus,
+  createDirectFileTransferBridgePlan,
+  createFileSearchBridgePlan,
+  createFileTransformBridgePlan,
+  proposeBridgePlanTransformFallback,
+  decideBridgePlanReview,
+  executeBridgePlanSearchAttempt,
+  executeDirectBridgePlanTransferAttempt,
+  executeBridgePlanTransferAttempt,
+  executeBridgePlanTransformAttempt,
   getDeviceProfile,
   getRoomControlSessionContext,
   joinRoom,
+  listBridgePlanWorkspace,
   listReceivedRoomControlEvents,
   listNearbyDevices,
   requestNearbyJoin,
-  resolveTransformConsentPrompt,
   revealInFolder,
-  resolveCandidatePayloadCapability,
-  sendRoomControlEvent,
+  sendBridgePlanReviewRequest,
+  startBridgePlanAttempt,
+  startBridgePlanTransferAttempt,
+  startBridgePlanTransformAttempt,
+  selectBridgePlanSearchCandidate,
   sendTextToRoom,
   writeTempFile,
 } from "../lib/tauri";
 import {
-  assertCapabilityEventHasSelectedPeerRoute,
   bridgeRoutePayload,
   enqueueTransferInputsWithBridgeRoute,
   sendTextToRoomWithBridgeRoute,
 } from "../lib/bridgeRoutingRuntime";
-import {
-  bridgePeerSessionId,
-  formatBridgeRouteErrorForUser,
-  type BridgeRoute,
-} from "../lib/bridgeRouting";
+import { bridgePeerSessionId, formatBridgeRouteErrorForUser, type BridgeRoute } from "../lib/bridgeRouting";
 import { legacyRoomToBridgePeerCollection } from "../lib/bridgeRoomAdapter";
 import {
   OperationTimeline,
@@ -41,84 +49,19 @@ import {
   type BridgePeerSession,
 } from "../lib/bridgePeers";
 import {
-  createRoomControlProductRegistry,
-  registerOutboundCapabilityPreview,
-  routeRoomControlInboxEvents,
-  type RoomControlProductRegistry,
-} from "../lib/agentBridge/roomControlProductRegistry";
-import {
   bridgePollingIntervalMs,
   reconcileSelectedPeerIds,
 } from "../lib/agentBridge/bridgeDetailPolling";
+import { useAgentBridgeRuntimeConfig } from "../lib/agentBridge";
 import {
-  buildCandidatePayloadExecutionRequest,
-  buildArtifactTransformExecutionRequest,
-  buildCandidatePayloadWorkflowPayloadPreview,
-  buildFileCandidateExecutionRequest,
-  buildPeerConsentStatusEvent,
-  buildSessionBoundCapabilityPreviewControlEvent,
-  confirmCandidatePayloadWorkflowSearch,
-  createCandidatePayloadWorkflow,
-  createControlQueueState,
-  createIdleRoomControlSendState,
-  createPeerConsentConsumptionState,
-  createPeerConsentSessionState,
-  denyPeerCapability,
-  markCandidatePayloadWorkflowPayloadPendingConsent,
-  markCandidatePayloadWorkflowPayloadAllowed,
-  markCandidatePayloadWorkflowSearchAllowed,
-  startCandidatePayloadWorkflowFromSearchAdvisory,
-  receiveCandidatePayloadWorkflowHandoffResult,
-  receiveCandidatePayloadWorkflowSearchResult,
-  allowPeerCapabilityOnce,
-  applyInboundPeerStatusToOutboundQueue,
-  enqueueInboundRoomControlEvents,
-  enqueueRoomControlEvent,
-  evaluatePeerCapabilityPreview,
-  executeInboundCandidatePayloadRequest,
-  executeInboundArtifactTransformRequest,
-  executeInboundFileCandidateRequest,
-  markControlQueueItemStatus,
-  matchExecutionResultToRequest,
-  processNextControlQueueItem,
-  roomControlSessionIdentity,
-  rustTransformReceiverHost,
-  useAgentBridgeRuntimeConfig,
-  type CapabilityExecuteRequestRoomControlEvent,
-  type CapabilityExecutionResultRoomControlEvent,
-  type CapabilityPreviewAckRoomControlEvent,
-  type CapabilityPreviewRoomControlEvent,
-  type CandidatePayloadHandoffResult,
-  type CandidatePayloadLocalResolution,
-  type CandidatePayloadWorkflow,
-  type ControlQueueItem,
-  type ControlQueueState,
-  type PeerConsentBinding,
-  type PeerConsentRecord,
-  type PeerConsentSessionState,
-  type PeerConsentConsumptionState,
-  type RoomControlEvent,
-  type RoomControlSendState,
-} from "../lib/agentBridge";
-import {
-  buildCapabilityRequestPreviewEnvelope,
-  buildArtifactTransformRequest,
   buildMockAiContextSnapshot,
-  buildNaturalV1SearchAdvisoryInput,
   CloudOpenAICompatibleProvider,
   CLOUD_STRICT_AI_CONTEXT_POLICY,
   generateMockAskBridgeNaturalV1Plan,
+  isSupportedBridgePlanSubmission,
   validateAskBridgeNaturalV1Plan,
-  type AiActionPlan,
   type AskBridgeNaturalV1Plan,
   type AiGenerateResult,
-  type CandidatePayloadExecutionRequest,
-  type CandidatePayloadExecutionResult,
-  type CandidatePayloadRequest,
-  type ArtifactTransformExecutionResult,
-  type ArtifactTransformRequest,
-  type FileCandidateExecutionResult,
-  type FileCandidateRequest,
 } from "../lib/ai";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
 import { formatBytes, formatCode, formatTimestamp } from "../lib/format";
@@ -129,6 +72,7 @@ import type {
   JoinRequestPrompt,
   NearbyDevice,
   RoomControlSessionContext,
+  ReceivedRoomControlEvent,
   RoomInfo,
   RoomItem,
 } from "../lib/types";
@@ -137,69 +81,13 @@ type PrimaryRoute = "bridge" | "activity" | "devices" | "settings";
 type BridgeTargetSelectionMode = "selected_peer" | "selected_peers" | "broadcast_bridge";
 type SafeSearchScope = "downloads" | "desktop" | "documents" | "pastey_shared";
 
-type RequestFileStatus =
-  | "idle"
-  | "search_preview_ready"
-  | "waiting_search_approval"
-  | "awaiting_peer"
-  | "search_denied"
-  | "candidates_found"
-  | "payload_request_sent"
-  | "payload_denied"
-  | "handoff_queued"
-  | "transform_request_sent"
-  | "transform_denied"
-  | "transform_unavailable"
-  | "failed";
-
-interface RequestFileProductState {
-  status: RequestFileStatus;
-  message: string | null;
-  steps: string[];
-  searchPreview: CapabilityPreviewRoomControlEvent | null;
-  payloadPreview: CapabilityPreviewRoomControlEvent | null;
-  peerReview: RequestFileReviewState | null;
-  latestResult: CapabilityExecutionResultRoomControlEvent | null;
-}
-
-interface RequestFileReviewState {
-  queueId: string;
-  event: CapabilityPreviewRoomControlEvent;
-  binding: PeerConsentBinding;
-  transformPromptId?: string;
-}
-
-const REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE = "Ask Bridge requires one selected device.";
-const REQUEST_FILE_LIFECYCLE_STEPS = [
-  "Search prepared",
-  "Host validated safe scopes",
-  "You confirmed",
-  "Peer approved search",
-  "Peer denied search",
-  "Candidates returned",
-  "Candidate selected",
-  "Payload request sent",
-  "Peer approved transfer",
-  "Peer denied transfer",
-  "Handoff queued",
-  "Transfer completed",
-  "Transform prepared",
-  "Sender confirmed",
-  "Peer requested",
-  "Peer approved Transform",
-  "Peer denied Transform",
-  "Candidate revalidated",
-  "Transform started",
-  "Typed result returned",
-  "Transform unavailable",
-] as const;
-
 const SAFE_SEARCH_SCOPES: Array<{ value: SafeSearchScope; label: string }> = [
   { value: "downloads", label: "Downloads" },
   { value: "desktop", label: "Desktop" },
   { value: "documents", label: "Documents" },
   { value: "pastey_shared", label: "Pastey Shared" },
 ];
+const BRIDGE_PLAN_REQUIRES_ONE_SELECTED_DEVICE = "Ask Bridge requires one selected device.";
 
 interface BridgePageProps {
   rooms: RoomInfo[];
@@ -387,7 +275,6 @@ interface BridgeDetailPageProps {
   onRefresh: () => Promise<void>;
   onLeaveOrBurn: (room: RoomInfo, action: "leave" | "burn") => Promise<void>;
   onEnqueueTransferInputs: (roomId: string, inputs: TransferQueueInput[]) => void;
-  onEnqueueCandidatePayloadHandoff: (roomId: string, input: TransferQueueInput) => boolean;
   onOpenActivity: () => void;
 }
 
@@ -401,7 +288,6 @@ export function BridgeDetailPage({
   onRefresh,
   onLeaveOrBurn,
   onEnqueueTransferInputs,
-  onEnqueueCandidatePayloadHandoff,
   onOpenActivity,
 }: BridgeDetailPageProps) {
   const [text, setText] = useState("");
@@ -412,11 +298,9 @@ export function BridgeDetailPage({
   const [selectedPeerIds, setSelectedPeerIds] = useState<string[]>([]);
   const [controlSession, setControlSession] = useState<RoomControlSessionContext | null>(null);
   const controlSessionRef = useRef<RoomControlSessionContext | null>(null);
-  const roomControlRegistryRef = useRef<RoomControlProductRegistry>(createRoomControlProductRegistry());
   const refreshInFlightRef = useRef(false);
   const refreshBridgeControlInboxRef = useRef<() => Promise<void>>(async () => {});
-  const [requestInboxBatch, setRequestInboxBatch] = useState<RoomControlEvent[]>([]);
-  const [requestPollingActive, setRequestPollingActive] = useState(false);
+  const [bridgePlanInboxBatch, setBridgePlanInboxBatch] = useState<ReceivedRoomControlEvent[]>([]);
   const [localDeviceProfile, setLocalDeviceProfile] = useState<DeviceProfile | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const enqueueDroppedFilesRef = useRef<(paths: string[]) => void>(() => {});
@@ -486,7 +370,7 @@ export function BridgeDetailPage({
     };
   }, [room.id, room.peer_connected, room.status]);
 
-  const roomControlPollingActive = requestPollingActive;
+  const roomControlPollingActive = true;
   refreshBridgeControlInboxRef.current = refreshBridgeControlInbox;
 
   useEffect(() => {
@@ -639,22 +523,11 @@ export function BridgeDetailPage({
 
   function applyControlSession(nextSession: RoomControlSessionContext | null) {
     const previous = controlSessionRef.current;
-    if (roomControlSessionIdentity(previous) !== roomControlSessionIdentity(nextSession)) {
-      roomControlRegistryRef.current = createRoomControlProductRegistry();
-      setRequestInboxBatch([]);
+    if (previous?.localSessionRef !== nextSession?.localSessionRef || previous?.peerSessionRef !== nextSession?.peerSessionRef) {
+      setBridgePlanInboxBatch([]);
     }
     controlSessionRef.current = nextSession;
     setControlSession(nextSession);
-  }
-
-  function registerProductPreview(
-    event: CapabilityPreviewRoomControlEvent,
-  ) {
-    roomControlRegistryRef.current = registerOutboundCapabilityPreview(
-      roomControlRegistryRef.current,
-      event,
-      "request_file",
-    );
   }
 
   async function refreshBridgeControlInbox() {
@@ -667,20 +540,13 @@ export function BridgeDetailPage({
     refreshInFlightRef.current = true;
     try {
       const events = await listReceivedRoomControlEvents(currentSession.roomId);
-      const routed = routeRoomControlInboxEvents(
-        roomControlRegistryRef.current,
-        events.map((event) => event.event),
-        {
-          expectedRoomRef: currentSession.roomId,
-          expectedSourceDeviceRef: currentSession.peerSessionRef,
-          expectedTargetPeerRef: currentSession.localSessionRef,
-        },
-      );
-      roomControlRegistryRef.current = routed.registry;
-      if (routed.requestFile.length > 0) {
-        setRequestInboxBatch((current) =>
-          [...current, ...routed.requestFile].slice(-256)
-        );
+      const bridgePlanEvents = events.filter((event) => event.kind.startsWith("bridge_plan."));
+      if (bridgePlanEvents.length > 0) {
+        setBridgePlanInboxBatch((current) => {
+          const byId = new Map(current.map((event) => [event.eventId, event]));
+          bridgePlanEvents.forEach((event) => byId.set(event.eventId, event));
+          return [...byId.values()].slice(-64);
+        });
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -761,20 +627,23 @@ export function BridgeDetailPage({
         </div>
       </Card>
 
-      <AskBridgePanel
+      <BridgePlanSenderPanel
         enabled={askBridgeBetaEnabled}
         config={bridgeConfig}
         room={room}
         selectedPeer={selectedSinglePeer}
         route={selectedRoute}
-        queueItems={queueItems}
-        transfers={transfers}
-        onEnqueueCandidatePayloadHandoff={onEnqueueCandidatePayloadHandoff}
-        inboxEvents={requestInboxBatch}
-        onRefresh={() => void refreshBridgeControlInbox()}
-        onPollingActiveChange={setRequestPollingActive}
-        onRegisterPreview={registerProductPreview}
+        inboxEvents={bridgePlanInboxBatch}
       />
+
+      <BridgePlanReceiverPanel
+        room={room}
+        route={selectedRoute}
+        inboxEvents={bridgePlanInboxBatch}
+        onRefresh={() => void refreshBridgeControlInbox()}
+      />
+
+      <BridgePlanWorkspacePanel room={room} />
 
       <Card className="recent-activity-card">
         <div className="section-row">
@@ -790,1255 +659,774 @@ export function BridgeDetailPage({
   );
 }
 
-function AskBridgePanel({
+interface ReviewedBridgePlan {
+  approvalId: string;
+  description: string;
+}
+
+interface StartedBridgePlanAttempt {
+  approvalId: string;
+  attemptId: string;
+}
+
+interface StartedBridgePlanTransfer {
+  approvalId: string;
+  attemptId: string;
+  requesterDirect: boolean;
+}
+interface StartedBridgePlanTransform {
+  approvalId: string;
+  attemptId: string;
+}
+
+function BridgePlanReceiverPanel({
+  room,
+  route,
+  inboxEvents,
+  onRefresh,
+}: {
+  room: RoomInfo;
+  route: BridgeRoute | null;
+  inboxEvents: readonly ReceivedRoomControlEvent[];
+  onRefresh: () => void;
+}) {
+  const [decisions, setDecisions] = useState<Record<string, "allow" | "deny">>({});
+  const [runningAttempts, setRunningAttempts] = useState<Record<string, "running" | "completed" | "failed">>({});
+  const [message, setMessage] = useState<string | null>(null);
+  const reviewedPlans = useMemo(
+    () => inboxEvents.flatMap(parseReviewedBridgePlan),
+    [inboxEvents],
+  );
+  const startedAttempts = useMemo(
+    () => inboxEvents.flatMap(parseStartedBridgePlanAttempt),
+    [inboxEvents],
+  );
+  const startedTransfers = useMemo(
+    () => inboxEvents.flatMap(parseStartedBridgePlanTransfer),
+    [inboxEvents],
+  );
+  const startedTransforms = useMemo(
+    () => inboxEvents.flatMap(parseStartedBridgePlanTransform),
+    [inboxEvents],
+  );
+  const singlePeerRoute = route?.target.kind === "selected_peer" ? route : null;
+
+  useEffect(() => {
+    setDecisions({});
+    setRunningAttempts({});
+    setMessage(null);
+  }, [room.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all(reviewedPlans.map(async (plan) => ({
+      approvalId: plan.approvalId,
+      decision: await bridgePlanReceiverReviewStatus(room.id, plan.approvalId),
+    }))).then((statuses) => {
+      if (cancelled) return;
+      setDecisions((current) => {
+        const next = { ...current };
+        statuses.forEach(({ approvalId, decision }) => {
+          if (decision) next[approvalId] = decision;
+        });
+        return next;
+      });
+    }).catch(() => {
+      // An absent local decision is a safe pending state; the Rust decision
+      // command remains authoritative when the user acts.
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [reviewedPlans, room.id]);
+
+  async function decide(plan: ReviewedBridgePlan, allow: boolean) {
+    if (!singlePeerRoute) {
+      setMessage("Select the requesting device before reviewing this plan.");
+      return;
+    }
+    setMessage(null);
+    try {
+      await decideBridgePlanReview(
+        room.id,
+        plan.approvalId,
+        allow,
+        bridgeRoutePayload(singlePeerRoute, "pastey-bridge-control-route-v1"),
+      );
+      setDecisions((current) => ({ ...current, [plan.approvalId]: allow ? "allow" : "deny" }));
+      setMessage(allow ? "Plan approved. Waiting for the requester to start it." : "Plan denied. No search will run.");
+      onRefresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "The plan decision could not be sent.");
+    }
+  }
+
+  async function runSearch(attempt: StartedBridgePlanAttempt) {
+    if (!singlePeerRoute) {
+      setMessage("Select the requesting device before running this plan.");
+      return;
+    }
+    setRunningAttempts((current) => ({ ...current, [attempt.attemptId]: "running" }));
+    setMessage("Searching the approved locations on this device…");
+    try {
+      await executeBridgePlanSearchAttempt(
+        room.id,
+        attempt.attemptId,
+        bridgeRoutePayload(singlePeerRoute, "pastey-bridge-control-route-v1"),
+      );
+      setRunningAttempts((current) => ({ ...current, [attempt.attemptId]: "completed" }));
+      setMessage("Search complete. The requester can see the result summary.");
+      onRefresh();
+    } catch (error) {
+      setRunningAttempts((current) => ({ ...current, [attempt.attemptId]: "failed" }));
+      setMessage(error instanceof Error ? error.message : "The approved search could not be completed.");
+    }
+  }
+
+  async function runTransfer(attempt: StartedBridgePlanTransfer) {
+    if (!singlePeerRoute) {
+      setMessage("Select the requesting device before completing this transfer.");
+      return;
+    }
+    setRunningAttempts((current) => ({ ...current, [`transfer:${attempt.attemptId}`]: "running" }));
+    setMessage("Transferring the selected file to the requesting device…");
+    try {
+      await executeBridgePlanTransferAttempt(
+        room.id,
+        attempt.attemptId,
+        bridgeRoutePayload(singlePeerRoute, "pastey-bridge-control-route-v1"),
+      );
+      setRunningAttempts((current) => ({ ...current, [`transfer:${attempt.attemptId}`]: "completed" }));
+      setMessage("Transfer complete.");
+      onRefresh();
+    } catch (error) {
+      setRunningAttempts((current) => ({ ...current, [`transfer:${attempt.attemptId}`]: "failed" }));
+      setMessage(error instanceof Error ? error.message : "The approved transfer could not be completed.");
+    }
+  }
+
+  async function runTransform(attempt: StartedBridgePlanTransform) {
+    if (!singlePeerRoute) { setMessage("Select the requesting device before processing this file."); return; }
+    setRunningAttempts((current) => ({ ...current, [`transform:${attempt.attemptId}`]: "running" }));
+    setMessage("Processing the selected file with the approved local capability…");
+    try {
+      await executeBridgePlanTransformAttempt(room.id, attempt.attemptId, bridgeRoutePayload(singlePeerRoute, "pastey-bridge-control-route-v1"));
+      setRunningAttempts((current) => ({ ...current, [`transform:${attempt.attemptId}`]: "completed" }));
+      setMessage("Transform complete. The generated result remains on this device."); onRefresh();
+    } catch (error) {
+      setRunningAttempts((current) => ({ ...current, [`transform:${attempt.attemptId}`]: "failed" }));
+      setMessage(error instanceof Error ? error.message : "The approved Transform could not be completed.");
+    }
+  }
+
+  const approvedAttempts = startedAttempts.filter((attempt) => decisions[attempt.approvalId] === "allow");
+  const approvedTransfers = startedTransfers.filter((attempt) => decisions[attempt.approvalId] === "allow");
+  const approvedTransforms = startedTransforms.filter((attempt) => decisions[attempt.approvalId] === "allow");
+  if (reviewedPlans.length === 0 && approvedAttempts.length === 0 && approvedTransfers.length === 0 && approvedTransforms.length === 0 && !message) return null;
+
+  return (
+    <Card className="ask-bridge-card" aria-label="Received Ask Bridge plan">
+      <div className="section-row">
+        <div>
+          <h2>Ask Bridge</h2>
+          <p className="muted">Plans from the selected device need your review before Pastey searches this device.</p>
+        </div>
+      </div>
+      {reviewedPlans.map((plan) => {
+        const decision = decisions[plan.approvalId];
+        return (
+          <div className="request-file-preview" key={plan.approvalId}>
+            <h3>Review plan</h3>
+            <p>{plan.description}</p>
+            {!decision ? (
+              <div className="button-row">
+                <button type="button" className="secondary-button" disabled={!singlePeerRoute} onClick={() => void decide(plan, false)}>
+                  Deny
+                </button>
+                <button type="button" className="primary-button" disabled={!singlePeerRoute} onClick={() => void decide(plan, true)}>
+                  Allow plan
+                </button>
+              </div>
+            ) : (
+              <p className={decision === "allow" ? "success-text" : "danger-text"}>
+                {decision === "allow" ? "Approved on this device." : "Denied on this device."}
+              </p>
+            )}
+          </div>
+        );
+      })}
+      {approvedAttempts.map((attempt) => {
+        const status = runningAttempts[attempt.attemptId];
+        return (
+          <div className="request-file-preview" key={attempt.attemptId}>
+            <h3>Approved plan ready</h3>
+            <p>Run the approved search on this device. Pastey will search only the reviewed locations and return a summary.</p>
+            {status === "completed" ? <p className="success-text">Search complete.</p> : null}
+            {status === "failed" ? <p className="danger-text">Search did not complete. Start a new approved attempt to try again.</p> : null}
+            {status !== "completed" ? (
+              <button type="button" className="primary-button" disabled={!singlePeerRoute || status === "running"} onClick={() => void runSearch(attempt)}>
+                {status === "running" ? "Searching…" : "Run search"}
+              </button>
+            ) : null}
+          </div>
+        );
+      })}
+      {approvedTransfers.map((attempt) => {
+        const status = runningAttempts[`transfer:${attempt.attemptId}`];
+        return (
+          <div className="request-file-preview" key={`transfer-${attempt.attemptId}`}>
+            <h3>{attempt.requesterDirect ? "Approved incoming transfer" : "Approved transfer ready"}</h3>
+            <p>{attempt.requesterDirect ? "The requesting device is transferring its reviewed local file to this device." : "Transfer the file selected by the requester from the reviewed search results."}</p>
+            {status === "completed" ? <p className="success-text">Transfer complete.</p> : null}
+            {status === "failed" ? <p className="danger-text">Transfer did not complete. Start a new plan to try again.</p> : null}
+            {!attempt.requesterDirect && status !== "completed" ? (
+              <button type="button" className="primary-button" disabled={!singlePeerRoute || status === "running"} onClick={() => void runTransfer(attempt)}>
+                {status === "running" ? "Transferring…" : "Transfer selected file"}
+              </button>
+            ) : null}
+          </div>
+        );
+      })}
+      {approvedTransforms.map((attempt) => {
+        const status = runningAttempts[`transform:${attempt.attemptId}`];
+        return <div className="request-file-preview" key={`transform-${attempt.attemptId}`}><h3>Approved transform ready</h3><p>Process the requester-selected file with the reviewed local capability.</p>{status === "completed" ? <p className="success-text">Transform complete; the result remains local.</p> : null}{status === "failed" ? <p className="danger-text">Transform did not complete. Start a new approved plan to try again.</p> : null}{status !== "completed" ? <button type="button" className="primary-button" disabled={!singlePeerRoute || status === "running"} onClick={() => void runTransform(attempt)}>{status === "running" ? "Processing…" : "Process selected file"}</button> : null}</div>;
+      })}
+      {message ? <p className="muted" role="status">{message}</p> : null}
+    </Card>
+  );
+}
+
+function BridgePlanSenderPanel({
   enabled,
   config,
   room,
   selectedPeer,
   route,
-  queueItems,
-  transfers,
-  onEnqueueCandidatePayloadHandoff,
   inboxEvents,
-  onRefresh,
-  onPollingActiveChange,
-  onRegisterPreview,
 }: {
   enabled: boolean;
   config: ReturnType<typeof useAgentBridgeRuntimeConfig>;
   room: RoomInfo;
   selectedPeer: BridgePeerSession | null;
   route: BridgeRoute | null;
-  queueItems: TransferQueueItem[];
-  transfers: FileTransferProgressEvent[];
-  onEnqueueCandidatePayloadHandoff: (roomId: string, input: TransferQueueInput) => boolean;
-  inboxEvents: readonly RoomControlEvent[];
-  onRefresh: () => void;
-  onPollingActiveChange: (active: boolean) => void;
-  onRegisterPreview: (event: CapabilityPreviewRoomControlEvent) => void;
+  inboxEvents: readonly ReceivedRoomControlEvent[];
 }) {
-  const [naturalInput, setNaturalInput] = useState("");
-  const [naturalPlan, setNaturalPlan] = useState<AskBridgeNaturalV1Plan | null>(null);
-  const [providerMessage, setProviderMessage] = useState<string | null>(null);
-  const [planning, setPlanning] = useState(false);
-  const [workflow, setWorkflow] = useState<CandidatePayloadWorkflow>(() => createCandidatePayloadWorkflow());
-  const workflowRef = useRef<CandidatePayloadWorkflow>(workflow);
-  const [selectedCandidateId, setSelectedCandidateId] = useState("");
-  const [session, setSession] = useState<RoomControlSessionContext | null>(null);
-  const sessionRef = useRef<RoomControlSessionContext | null>(null);
-  const [queue, setQueue] = useState<ControlQueueState>(createControlQueueState);
-  const queueRef = useRef<ControlQueueState>(queue);
-  const pumpInFlightRef = useRef(false);
-  const [sendState, setSendState] = useState<RoomControlSendState>(createIdleRoomControlSendState);
-  const [peerConsentSession, setPeerConsentSession] =
-    useState<PeerConsentSessionState>(createPeerConsentSessionState);
-  const [peerConsentRecords, setPeerConsentRecords] = useState<PeerConsentRecord[]>([]);
-  const [consumptionState, setConsumptionState] =
-    useState<PeerConsentConsumptionState>(createPeerConsentConsumptionState);
-  const [flow, setFlow] = useState<RequestFileProductState>(() => createRequestFileProductState());
-  const candidates = workflow.snapshot.candidates ?? [];
-  const requiresOnePeer = !selectedPeer || route?.target.kind !== "selected_peer";
-  const hasSupportedSearchPlan = naturalPlan?.status === "supported" && naturalPlan.steps[0]?.primitive === "Search";
-  const canRequestSearch = Boolean(enabled && !requiresOnePeer && session && hasSupportedSearchPlan);
-  const canConfirmSearch = Boolean(flow.searchPreview && flow.status === "search_preview_ready");
-  const canRequestFile = Boolean(!requiresOnePeer && session && selectedCandidateId && workflow.snapshot.state === "candidate_selection_required");
-  const isTransformPlan = naturalPlan?.status === "supported"
-    && naturalPlan.steps.some((step) => step.primitive === "Transform" && step.transformKind === "selected_artifact_output")
-    && naturalPlan.steps.some((step) => step.primitive === "Return" && step.returnKind === "typed_transform_result");
-  const isSelectedFileReturnPlan = naturalPlan?.status === "supported"
-    && naturalPlan.steps.some((step) => step.primitive === "Return" && step.returnKind === "selected_file");
-  const selectedCandidate = candidates.find((candidate) => candidate.candidateId === selectedCandidateId) ?? null;
-  const relatedQueueItem = selectedCandidateId
-    ? queueItems.find((item) => item.agentBridgeMetadata?.candidateId === selectedCandidateId) ?? null
-    : null;
-  const relatedTransfer = relatedQueueItem
-    ? transfers.find((transfer) => transfer.queue_item_id === relatedQueueItem.id || transfer.item_id === relatedQueueItem.id) ?? null
-    : null;
-  const displaySteps = requestFileStepsWithTransfer(flow.steps, relatedQueueItem, relatedTransfer);
+  const [input, setInput] = useState("");
+  const [advisory, setAdvisory] = useState<AskBridgeNaturalV1Plan | null>(null);
+  const [revisionId, setRevisionId] = useState<string | null>(null);
+  const [approvalId, setApprovalId] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState<"plan" | "review" | "start" | null>(null);
+  const [approvalState, setApprovalState] = useState<string | null>(null);
+  const [resultSummary, setResultSummary] = useState<string | null>(null);
+  const [attemptId, setAttemptId] = useState<string | null>(null);
+  const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(null);
+  const [hasTransform, setHasTransform] = useState(false);
+  const [directTransfer, setDirectTransfer] = useState(false);
+  const selectedPeerRoute = route?.target.kind === "selected_peer" ? route : null;
+  const canPlan = enabled && Boolean(selectedPeer && selectedPeerRoute);
+  const safeSearchCandidates = useMemo(
+    () => inboxEvents.flatMap(parseBridgePlanSearchCandidates).filter((entry) => !attemptId || entry.attemptId === attemptId),
+    [attemptId, inboxEvents],
+  );
+  const transformedAttemptIds = useMemo(
+    () => new Set(inboxEvents.flatMap(parseCompletedBridgePlanTransform)),
+    [inboxEvents],
+  );
+  const failedTransformAttemptIds = useMemo(
+    () => new Set(inboxEvents.flatMap(parseFailedBridgePlanTransform)),
+    [inboxEvents],
+  );
 
   useEffect(() => {
-    workflowRef.current = workflow;
-  }, [workflow]);
+    setAdvisory(null);
+    setRevisionId(null);
+    setApprovalId(null);
+    setApprovalState(null);
+    setResultSummary(null);
+    setAttemptId(null);
+    setSelectedCandidateId(null);
+    setDirectTransfer(false);
+    setMessage(null);
+  }, [room.id, selectedPeer?.peerSessionId]);
 
   useEffect(() => {
+    if (!approvalId) return;
     let cancelled = false;
-    if (!selectedPeer || room.status !== "active" || !room.peer_connected) {
-      applySession(null);
-      return;
-    }
-    void getRoomControlSessionContext(room.id)
-      .then((nextSession) => {
-        if (!cancelled) applySession(nextSession);
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          applySession(null);
-          setFlow((current) => ({
-            ...current,
-            status: "failed",
-            message: err instanceof Error ? err.message : String(err),
-          }));
-        }
+    const refresh = async () => {
+      try {
+        const workspace = await listBridgePlanWorkspace(room.id);
+        if (cancelled) return;
+        const approval = workspace.approvals
+          .map(parseBridgePlanApproval)
+          .find((entry): entry is { approvalId: string; state: string } => entry?.approvalId === approvalId);
+        if (approval) setApprovalState(approval.state);
+        const attemptIds = new Set(
+          workspace.attempts
+            .map(parseBridgePlanAttempt)
+            .filter((entry): entry is { approvalId: string; attemptId: string } => entry?.approvalId === approvalId)
+            .map((entry) => entry.attemptId),
+        );
+        const currentAttemptIds = [...attemptIds];
+        const latestAttemptId = currentAttemptIds.length > 0 ? currentAttemptIds[currentAttemptIds.length - 1] : null;
+        setAttemptId(latestAttemptId);
+        const result = workspace.results
+          .map(parseBridgePlanResult)
+          .find((entry): entry is { attemptId: string; summary: string } => Boolean(entry && attemptIds.has(entry.attemptId)));
+        if (result) setResultSummary(result.summary);
+      } catch (error) {
+        if (!cancelled) setMessage(error instanceof Error ? error.message : "Could not refresh the plan status.");
+      }
+    };
+    let timeout: number | null = null;
+    const poll = () => {
+      void refresh().finally(() => {
+        if (!cancelled) timeout = window.setTimeout(poll, 2_000);
       });
+    };
+    poll();
     return () => {
       cancelled = true;
+      if (timeout !== null) window.clearTimeout(timeout);
     };
-  }, [room.id, room.status, room.peer_connected, selectedPeer?.peerSessionId]);
+  }, [approvalId, room.id]);
 
-  useEffect(() => {
-    onPollingActiveChange(isRequestFilePollingActive(flow.status));
-    return () => onPollingActiveChange(false);
-  }, [flow.status, onPollingActiveChange]);
-
-  useEffect(() => {
-    const currentSession = sessionRef.current;
-    if (!currentSession || inboxEvents.length === 0) return;
-    const integrated = enqueueInboundRoomControlEvents(
-      queueRef.current,
-      inboxEvents,
-      {
-        expectedRoomRef: currentSession.roomId,
-        expectedSourceDeviceRef: currentSession.peerSessionRef,
-        expectedTargetPeerRef: currentSession.localSessionRef,
-      },
-    );
-    applyQueue(integrated.state);
-    void pumpRequestFileQueue();
-  }, [inboxEvents, session]);
-
-  function applySession(nextSession: RoomControlSessionContext | null) {
-    const previous = sessionRef.current;
-    if (roomControlSessionIdentity(previous) !== roomControlSessionIdentity(nextSession)) {
-      const freshQueue = createControlQueueState();
-      queueRef.current = freshQueue;
-      setQueue(freshQueue);
-      setSendState(createIdleRoomControlSendState());
-      setPeerConsentSession(createPeerConsentSessionState());
-      setPeerConsentRecords([]);
-      setConsumptionState(createPeerConsentConsumptionState());
-      const fresh = createCandidatePayloadWorkflow();
-      workflowRef.current = fresh;
-      setWorkflow(fresh);
-      setSelectedCandidateId("");
-      setFlow(createRequestFileProductState());
-      setNaturalPlan(null);
-      setProviderMessage(null);
-    }
-    sessionRef.current = nextSession;
-    setSession(nextSession);
-  }
-
-  function applyWorkflow(nextWorkflow: CandidatePayloadWorkflow) {
-    workflowRef.current = nextWorkflow;
-    setWorkflow(nextWorkflow);
-  }
-
-  function applyQueue(nextQueue: ControlQueueState) {
-    queueRef.current = nextQueue;
-    setQueue(nextQueue);
-  }
-
-  async function handlePlanNaturalInput() {
-    if (!enabled) {
-      setFlow((current) => ({ ...current, status: "idle", message: "Enable Labs in Settings to use Ask Bridge." }));
+  async function createPlan() {
+    if (!canPlan || !selectedPeerRoute) {
+      setMessage(BRIDGE_PLAN_REQUIRES_ONE_SELECTED_DEVICE);
       return;
     }
-    const trimmed = naturalInput.trim();
-    if (!trimmed) {
-      setFlow((current) => ({ ...current, status: "idle", message: "Type what you want Ask Bridge to search for." }));
+    const userGoal = input.trim();
+    if (!userGoal) {
+      setMessage("Describe the file you want to search for.");
       return;
     }
-    setPlanning(true);
-    setProviderMessage(null);
+    setBusy("plan");
+    setMessage(null);
     try {
       const generated = config.providerKind === "cloud" && config.cloudBaseUrl.trim() && config.cloudModel.trim() && config.cloudApiKey.trim()
-        ? await generateCloudNaturalPlan(trimmed, config)
-        : await generateMockAskBridgeNaturalV1Plan(trimmed);
+        ? await generateCloudNaturalPlan(userGoal, config)
+        : await generateMockAskBridgeNaturalV1Plan(userGoal);
       const validation = validateAskBridgeNaturalV1Plan(generated.parsedPlan);
-      if (!validation.valid) {
-        setNaturalPlan(null);
-        setFlow((current) => ({
-          ...current,
-          status: "failed",
-          message: validation.errors.join(" "),
-        }));
-        setProviderMessage("Provider plan failed closed. No peer request was sent.");
+      if (!validation.valid || validation.value.status !== "supported") {
+        setAdvisory(null);
+        setMessage(validation.valid ? validation.value.unsupportedReason ?? "This plan is not supported." : validation.errors.join(" "));
         return;
       }
-      setNaturalPlan(validation.value);
-      setProviderMessage(generated.error
-        ? `${generated.error.code}: ${generated.error.message}. Deterministic planning is still available.`
-        : config.providerKind === "cloud" && config.cloudApiKey.trim()
-          ? "Provider advisory validated locally. No peer request has been sent."
-          : "Deterministic planner used locally. No model or network call occurred.");
-      setFlow((current) => ({
-        ...current,
-        status: validation.value.status === "supported" ? "idle" : "failed",
-        message: validation.value.status === "supported"
-          ? `${validation.value.steps.map((step) => step.primitive).join(" / ")} plan ready. Confirm before any peer request is sent.`
-          : validation.value.unsupportedReason ?? "Transform is recognized but unsupported in natural-v1.",
-        steps: [],
-        searchPreview: null,
-        payloadPreview: null,
-        latestResult: null,
-      }));
-      setSelectedCandidateId("");
-    } finally {
-      setPlanning(false);
-    }
-  }
-
-  function handlePrepareSearch() {
-    if (requiresOnePeer || !selectedPeer || !session) {
-      setFlow((current) => ({
-        ...current,
-        status: "idle",
-        message: REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE,
-      }));
-      return;
-    }
-    if (!naturalPlan) {
-      setFlow((current) => ({ ...current, status: "idle", message: "Preview a Search, Transform, or Return plan first." }));
-      return;
-    }
-    if (naturalPlan.status !== "supported") {
-      setFlow((current) => ({
-        ...current,
-        status: "failed",
-        message: naturalPlan.unsupportedReason ?? "This Ask Bridge plan is unsupported.",
-      }));
-      return;
-    }
-    const prepared = prepareCandidateSearchWorkflow(naturalPlan, session.peerSessionRef);
-    const started = startCandidatePayloadWorkflowFromSearchAdvisory(createCandidatePayloadWorkflow(), prepared.plan, prepared.context);
-    const confirmed = started.ok
-      ? confirmCandidatePayloadWorkflowSearch(started.workflow, {
-          sourceDeviceRef: session.localSessionRef,
+      const search = validation.value.steps.find((step) => step.primitive === "Search");
+      const transform = validation.value.steps.find((step) => step.primitive === "Transform");
+      const transfer = validation.value.steps.find((step) => step.primitive === "Transfer");
+      const transferToRequester = Boolean(transfer
+        && transfer.primitive === "Transfer"
+        && transfer.destination === "requesting_device");
+      const supportsTransfer = Boolean(
+        transfer
+        && transfer.primitive === "Transfer"
+        && (transfer.destination === "requesting_device" || transfer.destination === "selected_device")
+        && (validation.value.steps.length === 2 || (validation.value.steps.length === 3 && Boolean(transform))),
+      );
+      const supportsTransform = Boolean(transform
+        && transform.primitive === "Transform"
+        && (validation.value.steps.length === 2 || (validation.value.steps.length === 3 && supportsTransfer)));
+      if (!search || !isSupportedBridgePlanSubmission(validation.value) || (!supportsTransfer && validation.value.steps.length !== 1 && !supportsTransform)) {
+        setAdvisory(validation.value);
+        setMessage("Pastey can currently run Search, Search followed by Transfer to the requesting device, and supported readable-text Transform plans. Other reviewed combinations are not available yet.");
+        return;
+      }
+      const workspace = supportsTransform
+        ? await createFileTransformBridgePlan({
+          roomId: room.id,
+          originalUserGoal: userGoal,
+          filenameHint: search.filenameHint,
+          extensions: search.extensions,
+          safeScopes: search.safeScopes,
+          transferToRequester: supportsTransfer,
+          transferDestination: transfer?.primitive === "Transfer" && transfer.destination === "selected_device" ? "selected_device" : "requesting_device",
+          transformIntent: transform?.primitive === "Transform" ? transform.intent : "process the selected file",
         })
-      : null;
-    if (!started.ok) {
-      applyWorkflow(started.workflow);
-      setFlow((current) => ({
-        ...current,
-        status: "failed",
-        message: started.errors.join(" "),
-      }));
-      return;
+        : await createFileSearchBridgePlan({
+          roomId: room.id,
+          originalUserGoal: userGoal,
+          filenameHint: search.filenameHint,
+          extensions: search.extensions,
+          safeScopes: search.safeScopes,
+          transferToRequester: supportsTransfer,
+          transferDestination: transfer?.primitive === "Transfer" && transfer.destination === "selected_device" ? "selected_device" : "requesting_device",
+        });
+      const revision = workspace.revisions.map(parseBridgePlanRevision).filter((entry): entry is { revisionId: string; state: string } => entry?.state === "available").pop();
+      if (!revision) throw new Error("Pastey did not return the durable Search plan.");
+      setAdvisory(validation.value);
+      setRevisionId(revision.revisionId);
+      setApprovalId(null);
+      setApprovalState(null);
+      setResultSummary(null);
+      setHasTransform(supportsTransform);
+      setMessage(supportsTransform
+        ? supportsTransfer ? "Plan ready. Review the complete Search, Transform, and Transfer plan before sending it to the selected device." : "Plan ready. Review the complete Search and Transform plan before sending it to the selected device."
+        : supportsTransfer ? "Plan ready. Review the complete Search and Transfer plan before sending it to the selected device." : "Plan ready. Review the complete Search plan before sending it to the selected device.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Pastey could not create the Search plan.");
+    } finally {
+      setBusy(null);
     }
-    if (!confirmed?.ok) {
-      applyWorkflow(confirmed?.workflow ?? started.workflow);
-      setFlow((current) => ({
-        ...current,
-        status: "failed",
-        message: confirmed?.errors.join(" ") ?? "Search preview could not be confirmed.",
-      }));
-      return;
-    }
-    const preview = buildRequestFilePreviewEvent(confirmed.request, session);
-    if (!preview.ok) {
-      applyWorkflow(confirmed.workflow);
-      setFlow((current) => ({ ...current, status: "failed", message: preview.errors.join(" ") }));
-      return;
-    }
-    applyWorkflow(confirmed.workflow);
-    setSelectedCandidateId("");
-    setFlow({
-      status: "search_preview_ready",
-      message: "Search preview ready. Confirm plan before asking the selected device.",
-      steps: ["Search prepared", "Host validated safe scopes"],
-      searchPreview: preview.event,
-      payloadPreview: null,
-      peerReview: null,
-      latestResult: null,
-    });
   }
 
-  async function handleConfirmSearch() {
-    if (!flow.searchPreview) {
-      handlePrepareSearch();
-      return;
-    }
-    onRegisterPreview(flow.searchPreview);
-    const queued = enqueueRoomControlEvent(queueRef.current, flow.searchPreview, "outbound");
-    if (!queued.ok) {
-      setFlow((current) => ({ ...current, status: "failed", message: queued.errors.join(" ") }));
-      return;
-    }
-    setFlow((current) => ({
-      ...current,
-      status: "waiting_search_approval",
-      message: "Waiting for the selected device to approve metadata search.",
-      steps: mergeRequestFileSteps(current.steps, ["You confirmed"]),
-    }));
-    applyQueue(queued.state);
-    await pumpRequestFileQueue();
-  }
-
-  function handleSelectCandidate(candidateId: string) {
-    setSelectedCandidateId(candidateId);
-    setFlow((current) => ({
-      ...current,
-      message: "Candidate selected. Request selected file when ready.",
-      steps: mergeRequestFileSteps(current.steps, ["Candidate selected"]),
-    }));
-  }
-
-  async function handleRequestSelectedFile() {
-    if (!isSelectedFileReturnPlan) {
-      setFlow((current) => ({ ...current, status: "failed", message: "This Ask Bridge plan returns a typed Transform result, not a selected file." }));
-      return;
-    }
-    if (requiresOnePeer || !selectedPeer || !session || !selectedCandidateId) {
-      setFlow((current) => ({
-        ...current,
-        status: current.status,
-        message: selectedCandidateId ? REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE : "Choose candidate first.",
-      }));
-      return;
-    }
-    const prepared = naturalPlan
-      ? prepareCandidateSearchWorkflow(naturalPlan, session.peerSessionRef)
-      : null;
-    if (!prepared) {
-      setFlow((current) => ({ ...current, status: "failed", message: "Search / Return plan is unavailable." }));
-      return;
-    }
-    const preview = buildCandidatePayloadWorkflowPayloadPreview(
-      workflowRef.current,
-      { candidateId: selectedCandidateId, selectedByUser: true },
-      prepared.context,
-      { sourceDeviceRef: session.localSessionRef },
-    );
-    if (!preview.ok) {
-      applyWorkflow(preview.workflow);
-      setFlow((current) => ({ ...current, status: "failed", message: preview.errors.join(" ") }));
-      return;
-    }
-    const previewEvent = buildRequestFilePreviewEvent(preview.request, session);
-    if (!previewEvent.ok) {
-      applyWorkflow(preview.workflow);
-      setFlow((current) => ({ ...current, status: "failed", message: previewEvent.errors.join(" ") }));
-      return;
-    }
-    const pending = markCandidatePayloadWorkflowPayloadPendingConsent(preview.workflow);
-    if (!pending.ok) {
-      applyWorkflow(pending.workflow);
-      setFlow((current) => ({ ...current, status: "failed", message: pending.errors.join(" ") }));
-      return;
-    }
-    onRegisterPreview(previewEvent.event);
-    const queued = enqueueRoomControlEvent(queueRef.current, previewEvent.event, "outbound");
-    if (!queued.ok) {
-      applyWorkflow(pending.workflow);
-      setFlow((current) => ({ ...current, status: "failed", message: queued.errors.join(" ") }));
-      return;
-    }
-    applyWorkflow(pending.workflow);
-    setFlow((current) => ({
-      ...current,
-      status: "payload_request_sent",
-      message: "Payload request sent. Waiting for second receiver consent.",
-      payloadPreview: previewEvent.event,
-      steps: mergeRequestFileSteps(current.steps, ["Candidate selected", "Payload request sent"]),
-    }));
-    applyQueue(queued.state);
-    await pumpRequestFileQueue();
-  }
-
-  async function handleRequestTransform() {
-    if (requiresOnePeer || !session || !selectedCandidate || !isTransformPlan) {
-      setFlow((current) => ({ ...current, status: "failed", message: selectedCandidate ? "Select a supported Transform plan first." : "Choose candidate first." }));
-      return;
-    }
-    const built = buildArtifactTransformRequest({
-      sourceCapability: "filesystem.find_file_candidates",
-      sourceRequestId: selectedCandidate.sourceRequestId,
-      candidateId: selectedCandidate.candidateId,
-      candidateKind: "filesystem_file",
-      resultContract: "typed_transform_result",
-      targetPeerRef: session.peerSessionRef,
-      sourceDeviceRef: session.localSessionRef,
-    });
-    if (!built.ok) {
-      setFlow((current) => ({ ...current, status: "failed", message: built.errors.join(" ") }));
-      return;
-    }
-    const preview = buildRequestFilePreviewEvent(built.request, session);
-    if (!preview.ok) {
-      setFlow((current) => ({ ...current, status: "failed", message: preview.errors.join(" ") }));
-      return;
-    }
-    onRegisterPreview(preview.event);
-    const queued = enqueueRoomControlEvent(queueRef.current, preview.event, "outbound");
-    if (!queued.ok) {
-      setFlow((current) => ({ ...current, status: "failed", message: queued.errors.join(" ") }));
-      return;
-    }
-    setFlow((current) => ({
-      ...current,
-      status: "transform_request_sent",
-      message: "Transform prepared. Waiting for selected-device approval.",
-      payloadPreview: preview.event,
-      steps: mergeRequestFileSteps(current.steps, ["Transform prepared", "Sender confirmed", "Peer requested"]),
-    }));
-    applyQueue(queued.state);
-    await pumpRequestFileQueue();
-  }
-
-  async function decideRequestFileReview(decision: "allow_once" | "deny") {
-    if (!flow.peerReview) {
-      setFlow((current) => ({ ...current, message: "No Ask Bridge approval is waiting on this device." }));
-      return;
-    }
-    const now = new Date();
-    const initialDecision = decision === "allow_once"
-      ? allowPeerCapabilityOnce(flow.peerReview.binding, peerConsentSession, { now })
-      : denyPeerCapability(flow.peerReview.binding, peerConsentSession, { now });
-    if (!initialDecision.ok) {
-      setFlow((current) => ({ ...current, status: "failed", message: initialDecision.errors.join(" ") }));
-      return;
-    }
-    let decisionResult = initialDecision;
-    if (decisionResult.record.binding.capability === "artifact.transform_selected") {
-      if (!flow.peerReview.transformPromptId || !session) {
-        setFlow((current) => ({ ...current, status: "failed", message: "Receiver-owned Transform consent prompt is unavailable." }));
-        return;
-      }
-      try {
-        const resolved = await resolveTransformConsentPrompt(session.roomId, flow.peerReview.transformPromptId, decision);
-        const binding = { ...decisionResult.record.binding, consentId: resolved.consentId } as PeerConsentBinding;
-        const record: PeerConsentRecord = {
-          ...decisionResult.record,
-          binding,
-          decidedAt: resolved.decidedAt ?? decisionResult.record.decidedAt,
-          status: resolved.status === "allowed_once" ? "allowed_once" : resolved.status === "denied" ? "denied" : "invalid",
-        };
-        decisionResult = {
-          ok: true,
-          record,
-          state: { ...decisionResult.state, consentIds: [...new Set([...decisionResult.state.consentIds, resolved.consentId])] },
-        };
-      } catch {
-        setFlow((current) => ({ ...current, status: "failed", message: "Receiver could not resolve the exact Transform consent prompt." }));
-        return;
-      }
-    }
-    const statusEvent = buildPeerConsentStatusEvent(flow.peerReview.event, decisionResult.record, { now });
-    if (!statusEvent.ok) {
-      setFlow((current) => ({ ...current, status: "failed", message: statusEvent.errors.join(" ") }));
-      return;
-    }
-    const reviewed = markControlQueueItemStatus(
-      queueRef.current,
-      flow.peerReview.queueId,
-      decision === "allow_once" ? "allowed_once" : "denied",
-      {
-        now,
-        reason: decision === "allow_once"
-          ? "Allowed once for this exact Ask Bridge capability."
-          : "Denied by receiver.",
-      },
-    );
-    if (!reviewed.ok) {
-      setFlow((current) => ({ ...current, status: "failed", message: reviewed.errors.join(" ") }));
-      return;
-    }
-    const outbound = enqueueRoomControlEvent(reviewed.state, statusEvent.event, "outbound", { now });
-    if (!outbound.ok) {
-      setFlow((current) => ({ ...current, status: "failed", message: outbound.errors.join(" ") }));
-      return;
-    }
-    setPeerConsentSession(decisionResult.state);
-    setPeerConsentRecords((records) => [...records, decisionResult.record]);
-    const deniedStep = flow.peerReview.binding.capability === "artifact.transform_selected"
-      ? "Peer denied Transform"
-      : flow.peerReview.binding.capability === "transfer.request_candidate_payload"
-      ? "Peer denied transfer"
-      : "Peer denied search";
-    setFlow((current) => ({
-      ...current,
-      status: decision === "allow_once"
-        ? current.peerReview?.binding.capability === "artifact.transform_selected"
-          ? "transform_request_sent"
-          : current.peerReview?.binding.capability === "transfer.request_candidate_payload"
-          ? "payload_request_sent"
-          : "waiting_search_approval"
-        : current.peerReview?.binding.capability === "artifact.transform_selected"
-          ? "transform_denied"
-          : current.peerReview?.binding.capability === "transfer.request_candidate_payload"
-          ? "payload_denied"
-          : "search_denied",
-      message: decision === "allow_once" ? "Allowed once. Waiting for the sender's execution request." : "Denied. Nothing will run.",
-      peerReview: null,
-      steps: decision === "allow_once" ? current.steps : mergeRequestFileSteps(current.steps, [deniedStep]),
-    }));
-    applyQueue(outbound.state);
-    await pumpRequestFileQueue();
-  }
-
-  async function pumpRequestFileQueue() {
-    if (pumpInFlightRef.current) return;
-    pumpInFlightRef.current = true;
+  async function requestReview() {
+    if (!revisionId || !selectedPeerRoute) return;
+    setBusy("review");
+    setMessage(null);
     try {
-      let nextQueue = queueRef.current;
-      for (let index = 0; index < 10; index += 1) {
-        const result = await processNextControlQueueItem(
-          nextQueue,
-          (event) => sendRequestFileControlEvent(event),
-          {
-            onState: (state) => {
-              nextQueue = state;
-              applyQueue(state);
-            },
-            onSendState: setSendState,
-          },
-        );
-        nextQueue = result.state;
-        applyQueue(nextQueue);
-        if (!result.ok) {
-          if (result.action !== "no_selectable_item") {
-            setFlow((current) => ({ ...current, status: "failed", message: result.message }));
-          }
-          return;
-        }
-        if (result.action === "selected_inbound") {
-          nextQueue = await handleRequestFileInbound(nextQueue, result.item);
-          applyQueue(nextQueue);
-          if (result.item.event.kind === "capability_preview") return;
-        }
-      }
+      const nextApprovalId = `bridge-plan-approval-${crypto.randomUUID()}`;
+      await approveBridgePlan(revisionId, nextApprovalId, true);
+      await sendBridgePlanReviewRequest(
+        nextApprovalId,
+        bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"),
+      );
+      setApprovalId(nextApprovalId);
+      setApprovalState("awaiting_receiver");
+      setMessage("Waiting for the selected device to review the complete plan.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Pastey could not send the plan for review.");
     } finally {
-      pumpInFlightRef.current = false;
+      setBusy(null);
     }
   }
 
-  async function handleRequestFileInbound(
-    state: ControlQueueState,
-    item: ControlQueueItem,
-  ): Promise<ControlQueueState> {
-    if (!session) return state;
-
-    if (item.event.kind === "capability_preview") {
-      const previewEvent = item.event as CapabilityPreviewRoomControlEvent;
-      const capability = previewEvent.payload.request.capability;
-      if (capability !== "filesystem.find_file_candidates" && capability !== "transfer.request_candidate_payload" && capability !== "artifact.transform_selected") {
-        const invalid = markControlQueueItemStatus(state, item.queueId, "invalid", {
-          reason: "Ask Bridge accepts only Search, Transform, or Return requests.",
-        });
-        setFlow((current) => ({ ...current, status: "failed", message: "Unknown capability request rejected." }));
-        return invalid.state;
-      }
-      const policy = evaluatePeerCapabilityPreview(previewEvent, {
-        roomRef: session.roomId,
-        sourceDeviceRef: session.peerSessionRef,
-        targetPeerRef: session.localSessionRef,
-        session: peerConsentSession,
+  async function createDirectTransferPlan() {
+    if (!canPlan) return;
+    setBusy("plan");
+    setMessage(null);
+    try {
+      const selected = await open({ multiple: false, directory: false });
+      if (typeof selected !== "string") return;
+      const workspace = await createDirectFileTransferBridgePlan({
+        roomId: room.id,
+        originalUserGoal: "Transfer one selected local file to the selected device.",
+        sourcePath: selected,
       });
-      if (policy.status === "rejected") {
-        const invalid = markControlQueueItemStatus(state, item.queueId, "invalid", {
-          reason: policy.errors.join(" ").slice(0, 512),
-        });
-        setFlow((current) => ({ ...current, status: "failed", message: policy.errors.join(" ") }));
-        return invalid.state;
-      }
-      const awaiting = markControlQueueItemStatus(state, item.queueId, "awaiting_peer_decision", {
-        reason: "Receiver PolicyGate accepted this exact Ask Bridge preview.",
-      });
-      if (!awaiting.ok) {
-        setFlow((current) => ({ ...current, status: "failed", message: awaiting.errors.join(" ") }));
-        return state;
-      }
-      if (capability === "artifact.transform_selected") {
-        // Production has no verified sandbox. Reject before creating a Rust prompt,
-        // reservation, operation, or lease; future available wiring creates the
-        // receiver-owned prompt from the authenticated inbox record at this point.
-        const unavailable = markControlQueueItemStatus(awaiting.state, item.queueId, "invalid", {
-          reason: "Transform is unavailable because no verified sandbox is available.",
-        });
-        setFlow((current) => ({
-          ...current,
-          status: "failed",
-          message: "Transform was rejected because no verified sandbox is available.",
-          steps: mergeRequestFileSteps(current.steps, ["Transform prepared", "Peer requested"]),
-        }));
-        return unavailable.state;
-      }
-      setFlow((current) => ({
-        ...current,
-        status: "awaiting_peer",
-        message: capability === "transfer.request_candidate_payload"
-          ? "This device received a selected-candidate payload request."
-          : "This device received a metadata-only search request.",
-        peerReview: {
-          queueId: item.queueId,
-          event: previewEvent,
-          binding: policy.binding,
-        },
-      }));
-      return awaiting.state;
-    }
+      const revision = workspace.revisions.map(parseBridgePlanRevision).filter((entry): entry is { revisionId: string; state: string } => entry?.state === "available").pop();
+      if (!revision) throw new Error("Pastey did not return the direct Transfer plan.");
+      setAdvisory({ schemaVersion: "ask-bridge-natural-v1", title: "Transfer a file", status: "supported", requiresUserConfirmation: true, steps: [{ primitive: "Transfer", destination: "selected_device", object: "selected_file" }] });
+      setRevisionId(revision.revisionId);
+      setApprovalId(null); setApprovalState(null); setAttemptId(null); setSelectedCandidateId(null);
+      setHasTransform(false); setDirectTransfer(true);
+      setMessage("Plan ready. Review the complete Transfer plan before sending it to the selected device.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Pastey could not create the direct Transfer plan.");
+    } finally { setBusy(null); }
+  }
 
-    if (item.event.kind === "capability_preview_ack" || item.event.kind === "capability_preview_deny") {
-      const decisionEvent = item.event;
-      const applied = applyInboundPeerStatusToOutboundQueue(state, decisionEvent);
-      if (!applied.ok) {
-        setFlow((current) => ({ ...current, status: "failed", message: applied.errors.join(" ") }));
-        return state;
-      }
-      const marked = markControlQueueItemStatus(
-        applied.state,
-        item.queueId,
-        decisionEvent.payload.status,
-        { reason: "Peer returned an Ask Bridge decision." },
+  async function startAttempt() {
+    if (!approvalId || !selectedPeerRoute) return;
+    setBusy("start");
+    setMessage(null);
+    try {
+      const attemptId = `bridge-plan-attempt-${crypto.randomUUID()}`;
+      await startBridgePlanAttempt(
+        approvalId,
+        attemptId,
+        bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"),
       );
-      if (!marked.ok) {
-        setFlow((current) => ({ ...current, status: "failed", message: marked.errors.join(" ") }));
-        return state;
+      setApprovalState("running");
+      if (directTransfer) {
+        await executeDirectBridgePlanTransferAttempt(room.id, attemptId);
+        setMessage("Transfer complete.");
+      } else {
+        setMessage("The selected device can now run the approved Search.");
       }
-      const decisionPreview = marked.state.outbound.find(
-        (candidate): candidate is ControlQueueItem & { event: CapabilityPreviewRoomControlEvent } =>
-          candidate.event.kind === "capability_preview" &&
-          candidate.event.payload.request.requestId === decisionEvent.payload.requestId,
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Pastey could not start the approved plan.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function selectCandidate(candidateId: string) {
+    if (!attemptId || !selectedPeerRoute) return;
+    setBusy("start");
+    setMessage(null);
+    try {
+      await selectBridgePlanSearchCandidate(
+        room.id,
+        attemptId,
+        candidateId,
+        bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"),
       );
-      const decisionCapability = decisionPreview?.event.payload.request.capability;
-      if (decisionEvent.kind === "capability_preview_deny") {
-        if (decisionCapability === "artifact.transform_selected") {
-          setFlow((current) => ({
-            ...current,
-            status: "transform_denied",
-            message: "The selected device denied Transform.",
-            steps: mergeRequestFileSteps(current.steps, ["Peer denied Transform"]),
-          }));
-          return marked.state;
-        }
-        const deniedStep = decisionCapability === "transfer.request_candidate_payload"
-          ? "Peer denied transfer"
-          : "Peer denied search";
-        setFlow((current) => ({
-          ...current,
-          status: decisionCapability === "transfer.request_candidate_payload" ? "payload_denied" : "search_denied",
-          message: decisionCapability === "transfer.request_candidate_payload"
-            ? "The selected device denied the payload request."
-            : "The selected device denied the metadata search.",
-          steps: mergeRequestFileSteps(current.steps, [deniedStep]),
-        }));
-        return marked.state;
-      }
-      const ackEvent = decisionEvent as CapabilityPreviewAckRoomControlEvent;
-      if (!ackEvent.payload.consent) return marked.state;
-      const requestItem = marked.state.outbound.find(
-        (candidate): candidate is ControlQueueItem & { event: CapabilityPreviewRoomControlEvent } =>
-          candidate.event.kind === "capability_preview"
-          && candidate.event.eventId === ackEvent.payload.consent?.sourcePreviewEventId,
-      );
-      if (!requestItem) {
-        setFlow((current) => ({ ...current, status: "failed", message: "The exact Ask Bridge preview for this Allow once response is unavailable." }));
-        return marked.state;
-      }
-      const capability = requestItem.event.payload.request.capability;
-      const execution = capability === "filesystem.find_file_candidates"
-        ? buildFileCandidateExecutionRequest(requestItem.event, ackEvent)
-        : capability === "transfer.request_candidate_payload"
-          ? buildCandidatePayloadExecutionRequest(requestItem.event, ackEvent)
-          : capability === "artifact.transform_selected"
-            ? buildArtifactTransformExecutionRequest(requestItem.event, ackEvent)
-          : { ok: false as const, errors: ["Ask Bridge received an unsupported capability acknowledgement."] };
-      if (!execution.ok) {
-        setFlow((current) => ({ ...current, status: "failed", message: execution.errors.join(" ") }));
-        return marked.state;
-      }
-      const queued = enqueueRoomControlEvent(marked.state, execution.event, "outbound");
-      if (!queued.ok) {
-        setFlow((current) => ({ ...current, status: "failed", message: queued.errors.join(" ") }));
-        return marked.state;
-      }
-      if (capability === "filesystem.find_file_candidates") {
-        const allowed = markCandidatePayloadWorkflowSearchAllowed(workflowRef.current);
-        if (allowed.ok) applyWorkflow(allowed.workflow);
-      } else if (capability === "transfer.request_candidate_payload") {
-        const allowed = markCandidatePayloadWorkflowPayloadAllowed(workflowRef.current);
-        if (allowed.ok) applyWorkflow(allowed.workflow);
-      }
-      setFlow((current) => ({
-        ...current,
-        status: capability === "artifact.transform_selected" ? "transform_request_sent" : capability === "filesystem.find_file_candidates" ? "waiting_search_approval" : "payload_request_sent",
-        message: capability === "filesystem.find_file_candidates"
-          ? "Peer approved search. Running metadata-only search."
-          : capability === "artifact.transform_selected"
-            ? "Peer approved Transform. Revalidating the selected artifact."
-            : "Peer approved transfer. Requesting handoff.",
-        steps: capability === "filesystem.find_file_candidates"
-          ? mergeRequestFileSteps(current.steps, ["Peer approved search"])
-          : capability === "artifact.transform_selected"
-            ? mergeRequestFileSteps(current.steps, ["Peer approved Transform"])
-            : mergeRequestFileSteps(current.steps, ["Peer approved transfer"]),
-      }));
-      return queued.state;
+      if (hasTransform) await startBridgePlanTransformAttempt(room.id, attemptId, bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"));
+      else await startBridgePlanTransferAttempt(room.id, attemptId, bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"));
+      setSelectedCandidateId(candidateId);
+      setMessage(hasTransform ? "The selected device can now process the chosen file." : "The selected device can now transfer the chosen file.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Pastey could not start the approved transfer.");
+    } finally {
+      setBusy(null);
     }
-
-    if (item.event.kind === "capability_execute_request") {
-      const capability = item.event.payload.capability;
-      if (capability === "filesystem.find_file_candidates") {
-        return executeRequestFileSearch(state, item as ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent });
-      }
-      if (capability === "transfer.request_candidate_payload") {
-        return executeRequestFilePayload(state, item as ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent });
-      }
-      if (capability === "artifact.transform_selected") {
-        return executeRequestTransform(state, item as ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent });
-      }
-    }
-
-    if (item.event.kind === "capability_execution_result") {
-      return receiveRequestFileResult(state, item as ControlQueueItem & { event: CapabilityExecutionResultRoomControlEvent });
-    }
-
-    return state;
   }
 
-  async function executeRequestFileSearch(
-    state: ControlQueueState,
-    item: ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent },
-  ): Promise<ControlQueueState> {
-    if (!session) return state;
-    const consent = peerConsentRecords.find((record) => record.binding.consentId === item.event.payload.consentId);
-    const execution = await executeInboundFileCandidateRequest(
-      item.event,
-      consent,
-      consumptionState,
-      executeFileCandidateSearchCapability,
-      {
-        roomRef: session.roomId,
-        sourceDeviceRef: session.peerSessionRef,
-        targetPeerRef: session.localSessionRef,
-      },
-    );
-    return enqueueRequestFileExecutionResult(state, item, execution.state, execution.resultEvent, execution.result.status === "completed"
-      ? "Exact search consent consumed. Metadata-only candidates returned."
-      : `Search rejected: ${execution.result.errorCode ?? execution.result.status}.`);
+  async function transferGeneratedResult() {
+    if (!attemptId || !selectedPeerRoute) return;
+    setBusy("start");
+    setMessage(null);
+    try {
+      await startBridgePlanTransferAttempt(room.id, attemptId, bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"));
+      setMessage("The selected device can now transfer the generated result.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Pastey could not start the approved transfer.");
+    } finally { setBusy(null); }
   }
 
-  async function executeRequestFilePayload(
-    state: ControlQueueState,
-    item: ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent },
-  ): Promise<ControlQueueState> {
-    if (!session) return state;
-    const consent = peerConsentRecords.find((record) => record.binding.consentId === item.event.payload.consentId);
-    const execution = await executeInboundCandidatePayloadRequest(
-      item.event,
-      consent,
-      consumptionState,
-      resolveCandidatePayloadCapability,
-      enqueueCandidatePayloadHandoff,
-      {
-        roomRef: session.roomId,
-        sourceDeviceRef: session.peerSessionRef,
-        targetPeerRef: session.localSessionRef,
-      },
-    );
-    return enqueueRequestFileExecutionResult(state, item, execution.state, execution.resultEvent, execution.result.status === "handoff_queued"
-      ? "Exact payload consent consumed. Handoff queued."
-      : `Payload request rejected: ${execution.result.errorCode ?? execution.result.status}.`);
+  async function proposeTransformFallback() {
+    if (!revisionId) return;
+    setBusy("plan");
+    setMessage(null);
+    try {
+      const workspace = await proposeBridgePlanTransformFallback(revisionId);
+      const revision = workspace.revisions.map(parseBridgePlanRevision).filter((entry): entry is { revisionId: string; state: string } => entry?.state === "available").pop();
+      if (!revision) throw new Error("Pastey did not create the revised plan.");
+      setRevisionId(revision.revisionId);
+      setApprovalId(null); setApprovalState(null); setAttemptId(null); setSelectedCandidateId(null); setHasTransform(false);
+      setMessage("A new unapproved alternative removed the unavailable processing step. Review it again before sending it to the selected device.");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not create a revised plan."); }
+    finally { setBusy(null); }
   }
 
-  async function executeRequestTransform(
-    state: ControlQueueState,
-    item: ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent },
-  ): Promise<ControlQueueState> {
-    if (!session) return state;
-    const consent = peerConsentRecords.find((record) => record.binding.consentId === item.event.payload.consentId);
-    const execution = await executeInboundArtifactTransformRequest(
-      item.event,
-      consent,
-      consumptionState,
-      rustTransformReceiverHost,
-      { roomRef: session.roomId, sourceDeviceRef: session.peerSessionRef, targetPeerRef: session.localSessionRef },
-    );
-    const lifecycleSteps = [
-      ...(execution.lifecycle.includes("revalidated") ? ["Candidate revalidated"] : []),
-      ...(execution.lifecycle.includes("executor_started") ? ["Transform started"] : []),
-    ] as const;
-    if (lifecycleSteps.length) {
-      setFlow((current) => ({ ...current, steps: mergeRequestFileSteps(current.steps, lifecycleSteps) }));
-    }
-    const completed = markControlQueueItemStatus(
-      state,
-      item.queueId,
-      execution.executed ? "execution_consumed" : "invalid",
-      {
-        reason: execution.errorCode === "sandbox_unavailable"
-          ? "Transform was rejected because no verified sandbox is available."
-          : `Receiver-host Transform terminal state: ${execution.terminalCategory ?? execution.errorCode ?? "rejected"}.`,
-      },
-    );
-    return completed.state;
-  }
-
-  function enqueueRequestFileExecutionResult(
-    state: ControlQueueState,
-    item: ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent },
-    nextConsumption: PeerConsentConsumptionState,
-    resultEvent: CapabilityExecutionResultRoomControlEvent,
-    reason: string,
-  ): ControlQueueState {
-    const completed = markControlQueueItemStatus(
-      state,
-      item.queueId,
-      resultEvent.payload.status === "completed" || resultEvent.payload.status === "handoff_queued"
-        ? "execution_consumed"
-        : "execution_rejected",
-      { reason },
-    );
-    if (!completed.ok) {
-      setFlow((current) => ({ ...current, status: "failed", message: completed.errors.join(" ") }));
-      return state;
-    }
-    const outbound = enqueueRoomControlEvent(completed.state, resultEvent, "outbound");
-    if (!outbound.ok) {
-      setFlow((current) => ({ ...current, status: "failed", message: outbound.errors.join(" ") }));
-      return completed.state;
-    }
-    setConsumptionState(nextConsumption);
-    const isTransformResult = "capability" in resultEvent.payload && resultEvent.payload.capability === "artifact.transform_selected";
-    setFlow((current) => ({
-      ...current,
-      status: isTransformResult
-        ? resultEvent.payload.errorCode === "sandbox_unavailable" ? "transform_unavailable" : "failed"
-        : resultEvent.payload.status === "handoff_queued"
-        ? "handoff_queued"
-        : resultEvent.payload.status === "completed"
-          ? "idle"
-          : "failed",
-      message: isTransformResult
-        ? "Transform is unavailable: Pastey has no verified sandbox and did not run anything."
-        : resultEvent.payload.status === "handoff_queued"
-        ? "Handoff queued. Existing transfer pipeline owns progress and completion."
-        : resultEvent.payload.status === "completed"
-          ? "Metadata-only search result returned to the requesting device."
-          : `Ask Bridge execution failed: ${resultEvent.payload.errorCode ?? resultEvent.payload.status}.`,
-      latestResult: resultEvent,
-    }));
-    return outbound.state;
-  }
-
-  function receiveRequestFileResult(
-    state: ControlQueueState,
-    item: ControlQueueItem & { event: CapabilityExecutionResultRoomControlEvent },
-  ): ControlQueueState {
-    const resultEvent = item.event;
-    const requestItem = state.outbound.find(
-      (candidate): candidate is ControlQueueItem & { event: CapabilityExecuteRequestRoomControlEvent } =>
-        candidate.event.kind === "capability_execute_request"
-        && matchExecutionResultToRequest(resultEvent, candidate.event),
-    );
-    const resultStatus = resultEvent.payload.status === "completed" || resultEvent.payload.status === "handoff_queued"
-      ? "execution_succeeded"
-      : resultEvent.payload.status === "already_consumed"
-        ? "already_consumed"
-        : resultEvent.payload.status === "failed"
-          ? "execution_failed"
-          : "execution_rejected";
-    const matched = requestItem
-      ? markControlQueueItemStatus(state, requestItem.queueId, resultStatus, {
-          reason: resultStatus === "execution_succeeded"
-            ? "Peer returned Ask Bridge result."
-            : `Peer returned ${resultEvent.payload.errorCode ?? resultEvent.payload.status}.`,
-        })
-      : { ok: false as const, state, errors: ["No matching Ask Bridge execution request was found."] };
-    const inbound = markControlQueueItemStatus(
-      matched.ok ? matched.state : state,
-      item.queueId,
-      matched.ok ? resultStatus : "invalid",
-      { reason: matched.ok ? "Matched Ask Bridge result." : matched.errors.join(" ") },
-    );
-
-    if ("capability" in resultEvent.payload && resultEvent.payload.capability === "filesystem.find_file_candidates") {
-      const received = receiveCandidatePayloadWorkflowSearchResult(
-        workflowRef.current,
-        resultEvent.payload as FileCandidateExecutionResult,
-      );
-      applyWorkflow(received.workflow);
-      setFlow((current) => ({
-        ...current,
-        status: received.ok ? "candidates_found" : "failed",
-        message: received.ok
-          ? `${received.workflow.snapshot.candidates?.length ?? 0} redacted candidate(s) returned.`
-          : received.errors.join(" "),
-        latestResult: resultEvent,
-        steps: received.ok ? mergeRequestFileSteps(current.steps, ["Candidates returned"]) : current.steps,
-      }));
-    } else if ("capability" in resultEvent.payload && resultEvent.payload.capability === "transfer.request_candidate_payload") {
-      const received = receiveCandidatePayloadWorkflowHandoffResult(
-        workflowRef.current,
-        resultEvent.payload as CandidatePayloadExecutionResult,
-      );
-      applyWorkflow(received.workflow);
-      setFlow((current) => ({
-        ...current,
-        status: received.ok ? "handoff_queued" : "failed",
-        message: received.ok
-          ? "Handoff queued. Existing transfer pipeline owns progress and completion."
-          : received.errors.join(" "),
-        latestResult: resultEvent,
-        steps: received.ok ? mergeRequestFileSteps(current.steps, ["Handoff queued"]) : current.steps,
-      }));
-    } else if ("capability" in resultEvent.payload && resultEvent.payload.capability === "artifact.transform_selected") {
-      const transform = resultEvent.payload as ArtifactTransformExecutionResult;
-      setFlow((current) => ({
-        ...current,
-        status: transform.status === "completed" ? "idle" : transform.errorCode === "sandbox_unavailable" ? "transform_unavailable" : "failed",
-        message: transform.status === "completed"
-          ? "Typed Transform result returned."
-          : transform.errorCode === "sandbox_unavailable"
-            ? "Transform unavailable: no verified sandbox ran anything."
-            : `Transform rejected: ${transform.errorCode ?? transform.status}.`,
-        latestResult: resultEvent,
-        steps: transform.status === "completed" ? mergeRequestFileSteps(current.steps, ["Typed result returned"]) : mergeRequestFileSteps(current.steps, ["Transform unavailable"]),
-      }));
-    }
-    return inbound.state;
-  }
-
-  async function enqueueCandidatePayloadHandoff(
-    request: CandidatePayloadExecutionRequest,
-    resolution: CandidatePayloadLocalResolution,
-  ): Promise<CandidatePayloadHandoffResult> {
-    if (!session || request.capability !== "transfer.request_candidate_payload" || !resolution.receiverLocalSource) {
-      return { queued: false, errorCode: "unsupported_route" };
-    }
-    const modifiedMs = typeof resolution.modifiedAt === "string" ? Date.parse(resolution.modifiedAt) : Number.NaN;
-    if (
-      resolution.candidateKind !== "filesystem_file" ||
-      typeof resolution.sizeBytes !== "number" ||
-      !Number.isFinite(modifiedMs)
-    ) {
-      return { queued: false, errorCode: "handoff_failed" };
-    }
-    const targetPeerSessionId = session.peerRouteRef ?? session.peerSessionRef;
-    const queued = onEnqueueCandidatePayloadHandoff(room.id, {
-      path: resolution.receiverLocalSource,
-      displayName: resolution.displayName ?? request.candidateDisplayName,
-      mimeType: "application/octet-stream",
-      sizeBytes: resolution.sizeBytes,
-      modifiedMs,
-      dedupeKey: [
-        "agent-bridge-candidate-payload",
-        request.sourceRequestId,
-        request.candidateId,
-        request.candidateKind,
-        resolution.sizeBytes,
-        modifiedMs,
-      ].join(":"),
-      bridgeRoute: {
-        bridgeSessionId: `legacy-room:${session.roomId}`,
-        target: {
-          kind: "selected_peer",
-          peerSessionId: bridgePeerSessionId(targetPeerSessionId),
-        },
-      },
-      bridgeOperationId: `agent-bridge-candidate:${request.requestId}:${request.executionId}`,
-      bridgeTargetKind: "selected_peer",
-      bridgeContentKind: "file",
-      targetPeerSessionId,
-      targetPeerDisplayName: selectedPeer?.displayName ?? room.peer_device_name ?? "selected peer",
-      targetCount: 1,
-      agentBridgeMetadata: {
-        origin: "agent_bridge_candidate_payload",
-        label: "Agent Bridge candidate payload request",
-        note: "Queued from approved candidate payload request.",
-        sourceCapability: "filesystem.find_file_candidates",
-        requestCapability: "transfer.request_candidate_payload",
-        sourceRequestId: request.sourceRequestId,
-        candidateId: request.candidateId,
-        candidateKind: "filesystem_file",
-        candidateDisplayName: resolution.displayName ?? request.candidateDisplayName,
-        requestedByPeerRef: request.sourceDeviceRef,
-        approvedByPeerRef: request.targetPeerRef,
-        consentId: request.consentId,
-        agentBridgeRequestId: request.requestId,
-        handoffCreatedAt: new Date().toISOString(),
-        sizeBytes: resolution.sizeBytes,
-        extension: resolution.extension,
-        mimeFamily: resolution.mimeFamily,
-      },
-    });
-    return queued ? { queued: true } : { queued: false, errorCode: "handoff_failed" };
-  }
-
-  async function sendRequestFileControlEvent(event: RoomControlEvent) {
-    const currentSession = sessionRef.current;
-    if (!currentSession) {
-      throw new Error("Ask Bridge requires an active selected-peer Bridge session.");
-    }
-    const selectedRoute = assertCapabilityEventHasSelectedPeerRoute(currentSession, event);
-    return sendRoomControlEvent(
-      currentSession.roomId,
-      event,
-      bridgeRoutePayload(selectedRoute, "pastey-bridge-control-route-v1"),
-    );
-  }
-
+  if (!enabled) return null;
   return (
-    <Card className="request-file-panel" data-testid="ask-bridge-natural-v1">
+    <Card className="ask-bridge-card">
       <div className="section-row">
         <div>
           <h2>Ask Bridge</h2>
-          <p className="muted">{selectedPeer && !requiresOnePeer ? `Selected device: ${selectedPeer.displayName}` : REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE}</p>
+          <p className="muted">Create one complete, reviewable plan for the selected device. Pastey never runs it until both devices approve the plan.</p>
         </div>
-        <StatusChip tone={enabled && selectedPeer && !requiresOnePeer ? "success" : "neutral"}>{enabled ? "natural-v1" : "Disabled"}</StatusChip>
       </div>
-      <div className="find-search-grid">
-        <label className="field-label">
-          <span>Ask Bridge</span>
-          <textarea
-            value={naturalInput}
-            onChange={(event) => setNaturalInput(event.target.value)}
-            placeholder="Find the report PDF on my other device and return it to me..."
-            aria-label="Ask Bridge natural-language request"
-            data-testid="ask-bridge-natural-input"
-          />
-        </label>
-      </div>
+      <textarea
+        value={input}
+        onChange={(event) => setInput(event.target.value)}
+        placeholder="Find my report PDF on this device"
+        aria-label="Ask Bridge request"
+      />
       <div className="button-row">
-        <button type="button" className="secondary-button" disabled={!enabled || planning || !naturalInput.trim()} onClick={() => void handlePlanNaturalInput()}>
-          {planning ? "Previewing..." : "Preview plan"}
+        <button type="button" className="primary-button" disabled={!canPlan || busy !== null} onClick={() => void createPlan()}>
+          {busy === "plan" ? "Planning…" : "Create plan"}
         </button>
-        <button type="button" className="primary-button" disabled={!canRequestSearch} onClick={handlePrepareSearch}>
-          Confirm Search plan
-        </button>
-        <button type="button" className="secondary-button" disabled={!canRequestFile} onClick={() => void handleRequestSelectedFile()}>
-          Return selected file
-        </button>
-        <button type="button" className="secondary-button" disabled={!canRequestFile || !isTransformPlan} onClick={() => void handleRequestTransform()}>
-          Transform selected artifact
+        <button type="button" className="secondary-button" disabled={!canPlan || busy !== null} onClick={() => void createDirectTransferPlan()}>
+          Transfer local file
         </button>
       </div>
-      {naturalPlan ? (
-        <div className="request-file-preview" role="status" data-testid="ask-bridge-plan-preview">
-          <span className="agent-bridge-status-label">Search / Transform / Return</span>
-          <strong>{naturalPlan.steps.map((step) => step.primitive).join(" -> ")}</strong>
-          <span className="muted">
-            {naturalPlan.status === "supported"
-              ? "Search returns metadata candidates only. Return waits for manual selection and second consent."
-              : naturalPlan.unsupportedReason}
-          </span>
+      {!canPlan ? <p className="muted">Select one connected device to create a plan.</p> : null}
+      {advisory && revisionId ? (
+        <div className="request-file-preview" data-testid="ask-bridge-plan-preview">
+          <h3>Review plan</h3>
+          <p>{directTransfer ? "Transfer the one local file you chose to the selected device after both devices approve this plan." : advisory.steps.some((step) => step.primitive === "Transform") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then process it locally with the reviewed capability." : advisory.steps.some((step) => step.primitive === "Transfer") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then transfer it to the approved destination." : "Search the selected device’s reviewed locations for matching files and return a bounded summary."}</p>
+          {!approvalId ? (
+            <button type="button" className="primary-button" disabled={busy !== null} onClick={() => void requestReview()}>
+              {busy === "review" ? "Sending…" : "Approve and send for review"}
+            </button>
+          ) : approvalState === "valid" ? (
+            <button type="button" className="primary-button" disabled={busy !== null} onClick={() => void startAttempt()}>
+              {busy === "start" ? "Starting…" : "Start approved plan"}
+            </button>
+          ) : null}
         </div>
       ) : null}
-      {providerMessage ? <p className="muted">{providerMessage}</p> : null}
-      {canConfirmSearch ? (
-        <div className="request-file-preview" role="status">
-          <span className="agent-bridge-status-label">Search preview</span>
-          <strong>Search selected device</strong>
-          <span className="muted">Metadata only. Safe scopes: {searchScopesForPlan(naturalPlan).map((scope) => SAFE_SEARCH_SCOPES.find((entry) => entry.value === scope)?.label ?? scope).join(", ")}.</span>
-          <div className="button-row">
-            <button type="button" className="primary-button" onClick={() => void handleConfirmSearch()}>Confirm Search</button>
-            <button type="button" className="secondary-button" onClick={() => setFlow(createRequestFileProductState())}>Cancel</button>
-          </div>
-        </div>
-      ) : null}
-      {flow.peerReview ? (
-        <div className="request-file-preview" data-testid="request-file-peer-review">
-          <span className="agent-bridge-status-label">Approval needed</span>
-          <strong>{flow.peerReview.binding.capability === "transfer.request_candidate_payload" ? "Allow Return of selected file once?" : "Allow Search once?"}</strong>
-          <span className="muted">
-            {flow.peerReview.binding.capability === "transfer.request_candidate_payload"
-              ? "This is separate from search consent. Pastey revalidates the selected candidate before queue handoff."
-              : "Search returns redacted metadata only and does not authorize transfer."}
-          </span>
-          <div className="button-row">
-            <button type="button" className="primary-button" onClick={() => void decideRequestFileReview("allow_once")}>Allow once</button>
-            <button type="button" className="secondary-button" onClick={() => void decideRequestFileReview("deny")}>Deny</button>
-          </div>
-        </div>
-      ) : null}
-      {candidates.length > 0 ? (
+      {approvalState === "awaiting_receiver" ? <p className="muted">Waiting for receiver review.</p> : null}
+      {approvalState === "denied" ? <p className="danger-text">The selected device denied this plan. Create a revised plan to try again.</p> : null}
+      {approvalState === "running" ? <p className="muted">Search is running on the selected device.</p> : null}
+      {resultSummary ? <p className="success-text">{resultSummary}</p> : null}
+      {safeSearchCandidates.length > 0 && advisory?.steps.some((step) => step.primitive === "Transfer" || step.primitive === "Transform") && !selectedCandidateId ? (
         <div className="candidate-card-list">
-          <h3>Choose candidate</h3>
-          {candidates.map((candidate) => (
-            <button
-              key={candidate.candidateId}
-              type="button"
-              className={`candidate-metadata-card ${selectedCandidateId === candidate.candidateId ? "selected" : ""}`}
-              onClick={() => handleSelectCandidate(candidate.candidateId)}
-            >
-              <strong>{candidate.candidateDisplayName}</strong>
-              <span>{formatBytes(candidate.sizeBytes)} - {candidate.extension || candidate.mimeFamily}</span>
+          <h3>Choose a file for the approved next step</h3>
+          {safeSearchCandidates.map((candidate) => (
+            <button key={candidate.candidateId} type="button" className="candidate-metadata-card" disabled={busy !== null} onClick={() => void selectCandidate(candidate.candidateId)}>
+              <strong>{candidate.displayName}</strong>
+              <span>{formatBytes(candidate.sizeBytes)} · {candidate.extension || candidate.mimeFamily}</span>
               <small>{candidate.matchReason}</small>
             </button>
           ))}
         </div>
       ) : null}
-      <div className="request-file-status-row">
-        <button type="button" className="secondary-button" onClick={onRefresh}>
-          Check for updates
-        </button>
-        <span className="muted">
-          {sendState.status === "sending"
-            ? "Sending capability event..."
-            : sendState.status === "accepted"
-              ? "Latest capability event delivered."
-              : sendState.status === "rejected"
-                ? sendState.message
-                : flow.message ?? (requiresOnePeer ? REQUEST_FILE_REQUIRES_ONE_SELECTED_DEVICE : "Ready.")}
-        </span>
-      </div>
-      <OperationTimeline
-        label="Ask Bridge lifecycle"
-        steps={buildOperationTimelineSteps(REQUEST_FILE_LIFECYCLE_STEPS, displaySteps)}
-        rows={requestFileLifecycleRows(flow, selectedCandidate, relatedQueueItem, relatedTransfer)}
-      />
-      <details className="ask-bridge-advanced-details">
-        <summary>Advanced details</summary>
-        <div className="agent-bridge-definition-list">
-          <FullValue label="Search capability" value={workflow.snapshot.search?.capability ?? "Not prepared"} />
-          <FullValue label="Search request" value={workflow.searchRequest?.requestId ?? "None"} />
-          <FullValue label="Payload capability" value={workflow.snapshot.payload?.capability ?? "Not prepared"} />
-          <FullValue label="Payload request" value={workflow.payloadRequest?.requestId ?? "None"} />
-          <FullValue label="Selected candidate" value={selectedCandidateId || "None"} />
-        </div>
-      </details>
+      {hasTransform && selectedCandidateId && attemptId && transformedAttemptIds.has(attemptId) && advisory?.steps.some((step) => step.primitive === "Transfer") ? (
+        <div className="request-file-preview"><h3>Generated result ready</h3><p>The approved Transform finished on the selected device. Transfer the generated result to the approved destination.</p><button type="button" className="primary-button" disabled={busy !== null} onClick={() => void transferGeneratedResult()}>{busy === "start" ? "Starting…" : "Transfer generated result"}</button></div>
+      ) : null}
+      {hasTransform && attemptId && failedTransformAttemptIds.has(attemptId) ? (
+        <div className="request-file-preview"><h3>Processing unavailable</h3><p>The selected device could not perform the approved Transform for this file. Create a new plan revision without that step; both devices must review it again.</p><button type="button" className="secondary-button" disabled={busy !== null} onClick={() => void proposeTransformFallback()}>{busy === "plan" ? "Preparing…" : "Create revised plan"}</button></div>
+      ) : null}
+      {message ? <p className="muted" role="status">{message}</p> : null}
     </Card>
   );
 }
 
-function buildRequestFilePreviewEvent(
-  request: FileCandidateRequest | CandidatePayloadRequest | ArtifactTransformRequest,
-  session: RoomControlSessionContext,
-): { ok: true; event: CapabilityPreviewRoomControlEvent } | { ok: false; errors: string[] } {
-  const envelope = buildCapabilityRequestPreviewEnvelope(request, {
-    roomRef: session.roomId,
-    sourceDeviceRef: session.localSessionRef,
-    targetPeerRef: session.peerSessionRef,
-  });
-  if (!envelope.ok) {
-    return { ok: false, errors: envelope.errors };
-  }
-  const preview = buildSessionBoundCapabilityPreviewControlEvent(envelope.envelope, session);
-  if (!preview.ok || preview.event.kind !== "capability_preview") {
-    return { ok: false, errors: preview.ok ? ["Ask Bridge preview builder produced the wrong event kind."] : preview.errors };
-  }
-  return { ok: true, event: preview.event };
-}
+function BridgePlanWorkspacePanel({ room }: { room: RoomInfo }) {
+  const [workspace, setWorkspace] = useState<{
+    plans: Array<{ description: string; state: string }>;
+    activity: string[];
+    results: string[];
+  }>({ plans: [], activity: [], results: [] });
+  const [error, setError] = useState<string | null>(null);
 
-function createRequestFileProductState(): RequestFileProductState {
-  return {
-    status: "idle",
-    message: null,
-    steps: [],
-    searchPreview: null,
-    payloadPreview: null,
-    peerReview: null,
-    latestResult: null,
+  const refresh = async () => {
+    try {
+      const records = await listBridgePlanWorkspace(room.id);
+      setWorkspace({
+        plans: records.revisions.map(parseBridgePlanWorkspaceRevision).filter((entry): entry is { description: string; state: string } => entry !== null),
+        activity: records.activities.map(parseBridgePlanActivity).filter((entry): entry is string => entry !== null).slice(-8),
+        results: records.results.map(parseBridgePlanResult).filter((entry): entry is { attemptId: string; summary: string } => entry !== null).map((entry) => entry.summary).slice(-8),
+      });
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Pastey could not load Bridge Plan history.");
+    }
   };
-}
 
-function mergeRequestFileSteps(
-  current: readonly string[],
-  next: readonly string[],
-): string[] {
-  return [...new Set([...current, ...next].filter((step) =>
-    (REQUEST_FILE_LIFECYCLE_STEPS as readonly string[]).includes(step)
-  ))];
-}
+  useEffect(() => {
+    void refresh();
+  }, [room.id]);
 
-function isRequestFileTerminal(status: RequestFileStatus): boolean {
-  return status === "search_denied"
-    || status === "payload_denied"
-    || status === "handoff_queued"
-    || status === "transform_denied"
-    || status === "transform_unavailable"
-    || status === "failed";
-}
-
-function isRequestFilePollingActive(status: RequestFileStatus): boolean {
-  return !isRequestFileTerminal(status) && (
-    status === "waiting_search_approval"
-    || status === "awaiting_peer"
-    || status === "payload_request_sent"
-    || status === "transform_request_sent"
+  if (workspace.plans.length === 0 && workspace.activity.length === 0 && workspace.results.length === 0 && !error) return null;
+  return (
+    <Card className="ask-bridge-card">
+      <div className="section-row">
+        <div>
+          <h2>Plan history</h2>
+          <p className="muted">Plan history stays with this Bridge until it is burned.</p>
+        </div>
+        <button type="button" className="text-button" onClick={() => void refresh()}>Refresh</button>
+      </div>
+      {workspace.plans.map((plan, index) => <p key={`${plan.description}-${index}`}>{plan.description} <span className="muted">({formatBridgePlanState(plan.state)})</span></p>)}
+      {workspace.activity.map((entry, index) => <p className="muted" key={`${entry}-${index}`}>{entry}</p>)}
+      {workspace.results.map((entry, index) => <p className="success-text" key={`${entry}-${index}`}>{entry}</p>)}
+      {error ? <p className="danger-text">{error}</p> : null}
+    </Card>
   );
 }
 
-function requestFileStepsWithTransfer(
-  current: readonly string[],
-  queueItem: TransferQueueItem | null,
-  transfer: FileTransferProgressEvent | null,
-): string[] {
-  const next = [...current];
-  if (queueItem) next.push("Handoff queued");
-  if (queueItem?.status === "completed" || transfer?.status === "completed") {
-    next.push("Transfer completed");
-  }
-  return mergeRequestFileSteps([], next);
+function parseBridgePlanWorkspaceRevision(value: unknown): { description: string; state: string } | null {
+  if (!isRecord(value) || !isRecord(value.revision) || !isRecord(value.revision.presentation) || typeof value.revision.presentation.natural_language_plan !== "string" || typeof value.state !== "string") return null;
+  return { description: value.revision.presentation.natural_language_plan, state: value.state };
 }
 
-function buildOperationTimelineSteps(
-  orderedLabels: readonly string[],
-  completedLabels: readonly string[],
-): OperationTimelineStep[] {
-  return orderedLabels
-    .filter((label) => completedLabels.includes(label))
-    .map((label, index, visibleLabels) => ({
-      id: normalizeOperationTimelineId(label),
-      label,
-      status: index === visibleLabels.length - 1 ? "active" : "complete",
-    }));
+function parseBridgePlanActivity(value: unknown): string | null {
+  return isRecord(value) && typeof value.summary === "string" ? value.summary : null;
 }
 
-function requestFileLifecycleRows(
-  flow: RequestFileProductState,
-  candidate: NonNullable<CandidatePayloadWorkflow["snapshot"]["candidates"]>[number] | null,
-  queueItem: TransferQueueItem | null,
-  transfer: FileTransferProgressEvent | null,
-): OperationTimelineRow[] {
-  const rows: OperationTimelineRow[] = [];
-  if (flow.status === "waiting_search_approval" || flow.status === "payload_request_sent" || flow.status === "awaiting_peer") {
-    rows.push(operationTimelineRow("Waiting for approval", "active", flow.message ?? "Receiver consent is required."));
-  }
-  if (flow.status === "candidates_found") {
-    rows.push(operationTimelineRow("Candidates found", "complete", flow.message ?? "Redacted metadata returned."));
-  }
-  if (flow.status === "search_denied" || flow.status === "payload_denied") {
-    rows.push(operationTimelineRow("Denied", "denied", flow.message ?? "The selected device denied the request."));
-  }
-  if (flow.status === "handoff_queued" || queueItem) {
-    rows.push(operationTimelineRow(
-      "Handoff queued",
-      "complete",
-      candidate ? `${candidate.candidateDisplayName} is in the existing transfer queue.` : "Existing transfer pipeline owns progress.",
-    ));
-  }
-  if (queueItem?.status === "sending" || transfer?.status === "transferring") {
-    rows.push(operationTimelineRow(
-      "Transfer started",
-      "active",
-      transfer ? `${formatBytes(transfer.transferred_bytes)} of ${formatBytes(transfer.file_size)}` : queueItem?.displayName ?? "Sending.",
-    ));
-  }
-  if (queueItem?.status === "completed" || transfer?.status === "completed") {
-    rows.push(operationTimelineRow("Transfer complete", "complete", queueItem?.displayName ?? transfer?.file_name ?? "Completed."));
-  }
-  if (flow.status === "failed" || queueItem?.status === "failed" || transfer?.status === "failed") {
-    rows.push(operationTimelineRow("Failed", "failed", flow.message ?? queueItem?.errorMessage ?? transfer?.error_message ?? "Ask Bridge failed."));
-  }
-  return rows;
+function formatBridgePlanState(state: string): string {
+  return state.replace(/_/g, " ");
 }
 
-function operationTimelineRow(
-  label: string,
-  status: OperationTimelineStatus,
-  detail: string,
-): OperationTimelineRow {
-  return {
-    id: `${normalizeOperationTimelineId(label)}:${normalizeOperationTimelineId(detail)}`,
-    label,
-    status,
-    detail,
-  };
+function parseBridgePlanRevision(value: unknown): { revisionId: string; state: string } | null {
+  if (!isRecord(value) || !isRecord(value.revision) || typeof value.revision.revision_id !== "string" || typeof value.state !== "string") return null;
+  return { revisionId: value.revision.revision_id, state: value.state };
 }
 
-function normalizeOperationTimelineId(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "operation";
+function parseBridgePlanApproval(value: unknown): { approvalId: string; state: string } | null {
+  if (!isRecord(value) || !isRecord(value.approval) || typeof value.approval.approval_id !== "string" || typeof value.state !== "string") return null;
+  return { approvalId: value.approval.approval_id, state: value.state };
+}
+
+function parseBridgePlanAttempt(value: unknown): { approvalId: string; attemptId: string } | null {
+  if (!isRecord(value) || !isRecord(value.attempt) || typeof value.attempt.approval_id !== "string" || typeof value.attempt.attempt_id !== "string") return null;
+  return { approvalId: value.attempt.approval_id, attemptId: value.attempt.attempt_id };
+}
+
+function parseBridgePlanResult(value: unknown): { attemptId: string; summary: string } | null {
+  if (!isRecord(value) || typeof value.attempt_id !== "string" || typeof value.summary !== "string") return null;
+  return { attemptId: value.attempt_id, summary: value.summary };
+}
+
+function parseReviewedBridgePlan(event: ReceivedRoomControlEvent): ReviewedBridgePlan[] {
+  if (event.kind !== "bridge_plan.review_request") return [];
+  const payload = roomControlEventPayload(event.event);
+  const approvalId = typeof payload?.approvalId === "string" ? payload.approvalId : null;
+  const revision = isRecord(payload?.revision) ? payload.revision : null;
+  const presentation = isRecord(revision?.presentation) ? revision.presentation : null;
+  const description = typeof presentation?.natural_language_plan === "string"
+    ? presentation.natural_language_plan.trim()
+    : "";
+  return approvalId && description ? [{ approvalId, description }] : [];
+}
+
+function parseStartedBridgePlanAttempt(event: ReceivedRoomControlEvent): StartedBridgePlanAttempt[] {
+  if (event.kind !== "bridge_plan.attempt_start") return [];
+  const payload = roomControlEventPayload(event.event);
+  const approvalId = typeof payload?.approvalId === "string" ? payload.approvalId : null;
+  const attemptId = typeof payload?.attemptId === "string" ? payload.attemptId : null;
+  return approvalId && attemptId ? [{ approvalId, attemptId }] : [];
+}
+
+function parseStartedBridgePlanTransfer(event: ReceivedRoomControlEvent): StartedBridgePlanTransfer[] {
+  if (event.kind !== "bridge_plan.transfer_start") return [];
+  const payload = roomControlEventPayload(event.event);
+  const approvalId = typeof payload?.approvalId === "string" ? payload.approvalId : null;
+  const attemptId = typeof payload?.attemptId === "string" ? payload.attemptId : null;
+  const transferStep = isRecord(payload?.transferStep) ? payload.transferStep : null;
+  const source = isRecord(transferStep?.source) ? transferStep.source : null;
+  return approvalId && attemptId
+    ? [{ approvalId, attemptId, requesterDirect: source?.kind === "future_user_selection" }]
+    : [];
+}
+
+function parseStartedBridgePlanTransform(event: ReceivedRoomControlEvent): StartedBridgePlanTransform[] {
+  if (event.kind !== "bridge_plan.transform_start") return [];
+  const payload = roomControlEventPayload(event.event);
+  const approvalId = typeof payload?.approvalId === "string" ? payload.approvalId : null;
+  const attemptId = typeof payload?.attemptId === "string" ? payload.attemptId : null;
+  return approvalId && attemptId ? [{ approvalId, attemptId }] : [];
+}
+
+function parseCompletedBridgePlanTransform(event: ReceivedRoomControlEvent): string[] {
+  if (event.kind !== "bridge_plan.step_result") return [];
+  const payload = roomControlEventPayload(event.event);
+  return payload?.stepId === "transform" && typeof payload.attemptId === "string" ? [payload.attemptId] : [];
+}
+
+function parseFailedBridgePlanTransform(event: ReceivedRoomControlEvent): string[] {
+  if (event.kind !== "bridge_plan.step_failed") return [];
+  const payload = roomControlEventPayload(event.event);
+  return payload?.stepId === "transform" && typeof payload.attemptId === "string" ? [payload.attemptId] : [];
+}
+
+function parseBridgePlanSearchCandidates(event: ReceivedRoomControlEvent): Array<{
+  attemptId: string;
+  candidateId: string;
+  displayName: string;
+  extension: string;
+  mimeFamily: string;
+  sizeBytes: number;
+  matchReason: string;
+}> {
+  if (event.kind !== "bridge_plan.step_result") return [];
+  const payload = roomControlEventPayload(event.event);
+  const attemptId = typeof payload?.attemptId === "string" ? payload.attemptId : null;
+  const safeResult = isRecord(payload?.safeResult) ? payload.safeResult : null;
+  const candidates = Array.isArray(safeResult?.candidates) ? safeResult.candidates : [];
+  if (!attemptId) return [];
+  return candidates.flatMap((candidate) => {
+    if (!isRecord(candidate)
+      || typeof candidate.candidateId !== "string"
+      || typeof candidate.displayName !== "string"
+      || typeof candidate.extension !== "string"
+      || typeof candidate.mimeFamily !== "string"
+      || typeof candidate.sizeBytes !== "number"
+      || typeof candidate.matchReason !== "string") return [];
+    return [{
+      attemptId,
+      candidateId: candidate.candidateId,
+      displayName: candidate.displayName,
+      extension: candidate.extension,
+      mimeFamily: candidate.mimeFamily,
+      sizeBytes: candidate.sizeBytes,
+      matchReason: candidate.matchReason,
+    }];
+  });
+}
+
+function roomControlEventPayload(event: unknown): Record<string, unknown> | null {
+  if (!isRecord(event) || !isRecord(event.payload)) return null;
+  return event.payload;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 interface ActivityPageProps {
@@ -2179,7 +1567,7 @@ export function DevicesProductPage({
     }
   }
 
-  const trustedRooms = rooms.filter((room) => room.peer_device_name || (room.peers?.length ?? 0) > 0);
+  const knownRooms = rooms.filter((room) => room.peer_device_name || (room.peers?.length ?? 0) > 0);
 
   return (
     <section className="product-page devices-page" aria-label="Devices">
@@ -2213,10 +1601,10 @@ export function DevicesProductPage({
       </section>
 
       <section className="page-section">
-        <h2>Trusted devices</h2>
+        <h2>Previously connected</h2>
         <div className="simple-list-card">
-          {trustedRooms.length === 0 ? <p className="muted">Known devices will appear here after you connect.</p> : null}
-          {trustedRooms.map((room) => (
+          {knownRooms.length === 0 ? <p className="muted">Known devices will appear here after you connect.</p> : null}
+          {knownRooms.map((room) => (
             <div key={room.id} className="simple-device-row">
               <div>
                 <strong>{room.peer_device_name ?? bridgeMemberSummary(room).title}</strong>
@@ -2439,32 +1827,6 @@ async function generateCloudNaturalPlan(
   return {
     ...fallback,
     error: generated.error,
-  };
-}
-
-function prepareCandidateSearchWorkflow(plan: AskBridgeNaturalV1Plan, targetPeerRef: string) {
-  const proposedInput = buildNaturalV1SearchAdvisoryInput(plan, targetPeerRef) ?? {};
-  const context = buildMockAiContextSnapshot();
-  return {
-    plan: {
-      schemaVersion: "ai-action-plan-v1",
-      kind: "request_peer_file_candidates",
-      title: "Ask Bridge Search",
-      explanation: "Ask the selected device to search safe scopes and return redacted metadata candidates only.",
-      confidence: "medium",
-      requiresUserConfirmation: true,
-      references: [{ kind: "peer" as const, ref: targetPeerRef }],
-      proposedInput,
-    } satisfies AiActionPlan,
-    context: {
-      ...context,
-      peers: [{
-        peerRef: targetPeerRef,
-        visible: true,
-        trusted: true,
-        capabilities: ["filesystem.find_file_candidates", "transfer.request_candidate_payload"],
-      }],
-    },
   };
 }
 

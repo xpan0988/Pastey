@@ -4,9 +4,14 @@ Detailed update and release history for Pastey.
 
 ## Unreleased
 
-- No unreleased user-facing changes are documented yet.
+- Hardened Burn as a receiver-host-owned, fail-closed cleanup boundary: it removes Bridge routes, membership, runtime control state, candidate/Transform authority, staging, queue projections, and durable Bridge content while preserving final user Inbox files and independent paired-device display identity.
+- Removed receiver absolute paths from cleanup and transfer logging, and reduced Layer 3 candidate-return queue metadata to an opaque non-authority operation projection.
+- Renamed product terminology from trusted devices to paired/previously connected devices so display identity is not mistaken for routeability, consent, or execution authority.
+- Replaced the pre-Bridge-Plan Transform/Return architecture with one Rust-owned Bridge Plan lifecycle for Search, readable-text Transform, and Transfer. Removed legacy consent, capability envelopes, compatibility UI, protocol handlers, sidecars, and executor schemas. Immutable staging, source identity checks, safe cleanup, and dormant Linux verification primitives remain isolated for future backend work.
 
 ## 1.9.1 — Layer 5 narrow product closure — 2026-07-08
+
+> Historical record. The capability, consent, Return, TaskGraph, and sidecar details below were superseded and physically removed by the Bridge Plan cleanup described in Unreleased; they are not current product behavior.
 
 ### Added
 

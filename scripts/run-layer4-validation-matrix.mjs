@@ -15,6 +15,7 @@ const matrixAreas = [
       "selected-peers ordinary text per-target outcomes",
       "broadcast ordinary data route resolution",
       "stale/unknown/mismatched/no-fallback route failures",
+      "active Bridge detail polling lifecycle",
     ],
   },
   {
@@ -23,22 +24,6 @@ const matrixAreas = [
       "file/image/pasted-image queue children",
       "shared operation id and target-specific children",
       "burn/cancel/terminal children do not revive",
-    ],
-  },
-  {
-    id: "control-capability-selected-peer",
-    covers: [
-      "room-control selected-peer route through bridge_peers",
-      "selected-peers control/capability rejection",
-      "broadcast control/capability rejection",
-    ],
-  },
-  {
-    id: "consent-and-hello-peer",
-    covers: [
-      "delivery receipt is not consent",
-      "Hello Peer allow-once exact consent",
-      "consent consumed once and not reused",
     ],
   },
   {
@@ -102,6 +87,7 @@ try {
     "tests/bridgePeers.test.ts",
     "tests/bridgeRoomAdapter.test.ts",
     "tests/bridgeRoutingRuntime.test.ts",
+    "tests/bridgeDetailPolling.test.ts",
     "tests/bridgeIdentity.test.ts",
     "tests/layer4ValidationMatrix.test.ts",
   ]);
@@ -109,12 +95,6 @@ try {
     "tests/transferSchedulerExecution.test.ts",
     "tests/transferPlanner.test.ts",
   ]);
-  run("room-control transport", process.execPath, ["scripts/run-room-control-transport-tests.mjs"]);
-  run("room-control event", process.execPath, ["scripts/run-room-control-event-tests.mjs"]);
-  run("control queue", process.execPath, ["scripts/run-control-queue-tests.mjs"]);
-  run("control queue integration", process.execPath, ["scripts/run-control-queue-integration-tests.mjs"]);
-  run("peer consent", process.execPath, ["scripts/run-peer-consent-tests.mjs"]);
-  run("Hello Peer execution", process.execPath, ["scripts/run-hello-peer-execution-tests.mjs"]);
   run("Rust ordinary data route tests", "cargo", [
     "test",
     "--manifest-path",

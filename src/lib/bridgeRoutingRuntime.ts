@@ -15,7 +15,7 @@ import type { BridgePeerCollection, BridgePeerSession } from "./bridgePeers";
 import {
   assertRouteCompatibleWithPeerCollection,
 } from "./bridgePeers";
-import type { RoomControlSessionContext, RoomInfo, RoomItem } from "./types";
+import type { RoomInfo, RoomItem } from "./types";
 
 export type BridgeRoutingRuntimeState =
   | {
@@ -95,13 +95,6 @@ export type FileRoomSender = (
 ) => Promise<RoomItem>;
 export type TransferInputEnqueuer<TInput> = (roomId: string, inputs: TInput[]) => void;
 export type FilePathEnqueuer = (roomId: string, paths: string[]) => void;
-export type BridgeRoutableControlEvent = {
-  readonly roomRef: string;
-  readonly sourceDeviceRef: string;
-  readonly targetPeerRef?: string;
-  readonly kind: string;
-};
-
 export function deriveBridgeRoutingStateForRoom(room: LegacyRoomBridgeInput): BridgeRoutingRuntimeState {
   try {
     const collection = legacyRoomToBridgePeerCollection(room);
@@ -177,32 +170,6 @@ export function deriveAuthoritativeImageSendRoute(
   input: LegacyRoomBridgeInput | BridgeRoutingRuntimeState | BridgeRoute,
 ): BridgeRoute {
   return deriveAuthoritativeDataRoute(input, "image");
-}
-
-export function deriveAuthoritativeControlRoute(
-  input: LegacyRoomBridgeInput | BridgeRoutingRuntimeState | BridgeRoute,
-): BridgeRoute {
-  return deriveAuthoritativeSelectedPeerRoute(input, "control");
-}
-
-export function deriveAuthoritativeCapabilityRoute(
-  input: LegacyRoomBridgeInput | BridgeRoutingRuntimeState | BridgeRoute,
-): BridgeRoute {
-  return deriveAuthoritativeSelectedPeerRoute(input, "capability");
-}
-
-export function assertControlEventHasSelectedPeerRoute(
-  session: RoomControlSessionContext,
-  event: BridgeRoutableControlEvent,
-): BridgeRoute {
-  return assertSessionBoundControlRoute(session, event, "control");
-}
-
-export function assertCapabilityEventHasSelectedPeerRoute(
-  session: RoomControlSessionContext,
-  event: BridgeRoutableControlEvent,
-): BridgeRoute {
-  return assertSessionBoundControlRoute(session, event, "capability");
 }
 
 export async function sendTextToRoomWithBridgeRoute(
@@ -286,26 +253,6 @@ function routeStateErrorMessage(state: BridgeRoutingRuntimeState): string {
   }
 }
 
-function deriveAuthoritativeSelectedPeerRoute(
-  input: LegacyRoomBridgeInput | BridgeRoutingRuntimeState | BridgeRoute,
-  contentKind: "text" | "file" | "image" | "control" | "capability",
-): BridgeRoute {
-  const route = routeFromRuntimeInput(input);
-  const validation = validateBridgeRoute(route);
-  if (!validation.valid) {
-    throw bridgeRouteError("malformed_route", validation.errors.join(" "));
-  }
-  if (validation.route.target.kind !== "selected_peer") {
-    throw bridgeRouteError(
-      validation.route.target.kind === "selected_peers"
-        ? "unsupported_selected_peers"
-        : "unsupported_broadcast",
-      `Production ${contentKind} send requires exactly one selected Bridge peer.`,
-    );
-  }
-  return validation.route;
-}
-
 function deriveAuthoritativeDataRoute(
   input: LegacyRoomBridgeInput | BridgeRoutingRuntimeState | BridgeRoute,
   contentKind: Extract<BridgeContentKind, "text" | "file" | "image" | "pasted_image">,
@@ -368,34 +315,6 @@ export function bridgeRoutePayload<TSchemaVersion extends string>(
             peerSessionId: route.target.peerSessionId,
           },
   };
-}
-
-function assertSessionBoundControlRoute(
-  session: RoomControlSessionContext,
-  event: BridgeRoutableControlEvent,
-  contentKind: "control" | "capability",
-): BridgeRoute {
-  if (event.roomRef !== session.roomId) {
-    throw bridgeRouteError("route_mismatch", `Production ${contentKind} send requires the active Bridge session.`);
-  }
-  if (event.sourceDeviceRef !== session.localSessionRef) {
-    throw bridgeRouteError("route_mismatch", `Production ${contentKind} send requires the active local session source.`);
-  }
-  if (event.targetPeerRef !== session.peerSessionRef) {
-    throw bridgeRouteError("route_mismatch", `Production ${contentKind} send requires exactly one selected Bridge peer target.`);
-  }
-  if (!session.peerConnected) {
-    throw bridgeRouteError("peer_unrouteable", `Production ${contentKind} send requires a connected selected Bridge peer.`);
-  }
-
-  const route = deriveAuthoritativeSelectedPeerRoute({
-    bridgeSessionId: `legacy-room:${session.roomId}`,
-    target: {
-      kind: "selected_peer",
-      peerSessionId: bridgePeerSessionId(session.peerRouteRef ?? session.peerSessionRef),
-    },
-  }, contentKind);
-  return route;
 }
 
 function routeFromRuntimeInput(

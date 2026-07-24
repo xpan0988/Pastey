@@ -123,11 +123,10 @@ pub(crate) fn prepare_staged_snapshot(
             profile_id: profile.id,
         }),
         Err(error) => {
-            if let Err(cleanup_error) = remove_partial_staging_root(&parent, &root) {
-                logging::write_error_line(&format!(
-                    "[pastey:transform-staging] event=partial_cleanup_failed staging_id={staging_id} error={}",
-                    cleanup_error.message()
-                ));
+            if remove_partial_staging_root(&parent, &root).is_err() {
+                logging::write_error_line(
+                    "[pastey:transform-staging] event=partial_cleanup_failed location=transform_staging_root error_code=cleanup_failed",
+                );
             }
             Err(error)
         }

@@ -12,11 +12,11 @@ Bridge sessions are ephemeral. Devices join through nearby discovery or an 8-dig
 - Layer 4 — Bridge sessions, peers, routing, and control transport
 - Layer 5 — AI-assisted planning and bounded Transform workflows
 
-Layers 1–4 form the non-AI Pastey core. Transfer, device, orchestration, Bridge, Search, and selected-file Return foundations are substantially implemented. Layer 5 natural-v1 planning and bounded Transform authority are implemented.
+Layers 1–4 form the non-AI Pastey core. Layer 5 adds one Rust-owned Bridge Plan lifecycle for bounded Search, readable-text Transform, and Transfer. Plans, approvals, receiver review, and attempts are the only Transform authority.
 
-Ask Bridge uses one natural-language surface built around **Search / Transform / Return**. The model is advisory only; the host validates, the sender confirms, and the receiver can Allow once or Deny. Search returns redacted candidate metadata. A selected-file Return requires a second receiver consent and queues the existing transfer path.
+Ask Bridge uses one natural-language surface built around **Search / Transform / Transfer**. The model is advisory only; Rust validates the bounded plan, the sender approves its complete revision, and the receiver reviews it. Search returns redacted metadata while private bindings remain on the selected device. Transform output stays Rust-private until a reviewed Plan Transfer consumes it.
 
-Real Transform execution remains unavailable in production. Descriptor-based staging, the static Linux capability probe, and the Stage 2B behavioral-verifier foundation are implemented. Live Linux isolation verification has not yet completed. Production remains bound to `sandbox_unavailable` with no direct-process fallback.
+The only implemented Transform is fixed readable-text extraction through the approved Bridge Plan. It uses immutable staging, source-identity checks, and a fixed Rust worker. Linux probes, cgroup helpers, launch-plan checks, and behavioral verification are dormant test infrastructure: they expose no product availability, command, UI, sidecar, or execution backend. Unsupported intents create an unapproved alternative Plan revision and do not execute.
 
 ## Documentation
 

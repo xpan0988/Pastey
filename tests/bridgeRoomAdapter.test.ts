@@ -109,13 +109,6 @@ test("adapter output does not include durable identity, history, trust, or conse
   assert.equal(serialized.includes("consent"), false);
 });
 
-test("adapter does not allow Agent Bridge capability broadcast", () => {
-  assert.throws(
-    () => assertLegacyRoomRouteAllowedForContentKind(broadcastRoute(), "agent_bridge_capability_event"),
-    /requires exactly one selected peer/,
-  );
-});
-
 test("adapter does not mutate input Room data", () => {
   const room: LegacyRoomBridgeInput = {
     ...ROOM,

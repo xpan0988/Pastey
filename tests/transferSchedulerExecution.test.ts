@@ -49,51 +49,6 @@ function readyInput(name: string, sizeBytes: number, path = `/tmp/${name}`, modi
   };
 }
 
-function agentBridgeCandidateInput(
-  name: string,
-  sizeBytes: number,
-  index: number,
-  mimeFamily: "document" | "image" | "archive" | "media" | "code" | "unknown" = "document",
-): TransferQueueInput {
-  return {
-    path: `/receiver/local/${name}`,
-    displayName: name,
-    mimeType: "application/octet-stream",
-    sizeBytes,
-    modifiedMs: 1_780_000_000_000 + index,
-    dedupeKey: `agent-bridge-candidate-payload:source-request:${index}:candidate-${index}:filesystem_file:${sizeBytes}`,
-    bridgeOperationId: `agent-bridge-candidate:request-${index}:execution-${index}`,
-    bridgeTargetKind: "selected_peer",
-    bridgeContentKind: "file",
-    targetPeerSessionId: "peer:sender",
-    targetPeerDisplayName: "Sender",
-    targetCount: 1,
-    bridgeRoute: {
-      bridgeSessionId: "legacy-room:room-1",
-      target: { kind: "selected_peer", peerSessionId: bridgePeerSessionId("peer:sender") },
-    },
-    agentBridgeMetadata: {
-      origin: "agent_bridge_candidate_payload",
-      label: "Agent Bridge candidate payload request",
-      note: "Queued from approved candidate payload request.",
-      sourceCapability: "filesystem.find_file_candidates",
-      requestCapability: "transfer.request_candidate_payload",
-      sourceRequestId: "source-request",
-      candidateId: `candidate-${index}`,
-      candidateKind: "filesystem_file",
-      candidateDisplayName: name,
-      requestedByPeerRef: "room-session:sender",
-      approvedByPeerRef: "room-session:receiver",
-      consentId: `consent-${index}`,
-      agentBridgeRequestId: `request-${index}`,
-      handoffCreatedAt: "2026-06-30T00:00:00.000Z",
-      sizeBytes,
-      extension: name.split(".").pop() ?? "bin",
-      mimeFamily,
-    },
-  };
-}
-
 function queuedItems(state: TransferSchedulerState): TransferQueueItem[] {
   return Object.values(state.items).sort((left, right) => left.createdAt - right.createdAt);
 }
@@ -135,62 +90,6 @@ test("bridge multi-target file enqueue creates target-distinct child queue items
   assert.deepEqual(items.map((item) => item.targetPeerSessionId), ["peer:a", "peer:b"]);
   assert.deepEqual(new Set(items.map((item) => item.bridgeOperationId)), new Set(["bridge-op-1"]));
   assert.notEqual(items[0].dedupeKey, items[1].dedupeKey);
-});
-
-test("Agent Bridge candidate payload handoff enters the normal queue with path-free audit metadata", () => {
-  const state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", [
-    agentBridgeCandidateInput("assignment.pdf", 512 * 1024, 1),
-  ]);
-  const [item] = queuedItems(state);
-  const metadataText = JSON.stringify(item.agentBridgeMetadata);
-
-  assert.equal(item.status, "queued");
-  assert.equal(item.metadataStatus, "ready");
-  assert.equal(item.bridgeContentKind, "file");
-  assert.equal(item.bridgeRoute?.target.kind, "selected_peer");
-  assert.equal(item.agentBridgeMetadata?.origin, "agent_bridge_candidate_payload");
-  assert.equal(item.agentBridgeMetadata?.note, "Queued from approved candidate payload request.");
-  for (const forbidden of ["path", "absolutePath", "filePath", "localPath", "realPath", "contents", "transferQueueId", "handoffId"]) {
-    assert.equal(metadataText.includes(forbidden), false, forbidden);
-  }
-
-  const { runnablePlans } = planRunnableTransferLaunches(state, activeRooms);
-  assert.equal(runnablePlans.length, 1);
-  assert.equal(runnablePlans[0].itemId, item.id);
-});
-
-test("Agent Bridge small and large candidate payload handoffs cooperate with scheduler contention and MicroFlowGroup", () => {
-  const inputs: TransferQueueInput[] = [
-    readyInput("ordinary.bin", 4 * MiB, "/tmp/ordinary.bin", 1),
-    agentBridgeCandidateInput("large-video.mov", 2 * GiB, 2, "media"),
-    ...Array.from({ length: 16 }, (_, index) => agentBridgeCandidateInput(
-      `tiny-${index}.${index % 2 === 0 ? "pdf" : "png"}`,
-      128 * 1024,
-      index + 3,
-      index % 2 === 0 ? "document" : "image",
-    )),
-  ];
-  const state = enqueueTransferBatch(createTransferSchedulerState(), "room-1", inputs);
-  const { runnablePlans, microGroupPlans, plannerResult } = planRunnableTransferLaunches(state, activeRooms);
-  const items = queuedItems(state);
-  const large = items.find((item) => item.agentBridgeMetadata?.candidateDisplayName === "large-video.mov");
-  const largePlan = runnablePlans.find((plan) => plan.itemId === large?.id);
-  const ordinary = items.find((item) => item.displayName === "ordinary.bin");
-  const ordinaryPlan = runnablePlans.find((plan) => plan.itemId === ordinary?.id);
-  const groupedItems = new Set(microGroupPlans.flatMap((plan) => plan.childItemIds));
-  const groupedMetadata = [...groupedItems].map((itemId) => state.items[itemId]?.agentBridgeMetadata);
-
-  assert.equal(items.length, 18);
-  assert.ok(large);
-  assert.equal(largePlan?.requestedWindow, 6);
-  assert.equal(ordinaryPlan?.requestedWindow, 1);
-  assert.equal(microGroupPlans.length, 1);
-  assert.equal(microGroupPlans[0].requestedWindow, 1);
-  assert.equal(microGroupPlans[0].childItemIds.length, 16);
-  assert.equal(plannerResult.requestedWindowTotal, 8);
-  assert.equal(groupedMetadata.every((metadata) => metadata?.origin === "agent_bridge_candidate_payload"), true);
-  assert.deepEqual(new Set(groupedMetadata.map((metadata) => metadata?.mimeFamily)), new Set(["document", "image"]));
-  assert.equal(summarizeMicroFlowGroupPlanning(state, activeRooms).contention, true);
 });
 
 test("huge-only queue starts one transfer", () => {

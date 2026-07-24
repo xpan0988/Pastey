@@ -42,44 +42,20 @@ const CONTROL_RECEIPT_ENVELOPE_SCHEMA: &str = "pastey-room-control-receipt-envel
 const CONTROL_DELIVERY_SCHEMA: &str = "pastey-room-control-delivery-v1";
 const ROOM_CONTROL_SCHEMA: &str = "pastey-room-control-event-v1";
 const CONTROL_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-control-route-v1";
-const HELLO_STDOUT_CAPABILITY: &str = "runtime.hello_stdout";
-const HELLO_STDOUT_EXPECTED_STDOUT: &str = "hello peer";
-const FILE_CANDIDATES_CAPABILITY: &str = "filesystem.find_file_candidates";
-const FILE_CANDIDATES_EXECUTOR_KIND: &str = "filesystem_find_candidates_host";
-const HELLO_STDOUT_REQUEST_SCHEMA: &str = "pastey-runtime-hello-stdout-request-v1";
-const HELLO_STDOUT_CONSENT_SCHEMA: &str = "pastey-runtime-hello-stdout-consent-grant-v1";
-const HELLO_STDOUT_EXECUTION_REQUEST_SCHEMA: &str =
-    "pastey-runtime-hello-stdout-execution-request-v1";
-const HELLO_STDOUT_EXECUTION_RESULT_SCHEMA: &str =
-    "pastey-runtime-hello-stdout-execution-result-v1";
-const FILE_CANDIDATES_REQUEST_SCHEMA: &str = "filesystem-find-file-candidates-request-v1";
-const FILE_CANDIDATES_CONSENT_SCHEMA: &str = "filesystem-find-file-candidates-consent-grant-v1";
-const FILE_CANDIDATES_EXECUTION_REQUEST_SCHEMA: &str =
-    "filesystem-find-file-candidates-execution-request-v1";
-const FILE_CANDIDATES_EXECUTION_RESULT_SCHEMA: &str = "filesystem-find-file-candidates-result-v1";
-const CANDIDATE_PAYLOAD_CAPABILITY: &str = "transfer.request_candidate_payload";
-const CANDIDATE_PAYLOAD_EXECUTOR_KIND: &str = "transfer_candidate_payload_host";
-const CANDIDATE_PAYLOAD_REQUEST_SCHEMA: &str = "transfer-request-candidate-payload-request-v1";
-const CANDIDATE_PAYLOAD_CONSENT_SCHEMA: &str =
-    "transfer-request-candidate-payload-consent-grant-v1";
-const CANDIDATE_PAYLOAD_EXECUTION_REQUEST_SCHEMA: &str =
-    "transfer-request-candidate-payload-execution-request-v1";
-const CANDIDATE_PAYLOAD_EXECUTION_RESULT_SCHEMA: &str =
-    "transfer-request-candidate-payload-result-v1";
-const ARTIFACT_TRANSFORM_CAPABILITY: &str = "artifact.transform_selected";
-const ARTIFACT_TRANSFORM_CONSENT_SCHEMA: &str = "artifact-transform-selected-consent-grant-v1";
-const ARTIFACT_TRANSFORM_EXECUTION_REQUEST_SCHEMA: &str = "artifact-transform-selected-execution-request-v1";
-const ARTIFACT_TRANSFORM_EXECUTION_RESULT_SCHEMA: &str = "artifact-transform-selected-result-v1";
-
 const ALLOWED_EVENT_KINDS: &[&str] = &[
-    "capability_preview",
-    "capability_preview_ack",
-    "capability_preview_deny",
-    "capability_preview_invalid",
-    "capability_preview_expired",
-    "capability_execute_request",
-    "capability_execution_result",
+    "bridge_plan.review_request",
+    "bridge_plan.review_decision",
+    "bridge_plan.attempt_start",
+    "bridge_plan.transfer_start",
+    "bridge_plan.transform_start",
+    "bridge_plan.search_selection",
+    "bridge_plan.attempt_ack",
+    "bridge_plan.step_progress",
+    "bridge_plan.step_result",
+    "bridge_plan.step_failed",
+    "bridge_plan.cancel",
 ];
+const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
 
 const UNSAFE_FIELDS: &[&str] = &[
     "command",
@@ -125,11 +101,34 @@ const UNSAFE_FIELDS: &[&str] = &[
     "exitcode",
     "process",
     "spawn",
+    "receiverlocalsource",
+    "sourcepath",
+    "resolvedpath",
+    "stagingpath",
+    "scoperoot",
+    "candidatelease",
+    "sourceidentity",
+    "privatedigest",
+    "workerpath",
+    "workeridentityinternals",
+    "cgrouppath",
+    "pid",
+    "seccompdescriptor",
+    "resolvedimplementationauthority",
+    "rawexecutorresult",
 ];
 
 #[derive(Default)]
 pub struct RoomControlRuntimeState {
     rooms: HashMap<String, RoomControlRoomState>,
+}
+
+impl RoomControlRuntimeState {
+    /// Burn is terminal for a Bridge: retain no inbox, replay cache, or rate
+    /// state that could replay or display an old control action.
+    pub fn purge_room(&mut self, room_id: &str) -> bool {
+        self.rooms.remove(room_id).is_some()
+    }
 }
 
 #[derive(Default)]
@@ -493,18 +492,7 @@ pub async fn send_room_control_event(
     event: Value,
     bridge_route: Option<Value>,
 ) -> AppResult<RoomControlDeliveryReceipt> {
-    send_room_control_event_internal(state, room_id, event, bridge_route, false).await
-}
-
-/// Only the receiver-host Transform finalizer may send a Transform execution
-/// result. Generic frontend room-control send is deliberately barred.
-pub async fn send_authoritative_transform_result_event(
-    state: Arc<AppState>,
-    room_id: &str,
-    event: Value,
-    bridge_route: Option<Value>,
-) -> AppResult<RoomControlDeliveryReceipt> {
-    send_room_control_event_internal(state, room_id, event, bridge_route, true).await
+    send_room_control_event_internal(state, room_id, event, bridge_route).await
 }
 
 async fn send_room_control_event_internal(
@@ -512,9 +500,7 @@ async fn send_room_control_event_internal(
     room_id: &str,
     event: Value,
     bridge_route: Option<Value>,
-    transform_result_authorized: bool,
 ) -> AppResult<RoomControlDeliveryReceipt> {
-    require_transform_result_authority(&event, transform_result_authorized)?;
     let room = storage::get_room_by_id(&state.paths, room_id)?;
     if room.status != RoomStatus::Active {
         return Err(AppError::InvalidInput("Room is not active.".into()));
@@ -624,20 +610,6 @@ async fn send_room_control_event_internal(
     Ok(receipt)
 }
 
-fn require_transform_result_authority(event: &Value, transform_result_authorized: bool) -> AppResult<()> {
-    if is_transform_execution_result_event(event) && !transform_result_authorized {
-        return Err(AppError::InvalidInput("transform_result_requires_authoritative_finalization".into()));
-    }
-    Ok(())
-}
-
-fn is_transform_execution_result_event(event: &Value) -> bool {
-    event.as_object().is_some_and(|event|
-        event.get("kind").and_then(Value::as_str) == Some("capability_execution_result")
-            && event.get("payload").and_then(Value::as_object).and_then(|payload| payload.get("capability")).and_then(Value::as_str) == Some(ARTIFACT_TRANSFORM_CAPABILITY)
-    )
-}
-
 pub fn list_received_room_control_events(
     state: &Arc<AppState>,
     room_id: &str,
@@ -650,48 +622,6 @@ pub fn list_received_room_control_events(
         .get(room_id)
         .map(|room| room.inbox.iter().cloned().collect())
         .unwrap_or_default())
-}
-
-/// Derives a Transform consent seed exclusively from an authenticated inbox
-/// preview and the current receiver-side room session. No renderer-provided
-/// grant binding is accepted here.
-pub fn authenticated_transform_preview_consent_seed(
-    state: &Arc<AppState>,
-    room_id: &str,
-    source_preview_event_id: &str,
-) -> AppResult<crate::file_candidates::ArtifactTransformConsentRegistration> {
-    let context = room_control_session_context(state, room_id)?;
-    let rooms = state.room_control.lock();
-    let room = rooms.rooms.get(room_id).ok_or_else(|| AppError::InvalidInput("Unknown Transform preview room.".into()))?;
-    let preview = room.inbox.iter().find(|received|
-        received.event_id == source_preview_event_id
-            && received.kind == "capability_preview"
-            && received.room_ref == room_id
-            && received.source_device_ref == context.peer_session_ref
-            && received.target_peer_ref == context.local_session_ref
-    ).ok_or_else(|| AppError::InvalidInput("Authenticated Transform preview not found.".into()))?;
-    let payload = preview.event.get("payload").and_then(Value::as_object).ok_or_else(|| AppError::InvalidInput("Invalid Transform preview payload.".into()))?;
-    let request = payload.get("request").and_then(Value::as_object).ok_or_else(|| AppError::InvalidInput("Invalid Transform preview request.".into()))?;
-    if string_field(request, "capability")? != ARTIFACT_TRANSFORM_CAPABILITY
-        || string_field(request, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
-        || string_field(request, "candidateKind")? != "filesystem_file"
-        || string_field(request, "resultContract")? != "typed_transform_result"
-    { return Err(AppError::InvalidInput("Invalid Transform preview request.".into())); }
-    let event_expires = OffsetDateTime::parse(string_field(preview.event.as_object().ok_or_else(|| AppError::InvalidInput("Invalid Transform preview event.".into()))?, "expiresAt")?, &Rfc3339)
-        .map_err(|_| AppError::InvalidInput("Invalid Transform preview expiry.".into()))?;
-    let request_expires = OffsetDateTime::parse(string_field(request, "expiresAt")?, &Rfc3339)
-        .map_err(|_| AppError::InvalidInput("Invalid Transform request expiry.".into()))?;
-    let expires_at = std::cmp::min(event_expires, request_expires).format(&Rfc3339)
-        .map_err(|_| AppError::InvalidInput("Invalid Transform prompt expiry.".into()))?;
-    Ok(crate::file_candidates::ArtifactTransformConsentRegistration {
-        consent_id: "pending".into(), source_preview_event_id: source_preview_event_id.into(),
-        envelope_id: string_field(payload, "envelopeId")?.into(), request_id: string_field(request, "requestId")?.into(),
-        request_payload_hash: string_field(request, "requestPayloadHash")?.into(), room_ref: room_id.into(),
-        source_device_ref: context.peer_session_ref, target_peer_ref: context.local_session_ref,
-        capability: ARTIFACT_TRANSFORM_CAPABILITY.into(), source_capability: FILE_CANDIDATES_CAPABILITY.into(),
-        source_request_id: string_field(request, "sourceRequestId")?.into(), candidate_id: string_field(request, "candidateId")?.into(),
-        candidate_kind: "filesystem_file".into(), result_contract: "typed_transform_result".into(), expires_at, decision: "allow_once".into(),
-    })
 }
 
 pub fn clear_room_control_state(state: &Arc<AppState>, room_id: &str) {
@@ -875,6 +805,22 @@ pub async fn receive_room_control_event_handler(
             )
         }
     };
+    if crate::bridge_plan::accept_inbound_protocol_event(
+        &ctx.state.paths,
+        &ctx.state.bridge_plan_protocol_authority.lock(),
+        &mut ctx.state.bridge_plan_candidate_store.lock(),
+        &validated.kind,
+        &validated.event,
+        storage::now_ts(),
+    )
+    .is_err()
+    {
+        return control_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_event",
+            "Invalid room control event.",
+        );
+    }
     let received_at = now_iso();
     {
         let mut runtime = ctx.state.room_control.lock();
@@ -949,20 +895,40 @@ fn validate_control_event(
     let object = event
         .as_object()
         .ok_or_else(|| AppError::InvalidInput("Invalid room control event.".into()))?;
+    let raw_kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     require_exact_fields(
         object,
-        &[
-            "schemaVersion",
-            "eventId",
-            "kind",
-            "roomRef",
-            "sourceDeviceRef",
-            "targetPeerRef",
-            "createdAt",
-            "expiresAt",
-            "previewOnly",
-            "payload",
-        ],
+        if raw_kind.starts_with("bridge_plan.") {
+            &[
+                "schemaVersion",
+                "eventId",
+                "kind",
+                "protocolFamily",
+                "roomRef",
+                "sourceDeviceRef",
+                "targetPeerRef",
+                "createdAt",
+                "expiresAt",
+                "previewOnly",
+                "payload",
+            ]
+        } else {
+            &[
+                "schemaVersion",
+                "eventId",
+                "kind",
+                "roomRef",
+                "sourceDeviceRef",
+                "targetPeerRef",
+                "createdAt",
+                "expiresAt",
+                "previewOnly",
+                "payload",
+            ]
+        },
     )?;
     if string_field(object, "schemaVersion")? != ROOM_CONTROL_SCHEMA {
         return Err(AppError::InvalidInput("Invalid room control event.".into()));
@@ -1004,167 +970,30 @@ fn validate_control_event(
         .get("payload")
         .and_then(Value::as_object)
         .ok_or_else(|| AppError::InvalidInput("Invalid room control event payload.".into()))?;
-    if !is_result_event_with_bounded_process_output(&kind, payload) && contains_unsafe_field(&event) {
+    if contains_unsafe_field(&event) {
         return Err(AppError::InvalidInput(
             "Room control event contains unsafe fields.".into(),
         ));
     }
-    let (envelope_id, request_id) = if kind == "capability_preview" {
-        if object.get("previewOnly") != Some(&Value::Bool(true)) {
-            return Err(AppError::InvalidInput(
-                "Invalid capability preview event.".into(),
-            ));
-        }
-        require_exact_fields(
-            payload,
-            &[
-                "schemaVersion",
-                "envelopeId",
-                "createdAt",
-                "expiresAt",
-                "roomRef",
-                "sourceDeviceRef",
-                "targetPeerRef",
-                "request",
-                "previewOnly",
-                "status",
-            ],
-        )?;
-        if string_field(payload, "schemaVersion")? != "pastey-capability-preview-v1"
-            || payload.get("previewOnly") != Some(&Value::Bool(true))
-            || string_field(payload, "status")? != "outbound_preview"
-            || string_field(payload, "roomRef")? != expected_room
-            || string_field(payload, "sourceDeviceRef")? != expected_source
-            || string_field(payload, "targetPeerRef")? != expected_target
+    let (envelope_id, request_id) = if kind.starts_with("bridge_plan.") {
+        if string_field(object, "protocolFamily")? != BRIDGE_PLAN_PROTOCOL_FAMILY
+            || object.get("previewOnly") != Some(&Value::Bool(false))
         {
             return Err(AppError::InvalidInput(
-                "Invalid capability preview envelope.".into(),
+                "Invalid Bridge Plan protocol event.".into(),
             ));
         }
-        let envelope_id = bounded_string_field(payload, "envelopeId", 256)?;
-        let request = payload
-            .get("request")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid preview request.".into()))?;
-        if string_field(request, "sourceDeviceRef")? != expected_source
-            || string_field(request, "targetPeerRef")? != expected_target
-            || string_field(request, "transportStatus")? != "preview_only"
-        {
-            return Err(AppError::InvalidInput("Invalid preview request.".into()));
-        }
-        validate_preview_request_payload(request)?;
-        (
-            Some(envelope_id),
-            Some(bounded_string_field(request, "requestId", 256)?),
-        )
-    } else if kind == "capability_execute_request" {
-        if object.get("previewOnly") != Some(&Value::Bool(false)) {
-            return Err(AppError::InvalidInput(
-                "Invalid execution request event.".into(),
-            ));
-        }
-        validate_execution_request_payload(
+        let metadata = crate::bridge_plan::protocol_metadata(
+            &kind,
             payload,
             expected_room,
             expected_source,
             expected_target,
+            now.unix_timestamp(),
         )?;
-        for field in [
-            "consentId",
-            "sourcePreviewEventId",
-            "envelopeId",
-            "requestId",
-            "requestPayloadHash",
-        ] {
-            let _ = bounded_string_field(payload, field, 256)?;
-        }
-        let execution_id = bounded_string_field(payload, "executionId", 256)?;
-        let payload_created = OffsetDateTime::parse(string_field(payload, "createdAt")?, &Rfc3339)
-            .map_err(|_| AppError::InvalidInput("Invalid execution request time.".into()))?;
-        let payload_expires = OffsetDateTime::parse(string_field(payload, "expiresAt")?, &Rfc3339)
-            .map_err(|_| AppError::InvalidInput("Invalid execution request time.".into()))?;
-        if payload_expires <= now || payload_expires <= payload_created || payload_expires > expires
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution request time.".into(),
-            ));
-        }
-        (None, Some(format!("exec-request:{execution_id}")))
-    } else if kind == "capability_execution_result" {
-        if object.get("previewOnly") != Some(&Value::Bool(false)) {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result event.".into(),
-            ));
-        }
-        validate_execution_result_payload(payload)?;
-        let execution_id = bounded_string_field(payload, "executionId", 256)?;
-        (None, Some(format!("exec-result:{execution_id}")))
+        (None, Some(metadata.replay_id))
     } else {
-        if object.get("previewOnly") != Some(&Value::Bool(true)) {
-            return Err(AppError::InvalidInput(
-                "Invalid preview status event.".into(),
-            ));
-        }
-        let base_len = if payload.contains_key("reason") { 4 } else { 3 };
-        let allowed_len = if payload.contains_key("consent") {
-            base_len + 1
-        } else {
-            base_len
-        };
-        if payload.len() != allowed_len
-            || !payload.contains_key("envelopeId")
-            || !payload.contains_key("requestId")
-            || !payload.contains_key("status")
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid preview status payload.".into(),
-            ));
-        }
-        let expected_status = match kind.as_str() {
-            "capability_preview_ack" => "acknowledged_preview_only",
-            "capability_preview_deny" => "denied",
-            "capability_preview_invalid" => "invalid",
-            "capability_preview_expired" => "expired",
-            _ => unreachable!(),
-        };
-        if string_field(payload, "status")? != expected_status {
-            return Err(AppError::InvalidInput(
-                "Invalid preview status payload.".into(),
-            ));
-        }
-        let _ = bounded_string_field(payload, "envelopeId", 256)?;
-        let _ = bounded_string_field(payload, "requestId", 256)?;
-        if payload.contains_key("reason") {
-            let _ = bounded_string_field(payload, "reason", 512)?;
-        }
-        if payload.contains_key("consent") {
-            if kind != "capability_preview_ack" {
-                return Err(AppError::InvalidInput(
-                    "Invalid preview status payload.".into(),
-                ));
-            }
-            let consent = payload
-                .get("consent")
-                .and_then(Value::as_object)
-                .ok_or_else(|| AppError::InvalidInput("Invalid consent grant.".into()))?;
-            validate_consent_grant_payload(consent)?;
-            for field in [
-                "consentId",
-                "sourcePreviewEventId",
-                "envelopeId",
-                "requestId",
-                "requestPayloadHash",
-            ] {
-                let _ = bounded_string_field(consent, field, 256)?;
-            }
-            let consent_expires =
-                OffsetDateTime::parse(string_field(consent, "expiresAt")?, &Rfc3339)
-                    .map_err(|_| AppError::InvalidInput("Invalid consent grant.".into()))?;
-            if consent_expires <= now {
-                return Err(AppError::InvalidInput("Invalid consent grant.".into()));
-            }
-        }
-        (None, None)
+        return Err(AppError::InvalidInput("Unsupported room control event kind.".into()));
     };
     Ok(ValidatedControlEvent {
         event_id,
@@ -1330,1476 +1159,6 @@ fn require_exact_fields(object: &Map<String, Value>, fields: &[&str]) -> AppResu
     Ok(())
 }
 
-fn require_fields_with_optional(
-    object: &Map<String, Value>,
-    required: &[&str],
-    optional: &[&str],
-) -> AppResult<()> {
-    let allowed: HashSet<&str> = required.iter().chain(optional.iter()).copied().collect();
-    if required.iter().any(|field| !object.contains_key(*field))
-        || object.keys().any(|field| !allowed.contains(field.as_str()))
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid room control event fields.".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_preview_request_payload(request: &Map<String, Value>) -> AppResult<()> {
-    let schema = request.get("schemaVersion").and_then(Value::as_str);
-    let capability = request.get("capability").and_then(Value::as_str);
-    if schema == Some("artifact-transform-selected-request-v1") || capability == Some(ARTIFACT_TRANSFORM_CAPABILITY) {
-        require_exact_fields(request, &[
-            "schemaVersion", "requestId", "nonce", "createdAt", "expiresAt", "sourceDeviceRef", "targetPeerRef",
-            "capability", "sourceCapability", "sourceRequestId", "candidateId", "candidateKind", "resultContract",
-            "requestPayloadHash", "transportStatus",
-        ])?;
-        if schema != Some("artifact-transform-selected-request-v1") || capability != Some(ARTIFACT_TRANSFORM_CAPABILITY)
-            || string_field(request, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
-            || string_field(request, "candidateKind")? != "filesystem_file"
-            || string_field(request, "resultContract")? != "typed_transform_result"
-            || string_field(request, "transportStatus")? != "preview_only" {
-            return Err(AppError::InvalidInput("Invalid preview request.".into()));
-        }
-        for field in ["requestId", "nonce", "sourceDeviceRef", "targetPeerRef", "sourceRequestId", "candidateId", "requestPayloadHash"] {
-            let value = bounded_string_field(request, field, 256)?;
-            if field == "candidateId" && (value.contains('/') || value.contains('\\') || is_absolute_path_like(&value)) { return Err(AppError::InvalidInput("Invalid preview request.".into())); }
-        }
-        return Ok(());
-    }
-    if schema == Some(CANDIDATE_PAYLOAD_REQUEST_SCHEMA)
-        || capability == Some(CANDIDATE_PAYLOAD_CAPABILITY)
-    {
-        require_exact_fields(
-            request,
-            &[
-                "schemaVersion",
-                "requestId",
-                "nonce",
-                "createdAt",
-                "expiresAt",
-                "sourceDeviceRef",
-                "targetPeerRef",
-                "capability",
-                "executorKind",
-                "input",
-                "pendingPayloadHash",
-                "requestPayloadHash",
-                "transportStatus",
-            ],
-        )?;
-        if schema != Some(CANDIDATE_PAYLOAD_REQUEST_SCHEMA)
-            || capability != Some(CANDIDATE_PAYLOAD_CAPABILITY)
-            || string_field(request, "executorKind")? != CANDIDATE_PAYLOAD_EXECUTOR_KIND
-            || string_field(request, "transportStatus")? != "preview_only"
-        {
-            return Err(AppError::InvalidInput("Invalid preview request.".into()));
-        }
-        let input = request
-            .get("input")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid preview request input.".into()))?;
-        validate_candidate_payload_input(input)?;
-        let _ = bounded_string_field(request, "pendingPayloadHash", 256)?;
-        let _ = bounded_string_field(request, "requestPayloadHash", 256)?;
-        return Ok(());
-    }
-    if schema == Some(FILE_CANDIDATES_REQUEST_SCHEMA)
-        || capability == Some(FILE_CANDIDATES_CAPABILITY)
-    {
-        require_exact_fields(
-            request,
-            &[
-                "schemaVersion",
-                "requestId",
-                "nonce",
-                "createdAt",
-                "expiresAt",
-                "sourceDeviceRef",
-                "targetPeerRef",
-                "capability",
-                "executorKind",
-                "input",
-                "pendingPayloadHash",
-                "requestPayloadHash",
-                "transportStatus",
-            ],
-        )?;
-        if schema != Some(FILE_CANDIDATES_REQUEST_SCHEMA)
-            || capability != Some(FILE_CANDIDATES_CAPABILITY)
-            || string_field(request, "executorKind")? != FILE_CANDIDATES_EXECUTOR_KIND
-            || string_field(request, "transportStatus")? != "preview_only"
-        {
-            return Err(AppError::InvalidInput("Invalid preview request.".into()));
-        }
-        let input = request
-            .get("input")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid preview request input.".into()))?;
-        validate_file_candidate_input(input, string_field(request, "targetPeerRef")?)?;
-        let _ = bounded_string_field(request, "pendingPayloadHash", 256)?;
-        let _ = bounded_string_field(request, "requestPayloadHash", 256)?;
-        return Ok(());
-    }
-    if schema == Some(HELLO_STDOUT_REQUEST_SCHEMA) || capability == Some(HELLO_STDOUT_CAPABILITY) {
-        require_exact_fields(
-            request,
-            &[
-                "schemaVersion",
-                "requestId",
-                "nonce",
-                "createdAt",
-                "expiresAt",
-                "sourceDeviceRef",
-                "targetPeerRef",
-                "capability",
-                "runtimeKind",
-                "input",
-                "constraints",
-                "pendingPayloadHash",
-                "requestPayloadHash",
-                "transportStatus",
-            ],
-        )?;
-        if schema != Some(HELLO_STDOUT_REQUEST_SCHEMA)
-            || capability != Some(HELLO_STDOUT_CAPABILITY)
-            || string_field(request, "runtimeKind")? != "rust_host_helper"
-        {
-            return Err(AppError::InvalidInput("Invalid preview request.".into()));
-        }
-        let input = request
-            .get("input")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid preview request input.".into()))?;
-        require_exact_fields(input, &["expectedStdout"])?;
-        if string_field(input, "expectedStdout")? != HELLO_STDOUT_EXPECTED_STDOUT {
-            return Err(AppError::InvalidInput(
-                "Invalid preview request input.".into(),
-            ));
-        }
-        let constraints = request
-            .get("constraints")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid preview request constraints.".into()))?;
-        require_exact_fields(
-            constraints,
-            &[
-                "templateOnly",
-                "noRawShell",
-                "filesystem",
-                "network",
-                "timeoutMs",
-                "maxStdoutBytes",
-                "maxStderrBytes",
-            ],
-        )?;
-        if constraints.get("templateOnly") != Some(&Value::Bool(true))
-            || constraints.get("noRawShell") != Some(&Value::Bool(true))
-            || string_field(constraints, "filesystem")? != "none"
-            || constraints.get("network") != Some(&Value::Bool(false))
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid preview request constraints.".into(),
-            ));
-        }
-        let _ = bounded_string_field(request, "pendingPayloadHash", 256)?;
-        let _ = bounded_string_field(request, "requestPayloadHash", 256)?;
-    }
-    Ok(())
-}
-
-fn validate_execution_request_payload(
-    payload: &Map<String, Value>,
-    expected_room: &str,
-    expected_source: &str,
-    expected_target: &str,
-) -> AppResult<()> {
-    let schema = string_field(payload, "schemaVersion")?;
-    let capability = string_field(payload, "capability")?;
-    if schema == ARTIFACT_TRANSFORM_EXECUTION_REQUEST_SCHEMA || capability == ARTIFACT_TRANSFORM_CAPABILITY {
-        require_exact_fields(payload, &[
-            "schemaVersion", "executionId", "consentId", "sourcePreviewEventId", "envelopeId", "requestId",
-            "requestPayloadHash", "roomRef", "sourceDeviceRef", "targetPeerRef", "capability", "sourceCapability",
-            "sourceRequestId", "candidateId", "candidateKind", "resultContract", "createdAt", "expiresAt",
-        ])?;
-        if schema != ARTIFACT_TRANSFORM_EXECUTION_REQUEST_SCHEMA
-            || capability != ARTIFACT_TRANSFORM_CAPABILITY
-            || string_field(payload, "roomRef")? != expected_room
-            || string_field(payload, "sourceDeviceRef")? != expected_source
-            || string_field(payload, "targetPeerRef")? != expected_target
-            || string_field(payload, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
-            || string_field(payload, "candidateKind")? != "filesystem_file"
-            || string_field(payload, "resultContract")? != "typed_transform_result" {
-            return Err(AppError::InvalidInput("Invalid execution request payload.".into()));
-        }
-        for field in ["executionId", "consentId", "sourcePreviewEventId", "envelopeId", "requestId", "requestPayloadHash", "sourceRequestId", "candidateId"] {
-            let value = bounded_string_field(payload, field, 256)?;
-            if field == "candidateId" && (value.contains('/') || value.contains('\\') || is_absolute_path_like(&value)) {
-                return Err(AppError::InvalidInput("Invalid execution request payload.".into()));
-            }
-        }
-        return Ok(());
-    }
-    if schema == CANDIDATE_PAYLOAD_EXECUTION_REQUEST_SCHEMA
-        || capability == CANDIDATE_PAYLOAD_CAPABILITY
-    {
-        require_exact_fields(
-            payload,
-            &[
-                "schemaVersion",
-                "executionId",
-                "consentId",
-                "sourcePreviewEventId",
-                "envelopeId",
-                "requestId",
-                "requestPayloadHash",
-                "roomRef",
-                "sourceDeviceRef",
-                "targetPeerRef",
-                "capability",
-                "executorKind",
-                "sourceCapability",
-                "sourceRequestId",
-                "candidateId",
-                "candidateKind",
-                "candidateDisplayName",
-                "createdAt",
-                "expiresAt",
-            ],
-        )?;
-        if schema != CANDIDATE_PAYLOAD_EXECUTION_REQUEST_SCHEMA
-            || string_field(payload, "roomRef")? != expected_room
-            || string_field(payload, "sourceDeviceRef")? != expected_source
-            || string_field(payload, "targetPeerRef")? != expected_target
-            || capability != CANDIDATE_PAYLOAD_CAPABILITY
-            || string_field(payload, "executorKind")? != CANDIDATE_PAYLOAD_EXECUTOR_KIND
-            || string_field(payload, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
-            || string_field(payload, "candidateKind")? != "filesystem_file"
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution request payload.".into(),
-            ));
-        }
-        let candidate_id = bounded_string_field(payload, "candidateId", 256)?;
-        if candidate_id.contains('/')
-            || candidate_id.contains('\\')
-            || is_absolute_path_like(&candidate_id)
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution request payload.".into(),
-            ));
-        }
-        let _ = bounded_string_field(payload, "sourceRequestId", 256)?;
-        let _ = bounded_string_field(payload, "candidateDisplayName", 256)?;
-        return Ok(());
-    }
-    if schema == FILE_CANDIDATES_EXECUTION_REQUEST_SCHEMA
-        || capability == FILE_CANDIDATES_CAPABILITY
-    {
-        require_exact_fields(
-            payload,
-            &[
-                "schemaVersion",
-                "executionId",
-                "consentId",
-                "sourcePreviewEventId",
-                "envelopeId",
-                "requestId",
-                "requestPayloadHash",
-                "roomRef",
-                "sourceDeviceRef",
-                "targetPeerRef",
-                "capability",
-                "executorKind",
-                "input",
-                "createdAt",
-                "expiresAt",
-            ],
-        )?;
-        if schema != FILE_CANDIDATES_EXECUTION_REQUEST_SCHEMA
-            || string_field(payload, "roomRef")? != expected_room
-            || string_field(payload, "sourceDeviceRef")? != expected_source
-            || string_field(payload, "targetPeerRef")? != expected_target
-            || capability != FILE_CANDIDATES_CAPABILITY
-            || string_field(payload, "executorKind")? != FILE_CANDIDATES_EXECUTOR_KIND
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution request payload.".into(),
-            ));
-        }
-        let input = payload
-            .get("input")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid execution request payload.".into()))?;
-        validate_file_candidate_input(input, expected_target)?;
-        return Ok(());
-    }
-    if schema == HELLO_STDOUT_EXECUTION_REQUEST_SCHEMA || capability == HELLO_STDOUT_CAPABILITY {
-        require_exact_fields(
-            payload,
-            &[
-                "schemaVersion",
-                "executionId",
-                "consentId",
-                "sourcePreviewEventId",
-                "envelopeId",
-                "requestId",
-                "requestPayloadHash",
-                "roomRef",
-                "sourceDeviceRef",
-                "targetPeerRef",
-                "capability",
-                "expectedStdout",
-                "createdAt",
-                "expiresAt",
-            ],
-        )?;
-        if schema != HELLO_STDOUT_EXECUTION_REQUEST_SCHEMA
-            || string_field(payload, "roomRef")? != expected_room
-            || string_field(payload, "sourceDeviceRef")? != expected_source
-            || string_field(payload, "targetPeerRef")? != expected_target
-            || capability != HELLO_STDOUT_CAPABILITY
-            || string_field(payload, "expectedStdout")? != HELLO_STDOUT_EXPECTED_STDOUT
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution request payload.".into(),
-            ));
-        }
-        return Ok(());
-    }
-
-    require_exact_fields(
-        payload,
-        &[
-            "schemaVersion",
-            "executionId",
-            "consentId",
-            "sourcePreviewEventId",
-            "envelopeId",
-            "requestId",
-            "requestPayloadHash",
-            "roomRef",
-            "sourceDeviceRef",
-            "targetPeerRef",
-            "capability",
-            "exactMessage",
-            "createdAt",
-            "expiresAt",
-        ],
-    )?;
-    if schema != "pastey-hello-peer-execution-request-v1"
-        || string_field(payload, "roomRef")? != expected_room
-        || string_field(payload, "sourceDeviceRef")? != expected_source
-        || string_field(payload, "targetPeerRef")? != expected_target
-        || capability != "runtime.execute_hello_template"
-        || string_field(payload, "exactMessage")? != "hello peer!"
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution request payload.".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_execution_result_payload(payload: &Map<String, Value>) -> AppResult<()> {
-    if string_field(payload, "schemaVersion")? == ARTIFACT_TRANSFORM_EXECUTION_RESULT_SCHEMA {
-        return validate_artifact_transform_execution_result_payload(payload);
-    }
-    if string_field(payload, "schemaVersion")? == CANDIDATE_PAYLOAD_EXECUTION_RESULT_SCHEMA {
-        return validate_candidate_payload_execution_result_payload(payload);
-    }
-    if string_field(payload, "schemaVersion")? == FILE_CANDIDATES_EXECUTION_RESULT_SCHEMA {
-        return validate_file_candidate_execution_result_payload(payload);
-    }
-    if string_field(payload, "schemaVersion")? == HELLO_STDOUT_EXECUTION_RESULT_SCHEMA {
-        return validate_hello_stdout_execution_result_payload(payload);
-    }
-    validate_hello_peer_execution_result_payload(payload)
-}
-
-pub fn validate_artifact_transform_execution_result_payload(payload: &Map<String, Value>) -> AppResult<()> {
-    require_fields_with_optional(
-        payload,
-        &["schemaVersion", "capability", "executionId", "requestId", "consentId", "status", "createdAt"],
-        &["result", "errorCode"],
-    )?;
-    if string_field(payload, "schemaVersion")? != ARTIFACT_TRANSFORM_EXECUTION_RESULT_SCHEMA
-        || string_field(payload, "capability")? != ARTIFACT_TRANSFORM_CAPABILITY {
-        return Err(AppError::InvalidInput("Invalid execution result payload.".into()));
-    }
-    for field in ["executionId", "requestId", "consentId"] { let _ = bounded_string_field(payload, field, 256)?; }
-    let _ = OffsetDateTime::parse(string_field(payload, "createdAt")?, &Rfc3339)
-        .map_err(|_| AppError::InvalidInput("Invalid execution result time.".into()))?;
-    let status = string_field(payload, "status")?;
-    if status == "completed" {
-        if payload.contains_key("errorCode") { return Err(AppError::InvalidInput("Invalid execution result payload.".into())); }
-        let result = payload.get("result").and_then(Value::as_object).ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?;
-        require_exact_fields(result, &["kind", "output"])?;
-        if string_field(result, "kind")? != "typed_transform_result" { return Err(AppError::InvalidInput("Invalid execution result payload.".into())); }
-        let output = result.get("output").and_then(Value::as_object).ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?;
-        require_exact_fields(output, &["kind", "stdout", "stderr", "exitCode", "durationMs", "timedOut", "stdoutTruncated", "stderrTruncated"])?;
-        if string_field(output, "kind")? != "process_output" || !valid_artifact_transform_output_text(output, "stdout", "stdoutTruncated") || !valid_artifact_transform_output_text(output, "stderr", "stderrTruncated") || !(0..=255).contains(&integer_field(output, "exitCode")?) || !(0..=60_000).contains(&integer_field(output, "durationMs")?) || output.get("timedOut") != Some(&Value::Bool(false)) {
-            return Err(AppError::InvalidInput("Invalid execution result payload.".into()));
-        }
-    } else if !["failed", "timed_out", "rejected", "expired", "already_consumed"].contains(&status)
-        || payload.contains_key("result")
-        || !payload.get("errorCode").and_then(Value::as_str).is_some_and(is_artifact_transform_error_code) {
-        return Err(AppError::InvalidInput("Invalid execution result payload.".into()));
-    }
-    Ok(())
-}
-
-fn validate_hello_peer_execution_result_payload(payload: &Map<String, Value>) -> AppResult<()> {
-    let allowed_len = if payload.contains_key("output") || payload.contains_key("errorCode") {
-        7
-    } else {
-        6
-    };
-    if payload.len() != allowed_len
-        || !payload.contains_key("schemaVersion")
-        || !payload.contains_key("executionId")
-        || !payload.contains_key("requestId")
-        || !payload.contains_key("consentId")
-        || !payload.contains_key("status")
-        || !payload.contains_key("createdAt")
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    if string_field(payload, "schemaVersion")? != "pastey-hello-peer-execution-result-v1" {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    let _ = bounded_string_field(payload, "executionId", 256)?;
-    let _ = bounded_string_field(payload, "requestId", 256)?;
-    let _ = bounded_string_field(payload, "consentId", 256)?;
-    let _ = OffsetDateTime::parse(string_field(payload, "createdAt")?, &Rfc3339)
-        .map_err(|_| AppError::InvalidInput("Invalid execution result time.".into()))?;
-    let status = string_field(payload, "status")?;
-    if status == "succeeded" {
-        if payload.get("output") != Some(&Value::String("hello peer!".into()))
-            || payload.contains_key("errorCode")
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-    } else if !["rejected", "expired", "already_consumed", "failed"].contains(&status)
-        || payload.contains_key("output")
-        || !payload.contains_key("errorCode")
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    } else {
-        let _ = bounded_string_field(payload, "errorCode", 64)?;
-    }
-    Ok(())
-}
-
-pub fn validate_hello_stdout_execution_result_payload(
-    payload: &Map<String, Value>,
-) -> AppResult<()> {
-    let fields_without_error = [
-        "schemaVersion",
-        "executionId",
-        "requestId",
-        "consentId",
-        "capability",
-        "runtimeKind",
-        "status",
-        "stdout",
-        "stderr",
-        "exitCode",
-        "durationMs",
-        "timedOut",
-        "stdoutTruncated",
-        "stderrTruncated",
-        "createdAt",
-    ];
-    let fields_with_error = [
-        "schemaVersion",
-        "executionId",
-        "requestId",
-        "consentId",
-        "capability",
-        "runtimeKind",
-        "status",
-        "stdout",
-        "stderr",
-        "exitCode",
-        "durationMs",
-        "timedOut",
-        "stdoutTruncated",
-        "stderrTruncated",
-        "errorCode",
-        "createdAt",
-    ];
-    if payload.contains_key("errorCode") {
-        require_exact_fields(payload, &fields_with_error)?;
-    } else {
-        require_exact_fields(payload, &fields_without_error)?;
-    }
-    if string_field(payload, "schemaVersion")? != HELLO_STDOUT_EXECUTION_RESULT_SCHEMA
-        || string_field(payload, "capability")? != HELLO_STDOUT_CAPABILITY
-        || string_field(payload, "runtimeKind")? != "rust_host_helper"
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    for field in ["executionId", "requestId", "consentId"] {
-        let _ = bounded_string_field(payload, field, 256)?;
-    }
-    let _ = OffsetDateTime::parse(string_field(payload, "createdAt")?, &Rfc3339)
-        .map_err(|_| AppError::InvalidInput("Invalid execution result time.".into()))?;
-    bounded_string_bytes(payload, "stdout", 64)?;
-    bounded_string_bytes(payload, "stderr", 256)?;
-    let exit_code = integer_field(payload, "exitCode")?;
-    let duration_ms = integer_field(payload, "durationMs")?;
-    for field in ["timedOut", "stdoutTruncated", "stderrTruncated"] {
-        if payload.get(field).and_then(Value::as_bool).is_none() {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-    }
-    let status = string_field(payload, "status")?;
-    if status == "succeeded" {
-        if string_field(payload, "stdout")? != HELLO_STDOUT_EXPECTED_STDOUT
-            || string_field(payload, "stderr")? != ""
-            || exit_code != 0
-            || payload.get("timedOut") != Some(&Value::Bool(false))
-            || payload.contains_key("errorCode")
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-    } else if !["rejected", "expired", "already_consumed", "failed"].contains(&status)
-        || !payload.contains_key("errorCode")
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    } else {
-        let _ = bounded_string_field(payload, "errorCode", 64)?;
-    }
-    if duration_ms < 0 || duration_ms > 60_000 {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    Ok(())
-}
-
-pub fn validate_file_candidate_execution_result_payload(
-    payload: &Map<String, Value>,
-) -> AppResult<()> {
-    require_exact_fields(
-        payload,
-        &[
-            "schemaVersion",
-            "capability",
-            "executionId",
-            "requestId",
-            "consentId",
-            "status",
-            "queryEcho",
-            "candidates",
-            "omitted",
-            "durationMs",
-            "truncated",
-            "errorCode",
-            "createdAt",
-        ],
-    )?;
-    if string_field(payload, "schemaVersion")? != FILE_CANDIDATES_EXECUTION_RESULT_SCHEMA
-        || string_field(payload, "capability")? != FILE_CANDIDATES_CAPABILITY
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    for field in ["executionId", "requestId", "consentId"] {
-        let _ = bounded_string_field(payload, field, 256)?;
-    }
-    let _ = OffsetDateTime::parse(string_field(payload, "createdAt")?, &Rfc3339)
-        .map_err(|_| AppError::InvalidInput("Invalid execution result time.".into()))?;
-    let status = string_field(payload, "status")?;
-    if ![
-        "completed",
-        "rejected",
-        "expired",
-        "already_consumed",
-        "failed",
-    ]
-    .contains(&status)
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    validate_file_candidate_query_echo(
-        payload
-            .get("queryEcho")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?,
-    )?;
-    validate_file_candidate_result_candidates(
-        payload
-            .get("candidates")
-            .and_then(Value::as_array)
-            .ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?,
-    )?;
-    validate_file_candidate_omitted(
-        payload
-            .get("omitted")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?,
-    )?;
-    let duration_ms = integer_field(payload, "durationMs")?;
-    if !(0..=60_000).contains(&duration_ms)
-        || payload.get("truncated").and_then(Value::as_bool).is_none()
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    if status == "completed" {
-        if !payload.get("errorCode").is_some_and(Value::is_null) {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-    } else if !payload
-        .get("errorCode")
-        .and_then(Value::as_str)
-        .is_some_and(is_file_candidate_error_code)
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    Ok(())
-}
-
-pub fn validate_candidate_payload_execution_result_payload(
-    payload: &Map<String, Value>,
-) -> AppResult<()> {
-    require_fields_with_optional(
-        payload,
-        &[
-            "schemaVersion",
-            "capability",
-            "executionId",
-            "requestId",
-            "consentId",
-            "status",
-            "candidate",
-            "transferredBytes",
-            "handoffQueued",
-            "errorCode",
-            "createdAt",
-        ],
-        &["candidateResolution", "transferStatus"],
-    )?;
-    if string_field(payload, "schemaVersion")? != CANDIDATE_PAYLOAD_EXECUTION_RESULT_SCHEMA
-        || string_field(payload, "capability")? != CANDIDATE_PAYLOAD_CAPABILITY
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    for field in ["executionId", "requestId", "consentId"] {
-        let _ = bounded_string_field(payload, field, 256)?;
-    }
-    let _ = OffsetDateTime::parse(string_field(payload, "createdAt")?, &Rfc3339)
-        .map_err(|_| AppError::InvalidInput("Invalid execution result time.".into()))?;
-    let status = string_field(payload, "status")?;
-    if ![
-        "handoff_queued",
-        "handoff_failed",
-        "candidate_resolved_handoff_not_implemented",
-        "candidate_not_found",
-        "candidate_expired",
-        "candidate_changed",
-        "handoff_not_implemented",
-        "rejected",
-        "expired",
-        "already_consumed",
-        "failed",
-    ]
-    .contains(&status)
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    validate_candidate_payload_result_candidate(
-        payload
-            .get("candidate")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?,
-    )?;
-    if let Some(resolution) = payload.get("candidateResolution") {
-        validate_candidate_payload_resolution(
-            resolution.as_object().ok_or_else(|| {
-                AppError::InvalidInput("Invalid execution result payload.".into())
-            })?,
-        )?;
-    }
-    if integer_field(payload, "transferredBytes")? != 0 {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    if status == "handoff_queued" {
-        if payload.get("handoffQueued") != Some(&Value::Bool(true))
-            || payload.get("transferStatus").and_then(Value::as_str) != Some("queued")
-            || !payload.get("errorCode").is_some_and(Value::is_null)
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-    } else {
-        if payload.get("handoffQueued") != Some(&Value::Bool(false))
-            || payload.get("transferStatus").is_some()
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-    }
-    if status != "handoff_queued"
-        && [
-            "candidate_resolved_handoff_not_implemented",
-            "candidate_not_found",
-            "candidate_expired",
-            "candidate_changed",
-            "handoff_not_implemented",
-        ]
-        .contains(&status)
-    {
-        if !payload.get("errorCode").is_some_and(Value::is_null) {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-    } else if !payload
-        .get("errorCode")
-        .and_then(Value::as_str)
-        .is_some_and(is_candidate_payload_error_code)
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_consent_grant_payload(consent: &Map<String, Value>) -> AppResult<()> {
-    let schema = string_field(consent, "schemaVersion")?;
-    let capability = string_field(consent, "capability")?;
-    if schema == ARTIFACT_TRANSFORM_CONSENT_SCHEMA || capability == ARTIFACT_TRANSFORM_CAPABILITY {
-        require_exact_fields(consent, &[
-            "schemaVersion", "consentId", "sourcePreviewEventId", "envelopeId", "requestId", "requestPayloadHash",
-            "capability", "sourceCapability", "sourceRequestId", "candidateId", "candidateKind", "resultContract", "expiresAt",
-        ])?;
-        if schema != ARTIFACT_TRANSFORM_CONSENT_SCHEMA || capability != ARTIFACT_TRANSFORM_CAPABILITY
-            || string_field(consent, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
-            || string_field(consent, "candidateKind")? != "filesystem_file"
-            || string_field(consent, "resultContract")? != "typed_transform_result" {
-            return Err(AppError::InvalidInput("Invalid consent grant.".into()));
-        }
-        for field in ["consentId", "sourcePreviewEventId", "envelopeId", "requestId", "requestPayloadHash", "sourceRequestId", "candidateId"] {
-            let value = bounded_string_field(consent, field, 256)?;
-            if field == "candidateId" && (value.contains('/') || value.contains('\\') || is_absolute_path_like(&value)) { return Err(AppError::InvalidInput("Invalid consent grant.".into())); }
-        }
-        return Ok(());
-    }
-    if schema == CANDIDATE_PAYLOAD_CONSENT_SCHEMA || capability == CANDIDATE_PAYLOAD_CAPABILITY {
-        require_exact_fields(
-            consent,
-            &[
-                "schemaVersion",
-                "consentId",
-                "sourcePreviewEventId",
-                "envelopeId",
-                "requestId",
-                "requestPayloadHash",
-                "capability",
-                "sourceCapability",
-                "sourceRequestId",
-                "candidateId",
-                "candidateKind",
-                "candidateDisplayName",
-                "expiresAt",
-            ],
-        )?;
-        if schema != CANDIDATE_PAYLOAD_CONSENT_SCHEMA
-            || capability != CANDIDATE_PAYLOAD_CAPABILITY
-            || string_field(consent, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
-            || string_field(consent, "candidateKind")? != "filesystem_file"
-        {
-            return Err(AppError::InvalidInput("Invalid consent grant.".into()));
-        }
-        let candidate_id = bounded_string_field(consent, "candidateId", 256)?;
-        if candidate_id.contains('/')
-            || candidate_id.contains('\\')
-            || is_absolute_path_like(&candidate_id)
-        {
-            return Err(AppError::InvalidInput("Invalid consent grant.".into()));
-        }
-        let _ = bounded_string_field(consent, "sourceRequestId", 256)?;
-        let _ = bounded_string_field(consent, "candidateDisplayName", 256)?;
-        return Ok(());
-    }
-    if schema == FILE_CANDIDATES_CONSENT_SCHEMA || capability == FILE_CANDIDATES_CAPABILITY {
-        require_exact_fields(
-            consent,
-            &[
-                "schemaVersion",
-                "consentId",
-                "sourcePreviewEventId",
-                "envelopeId",
-                "requestId",
-                "requestPayloadHash",
-                "capability",
-                "filenameHint",
-                "searchMode",
-                "expiresAt",
-            ],
-        )?;
-        if schema != FILE_CANDIDATES_CONSENT_SCHEMA
-            || capability != FILE_CANDIDATES_CAPABILITY
-            || string_field(consent, "searchMode")? != "filename_metadata_only"
-        {
-            return Err(AppError::InvalidInput("Invalid consent grant.".into()));
-        }
-        let _ = bounded_string_field(consent, "filenameHint", 128)?;
-        return Ok(());
-    }
-    if schema == HELLO_STDOUT_CONSENT_SCHEMA || capability == HELLO_STDOUT_CAPABILITY {
-        require_exact_fields(
-            consent,
-            &[
-                "schemaVersion",
-                "consentId",
-                "sourcePreviewEventId",
-                "envelopeId",
-                "requestId",
-                "requestPayloadHash",
-                "capability",
-                "expectedStdout",
-                "expiresAt",
-            ],
-        )?;
-        if schema != HELLO_STDOUT_CONSENT_SCHEMA
-            || capability != HELLO_STDOUT_CAPABILITY
-            || string_field(consent, "expectedStdout")? != HELLO_STDOUT_EXPECTED_STDOUT
-        {
-            return Err(AppError::InvalidInput("Invalid consent grant.".into()));
-        }
-        return Ok(());
-    }
-
-    require_exact_fields(
-        consent,
-        &[
-            "schemaVersion",
-            "consentId",
-            "sourcePreviewEventId",
-            "envelopeId",
-            "requestId",
-            "requestPayloadHash",
-            "capability",
-            "exactMessage",
-            "expiresAt",
-        ],
-    )?;
-    if schema != "pastey-hello-peer-consent-grant-v1"
-        || capability != "runtime.execute_hello_template"
-        || string_field(consent, "exactMessage")? != "hello peer!"
-    {
-        return Err(AppError::InvalidInput("Invalid consent grant.".into()));
-    }
-    Ok(())
-}
-
-fn is_result_event_with_bounded_process_output(kind: &str, payload: &Map<String, Value>) -> bool {
-    kind == "capability_execution_result"
-        && payload
-            .get("schemaVersion")
-            .and_then(Value::as_str)
-            .is_some_and(|schema| schema == HELLO_STDOUT_EXECUTION_RESULT_SCHEMA || schema == ARTIFACT_TRANSFORM_EXECUTION_RESULT_SCHEMA)
-}
-
-fn is_artifact_transform_error_code(value: &str) -> bool {
-    matches!(value, "sandbox_unavailable" | "malformed_request" | "missing_consent" | "consent_not_allowed_once" | "consent_expired" | "invalid_consent" | "consent_binding_mismatch" | "already_consumed" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed" | "policy_rejected" | "executor_failed" | "invalid_executor_result" | "result_contains_private_host_data" | "timed_out")
-}
-
-fn validate_candidate_payload_input(input: &Map<String, Value>) -> AppResult<()> {
-    require_fields_with_optional(
-        input,
-        &[
-            "sourceCapability",
-            "sourceRequestId",
-            "candidateId",
-            "candidateDisplayName",
-            "candidateKind",
-        ],
-        &[
-            "redactedLocation",
-            "sizeBytes",
-            "modifiedAt",
-            "mimeFamily",
-            "extension",
-        ],
-    )?;
-    if string_field(input, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
-        || string_field(input, "candidateKind")? != "filesystem_file"
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid candidate payload input.".into(),
-        ));
-    }
-    let candidate_id = bounded_string_field(input, "candidateId", 256)?;
-    if candidate_id.contains('/')
-        || candidate_id.contains('\\')
-        || is_absolute_path_like(&candidate_id)
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid candidate payload input.".into(),
-        ));
-    }
-    let _ = bounded_string_field(input, "sourceRequestId", 256)?;
-    let _ = bounded_string_field(input, "candidateDisplayName", 255)?;
-    if let Some(redacted_location) = input.get("redactedLocation") {
-        let Some(redacted_location) = redacted_location.as_str() else {
-            return Err(AppError::InvalidInput(
-                "Invalid candidate payload input.".into(),
-            ));
-        };
-        if redacted_location.is_empty()
-            || redacted_location.len() > 512
-            || is_absolute_path_like(redacted_location)
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid candidate payload input.".into(),
-            ));
-        }
-    }
-    validate_optional_non_negative_integer(input, "sizeBytes", "Invalid candidate payload input.")?;
-    validate_optional_rfc3339(input, "modifiedAt", "Invalid candidate payload input.")?;
-    validate_optional_mime_and_extension(input)
-}
-
-fn validate_file_candidate_input(
-    input: &Map<String, Value>,
-    expected_target: &str,
-) -> AppResult<()> {
-    require_exact_fields(
-        input,
-        &[
-            "capability",
-            "targetPeerRef",
-            "query",
-            "scopePolicy",
-            "limits",
-            "safety",
-        ],
-    )?;
-    if string_field(input, "capability")? != FILE_CANDIDATES_CAPABILITY
-        || string_field(input, "targetPeerRef")? != expected_target
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid file candidate input.".into(),
-        ));
-    }
-    validate_file_candidate_query(
-        input
-            .get("query")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid file candidate query.".into()))?,
-    )?;
-    validate_file_candidate_scope_policy(
-        input
-            .get("scopePolicy")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid file candidate scope.".into()))?,
-    )?;
-    validate_file_candidate_limits(
-        input
-            .get("limits")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid file candidate limits.".into()))?,
-    )?;
-    validate_file_candidate_safety(
-        input
-            .get("safety")
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError::InvalidInput("Invalid file candidate safety.".into()))?,
-    )
-}
-
-fn validate_file_candidate_query(query: &Map<String, Value>) -> AppResult<()> {
-    require_exact_fields(
-        query,
-        &["rawUserRequest", "filenameHint", "extensions", "searchMode"],
-    )?;
-    let _ = bounded_string_field(query, "rawUserRequest", 512)?;
-    let filename_hint = bounded_string_field(query, "filenameHint", 128)?;
-    if !filename_hint
-        .chars()
-        .any(|character| character.is_ascii_alphanumeric())
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid file candidate query.".into(),
-        ));
-    }
-    if string_field(query, "searchMode")? != "filename_metadata_only" {
-        return Err(AppError::InvalidInput(
-            "Invalid file candidate query.".into(),
-        ));
-    }
-    validate_extension_array(
-        query
-            .get("extensions")
-            .and_then(Value::as_array)
-            .ok_or_else(|| AppError::InvalidInput("Invalid file candidate query.".into()))?,
-    )
-}
-
-fn validate_file_candidate_scope_policy(scope: &Map<String, Value>) -> AppResult<()> {
-    require_exact_fields(
-        scope,
-        &[
-            "allowedScopes",
-            "allowFullDisk",
-            "includeFileContents",
-            "includeAbsolutePaths",
-            "includeHiddenFiles",
-        ],
-    )?;
-    let scopes = scope
-        .get("allowedScopes")
-        .and_then(Value::as_array)
-        .ok_or_else(|| AppError::InvalidInput("Invalid file candidate scope.".into()))?;
-    if scopes.is_empty() {
-        return Err(AppError::InvalidInput(
-            "Invalid file candidate scope.".into(),
-        ));
-    }
-    let mut seen = HashSet::new();
-    for value in scopes {
-        let Some(scope) = value.as_str() else {
-            return Err(AppError::InvalidInput(
-                "Invalid file candidate scope.".into(),
-            ));
-        };
-        if !["downloads", "desktop", "documents", "pastey_shared"].contains(&scope)
-            || !seen.insert(scope)
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid file candidate scope.".into(),
-            ));
-        }
-    }
-    if scope.get("allowFullDisk") != Some(&Value::Bool(false))
-        || scope.get("includeFileContents") != Some(&Value::Bool(false))
-        || scope.get("includeAbsolutePaths") != Some(&Value::Bool(false))
-        || scope.get("includeHiddenFiles") != Some(&Value::Bool(false))
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid file candidate scope.".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_file_candidate_limits(limits: &Map<String, Value>) -> AppResult<()> {
-    require_exact_fields(limits, &["maxCandidates", "maxSearchMs", "maxDepth"])?;
-    let max_candidates = integer_field(limits, "maxCandidates")?;
-    let max_search_ms = integer_field(limits, "maxSearchMs")?;
-    let max_depth = integer_field(limits, "maxDepth")?;
-    if !(1..=20).contains(&max_candidates)
-        || !(500..=10_000).contains(&max_search_ms)
-        || !(1..=8).contains(&max_depth)
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid file candidate limits.".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_file_candidate_safety(safety: &Map<String, Value>) -> AppResult<()> {
-    require_exact_fields(
-        safety,
-        &[
-            "returnRedactedPaths",
-            "noAutoTransfer",
-            "requireReceiverConsent",
-            "selectedPeerOnly",
-        ],
-    )?;
-    if safety.get("returnRedactedPaths") != Some(&Value::Bool(true))
-        || safety.get("noAutoTransfer") != Some(&Value::Bool(true))
-        || safety.get("requireReceiverConsent") != Some(&Value::Bool(true))
-        || safety.get("selectedPeerOnly") != Some(&Value::Bool(true))
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid file candidate safety.".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_file_candidate_query_echo(query: &Map<String, Value>) -> AppResult<()> {
-    require_exact_fields(query, &["filenameHint", "extensions", "searchMode"])?;
-    let _ = bounded_string_field(query, "filenameHint", 128)?;
-    if string_field(query, "searchMode")? != "filename_metadata_only" {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    validate_extension_array(
-        query
-            .get("extensions")
-            .and_then(Value::as_array)
-            .ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?,
-    )
-}
-
-fn validate_extension_array(values: &[Value]) -> AppResult<()> {
-    if values.len() > 10 {
-        return Err(AppError::InvalidInput(
-            "Invalid file candidate extensions.".into(),
-        ));
-    }
-    for value in values {
-        let Some(extension) = value.as_str() else {
-            return Err(AppError::InvalidInput(
-                "Invalid file candidate extensions.".into(),
-            ));
-        };
-        if extension.len() > 16
-            || extension
-                .chars()
-                .any(|character| !character.is_ascii_alphanumeric())
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid file candidate extensions.".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_file_candidate_result_candidates(candidates: &[Value]) -> AppResult<()> {
-    if candidates.len() > 20 {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    for candidate in candidates {
-        let candidate = candidate
-            .as_object()
-            .ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?;
-        require_exact_fields(
-            candidate,
-            &[
-                "candidateId",
-                "displayName",
-                "redactedLocation",
-                "extension",
-                "mimeFamily",
-                "sizeBytes",
-                "modifiedAt",
-                "matchReason",
-                "confidence",
-            ],
-        )?;
-        let candidate_id = bounded_string_field(candidate, "candidateId", 256)?;
-        if candidate_id.contains('/')
-            || candidate_id.contains('\\')
-            || is_absolute_path_like(&candidate_id)
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-        let _ = bounded_string_field(candidate, "displayName", 255)?;
-        let redacted_location = bounded_string_field(candidate, "redactedLocation", 512)?;
-        if is_absolute_path_like(&redacted_location) {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-        let extension = string_field(candidate, "extension")?;
-        if extension.len() > 16
-            || extension
-                .chars()
-                .any(|character| !character.is_ascii_alphanumeric())
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-        if !["document", "image", "archive", "media", "code", "unknown"]
-            .contains(&string_field(candidate, "mimeFamily")?)
-            || ![
-                "filename_exact_match",
-                "filename_case_insensitive_match",
-                "filename_substring_match",
-            ]
-            .contains(&string_field(candidate, "matchReason")?)
-            || !["high", "medium", "low"].contains(&string_field(candidate, "confidence")?)
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-        if integer_field(candidate, "sizeBytes")? < 0 {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-        let _ = OffsetDateTime::parse(string_field(candidate, "modifiedAt")?, &Rfc3339)
-            .map_err(|_| AppError::InvalidInput("Invalid execution result payload.".into()))?;
-    }
-    Ok(())
-}
-
-fn validate_candidate_payload_result_candidate(candidate: &Map<String, Value>) -> AppResult<()> {
-    require_fields_with_optional(
-        candidate,
-        &["candidateId", "candidateKind", "candidateDisplayName"],
-        &["sizeBytes", "mimeFamily", "extension"],
-    )?;
-    validate_candidate_payload_metadata_common(candidate, false)
-}
-
-fn validate_candidate_payload_resolution(resolution: &Map<String, Value>) -> AppResult<()> {
-    require_fields_with_optional(
-        resolution,
-        &[
-            "sourceCapability",
-            "sourceRequestId",
-            "candidateId",
-            "candidateKind",
-            "resolved",
-            "reason",
-        ],
-        &[
-            "displayName",
-            "sizeBytes",
-            "modifiedAt",
-            "mimeFamily",
-            "extension",
-        ],
-    )?;
-    if string_field(resolution, "sourceCapability")? != FILE_CANDIDATES_CAPABILITY
-        || resolution
-            .get("resolved")
-            .and_then(Value::as_bool)
-            .is_none()
-        || ![
-            "resolved",
-            "not_found",
-            "expired",
-            "changed",
-            "binding_mismatch",
-            "unsupported_kind",
-        ]
-        .contains(&string_field(resolution, "reason")?)
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    let _ = bounded_string_field(resolution, "sourceRequestId", 256)?;
-    validate_candidate_payload_metadata_common(resolution, true)
-}
-
-fn validate_candidate_payload_metadata_common(
-    value: &Map<String, Value>,
-    resolution_shape: bool,
-) -> AppResult<()> {
-    let candidate_id = bounded_string_field(value, "candidateId", 256)?;
-    if candidate_id.contains('/')
-        || candidate_id.contains('\\')
-        || is_absolute_path_like(&candidate_id)
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    if string_field(value, "candidateKind")? != "filesystem_file" {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    let display_field = if resolution_shape {
-        "displayName"
-    } else {
-        "candidateDisplayName"
-    };
-    if value.contains_key(display_field) {
-        let display_name = bounded_string_field(value, display_field, 255)?;
-        if display_name.contains('/')
-            || display_name.contains('\\')
-            || is_absolute_path_like(&display_name)
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-    } else if !resolution_shape {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    validate_optional_non_negative_integer(
-        value,
-        "sizeBytes",
-        "Invalid execution result payload.",
-    )?;
-    validate_optional_rfc3339(value, "modifiedAt", "Invalid execution result payload.")?;
-    validate_optional_mime_and_extension(value)
-}
-
-fn validate_optional_non_negative_integer(
-    value: &Map<String, Value>,
-    field: &str,
-    message: &str,
-) -> AppResult<()> {
-    if value.contains_key(field) && integer_field(value, field)? < 0 {
-        return Err(AppError::InvalidInput(message.into()));
-    }
-    Ok(())
-}
-
-fn validate_optional_rfc3339(
-    value: &Map<String, Value>,
-    field: &str,
-    message: &str,
-) -> AppResult<()> {
-    if value.contains_key(field) {
-        let _ = OffsetDateTime::parse(string_field(value, field)?, &Rfc3339)
-            .map_err(|_| AppError::InvalidInput(message.into()))?;
-    }
-    Ok(())
-}
-
-fn validate_optional_mime_and_extension(value: &Map<String, Value>) -> AppResult<()> {
-    if value.contains_key("mimeFamily")
-        && !["document", "image", "archive", "media", "code", "unknown"]
-            .contains(&string_field(value, "mimeFamily")?)
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    if value.contains_key("extension") {
-        let extension = string_field(value, "extension")?;
-        if extension.len() > 16
-            || extension
-                .chars()
-                .any(|character| !character.is_ascii_alphanumeric())
-        {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_file_candidate_omitted(omitted: &Map<String, Value>) -> AppResult<()> {
-    require_exact_fields(
-        omitted,
-        &[
-            "tooManyMatches",
-            "hiddenFilesSkipped",
-            "symlinksSkipped",
-            "scopesSkipped",
-        ],
-    )?;
-    for field in ["tooManyMatches", "hiddenFilesSkipped", "symlinksSkipped"] {
-        if omitted.get(field).and_then(Value::as_bool).is_none() {
-            return Err(AppError::InvalidInput(
-                "Invalid execution result payload.".into(),
-            ));
-        }
-    }
-    let skipped = omitted
-        .get("scopesSkipped")
-        .and_then(Value::as_array)
-        .ok_or_else(|| AppError::InvalidInput("Invalid execution result payload.".into()))?;
-    if skipped.len() > 8
-        || skipped.iter().any(|value| {
-            value
-                .as_str()
-                .is_none_or(|entry| entry.is_empty() || entry.len() > 64)
-        })
-    {
-        return Err(AppError::InvalidInput(
-            "Invalid execution result payload.".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn is_file_candidate_error_code(value: &str) -> bool {
-    [
-        "missing_consent",
-        "consent_not_allowed_once",
-        "consent_expired",
-        "invalid_consent",
-        "consent_binding_mismatch",
-        "already_consumed",
-        "malformed_request",
-        "unsupported_route",
-        "invalid_scope",
-        "no_searchable_scopes",
-        "search_timeout",
-        "result_truncated",
-        "executor_unavailable",
-        "unsafe_request_rejected",
-        "internal_filesystem_error",
-        "policy_rejected",
-    ]
-    .contains(&value)
-}
-
-fn is_candidate_payload_error_code(value: &str) -> bool {
-    [
-        "missing_consent",
-        "consent_not_allowed_once",
-        "consent_expired",
-        "invalid_consent",
-        "consent_binding_mismatch",
-        "already_consumed",
-        "malformed_request",
-        "unsupported_route",
-        "unsafe_request_rejected",
-        "handoff_not_implemented",
-        "handoff_failed",
-        "policy_rejected",
-    ]
-    .contains(&value)
-}
-
-fn is_absolute_path_like(value: &str) -> bool {
-    value.starts_with('/') || value.as_bytes().get(1) == Some(&b':')
-}
-
 fn string_field<'a>(object: &'a Map<String, Value>, field: &str) -> AppResult<&'a str> {
     object
         .get(field)
@@ -2815,30 +1174,6 @@ fn bounded_string_field(object: &Map<String, Value>, field: &str, max: usize) ->
         ));
     }
     Ok(value.to_string())
-}
-
-fn bounded_string_bytes(object: &Map<String, Value>, field: &str, max: usize) -> AppResult<()> {
-    let value = string_field(object, field)?;
-    if value.len() > max {
-        return Err(AppError::InvalidInput(
-            "Invalid room control event field.".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn valid_artifact_transform_output_text(object: &Map<String, Value>, field: &str, truncated_field: &str) -> bool {
-    let Ok(value) = string_field(object, field) else { return false; };
-    let Some(truncated) = object.get(truncated_field).and_then(Value::as_bool) else { return false; };
-    value.len() <= 16 * 1024
-        && (!truncated || value.len() == 16 * 1024)
-}
-
-fn integer_field(object: &Map<String, Value>, field: &str) -> AppResult<i64> {
-    object
-        .get(field)
-        .and_then(Value::as_i64)
-        .ok_or_else(|| AppError::InvalidInput("Invalid room control event field.".into()))
 }
 
 fn contains_unsafe_field(value: &Value) -> bool {
@@ -2930,154 +1265,7 @@ mod tests {
         );
     }
 
-    fn preview_event(event_id: &str, envelope_id: &str, request_id: &str) -> Value {
-        let now = OffsetDateTime::now_utc();
-        let created_at = now.format(&Rfc3339).unwrap();
-        let expires_at = (now + time::Duration::seconds(60))
-            .format(&Rfc3339)
-            .unwrap();
-        serde_json::json!({
-            "schemaVersion": ROOM_CONTROL_SCHEMA,
-            "eventId": event_id,
-            "kind": "capability_preview",
-            "roomRef": "room",
-            "sourceDeviceRef": "source",
-            "targetPeerRef": "target",
-            "createdAt": created_at,
-            "expiresAt": expires_at,
-            "previewOnly": true,
-            "payload": {
-                "schemaVersion": "pastey-capability-preview-v1",
-                "envelopeId": envelope_id,
-                "createdAt": created_at,
-                "expiresAt": expires_at,
-                "roomRef": "room",
-                "sourceDeviceRef": "source",
-                "targetPeerRef": "target",
-                "request": {
-                    "requestId": request_id,
-                    "sourceDeviceRef": "source",
-                    "targetPeerRef": "target",
-                    "transportStatus": "preview_only"
-                },
-                "previewOnly": true,
-                "status": "outbound_preview"
-            }
-        })
-    }
-
-    fn status_event(event_id: &str) -> Value {
-        let now = OffsetDateTime::now_utc();
-        serde_json::json!({
-            "schemaVersion": ROOM_CONTROL_SCHEMA,
-            "eventId": event_id,
-            "kind": "capability_preview_ack",
-            "roomRef": "room",
-            "sourceDeviceRef": "source",
-            "targetPeerRef": "target",
-            "createdAt": now.format(&Rfc3339).unwrap(),
-            "expiresAt": (now + time::Duration::seconds(60)).format(&Rfc3339).unwrap(),
-            "previewOnly": true,
-            "payload": {
-                "envelopeId": "envelope",
-                "requestId": "request",
-                "status": "acknowledged_preview_only"
-            }
-        })
-    }
-
-    fn execution_request_event(event_id: &str, execution_id: &str) -> Value {
-        let now = OffsetDateTime::now_utc();
-        let created_at = now.format(&Rfc3339).unwrap();
-        let expires_at = (now + time::Duration::seconds(60))
-            .format(&Rfc3339)
-            .unwrap();
-        serde_json::json!({
-            "schemaVersion": ROOM_CONTROL_SCHEMA,
-            "eventId": event_id,
-            "kind": "capability_execute_request",
-            "roomRef": "room",
-            "sourceDeviceRef": "source",
-            "targetPeerRef": "target",
-            "createdAt": created_at,
-            "expiresAt": expires_at,
-            "previewOnly": false,
-            "payload": {
-                "schemaVersion": "pastey-hello-peer-execution-request-v1",
-                "executionId": execution_id,
-                "consentId": "consent",
-                "sourcePreviewEventId": "preview",
-                "envelopeId": "envelope",
-                "requestId": "request",
-                "requestPayloadHash": "hash",
-                "roomRef": "room",
-                "sourceDeviceRef": "source",
-                "targetPeerRef": "target",
-                "capability": "runtime.execute_hello_template",
-                "exactMessage": "hello peer!",
-                "createdAt": created_at,
-                "expiresAt": expires_at
-            }
-        })
-    }
-
-    fn execution_result_event(event_id: &str, execution_id: &str) -> Value {
-        let now = OffsetDateTime::now_utc();
-        serde_json::json!({
-            "schemaVersion": ROOM_CONTROL_SCHEMA,
-            "eventId": event_id,
-            "kind": "capability_execution_result",
-            "roomRef": "room",
-            "sourceDeviceRef": "source",
-            "targetPeerRef": "target",
-            "createdAt": now.format(&Rfc3339).unwrap(),
-            "expiresAt": (now + time::Duration::seconds(60)).format(&Rfc3339).unwrap(),
-            "previewOnly": false,
-            "payload": {
-                "schemaVersion": "pastey-hello-peer-execution-result-v1",
-                "executionId": execution_id,
-                "requestId": "request",
-                "consentId": "consent",
-                "status": "succeeded",
-                "output": "hello peer!",
-                "createdAt": now.format(&Rfc3339).unwrap()
-            }
-        })
-    }
-
-    fn hello_stdout_execution_result_event(event_id: &str, execution_id: &str) -> Value {
-        let now = OffsetDateTime::now_utc();
-        serde_json::json!({
-            "schemaVersion": ROOM_CONTROL_SCHEMA,
-            "eventId": event_id,
-            "kind": "capability_execution_result",
-            "roomRef": "room",
-            "sourceDeviceRef": "source",
-            "targetPeerRef": "target",
-            "createdAt": now.format(&Rfc3339).unwrap(),
-            "expiresAt": (now + time::Duration::seconds(60)).format(&Rfc3339).unwrap(),
-            "previewOnly": false,
-            "payload": {
-                "schemaVersion": HELLO_STDOUT_EXECUTION_RESULT_SCHEMA,
-                "executionId": execution_id,
-                "requestId": "request",
-                "consentId": "consent",
-                "capability": HELLO_STDOUT_CAPABILITY,
-                "runtimeKind": "rust_host_helper",
-                "status": "succeeded",
-                "stdout": HELLO_STDOUT_EXPECTED_STDOUT,
-                "stderr": "",
-                "exitCode": 0,
-                "durationMs": 1,
-                "timedOut": false,
-                "stdoutTruncated": false,
-                "stderrTruncated": false,
-                "createdAt": now.format(&Rfc3339).unwrap()
-            }
-        })
-    }
-
-    #[test]
+                #[test]
     fn selected_peer_room_control_route_resolves_through_bridge_peers() {
         let room = route_room();
         let peers = vec![route_peer("legacy-room-peer:room")];
@@ -3253,130 +1441,6 @@ mod tests {
     }
 
     #[test]
-    fn validates_preview_and_rejects_unknown_or_execution_fields() {
-        let now = OffsetDateTime::now_utc();
-        assert!(validate_control_event(
-            preview_event("e1", "v1", "r1"),
-            "room",
-            "source",
-            "target",
-            now
-        )
-        .is_ok());
-        let mut unknown = preview_event("e2", "v2", "r2");
-        unknown["kind"] = Value::String("capability_request".into());
-        assert!(validate_control_event(unknown, "room", "source", "target", now).is_err());
-        let mut unsafe_event = preview_event("e3", "v3", "r3");
-        unsafe_event["stdout"] = Value::String("not allowed".into());
-        assert!(validate_control_event(unsafe_event, "room", "source", "target", now).is_err());
-        assert!(
-            validate_control_event(status_event("status-1"), "room", "source", "target", now)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn validates_only_fixed_bounded_hello_peer_execution_events() {
-        let now = OffsetDateTime::now_utc();
-        assert!(validate_control_event(
-            execution_request_event("execute", "execution"),
-            "room",
-            "source",
-            "target",
-            now
-        )
-        .is_ok());
-        assert!(validate_control_event(
-            execution_result_event("result", "execution"),
-            "room",
-            "source",
-            "target",
-            now
-        )
-        .is_ok());
-
-        let mut wrong_message = execution_request_event("wrong-message", "execution-2");
-        wrong_message["payload"]["exactMessage"] = Value::String("arbitrary".into());
-        assert!(validate_control_event(wrong_message, "room", "source", "target", now).is_err());
-
-        let mut arbitrary_output = execution_result_event("wrong-output", "execution-3");
-        arbitrary_output["payload"]["output"] = Value::String("arbitrary".into());
-        assert!(validate_control_event(arbitrary_output, "room", "source", "target", now).is_err());
-
-        let mut stdout = execution_result_event("stdout", "execution-4");
-        stdout["payload"]["stdout"] = Value::String("no".into());
-        assert!(validate_control_event(stdout, "room", "source", "target", now).is_err());
-    }
-
-    #[test]
-    fn validates_fixed_bounded_hello_stdout_execution_result_only() {
-        let now = OffsetDateTime::now_utc();
-        assert!(validate_control_event(
-            hello_stdout_execution_result_event("stdout-result", "stdout-execution"),
-            "room",
-            "source",
-            "target",
-            now
-        )
-        .is_ok());
-
-        let mut wrong_stdout =
-            hello_stdout_execution_result_event("stdout-wrong", "stdout-execution-2");
-        wrong_stdout["payload"]["stdout"] = Value::String("hello peer!".into());
-        assert!(validate_control_event(wrong_stdout, "room", "source", "target", now).is_err());
-
-        let mut unsafe_nested =
-            hello_stdout_execution_result_event("stdout-unsafe", "stdout-execution-3");
-        unsafe_nested["payload"]["command"] = Value::String("echo hacked".into());
-        assert!(validate_control_event(unsafe_nested, "room", "source", "target", now).is_err());
-
-        let mut unsafe_top =
-            hello_stdout_execution_result_event("stdout-top", "stdout-execution-4");
-        unsafe_top["stdout"] = Value::String("not allowed".into());
-        assert!(validate_control_event(unsafe_top, "room", "source", "target", now).is_err());
-    }
-
-    #[test]
-    fn rejects_expired_room_and_target_mismatch() {
-        let now = OffsetDateTime::now_utc();
-        let mut expired = preview_event("e1", "v1", "r1");
-        expired["expiresAt"] =
-            Value::String((now - time::Duration::seconds(1)).format(&Rfc3339).unwrap());
-        assert!(validate_control_event(expired, "room", "source", "target", now).is_err());
-        assert!(validate_control_event(
-            preview_event("e2", "v2", "r2"),
-            "other",
-            "source",
-            "target",
-            now
-        )
-        .is_err());
-        assert!(validate_control_event(
-            preview_event("e3", "v3", "r3"),
-            "room",
-            "source",
-            "other",
-            now
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn rejects_oversized_events_reasons_and_malformed_ciphertext() {
-        let now = OffsetDateTime::now_utc();
-        let mut oversized = preview_event("e1", "v1", "r1");
-        oversized["payload"]["request"]["padding"] =
-            Value::String("x".repeat(MAX_CONTROL_EVENT_BYTES));
-        assert!(validate_control_event(oversized, "room", "source", "target", now).is_err());
-
-        let mut oversized_reason = status_event("status-1");
-        oversized_reason["payload"]["reason"] = Value::String("x".repeat(513));
-        assert!(validate_control_event(oversized_reason, "room", "source", "target", now).is_err());
-
-        assert!(crypto::decrypt_bytes(&[1, 2, 3], &crypto::random_key(), &[0; 12]).is_err());
-    }
-
-    #[test]
     fn control_key_wrap_is_domain_separated_and_receipt_is_transport_only() {
         let sender = crypto::generate_transport_secret();
         let receiver = crypto::generate_transport_secret();
@@ -3427,41 +1491,39 @@ mod tests {
     }
 
     #[test]
-    fn replay_checks_event_preview_envelope_and_request_ids() {
-        let now = OffsetDateTime::now_utc();
-        let event = validate_control_event(
-            preview_event("e1", "v1", "r1"),
-            "room",
-            "source",
-            "target",
-            now,
-        )
-        .unwrap();
+    fn burn_purge_removes_room_control_inbox_replay_and_rate_state() {
+        let mut runtime = RoomControlRuntimeState::default();
         let mut room = RoomControlRoomState::default();
-        assert!(!is_replayed(&room, &event));
-
+        room.inbox.push_back(ReceivedRoomControlEvent {
+            event_id: "event".into(),
+            kind: "bridge_plan.step_progress".into(),
+            room_ref: "room".into(),
+            source_device_ref: "source".into(),
+            target_peer_ref: "target".into(),
+            created_at: "now".into(),
+            expires_at: "later".into(),
+            event: serde_json::json!({}),
+            received_at: "now".into(),
+        });
         record_replay_id(
             &mut room.seen_event_ids,
             &mut room.seen_event_id_set,
-            event.event_id.clone(),
+            "event".into(),
         );
-        assert!(is_replayed(&room, &event));
-
-        room = RoomControlRoomState::default();
         record_replay_id(
             &mut room.seen_envelope_ids,
             &mut room.seen_envelope_id_set,
-            event.envelope_id.clone().unwrap(),
+            "envelope".into(),
         );
-        assert!(is_replayed(&room, &event));
-
-        room = RoomControlRoomState::default();
         record_replay_id(
             &mut room.seen_request_ids,
             &mut room.seen_request_id_set,
-            event.request_id.clone().unwrap(),
+            "request".into(),
         );
-        assert!(is_replayed(&room, &event));
+        room.received_at_seconds.push_back(1);
+        runtime.rooms.insert("room".into(), room);
+        assert!(runtime.purge_room("room"));
+        assert!(runtime.rooms.get("room").is_none());
     }
 
     #[test]
@@ -3494,20 +1556,5 @@ mod tests {
         );
     }
 
-    #[test]
-    fn generic_transform_execution_result_requires_authoritative_finalization() {
-        for status in ["completed", "failed", "timed_out", "rejected"] {
-            let transform_result = serde_json::json!({
-                "kind": "capability_execution_result",
-                "payload": { "capability": "artifact.transform_selected", "status": status }
-            });
-            assert!(matches!(require_transform_result_authority(&transform_result, false), Err(AppError::InvalidInput(message)) if message == "transform_result_requires_authoritative_finalization"));
-            assert!(require_transform_result_authority(&transform_result, true).is_ok());
-        }
-        let unrelated = serde_json::json!({
-            "kind": "capability_execution_result",
-            "payload": { "capability": "filesystem.find_file_candidates" }
-        });
-        assert!(require_transform_result_authority(&unrelated, false).is_ok());
-    }
+
 }

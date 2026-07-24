@@ -49,27 +49,6 @@ export interface TransferQueueInput {
   targetPeerSessionId?: string;
   targetPeerDisplayName?: string;
   targetCount?: number;
-  agentBridgeMetadata?: AgentBridgeCandidatePayloadQueueMetadata;
-}
-
-export interface AgentBridgeCandidatePayloadQueueMetadata {
-  origin: "agent_bridge_candidate_payload";
-  label: "Agent Bridge candidate payload request";
-  note: "Queued from approved candidate payload request.";
-  sourceCapability: "filesystem.find_file_candidates";
-  requestCapability: "transfer.request_candidate_payload";
-  sourceRequestId: string;
-  candidateId: string;
-  candidateKind: "filesystem_file";
-  candidateDisplayName: string;
-  requestedByPeerRef: string;
-  approvedByPeerRef: string;
-  consentId: string;
-  agentBridgeRequestId: string;
-  handoffCreatedAt: string;
-  sizeBytes?: number;
-  extension?: string;
-  mimeFamily?: string;
 }
 
 export interface TransferQueueItem {
@@ -96,7 +75,6 @@ export interface TransferQueueItem {
   targetPeerSessionId?: string;
   targetPeerDisplayName?: string;
   targetCount?: number;
-  agentBridgeMetadata?: AgentBridgeCandidatePayloadQueueMetadata;
   createdAt: number;
   updatedAt: number;
 }
@@ -310,7 +288,6 @@ export function enqueueTransferBatch(
       targetPeerSessionId: input.targetPeerSessionId,
       targetPeerDisplayName: input.targetPeerDisplayName,
       targetCount: input.targetCount,
-      agentBridgeMetadata: input.agentBridgeMetadata,
       createdAt: now,
       updatedAt: now
     };

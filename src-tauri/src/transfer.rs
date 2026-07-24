@@ -179,7 +179,6 @@ struct ReceiverWriteFailure {
     code: &'static str,
     message: &'static str,
     status: StatusCode,
-    cause: String,
     parent_exists: bool,
     file_exists: bool,
 }
@@ -3410,11 +3409,8 @@ async fn receive_file_chunk_handler(
             encoded_payload_size,
             error.status,
             &format!(
-                "{}: part_path={} parent_exists={} file_exists={} transfer_status=active",
-                error.cause,
-                part_path.display(),
-                error.parent_exists,
-                error.file_exists
+                "error_code={}: location=inbox_part_root parent_exists={} file_exists={} transfer_status=active",
+                error.code, error.parent_exists, error.file_exists
             ),
         );
         fail_receiver_transfer(&ctx.state, &transfer_id, error.message).await;
@@ -3692,11 +3688,7 @@ async fn finish_file_transfer_handler(
         &transfer_id,
         &room_id,
         "finalize_rename",
-        &format!(
-            "part_path={} final_path={}",
-            part_path.display(),
-            final_path.display()
-        ),
+        "part_location=inbox_part_root final_location=inbox_root",
     );
     if tokio::fs::rename(part_path, final_path).await.is_err() {
         dev_log_receiver_finalize(
@@ -3736,11 +3728,7 @@ async fn finish_file_transfer_handler(
         &transfer_id,
         &room_id,
         "finalize_item_update",
-        &format!(
-            "item_kind=incoming_file status=received final_path={} mime_type={:?}",
-            final_path.display(),
-            mime_type
-        ),
+        &format!("item_kind=incoming_file status=received final_location=inbox_root mime_type={mime_type:?}"),
     );
     let master_key = {
         let config = ctx.state.config.read();
@@ -3881,15 +3869,8 @@ async fn remote_burn_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let _ = cancel_room_transfers(
-        ctx.state.clone(),
-        &room_id,
-        ROOM_BURNED_MESSAGE,
-        false,
-        Some("peer_disconnected"),
-    )
-    .await;
-    storage::mark_peer_burned(&ctx.state.paths, &room_id)
+    crate::commands::burn_bridge_scope(ctx.state.clone(), &room_id, false, false)
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let state = ctx.state.clone();
     tokio::spawn(async move {
@@ -4351,9 +4332,8 @@ async fn abort_receiver_finalize_for_burn(
         if let Err(error) = tokio::fs::remove_file(path).await {
             if error.kind() != std::io::ErrorKind::NotFound {
                 logging::write_error_line(&format!(
-                    "[pastey cleanup][room_id={}] event=room_file_cleanup_error category=burn_finalize path_kind=transfer_file error={:?}",
+                    "[pastey cleanup][room_id={}] event=room_file_cleanup_error category=burn_finalize location=app_owned_root error_code=cleanup_failed",
                     transfer.room_id,
-                    error.to_string()
                 ));
             }
         }
@@ -4377,6 +4357,9 @@ async fn abort_receiver_finalize_for_burn(
 }
 
 fn room_is_burned(state: &Arc<AppState>, room_id: &str) -> bool {
+    if storage::is_burned_bridge(&state.paths, room_id).unwrap_or(true) {
+        return true;
+    }
     storage::get_room_by_id(&state.paths, room_id)
         .map(|room| room.status == RoomStatus::Burned)
         .unwrap_or(true)
@@ -4390,11 +4373,9 @@ async fn remove_active_receiver_part_file(
     match tokio::fs::remove_file(part_path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
+        Err(_) => {
             logging::write_error_line(&format!(
-                "[pastey cleanup][room_id={room_id}] event=room_file_cleanup_error category={category} path={} error={:?}",
-                part_path.display(),
-                error.to_string()
+                "[pastey cleanup][room_id={room_id}] event=room_file_cleanup_error category={category} location=inbox_part_root error_code=cleanup_failed",
             ));
             Err(AppError::InvalidInput(
                 "Could not delete local room files. Check folder permissions.".into(),
@@ -4678,7 +4659,7 @@ fn receiver_write_failure(
     code: &'static str,
     message: &'static str,
     status: StatusCode,
-    cause: String,
+    _cause: String,
 ) -> ReceiverWriteFailure {
     let parent_exists = part_path.parent().is_some_and(Path::exists);
     let file_exists = part_path.exists();
@@ -4686,7 +4667,6 @@ fn receiver_write_failure(
         code,
         message,
         status,
-        cause,
         parent_exists,
         file_exists,
     }

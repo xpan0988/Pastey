@@ -30,7 +30,7 @@ test("Bridge detail owns one interval with cleanup on session change and unmount
   const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
   const detail = pages.slice(
     pages.indexOf("export function BridgeDetailPage"),
-    pages.indexOf("function AskBridgePanel"),
+    pages.indexOf("function BridgePlanReceiverPanel"),
   );
   assert.equal(detail.match(/window\.setInterval/g)?.length, 1);
   assert.match(detail, /bridgePollingIntervalMs\(roomControlPollingActive\)/);
@@ -44,7 +44,7 @@ test("drag-drop listener registration is stable and cleans up async registration
   const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
   const detail = pages.slice(
     pages.indexOf("export function BridgeDetailPage"),
-    pages.indexOf("function AskBridgePanel"),
+    pages.indexOf("function BridgePlanReceiverPanel"),
   );
   assert.match(detail, /onDragDropEvent/);
   assert.match(detail, /if \(cancelled\) \{\s*fn\(\)/);

@@ -242,7 +242,7 @@ export function SettingsPage({ config, onConfigChange, onJoinWithCode }: Setting
         <SettingsCard title="Security" icon="shield">
           <SettingsControlRow label="Encryption enabled" value="On" status="Secure" />
           <SettingsControlRow label="Require approval" value="On" />
-          <SettingsControlRow label="Trusted devices" value="Managed from Devices" />
+          <SettingsControlRow label="Paired devices" value="Managed from Devices" />
         </SettingsCard>
 
         <SettingsCard title="Discovery" icon="nearby">

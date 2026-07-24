@@ -15,7 +15,7 @@ test("Layer 4 validation matrix documents required route and authority boundarie
   assert.match(bridge, /selected peers/);
   assert.match(bridge, /broadcast to Bridge/);
   assert.match(bridge, /File, image, and pasted-image/);
-  assert.match(bridge, /Control and capability events remain exact selected-peer only/);
+  assert.match(bridge, /Bridge Plan control messages remain exact selected-peer only/);
   assert.match(bridge, /delivery receipt says only/);
   assert.match(bridge, /display\/recognition metadata only/);
   assert.match(bridge, /Full cryptographic paired-key rotation is not implemented/);
@@ -28,14 +28,13 @@ test("Layer 4 validation runner keeps matrix evidence grouped by invariant", () 
   for (const area of [
     "ordinary-data-routing",
     "queue-children-and-terminal-state",
-    "control-capability-selected-peer",
-    "consent-and-hello-peer",
     "backend-route-and-durable-boundaries",
   ]) {
     assert.match(runner, new RegExp(area));
   }
 
   assert.match(runner, /bridgeRoutingRuntime\.test\.ts/);
+  assert.match(runner, /bridgeDetailPolling\.test\.ts/);
   assert.match(runner, /transferSchedulerExecution\.test\.ts/);
   assert.match(runner, /room_control::tests::/);
   assert.match(runner, /storage::tests::/);

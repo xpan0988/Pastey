@@ -23,12 +23,10 @@ pub(crate) fn cleanup_staged_snapshot(snapshot: &StagedSnapshot) -> AppResult<()
         ));
     }
     let result = remove_tree_without_following_symlinks(&expected);
-    if let Err(error) = &result {
-        logging::write_error_line(&format!(
-            "[pastey:transform-staging] event=cleanup_failed staging_id={} error={}",
-            snapshot.staging_id,
-            error.message()
-        ));
+    if result.is_err() {
+        logging::write_error_line(
+            "[pastey:transform-staging] event=cleanup_failed location=transform_staging_root error_code=cleanup_failed",
+        );
     }
     result
 }
@@ -56,10 +54,9 @@ pub(crate) fn cleanup_orphaned_transform_staging(app_data_dir: &Path) -> AppResu
         let path = parent.join(name);
         match remove_tree_without_following_symlinks(&path) {
             Ok(()) => removed += 1,
-            Err(error) => logging::write_error_line(&format!(
-                "[pastey:transform-staging] event=orphan_cleanup_failed staging_id={name} error={}",
-                error.message()
-            )),
+            Err(_) => logging::write_error_line(
+                "[pastey:transform-staging] event=orphan_cleanup_failed location=transform_staging_root error_code=cleanup_failed",
+            ),
         }
     }
     Ok(removed)

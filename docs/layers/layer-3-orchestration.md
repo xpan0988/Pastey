@@ -14,7 +14,9 @@ Outgoing local Bridge control demand reserves capacity by lowering the data targ
 
 Layer 4 resolves selected-peers or explicit ordinary-data broadcast before enqueue. Each file/image/pasted-image target becomes an ordinary target-specific queue child with a shared in-memory `bridgeOperationId`. Child terminal states produce aggregate completed, partial, failed, cancelled, or interrupted presentation. An old route fails for that child and never silently rebinds after reconnect.
 
-`transfer.request_candidate_payload` enters this same queue after its own second consent. `handoff_queued` means queue acceptance only; it does not change Layer 1 byte-transfer or completion semantics.
+The durable Bridge Plan Search → Transfer workflow uses Plan-specific admission: the receiver validates the selected bounded candidate and resolves its source inside Rust before handing it to the transfer engine. The frontend scheduler does not receive a path-bearing Transfer item. `handoff_queued` means Rust accepted the transfer operation, not that bytes moved or the transfer completed.
+
+Layer 3 does not retain Layer 5 Transform authority or result metadata. ObjectRefs, private sources, consent IDs, candidate IDs, previews, approval records, leases, resolved intents, implementation identities, request hashes, and other Layer 5 authority data stay out of Layer 3.
 
 ## MicroFlowGroup
 

@@ -1,7 +1,7 @@
-//! Test-only behavioral verification for the future Linux isolation substrate.
+//! Closed behavioral verification for the Linux isolation substrate.
 //!
-//! It is deliberately separate from static feasibility and every Transform
-//! authority path. A verified candidate is not a production execution grant.
+//! The live harness uses synthetic bytes only and is part of the production
+//! availability gate. A verified candidate still grants no Transform authority.
 
 use std::{
     fs,
@@ -9,6 +9,12 @@ use std::{
 };
 
 use super::capability_probe::{CapabilityStatus, LinuxSandboxCapabilities};
+
+#[cfg(target_os = "linux")]
+use super::{
+    cgroup::{CgroupOperation, ResourcePolicy},
+    launch_plan::{fixed_seccomp_policy_file, VerifiedExecutable, VerifiedSeccompPolicy},
+};
 
 const MAX_CAPTURED_PROBE_BYTES: usize = 16 * 1024;
 const ALLOWED_FIXTURE_MARKER: &[u8] = b"pastey-verification-allowed-v1";
@@ -247,6 +253,8 @@ pub(crate) fn fixed_bubblewrap_argument_template() -> &'static [&'static str] {
         "/dev",
         "--chdir",
         "/fixture/work",
+        "--seccomp",
+        "{seccomp-fd}",
         "--",
         "/probe",
         "{mode}",
@@ -258,8 +266,269 @@ pub(crate) trait BehavioralHarness {
     fn cleanup(&mut self) -> VerificationStatus;
 }
 
-/// Rust-private future enablement input. Production never calls it; tests and
-/// an explicitly non-shipping verification feature may provide the harness.
+/// Live Linux implementation. It can launch only the fixed verification probe
+/// against synthetic fixture bytes; it has no artifact, Bridge, or authority
+/// input.
+#[cfg(target_os = "linux")]
+pub(crate) struct LiveLinuxBehavioralHarness {
+    fixture: VerificationFixture,
+    bubblewrap: VerifiedExecutable,
+    probe: VerifiedExecutable,
+    host_pid_namespace: String,
+    host_network_namespace: String,
+    cleaned: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LiveLinuxBehavioralHarness {
+    pub(crate) fn new(
+        parent: &Path,
+        bubblewrap_path: &Path,
+        probe_path: &Path,
+    ) -> std::io::Result<Self> {
+        let fixture = create_verification_fixture(parent)?;
+        let bubblewrap = match VerifiedExecutable::verify(bubblewrap_path, "bwrap") {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = cleanup_verification_fixture(&fixture);
+                return Err(error);
+            }
+        };
+        let probe = match VerifiedExecutable::verify(probe_path, "pastey-transform-sandbox-probe") {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = cleanup_verification_fixture(&fixture);
+                return Err(error);
+            }
+        };
+        let namespaces = (|| -> std::io::Result<(String, String)> {
+            Ok((
+                fs::read_link("/proc/self/ns/pid")?
+                    .to_string_lossy()
+                    .into_owned(),
+                fs::read_link("/proc/self/ns/net")?
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+        })();
+        let (host_pid_namespace, host_network_namespace) = match namespaces {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = cleanup_verification_fixture(&fixture);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            fixture,
+            bubblewrap,
+            probe,
+            host_pid_namespace,
+            host_network_namespace,
+            cleaned: false,
+        })
+    }
+
+    fn run_live(&mut self, mode: VerificationProbeMode) -> std::io::Result<ProbeObservation> {
+        use std::{
+            io::Read,
+            process::{Command, Stdio},
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+
+        self.bubblewrap.reverify()?;
+        self.probe.reverify()?;
+        let policy = ResourcePolicy {
+            memory_max: 32 * 1024 * 1024,
+            pids_max: 4,
+            cpu_quota: 25_000,
+            cpu_period: 100_000,
+        };
+        let mut cgroup = CgroupOperation::create(policy)?;
+        let counters_before = cgroup.resource_counters()?;
+        let (policy_file, policy_digest) = fixed_seccomp_policy_file(&self.fixture.root)?;
+        let seccomp = VerifiedSeccompPolicy::fixed(policy_file, policy_digest)?;
+        if unsafe { libc::fcntl(seccomp.raw_fd(), libc::F_SETFD, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut command = Command::new(self.bubblewrap.path());
+        command
+            .env_clear()
+            .current_dir("/")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for argument in fixed_bubblewrap_argument_template() {
+            let rendered = match *argument {
+                "{probe}" => self.probe.path().to_string_lossy().into_owned(),
+                "{allowed}" => self.fixture.allowed.to_string_lossy().into_owned(),
+                "{work}" => self.fixture.work.to_string_lossy().into_owned(),
+                "{mode}" => mode.argument().into(),
+                "{seccomp-fd}" => seccomp.raw_fd().to_string(),
+                value => value.into(),
+            };
+            command.arg(rendered);
+        }
+        cgroup.configure_pre_exec_self_attach(&mut command)?;
+        let mut child = command.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing probe stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing probe stderr"))?;
+        let (sender, receiver) = mpsc::channel();
+        for mut stream in [
+            Box::new(stdout) as Box<dyn Read + Send>,
+            Box::new(stderr) as Box<dyn Read + Send>,
+        ] {
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = stream
+                    .by_ref()
+                    .take((MAX_CAPTURED_PROBE_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes);
+                let _ = sender.send(bytes);
+            });
+        }
+        drop(sender);
+        let started = Instant::now();
+        let timeout = Duration::from_secs(2);
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if started.elapsed() >= timeout {
+                timed_out = true;
+                cgroup.kill()?;
+                let _ = child.kill();
+                break child.wait()?;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        cgroup.wait_empty(Duration::from_secs(2))?;
+        let counters_after = cgroup.resource_counters()?;
+        let capture_started = Instant::now();
+        let capture_timeout = Duration::from_secs(2);
+        let mut captured = Vec::new();
+        let mut capture_overflowed = false;
+        for _ in 0..2 {
+            let remaining_timeout = capture_timeout
+                .checked_sub(capture_started.elapsed())
+                .unwrap_or(Duration::ZERO);
+            let bytes = receiver.recv_timeout(remaining_timeout).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "probe output reader did not terminate",
+                )
+            })?;
+            let remaining_bytes = (MAX_CAPTURED_PROBE_BYTES + 1).saturating_sub(captured.len());
+            if bytes.len() > remaining_bytes {
+                capture_overflowed = true;
+            }
+            captured.extend(bytes.into_iter().take(remaining_bytes));
+        }
+        capture_overflowed |= captured.len() > MAX_CAPTURED_PROBE_BYTES;
+        let captured_bytes = captured.len().min(MAX_CAPTURED_PROBE_BYTES);
+        let output = String::from_utf8_lossy(&captured);
+        let memory_enforced =
+            counters_after.memory_limit_events > counters_before.memory_limit_events;
+        let pids_enforced = counters_after.pids_limit_events > counters_before.pids_limit_events;
+        let cpu_enforced =
+            counters_after.cpu_throttled_events > counters_before.cpu_throttled_events;
+        let kind = if capture_overflowed && mode != VerificationProbeMode::FloodOutput {
+            ProbeObservationKind::Unexpected
+        } else {
+            match mode {
+                VerificationProbeMode::ReportVisibleFixtures
+                    if status.success()
+                        && output.contains("P100")
+                        && !output.contains(&self.host_pid_namespace)
+                        && !output.contains(&self.host_network_namespace) =>
+                {
+                    ProbeObservationKind::Expected
+                }
+                VerificationProbeMode::AttemptForbiddenRead
+                | VerificationProbeMode::AttemptForbiddenWrite
+                | VerificationProbeMode::AttemptNetworkConnect
+                | VerificationProbeMode::AttemptLoopbackConnect
+                    if status.success() && output.contains("P101") =>
+                {
+                    ProbeObservationKind::Denied
+                }
+                VerificationProbeMode::AttemptForbiddenSyscall
+                    if status.success() && output.contains("P102") =>
+                {
+                    ProbeObservationKind::Denied
+                }
+                VerificationProbeMode::SpawnChild
+                    if timed_out && pids_enforced && output.contains("P103") =>
+                {
+                    ProbeObservationKind::ResourceEnforced
+                }
+                VerificationProbeMode::SpawnGrandchild
+                | VerificationProbeMode::DoubleForkOrDaemonize
+                    if timed_out =>
+                {
+                    ProbeObservationKind::DescendantsContained
+                }
+                VerificationProbeMode::AllocateMemory
+                    if memory_enforced && (!status.success() || timed_out) =>
+                {
+                    ProbeObservationKind::ResourceEnforced
+                }
+                VerificationProbeMode::ConsumeCpu if cpu_enforced => {
+                    ProbeObservationKind::ResourceEnforced
+                }
+                VerificationProbeMode::FloodOutput if timed_out || capture_overflowed => {
+                    ProbeObservationKind::ResourceEnforced
+                }
+                VerificationProbeMode::WaitForSignal if timed_out => {
+                    ProbeObservationKind::DescendantsContained
+                }
+                _ => ProbeObservationKind::Unexpected,
+            }
+        };
+        cgroup.cleanup()?;
+        Ok(ProbeObservation {
+            kind,
+            captured_bytes,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl BehavioralHarness for LiveLinuxBehavioralHarness {
+    fn run(&mut self, mode: VerificationProbeMode) -> ProbeObservation {
+        self.run_live(mode).unwrap_or(ProbeObservation {
+            kind: ProbeObservationKind::Unexpected,
+            captured_bytes: 0,
+        })
+    }
+    fn cleanup(&mut self) -> VerificationStatus {
+        if self.cleaned {
+            return VerificationStatus::Verified;
+        }
+        self.cleaned = true;
+        match cleanup_verification_fixture(&self.fixture) {
+            Ok(()) => VerificationStatus::Verified,
+            Err(_) => VerificationStatus::Failed(VerificationFailure::FixtureCleanupFailed),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveLinuxBehavioralHarness {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+/// Rust-private verification coordinator. Linux production supplies the closed
+/// synthetic harness; unit tests supply a deterministic mock harness.
 pub(crate) struct LinuxSandboxBehaviorVerifier;
 
 impl LinuxSandboxBehaviorVerifier {
@@ -297,7 +566,7 @@ fn verify_with_harness(
     );
     let network_isolation = required(
         harness,
-        &[],
+        &[VerificationProbeMode::ReportVisibleFixtures],
         &[
             VerificationProbeMode::AttemptNetworkConnect,
             VerificationProbeMode::AttemptLoopbackConnect,
@@ -305,7 +574,10 @@ fn verify_with_harness(
     );
     let pid_namespace = required(
         harness,
-        &[VerificationProbeMode::SpawnChild],
+        &[
+            VerificationProbeMode::ReportVisibleFixtures,
+            VerificationProbeMode::SpawnChild,
+        ],
         &[VerificationProbeMode::SpawnGrandchild],
     );
     let seccomp_enforcement = required(
