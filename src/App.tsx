@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { MutableRefObject } from "react";
 import { AppShell } from "./components/AppShell";
 import type { PrimaryView } from "./components/PrimarySidebar";
@@ -77,18 +77,6 @@ import {
 } from "./lib/bridgeRoutingRuntime";
 import { formatBridgeRouteErrorForUser } from "./lib/bridgeRouting";
 import { mergeTransferEvent } from "./lib/transferState";
-import {
-  createRuntimeDataWindowTargetState,
-  getControlWindowSessionRevision,
-  getOutgoingControlWindowDemand,
-  getRuntimeControlWindowStatus,
-  logAgentBridgeLifecycle,
-  publishRuntimeControlWindowStatus,
-  reduceRuntimeDataWindowTarget,
-  subscribeOutgoingControlWindowDemand,
-  subscribeControlWindowSessionRevision,
-  type RuntimeDataWindowTarget,
-} from "./lib/agentBridge";
 import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, NearbyDevice, RoomInfo, RoomItem } from "./lib/types";
 
 type View =
@@ -136,17 +124,6 @@ function App() {
   const [joinRequest, setJoinRequest] = useState<JoinRequestPrompt | null>(null);
   const [focusToken, setFocusToken] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const outgoingControlDemand = useSyncExternalStore(
-    subscribeOutgoingControlWindowDemand,
-    getOutgoingControlWindowDemand,
-  );
-  const controlWindowSessionRevision = useSyncExternalStore(
-    subscribeControlWindowSessionRevision,
-    getControlWindowSessionRevision,
-  );
-  const [runtimeDataWindowState, setRuntimeDataWindowState] = useState(
-    createRuntimeDataWindowTargetState,
-  );
   const closedRoomIdsRef = useRef<Set<string>>(new Set());
   const schedulerRef = useRef(scheduler);
   const roomsRef = useRef(rooms);
@@ -158,7 +135,7 @@ function App() {
   const runtimeWindowStatsRef = useRef<Map<string, RuntimeWindowDiagnosticStats>>(new Map());
   const plannerLaunchSummaryKeyRef = useRef<string>("");
   const serialMicroGroupRunningRef = useRef(false);
-  const runtimeDataWindowTargetRef = useRef<RuntimeDataWindowTarget>(8);
+  const runtimeDataWindowTargetRef = useRef(8);
   const runtimeWindowRebalanceChainRef = useRef<Promise<unknown>>(Promise.resolve());
 
   useEffect(() => {
@@ -168,80 +145,6 @@ function App() {
   useEffect(() => {
     roomsRef.current = rooms;
   }, [rooms]);
-
-  useEffect(() => {
-    setRuntimeDataWindowState((current) =>
-      reduceRuntimeDataWindowTarget(current, {
-        type: "demand_changed",
-        outgoingControlDemand,
-        nowMs: Date.now(),
-      })
-    );
-  }, [outgoingControlDemand]);
-
-  useEffect(() => {
-    setRuntimeDataWindowState(
-      outgoingControlDemand
-        ? reduceRuntimeDataWindowTarget(createRuntimeDataWindowTargetState(), {
-            type: "demand_changed",
-            outgoingControlDemand: true,
-            nowMs: Date.now(),
-          })
-        : createRuntimeDataWindowTargetState()
-    );
-  }, [controlWindowSessionRevision]);
-
-  useEffect(() => {
-    if (runtimeDataWindowState.restoreAfterMs === null) {
-      return;
-    }
-    const delayMs = Math.max(0, runtimeDataWindowState.restoreAfterMs - Date.now());
-    const timeout = window.setTimeout(() => {
-      setRuntimeDataWindowState((current) =>
-        reduceRuntimeDataWindowTarget(current, {
-          type: "restore_quiet_period_elapsed",
-          nowMs: Date.now(),
-        })
-      );
-    }, delayMs);
-    return () => window.clearTimeout(timeout);
-  }, [runtimeDataWindowState.restoreAfterMs]);
-
-  useEffect(() => {
-    runtimeDataWindowTargetRef.current = runtimeDataWindowState.targetDataWindows;
-    if (runtimeDataWindowState.targetDataWindows === 7) {
-      logAgentBridgeLifecycle({
-        eventKind: "control_demand_started",
-        roomRefShort: currentRoom?.id,
-        runtimeDataWindowTarget: 7,
-      });
-    }
-    logAgentBridgeLifecycle({
-      eventKind: runtimeDataWindowState.targetDataWindows === 7
-        ? "runtime_window_target_7"
-        : "runtime_window_target_8",
-      roomRefShort: currentRoom?.id,
-      runtimeDataWindowTarget: runtimeDataWindowState.targetDataWindows,
-    });
-    void scheduleActiveTransferWindowRebalance(undefined, runtimeDataWindowState.targetDataWindows);
-  }, [runtimeDataWindowState.targetDataWindows]);
-
-  useEffect(() => {
-    const current = getRuntimeControlWindowStatus();
-    if (current.targetDataWindows !== runtimeDataWindowState.targetDataWindows) {
-      return;
-    }
-    const reason = runtimeDataWindowState.targetDataWindows === 8
-      ? "idle"
-      : runtimeDataWindowState.outgoingControlDemand
-        ? "outgoing_control_demand"
-        : "restore_quiet_period";
-    publishRuntimeControlWindowStatus({ ...current, reason });
-  }, [
-    runtimeDataWindowState.outgoingControlDemand,
-    runtimeDataWindowState.restoreAfterMs,
-    runtimeDataWindowState.targetDataWindows,
-  ]);
 
   function updateSchedulerState(updater: (current: TransferSchedulerState) => TransferSchedulerState): TransferSchedulerState {
     const next = updater(schedulerRef.current);
@@ -428,7 +331,7 @@ function App() {
   useEffect(() => {
     const plannerPolicy = microGroupPlannerPolicy(
       config?.micro_flow_group_mode,
-      runtimeDataWindowState.targetDataWindows
+      runtimeDataWindowTargetRef.current
     );
     const launchPlan = planRunnableTransferLaunches(
       scheduler,
@@ -499,7 +402,7 @@ function App() {
         updateSchedulerState((current) => ({ ...current }));
       });
     }
-  }, [scheduler, rooms, config?.micro_flow_group_mode, runtimeDataWindowState.targetDataWindows]);
+  }, [scheduler, rooms, config?.micro_flow_group_mode]);
 
   useEffect(() => {
     for (const itemId of [...launchingQueueItemWindowsRef.current.keys()]) {
@@ -1390,17 +1293,6 @@ function App() {
         : `No active data allocations required adjustment for target ${targetDataWindows}.`,
       ...(failed ? { error: "One or more active data-window updates failed." } : {}),
     };
-    publishRuntimeControlWindowStatus({
-      targetDataWindows,
-      reason: targetDataWindows === 8
-        ? "idle"
-        : getOutgoingControlWindowDemand()
-          ? "outgoing_control_demand"
-          : "restore_quiet_period",
-      reservationReady: !failed,
-      activeAllocationUpdates: outcome.summary,
-      ...(outcome.error ? { lastError: outcome.error } : {}),
-    });
     return outcome;
   }
 
@@ -1413,30 +1305,6 @@ function App() {
       }
       return next;
     });
-  }
-
-  function enqueueAgentBridgeCandidatePayloadHandoff(roomId: string, input: TransferQueueInput): boolean {
-    console.info(
-      "[pastey queue] event=agent_bridge_candidate_payload_handoff_enqueue_attempt room_id=%s candidate_id=%s",
-      roomId,
-      input.agentBridgeMetadata?.candidateId ?? "unknown"
-    );
-    const next = enqueueTransferBatch(schedulerRef.current, roomId, [input]);
-    if (next === schedulerRef.current) {
-      console.info(
-        "[pastey queue] event=agent_bridge_candidate_payload_handoff_enqueue_rejected room_id=%s reason=no_new_items",
-        roomId
-      );
-      return false;
-    }
-    updateSchedulerState(() => next);
-    console.info(
-      "[pastey queue] event=agent_bridge_candidate_payload_handoff_queued room_id=%s candidate_id=%s label=%s",
-      roomId,
-      input.agentBridgeMetadata?.candidateId ?? "unknown",
-      input.agentBridgeMetadata?.label ?? "Candidate payload request"
-    );
-    return true;
   }
 
   async function handleLeaveOrBurnBridge(room: RoomInfo, action: "leave" | "burn") {
@@ -1534,7 +1402,6 @@ function App() {
       onRefresh={refreshCurrentRoom}
       onLeaveOrBurn={handleLeaveOrBurnBridge}
       onEnqueueTransferInputs={enqueueRoomTransferInputs}
-      onEnqueueCandidatePayloadHandoff={enqueueAgentBridgeCandidatePayloadHandoff}
       onOpenActivity={() => {
         setActivePrimaryView("activity");
         setView({ screen: "primary" });

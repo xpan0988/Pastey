@@ -106,26 +106,6 @@ test("bridge control event rejects broadcast", () => {
   );
 });
 
-test("Agent Bridge capability event rejects broadcast", () => {
-  const broadcast = route({ kind: "broadcast_bridge", explicit: true });
-
-  assertPolicyRejects(
-    () => assertRouteAllowedForContentKind(broadcast, "agent_bridge_capability_event"),
-    "requires exactly one selected peer",
-  );
-});
-
-test("capability route requires exact selected peer", () => {
-  const selectedPeer = route({ kind: "selected_peer", peerSessionId: PEER_A });
-  const selectedPeers = route({ kind: "selected_peers", peerSessionIds: [PEER_A, PEER_B] });
-
-  assert.doesNotThrow(() => assertRouteAllowedForContentKind(selectedPeer, "agent_bridge_capability_event"));
-  assertPolicyRejects(
-    () => assertRouteAllowedForContentKind(selectedPeers, "agent_bridge_capability_event"),
-    "requires exactly one selected peer",
-  );
-});
-
 test("route validation does not create consent, trust, or authority", () => {
   const selectedPeer = route({ kind: "selected_peer", peerSessionId: PEER_A });
   const serialized = JSON.stringify(selectedPeer);

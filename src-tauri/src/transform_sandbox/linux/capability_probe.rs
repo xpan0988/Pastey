@@ -273,14 +273,28 @@ impl LinuxProbeEnvironment for HostLinuxProbeEnvironment {
         pid_namespace: CapabilityStatus,
         cgroup_v2: CapabilityStatus,
     ) -> CapabilityStatus {
-        if pid_namespace != CapabilityStatus::Available || cgroup_v2 != CapabilityStatus::Available
-        {
-            return CapabilityStatus::Unavailable(
-                CapabilityUnavailableReason::ProcessTreeControlUnavailable,
-            );
-        }
-        CapabilityStatus::Indeterminate(CapabilityIndeterminateReason::ProcessTreeTestRequired)
+        process_tree_control_status(pid_namespace, cgroup_v2)
     }
+}
+
+fn process_tree_control_status(
+    pid_namespace: CapabilityStatus,
+    cgroup_v2: CapabilityStatus,
+) -> CapabilityStatus {
+    for status in [pid_namespace, cgroup_v2] {
+        match status {
+            CapabilityStatus::ProbeFailed(failure) => {
+                return CapabilityStatus::ProbeFailed(failure)
+            }
+            CapabilityStatus::Unavailable(_) => {
+                return CapabilityStatus::Unavailable(
+                    CapabilityUnavailableReason::ProcessTreeControlUnavailable,
+                )
+            }
+            CapabilityStatus::Available | CapabilityStatus::Indeterminate(_) => {}
+        }
+    }
+    CapabilityStatus::Indeterminate(CapabilityIndeterminateReason::ProcessTreeTestRequired)
 }
 
 #[cfg(target_os = "linux")]
@@ -458,50 +472,12 @@ fn linux_seccomp_status(bubblewrap: CapabilityStatus) -> CapabilityStatus {
 fn linux_cgroup_v2_status() -> CapabilityStatus {
     #[cfg(target_os = "linux")]
     {
-        use std::fs::OpenOptions;
+        use super::cgroup::{discover_current_delegated_cgroup, verify_delegation};
 
-        let root = Path::new("/sys/fs/cgroup");
-        let controllers = root.join("cgroup.controllers");
-        let controller_names = match std::fs::read_to_string(&controllers) {
-            Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return CapabilityStatus::Unavailable(
-                    CapabilityUnavailableReason::CgroupV2NotMounted,
-                )
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                return CapabilityStatus::Unavailable(CapabilityUnavailableReason::PermissionDenied)
-            }
-            Err(_) => {
-                return CapabilityStatus::ProbeFailed(CapabilityProbeFailure::HostInspectionFailed)
-            }
-        };
-        if !["memory", "pids", "cpu"].iter().all(|name| {
-            controller_names
-                .split_whitespace()
-                .any(|found| found == name)
-        }) {
-            return CapabilityStatus::Unavailable(
-                CapabilityUnavailableReason::RequiredControllerMissing,
-            );
-        }
-        if ![
-            "memory.max",
-            "pids.max",
-            "cpu.max",
-            "cgroup.procs",
-            "cgroup.kill",
-        ]
-        .iter()
-        .all(|name| root.join(name).exists())
-        {
-            return CapabilityStatus::Unavailable(
-                CapabilityUnavailableReason::PrivateCgroupUnavailable,
-            );
-        }
-        let subtree_control = root.join("cgroup.subtree_control");
-        match OpenOptions::new().write(true).open(&subtree_control) {
-            Ok(_) => CapabilityStatus::Indeterminate(
+        let result =
+            discover_current_delegated_cgroup().and_then(|parent| verify_delegation(&parent));
+        match result {
+            Ok(()) => CapabilityStatus::Indeterminate(
                 CapabilityIndeterminateReason::BehavioralVerificationRequired,
             ),
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -510,6 +486,9 @@ fn linux_cgroup_v2_status() -> CapabilityStatus {
                 )
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                CapabilityStatus::Unavailable(CapabilityUnavailableReason::CgroupV2NotMounted)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
                 CapabilityStatus::Unavailable(
                     CapabilityUnavailableReason::CgroupDelegationUnavailable,
                 )
@@ -666,6 +645,23 @@ mod tests {
             capabilities.bubblewrap,
             CapabilityStatus::Unavailable(CapabilityUnavailableReason::UnsupportedPlatform)
         );
+    }
+
+    #[test]
+    fn indeterminate_pid_and_cgroup_prerequisites_defer_to_live_process_tree_verification() {
+        assert_eq!(
+            process_tree_control_status(INDETERMINATE, INDETERMINATE),
+            CapabilityStatus::Indeterminate(CapabilityIndeterminateReason::ProcessTreeTestRequired)
+        );
+        assert!(matches!(
+            process_tree_control_status(
+                CapabilityStatus::Unavailable(CapabilityUnavailableReason::PermissionDenied),
+                INDETERMINATE
+            ),
+            CapabilityStatus::Unavailable(
+                CapabilityUnavailableReason::ProcessTreeControlUnavailable
+            )
+        ));
     }
 
     #[test]

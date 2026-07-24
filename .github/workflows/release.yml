@@ -49,7 +49,6 @@ jobs:
             libssl-dev \
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
-            patchelf \
             wget
 
       - name: Setup Node.js
@@ -72,6 +71,12 @@ jobs:
 
       - name: Check Rust
         run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Check and test Linux verification targets
+        if: runner.os == 'Linux'
+        run: |
+          cargo check --all-targets --all-features --manifest-path src-tauri/Cargo.toml
+          cargo test --all-targets --all-features --manifest-path src-tauri/Cargo.toml
 
       - name: Build installers and audit bundle contents
         if: runner.os != 'Linux'

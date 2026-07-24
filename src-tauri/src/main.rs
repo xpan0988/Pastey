@@ -1,3 +1,4 @@
+mod bridge_plan;
 mod capability_probe;
 mod chunk_frame;
 mod cleanup;
@@ -10,14 +11,15 @@ mod diagnostics;
 mod discovery;
 mod error;
 mod file_candidates;
-mod hello_stdout;
 mod link_benchmark;
 mod logging;
 mod models;
+mod object_refs;
 mod room_control;
 mod storage;
 mod transfer;
 mod transfer_tuning;
+mod transform_registry;
 mod transform_sandbox;
 
 use std::{collections::HashMap, sync::Arc};
@@ -32,18 +34,25 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 
 use crate::{
     commands::{
-        accept_nearby_join, burn_room, cancel_transfer, check_for_updates, copy_last_error,
-        copy_text_to_clipboard, create_room, delete_temp_file,
-        execute_file_candidate_search_capability, execute_hello_stdout_capability, get_config,
-        get_device_capabilities, get_device_profile, get_file_transfer_metadata,
-        get_last_benchmark_results, get_room, get_room_control_session_context, join_room,
-        leave_room, list_nearby_devices, list_received_room_control_events, list_room_items,
-        list_rooms, log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
+        accept_nearby_join, approve_bridge_plan, bridge_plan_receiver_review_status, burn_room, cancel_transfer,
+        check_for_updates, copy_last_error, copy_text_to_clipboard, create_direct_file_transfer_bridge_plan, create_file_search_bridge_plan,
+        create_file_transform_bridge_plan, create_room,
+        decide_bridge_plan_review, delete_temp_file,
+        execute_bridge_plan_search_attempt, execute_direct_bridge_plan_transfer_attempt,
+        execute_bridge_plan_transfer_attempt, execute_bridge_plan_transform_attempt,
+        get_config, get_device_capabilities,
+        get_device_profile, get_file_transfer_metadata, get_last_benchmark_results, get_room,
+        get_room_control_session_context, join_room, leave_room, list_bridge_plan_workspace,
+        list_nearby_devices, list_received_room_control_events, list_room_items, list_rooms,
+        log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
         mark_join_prompt_rendered, open_logs_folder, pair_bridge_peer, pending_join_requests,
-        reject_nearby_join, request_nearby_join, resolve_candidate_payload_capability, begin_transform_operation, create_transform_consent_prompt, resolve_transform_consent_prompt, revalidate_transform_operation, abort_transform_operation, execute_transform_with_receiver_host, get_transform_operation_status,
-        reveal_in_folder, revoke_bridge_peer_pairing, run_loopback_benchmark,
-        run_peer_link_benchmark, send_file_to_room, send_room_control_event, send_text_to_room,
-        update_config, update_transfer_window, write_temp_file,
+        propose_bridge_plan_transform_fallback, reject_nearby_join, request_nearby_join,
+        reveal_in_folder, revoke_bridge_peer_pairing,
+        run_loopback_benchmark, run_peer_link_benchmark, select_bridge_plan_search_candidate,
+        send_bridge_plan_review_request, send_file_to_room,
+        send_text_to_room, start_bridge_plan_attempt, start_bridge_plan_transfer_attempt,
+        start_bridge_plan_transform_attempt, update_config, update_transfer_window,
+        write_temp_file,
     },
     config::StoredConfig,
     error::{AppError, AppResult},
@@ -68,8 +77,16 @@ pub struct AppState {
     pub latest_device_capabilities: Mutex<Option<diagnostics::DeviceCapabilities>>,
     pub latest_benchmark_results: Mutex<HashMap<String, diagnostics::LinkBenchmarkResult>>,
     pub room_control: Mutex<room_control::RoomControlRuntimeState>,
-    pub candidate_payload_store: Mutex<file_candidates::CandidatePayloadStore>,
-    pub(crate) transform_authority: Mutex<file_candidates::TransformAuthorityStore>,
+    pub bridge_plan_candidate_store: Mutex<file_candidates::BridgePlanCandidateStore>,
+    /// Requester-local direct-Transfer sources keyed by immutable revision.
+    /// They are process-local and therefore invalidated by restart.
+    pub(crate) bridge_plan_requester_sources:
+        Mutex<HashMap<String, file_candidates::BridgePlanPrivateFile>>,
+    /// Dormant Phase 2 owner. It is never exposed through commands or current
+    /// product paths, but Burn purges it before durable Bridge Plan cleanup.
+    pub(crate) bridge_plan_authority: Mutex<bridge_plan::EphemeralStepAuthorityStore>,
+    /// Phase 3A receiver-local Search grants. They are process-local only.
+    pub(crate) bridge_plan_protocol_authority: Mutex<bridge_plan::ProtocolSearchAuthorityStore>,
 }
 
 pub struct ActiveRoomServer {
@@ -98,7 +115,7 @@ pub struct NearbyHttpHandle {
 }
 
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -106,19 +123,32 @@ fn main() {
             let shortcut_label = default_shortcut_label();
             let paths = storage::init_app_paths(&app.handle())?;
             logging::init(paths.logs_dir.clone());
-            if let Err(error) = transform_sandbox::cleanup_orphaned_transform_staging(&paths.app_data_dir) {
-                logging::write_error_line(&format!(
-                    "[pastey:transform-staging] event=orphan_cleanup_startup_failed error={}",
-                    error.message()
-                ));
+            if transform_sandbox::cleanup_orphaned_transform_staging(&paths.app_data_dir).is_err() {
+                logging::write_error_line(
+                    "[pastey:transform-staging] event=orphan_cleanup_startup_failed location=transform_staging_root error_code=cleanup_failed",
+                );
+            }
+            if object_refs::cleanup_orphaned_transform_objects(&paths.app_data_dir).is_err() {
+                logging::write_error_line(
+                    "[pastey:transform-objects] event=orphan_cleanup_startup_failed location=transform_object_root error_code=cleanup_failed",
+                );
             }
             storage::init_database(&paths)?;
             let config = config::load_or_create(&paths, shortcut_label)?;
             let effective_inbox_dir = config::effective_inbox_dir(&paths, &config);
             storage::run_startup_recovery(&paths, &effective_inbox_dir)?;
-            let transform_authority = file_candidates::TransformAuthorityStore::load(
-                paths.app_data_dir.join("transform-operation-journal.json"),
-            );
+            // A prior Burn may have cut authority off before a later cleanup
+            // failed. Retry durable cleanup and purge its crash journal before
+            // exposing any runtime state.
+            for room_id in storage::burned_bridge_ids(&paths)? {
+                storage::finalize_burned_room(&paths, &room_id, &effective_inbox_dir)?;
+            }
+            // Bridge Plan workspace records are durable, while active attempts
+            // are deliberately non-resumable across a Host restart. Burned
+            // Bridges are finalized first, so restart reconciliation can never
+            // add activity to a Bridge whose authority has been cut off.
+            bridge_plan::reconcile_startup(&paths, storage::now_ts())?;
+            bridge_plan::reconcile_protocol_startup(&paths, storage::now_ts())?;
             let state = Arc::new(AppState {
                 app_handle: app.handle().clone(),
                 paths,
@@ -137,20 +167,19 @@ fn main() {
                 latest_device_capabilities: Mutex::new(None),
                 latest_benchmark_results: Mutex::new(HashMap::new()),
                 room_control: Mutex::new(room_control::RoomControlRuntimeState::default()),
-                candidate_payload_store: Mutex::new(
-                    file_candidates::CandidatePayloadStore::default(),
+                bridge_plan_candidate_store: Mutex::new(
+                    file_candidates::BridgePlanCandidateStore::default(),
                 ),
-                transform_authority: Mutex::new(transform_authority),
+                bridge_plan_requester_sources: Mutex::new(HashMap::new()),
+                bridge_plan_authority: Mutex::new(bridge_plan::EphemeralStepAuthorityStore::default()),
+                bridge_plan_protocol_authority: Mutex::new(bridge_plan::ProtocolSearchAuthorityStore::default()),
             });
 
             app.manage(state.clone());
             let antenna_state = state.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = discovery::ensure_service(antenna_state.clone()).await {
-                    logging::write_error_line(&format!(
-                        "[pastey antenna] event=antenna_start error={:?}",
-                        error.message()
-                    ));
+                if discovery::ensure_service(antenna_state.clone()).await.is_err() {
+                    logging::write_error_line("[pastey antenna] event=antenna_start error_code=service_unavailable");
                     return;
                 }
                 discovery::start_antenna(antenna_state).await;
@@ -190,17 +219,23 @@ fn main() {
             list_room_items,
             send_text_to_room,
             send_file_to_room,
-            send_room_control_event,
-            execute_hello_stdout_capability,
-            execute_file_candidate_search_capability,
-            resolve_candidate_payload_capability,
-            begin_transform_operation,
-            create_transform_consent_prompt,
-            resolve_transform_consent_prompt,
-            revalidate_transform_operation,
-            abort_transform_operation,
-            execute_transform_with_receiver_host,
-            get_transform_operation_status,
+            create_file_search_bridge_plan,
+            create_direct_file_transfer_bridge_plan,
+            create_file_transform_bridge_plan,
+            propose_bridge_plan_transform_fallback,
+            list_bridge_plan_workspace,
+            approve_bridge_plan,
+            send_bridge_plan_review_request,
+            decide_bridge_plan_review,
+            bridge_plan_receiver_review_status,
+            start_bridge_plan_attempt,
+            select_bridge_plan_search_candidate,
+            execute_bridge_plan_search_attempt,
+            execute_direct_bridge_plan_transfer_attempt,
+            start_bridge_plan_transfer_attempt,
+            execute_bridge_plan_transfer_attempt,
+            start_bridge_plan_transform_attempt,
+            execute_bridge_plan_transform_attempt,
             get_room_control_session_context,
             list_received_room_control_events,
             cancel_transfer,
@@ -224,8 +259,19 @@ fn main() {
             copy_text_to_clipboard,
             log_frontend_diagnostic
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running pastey");
+        .build(tauri::generate_context!())
+        .expect("error while building pastey");
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            if let Some(state) = app_handle.try_state::<Arc<AppState>>() {
+                let _ = state
+                    .bridge_plan_candidate_store
+                    .lock()
+                    .object_store
+                    .purge_all();
+            }
+        }
+    });
 }
 
 fn install_global_shortcut(app: &AppHandle) -> AppResult<()> {

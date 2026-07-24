@@ -1,5 +1,6 @@
 //! Feature-gated deterministic probe for Linux isolation verification only.
-//! It accepts no user data and is never part of the normal Pastey bundle.
+//! It is compiled only with the verification feature, is not packaged, and
+//! accepts no user data or Tauri, Bridge, candidate, or Transform authority.
 
 #[cfg(not(feature = "transform-sandbox-verification"))]
 compile_error!("the transform sandbox probe requires its verification feature");
@@ -67,10 +68,14 @@ fn run(mode: Mode) -> i32 {
         Mode::AttemptForbiddenWrite => {
             denied(fs::write("/fixture/allowed/forbidden-write", b"x").is_err())
         }
-        Mode::AttemptNetworkConnect => denied(connects(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)))),
-        Mode::AttemptLoopbackConnect => denied(connects(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+        Mode::AttemptNetworkConnect => denied(network_is_denied(connects(IpAddr::V4(
+            Ipv4Addr::new(198, 18, 0, 1),
+        )))),
+        Mode::AttemptLoopbackConnect => {
+            denied(network_is_denied(connects(IpAddr::V4(Ipv4Addr::LOCALHOST))))
+        }
         Mode::AttemptForbiddenSyscall => forbidden_syscall(),
-        Mode::SpawnChild => spawn_descendants(false),
+        Mode::SpawnChild => pressure_pids(),
         Mode::SpawnGrandchild => spawn_descendants(true),
         Mode::DoubleForkOrDaemonize => double_fork(),
         Mode::AllocateMemory => allocate_memory(),
@@ -89,7 +94,20 @@ fn report_visible_fixtures() -> i32 {
     if fs::write(WORK_PATH, b"pastey-verification-work-v1").is_err() {
         return 2;
     }
-    emit("P100")
+    let pid_namespace = match fs::read_link("/proc/self/ns/pid") {
+        Ok(value) => value,
+        Err(_) => return 3,
+    };
+    let network_namespace = match fs::read_link("/proc/self/ns/net") {
+        Ok(value) => value,
+        Err(_) => return 4,
+    };
+    println!(
+        "P100 pidns={} netns={}",
+        pid_namespace.to_string_lossy(),
+        network_namespace.to_string_lossy()
+    );
+    0
 }
 
 fn denied(value: bool) -> i32 {
@@ -104,15 +122,22 @@ fn connects(address: IpAddr) -> bool {
     TcpStream::connect_timeout(&SocketAddr::new(address, 9), Duration::from_millis(100)).is_ok()
 }
 
+fn network_is_denied(connected: bool) -> bool {
+    !connected
+}
+
 #[cfg(target_os = "linux")]
 fn forbidden_syscall() -> i32 {
-    if install_test_seccomp_policy().is_err() {
-        return 2;
-    }
-    let result = unsafe { libc::getppid() };
+    // The outer Bubblewrap policy used by production denies socket(2). Do not
+    // install a second policy here: doing so would let this probe pass even if
+    // Bubblewrap ignored or failed to apply the production policy.
+    let result = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
         emit("P102")
     } else {
+        if result >= 0 {
+            unsafe { libc::close(result) };
+        }
         1
     }
 }
@@ -122,65 +147,25 @@ fn forbidden_syscall() -> i32 {
     2
 }
 
-/// The test-only policy returns EPERM for getppid. ERRNO is selected over kill
-/// or trap so the harness can deterministically observe denial and cleanup.
 #[cfg(target_os = "linux")]
-fn install_test_seccomp_policy() -> Result<(), ()> {
-    #[repr(C)]
-    struct SockFilter {
-        code: u16,
-        jt: u8,
-        jf: u8,
-        k: u32,
+fn pressure_pids() -> i32 {
+    for _ in 0..12 {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            emit("P103");
+            return wait_for_signal();
+        }
+        if pid == 0 {
+            return wait_for_signal();
+        }
     }
-    #[repr(C)]
-    struct SockFprog {
-        len: u16,
-        filter: *const SockFilter,
-    }
-    const BPF_LD_W_ABS: u16 = 0x20;
-    const BPF_JMP_JEQ_K: u16 = 0x15;
-    const BPF_RET_K: u16 = 0x06;
-    const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
-    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
-    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-    let filters = [
-        SockFilter {
-            code: BPF_LD_W_ABS,
-            jt: 0,
-            jf: 0,
-            k: 0,
-        },
-        SockFilter {
-            code: BPF_JMP_JEQ_K,
-            jt: 0,
-            jf: 1,
-            k: libc::SYS_getppid as u32,
-        },
-        SockFilter {
-            code: BPF_RET_K,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ERRNO | libc::EPERM as u32,
-        },
-        SockFilter {
-            code: BPF_RET_K,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ALLOW,
-        },
-    ];
-    let program = SockFprog {
-        len: filters.len() as u16,
-        filter: filters.as_ptr(),
-    };
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(());
-    }
-    if unsafe { libc::prctl(libc::PR_SET_SECCOMP, SECCOMP_SET_MODE_FILTER, &program) } != 0 {
-        return Err(());
-    }
-    Ok(())
+    emit("P103");
+    wait_for_signal()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pressure_pids() -> i32 {
+    2
 }
 
 #[cfg(target_os = "linux")]
@@ -273,4 +258,22 @@ fn wait_for_signal() -> i32 {
 fn emit(value: &str) -> i32 {
     println!("{value}");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_observation_rejects_success_and_accepts_denial() {
+        assert!(!network_is_denied(true));
+        assert!(network_is_denied(false));
+    }
+
+    #[test]
+    fn probe_does_not_install_a_second_seccomp_policy() {
+        let source = include_str!("test_probe.rs");
+        assert!(!source.contains(&["PR_SET", "SECCOMP"].join("_")));
+        assert!(!source.contains(&["install_test", "seccomp_policy"].join("_")));
+    }
 }

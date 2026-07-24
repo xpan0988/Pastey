@@ -25,17 +25,7 @@ export function buildMockAiContextSnapshot(): AiContextSnapshot {
       trustedRoom: true,
       peerCount: 1
     },
-    peers: [{
-      peerRef: "mock-peer-1",
-      visible: true,
-      trusted: true,
-      capabilities: [
-        "runtime.execute_hello_template",
-        "runtime.hello_stdout",
-        "filesystem.find_file_candidates",
-        "transfer.request_candidate_payload"
-      ]
-    }],
+    peers: [{ peerRef: "mock-peer-1", visible: true, trusted: true }],
     scheduler: {
       microFlowGroupMode: "unknown"
     },
@@ -47,12 +37,7 @@ export function buildMockAiContextSnapshot(): AiContextSnapshot {
       level: "info",
       message: "AI Slot v0 mock context is ready."
     },
-    allowedActions: [
-      "request_peer_hello_demo",
-      "request_peer_hello_stdout_demo",
-      "request_peer_file_candidates",
-      "request_peer_candidate_payload"
-    ]
+    allowedActions: []
   };
 }
 

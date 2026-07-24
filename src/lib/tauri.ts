@@ -14,38 +14,110 @@ import type {
   RoomInfo,
   RoomItem
 } from "./types";
-import {
-  validateCandidatePayloadExecutionRequest,
-  validateArtifactTransformExecutionRequest,
-  validateFileCandidateExecutionRequest,
-  type ArtifactTransformExecutionRequest,
-  type CandidatePayloadExecutionRequest,
-  type CandidatePayloadResolution,
-  type FileCandidateExecutionRequest,
-  type FileCandidateExecutionResult,
-} from "./ai";
-import {
-  validateHelloStdoutExecutionRequest,
-  validateRoomControlEvent,
-  type CandidatePayloadLocalResolution,
-  type HelloStdoutExecutionRequest,
-  type HelloStdoutExecutionResult,
-  type RoomControlEvent
-} from "./agentBridge";
 import type {
   ControlBridgeRoutePayload,
   FileBridgeRoutePayload,
   TextBridgeRoutePayload,
 } from "./bridgeRoutingRuntime";
 
-export interface TransformConsentPromptInfo {
-  pendingConsentPromptId: string;
-  consentId: string;
-  roomRef: string;
-  sourcePreviewEventId: string;
-  expiresAt: string;
-  status: "pending" | "allowed_once" | "denied" | "expired";
-  decidedAt?: string;
+/** Public workspace projection. It contains reviewed plan semantics and safe
+ * history only; execution grants and receiver-local resolution remain Rust
+ * private. */
+export interface BridgePlanWorkspace {
+  plans: unknown[];
+  revisions: unknown[];
+  approvals: unknown[];
+  attempts: unknown[];
+  activities: unknown[];
+  results: unknown[];
+}
+
+export interface FileSearchBridgePlanRequest {
+  roomId: string;
+  originalUserGoal: string;
+  filenameHint: string;
+  extensions: string[];
+  safeScopes: Array<"downloads" | "desktop" | "documents" | "pastey_shared">;
+  transferToRequester: boolean;
+  transferDestination?: "requesting_device" | "selected_device";
+}
+
+export function createFileSearchBridgePlan(request: FileSearchBridgePlanRequest): Promise<BridgePlanWorkspace> {
+  return invoke<BridgePlanWorkspace>("create_file_search_bridge_plan", { request });
+}
+
+export interface DirectFileTransferBridgePlanRequest {
+  roomId: string;
+  originalUserGoal: string;
+  sourcePath: string;
+}
+
+export function createDirectFileTransferBridgePlan(request: DirectFileTransferBridgePlanRequest): Promise<BridgePlanWorkspace> {
+  return invoke<BridgePlanWorkspace>("create_direct_file_transfer_bridge_plan", { request });
+}
+
+export interface FileTransformAlternativeBridgePlanRequest extends FileSearchBridgePlanRequest {
+  transformIntent: string;
+}
+
+export function createFileTransformBridgePlan(request: FileTransformAlternativeBridgePlanRequest): Promise<BridgePlanWorkspace> {
+  return invoke<BridgePlanWorkspace>("create_file_transform_bridge_plan", { request });
+}
+
+export function proposeBridgePlanTransformFallback(revisionId: string): Promise<BridgePlanWorkspace> {
+  return invoke<BridgePlanWorkspace>("propose_bridge_plan_transform_fallback", { revisionId });
+}
+
+export function listBridgePlanWorkspace(roomId: string): Promise<BridgePlanWorkspace> {
+  return invoke<BridgePlanWorkspace>("list_bridge_plan_workspace", { roomId });
+}
+
+export function approveBridgePlan(revisionId: string, approvalId: string, receiverRequired: boolean): Promise<BridgePlanWorkspace> {
+  return invoke<BridgePlanWorkspace>("approve_bridge_plan", { revisionId, approvalId, receiverRequired });
+}
+
+export function sendBridgePlanReviewRequest(approvalId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
+  return invoke<RoomControlDeliveryReceipt>("send_bridge_plan_review_request", { approvalId, bridgeRoute });
+}
+
+export function decideBridgePlanReview(roomId: string, approvalId: string, allow: boolean, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
+  return invoke<RoomControlDeliveryReceipt>("decide_bridge_plan_review", { roomId, approvalId, allow, bridgeRoute });
+}
+
+export function bridgePlanReceiverReviewStatus(roomId: string, approvalId: string): Promise<"allow" | "deny" | null> {
+  return invoke<"allow" | "deny" | null>("bridge_plan_receiver_review_status", { roomId, approvalId });
+}
+
+export function startBridgePlanAttempt(approvalId: string, attemptId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
+  return invoke<RoomControlDeliveryReceipt>("start_bridge_plan_attempt", { approvalId, attemptId, bridgeRoute });
+}
+
+export function selectBridgePlanSearchCandidate(roomId: string, attemptId: string, candidateId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
+  return invoke<RoomControlDeliveryReceipt>("select_bridge_plan_search_candidate", { roomId, attemptId, candidateId, bridgeRoute });
+}
+
+export function startBridgePlanTransferAttempt(roomId: string, attemptId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
+  return invoke<RoomControlDeliveryReceipt>("start_bridge_plan_transfer_attempt", { roomId, attemptId, bridgeRoute });
+}
+
+export function executeBridgePlanTransferAttempt(roomId: string, attemptId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<boolean> {
+  return invoke<boolean>("execute_bridge_plan_transfer_attempt", { roomId, attemptId, bridgeRoute });
+}
+
+export function executeDirectBridgePlanTransferAttempt(roomId: string, attemptId: string): Promise<boolean> {
+  return invoke<boolean>("execute_direct_bridge_plan_transfer_attempt", { roomId, attemptId });
+}
+
+export function startBridgePlanTransformAttempt(roomId: string, attemptId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
+  return invoke<RoomControlDeliveryReceipt>("start_bridge_plan_transform_attempt", { roomId, attemptId, bridgeRoute });
+}
+
+export function executeBridgePlanTransformAttempt(roomId: string, attemptId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<boolean> {
+  return invoke<boolean>("execute_bridge_plan_transform_attempt", { roomId, attemptId, bridgeRoute });
+}
+
+export function executeBridgePlanSearchAttempt(roomId: string, attemptId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<void> {
+  return invoke<void>("execute_bridge_plan_search_attempt", { roomId, attemptId, bridgeRoute });
 }
 
 interface SendFileOptions {
@@ -134,104 +206,6 @@ export async function sendTextToRoom(
     text,
     bridgeRoute: bridgeRoute ?? null,
   });
-}
-
-export async function sendRoomControlEvent(
-  roomId: string,
-  event: RoomControlEvent,
-  bridgeRoute?: ControlBridgeRoutePayload,
-): Promise<RoomControlDeliveryReceipt> {
-  const validation = validateRoomControlEvent(event, {
-    expectedRoomRef: roomId,
-  });
-  if (!validation.valid) {
-    throw new Error(validation.errors.join(" "));
-  }
-  return invoke("send_room_control_event", {
-    roomId,
-    event: validation.value,
-    bridgeRoute: bridgeRoute ?? null,
-  });
-}
-
-export async function executeHelloStdoutCapability(
-  request: HelloStdoutExecutionRequest,
-): Promise<HelloStdoutExecutionResult> {
-  const errors = validateHelloStdoutExecutionRequest(request);
-  if (errors.length > 0) {
-    throw new Error(errors.join(" "));
-  }
-  return invoke("execute_hello_stdout_capability", { request });
-}
-
-export async function executeFileCandidateSearchCapability(
-  request: FileCandidateExecutionRequest,
-): Promise<FileCandidateExecutionResult> {
-  const validation = validateFileCandidateExecutionRequest(request);
-  if (!validation.valid) {
-    throw new Error(validation.errors.join(" "));
-  }
-  return invoke("execute_file_candidate_search_capability", { request });
-}
-
-export async function resolveCandidatePayloadCapability(
-  request: CandidatePayloadExecutionRequest,
-): Promise<CandidatePayloadLocalResolution> {
-  const validation = validateCandidatePayloadExecutionRequest(request);
-  if (!validation.valid) {
-    throw new Error(validation.errors.join(" "));
-  }
-  return invoke("resolve_candidate_payload_capability", { request });
-}
-
-export async function beginTransformOperation(
-  request: ArtifactTransformExecutionRequest,
-): Promise<"leased" | "already_leased" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed"> {
-  const validation = validateArtifactTransformExecutionRequest(request);
-  if (!validation.valid) throw new Error(validation.errors.join(" "));
-  const result = await invoke<{ status: "leased" | "already_leased" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed" }>("begin_transform_operation", {
-    request,
-  });
-  return result.status;
-}
-
-export async function revalidateTransformOperation(
-  request: ArtifactTransformExecutionRequest,
-): Promise<"revalidated" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed" | "invalid_consent"> {
-  const validation = validateArtifactTransformExecutionRequest(request);
-  if (!validation.valid) throw new Error(validation.errors.join(" "));
-  const result = await invoke<{ status: "revalidated" | "candidate_not_found" | "candidate_expired" | "candidate_changed" | "candidate_claimed" | "invalid_consent" }>("revalidate_transform_operation", { request });
-  return result.status;
-}
-
-/** Pre-start cleanup only: the receiver host releases the exact request lease and preserves a still-valid grant for retry. */
-export async function abortTransformOperation(request: ArtifactTransformExecutionRequest): Promise<"released" | "candidate_not_found" | "candidate_claimed"> {
-  const validation = validateArtifactTransformExecutionRequest(request);
-  if (!validation.valid) throw new Error(validation.errors.join(" "));
-  const result = await invoke<{ status: "released" | "candidate_not_found" | "candidate_claimed" }>("abort_transform_operation", { request });
-  return result.status;
-}
-
-export async function getTransformOperationStatus(request: ArtifactTransformExecutionRequest): Promise<string> {
-  const validation = validateArtifactTransformExecutionRequest(request);
-  if (!validation.valid) throw new Error(validation.errors.join(" "));
-  const result = await invoke<{ status: string }>("get_transform_operation_status", { request });
-  return result.status;
-}
-
-export async function createTransformConsentPrompt(
-  roomId: string,
-  sourcePreviewEventId: string,
-): Promise<TransformConsentPromptInfo> {
-  return invoke<TransformConsentPromptInfo>("create_transform_consent_prompt", { roomId, sourcePreviewEventId });
-}
-
-export async function resolveTransformConsentPrompt(
-  roomId: string,
-  pendingConsentPromptId: string,
-  decision: "allow_once" | "deny",
-): Promise<TransformConsentPromptInfo> {
-  return invoke<TransformConsentPromptInfo>("resolve_transform_consent_prompt", { roomId, pendingConsentPromptId, decision });
 }
 
 export async function getRoomControlSessionContext(

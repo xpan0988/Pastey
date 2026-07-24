@@ -18,7 +18,7 @@ The sender may update a supported active binary-v1 window at runtime. Window pol
 
 Layer 4 validates a current-session route before ordinary text or file-like delivery. A failed selected-peer route has no arbitrary legacy fallback. Ordinary-data selected-peers and broadcast are expanded according to Layer 4 and Layer 3 rules; each file-like target still uses the existing selected-peer transfer path.
 
-Layer 5 selected-file Return reuses this transfer path. `handoff_queued` is not transfer completion: it says only that the existing queue accepted a source. It does not say that bytes transferred, an endpoint accepted the transfer, or the transfer completed.
+The live durable Bridge Plan Search → Transfer workflow reuses this encrypted path only when its approved destination is the requesting device, after the receiver validates a requester-selected bounded result against its private candidate store. A selected-device Pastey Shared destination is instead copied locally by the selected Host. `handoff_queued` is not transfer completion: it says only that the existing queue accepted a source. It does not say that bytes transferred, an endpoint accepted the transfer, or the transfer completed.
 
 ## Cancellation, recovery, and failure
 

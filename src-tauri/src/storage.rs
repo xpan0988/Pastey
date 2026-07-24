@@ -11,7 +11,7 @@ use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
 use crate::{
-    crypto,
+    bridge_plan, crypto,
     error::{AppError, AppResult},
     logging,
     models::{
@@ -179,6 +179,13 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             rotation_state TEXT NOT NULL
         );
 
+        -- Burn tombstones intentionally contain no room code, peer, route, or
+        -- membership material. They make a failed cleanup retry fail closed.
+        CREATE TABLE IF NOT EXISTS burned_bridges (
+            room_id TEXT PRIMARY KEY,
+            burned_at INTEGER NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_rooms_code_hash ON rooms(room_code_hash);
         CREATE INDEX IF NOT EXISTS idx_rooms_expires_at ON rooms(expires_at);
         CREATE INDEX IF NOT EXISTS idx_room_items_room_id ON room_items(room_id, created_at);
@@ -188,6 +195,7 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
         "#,
     )?;
     ensure_room_schema(&conn)?;
+    bridge_plan::init_schema(&conn)?;
     migrate_room_statuses(&conn)?;
     backfill_legacy_bridge_peers(&conn)?;
     Ok(())
@@ -843,16 +851,19 @@ pub fn list_bridge_peer_endpoints(
 
 pub fn set_room_status(paths: &AppPaths, room_id: &str, status: RoomStatus) -> AppResult<()> {
     let conn = connection(paths)?;
-    if status == RoomStatus::Active {
+    let changed = if status == RoomStatus::Active {
         conn.execute(
             "UPDATE rooms SET status = ?1 WHERE id = ?2 AND status != 'burned'",
             params![status.as_str(), room_id],
-        )?;
+        )?
     } else {
         conn.execute(
             "UPDATE rooms SET status = ?1 WHERE id = ?2",
             params![status.as_str(), room_id],
-        )?;
+        )?
+    };
+    if changed == 0 {
+        return Err(AppError::NotFound("room not found or burned".into()));
     }
     Ok(())
 }
@@ -1120,6 +1131,7 @@ pub fn set_room_item_status(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn burn_room(
     paths: &AppPaths,
     room_id: &str,
@@ -1127,21 +1139,79 @@ pub fn burn_room(
 ) -> AppResult<Option<StoredRoom>> {
     let room = get_room_by_id(paths, room_id).ok();
     if room.is_none() {
-        return Ok(None);
+        return if is_burned_bridge(paths, room_id)? {
+            Ok(None)
+        } else {
+            Ok(None)
+        };
+    }
+
+    cut_off_bridge_authority(paths, room_id)?;
+    finalize_burned_room(paths, room_id, effective_inbox_dir)?;
+    Ok(room)
+}
+
+/// Persist the terminal authority cutoff before any fallible cleanup.
+pub fn cut_off_bridge_authority(paths: &AppPaths, room_id: &str) -> AppResult<bool> {
+    if get_room_by_id(paths, room_id).is_err() {
+        return is_burned_bridge(paths, room_id);
     }
 
     let conn = connection(paths)?;
+    // This is the authority cutoff. It happens before file/content cleanup so
+    // a cleanup failure can never revive the Bridge.
     conn.execute(
-        "UPDATE rooms SET status = 'burned', peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL, local_burned_at = ?1 WHERE id = ?2",
+        "INSERT OR IGNORE INTO burned_bridges (room_id, burned_at) VALUES (?1, ?2)",
+        params![room_id, now_ts()],
+    )?;
+    conn.execute(
+        "UPDATE rooms SET status = 'burned', room_code_hash = '', wrapped_room_code = '', code_nonce = '', peer_device_name = NULL, peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL, local_burned_at = ?1 WHERE id = ?2",
         params![now_ts(), room_id],
     )?;
-    conn.execute(
-        "UPDATE bridge_peers SET liveness = ?1, endpoint_host = NULL, endpoint_port = NULL, transport_public_key = NULL, updated_at = ?2 WHERE room_id = ?3",
-        params![BridgePeerLiveness::Stale.as_str(), now_ts(), room_id],
-    )?;
+    Ok(true)
+}
+
+/// Removes the old Bridge contents and membership while retaining only the
+/// opaque burned_bridges tombstone created by `cut_off_bridge_authority`.
+pub fn finalize_burned_room(
+    paths: &AppPaths,
+    room_id: &str,
+    effective_inbox_dir: &Path,
+) -> AppResult<()> {
+    if !is_burned_bridge(paths, room_id)? {
+        return Err(AppError::InvalidInput("Bridge is not burned.".into()));
+    }
+    // Bridge Plan data is Bridge-scoped workspace history. It must be removed
+    // after the authority cutoff and before the room can be finalized. Any
+    // deletion failure leaves the burned tombstone in place for retry.
+    bridge_plan::delete_bridge_records(paths, room_id)?;
+    let conn = connection(paths)?;
     delete_room_files(paths, room_id, effective_inbox_dir)?;
     conn.execute("DELETE FROM room_items WHERE room_id = ?1", [room_id])?;
-    Ok(room)
+    // Pairing is stored separately in bridge_durable_identities and survives;
+    // the per-Bridge membership row must not survive as history.
+    conn.execute("DELETE FROM bridge_peers WHERE room_id = ?1", [room_id])?;
+    conn.execute("DELETE FROM rooms WHERE id = ?1", [room_id])?;
+    Ok(())
+}
+
+pub fn is_burned_bridge(paths: &AppPaths, room_id: &str) -> AppResult<bool> {
+    let conn = connection(paths)?;
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM burned_bridges WHERE room_id = ?1)",
+        [room_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(exists != 0)
+}
+
+pub fn burned_bridge_ids(paths: &AppPaths) -> AppResult<Vec<String>> {
+    let conn = connection(paths)?;
+    let mut stmt = conn.prepare("SELECT room_id FROM burned_bridges")?;
+    let ids: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    Ok(ids)
 }
 
 pub fn leave_room(paths: &AppPaths, room_id: &str) -> AppResult<Option<StoredRoom>> {
@@ -1699,10 +1769,9 @@ fn cleanup_stale_part_files_in_dir(root: &Path) {
                 "[pastey recovery] event=stale_part_cleanup_deleted location=pastey_parts",
             ),
             Ok(false) => {}
-            Err(error) => logging::write_error_line(&format!(
-                "[pastey recovery] event=stale_part_cleanup_failed location=pastey_parts error={:?}",
-                error.message()
-            )),
+            Err(_) => logging::write_error_line(
+                "[pastey recovery] event=stale_part_cleanup_failed location=pastey_parts error_code=cleanup_failed",
+            ),
         }
     }
 }
@@ -1909,11 +1978,11 @@ fn remove_tracked_room_file(
     match remove_file_if_exists(path) {
         Ok(_) => Ok(()),
         Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            log_room_file_cleanup_error(room_id, category, path, &error.to_string());
+            log_room_file_cleanup_error(room_id, category, path, "permission_denied");
             Err(AppError::InvalidInput(ROOM_FILE_DELETE_ERROR.into()))
         }
-        Err(error) => {
-            log_room_file_cleanup_error(room_id, category, path, &error.message());
+        Err(_) => {
+            log_room_file_cleanup_error(room_id, category, path, "io_failure");
             Err(AppError::InvalidInput(ROOM_FILE_DELETE_ERROR.into()))
         }
     }
@@ -1931,17 +2000,24 @@ fn is_path_under_any_root(path: &Path, roots: &[&Path]) -> bool {
     })
 }
 
+fn cleanup_location_class(path: &Path) -> &'static str {
+    let _ = path;
+    // Callers have already constrained this to a fixed app-owned root. Never
+    // format the local path or filename into a log line.
+    "app_owned_root"
+}
+
 fn log_room_file_cleanup_warning(room_id: &str, category: &str, path: &Path, message: &str) {
     logging::write_transfer_line(&format!(
-        "[pastey cleanup][room_id={room_id}] event=room_file_cleanup_warning category={category} path={} message={message:?}",
-        path.display()
+        "[pastey cleanup][room_id={room_id}] event=room_file_cleanup_warning category={category} location={} message={message:?}",
+        cleanup_location_class(path)
     ));
 }
 
-fn log_room_file_cleanup_error(room_id: &str, category: &str, path: &Path, error: &str) {
+fn log_room_file_cleanup_error(room_id: &str, category: &str, path: &Path, error_code: &str) {
     logging::write_error_line(&format!(
-        "[pastey cleanup][room_id={room_id}] event=room_file_cleanup_error category={category} path={} error={error:?}",
-        path.display()
+        "[pastey cleanup][room_id={room_id}] event=room_file_cleanup_error category={category} location={} error_code={error_code}",
+        cleanup_location_class(path)
     ));
 }
 
@@ -2695,7 +2771,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_marks_bridge_peers_stale_without_route_metadata() {
+    fn burn_deletes_bridge_peer_membership_without_route_metadata() {
         let paths = test_paths("pastey_bridge_peer_table_burn");
         init_database(&paths).unwrap();
         let master_key = crypto::random_key();
@@ -2723,12 +2799,8 @@ mod tests {
         burn_room(&paths, "room", &paths.inbox_dir).unwrap();
 
         let peers = list_bridge_peer_endpoints(&paths, "room").unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].liveness, BridgePeerLiveness::Stale);
-        assert_eq!(peers[0].endpoint_host, None);
-        assert_eq!(peers[0].endpoint_port, None);
-        assert_eq!(peers[0].transport_public_key, None);
-        assert_eq!(peers[0].durable_identity_id, None);
+        assert!(peers.is_empty());
+        assert!(is_burned_bridge(&paths, "room").unwrap());
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 
@@ -3068,7 +3140,7 @@ mod tests {
             .is_some());
         assert!(burn_room(&paths, "room", &paths.inbox_dir)
             .unwrap()
-            .is_some());
+            .is_none());
 
         assert!(list_room_items(&paths, "room").unwrap().is_empty());
         let _ = fs::remove_dir_all(paths.app_data_dir);
@@ -3244,12 +3316,9 @@ mod tests {
         .unwrap();
 
         burn_room(&paths, "room", &paths.inbox_dir).unwrap();
-        set_room_status(&paths, "room", RoomStatus::Active).unwrap();
-
-        assert_eq!(
-            get_room_by_id(&paths, "room").unwrap().status,
-            RoomStatus::Burned
-        );
+        assert!(is_burned_bridge(&paths, "room").unwrap());
+        assert!(set_room_status(&paths, "room", RoomStatus::Active).is_err());
+        assert!(get_room_by_id(&paths, "room").is_err());
         assert!(persist_incoming_file_item_metadata(
             &paths,
             &master_key,

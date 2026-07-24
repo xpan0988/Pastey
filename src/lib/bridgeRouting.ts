@@ -24,8 +24,7 @@ export type BridgeContentKind =
   | "file"
   | "image"
   | "pasted_image"
-  | "bridge_control_event"
-  | "agent_bridge_capability_event";
+  | "bridge_control_event";
 
 export interface BridgeRoutingPolicy {
   readonly contentKind: BridgeContentKind;
@@ -103,13 +102,6 @@ export const DEFAULT_BRIDGE_ROUTING_POLICIES: Readonly<Record<BridgeContentKind,
     allowSelectedPeer: true,
     allowSelectedPeers: false,
     allowBroadcast: false,
-  },
-  agent_bridge_capability_event: {
-    contentKind: "agent_bridge_capability_event",
-    allowSelectedPeer: true,
-    allowSelectedPeers: false,
-    allowBroadcast: false,
-    requireExactSelectedPeer: true,
   },
 };
 

@@ -23,12 +23,7 @@ export type AiActionKind =
   | "suggest_benchmark"
   | "suggest_transfer"
   | "draft_text_message"
-  | "explain_microflowgroup_mode"
-  | "request_peer_hello_demo"
-  | "request_peer_hello_stdout_demo"
-  | "request_peer_file_candidates"
-  | "request_peer_candidate_payload"
-  | "request_peer_artifact_transform";
+  | "explain_microflowgroup_mode";
 
 export type AiConfidence = "low" | "medium" | "high";
 

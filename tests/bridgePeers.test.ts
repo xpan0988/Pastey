@@ -101,7 +101,7 @@ test("manual-code peer is current-session only", () => {
   assert.equal(result.peer.currentSessionOnly, true);
 });
 
-test("accepted peer is not durable trusted device", () => {
+test("accepted peer is not a durable paired device", () => {
   const normalized = normalizeBridgePeerSession({
     bridgeSessionId: BRIDGE_SESSION,
     peerSessionId: PEER_A,
@@ -199,29 +199,6 @@ test("broadcast resolves only routeable remote peers", () => {
   const broadcast = route({ kind: "broadcast_bridge", explicit: true });
 
   assert.deepEqual(resolveBridgeRoutePeerIds(broadcast, peers), [PEER_A, PEER_C]);
-});
-
-test("Agent Bridge capability route requires exact selected peer", () => {
-  const peers = collection([peer(PEER_A), peer(PEER_B)]);
-  const selected = route({ kind: "selected_peer", peerSessionId: PEER_A });
-  const selectedPeers = route({ kind: "selected_peers", peerSessionIds: [PEER_A, PEER_B] });
-  const broadcast = route({ kind: "broadcast_bridge", explicit: true });
-
-  assert.doesNotThrow(() =>
-    assertRouteCompatibleWithPeerCollection(selected, peers, { contentKind: "agent_bridge_capability_event" })
-  );
-  assertRejects(
-    () => assertRouteCompatibleWithPeerCollection(selectedPeers, peers, {
-      contentKind: "agent_bridge_capability_event",
-    }),
-    "requires exactly one selected peer",
-  );
-  assertRejects(
-    () => assertRouteCompatibleWithPeerCollection(broadcast, peers, {
-      contentKind: "agent_bridge_capability_event",
-    }),
-    "requires exactly one selected peer",
-  );
 });
 
 test("default route derives selected peer only for one routeable remote peer", () => {

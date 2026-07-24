@@ -1,22 +1,26 @@
 use std::{path::PathBuf, sync::Arc};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
+use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::{
+    bridge_plan::{
+        self, ActivityKind, BridgePlan, BridgePlanActivity, BridgePlanApproval, BridgePlanRecords, BridgePlanResultSummary,
+        BridgePlanRevision, BridgePlanState, RevisionState,
+    },
     capability_probe::{self, CapabilityProbeMode},
     config, crypto,
     device_profile::{self, ProfileProbeMode},
     diagnostics, discovery,
     error::{AppError, AppResult},
     file_candidates::{
-        self, ArtifactTransformClaimRequest, ArtifactTransformClaimResult, CandidatePayloadExecutionRequest, CandidatePayloadLocalResolution,
-        FileCandidateExecutionRequest, FileCandidateExecutionResult,
+        self,
+        BridgePlanSearchRequest,
     },
-    hello_stdout::{self, HelloStdoutExecutionRequest, HelloStdoutExecutionResult},
     link_benchmark, logging,
     models::{
         AppConfig, BridgeDeliveryContentKind, BridgeDeliveryOutcome, BridgeDeliveryOutcomeStatus,
@@ -25,7 +29,7 @@ use crate::{
         RoomInfo, RoomItem, RoomStatus, StoredBridgePeerEndpoint, StoredRoom,
     },
     room_control::{
-        ReceivedRoomControlEvent, RoomControlDeliveryReceipt, RoomControlSendError,
+        ReceivedRoomControlEvent, RoomControlDeliveryReceipt,
         RoomControlSessionContext,
     },
     storage, transfer, AppState,
@@ -36,25 +40,68 @@ const DIAGNOSTICS_CACHE_TTL_SECONDS: i64 = 60;
 const TEXT_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-text-route-v1";
 const FILE_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-file-route-v1";
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TransformFinalizationDelivery {
-    terminal_category: String,
-    sent: bool,
+const BRIDGE_PLAN_APPROVAL_TTL_SECONDS: i64 = 24 * 60 * 60;
+const BRIDGE_PLAN_CONTROL_LIFETIME_SECONDS: i64 = 120;
+
+fn bridge_plan_control_event(
+    kind: &str,
+    payload: Value,
+    context: &RoomControlSessionContext,
+) -> AppResult<Value> {
+    let now = OffsetDateTime::now_utc();
+    Ok(serde_json::json!({
+        "schemaVersion": "pastey-room-control-event-v1",
+        "eventId": format!("bridge-plan-event-{}", uuid::Uuid::new_v4()),
+        "kind": kind,
+        "protocolFamily": "bridge_plan",
+        "roomRef": context.room_id,
+        "sourceDeviceRef": context.local_session_ref,
+        "targetPeerRef": context.peer_session_ref,
+        "createdAt": now.format(&Rfc3339).map_err(|_| AppError::InvalidInput("Unable to format Bridge Plan event time.".into()))?,
+        "expiresAt": (now + Duration::seconds(BRIDGE_PLAN_CONTROL_LIFETIME_SECONDS)).format(&Rfc3339).map_err(|_| AppError::InvalidInput("Unable to format Bridge Plan event time.".into()))?,
+        "previewOnly": false,
+        "payload": payload,
+    }))
 }
 
-/// Bounded receiver-host metadata returned to TypeScript. It intentionally
-/// contains no executor output, private marker, path, digest, or lease data.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TransformHostExecutionOutcome {
-    executed: bool,
-    lifecycle: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    terminal_category: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error_code: Option<String>,
-    delivery_status: String,
+
+/// Renderer-provided intent for a file Search. Device bindings, immutable
+/// revision shape, and authority stay Host-owned.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileSearchBridgePlanRequest {
+    pub room_id: String,
+    pub original_user_goal: String,
+    pub filename_hint: String,
+    pub extensions: Vec<String>,
+    pub safe_scopes: Vec<String>,
+    #[serde(default)]
+    pub transfer_to_requester: bool,
+    #[serde(default)]
+    pub transfer_destination: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileTransformAlternativeBridgePlanRequest {
+    pub room_id: String,
+    pub original_user_goal: String,
+    pub filename_hint: String,
+    pub extensions: Vec<String>,
+    pub safe_scopes: Vec<String>,
+    pub transform_intent: String,
+    #[serde(default)]
+    pub transfer_to_requester: bool,
+    #[serde(default)]
+    pub transfer_destination: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectFileTransferBridgePlanRequest {
+    pub room_id: String,
+    pub original_user_goal: String,
+    pub source_path: String,
 }
 
 #[derive(Serialize)]
@@ -1243,293 +1290,1153 @@ pub async fn send_file_to_room(
     .await
 }
 
+/// Creates the first immutable revision for a Bridge workspace.  The caller
+/// supplies only reviewed product semantics; the Host recomputes the semantic
+/// hash and owns every durable state transition.
+pub fn create_bridge_plan(
+    mut revision: BridgePlanRevision,
+    state: State<'_, Arc<AppState>>,
+) -> Result<BridgePlanRecords, String> {
+    let now = storage::now_ts();
+    revision.revision_hash =
+        bridge_plan::canonical_revision_hash(&revision).map_err(|error| error.message())?;
+    let store = bridge_plan::BridgePlanStore::new(&state.paths);
+    let plan = BridgePlan {
+        plan_id: revision.plan_id.clone(),
+        bridge_id: revision.bridge_id.clone(),
+        requesting_device_ref: revision.requesting_device_ref.clone(),
+        created_at: now,
+    };
+    store
+        .create_plan(&plan, BridgePlanState::Draft)
+        .map_err(|error| error.message())?;
+    store
+        .transition_plan(&plan.plan_id, BridgePlanState::Open)
+        .map_err(|error| error.message())?;
+    store
+        .append_revision(&revision, RevisionState::Proposed, now)
+        .map_err(|error| error.message())?;
+    store
+        .transition_revision(&revision.revision_id, RevisionState::Available)
+        .map_err(|error| error.message())?;
+    store
+        .append_activity(&BridgePlanActivity {
+            activity_id: format!("plan-created-{}", uuid::Uuid::new_v4()),
+            bridge_id: revision.bridge_id.clone(),
+            plan_id: revision.plan_id.clone(),
+            revision_id: revision.revision_id.clone(),
+            attempt_id: None,
+            step_id: None,
+            kind: ActivityKind::RevisionProposed,
+            occurred_at: now,
+            summary: "Plan ready for complete review.".into(),
+        })
+        .map_err(|error| error.message())?;
+    store
+        .list_bridge(&revision.bridge_id)
+        .map_err(|error| error.message())
+}
+
+/// Creates the supported file Search plan from a bounded natural-language
+/// advisory. This is the renderer entry point; arbitrary Bridge Plan revisions
+/// are not constructed in TypeScript.
 #[tauri::command]
-pub async fn send_room_control_event(
+pub fn create_file_search_bridge_plan(
+    request: FileSearchBridgePlanRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<BridgePlanRecords, String> {
+    let context = crate::room_control::room_control_session_context(&state, &request.room_id)
+        .map_err(|error| error.message())?;
+    let mut revision = bridge_plan::build_file_plan_revision(
+        request.room_id,
+        context.local_session_ref,
+        context.peer_session_ref.clone(),
+        request.original_user_goal,
+        request.filename_hint,
+        request.extensions,
+        request.safe_scopes,
+        request.transfer_to_requester
+            || request.transfer_destination.as_deref() == Some("selected_device"),
+    )
+    .map_err(|error| error.message())?;
+    if request.transfer_destination.as_deref() == Some("selected_device") {
+        for step in &mut revision.steps {
+            if let bridge_plan::BridgePlanStep::Transfer { destination, .. } = step {
+                *destination = bridge_plan::TransferDestination::UserSelectedLocation {
+                    device_ref: context.peer_session_ref.clone(),
+                    user_visible_location_scope: bridge_plan::SafeLocationDescription::from(
+                        "Pastey Shared",
+                    ),
+                };
+            }
+        }
+        revision.revision_hash =
+            bridge_plan::canonical_revision_hash(&revision).map_err(|error| error.message())?;
+    }
+    create_bridge_plan(revision, state)
+}
+
+/// Creates a live supported Search -> Transform plan. Intent remains natural
+/// language in the immutable revision; the receiver Host resolves the fixed
+/// capability only after the bounded Search selection is available locally.
+#[tauri::command]
+pub fn create_file_transform_bridge_plan(
+    request: FileTransformAlternativeBridgePlanRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<BridgePlanRecords, String> {
+    let context = crate::room_control::room_control_session_context(&state, &request.room_id)
+        .map_err(|error| error.message())?;
+    let mut revision = bridge_plan::build_file_transform_revision(
+        request.room_id,
+        context.local_session_ref,
+        context.peer_session_ref.clone(),
+        request.original_user_goal,
+        request.filename_hint,
+        request.extensions,
+        request.safe_scopes,
+        request.transform_intent,
+        request.transfer_to_requester,
+    )
+    .map_err(|error| error.message())?;
+    if request.transfer_destination.as_deref() == Some("selected_device") {
+        for step in &mut revision.steps {
+            if let bridge_plan::BridgePlanStep::Transfer { destination, .. } = step {
+                *destination = bridge_plan::TransferDestination::UserSelectedLocation {
+                    device_ref: context.peer_session_ref.clone(),
+                    user_visible_location_scope: bridge_plan::SafeLocationDescription::from(
+                        "Pastey Shared",
+                    ),
+                };
+            }
+        }
+        revision.revision_hash =
+            bridge_plan::canonical_revision_hash(&revision).map_err(|error| error.message())?;
+    }
+    create_bridge_plan(revision, state)
+}
+
+/// Creates a requester-originated Transfer revision. The path received from
+/// the file picker is captured into process-local Rust state and is never
+/// stored in, serialized with, or returned from the immutable Plan.
+#[tauri::command]
+pub fn create_direct_file_transfer_bridge_plan(
+    request: DirectFileTransferBridgePlanRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<BridgePlanRecords, String> {
+    let context = crate::room_control::room_control_session_context(&state, &request.room_id)
+        .map_err(|error| error.message())?;
+    let source = file_candidates::capture_bridge_plan_requester_file(request.source_path.into())
+        .map_err(|error| error.message())?;
+    let revision = bridge_plan::build_direct_file_transfer_revision(
+        request.room_id,
+        context.local_session_ref,
+        context.peer_session_ref,
+        request.original_user_goal,
+    )
+    .map_err(|error| error.message())?;
+    let revision_id = revision.revision_id.clone();
+    let records = create_bridge_plan(revision, state.clone())?;
+    state.bridge_plan_requester_sources.lock().insert(revision_id, source);
+    Ok(records)
+}
+
+/// Creates an explicit fallback revision only after a live Transform attempt
+/// reports that the selected device cannot execute it. The original immutable
+/// revision and its attempt history remain intact; this revision is unapproved
+/// and must receive complete-plan review again.
+#[tauri::command]
+pub fn propose_bridge_plan_transform_fallback(
+    revision_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<BridgePlanRecords, String> {
+    let store = bridge_plan::BridgePlanStore::new(&state.paths);
+    let base = store
+        .get_revision(&revision_id)
+        .map_err(|error| error.message())?;
+    let transform_index = base
+        .revision
+        .steps
+        .iter()
+        .position(|step| matches!(step, bridge_plan::BridgePlanStep::Transform { .. }))
+        .ok_or_else(|| "This revision has no Transform step to replace.".to_string())?;
+    let mut alternative = base.revision.clone();
+    let transform = alternative.steps.remove(transform_index);
+    let bridge_plan::BridgePlanStep::Transform { input_slots, .. } = transform else {
+        unreachable!()
+    };
+    let selected_input = input_slots
+        .into_iter()
+        .next()
+        .ok_or_else(|| "This Transform has no approved input.".to_string())?;
+    for step in &mut alternative.steps {
+        if let bridge_plan::BridgePlanStep::Transfer {
+            depends_on,
+            input_slots,
+            source,
+            ..
+        } = step
+        {
+            if depends_on
+                .iter()
+                .any(|dependency| dependency == "transform")
+            {
+                *depends_on = vec!["search".into()];
+                *input_slots = vec![selected_input.clone()];
+                *source = bridge_plan::ObjectSelectionRule::FromSlot {
+                    slot_id: selected_input.slot_id.clone(),
+                };
+            }
+        }
+    }
+    if !alternative
+        .steps
+        .iter()
+        .any(|step| matches!(step, bridge_plan::BridgePlanStep::Transfer { .. }))
+    {
+        if let Some(bridge_plan::BridgePlanStep::Search { selection, .. }) = alternative
+            .steps
+            .iter_mut()
+            .find(|step| matches!(step, bridge_plan::BridgePlanStep::Search { .. }))
+        {
+            *selection = None;
+            alternative.search_selection_mode = bridge_plan::SearchSelectionMode::Staged;
+        }
+    }
+    alternative
+        .presentation
+        .step_explanations
+        .retain(|entry| entry.step_id != "transform");
+    alternative.presentation.title = bridge_plan::GeneratedUserVisibleText::from_semantic(
+        "Alternative file plan without local processing",
+    );
+    alternative.presentation.natural_language_plan = bridge_plan::GeneratedUserVisibleText::from_semantic("The selected device cannot perform the requested processing for the selected file. This alternative keeps the original file flow and removes that processing step.");
+    alternative.expected_outcome = bridge_plan::GeneratedUserVisibleText::from_semantic(
+        "The original file is handled without the unavailable processing step.",
+    );
+    alternative.revision_id = format!("revision-{}", uuid::Uuid::new_v4());
+    alternative.revision_number = base.revision.revision_number + 1;
+    alternative.revision_hash.clear();
+    alternative.alternative = Some(bridge_plan::AlternativeProposal {
+        based_on_revision_id: base.revision.revision_id.clone(),
+        change_explanation: bridge_plan::GeneratedUserVisibleText::from_semantic("The selected device cannot execute the approved Transform for this file. The proposed revision removes only that Transform; all remaining reviewed devices, locations, and transfers stay unchanged."),
+    });
+    let alternative = store
+        .append_alternative_revision(&base.revision.revision_id, alternative, storage::now_ts())
+        .map_err(|error| error.message())?;
+    store
+        .transition_revision(
+            &alternative.revision_id,
+            bridge_plan::RevisionState::Available,
+        )
+        .map_err(|error| error.message())?;
+    store.append_activity(&BridgePlanActivity {
+        activity_id: format!("transform-alternative-proposed-{}", uuid::Uuid::new_v4()),
+        bridge_id: alternative.bridge_id.clone(), plan_id: alternative.plan_id.clone(), revision_id: alternative.revision_id.clone(), attempt_id: None, step_id: None,
+        kind: ActivityKind::RevisionProposed, occurred_at: storage::now_ts(),
+        summary: "A new unapproved alternative was proposed because the selected device cannot execute the requested Transform.".into(),
+    }).map_err(|error| error.message())?;
+    store
+        .list_bridge(&alternative.bridge_id)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn list_bridge_plan_workspace(
     room_id: String,
-    event: Value,
+    state: State<'_, Arc<AppState>>,
+) -> Result<BridgePlanRecords, String> {
+    bridge_plan::BridgePlanStore::new(&state.paths)
+        .list_bridge(&room_id)
+        .map_err(|error| error.message())
+}
+
+/// Records one requester approval for an exact immutable revision. A receiver
+/// review remains required whenever the selected device is remote; this command
+/// never creates an attempt or execution authority.
+#[tauri::command]
+pub fn approve_bridge_plan(
+    revision_id: String,
+    approval_id: String,
+    receiver_required: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<BridgePlanRecords, String> {
+    let now = storage::now_ts();
+    let store = bridge_plan::BridgePlanStore::new(&state.paths);
+    let record = store
+        .get_revision(&revision_id)
+        .map_err(|error| error.message())?;
+    if record.state != RevisionState::Available {
+        return Err("This plan revision is not available for approval.".into());
+    }
+    let revision = record.revision;
+    let approval = BridgePlanApproval {
+        approval_id,
+        plan_id: revision.plan_id.clone(),
+        revision_id: revision.revision_id.clone(),
+        revision_hash: revision.revision_hash.clone(),
+        bridge_id: revision.bridge_id.clone(),
+        requester_device_ref: revision.requesting_device_ref.clone(),
+        selected_device_ref: revision.selected_device_ref.clone(),
+        receiver_required,
+        expires_at: now + BRIDGE_PLAN_APPROVAL_TTL_SECONDS,
+    };
+    store
+        .create_approval(&approval, now)
+        .map_err(|error| error.message())?;
+    store
+        .append_activity(&BridgePlanActivity {
+            activity_id: format!("plan-approved-{}", uuid::Uuid::new_v4()),
+            bridge_id: revision.bridge_id.clone(),
+            plan_id: revision.plan_id.clone(),
+            revision_id: revision.revision_id.clone(),
+            attempt_id: None,
+            step_id: None,
+            kind: ActivityKind::ApprovalCreated,
+            occurred_at: now,
+            summary: if receiver_required {
+                "Requester approved the complete plan; receiver review is required.".into()
+            } else {
+                "Requester approved the complete plan.".into()
+            },
+        })
+        .map_err(|error| error.message())?;
+    store
+        .list_bridge(&revision.bridge_id)
+        .map_err(|error| error.message())
+}
+
+/// Sends the immutable, already-approved revision to the explicitly selected
+/// receiver for one complete-plan review. Sending does not create an attempt.
+#[tauri::command]
+pub async fn send_bridge_plan_review_request(
+    approval_id: String,
     bridge_route: Option<Value>,
     state: State<'_, Arc<AppState>>,
-) -> Result<RoomControlDeliveryReceipt, RoomControlSendError> {
-    crate::room_control::send_room_control_event(
-        state.inner().clone(),
+) -> Result<RoomControlDeliveryReceipt, String> {
+    let state = state.inner().clone();
+    let store = bridge_plan::BridgePlanStore::new(&state.paths);
+    let approval = store
+        .get_approval(&approval_id)
+        .map_err(|error| error.message())?;
+    if approval.state != bridge_plan::ApprovalState::AwaitingReceiver {
+        return Err("This plan is not awaiting receiver review.".into());
+    }
+    let revision = store
+        .get_revision(&approval.approval.revision_id)
+        .map_err(|error| error.message())?;
+    let payload = bridge_plan::review_request_payload(&approval.approval, &revision.revision)
+        .map_err(|error| error.message())?;
+    let context =
+        crate::room_control::room_control_session_context(&state, &approval.approval.bridge_id)
+            .map_err(|error| error.message())?;
+    if context.local_session_ref != approval.approval.requester_device_ref
+        || context.peer_session_ref != approval.approval.selected_device_ref
+    {
+        return Err(
+            "The selected device session changed before this plan could be reviewed.".into(),
+        );
+    }
+    let event = bridge_plan_control_event("bridge_plan.review_request", payload, &context)
+        .map_err(|error| error.message())?;
+    crate::room_control::send_room_control_event(state, &context.room_id, event, bridge_route)
+        .await
+        .map_err(|error| error.message())
+}
+
+/// Receiver-local decision for the exact durable review record. The returned
+/// attestation is constructed by Rust and binds the reviewed revision.
+#[tauri::command]
+pub async fn decide_bridge_plan_review(
+    room_id: String,
+    approval_id: String,
+    allow: bool,
+    bridge_route: Option<Value>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomControlDeliveryReceipt, String> {
+    let state = state.inner().clone();
+    let context = crate::room_control::room_control_session_context(&state, &room_id)
+        .map_err(|error| error.message())?;
+    let payload = bridge_plan::receiver_decision_payload(
+        &state.paths,
         &room_id,
-        event,
-        bridge_route,
+        &approval_id,
+        allow,
+        storage::now_ts(),
     )
-    .await
-    .map_err(RoomControlSendError::from_app_error)
-}
-
-#[tauri::command]
-pub async fn execute_hello_stdout_capability(
-    request: HelloStdoutExecutionRequest,
-) -> Result<HelloStdoutExecutionResult, String> {
-    hello_stdout::execute_hello_stdout(request).map_err(|error| error.message())
-}
-
-#[tauri::command]
-pub async fn execute_file_candidate_search_capability(
-    request: FileCandidateExecutionRequest,
-    state: State<'_, Arc<AppState>>,
-) -> Result<FileCandidateExecutionResult, String> {
-    let mut store = state.candidate_payload_store.lock();
-    file_candidates::execute_file_candidate_search_and_store(request, &state.paths, &mut store)
-        .map_err(|error| error.message())
-}
-
-#[tauri::command]
-pub async fn resolve_candidate_payload_capability(
-    request: CandidatePayloadExecutionRequest,
-    state: State<'_, Arc<AppState>>,
-) -> Result<CandidatePayloadLocalResolution, String> {
-    let mut store = state.candidate_payload_store.lock();
-    file_candidates::resolve_candidate_payload_for_handoff(request, &mut store)
-        .map_err(|error| error.message())
-}
-
-#[tauri::command]
-pub async fn begin_transform_operation(
-    request: ArtifactTransformClaimRequest,
-    state: State<'_, Arc<AppState>>,
-) -> Result<ArtifactTransformClaimResult, String> {
-    let mut store = state.candidate_payload_store.lock();
-    let mut authority = state.transform_authority.lock();
-    file_candidates::begin_artifact_transform_operation(request, &mut store, &mut authority)
-        .map_err(|error| error.message())
-}
-
-#[tauri::command]
-pub async fn create_transform_consent_prompt(
-    room_id: String,
-    source_preview_event_id: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<file_candidates::TransformConsentPromptInfo, String> {
-    let seed = crate::room_control::authenticated_transform_preview_consent_seed(&state, &room_id, &source_preview_event_id)
+    .map_err(|error| error.message())?;
+    let event = bridge_plan_control_event("bridge_plan.review_decision", payload, &context)
         .map_err(|error| error.message())?;
-    let mut authority = state.transform_authority.lock();
-    file_candidates::create_pending_transform_consent_prompt(seed, &mut authority)
+    crate::room_control::send_room_control_event(state, &room_id, event, bridge_route)
+        .await
         .map_err(|error| error.message())
 }
 
 #[tauri::command]
-pub async fn resolve_transform_consent_prompt(
+pub fn bridge_plan_receiver_review_status(
     room_id: String,
-    pending_consent_prompt_id: String,
-    decision: String,
+    approval_id: String,
     state: State<'_, Arc<AppState>>,
-) -> Result<file_candidates::TransformConsentPromptInfo, String> {
-    let context = crate::room_control::room_control_session_context(&state, &room_id).map_err(|error| error.message())?;
-    let mut authority = state.transform_authority.lock();
-    file_candidates::resolve_pending_transform_consent_prompt(
-        &pending_consent_prompt_id, &decision, &room_id, &context.peer_session_ref, &context.local_session_ref, &mut authority,
-    ).map_err(|error| error.message())
-}
-
-#[tauri::command]
-pub async fn revalidate_transform_operation(
-    request: ArtifactTransformClaimRequest,
-    state: State<'_, Arc<AppState>>,
-) -> Result<ArtifactTransformClaimResult, String> {
-    let mut store = state.candidate_payload_store.lock();
-    let mut authority = state.transform_authority.lock();
-    file_candidates::revalidate_artifact_transform_operation(&request, &mut store, &mut authority)
+) -> Result<Option<String>, String> {
+    bridge_plan::receiver_review_decision(&state.paths, &room_id, &approval_id)
+        .map(|decision| {
+            decision.map(|value| match value {
+                bridge_plan::ReceiverDecision::Approved => "allow".to_owned(),
+                bridge_plan::ReceiverDecision::Denied => "deny".to_owned(),
+            })
+        })
         .map_err(|error| error.message())
 }
 
+/// Starts the single attempt bound to a consumed approval, then tells the
+/// selected receiver to derive its own local authority. A retry can resend the
+/// exact attempt-start event only while its authority remains live on A.
 #[tauri::command]
-pub async fn abort_transform_operation(
-    request: ArtifactTransformClaimRequest,
+pub async fn start_bridge_plan_attempt(
+    approval_id: String,
+    attempt_id: String,
+    bridge_route: Option<Value>,
     state: State<'_, Arc<AppState>>,
-) -> Result<ArtifactTransformClaimResult, String> {
-    let mut store = state.candidate_payload_store.lock();
-    let mut authority = state.transform_authority.lock();
-    file_candidates::abort_artifact_transform_operation(&request, &mut store, &mut authority)
+) -> Result<RoomControlDeliveryReceipt, String> {
+    let state = state.inner().clone();
+    let now = storage::now_ts();
+    let store = bridge_plan::BridgePlanStore::new(&state.paths);
+    let attempt = store
+        .create_attempt_from_approval(&attempt_id, &approval_id, now)
+        .map_err(|error| error.message())?;
+    store
+        .transition_attempt(&attempt.attempt_id, bridge_plan::AttemptState::Running, now)
+        .map_err(|error| error.message())?;
+    let search_step = attempt
+        .graph_projection
+        .nodes
+        .iter()
+        .find(|node| matches!(node.operation, bridge_plan::StepOperation::Search))
+        .map(|node| node.step_id.clone());
+    let (step_id, summary, event_kind, payload) = if let Some(search_step) = search_step {
+        store
+            .transition_step(
+                &attempt.attempt_id,
+                &search_step,
+                bridge_plan::StepExecutionState::Authorized,
+                now,
+            )
+            .map_err(|error| error.message())?;
+        (
+            search_step,
+            "Approved plan started on the selected device.",
+            "bridge_plan.attempt_start",
+            bridge_plan::attempt_start_payload(&state.paths, &attempt, now)
+                .map_err(|error| error.message())?,
+        )
+    } else {
+        let transfer = attempt
+            .graph_projection
+            .nodes
+            .iter()
+            .find(|node| matches!(node.operation, bridge_plan::StepOperation::Transfer))
+            .ok_or_else(|| "This plan has no supported first step.".to_string())?;
+        store
+            .transition_step(
+                &attempt.attempt_id,
+                &transfer.step_id,
+                bridge_plan::StepExecutionState::Authorized,
+                now,
+            )
+            .map_err(|error| error.message())?;
+        (
+            transfer.step_id.clone(),
+            "Approved direct Transfer started on the requesting device.",
+            "bridge_plan.transfer_start",
+            bridge_plan::transfer_start_payload(&state.paths, &attempt.bridge_id, &attempt.attempt_id, now)
+                .map_err(|error| error.message())?,
+        )
+    };
+    store
+        .append_activity(&BridgePlanActivity {
+            activity_id: format!("attempt-started-{}", uuid::Uuid::new_v4()),
+            bridge_id: attempt.bridge_id.clone(),
+            plan_id: attempt.plan_id.clone(),
+            revision_id: attempt.revision_id.clone(),
+            attempt_id: Some(attempt.attempt_id.clone()),
+            step_id: Some(step_id),
+            kind: ActivityKind::AttemptStarted,
+            occurred_at: now,
+            summary: summary.into(),
+        })
+        .map_err(|error| error.message())?;
+    let context = crate::room_control::room_control_session_context(&state, &attempt.bridge_id)
+        .map_err(|error| error.message())?;
+    if context.local_session_ref
+        != payload
+            .get("requesterDeviceRef")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        || context.peer_session_ref
+            != payload
+                .get("receiverDeviceRef")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+    {
+        return Err("The selected device session changed before this attempt could start.".into());
+    }
+    let event = bridge_plan_control_event(event_kind, payload, &context)
+        .map_err(|error| error.message())?;
+    crate::room_control::send_room_control_event(state, &context.room_id, event, bridge_route)
+        .await
         .map_err(|error| error.message())
 }
 
-/// Rust-private finalization and transport. Raw executor output enters here
-/// only from a Rust-private sandbox adapter.
-pub(crate) async fn finalize_and_send_transform_result(
-    state: Arc<AppState>,
-    request: ArtifactTransformClaimRequest,
-    raw_result: Value,
-) -> Result<TransformFinalizationDelivery, String> {
-    let outcome = {
-        let mut store = state.candidate_payload_store.lock();
-        let mut authority = state.transform_authority.lock();
-        file_candidates::sanitize_and_finalize_transform_operation(&request, raw_result, &mut store, &mut authority)
-            .map_err(|error| error.message())?
-    };
-    let Some(result) = outcome.result else {
-        return Ok(TransformFinalizationDelivery { terminal_category: outcome.terminal_category, sent: false });
-    };
-    let now = time::OffsetDateTime::now_utc();
-    let event = serde_json::json!({
-        "schemaVersion": "pastey-room-control-event-v1",
-        "eventId": format!("transform-result-{}", uuid::Uuid::new_v4()),
-        "kind": "capability_execution_result",
-        "roomRef": request.room_ref,
-        "sourceDeviceRef": request.target_peer_ref,
-        "targetPeerRef": request.source_device_ref,
-        "createdAt": now.format(&time::format_description::well_known::Rfc3339).map_err(|_| "Invalid Transform result time.")?,
-        "expiresAt": (now + time::Duration::seconds(60)).format(&time::format_description::well_known::Rfc3339).map_err(|_| "Invalid Transform result expiry.")?,
-        "previewOnly": false,
-        "payload": result,
-    });
-    crate::room_control::send_authoritative_transform_result_event(state, &request.room_ref, event, None)
-        .await.map_err(|error| error.message())?;
-    Ok(TransformFinalizationDelivery { terminal_category: outcome.terminal_category, sent: true })
+/// Sends the requester-selected bounded Search candidate back to the selected
+/// device. The receiver validates it against its original private result set
+/// and keeps the backing object local to the attempt.
+#[tauri::command]
+pub async fn select_bridge_plan_search_candidate(
+    room_id: String,
+    attempt_id: String,
+    candidate_id: String,
+    bridge_route: Option<Value>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomControlDeliveryReceipt, String> {
+    let state = state.inner().clone();
+    let context = crate::room_control::room_control_session_context(&state, &room_id)
+        .map_err(|error| error.message())?;
+    let payload =
+        bridge_plan::search_selection_payload(&state.paths, &room_id, &attempt_id, &candidate_id)
+            .map_err(|error| error.message())?;
+    if context.local_session_ref
+        != payload
+            .get("requesterDeviceRef")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        || context.peer_session_ref
+            != payload
+                .get("receiverDeviceRef")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+    {
+        return Err(
+            "The selected device session changed before this candidate could be selected.".into(),
+        );
+    }
+    let event = bridge_plan_control_event("bridge_plan.search_selection", payload, &context)
+        .map_err(|error| error.message())?;
+    crate::room_control::send_room_control_event(state, &room_id, event, bridge_route)
+        .await
+        .map_err(|error| error.message())
 }
 
-/// Rust-private lifecycle for a future verified sandbox adapter. The adapter
-/// acknowledges a real start before the durable operation is marked started;
-/// raw output then flows directly into Rust sanitation and transport.
-pub(crate) async fn execute_transform_with_adapter(
-    state: Arc<AppState>,
-    request: ArtifactTransformClaimRequest,
-    adapter: &dyn file_candidates::TransformSandboxAdapter,
-) -> Result<TransformHostExecutionOutcome, String> {
-    if let Some(outcome) = prepare_transform_adapter(&request, adapter)? {
-        return Ok(outcome);
+/// Starts the approved Transfer step after the requester selects one bounded
+/// Search result. This does not create a second consent surface: the immutable
+/// plan approval and receiver review already bind the exact Transfer step.
+#[tauri::command]
+pub async fn start_bridge_plan_transfer_attempt(
+    room_id: String,
+    attempt_id: String,
+    bridge_route: Option<Value>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomControlDeliveryReceipt, String> {
+    let state = state.inner().clone();
+    let now = storage::now_ts();
+    let store = bridge_plan::BridgePlanStore::new(&state.paths);
+    let attempt = store
+        .list_attempt(&attempt_id)
+        .map_err(|error| error.message())?;
+    if attempt.attempt.bridge_id != room_id || attempt.state != bridge_plan::AttemptState::Running {
+        return Err("This approved plan is not ready to transfer a selected file.".into());
     }
-
-    let claimed = {
-        let mut store = state.candidate_payload_store.lock();
-        let mut authority = state.transform_authority.lock();
-        file_candidates::begin_artifact_transform_operation(request.clone(), &mut store, &mut authority)
-            .map_err(|error| error.message())?
-    };
-    if claimed.status != "leased" && claimed.status != "already_leased" {
-        return Ok(pre_start_transform_outcome(claimed.status, vec!["prepared".into()]));
+    let transfer_node = attempt
+        .attempt
+        .graph_projection
+        .nodes
+        .iter()
+        .find(|node| matches!(node.operation, bridge_plan::StepOperation::Transfer))
+        .ok_or_else(|| "This plan has no supported Transfer step.".to_string())?;
+    let transfer = attempt
+        .steps
+        .iter()
+        .find(|step| step.step_id == transfer_node.step_id)
+        .ok_or_else(|| "This plan has no durable Transfer state.".to_string())?;
+    if transfer.state != bridge_plan::StepExecutionState::Eligible {
+        return Err("Choose a completed Search result before starting Transfer.".into());
     }
-
-    let revalidated = {
-        let mut store = state.candidate_payload_store.lock();
-        let mut authority = state.transform_authority.lock();
-        file_candidates::revalidate_artifact_transform_operation(&request, &mut store, &mut authority)
-            .map_err(|error| error.message())?
-    };
-    if revalidated.status != "revalidated" {
-        return Ok(pre_start_transform_outcome(revalidated.status, vec!["prepared".into(), "claimed".into()]));
+    let payload = bridge_plan::transfer_start_payload(&state.paths, &room_id, &attempt_id, now)
+        .map_err(|error| error.message())?;
+    let context = crate::room_control::room_control_session_context(&state, &room_id)
+        .map_err(|error| error.message())?;
+    if context.local_session_ref
+        != payload
+            .get("requesterDeviceRef")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        || context.peer_session_ref
+            != payload
+                .get("receiverDeviceRef")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+    {
+        return Err("The selected device session changed before Transfer could start.".into());
     }
+    let event = bridge_plan_control_event("bridge_plan.transfer_start", payload, &context)
+        .map_err(|error| error.message())?;
+    let receipt =
+        crate::room_control::send_room_control_event(state.clone(), &room_id, event, bridge_route)
+            .await
+            .map_err(|error| error.message())?;
+    let refreshed = store
+        .list_attempt(&attempt_id)
+        .map_err(|error| error.message())?;
+    if refreshed
+        .steps
+        .iter()
+        .find(|step| step.step_id == transfer.step_id)
+        .is_some_and(|step| step.state == bridge_plan::StepExecutionState::Eligible)
+    {
+        store
+            .transition_step(
+                &attempt_id,
+                &transfer.step_id,
+                bridge_plan::StepExecutionState::Authorized,
+                now,
+            )
+            .map_err(|error| error.message())?;
+    }
+    Ok(receipt)
+}
 
-    match adapter.start(&request) {
-        Ok(()) => {}
-        Err(_) => {
-            let mut store = state.candidate_payload_store.lock();
-            let mut authority = state.transform_authority.lock();
-            let _ = file_candidates::abort_artifact_transform_operation(&request, &mut store, &mut authority);
-            return Ok(pre_start_transform_outcome("executor_failed".into(), vec!["prepared".into(), "claimed".into(), "revalidated".into()]));
+/// Executes the requester-owned half of an approved direct Transfer. The
+/// source was captured when its immutable revision was created and is checked
+/// again here; no renderer path or receiver authority is accepted.
+#[tauri::command]
+pub async fn execute_direct_bridge_plan_transfer_attempt(
+    room_id: String,
+    attempt_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    let now = storage::now_ts();
+    let store = bridge_plan::BridgePlanStore::new(&state.paths);
+    let attempt = store.list_attempt(&attempt_id).map_err(|error| error.message())?;
+    if attempt.attempt.bridge_id != room_id || attempt.state != bridge_plan::AttemptState::Running {
+        return Err("This direct Transfer plan is not running.".into());
+    }
+    let revision = store.get_revision(&attempt.attempt.revision_id).map_err(|error| error.message())?.revision;
+    let transfer = revision.steps.iter().find(|step| matches!(step, bridge_plan::BridgePlanStep::Transfer { .. }))
+        .ok_or_else(|| "This plan has no Transfer step.".to_string())?;
+    let bridge_plan::BridgePlanStep::Transfer { step_id, source, destination, .. } = transfer else { unreachable!() };
+    if !matches!(source, bridge_plan::ObjectSelectionRule::FutureUserSelection { .. })
+        || !matches!(destination, bridge_plan::TransferDestination::SelectedDevice { device_ref } if device_ref == &revision.selected_device_ref)
+    {
+        return Err("This plan is not a supported requester Transfer.".into());
+    }
+    let context = crate::room_control::room_control_session_context(&state, &room_id)
+        .map_err(|error| error.message())?;
+    if context.local_session_ref != revision.requesting_device_ref || context.peer_session_ref != revision.selected_device_ref {
+        return Err("The selected device session changed before Transfer could run.".into());
+    }
+    let private_file = state.bridge_plan_requester_sources.lock().get(&revision.revision_id).cloned()
+        .ok_or_else(|| "The selected local file is unavailable after restart or cancellation.".to_string())?;
+    let metadata = std::fs::symlink_metadata(&private_file.path)
+        .map_err(|_| "The selected local file is unavailable.".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != private_file.size_bytes {
+        return Err("The selected local file changed before Transfer started.".into());
+    }
+    store.transition_step(&attempt_id, step_id, bridge_plan::StepExecutionState::Running, now)
+        .map_err(|error| error.message())?;
+    let peers = storage::list_bridge_peer_endpoints(&state.paths, &room_id).map_err(|error| error.message())?;
+    let endpoint = resolve_routeable_bridge_peer(&peers, &context.peer_route_ref, "Transfer").map_err(|error| error.message())?;
+    let master_key = { let config = state.config.read(); config::master_key(&config).map_err(|error| error.message())? };
+    let item = storage::create_outgoing_file_item_with_metadata(&state.paths, &master_key, &room_id, &private_file.path, Some(private_file.display_name.clone()), Some(private_file.mime_type.clone())).map_err(|error| error.message())?;
+    let sent = transfer::send_room_file_to_bridge_peer_endpoint(state.clone(), &room_id, &item.id, &private_file.path, Some(format!("bridge-plan-transfer-{attempt_id}")), None, endpoint).await;
+    match sent {
+        Ok(()) => {
+            let completed_at = storage::now_ts();
+            store.transition_step(&attempt_id, step_id, bridge_plan::StepExecutionState::Completed, completed_at).map_err(|error| error.message())?;
+            store.transition_attempt(&attempt_id, bridge_plan::AttemptState::Completed, completed_at).map_err(|error| error.message())?;
+            store.append_result(&BridgePlanResultSummary {
+                result_id: format!("direct-transfer-result-{}", uuid::Uuid::new_v4()),
+                bridge_id: room_id.clone(),
+                plan_id: attempt.attempt.plan_id.clone(),
+                revision_id: revision.revision_id.clone(),
+                attempt_id: attempt_id.clone(),
+                step_id: step_id.clone(),
+                status: bridge_plan::GeneratedUserVisibleText::from_semantic("completed"),
+                summary: "Transfer completed to the selected device.".into(),
+                produced_object_description: Some(bridge_plan::GeneratedUserVisibleText::from_semantic("One reviewed file was transferred.")),
+                created_at: completed_at,
+            }).map_err(|error| error.message())?;
+            store.append_activity(&BridgePlanActivity {
+                activity_id: format!("direct-transfer-completed-{}", uuid::Uuid::new_v4()),
+                bridge_id: room_id.clone(), plan_id: attempt.attempt.plan_id.clone(), revision_id: revision.revision_id.clone(),
+                attempt_id: Some(attempt_id.clone()), step_id: Some(step_id.clone()), kind: ActivityKind::AttemptCompleted,
+                occurred_at: completed_at, summary: "Direct Transfer completed to the selected device.".into(),
+            }).map_err(|error| error.message())?;
+            state.bridge_plan_requester_sources.lock().remove(&revision.revision_id);
+            Ok(true)
         }
-    }
-
-    let started = {
-        let mut store = state.candidate_payload_store.lock();
-        let mut authority = state.transform_authority.lock();
-        file_candidates::mark_artifact_transform_operation_started(&request, &mut store, &mut authority)
-    };
-    let started = match started {
-        Ok(started) => started,
-        Err(_) => {
-            // The adapter has already acknowledged start. Preserve that fact
-            // rather than misreporting a durable-journal failure as pre-start.
-            return Ok(TransformHostExecutionOutcome {
-                executed: true,
-                lifecycle: vec!["prepared".into(), "claimed".into(), "revalidated".into(), "executor_started".into()],
-                terminal_category: None,
-                error_code: Some("start_record_failed".into()),
-                delivery_status: "not_sent".into(),
+        Err(error) => {
+            let failed_at = storage::now_ts();
+            let _ = store.transition_step(&attempt_id, step_id, bridge_plan::StepExecutionState::Failed, failed_at);
+            let _ = store.transition_attempt(&attempt_id, bridge_plan::AttemptState::Failed, failed_at);
+            let _ = store.append_activity(&BridgePlanActivity {
+                activity_id: format!("direct-transfer-failed-{}", uuid::Uuid::new_v4()),
+                bridge_id: room_id.clone(), plan_id: attempt.attempt.plan_id.clone(), revision_id: revision.revision_id.clone(),
+                attempt_id: Some(attempt_id.clone()), step_id: Some(step_id.clone()), kind: ActivityKind::AttemptFailed,
+                occurred_at: failed_at, summary: "Direct Transfer could not complete.".into(),
             });
+            Err(error.message())
         }
-    };
-    if started.status != "started" {
-        return Ok(TransformHostExecutionOutcome {
-            executed: true,
-            lifecycle: vec!["prepared".into(), "claimed".into(), "revalidated".into(), "executor_started".into()],
-            terminal_category: None,
-            error_code: Some("start_record_failed".into()),
-            delivery_status: "not_sent".into(),
-        });
-    }
-
-    // Result collection is post-start work. A collection failure is recorded
-    // as a bounded failed execution and must never become retryable.
-    let raw_result = adapter.collect_result(&request).unwrap_or_else(|_| file_candidates::ArtifactTransformRawExecutorResult {
-        status: "failed".into(),
-        result: None,
-        error_code: Some("executor_failed".into()),
-    });
-
-    match finalize_and_send_transform_result(state, request, serde_json::to_value(raw_result).map_err(|_| "Invalid Transform adapter result.")?).await {
-        Ok(delivery) => Ok(TransformHostExecutionOutcome {
-            executed: true,
-            lifecycle: if delivery.terminal_category == "completed" { vec!["prepared".into(), "claimed".into(), "revalidated".into(), "executor_started".into(), "completed".into()] } else { vec!["prepared".into(), "claimed".into(), "revalidated".into(), "executor_started".into()] },
-            terminal_category: Some(delivery.terminal_category),
-            error_code: None,
-            delivery_status: if delivery.sent { "sent".into() } else { "replay".into() },
-        }),
-        Err(_) => Ok(TransformHostExecutionOutcome {
-            executed: true,
-            lifecycle: vec!["prepared".into(), "claimed".into(), "revalidated".into(), "executor_started".into()],
-            terminal_category: None,
-            error_code: Some("result_transport_failed".into()),
-            delivery_status: "not_sent".into(),
-        }),
     }
 }
 
-/// The availability gate takes no receiver state, so an unavailable adapter
-/// cannot reserve consent, acquire a lease, or create a journal record.
-fn prepare_transform_adapter(
-    request: &ArtifactTransformClaimRequest,
-    adapter: &dyn file_candidates::TransformSandboxAdapter,
-) -> Result<Option<TransformHostExecutionOutcome>, String> {
-    file_candidates::validate_artifact_transform_claim_request(&request)
-        .map_err(|error| error.message())?;
-    if matches!(adapter.prepare(&request), file_candidates::TransformSandboxPreparation::Unavailable) {
-        return Ok(Some(TransformHostExecutionOutcome {
-            executed: false,
-            lifecycle: vec!["prepared".into()],
-            terminal_category: None,
-            error_code: Some("sandbox_unavailable".into()),
-            delivery_status: "not_sent".into(),
-        }));
-    }
-    Ok(None)
-}
-
-fn pre_start_transform_outcome(error_code: String, lifecycle: Vec<String>) -> TransformHostExecutionOutcome {
-    TransformHostExecutionOutcome {
-        executed: false,
-        lifecycle,
-        terminal_category: None,
-        error_code: Some(error_code),
-        delivery_status: "not_sent".into(),
-    }
-}
-
-/// Frontend-safe production entry point. The unavailable adapter returns before
-/// any ledger, lease, journal, identity, start, or result mutation.
+/// Starts the approved Transform after the requester selects one bounded
+/// Search result. It uses the existing whole-plan approval and does not open a
+/// separate Transform-consent prompt.
 #[tauri::command]
-pub async fn execute_transform_with_receiver_host(
-    request: ArtifactTransformClaimRequest,
+pub async fn start_bridge_plan_transform_attempt(
+    room_id: String,
+    attempt_id: String,
+    bridge_route: Option<Value>,
     state: State<'_, Arc<AppState>>,
-) -> Result<TransformHostExecutionOutcome, String> {
-    execute_transform_with_adapter(
-        state.inner().clone(),
-        request,
-        &file_candidates::UnavailableTransformSandboxAdapter,
+) -> Result<RoomControlDeliveryReceipt, String> {
+    let state = state.inner().clone();
+    let now = storage::now_ts();
+    let store = bridge_plan::BridgePlanStore::new(&state.paths);
+    let attempt = store
+        .list_attempt(&attempt_id)
+        .map_err(|error| error.message())?;
+    if attempt.attempt.bridge_id != room_id || attempt.state != bridge_plan::AttemptState::Running {
+        return Err("This approved plan is not ready to process a selected file.".into());
+    }
+    let transform_node = attempt
+        .attempt
+        .graph_projection
+        .nodes
+        .iter()
+        .find(|node| matches!(node.operation, bridge_plan::StepOperation::Transform))
+        .ok_or_else(|| "This plan has no supported Transform step.".to_string())?;
+    let transform = attempt
+        .steps
+        .iter()
+        .find(|step| step.step_id == transform_node.step_id)
+        .ok_or_else(|| "This plan has no durable Transform state.".to_string())?;
+    if transform.state != bridge_plan::StepExecutionState::Eligible {
+        return Err("Choose a completed Search result before starting Transform.".into());
+    }
+    let payload = bridge_plan::transform_start_payload(&state.paths, &room_id, &attempt_id, now)
+        .map_err(|error| error.message())?;
+    let context = crate::room_control::room_control_session_context(&state, &room_id)
+        .map_err(|error| error.message())?;
+    if context.local_session_ref
+        != payload
+            .get("requesterDeviceRef")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        || context.peer_session_ref
+            != payload
+                .get("receiverDeviceRef")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+    {
+        return Err("The selected device session changed before Transform could start.".into());
+    }
+    let event = bridge_plan_control_event("bridge_plan.transform_start", payload, &context)
+        .map_err(|error| error.message())?;
+    let receipt =
+        crate::room_control::send_room_control_event(state.clone(), &room_id, event, bridge_route)
+            .await
+            .map_err(|error| error.message())?;
+    let refreshed = store
+        .list_attempt(&attempt_id)
+        .map_err(|error| error.message())?;
+    if refreshed
+        .steps
+        .iter()
+        .find(|step| step.step_id == transform.step_id)
+        .is_some_and(|step| step.state == bridge_plan::StepExecutionState::Eligible)
+    {
+        store
+            .transition_step(
+                &attempt_id,
+                &transform.step_id,
+                bridge_plan::StepExecutionState::Authorized,
+                now,
+            )
+            .map_err(|error| error.message())?;
+    }
+    Ok(receipt)
+}
+
+/// Executes exactly one receiver-local Search after consuming the local grant
+/// created from an authenticated attempt-start event. No A-side authority,
+/// renderer state, raw path, or provider output reaches this boundary.
+#[tauri::command]
+pub async fn execute_bridge_plan_search_attempt(
+    room_id: String,
+    attempt_id: String,
+    bridge_route: Option<Value>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let now = storage::now_ts();
+    let grant = bridge_plan::consume_search_execution_grant(
+        &state.paths,
+        &state.bridge_plan_protocol_authority.lock(),
+        &room_id,
+        &attempt_id,
+        now,
+    )
+    .map_err(|error| error.message())?;
+    let context = crate::room_control::room_control_session_context(&state, &room_id)
+        .map_err(|error| error.message())?;
+    if context.local_session_ref != grant.receiver_device_ref
+        || context.peer_session_ref != grant.requester_device_ref
+    {
+        return Err("The requester session changed before Search could run.".into());
+    }
+    let send = |kind: &str, payload: Value| {
+        let event = bridge_plan_control_event(kind, payload, &context)?;
+        Ok::<_, AppError>(event)
+    };
+    let ack = send(
+        "bridge_plan.attempt_ack",
+        bridge_plan::attempt_update_payload(&grant, "bridge_plan.attempt_ack", None, None)
+            .map_err(|error| error.message())?,
+    )
+    .map_err(|error| error.message())?;
+    crate::room_control::send_room_control_event(
+        state.clone(),
+        &room_id,
+        ack,
+        bridge_route.clone(),
     )
     .await
+    .map_err(|error| error.message())?;
+    let progress = send(
+        "bridge_plan.step_progress",
+        bridge_plan::attempt_update_payload(&grant, "bridge_plan.step_progress", None, None)
+            .map_err(|error| error.message())?,
+    )
+    .map_err(|error| error.message())?;
+    crate::room_control::send_room_control_event(
+        state.clone(),
+        &room_id,
+        progress,
+        bridge_route.clone(),
+    )
+    .await
+    .map_err(|error| error.message())?;
+    let created = OffsetDateTime::now_utc();
+    let request = BridgePlanSearchRequest {
+        request_id: format!("bridge-plan-request-{}", grant.attempt_id),
+        room_ref: room_id.clone(),
+        requester_device_ref: grant.requester_device_ref.clone(),
+        receiver_device_ref: grant.receiver_device_ref.clone(),
+        filename_hint: grant.filename_hint.clone(),
+        extensions: grant.extensions.clone(),
+        safe_scope_labels: grant.safe_scope_labels.clone(),
+        expires_at: (created + Duration::seconds(BRIDGE_PLAN_CONTROL_LIFETIME_SECONDS))
+            .format(&Rfc3339)
+            .map_err(|error| error.to_string())?,
+    };
+    let result = {
+        let mut candidates = state.bridge_plan_candidate_store.lock();
+        file_candidates::execute_bridge_plan_search_and_store(
+            request,
+            &state.paths,
+            &mut candidates,
+        )
+        .map_err(|error| error.message())?
+    };
+    let (kind, payload) = if result.status == "completed" {
+        (
+            "bridge_plan.step_result",
+            bridge_plan::attempt_search_result_payload(&grant, &result)
+                .map_err(|error| error.message())?,
+        )
+    } else {
+        (
+            "bridge_plan.step_failed",
+            bridge_plan::attempt_update_payload(
+                &grant,
+                "bridge_plan.step_failed",
+                None,
+                result.error_code.as_deref().or(Some("search_failed")),
+            )
+            .map_err(|error| error.message())?,
+        )
+    };
+    let terminal = send(kind, payload).map_err(|error| error.message())?;
+    crate::room_control::send_room_control_event(state, &room_id, terminal, bridge_route)
+        .await
+        .map_err(|error| error.message())?;
+    Ok(())
 }
 
+/// Executes one receiver-local Transform after consuming the grant derived
+/// from the authenticated complete-plan review. The generated file is kept in
+/// receiver-private ephemeral storage; no path or ObjectRef crosses Room
+/// Control, and unsupported input or intent fails with a product-safe result.
 #[tauri::command]
-pub async fn get_transform_operation_status(
-    request: ArtifactTransformClaimRequest,
+pub async fn execute_bridge_plan_transform_attempt(
+    room_id: String,
+    attempt_id: String,
+    bridge_route: Option<Value>,
     state: State<'_, Arc<AppState>>,
-) -> Result<ArtifactTransformClaimResult, String> {
-    let authority = state.transform_authority.lock();
-    Ok(file_candidates::artifact_transform_operation_status(&request, &authority))
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    let grant = bridge_plan::consume_transform_execution_grant(
+        &state.paths,
+        &state.bridge_plan_protocol_authority.lock(),
+        &room_id,
+        &attempt_id,
+        storage::now_ts(),
+    )
+    .map_err(|error| error.message())?;
+    let context = crate::room_control::room_control_session_context(&state, &room_id)
+        .map_err(|error| error.message())?;
+    if context.local_session_ref != grant.receiver_device_ref
+        || context.peer_session_ref != grant.requester_device_ref
+    {
+        return Err("The requester session changed before Transform could run.".into());
+    }
+    let send = |kind: &str, payload: Value| -> Result<_, String> {
+        bridge_plan_control_event(kind, payload, &context).map_err(|error| error.message())
+    };
+    for (kind, payload) in [
+        (
+            "bridge_plan.attempt_ack",
+            bridge_plan::transform_update_payload(&grant, "bridge_plan.attempt_ack", None, None),
+        ),
+        (
+            "bridge_plan.step_progress",
+            bridge_plan::transform_update_payload(&grant, "bridge_plan.step_progress", None, None),
+        ),
+    ] {
+        let event = send(kind, payload.map_err(|error| error.message())?)?;
+        crate::room_control::send_room_control_event(
+            state.clone(),
+            &room_id,
+            event,
+            bridge_route.clone(),
+        )
+        .await
+        .map_err(|error| error.message())?;
+    }
+    let transformed = {
+        let mut candidates = state.bridge_plan_candidate_store.lock();
+        file_candidates::transform_bridge_plan_selected_file(
+            &mut candidates,
+            &state.paths,
+            &room_id,
+            &grant.requester_device_ref,
+            &grant.receiver_device_ref,
+            &grant.attempt_id,
+            &grant.candidate_id,
+            &grant.intent,
+        )
+    };
+    let (kind, payload, succeeded) = match transformed {
+        Ok(output) => {
+            state
+                .bridge_plan_protocol_authority
+                .lock()
+                .retain_transform_output(&room_id, &attempt_id, output)
+                .map_err(|error| error.message())?;
+            (
+                "bridge_plan.step_result",
+                bridge_plan::transform_update_payload(
+                    &grant,
+                    "bridge_plan.step_result",
+                    Some("The selected file was processed and remains on the selected device."),
+                    None,
+                ),
+                true,
+            )
+        }
+        Err(_) => (
+            "bridge_plan.step_failed",
+            bridge_plan::transform_update_payload(
+                &grant,
+                "bridge_plan.step_failed",
+                None,
+                Some("transform_unavailable_or_failed"),
+            ),
+            false,
+        ),
+    };
+    let terminal = send(kind, payload.map_err(|error| error.message())?)?;
+    crate::room_control::send_room_control_event(state, &room_id, terminal, bridge_route)
+        .await
+        .map_err(|error| error.message())?;
+    if !succeeded {
+        return Err("The approved Transform could not be completed on the selected device.".into());
+    }
+    Ok(true)
+}
+
+/// Executes one receiver-local Transfer. The selected candidate is resolved
+/// only in Rust after the authenticated transfer-start grant is consumed; no
+/// path or private object reference enters this product path.
+#[tauri::command]
+pub async fn execute_bridge_plan_transfer_attempt(
+    room_id: String,
+    attempt_id: String,
+    bridge_route: Option<Value>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    let now = storage::now_ts();
+    let grant = bridge_plan::consume_transfer_execution_grant(
+        &state.paths,
+        &state.bridge_plan_protocol_authority.lock(),
+        &room_id,
+        &attempt_id,
+        now,
+    )
+    .map_err(|error| error.message())?;
+    let context = crate::room_control::room_control_session_context(&state, &room_id)
+        .map_err(|error| error.message())?;
+    if context.local_session_ref != grant.receiver_device_ref
+        || context.peer_session_ref != grant.requester_device_ref
+    {
+        return Err("The requester session changed before Transfer could run.".into());
+    }
+    let send = |kind: &str, payload: Value| -> Result<_, String> {
+        bridge_plan_control_event(kind, payload, &context).map_err(|error| error.message())
+    };
+    let ack = send(
+        "bridge_plan.attempt_ack",
+        bridge_plan::transfer_update_payload(&grant, "bridge_plan.attempt_ack", None, None)
+            .map_err(|error| error.message())?,
+    )?;
+    crate::room_control::send_room_control_event(
+        state.clone(),
+        &room_id,
+        ack,
+        bridge_route.clone(),
+    )
+    .await
+    .map_err(|error| error.message())?;
+    let progress = send(
+        "bridge_plan.step_progress",
+        bridge_plan::transfer_update_payload(&grant, "bridge_plan.step_progress", None, None)
+            .map_err(|error| error.message())?,
+    )?;
+    crate::room_control::send_room_control_event(
+        state.clone(),
+        &room_id,
+        progress,
+        bridge_route.clone(),
+    )
+    .await
+    .map_err(|error| error.message())?;
+
+    let transfer_result: Result<(), AppError> = async {
+        let private_file = match grant.generated_file.clone() {
+            Some(output) => output,
+            None => {
+                let mut candidates = state.bridge_plan_candidate_store.lock();
+                file_candidates::resolve_bridge_plan_selected_file(
+                    &mut candidates,
+                    &room_id,
+                    &grant.requester_device_ref,
+                    &grant.receiver_device_ref,
+                    &grant.attempt_id,
+                    &grant.candidate_id,
+                )?
+            }
+        };
+        match &grant.destination {
+            bridge_plan::TransferDestination::RequestingDevice { .. } => {
+                let peers = storage::list_bridge_peer_endpoints(&state.paths, &room_id)?;
+                let endpoint =
+                    resolve_routeable_bridge_peer(&peers, &context.peer_route_ref, "Transfer")?;
+                let master_key = {
+                    let config = state.config.read();
+                    config::master_key(&config)?
+                };
+                let item = storage::create_outgoing_file_item_with_metadata(
+                    &state.paths,
+                    &master_key,
+                    &room_id,
+                    &private_file.path,
+                    Some(private_file.display_name.clone()),
+                    Some(private_file.mime_type.clone()),
+                )?;
+                if item.size_bytes != private_file.size_bytes {
+                    return Err(AppError::InvalidInput(
+                        "The selected file changed before Transfer started.".into(),
+                    ));
+                }
+                transfer::send_room_file_to_bridge_peer_endpoint(
+                    state.clone(),
+                    &room_id,
+                    &item.id,
+                    &private_file.path,
+                    Some(format!("bridge-plan-transfer-{}", grant.attempt_id)),
+                    None,
+                    endpoint,
+                )
+                .await
+            }
+            bridge_plan::TransferDestination::UserSelectedLocation {
+                device_ref,
+                user_visible_location_scope,
+            } if device_ref == &grant.receiver_device_ref
+                && user_visible_location_scope.as_str() == "Pastey Shared" =>
+            {
+                let root = state.paths.app_data_dir.join("shared");
+                std::fs::create_dir_all(&root)?;
+                let root = std::fs::canonicalize(root)?;
+                let name = sanitize_filename::sanitize(&private_file.display_name);
+                let destination = root.join(format!("bridge-plan-{}-{name}", uuid::Uuid::new_v4()));
+                if std::fs::copy(&private_file.path, &destination)? != private_file.size_bytes {
+                    return Err(AppError::InvalidInput(
+                        "The approved location copy was incomplete.".into(),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(AppError::InvalidInput(
+                "This approved Transfer destination is unavailable on this device.".into(),
+            )),
+        }
+    }
+    .await;
+    let success_summary = match &grant.destination {
+        bridge_plan::TransferDestination::UserSelectedLocation { .. } => {
+            "Transfer saved in the approved Pastey Shared location on the selected device."
+        }
+        _ => "Transfer completed to the requesting device.",
+    };
+    let (kind, payload) = match transfer_result {
+        Ok(()) => (
+            "bridge_plan.step_result",
+            bridge_plan::transfer_update_payload(
+                &grant,
+                "bridge_plan.step_result",
+                Some(success_summary),
+                None,
+            ),
+        ),
+        Err(_) => (
+            "bridge_plan.step_failed",
+            bridge_plan::transfer_update_payload(
+                &grant,
+                "bridge_plan.step_failed",
+                None,
+                Some("transfer_failed"),
+            ),
+        ),
+    };
+    let terminal = send(kind, payload.map_err(|error| error.message())?)?;
+    crate::room_control::send_room_control_event(state, &room_id, terminal, bridge_route)
+        .await
+        .map_err(|error| error.message())?;
+    if transfer_result.is_err() {
+        return Err("The approved Transfer could not be completed.".into());
+    }
+    Ok(true)
 }
 
 #[tauri::command]
@@ -1587,30 +2494,83 @@ pub fn delete_temp_file(path: String, state: State<'_, Arc<AppState>>) -> Result
 
 #[tauri::command]
 pub async fn burn_room(room_id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
-    run_async(async move {
-        let peer = storage::get_room_by_id(&state.paths, &room_id)
-            .ok()
-            .and_then(|room| room.peer_host.zip(room.peer_port));
-        transfer::cancel_room_transfers(
-            state.inner().clone(),
-            &room_id,
-            "Room burned",
-            false,
-            Some("receiver_burned_room"),
-        )
-        .await?;
-        let effective_inbox_dir = {
-            let config = state.config.read();
-            config::effective_inbox_dir(&state.paths, &config)
-        };
-        let removed = storage::burn_room(&state.paths, &room_id, &effective_inbox_dir)?.is_some();
-        let _ = transfer::stop_room_server(state.inner().clone(), &room_id).await;
-        if let Some((peer_host, peer_port)) = peer {
-            transfer::notify_room_burn_with_peer(&peer_host, peer_port, &room_id).await;
+    run_async(async move { burn_bridge_scope(state.inner().clone(), &room_id, true, true).await })
+        .await
+}
+
+/// Purges all ephemeral execution authority for one Bridge. Lock acquisition
+/// is deliberately stable so no pre-Burn private binding can interleave with
+/// the individual stores' purges.
+pub(crate) fn purge_bridge_runtime_authority(
+    state: &Arc<AppState>,
+    room_id: &str,
+) -> AppResult<()> {
+    state.room_control.lock().purge_room(room_id);
+
+    let mut first_error = None;
+    let mut candidates = state.bridge_plan_candidate_store.lock();
+    // Direct requester sources are never durable. Clearing the small
+    // process-local map on Burn is conservative across all Bridges and
+    // prevents any later retry from reusing a pre-Burn file binding.
+    state.bridge_plan_requester_sources.lock().clear();
+    let bridge_plan_authority = state.bridge_plan_authority.lock();
+    let bridge_plan_protocol_authority = state.bridge_plan_protocol_authority.lock();
+    if let Err(error) = candidates.purge_room(room_id) {
+        first_error.get_or_insert(error);
+    }
+    bridge_plan_authority.purge_bridge(room_id);
+    bridge_plan_protocol_authority.purge_bridge(room_id);
+
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Receiver-host-owned, cross-layer terminal cleanup. Authority is cut off
+/// first; later failures retain the tombstone and cannot reopen the Bridge.
+pub(crate) async fn burn_bridge_scope(
+    state: Arc<AppState>,
+    room_id: &str,
+    stop_server: bool,
+    notify_peer: bool,
+) -> AppResult<bool> {
+    let peer = storage::get_room_by_id(&state.paths, room_id)
+        .ok()
+        .and_then(|room| room.peer_host.zip(room.peer_port));
+    if !storage::cut_off_bridge_authority(&state.paths, room_id)? {
+        return Ok(false);
+    }
+    let mut cleanup_error = purge_bridge_runtime_authority(&state, room_id).err();
+    if stop_server {
+        if let Err(error) = transfer::stop_room_server(state.clone(), room_id).await {
+            cleanup_error.get_or_insert(error);
         }
-        Ok(removed)
-    })
+    }
+    if let Err(error) = transfer::cancel_room_transfers(
+        state.clone(),
+        room_id,
+        "Room burned",
+        false,
+        Some("receiver_burned_room"),
+    )
     .await
+    {
+        cleanup_error.get_or_insert(error);
+    }
+    let effective_inbox_dir = {
+        let config = state.config.read();
+        config::effective_inbox_dir(&state.paths, &config)
+    };
+    if let Err(error) = storage::finalize_burned_room(&state.paths, room_id, &effective_inbox_dir) {
+        cleanup_error.get_or_insert(error);
+    }
+    if notify_peer {
+        if let Some((peer_host, peer_port)) = peer {
+            let _ = transfer::notify_room_burn_with_peer(&peer_host, peer_port, room_id).await;
+        }
+    }
+    if let Some(error) = cleanup_error {
+        return Err(error);
+    }
+    Ok(true)
 }
 
 #[tauri::command]
@@ -2073,7 +3033,6 @@ fn resolve_user_path(input: &str) -> AppResult<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn bridge_route_room() -> StoredRoom {
         StoredRoom {
@@ -2719,70 +3678,11 @@ mod tests {
             "[pastey:runtime-window] event=summary display_name=C:\\Users\\me\\secret.txt"
         )
         .is_err());
+        assert!(normalize_frontend_diagnostic_line(
+            "[pastey:agent-bridge] event=summary url=file:///Users/pastey-secret/Documents/private.pdf"
+        )
+        .is_err());
     }
 
-    struct UnavailableProbeAdapter {
-        prepares: AtomicUsize,
-        starts: AtomicUsize,
-        results: AtomicUsize,
-    }
 
-    impl file_candidates::TransformSandboxAdapter for UnavailableProbeAdapter {
-        fn prepare(&self, _request: &ArtifactTransformClaimRequest) -> file_candidates::TransformSandboxPreparation {
-            self.prepares.fetch_add(1, Ordering::SeqCst);
-            file_candidates::TransformSandboxPreparation::Unavailable
-        }
-
-        fn start(&self, _request: &ArtifactTransformClaimRequest) -> AppResult<()> {
-            self.starts.fetch_add(1, Ordering::SeqCst);
-            Err(AppError::InvalidInput("unexpected sandbox start".into()))
-        }
-
-        fn collect_result(&self, _request: &ArtifactTransformClaimRequest) -> AppResult<file_candidates::ArtifactTransformRawExecutorResult> {
-            self.results.fetch_add(1, Ordering::SeqCst);
-            Err(AppError::InvalidInput("unexpected result collection".into()))
-        }
-    }
-
-    #[test]
-    fn unavailable_adapter_preflight_is_pre_mutation_and_pre_start() {
-        let staging_probe_root = std::env::temp_dir().join(format!(
-            "pastey_transform_unavailable_{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir(&staging_probe_root).unwrap();
-        let request = ArtifactTransformClaimRequest {
-            schema_version: "artifact-transform-selected-execution-request-v1".into(),
-            execution_id: "execution-1".into(),
-            consent_id: "consent-1".into(),
-            source_preview_event_id: "preview-1".into(),
-            envelope_id: "envelope-1".into(),
-            request_id: "request-1".into(),
-            request_payload_hash: "hash-1".into(),
-            room_ref: "room-1".into(),
-            source_device_ref: "source-1".into(),
-            target_peer_ref: "target-1".into(),
-            capability: "artifact.transform_selected".into(),
-            source_capability: "filesystem.find_file_candidates".into(),
-            source_request_id: "search-1".into(),
-            candidate_id: "candidate-1".into(),
-            candidate_kind: "filesystem_file".into(),
-            result_contract: "typed_transform_result".into(),
-            expires_at: (time::OffsetDateTime::now_utc() + time::Duration::minutes(1))
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap(),
-        };
-        let adapter = UnavailableProbeAdapter { prepares: AtomicUsize::new(0), starts: AtomicUsize::new(0), results: AtomicUsize::new(0) };
-
-        let outcome = prepare_transform_adapter(&request, &adapter).unwrap().expect("unavailable outcome");
-
-        assert!(!outcome.executed);
-        assert_eq!(outcome.lifecycle, vec!["prepared"]);
-        assert_eq!(outcome.error_code.as_deref(), Some("sandbox_unavailable"));
-        assert_eq!(adapter.prepares.load(Ordering::SeqCst), 1);
-        assert_eq!(adapter.starts.load(Ordering::SeqCst), 0);
-        assert_eq!(adapter.results.load(Ordering::SeqCst), 0);
-        assert!(!staging_probe_root.join("transform-staging").exists());
-        let _ = std::fs::remove_dir_all(staging_probe_root);
-    }
 }
