@@ -433,13 +433,25 @@ pub(crate) fn review_request_payload(
     approval: &BridgePlanApproval,
     revision: &BridgePlanRevision,
 ) -> AppResult<Value> {
-    let search = revision
+    let review_step = revision
         .steps
         .iter()
         .find(|step| matches!(step, BridgePlanStep::Search { .. }))
+        .or_else(|| {
+            revision.steps.iter().find(|step| {
+                matches!(
+                    step,
+                    BridgePlanStep::Transfer {
+                        source: super::ObjectSelectionRule::FutureUserSelection { .. },
+                        destination: super::TransferDestination::SelectedDevice { .. },
+                        ..
+                    }
+                )
+            })
+        })
         .ok_or_else(|| {
             AppError::InvalidInput(
-                "Bridge Plan currently requires a Search step for receiver review.".into(),
+                "Bridge Plan has no supported first step for receiver review.".into(),
             )
         })?;
     let mut payload = Map::new();
@@ -482,11 +494,23 @@ pub(crate) fn review_request_payload(
         Value::Number(approval.expires_at.into()),
     );
     payload.insert("revision".into(), serde_json::to_value(revision)?);
-    payload.insert("searchStep".into(), serde_json::to_value(search)?);
-    payload.insert(
-        "searchStepDigest".into(),
-        Value::String(step_digest(search)?),
-    );
+    match review_step {
+        BridgePlanStep::Search { .. } => {
+            payload.insert("searchStep".into(), serde_json::to_value(review_step)?);
+            payload.insert(
+                "searchStepDigest".into(),
+                Value::String(step_digest(review_step)?),
+            );
+        }
+        BridgePlanStep::Transfer { .. } => {
+            payload.insert("transferStep".into(), serde_json::to_value(review_step)?);
+            payload.insert(
+                "transferStepDigest".into(),
+                Value::String(step_digest(review_step)?),
+            );
+        }
+        _ => unreachable!("review step is constrained above"),
+    }
     Ok(Value::Object(payload))
 }
 
@@ -499,13 +523,20 @@ pub(crate) fn receiver_decision_payload(
 ) -> AppResult<Value> {
     let conn = connection(paths)?;
     let stored = conn.query_row(
-        "SELECT plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,correlation_id,request_nonce,search_step_digest,review_expires_at,decision FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='receiver' AND approval_id=?2",
+        "SELECT plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,correlation_id,request_nonce,search_step_digest,review_expires_at,decision,reviewed_at,attestation_digest FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='receiver' AND approval_id=?2",
         params![bridge_id, approval_id],
-        |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,i64>(8)?,row.get::<_,Option<String>>(9)?)),
+        |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,i64>(8)?,row.get::<_,Option<String>>(9)?,row.get::<_,Option<i64>>(10)?,row.get::<_,Option<String>>(11)?)),
     ).optional()?.ok_or_else(|| AppError::InvalidInput("Bridge Plan review is unavailable.".into()))?;
-    if stored.8 <= now || stored.9.is_some() {
+    if stored.8 <= now {
         return invalid("Bridge Plan review is no longer available.");
     }
+    let (decision, reviewed_at, stored_attestation) = match stored.9.as_deref() {
+        None => (allow, now, None),
+        Some("allow") if allow => (true, stored.10.ok_or_else(|| AppError::InvalidInput("Bridge Plan receiver decision is incomplete.".into()))?, stored.11.clone()),
+        Some("deny") if !allow => (false, stored.10.ok_or_else(|| AppError::InvalidInput("Bridge Plan receiver decision is incomplete.".into()))?, stored.11.clone()),
+        Some("allow" | "deny") => return invalid("Bridge Plan receiver decision is already recorded."),
+        Some(_) => return invalid("Bridge Plan receiver review has an invalid decision."),
+    };
     let mut payload = Map::new();
     payload.insert(
         "schemaVersion".into(),
@@ -524,14 +555,19 @@ pub(crate) fn receiver_decision_payload(
     payload.insert("searchStepDigest".into(), Value::String(stored.7));
     payload.insert(
         "decision".into(),
-        Value::String(if allow { "allow" } else { "deny" }.into()),
+        Value::String(if decision { "allow" } else { "deny" }.into()),
     );
-    payload.insert("reviewedAt".into(), Value::Number(now.into()));
+    payload.insert("reviewedAt".into(), Value::Number(reviewed_at.into()));
     payload.insert(
         "attestationVersion".into(),
         Value::String(PROTOCOL_VERSION.into()),
     );
     let digest = attestation_digest(&payload)?;
+    if let Some(stored_attestation) = stored_attestation {
+        if stored_attestation != digest {
+            return invalid("Bridge Plan receiver decision is inconsistent.");
+        }
+    }
     payload.insert("attestationDigest".into(), Value::String(digest));
     Ok(Value::Object(payload))
 }
@@ -1345,9 +1381,9 @@ fn record_receiver_decision(paths: &AppPaths, decision: &Decision) -> AppResult<
     let mut conn = connection(paths)?;
     let tx = conn.transaction()?;
     let stored = tx.query_row(
-        "SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,correlation_id,request_nonce,search_step_digest,review_expires_at,decision FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='receiver' AND request_nonce=?2",
+        "SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,correlation_id,request_nonce,search_step_digest,review_expires_at,decision,reviewed_at,attestation_digest FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='receiver' AND request_nonce=?2",
         params![decision.common.bridge, decision.nonce],
-        |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,String>(8)?,row.get::<_,i64>(9)?,row.get::<_,Option<String>>(10)?)),
+        |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,String>(8)?,row.get::<_,i64>(9)?,row.get::<_,Option<String>>(10)?,row.get::<_,Option<i64>>(11)?,row.get::<_,Option<String>>(12)?)),
     ).optional()?.ok_or_else(|| AppError::InvalidInput("Bridge Plan receiver review not found.".into()))?;
     if stored.0 != decision.approval
         || stored.1 != decision.common.plan
@@ -1359,9 +1395,19 @@ fn record_receiver_decision(paths: &AppPaths, decision: &Decision) -> AppResult<
         || stored.7 != decision.nonce
         || stored.8 != decision.digest
         || stored.9 != decision.expires
-        || stored.10.is_some()
     {
         return invalid("Bridge Plan receiver decision does not bind review.");
+    }
+    if stored.10.is_some() {
+        let expected = if decision.decision == ReceiverDecision::Approved { "allow" } else { "deny" };
+        if stored.10.as_deref() == Some(expected)
+            && stored.11 == Some(decision.reviewed)
+            && stored.12.as_deref() == Some(decision.attestation.as_str())
+        {
+            tx.commit()?;
+            return Ok(());
+        }
+        return invalid("Bridge Plan receiver decision is already recorded.");
     }
     if tx.execute(
         "UPDATE bridge_plan_protocol_reviews SET decision=?1,reviewed_at=?2,attestation_digest=?3 WHERE bridge_id=?4 AND direction='receiver' AND request_nonce=?5 AND decision IS NULL",
@@ -1485,9 +1531,7 @@ fn common_for_event(
 }
 
 fn review(value: &Map<String, Value>, common: &Common, now: i64) -> AppResult<Review> {
-    exact(
-        value,
-        &[
+    let common_fields = [
             "schemaVersion",
             "bridgeId",
             "planId",
@@ -1500,11 +1544,22 @@ fn review(value: &Map<String, Value>, common: &Common, now: i64) -> AppResult<Re
             "requestNonce",
             "reviewExpiresAt",
             "revision",
+        ];
+    let (step_field, digest_field, is_supported_review_step) = if value.contains_key("searchStep") {
+        exact(value, &common_fields, &["searchStep", "searchStepDigest"])?;
+        (
             "searchStep",
             "searchStepDigest",
-        ],
-        &[],
-    )?;
+            is_search_review_step as fn(&BridgePlanStep) -> bool,
+        )
+    } else {
+        exact(value, &common_fields, &["transferStep", "transferStepDigest"])?;
+        (
+            "transferStep",
+            "transferStepDigest",
+            is_direct_transfer_review_step as fn(&BridgePlanStep) -> bool,
+        )
+    };
     let raw = value
         .get("revision")
         .cloned()
@@ -1522,20 +1577,20 @@ fn review(value: &Map<String, Value>, common: &Common, now: i64) -> AppResult<Re
         return invalid("Bridge Plan review revision mismatch.");
     }
     let raw_step = value
-        .get("searchStep")
+        .get(step_field)
         .cloned()
-        .ok_or_else(|| AppError::InvalidInput("Invalid Bridge Plan Search step.".into()))?;
+        .ok_or_else(|| AppError::InvalidInput("Invalid Bridge Plan review step.".into()))?;
     let step: BridgePlanStep = serde_json::from_value(raw_step.clone())
-        .map_err(|_| AppError::InvalidInput("Invalid Bridge Plan Search step.".into()))?;
+        .map_err(|_| AppError::InvalidInput("Invalid Bridge Plan review step.".into()))?;
     if serde_json::to_value(&step)? != raw_step
-        || !matches!(step, BridgePlanStep::Search { .. })
+        || !is_supported_review_step(&step)
         || !revision.steps.iter().any(|candidate| candidate == &step)
     {
-        return invalid("Bridge Plan Search step mismatch.");
+        return invalid("Bridge Plan review step mismatch.");
     }
     let digest = step_digest(&step)?;
-    if string(value, "searchStepDigest", 256)? != digest {
-        return invalid("Bridge Plan Search digest mismatch.");
+    if string(value, digest_field, 256)? != digest {
+        return invalid("Bridge Plan review step digest mismatch.");
     }
     let expires = integer(value, "reviewExpiresAt")?;
     if expires <= now || expires > now + MAX_LIFETIME {
@@ -1550,6 +1605,21 @@ fn review(value: &Map<String, Value>, common: &Common, now: i64) -> AppResult<Re
         digest,
         revision,
     })
+}
+
+fn is_search_review_step(step: &BridgePlanStep) -> bool {
+    matches!(step, BridgePlanStep::Search { .. })
+}
+
+fn is_direct_transfer_review_step(step: &BridgePlanStep) -> bool {
+    matches!(
+        step,
+        BridgePlanStep::Transfer {
+            source: super::ObjectSelectionRule::FutureUserSelection { .. },
+            destination: super::TransferDestination::SelectedDevice { .. },
+            ..
+        }
+    )
 }
 
 fn decision(value: &Map<String, Value>, common: &Common, now: i64) -> AppResult<Decision> {
@@ -2417,7 +2487,11 @@ fn attestation_digest(value: &Map<String, Value>) -> AppResult<String> {
 mod tests {
     use super::*;
     use crate::{
-        bridge_plan::{build_file_search_revision, init_schema, BridgePlanApproval},
+        bridge_plan::{
+            build_direct_file_transfer_revision, build_file_search_revision, init_schema,
+            ApprovalState, BridgePlan, BridgePlanApproval, BridgePlanState, BridgePlanStore,
+            RevisionState,
+        },
         storage::AppPaths,
     };
     use std::fs;
@@ -2441,6 +2515,97 @@ mod tests {
 
     fn outer(kind: &str, payload: Value, source: &str, target: &str) -> Value {
         serde_json::json!({"kind": kind, "sourceDeviceRef": source, "targetPeerRef": target, "payload": payload})
+    }
+
+    fn persist_requester_approval(
+        paths: &AppPaths,
+        revision: &BridgePlanRevision,
+        approval: &BridgePlanApproval,
+        now: i64,
+    ) {
+        let store = BridgePlanStore::new(paths);
+        store
+            .create_plan(
+                &BridgePlan {
+                    plan_id: revision.plan_id.clone(),
+                    bridge_id: revision.bridge_id.clone(),
+                    requesting_device_ref: revision.requesting_device_ref.clone(),
+                    created_at: now,
+                },
+                BridgePlanState::Draft,
+            )
+            .unwrap();
+        store
+            .append_revision(revision, RevisionState::Proposed, now)
+            .unwrap();
+        store
+            .transition_plan(&revision.plan_id, BridgePlanState::Open)
+            .unwrap();
+        store
+            .transition_revision(&revision.revision_id, RevisionState::Available)
+            .unwrap();
+        store.create_approval(approval, now).unwrap();
+    }
+
+    fn protocol_round_trip(
+        revision: BridgePlanRevision,
+        allow: bool,
+    ) -> (AppPaths, BridgePlanApproval, Value) {
+        let requester = paths();
+        let receiver = paths();
+        crate::storage::init_database(&requester).unwrap();
+        crate::storage::init_database(&receiver).unwrap();
+        let now = crate::storage::now_ts();
+        let approval = BridgePlanApproval {
+            approval_id: "approval".into(),
+            plan_id: revision.plan_id.clone(),
+            revision_id: revision.revision_id.clone(),
+            revision_hash: revision.revision_hash.clone(),
+            bridge_id: revision.bridge_id.clone(),
+            requester_device_ref: revision.requesting_device_ref.clone(),
+            selected_device_ref: revision.selected_device_ref.clone(),
+            receiver_required: true,
+            expires_at: now + 600,
+        };
+        persist_requester_approval(&requester, &revision, &approval, now);
+        let review = review_request_payload(&approval, &revision).unwrap();
+        let authorities = ProtocolSearchAuthorityStore::default();
+        let mut candidates = crate::file_candidates::BridgePlanCandidateStore::default();
+        accept_inbound_protocol_event(
+            &receiver,
+            &authorities,
+            &mut candidates,
+            "bridge_plan.review_request",
+            &outer(
+                "bridge_plan.review_request",
+                review.clone(),
+                &revision.requesting_device_ref,
+                &revision.selected_device_ref,
+            ),
+            now,
+        )
+        .unwrap();
+        let decision = receiver_decision_payload(
+            &receiver,
+            &revision.bridge_id,
+            &approval.approval_id,
+            allow,
+            now,
+        )
+        .unwrap();
+        record_outbound_protocol_event(
+            &receiver,
+            "bridge_plan.review_decision",
+            &outer(
+                "bridge_plan.review_decision",
+                decision.clone(),
+                &revision.selected_device_ref,
+                &revision.requesting_device_ref,
+            ),
+            now,
+        )
+        .unwrap();
+        (requester, approval, serde_json::json!({ "review": review, "decision": decision }))
     }
 
     #[test]
@@ -2488,6 +2653,113 @@ mod tests {
             requester,
             receiver,
         ));
+    }
+
+    #[test]
+    fn direct_transfer_review_round_trip_binds_the_selected_peer_and_revision() {
+        let revision = build_direct_file_transfer_revision(
+            "bridge".into(),
+            "requester".into(),
+            "receiver".into(),
+            "Send one file.".into(),
+        )
+        .unwrap();
+        let revision_id = revision.revision_id.clone();
+        let revision_hash = revision.revision_hash.clone();
+        let (requester, approval, values) = protocol_round_trip(revision, true);
+        let review = values["review"].clone();
+        assert!(review.get("transferStep").is_some());
+        assert!(review.get("transferStepDigest").is_some());
+        assert!(review.get("searchStep").is_none());
+
+        let now = crate::storage::now_ts();
+        let authorities = ProtocolSearchAuthorityStore::default();
+        let mut candidates = crate::file_candidates::BridgePlanCandidateStore::default();
+        let decision = values["decision"].clone();
+        assert!(accept_inbound_protocol_event(
+            &requester,
+            &authorities,
+            &mut candidates,
+            "bridge_plan.review_decision",
+            &outer("bridge_plan.review_decision", decision.clone(), "receiver", "requester"),
+            now,
+        )
+        .is_err());
+
+        record_outbound_protocol_event(
+            &requester,
+            "bridge_plan.review_request",
+            &outer("bridge_plan.review_request", review, "requester", "receiver"),
+            now,
+        )
+        .unwrap();
+        accept_inbound_protocol_event(
+            &requester,
+            &authorities,
+            &mut candidates,
+            "bridge_plan.review_decision",
+            &outer("bridge_plan.review_decision", decision, "receiver", "requester"),
+            now,
+        )
+        .unwrap();
+        let stored = BridgePlanStore::new(&requester)
+            .get_approval(&approval.approval_id)
+            .unwrap();
+        assert_eq!(stored.state, ApprovalState::Valid);
+        assert_eq!(stored.approval.revision_id, revision_id);
+        assert_eq!(stored.approval.revision_hash, revision_hash);
+    }
+
+    #[test]
+    fn receiver_denial_returns_to_the_original_requester_and_preserves_review_binding() {
+        let revision = build_file_search_revision(
+            "bridge".into(),
+            "requester".into(),
+            "receiver".into(),
+            "Find the report PDF.".into(),
+            "report".into(),
+            vec!["pdf".into()],
+            vec!["documents".into()],
+        )
+        .unwrap();
+        let plan_id = revision.plan_id.clone();
+        let revision_id = revision.revision_id.clone();
+        let (requester, approval, values) = protocol_round_trip(revision, false);
+        let now = crate::storage::now_ts();
+        record_outbound_protocol_event(
+            &requester,
+            "bridge_plan.review_request",
+            &outer(
+                "bridge_plan.review_request",
+                values["review"].clone(),
+                "requester",
+                "receiver",
+            ),
+            now,
+        )
+        .unwrap();
+        let authorities = ProtocolSearchAuthorityStore::default();
+        let mut candidates = crate::file_candidates::BridgePlanCandidateStore::default();
+        accept_inbound_protocol_event(
+            &requester,
+            &authorities,
+            &mut candidates,
+            "bridge_plan.review_decision",
+            &outer(
+                "bridge_plan.review_decision",
+                values["decision"].clone(),
+                "receiver",
+                "requester",
+            ),
+            now,
+        )
+        .unwrap();
+        let stored = BridgePlanStore::new(&requester)
+            .get_approval(&approval.approval_id)
+            .unwrap();
+        assert_eq!(stored.state, ApprovalState::Denied);
+        assert_eq!(stored.approval.plan_id, plan_id);
+        assert_eq!(stored.approval.revision_id, revision_id);
     }
 
     #[test]
@@ -2540,11 +2812,25 @@ mod tests {
             "bridge_plan.review_decision",
             &outer(
                 "bridge_plan.review_decision",
-                decision,
+                decision.clone(),
                 "receiver",
                 "requester",
             ),
             now,
+        )
+        .unwrap();
+        let retry = receiver_decision_payload(&paths, "bridge", "approval", true, now + 1).unwrap();
+        assert_eq!(retry, decision);
+        record_outbound_protocol_event(
+            &paths,
+            "bridge_plan.review_decision",
+            &outer(
+                "bridge_plan.review_decision",
+                retry,
+                "receiver",
+                "requester",
+            ),
+            now + 1,
         )
         .unwrap();
         assert_eq!(

@@ -20,6 +20,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::{
     crypto,
     error::{AppError, AppResult},
+    logging,
     models::{BridgePeerLiveness, RoomStatus, StoredBridgePeerEndpoint},
     storage,
     transfer::RoomServerContext,
@@ -56,6 +57,29 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "bridge_plan.cancel",
 ];
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
+
+fn log_bridge_plan_control_event(event: &ValidatedControlEvent, stage: &str) {
+    let field = |value: &Value, name: &str| {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let payload = event.event.get("payload").unwrap_or(&event.event);
+    logging::write_transfer_line(&format!(
+        "[pastey bridge-plan-control] stage={stage} kind={} event_id={} bridge_id={} plan_id={} revision_id={} approval_id={} source_session={} target_session={}",
+        event.kind,
+        event.event_id,
+        field(payload, "bridgeId"),
+        field(payload, "planId"),
+        field(payload, "revisionId"),
+        field(payload, "approvalId"),
+        event.source_device_ref,
+        event.target_peer_ref,
+    ));
+}
 
 const UNSAFE_FIELDS: &[&str] = &[
     "command",
@@ -805,6 +829,7 @@ pub async fn receive_room_control_event_handler(
             )
         }
     };
+    log_bridge_plan_control_event(&validated, "inbound_validated");
     if crate::bridge_plan::accept_inbound_protocol_event(
         &ctx.state.paths,
         &ctx.state.bridge_plan_protocol_authority.lock(),
@@ -815,6 +840,7 @@ pub async fn receive_room_control_event_handler(
     )
     .is_err()
     {
+        log_bridge_plan_control_event(&validated, "inbound_protocol_rejected");
         return control_error(
             StatusCode::BAD_REQUEST,
             "invalid_event",
@@ -846,6 +872,7 @@ pub async fn receive_room_control_event_handler(
                 "Room control event was already received.",
             );
         }
+        log_bridge_plan_control_event(&validated, "inbound_persisted");
         record_replay_id(
             &mut room_state.seen_event_ids,
             &mut room_state.seen_event_id_set,
@@ -1554,6 +1581,28 @@ mod tests {
             .code,
             "inbox_full"
         );
+    }
+
+    #[test]
+    fn generic_capability_control_events_remain_unavailable() {
+        let now = OffsetDateTime::now_utc();
+        let event = serde_json::json!({
+            "schemaVersion": ROOM_CONTROL_SCHEMA,
+            "eventId": "generic-capability-event",
+            "kind": "capability.request",
+            "roomRef": "room",
+            "sourceDeviceRef": "source",
+            "targetPeerRef": "target",
+            "createdAt": now.format(&Rfc3339).unwrap(),
+            "expiresAt": (now + time::Duration::seconds(60)).format(&Rfc3339).unwrap(),
+            "previewOnly": false,
+            "payload": {},
+        });
+        let error = match validate_control_event(event, "room", "source", "target", now) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("generic capability event must be rejected"),
+        };
+        assert!(error.contains("Unsupported room control event kind."));
     }
 
 
