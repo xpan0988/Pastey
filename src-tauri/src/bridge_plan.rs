@@ -27,6 +27,7 @@ pub(crate) use protocol::{
     attempt_update_payload, consume_search_execution_grant, consume_transfer_execution_grant,
     consume_transform_execution_grant, protocol_metadata, receiver_decision_payload,
     receiver_review_decision, reconcile_protocol_startup,
+    record_outbound_protocol_event,
     review_request_payload, search_selection_payload, transfer_start_payload,
     transfer_update_payload, transform_start_payload, transform_update_payload,
     ProtocolSearchAuthorityStore,

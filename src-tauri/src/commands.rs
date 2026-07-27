@@ -64,6 +64,32 @@ fn bridge_plan_control_event(
     }))
 }
 
+/// Emits only opaque Bridge Plan correlation identifiers.  It deliberately
+/// excludes transport keys, private paths, and protocol bodies so two-device
+/// failures can be correlated without turning the event log into authority.
+fn log_bridge_plan_control(event: &Value, stage: &str) {
+    let field = |object: &Value, name: &str| {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let payload = event.get("payload").unwrap_or(event);
+    logging::write_transfer_line(&format!(
+        "[pastey bridge-plan-control] stage={stage} kind={} event_id={} bridge_id={} plan_id={} revision_id={} approval_id={} source_session={} target_session={}",
+        field(event, "kind"),
+        field(event, "eventId"),
+        field(payload, "bridgeId"),
+        field(payload, "planId"),
+        field(payload, "revisionId"),
+        field(payload, "approvalId"),
+        field(event, "sourceDeviceRef"),
+        field(event, "targetPeerRef"),
+    ));
+}
+
 
 /// Renderer-provided intent for a file Search. Device bindings, immutable
 /// revision shape, and authority stay Host-owned.
@@ -1638,9 +1664,31 @@ pub async fn send_bridge_plan_review_request(
     }
     let event = bridge_plan_control_event("bridge_plan.review_request", payload, &context)
         .map_err(|error| error.message())?;
-    crate::room_control::send_room_control_event(state, &context.room_id, event, bridge_route)
-        .await
-        .map_err(|error| error.message())
+    log_bridge_plan_control(&event, "review_request_dispatch");
+    let receipt = match crate::room_control::send_room_control_event(
+        state.clone(),
+        &context.room_id,
+        event.clone(),
+        bridge_route,
+    )
+    .await
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            log_bridge_plan_control(&event, "review_request_delivery_failed");
+            return Err(error.message());
+        }
+    };
+    log_bridge_plan_control(&event, "review_request_delivered");
+    bridge_plan::record_outbound_protocol_event(
+        &state.paths,
+        "bridge_plan.review_request",
+        &event,
+        storage::now_ts(),
+    )
+    .map_err(|error| error.message())?;
+    log_bridge_plan_control(&event, "review_request_correlated");
+    Ok(receipt)
 }
 
 /// Receiver-local decision for the exact durable review record. The returned
@@ -1666,9 +1714,24 @@ pub async fn decide_bridge_plan_review(
     .map_err(|error| error.message())?;
     let event = bridge_plan_control_event("bridge_plan.review_decision", payload, &context)
         .map_err(|error| error.message())?;
-    crate::room_control::send_room_control_event(state, &room_id, event, bridge_route)
-        .await
-        .map_err(|error| error.message())
+    bridge_plan::record_outbound_protocol_event(
+        &state.paths,
+        "bridge_plan.review_decision",
+        &event,
+        storage::now_ts(),
+    )
+    .map_err(|error| error.message())?;
+    log_bridge_plan_control(&event, "review_decision_recorded");
+    match crate::room_control::send_room_control_event(state, &room_id, event.clone(), bridge_route).await {
+        Ok(receipt) => {
+            log_bridge_plan_control(&event, "review_decision_delivered");
+            Ok(receipt)
+        }
+        Err(error) => {
+            log_bridge_plan_control(&event, "review_decision_delivery_failed");
+            Err(error.message())
+        }
+    }
 }
 
 #[tauri::command]

@@ -35,7 +35,12 @@ import {
   enqueueTransferInputsWithBridgeRoute,
   sendTextToRoomWithBridgeRoute,
 } from "../lib/bridgeRoutingRuntime";
-import { bridgePeerSessionId, formatBridgeRouteErrorForUser, type BridgeRoute } from "../lib/bridgeRouting";
+import {
+  bridgePeerSessionId,
+  bridgeRouteErrorCodeFromMessage,
+  formatBridgeRouteErrorForUser,
+  type BridgeRoute,
+} from "../lib/bridgeRouting";
 import { legacyRoomToBridgePeerCollection } from "../lib/bridgeRoomAdapter";
 import {
   OperationTimeline,
@@ -88,6 +93,30 @@ const SAFE_SEARCH_SCOPES: Array<{ value: SafeSearchScope; label: string }> = [
   { value: "pastey_shared", label: "Pastey Shared" },
 ];
 const BRIDGE_PLAN_REQUIRES_ONE_SELECTED_DEVICE = "Ask Bridge requires one selected device.";
+
+function bridgePlanControlErrorMessage(error: unknown, action: "review" | "decision"): string {
+  if (bridgeRouteErrorCodeFromMessage(error)) {
+    return formatBridgeRouteErrorForUser(error);
+  }
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  if (message.includes("selected device session changed")) {
+    return "The selected device reconnected. Refresh the Bridge, select its current session, and send a new review request.";
+  }
+  if (message.includes("Room control session") || message.includes("Room session is unavailable")) {
+    return "The Bridge session is no longer active on one device. Reopen the active Bridge and try again.";
+  }
+  if (message.includes("Peer is unavailable") || message.includes("delivery failed") || message.includes("delivery timed out")) {
+    return "The selected device is not reachable for Bridge review. Confirm that both devices are connected to the same active Bridge, then try again.";
+  }
+  if (message.includes("event validation failed") || message.includes("Bridge Plan review not found") || message.includes("receiver review")) {
+    return action === "review"
+      ? "The selected device could not validate this review request. Refresh the Bridge and create a new plan."
+      : "The requester could not validate this decision. Refresh the Bridge and send a new review request.";
+  }
+  return action === "review"
+    ? "Pastey could not send the plan for review. Refresh the Bridge and try again."
+    : "The plan decision could not be sent. Refresh the Bridge and try again.";
+}
 
 interface BridgePageProps {
   rooms: RoomInfo[];
@@ -757,7 +786,7 @@ function BridgePlanReceiverPanel({
       setMessage(allow ? "Plan approved. Waiting for the requester to start it." : "Plan denied. No search will run.");
       onRefresh();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "The plan decision could not be sent.");
+      setMessage(bridgePlanControlErrorMessage(error, "decision"));
     }
   }
 
@@ -1086,7 +1115,7 @@ function BridgePlanSenderPanel({
       setApprovalState("awaiting_receiver");
       setMessage("Waiting for the selected device to review the complete plan.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not send the plan for review.");
+      setMessage(bridgePlanControlErrorMessage(error, "review"));
     } finally {
       setBusy(null);
     }

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildDeterministicAskBridgeNaturalV1Plan,
+  generateMockAskBridgeNaturalV1Plan,
   isSupportedBridgePlanSubmission,
   validateAskBridgeNaturalV1Plan,
 } from "../src/lib/ai/naturalV1Plan";
@@ -20,4 +21,13 @@ test("unsupported Transform remains non-submittable and fail-closed", () => {
   const plan = buildDeterministicAskBridgeNaturalV1Plan("Find report.pdf, translate it, and send it to me.");
   assert.equal(plan.status, "unsupported_future");
   assert.equal(isSupportedBridgePlanSubmission(plan), false);
+});
+
+test("explicit Search planning falls back locally when no cloud provider is configured", async () => {
+  const generated = await generateMockAskBridgeNaturalV1Plan("Find report.pdf on the selected device.");
+
+  assert.equal(generated.providerId, "pastey-mock-provider");
+  assert.match(generated.rawText, /No model or network call occurred/);
+  assert.equal(generated.parsedPlan.steps[0]?.primitive, "Search");
+  assert.equal(isSupportedBridgePlanSubmission(generated.parsedPlan), true);
 });
