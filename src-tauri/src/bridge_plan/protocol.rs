@@ -2550,7 +2550,7 @@ mod tests {
     fn protocol_round_trip(
         revision: BridgePlanRevision,
         allow: bool,
-    ) -> (AppPaths, BridgePlanApproval, Value) {
+    ) -> (AppPaths, AppPaths, BridgePlanApproval, Value) {
         let requester = paths();
         let receiver = paths();
         crate::storage::init_database(&requester).unwrap();
@@ -2605,7 +2605,7 @@ mod tests {
             now,
         )
         .unwrap();
-        (requester, approval, serde_json::json!({ "review": review, "decision": decision }))
+        (requester, receiver, approval, serde_json::json!({ "review": review, "decision": decision }))
     }
 
     #[test]
@@ -2666,7 +2666,7 @@ mod tests {
         .unwrap();
         let revision_id = revision.revision_id.clone();
         let revision_hash = revision.revision_hash.clone();
-        let (requester, approval, values) = protocol_round_trip(revision, true);
+        let (requester, _receiver, approval, values) = protocol_round_trip(revision, true);
         let review = values["review"].clone();
         assert!(review.get("transferStep").is_some());
         assert!(review.get("transferStepDigest").is_some());
@@ -2724,7 +2724,7 @@ mod tests {
         .unwrap();
         let plan_id = revision.plan_id.clone();
         let revision_id = revision.revision_id.clone();
-        let (requester, approval, values) = protocol_round_trip(revision, false);
+        let (requester, _receiver, approval, values) = protocol_round_trip(revision, false);
         let now = crate::storage::now_ts();
         record_outbound_protocol_event(
             &requester,
@@ -2760,6 +2760,121 @@ mod tests {
         assert_eq!(stored.state, ApprovalState::Denied);
         assert_eq!(stored.approval.plan_id, plan_id);
         assert_eq!(stored.approval.revision_id, revision_id);
+    }
+
+    #[test]
+    fn requester_records_outbound_attempt_before_receiver_acknowledges_it() {
+        let revision = build_file_search_revision(
+            "bridge".into(),
+            "requester".into(),
+            "receiver".into(),
+            "Find report.pdf.".into(),
+            "report.pdf".into(),
+            vec!["pdf".into()],
+            vec!["downloads".into()],
+        )
+        .unwrap();
+        let (requester, receiver, _approval, values) = protocol_round_trip(revision.clone(), true);
+        let now = crate::storage::now_ts();
+        let review = values["review"].clone();
+        let decision = values["decision"].clone();
+        let requester_authorities = ProtocolSearchAuthorityStore::default();
+        let receiver_authorities = ProtocolSearchAuthorityStore::default();
+        let mut requester_candidates = crate::file_candidates::BridgePlanCandidateStore::default();
+        let mut receiver_candidates = crate::file_candidates::BridgePlanCandidateStore::default();
+
+        record_outbound_protocol_event(
+            &requester,
+            "bridge_plan.review_request",
+            &outer("bridge_plan.review_request", review.clone(), "requester", "receiver"),
+            now,
+        )
+        .unwrap();
+        accept_inbound_protocol_event(
+            &requester,
+            &requester_authorities,
+            &mut requester_candidates,
+            "bridge_plan.review_decision",
+            &outer("bridge_plan.review_decision", decision, "receiver", "requester"),
+            now,
+        )
+        .unwrap();
+        BridgePlanStore::new(&requester)
+            .create_attempt_from_approval("attempt", "approval", now)
+            .unwrap();
+
+        let review_payload = review.as_object().unwrap();
+        let start = serde_json::json!({
+            "schemaVersion": PROTOCOL_VERSION,
+            "bridgeId": revision.bridge_id,
+            "planId": revision.plan_id,
+            "revisionId": revision.revision_id,
+            "revisionHash": revision.revision_hash,
+            "requesterDeviceRef": "requester",
+            "receiverDeviceRef": "receiver",
+            "approvalId": "approval",
+            "attemptId": "attempt",
+            "searchStep": review_payload["searchStep"].clone(),
+            "searchStepDigest": review_payload["searchStepDigest"].clone(),
+            "attemptNonce": "attempt-nonce",
+            "attemptExpiresAt": now + 600,
+        });
+        let start_event = outer("bridge_plan.attempt_start", start.clone(), "requester", "receiver");
+        record_outbound_protocol_event(&requester, "bridge_plan.attempt_start", &start_event, now)
+            .unwrap();
+        accept_inbound_protocol_event(
+            &receiver,
+            &receiver_authorities,
+            &mut receiver_candidates,
+            "bridge_plan.attempt_start",
+            &start_event,
+            now,
+        )
+        .unwrap();
+        let grant = consume_search_execution_grant(
+            &receiver,
+            &receiver_authorities,
+            "bridge",
+            "attempt",
+            now,
+        )
+        .unwrap();
+        let ack = attempt_update_payload(&grant, "bridge_plan.attempt_ack", None, None).unwrap();
+        assert!(accept_inbound_protocol_event(
+            &requester,
+            &requester_authorities,
+            &mut requester_candidates,
+            "bridge_plan.attempt_ack",
+            &outer("bridge_plan.attempt_ack", ack, "receiver", "requester"),
+            now,
+        )
+        .is_ok());
+        let progress = attempt_update_payload(&grant, "bridge_plan.step_progress", None, None).unwrap();
+        accept_inbound_protocol_event(
+            &requester,
+            &requester_authorities,
+            &mut requester_candidates,
+            "bridge_plan.step_progress",
+            &outer("bridge_plan.step_progress", progress, "receiver", "requester"),
+            now,
+        )
+        .unwrap();
+        let result = attempt_update_payload(
+            &grant,
+            "bridge_plan.step_result",
+            Some("Search finished with 0 matching file result(s)."),
+            None,
+        )
+        .unwrap();
+        accept_inbound_protocol_event(
+            &requester,
+            &requester_authorities,
+            &mut requester_candidates,
+            "bridge_plan.step_result",
+            &outer("bridge_plan.step_result", result, "receiver", "requester"),
+            now,
+        )
+        .unwrap();
     }
 
     #[test]

@@ -367,12 +367,28 @@ function validatePrimitiveOrder(
 
 function buildSearchStep(userRequest: string): AskBridgeNaturalV1SearchStep {
   const extensions = extractExtensions(userRequest);
+  const pathMetadata = extractReviewedPathMetadata(userRequest);
   return {
     primitive: "Search",
-    filenameHint: extractFilenameHint(userRequest, extensions),
+    filenameHint: pathMetadata?.filenameHint ?? extractFilenameHint(userRequest, extensions),
     extensions,
-    safeScopes: ["downloads", "desktop", "documents", "pastey_shared"],
+    safeScopes: pathMetadata?.safeScope ? [pathMetadata.safeScope] : ["downloads", "desktop", "documents", "pastey_shared"],
   };
+}
+
+function extractReviewedPathMetadata(value: string): { filenameHint: string; safeScope?: AskBridgeSafeScope } | null {
+  // A path is only a filename hint. It never crosses into the plan as a root
+  // or permission; an explicit reviewed-folder segment can merely narrow the
+  // existing labels already accepted by the host.
+  const path = value.match(/(?:[a-z]:)?[\\/][^\s"'<>]*/i)?.[0]?.replace(/[),.;!?]+$/, "");
+  if (!path) return null;
+  const segments = path.split(/[\\/]+/).filter(Boolean);
+  const filenameHint = segments[segments.length - 1];
+  if (!filenameHint || !/^[a-z0-9][a-z0-9._ -]{0,127}$/i.test(filenameHint)) return null;
+  const safeScope = segments
+    .map((segment) => segment.toLowerCase())
+    .find((segment): segment is AskBridgeSafeScope => SAFE_SCOPES.has(segment as AskBridgeSafeScope));
+  return { filenameHint, safeScope };
 }
 
 function extractExtensions(value: string): string[] {

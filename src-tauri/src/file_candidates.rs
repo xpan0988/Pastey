@@ -10,6 +10,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     error::{AppError, AppResult},
+    logging,
     object_refs::{
         self, EphemeralObjectStore, ObjectKind, ObjectRefDescriptor,
     },
@@ -78,6 +79,35 @@ struct SearchScope {
     root: PathBuf,
 }
 
+/// Roots for the OS-reviewed folders. On Windows these come from the Shell
+/// Known Folder API through `dirs`, so redirected OneDrive locations remain
+/// inside the reviewed label rather than being guessed from a profile path.
+#[derive(Clone, Debug, Default)]
+struct ReviewedScopeRoots {
+    downloads: Option<PathBuf>,
+    desktop: Option<PathBuf>,
+    documents: Option<PathBuf>,
+}
+
+impl ReviewedScopeRoots {
+    fn from_platform() -> Self {
+        Self {
+            downloads: dirs::download_dir(),
+            desktop: dirs::desktop_dir(),
+            documents: dirs::document_dir(),
+        }
+    }
+
+    fn root_for(&self, label: &str) -> Option<PathBuf> {
+        match label {
+            "downloads" => self.downloads.clone(),
+            "desktop" => self.desktop.clone(),
+            "documents" => self.documents.clone(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DiscoveredFileCandidate {
     public: FileCandidateMetadata,
@@ -138,6 +168,15 @@ fn execute_bridge_plan_search_internal(
     request: BridgePlanSearchRequest,
     paths: &AppPaths,
 ) -> AppResult<(BridgePlanSearchResult, Vec<DiscoveredFileCandidate>)> {
+    let scope_roots = ReviewedScopeRoots::from_platform();
+    execute_bridge_plan_search_internal_with_roots(request, paths, &scope_roots)
+}
+
+fn execute_bridge_plan_search_internal_with_roots(
+    request: BridgePlanSearchRequest,
+    paths: &AppPaths,
+    scope_roots: &ReviewedScopeRoots,
+) -> AppResult<(BridgePlanSearchResult, Vec<DiscoveredFileCandidate>)> {
     validate_request(&request)?;
     let started = Instant::now();
     let mut omitted = FileCandidateOmitted {
@@ -146,9 +185,11 @@ fn execute_bridge_plan_search_internal(
         symlinks_skipped: false,
         scopes_skipped: Vec::new(),
     };
-    let scopes = resolve_scopes(
+    let scopes = resolve_scopes_with_roots(
         &request.safe_scope_labels,
         paths,
+        scope_roots,
+        &request,
         &mut omitted,
     );
     if scopes.is_empty() {
@@ -376,29 +417,32 @@ fn validate_scopes(scopes: &[String]) -> AppResult<()> {
     Ok(())
 }
 
-fn resolve_scopes(
+fn resolve_scopes_with_roots(
     labels: &[String],
     paths: &AppPaths,
+    scope_roots: &ReviewedScopeRoots,
+    request: &BridgePlanSearchRequest,
     omitted: &mut FileCandidateOmitted,
 ) -> Vec<SearchScope> {
     labels
         .iter()
-        .filter_map(|label| resolve_scope(label, paths, omitted))
+        .filter_map(|label| resolve_scope(label, paths, scope_roots, request, omitted))
         .collect()
 }
 
 fn resolve_scope(
     label: &str,
     paths: &AppPaths,
+    scope_roots: &ReviewedScopeRoots,
+    request: &BridgePlanSearchRequest,
     omitted: &mut FileCandidateOmitted,
 ) -> Option<SearchScope> {
-    let home = home_dir();
-    let root = match label {
-        "downloads" => home.as_ref().map(|home| home.join("Downloads")),
-        "desktop" => home.as_ref().map(|home| home.join("Desktop")),
-        "documents" => home.as_ref().map(|home| home.join("Documents")),
-        "pastey_shared" => Some(paths.app_data_dir.join("shared")),
-        _ => None,
+    let known_folder_resolved = matches!(label, "downloads" | "desktop" | "documents")
+        && scope_roots.root_for(label).is_some();
+    let root = if label == "pastey_shared" {
+        Some(paths.app_data_dir.join("shared"))
+    } else {
+        scope_roots.root_for(label)
     };
     let display_prefix = match label {
         "downloads" => "~/Downloads",
@@ -409,12 +453,15 @@ fn resolve_scope(
     };
     let Some(root) = root else {
         omitted.scopes_skipped.push(label.to_string());
+        log_search_scope(request, "search_scope_unavailable", label, known_folder_resolved, "known_folder_unavailable");
         return None;
     };
     if !root.is_dir() {
         omitted.scopes_skipped.push(label.to_string());
+        log_search_scope(request, "search_scope_unavailable", label, known_folder_resolved, "scope_not_directory");
         return None;
     }
+    log_search_scope(request, "search_scope_resolved", label, known_folder_resolved, "resolved");
     Some(SearchScope {
         label: label.to_string(),
         display_prefix: display_prefix.to_string(),
@@ -422,10 +469,21 @@ fn resolve_scope(
     })
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+fn log_search_scope(
+    request: &BridgePlanSearchRequest,
+    stage: &str,
+    label: &str,
+    known_folder_resolved: bool,
+    code: &str,
+) {
+    logging::write_transfer_line(&format!(
+        "[pastey bridge-plan-search] stage={stage} request_id={} room_ref={} scope={} known_folder_resolved={} platform={} code={code}",
+        request.request_id,
+        request.room_ref,
+        label,
+        known_folder_resolved,
+        std::env::consts::OS,
+    ));
 }
 
 fn is_hidden_path(path: &Path, root: &Path) -> bool {
@@ -923,4 +981,120 @@ fn parse_time(value: &str) -> AppResult<OffsetDateTime> {
 
 fn looks_like_path(value: &str) -> bool {
     value.starts_with('/') || value.contains('\\') || value.contains('/')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_paths() -> AppPaths {
+        let root = std::env::temp_dir().join(format!(
+            "pastey-bridge-plan-search-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        AppPaths {
+            app_data_dir: root.clone(),
+            db_path: root.join("db.sqlite"),
+            payloads_dir: root.join("payloads"),
+            inbox_dir: root.join("inbox"),
+            temp_dir: root.join("temp"),
+            logs_dir: root.join("logs"),
+            config_path: root.join("config.json"),
+        }
+    }
+
+    fn request(scopes: Vec<&str>, filename_hint: &str) -> BridgePlanSearchRequest {
+        BridgePlanSearchRequest {
+            request_id: "request".into(),
+            room_ref: "bridge".into(),
+            requester_device_ref: "requester".into(),
+            receiver_device_ref: "receiver".into(),
+            filename_hint: filename_hint.into(),
+            extensions: vec!["pdf".into()],
+            safe_scope_labels: scopes.into_iter().map(str::to_owned).collect(),
+            expires_at: (OffsetDateTime::now_utc() + time::Duration::minutes(1))
+                .format(&Rfc3339)
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn redirected_windows_downloads_root_stays_bound_to_downloads() {
+        let paths = test_paths();
+        let redirected = paths.app_data_dir.join("OneDrive").join("Downloads");
+        fs::create_dir_all(&redirected).unwrap();
+        let roots = ReviewedScopeRoots {
+            downloads: Some(redirected.clone()),
+            ..Default::default()
+        };
+        let mut omitted = FileCandidateOmitted {
+            too_many_matches: false,
+            hidden_files_skipped: false,
+            symlinks_skipped: false,
+            scopes_skipped: Vec::new(),
+        };
+        let scope = resolve_scope("downloads", &paths, &roots, &request(vec!["downloads"], "report.pdf"), &mut omitted)
+            .unwrap();
+        assert_eq!(scope.root, redirected);
+        assert!(omitted.scopes_skipped.is_empty());
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
+
+    #[test]
+    fn unavailable_scope_does_not_block_another_reviewed_scope() {
+        let paths = test_paths();
+        let desktop = paths.app_data_dir.join("redirected-desktop");
+        fs::create_dir_all(&desktop).unwrap();
+        let roots = ReviewedScopeRoots {
+            desktop: Some(desktop),
+            ..Default::default()
+        };
+        let (result, _) = execute_bridge_plan_search_internal_with_roots(
+            request(vec!["downloads", "desktop"], "missing.pdf"),
+            &paths,
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(result.status, "completed");
+        assert!(result.candidates.is_empty());
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
+
+    #[test]
+    fn missing_all_reviewed_scopes_returns_the_safe_failure_code() {
+        let paths = test_paths();
+        let (result, _) = execute_bridge_plan_search_internal_with_roots(
+            request(vec!["downloads"], "missing.pdf"),
+            &paths,
+            &ReviewedScopeRoots::default(),
+        )
+        .unwrap();
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.error_code.as_deref(), Some("no_searchable_scopes"));
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
+
+    #[test]
+    fn matching_filename_is_case_insensitive_and_public_result_has_no_private_path() {
+        let paths = test_paths();
+        let downloads = paths.app_data_dir.join("private-root").join("Downloads");
+        fs::create_dir_all(&downloads).unwrap();
+        fs::write(downloads.join("INFO2222-2026-PD.PDF"), b"pdf").unwrap();
+        let roots = ReviewedScopeRoots {
+            downloads: Some(downloads.clone()),
+            ..Default::default()
+        };
+        let (result, _) = execute_bridge_plan_search_internal_with_roots(
+            request(vec!["downloads"], "info2222-2026-pd.pdf"),
+            &paths,
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].match_reason, "filename_case_insensitive_match");
+        assert!(!serde_json::to_string(&result).unwrap().contains(&downloads.display().to_string()));
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
 }

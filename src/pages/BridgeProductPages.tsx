@@ -118,6 +118,27 @@ function bridgePlanControlErrorMessage(error: unknown, action: "review" | "decis
     : "The plan decision could not be sent. Refresh the Bridge and try again.";
 }
 
+function bridgePlanSearchErrorMessage(error: unknown): string {
+  if (bridgeRouteErrorCodeFromMessage(error)) return formatBridgeRouteErrorForUser(error);
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  if (message.includes("no_searchable_scopes")) {
+    return "No approved folder is available to search on this device. Check the reviewed Downloads, Desktop, Documents, or Pastey Shared folder, then start a new approved attempt.";
+  }
+  if (message.includes("Invalid file candidate filename")) {
+    return "This approved Search has an invalid filename request. Create a new plan using a filename only.";
+  }
+  if (message.includes("search_timeout")) {
+    return "The approved Search timed out. Narrow the filename or reviewed locations, then start a new approved attempt.";
+  }
+  if (message.includes("delivery failed") || message.includes("delivery timed out")) {
+    return "Search finished locally but the result could not be delivered. Confirm the requester is still connected, then start a new approved attempt.";
+  }
+  if (message.includes("Search execution grant") || message.includes("Bridge Plan attempt missing")) {
+    return "This approved Search is no longer available on this device. Refresh the Bridge and start a new approved attempt.";
+  }
+  return "The approved Search could not be completed. Check the reviewed folders and Bridge connection, then start a new approved attempt.";
+}
+
 interface BridgePageProps {
   rooms: RoomInfo[];
   roomItems: RoomItem[];
@@ -808,7 +829,7 @@ function BridgePlanReceiverPanel({
       onRefresh();
     } catch (error) {
       setRunningAttempts((current) => ({ ...current, [attempt.attemptId]: "failed" }));
-      setMessage(error instanceof Error ? error.message : "The approved search could not be completed.");
+      setMessage(bridgePlanSearchErrorMessage(error));
     }
   }
 

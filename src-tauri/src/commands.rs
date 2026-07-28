@@ -90,6 +90,20 @@ fn log_bridge_plan_control(event: &Value, stage: &str) {
     ));
 }
 
+fn log_bridge_plan_search_attempt(
+    stage: &str,
+    room_id: &str,
+    attempt_id: &str,
+    code: &str,
+    candidate_count: Option<usize>,
+) {
+    logging::write_transfer_line(&format!(
+        "[pastey bridge-plan-search] stage={stage} bridge_id={room_id} attempt_id={attempt_id} platform={} code={code} candidate_count={}",
+        std::env::consts::OS,
+        candidate_count.map(|count| count.to_string()).unwrap_or_else(|| "unknown".into()),
+    ));
+}
+
 
 /// Renderer-provided intent for a file Search. Device bindings, immutable
 /// revision shape, and authority stay Host-owned.
@@ -1844,9 +1858,26 @@ pub async fn start_bridge_plan_attempt(
     }
     let event = bridge_plan_control_event(event_kind, payload, &context)
         .map_err(|error| error.message())?;
-    crate::room_control::send_room_control_event(state, &context.room_id, event, bridge_route)
+    log_bridge_plan_control(&event, "attempt_start_dispatch");
+    let receipt = match crate::room_control::send_room_control_event(
+        state.clone(),
+        &context.room_id,
+        event.clone(),
+        bridge_route,
+    )
         .await
-        .map_err(|error| error.message())
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            log_bridge_plan_control(&event, "attempt_start_delivery_failed");
+            return Err(error.message());
+        }
+    };
+    log_bridge_plan_control(&event, "attempt_start_delivered");
+    bridge_plan::record_outbound_protocol_event(&state.paths, event_kind, &event, now)
+        .map_err(|error| error.message())?;
+    log_bridge_plan_control(&event, "attempt_start_correlated");
+    Ok(receipt)
 }
 
 /// Sends the requester-selected bounded Search candidate back to the selected
@@ -2141,19 +2172,61 @@ pub async fn execute_bridge_plan_search_attempt(
 ) -> Result<(), String> {
     let state = state.inner().clone();
     let now = storage::now_ts();
-    let grant = bridge_plan::consume_search_execution_grant(
+    log_bridge_plan_search_attempt(
+        "search_attempt_started",
+        &room_id,
+        &attempt_id,
+        "started",
+        None,
+    );
+    let grant = match bridge_plan::consume_search_execution_grant(
         &state.paths,
         &state.bridge_plan_protocol_authority.lock(),
         &room_id,
         &attempt_id,
         now,
     )
-    .map_err(|error| error.message())?;
+    {
+        Ok(grant) => grant,
+        Err(error) => {
+            log_bridge_plan_search_attempt(
+                "search_execution_failed",
+                &room_id,
+                &attempt_id,
+                "grant_unavailable",
+                None,
+            );
+            return Err(error.message());
+        }
+    };
+    log_bridge_plan_search_attempt(
+        "search_grant_consumed",
+        &room_id,
+        &attempt_id,
+        "consumed",
+        None,
+    );
     let context = crate::room_control::room_control_session_context(&state, &room_id)
-        .map_err(|error| error.message())?;
+        .map_err(|error| {
+            log_bridge_plan_search_attempt(
+                "search_execution_failed",
+                &room_id,
+                &attempt_id,
+                "room_control_context_unavailable",
+                None,
+            );
+            error.message()
+        })?;
     if context.local_session_ref != grant.receiver_device_ref
         || context.peer_session_ref != grant.requester_device_ref
     {
+        log_bridge_plan_search_attempt(
+            "search_execution_failed",
+            &room_id,
+            &attempt_id,
+            "requester_session_changed",
+            None,
+        );
         return Err("The requester session changed before Search could run.".into());
     }
     let send = |kind: &str, payload: Value| {
@@ -2173,7 +2246,16 @@ pub async fn execute_bridge_plan_search_attempt(
         bridge_route.clone(),
     )
     .await
-    .map_err(|error| error.message())?;
+    .map_err(|error| {
+        log_bridge_plan_search_attempt(
+            "search_execution_failed",
+            &room_id,
+            &attempt_id,
+            "attempt_ack_delivery_failed",
+            None,
+        );
+        error.message()
+    })?;
     let progress = send(
         "bridge_plan.step_progress",
         bridge_plan::attempt_update_payload(&grant, "bridge_plan.step_progress", None, None)
@@ -2187,7 +2269,16 @@ pub async fn execute_bridge_plan_search_attempt(
         bridge_route.clone(),
     )
     .await
-    .map_err(|error| error.message())?;
+    .map_err(|error| {
+        log_bridge_plan_search_attempt(
+            "search_execution_failed",
+            &room_id,
+            &attempt_id,
+            "progress_delivery_failed",
+            None,
+        );
+        error.message()
+    })?;
     let created = OffsetDateTime::now_utc();
     let request = BridgePlanSearchRequest {
         request_id: format!("bridge-plan-request-{}", grant.attempt_id),
@@ -2208,8 +2299,28 @@ pub async fn execute_bridge_plan_search_attempt(
             &state.paths,
             &mut candidates,
         )
-        .map_err(|error| error.message())?
+        .map_err(|error| {
+            log_bridge_plan_search_attempt(
+                "search_execution_failed",
+                &room_id,
+                &attempt_id,
+                "search_request_invalid",
+                None,
+            );
+            error.message()
+        })?
     };
+    log_bridge_plan_search_attempt(
+        if result.status == "completed" {
+            "search_execution_completed"
+        } else {
+            "search_execution_failed"
+        },
+        &room_id,
+        &attempt_id,
+        result.error_code.as_deref().unwrap_or("completed"),
+        Some(result.candidates.len()),
+    );
     let (kind, payload) = if result.status == "completed" {
         (
             "bridge_plan.step_result",
@@ -2231,7 +2342,23 @@ pub async fn execute_bridge_plan_search_attempt(
     let terminal = send(kind, payload).map_err(|error| error.message())?;
     crate::room_control::send_room_control_event(state, &room_id, terminal, bridge_route)
         .await
-        .map_err(|error| error.message())?;
+        .map_err(|error| {
+            log_bridge_plan_search_attempt(
+                "search_execution_failed",
+                &room_id,
+                &attempt_id,
+                "result_delivery_failed",
+                Some(result.candidates.len()),
+            );
+            error.message()
+        })?;
+    log_bridge_plan_search_attempt(
+        "search_result_delivered",
+        &room_id,
+        &attempt_id,
+        result.error_code.as_deref().unwrap_or("completed"),
+        Some(result.candidates.len()),
+    );
     Ok(())
 }
 
