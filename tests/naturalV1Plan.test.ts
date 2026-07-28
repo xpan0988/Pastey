@@ -31,3 +31,30 @@ test("explicit Search planning falls back locally when no cloud provider is conf
   assert.equal(generated.parsedPlan.steps[0]?.primitive, "Search");
   assert.equal(isSupportedBridgePlanSubmission(generated.parsedPlan), true);
 });
+
+test("Windows Downloads paths narrow Search to the reviewed scope and basename", () => {
+  const plan = buildDeterministicAskBridgeNaturalV1Plan(
+    "Find C:\\Users\\admin\\Downloads\\INFO2222-2026-PD.pdf on the selected device.",
+  );
+  const search = plan.steps[0];
+
+  assert.deepEqual(search, {
+    primitive: "Search",
+    filenameHint: "INFO2222-2026-PD.pdf",
+    extensions: ["pdf"],
+    safeScopes: ["downloads"],
+  });
+  assert.equal(validateAskBridgeNaturalV1Plan(plan).valid, true);
+});
+
+test("an arbitrary absolute path never becomes Search authority", () => {
+  const plan = buildDeterministicAskBridgeNaturalV1Plan(
+    "Find C:\\Sensitive\\Payroll\\report.pdf on the selected device.",
+  );
+  const search = plan.steps[0];
+  assert.equal(search.primitive, "Search");
+  assert.equal(search.filenameHint, "report.pdf");
+  assert.deepEqual(search.safeScopes, ["downloads", "desktop", "documents", "pastey_shared"]);
+  assert.equal(JSON.stringify(plan).includes("Sensitive"), false);
+  assert.equal(JSON.stringify(plan).includes("C:\\"), false);
+});
