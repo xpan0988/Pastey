@@ -81,6 +81,66 @@ fn log_bridge_plan_control_event(event: &ValidatedControlEvent, stage: &str) {
     ));
 }
 
+/// Records only identifiers and a bounded reason code for an event rejected
+/// before it can enter the Bridge Plan inbox.  The decrypted event body can
+/// contain user-visible plan text, so it must never be logged here.
+fn log_bridge_plan_validation_rejected(event: &Value, reason: &str) {
+    let field = |object: &Value, name: &str| {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let payload = event.get("payload").unwrap_or(event);
+    logging::write_transfer_line(&format!(
+        "[pastey bridge-plan-control] stage=inbound_protocol_rejected reason={reason} kind={} event_id={} bridge_id={} plan_id={} revision_id={} approval_id={} revision_hash={} source_session={} target_session={}",
+        field(event, "kind"),
+        field(event, "eventId"),
+        field(payload, "bridgeId"),
+        field(payload, "planId"),
+        field(payload, "revisionId"),
+        field(payload, "approvalId"),
+        field(payload, "revisionHash"),
+        field(event, "sourceDeviceRef"),
+        field(event, "targetPeerRef"),
+    ));
+}
+
+fn bridge_plan_validation_reason(message: &str) -> &'static str {
+    if message.contains("review revision mismatch") {
+        "review_revision_hash_mismatch"
+    } else if message.contains("review step digest mismatch") || message.contains("review step mismatch") {
+        "review_step_digest_mismatch"
+    } else if message.contains("review expiry") {
+        "review_expiry_invalid"
+    } else if message.contains("expired") {
+        "review_expired"
+    } else if message.contains("session mismatch") || message.contains("sender or receiver mismatch") {
+        "review_session_mismatch"
+    } else {
+        "review_payload_invalid"
+    }
+}
+
+fn bridge_plan_protocol_rejection_reason(error: &AppError) -> &'static str {
+    let message = error.message();
+    if message.contains("review not found") || message.contains("receiver review missing") {
+        "review_unknown_approval"
+    } else if message.contains("revision mismatch") {
+        "review_revision_hash_mismatch"
+    } else if message.contains("step digest") || message.contains("step mismatch") {
+        "review_step_digest_mismatch"
+    } else if message.contains("expired") {
+        "review_expired"
+    } else if message.contains("session") || message.contains("sender") || message.contains("receiver") {
+        "review_session_mismatch"
+    } else {
+        "review_payload_invalid"
+    }
+}
+
 const UNSAFE_FIELDS: &[&str] = &[
     "command",
     "cmd",
@@ -800,7 +860,7 @@ pub async fn receive_room_control_event_handler(
         }
     };
     let validated = match validate_control_event(
-        event,
+        event.clone(),
         &room_id,
         &session_ref(&inbound_peer.transport_public_key),
         &session_ref(&local_key),
@@ -808,6 +868,13 @@ pub async fn receive_room_control_event_handler(
     ) {
         Ok(value) => value,
         Err(AppError::InvalidInput(message)) if message.contains("expired") => {
+            if event
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("bridge_plan."))
+            {
+                log_bridge_plan_validation_rejected(&event, bridge_plan_validation_reason(&message));
+            }
             return control_error(
                 StatusCode::GONE,
                 "event_expired",
@@ -815,11 +882,33 @@ pub async fn receive_room_control_event_handler(
             )
         }
         Err(AppError::InvalidInput(message)) if message.contains("session mismatch") => {
+            if event
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("bridge_plan."))
+            {
+                log_bridge_plan_validation_rejected(&event, bridge_plan_validation_reason(&message));
+            }
             return control_error(
                 StatusCode::FORBIDDEN,
                 "session_mismatch",
                 "Room control session mismatch.",
             )
+        }
+        Err(AppError::InvalidInput(message)) => {
+            let reason = bridge_plan_validation_reason(&message);
+            if event
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("bridge_plan."))
+            {
+                log_bridge_plan_validation_rejected(&event, reason);
+            }
+            return control_error(
+                StatusCode::BAD_REQUEST,
+                reason,
+                "Bridge Plan review validation failed.",
+            );
         }
         Err(_) => {
             return control_error(
@@ -830,21 +919,20 @@ pub async fn receive_room_control_event_handler(
         }
     };
     log_bridge_plan_control_event(&validated, "inbound_validated");
-    if crate::bridge_plan::accept_inbound_protocol_event(
+    if let Err(error) = crate::bridge_plan::accept_inbound_protocol_event(
         &ctx.state.paths,
         &ctx.state.bridge_plan_protocol_authority.lock(),
         &mut ctx.state.bridge_plan_candidate_store.lock(),
         &validated.kind,
         &validated.event,
         storage::now_ts(),
-    )
-    .is_err()
-    {
-        log_bridge_plan_control_event(&validated, "inbound_protocol_rejected");
+    ) {
+        let reason = bridge_plan_protocol_rejection_reason(&error);
+        log_bridge_plan_validation_rejected(&validated.event, reason);
         return control_error(
             StatusCode::BAD_REQUEST,
-            "invalid_event",
-            "Invalid room control event.",
+            reason,
+            "Bridge Plan review validation failed.",
         );
     }
     let received_at = now_iso();
@@ -1119,6 +1207,24 @@ async fn control_response_failure(response: reqwest::Response) -> AppError {
         Some("inbox_full") => "Room control inbox is full.",
         Some("rate_limited") => "Room control rate limit was reached.",
         Some("request_too_large" | "event_too_large") => "Room control event is too large.",
+        Some("review_revision_hash_mismatch") => {
+            "Bridge Plan review validation failed: review_revision_hash_mismatch."
+        }
+        Some("review_step_digest_mismatch") => {
+            "Bridge Plan review validation failed: review_step_digest_mismatch."
+        }
+        Some("review_session_mismatch") => {
+            "Bridge Plan review validation failed: review_session_mismatch."
+        }
+        Some("review_unknown_approval") => {
+            "Bridge Plan review validation failed: review_unknown_approval."
+        }
+        Some("review_expiry_invalid" | "review_expired") => {
+            "Bridge Plan review validation failed: review_expired."
+        }
+        Some("review_payload_invalid") => {
+            "Bridge Plan review validation failed: review_payload_invalid."
+        }
         Some("invalid_event" | "invalid_envelope" | "invalid_request") => {
             "Room control event validation failed."
         }
@@ -1604,6 +1710,60 @@ mod tests {
         };
         assert!(error.contains("Unsupported room control event kind."));
     }
+
+    #[test]
+    fn windows_search_review_envelope_is_validated_before_inbox_persistence() {
+        let now = OffsetDateTime::now_utc();
+        let revision = crate::bridge_plan::build_file_search_revision(
+            "room".into(),
+            "source".into(),
+            "target".into(),
+            r"Find C:\Users\admin\Downloads\INFO2222-2026-PD.pdf".into(),
+            "INFO2222-2026-PD.pdf".into(),
+            vec!["pdf".into()],
+            vec!["downloads".into()],
+        )
+        .unwrap();
+        let approval = crate::bridge_plan::BridgePlanApproval {
+            approval_id: "approval".into(),
+            plan_id: revision.plan_id.clone(),
+            revision_id: revision.revision_id.clone(),
+            revision_hash: revision.revision_hash.clone(),
+            bridge_id: revision.bridge_id.clone(),
+            requester_device_ref: "source".into(),
+            selected_device_ref: "target".into(),
+            receiver_required: true,
+            // The requester may be one second ahead of the receiver. A
+            // one-day immutable review must not become invalid at that
+            // boundary solely because of ordinary device clock skew.
+            expires_at: now.unix_timestamp() + (24 * 60 * 60) + 1,
+        };
+        let event = serde_json::json!({
+            "schemaVersion": ROOM_CONTROL_SCHEMA,
+            "eventId": "event",
+            "kind": "bridge_plan.review_request",
+            "protocolFamily": BRIDGE_PLAN_PROTOCOL_FAMILY,
+            "roomRef": "room",
+            "sourceDeviceRef": "source",
+            "targetPeerRef": "target",
+            "createdAt": now.format(&Rfc3339).unwrap(),
+            "expiresAt": (now + time::Duration::seconds(60)).format(&Rfc3339).unwrap(),
+            "previewOnly": false,
+            "payload": crate::bridge_plan::review_request_payload(&approval, &revision).unwrap(),
+        });
+
+        assert!(validate_control_event(event.clone(), "room", "source", "target", now).is_ok());
+
+        let mut beyond_clock_skew = event;
+        beyond_clock_skew["payload"]["reviewExpiresAt"] =
+            Value::Number((now.unix_timestamp() + (24 * 60 * 60) + (5 * 60) + 1).into());
+        let error = match validate_control_event(beyond_clock_skew, "room", "source", "target", now) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("review expiry beyond permitted clock skew must be rejected"),
+        };
+        assert!(error.contains("review expiry"));
+    }
+
 
 
 }

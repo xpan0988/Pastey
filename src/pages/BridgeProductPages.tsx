@@ -108,6 +108,29 @@ function bridgePlanControlErrorMessage(error: unknown, action: "review" | "decis
   if (message.includes("Peer is unavailable") || message.includes("delivery failed") || message.includes("delivery timed out")) {
     return "The selected device is not reachable for Bridge review. Confirm that both devices are connected to the same active Bridge, then try again.";
   }
+  if (message.includes("review_expired")) {
+    return action === "review"
+      ? "This review request expired before the selected device could accept it. Create a new plan and send it again."
+      : "This review decision arrived after the request expired. Create a new plan and send a new review request.";
+  }
+  if (message.includes("review_session_mismatch")) {
+    return "The selected device reconnected or the Bridge session changed. Refresh the Bridge, select its current session, and create a new plan.";
+  }
+  if (message.includes("review_revision_hash_mismatch") || message.includes("review_step_digest_mismatch")) {
+    return action === "review"
+      ? "The selected device rejected a mismatched immutable plan. Refresh the Bridge and create a new plan."
+      : "The requester rejected a mismatched immutable plan decision. Refresh the Bridge and send a new review request.";
+  }
+  if (message.includes("review_unknown_approval")) {
+    return action === "review"
+      ? "The selected device no longer has this approved review request. Create a new plan and send it again."
+      : "The requester no longer has this approved review request. Refresh the Bridge and send a new review request.";
+  }
+  if (message.includes("review_payload_invalid")) {
+    return action === "review"
+      ? "The selected device rejected an invalid review request. Refresh the Bridge and create a new plan."
+      : "The requester rejected an invalid review decision. Refresh the Bridge and send a new review request.";
+  }
   if (message.includes("event validation failed") || message.includes("Bridge Plan review not found") || message.includes("receiver review")) {
     return action === "review"
       ? "The selected device could not validate this review request. Refresh the Bridge and create a new plan."
