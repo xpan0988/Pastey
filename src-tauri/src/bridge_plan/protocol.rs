@@ -23,6 +23,14 @@ use crate::{
 
 pub(crate) const PROTOCOL_VERSION: &str = "pastey-bridge-plan-protocol-v1";
 const MAX_LIFETIME: i64 = 24 * 60 * 60;
+// A review expiry is generated on one device and compared against the other
+// device's wall clock. Keep immutable authority bounded, but permit ordinary
+// LAN clock skew rather than rejecting an otherwise exact one-day review.
+const MAX_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
+
+fn protocol_expiry_is_valid(expires: i64, now: i64) -> bool {
+    expires > now && expires <= now + MAX_LIFETIME + MAX_CLOCK_SKEW_SECONDS
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProtocolMetadata {
@@ -1593,7 +1601,7 @@ fn review(value: &Map<String, Value>, common: &Common, now: i64) -> AppResult<Re
         return invalid("Bridge Plan review step digest mismatch.");
     }
     let expires = integer(value, "reviewExpiresAt")?;
-    if expires <= now || expires > now + MAX_LIFETIME {
+    if !protocol_expiry_is_valid(expires, now) {
         return invalid("Bridge Plan review expiry is invalid.");
     }
     Ok(Review {
@@ -1652,8 +1660,7 @@ fn decision(value: &Map<String, Value>, common: &Common, now: i64) -> AppResult<
     };
     let expires = integer(value, "reviewExpiresAt")?;
     let reviewed = integer(value, "reviewedAt")?;
-    if expires <= now
-        || expires > now + MAX_LIFETIME
+    if !protocol_expiry_is_valid(expires, now)
         || reviewed <= 0
         || string(value, "attestationVersion", 128)? != PROTOCOL_VERSION
     {
@@ -1710,7 +1717,7 @@ fn start(value: &Map<String, Value>, common: &Common, now: i64) -> AppResult<Att
         return invalid("Bridge Plan attempt digest mismatch.");
     }
     let expires = integer(value, "attemptExpiresAt")?;
-    if expires <= now || expires > now + MAX_LIFETIME {
+    if !protocol_expiry_is_valid(expires, now) {
         return invalid("Bridge Plan attempt expiry is invalid.");
     }
     Ok(Attempt {
@@ -1760,7 +1767,7 @@ fn transfer_start(value: &Map<String, Value>, common: &Common, now: i64) -> AppR
         return invalid("Bridge Plan Transfer digest mismatch.");
     }
     let expires = integer(value, "attemptExpiresAt")?;
-    if expires <= now || expires > now + MAX_LIFETIME {
+    if !protocol_expiry_is_valid(expires, now) {
         return invalid("Bridge Plan Transfer expiry is invalid.");
     }
     Ok(Attempt {
@@ -1810,7 +1817,7 @@ fn transform_start(value: &Map<String, Value>, common: &Common, now: i64) -> App
         return invalid("Bridge Plan Transform digest mismatch.");
     }
     let expires = integer(value, "attemptExpiresAt")?;
-    if expires <= now || expires > now + MAX_LIFETIME {
+    if !protocol_expiry_is_valid(expires, now) {
         return invalid("Bridge Plan Transform expiry is invalid.");
     }
     Ok(Attempt {
