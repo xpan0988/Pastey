@@ -69,7 +69,16 @@ import {
   type AiGenerateResult,
 } from "../lib/ai";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
-import { formatBytes, formatCode, formatTimestamp } from "../lib/format";
+import { formatCode, formatTimestamp } from "../lib/format";
+import {
+  bridgePlanSearchCandidateMode,
+  candidateMetadata,
+  parseBridgePlanSearchCandidates,
+  parseBridgePlanSearchTerminalResult,
+  selectedBridgePlanCandidateId,
+  terminalSearchPresentation,
+  type BridgePlanSearchCandidate,
+} from "../lib/bridgePlanSearchResults";
 import type { TransferQueueInput, TransferQueueItem } from "../lib/transferScheduler";
 import type {
   FileTransferProgressEvent,
@@ -1002,6 +1011,16 @@ function BridgePlanSenderPanel({
     () => inboxEvents.flatMap(parseBridgePlanSearchCandidates).filter((entry) => !attemptId || entry.attemptId === attemptId),
     [attemptId, inboxEvents],
   );
+  const terminalSearchResult = useMemo(
+    () => inboxEvents
+      .flatMap((event) => {
+        const result = parseBridgePlanSearchTerminalResult(event);
+        return result ? [result] : [];
+      })
+      .find((entry) => entry.attemptId === attemptId) ?? null,
+    [attemptId, inboxEvents],
+  );
+  const candidateMode = bridgePlanSearchCandidateMode(advisory?.steps.map((step) => step.primitive) ?? []);
   const transformedAttemptIds = useMemo(
     () => new Set(inboxEvents.flatMap(parseCompletedBridgePlanTransform)),
     [inboxEvents],
@@ -1063,6 +1082,14 @@ function BridgePlanSenderPanel({
       if (timeout !== null) window.clearTimeout(timeout);
     };
   }, [approvalId, room.id]);
+
+  useEffect(() => {
+    if (!terminalSearchResult) return;
+    const presentation = terminalSearchPresentation(terminalSearchResult);
+    setApprovalState(presentation.status);
+    setResultSummary(presentation.summary);
+    setMessage(null);
+  }, [terminalSearchResult]);
 
   async function createPlan() {
     if (!canPlan || !selectedPeerRoute) {
@@ -1133,7 +1160,10 @@ function BridgePlanSenderPanel({
       setApprovalId(null);
       setApprovalState(null);
       setResultSummary(null);
+      setAttemptId(null);
+      setSelectedCandidateId(null);
       setHasTransform(supportsTransform);
+      setDirectTransfer(false);
       setMessage(supportsTransform
         ? supportsTransfer ? "Plan ready. Review the complete Search, Transform, and Transfer plan before sending it to the selected device." : "Plan ready. Review the complete Search and Transform plan before sending it to the selected device."
         : supportsTransfer ? "Plan ready. Review the complete Search and Transfer plan before sending it to the selected device." : "Plan ready. Review the complete Search plan before sending it to the selected device.");
@@ -1200,6 +1230,7 @@ function BridgePlanSenderPanel({
         attemptId,
         bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"),
       );
+      setAttemptId(attemptId);
       setApprovalState("running");
       if (directTransfer) {
         await executeDirectBridgePlanTransferAttempt(room.id, attemptId);
@@ -1305,16 +1336,25 @@ function BridgePlanSenderPanel({
       {approvalState === "awaiting_receiver" ? <p className="muted">Waiting for receiver review.</p> : null}
       {approvalState === "denied" ? <p className="danger-text">The selected device denied this plan. Create a revised plan to try again.</p> : null}
       {approvalState === "running" ? <p className="muted">Search is running on the selected device.</p> : null}
-      {resultSummary ? <p className="success-text">{resultSummary}</p> : null}
-      {safeSearchCandidates.length > 0 && advisory?.steps.some((step) => step.primitive === "Transfer" || step.primitive === "Transform") && !selectedCandidateId ? (
+      {resultSummary && terminalSearchResult?.candidateCount !== 0 ? <p className="success-text">{resultSummary}</p> : null}
+      {terminalSearchResult?.candidateCount === 0 ? (
+        <div className="request-file-preview">
+          <h3>Search results</h3>
+          <p className="success-text">Search completed with no matching files.</p>
+        </div>
+      ) : null}
+      {safeSearchCandidates.length > 0 && (candidateMode === "result" || !selectedCandidateId) ? (
         <div className="candidate-card-list">
-          <h3>Choose a file for the approved next step</h3>
+          <h3>{candidateMode === "selectable" ? "Choose a file for the approved next step" : "Search results on the selected device"}</h3>
+          {candidateMode === "result" ? <p className="muted">These matching files remain on the selected device.</p> : null}
           {safeSearchCandidates.map((candidate) => (
-            <button key={candidate.candidateId} type="button" className="candidate-metadata-card" disabled={busy !== null} onClick={() => void selectCandidate(candidate.candidateId)}>
-              <strong>{candidate.displayName}</strong>
-              <span>{formatBytes(candidate.sizeBytes)} · {candidate.extension || candidate.mimeFamily}</span>
-              <small>{candidate.matchReason}</small>
-            </button>
+            <SearchCandidateCard
+              key={candidate.candidateId}
+              candidate={candidate}
+              selectable={candidateMode === "selectable"}
+              disabled={busy !== null}
+              onSelect={candidateMode === "selectable" ? () => void selectCandidate(selectedBridgePlanCandidateId(candidate)) : undefined}
+            />
           ))}
         </div>
       ) : null}
@@ -1326,6 +1366,36 @@ function BridgePlanSenderPanel({
       ) : null}
       {message ? <p className="muted" role="status">{message}</p> : null}
     </Card>
+  );
+}
+
+function SearchCandidateCard({
+  candidate,
+  selectable,
+  disabled,
+  onSelect,
+}: {
+  candidate: BridgePlanSearchCandidate;
+  selectable: boolean;
+  disabled: boolean;
+  onSelect?: () => void;
+}) {
+  const metadata = candidateMetadata(candidate);
+  const contents = <>
+    <strong>{candidate.displayName}</strong>
+    <span>{metadata.size} · {metadata.fileType}</span>
+    {metadata.redactedLocation ? <small>Location: {metadata.redactedLocation}</small> : null}
+    {metadata.modifiedAt ? <small>Modified: {metadata.modifiedAt}</small> : null}
+    <small>{metadata.matchReason}{metadata.confidence ? ` · ${metadata.confidence} confidence` : ""}</small>
+  </>;
+  return selectable ? (
+    <button type="button" className="candidate-metadata-card" disabled={disabled} onClick={onSelect}>
+      {contents}
+    </button>
+  ) : (
+    <article className="candidate-metadata-card search-result-card" data-testid="bridge-plan-search-result-card">
+      {contents}
+    </article>
   );
 }
 
@@ -1456,41 +1526,6 @@ function parseFailedBridgePlanTransform(event: ReceivedRoomControlEvent): string
   if (event.kind !== "bridge_plan.step_failed") return [];
   const payload = roomControlEventPayload(event.event);
   return payload?.stepId === "transform" && typeof payload.attemptId === "string" ? [payload.attemptId] : [];
-}
-
-function parseBridgePlanSearchCandidates(event: ReceivedRoomControlEvent): Array<{
-  attemptId: string;
-  candidateId: string;
-  displayName: string;
-  extension: string;
-  mimeFamily: string;
-  sizeBytes: number;
-  matchReason: string;
-}> {
-  if (event.kind !== "bridge_plan.step_result") return [];
-  const payload = roomControlEventPayload(event.event);
-  const attemptId = typeof payload?.attemptId === "string" ? payload.attemptId : null;
-  const safeResult = isRecord(payload?.safeResult) ? payload.safeResult : null;
-  const candidates = Array.isArray(safeResult?.candidates) ? safeResult.candidates : [];
-  if (!attemptId) return [];
-  return candidates.flatMap((candidate) => {
-    if (!isRecord(candidate)
-      || typeof candidate.candidateId !== "string"
-      || typeof candidate.displayName !== "string"
-      || typeof candidate.extension !== "string"
-      || typeof candidate.mimeFamily !== "string"
-      || typeof candidate.sizeBytes !== "number"
-      || typeof candidate.matchReason !== "string") return [];
-    return [{
-      attemptId,
-      candidateId: candidate.candidateId,
-      displayName: candidate.displayName,
-      extension: candidate.extension,
-      mimeFamily: candidate.mimeFamily,
-      sizeBytes: candidate.sizeBytes,
-      matchReason: candidate.matchReason,
-    }];
-  });
 }
 
 function roomControlEventPayload(event: unknown): Record<string, unknown> | null {
