@@ -599,7 +599,7 @@ p {
   text-align: left;
 }
 
-.candidate-metadata-card:hover,
+button.candidate-metadata-card:hover,
 .candidate-metadata-card.selected {
   border-color: rgba(31, 111, 255, 0.48);
   background: #edf5ff;
