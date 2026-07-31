@@ -171,6 +171,33 @@ function bridgePlanSearchErrorMessage(error: unknown): string {
   return "The approved Search could not be completed. Check the reviewed folders and Bridge connection, then start a new approved attempt.";
 }
 
+function bridgePlanTransferErrorMessage(error: unknown): string {
+  if (bridgeRouteErrorCodeFromMessage(error)) return formatBridgeRouteErrorForUser(error);
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  if (message.includes("attempt_missing") || message.includes("attempt_correlation_mismatch")) {
+    return "The requester could not confirm this approved Transfer attempt. Create a new approved plan and try again.";
+  }
+  if (message.includes("candidate_changed")) {
+    return "The selected file changed after Search completed. Start a new approved plan to search it again.";
+  }
+  if (message.includes("candidate_unavailable") || message.includes("candidate is unavailable")) {
+    return "The selected Search result is no longer available on this device. Start a new approved plan.";
+  }
+  if (message.includes("route_unavailable") || message.includes("route target") || message.includes("routeable")) {
+    return "The requesting device is no longer reachable for Transfer. Reconnect it to this Bridge and start a new approved plan.";
+  }
+  if (message.includes("outgoing_item_failed")) {
+    return "Pastey could not prepare the approved file for Transfer. Start a new approved plan.";
+  }
+  if (message.includes("file_send_failed")) {
+    return "The approved file could not be sent to the requesting device. Confirm the Bridge connection and start a new approved plan.";
+  }
+  if (message.includes("result_delivery_failed")) {
+    return "Transfer finished locally but its result could not be delivered. Confirm the Bridge connection before starting a new approved plan.";
+  }
+  return "The approved Transfer could not be completed. Check the Bridge connection and start a new approved plan.";
+}
+
 interface BridgePageProps {
   rooms: RoomInfo[];
   roomItems: RoomItem[];
@@ -883,7 +910,7 @@ function BridgePlanReceiverPanel({
       onRefresh();
     } catch (error) {
       setRunningAttempts((current) => ({ ...current, [`transfer:${attempt.attemptId}`]: "failed" }));
-      setMessage(error instanceof Error ? error.message : "The approved transfer could not be completed.");
+      setMessage(bridgePlanTransferErrorMessage(error));
     }
   }
 
@@ -1021,6 +1048,8 @@ function BridgePlanSenderPanel({
     [attemptId, inboxEvents],
   );
   const candidateMode = bridgePlanSearchCandidateMode(advisory?.steps.map((step) => step.primitive) ?? []);
+  const reviewSearch = advisory?.steps.find((step) => step.primitive === "Search");
+  const reviewTransfer = advisory?.steps.find((step) => step.primitive === "Transfer");
   const transformedAttemptIds = useMemo(
     () => new Set(inboxEvents.flatMap(parseCompletedBridgePlanTransform)),
     [inboxEvents],
@@ -1261,7 +1290,7 @@ function BridgePlanSenderPanel({
       setSelectedCandidateId(candidateId);
       setMessage(hasTransform ? "The selected device can now process the chosen file." : "The selected device can now transfer the chosen file.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not start the approved transfer.");
+      setMessage(bridgePlanTransferErrorMessage(error));
     } finally {
       setBusy(null);
     }
@@ -1275,7 +1304,7 @@ function BridgePlanSenderPanel({
       await startBridgePlanTransferAttempt(room.id, attemptId, bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"));
       setMessage("The selected device can now transfer the generated result.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not start the approved transfer.");
+      setMessage(bridgePlanTransferErrorMessage(error));
     } finally { setBusy(null); }
   }
 
@@ -1322,6 +1351,12 @@ function BridgePlanSenderPanel({
         <div className="request-file-preview" data-testid="ask-bridge-plan-preview">
           <h3>Review plan</h3>
           <p>{directTransfer ? "Transfer the one local file you chose to the selected device after both devices approve this plan." : advisory.steps.some((step) => step.primitive === "Transform") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then process it locally with the reviewed capability." : advisory.steps.some((step) => step.primitive === "Transfer") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then transfer it to the approved destination." : "Search the selected device’s reviewed locations for matching files and return a bounded summary."}</p>
+          {!directTransfer && reviewSearch?.primitive === "Search" ? (
+            <p className="muted">
+              Search: {reviewSearch.filenameHint} {reviewSearch.extensions.length ? `(${reviewSearch.extensions.join(", ").toUpperCase()})` : ""} in {reviewSearch.safeScopes.join(", ")}.
+              {reviewTransfer?.primitive === "Transfer" ? ` Destination: ${reviewTransfer.destination === "requesting_device" ? "requesting device" : "selected device Pastey Shared"}.` : ""}
+            </p>
+          ) : null}
           {!approvalId ? (
             <button type="button" className="primary-button" disabled={busy !== null} onClick={() => void requestReview()}>
               {busy === "review" ? "Sending…" : "Approve and send for review"}
