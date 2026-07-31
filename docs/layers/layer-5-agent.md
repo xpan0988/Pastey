@@ -27,6 +27,7 @@ Every reviewed Plan binds one Bridge session, source peer, target peer, revision
 `filesystem.find_file_candidates` searches only safe receiver-local scope labels (`downloads`, `desktop`, `documents`, and `pastey_shared` when available), skips hidden entries and symlinks. The durable Bridge Plan Search flow retains receiver-local candidate resolution privately and sends bounded redacted metadata only. Candidate IDs and ObjectRefs are not paths, file handles, consent, leases, or reusable Transfer authority.
 
 Complete-plan approval plus receiver review bind the Plan Transfer step; the requester selection is bounded to the preceding Search result and is validated locally before transfer.
+Before approval, the requester preview shows the normalized filename hint, extensions, reviewed scope labels, and approved Transfer destination. After delivery, every downstream Transfer or Transform start is durably correlated on the requester before its receiver ACK, progress, or result can be accepted.
 
 ## Transform authority and results
 

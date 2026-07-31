@@ -79,6 +79,26 @@ test("explicit Search planning falls back locally when no cloud provider is conf
   assert.equal(isSupportedBridgePlanSubmission(generated.parsedPlan), true);
 });
 
+test("natural Search to Transfer keeps an explicit filename separate from the transfer clause", () => {
+  const plan = buildDeterministicAskBridgeNaturalV1Plan(
+    "Find Funding Statement.pdf on the selected device and send it to me.",
+  );
+  const [search, transfer] = plan.steps;
+
+  assert.deepEqual(search, {
+    primitive: "Search",
+    filenameHint: "Funding Statement.pdf",
+    extensions: ["pdf"],
+    safeScopes: ["downloads", "desktop", "documents", "pastey_shared"],
+  });
+  assert.deepEqual(transfer, {
+    primitive: "Transfer",
+    destination: "requesting_device",
+    object: "search_result",
+  });
+  assert.equal(isSupportedBridgePlanSubmission(plan), true);
+});
+
 test("Windows Downloads paths narrow Search to the reviewed scope and basename", () => {
   const plan = buildDeterministicAskBridgeNaturalV1Plan(
     "Find C:\\Users\\admin\\Downloads\\INFO2222-2026-PD.pdf on the selected device.",

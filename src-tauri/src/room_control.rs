@@ -126,7 +126,11 @@ fn bridge_plan_validation_reason(message: &str) -> &'static str {
 
 fn bridge_plan_protocol_rejection_reason(error: &AppError) -> &'static str {
     let message = error.message();
-    if message.contains("review not found") || message.contains("receiver review missing") {
+    if message.contains("attempt missing") {
+        "attempt_missing"
+    } else if message.contains("update correlation mismatch") {
+        "attempt_correlation_mismatch"
+    } else if message.contains("review not found") || message.contains("receiver review missing") {
         "review_unknown_approval"
     } else if message.contains("revision mismatch") {
         "review_revision_hash_mismatch"
@@ -1224,6 +1228,10 @@ async fn control_response_failure(response: reqwest::Response) -> AppError {
         }
         Some("review_payload_invalid") => {
             "Bridge Plan review validation failed: review_payload_invalid."
+        }
+        Some("attempt_missing") => "Bridge Plan protocol validation failed: attempt_missing.",
+        Some("attempt_correlation_mismatch") => {
+            "Bridge Plan protocol validation failed: attempt_correlation_mismatch."
         }
         Some("invalid_event" | "invalid_envelope" | "invalid_request") => {
             "Room control event validation failed."

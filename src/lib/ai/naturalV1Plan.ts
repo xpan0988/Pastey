@@ -401,6 +401,8 @@ function extractExtensions(value: string): string[] {
 }
 
 function extractFilenameHint(value: string, extensions: readonly string[]): string {
+  const explicitFilename = extractExplicitFilenameHint(value);
+  if (explicitFilename) return explicitFilename;
   const withoutExtensions = extensions.reduce(
     (current, extension) => current.replace(new RegExp(`\\b${escapeRegExp(extension)}\\b`, "gi"), " "),
     value.replace(/\.[a-z0-9]{1,16}\b/gi, " "),
@@ -411,6 +413,22 @@ function extractFilenameHint(value: string, extensions: readonly string[]): stri
     .split(/\s+/)
     .filter((word) => word.length > 1 && !STOP_WORDS.has(word));
   return (words.slice(0, 4).join(" ") || "file").slice(0, 128);
+}
+
+function extractExplicitFilenameHint(value: string): string | null {
+  // Prefer a filename-looking phrase before applying word-based fallback
+  // heuristics.  Transfer language is not part of the Search request, so it
+  // must not contaminate the immutable filename hint.
+  const searchClause = value
+    .replace(/^\s*(?:find|search|locate|get|fetch)\s+(?:for\s+)?/i, "")
+    .replace(/\s+(?:on|from)\s+(?:the\s+)?selected\s+device\b.*$/i, "")
+    .replace(/\s+(?:and\s+)?(?:send|transfer|return|bring|copy)\b.*$/i, "")
+    .trim();
+  const match = searchClause.match(/([a-z0-9][a-z0-9._ -]{0,127}\.[a-z0-9]{1,16})/i);
+  if (!match?.[1]) return null;
+  const filenameHint = match[1].trim();
+  const extension = filenameHint.split(".").pop()?.toLowerCase();
+  return extension && KNOWN_EXTENSIONS.has(extension) ? filenameHint : null;
 }
 
 function extractTransformIntent(value: string): "extract readable text" | null {

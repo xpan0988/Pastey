@@ -104,6 +104,31 @@ fn log_bridge_plan_search_attempt(
     ));
 }
 
+/// Emits only correlation identifiers and a bounded execution stage for the
+/// receiver-owned Transfer path. Private candidate paths and transfer payloads
+/// must not enter diagnostic logs.
+fn log_bridge_plan_transfer_attempt(stage: &str, room_id: &str, attempt_id: &str, code: &str) {
+    logging::write_transfer_line(&format!(
+        "[pastey bridge-plan-transfer] stage={stage} bridge_id={room_id} attempt_id={attempt_id} platform={} code={code}",
+        std::env::consts::OS,
+    ));
+}
+
+fn bridge_plan_transfer_failure_code(error: &AppError) -> &'static str {
+    let message = error.message();
+    if message.contains("candidate changed") {
+        "candidate_changed"
+    } else if message.contains("candidate") {
+        "candidate_unavailable"
+    } else if message.contains("route target") || message.contains("routeable") {
+        "route_unavailable"
+    } else if message.contains("outgoing") || message.contains("master key") {
+        "outgoing_item_failed"
+    } else {
+        "file_send_failed"
+    }
+}
+
 
 /// Renderer-provided intent for a file Search. Device bindings, immutable
 /// revision shape, and authority stay Host-owned.
@@ -1972,10 +1997,30 @@ pub async fn start_bridge_plan_transfer_attempt(
     }
     let event = bridge_plan_control_event("bridge_plan.transfer_start", payload, &context)
         .map_err(|error| error.message())?;
-    let receipt =
-        crate::room_control::send_room_control_event(state.clone(), &room_id, event, bridge_route)
-            .await
-            .map_err(|error| error.message())?;
+    log_bridge_plan_control(&event, "transfer_start_dispatch");
+    let receipt = match crate::room_control::send_room_control_event(
+        state.clone(),
+        &room_id,
+        event.clone(),
+        bridge_route,
+    )
+    .await
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            log_bridge_plan_control(&event, "transfer_start_delivery_failed");
+            return Err(error.message());
+        }
+    };
+    log_bridge_plan_control(&event, "transfer_start_delivered");
+    bridge_plan::record_outbound_protocol_event(
+        &state.paths,
+        "bridge_plan.transfer_start",
+        &event,
+        now,
+    )
+    .map_err(|error| error.message())?;
+    log_bridge_plan_control(&event, "transfer_start_correlated");
     let refreshed = store
         .list_attempt(&attempt_id)
         .map_err(|error| error.message())?;
@@ -2135,10 +2180,30 @@ pub async fn start_bridge_plan_transform_attempt(
     }
     let event = bridge_plan_control_event("bridge_plan.transform_start", payload, &context)
         .map_err(|error| error.message())?;
-    let receipt =
-        crate::room_control::send_room_control_event(state.clone(), &room_id, event, bridge_route)
-            .await
-            .map_err(|error| error.message())?;
+    log_bridge_plan_control(&event, "transform_start_dispatch");
+    let receipt = match crate::room_control::send_room_control_event(
+        state.clone(),
+        &room_id,
+        event.clone(),
+        bridge_route,
+    )
+    .await
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            log_bridge_plan_control(&event, "transform_start_delivery_failed");
+            return Err(error.message());
+        }
+    };
+    log_bridge_plan_control(&event, "transform_start_delivered");
+    bridge_plan::record_outbound_protocol_event(
+        &state.paths,
+        "bridge_plan.transform_start",
+        &event,
+        now,
+    )
+    .map_err(|error| error.message())?;
+    log_bridge_plan_control(&event, "transform_start_correlated");
     let refreshed = store
         .list_attempt(&attempt_id)
         .map_err(|error| error.message())?;
@@ -2476,6 +2541,7 @@ pub async fn execute_bridge_plan_transfer_attempt(
 ) -> Result<bool, String> {
     let state = state.inner().clone();
     let now = storage::now_ts();
+    log_bridge_plan_transfer_attempt("transfer_attempt_started", &room_id, &attempt_id, "started");
     let grant = bridge_plan::consume_transfer_execution_grant(
         &state.paths,
         &state.bridge_plan_protocol_authority.lock(),
@@ -2483,7 +2549,11 @@ pub async fn execute_bridge_plan_transfer_attempt(
         &attempt_id,
         now,
     )
-    .map_err(|error| error.message())?;
+    .map_err(|error| {
+        log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "grant_unavailable");
+        error.message()
+    })?;
+    log_bridge_plan_transfer_attempt("transfer_grant_consumed", &room_id, &attempt_id, "consumed");
     let context = crate::room_control::room_control_session_context(&state, &room_id)
         .map_err(|error| error.message())?;
     if context.local_session_ref != grant.receiver_device_ref
@@ -2506,7 +2576,11 @@ pub async fn execute_bridge_plan_transfer_attempt(
         bridge_route.clone(),
     )
     .await
-    .map_err(|error| error.message())?;
+    .map_err(|error| {
+        log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "transfer_ack_delivery_failed");
+        error.message()
+    })?;
+    log_bridge_plan_transfer_attempt("transfer_ack_delivered", &room_id, &attempt_id, "accepted");
     let progress = send(
         "bridge_plan.step_progress",
         bridge_plan::transfer_update_payload(&grant, "bridge_plan.step_progress", None, None)
@@ -2519,7 +2593,10 @@ pub async fn execute_bridge_plan_transfer_attempt(
         bridge_route.clone(),
     )
     .await
-    .map_err(|error| error.message())?;
+    .map_err(|error| {
+        log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "progress_delivery_failed");
+        error.message()
+    })?;
 
     let transfer_result: Result<(), AppError> = async {
         let private_file = match grant.generated_file.clone() {
@@ -2533,14 +2610,28 @@ pub async fn execute_bridge_plan_transfer_attempt(
                     &grant.receiver_device_ref,
                     &grant.attempt_id,
                     &grant.candidate_id,
-                )?
+                )
+                .map_err(|error| {
+                    log_bridge_plan_transfer_attempt(
+                        "transfer_execution_failed",
+                        &room_id,
+                        &attempt_id,
+                        bridge_plan_transfer_failure_code(&error),
+                    );
+                    error
+                })?
             }
         };
+        log_bridge_plan_transfer_attempt("transfer_candidate_resolved", &room_id, &attempt_id, "resolved");
         match &grant.destination {
             bridge_plan::TransferDestination::RequestingDevice { .. } => {
                 let peers = storage::list_bridge_peer_endpoints(&state.paths, &room_id)?;
                 let endpoint =
-                    resolve_routeable_bridge_peer(&peers, &context.peer_route_ref, "Transfer")?;
+                    resolve_routeable_bridge_peer(&peers, &context.peer_route_ref, "Transfer").map_err(|error| {
+                        log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "route_unavailable");
+                        error
+                    })?;
+                log_bridge_plan_transfer_attempt("transfer_route_resolved", &room_id, &attempt_id, "resolved");
                 let master_key = {
                     let config = state.config.read();
                     config::master_key(&config)?
@@ -2552,7 +2643,12 @@ pub async fn execute_bridge_plan_transfer_attempt(
                     &private_file.path,
                     Some(private_file.display_name.clone()),
                     Some(private_file.mime_type.clone()),
-                )?;
+                )
+                .map_err(|error| {
+                    log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "outgoing_item_failed");
+                    error
+                })?;
+                log_bridge_plan_transfer_attempt("transfer_item_created", &room_id, &attempt_id, "created");
                 if item.size_bytes != private_file.size_bytes {
                     return Err(AppError::InvalidInput(
                         "The selected file changed before Transfer started.".into(),
@@ -2568,6 +2664,9 @@ pub async fn execute_bridge_plan_transfer_attempt(
                     endpoint,
                 )
                 .await
+                .map(|()| {
+                    log_bridge_plan_transfer_attempt("transfer_bytes_completed", &room_id, &attempt_id, "completed");
+                })
             }
             bridge_plan::TransferDestination::UserSelectedLocation {
                 device_ref,
@@ -2609,23 +2708,28 @@ pub async fn execute_bridge_plan_transfer_attempt(
                 None,
             ),
         ),
-        Err(_) => (
+        Err(ref error) => (
             "bridge_plan.step_failed",
             bridge_plan::transfer_update_payload(
                 &grant,
                 "bridge_plan.step_failed",
                 None,
-                Some("transfer_failed"),
+                Some(bridge_plan_transfer_failure_code(&error)),
             ),
         ),
     };
     let terminal = send(kind, payload.map_err(|error| error.message())?)?;
     crate::room_control::send_room_control_event(state, &room_id, terminal, bridge_route)
         .await
-        .map_err(|error| error.message())?;
+        .map_err(|error| {
+            log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "result_delivery_failed");
+            error.message()
+        })?;
     if transfer_result.is_err() {
+        log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "failed");
         return Err("The approved Transfer could not be completed.".into());
     }
+    log_bridge_plan_transfer_attempt("transfer_result_delivered", &room_id, &attempt_id, "completed");
     Ok(true)
 }
 
