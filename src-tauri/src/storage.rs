@@ -410,6 +410,7 @@ pub fn mark_peer_left(paths: &AppPaths, room_id: &str) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn mark_peer_burned(paths: &AppPaths, room_id: &str) -> AppResult<()> {
     let conn = connection(paths)?;
     conn.execute(

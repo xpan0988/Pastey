@@ -60,6 +60,7 @@ export interface RoomControlSessionContext {
   localSessionRef: string;
   peerSessionRef: string;
   peerRouteRef?: string;
+  peerObservationRef: string;
   peerConnected: boolean;
 }
 

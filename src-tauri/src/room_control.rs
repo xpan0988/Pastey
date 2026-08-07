@@ -44,6 +44,8 @@ const CONTROL_DELIVERY_SCHEMA: &str = "pastey-room-control-delivery-v1";
 const ROOM_CONTROL_SCHEMA: &str = "pastey-room-control-event-v1";
 const CONTROL_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-control-route-v1";
 const ALLOWED_EVENT_KINDS: &[&str] = &[
+    "peer_capability.query",
+    "peer_capability.response",
     "bridge_plan.review_request",
     "bridge_plan.review_decision",
     "bridge_plan.attempt_start",
@@ -57,6 +59,28 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "bridge_plan.cancel",
 ];
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
+const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
+
+pub(crate) fn peer_capability_event(
+    kind: &str,
+    payload: Value,
+    context: &RoomControlSessionContext,
+) -> AppResult<Value> {
+    let now = OffsetDateTime::now_utc();
+    Ok(serde_json::json!({
+        "schemaVersion": ROOM_CONTROL_SCHEMA,
+        "eventId": format!("peer-capability-event-{}", uuid::Uuid::new_v4()),
+        "kind": kind,
+        "protocolFamily": PEER_CAPABILITY_PROTOCOL_FAMILY,
+        "roomRef": context.room_id,
+        "sourceDeviceRef": context.local_session_ref,
+        "targetPeerRef": context.peer_session_ref,
+        "createdAt": now.format(&Rfc3339).map_err(|_| AppError::InvalidInput("Invalid capability event time.".into()))?,
+        "expiresAt": (now + time::Duration::seconds(MAX_EVENT_LIFETIME_SECONDS)).format(&Rfc3339).map_err(|_| AppError::InvalidInput("Invalid capability event time.".into()))?,
+        "previewOnly": false,
+        "payload": payload,
+    }))
+}
 
 fn log_bridge_plan_control_event(event: &ValidatedControlEvent, stage: &str) {
     let field = |value: &Value, name: &str| {
@@ -111,13 +135,17 @@ fn log_bridge_plan_validation_rejected(event: &Value, reason: &str) {
 fn bridge_plan_validation_reason(message: &str) -> &'static str {
     if message.contains("review revision mismatch") {
         "review_revision_hash_mismatch"
-    } else if message.contains("review step digest mismatch") || message.contains("review step mismatch") {
+    } else if message.contains("review step digest mismatch")
+        || message.contains("review step mismatch")
+    {
         "review_step_digest_mismatch"
     } else if message.contains("review expiry") {
         "review_expiry_invalid"
     } else if message.contains("expired") {
         "review_expired"
-    } else if message.contains("session mismatch") || message.contains("sender or receiver mismatch") {
+    } else if message.contains("session mismatch")
+        || message.contains("sender or receiver mismatch")
+    {
         "review_session_mismatch"
     } else {
         "review_payload_invalid"
@@ -138,7 +166,10 @@ fn bridge_plan_protocol_rejection_reason(error: &AppError) -> &'static str {
         "review_step_digest_mismatch"
     } else if message.contains("expired") {
         "review_expired"
-    } else if message.contains("session") || message.contains("sender") || message.contains("receiver") {
+    } else if message.contains("session")
+        || message.contains("sender")
+        || message.contains("receiver")
+    {
         "review_session_mismatch"
     } else {
         "review_payload_invalid"
@@ -259,6 +290,7 @@ pub struct RoomControlDeliveryReceipt {
     pub received_at: String,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoomControlSendError {
@@ -266,6 +298,7 @@ pub struct RoomControlSendError {
     pub message: &'static str,
 }
 
+#[cfg(test)]
 impl RoomControlSendError {
     pub fn from_app_error(error: AppError) -> Self {
         let message = error.message();
@@ -325,6 +358,7 @@ pub struct RoomControlSessionContext {
     pub local_session_ref: String,
     pub peer_session_ref: String,
     pub peer_route_ref: String,
+    pub peer_observation_ref: String,
     pub peer_connected: bool,
 }
 
@@ -569,9 +603,22 @@ pub fn room_control_session_context(
         room_id: room_id.to_string(),
         local_session_ref: session_ref(&local_key),
         peer_session_ref: session_ref(&peer.transport_public_key),
-        peer_route_ref: peer.peer_session_id,
+        peer_route_ref: peer.peer_session_id.clone(),
+        peer_observation_ref: peer_observation_ref(&peer),
         peer_connected: true,
     })
+}
+
+/// Opaque current-route binding for non-authorizing peer observations. It is
+/// derived from the route endpoint as well as session/key, so an endpoint
+/// change cannot reuse a fact observed for the old route.
+fn peer_observation_ref(peer: &RoomControlRouteEndpoint) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(peer.peer_session_id.as_bytes());
+    hasher.update(peer.host.as_bytes());
+    hasher.update(&peer.port.to_be_bytes());
+    hasher.update(peer.transport_public_key.as_bytes());
+    format!("peer-observation:{}", hasher.finalize().to_hex())
 }
 
 pub async fn send_room_control_event(
@@ -877,13 +924,16 @@ pub async fn receive_room_control_event_handler(
                 .and_then(Value::as_str)
                 .is_some_and(|kind| kind.starts_with("bridge_plan."))
             {
-                log_bridge_plan_validation_rejected(&event, bridge_plan_validation_reason(&message));
+                log_bridge_plan_validation_rejected(
+                    &event,
+                    bridge_plan_validation_reason(&message),
+                );
             }
             return control_error(
                 StatusCode::GONE,
                 "event_expired",
                 "Room control event expired.",
-            )
+            );
         }
         Err(AppError::InvalidInput(message)) if message.contains("session mismatch") => {
             if event
@@ -891,13 +941,16 @@ pub async fn receive_room_control_event_handler(
                 .and_then(Value::as_str)
                 .is_some_and(|kind| kind.starts_with("bridge_plan."))
             {
-                log_bridge_plan_validation_rejected(&event, bridge_plan_validation_reason(&message));
+                log_bridge_plan_validation_rejected(
+                    &event,
+                    bridge_plan_validation_reason(&message),
+                );
             }
             return control_error(
                 StatusCode::FORBIDDEN,
                 "session_mismatch",
                 "Room control session mismatch.",
-            )
+            );
         }
         Err(AppError::InvalidInput(message)) => {
             let reason = bridge_plan_validation_reason(&message);
@@ -922,8 +975,84 @@ pub async fn receive_room_control_event_handler(
             )
         }
     };
-    log_bridge_plan_control_event(&validated, "inbound_validated");
-    if let Err(error) = crate::bridge_plan::accept_inbound_protocol_event(
+    if validated.kind.starts_with("bridge_plan.") {
+        log_bridge_plan_control_event(&validated, "inbound_validated");
+    }
+    if validated.kind == "peer_capability.response" {
+        let projection: crate::peer_capabilities::PeerCapabilityProjection =
+            match serde_json::from_value(
+                validated
+                    .event
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ) {
+                Ok(value) => value,
+                Err(_) => {
+                    return control_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_capability",
+                        "Invalid peer capability fact.",
+                    )
+                }
+            };
+        if ctx
+            .state
+            .peer_capabilities
+            .lock()
+            .observe(
+                &room_id,
+                &inbound_peer.peer_session_id,
+                &peer_observation_ref(&inbound_peer),
+                projection,
+                storage::now_ts(),
+            )
+            .is_err()
+        {
+            return control_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_capability",
+                "Invalid peer capability fact.",
+            );
+        }
+    } else if validated.kind == "peer_capability.query" {
+        let peer_session_id = validated
+            .event
+            .get("payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| payload.get("peerSessionId"))
+            .and_then(Value::as_str);
+        let Some(peer_session_id) = peer_session_id else {
+            return control_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_capability",
+                "Invalid peer capability query.",
+            );
+        };
+        let response_context = RoomControlSessionContext {
+            room_id: room_id.clone(),
+            local_session_ref: session_ref(&local_key),
+            peer_session_ref: session_ref(&inbound_peer.transport_public_key),
+            peer_route_ref: inbound_peer.peer_session_id.clone(),
+            peer_observation_ref: peer_observation_ref(&inbound_peer),
+            peer_connected: true,
+        };
+        let payload = serde_json::to_value(crate::peer_capabilities::local_projection(
+            peer_session_id.into(),
+            storage::now_ts(),
+        ))
+        .expect("peer capability projection serializes");
+        if let Ok(response) =
+            peer_capability_event("peer_capability.response", payload, &response_context)
+        {
+            let response_state = ctx.state.clone();
+            let response_room_id = room_id.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = send_room_control_event(response_state, &response_room_id, response, None)
+                    .await;
+            });
+        }
+    } else if let Err(error) = crate::bridge_plan::accept_inbound_protocol_event(
         &ctx.state.paths,
         &ctx.state.bridge_plan_protocol_authority.lock(),
         &mut ctx.state.bridge_plan_candidate_store.lock(),
@@ -1020,7 +1149,7 @@ fn validate_control_event(
         .unwrap_or_default();
     require_exact_fields(
         object,
-        if raw_kind.starts_with("bridge_plan.") {
+        if raw_kind.starts_with("bridge_plan.") || raw_kind.starts_with("peer_capability.") {
             &[
                 "schemaVersion",
                 "eventId",
@@ -1111,8 +1240,44 @@ fn validate_control_event(
             now.unix_timestamp(),
         )?;
         (None, Some(metadata.replay_id))
+    } else if kind.starts_with("peer_capability.") {
+        if string_field(object, "protocolFamily")? != PEER_CAPABILITY_PROTOCOL_FAMILY
+            || object.get("previewOnly") != Some(&Value::Bool(false))
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid peer capability event.".into(),
+            ));
+        }
+        match kind.as_str() {
+            "peer_capability.query" => {
+                require_exact_fields(payload, &["schemaVersion", "peerSessionId"])?;
+                if string_field(payload, "schemaVersion")?
+                    != crate::peer_capabilities::PEER_CAPABILITY_SCHEMA
+                    || bounded_string_field(payload, "peerSessionId", 256)?.is_empty()
+                {
+                    return Err(AppError::InvalidInput(
+                        "Invalid peer capability query.".into(),
+                    ));
+                }
+            }
+            "peer_capability.response" => {
+                let projection: crate::peer_capabilities::PeerCapabilityProjection =
+                    serde_json::from_value(Value::Object(payload.clone())).map_err(|_| {
+                        AppError::InvalidInput("Invalid peer capability projection.".into())
+                    })?;
+                crate::peer_capabilities::validate_projection(&projection)?;
+            }
+            _ => {
+                return Err(AppError::InvalidInput(
+                    "Unsupported peer capability event kind.".into(),
+                ))
+            }
+        }
+        (None, None)
     } else {
-        return Err(AppError::InvalidInput("Unsupported room control event kind.".into()));
+        return Err(AppError::InvalidInput(
+            "Unsupported room control event kind.".into(),
+        ));
     };
     Ok(ValidatedControlEvent {
         event_id,
@@ -1406,7 +1571,7 @@ mod tests {
         );
     }
 
-                #[test]
+    #[test]
     fn selected_peer_room_control_route_resolves_through_bridge_peers() {
         let room = route_room();
         let peers = vec![route_peer("legacy-room-peer:room")];
@@ -1720,6 +1885,48 @@ mod tests {
     }
 
     #[test]
+    fn peer_capability_events_are_typed_bounded_and_not_generic_control() {
+        let now = OffsetDateTime::now_utc();
+        let context = RoomControlSessionContext {
+            room_id: "room".into(),
+            local_session_ref: "source".into(),
+            peer_session_ref: "target".into(),
+            peer_route_ref: "selected-peer-session".into(),
+            peer_observation_ref: "route-binding".into(),
+            peer_connected: true,
+        };
+        let valid = peer_capability_event(
+            "peer_capability.response",
+            serde_json::to_value(crate::peer_capabilities::local_projection(
+                "selected-peer-session".into(),
+                now.unix_timestamp(),
+            ))
+            .unwrap(),
+            &context,
+        )
+        .unwrap();
+        assert!(validate_control_event(valid, "room", "source", "target", now).is_ok());
+
+        let malformed = peer_capability_event(
+            "peer_capability.response",
+            serde_json::json!({
+                "schemaVersion": crate::peer_capabilities::PEER_CAPABILITY_SCHEMA,
+                "peerSessionId": "selected-peer-session",
+                "observedAt": now.unix_timestamp(),
+                "capabilities": [{
+                    "capabilityId": "unknown_capability",
+                    "available": true,
+                    "acceptedInputMediaTypes": ["text/plain"],
+                    "outputMediaType": "text/plain"
+                }]
+            }),
+            &context,
+        )
+        .unwrap();
+        assert!(validate_control_event(malformed, "room", "source", "target", now).is_err());
+    }
+
+    #[test]
     fn windows_search_review_envelope_is_validated_before_inbox_persistence() {
         let now = OffsetDateTime::now_utc();
         let revision = crate::bridge_plan::build_file_search_revision(
@@ -1765,13 +1972,11 @@ mod tests {
         let mut beyond_clock_skew = event;
         beyond_clock_skew["payload"]["reviewExpiresAt"] =
             Value::Number((now.unix_timestamp() + (24 * 60 * 60) + (5 * 60) + 1).into());
-        let error = match validate_control_event(beyond_clock_skew, "room", "source", "target", now) {
+        let error = match validate_control_event(beyond_clock_skew, "room", "source", "target", now)
+        {
             Err(error) => error.to_string(),
             Ok(_) => panic!("review expiry beyond permitted clock skew must be rejected"),
         };
         assert!(error.contains("review expiry"));
     }
-
-
-
 }

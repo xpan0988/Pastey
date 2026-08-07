@@ -9,18 +9,15 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::{
     bridge_plan::{
-        self, ActivityKind, BridgePlan, BridgePlanActivity, BridgePlanApproval, BridgePlanRecords, BridgePlanResultSummary,
-        BridgePlanRevision, BridgePlanState, RevisionState,
+        self, ActivityKind, BridgePlan, BridgePlanActivity, BridgePlanApproval, BridgePlanRecords,
+        BridgePlanResultSummary, BridgePlanRevision, BridgePlanState, RevisionState,
     },
     capability_probe::{self, CapabilityProbeMode},
     config, crypto,
     device_profile::{self, ProfileProbeMode},
     diagnostics, discovery,
     error::{AppError, AppResult},
-    file_candidates::{
-        self,
-        BridgePlanSearchRequest,
-    },
+    file_candidates::{self, BridgePlanSearchRequest},
     link_benchmark, logging,
     models::{
         AppConfig, BridgeDeliveryContentKind, BridgeDeliveryOutcome, BridgeDeliveryOutcomeStatus,
@@ -29,8 +26,7 @@ use crate::{
         RoomInfo, RoomItem, RoomStatus, StoredBridgePeerEndpoint, StoredRoom,
     },
     room_control::{
-        ReceivedRoomControlEvent, RoomControlDeliveryReceipt,
-        RoomControlSessionContext,
+        ReceivedRoomControlEvent, RoomControlDeliveryReceipt, RoomControlSessionContext,
     },
     storage, transfer, AppState,
 };
@@ -42,6 +38,70 @@ const FILE_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-file-route-v1";
 
 const BRIDGE_PLAN_APPROVAL_TTL_SECONDS: i64 = 24 * 60 * 60;
 const BRIDGE_PLAN_CONTROL_LIFETIME_SECONDS: i64 = 120;
+
+/// Requests a fresh, selected-peer capability observation over the existing
+/// current-session Room Control channel. Delivery is not availability: the
+/// response remains a separate non-authorizing fact.
+#[tauri::command]
+pub async fn refresh_selected_peer_capabilities(
+    room_id: String,
+    bridge_route: Option<Value>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomControlDeliveryReceipt, String> {
+    let state = state.inner().clone();
+    let context = crate::room_control::room_control_session_context(&state, &room_id)
+        .map_err(|error| error.message())?;
+    let event = crate::room_control::peer_capability_event(
+        "peer_capability.query",
+        serde_json::json!({
+            "schemaVersion": crate::peer_capabilities::PEER_CAPABILITY_SCHEMA,
+            "peerSessionId": context.peer_route_ref,
+        }),
+        &context,
+    )
+    .map_err(|error| error.message())?;
+    crate::room_control::send_room_control_event(state, &room_id, event, bridge_route)
+        .await
+        .map_err(|error| error.message())
+}
+
+/// Returns only the fresh observation bound to the currently selected peer
+/// session. Missing, restarted, reconnected, or purged state is Unknown.
+#[tauri::command]
+pub fn selected_peer_transform_availability(
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::peer_capabilities::SelectedPeerTransformAvailability, String> {
+    let context = crate::room_control::room_control_session_context(state.inner(), &room_id)
+        .map_err(|error| error.message())?;
+    Ok(state.peer_capabilities.lock().selected_transform(
+        &room_id,
+        &context.peer_route_ref,
+        &context.peer_observation_ref,
+        storage::now_ts(),
+    ))
+}
+
+/// A selected-peer fact is only composition/admission input. This does not
+/// issue any execution authority; receiver-local Transform execution still
+/// revalidates its one-use grant, candidate, media type, and backend.
+fn require_selected_peer_transform_available(
+    state: &Arc<AppState>,
+    room_id: &str,
+    context: &RoomControlSessionContext,
+) -> Result<(), String> {
+    let observation = state.peer_capabilities.lock().selected_transform(
+        room_id,
+        &context.peer_route_ref,
+        &context.peer_observation_ref,
+        storage::now_ts(),
+    );
+    if observation.available {
+        Ok(())
+    } else {
+        Err(observation.reason.into())
+    }
+}
 
 fn bridge_plan_control_event(
     kind: &str,
@@ -128,7 +188,6 @@ fn bridge_plan_transfer_failure_code(error: &AppError) -> &'static str {
         "file_send_failed"
     }
 }
-
 
 /// Renderer-provided intent for a file Search. Device bindings, immutable
 /// revision shape, and authority stay Host-owned.
@@ -1451,6 +1510,7 @@ pub fn create_file_transform_bridge_plan(
 ) -> Result<BridgePlanRecords, String> {
     let context = crate::room_control::room_control_session_context(&state, &request.room_id)
         .map_err(|error| error.message())?;
+    require_selected_peer_transform_available(state.inner(), &request.room_id, &context)?;
     let mut revision = bridge_plan::build_file_transform_revision(
         request.room_id,
         context.local_session_ref,
@@ -1501,7 +1561,10 @@ pub fn create_direct_file_transfer_bridge_plan(
     .map_err(|error| error.message())?;
     let revision_id = revision.revision_id.clone();
     let records = create_bridge_plan(revision, state.clone())?;
-    state.bridge_plan_requester_sources.lock().insert(revision_id, source);
+    state
+        .bridge_plan_requester_sources
+        .lock()
+        .insert(revision_id, source);
     Ok(records)
 }
 
@@ -1761,7 +1824,9 @@ pub async fn decide_bridge_plan_review(
     )
     .map_err(|error| error.message())?;
     log_bridge_plan_control(&event, "review_decision_recorded");
-    match crate::room_control::send_room_control_event(state, &room_id, event.clone(), bridge_route).await {
+    match crate::room_control::send_room_control_event(state, &room_id, event.clone(), bridge_route)
+        .await
+    {
         Ok(receipt) => {
             log_bridge_plan_control(&event, "review_decision_delivered");
             Ok(receipt)
@@ -1849,8 +1914,13 @@ pub async fn start_bridge_plan_attempt(
             transfer.step_id.clone(),
             "Approved direct Transfer started on the requesting device.",
             "bridge_plan.transfer_start",
-            bridge_plan::transfer_start_payload(&state.paths, &attempt.bridge_id, &attempt.attempt_id, now)
-                .map_err(|error| error.message())?,
+            bridge_plan::transfer_start_payload(
+                &state.paths,
+                &attempt.bridge_id,
+                &attempt.attempt_id,
+                now,
+            )
+            .map_err(|error| error.message())?,
         )
     };
     store
@@ -1890,7 +1960,7 @@ pub async fn start_bridge_plan_attempt(
         event.clone(),
         bridge_route,
     )
-        .await
+    .await
     {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -2054,73 +2124,170 @@ pub async fn execute_direct_bridge_plan_transfer_attempt(
     let state = state.inner().clone();
     let now = storage::now_ts();
     let store = bridge_plan::BridgePlanStore::new(&state.paths);
-    let attempt = store.list_attempt(&attempt_id).map_err(|error| error.message())?;
+    let attempt = store
+        .list_attempt(&attempt_id)
+        .map_err(|error| error.message())?;
     if attempt.attempt.bridge_id != room_id || attempt.state != bridge_plan::AttemptState::Running {
         return Err("This direct Transfer plan is not running.".into());
     }
-    let revision = store.get_revision(&attempt.attempt.revision_id).map_err(|error| error.message())?.revision;
-    let transfer = revision.steps.iter().find(|step| matches!(step, bridge_plan::BridgePlanStep::Transfer { .. }))
+    let revision = store
+        .get_revision(&attempt.attempt.revision_id)
+        .map_err(|error| error.message())?
+        .revision;
+    let transfer = revision
+        .steps
+        .iter()
+        .find(|step| matches!(step, bridge_plan::BridgePlanStep::Transfer { .. }))
         .ok_or_else(|| "This plan has no Transfer step.".to_string())?;
-    let bridge_plan::BridgePlanStep::Transfer { step_id, source, destination, .. } = transfer else { unreachable!() };
-    if !matches!(source, bridge_plan::ObjectSelectionRule::FutureUserSelection { .. })
-        || !matches!(destination, bridge_plan::TransferDestination::SelectedDevice { device_ref } if device_ref == &revision.selected_device_ref)
+    let bridge_plan::BridgePlanStep::Transfer {
+        step_id,
+        source,
+        destination,
+        ..
+    } = transfer
+    else {
+        unreachable!()
+    };
+    if !matches!(
+        source,
+        bridge_plan::ObjectSelectionRule::FutureUserSelection { .. }
+    ) || !matches!(destination, bridge_plan::TransferDestination::SelectedDevice { device_ref } if device_ref == &revision.selected_device_ref)
     {
         return Err("This plan is not a supported requester Transfer.".into());
     }
     let context = crate::room_control::room_control_session_context(&state, &room_id)
         .map_err(|error| error.message())?;
-    if context.local_session_ref != revision.requesting_device_ref || context.peer_session_ref != revision.selected_device_ref {
+    if context.local_session_ref != revision.requesting_device_ref
+        || context.peer_session_ref != revision.selected_device_ref
+    {
         return Err("The selected device session changed before Transfer could run.".into());
     }
-    let private_file = state.bridge_plan_requester_sources.lock().get(&revision.revision_id).cloned()
-        .ok_or_else(|| "The selected local file is unavailable after restart or cancellation.".to_string())?;
+    let private_file = state
+        .bridge_plan_requester_sources
+        .lock()
+        .get(&revision.revision_id)
+        .cloned()
+        .ok_or_else(|| {
+            "The selected local file is unavailable after restart or cancellation.".to_string()
+        })?;
     let metadata = std::fs::symlink_metadata(&private_file.path)
         .map_err(|_| "The selected local file is unavailable.".to_string())?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != private_file.size_bytes {
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != private_file.size_bytes
+    {
         return Err("The selected local file changed before Transfer started.".into());
     }
-    store.transition_step(&attempt_id, step_id, bridge_plan::StepExecutionState::Running, now)
+    store
+        .transition_step(
+            &attempt_id,
+            step_id,
+            bridge_plan::StepExecutionState::Running,
+            now,
+        )
         .map_err(|error| error.message())?;
-    let peers = storage::list_bridge_peer_endpoints(&state.paths, &room_id).map_err(|error| error.message())?;
-    let endpoint = resolve_routeable_bridge_peer(&peers, &context.peer_route_ref, "Transfer").map_err(|error| error.message())?;
-    let master_key = { let config = state.config.read(); config::master_key(&config).map_err(|error| error.message())? };
-    let item = storage::create_outgoing_file_item_with_metadata(&state.paths, &master_key, &room_id, &private_file.path, Some(private_file.display_name.clone()), Some(private_file.mime_type.clone())).map_err(|error| error.message())?;
-    let sent = transfer::send_room_file_to_bridge_peer_endpoint(state.clone(), &room_id, &item.id, &private_file.path, Some(format!("bridge-plan-transfer-{attempt_id}")), None, endpoint).await;
+    let peers = storage::list_bridge_peer_endpoints(&state.paths, &room_id)
+        .map_err(|error| error.message())?;
+    let endpoint = resolve_routeable_bridge_peer(&peers, &context.peer_route_ref, "Transfer")
+        .map_err(|error| error.message())?;
+    let master_key = {
+        let config = state.config.read();
+        config::master_key(&config).map_err(|error| error.message())?
+    };
+    let item = storage::create_outgoing_file_item_with_metadata(
+        &state.paths,
+        &master_key,
+        &room_id,
+        &private_file.path,
+        Some(private_file.display_name.clone()),
+        Some(private_file.mime_type.clone()),
+    )
+    .map_err(|error| error.message())?;
+    let sent = transfer::send_room_file_to_bridge_peer_endpoint(
+        state.clone(),
+        &room_id,
+        &item.id,
+        &private_file.path,
+        Some(format!("bridge-plan-transfer-{attempt_id}")),
+        None,
+        endpoint,
+    )
+    .await;
     match sent {
         Ok(()) => {
             let completed_at = storage::now_ts();
-            store.transition_step(&attempt_id, step_id, bridge_plan::StepExecutionState::Completed, completed_at).map_err(|error| error.message())?;
-            store.transition_attempt(&attempt_id, bridge_plan::AttemptState::Completed, completed_at).map_err(|error| error.message())?;
-            store.append_result(&BridgePlanResultSummary {
-                result_id: format!("direct-transfer-result-{}", uuid::Uuid::new_v4()),
-                bridge_id: room_id.clone(),
-                plan_id: attempt.attempt.plan_id.clone(),
-                revision_id: revision.revision_id.clone(),
-                attempt_id: attempt_id.clone(),
-                step_id: step_id.clone(),
-                status: bridge_plan::GeneratedUserVisibleText::from_semantic("completed"),
-                summary: "Transfer completed to the selected device.".into(),
-                produced_object_description: Some(bridge_plan::GeneratedUserVisibleText::from_semantic("One reviewed file was transferred.")),
-                created_at: completed_at,
-            }).map_err(|error| error.message())?;
-            store.append_activity(&BridgePlanActivity {
-                activity_id: format!("direct-transfer-completed-{}", uuid::Uuid::new_v4()),
-                bridge_id: room_id.clone(), plan_id: attempt.attempt.plan_id.clone(), revision_id: revision.revision_id.clone(),
-                attempt_id: Some(attempt_id.clone()), step_id: Some(step_id.clone()), kind: ActivityKind::AttemptCompleted,
-                occurred_at: completed_at, summary: "Direct Transfer completed to the selected device.".into(),
-            }).map_err(|error| error.message())?;
-            state.bridge_plan_requester_sources.lock().remove(&revision.revision_id);
+            store
+                .transition_step(
+                    &attempt_id,
+                    step_id,
+                    bridge_plan::StepExecutionState::Completed,
+                    completed_at,
+                )
+                .map_err(|error| error.message())?;
+            store
+                .transition_attempt(
+                    &attempt_id,
+                    bridge_plan::AttemptState::Completed,
+                    completed_at,
+                )
+                .map_err(|error| error.message())?;
+            store
+                .append_result(&BridgePlanResultSummary {
+                    result_id: format!("direct-transfer-result-{}", uuid::Uuid::new_v4()),
+                    bridge_id: room_id.clone(),
+                    plan_id: attempt.attempt.plan_id.clone(),
+                    revision_id: revision.revision_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    step_id: step_id.clone(),
+                    status: bridge_plan::GeneratedUserVisibleText::from_semantic("completed"),
+                    summary: "Transfer completed to the selected device.".into(),
+                    produced_object_description: Some(
+                        bridge_plan::GeneratedUserVisibleText::from_semantic(
+                            "One reviewed file was transferred.",
+                        ),
+                    ),
+                    created_at: completed_at,
+                })
+                .map_err(|error| error.message())?;
+            store
+                .append_activity(&BridgePlanActivity {
+                    activity_id: format!("direct-transfer-completed-{}", uuid::Uuid::new_v4()),
+                    bridge_id: room_id.clone(),
+                    plan_id: attempt.attempt.plan_id.clone(),
+                    revision_id: revision.revision_id.clone(),
+                    attempt_id: Some(attempt_id.clone()),
+                    step_id: Some(step_id.clone()),
+                    kind: ActivityKind::AttemptCompleted,
+                    occurred_at: completed_at,
+                    summary: "Direct Transfer completed to the selected device.".into(),
+                })
+                .map_err(|error| error.message())?;
+            state
+                .bridge_plan_requester_sources
+                .lock()
+                .remove(&revision.revision_id);
             Ok(true)
         }
         Err(error) => {
             let failed_at = storage::now_ts();
-            let _ = store.transition_step(&attempt_id, step_id, bridge_plan::StepExecutionState::Failed, failed_at);
-            let _ = store.transition_attempt(&attempt_id, bridge_plan::AttemptState::Failed, failed_at);
+            let _ = store.transition_step(
+                &attempt_id,
+                step_id,
+                bridge_plan::StepExecutionState::Failed,
+                failed_at,
+            );
+            let _ =
+                store.transition_attempt(&attempt_id, bridge_plan::AttemptState::Failed, failed_at);
             let _ = store.append_activity(&BridgePlanActivity {
                 activity_id: format!("direct-transfer-failed-{}", uuid::Uuid::new_v4()),
-                bridge_id: room_id.clone(), plan_id: attempt.attempt.plan_id.clone(), revision_id: revision.revision_id.clone(),
-                attempt_id: Some(attempt_id.clone()), step_id: Some(step_id.clone()), kind: ActivityKind::AttemptFailed,
-                occurred_at: failed_at, summary: "Direct Transfer could not complete.".into(),
+                bridge_id: room_id.clone(),
+                plan_id: attempt.attempt.plan_id.clone(),
+                revision_id: revision.revision_id.clone(),
+                attempt_id: Some(attempt_id.clone()),
+                step_id: Some(step_id.clone()),
+                kind: ActivityKind::AttemptFailed,
+                occurred_at: failed_at,
+                summary: "Direct Transfer could not complete.".into(),
             });
             Err(error.message())
         }
@@ -2250,8 +2417,7 @@ pub async fn execute_bridge_plan_search_attempt(
         &room_id,
         &attempt_id,
         now,
-    )
-    {
+    ) {
         Ok(grant) => grant,
         Err(error) => {
             log_bridge_plan_search_attempt(
@@ -2271,8 +2437,8 @@ pub async fn execute_bridge_plan_search_attempt(
         "consumed",
         None,
     );
-    let context = crate::room_control::room_control_session_context(&state, &room_id)
-        .map_err(|error| {
+    let context =
+        crate::room_control::room_control_session_context(&state, &room_id).map_err(|error| {
             log_bridge_plan_search_attempt(
                 "search_execution_failed",
                 &room_id,
@@ -2490,7 +2656,7 @@ pub async fn execute_bridge_plan_transform_attempt(
             &grant.intent,
         )
     };
-    let (kind, payload, succeeded) = match transformed {
+    let (kind, payload, succeeded, failure_message) = match transformed {
         Ok(output) => {
             state
                 .bridge_plan_protocol_authority
@@ -2506,25 +2672,42 @@ pub async fn execute_bridge_plan_transform_attempt(
                     None,
                 ),
                 true,
+                None,
             )
         }
-        Err(_) => (
-            "bridge_plan.step_failed",
-            bridge_plan::transform_update_payload(
-                &grant,
+        Err(error) => {
+            let unsupported_input = error
+                .message()
+                .contains("cannot process this file with the requested Transform");
+            (
                 "bridge_plan.step_failed",
-                None,
-                Some("transform_unavailable_or_failed"),
-            ),
-            false,
-        ),
+                bridge_plan::transform_update_payload(
+                    &grant,
+                    "bridge_plan.step_failed",
+                    None,
+                    Some(if unsupported_input {
+                        "transform_input_unsupported"
+                    } else {
+                        "transform_unavailable_or_failed"
+                    }),
+                ),
+                false,
+                Some(if unsupported_input {
+                    "The selected file type is not supported by the approved Transform."
+                } else {
+                    "The approved Transform could not be completed on the selected device."
+                }),
+            )
+        }
     };
     let terminal = send(kind, payload.map_err(|error| error.message())?)?;
     crate::room_control::send_room_control_event(state, &room_id, terminal, bridge_route)
         .await
         .map_err(|error| error.message())?;
     if !succeeded {
-        return Err("The approved Transform could not be completed on the selected device.".into());
+        return Err(failure_message
+            .unwrap_or("The approved Transform could not be completed on the selected device.")
+            .into());
     }
     Ok(true)
 }
@@ -2550,7 +2733,12 @@ pub async fn execute_bridge_plan_transfer_attempt(
         now,
     )
     .map_err(|error| {
-        log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "grant_unavailable");
+        log_bridge_plan_transfer_attempt(
+            "transfer_execution_failed",
+            &room_id,
+            &attempt_id,
+            "grant_unavailable",
+        );
         error.message()
     })?;
     log_bridge_plan_transfer_attempt("transfer_grant_consumed", &room_id, &attempt_id, "consumed");
@@ -2577,7 +2765,12 @@ pub async fn execute_bridge_plan_transfer_attempt(
     )
     .await
     .map_err(|error| {
-        log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "transfer_ack_delivery_failed");
+        log_bridge_plan_transfer_attempt(
+            "transfer_execution_failed",
+            &room_id,
+            &attempt_id,
+            "transfer_ack_delivery_failed",
+        );
         error.message()
     })?;
     log_bridge_plan_transfer_attempt("transfer_ack_delivered", &room_id, &attempt_id, "accepted");
@@ -2594,7 +2787,12 @@ pub async fn execute_bridge_plan_transfer_attempt(
     )
     .await
     .map_err(|error| {
-        log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "progress_delivery_failed");
+        log_bridge_plan_transfer_attempt(
+            "transfer_execution_failed",
+            &room_id,
+            &attempt_id,
+            "progress_delivery_failed",
+        );
         error.message()
     })?;
 
@@ -2622,16 +2820,32 @@ pub async fn execute_bridge_plan_transfer_attempt(
                 })?
             }
         };
-        log_bridge_plan_transfer_attempt("transfer_candidate_resolved", &room_id, &attempt_id, "resolved");
+        log_bridge_plan_transfer_attempt(
+            "transfer_candidate_resolved",
+            &room_id,
+            &attempt_id,
+            "resolved",
+        );
         match &grant.destination {
             bridge_plan::TransferDestination::RequestingDevice { .. } => {
                 let peers = storage::list_bridge_peer_endpoints(&state.paths, &room_id)?;
                 let endpoint =
-                    resolve_routeable_bridge_peer(&peers, &context.peer_route_ref, "Transfer").map_err(|error| {
-                        log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "route_unavailable");
-                        error
-                    })?;
-                log_bridge_plan_transfer_attempt("transfer_route_resolved", &room_id, &attempt_id, "resolved");
+                    resolve_routeable_bridge_peer(&peers, &context.peer_route_ref, "Transfer")
+                        .map_err(|error| {
+                            log_bridge_plan_transfer_attempt(
+                                "transfer_execution_failed",
+                                &room_id,
+                                &attempt_id,
+                                "route_unavailable",
+                            );
+                            error
+                        })?;
+                log_bridge_plan_transfer_attempt(
+                    "transfer_route_resolved",
+                    &room_id,
+                    &attempt_id,
+                    "resolved",
+                );
                 let master_key = {
                     let config = state.config.read();
                     config::master_key(&config)?
@@ -2645,10 +2859,20 @@ pub async fn execute_bridge_plan_transfer_attempt(
                     Some(private_file.mime_type.clone()),
                 )
                 .map_err(|error| {
-                    log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "outgoing_item_failed");
+                    log_bridge_plan_transfer_attempt(
+                        "transfer_execution_failed",
+                        &room_id,
+                        &attempt_id,
+                        "outgoing_item_failed",
+                    );
                     error
                 })?;
-                log_bridge_plan_transfer_attempt("transfer_item_created", &room_id, &attempt_id, "created");
+                log_bridge_plan_transfer_attempt(
+                    "transfer_item_created",
+                    &room_id,
+                    &attempt_id,
+                    "created",
+                );
                 if item.size_bytes != private_file.size_bytes {
                     return Err(AppError::InvalidInput(
                         "The selected file changed before Transfer started.".into(),
@@ -2665,7 +2889,12 @@ pub async fn execute_bridge_plan_transfer_attempt(
                 )
                 .await
                 .map(|()| {
-                    log_bridge_plan_transfer_attempt("transfer_bytes_completed", &room_id, &attempt_id, "completed");
+                    log_bridge_plan_transfer_attempt(
+                        "transfer_bytes_completed",
+                        &room_id,
+                        &attempt_id,
+                        "completed",
+                    );
                 })
             }
             bridge_plan::TransferDestination::UserSelectedLocation {
@@ -2722,14 +2951,29 @@ pub async fn execute_bridge_plan_transfer_attempt(
     crate::room_control::send_room_control_event(state, &room_id, terminal, bridge_route)
         .await
         .map_err(|error| {
-            log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "result_delivery_failed");
+            log_bridge_plan_transfer_attempt(
+                "transfer_execution_failed",
+                &room_id,
+                &attempt_id,
+                "result_delivery_failed",
+            );
             error.message()
         })?;
     if transfer_result.is_err() {
-        log_bridge_plan_transfer_attempt("transfer_execution_failed", &room_id, &attempt_id, "failed");
+        log_bridge_plan_transfer_attempt(
+            "transfer_execution_failed",
+            &room_id,
+            &attempt_id,
+            "failed",
+        );
         return Err("The approved Transfer could not be completed.".into());
     }
-    log_bridge_plan_transfer_attempt("transfer_result_delivered", &room_id, &attempt_id, "completed");
+    log_bridge_plan_transfer_attempt(
+        "transfer_result_delivered",
+        &room_id,
+        &attempt_id,
+        "completed",
+    );
     Ok(true)
 }
 
@@ -2807,13 +3051,13 @@ pub(crate) fn purge_bridge_runtime_authority(
     // process-local map on Burn is conservative across all Bridges and
     // prevents any later retry from reusing a pre-Burn file binding.
     state.bridge_plan_requester_sources.lock().clear();
-    let bridge_plan_authority = state.bridge_plan_authority.lock();
     let bridge_plan_protocol_authority = state.bridge_plan_protocol_authority.lock();
+    let mut peer_capabilities = state.peer_capabilities.lock();
     if let Err(error) = candidates.purge_room(room_id) {
         first_error.get_or_insert(error);
     }
-    bridge_plan_authority.purge_bridge(room_id);
     bridge_plan_protocol_authority.purge_bridge(room_id);
+    peer_capabilities.purge_room(room_id);
 
     first_error.map_or(Ok(()), Err)
 }
@@ -3977,6 +4221,4 @@ mod tests {
         )
         .is_err());
     }
-
-
 }

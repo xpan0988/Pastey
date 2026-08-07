@@ -53,9 +53,10 @@ pub(crate) struct StagedSnapshot {
     pub(crate) root: PathBuf,
     pub(crate) input_path: PathBuf,
     pub(crate) work_dir: PathBuf,
+    #[cfg(test)]
     pub(crate) digest: String,
+    #[cfg(test)]
     pub(crate) byte_count: u64,
-    pub(crate) profile_id: &'static str,
 }
 
 pub(crate) fn capture_source_identity(
@@ -112,6 +113,7 @@ pub(crate) fn prepare_staged_snapshot(
         before.clone(),
     );
     match result {
+        #[cfg(test)]
         Ok((input_path, work_dir, digest, byte_count)) => Ok(StagedSnapshot {
             app_data_dir: app_data_dir.to_path_buf(),
             staging_id,
@@ -120,7 +122,14 @@ pub(crate) fn prepare_staged_snapshot(
             work_dir,
             digest,
             byte_count,
-            profile_id: profile.id,
+        }),
+        #[cfg(not(test))]
+        Ok((input_path, work_dir, _, _)) => Ok(StagedSnapshot {
+            app_data_dir: app_data_dir.to_path_buf(),
+            staging_id,
+            root,
+            input_path,
+            work_dir,
         }),
         Err(error) => {
             if remove_partial_staging_root(&parent, &root).is_err() {

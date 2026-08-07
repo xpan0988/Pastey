@@ -21,5 +21,6 @@ pub(crate) const FIXED_TEXT_STAGING_PROFILE: TransformStagingProfile = Transform
 
 /// Kept for the existing staging tests while production callers use the
 /// capability-named profile above.
+#[cfg(test)]
 pub(crate) const DETERMINISTIC_STAGED_INPUT_TEST: TransformStagingProfile =
     FIXED_TEXT_STAGING_PROFILE;

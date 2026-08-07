@@ -64,6 +64,23 @@ export function createFileTransformBridgePlan(request: FileTransformAlternativeB
   return invoke<BridgePlanWorkspace>("create_file_transform_bridge_plan", { request });
 }
 
+export interface SelectedPeerTransformAvailability {
+  peerSessionId: string;
+  status: "unknown" | "available" | "unavailable";
+  available: boolean;
+  reason: string;
+  acceptedInputMediaTypes: string[];
+  outputMediaType: string | null;
+}
+
+export function refreshSelectedPeerCapabilities(roomId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
+  return invoke<RoomControlDeliveryReceipt>("refresh_selected_peer_capabilities", { roomId, bridgeRoute });
+}
+
+export function selectedPeerTransformAvailability(roomId: string): Promise<SelectedPeerTransformAvailability> {
+  return invoke<SelectedPeerTransformAvailability>("selected_peer_transform_availability", { roomId });
+}
+
 export function proposeBridgePlanTransformFallback(revisionId: string): Promise<BridgePlanWorkspace> {
   return invoke<BridgePlanWorkspace>("propose_bridge_plan_transform_fallback", { revisionId });
 }

@@ -15,6 +15,7 @@ mod link_benchmark;
 mod logging;
 mod models;
 mod object_refs;
+mod peer_capabilities;
 mod room_control;
 mod storage;
 mod transfer;
@@ -34,22 +35,22 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 
 use crate::{
     commands::{
-        accept_nearby_join, approve_bridge_plan, bridge_plan_receiver_review_status, burn_room, cancel_transfer,
-        check_for_updates, copy_last_error, copy_text_to_clipboard, create_direct_file_transfer_bridge_plan, create_file_search_bridge_plan,
-        create_file_transform_bridge_plan, create_room,
-        decide_bridge_plan_review, delete_temp_file,
-        execute_bridge_plan_search_attempt, execute_direct_bridge_plan_transfer_attempt,
-        execute_bridge_plan_transfer_attempt, execute_bridge_plan_transform_attempt,
-        get_config, get_device_capabilities,
-        get_device_profile, get_file_transfer_metadata, get_last_benchmark_results, get_room,
-        get_room_control_session_context, join_room, leave_room, list_bridge_plan_workspace,
-        list_nearby_devices, list_received_room_control_events, list_room_items, list_rooms,
-        log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
-        mark_join_prompt_rendered, open_logs_folder, pair_bridge_peer, pending_join_requests,
-        propose_bridge_plan_transform_fallback, reject_nearby_join, request_nearby_join,
-        reveal_in_folder, revoke_bridge_peer_pairing,
-        run_loopback_benchmark, run_peer_link_benchmark, select_bridge_plan_search_candidate,
-        send_bridge_plan_review_request, send_file_to_room,
+        accept_nearby_join, approve_bridge_plan, bridge_plan_receiver_review_status, burn_room,
+        cancel_transfer, check_for_updates, copy_last_error, copy_text_to_clipboard,
+        create_direct_file_transfer_bridge_plan, create_file_search_bridge_plan,
+        create_file_transform_bridge_plan, create_room, decide_bridge_plan_review,
+        delete_temp_file, execute_bridge_plan_search_attempt, execute_bridge_plan_transfer_attempt,
+        execute_bridge_plan_transform_attempt, execute_direct_bridge_plan_transfer_attempt,
+        get_config, get_device_capabilities, get_device_profile, get_file_transfer_metadata,
+        get_last_benchmark_results, get_room, get_room_control_session_context, join_room,
+        leave_room, list_bridge_plan_workspace, list_nearby_devices,
+        list_received_room_control_events, list_room_items, list_rooms, log_frontend_diagnostic,
+        mark_bridge_peer_pairing_rotation_required, mark_join_prompt_rendered, open_logs_folder,
+        pair_bridge_peer, pending_join_requests, propose_bridge_plan_transform_fallback,
+        refresh_selected_peer_capabilities, reject_nearby_join, request_nearby_join,
+        reveal_in_folder, revoke_bridge_peer_pairing, run_loopback_benchmark,
+        run_peer_link_benchmark, select_bridge_plan_search_candidate,
+        selected_peer_transform_availability, send_bridge_plan_review_request, send_file_to_room,
         send_text_to_room, start_bridge_plan_attempt, start_bridge_plan_transfer_attempt,
         start_bridge_plan_transform_attempt, update_config, update_transfer_window,
         write_temp_file,
@@ -82,11 +83,9 @@ pub struct AppState {
     /// They are process-local and therefore invalidated by restart.
     pub(crate) bridge_plan_requester_sources:
         Mutex<HashMap<String, file_candidates::BridgePlanPrivateFile>>,
-    /// Dormant Phase 2 owner. It is never exposed through commands or current
-    /// product paths, but Burn purges it before durable Bridge Plan cleanup.
-    pub(crate) bridge_plan_authority: Mutex<bridge_plan::EphemeralStepAuthorityStore>,
     /// Phase 3A receiver-local Search grants. They are process-local only.
     pub(crate) bridge_plan_protocol_authority: Mutex<bridge_plan::ProtocolSearchAuthorityStore>,
+    pub(crate) peer_capabilities: Mutex<peer_capabilities::PeerCapabilityStore>,
 }
 
 pub struct ActiveRoomServer {
@@ -171,8 +170,8 @@ fn main() {
                     file_candidates::BridgePlanCandidateStore::default(),
                 ),
                 bridge_plan_requester_sources: Mutex::new(HashMap::new()),
-                bridge_plan_authority: Mutex::new(bridge_plan::EphemeralStepAuthorityStore::default()),
                 bridge_plan_protocol_authority: Mutex::new(bridge_plan::ProtocolSearchAuthorityStore::default()),
+                peer_capabilities: Mutex::new(peer_capabilities::PeerCapabilityStore::default()),
             });
 
             app.manage(state.clone());
@@ -222,6 +221,8 @@ fn main() {
             create_file_search_bridge_plan,
             create_direct_file_transfer_bridge_plan,
             create_file_transform_bridge_plan,
+            refresh_selected_peer_capabilities,
+            selected_peer_transform_availability,
             propose_bridge_plan_transform_fallback,
             list_bridge_plan_workspace,
             approve_bridge_plan,
