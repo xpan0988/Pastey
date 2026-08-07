@@ -18,7 +18,7 @@ Layer 1 owns LAN discovery and join plumbing where it is transport-owned; encryp
 
 ### Layer 2 — Device intelligence
 
-Layer 2 owns factual observations: `DeviceProfile`, `DeviceCapabilities`, `LinkBenchmark`, liveness facts, endpoint availability facts, provider availability facts, and Developer Tools diagnostics. It does not rank devices, recommend peers, command the scheduler, grant trust, or grant execution authority.
+Layer 2 owns factual observations: `DeviceProfile`, `DeviceCapabilities`, `LinkBenchmark`, liveness facts, endpoint availability facts, provider availability facts, remote Transform backend availability, and Developer Tools diagnostics. A remote Host computes its own Transform fact from its compiled production backend; Layer 2 does not rank devices, recommend peers, command the scheduler, grant trust, or grant execution authority.
 
 ### Layer 3 — Smart orchestration
 
@@ -26,17 +26,19 @@ Layer 3 owns transfer planning, scheduler policy, runtime-window allocation, `Mi
 
 ### Layer 4 — Multi-device Bridge sessions and peer identity
 
-Layer 4 owns Bridge lifecycle, current-session membership, selected-peer and selected-peers routing, ordinary-data broadcast, control transport, reconnect semantics, current-session provenance, paired-device display identity, and replay/session boundaries.
+Layer 4 owns Bridge lifecycle, current-session membership, selected-peer and selected-peers routing, ordinary-data broadcast, control transport, reconnect semantics, current-session provenance, paired-device display identity, replay/session boundaries, and the current-session binding for typed peer facts. It does not make facts durable pairing trust or execution authority.
 
 ### Layer 5 — Agent-assisted device workspace
 
-Layer 5 owns natural-v1 advisory planning, durable Bridge Plans, host validation, complete-plan approval, receiver review, bounded Search and file Transfer execution, Transform availability resolution, and audit.
+Layer 2 owns factual local capability availability. Layer 4 transports those facts over the exact current peer session. Layer 5 owns manual Block Composer input, optional natural-v1 advisory proposals, durable Bridge Plans, host validation, complete-plan approval, receiver review, bounded Search and file Transfer execution, and audit.
 
 ## Boundaries and dependencies
 
 Layer 1 supplies encrypted transport to Layers 3 and 4. Layer 2 supplies observations; it does not issue instructions to Layer 3. Layer 3 schedules ordinary transfer work over Layer 1 and reserves capacity for Layer 4/5 control demand. Layer 4 resolves the current-session peer route used by ordinary data and control messages. Layer 5 may request a selected-peer control operation, but it cannot turn membership or delivery into authority.
 
 The frontend owns presentation, user intent, and defense-in-depth validation. Rust owns the durable Bridge Plan workspace, local transport, endpoint validation, receiver-local candidate bindings and filesystem operations, Transfer admission and private handoff, Transform admission, Plan approval/review records, and authoritative Transform output construction. Product plan and execution state do not live in renderer memory. The renderer receives only safe activity and opaque transfer projections; it never receives the private transfer source, candidate binding, resolved intent, implementation, or approval binding.
+
+Remote capability availability is an observation, not authority. `pastey-peer-capabilities-v1` contains only `schemaVersion`, the requester-correlated `peerSessionId`, an observation timestamp, and bounded capability records (`capabilityId`, `available`, accepted input media types, output media type, and an optional bounded unavailable reason code). It is exchanged as a typed query/response over current-session Room Control and stored only under the current Bridge plus selected `peer_session_id`; it contains no paths, commands, private object references, approval IDs, grants, or secrets. Restart, Burn, leave, endpoint/key change, or a new peer session makes the old observation unusable. Windows advertises readable-text Transform as unavailable until a secure Windows staging backend exists.
 
 The following invariants are deliberate fail-closed boundaries:
 
@@ -51,7 +53,7 @@ The following invariants are deliberate fail-closed boundaries:
 
 ## High-level workflows
 
-**Search.** Ask Bridge produces a natural-v1 advisory. Rust constructs an immutable one-step Search revision from bounded intent; the requester approves the complete plan and the selected receiver chooses Allow or Deny. Only an authenticated approved attempt creates a one-use receiver-local Search grant. The result is a bounded safe summary, not candidate metadata, paths, or an object handle.
+**Search.** Ask Bridge's manual composer supplies explicit bounded filename, extension, and reviewed scope labels. Rust constructs an immutable one-step Search revision from that bounded input; the requester approves the complete plan and the selected receiver chooses Allow or Deny. Only an authenticated approved attempt creates a one-use receiver-local Search grant. The result is a bounded safe summary, not candidate metadata, paths, or an object handle.
 
 **Search → Transfer.** This is a live file workflow. The requester selects one bounded, redacted Search result; the selected device validates that selection against its private Bridge Plan candidate store, then performs the approved Transfer through the existing encrypted transfer engine. The supported destinations are the requesting device or the selected device's approved Pastey Shared location.
 

@@ -22,11 +22,13 @@ import {
   listNearbyDevices,
   requestNearbyJoin,
   revealInFolder,
+  refreshSelectedPeerCapabilities,
   sendBridgePlanReviewRequest,
   startBridgePlanAttempt,
   startBridgePlanTransferAttempt,
   startBridgePlanTransformAttempt,
   selectBridgePlanSearchCandidate,
+  selectedPeerTransformAvailability,
   sendTextToRoom,
   writeTempFile,
 } from "../lib/tauri";
@@ -57,17 +59,19 @@ import {
   bridgePollingIntervalMs,
   reconcileSelectedPeerIds,
 } from "../lib/agentBridge/bridgeDetailPolling";
-import { useAgentBridgeRuntimeConfig } from "../lib/agentBridge";
 import {
-  buildMockAiContextSnapshot,
-  CloudOpenAICompatibleProvider,
-  CLOUD_STRICT_AI_CONTEXT_POLICY,
-  generateMockAskBridgeNaturalV1Plan,
-  isSupportedBridgePlanSubmission,
-  validateAskBridgeNaturalV1Plan,
-  type AskBridgeNaturalV1Plan,
-  type AiGenerateResult,
-} from "../lib/ai";
+  SAFE_SEARCH_SCOPES,
+  addPrimitive,
+  canAddPrimitive,
+  manualBridgePlanInput,
+  moveBlock,
+  newSearchBlock,
+  removeBlock,
+  updateSearchBlock,
+  type ComposerBlock,
+  type SafeSearchScope,
+  type TransformAvailability,
+} from "../lib/bridgePlanComposer";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
 import { formatCode, formatTimestamp } from "../lib/format";
 import {
@@ -93,14 +97,6 @@ import type {
 
 type PrimaryRoute = "bridge" | "activity" | "devices" | "settings";
 type BridgeTargetSelectionMode = "selected_peer" | "selected_peers" | "broadcast_bridge";
-type SafeSearchScope = "downloads" | "desktop" | "documents" | "pastey_shared";
-
-const SAFE_SEARCH_SCOPES: Array<{ value: SafeSearchScope; label: string }> = [
-  { value: "downloads", label: "Downloads" },
-  { value: "desktop", label: "Desktop" },
-  { value: "documents", label: "Documents" },
-  { value: "pastey_shared", label: "Pastey Shared" },
-];
 const BRIDGE_PLAN_REQUIRES_ONE_SELECTED_DEVICE = "Ask Bridge requires one selected device.";
 
 function bridgePlanControlErrorMessage(error: unknown, action: "review" | "decision"): string {
@@ -428,7 +424,6 @@ export function BridgeDetailPage({
   );
   const selectedSinglePeer = selectedRoute?.target.kind === "selected_peer" ? selectedPeers[0] ?? null : null;
   const canSend = room.status === "active" && room.peer_connected && selectedRoute !== null && selectedPeers.length > 0 && busy === null;
-  const bridgeConfig = useAgentBridgeRuntimeConfig();
 
   useEffect(() => {
     let cancelled = false;
@@ -738,7 +733,6 @@ export function BridgeDetailPage({
 
       <BridgePlanSenderPanel
         enabled={askBridgeBetaEnabled}
-        config={bridgeConfig}
         room={room}
         selectedPeer={selectedSinglePeer}
         route={selectedRoute}
@@ -1007,21 +1001,25 @@ function BridgePlanReceiverPanel({
 
 function BridgePlanSenderPanel({
   enabled,
-  config,
   room,
   selectedPeer,
   route,
   inboxEvents,
 }: {
   enabled: boolean;
-  config: ReturnType<typeof useAgentBridgeRuntimeConfig>;
   room: RoomInfo;
   selectedPeer: BridgePeerSession | null;
   route: BridgeRoute | null;
   inboxEvents: readonly ReceivedRoomControlEvent[];
 }) {
-  const [input, setInput] = useState("");
-  const [advisory, setAdvisory] = useState<AskBridgeNaturalV1Plan | null>(null);
+  const [blocks, setBlocks] = useState<ComposerBlock[]>([newSearchBlock()]);
+  const [transformAvailability, setTransformAvailability] = useState<TransformAvailability>({
+    intent: "extract readable text",
+    status: "unknown",
+    available: false,
+    reason: "Checking the Host-owned Transform capability…",
+    hostLabel: "the selected Host",
+  });
   const [revisionId, setRevisionId] = useState<string | null>(null);
   const [approvalId, setApprovalId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -1047,9 +1045,9 @@ function BridgePlanSenderPanel({
       .find((entry) => entry.attemptId === attemptId) ?? null,
     [attemptId, inboxEvents],
   );
-  const candidateMode = bridgePlanSearchCandidateMode(advisory?.steps.map((step) => step.primitive) ?? []);
-  const reviewSearch = advisory?.steps.find((step) => step.primitive === "Search");
-  const reviewTransfer = advisory?.steps.find((step) => step.primitive === "Transfer");
+  const candidateMode = bridgePlanSearchCandidateMode(blocks.map((step) => step.primitive));
+  const reviewSearch = blocks.find((step) => step.primitive === "Search");
+  const reviewTransfer = blocks.find((step) => step.primitive === "Transfer");
   const transformedAttemptIds = useMemo(
     () => new Set(inboxEvents.flatMap(parseCompletedBridgePlanTransform)),
     [inboxEvents],
@@ -1060,7 +1058,7 @@ function BridgePlanSenderPanel({
   );
 
   useEffect(() => {
-    setAdvisory(null);
+    setBlocks([newSearchBlock()]);
     setRevisionId(null);
     setApprovalId(null);
     setApprovalState(null);
@@ -1070,6 +1068,47 @@ function BridgePlanSenderPanel({
     setDirectTransfer(false);
     setMessage(null);
   }, [room.id, selectedPeer?.peerSessionId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedPeerRoute || !selectedPeer) return;
+    let refreshing = false;
+    const refresh = async () => {
+      if (refreshing) return;
+      refreshing = true;
+      setTransformAvailability({ intent: "extract readable text", status: "unknown", available: false, reason: "Checking selected device capability…", hostLabel: selectedPeer.displayName });
+      try {
+        await refreshSelectedPeerCapabilities(room.id, bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"));
+        for (let attempt = 0; attempt < 5 && !cancelled; attempt += 1) {
+          const observation = await selectedPeerTransformAvailability(room.id);
+          if (cancelled) return;
+          setTransformAvailability({ intent: "extract readable text", status: observation.status, available: observation.available, reason: observation.reason, hostLabel: selectedPeer.displayName, acceptedInputMediaTypes: observation.acceptedInputMediaTypes, outputMediaType: observation.outputMediaType });
+          if (observation.status !== "unknown") return;
+          await new Promise((resolve) => window.setTimeout(resolve, 300));
+        }
+      } catch {
+        if (!cancelled) setTransformAvailability({ intent: "extract readable text", status: "unknown", available: false, reason: "Selected device capability is unknown.", hostLabel: selectedPeer.displayName });
+      } finally {
+        refreshing = false;
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(() => { void refresh(); }, 60_000);
+    return () => { cancelled = true; window.clearInterval(interval); };
+  }, [room.id, selectedPeer?.peerSessionId, selectedPeerRoute]);
+
+  function editBlocks(next: ComposerBlock[]) {
+    if (revisionId) {
+      setRevisionId(null);
+      setApprovalId(null);
+      setApprovalState(null);
+      setAttemptId(null);
+      setSelectedCandidateId(null);
+      setDirectTransfer(false);
+      setMessage("Plan semantics changed. Review creates a new immutable revision before approval.");
+    }
+    setBlocks(next);
+  }
 
   useEffect(() => {
     if (!approvalId) return;
@@ -1125,66 +1164,36 @@ function BridgePlanSenderPanel({
       setMessage(BRIDGE_PLAN_REQUIRES_ONE_SELECTED_DEVICE);
       return;
     }
-    const userGoal = input.trim();
-    if (!userGoal) {
-      setMessage("Describe the file you want to search for.");
-      return;
-    }
+    const composed = manualBridgePlanInput(blocks, transformAvailability);
+    if (!composed.value) { setMessage(composed.error ?? "Complete the bounded plan fields."); return; }
     setBusy("plan");
     setMessage(null);
     try {
-      const generated = config.providerKind === "cloud" && config.cloudBaseUrl.trim() && config.cloudModel.trim() && config.cloudApiKey.trim()
-        ? await generateCloudNaturalPlan(userGoal, config)
-        : await generateMockAskBridgeNaturalV1Plan(userGoal);
-      const validation = validateAskBridgeNaturalV1Plan(generated.parsedPlan);
-      if (!validation.valid || validation.value.status !== "supported") {
-        setAdvisory(null);
-        setMessage(validation.valid ? validation.value.unsupportedReason ?? "This plan is not supported." : validation.errors.join(" "));
-        return;
-      }
-      const search = validation.value.steps.find((step) => step.primitive === "Search");
-      const transform = validation.value.steps.find((step) => step.primitive === "Transform");
-      const transfer = validation.value.steps.find((step) => step.primitive === "Transfer");
-      const transferToRequester = Boolean(transfer
-        && transfer.primitive === "Transfer"
-        && transfer.destination === "requesting_device");
-      const supportsTransfer = Boolean(
-        transfer
-        && transfer.primitive === "Transfer"
-        && (transfer.destination === "requesting_device" || transfer.destination === "selected_device")
-        && (validation.value.steps.length === 2 || (validation.value.steps.length === 3 && Boolean(transform))),
-      );
-      const supportsTransform = Boolean(transform
-        && transform.primitive === "Transform"
-        && (validation.value.steps.length === 2 || (validation.value.steps.length === 3 && supportsTransfer)));
-      if (!search || !isSupportedBridgePlanSubmission(validation.value) || (!supportsTransfer && validation.value.steps.length !== 1 && !supportsTransform)) {
-        setAdvisory(validation.value);
-        setMessage("Pastey can currently run Search, Search followed by Transfer to the requesting device, and supported readable-text Transform plans. Other reviewed combinations are not available yet.");
-        return;
-      }
+      const plan = composed.value;
+      const supportsTransform = Boolean(plan.transformIntent);
+      const supportsTransfer = Boolean(plan.transferDestination);
       const workspace = supportsTransform
         ? await createFileTransformBridgePlan({
           roomId: room.id,
-          originalUserGoal: userGoal,
-          filenameHint: search.filenameHint,
-          extensions: search.extensions,
-          safeScopes: search.safeScopes,
-          transferToRequester: supportsTransfer,
-          transferDestination: transfer?.primitive === "Transfer" && transfer.destination === "selected_device" ? "selected_device" : "requesting_device",
-          transformIntent: transform?.primitive === "Transform" ? transform.intent : "process the selected file",
+          originalUserGoal: plan.originalUserGoal,
+          filenameHint: plan.filenameHint,
+          extensions: plan.extensions,
+          safeScopes: plan.safeScopes,
+          transferToRequester: plan.transferDestination === "requesting_device",
+          transferDestination: plan.transferDestination === "pastey_shared" ? "selected_device" : "requesting_device",
+          transformIntent: plan.transformIntent ?? "extract readable text",
         })
         : await createFileSearchBridgePlan({
           roomId: room.id,
-          originalUserGoal: userGoal,
-          filenameHint: search.filenameHint,
-          extensions: search.extensions,
-          safeScopes: search.safeScopes,
-          transferToRequester: supportsTransfer,
-          transferDestination: transfer?.primitive === "Transfer" && transfer.destination === "selected_device" ? "selected_device" : "requesting_device",
+          originalUserGoal: plan.originalUserGoal,
+          filenameHint: plan.filenameHint,
+          extensions: plan.extensions,
+          safeScopes: plan.safeScopes,
+          transferToRequester: plan.transferDestination === "requesting_device",
+          transferDestination: plan.transferDestination === "pastey_shared" ? "selected_device" : "requesting_device",
         });
       const revision = workspace.revisions.map(parseBridgePlanRevision).filter((entry): entry is { revisionId: string; state: string } => entry?.state === "available").pop();
       if (!revision) throw new Error("Pastey did not return the durable Search plan.");
-      setAdvisory(validation.value);
       setRevisionId(revision.revisionId);
       setApprovalId(null);
       setApprovalState(null);
@@ -1238,7 +1247,7 @@ function BridgePlanSenderPanel({
       });
       const revision = workspace.revisions.map(parseBridgePlanRevision).filter((entry): entry is { revisionId: string; state: string } => entry?.state === "available").pop();
       if (!revision) throw new Error("Pastey did not return the direct Transfer plan.");
-      setAdvisory({ schemaVersion: "ask-bridge-natural-v1", title: "Transfer a file", status: "supported", requiresUserConfirmation: true, steps: [{ primitive: "Transfer", destination: "selected_device", object: "selected_file" }] });
+      setBlocks([{ primitive: "Transfer", destination: "pastey_shared" }]);
       setRevisionId(revision.revisionId);
       setApprovalId(null); setApprovalState(null); setAttemptId(null); setSelectedCandidateId(null);
       setHasTransform(false); setDirectTransfer(true);
@@ -1332,28 +1341,33 @@ function BridgePlanSenderPanel({
           <p className="muted">Create one complete, reviewable plan for the selected device. Pastey never runs it until both devices approve the plan.</p>
         </div>
       </div>
-      <textarea
-        value={input}
-        onChange={(event) => setInput(event.target.value)}
-        placeholder="Find my report PDF on this device"
-        aria-label="Ask Bridge request"
-      />
       <div className="button-row">
-        <button type="button" className="primary-button" disabled={!canPlan || busy !== null} onClick={() => void createPlan()}>
-          {busy === "plan" ? "Planning…" : "Create plan"}
-        </button>
+        <button type="button" className="secondary-button" disabled={!canAddPrimitive(blocks, "Search")} onClick={() => editBlocks(addPrimitive(blocks, "Search").blocks)}>+ Search</button>
+        <button type="button" className="secondary-button" disabled={!canAddPrimitive(blocks, "Transform")} onClick={() => editBlocks(addPrimitive(blocks, "Transform").blocks)}>+ Transform</button>
+        <button type="button" className="secondary-button" disabled={!canAddPrimitive(blocks, "Transfer")} onClick={() => editBlocks(addPrimitive(blocks, "Transfer").blocks)}>+ Transfer</button>
         <button type="button" className="secondary-button" disabled={!canPlan || busy !== null} onClick={() => void createDirectTransferPlan()}>
           Transfer local file
         </button>
       </div>
+      <div className="request-file-preview" data-testid="ask-bridge-block-composer">
+        {blocks.map((block, index) => (
+          <section key={`${block.primitive}-${index}`} className="bridge-plan-block">
+            <div className="section-row"><h3>{index + 1}. {block.primitive}</h3><div className="button-row"><button type="button" className="text-button" disabled={index === 0} onClick={() => { const next = moveBlock(blocks, index, index - 1); editBlocks(next.blocks); setMessage(next.error); }}>↑</button><button type="button" className="text-button" disabled={index === blocks.length - 1} onClick={() => { const next = moveBlock(blocks, index, index + 1); editBlocks(next.blocks); setMessage(next.error); }}>↓</button><button type="button" className="text-button" onClick={() => { const next = removeBlock(blocks, index); editBlocks(next.blocks); setMessage(next.error); }}>Remove</button></div></div>
+            {block.primitive === "Search" ? <div className="bridge-plan-block-fields"><label>Device<input value={selectedPeer?.displayName ?? "Selected device"} readOnly /></label><label>Look in<select aria-label="Reviewed Search scope" value={block.safeScopes[0] ?? "downloads"} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { safeScopes: [event.target.value as SafeSearchScope] }) : entry))}>{SAFE_SEARCH_SCOPES.map((scope) => <option key={scope.value} value={scope.value}>{scope.label}</option>)}</select></label><label>File name<input aria-label="Search filename" value={block.filenameHint} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { filenameHint: event.target.value }) : entry))} placeholder="Funding Statement.pdf" /></label><label>Type<input aria-label="Search extension" value={block.extension} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { extension: event.target.value }) : entry))} placeholder="pdf" /></label></div> : null}
+            {block.primitive === "Transform" ? <div className="bridge-plan-block-fields"><p>Process file: <strong>Extract readable text</strong></p><p>Runs on: {transformAvailability.hostLabel}</p><p className={transformAvailability.status === "unknown" ? "muted" : transformAvailability.available ? "success-text" : "danger-text"}>Availability: {transformAvailability.status === "unknown" ? "Checking / Unknown" : transformAvailability.available ? "Available" : "Unavailable"}{transformAvailability.reason ? ` — ${transformAvailability.reason}` : ""}</p>{transformAvailability.acceptedInputMediaTypes?.length ? <p className="muted">Accepted input types: {transformAvailability.acceptedInputMediaTypes.join(", ")}. Selected-file compatibility is checked again by the receiving Host.</p> : null}</div> : null}
+            {block.primitive === "Transfer" ? <div className="bridge-plan-block-fields"><label>Send result to:<select aria-label="Transfer destination" value={block.destination} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transfer" ? { ...entry, destination: event.target.value as "requesting_device" | "pastey_shared" } : entry))}><option value="requesting_device">This device</option><option value="pastey_shared">Pastey Shared on selected device</option></select></label></div> : null}
+          </section>
+        ))}
+      </div>
+      <div className="button-row"><button type="button" className="primary-button" disabled={!canPlan || busy !== null || directTransfer || (blocks.some((step) => step.primitive === "Transform") && !transformAvailability.available)} onClick={() => void createPlan()}>{busy === "plan" ? "Building…" : "Review plan"}</button></div>
       {!canPlan ? <p className="muted">Select one connected device to create a plan.</p> : null}
-      {advisory && revisionId ? (
+      {revisionId ? (
         <div className="request-file-preview" data-testid="ask-bridge-plan-preview">
           <h3>Review plan</h3>
-          <p>{directTransfer ? "Transfer the one local file you chose to the selected device after both devices approve this plan." : advisory.steps.some((step) => step.primitive === "Transform") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then process it locally with the reviewed capability." : advisory.steps.some((step) => step.primitive === "Transfer") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then transfer it to the approved destination." : "Search the selected device’s reviewed locations for matching files and return a bounded summary."}</p>
+          <p>{directTransfer ? "Transfer the one local file you chose to the selected device after both devices approve this plan." : blocks.some((step) => step.primitive === "Transform") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then process it locally with the reviewed capability." : blocks.some((step) => step.primitive === "Transfer") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then transfer it to the approved destination." : "Search the selected device’s reviewed locations for matching files and return a bounded summary."}</p>
           {!directTransfer && reviewSearch?.primitive === "Search" ? (
             <p className="muted">
-              Search: {reviewSearch.filenameHint} {reviewSearch.extensions.length ? `(${reviewSearch.extensions.join(", ").toUpperCase()})` : ""} in {reviewSearch.safeScopes.join(", ")}.
+              Search: {reviewSearch.filenameHint} {reviewSearch.extension ? `(${reviewSearch.extension.toUpperCase()})` : ""} in {reviewSearch.safeScopes.join(", ")}.
               {reviewTransfer?.primitive === "Transfer" ? ` Destination: ${reviewTransfer.destination === "requesting_device" ? "requesting device" : "selected device Pastey Shared"}.` : ""}
             </p>
           ) : null}
@@ -1393,7 +1407,7 @@ function BridgePlanSenderPanel({
           ))}
         </div>
       ) : null}
-      {hasTransform && selectedCandidateId && attemptId && transformedAttemptIds.has(attemptId) && advisory?.steps.some((step) => step.primitive === "Transfer") ? (
+      {hasTransform && selectedCandidateId && attemptId && transformedAttemptIds.has(attemptId) && blocks.some((step) => step.primitive === "Transfer") ? (
         <div className="request-file-preview"><h3>Generated result ready</h3><p>The approved Transform finished on the selected device. Transfer the generated result to the approved destination.</p><button type="button" className="primary-button" disabled={busy !== null} onClick={() => void transferGeneratedResult()}>{busy === "start" ? "Starting…" : "Transfer generated result"}</button></div>
       ) : null}
       {hasTransform && attemptId && failedTransformAttemptIds.has(attemptId) ? (
@@ -1936,46 +1950,6 @@ function transferInputsForSelectedRoute(
     targetPeerDisplayName: peer.displayName,
     targetCount: selectedRoutePeers.length,
   })));
-}
-
-async function generateCloudNaturalPlan(
-  userRequest: string,
-  config: ReturnType<typeof useAgentBridgeRuntimeConfig>,
-): Promise<AiGenerateResult> {
-  const provider = new CloudOpenAICompatibleProvider({
-    providerId: "pastey-cloud-openai-compatible-natural-v1",
-    displayName: "CloudOpenAICompatibleProvider",
-    kind: "cloud_openai_compatible",
-    apiShape: "openai_compatible_chat",
-    baseUrl: config.cloudBaseUrl,
-    model: config.cloudModel,
-    apiKeyRef: config.cloudApiKey ? "runtime-memory-only" : undefined,
-    timeoutMs: 30_000,
-    maxOutputTokens: 512,
-    enabled: true,
-  }, {
-    apiKey: config.cloudApiKey,
-  });
-  const generated = await provider.generate({
-    requestId: `ask-bridge-natural-cloud-${Date.now()}`,
-    providerId: provider.config.providerId,
-    context: buildMockAiContextSnapshot(),
-    contextPolicy: CLOUD_STRICT_AI_CONTEXT_POLICY,
-    allowedActionKinds: [],
-    outputSchema: "ask-bridge-natural-v1",
-    userRequest,
-  });
-  if (!generated.error) return generated;
-  const fallback = await generateMockAskBridgeNaturalV1Plan(userRequest);
-  return {
-    ...fallback,
-    error: generated.error,
-  };
-}
-
-function searchScopesForPlan(plan: AskBridgeNaturalV1Plan | null): SafeSearchScope[] {
-  const search = plan?.steps.find((step) => step.primitive === "Search");
-  return search?.primitive === "Search" ? search.safeScopes : ["downloads", "desktop", "documents", "pastey_shared"];
 }
 
 interface ActivityListRow {

@@ -16,6 +16,22 @@ import {
   terminalSearchPresentation,
 } from "../src/lib/bridgePlanSearchResults";
 import type { ReceivedRoomControlEvent } from "../src/lib/types";
+import {
+  SAFE_SEARCH_SCOPES,
+  addPrimitive,
+  manualBridgePlanInput,
+  moveBlock,
+  newSearchBlock,
+  newTransformBlock,
+  newTransferBlock,
+  removeBlock,
+  updateSearchBlock,
+  type TransformAvailability,
+} from "../src/lib/bridgePlanComposer";
+
+const availableTransform: TransformAvailability = {
+  intent: "extract readable text", available: true, reason: "available", hostLabel: "Host",
+};
 
 function searchResultEvent(candidates: unknown[]): ReceivedRoomControlEvent {
   return {
@@ -170,5 +186,62 @@ test("zero-result Search is a successful terminal completion that replaces runna
     status: "completed",
     summary: "Search completed with no matching files.",
     isEmpty: true,
+  });
+});
+
+test("manual composer produces bounded Search metadata without the natural-language parser or an AI provider", () => {
+  const search = updateSearchBlock(newSearchBlock(), {
+    filenameHint: "Funding Statement.pdf", extension: "PDF", safeScopes: ["downloads"],
+  });
+  const result = manualBridgePlanInput([search], availableTransform);
+  assert.deepEqual(result.value?.safeScopes, ["downloads"]);
+  assert.deepEqual(result.value?.extensions, ["pdf"]);
+  assert.equal(result.value?.filenameHint, "Funding Statement.pdf");
+  assert.deepEqual(SAFE_SEARCH_SCOPES.map((scope) => scope.value), ["downloads", "desktop", "documents", "pastey_shared"]);
+});
+
+test("manual composer accepts each bounded Search composition and maps transfer destinations", () => {
+  const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
+  assert.ok(manualBridgePlanInput([search], availableTransform).value);
+  assert.equal(manualBridgePlanInput([search, newTransferBlock()], availableTransform).value?.transferDestination, "requesting_device");
+  assert.equal(manualBridgePlanInput([search, newTransformBlock()], availableTransform).value?.transformIntent, "extract readable text");
+  const shared = { ...newTransferBlock(), destination: "pastey_shared" as const };
+  assert.deepEqual(manualBridgePlanInput([search, newTransformBlock(), shared], availableTransform).value?.blocks.map((block) => block.primitive), ["Search", "Transform", "Transfer"]);
+  assert.equal(manualBridgePlanInput([search, newTransformBlock(), shared], availableTransform).value?.transferDestination, "pastey_shared");
+});
+
+test("manual composer prevents invalid add, remove, and reorder operations instead of reinterpreting them", () => {
+  assert.equal(addPrimitive([], "Transform").error, "Transform needs a selected input before it can run.");
+  assert.equal(addPrimitive([], "Transfer").error, "Transfer needs an available source before it can run.");
+  const blocks = [newSearchBlock(), newTransformBlock(), newTransferBlock()];
+  assert.equal(moveBlock(blocks, 2, 0).error, "Transfer needs an available source before it can run.");
+  assert.equal(removeBlock(blocks, 0).error, "Transform needs a selected input before it can run.");
+  assert.deepEqual(moveBlock(blocks, 2, 0).blocks.map((block) => block.primitive), ["Search", "Transform", "Transfer"]);
+});
+
+test("an unavailable Host Transform cannot become an executable manual revision", () => {
+  const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
+  const unavailable: TransformAvailability = { ...availableTransform, available: false, reason: "staging unsupported" };
+  assert.deepEqual(manualBridgePlanInput([search, newTransformBlock()], unavailable), { error: "staging unsupported" });
+});
+
+test("selected-peer facts, not requester capability, gate Transform composition", () => {
+  const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
+  const selectedWindows: TransformAvailability = { ...availableTransform, available: false, reason: "Unavailable on Windows PC", hostLabel: "Windows PC" };
+  const selectedMac: TransformAvailability = { ...availableTransform, available: true, reason: "Available on Mac", hostLabel: "Mac" };
+  assert.equal(manualBridgePlanInput([search, newTransformBlock()], selectedWindows).error, "Unavailable on Windows PC");
+  assert.equal(manualBridgePlanInput([search, newTransformBlock()], selectedMac).value?.transformIntent, "extract readable text");
+});
+
+test("an unknown selected-peer capability is not treated as available", () => {
+  const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
+  const checking: TransformAvailability = {
+    ...availableTransform,
+    status: "unknown",
+    available: false,
+    reason: "Checking selected device capability…",
+  };
+  assert.deepEqual(manualBridgePlanInput([search, newTransformBlock()], checking), {
+    error: "Checking selected device capability…",
   });
 });

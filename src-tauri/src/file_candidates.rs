@@ -11,12 +11,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::{
     error::{AppError, AppResult},
     logging,
-    object_refs::{
-        self, EphemeralObjectStore, ObjectKind, ObjectRefDescriptor,
-    },
+    object_refs::{self, EphemeralObjectStore, ObjectKind, ObjectRefDescriptor},
     storage::AppPaths,
-    transform_registry,
-    transform_sandbox,
+    transform_registry, transform_sandbox,
 };
 
 const MAX_IDENTIFIER_LENGTH: usize = 256;
@@ -453,15 +450,33 @@ fn resolve_scope(
     };
     let Some(root) = root else {
         omitted.scopes_skipped.push(label.to_string());
-        log_search_scope(request, "search_scope_unavailable", label, known_folder_resolved, "known_folder_unavailable");
+        log_search_scope(
+            request,
+            "search_scope_unavailable",
+            label,
+            known_folder_resolved,
+            "known_folder_unavailable",
+        );
         return None;
     };
     if !root.is_dir() {
         omitted.scopes_skipped.push(label.to_string());
-        log_search_scope(request, "search_scope_unavailable", label, known_folder_resolved, "scope_not_directory");
+        log_search_scope(
+            request,
+            "search_scope_unavailable",
+            label,
+            known_folder_resolved,
+            "scope_not_directory",
+        );
         return None;
     }
-    log_search_scope(request, "search_scope_resolved", label, known_folder_resolved, "resolved");
+    log_search_scope(
+        request,
+        "search_scope_resolved",
+        label,
+        known_folder_resolved,
+        "resolved",
+    );
     Some(SearchScope {
         label: label.to_string(),
         display_prefix: display_prefix.to_string(),
@@ -685,7 +700,6 @@ impl BridgePlanCandidateStore {
         self.entries.retain(|_, entry| entry.room_ref != room_id);
         Ok(before - self.entries.len())
     }
-
 }
 
 /// Confirms that an authenticated Bridge Plan selection still names one of the
@@ -748,7 +762,9 @@ pub(crate) struct BridgePlanPrivateFile {
 /// Captures a requester-selected local file for a direct Bridge Plan Transfer.
 /// The path is immediately canonicalized and remains Rust-private; callers
 /// retain only the immutable plan revision and a process-local binding.
-pub(crate) fn capture_bridge_plan_requester_file(path: PathBuf) -> AppResult<BridgePlanPrivateFile> {
+pub(crate) fn capture_bridge_plan_requester_file(
+    path: PathBuf,
+) -> AppResult<BridgePlanPrivateFile> {
     let metadata = fs::symlink_metadata(&path)
         .map_err(|_| AppError::NotFound("The selected file is unavailable.".into()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -759,9 +775,12 @@ pub(crate) fn capture_bridge_plan_requester_file(path: PathBuf) -> AppResult<Bri
     let canonical = path
         .canonicalize()
         .map_err(|_| AppError::InvalidInput("The selected file is unavailable.".into()))?;
-    let scope_root = canonical.parent().ok_or_else(|| {
-        AppError::InvalidInput("The selected file has no safe local parent.".into())
-    })?.to_path_buf();
+    let scope_root = canonical
+        .parent()
+        .ok_or_else(|| {
+            AppError::InvalidInput("The selected file has no safe local parent.".into())
+        })?
+        .to_path_buf();
     let display_name = canonical
         .file_name()
         .and_then(|name| name.to_str())
@@ -933,7 +952,6 @@ pub(crate) fn transform_bridge_plan_selected_file(
         receiver_device_ref.into(),
         private_output.clone(),
         private_root.clone(),
-        blake3::hash(&bytes).to_hex().to_string(),
         metadata.len(),
         "readable-text.txt".into(),
         CANDIDATE_PAYLOAD_STORE_TTL_SECONDS,
@@ -1034,8 +1052,14 @@ mod tests {
             symlinks_skipped: false,
             scopes_skipped: Vec::new(),
         };
-        let scope = resolve_scope("downloads", &paths, &roots, &request(vec!["downloads"], "report.pdf"), &mut omitted)
-            .unwrap();
+        let scope = resolve_scope(
+            "downloads",
+            &paths,
+            &roots,
+            &request(vec!["downloads"], "report.pdf"),
+            &mut omitted,
+        )
+        .unwrap();
         assert_eq!(scope.root, redirected);
         assert!(omitted.scopes_skipped.is_empty());
         fs::remove_dir_all(paths.app_data_dir).unwrap();
@@ -1093,8 +1117,13 @@ mod tests {
         .unwrap();
         assert_eq!(result.status, "completed");
         assert_eq!(result.candidates.len(), 1);
-        assert_eq!(result.candidates[0].match_reason, "filename_case_insensitive_match");
-        assert!(!serde_json::to_string(&result).unwrap().contains(&downloads.display().to_string()));
+        assert_eq!(
+            result.candidates[0].match_reason,
+            "filename_case_insensitive_match"
+        );
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains(&downloads.display().to_string()));
         fs::remove_dir_all(paths.app_data_dir).unwrap();
     }
 }

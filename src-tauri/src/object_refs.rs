@@ -47,9 +47,7 @@ pub(crate) struct ObjectRefDescriptor {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TransformOutputObject {
-    pub(crate) private_output_path: PathBuf,
     pub(crate) private_output_root: PathBuf,
-    pub(crate) private_digest: String,
 }
 
 #[derive(Clone, Debug)]
@@ -115,13 +113,11 @@ impl EphemeralObjectStore {
         owner_device_ref: String,
         private_output_path: PathBuf,
         private_output_root: PathBuf,
-        private_digest: String,
         size_bytes: u64,
         display_name: String,
         ttl_seconds: i64,
     ) -> AppResult<ObjectRefDescriptor> {
         validate_private_output(&private_output_path, &private_output_root, size_bytes)?;
-        let private_output_path = fs::canonicalize(private_output_path)?;
         let private_output_root = fs::canonicalize(private_output_root)?;
         let created = OffsetDateTime::now_utc();
         let expires = created + time::Duration::seconds(ttl_seconds.clamp(1, 600));
@@ -147,68 +143,11 @@ impl EphemeralObjectStore {
             StoredObject {
                 descriptor: descriptor.clone(),
                 entry: EphemeralObjectEntry::TransformOutput(TransformOutputObject {
-                    private_output_path,
                     private_output_root,
-                    private_digest,
                 }),
             },
         );
         Ok(descriptor)
-    }
-
-    pub(crate) fn resolve(
-        &mut self,
-        object_ref: &str,
-        bridge_session_ref: &str,
-        owner_device_ref: &str,
-        expected_kind: ObjectKind,
-    ) -> AppResult<(ObjectRefDescriptor, EphemeralObjectEntry)> {
-        validate_object_ref(object_ref)?;
-        let now = OffsetDateTime::now_utc();
-        let expired = self
-            .entries
-            .get(object_ref)
-            .and_then(|stored| parse_time(&stored.descriptor.expires_at).ok())
-            .is_some_and(|expiry| expiry <= now);
-        if expired {
-            self.purge_object(object_ref)?;
-            return Err(AppError::InvalidInput("ObjectRef expired.".into()));
-        }
-        let stored = self
-            .entries
-            .get(object_ref)
-            .ok_or_else(|| AppError::NotFound("ObjectRef not found.".into()))?;
-        if stored.descriptor.bridge_session_ref != bridge_session_ref {
-            return Err(AppError::InvalidInput(
-                "ObjectRef Bridge binding mismatch.".into(),
-            ));
-        }
-        if stored.descriptor.owner_device_ref != owner_device_ref {
-            return Err(AppError::InvalidInput(
-                "ObjectRef owner binding mismatch.".into(),
-            ));
-        }
-        if stored.descriptor.object_kind != expected_kind {
-            return Err(AppError::InvalidInput(
-                "ObjectRef kind binding mismatch.".into(),
-            ));
-        }
-        if let EphemeralObjectEntry::TransformOutput(output) = &stored.entry {
-            validate_private_output(
-                &output.private_output_path,
-                &output.private_output_root,
-                stored.descriptor.size_bytes.unwrap_or_default(),
-            )?;
-            let digest = blake3::hash(&fs::read(&output.private_output_path)?)
-                .to_hex()
-                .to_string();
-            if digest != output.private_digest {
-                return Err(AppError::InvalidInput(
-                    "Transform output identity changed.".into(),
-                ));
-            }
-        }
-        Ok((stored.descriptor.clone(), stored.entry.clone()))
     }
 
     pub(crate) fn purge_object(&mut self, object_ref: &str) -> AppResult<bool> {
@@ -414,14 +353,6 @@ fn parse_time(value: &str) -> AppResult<OffsetDateTime> {
 mod tests {
     use super::*;
 
-    fn times() -> (String, String) {
-        let now = OffsetDateTime::now_utc();
-        (
-            now.format(&Rfc3339).unwrap(),
-            (now + time::Duration::minutes(1)).format(&Rfc3339).unwrap(),
-        )
-    }
-
     #[test]
     fn object_refs_are_opaque_and_path_like_values_fail() {
         assert!(validate_object_ref(&new_object_ref()).is_ok());
@@ -433,100 +364,5 @@ mod tests {
         ] {
             assert!(validate_object_ref(value).is_err());
         }
-    }
-
-    #[test]
-    fn resolution_is_exact_and_burn_purges_bridge_entries() {
-        let mut store = EphemeralObjectStore::default();
-        let object_ref = new_object_ref();
-        let (created, expires) = times();
-        store
-            .register_filesystem_candidate(
-                object_ref.clone(),
-                "bridge".into(),
-                "owner".into(),
-                "text/plain".into(),
-                1,
-                "note.txt".into(),
-                created,
-                expires,
-            )
-            .unwrap();
-        assert!(store
-            .resolve(
-                &object_ref,
-                "bridge",
-                "owner",
-                ObjectKind::FilesystemCandidate
-            )
-            .is_ok());
-        assert!(store
-            .resolve(
-                &object_ref,
-                "wrong",
-                "owner",
-                ObjectKind::FilesystemCandidate
-            )
-            .is_err());
-        assert!(store
-            .resolve(
-                &object_ref,
-                "bridge",
-                "wrong",
-                ObjectKind::FilesystemCandidate
-            )
-            .is_err());
-        assert!(store
-            .resolve(&object_ref, "bridge", "owner", ObjectKind::TransformOutput)
-            .is_err());
-        assert_eq!(store.purge_bridge("bridge").unwrap(), 1);
-        assert!(store
-            .resolve(
-                &object_ref,
-                "bridge",
-                "owner",
-                ObjectKind::FilesystemCandidate
-            )
-            .is_err());
-    }
-
-    #[test]
-    fn expired_refs_are_removed() {
-        let mut store = EphemeralObjectStore::default();
-        let object_ref = new_object_ref();
-        let created = (OffsetDateTime::now_utc() - time::Duration::minutes(2))
-            .format(&Rfc3339)
-            .unwrap();
-        let expires = (OffsetDateTime::now_utc() - time::Duration::minutes(1))
-            .format(&Rfc3339)
-            .unwrap();
-        let descriptor = ObjectRefDescriptor {
-            schema_version: OBJECT_REF_SCHEMA.into(),
-            object_ref: object_ref.clone(),
-            object_kind: ObjectKind::FilesystemCandidate,
-            owner_device_ref: "owner".into(),
-            bridge_session_ref: "bridge".into(),
-            media_type: "text/plain".into(),
-            size_bytes: Some(1),
-            display_name: Some("a.txt".into()),
-            created_at: created,
-            expires_at: expires,
-        };
-        store.entries.insert(
-            object_ref.clone(),
-            StoredObject {
-                descriptor,
-                entry: EphemeralObjectEntry::FilesystemCandidate,
-            },
-        );
-        assert!(store
-            .resolve(
-                &object_ref,
-                "bridge",
-                "owner",
-                ObjectKind::FilesystemCandidate
-            )
-            .is_err());
-        assert!(!store.entries.contains_key(&object_ref));
     }
 }

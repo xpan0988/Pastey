@@ -5,10 +5,9 @@
 //! history only; all capability grants, ObjectRef backing, leases, and process
 //! state remain in their existing ephemeral Host-owned stores.
 
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    sync::Mutex,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -26,8 +25,7 @@ pub(crate) use protocol::{
     accept_inbound_protocol_event, attempt_search_result_payload, attempt_start_payload,
     attempt_update_payload, consume_search_execution_grant, consume_transfer_execution_grant,
     consume_transform_execution_grant, protocol_metadata, receiver_decision_payload,
-    receiver_review_decision, reconcile_protocol_startup,
-    record_outbound_protocol_event,
+    receiver_review_decision, reconcile_protocol_startup, record_outbound_protocol_event,
     review_request_payload, search_selection_payload, transfer_start_payload,
     transfer_update_payload, transform_start_payload, transform_update_payload,
     ProtocolSearchAuthorityStore,
@@ -501,6 +499,7 @@ pub(crate) struct BridgePlanRevision {
 /// Builds the only currently executable file-search revision from bounded
 /// product intent. The renderer never supplies a revision, object reference,
 /// device binding, or execution grant.
+#[cfg(test)]
 pub(crate) fn build_file_search_revision(
     bridge_id: String,
     requesting_device_ref: String,
@@ -534,7 +533,9 @@ pub(crate) fn build_direct_file_transfer_revision(
     let object = ObjectContract {
         object_type: GeneratedUserVisibleText::from_semantic("file"),
         media_types: Vec::new(),
-        user_visible_description: GeneratedUserVisibleText::from_semantic("one file chosen on the requesting device"),
+        user_visible_description: GeneratedUserVisibleText::from_semantic(
+            "one file chosen on the requesting device",
+        ),
     };
     let transfer = BridgePlanStep::Transfer {
         step_id: "transfer".into(),
@@ -1030,6 +1031,7 @@ pub(crate) struct StepExecutionProjection {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct EphemeralStepAuthority {
     authority_id: String,
     bridge_id: String,
@@ -1052,6 +1054,7 @@ struct EphemeralStepAuthority {
     consumed: bool,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct EphemeralStepAuthorityStore {
     grants: Mutex<HashMap<String, EphemeralStepAuthority>>,
@@ -2053,6 +2056,7 @@ impl<'a> BridgePlanStore<'a> {
         tx.commit()?;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn get_plan(&self, plan_id: &str) -> AppResult<BridgePlan> {
         let conn = self.connection()?;
         conn.query_row("SELECT plan_id, bridge_id, requesting_device_ref, created_at FROM bridge_plans WHERE plan_id = ?1", [plan_id], |row| Ok(BridgePlan { plan_id: row.get(0)?, bridge_id: row.get(1)?, requesting_device_ref: row.get(2)?, created_at: row.get(3)? })).optional()?.ok_or_else(|| AppError::NotFound("Bridge Plan not found.".into()))
@@ -2283,6 +2287,7 @@ impl<'a> BridgePlanStore<'a> {
         tx.commit()?;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn transition_approval(
         &self,
         approval_id: &str,
@@ -2306,6 +2311,7 @@ impl<'a> BridgePlanStore<'a> {
         tx.commit()?;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn consume_approval_create_attempt(
         &self,
         attempt: &BridgePlanAttempt,
@@ -2604,6 +2610,7 @@ impl<'a> BridgePlanStore<'a> {
     }
 }
 
+#[cfg(test)]
 impl EphemeralStepAuthorityStore {
     pub(crate) fn derive(
         &self,
@@ -2787,11 +2794,6 @@ impl EphemeralStepAuthorityStore {
         }
         authority.consumed = true;
         Ok(())
-    }
-    pub(crate) fn purge_bridge(&self, bridge_id: &str) {
-        if let Ok(mut grants) = self.grants.lock() {
-            grants.retain(|_, authority| authority.bridge_id != bridge_id);
-        }
     }
     fn purge_attempt(&self, attempt_id: &str) {
         if let Ok(mut grants) = self.grants.lock() {
@@ -3014,6 +3016,7 @@ fn revision_state_tx(tx: &Transaction<'_>, revision_id: &str) -> AppResult<Revis
     .and_then(|value| revision_state_from(&value))
     .ok_or_else(|| AppError::NotFound("Bridge Plan revision not found.".into()))
 }
+#[cfg(test)]
 fn approval_state_tx(tx: &Transaction<'_>, approval_id: &str) -> AppResult<ApprovalState> {
     tx.query_row(
         "SELECT state FROM bridge_plan_approvals WHERE approval_id = ?1",
@@ -3142,6 +3145,7 @@ fn legal_revision(current: &RevisionState, next: &RevisionState) -> bool {
         )
     )
 }
+#[cfg(test)]
 fn legal_approval(current: &ApprovalState, next: &ApprovalState) -> bool {
     matches!(
         (current, next),
@@ -3209,6 +3213,7 @@ fn legal_step(current: &StepExecutionState, next: &StepExecutionState) -> bool {
         )
     )
 }
+#[cfg(test)]
 fn authority_destination_device(step: &BridgePlanStep) -> Option<String> {
     match step {
         BridgePlanStep::Transfer { destination, .. } => Some(match destination {
@@ -5433,7 +5438,10 @@ mod tests {
         assert!(depends_on.is_empty());
         assert_eq!(source_device_ref.as_deref(), Some("requester"));
         assert_eq!(execution_device_ref, "requester");
-        assert!(matches!(source, ObjectSelectionRule::FutureUserSelection { .. }));
+        assert!(matches!(
+            source,
+            ObjectSelectionRule::FutureUserSelection { .. }
+        ));
         assert_eq!(
             destination,
             &TransferDestination::SelectedDevice {

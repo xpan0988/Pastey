@@ -7,7 +7,10 @@
 //! backend infrastructure, not product Transform availability.
 
 pub(crate) mod cleanup;
-#[cfg(test)]
+// The dormant isolation verifier has no production authority and exercises
+// Linux-only cgroup, namespace, and Bubblewrap seams. Keeping it out of
+// non-Linux test builds avoids compiling a fake cross-platform backend.
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) mod linux;
 pub(crate) mod profile;
 pub(crate) mod staging;
