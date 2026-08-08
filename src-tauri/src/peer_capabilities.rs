@@ -8,7 +8,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{AppError, AppResult};
+use crate::{
+    error::{AppError, AppResult},
+    room_control::log_peer_capability,
+};
 
 pub(crate) const PEER_CAPABILITY_SCHEMA: &str = "pastey-peer-capabilities-v1";
 pub(crate) const CAPABILITY_ID: &str = "extract_readable_text_v1";
@@ -123,9 +126,15 @@ impl PeerCapabilityStore {
             peer_session_id.into(),
             peer_observation_ref.into(),
         )) else {
+            log_peer_capability(
+                "projection_lookup_miss",
+                None,
+                Some("missing_or_route_changed"),
+            );
             return unknown(peer_session_id);
         };
         if observed.received_at <= 0 || now - observed.received_at > MAX_FACT_AGE_SECONDS {
+            log_peer_capability("projection_lookup_miss", None, Some("stale"));
             return unknown(peer_session_id);
         }
         let Some(capability) = observed
@@ -134,9 +143,11 @@ impl PeerCapabilityStore {
             .iter()
             .find(|fact| fact.capability_id == CAPABILITY_ID)
         else {
+            log_peer_capability("projection_lookup_miss", None, Some("capability_missing"));
             return unknown(peer_session_id);
         };
         if capability.available {
+            log_peer_capability("projection_lookup_hit", Some(true), Some("available"));
             SelectedPeerTransformAvailability {
                 peer_session_id: peer_session_id.into(),
                 status: "available",
@@ -146,6 +157,11 @@ impl PeerCapabilityStore {
                 output_media_type: Some(capability.output_media_type.clone()),
             }
         } else {
+            log_peer_capability(
+                "projection_lookup_hit",
+                Some(false),
+                capability.unavailable_reason.as_deref(),
+            );
             SelectedPeerTransformAvailability {
                 peer_session_id: peer_session_id.into(),
                 status: "unavailable",
@@ -280,6 +296,15 @@ mod tests {
                 .status,
             "unknown"
         );
+        assert!(store
+            .observe(
+                "room",
+                "windows-selected-session",
+                "endpoint-one",
+                local_projection("requester-session".into(), 100),
+                100,
+            )
+            .is_err());
     }
 
     #[test]
