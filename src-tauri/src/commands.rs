@@ -60,9 +60,21 @@ pub async fn refresh_selected_peer_capabilities(
         &context,
     )
     .map_err(|error| error.message())?;
-    crate::room_control::send_room_control_event(state, &room_id, event, bridge_route)
-        .await
-        .map_err(|error| error.message())
+    crate::room_control::log_peer_capability("query_dispatch", None, None);
+    match crate::room_control::send_room_control_event(state, &room_id, event, bridge_route).await {
+        Ok(receipt) => {
+            crate::room_control::log_peer_capability("query_delivered", None, None);
+            Ok(receipt)
+        }
+        Err(error) => {
+            crate::room_control::log_peer_capability(
+                "query_rejected",
+                None,
+                Some("delivery_failed"),
+            );
+            Err(error.message())
+        }
+    }
 }
 
 /// Returns only the fresh observation bound to the currently selected peer

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -61,6 +61,63 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
 const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
 
+/// Writes only fixed capability metadata and reason codes. In particular, it
+/// never includes a transport key, endpoint, route binding, path, or grant.
+pub(crate) fn log_peer_capability(stage: &str, available: Option<bool>, code: Option<&str>) {
+    let mut line = format!("[pastey peer-capability] stage={stage}");
+    if available.is_some() {
+        line.push_str(" capability=extract_readable_text_v1");
+        line.push_str(if available == Some(true) {
+            " available=true"
+        } else {
+            " available=false"
+        });
+    }
+    if let Some(code) = code {
+        line.push_str(if available.is_some() {
+            " reason="
+        } else {
+            " code="
+        });
+        line.push_str(code);
+    }
+    logging::write_transfer_line(&line);
+}
+
+fn peer_capability_rejection_stage(event: &Value) -> Option<&'static str> {
+    match event.get("kind").and_then(Value::as_str) {
+        Some("peer_capability.query") => Some("query_rejected"),
+        Some("peer_capability.response") => Some("response_rejected"),
+        _ => None,
+    }
+}
+
+fn peer_capability_rejection_code(message: &str) -> &'static str {
+    if message.contains("expired") {
+        "expired"
+    } else if message.contains("session mismatch") {
+        "session_mismatch"
+    } else if message.contains("too large") {
+        "payload_too_large"
+    } else if message.contains("Unsupported peer capability") {
+        "unsupported_capability"
+    } else {
+        "invalid_schema"
+    }
+}
+
+fn peer_capability_fact_code(
+    fact: &crate::peer_capabilities::TransformCapabilityFact,
+) -> &'static str {
+    match (fact.available, fact.unavailable_reason.as_deref()) {
+        (true, None) => "available",
+        (false, Some("platform_unsupported")) => "platform_unsupported",
+        (false, Some("backend_unavailable")) => "backend_unavailable",
+        (false, Some("capability_unavailable")) => "capability_unavailable",
+        _ => "invalid_capability",
+    }
+}
+
 pub(crate) fn peer_capability_event(
     kind: &str,
     payload: Value,
@@ -80,6 +137,17 @@ pub(crate) fn peer_capability_event(
         "previewOnly": false,
         "payload": payload,
     }))
+}
+
+fn selected_peer_control_route(room_id: &str, peer_session_id: &str) -> Value {
+    serde_json::json!({
+        "schemaVersion": CONTROL_BRIDGE_ROUTE_SCHEMA_VERSION,
+        "bridgeSessionId": bridge_session_ref(room_id),
+        "target": {
+            "kind": "selected_peer",
+            "peerSessionId": peer_session_id,
+        },
+    })
 }
 
 fn log_bridge_plan_control_event(event: &ValidatedControlEvent, stage: &str) {
@@ -615,10 +683,25 @@ pub fn room_control_session_context(
 fn peer_observation_ref(peer: &RoomControlRouteEndpoint) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(peer.peer_session_id.as_bytes());
-    hasher.update(peer.host.as_bytes());
+    hasher.update(canonical_endpoint_host(&peer.host).as_bytes());
     hasher.update(&peer.port.to_be_bytes());
     hasher.update(peer.transport_public_key.as_bytes());
     format!("peer-observation:{}", hasher.finalize().to_hex())
+}
+
+/// Endpoint spellings are transport metadata, not product data. Normalize
+/// their semantic route identity before hashing so IPv4-mapped IPv6 and DNS
+/// case differences do not spuriously invalidate a current fact.
+fn canonical_endpoint_host(host: &str) -> String {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => address.to_string(),
+        Ok(IpAddr::V6(address)) => address
+            .to_ipv4_mapped()
+            .map(|mapped| mapped.to_string())
+            .unwrap_or_else(|| address.to_string()),
+        Err(_) => host.trim_end_matches('.').to_ascii_lowercase(),
+    }
 }
 
 pub async fn send_room_control_event(
@@ -919,6 +1002,9 @@ pub async fn receive_room_control_event_handler(
     ) {
         Ok(value) => value,
         Err(AppError::InvalidInput(message)) if message.contains("expired") => {
+            if let Some(stage) = peer_capability_rejection_stage(&event) {
+                log_peer_capability(stage, None, Some(peer_capability_rejection_code(&message)));
+            }
             if event
                 .get("kind")
                 .and_then(Value::as_str)
@@ -936,6 +1022,9 @@ pub async fn receive_room_control_event_handler(
             );
         }
         Err(AppError::InvalidInput(message)) if message.contains("session mismatch") => {
+            if let Some(stage) = peer_capability_rejection_stage(&event) {
+                log_peer_capability(stage, None, Some(peer_capability_rejection_code(&message)));
+            }
             if event
                 .get("kind")
                 .and_then(Value::as_str)
@@ -953,6 +1042,9 @@ pub async fn receive_room_control_event_handler(
             );
         }
         Err(AppError::InvalidInput(message)) => {
+            if let Some(stage) = peer_capability_rejection_stage(&event) {
+                log_peer_capability(stage, None, Some(peer_capability_rejection_code(&message)));
+            }
             let reason = bridge_plan_validation_reason(&message);
             if event
                 .get("kind")
@@ -979,6 +1071,8 @@ pub async fn receive_room_control_event_handler(
         log_bridge_plan_control_event(&validated, "inbound_validated");
     }
     if validated.kind == "peer_capability.response" {
+        log_peer_capability("response_received", None, None);
+        log_peer_capability("response_validated", None, None);
         let projection: crate::peer_capabilities::PeerCapabilityProjection =
             match serde_json::from_value(
                 validated
@@ -989,13 +1083,16 @@ pub async fn receive_room_control_event_handler(
             ) {
                 Ok(value) => value,
                 Err(_) => {
+                    log_peer_capability("response_rejected", None, Some("invalid_schema"));
                     return control_error(
                         StatusCode::BAD_REQUEST,
                         "invalid_capability",
                         "Invalid peer capability fact.",
-                    )
+                    );
                 }
             };
+        let available = projection.capabilities[0].available;
+        let code = peer_capability_fact_code(&projection.capabilities[0]);
         if ctx
             .state
             .peer_capabilities
@@ -1009,13 +1106,16 @@ pub async fn receive_room_control_event_handler(
             )
             .is_err()
         {
+            log_peer_capability("response_rejected", None, Some("session_or_route_mismatch"));
             return control_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_capability",
                 "Invalid peer capability fact.",
             );
         }
+        log_peer_capability("projection_stored", Some(available), Some(code));
     } else if validated.kind == "peer_capability.query" {
+        log_peer_capability("query_received", None, None);
         let peer_session_id = validated
             .event
             .get("payload")
@@ -1023,6 +1123,7 @@ pub async fn receive_room_control_event_handler(
             .and_then(|payload| payload.get("peerSessionId"))
             .and_then(Value::as_str);
         let Some(peer_session_id) = peer_session_id else {
+            log_peer_capability("query_rejected", None, Some("invalid_schema"));
             return control_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_capability",
@@ -1037,21 +1138,46 @@ pub async fn receive_room_control_event_handler(
             peer_observation_ref: peer_observation_ref(&inbound_peer),
             peer_connected: true,
         };
-        let payload = serde_json::to_value(crate::peer_capabilities::local_projection(
-            peer_session_id.into(),
-            storage::now_ts(),
-        ))
-        .expect("peer capability projection serializes");
-        if let Ok(response) =
-            peer_capability_event("peer_capability.response", payload, &response_context)
-        {
-            let response_state = ctx.state.clone();
-            let response_room_id = room_id.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = send_room_control_event(response_state, &response_room_id, response, None)
-                    .await;
-            });
-        }
+        // This is the requester's selected-peer session identifier. The
+        // receiver must echo it, rather than substituting the requester's
+        // inbound session id, so the requester can bind the fact to its
+        // current selected remote peer after authenticated delivery.
+        let projection =
+            crate::peer_capabilities::local_projection(peer_session_id.into(), storage::now_ts());
+        let available = projection.capabilities[0].available;
+        let code = peer_capability_fact_code(&projection.capabilities[0]);
+        log_peer_capability("local_projection_created", Some(available), Some(code));
+        let payload =
+            serde_json::to_value(projection).expect("peer capability projection serializes");
+        let response =
+            match peer_capability_event("peer_capability.response", payload, &response_context) {
+                Ok(response) => response,
+                Err(_) => {
+                    log_peer_capability("response_rejected", None, Some("construction_failed"));
+                    return control_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_capability",
+                        "Invalid peer capability response.",
+                    );
+                }
+            };
+        let response_route = selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
+        let response_state = ctx.state.clone();
+        let response_room_id = room_id.clone();
+        log_peer_capability("response_dispatch", Some(available), None);
+        tauri::async_runtime::spawn(async move {
+            match send_room_control_event(
+                response_state,
+                &response_room_id,
+                response,
+                Some(response_route),
+            )
+            .await
+            {
+                Ok(_) => log_peer_capability("response_delivered", Some(available), None),
+                Err(_) => log_peer_capability("response_rejected", None, Some("delivery_failed")),
+            }
+        });
     } else if let Err(error) = crate::bridge_plan::accept_inbound_protocol_event(
         &ctx.state.paths,
         &ctx.state.bridge_plan_protocol_authority.lock(),
@@ -1924,6 +2050,35 @@ mod tests {
         )
         .unwrap();
         assert!(validate_control_event(malformed, "room", "source", "target", now).is_err());
+    }
+
+    #[test]
+    fn peer_capability_response_route_targets_the_authenticated_inbound_peer() {
+        let room = route_room();
+        let inbound_peer = route_peer("requester-current-session");
+        let response_route = selected_peer_control_route("room", &inbound_peer.peer_session_id);
+        let resolved =
+            resolve_room_control_route(Some(&response_route), "room", &room, &[inbound_peer])
+                .unwrap();
+        assert_eq!(resolved.peer_session_id, "requester-current-session");
+    }
+
+    #[test]
+    fn peer_observation_binding_normalizes_equivalent_ip_endpoints() {
+        let ipv4 = RoomControlRouteEndpoint {
+            peer_session_id: "peer-session".into(),
+            host: "127.0.0.1".into(),
+            port: 9000,
+            transport_public_key: "key".into(),
+        };
+        let mapped_ipv6 = RoomControlRouteEndpoint {
+            host: "::ffff:127.0.0.1".into(),
+            ..ipv4.clone()
+        };
+        assert_eq!(
+            peer_observation_ref(&ipv4),
+            peer_observation_ref(&mapped_ipv6)
+        );
     }
 
     #[test]
