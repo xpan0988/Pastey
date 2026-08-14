@@ -37,11 +37,11 @@ Names must identify the owning Plan boundary and must not create authority outsi
 
 ## Room-control event vocabulary
 
-Room-control carries only `bridge_plan.*` review, attempt, progress, result, and failure messages for Layer 5. It is encrypted current-session control transport—not ordinary Bridge items and not a second authority model. A delivery receipt never establishes Plan approval or receiver review.
+Room-control carries only `bridge_plan.*` plan, attempt, progress, result, and failure messages for Layer 5. It is encrypted current-session control transport—not ordinary Bridge items and not a second authority model. A delivery receipt never establishes Plan approval or execution authority.
 
 ## Approval and candidate vocabulary
 
-Complete-plan approval and receiver review bind the Bridge, peers, revision, and expiry. One-use execution grants are process-local and terminally consumed; denial or an unsupported intent creates no execution authority.
+One complete requester approval binds the Bridge, peers, immutable revision, and expiry. Current-session consent is the bounded receiver consent boundary; the receiver Host derives and consumes process-local one-use execution grants automatically. An unsupported intent, input, or chosen-executor capability creates no execution authority.
 
 A **candidate** is bounded, redacted discovery metadata. A live Search → Transfer Plan may return this metadata to let the requester choose one result; the selected Host validates that opaque selection against its private Bridge Plan candidate store before transfer. An **ObjectRef** is an opaque receiver-owned ephemeral identity bound to one Bridge, owner, kind, and finite TTL. It is not a path, approval, authority token, worker ID, or durable handle. `handoff_queued` means the Layer 3 queue accepted a source; it is neither byte-transfer success nor completion.
 

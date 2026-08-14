@@ -267,8 +267,7 @@ pub struct FileTransformAlternativeBridgePlanRequest {
     pub extensions: Vec<String>,
     pub safe_scopes: Vec<String>,
     pub transform_intent: String,
-    #[serde(default)]
-    pub transform_execution_device: Option<String>,
+    pub transform_execution_device: String,
     #[serde(default)]
     pub transfer_to_requester: bool,
     #[serde(default)]
@@ -1555,9 +1554,9 @@ pub fn create_file_search_bridge_plan(
     create_bridge_plan(revision, state)
 }
 
-/// Creates a live supported Search -> Transform plan. Intent remains natural
-/// language in the immutable revision; the receiver Host resolves the fixed
-/// capability only after the bounded Search selection is available locally.
+/// Creates a live supported Search -> Transform plan. The request must carry
+/// the reviewed Bridge-role executor; Rust resolves it to the current session,
+/// validates that Host's capability fact, and constructs the immutable flow.
 #[tauri::command]
 pub fn create_file_transform_bridge_plan(
     request: FileTransformAlternativeBridgePlanRequest,
@@ -1565,12 +1564,12 @@ pub fn create_file_transform_bridge_plan(
 ) -> Result<BridgePlanRecords, String> {
     let context = crate::room_control::room_control_session_context(&state, &request.room_id)
         .map_err(|error| error.message())?;
-    let transform_execution_device = match request.transform_execution_device.as_deref() {
-        None | Some("selected_device") => {
+    let transform_execution_device = match request.transform_execution_device.as_str() {
+        "selected_device" => {
             require_selected_peer_transform_available(state.inner(), &request.room_id, &context)?;
             context.peer_session_ref.clone()
         }
-        Some("requesting_device") => {
+        "requesting_device" => {
             if !crate::peer_capabilities::local_projection("local".into(), storage::now_ts())
                 .capabilities[0]
                 .available
@@ -1579,9 +1578,7 @@ pub fn create_file_transform_bridge_plan(
             }
             context.local_session_ref.clone()
         }
-        Some(_) => {
-            return Err("Transform execution device is not part of this current Bridge.".into())
-        }
+        _ => return Err("Transform execution device is not part of this current Bridge.".into()),
     };
     let mut revision = bridge_plan::build_file_transform_revision(
         request.room_id,
@@ -1611,6 +1608,33 @@ pub fn create_file_transform_bridge_plan(
             bridge_plan::canonical_revision_hash(&revision).map_err(|error| error.message())?;
     }
     create_bridge_plan(revision, state)
+}
+
+/// Withdraws an unapproved renderer-visible revision after its draft semantics
+/// change. The Host verifies current requester/session ownership and performs
+/// the durable transition atomically; an approved revision cannot be edited.
+#[tauri::command]
+pub fn withdraw_bridge_plan_revision(
+    room_id: String,
+    revision_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<BridgePlanRecords, String> {
+    let context = crate::room_control::room_control_session_context(&state, &room_id)
+        .map_err(|error| error.message())?;
+    let store = bridge_plan::BridgePlanStore::new(&state.paths);
+    let record = store
+        .get_revision(&revision_id)
+        .map_err(|error| error.message())?;
+    if record.revision.bridge_id != room_id
+        || record.revision.requesting_device_ref != context.local_session_ref
+        || record.revision.selected_device_ref != context.peer_session_ref
+    {
+        return Err("Bridge Plan revision is not owned by this current requester session.".into());
+    }
+    store
+        .withdraw_unapproved_revision(&revision_id)
+        .map_err(|error| error.message())?;
+    store.list_bridge(&room_id).map_err(|error| error.message())
 }
 
 /// Creates a requester-originated Transfer revision. The path received from
