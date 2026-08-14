@@ -58,6 +58,8 @@ export function createDirectFileTransferBridgePlan(request: DirectFileTransferBr
 
 export interface FileTransformAlternativeBridgePlanRequest extends FileSearchBridgePlanRequest {
   transformIntent: string;
+  /** The two current Bridge roles only; Rust resolves these to live sessions. */
+  transformExecutionDevice?: "requesting_device" | "selected_device";
 }
 
 export function createFileTransformBridgePlan(request: FileTransformAlternativeBridgePlanRequest): Promise<BridgePlanWorkspace> {
@@ -81,6 +83,10 @@ export function selectedPeerTransformAvailability(roomId: string): Promise<Selec
   return invoke<SelectedPeerTransformAvailability>("selected_peer_transform_availability", { roomId });
 }
 
+export function localTransformAvailability(): Promise<SelectedPeerTransformAvailability> {
+  return invoke<SelectedPeerTransformAvailability>("local_transform_availability");
+}
+
 export function proposeBridgePlanTransformFallback(revisionId: string): Promise<BridgePlanWorkspace> {
   return invoke<BridgePlanWorkspace>("propose_bridge_plan_transform_fallback", { revisionId });
 }
@@ -89,20 +95,12 @@ export function listBridgePlanWorkspace(roomId: string): Promise<BridgePlanWorks
   return invoke<BridgePlanWorkspace>("list_bridge_plan_workspace", { roomId });
 }
 
-export function approveBridgePlan(revisionId: string, approvalId: string, receiverRequired: boolean): Promise<BridgePlanWorkspace> {
-  return invoke<BridgePlanWorkspace>("approve_bridge_plan", { revisionId, approvalId, receiverRequired });
+export function approveBridgePlan(revisionId: string, approvalId: string): Promise<BridgePlanWorkspace> {
+  return invoke<BridgePlanWorkspace>("approve_bridge_plan", { revisionId, approvalId });
 }
 
-export function sendBridgePlanReviewRequest(approvalId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
-  return invoke<RoomControlDeliveryReceipt>("send_bridge_plan_review_request", { approvalId, bridgeRoute });
-}
-
-export function decideBridgePlanReview(roomId: string, approvalId: string, allow: boolean, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
-  return invoke<RoomControlDeliveryReceipt>("decide_bridge_plan_review", { roomId, approvalId, allow, bridgeRoute });
-}
-
-export function bridgePlanReceiverReviewStatus(roomId: string, approvalId: string): Promise<"allow" | "deny" | null> {
-  return invoke<"allow" | "deny" | null>("bridge_plan_receiver_review_status", { roomId, approvalId });
+export function bindBridgePlanToSession(approvalId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
+  return invoke<RoomControlDeliveryReceipt>("bind_bridge_plan_to_session", { approvalId, bridgeRoute });
 }
 
 export function startBridgePlanAttempt(approvalId: string, attemptId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
@@ -113,29 +111,6 @@ export function selectBridgePlanSearchCandidate(roomId: string, attemptId: strin
   return invoke<RoomControlDeliveryReceipt>("select_bridge_plan_search_candidate", { roomId, attemptId, candidateId, bridgeRoute });
 }
 
-export function startBridgePlanTransferAttempt(roomId: string, attemptId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
-  return invoke<RoomControlDeliveryReceipt>("start_bridge_plan_transfer_attempt", { roomId, attemptId, bridgeRoute });
-}
-
-export function executeBridgePlanTransferAttempt(roomId: string, attemptId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<boolean> {
-  return invoke<boolean>("execute_bridge_plan_transfer_attempt", { roomId, attemptId, bridgeRoute });
-}
-
-export function executeDirectBridgePlanTransferAttempt(roomId: string, attemptId: string): Promise<boolean> {
-  return invoke<boolean>("execute_direct_bridge_plan_transfer_attempt", { roomId, attemptId });
-}
-
-export function startBridgePlanTransformAttempt(roomId: string, attemptId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
-  return invoke<RoomControlDeliveryReceipt>("start_bridge_plan_transform_attempt", { roomId, attemptId, bridgeRoute });
-}
-
-export function executeBridgePlanTransformAttempt(roomId: string, attemptId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<boolean> {
-  return invoke<boolean>("execute_bridge_plan_transform_attempt", { roomId, attemptId, bridgeRoute });
-}
-
-export function executeBridgePlanSearchAttempt(roomId: string, attemptId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<void> {
-  return invoke<void>("execute_bridge_plan_search_attempt", { roomId, attemptId, bridgeRoute });
-}
 
 interface SendFileOptions {
   displayName?: string;

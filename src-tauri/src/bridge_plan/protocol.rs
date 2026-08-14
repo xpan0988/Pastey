@@ -4,7 +4,7 @@
 //! no ObjectRef, path, token, worker, or transport material and is cleared on
 //! restart and Burn.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::HashMap, io::Read, sync::Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{Map, Value};
@@ -13,8 +13,10 @@ use super::{
     canonical_json, canonical_revision_hash, connection, id, json, ActivityKind, AttemptState,
     BridgePlanActivity, BridgePlanApproval, BridgePlanAttempt, BridgePlanResultSummary,
     BridgePlanRevision, BridgePlanStep, BridgePlanStore, GeneratedUserVisibleText,
-    ReceiverDecision, ReceiverDecisionEvidence, SafeActivitySummary, StepExecutionState,
+    SafeActivitySummary, StepExecutionState,
 };
+#[cfg(test)]
+use super::{ReceiverDecision, ReceiverDecisionEvidence};
 use crate::{
     error::{AppError, AppResult},
     file_candidates::{BridgePlanPrivateFile, BridgePlanSearchResult},
@@ -62,6 +64,20 @@ struct LocalTransformAuthority {
 struct LocalTransformOutput {
     bridge_id: String,
     output: BridgePlanPrivateFile,
+}
+#[derive(Clone, Debug)]
+struct LocalPipelineInput {
+    bridge_id: String,
+    plan_id: String,
+    revision_id: String,
+    revision_hash: String,
+    attempt_id: String,
+    step_id: String,
+    source_device_ref: String,
+    destination_device_ref: String,
+    expires_at: i64,
+    digest: String,
+    input: BridgePlanPrivateFile,
 }
 #[derive(Clone, Debug)]
 struct LocalCandidateSelection {
@@ -151,6 +167,7 @@ pub(crate) struct ProtocolSearchAuthorityStore {
     transfer_grants: Mutex<HashMap<String, LocalTransferAuthority>>,
     transform_grants: Mutex<HashMap<String, LocalTransformAuthority>>,
     transform_outputs: Mutex<HashMap<String, LocalTransformOutput>>,
+    pipeline_inputs: Mutex<HashMap<String, LocalPipelineInput>>,
     selections: Mutex<HashMap<String, LocalCandidateSelection>>,
 }
 
@@ -313,6 +330,19 @@ impl ProtocolSearchAuthorityStore {
         if let Ok(mut outputs) = self.transform_outputs.lock() {
             outputs.retain(|_, value| value.bridge_id != bridge_id);
         }
+        if let Ok(mut inputs) = self.pipeline_inputs.lock() {
+            let stale = inputs
+                .iter()
+                .filter_map(|(attempt_id, value)| {
+                    (value.bridge_id == bridge_id).then(|| attempt_id.clone())
+                })
+                .collect::<Vec<_>>();
+            for attempt_id in stale {
+                if let Some(input) = inputs.remove(&attempt_id) {
+                    crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&input.input);
+                }
+            }
+        }
     }
     fn bind_selection(
         &self,
@@ -401,7 +431,7 @@ impl ProtocolSearchAuthorityStore {
         }
         Ok(())
     }
-    fn consume_transform_output(
+    pub(crate) fn consume_transform_output(
         &self,
         bridge_id: &str,
         attempt_id: &str,
@@ -433,6 +463,95 @@ impl ProtocolSearchAuthorityStore {
             .get(attempt_id)
             .is_some_and(|output| output.bridge_id == bridge_id))
     }
+
+    pub(crate) fn register_pipeline_input(
+        &self,
+        metadata: &crate::models::PipelineHandoffMetadata,
+        input: BridgePlanPrivateFile,
+    ) -> AppResult<()> {
+        let mut inputs = self.pipeline_inputs.lock().map_err(|_| {
+            AppError::InvalidInput("Pipeline private object store is unavailable.".into())
+        })?;
+        if inputs.contains_key(&metadata.attempt_id) {
+            return invalid("Pipeline private object was already registered.");
+        }
+        let digest = private_pipeline_digest(&input)?;
+        inputs.insert(
+            metadata.attempt_id.clone(),
+            LocalPipelineInput {
+                bridge_id: metadata.bridge_id.clone(),
+                plan_id: metadata.plan_id.clone(),
+                revision_id: metadata.revision_id.clone(),
+                revision_hash: metadata.revision_hash.clone(),
+                attempt_id: metadata.attempt_id.clone(),
+                step_id: metadata.step_id.clone(),
+                source_device_ref: metadata.source_device_ref.clone(),
+                destination_device_ref: metadata.destination_device_ref.clone(),
+                expires_at: crate::storage::now_ts() + MAX_LIFETIME,
+                digest,
+                input,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn consume_pipeline_input(
+        &self,
+        metadata: &crate::models::PipelineHandoffMetadata,
+    ) -> AppResult<BridgePlanPrivateFile> {
+        let mut inputs = self.pipeline_inputs.lock().map_err(|_| {
+            AppError::InvalidInput("Pipeline private object store is unavailable.".into())
+        })?;
+        let input = inputs.remove(&metadata.attempt_id).ok_or_else(|| {
+            AppError::InvalidInput(
+                "Pipeline private object is unavailable after restart or expiry.".into(),
+            )
+        })?;
+        if input.bridge_id != metadata.bridge_id
+            || input.plan_id != metadata.plan_id
+            || input.revision_id != metadata.revision_id
+            || input.revision_hash != metadata.revision_hash
+            || input.attempt_id != metadata.attempt_id
+            || input.step_id != metadata.step_id
+            || input.source_device_ref != metadata.source_device_ref
+            || input.destination_device_ref != metadata.destination_device_ref
+        {
+            return invalid("Pipeline private object crossed its Plan binding.");
+        }
+        if input.expires_at <= crate::storage::now_ts() {
+            crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&input.input);
+            return invalid("Pipeline private object expired.");
+        }
+        if private_pipeline_digest(&input.input)? != input.digest {
+            crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&input.input);
+            return invalid("Pipeline private object changed before it could be consumed.");
+        }
+        Ok(input.input)
+    }
+}
+
+fn private_pipeline_digest(input: &BridgePlanPrivateFile) -> AppResult<String> {
+    let mut file = std::fs::File::open(&input.path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut read_total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        read_total = read_total.checked_add(read as u64).ok_or_else(|| {
+            AppError::InvalidInput("Pipeline private object size overflowed.".into())
+        })?;
+        if read_total > input.size_bytes {
+            return invalid("Pipeline private object changed before it could be consumed.");
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if read_total != input.size_bytes {
+        return invalid("Pipeline private object changed before it could be consumed.");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub(crate) fn review_request_payload(
@@ -520,6 +639,7 @@ pub(crate) fn review_request_payload(
     Ok(Value::Object(payload))
 }
 
+#[cfg(test)]
 pub(crate) fn receiver_decision_payload(
     paths: &AppPaths,
     bridge_id: &str,
@@ -595,6 +715,7 @@ pub(crate) fn receiver_decision_payload(
 /// Safe receiver-local projection for restoring product review UI after a
 /// renderer reload. It exposes only the receiver's decision, never the review
 /// payload, attestation, or execution authority.
+#[cfg(test)]
 pub(crate) fn receiver_review_decision(
     paths: &AppPaths,
     bridge_id: &str,
@@ -807,6 +928,9 @@ fn supported_transfer_destination(
     receiver_device_ref: &str,
 ) -> bool {
     match destination {
+        super::TransferDestination::PipelineHandoff { device_ref } => {
+            device_ref == requester_device_ref
+        }
         super::TransferDestination::RequestingDevice { device_ref } => {
             device_ref == requester_device_ref
         }
@@ -1275,6 +1399,7 @@ struct Review {
     digest: String,
     revision: BridgePlanRevision,
 }
+#[cfg(test)]
 #[derive(Clone)]
 struct Decision {
     common: Common,
@@ -1322,6 +1447,7 @@ pub(crate) fn protocol_metadata(
             "bridge-plan-review:{}",
             review(payload, &common, now)?.nonce
         ),
+        #[cfg(test)]
         "bridge_plan.review_decision" => format!(
             "bridge-plan-decision:{}",
             decision(payload, &common, now)?.nonce
@@ -1375,6 +1501,7 @@ pub(crate) fn record_outbound_protocol_event(
             let review = review(payload, &common(payload, &bridge, &sender, &receiver)?, now)?;
             insert_review(paths, "requester", &review)
         }
+        #[cfg(test)]
         "bridge_plan.review_decision" => {
             let requester = string(payload, "requesterDeviceRef", 128)?;
             let receiver = string(payload, "receiverDeviceRef", 128)?;
@@ -1422,6 +1549,7 @@ pub(crate) fn record_outbound_protocol_event(
 /// The receiver must retain its exact reviewed decision before it sends the
 /// attestation. Attempt-start checks this receiver-local record, so a restart
 /// never turns an unrecorded click into execution authority.
+#[cfg(test)]
 fn record_receiver_decision(paths: &AppPaths, decision: &Decision) -> AppResult<()> {
     let mut conn = connection(paths)?;
     let tx = conn.transaction()?;
@@ -1497,6 +1625,7 @@ pub(crate) fn accept_inbound_protocol_event(
         "bridge_plan.review_request" => {
             insert_review(paths, "receiver", &review(payload, &common, now)?)?
         }
+        #[cfg(test)]
         "bridge_plan.review_decision" => accept_decision(paths, payload, &common, now)?,
         "bridge_plan.attempt_start" => accept_start(paths, authorities, payload, &common, now)?,
         "bridge_plan.transfer_start" => {
@@ -1675,6 +1804,7 @@ fn is_direct_transfer_review_step(step: &BridgePlanStep) -> bool {
     )
 }
 
+#[cfg(test)]
 fn decision(value: &Map<String, Value>, common: &Common, now: i64) -> AppResult<Decision> {
     exact(
         value,
@@ -2024,6 +2154,7 @@ fn insert_review(paths: &AppPaths, direction: &str, review: &Review) -> AppResul
     Ok(())
 }
 
+#[cfg(test)]
 fn accept_decision(
     paths: &AppPaths,
     value: &Map<String, Value>,
@@ -2079,9 +2210,9 @@ fn accept_start(
         || review.4 != common.receiver
         || review.5 != attempt.digest
         || review.6 <= now
-        || review.7.as_deref() != Some("allow")
+        || review.7.is_some_and(|decision| decision != "allow")
     {
-        return invalid("Bridge Plan attempt is not approved by receiver.");
+        return invalid("Bridge Plan attempt does not match the current Bridge plan binding.");
     }
     drop(conn);
     insert_attempt(paths, &attempt)?;
@@ -2116,8 +2247,8 @@ fn accept_transfer_start(
     let attempt = transfer_start(value, common, now)?;
     let conn = connection(paths)?;
     let review=conn.query_row("SELECT revision_json,review_expires_at,decision FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='receiver' AND approval_id=?2",params![common.bridge,attempt.approval],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?))).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan receiver review missing.".into()))?;
-    if review.1 <= now || review.2.as_deref() != Some("allow") {
-        return invalid("Bridge Plan Transfer is not approved by receiver.");
+    if review.1 <= now || review.2.is_some_and(|decision| decision != "allow") {
+        return invalid("Bridge Plan Transfer does not match the current Bridge plan binding.");
     }
     let revision: BridgePlanRevision = serde_json::from_str(&review.0)?;
     if revision.plan_id != common.plan
@@ -2172,8 +2303,8 @@ fn accept_transform_start(
     let attempt = transform_start(value, common, now)?;
     let conn = connection(paths)?;
     let review=conn.query_row("SELECT revision_json,review_expires_at,decision FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='receiver' AND approval_id=?2",params![common.bridge,attempt.approval],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<String>>(2)?))).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan receiver review missing.".into()))?;
-    if review.1 <= now || review.2.as_deref() != Some("allow") {
-        return invalid("Bridge Plan Transform is not approved by receiver.");
+    if review.1 <= now || review.2.is_some_and(|decision| decision != "allow") {
+        return invalid("Bridge Plan Transform does not match the current Bridge plan binding.");
     }
     let revision: BridgePlanRevision = serde_json::from_str(&review.0)?;
     if revision.plan_id != common.plan
@@ -2535,6 +2666,7 @@ fn transform_step_id(step: &BridgePlanStep) -> AppResult<String> {
         _ => invalid("Bridge Plan step is not Transform."),
     }
 }
+#[cfg(test)]
 fn attestation_digest(value: &Map<String, Value>) -> AppResult<String> {
     let mut bound = value.clone();
     bound.remove("attestationDigest");
@@ -3003,6 +3135,7 @@ mod tests {
                     vec!["txt".into()],
                     vec!["downloads".into()],
                     "extract readable text".into(),
+                    "receiver".into(),
                     false,
                 )
             }
@@ -3339,5 +3472,48 @@ mod tests {
         assert!(
             consume_search_execution_grant(&paths, &authorities, "bridge", "attempt", now).is_err()
         );
+    }
+
+    #[test]
+    fn pipeline_private_input_is_one_use_and_bound_to_its_exact_attempt() {
+        let paths = paths();
+        let root = paths.temp_dir.join("pipeline-handoffs").join("transfer");
+        fs::create_dir_all(&root).unwrap();
+        let input_path = root.join("input");
+        fs::write(&input_path, b"plain text").unwrap();
+        let metadata = crate::models::PipelineHandoffMetadata {
+            bridge_id: "bridge".into(),
+            plan_id: "plan".into(),
+            revision_id: "revision".into(),
+            revision_hash: "hash".into(),
+            attempt_id: "attempt".into(),
+            step_id: "pipeline_transfer".into(),
+            source_device_ref: "windows-session".into(),
+            destination_device_ref: "mac-session".into(),
+            media_type: "text/plain".into(),
+        };
+        let file = crate::file_candidates::bridge_plan_private_pipeline_file(
+            input_path,
+            root.clone(),
+            "pipeline-input".into(),
+            "text/plain".into(),
+            10,
+        )
+        .unwrap();
+        let authorities = ProtocolSearchAuthorityStore::default();
+        authorities
+            .register_pipeline_input(&metadata, file)
+            .unwrap();
+
+        let mut wrong_attempt = metadata.clone();
+        wrong_attempt.attempt_id = "other-attempt".into();
+        assert!(authorities.consume_pipeline_input(&wrong_attempt).is_err());
+        let consumed = authorities.consume_pipeline_input(&metadata).unwrap();
+        assert_eq!(consumed.mime_type, "text/plain");
+        assert_eq!(consumed.size_bytes, 10);
+        assert!(authorities.consume_pipeline_input(&metadata).is_err());
+        crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&consumed);
+        assert!(!root.exists());
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
     }
 }

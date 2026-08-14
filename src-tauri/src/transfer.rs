@@ -38,8 +38,8 @@ use crate::{
     link_benchmark, logging,
     models::{
         ChunkAckResponse, ChunkUploadRequest, FileTransferFinishRequest, FileTransferProgressEvent,
-        FileTransferStartRequest, JoinRoomRequest, JoinRoomResponse, PayloadType, RoomItemStatus,
-        RoomItemUpload, RoomStatus, TransferErrorResponse,
+        FileTransferStartRequest, JoinRoomRequest, JoinRoomResponse, PayloadType,
+        PipelineHandoffMetadata, RoomItemStatus, RoomItemUpload, RoomStatus, TransferErrorResponse,
     },
     storage,
     transfer_tuning::{self, TransferTuning},
@@ -108,6 +108,7 @@ enum ActiveFileTransferKind {
         part_path: PathBuf,
         final_path: PathBuf,
         mime_type: Option<String>,
+        pipeline_handoff: Option<PipelineHandoffMetadata>,
         created_at: i64,
         transferred_bytes: u64,
         expected_chunk_index: u64,
@@ -568,6 +569,29 @@ pub async fn send_room_file_to_bridge_peer_endpoint(
     requested_window: Option<usize>,
     endpoint: BridgePeerTransferEndpoint,
 ) -> AppResult<()> {
+    send_room_file_to_bridge_peer_endpoint_with_landing(
+        state,
+        room_id,
+        item_id,
+        file_path,
+        queue_item_id,
+        requested_window,
+        endpoint,
+        None,
+    )
+    .await
+}
+
+pub async fn send_room_file_to_bridge_peer_endpoint_with_landing(
+    state: Arc<AppState>,
+    room_id: &str,
+    item_id: &str,
+    file_path: &Path,
+    queue_item_id: Option<String>,
+    requested_window: Option<usize>,
+    endpoint: BridgePeerTransferEndpoint,
+    pipeline_handoff: Option<PipelineHandoffMetadata>,
+) -> AppResult<()> {
     let room = storage::get_room_by_id(&state.paths, room_id)?;
     if room.status == RoomStatus::Burned {
         return Err(AppError::InvalidInput(ROOM_BURNED_MESSAGE.into()));
@@ -665,6 +689,7 @@ pub async fn send_room_file_to_bridge_peer_endpoint(
         transport_nonce,
         sender_public_key,
         preferred_chunk_protocol: Some(CHUNK_PROTOCOL_BINARY_V1.to_string()),
+        pipeline_handoff,
     };
 
     let start_response = client.post(&start_url).json(&start).send().await;
@@ -2883,10 +2908,51 @@ async fn start_file_transfer_handler(
             "Transfer metadata mismatch".into(),
         );
     }
-    match storage::room_item_exists(&ctx.state.paths, &start.item_id) {
-        Ok(true) => return Json(file_transfer_start_response()).into_response(),
-        Ok(false) => {}
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let pipeline_handoff = start.pipeline_handoff.clone();
+    if let Some(metadata) = &pipeline_handoff {
+        crate::commands::log_pipeline_handoff(
+            "pipeline_transfer_created",
+            &metadata.bridge_id,
+            &metadata.attempt_id,
+            &metadata.step_id,
+            "received",
+        );
+        let context = match crate::room_control::room_control_session_context(&ctx.state, &room_id)
+        {
+            Ok(context) => context,
+            Err(_) => {
+                return transfer_error(
+                    StatusCode::GONE,
+                    "pipeline_route_unavailable",
+                    "Pipeline handoff is no longer in the current Bridge session.".into(),
+                )
+            }
+        };
+        if let Err(_) = crate::bridge_plan::validate_pipeline_handoff_metadata(
+            &ctx.state.paths,
+            metadata,
+            &context.local_session_ref,
+            &context.peer_session_ref,
+        ) {
+            crate::commands::log_pipeline_handoff(
+                "pipeline_receive_failed",
+                &metadata.bridge_id,
+                &metadata.attempt_id,
+                &metadata.step_id,
+                "pipeline_binding_invalid",
+            );
+            return transfer_error(
+                StatusCode::BAD_REQUEST,
+                "pipeline_binding_invalid",
+                "Pipeline handoff does not match the reviewed Plan.".into(),
+            );
+        }
+    } else {
+        match storage::room_item_exists(&ctx.state.paths, &start.item_id) {
+            Ok(true) => return Json(file_transfer_start_response()).into_response(),
+            Ok(false) => {}
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
     }
 
     let snapshot = match room_server_snapshot(&ctx.state, &room_id) {
@@ -2914,7 +2980,13 @@ async fn start_file_transfer_handler(
             );
         }
     };
-    let destination_dir = {
+    let destination_dir = if pipeline_handoff.is_some() {
+        ctx.state
+            .paths
+            .temp_dir
+            .join("pipeline-handoffs")
+            .join(&start.transfer_id)
+    } else {
         let config = ctx.state.config.read();
         config::received_item_destination_dir(&ctx.state.paths, &config, start.mime_type.as_deref())
     };
@@ -2925,22 +2997,30 @@ async fn start_file_transfer_handler(
             "Not enough disk space to receive this file.".into(),
         );
     }
-    let reserved_final_paths = active_receiver_final_paths(&ctx.state);
-    let final_path = match storage::next_inbox_path_excluding(
-        &destination_dir,
-        start.display_name.as_deref(),
-        &reserved_final_paths,
-    ) {
-        Ok(path) => path,
-        Err(_) => {
-            return transfer_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "write_failed",
-                "Could not write to destination folder.".into(),
-            )
-        }
+    let (final_path, part_path) = if pipeline_handoff.is_some() {
+        (
+            destination_dir.join("input"),
+            destination_dir.join("input.part"),
+        )
+    } else {
+        let reserved_final_paths = active_receiver_final_paths(&ctx.state);
+        let final_path = match storage::next_inbox_path_excluding(
+            &destination_dir,
+            start.display_name.as_deref(),
+            &reserved_final_paths,
+        ) {
+            Ok(path) => path,
+            Err(_) => {
+                return transfer_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "write_failed",
+                    "Could not write to destination folder.".into(),
+                )
+            }
+        };
+        let part_path = storage::transfer_part_path(&destination_dir, &start.transfer_id);
+        (final_path, part_path)
     };
-    let part_path = storage::transfer_part_path(&destination_dir, &start.transfer_id);
     let Some(part_dir) = part_path.parent() else {
         return transfer_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2988,6 +3068,7 @@ async fn start_file_transfer_handler(
             part_path,
             final_path,
             mime_type: start.mime_type,
+            pipeline_handoff,
             created_at: start.created_at,
             transferred_bytes: 0,
             expected_chunk_index: 0,
@@ -3578,6 +3659,7 @@ async fn finish_file_transfer_handler(
         part_path,
         final_path,
         mime_type,
+        pipeline_handoff,
         created_at,
         transferred_bytes,
         expected_chunk_index,
@@ -3622,7 +3704,7 @@ async fn finish_file_transfer_handler(
             "finalize_failure",
             "error_kind=invalid_transfer message=\"Invalid file metadata\"",
         );
-        let _ = tokio::fs::remove_file(part_path).await;
+        let _ = remove_active_receiver_part_file(&room_id, "finalize_failed", part_path).await;
         emit_event(
             &ctx.state,
             &transfer,
@@ -3651,7 +3733,7 @@ async fn finish_file_transfer_handler(
             "finalize_failure",
             &format!("error_kind={code} message={message:?}"),
         );
-        let _ = tokio::fs::remove_file(part_path).await;
+        let _ = remove_active_receiver_part_file(&room_id, "finalize_failed", part_path).await;
         emit_event(
             &ctx.state,
             &transfer,
@@ -3688,7 +3770,11 @@ async fn finish_file_transfer_handler(
         &transfer_id,
         &room_id,
         "finalize_rename",
-        "part_location=inbox_part_root final_location=inbox_root",
+        if pipeline_handoff.is_some() {
+            "landing=pipeline_private"
+        } else {
+            "part_location=inbox_part_root final_location=inbox_root"
+        },
     );
     if tokio::fs::rename(part_path, final_path).await.is_err() {
         dev_log_receiver_finalize(
@@ -3697,7 +3783,7 @@ async fn finish_file_transfer_handler(
             "finalize_failure",
             "error_kind=write_failed message=\"Receiver failed to write chunk\"",
         );
-        let _ = tokio::fs::remove_file(part_path).await;
+        let _ = remove_active_receiver_part_file(&room_id, "finalize_failed", part_path).await;
         emit_event(
             &ctx.state,
             &transfer,
@@ -3722,6 +3808,121 @@ async fn finish_file_transfer_handler(
             *transferred_bytes,
         )
         .await;
+    }
+
+    if let Some(metadata) = pipeline_handoff {
+        crate::commands::log_pipeline_handoff(
+            "pipeline_private_finalize_started",
+            &metadata.bridge_id,
+            &metadata.attempt_id,
+            &metadata.step_id,
+            "started",
+        );
+        let private_file = match crate::file_candidates::bridge_plan_private_pipeline_file(
+            final_path.clone(),
+            final_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default(),
+            "pipeline-input".into(),
+            metadata.media_type.clone(),
+            transfer.file_size,
+        ) {
+            Ok(file) => file,
+            Err(_) => {
+                let _ = cleanup_pipeline_handoff_root(&final_path).await;
+                crate::commands::log_pipeline_handoff(
+                    "pipeline_receive_failed",
+                    &metadata.bridge_id,
+                    &metadata.attempt_id,
+                    &metadata.step_id,
+                    "pipeline_private_finalize_failed",
+                );
+                return transfer_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "pipeline_private_finalize_failed",
+                    "Pipeline private object could not be finalized.".into(),
+                );
+            }
+        };
+        if ctx
+            .state
+            .bridge_plan_protocol_authority
+            .lock()
+            .register_pipeline_input(metadata, private_file)
+            .is_err()
+        {
+            let _ = cleanup_pipeline_handoff_root(&final_path).await;
+            crate::commands::log_pipeline_handoff(
+                "pipeline_receive_failed",
+                &metadata.bridge_id,
+                &metadata.attempt_id,
+                &metadata.step_id,
+                "pipeline_object_registration_failed",
+            );
+            return transfer_error(
+                StatusCode::BAD_REQUEST,
+                "pipeline_object_registration_failed",
+                "Pipeline private object could not be registered.".into(),
+            );
+        }
+        dev_log_receiver_finalize(
+            &transfer_id,
+            &room_id,
+            "pipeline_private_object_registered",
+            "landing=pipeline_private",
+        );
+        crate::commands::log_pipeline_handoff(
+            "pipeline_private_object_registered",
+            &metadata.bridge_id,
+            &metadata.attempt_id,
+            &metadata.step_id,
+            "registered",
+        );
+        let continuation_state = ctx.state.clone();
+        let cleanup_state = ctx.state.clone();
+        let continuation_metadata = metadata.clone();
+        tauri::async_runtime::spawn(async move {
+            if crate::commands::execute_pipeline_transform_after_handoff(
+                continuation_state,
+                continuation_metadata.clone(),
+            )
+            .await
+            .is_err()
+            {
+                crate::commands::log_pipeline_handoff(
+                    "pipeline_receive_failed",
+                    &continuation_metadata.bridge_id,
+                    &continuation_metadata.attempt_id,
+                    &continuation_metadata.step_id,
+                    "pipeline_dependency_failed",
+                );
+                if let Ok(private) = cleanup_state
+                    .bridge_plan_protocol_authority
+                    .lock()
+                    .consume_pipeline_input(&continuation_metadata)
+                {
+                    crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&private);
+                }
+                let store = crate::bridge_plan::BridgePlanStore::new(&cleanup_state.paths);
+                let _ = store.transition_attempt(
+                    &continuation_metadata.attempt_id,
+                    crate::bridge_plan::AttemptState::Failed,
+                    crate::storage::now_ts(),
+                );
+            }
+        });
+        emit_event(
+            &ctx.state,
+            &transfer,
+            "completed",
+            transfer.file_size,
+            0.0,
+            average_speed(&transfer, transfer.file_size),
+            Some(0.0),
+            None,
+        );
+        return Json(TransferOkResponse { ok: true }).into_response();
     }
 
     dev_log_receiver_finalize(
@@ -4370,7 +4571,7 @@ async fn remove_active_receiver_part_file(
     category: &str,
     part_path: &Path,
 ) -> AppResult<()> {
-    match tokio::fs::remove_file(part_path).await {
+    let remove_result = match tokio::fs::remove_file(part_path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => {
@@ -4381,6 +4582,36 @@ async fn remove_active_receiver_part_file(
                 "Could not delete local room files. Check folder permissions.".into(),
             ))
         }
+    };
+    if let Some(root) = pipeline_handoff_root(part_path) {
+        if tokio::fs::remove_dir_all(root).await.is_err() && root.exists() {
+            logging::write_error_line(&format!(
+                "[pastey cleanup][room_id={room_id}] event=pipeline_private_cleanup_error category={category} location=pipeline_private_root error_code=cleanup_failed",
+            ));
+            return Err(AppError::InvalidInput(
+                "Could not delete private Pipeline handoff data.".into(),
+            ));
+        }
+    }
+    remove_result
+}
+
+/// The only path shape accepted here is created by the PipelinePrivate
+/// receiver branch above. This is cleanup classification, not landing-mode
+/// admission: ordinary user-visible destinations never enter this root.
+fn pipeline_handoff_root(part_path: &Path) -> Option<&Path> {
+    let transfer_root = part_path.parent()?;
+    (transfer_root
+        .parent()?
+        .file_name()
+        .is_some_and(|name| name == "pipeline-handoffs"))
+    .then_some(transfer_root)
+}
+
+async fn cleanup_pipeline_handoff_root(file_path: &Path) -> std::io::Result<()> {
+    match pipeline_handoff_root(file_path) {
+        Some(root) => tokio::fs::remove_dir_all(root).await,
+        None => Ok(()),
     }
 }
 
@@ -4943,6 +5174,7 @@ mod tests {
                 part_path: PathBuf::from("/tmp/pastey-test.part"),
                 final_path: PathBuf::from("/tmp/pastey-test.bin"),
                 mime_type: None,
+                pipeline_handoff: None,
                 created_at: 0,
                 transferred_bytes: 0,
                 expected_chunk_index: 0,

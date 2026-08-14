@@ -17,6 +17,7 @@ use serde_json::Value;
 use crate::storage;
 use crate::{
     error::{AppError, AppResult},
+    models::PipelineHandoffMetadata,
     storage::AppPaths,
 };
 
@@ -24,11 +25,10 @@ mod protocol;
 pub(crate) use protocol::{
     accept_inbound_protocol_event, attempt_search_result_payload, attempt_start_payload,
     attempt_update_payload, consume_search_execution_grant, consume_transfer_execution_grant,
-    consume_transform_execution_grant, protocol_metadata, receiver_decision_payload,
-    receiver_review_decision, reconcile_protocol_startup, record_outbound_protocol_event,
-    review_request_payload, search_selection_payload, transfer_start_payload,
-    transfer_update_payload, transform_start_payload, transform_update_payload,
-    ProtocolSearchAuthorityStore,
+    consume_transform_execution_grant, protocol_metadata, reconcile_protocol_startup,
+    record_outbound_protocol_event, review_request_payload, search_selection_payload,
+    transfer_start_payload, transfer_update_payload, transform_start_payload,
+    transform_update_payload, ProtocolSearchAuthorityStore,
 };
 
 const HASH_VERSION: &str = "bridge-plan-revision-hash-v1";
@@ -173,6 +173,7 @@ pub(crate) enum ReceiverDecision {
     Denied,
 }
 impl ReceiverDecision {
+    #[cfg(test)]
     fn as_str(&self) -> &'static str {
         match self {
             Self::Approved => "approved",
@@ -318,6 +319,11 @@ pub(crate) enum ObjectSelectionRule {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum TransferDestination {
+    /// A private, expiring object handoff required by a following step. It is
+    /// distinct from Inbox/Pastey Shared final delivery in the revision.
+    PipelineHandoff {
+        device_ref: String,
+    },
     RequestingDevice {
         device_ref: String,
     },
@@ -783,6 +789,7 @@ pub(crate) fn build_file_transform_revision(
     extensions: Vec<String>,
     safe_scope_labels: Vec<String>,
     transform_intent: String,
+    transform_execution_device_ref: String,
     transfer_to_requester: bool,
 ) -> AppResult<BridgePlanRevision> {
     let mut revision = build_file_plan_revision(
@@ -831,11 +838,25 @@ pub(crate) fn build_file_transform_revision(
         downstream_slot_id: selected_file.clone(),
     });
     revision.search_selection_mode = SearchSelectionMode::BoundedInline;
+    if !matches_device(&transform_execution_device_ref, &revision) {
+        return Err(AppError::InvalidInput(
+            "Bridge Plan Transform execution device is outside its Bridge.".into(),
+        ));
+    }
+    let pipeline_required = transform_execution_device_ref != revision.selected_device_ref;
     let transform = BridgePlanStep::Transform {
         step_id: "transform".into(),
-        depends_on: vec!["search".into()],
+        depends_on: vec![if pipeline_required {
+            "pipeline_transfer".into()
+        } else {
+            "search".into()
+        }],
         input_slots: vec![PlanSlot {
-            slot_id: selected_file.clone(),
+            slot_id: if pipeline_required {
+                "pipeline_file".into()
+            } else {
+                selected_file.clone()
+            },
             object: file_contract.clone(),
             cardinality: SlotCardinality::One,
         }],
@@ -844,10 +865,10 @@ pub(crate) fn build_file_transform_revision(
             object: transformed_contract.clone(),
             cardinality: SlotCardinality::One,
         }],
-        source_device_ref: Some(revision.selected_device_ref.clone()),
-        execution_device_ref: revision.selected_device_ref.clone(),
+        source_device_ref: Some(transform_execution_device_ref.clone()),
+        execution_device_ref: transform_execution_device_ref.clone(),
         user_visible_action: GeneratedUserVisibleText::from_semantic(
-            "Process the selected file on the selected device.",
+            "Process the selected file on the approved execution device.",
         ),
         capability_requirements: vec![CapabilityRequirement {
             category: GeneratedUserVisibleText::from_semantic("object_transform"),
@@ -860,16 +881,68 @@ pub(crate) fn build_file_transform_revision(
         expected_input: file_contract.clone(),
         expected_output: transformed_contract.clone(),
     };
-    if let Some(position) = revision
-        .steps
-        .iter()
-        .position(|step| matches!(step, BridgePlanStep::Transfer { .. }))
-    {
+    if pipeline_required {
+        revision.steps.push(BridgePlanStep::Transfer {
+            step_id: "pipeline_transfer".into(),
+            depends_on: vec!["search".into()],
+            input_slots: vec![PlanSlot {
+                slot_id: selected_file.clone(),
+                object: file_contract.clone(),
+                cardinality: SlotCardinality::One,
+            }],
+            output_slots: vec![PlanSlot {
+                slot_id: "pipeline_file".into(),
+                object: file_contract.clone(),
+                cardinality: SlotCardinality::One,
+            }],
+            source_device_ref: Some(revision.selected_device_ref.clone()),
+            execution_device_ref: revision.selected_device_ref.clone(),
+            user_visible_action: GeneratedUserVisibleText::from_semantic(
+                "Move the selected file privately to the approved processing device.",
+            ),
+            capability_requirements: vec![CapabilityRequirement {
+                category: GeneratedUserVisibleText::from_semantic("file_transfer"),
+                user_visible_requirement: GeneratedUserVisibleText::from_semantic(
+                    "Use a private, expiring handoff only for the following approved Transform.",
+                ),
+            }],
+            failure_behavior: StepFailureBehavior::StopPlan,
+            source: ObjectSelectionRule::FromSlot {
+                slot_id: selected_file.clone(),
+            },
+            destination: TransferDestination::PipelineHandoff {
+                device_ref: transform_execution_device_ref.clone(),
+            },
+        });
+        revision
+            .presentation
+            .step_explanations
+            .push(StepExplanation {
+                step_id: "pipeline_transfer".into(),
+                action_summary: GeneratedUserVisibleText::from_semantic(
+                    "Move the selected file to the processing device.",
+                ),
+                expected_result: GeneratedUserVisibleText::from_semantic(
+                    "A private pipeline object is available only to the next approved Transform.",
+                ),
+            });
+    }
+    if let Some(position) = revision.steps.iter().position(|step| {
+        matches!(
+            step,
+            BridgePlanStep::Transfer {
+                destination: TransferDestination::RequestingDevice { .. },
+                ..
+            }
+        )
+    }) {
         let transfer = &mut revision.steps[position];
         if let BridgePlanStep::Transfer {
             depends_on,
             input_slots,
             source,
+            source_device_ref,
+            execution_device_ref,
             ..
         } = transfer
         {
@@ -882,6 +955,8 @@ pub(crate) fn build_file_transform_revision(
             *source = ObjectSelectionRule::FromSlot {
                 slot_id: transformed_file.clone(),
             };
+            *source_device_ref = Some(transform_execution_device_ref.clone());
+            *execution_device_ref = transform_execution_device_ref.clone();
         }
         revision.steps.insert(position, transform);
         revision.presentation.step_explanations.insert(
@@ -1635,6 +1710,21 @@ fn canonical_json(value: &Value) -> String {
     }
 }
 
+fn step_output_device(step: &BridgePlanStep) -> AppResult<&str> {
+    match step {
+        BridgePlanStep::Transfer { destination, .. } => match destination {
+            TransferDestination::PipelineHandoff { device_ref }
+            | TransferDestination::RequestingDevice { device_ref }
+            | TransferDestination::SelectedDevice { device_ref }
+            | TransferDestination::UserSelectedLocation { device_ref, .. }
+            | TransferDestination::LeaveOnProducingDevice { device_ref } => Ok(device_ref),
+        },
+        BridgePlanStep::Search { .. } | BridgePlanStep::Transform { .. } => {
+            Ok(step.execution_device())
+        }
+    }
+}
+
 pub(crate) fn validate_revision(revision: &BridgePlanRevision) -> AppResult<()> {
     id(&revision.plan_id, "plan id")?;
     id(&revision.revision_id, "revision id")?;
@@ -1657,6 +1747,7 @@ pub(crate) fn validate_revision(revision: &BridgePlanRevision) -> AppResult<()> 
     }
     let mut steps = HashSet::new();
     let mut output_owner = HashMap::new();
+    let mut output_location: HashMap<&str, String> = HashMap::new();
     for step in &revision.steps {
         id(step.id(), "step id")?;
         if !steps.insert(step.id()) {
@@ -1687,6 +1778,7 @@ pub(crate) fn validate_revision(revision: &BridgePlanRevision) -> AppResult<()> 
             {
                 return invalid("Bridge Plan slot has more than one producer.");
             }
+            output_location.insert(slot.slot_id.as_str(), step_output_device(step)?.to_owned());
         }
         for slot in step.inputs() {
             id(&slot.slot_id, "input slot")?;
@@ -1749,6 +1841,10 @@ pub(crate) fn validate_revision(revision: &BridgePlanRevision) -> AppResult<()> 
             {
                 return invalid("Bridge Plan selected-result slot has more than one producer.");
             }
+            output_location.insert(
+                selection.downstream_slot_id.as_str(),
+                step.execution_device().to_owned(),
+            );
             validate_contract(&selection.allowed_object)?;
         }
         if let BridgePlanStep::Search {
@@ -1792,6 +1888,16 @@ pub(crate) fn validate_revision(revision: &BridgePlanRevision) -> AppResult<()> 
                 .any(|dependency| dependency == *owner)
             {
                 return invalid("Bridge Plan input slot producer is not a dependency.");
+            }
+            let location = output_location.get(slot.slot_id.as_str()).ok_or_else(|| {
+                AppError::InvalidInput("Bridge Plan input object location is unavailable.".into())
+            })?;
+            if matches!(
+                step,
+                BridgePlanStep::Transform { .. } | BridgePlanStep::Transfer { .. }
+            ) && step.source_device() != Some(location.as_str())
+            {
+                return invalid("Bridge Plan step consumes an object at the wrong device.");
             }
         }
         if let BridgePlanStep::Transfer {
@@ -1915,6 +2021,7 @@ fn validate_destination(
     revision: &BridgePlanRevision,
 ) -> AppResult<()> {
     let device = match destination {
+        TransferDestination::PipelineHandoff { device_ref } => device_ref,
         TransferDestination::RequestingDevice { device_ref } => {
             if device_ref != &revision.requesting_device_ref {
                 return invalid(
@@ -1947,6 +2054,56 @@ fn validate_destination(
 }
 fn matches_device(device: &str, revision: &BridgePlanRevision) -> bool {
     device == revision.requesting_device_ref || device == revision.selected_device_ref
+}
+
+/// Validates transfer-start metadata against the receiver's own immutable
+/// attempt/revision. This is an admission check only; it does not create an
+/// execution grant or expose a private destination path.
+pub(crate) fn validate_pipeline_handoff_metadata(
+    paths: &AppPaths,
+    metadata: &PipelineHandoffMetadata,
+    local_device_ref: &str,
+    peer_device_ref: &str,
+) -> AppResult<()> {
+    let attempt = BridgePlanStore::new(paths).list_attempt(&metadata.attempt_id)?;
+    if attempt.attempt.bridge_id != metadata.bridge_id
+        || attempt.attempt.plan_id != metadata.plan_id
+        || attempt.attempt.revision_id != metadata.revision_id
+        || attempt.attempt.revision_hash != metadata.revision_hash
+        || metadata.destination_device_ref != local_device_ref
+        || metadata.source_device_ref != peer_device_ref
+    {
+        return invalid("Pipeline handoff crossed its current Bridge binding.");
+    }
+    let revision = BridgePlanStore::new(paths)
+        .get_revision(&metadata.revision_id)?
+        .revision;
+    let step = revision
+        .steps
+        .iter()
+        .find(|step| step.id() == metadata.step_id)
+        .ok_or_else(|| AppError::InvalidInput("Pipeline handoff step is unavailable.".into()))?;
+    let BridgePlanStep::Transfer {
+        destination,
+        source_device_ref,
+        output_slots,
+        ..
+    } = step
+    else {
+        return invalid("Pipeline handoff step is not Transfer.");
+    };
+    if !matches!(destination, TransferDestination::PipelineHandoff { device_ref } if device_ref == local_device_ref)
+        || source_device_ref.as_deref() != Some(peer_device_ref)
+        || output_slots.len() != 1
+        || output_slots[0]
+            .object
+            .media_types
+            .iter()
+            .any(|media| media.as_str() != metadata.media_type)
+    {
+        return invalid("Pipeline handoff metadata does not match the immutable step.");
+    }
+    Ok(())
 }
 fn validate_acyclic(steps: &[BridgePlanStep]) -> AppResult<()> {
     fn visit<'a>(
@@ -2253,6 +2410,7 @@ impl<'a> BridgePlanStore<'a> {
         tx.commit()?;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn decide_receiver(
         &self,
         approval_id: &str,
@@ -3217,7 +3375,8 @@ fn legal_step(current: &StepExecutionState, next: &StepExecutionState) -> bool {
 fn authority_destination_device(step: &BridgePlanStep) -> Option<String> {
     match step {
         BridgePlanStep::Transfer { destination, .. } => Some(match destination {
-            TransferDestination::RequestingDevice { device_ref }
+            TransferDestination::PipelineHandoff { device_ref }
+            | TransferDestination::RequestingDevice { device_ref }
             | TransferDestination::SelectedDevice { device_ref }
             | TransferDestination::UserSelectedLocation { device_ref, .. }
             | TransferDestination::LeaveOnProducingDevice { device_ref } => device_ref.clone(),
@@ -3308,6 +3467,7 @@ fn validate_approval(approval: &BridgePlanApproval) -> AppResult<()> {
     }
     Ok(())
 }
+#[cfg(test)]
 fn validate_receiver_evidence(evidence: &ReceiverDecisionEvidence) -> AppResult<()> {
     id(&evidence.receiver_device_ref, "receiver device")?;
     if !evidence.revision_hash.starts_with(HASH_VERSION)
@@ -5383,6 +5543,7 @@ mod tests {
             vec!["txt".into()],
             vec!["documents".into()],
             "extract readable text".into(),
+            "selected".into(),
             true,
         )
         .unwrap();
@@ -5412,6 +5573,84 @@ mod tests {
             }
         );
         assert!(validate_revision(&revision).is_ok());
+    }
+
+    #[test]
+    fn cross_device_transform_inserts_a_private_pipeline_handoff() {
+        let revision = build_file_transform_revision(
+            "bridge".into(),
+            "mac".into(),
+            "windows".into(),
+            "Find transform-test.txt and extract readable text on this Mac.".into(),
+            "transform-test.txt".into(),
+            vec!["txt".into()],
+            vec!["downloads".into()],
+            "extract readable text".into(),
+            "mac".into(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(revision.steps.len(), 3);
+        let pipeline = revision
+            .steps
+            .iter()
+            .find(|step| step.id() == "pipeline_transfer")
+            .unwrap();
+        let BridgePlanStep::Transfer {
+            destination,
+            output_slots,
+            ..
+        } = pipeline
+        else {
+            panic!("cross-device Transform must include a visible pipeline Transfer");
+        };
+        assert_eq!(output_slots[0].slot_id, "pipeline_file");
+        assert_eq!(
+            destination,
+            &TransferDestination::PipelineHandoff {
+                device_ref: "mac".into()
+            }
+        );
+        let transform = revision
+            .steps
+            .iter()
+            .find(|step| step.id() == "transform")
+            .unwrap();
+        assert_eq!(transform.source_device(), Some("mac"));
+        assert!(validate_revision(&revision).is_ok());
+    }
+
+    #[test]
+    fn object_flow_rejects_a_transform_with_a_remote_input_location() {
+        let mut revision = build_file_transform_revision(
+            "bridge".into(),
+            "mac".into(),
+            "windows".into(),
+            "Find transform-test.txt and extract readable text on this Mac.".into(),
+            "transform-test.txt".into(),
+            vec!["txt".into()],
+            vec!["downloads".into()],
+            "extract readable text".into(),
+            "mac".into(),
+            false,
+        )
+        .unwrap();
+        let transform = revision
+            .steps
+            .iter_mut()
+            .find(|step| step.id() == "transform")
+            .unwrap();
+        let BridgePlanStep::Transform {
+            input_slots,
+            depends_on,
+            ..
+        } = transform
+        else {
+            unreachable!()
+        };
+        *depends_on = vec!["search".into()];
+        input_slots[0].slot_id = "selected_file".into();
+        assert!(validate_revision(&revision).is_err());
     }
 
     #[test]

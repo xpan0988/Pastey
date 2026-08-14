@@ -47,7 +47,6 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "peer_capability.query",
     "peer_capability.response",
     "bridge_plan.review_request",
-    "bridge_plan.review_decision",
     "bridge_plan.attempt_start",
     "bridge_plan.transfer_start",
     "bridge_plan.transform_start",
@@ -1194,6 +1193,137 @@ pub async fn receive_room_control_event_handler(
             "Bridge Plan review validation failed.",
         );
     }
+    // A current-Bridge session has already granted the bounded primitive
+    // consent. Once the immutable attempt-start was authenticated and the
+    // receiver-local one-use Search grant was derived, execution is a Rust
+    // continuation—not a renderer button.
+    if matches!(
+        validated.kind.as_str(),
+        "bridge_plan.attempt_start" | "bridge_plan.transform_start" | "bridge_plan.transfer_start"
+    ) {
+        if let Some(attempt_id) = validated
+            .event
+            .get("payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| payload.get("attemptId"))
+            .and_then(Value::as_str)
+            .filter(|attempt_id| !attempt_id.is_empty() && attempt_id.len() <= 128)
+        {
+            let execution_state = ctx.state.clone();
+            let execution_room = room_id.clone();
+            let execution_attempt = attempt_id.to_owned();
+            let return_route = selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
+            match validated.kind.as_str() {
+                "bridge_plan.attempt_start" => {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = crate::commands::execute_bridge_plan_search_attempt_inner(
+                            execution_state,
+                            execution_room,
+                            execution_attempt,
+                            Some(return_route),
+                        )
+                        .await;
+                    });
+                }
+                "bridge_plan.transform_start" => {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = crate::commands::execute_bridge_plan_transform_attempt_inner(
+                            execution_state,
+                            execution_room,
+                            execution_attempt,
+                            Some(return_route),
+                        )
+                        .await;
+                    });
+                }
+                "bridge_plan.transfer_start" => {
+                    // A direct local-file Transfer is executed by the
+                    // requesting Host immediately after the one plan start.
+                    // The selected Host receives its correlated start for
+                    // validation only and must not consume a nonexistent
+                    // Search selection as a second execution path.
+                    let requester_local_source = validated
+                        .event
+                        .get("payload")
+                        .and_then(Value::as_object)
+                        .and_then(|payload| payload.get("transferStep"))
+                        .and_then(Value::as_object)
+                        .and_then(|step| step.get("source"))
+                        .and_then(Value::as_object)
+                        .and_then(|source| source.get("kind"))
+                        .and_then(Value::as_str)
+                        == Some("future_user_selection");
+                    if !requester_local_source {
+                        tauri::async_runtime::spawn(async move {
+                            let _ = crate::commands::execute_bridge_plan_transfer_attempt_inner(
+                                execution_state,
+                                execution_room,
+                                execution_attempt,
+                                Some(return_route),
+                            )
+                            .await;
+                        });
+                    }
+                }
+                _ => unreachable!(),
+            };
+        }
+    }
+    // A completed remote Transform may make a final Transfer eligible on the
+    // requester. This is a Host continuation of the approved graph, not a
+    // renderer action. Search results deliberately do not take this branch:
+    // they still require requester data selection first.
+    if validated.kind == "bridge_plan.step_result"
+        && validated
+            .event
+            .get("payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| payload.get("stepId"))
+            .and_then(Value::as_str)
+            == Some("transform")
+    {
+        if let Some(attempt_id) = validated
+            .event
+            .get("payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| payload.get("attemptId"))
+            .and_then(Value::as_str)
+            .filter(|attempt_id| !attempt_id.is_empty() && attempt_id.len() <= 128)
+        {
+            let continuation_state = ctx.state.clone();
+            let continuation_room = room_id.clone();
+            let continuation_attempt = attempt_id.to_owned();
+            let continuation_route =
+                selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
+            tauri::async_runtime::spawn(async move {
+                let store = crate::bridge_plan::BridgePlanStore::new(&continuation_state.paths);
+                if store
+                    .list_attempt(&continuation_attempt)
+                    .ok()
+                    .is_some_and(|attempt| {
+                        attempt.steps.iter().any(|step| {
+                            matches!(step.state, crate::bridge_plan::StepExecutionState::Eligible)
+                                && attempt.attempt.graph_projection.nodes.iter().any(|node| {
+                                    node.step_id == step.step_id
+                                        && matches!(
+                                            node.operation,
+                                            crate::bridge_plan::StepOperation::Transfer
+                                        )
+                                })
+                        })
+                    })
+                {
+                    let _ = crate::commands::start_bridge_plan_transfer_attempt_inner(
+                        continuation_state,
+                        continuation_room,
+                        continuation_attempt,
+                        Some(continuation_route),
+                    )
+                    .await;
+                }
+            });
+        }
+    }
     let received_at = now_iso();
     {
         let mut runtime = ctx.state.room_control.lock();
@@ -2008,6 +2138,12 @@ mod tests {
             Ok(_) => panic!("generic capability event must be rejected"),
         };
         assert!(error.contains("Unsupported room control event kind."));
+    }
+
+    #[test]
+    fn receiver_review_decision_is_not_a_live_room_control_event() {
+        assert!(!ALLOWED_EVENT_KINDS.contains(&"bridge_plan.review_decision"));
+        assert!(ALLOWED_EVENT_KINDS.contains(&"bridge_plan.review_request"));
     }
 
     #[test]

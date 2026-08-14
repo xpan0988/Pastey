@@ -30,7 +30,7 @@ Layer 4 owns Bridge lifecycle, current-session membership, selected-peer and sel
 
 ### Layer 5 — Agent-assisted device workspace
 
-Layer 2 owns factual local capability availability. Layer 4 transports those facts over the exact current peer session. Layer 5 owns manual Block Composer input, optional natural-v1 advisory proposals, durable Bridge Plans, host validation, complete-plan approval, receiver review, bounded Search and file Transfer execution, and audit.
+Layer 2 owns factual local capability availability. Layer 4 transports those facts over the exact current peer session. Layer 5 owns manual Block Composer input, optional natural-v1 advisory proposals, durable object-flow Bridge Plans, Host validation, one complete requester approval, bounded current-Bridge session consent, Search/Transfer/Transform execution, and audit.
 
 ## Boundaries and dependencies
 
@@ -38,7 +38,7 @@ Layer 1 supplies encrypted transport to Layers 3 and 4. Layer 2 supplies observa
 
 The frontend owns presentation, user intent, and defense-in-depth validation. Rust owns the durable Bridge Plan workspace, local transport, endpoint validation, receiver-local candidate bindings and filesystem operations, Transfer admission and private handoff, Transform admission, Plan approval/review records, and authoritative Transform output construction. Product plan and execution state do not live in renderer memory. The renderer receives only safe activity and opaque transfer projections; it never receives the private transfer source, candidate binding, resolved intent, implementation, or approval binding.
 
-Remote capability availability is an observation, not authority. `pastey-peer-capabilities-v1` contains only `schemaVersion`, the requester-correlated `peerSessionId`, an observation timestamp, and bounded capability records (`capabilityId`, `available`, accepted input media types, output media type, and an optional bounded unavailable reason code). It is exchanged as a typed query/response over current-session Room Control and stored only under the current Bridge plus selected `peer_session_id`; it contains no paths, commands, private object references, approval IDs, grants, or secrets. Restart, Burn, leave, endpoint/key change, or a new peer session makes the old observation unusable. Windows advertises readable-text Transform as unavailable until a secure Windows staging backend exists.
+Remote capability availability is an observation, not authority. `pastey-peer-capabilities-v1` contains only `schemaVersion`, the requester-correlated `peerSessionId`, an observation timestamp, and bounded capability records (`capabilityId`, `available`, accepted input media types, output media type, and an optional bounded unavailable reason code). It is exchanged as a typed query/response over current-session Room Control and stored only under the current Bridge plus selected `peer_session_id`; it contains no paths, commands, private object references, approval IDs, grants, or secrets. The Composer chooses a Transform executor from these facts; if object location differs, Rust makes the required private pipeline handoff visible in the complete Plan. Restart, Burn, leave, endpoint/key change, or a new peer session makes the old observation unusable. Windows advertises readable-text Transform as unavailable until a secure Windows staging backend exists.
 
 The following invariants are deliberate fail-closed boundaries:
 
@@ -46,7 +46,7 @@ The following invariants are deliberate fail-closed boundaries:
 - An encrypted session is not durable device identity.
 - Bridge membership is not execution authority.
 - Transport delivery is not consent.
-- Bridge Plan approval and receiver review are not reusable authority.
+- Bridge Plan approval, current-session consent, and one-use step grants are not reusable authority.
 - Model output is not executable instruction.
 - `ObjectRef` is identity, not authority, consent, a lease, or a path.
 - Logs are not runtime state or authorization, and never contain receiver absolute paths.
@@ -57,9 +57,9 @@ The following invariants are deliberate fail-closed boundaries:
 
 **Search → Transfer.** This is a live file workflow. The requester selects one bounded, redacted Search result; the selected device validates that selection against its private Bridge Plan candidate store, then performs the approved Transfer through the existing encrypted transfer engine. The supported destinations are the requesting device or the selected device's approved Pastey Shared location.
 
-**Transfer (requesting device → selected device).** The requester can create a one-file Transfer Plan, choose its local source, and submit the complete plan for the same receiver review. The local source remains process-local and is revalidated before the existing encrypted Bridge transfer runs; it is invalidated by restart or Burn.
+**Transfer (requesting device → selected device).** The requester can create a one-file Transfer Plan, choose its local source, and approve the complete plan once. The local source remains process-local and is revalidated before the existing encrypted Bridge transfer runs; it is invalidated by restart or Burn.
 
-**Search → Transform → Transfer.** Transform intent is durable and provider-advisory only. A host resolves the bounded readable-text capability locally and keeps its generated output private to the selected device until an already-approved Transfer consumes it. Unsupported intent or input fails closed; Pastey records the limitation and presents an unapproved revised file plan.
+**Search → PipelineHandoff → Transform → Final Transfer.** A private pipeline handoff reuses encrypted binary transfer framing but lands under an app-owned ephemeral root, registers a Rust-private object bound to Bridge/revision/attempt/step, and never creates an Inbox or Pastey Shared item. Its dependent Transform consumes that private object automatically. Only an explicit final-delivery Transfer materializes a user-visible file. Unsupported intent or input fails closed; Pastey records the limitation and presents an unapproved revised file plan.
 
 ## Current implementation status
 

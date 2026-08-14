@@ -210,6 +210,23 @@ test("manual composer accepts each bounded Search composition and maps transfer 
   assert.equal(manualBridgePlanInput([search, newTransformBlock(), shared], availableTransform).value?.transferDestination, "pastey_shared");
 });
 
+test("object-flow composer visibly inserts a private handoff when the Transform executor changes", () => {
+  const search = updateSearchBlock(newSearchBlock(), { filenameHint: "transform-test.txt", extension: "txt" });
+  const transformOnRequester = { ...newTransformBlock(), executionDevice: "requesting_device" as const };
+  const plan = manualBridgePlanInput([search, transformOnRequester], availableTransform).value;
+  assert.deepEqual(plan?.visibleBlocks.map((block) => block.primitive), ["Search", "Transfer", "Transform"]);
+  assert.equal(plan?.visibleBlocks[1]?.primitive, "Transfer");
+  assert.equal(plan?.visibleBlocks[1] && "landingMode" in plan.visibleBlocks[1] ? plan.visibleBlocks[1].landingMode : null, "pipeline_handoff");
+  assert.equal(plan?.transformExecutionDevice, "requesting_device");
+});
+
+test("object-flow composer rejects known PDF readable-text input before approval", () => {
+  const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.pdf", extension: "pdf" });
+  assert.deepEqual(manualBridgePlanInput([search, newTransformBlock()], availableTransform), {
+    error: "Extract readable text does not accept PDF input.",
+  });
+});
+
 test("manual composer prevents invalid add, remove, and reorder operations instead of reinterpreting them", () => {
   assert.equal(addPrimitive([], "Transform").error, "Transform needs a selected input before it can run.");
   assert.equal(addPrimitive([], "Transfer").error, "Transfer needs an available source before it can run.");
