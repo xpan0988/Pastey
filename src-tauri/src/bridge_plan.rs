@@ -778,8 +778,8 @@ pub(crate) fn build_file_plan_revision(
 
 /// Constructs the supported file Transform revision. It carries natural
 /// language intent only—never a worker, command, path, runtime, or
-/// implementation choice. The selected Host resolves the capability only
-/// after it receives the bounded local input.
+/// implementation choice. The explicit execution Host resolves the capability
+/// only after it receives the bounded local input.
 pub(crate) fn build_file_transform_revision(
     bridge_id: String,
     requesting_device_ref: String,
@@ -986,12 +986,23 @@ pub(crate) fn build_file_transform_revision(
                 ),
             });
     }
-    revision.presentation.title =
-        GeneratedUserVisibleText::from_semantic("Search and process a file on the selected device");
-    revision.presentation.natural_language_plan = GeneratedUserVisibleText::from_semantic("Search the selected device, select one matching file, then process it with a supported local capability.");
-    revision.expected_outcome = GeneratedUserVisibleText::from_semantic(
-        "A selected file is processed on the selected device.",
+    let transform_executor_label =
+        if transform_execution_device_ref == revision.requesting_device_ref {
+            "requesting device"
+        } else {
+            "selected device"
+        };
+    revision.presentation.title = GeneratedUserVisibleText::from_semantic(format!(
+        "Search the selected device and process a file on the {transform_executor_label}"
+    ));
+    revision.presentation.natural_language_plan = GeneratedUserVisibleText::from_semantic(
+        format!(
+            "Search the selected device, select one matching file, then process it on the {transform_executor_label} with its supported local capability."
+        ),
     );
+    revision.expected_outcome = GeneratedUserVisibleText::from_semantic(format!(
+        "A selected file is processed on the {transform_executor_label}."
+    ));
     validate_revision(&revision)?;
     revision.revision_hash = canonical_revision_hash(&revision)?;
     Ok(revision)
@@ -2364,6 +2375,32 @@ impl<'a> BridgePlanStore<'a> {
         )?;
         if changed != 1 {
             return invalid("Bridge Plan revision transition became stale.");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn withdraw_unapproved_revision(&self, revision_id: &str) -> AppResult<()> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        let revision = revision_row_tx(&tx, revision_id)?;
+        ensure_active_bridge_tx(&tx, &revision.revision.bridge_id)?;
+        if revision.state != RevisionState::Available {
+            return invalid("Only an available Bridge Plan revision can be withdrawn.");
+        }
+        let approval_count = tx.query_row(
+            "SELECT COUNT(*) FROM bridge_plan_approvals WHERE revision_id = ?1",
+            [revision_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if approval_count != 0 {
+            return invalid("An approved Bridge Plan revision cannot be edited.");
+        }
+        let changed = tx.execute(
+            "UPDATE bridge_plan_revisions SET state = 'withdrawn' WHERE revision_id = ?1 AND state = 'available'",
+            [revision_id],
+        )?;
+        if changed != 1 {
+            return invalid("Bridge Plan revision withdrawal became stale.");
         }
         tx.commit()?;
         Ok(())
@@ -5591,6 +5628,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(revision.steps.len(), 3);
+        let search = revision
+            .steps
+            .iter()
+            .find(|step| step.id() == "search")
+            .unwrap();
+        assert_eq!(search.execution_device(), "windows");
         let pipeline = revision
             .steps
             .iter()
@@ -5599,12 +5642,16 @@ mod tests {
         let BridgePlanStep::Transfer {
             destination,
             output_slots,
+            source_device_ref,
+            execution_device_ref,
             ..
         } = pipeline
         else {
             panic!("cross-device Transform must include a visible pipeline Transfer");
         };
         assert_eq!(output_slots[0].slot_id, "pipeline_file");
+        assert_eq!(source_device_ref.as_deref(), Some("windows"));
+        assert_eq!(execution_device_ref, "windows");
         assert_eq!(
             destination,
             &TransferDestination::PipelineHandoff {
@@ -5617,7 +5664,62 @@ mod tests {
             .find(|step| step.id() == "transform")
             .unwrap();
         assert_eq!(transform.source_device(), Some("mac"));
+        assert_eq!(transform.execution_device(), "mac");
+        assert_eq!(
+            revision
+                .steps
+                .iter()
+                .filter(|step| matches!(
+                    step,
+                    BridgePlanStep::Transfer {
+                        destination: TransferDestination::PipelineHandoff { .. },
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(revision
+            .presentation
+            .natural_language_plan
+            .as_str()
+            .contains("requesting device"));
+        let round_trip: BridgePlanRevision =
+            serde_json::from_str(&serde_json::to_string(&revision).unwrap()).unwrap();
+        assert_eq!(round_trip, revision);
         assert!(validate_revision(&revision).is_ok());
+    }
+
+    #[test]
+    fn executor_edit_withdraws_the_old_immutable_revision_before_new_approval() {
+        let (_, unapproved_store) = store();
+        let revision = ready(&unapproved_store);
+        unapproved_store
+            .withdraw_unapproved_revision(&revision.revision_id)
+            .unwrap();
+        assert_eq!(
+            unapproved_store
+                .get_revision(&revision.revision_id)
+                .unwrap()
+                .state,
+            RevisionState::Withdrawn
+        );
+
+        let (_, approved_store) = store();
+        let approved_revision = ready(&approved_store);
+        approved_store
+            .create_approval(&approval(&approved_revision, "approval"), 20)
+            .unwrap();
+        assert!(approved_store
+            .withdraw_unapproved_revision(&approved_revision.revision_id)
+            .is_err());
+        assert_eq!(
+            approved_store
+                .get_revision(&approved_revision.revision_id)
+                .unwrap()
+                .state,
+            RevisionState::Available
+        );
     }
 
     #[test]

@@ -12,9 +12,9 @@ Bridge sessions are ephemeral. Devices join through nearby discovery or an 8-dig
 - Layer 4 — Bridge sessions, peers, routing, and control transport
 - Layer 5 — AI-assisted planning and bounded Transform workflows
 
-Layers 1–4 form the non-AI Pastey core. Layer 5 adds one Rust-owned Bridge Plan lifecycle for bounded Search, readable-text Transform, and Transfer. Plans, approvals, receiver review, and attempts are the only Transform authority.
+Layers 1–4 form the non-AI Pastey core. Layer 5 adds one Rust-owned Bridge Plan lifecycle for bounded Search, readable-text Transform, and Transfer. Immutable Plans, one requester approval, current-session consent, one-use grants, and attempts are the only Transform authority.
 
-Ask Bridge uses one natural-language surface built around **Search / Transform / Transfer**. The model is advisory only; Rust validates the bounded plan, the sender approves its complete revision, and the receiver reviews it. Search returns redacted metadata while private bindings remain on the selected device. Transform output stays Rust-private until a reviewed Plan Transfer consumes it.
+Ask Bridge normally uses a guided **Search / Transform / Transfer** Block Composer; natural-v1 providers are optional and advisory only. The Composer treats the local requester and selected peer as separate Transform executor candidates, displays each Host-owned capability fact, and records the chosen executor explicitly. Rust validates the bounded plan, the requester approves its complete revision once, and the current-session receiver executes eligible steps automatically. Search returns redacted metadata while private bindings remain Host-owned. If execution moves between Hosts, a reviewed private `PipelineHandoff` moves the intermediate object without creating an Inbox or Pastey Shared delivery.
 
 The only implemented Transform is fixed readable-text extraction through the approved Bridge Plan. It uses immutable staging, source-identity checks, and a fixed Rust worker. Linux probes, cgroup helpers, launch-plan checks, and behavioral verification are dormant test infrastructure: they expose no product availability, command, UI, sidecar, or execution backend. Unsupported intents create an unapproved alternative Plan revision and do not execute.
 

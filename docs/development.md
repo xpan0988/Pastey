@@ -41,7 +41,7 @@ The Layer 4 matrix covers ordinary-data routing, active Bridge-detail polling, q
 
 ## Transform and provider validation
 
-For the live product, run `cargo test --manifest-path src-tauri/Cargo.toml bridge_plan:: -- --nocapture`; it covers durable Plan lifecycle, receiver protocol review, Search grants, and bounded Transform/Transfer bindings. The live readable-text Transform uses Rust-private immutable staging and a fixed worker; no legacy Transform consent, journal, adapter, or command path remains.
+For the live product, run `cargo test --manifest-path src-tauri/Cargo.toml bridge_plan:: -- --nocapture`; it covers durable Plan lifecycle, automatic receiver protocol execution, Search grants, explicit Transform executors, private pipeline handoffs, and bounded Transform/Transfer bindings. The live readable-text Transform uses Rust-private immutable staging and a fixed worker; no legacy Transform consent, journal, adapter, or command path remains.
 
 Provider health checks are Settings-driven and advisory-only: use a deliberately minimal configured request, verify validation reports, and confirm it neither creates a Bridge control event nor changes consent/execution state. Do not put API keys in fixtures, logs, or documentation.
 

@@ -36,6 +36,7 @@ export type TransferBlock = {
 };
 export type DerivedPipelineTransferBlock = {
   primitive: "Transfer";
+  source: ComposerDevice;
   destination: ComposerDevice;
   landingMode: "pipeline_handoff";
   derived: true;
@@ -46,13 +47,15 @@ export type VisibleComposerBlock = ComposerBlock | DerivedPipelineTransferBlock;
 
 export type TransformAvailability = {
   intent: "extract readable text";
-  status?: "unknown" | "available" | "unavailable";
+  status: "unknown" | "available" | "unavailable";
   available: boolean;
   reason: string;
   hostLabel: string;
   acceptedInputMediaTypes?: string[];
   outputMediaType?: string | null;
 };
+
+export type TransformExecutorCapabilities = Record<ComposerDevice, TransformAvailability>;
 
 export type ManualBridgePlanInput = {
   blocks: ComposerBlock[];
@@ -70,8 +73,15 @@ export function newSearchBlock(): SearchBlock {
   return { primitive: "Search", executionDevice: "selected_device", filenameHint: "", extension: "", safeScopes: ["downloads"] };
 }
 
-export function newTransformBlock(): TransformBlock {
-  return { primitive: "Transform", intent: "extract readable text", executionDevice: "selected_device" };
+export function newTransformBlock(executionDevice: ComposerDevice = "requesting_device"): TransformBlock {
+  return { primitive: "Transform", intent: "extract readable text", executionDevice };
+}
+
+/** Selects the sole available executor, otherwise keeps the deterministic local-first default. */
+export function initialTransformExecutionDevice(capabilities: TransformExecutorCapabilities): ComposerDevice {
+  const available = (["requesting_device", "selected_device"] as const)
+    .filter((device) => capabilities[device].status === "available" && capabilities[device].available);
+  return available.length === 1 ? available[0]! : "requesting_device";
 }
 
 export function newTransferBlock(): TransferBlock {
@@ -100,6 +110,7 @@ export function objectFlow(blocks: readonly ComposerBlock[]): { visibleBlocks: V
       if (location !== block.executionDevice) {
         visibleBlocks.push({
           primitive: "Transfer",
+          source: location,
           destination: block.executionDevice,
           landingMode: "pipeline_handoff",
           derived: true,
@@ -131,8 +142,12 @@ export function canAddPrimitive(blocks: readonly ComposerBlock[], primitive: Com
   return dependencyError([...blocks, blockForPrimitive(primitive)]) === null;
 }
 
-export function addPrimitive(blocks: readonly ComposerBlock[], primitive: ComposerPrimitive): { blocks: ComposerBlock[]; error: string | null } {
-  const next = [...blocks, blockForPrimitive(primitive)];
+export function addPrimitive(
+  blocks: readonly ComposerBlock[],
+  primitive: ComposerPrimitive,
+  transformExecutionDevice: ComposerDevice = "requesting_device",
+): { blocks: ComposerBlock[]; error: string | null } {
+  const next = [...blocks, blockForPrimitive(primitive, transformExecutionDevice)];
   const error = dependencyError(next);
   return { blocks: error ? [...blocks] : next, error };
 }
@@ -159,7 +174,7 @@ export function updateSearchBlock(block: SearchBlock, patch: Partial<Omit<Search
 
 export function manualBridgePlanInput(
   blocks: readonly ComposerBlock[],
-  transformAvailability: TransformAvailability,
+  transformCapabilities: TransformExecutorCapabilities,
 ): { value?: ManualBridgePlanInput; error?: string } {
   const flow = objectFlow(blocks);
   if (flow.error) return { error: flow.error };
@@ -169,9 +184,12 @@ export function manualBridgePlanInput(
   if (!filenameHint) return { error: "Enter the filename to search for." };
   if (!search.safeScopes.length || search.safeScopes.some((scope) => !SAFE_SEARCH_SCOPES.some((entry) => entry.value === scope))) return { error: "Choose one or more reviewed Search locations." };
   const transform = blocks.find((block): block is TransformBlock => block.primitive === "Transform");
-  if (transform && !transformAvailability.available) return { error: transformAvailability.reason };
   const extensions = search.extension ? [search.extension] : [];
   if (transform && extensions.includes("pdf")) return { error: "Extract readable text does not accept PDF input." };
+  if (transform) {
+    const chosenCapability = transformCapabilities[transform.executionDevice];
+    if (chosenCapability.status !== "available" || !chosenCapability.available) return { error: chosenCapability.reason };
+  }
   const transfer = [...blocks].reverse().find((block): block is TransferBlock => block.primitive === "Transfer");
   return { value: {
     blocks: blocks.map((block) => ({ ...block, ...(block.primitive === "Search" ? { safeScopes: [...block.safeScopes] } : {}) })) as ComposerBlock[],
@@ -190,8 +208,8 @@ export function manualGoal(blocks: readonly Pick<VisibleComposerBlock, "primitiv
   return `${blocks.map((block) => block.primitive).join(" → ")}: ${filenameHint}`;
 }
 
-function blockForPrimitive(primitive: ComposerPrimitive): ComposerBlock {
+function blockForPrimitive(primitive: ComposerPrimitive, transformExecutionDevice: ComposerDevice = "requesting_device"): ComposerBlock {
   if (primitive === "Search") return newSearchBlock();
-  if (primitive === "Transform") return newTransformBlock();
+  if (primitive === "Transform") return newTransformBlock(transformExecutionDevice);
   return newTransferBlock();
 }

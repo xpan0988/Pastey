@@ -59,7 +59,7 @@ export function createDirectFileTransferBridgePlan(request: DirectFileTransferBr
 export interface FileTransformAlternativeBridgePlanRequest extends FileSearchBridgePlanRequest {
   transformIntent: string;
   /** The two current Bridge roles only; Rust resolves these to live sessions. */
-  transformExecutionDevice?: "requesting_device" | "selected_device";
+  transformExecutionDevice: "requesting_device" | "selected_device";
 }
 
 export function createFileTransformBridgePlan(request: FileTransformAlternativeBridgePlanRequest): Promise<BridgePlanWorkspace> {
@@ -97,6 +97,10 @@ export function listBridgePlanWorkspace(roomId: string): Promise<BridgePlanWorks
 
 export function approveBridgePlan(revisionId: string, approvalId: string): Promise<BridgePlanWorkspace> {
   return invoke<BridgePlanWorkspace>("approve_bridge_plan", { revisionId, approvalId });
+}
+
+export function withdrawBridgePlanRevision(roomId: string, revisionId: string): Promise<BridgePlanWorkspace> {
+  return invoke<BridgePlanWorkspace>("withdraw_bridge_plan_revision", { roomId, revisionId });
 }
 
 export function bindBridgePlanToSession(approvalId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {

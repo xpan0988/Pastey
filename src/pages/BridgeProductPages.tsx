@@ -23,6 +23,8 @@ import {
   selectBridgePlanSearchCandidate,
   selectedPeerTransformAvailability,
   sendTextToRoom,
+  type SelectedPeerTransformAvailability,
+  withdrawBridgePlanRevision,
   writeTempFile,
 } from "../lib/tauri";
 import {
@@ -56,14 +58,19 @@ import {
   SAFE_SEARCH_SCOPES,
   addPrimitive,
   canAddPrimitive,
+  initialTransformExecutionDevice,
   manualBridgePlanInput,
   moveBlock,
   newSearchBlock,
+  objectFlow,
   removeBlock,
   updateSearchBlock,
   type ComposerBlock,
+  type ComposerDevice,
+  type DerivedPipelineTransferBlock,
   type SafeSearchScope,
   type TransformAvailability,
+  type TransformExecutorCapabilities,
 } from "../lib/bridgePlanComposer";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
 import { formatCode, formatTimestamp } from "../lib/format";
@@ -728,6 +735,7 @@ export function BridgeDetailPage({
       <BridgePlanSenderPanel
         enabled={askBridgeBetaEnabled}
         room={room}
+        localDeviceProfile={localDeviceProfile}
         selectedPeer={selectedSinglePeer}
         route={selectedRoute}
         inboxEvents={bridgePlanInboxBatch}
@@ -777,24 +785,25 @@ function BridgePlanReceiverPanel({
 function BridgePlanSenderPanel({
   enabled,
   room,
+  localDeviceProfile,
   selectedPeer,
   route,
   inboxEvents,
 }: {
   enabled: boolean;
   room: RoomInfo;
+  localDeviceProfile: DeviceProfile | null;
   selectedPeer: BridgePeerSession | null;
   route: BridgeRoute | null;
   inboxEvents: readonly ReceivedRoomControlEvent[];
 }) {
   const [blocks, setBlocks] = useState<ComposerBlock[]>([newSearchBlock()]);
-  const [transformAvailability, setTransformAvailability] = useState<TransformAvailability>({
-    intent: "extract readable text",
-    status: "unknown",
-    available: false,
-    reason: "Checking the Host-owned Transform capability…",
-    hostLabel: "the selected Host",
-  });
+  const localTransformHostLabel = localDeviceProfile?.device_name?.trim() || localDeviceLabel(localDeviceProfile);
+  const selectedTransformHostLabel = selectedPeer?.displayName ?? "Selected device";
+  const [transformCapabilities, setTransformCapabilities] = useState<TransformExecutorCapabilities>(() => ({
+    requesting_device: unknownTransformAvailability("This device", "Checking this device capability…"),
+    selected_device: unknownTransformAvailability("Selected device", "Checking selected device capability…"),
+  }));
   const [revisionId, setRevisionId] = useState<string | null>(null);
   const [approvalId, setApprovalId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -821,7 +830,11 @@ function BridgePlanSenderPanel({
     [attemptId, inboxEvents],
   );
   const candidateMode = bridgePlanSearchCandidateMode(blocks.map((step) => step.primitive));
-  const transformExecutor = blocks.find((step): step is Extract<ComposerBlock, { primitive: "Transform" }> => step.primitive === "Transform")?.executionDevice ?? "selected_device";
+  const transformExecutor = blocks.find((step): step is Extract<ComposerBlock, { primitive: "Transform" }> => step.primitive === "Transform")?.executionDevice ?? "requesting_device";
+  const transformAvailability = transformCapabilities[transformExecutor];
+  const visibleObjectFlow = objectFlow(blocks).visibleBlocks;
+  const derivedPipelineHandoffs = visibleObjectFlow.filter((step): step is DerivedPipelineTransferBlock => step.primitive === "Transfer" && "derived" in step);
+  const composerDeviceLabel = (device: ComposerDevice) => device === "requesting_device" ? localTransformHostLabel : selectedTransformHostLabel;
   const reviewSearch = blocks.find((step) => step.primitive === "Search");
   const reviewTransfer = blocks.find((step) => step.primitive === "Transfer");
   const failedTransformAttemptIds = useMemo(
@@ -830,6 +843,9 @@ function BridgePlanSenderPanel({
   );
 
   useEffect(() => {
+    if (revisionId && !approvalId) {
+      void withdrawBridgePlanRevision(room.id, revisionId).catch(() => undefined);
+    }
     setBlocks([newSearchBlock()]);
     setRevisionId(null);
     setApprovalId(null);
@@ -843,28 +859,50 @@ function BridgePlanSenderPanel({
 
   useEffect(() => {
     let cancelled = false;
+    setTransformCapabilities({
+      requesting_device: unknownTransformAvailability(localTransformHostLabel, "Checking this device capability…"),
+      selected_device: unknownTransformAvailability(selectedTransformHostLabel, "Checking selected device capability…"),
+    });
     if (!selectedPeerRoute || !selectedPeer) return;
     let refreshing = false;
     const refresh = async () => {
       if (refreshing) return;
       refreshing = true;
-      setTransformAvailability({ intent: "extract readable text", status: "unknown", available: false, reason: transformExecutor === "requesting_device" ? "Checking this device capability…" : "Checking selected device capability…", hostLabel: transformExecutor === "requesting_device" ? "this device" : selectedPeer.displayName });
       try {
-        if (transformExecutor === "requesting_device") {
-          const observation = await localTransformAvailability();
-          if (!cancelled) setTransformAvailability({ intent: "extract readable text", status: observation.status, available: observation.available, reason: observation.reason, hostLabel: "this device", acceptedInputMediaTypes: observation.acceptedInputMediaTypes, outputMediaType: observation.outputMediaType });
-          return;
-        }
-        await refreshSelectedPeerCapabilities(room.id, bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"));
-        for (let attempt = 0; attempt < 5 && !cancelled; attempt += 1) {
-          const observation = await selectedPeerTransformAvailability(room.id);
-          if (cancelled) return;
-          setTransformAvailability({ intent: "extract readable text", status: observation.status, available: observation.available, reason: observation.reason, hostLabel: selectedPeer.displayName, acceptedInputMediaTypes: observation.acceptedInputMediaTypes, outputMediaType: observation.outputMediaType });
-          if (observation.status !== "unknown") return;
-          await new Promise((resolve) => window.setTimeout(resolve, 300));
-        }
-      } catch {
-        if (!cancelled) setTransformAvailability({ intent: "extract readable text", status: "unknown", available: false, reason: "Selected device capability is unknown.", hostLabel: selectedPeer.displayName });
+        const local = localTransformAvailability()
+          .then((observation) => {
+            if (!cancelled) setTransformCapabilities((current) => ({
+              ...current,
+              requesting_device: transformAvailabilityFromObservation(observation, localTransformHostLabel),
+            }));
+          })
+          .catch(() => {
+            if (!cancelled) setTransformCapabilities((current) => ({
+              ...current,
+              requesting_device: unknownTransformAvailability(localTransformHostLabel, "This device capability is unknown."),
+            }));
+          });
+        const remote = (async () => {
+          try {
+            await refreshSelectedPeerCapabilities(room.id, bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"));
+            for (let attempt = 0; attempt < 5 && !cancelled; attempt += 1) {
+              const observation = await selectedPeerTransformAvailability(room.id);
+              if (cancelled) return;
+              setTransformCapabilities((current) => ({
+                ...current,
+                selected_device: transformAvailabilityFromObservation(observation, selectedTransformHostLabel),
+              }));
+              if (observation.status !== "unknown") return;
+              await new Promise((resolve) => window.setTimeout(resolve, 300));
+            }
+          } catch {
+            if (!cancelled) setTransformCapabilities((current) => ({
+              ...current,
+              selected_device: unknownTransformAvailability(selectedTransformHostLabel, "Selected device capability is unknown."),
+            }));
+          }
+        })();
+        await Promise.all([local, remote]);
       } finally {
         refreshing = false;
       }
@@ -872,10 +910,18 @@ function BridgePlanSenderPanel({
     void refresh();
     const interval = window.setInterval(() => { void refresh(); }, 60_000);
     return () => { cancelled = true; window.clearInterval(interval); };
-  }, [room.id, selectedPeer?.peerSessionId, selectedPeerRoute, transformExecutor]);
+  }, [localTransformHostLabel, room.id, selectedPeer?.peerSessionId, selectedPeerRoute, selectedTransformHostLabel]);
 
   function editBlocks(next: ComposerBlock[]) {
+    if (approvalId) {
+      setMessage("The approved revision is already running. Its execution devices cannot be changed.");
+      return;
+    }
     if (revisionId) {
+      const staleRevisionId = revisionId;
+      void withdrawBridgePlanRevision(room.id, staleRevisionId).catch((error) => {
+        setMessage(error instanceof Error ? error.message : "Pastey could not withdraw the stale plan revision.");
+      });
       setRevisionId(null);
       setApprovalId(null);
       setApprovalState(null);
@@ -886,6 +932,15 @@ function BridgePlanSenderPanel({
     }
     setBlocks(next);
   }
+
+  useEffect(() => {
+    const hasDraftTransform = blocks.some((step) => step.primitive === "Transform");
+    if (!revisionId || approvalId || !hasDraftTransform || transformAvailability.status !== "unavailable") return;
+    const staleRevisionId = revisionId;
+    setRevisionId(null);
+    setMessage(`${transformAvailability.hostLabel} can no longer execute the reviewed Transform. Review a new revision after choosing an Available executor.`);
+    void withdrawBridgePlanRevision(room.id, staleRevisionId).catch(() => undefined);
+  }, [approvalId, blocks, revisionId, room.id, transformAvailability.hostLabel, transformAvailability.status]);
 
   useEffect(() => {
     if (!approvalId) return;
@@ -941,7 +996,7 @@ function BridgePlanSenderPanel({
       setMessage(BRIDGE_PLAN_REQUIRES_ONE_SELECTED_DEVICE);
       return;
     }
-    const composed = manualBridgePlanInput(blocks, transformAvailability);
+    const composed = manualBridgePlanInput(blocks, transformCapabilities);
     if (!composed.value) { setMessage(composed.error ?? "Complete the bounded plan fields."); return; }
     setBusy("plan");
     setMessage(null);
@@ -949,7 +1004,8 @@ function BridgePlanSenderPanel({
       const plan = composed.value;
       const supportsTransform = Boolean(plan.transformIntent);
       const supportsTransfer = Boolean(plan.transferDestination);
-      const workspace = supportsTransform
+      if (supportsTransform && !plan.transformExecutionDevice) throw new Error("Choose an explicit Transform execution device.");
+      const workspace = plan.transformIntent && plan.transformExecutionDevice
         ? await createFileTransformBridgePlan({
           roomId: room.id,
           originalUserGoal: plan.originalUserGoal,
@@ -958,7 +1014,7 @@ function BridgePlanSenderPanel({
           safeScopes: plan.safeScopes,
           transferToRequester: plan.transferDestination === "requesting_device",
           transferDestination: plan.transferDestination === "pastey_shared" ? "selected_device" : "requesting_device",
-          transformIntent: plan.transformIntent ?? "extract readable text",
+          transformIntent: plan.transformIntent,
           transformExecutionDevice: plan.transformExecutionDevice,
         })
         : await createFileSearchBridgePlan({
@@ -992,6 +1048,10 @@ function BridgePlanSenderPanel({
 
   async function requestReview() {
     if (!revisionId || !selectedPeerRoute) return;
+    if (blocks.some((step) => step.primitive === "Transform") && (transformAvailability.status !== "available" || !transformAvailability.available)) {
+      setMessage(transformAvailability.reason);
+      return;
+    }
     setBusy("review");
     setMessage(null);
     try {
@@ -1088,7 +1148,7 @@ function BridgePlanSenderPanel({
       </div>
       <div className="button-row">
         <button type="button" className="secondary-button" disabled={!canAddPrimitive(blocks, "Search")} onClick={() => editBlocks(addPrimitive(blocks, "Search").blocks)}>+ Search</button>
-        <button type="button" className="secondary-button" disabled={!canAddPrimitive(blocks, "Transform")} onClick={() => editBlocks(addPrimitive(blocks, "Transform").blocks)}>+ Transform</button>
+        <button type="button" className="secondary-button" disabled={Boolean(approvalId) || !canAddPrimitive(blocks, "Transform")} onClick={() => editBlocks(addPrimitive(blocks, "Transform", initialTransformExecutionDevice(transformCapabilities)).blocks)}>+ Transform</button>
         <button type="button" className="secondary-button" disabled={!canAddPrimitive(blocks, "Transfer")} onClick={() => editBlocks(addPrimitive(blocks, "Transfer").blocks)}>+ Transfer</button>
         <button type="button" className="secondary-button" disabled={!canPlan || busy !== null} onClick={() => void createDirectTransferPlan()}>
           Transfer local file
@@ -1099,12 +1159,20 @@ function BridgePlanSenderPanel({
           <section key={`${block.primitive}-${index}`} className="bridge-plan-block">
             <div className="section-row"><h3>{index + 1}. {block.primitive}</h3><div className="button-row"><button type="button" className="text-button" disabled={index === 0} onClick={() => { const next = moveBlock(blocks, index, index - 1); editBlocks(next.blocks); setMessage(next.error); }}>↑</button><button type="button" className="text-button" disabled={index === blocks.length - 1} onClick={() => { const next = moveBlock(blocks, index, index + 1); editBlocks(next.blocks); setMessage(next.error); }}>↓</button><button type="button" className="text-button" onClick={() => { const next = removeBlock(blocks, index); editBlocks(next.blocks); setMessage(next.error); }}>Remove</button></div></div>
             {block.primitive === "Search" ? <div className="bridge-plan-block-fields"><label>Device<input value={selectedPeer?.displayName ?? "Selected device"} readOnly /></label><label>Look in<select aria-label="Reviewed Search scope" value={block.safeScopes[0] ?? "downloads"} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { safeScopes: [event.target.value as SafeSearchScope] }) : entry))}>{SAFE_SEARCH_SCOPES.map((scope) => <option key={scope.value} value={scope.value}>{scope.label}</option>)}</select></label><label>File name<input aria-label="Search filename" value={block.filenameHint} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { filenameHint: event.target.value }) : entry))} placeholder="Funding Statement.pdf" /></label><label>Type<input aria-label="Search extension" value={block.extension} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { extension: event.target.value }) : entry))} placeholder="pdf" /></label></div> : null}
-            {block.primitive === "Transform" ? <div className="bridge-plan-block-fields"><p>Process file: <strong>Extract readable text</strong></p><label>Process on:<select aria-label="Transform execution device" value={block.executionDevice} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transform" ? { ...entry, executionDevice: event.target.value as "requesting_device" | "selected_device" } : entry))}><option value="selected_device">Selected device</option><option value="requesting_device">This device</option></select></label><p>Runs on: {block.executionDevice === "selected_device" ? transformAvailability.hostLabel : "this device"}</p><p className={transformAvailability.status === "unknown" ? "muted" : transformAvailability.available ? "success-text" : "danger-text"}>Availability: {transformAvailability.status === "unknown" ? "Checking / Unknown" : transformAvailability.available ? "Available" : "Unavailable"}{transformAvailability.reason ? ` — ${transformAvailability.reason}` : ""}</p>{transformAvailability.acceptedInputMediaTypes?.length ? <p className="muted">Accepted input types: {transformAvailability.acceptedInputMediaTypes.join(", ")}. Candidate compatibility is rechecked by the execution Host.</p> : null}</div> : null}
+            {block.primitive === "Transform" ? <div className="bridge-plan-block-fields"><p>Process file: <strong>Extract readable text</strong></p><label>Process on:<select aria-label="Transform execution device" disabled={Boolean(approvalId)} value={block.executionDevice} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transform" ? { ...entry, executionDevice: event.target.value as ComposerDevice } : entry))}><option value="requesting_device">{localTransformHostLabel} — {transformCapabilityStatusLabel(transformCapabilities.requesting_device)}</option><option value="selected_device">{selectedTransformHostLabel} — {transformCapabilityStatusLabel(transformCapabilities.selected_device)}</option></select></label><div aria-label="Transform executor capabilities">{(["requesting_device", "selected_device"] as const).map((device) => { const capability = transformCapabilities[device]; return <p key={device} className={capability.status === "unknown" ? "muted" : capability.available ? "success-text" : "danger-text"}><strong>{composerDeviceLabel(device)}</strong>: {transformCapabilityStatusLabel(capability)}{capability.reason ? ` — ${capability.reason}` : ""}</p>; })}</div><p>Runs on: {transformAvailability.hostLabel}</p><p className={transformAvailability.status === "unknown" ? "muted" : transformAvailability.available ? "success-text" : "danger-text"}>Availability: {transformCapabilityStatusLabel(transformAvailability)}{transformAvailability.reason ? ` — ${transformAvailability.reason}` : ""}</p>{transformAvailability.acceptedInputMediaTypes?.length ? <p className="muted">Accepted input types: {transformAvailability.acceptedInputMediaTypes.join(", ")}. Candidate compatibility is rechecked by the execution Host.</p> : null}</div> : null}
             {block.primitive === "Transfer" ? <div className="bridge-plan-block-fields"><label>Send result to:<select aria-label="Transfer destination" value={block.destination} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transfer" ? { ...entry, destination: event.target.value as "requesting_device" | "selected_device" | "pastey_shared" } : entry))}><option value="requesting_device">This device</option><option value="selected_device">Selected device</option><option value="pastey_shared">Pastey Shared on selected device</option></select></label><p className="muted">Final delivery creates a user-visible result. Required processing handoffs are shown in the reviewed plan and stay private.</p></div> : null}
           </section>
         ))}
+        {derivedPipelineHandoffs.map((handoff, index) => (
+          <section key={`pipeline-handoff-${index}`} className="bridge-plan-block" aria-label="Derived Pipeline handoff">
+            <h3>Transfer for processing</h3>
+            <p><strong>{composerDeviceLabel(handoff.source)} → {composerDeviceLabel(handoff.destination)}</strong></p>
+            <p>Pipeline handoff</p>
+            <p className="muted">Private intermediate transfer. Required for processing; it does not create an Inbox or Pastey Shared delivery.</p>
+          </section>
+        ))}
       </div>
-      <div className="button-row"><button type="button" className="primary-button" disabled={!canPlan || busy !== null || directTransfer || (blocks.some((step) => step.primitive === "Transform") && !transformAvailability.available)} onClick={() => void createPlan()}>{busy === "plan" ? "Building…" : "Review plan"}</button></div>
+      <div className="button-row"><button type="button" className="primary-button" disabled={!canPlan || busy !== null || directTransfer || Boolean(approvalId) || (blocks.some((step) => step.primitive === "Transform") && (transformAvailability.status !== "available" || !transformAvailability.available))} onClick={() => void createPlan()}>{busy === "plan" ? "Building…" : "Review plan"}</button></div>
       {!canPlan ? <p className="muted">Select one connected device to create a plan.</p> : null}
       {revisionId ? (
         <div className="request-file-preview" data-testid="ask-bridge-plan-preview">
@@ -1116,8 +1184,18 @@ function BridgePlanSenderPanel({
               {reviewTransfer?.primitive === "Transfer" ? ` Destination: ${reviewTransfer.destination === "requesting_device" ? "requesting device" : "selected device Pastey Shared"}.` : ""}
             </p>
           ) : null}
+          {!directTransfer ? (
+            <div aria-label="Reviewed object flow">
+              {visibleObjectFlow.map((step, index) => {
+                if (step.primitive === "Search") return <p key={`review-flow-${index}`}><strong>Search @ {composerDeviceLabel(step.executionDevice)}</strong></p>;
+                if (step.primitive === "Transform") return <p key={`review-flow-${index}`}><strong>Transform @ {composerDeviceLabel(step.executionDevice)}</strong><br /><span className="muted">Extract readable text</span></p>;
+                if ("derived" in step) return <p key={`review-flow-${index}`}><strong>PipelineHandoff</strong><br />{composerDeviceLabel(step.source)} → {composerDeviceLabel(step.destination)}<br /><span className="muted">Required for processing · Private intermediate transfer</span></p>;
+                return <p key={`review-flow-${index}`}><strong>Final Transfer → {step.destination === "requesting_device" ? localTransformHostLabel : selectedTransformHostLabel}</strong></p>;
+              })}
+            </div>
+          ) : null}
           {!approvalId ? (
-            <button type="button" className="primary-button" disabled={busy !== null} onClick={() => void requestReview()}>
+            <button type="button" className="primary-button" disabled={busy !== null || (blocks.some((step) => step.primitive === "Transform") && (transformAvailability.status !== "available" || !transformAvailability.available))} onClick={() => void requestReview()}>
               {busy === "review" ? "Starting…" : "Review & Run"}
             </button>
           ) : null}
@@ -1152,6 +1230,36 @@ function BridgePlanSenderPanel({
       {message ? <p className="muted" role="status">{message}</p> : null}
     </Card>
   );
+}
+
+function unknownTransformAvailability(hostLabel: string, reason: string): TransformAvailability {
+  return {
+    intent: "extract readable text",
+    status: "unknown",
+    available: false,
+    reason,
+    hostLabel,
+  };
+}
+
+function transformAvailabilityFromObservation(
+  observation: SelectedPeerTransformAvailability,
+  hostLabel: string,
+): TransformAvailability {
+  return {
+    intent: "extract readable text",
+    status: observation.status,
+    available: observation.available,
+    reason: observation.reason,
+    hostLabel,
+    acceptedInputMediaTypes: observation.acceptedInputMediaTypes,
+    outputMediaType: observation.outputMediaType,
+  };
+}
+
+function transformCapabilityStatusLabel(capability: TransformAvailability): string {
+  if (capability.status === "unknown") return "Unknown";
+  return capability.available ? "Available" : "Unavailable";
 }
 
 function SearchCandidateCard({
