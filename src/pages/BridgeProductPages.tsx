@@ -4,29 +4,22 @@ import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNo
 import {
   copyTextToClipboard,
   approveBridgePlan,
-  bridgePlanReceiverReviewStatus,
   createDirectFileTransferBridgePlan,
   createFileSearchBridgePlan,
   createFileTransformBridgePlan,
   proposeBridgePlanTransformFallback,
-  decideBridgePlanReview,
-  executeBridgePlanSearchAttempt,
-  executeDirectBridgePlanTransferAttempt,
-  executeBridgePlanTransferAttempt,
-  executeBridgePlanTransformAttempt,
   getDeviceProfile,
   getRoomControlSessionContext,
   joinRoom,
   listBridgePlanWorkspace,
   listReceivedRoomControlEvents,
   listNearbyDevices,
+  localTransformAvailability,
   requestNearbyJoin,
   revealInFolder,
   refreshSelectedPeerCapabilities,
-  sendBridgePlanReviewRequest,
+  bindBridgePlanToSession,
   startBridgePlanAttempt,
-  startBridgePlanTransferAttempt,
-  startBridgePlanTransformAttempt,
   selectBridgePlanSearchCandidate,
   selectedPeerTransformAvailability,
   sendTextToRoom,
@@ -270,6 +263,7 @@ export function BridgePage({
           <div>
             <strong>Enter an 8-digit code</strong>
             <p className="muted">Ask the other device for its code.</p>
+            <p className="muted">Joining allows the other current Bridge device to run reviewed, bounded Pastey tasks for this session only. It does not grant file-system, shell, or durable device control.</p>
           </div>
           <div className="join-code-controls compact">
             <input
@@ -740,10 +734,7 @@ export function BridgeDetailPage({
       />
 
       <BridgePlanReceiverPanel
-        room={room}
-        route={selectedRoute}
         inboxEvents={bridgePlanInboxBatch}
-        onRefresh={() => void refreshBridgeControlInbox()}
       />
 
       <BridgePlanWorkspacePanel room={room} />
@@ -762,239 +753,23 @@ export function BridgeDetailPage({
   );
 }
 
-interface ReviewedBridgePlan {
-  approvalId: string;
-  description: string;
-}
-
-interface StartedBridgePlanAttempt {
-  approvalId: string;
-  attemptId: string;
-}
-
-interface StartedBridgePlanTransfer {
-  approvalId: string;
-  attemptId: string;
-  requesterDirect: boolean;
-}
-interface StartedBridgePlanTransform {
-  approvalId: string;
-  attemptId: string;
-}
-
 function BridgePlanReceiverPanel({
-  room,
-  route,
   inboxEvents,
-  onRefresh,
 }: {
-  room: RoomInfo;
-  route: BridgeRoute | null;
   inboxEvents: readonly ReceivedRoomControlEvent[];
-  onRefresh: () => void;
 }) {
-  const [decisions, setDecisions] = useState<Record<string, "allow" | "deny">>({});
-  const [runningAttempts, setRunningAttempts] = useState<Record<string, "running" | "completed" | "failed">>({});
-  const [message, setMessage] = useState<string | null>(null);
-  const reviewedPlans = useMemo(
-    () => inboxEvents.flatMap(parseReviewedBridgePlan),
-    [inboxEvents],
-  );
-  const startedAttempts = useMemo(
-    () => inboxEvents.flatMap(parseStartedBridgePlanAttempt),
-    [inboxEvents],
-  );
-  const startedTransfers = useMemo(
-    () => inboxEvents.flatMap(parseStartedBridgePlanTransfer),
-    [inboxEvents],
-  );
-  const startedTransforms = useMemo(
-    () => inboxEvents.flatMap(parseStartedBridgePlanTransform),
-    [inboxEvents],
-  );
-  const singlePeerRoute = route?.target.kind === "selected_peer" ? route : null;
-
-  useEffect(() => {
-    setDecisions({});
-    setRunningAttempts({});
-    setMessage(null);
-  }, [room.id]);
-
-  useEffect(() => {
-    let cancelled = false;
-    void Promise.all(reviewedPlans.map(async (plan) => ({
-      approvalId: plan.approvalId,
-      decision: await bridgePlanReceiverReviewStatus(room.id, plan.approvalId),
-    }))).then((statuses) => {
-      if (cancelled) return;
-      setDecisions((current) => {
-        const next = { ...current };
-        statuses.forEach(({ approvalId, decision }) => {
-          if (decision) next[approvalId] = decision;
-        });
-        return next;
-      });
-    }).catch(() => {
-      // An absent local decision is a safe pending state; the Rust decision
-      // command remains authoritative when the user acts.
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [reviewedPlans, room.id]);
-
-  async function decide(plan: ReviewedBridgePlan, allow: boolean) {
-    if (!singlePeerRoute) {
-      setMessage("Select the requesting device before reviewing this plan.");
-      return;
-    }
-    setMessage(null);
-    try {
-      await decideBridgePlanReview(
-        room.id,
-        plan.approvalId,
-        allow,
-        bridgeRoutePayload(singlePeerRoute, "pastey-bridge-control-route-v1"),
-      );
-      setDecisions((current) => ({ ...current, [plan.approvalId]: allow ? "allow" : "deny" }));
-      setMessage(allow ? "Plan approved. Waiting for the requester to start it." : "Plan denied. No search will run.");
-      onRefresh();
-    } catch (error) {
-      setMessage(bridgePlanControlErrorMessage(error, "decision"));
-    }
-  }
-
-  async function runSearch(attempt: StartedBridgePlanAttempt) {
-    if (!singlePeerRoute) {
-      setMessage("Select the requesting device before running this plan.");
-      return;
-    }
-    setRunningAttempts((current) => ({ ...current, [attempt.attemptId]: "running" }));
-    setMessage("Searching the approved locations on this device…");
-    try {
-      await executeBridgePlanSearchAttempt(
-        room.id,
-        attempt.attemptId,
-        bridgeRoutePayload(singlePeerRoute, "pastey-bridge-control-route-v1"),
-      );
-      setRunningAttempts((current) => ({ ...current, [attempt.attemptId]: "completed" }));
-      setMessage("Search complete. The requester can see the result summary.");
-      onRefresh();
-    } catch (error) {
-      setRunningAttempts((current) => ({ ...current, [attempt.attemptId]: "failed" }));
-      setMessage(bridgePlanSearchErrorMessage(error));
-    }
-  }
-
-  async function runTransfer(attempt: StartedBridgePlanTransfer) {
-    if (!singlePeerRoute) {
-      setMessage("Select the requesting device before completing this transfer.");
-      return;
-    }
-    setRunningAttempts((current) => ({ ...current, [`transfer:${attempt.attemptId}`]: "running" }));
-    setMessage("Transferring the selected file to the requesting device…");
-    try {
-      await executeBridgePlanTransferAttempt(
-        room.id,
-        attempt.attemptId,
-        bridgeRoutePayload(singlePeerRoute, "pastey-bridge-control-route-v1"),
-      );
-      setRunningAttempts((current) => ({ ...current, [`transfer:${attempt.attemptId}`]: "completed" }));
-      setMessage("Transfer complete.");
-      onRefresh();
-    } catch (error) {
-      setRunningAttempts((current) => ({ ...current, [`transfer:${attempt.attemptId}`]: "failed" }));
-      setMessage(bridgePlanTransferErrorMessage(error));
-    }
-  }
-
-  async function runTransform(attempt: StartedBridgePlanTransform) {
-    if (!singlePeerRoute) { setMessage("Select the requesting device before processing this file."); return; }
-    setRunningAttempts((current) => ({ ...current, [`transform:${attempt.attemptId}`]: "running" }));
-    setMessage("Processing the selected file with the approved local capability…");
-    try {
-      await executeBridgePlanTransformAttempt(room.id, attempt.attemptId, bridgeRoutePayload(singlePeerRoute, "pastey-bridge-control-route-v1"));
-      setRunningAttempts((current) => ({ ...current, [`transform:${attempt.attemptId}`]: "completed" }));
-      setMessage("Transform complete. The generated result remains on this device."); onRefresh();
-    } catch (error) {
-      setRunningAttempts((current) => ({ ...current, [`transform:${attempt.attemptId}`]: "failed" }));
-      setMessage(error instanceof Error ? error.message : "The approved Transform could not be completed.");
-    }
-  }
-
-  const approvedAttempts = startedAttempts.filter((attempt) => decisions[attempt.approvalId] === "allow");
-  const approvedTransfers = startedTransfers.filter((attempt) => decisions[attempt.approvalId] === "allow");
-  const approvedTransforms = startedTransforms.filter((attempt) => decisions[attempt.approvalId] === "allow");
-  if (reviewedPlans.length === 0 && approvedAttempts.length === 0 && approvedTransfers.length === 0 && approvedTransforms.length === 0 && !message) return null;
+  const active = inboxEvents.some((event) => event.kind.startsWith("bridge_plan."));
+  if (!active) return null;
 
   return (
     <Card className="ask-bridge-card" aria-label="Received Ask Bridge plan">
       <div className="section-row">
         <div>
           <h2>Ask Bridge</h2>
-          <p className="muted">Plans from the selected device need your review before Pastey searches this device.</p>
+          <p className="muted">Running bounded tasks from the current Bridge session. Progress is observational; Stop or Burn remains available from Bridge controls.</p>
         </div>
       </div>
-      {reviewedPlans.map((plan) => {
-        const decision = decisions[plan.approvalId];
-        return (
-          <div className="request-file-preview" key={plan.approvalId}>
-            <h3>Review plan</h3>
-            <p>{plan.description}</p>
-            {!decision ? (
-              <div className="button-row">
-                <button type="button" className="secondary-button" disabled={!singlePeerRoute} onClick={() => void decide(plan, false)}>
-                  Deny
-                </button>
-                <button type="button" className="primary-button" disabled={!singlePeerRoute} onClick={() => void decide(plan, true)}>
-                  Allow plan
-                </button>
-              </div>
-            ) : (
-              <p className={decision === "allow" ? "success-text" : "danger-text"}>
-                {decision === "allow" ? "Approved on this device." : "Denied on this device."}
-              </p>
-            )}
-          </div>
-        );
-      })}
-      {approvedAttempts.map((attempt) => {
-        const status = runningAttempts[attempt.attemptId];
-        return (
-          <div className="request-file-preview" key={attempt.attemptId}>
-            <h3>Approved plan ready</h3>
-            <p>Run the approved search on this device. Pastey will search only the reviewed locations and return a summary.</p>
-            {status === "completed" ? <p className="success-text">Search complete.</p> : null}
-            {status === "failed" ? <p className="danger-text">Search did not complete. Start a new approved attempt to try again.</p> : null}
-            {status !== "completed" ? (
-              <button type="button" className="primary-button" disabled={!singlePeerRoute || status === "running"} onClick={() => void runSearch(attempt)}>
-                {status === "running" ? "Searching…" : "Run search"}
-              </button>
-            ) : null}
-          </div>
-        );
-      })}
-      {approvedTransfers.map((attempt) => {
-        const status = runningAttempts[`transfer:${attempt.attemptId}`];
-        return (
-          <div className="request-file-preview" key={`transfer-${attempt.attemptId}`}>
-            <h3>{attempt.requesterDirect ? "Approved incoming transfer" : "Approved transfer ready"}</h3>
-            <p>{attempt.requesterDirect ? "The requesting device is transferring its reviewed local file to this device." : "Transfer the file selected by the requester from the reviewed search results."}</p>
-            {status === "completed" ? <p className="success-text">Transfer complete.</p> : null}
-            {status === "failed" ? <p className="danger-text">Transfer did not complete. Start a new plan to try again.</p> : null}
-            {!attempt.requesterDirect && status !== "completed" ? (
-              <button type="button" className="primary-button" disabled={!singlePeerRoute || status === "running"} onClick={() => void runTransfer(attempt)}>
-                {status === "running" ? "Transferring…" : "Transfer selected file"}
-              </button>
-            ) : null}
-          </div>
-        );
-      })}
-      {approvedTransforms.map((attempt) => {
-        const status = runningAttempts[`transform:${attempt.attemptId}`];
-        return <div className="request-file-preview" key={`transform-${attempt.attemptId}`}><h3>Approved transform ready</h3><p>Process the requester-selected file with the reviewed local capability.</p>{status === "completed" ? <p className="success-text">Transform complete; the result remains local.</p> : null}{status === "failed" ? <p className="danger-text">Transform did not complete. Start a new approved plan to try again.</p> : null}{status !== "completed" ? <button type="button" className="primary-button" disabled={!singlePeerRoute || status === "running"} onClick={() => void runTransform(attempt)}>{status === "running" ? "Processing…" : "Process selected file"}</button> : null}</div>;
-      })}
-      {message ? <p className="muted" role="status">{message}</p> : null}
+      <div className="request-file-preview"><h3>Executing automatically</h3><p>Pastey derives and consumes each eligible bounded step authority on this Host. This device does not approve or start individual plan steps.</p></div>
     </Card>
   );
 }
@@ -1046,12 +821,9 @@ function BridgePlanSenderPanel({
     [attemptId, inboxEvents],
   );
   const candidateMode = bridgePlanSearchCandidateMode(blocks.map((step) => step.primitive));
+  const transformExecutor = blocks.find((step): step is Extract<ComposerBlock, { primitive: "Transform" }> => step.primitive === "Transform")?.executionDevice ?? "selected_device";
   const reviewSearch = blocks.find((step) => step.primitive === "Search");
   const reviewTransfer = blocks.find((step) => step.primitive === "Transfer");
-  const transformedAttemptIds = useMemo(
-    () => new Set(inboxEvents.flatMap(parseCompletedBridgePlanTransform)),
-    [inboxEvents],
-  );
   const failedTransformAttemptIds = useMemo(
     () => new Set(inboxEvents.flatMap(parseFailedBridgePlanTransform)),
     [inboxEvents],
@@ -1076,8 +848,13 @@ function BridgePlanSenderPanel({
     const refresh = async () => {
       if (refreshing) return;
       refreshing = true;
-      setTransformAvailability({ intent: "extract readable text", status: "unknown", available: false, reason: "Checking selected device capability…", hostLabel: selectedPeer.displayName });
+      setTransformAvailability({ intent: "extract readable text", status: "unknown", available: false, reason: transformExecutor === "requesting_device" ? "Checking this device capability…" : "Checking selected device capability…", hostLabel: transformExecutor === "requesting_device" ? "this device" : selectedPeer.displayName });
       try {
+        if (transformExecutor === "requesting_device") {
+          const observation = await localTransformAvailability();
+          if (!cancelled) setTransformAvailability({ intent: "extract readable text", status: observation.status, available: observation.available, reason: observation.reason, hostLabel: "this device", acceptedInputMediaTypes: observation.acceptedInputMediaTypes, outputMediaType: observation.outputMediaType });
+          return;
+        }
         await refreshSelectedPeerCapabilities(room.id, bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"));
         for (let attempt = 0; attempt < 5 && !cancelled; attempt += 1) {
           const observation = await selectedPeerTransformAvailability(room.id);
@@ -1095,7 +872,7 @@ function BridgePlanSenderPanel({
     void refresh();
     const interval = window.setInterval(() => { void refresh(); }, 60_000);
     return () => { cancelled = true; window.clearInterval(interval); };
-  }, [room.id, selectedPeer?.peerSessionId, selectedPeerRoute]);
+  }, [room.id, selectedPeer?.peerSessionId, selectedPeerRoute, transformExecutor]);
 
   function editBlocks(next: ComposerBlock[]) {
     if (revisionId) {
@@ -1182,6 +959,7 @@ function BridgePlanSenderPanel({
           transferToRequester: plan.transferDestination === "requesting_device",
           transferDestination: plan.transferDestination === "pastey_shared" ? "selected_device" : "requesting_device",
           transformIntent: plan.transformIntent ?? "extract readable text",
+          transformExecutionDevice: plan.transformExecutionDevice,
         })
         : await createFileSearchBridgePlan({
           roomId: room.id,
@@ -1218,14 +996,21 @@ function BridgePlanSenderPanel({
     setMessage(null);
     try {
       const nextApprovalId = `bridge-plan-approval-${crypto.randomUUID()}`;
-      await approveBridgePlan(revisionId, nextApprovalId, true);
-      await sendBridgePlanReviewRequest(
+      await approveBridgePlan(revisionId, nextApprovalId);
+      await bindBridgePlanToSession(
         nextApprovalId,
         bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"),
       );
       setApprovalId(nextApprovalId);
-      setApprovalState("awaiting_receiver");
-      setMessage("Waiting for the selected device to review the complete plan.");
+      const nextAttemptId = `bridge-plan-attempt-${crypto.randomUUID()}`;
+      await startBridgePlanAttempt(
+        nextApprovalId,
+        nextAttemptId,
+        bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"),
+      );
+      setAttemptId(nextAttemptId);
+      setApprovalState("running");
+      setMessage("Approved plan started. Pastey is waiting only for a bounded Search result selection if needed.");
     } catch (error) {
       setMessage(bridgePlanControlErrorMessage(error, "review"));
     } finally {
@@ -1247,7 +1032,7 @@ function BridgePlanSenderPanel({
       });
       const revision = workspace.revisions.map(parseBridgePlanRevision).filter((entry): entry is { revisionId: string; state: string } => entry?.state === "available").pop();
       if (!revision) throw new Error("Pastey did not return the direct Transfer plan.");
-      setBlocks([{ primitive: "Transfer", destination: "pastey_shared" }]);
+      setBlocks([{ primitive: "Transfer", destination: "pastey_shared", landingMode: "final_delivery" }]);
       setRevisionId(revision.revisionId);
       setApprovalId(null); setApprovalState(null); setAttemptId(null); setSelectedCandidateId(null);
       setHasTransform(false); setDirectTransfer(true);
@@ -1255,32 +1040,6 @@ function BridgePlanSenderPanel({
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Pastey could not create the direct Transfer plan.");
     } finally { setBusy(null); }
-  }
-
-  async function startAttempt() {
-    if (!approvalId || !selectedPeerRoute) return;
-    setBusy("start");
-    setMessage(null);
-    try {
-      const attemptId = `bridge-plan-attempt-${crypto.randomUUID()}`;
-      await startBridgePlanAttempt(
-        approvalId,
-        attemptId,
-        bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"),
-      );
-      setAttemptId(attemptId);
-      setApprovalState("running");
-      if (directTransfer) {
-        await executeDirectBridgePlanTransferAttempt(room.id, attemptId);
-        setMessage("Transfer complete.");
-      } else {
-        setMessage("The selected device can now run the approved Search.");
-      }
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not start the approved plan.");
-    } finally {
-      setBusy(null);
-    }
   }
 
   async function selectCandidate(candidateId: string) {
@@ -1294,27 +1053,13 @@ function BridgePlanSenderPanel({
         candidateId,
         bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"),
       );
-      if (hasTransform) await startBridgePlanTransformAttempt(room.id, attemptId, bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"));
-      else await startBridgePlanTransferAttempt(room.id, attemptId, bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"));
       setSelectedCandidateId(candidateId);
-      setMessage(hasTransform ? "The selected device can now process the chosen file." : "The selected device can now transfer the chosen file.");
+      setMessage("Candidate selected. Pastey is continuing the approved object flow…");
     } catch (error) {
       setMessage(bridgePlanTransferErrorMessage(error));
     } finally {
       setBusy(null);
     }
-  }
-
-  async function transferGeneratedResult() {
-    if (!attemptId || !selectedPeerRoute) return;
-    setBusy("start");
-    setMessage(null);
-    try {
-      await startBridgePlanTransferAttempt(room.id, attemptId, bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"));
-      setMessage("The selected device can now transfer the generated result.");
-    } catch (error) {
-      setMessage(bridgePlanTransferErrorMessage(error));
-    } finally { setBusy(null); }
   }
 
   async function proposeTransformFallback() {
@@ -1338,7 +1083,7 @@ function BridgePlanSenderPanel({
       <div className="section-row">
         <div>
           <h2>Ask Bridge</h2>
-          <p className="muted">Create one complete, reviewable plan for the selected device. Pastey never runs it until both devices approve the plan.</p>
+          <p className="muted">Create one complete, reviewable plan for the selected device. Review &amp; Run gives the current Bridge session one bounded task to execute.</p>
         </div>
       </div>
       <div className="button-row">
@@ -1354,8 +1099,8 @@ function BridgePlanSenderPanel({
           <section key={`${block.primitive}-${index}`} className="bridge-plan-block">
             <div className="section-row"><h3>{index + 1}. {block.primitive}</h3><div className="button-row"><button type="button" className="text-button" disabled={index === 0} onClick={() => { const next = moveBlock(blocks, index, index - 1); editBlocks(next.blocks); setMessage(next.error); }}>↑</button><button type="button" className="text-button" disabled={index === blocks.length - 1} onClick={() => { const next = moveBlock(blocks, index, index + 1); editBlocks(next.blocks); setMessage(next.error); }}>↓</button><button type="button" className="text-button" onClick={() => { const next = removeBlock(blocks, index); editBlocks(next.blocks); setMessage(next.error); }}>Remove</button></div></div>
             {block.primitive === "Search" ? <div className="bridge-plan-block-fields"><label>Device<input value={selectedPeer?.displayName ?? "Selected device"} readOnly /></label><label>Look in<select aria-label="Reviewed Search scope" value={block.safeScopes[0] ?? "downloads"} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { safeScopes: [event.target.value as SafeSearchScope] }) : entry))}>{SAFE_SEARCH_SCOPES.map((scope) => <option key={scope.value} value={scope.value}>{scope.label}</option>)}</select></label><label>File name<input aria-label="Search filename" value={block.filenameHint} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { filenameHint: event.target.value }) : entry))} placeholder="Funding Statement.pdf" /></label><label>Type<input aria-label="Search extension" value={block.extension} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { extension: event.target.value }) : entry))} placeholder="pdf" /></label></div> : null}
-            {block.primitive === "Transform" ? <div className="bridge-plan-block-fields"><p>Process file: <strong>Extract readable text</strong></p><p>Runs on: {transformAvailability.hostLabel}</p><p className={transformAvailability.status === "unknown" ? "muted" : transformAvailability.available ? "success-text" : "danger-text"}>Availability: {transformAvailability.status === "unknown" ? "Checking / Unknown" : transformAvailability.available ? "Available" : "Unavailable"}{transformAvailability.reason ? ` — ${transformAvailability.reason}` : ""}</p>{transformAvailability.acceptedInputMediaTypes?.length ? <p className="muted">Accepted input types: {transformAvailability.acceptedInputMediaTypes.join(", ")}. Selected-file compatibility is checked again by the receiving Host.</p> : null}</div> : null}
-            {block.primitive === "Transfer" ? <div className="bridge-plan-block-fields"><label>Send result to:<select aria-label="Transfer destination" value={block.destination} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transfer" ? { ...entry, destination: event.target.value as "requesting_device" | "pastey_shared" } : entry))}><option value="requesting_device">This device</option><option value="pastey_shared">Pastey Shared on selected device</option></select></label></div> : null}
+            {block.primitive === "Transform" ? <div className="bridge-plan-block-fields"><p>Process file: <strong>Extract readable text</strong></p><label>Process on:<select aria-label="Transform execution device" value={block.executionDevice} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transform" ? { ...entry, executionDevice: event.target.value as "requesting_device" | "selected_device" } : entry))}><option value="selected_device">Selected device</option><option value="requesting_device">This device</option></select></label><p>Runs on: {block.executionDevice === "selected_device" ? transformAvailability.hostLabel : "this device"}</p><p className={transformAvailability.status === "unknown" ? "muted" : transformAvailability.available ? "success-text" : "danger-text"}>Availability: {transformAvailability.status === "unknown" ? "Checking / Unknown" : transformAvailability.available ? "Available" : "Unavailable"}{transformAvailability.reason ? ` — ${transformAvailability.reason}` : ""}</p>{transformAvailability.acceptedInputMediaTypes?.length ? <p className="muted">Accepted input types: {transformAvailability.acceptedInputMediaTypes.join(", ")}. Candidate compatibility is rechecked by the execution Host.</p> : null}</div> : null}
+            {block.primitive === "Transfer" ? <div className="bridge-plan-block-fields"><label>Send result to:<select aria-label="Transfer destination" value={block.destination} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transfer" ? { ...entry, destination: event.target.value as "requesting_device" | "selected_device" | "pastey_shared" } : entry))}><option value="requesting_device">This device</option><option value="selected_device">Selected device</option><option value="pastey_shared">Pastey Shared on selected device</option></select></label><p className="muted">Final delivery creates a user-visible result. Required processing handoffs are shown in the reviewed plan and stay private.</p></div> : null}
           </section>
         ))}
       </div>
@@ -1364,7 +1109,7 @@ function BridgePlanSenderPanel({
       {revisionId ? (
         <div className="request-file-preview" data-testid="ask-bridge-plan-preview">
           <h3>Review plan</h3>
-          <p>{directTransfer ? "Transfer the one local file you chose to the selected device after both devices approve this plan." : blocks.some((step) => step.primitive === "Transform") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then process it locally with the reviewed capability." : blocks.some((step) => step.primitive === "Transfer") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then transfer it to the approved destination." : "Search the selected device’s reviewed locations for matching files and return a bounded summary."}</p>
+          <p>{directTransfer ? "Transfer the one local file you chose to the selected device after your single Review & Run approval." : blocks.some((step) => step.primitive === "Transform") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then process it with the reviewed capability." : blocks.some((step) => step.primitive === "Transfer") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then transfer it to the approved destination." : "Search the selected device’s reviewed locations for matching files and return a bounded summary."}</p>
           {!directTransfer && reviewSearch?.primitive === "Search" ? (
             <p className="muted">
               Search: {reviewSearch.filenameHint} {reviewSearch.extension ? `(${reviewSearch.extension.toUpperCase()})` : ""} in {reviewSearch.safeScopes.join(", ")}.
@@ -1373,17 +1118,11 @@ function BridgePlanSenderPanel({
           ) : null}
           {!approvalId ? (
             <button type="button" className="primary-button" disabled={busy !== null} onClick={() => void requestReview()}>
-              {busy === "review" ? "Sending…" : "Approve and send for review"}
-            </button>
-          ) : approvalState === "valid" ? (
-            <button type="button" className="primary-button" disabled={busy !== null} onClick={() => void startAttempt()}>
-              {busy === "start" ? "Starting…" : "Start approved plan"}
+              {busy === "review" ? "Starting…" : "Review & Run"}
             </button>
           ) : null}
         </div>
       ) : null}
-      {approvalState === "awaiting_receiver" ? <p className="muted">Waiting for receiver review.</p> : null}
-      {approvalState === "denied" ? <p className="danger-text">The selected device denied this plan. Create a revised plan to try again.</p> : null}
       {approvalState === "running" ? <p className="muted">Search is running on the selected device.</p> : null}
       {resultSummary && terminalSearchResult?.candidateCount !== 0 ? <p className="success-text">{resultSummary}</p> : null}
       {terminalSearchResult?.candidateCount === 0 ? (
@@ -1406,9 +1145,6 @@ function BridgePlanSenderPanel({
             />
           ))}
         </div>
-      ) : null}
-      {hasTransform && selectedCandidateId && attemptId && transformedAttemptIds.has(attemptId) && blocks.some((step) => step.primitive === "Transfer") ? (
-        <div className="request-file-preview"><h3>Generated result ready</h3><p>The approved Transform finished on the selected device. Transfer the generated result to the approved destination.</p><button type="button" className="primary-button" disabled={busy !== null} onClick={() => void transferGeneratedResult()}>{busy === "start" ? "Starting…" : "Transfer generated result"}</button></div>
       ) : null}
       {hasTransform && attemptId && failedTransformAttemptIds.has(attemptId) ? (
         <div className="request-file-preview"><h3>Processing unavailable</h3><p>The selected device could not perform the approved Transform for this file. Create a new plan revision without that step; both devices must review it again.</p><button type="button" className="secondary-button" disabled={busy !== null} onClick={() => void proposeTransformFallback()}>{busy === "plan" ? "Preparing…" : "Create revised plan"}</button></div>
@@ -1523,52 +1259,6 @@ function parseBridgePlanAttempt(value: unknown): { approvalId: string; attemptId
 function parseBridgePlanResult(value: unknown): { attemptId: string; summary: string } | null {
   if (!isRecord(value) || typeof value.attempt_id !== "string" || typeof value.summary !== "string") return null;
   return { attemptId: value.attempt_id, summary: value.summary };
-}
-
-function parseReviewedBridgePlan(event: ReceivedRoomControlEvent): ReviewedBridgePlan[] {
-  if (event.kind !== "bridge_plan.review_request") return [];
-  const payload = roomControlEventPayload(event.event);
-  const approvalId = typeof payload?.approvalId === "string" ? payload.approvalId : null;
-  const revision = isRecord(payload?.revision) ? payload.revision : null;
-  const presentation = isRecord(revision?.presentation) ? revision.presentation : null;
-  const description = typeof presentation?.natural_language_plan === "string"
-    ? presentation.natural_language_plan.trim()
-    : "";
-  return approvalId && description ? [{ approvalId, description }] : [];
-}
-
-function parseStartedBridgePlanAttempt(event: ReceivedRoomControlEvent): StartedBridgePlanAttempt[] {
-  if (event.kind !== "bridge_plan.attempt_start") return [];
-  const payload = roomControlEventPayload(event.event);
-  const approvalId = typeof payload?.approvalId === "string" ? payload.approvalId : null;
-  const attemptId = typeof payload?.attemptId === "string" ? payload.attemptId : null;
-  return approvalId && attemptId ? [{ approvalId, attemptId }] : [];
-}
-
-function parseStartedBridgePlanTransfer(event: ReceivedRoomControlEvent): StartedBridgePlanTransfer[] {
-  if (event.kind !== "bridge_plan.transfer_start") return [];
-  const payload = roomControlEventPayload(event.event);
-  const approvalId = typeof payload?.approvalId === "string" ? payload.approvalId : null;
-  const attemptId = typeof payload?.attemptId === "string" ? payload.attemptId : null;
-  const transferStep = isRecord(payload?.transferStep) ? payload.transferStep : null;
-  const source = isRecord(transferStep?.source) ? transferStep.source : null;
-  return approvalId && attemptId
-    ? [{ approvalId, attemptId, requesterDirect: source?.kind === "future_user_selection" }]
-    : [];
-}
-
-function parseStartedBridgePlanTransform(event: ReceivedRoomControlEvent): StartedBridgePlanTransform[] {
-  if (event.kind !== "bridge_plan.transform_start") return [];
-  const payload = roomControlEventPayload(event.event);
-  const approvalId = typeof payload?.approvalId === "string" ? payload.approvalId : null;
-  const attemptId = typeof payload?.attemptId === "string" ? payload.attemptId : null;
-  return approvalId && attemptId ? [{ approvalId, attemptId }] : [];
-}
-
-function parseCompletedBridgePlanTransform(event: ReceivedRoomControlEvent): string[] {
-  if (event.kind !== "bridge_plan.step_result") return [];
-  const payload = roomControlEventPayload(event.event);
-  return payload?.stepId === "transform" && typeof payload.attemptId === "string" ? [payload.attemptId] : [];
 }
 
 function parseFailedBridgePlanTransform(event: ReceivedRoomControlEvent): string[] {
@@ -1781,6 +1471,7 @@ export function DevicesProductPage({
           <div>
             <strong>Enter an 8-digit code</strong>
             <p className="muted">Ask the other device for its code.</p>
+            <p className="muted">Joining allows reviewed bounded Pastey tasks in this current Bridge session only; Burn, leave, restart, or reconnect removes that session permission.</p>
           </div>
           <div className="join-code-controls compact">
             <input

@@ -548,6 +548,20 @@ pub struct RoomItemUpload {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PipelineHandoffMetadata {
+    pub bridge_id: String,
+    pub plan_id: String,
+    pub revision_id: String,
+    pub revision_hash: String,
+    pub attempt_id: String,
+    pub step_id: String,
+    pub source_device_ref: String,
+    pub destination_device_ref: String,
+    pub media_type: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileTransferStartRequest {
     pub transfer_id: String,
     pub item_id: String,
@@ -562,6 +576,9 @@ pub struct FileTransferStartRequest {
     pub sender_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_chunk_protocol: Option<String>,
+    /// Rust-owned, bounded binding for a non-user-visible Plan handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_handoff: Option<PipelineHandoffMetadata>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

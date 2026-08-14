@@ -759,6 +759,47 @@ pub(crate) struct BridgePlanPrivateFile {
     pub(crate) size_bytes: u64,
 }
 
+/// Constructs a Rust-private input for a completed PipelinePrivate receive.
+/// The receiver supplies the fixed app-owned root; no renderer or control
+/// message can select this path.
+pub(crate) fn bridge_plan_private_pipeline_file(
+    path: PathBuf,
+    scope_root: PathBuf,
+    display_name: String,
+    mime_type: String,
+    size_bytes: u64,
+) -> AppResult<BridgePlanPrivateFile> {
+    let root = scope_root.canonicalize()?;
+    let canonical = path.canonicalize()?;
+    if !canonical.starts_with(&root) {
+        return Err(AppError::InvalidInput(
+            "Pipeline private object escaped its owned root.".into(),
+        ));
+    }
+    let metadata = fs::symlink_metadata(&canonical)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != size_bytes {
+        return Err(AppError::InvalidInput(
+            "Pipeline private object is invalid.".into(),
+        ));
+    }
+    Ok(BridgePlanPrivateFile {
+        path: canonical,
+        scope_root: root,
+        display_name,
+        mime_type,
+        size_bytes,
+    })
+}
+
+pub(crate) fn cleanup_bridge_plan_private_pipeline_file(file: &BridgePlanPrivateFile) {
+    let _ = fs::remove_dir_all(&file.scope_root);
+}
+
+pub(crate) fn cleanup_orphaned_pipeline_handoffs(temp_dir: &Path) {
+    let root = temp_dir.join("pipeline-handoffs");
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Captures a requester-selected local file for a direct Bridge Plan Transfer.
 /// The path is immediately canonicalized and remains Rust-private; callers
 /// retain only the immutable plan revision and a process-local binding.
@@ -886,6 +927,20 @@ pub(crate) fn transform_bridge_plan_selected_file(
         attempt_id,
         candidate_id,
     )?;
+    transform_bridge_plan_private_file(store, paths, room_ref, receiver_device_ref, &source, intent)
+}
+
+/// Runs the same bounded Transform against a previously validated private
+/// object. PipelinePrivate inputs keep their owned root and therefore receive
+/// the identical identity/staging checks as a Search candidate.
+pub(crate) fn transform_bridge_plan_private_file(
+    store: &mut BridgePlanCandidateStore,
+    paths: &AppPaths,
+    room_ref: &str,
+    receiver_device_ref: &str,
+    source: &BridgePlanPrivateFile,
+    intent: &str,
+) -> AppResult<BridgePlanPrivateFile> {
     let resolved = transform_registry::resolve_transform_intent(intent, &source.mime_type)
         .ok_or_else(|| {
             AppError::InvalidInput(
@@ -1124,6 +1179,47 @@ mod tests {
         assert!(!serde_json::to_string(&result)
             .unwrap()
             .contains(&downloads.display().to_string()));
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
+
+    #[test]
+    fn pipeline_private_file_stays_in_its_app_owned_root_and_cleanup_removes_it() {
+        let paths = test_paths();
+        let root = paths.temp_dir.join("pipeline-handoffs").join("transfer");
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("input");
+        fs::write(&input, b"plain text").unwrap();
+
+        let private = bridge_plan_private_pipeline_file(
+            input.clone(),
+            root.clone(),
+            "pipeline-input".into(),
+            "text/plain".into(),
+            10,
+        )
+        .unwrap();
+        assert_eq!(private.mime_type, "text/plain");
+        assert_eq!(private.size_bytes, 10);
+        cleanup_bridge_plan_private_pipeline_file(&private);
+        assert!(!root.exists());
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
+
+    #[test]
+    fn pipeline_private_file_rejects_a_path_outside_its_owned_root() {
+        let paths = test_paths();
+        let root = paths.temp_dir.join("pipeline-handoffs").join("transfer");
+        let outside = paths.temp_dir.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, b"plain text").unwrap();
+        assert!(bridge_plan_private_pipeline_file(
+            outside,
+            root,
+            "pipeline-input".into(),
+            "text/plain".into(),
+            10,
+        )
+        .is_err());
         fs::remove_dir_all(paths.app_data_dir).unwrap();
     }
 }
