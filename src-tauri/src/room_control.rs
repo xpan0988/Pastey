@@ -49,7 +49,6 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "bridge_plan.review_request",
     "bridge_plan.attempt_start",
     "bridge_plan.transfer_start",
-    "bridge_plan.transform_start",
     "bridge_plan.search_selection",
     "bridge_plan.attempt_ack",
     "bridge_plan.step_progress",
@@ -65,7 +64,7 @@ const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
 pub(crate) fn log_peer_capability(stage: &str, available: Option<bool>, code: Option<&str>) {
     let mut line = format!("[pastey peer-capability] stage={stage}");
     if available.is_some() {
-        line.push_str(" capability=extract_readable_text_v1");
+        line.push_str(" capability_fact=true");
         line.push_str(if available == Some(true) {
             " available=true"
         } else {
@@ -105,14 +104,13 @@ fn peer_capability_rejection_code(message: &str) -> &'static str {
     }
 }
 
-fn peer_capability_fact_code(
-    fact: &crate::peer_capabilities::TransformCapabilityFact,
-) -> &'static str {
+fn peer_capability_fact_code(fact: &crate::peer_capabilities::HostCapabilityFact) -> &'static str {
     match (fact.available, fact.unavailable_reason.as_deref()) {
         (true, None) => "available",
         (false, Some("platform_unsupported")) => "platform_unsupported",
         (false, Some("backend_unavailable")) => "backend_unavailable",
         (false, Some("capability_unavailable")) => "capability_unavailable",
+        (false, Some("runtime_unavailable")) => "runtime_unavailable",
         _ => "invalid_capability",
     }
 }
@@ -1201,7 +1199,7 @@ pub async fn receive_room_control_event_handler(
     // continuation—not a renderer button.
     if matches!(
         validated.kind.as_str(),
-        "bridge_plan.attempt_start" | "bridge_plan.transform_start" | "bridge_plan.transfer_start"
+        "bridge_plan.attempt_start" | "bridge_plan.transfer_start"
     ) {
         if let Some(attempt_id) = validated
             .event
@@ -1219,17 +1217,6 @@ pub async fn receive_room_control_event_handler(
                 "bridge_plan.attempt_start" => {
                     tauri::async_runtime::spawn(async move {
                         let _ = crate::commands::execute_bridge_plan_search_attempt_inner(
-                            execution_state,
-                            execution_room,
-                            execution_attempt,
-                            Some(return_route),
-                        )
-                        .await;
-                    });
-                }
-                "bridge_plan.transform_start" => {
-                    tauri::async_runtime::spawn(async move {
-                        let _ = crate::commands::execute_bridge_plan_transform_attempt_inner(
                             execution_state,
                             execution_room,
                             execution_attempt,
@@ -2181,7 +2168,7 @@ mod tests {
                     "capabilityId": "unknown_capability",
                     "available": true,
                     "acceptedInputMediaTypes": ["text/plain"],
-                    "outputMediaType": "text/plain"
+                    "authorityToken": "not-allowed"
                 }]
             }),
             &context,

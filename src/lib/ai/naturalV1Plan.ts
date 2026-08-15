@@ -6,7 +6,7 @@ import type { AiGenerateResult, CloudOpenAICompatibleProviderConfig } from "./ty
 
 /** Product operations. Provider output describes intent only; the Host owns
  * object resolution, destinations, and execution authority. */
-export type AskBridgePrimitive = "Search" | "Transform" | "Transfer";
+export type AskBridgePrimitive = "Search" | "Transform" | "Transfer" | "Execute";
 export type AskBridgeNaturalV1Status = "supported" | "unsupported_future";
 export type AskBridgeSafeScope = "downloads" | "desktop" | "documents" | "pastey_shared";
 
@@ -19,19 +19,25 @@ export interface AskBridgeNaturalV1SearchStep {
 
 export interface AskBridgeNaturalV1TransformStep {
   primitive: "Transform";
-  intent: string;
+  modificationIntent: string;
 }
 
 export interface AskBridgeNaturalV1TransferStep {
   primitive: "Transfer";
-  destination: "requesting_device" | "selected_device" | "user_selected_location" | "leave_on_producing_device";
-  object: "selected_file" | "search_result" | "transform_result";
+  destination: "requesting_device" | "selected_device" | "user_selected_location";
+  object: "selected_file";
+}
+
+export interface AskBridgeNaturalV1ExecuteStep {
+  primitive: "Execute";
+  executionIntent: string;
 }
 
 export type AskBridgeNaturalV1Step =
   | AskBridgeNaturalV1SearchStep
   | AskBridgeNaturalV1TransformStep
-  | AskBridgeNaturalV1TransferStep;
+  | AskBridgeNaturalV1TransferStep
+  | AskBridgeNaturalV1ExecuteStep;
 
 export interface AskBridgeNaturalV1Plan {
   schemaVersion: "ask-bridge-natural-v1";
@@ -65,8 +71,9 @@ const TOP_LEVEL_FIELDS = new Set([
 ]);
 const STEP_COMMON_FIELDS = new Set(["primitive"]);
 const SEARCH_FIELDS = new Set(["primitive", "filenameHint", "extensions", "safeScopes"]);
-const TRANSFORM_FIELDS = new Set(["primitive", "intent"]);
+const TRANSFORM_FIELDS = new Set(["primitive", "modificationIntent"]);
 const TRANSFER_FIELDS = new Set(["primitive", "destination", "object"]);
+const EXECUTE_FIELDS = new Set(["primitive", "executionIntent"]);
 const SAFE_SCOPES = new Set<AskBridgeSafeScope>(["downloads", "desktop", "documents", "pastey_shared"]);
 const FORBIDDEN_NATURAL_FIELD_NAMES = new Set([
   "command",
@@ -130,6 +137,10 @@ const KNOWN_EXTENSIONS = new Set([
   "webp",
   "zip",
   "json",
+  "py",
+  "js",
+  "ts",
+  "rs",
 ]);
 
 export function validateAskBridgeNaturalV1Plan(value: unknown): AskBridgeNaturalV1ValidationResult {
@@ -179,31 +190,37 @@ export function validateAskBridgeNaturalV1Plan(value: unknown): AskBridgeNatural
 
 export function buildDeterministicAskBridgeNaturalV1Plan(userRequest: string): AskBridgeNaturalV1Plan {
   const search = buildSearchStep(userRequest);
-  const wantsTransform = /\b(convert|transform|summari[sz]e|extract|resize|translate|compress|redact)\b/i.test(userRequest);
-  const wantsTransfer = wantsTransform || /\b(send|return|get|fetch|bring|copy|download|back|to me|here)\b/i.test(userRequest);
-  const transformIntent = wantsTransform ? extractTransformIntent(userRequest) : null;
+  const wantsTransform = /\b(modify|patch|replace|change|edit)\b/i.test(userRequest);
+  const wantsExecute = /\b(run|execute)\b/i.test(userRequest);
+  const wantsTransfer = /\b(send|return|get|fetch|bring|copy|download|back|to me|here)\b/i.test(userRequest);
   const steps: AskBridgeNaturalV1Step[] = [search];
   if (wantsTransform) {
-    steps.push({ primitive: "Transform", intent: transformIntent ?? "unsupported transform" });
+    steps.push({ primitive: "Transform", modificationIntent: userRequest.trim().slice(0, 1024) });
   }
   if (wantsTransfer) {
     steps.push({
       primitive: "Transfer",
       destination: "requesting_device",
-      object: wantsTransform ? "transform_result" : "search_result",
+      object: "selected_file",
     });
   }
+  if (wantsExecute) {
+    steps.push({ primitive: "Execute", executionIntent: userRequest.trim().slice(0, 1024) });
+  }
+  const unsupported = wantsTransform || wantsExecute;
   return {
     schemaVersion: "ask-bridge-natural-v1",
-    title: wantsTransform
-      ? "Search, Transform, Transfer"
+    title: wantsExecute
+      ? "Search, Transform, Execute"
+      : wantsTransform
+        ? "Search and Transform"
       : wantsTransfer
         ? "Search and Transfer"
         : "Search",
-    status: wantsTransform && transformIntent === null ? "unsupported_future" : "supported",
+    status: unsupported ? "unsupported_future" : "supported",
     requiresUserConfirmation: true,
     steps,
-    unsupportedReason: wantsTransform && transformIntent === null ? "No statically registered Transform transition supports this intent and input type." : undefined,
+    unsupportedReason: unsupported ? "Transform and Execute are framework-defined intents, but Pastey Core has no Agent implementation to execute them yet." : undefined,
   };
 }
 
@@ -321,18 +338,21 @@ function validateStep(value: unknown, index: number, errors: string[]) {
     }
   } else if (value.primitive === "Transform") {
     requireExactFields(value, TRANSFORM_FIELDS, `steps[${index}]`, errors);
-    if (!isBoundedString(value.intent, 1, 160)) errors.push(`natural-v1 steps[${index}].intent must be bounded.`);
+    if (!isBoundedString(value.modificationIntent, 1, 1024)) errors.push(`natural-v1 steps[${index}].modificationIntent must be bounded reviewed intent.`);
   } else if (value.primitive === "Transfer") {
     requireExactFields(value, TRANSFER_FIELDS, `steps[${index}]`, errors);
-    if (!["requesting_device", "selected_device", "user_selected_location", "leave_on_producing_device"].includes(String(value.destination))) {
+    if (!["requesting_device", "selected_device", "user_selected_location"].includes(String(value.destination))) {
       errors.push(`natural-v1 steps[${index}].destination is unsupported.`);
     }
-    if (!["selected_file", "search_result", "transform_result"].includes(String(value.object))) {
+    if (value.object !== "selected_file") {
       errors.push(`natural-v1 steps[${index}].object is unsupported.`);
     }
+  } else if (value.primitive === "Execute") {
+    requireExactFields(value, EXECUTE_FIELDS, `steps[${index}]`, errors);
+    if (!isBoundedString(value.executionIntent, 1, 1024)) errors.push(`natural-v1 steps[${index}].executionIntent must be bounded reviewed intent.`);
   } else {
     requireExactFields(value, STEP_COMMON_FIELDS, `steps[${index}]`, errors);
-    errors.push(`natural-v1 steps[${index}].primitive must be Search, Transform, or Transfer.`);
+    errors.push(`natural-v1 steps[${index}].primitive must be Search, Transform, Transfer, or Execute.`);
   }
 }
 
@@ -349,24 +369,17 @@ function validatePrimitiveOrder(
   if (records.slice(1).some((step) => step.primitive === "Search")) {
     errors.push("natural-v1 contains more than one object-flow root Search.");
   }
-  let currentObject: AskBridgeNaturalV1TransferStep["object"] = "search_result";
-  let unsupportedTransform = false;
+  const currentObject: AskBridgeNaturalV1TransferStep["object"] = "selected_file";
   for (const step of records.slice(1)) {
-    if (step.primitive === "Transform") {
-      if (step.intent !== "extract readable text") unsupportedTransform = true;
-      currentObject = "transform_result";
-    } else if (step.primitive === "Transfer" && step.object !== currentObject) {
+    if (step.primitive === "Transfer" && step.object !== currentObject) {
       errors.push("natural-v1 Transfer must consume the object produced by the preceding dependency flow.");
     }
   }
-  if (unsupportedTransform && status !== "unsupported_future") {
-    errors.push("Unsupported Transform plans must be marked unsupported_future.");
+  if (records.some((step) => step.primitive === "Transform" || step.primitive === "Execute") && status !== "unsupported_future") {
+    errors.push("Transform and Execute plans must fail closed as unsupported_future until Agent execution exists.");
   }
-  if (!unsupportedTransform && records.some((step) => step.primitive === "Transform") && status !== "supported") {
-    errors.push("extract readable text Transform plans must be marked supported.");
-  }
-  if (status === "unsupported_future" && !records.some((step) => step.primitive === "Transform")) {
-    errors.push("natural-v1 unsupported_future is reserved for unsupported Transform plans.");
+  if (status === "unsupported_future" && !records.some((step) => step.primitive === "Transform" || step.primitive === "Execute")) {
+    errors.push("natural-v1 unsupported_future is reserved for unsupported Transform or Execute proposals.");
   }
 }
 
@@ -434,12 +447,6 @@ function extractExplicitFilenameHint(value: string): string | null {
   const filenameHint = match[1].trim();
   const extension = filenameHint.split(".").pop()?.toLowerCase();
   return extension && KNOWN_EXTENSIONS.has(extension) ? filenameHint : null;
-}
-
-function extractTransformIntent(value: string): "extract readable text" | null {
-  const textLike = /\.(txt|md|markdown|json|csv)\b/i.test(value) || /\b(text|markdown|json|csv)\b/i.test(value);
-  const extraction = /\b(extract|normalize|readable text)\b/i.test(value);
-  return textLike && extraction ? "extract readable text" : null;
 }
 
 const STOP_WORDS = new Set([

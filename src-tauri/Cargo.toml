@@ -44,18 +44,11 @@ uuid = { version = "1", features = ["serde", "v4"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-transform-sandbox-verification = []
-
-[[bin]]
-name = "pastey-transform-sandbox-probe"
-path = "src/transform_sandbox/linux/test_probe.rs"
-required-features = ["transform-sandbox-verification"]
-bench = false
 
 [profile.dev-fast]
 inherits = "dev"

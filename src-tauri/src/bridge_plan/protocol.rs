@@ -52,18 +52,6 @@ struct LocalTransferAuthority {
     expires_at: i64,
 }
 #[derive(Clone, Debug)]
-struct LocalTransformAuthority {
-    bridge_id: String,
-    attempt_id: String,
-    step_id: String,
-    expires_at: i64,
-}
-#[derive(Clone, Debug)]
-struct LocalTransformOutput {
-    bridge_id: String,
-    output: BridgePlanPrivateFile,
-}
-#[derive(Clone, Debug)]
 struct LocalPipelineInput {
     bridge_id: String,
     plan_id: String,
@@ -121,27 +109,7 @@ pub(crate) struct TransferExecutionGrant {
     pub(crate) step_id: String,
     pub(crate) step_digest: String,
     pub(crate) candidate_id: String,
-    pub(crate) generated_file: Option<BridgePlanPrivateFile>,
     pub(crate) destination: super::TransferDestination,
-}
-
-/// Receiver-local authority for a Transform following a bounded Search
-/// selection. The selected source remains in the private candidate store and
-/// generated output remains in the local ephemeral object store.
-#[derive(Clone, Debug)]
-pub(crate) struct TransformExecutionGrant {
-    pub(crate) bridge_id: String,
-    pub(crate) plan_id: String,
-    pub(crate) revision_id: String,
-    pub(crate) revision_hash: String,
-    pub(crate) requester_device_ref: String,
-    pub(crate) receiver_device_ref: String,
-    pub(crate) approval_id: String,
-    pub(crate) attempt_id: String,
-    pub(crate) step_id: String,
-    pub(crate) step_digest: String,
-    pub(crate) candidate_id: String,
-    pub(crate) intent: String,
 }
 
 /// Candidate data allowed to cross the Bridge Plan result boundary. It has no
@@ -163,8 +131,6 @@ pub(crate) struct SafeSearchCandidate {
 pub(crate) struct ProtocolSearchAuthorityStore {
     grants: Mutex<HashMap<String, LocalSearchAuthority>>,
     transfer_grants: Mutex<HashMap<String, LocalTransferAuthority>>,
-    transform_grants: Mutex<HashMap<String, LocalTransformAuthority>>,
-    transform_outputs: Mutex<HashMap<String, LocalTransformOutput>>,
     pipeline_inputs: Mutex<HashMap<String, LocalPipelineInput>>,
     selections: Mutex<HashMap<String, LocalCandidateSelection>>,
 }
@@ -249,50 +215,6 @@ impl ProtocolSearchAuthorityStore {
         }
         Ok(grant)
     }
-    fn grant_transform(
-        &self,
-        bridge_id: &str,
-        attempt_id: &str,
-        step_id: &str,
-        expires_at: i64,
-    ) -> AppResult<()> {
-        let mut grants = self
-            .transform_grants
-            .lock()
-            .map_err(|_| AppError::InvalidInput("Bridge Plan authority unavailable.".into()))?;
-        if grants.contains_key(attempt_id) {
-            return invalid("Bridge Plan Transform was already started.");
-        }
-        grants.insert(
-            attempt_id.into(),
-            LocalTransformAuthority {
-                bridge_id: bridge_id.into(),
-                attempt_id: attempt_id.into(),
-                step_id: step_id.into(),
-                expires_at,
-            },
-        );
-        Ok(())
-    }
-    fn consume_transform(
-        &self,
-        bridge_id: &str,
-        attempt_id: &str,
-        now: i64,
-    ) -> AppResult<LocalTransformAuthority> {
-        let mut grants = self
-            .transform_grants
-            .lock()
-            .map_err(|_| AppError::InvalidInput("Bridge Plan authority unavailable.".into()))?;
-        let grant = grants.remove(attempt_id).ok_or_else(|| {
-            AppError::InvalidInput("Bridge Plan Transform authority is unavailable.".into())
-        })?;
-        if grant.bridge_id != bridge_id || grant.attempt_id != attempt_id || grant.expires_at <= now
-        {
-            return invalid("Bridge Plan Transform authority expired or crossed Bridge scope.");
-        }
-        Ok(grant)
-    }
     fn consume(
         &self,
         bridge_id: &str,
@@ -319,14 +241,8 @@ impl ProtocolSearchAuthorityStore {
         if let Ok(mut grants) = self.transfer_grants.lock() {
             grants.retain(|_, value| value.bridge_id != bridge_id);
         }
-        if let Ok(mut grants) = self.transform_grants.lock() {
-            grants.retain(|_, value| value.bridge_id != bridge_id);
-        }
         if let Ok(mut selections) = self.selections.lock() {
             selections.retain(|_, value| value.bridge_id != bridge_id);
-        }
-        if let Ok(mut outputs) = self.transform_outputs.lock() {
-            outputs.retain(|_, value| value.bridge_id != bridge_id);
         }
         if let Ok(mut inputs) = self.pipeline_inputs.lock() {
             let stale = inputs
@@ -406,62 +322,6 @@ impl ProtocolSearchAuthorityStore {
         }
         Ok(selection.candidate_id)
     }
-    pub(crate) fn retain_transform_output(
-        &self,
-        bridge_id: &str,
-        attempt_id: &str,
-        output: BridgePlanPrivateFile,
-    ) -> AppResult<()> {
-        let mut outputs = self.transform_outputs.lock().map_err(|_| {
-            AppError::InvalidInput("Bridge Plan Transform output authority unavailable.".into())
-        })?;
-        if outputs
-            .insert(
-                attempt_id.into(),
-                LocalTransformOutput {
-                    bridge_id: bridge_id.into(),
-                    output,
-                },
-            )
-            .is_some()
-        {
-            return invalid("Bridge Plan Transform result was already retained.");
-        }
-        Ok(())
-    }
-    pub(crate) fn consume_transform_output(
-        &self,
-        bridge_id: &str,
-        attempt_id: &str,
-    ) -> AppResult<BridgePlanPrivateFile> {
-        let output = self
-            .transform_outputs
-            .lock()
-            .map_err(|_| {
-                AppError::InvalidInput("Bridge Plan Transform output authority unavailable.".into())
-            })?
-            .remove(attempt_id)
-            .ok_or_else(|| {
-                AppError::InvalidInput(
-                    "Bridge Plan Transform result is unavailable after restart or expiry.".into(),
-                )
-            })?;
-        if output.bridge_id != bridge_id {
-            return invalid("Bridge Plan Transform result crossed Bridge scope.");
-        }
-        Ok(output.output)
-    }
-    fn has_transform_output(&self, bridge_id: &str, attempt_id: &str) -> AppResult<bool> {
-        Ok(self
-            .transform_outputs
-            .lock()
-            .map_err(|_| {
-                AppError::InvalidInput("Bridge Plan Transform output authority unavailable.".into())
-            })?
-            .get(attempt_id)
-            .is_some_and(|output| output.bridge_id == bridge_id))
-    }
-
     pub(crate) fn register_pipeline_input(
         &self,
         metadata: &crate::models::PipelineHandoffMetadata,
@@ -689,10 +549,7 @@ pub(crate) fn attempt_start_payload(
         Value::String(attempt.attempt_id.clone()),
     );
     payload.insert("searchStep".into(), serde_json::to_value(search)?);
-    payload.insert(
-        "searchStepDigest".into(),
-        Value::String(step_digest(search)?),
-    );
+    payload.insert("stepDigest".into(), Value::String(step_digest(search)?));
     payload.insert(
         "attemptNonce".into(),
         Value::String(format!("attempt-nonce-{}", uuid::Uuid::new_v4())),
@@ -846,33 +703,7 @@ fn supported_transfer_destination(
         super::TransferDestination::SelectedDevice { device_ref } => {
             device_ref == receiver_device_ref
         }
-        _ => false,
     }
-}
-
-pub(crate) fn transform_start_payload(
-    paths: &AppPaths,
-    bridge_id: &str,
-    attempt_id: &str,
-    now: i64,
-) -> AppResult<Value> {
-    let conn = connection(paths)?;
-    let stored = conn.query_row("SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,state FROM bridge_plan_protocol_attempts WHERE bridge_id=?1 AND attempt_id=?2", params![bridge_id,attempt_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?))).optional()?.ok_or_else(|| AppError::InvalidInput("Bridge Plan attempt is unavailable.".into()))?;
-    if stored.6 != "completed" {
-        return invalid("Bridge Plan Search must finish before Transform can start.");
-    }
-    let revision_json: String = conn.query_row("SELECT revision_json FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='requester' AND approval_id=?2", params![bridge_id,stored.0], |r| r.get(0)).optional()?.ok_or_else(|| AppError::InvalidInput("Bridge Plan review record is unavailable.".into()))?;
-    let revision: BridgePlanRevision = serde_json::from_str(&revision_json)?;
-    let transform = revision
-        .steps
-        .iter()
-        .find(|step| matches!(step, BridgePlanStep::Transform { .. }))
-        .ok_or_else(|| {
-            AppError::InvalidInput("This plan has no supported Transform step.".into())
-        })?;
-    Ok(
-        serde_json::json!({"schemaVersion":PROTOCOL_VERSION,"bridgeId":bridge_id,"planId":stored.1,"revisionId":stored.2,"revisionHash":stored.3,"requesterDeviceRef":stored.4,"receiverDeviceRef":stored.5,"approvalId":stored.0,"attemptId":attempt_id,"transformStep":transform,"transformStepDigest":step_digest(transform)?,"attemptNonce":format!("transform-nonce-{}",uuid::Uuid::new_v4()),"attemptExpiresAt":now+MAX_LIFETIME}),
-    )
 }
 
 pub(crate) fn consume_search_execution_grant(
@@ -964,18 +795,11 @@ pub(crate) fn consume_transfer_execution_grant(
     if !supported_destination || step_digest(transfer)? != stored.7 {
         return invalid("Bridge Plan Transfer binding mismatch.");
     }
-    let generated_file = match source {
-        super::ObjectSelectionRule::FromSlot { slot_id } if slot_id == "transformed_file" => {
-            Some(authorities.consume_transform_output(bridge_id, attempt_id)?)
-        }
-        super::ObjectSelectionRule::FromSlot { slot_id } if slot_id == "selected_file" => None,
+    match source {
+        super::ObjectSelectionRule::FromSlot { slot_id } if slot_id == "selected_file" => {}
         _ => return invalid("Bridge Plan Transfer source is not available yet."),
-    };
-    let candidate_id = if generated_file.is_none() {
-        authorities.consume_selected_candidate_id(bridge_id, attempt_id, now)?
-    } else {
-        String::new()
-    };
+    }
+    let candidate_id = authorities.consume_selected_candidate_id(bridge_id, attempt_id, now)?;
     Ok(TransferExecutionGrant {
         bridge_id: bridge_id.into(),
         plan_id: stored.1,
@@ -988,53 +812,7 @@ pub(crate) fn consume_transfer_execution_grant(
         step_id: stored.6,
         step_digest: stored.7,
         candidate_id,
-        generated_file,
         destination: destination.clone(),
-    })
-}
-
-pub(crate) fn consume_transform_execution_grant(
-    paths: &AppPaths,
-    authorities: &ProtocolSearchAuthorityStore,
-    bridge_id: &str,
-    attempt_id: &str,
-    now: i64,
-) -> AppResult<TransformExecutionGrant> {
-    let local = authorities.consume_transform(bridge_id, attempt_id, now)?;
-    let conn = connection(paths)?;
-    let stored = conn.query_row("SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,step_digest FROM bridge_plan_protocol_transform_attempts WHERE bridge_id=?1 AND attempt_id=?2 AND state='accepted'", params![bridge_id,attempt_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?))).optional()?.ok_or_else(|| AppError::InvalidInput("Bridge Plan Transform is unavailable.".into()))?;
-    if local.step_id != stored.6 {
-        return invalid("Bridge Plan Transform authority does not match the attempt.");
-    }
-    let revision_json: String = conn.query_row("SELECT revision_json FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='receiver' AND approval_id=?2", params![bridge_id,stored.0], |r| r.get(0)).optional()?.ok_or_else(|| AppError::InvalidInput("Bridge Plan reviewed revision is unavailable.".into()))?;
-    let revision: BridgePlanRevision = serde_json::from_str(&revision_json)?;
-    let transform = revision
-        .steps
-        .iter()
-        .find(|step| step.id() == stored.6)
-        .ok_or_else(|| {
-            AppError::InvalidInput("Bridge Plan Transform step is unavailable.".into())
-        })?;
-    let BridgePlanStep::Transform { intent, .. } = transform else {
-        return invalid("Bridge Plan execution step is not Transform.");
-    };
-    if step_digest(transform)? != stored.7 {
-        return invalid("Bridge Plan Transform binding mismatch.");
-    }
-    let candidate_id = authorities.consume_selected_candidate_id(bridge_id, attempt_id, now)?;
-    Ok(TransformExecutionGrant {
-        bridge_id: bridge_id.into(),
-        plan_id: stored.1,
-        revision_id: stored.2,
-        revision_hash: stored.3,
-        requester_device_ref: stored.4,
-        receiver_device_ref: stored.5,
-        approval_id: stored.0,
-        attempt_id: attempt_id.into(),
-        step_id: stored.6,
-        step_digest: stored.7,
-        candidate_id,
-        intent: intent.as_str().into(),
     })
 }
 
@@ -1074,7 +852,7 @@ pub(crate) fn attempt_update_payload(
     payload.insert("attemptId".into(), Value::String(grant.attempt_id.clone()));
     payload.insert("stepId".into(), Value::String(grant.step_id.clone()));
     payload.insert(
-        "searchStepDigest".into(),
+        "stepDigest".into(),
         Value::String(grant.search_step_digest.clone()),
     );
     match kind {
@@ -1128,36 +906,6 @@ pub(crate) fn transfer_update_payload(
         safe_scope_labels: Vec::new(),
     };
     attempt_update_payload(&search_grant, kind, safe_summary, failure_code)
-}
-
-pub(crate) fn transform_update_payload(
-    grant: &TransformExecutionGrant,
-    kind: &str,
-    safe_summary: Option<&str>,
-    failure_code: Option<&str>,
-) -> AppResult<Value> {
-    transfer_update_payload(
-        &TransferExecutionGrant {
-            bridge_id: grant.bridge_id.clone(),
-            plan_id: grant.plan_id.clone(),
-            revision_id: grant.revision_id.clone(),
-            revision_hash: grant.revision_hash.clone(),
-            requester_device_ref: grant.requester_device_ref.clone(),
-            receiver_device_ref: grant.receiver_device_ref.clone(),
-            approval_id: grant.approval_id.clone(),
-            attempt_id: grant.attempt_id.clone(),
-            step_id: grant.step_id.clone(),
-            step_digest: grant.step_digest.clone(),
-            candidate_id: grant.candidate_id.clone(),
-            generated_file: None,
-            destination: super::TransferDestination::RequestingDevice {
-                device_ref: grant.requester_device_ref.clone(),
-            },
-        },
-        kind,
-        safe_summary,
-        failure_code,
-    )
 }
 
 pub(crate) fn attempt_search_result_payload(
@@ -1240,14 +988,6 @@ pub(crate) fn init_schema(conn: &Connection) -> AppResult<()> {
         expires_at INTEGER NOT NULL, state TEXT NOT NULL, terminal_summary TEXT,
         PRIMARY KEY (bridge_id, attempt_id), UNIQUE (bridge_id, attempt_nonce)
       );
-      CREATE TABLE IF NOT EXISTS bridge_plan_protocol_transform_attempts (
-        bridge_id TEXT NOT NULL, attempt_id TEXT NOT NULL, approval_id TEXT NOT NULL,
-        plan_id TEXT NOT NULL, revision_id TEXT NOT NULL, revision_hash TEXT NOT NULL,
-        requester_device_ref TEXT NOT NULL, receiver_device_ref TEXT NOT NULL,
-        step_id TEXT NOT NULL, step_digest TEXT NOT NULL, attempt_nonce TEXT NOT NULL,
-        expires_at INTEGER NOT NULL, state TEXT NOT NULL, terminal_summary TEXT,
-        PRIMARY KEY (bridge_id, attempt_id), UNIQUE (bridge_id, attempt_nonce)
-      );
     "#,
     )?;
     Ok(())
@@ -1263,10 +1003,6 @@ pub(crate) fn delete_bridge_records(tx: &Transaction<'_>, bridge_id: &str) -> Ap
         [bridge_id],
     )?;
     tx.execute(
-        "DELETE FROM bridge_plan_protocol_transform_attempts WHERE bridge_id = ?1",
-        [bridge_id],
-    )?;
-    tx.execute(
         "DELETE FROM bridge_plan_protocol_reviews WHERE bridge_id = ?1",
         [bridge_id],
     )?;
@@ -1277,8 +1013,7 @@ pub(crate) fn reconcile_protocol_startup(paths: &AppPaths, _now: i64) -> AppResu
     let conn = connection(paths)?;
     let search = conn.execute("UPDATE bridge_plan_protocol_attempts SET state = 'interrupted', terminal_summary = 'application_restarted' WHERE state IN ('accepted','running')", [])?;
     let transfer = conn.execute("UPDATE bridge_plan_protocol_transfer_attempts SET state = 'interrupted', terminal_summary = 'application_restarted' WHERE state IN ('accepted','running')", [])?;
-    let transform = conn.execute("UPDATE bridge_plan_protocol_transform_attempts SET state = 'interrupted', terminal_summary = 'application_restarted' WHERE state IN ('accepted','running')", [])?;
-    Ok(search + transfer + transform)
+    Ok(search + transfer)
 }
 
 #[derive(Clone)]
@@ -1343,10 +1078,6 @@ pub(crate) fn protocol_metadata(
             "bridge-plan-transfer:{}",
             transfer_start(payload, &common, now)?.nonce
         ),
-        "bridge_plan.transform_start" => format!(
-            "bridge-plan-transform:{}",
-            transform_start(payload, &common, now)?.nonce
-        ),
         "bridge_plan.search_selection" => {
             let selection = selection(payload, &common, now)?;
             format!(
@@ -1404,16 +1135,6 @@ pub(crate) fn record_outbound_protocol_event(
             )?;
             insert_transfer_attempt(paths, &attempt)
         }
-        "bridge_plan.transform_start" => {
-            let requester = string(payload, "requesterDeviceRef", 128)?;
-            let receiver = string(payload, "receiverDeviceRef", 128)?;
-            let attempt = transform_start(
-                payload,
-                &common(payload, &bridge, &requester, &receiver)?,
-                now,
-            )?;
-            insert_transform_attempt(paths, &attempt)
-        }
         _ => Ok(()),
     }
 }
@@ -1450,9 +1171,6 @@ pub(crate) fn accept_inbound_protocol_event(
         "bridge_plan.attempt_start" => accept_start(paths, authorities, payload, &common, now)?,
         "bridge_plan.transfer_start" => {
             accept_transfer_start(paths, authorities, payload, &common, now)?
-        }
-        "bridge_plan.transform_start" => {
-            accept_transform_start(paths, authorities, payload, &common, now)?
         }
         "bridge_plan.search_selection" => {
             accept_selection(paths, authorities, candidates, payload, &common, now)?
@@ -1516,7 +1234,6 @@ fn common_for_event(
         "bridge_plan.review_request"
             | "bridge_plan.attempt_start"
             | "bridge_plan.transfer_start"
-            | "bridge_plan.transform_start"
             | "bridge_plan.search_selection"
             | "bridge_plan.cancel"
     );
@@ -1724,56 +1441,6 @@ fn transfer_start(value: &Map<String, Value>, common: &Common, now: i64) -> AppR
     })
 }
 
-fn transform_start(value: &Map<String, Value>, common: &Common, now: i64) -> AppResult<Attempt> {
-    exact(
-        value,
-        &[
-            "schemaVersion",
-            "bridgeId",
-            "planId",
-            "revisionId",
-            "revisionHash",
-            "requesterDeviceRef",
-            "receiverDeviceRef",
-            "approvalId",
-            "attemptId",
-            "transformStep",
-            "transformStepDigest",
-            "attemptNonce",
-            "attemptExpiresAt",
-        ],
-        &[],
-    )?;
-    let raw = value
-        .get("transformStep")
-        .cloned()
-        .ok_or_else(|| AppError::InvalidInput("Invalid Bridge Plan Transform step.".into()))?;
-    let step: BridgePlanStep = serde_json::from_value(raw.clone())
-        .map_err(|_| AppError::InvalidInput("Invalid Bridge Plan Transform step.".into()))?;
-    if serde_json::to_value(&step)? != raw || !matches!(step, BridgePlanStep::Transform { .. }) {
-        return invalid("Bridge Plan attempt must be exact Transform.");
-    }
-    let digest = step_digest(&step)?;
-    if string(value, "transformStepDigest", 256)? != digest {
-        return invalid("Bridge Plan Transform digest mismatch.");
-    }
-    let expires = integer(value, "attemptExpiresAt")?;
-    if !protocol_expiry_is_valid(expires, now) {
-        return invalid("Bridge Plan Transform expiry is invalid.");
-    }
-    Ok(Attempt {
-        common: common.clone(),
-        approval: string(value, "approvalId", 128)?,
-        id: string(value, "attemptId", 128)?,
-        step: transform_step_id(&step)?,
-        digest,
-        nonce: string(value, "attemptNonce", 128)?,
-        expires,
-        state: "accepted".into(),
-        summary: None,
-    })
-}
-
 fn selection(value: &Map<String, Value>, _common: &Common, _now: i64) -> AppResult<Selection> {
     exact(
         value,
@@ -1809,23 +1476,11 @@ fn selection(value: &Map<String, Value>, _common: &Common, _now: i64) -> AppResu
 fn update(value: &Map<String, Value>, common: &Common, kind: &str) -> AppResult<Attempt> {
     let (required, status) = match kind {
         "bridge_plan.attempt_ack" => (
-            &[
-                "approvalId",
-                "attemptId",
-                "stepId",
-                "searchStepDigest",
-                "status",
-            ][..],
+            &["approvalId", "attemptId", "stepId", "stepDigest", "status"][..],
             "accepted",
         ),
         "bridge_plan.step_progress" => (
-            &[
-                "approvalId",
-                "attemptId",
-                "stepId",
-                "searchStepDigest",
-                "status",
-            ][..],
+            &["approvalId", "attemptId", "stepId", "stepDigest", "status"][..],
             "running",
         ),
         "bridge_plan.step_result" => (
@@ -1833,7 +1488,7 @@ fn update(value: &Map<String, Value>, common: &Common, kind: &str) -> AppResult<
                 "approvalId",
                 "attemptId",
                 "stepId",
-                "searchStepDigest",
+                "stepDigest",
                 "status",
                 "safeResult",
             ][..],
@@ -1844,20 +1499,14 @@ fn update(value: &Map<String, Value>, common: &Common, kind: &str) -> AppResult<
                 "approvalId",
                 "attemptId",
                 "stepId",
-                "searchStepDigest",
+                "stepDigest",
                 "status",
                 "failureCode",
             ][..],
             "failed",
         ),
         "bridge_plan.cancel" => (
-            &[
-                "approvalId",
-                "attemptId",
-                "stepId",
-                "searchStepDigest",
-                "status",
-            ][..],
+            &["approvalId", "attemptId", "stepId", "stepDigest", "status"][..],
             "cancelled",
         ),
         _ => return invalid("Unsupported Bridge Plan protocol event kind."),
@@ -1906,7 +1555,7 @@ fn update(value: &Map<String, Value>, common: &Common, kind: &str) -> AppResult<
         approval: string(value, "approvalId", 128)?,
         id: string(value, "attemptId", 128)?,
         step: string(value, "stepId", 128)?,
-        digest: string(value, "searchStepDigest", 256)?,
+        digest: string(value, "stepDigest", 256)?,
         nonce: String::new(),
         expires: 0,
         state: status.into(),
@@ -1957,12 +1606,6 @@ fn insert_transfer_attempt(paths: &AppPaths, attempt: &Attempt) -> AppResult<()>
     Ok(())
 }
 
-fn insert_transform_attempt(paths: &AppPaths, attempt: &Attempt) -> AppResult<()> {
-    let conn = connection(paths)?;
-    if conn.execute("INSERT OR IGNORE INTO bridge_plan_protocol_transform_attempts (bridge_id,attempt_id,approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,step_digest,attempt_nonce,expires_at,state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'accepted')",params![attempt.common.bridge,attempt.id,attempt.approval,attempt.common.plan,attempt.common.revision,attempt.common.hash,attempt.common.requester,attempt.common.receiver,attempt.step,attempt.digest,attempt.nonce,attempt.expires])? !=1{return invalid("Bridge Plan Transform replayed.");}
-    Ok(())
-}
-
 fn accept_transfer_start(
     paths: &AppPaths,
     authorities: &ProtocolSearchAuthorityStore,
@@ -2003,58 +1646,11 @@ fn accept_transfer_start(
         super::ObjectSelectionRule::FromSlot { slot_id } if slot_id == "selected_file" => {
             authorities.selected_candidate_id(&common.bridge, &attempt.id, now)?;
         }
-        super::ObjectSelectionRule::FromSlot { slot_id } if slot_id == "transformed_file" => {
-            // The output remains Rust-private; its presence proves the prior
-            // approved Transform completed in this receiver process.
-            if !authorities.has_transform_output(&common.bridge, &attempt.id)? {
-                return invalid(
-                    "Bridge Plan Transform result is unavailable after restart or expiry.",
-                );
-            }
-        }
         super::ObjectSelectionRule::FutureUserSelection { .. } => {}
         _ => return invalid("Bridge Plan Transfer source is not available yet."),
     }
     insert_transfer_attempt(paths, &attempt)?;
     authorities.grant_transfer(&common.bridge, &attempt.id, &attempt.step, attempt.expires)
-}
-
-fn accept_transform_start(
-    paths: &AppPaths,
-    authorities: &ProtocolSearchAuthorityStore,
-    value: &Map<String, Value>,
-    common: &Common,
-    now: i64,
-) -> AppResult<()> {
-    let attempt = transform_start(value, common, now)?;
-    let conn = connection(paths)?;
-    let review=conn.query_row("SELECT revision_json,review_expires_at FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='receiver' AND approval_id=?2",params![common.bridge,attempt.approval],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan remote plan binding missing.".into()))?;
-    if review.1 <= now {
-        return invalid("Bridge Plan Transform does not match the current Bridge plan binding.");
-    }
-    let revision: BridgePlanRevision = serde_json::from_str(&review.0)?;
-    if revision.plan_id != common.plan
-        || revision.revision_id != common.revision
-        || revision.revision_hash != common.hash
-        || revision.requesting_device_ref != common.requester
-        || revision.selected_device_ref != common.receiver
-    {
-        return invalid("Bridge Plan Transform immutable plan binding mismatch.");
-    }
-    let step = revision
-        .steps
-        .iter()
-        .find(|step| step.id() == attempt.step)
-        .ok_or_else(|| {
-            AppError::InvalidInput("Bridge Plan Transform step is unavailable.".into())
-        })?;
-    if !matches!(step, BridgePlanStep::Transform { .. }) || step_digest(step)? != attempt.digest {
-        return invalid("Bridge Plan Transform step mismatch.");
-    }
-    drop(conn);
-    authorities.selected_candidate_id(&common.bridge, &attempt.id, now)?;
-    insert_transform_attempt(paths, &attempt)?;
-    authorities.grant_transform(&common.bridge, &attempt.id, &attempt.step, attempt.expires)
 }
 
 fn accept_selection(
@@ -2106,7 +1702,7 @@ fn accept_update(
 ) -> AppResult<()> {
     let update = update(value, common, kind)?;
     let conn = connection(paths)?;
-    let stored=conn.query_row("SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,search_step_digest,state,'search' FROM bridge_plan_protocol_attempts WHERE bridge_id=?1 AND attempt_id=?2 AND step_id=?3 UNION ALL SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,step_digest,state,'transfer' FROM bridge_plan_protocol_transfer_attempts WHERE bridge_id=?1 AND attempt_id=?2 AND step_id=?3 UNION ALL SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,step_digest,state,'transform' FROM bridge_plan_protocol_transform_attempts WHERE bridge_id=?1 AND attempt_id=?2 AND step_id=?3",params![common.bridge,update.id,update.step],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?))).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan attempt missing.".into()))?;
+    let stored=conn.query_row("SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,search_step_digest,state,'search' FROM bridge_plan_protocol_attempts WHERE bridge_id=?1 AND attempt_id=?2 AND step_id=?3 UNION ALL SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,step_digest,state,'transfer' FROM bridge_plan_protocol_transfer_attempts WHERE bridge_id=?1 AND attempt_id=?2 AND step_id=?3",params![common.bridge,update.id,update.step],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?))).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan attempt missing.".into()))?;
     if stored.0 != update.approval
         || stored.1 != common.plan
         || stored.2 != common.revision
@@ -2135,7 +1731,6 @@ fn accept_update(
     let table = match stored.9.as_str() {
         "search" => "bridge_plan_protocol_attempts",
         "transfer" => "bridge_plan_protocol_transfer_attempts",
-        "transform" => "bridge_plan_protocol_transform_attempts",
         _ => return invalid("Bridge Plan execution kind is invalid."),
     };
     if conn.execute(&format!("UPDATE {table} SET state=?1,terminal_summary=?2 WHERE bridge_id=?3 AND attempt_id=?4 AND state=?5"),params![update.state,update.summary,common.bridge,update.id,stored.8])? != 1 { return invalid("Bridge Plan update became stale."); }
@@ -2383,24 +1978,14 @@ fn transfer_step_id(step: &BridgePlanStep) -> AppResult<String> {
     }
 }
 
-fn transform_step_id(step: &BridgePlanStep) -> AppResult<String> {
-    match step {
-        BridgePlanStep::Transform { step_id, .. } => {
-            id(step_id, "Bridge Plan Transform step")?;
-            Ok(step_id.clone())
-        }
-        _ => invalid("Bridge Plan step is not Transform."),
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         bridge_plan::{
-            build_composed_file_revision, build_direct_file_transfer_revision,
-            build_file_plan_revision, build_file_search_revision, init_schema, ApprovalState,
-            BridgePlan, BridgePlanApproval, BridgePlanState, BridgePlanStore,
-            ComposedFilePlanBlock, RevisionState,
+            build_direct_file_transfer_revision, build_file_search_revision, init_schema,
+            ApprovalState, BridgePlan, BridgePlanApproval, BridgePlanState, BridgePlanStore,
+            RevisionState,
         },
         storage::AppPaths,
     };
@@ -2535,13 +2120,6 @@ mod tests {
                 user_visible_location_scope: super::super::SafeLocationDescription::from(
                     "Downloads",
                 ),
-            },
-            requester,
-            receiver,
-        ));
-        assert!(!supported_transfer_destination(
-            &super::super::TransferDestination::LeaveOnProducingDevice {
-                device_ref: receiver.into(),
             },
             requester,
             receiver,
@@ -2705,259 +2283,6 @@ mod tests {
             now,
         )
         .unwrap();
-    }
-
-    #[test]
-    fn requester_correlates_transfer_and_transform_starts_before_their_acks() {
-        for downstream in ["transfer", "transform"] {
-            let revision = if downstream == "transfer" {
-                build_file_plan_revision(
-                    "bridge".into(),
-                    "requester".into(),
-                    "receiver".into(),
-                    "Find report.pdf and send it to me.".into(),
-                    "report.pdf".into(),
-                    vec!["pdf".into()],
-                    vec!["downloads".into()],
-                    true,
-                )
-            } else {
-                build_composed_file_revision(
-                    "bridge".into(),
-                    "requester".into(),
-                    "receiver".into(),
-                    "Find report.txt and extract readable text.".into(),
-                    vec![
-                        ComposedFilePlanBlock::Search {
-                            execution_device_ref: "receiver".into(),
-                            filename_hint: "report.txt".into(),
-                            extensions: vec!["txt".into()],
-                            safe_scope_labels: vec!["downloads".into()],
-                        },
-                        ComposedFilePlanBlock::Transform {
-                            execution_device_ref: "receiver".into(),
-                            intent: "extract readable text".into(),
-                        },
-                    ],
-                )
-            }
-            .unwrap();
-            let (requester, receiver, _approval, values) = protocol_round_trip(revision.clone());
-            let now = crate::storage::now_ts();
-            let requester_authorities = ProtocolSearchAuthorityStore::default();
-            let receiver_authorities = ProtocolSearchAuthorityStore::default();
-            let mut requester_candidates =
-                crate::file_candidates::BridgePlanCandidateStore::default();
-            let mut receiver_candidates =
-                crate::file_candidates::BridgePlanCandidateStore::default();
-            let review = values["review"].clone();
-
-            record_outbound_protocol_event(
-                &requester,
-                "bridge_plan.review_request",
-                &outer(
-                    "bridge_plan.review_request",
-                    review.clone(),
-                    "requester",
-                    "receiver",
-                ),
-                now,
-            )
-            .unwrap();
-            BridgePlanStore::new(&requester)
-                .create_attempt_from_approval("attempt", "approval", now)
-                .unwrap();
-
-            let review_payload = review.as_object().unwrap();
-            let search_start = serde_json::json!({
-                "schemaVersion": PROTOCOL_VERSION, "bridgeId": revision.bridge_id,
-                "planId": revision.plan_id, "revisionId": revision.revision_id,
-                "revisionHash": revision.revision_hash, "requesterDeviceRef": "requester",
-                "receiverDeviceRef": "receiver", "approvalId": "approval", "attemptId": "attempt",
-                "searchStep": review_payload["searchStep"].clone(),
-                "searchStepDigest": review_payload["searchStepDigest"].clone(),
-                "attemptNonce": "search-nonce", "attemptExpiresAt": now + 600,
-            });
-            let search_event = outer(
-                "bridge_plan.attempt_start",
-                search_start,
-                "requester",
-                "receiver",
-            );
-            record_outbound_protocol_event(
-                &requester,
-                "bridge_plan.attempt_start",
-                &search_event,
-                now,
-            )
-            .unwrap();
-            accept_inbound_protocol_event(
-                &receiver,
-                &receiver_authorities,
-                &mut receiver_candidates,
-                "bridge_plan.attempt_start",
-                &search_event,
-                now,
-            )
-            .unwrap();
-            let search_grant = consume_search_execution_grant(
-                &receiver,
-                &receiver_authorities,
-                "bridge",
-                "attempt",
-                now,
-            )
-            .unwrap();
-            let progress =
-                attempt_update_payload(&search_grant, "bridge_plan.step_progress", None, None)
-                    .unwrap();
-            accept_inbound_protocol_event(
-                &requester,
-                &requester_authorities,
-                &mut requester_candidates,
-                "bridge_plan.step_progress",
-                &outer(
-                    "bridge_plan.step_progress",
-                    progress,
-                    "receiver",
-                    "requester",
-                ),
-                now,
-            )
-            .unwrap();
-            let result = attempt_update_payload(
-                &search_grant,
-                "bridge_plan.step_result",
-                Some("Search finished with 1 matching file result(s)."),
-                None,
-            )
-            .unwrap();
-            accept_inbound_protocol_event(
-                &requester,
-                &requester_authorities,
-                &mut requester_candidates,
-                "bridge_plan.step_result",
-                &outer("bridge_plan.step_result", result, "receiver", "requester"),
-                now,
-            )
-            .unwrap();
-            receiver_authorities
-                .bind_selection("bridge", "attempt", "candidate-opaque", now + 600)
-                .unwrap();
-
-            let (kind, payload) = if downstream == "transfer" {
-                (
-                    "bridge_plan.transfer_start",
-                    transfer_start_payload(&requester, "bridge", "attempt", now).unwrap(),
-                )
-            } else {
-                (
-                    "bridge_plan.transform_start",
-                    transform_start_payload(&requester, "bridge", "attempt", now).unwrap(),
-                )
-            };
-            let event = outer(kind, payload, "requester", "receiver");
-            accept_inbound_protocol_event(
-                &receiver,
-                &receiver_authorities,
-                &mut receiver_candidates,
-                kind,
-                &event,
-                now,
-            )
-            .unwrap();
-            let (ack, progress, result) = if downstream == "transfer" {
-                let grant = consume_transfer_execution_grant(
-                    &receiver,
-                    &receiver_authorities,
-                    "bridge",
-                    "attempt",
-                    now,
-                )
-                .unwrap();
-                (
-                    transfer_update_payload(&grant, "bridge_plan.attempt_ack", None, None).unwrap(),
-                    transfer_update_payload(&grant, "bridge_plan.step_progress", None, None)
-                        .unwrap(),
-                    transfer_update_payload(
-                        &grant,
-                        "bridge_plan.step_result",
-                        Some("Transfer completed to the requesting device."),
-                        None,
-                    )
-                    .unwrap(),
-                )
-            } else {
-                let grant = consume_transform_execution_grant(
-                    &receiver,
-                    &receiver_authorities,
-                    "bridge",
-                    "attempt",
-                    now,
-                )
-                .unwrap();
-                (
-                    transform_update_payload(&grant, "bridge_plan.attempt_ack", None, None)
-                        .unwrap(),
-                    transform_update_payload(&grant, "bridge_plan.step_progress", None, None)
-                        .unwrap(),
-                    transform_update_payload(
-                        &grant,
-                        "bridge_plan.step_result",
-                        Some("Transform completed on the selected device."),
-                        None,
-                    )
-                    .unwrap(),
-                )
-            };
-            assert!(
-                accept_inbound_protocol_event(
-                    &requester,
-                    &requester_authorities,
-                    &mut requester_candidates,
-                    "bridge_plan.attempt_ack",
-                    &outer(
-                        "bridge_plan.attempt_ack",
-                        ack.clone(),
-                        "receiver",
-                        "requester"
-                    ),
-                    now,
-                )
-                .is_err(),
-                "{downstream} ACK must fail closed without requester correlation"
-            );
-            record_outbound_protocol_event(&requester, kind, &event, now).unwrap();
-            assert!(
-                accept_inbound_protocol_event(
-                    &requester,
-                    &requester_authorities,
-                    &mut requester_candidates,
-                    "bridge_plan.attempt_ack",
-                    &outer("bridge_plan.attempt_ack", ack, "receiver", "requester"),
-                    now,
-                )
-                .is_ok(),
-                "{downstream} ACK must see the requester correlation row"
-            );
-            for (kind, update) in [
-                ("bridge_plan.step_progress", progress),
-                ("bridge_plan.step_result", result),
-            ] {
-                assert!(
-                    accept_inbound_protocol_event(
-                        &requester,
-                        &requester_authorities,
-                        &mut requester_candidates,
-                        kind,
-                        &outer(kind, update, "receiver", "requester"),
-                        now,
-                    )
-                    .is_ok(),
-                    "{downstream} {kind} must retain its correlated attempt binding"
-                );
-            }
-        }
     }
 
     #[test]

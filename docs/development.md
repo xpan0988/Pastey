@@ -39,13 +39,29 @@ node scripts/run-layer4-validation-matrix.mjs
 
 The Layer 4 matrix covers ordinary-data routing, active Bridge-detail polling, queue children/terminal state, and durable-display/reconnect boundaries. It is not a substitute for a GUI or two-device LAN run.
 
-## Transform and provider validation
+## Transform, Execute, and provider validation
 
-For the live product, run `cargo test --manifest-path src-tauri/Cargo.toml bridge_plan:: -- --nocapture`; it covers durable Plan lifecycle, automatic receiver protocol execution, Search grants, explicit Transform executors, authored private pipeline Transfers, and bounded Transform/Transfer bindings. The live readable-text Transform uses Rust-private immutable staging and a fixed worker; no legacy Transform consent, capability-fallback routing, journal, adapter, or renderer step-start path remains. On a development host with the GNU Windows target and MinGW installed, `cargo check --manifest-path src-tauri/Cargo.toml --tests --target x86_64-pc-windows-gnu` also compiles the Windows handle/reparse staging tests; execute those tests on Windows for platform behavioral proof.
+For the live product, run the complete Rust suite. It covers durable Plan lifecycle, Search/Transfer execution, explicit Transform/Execute Hosts, logical revision dependencies, authored PipelinePrivate Transfers, safe candidate identity, protocol correlation, restart, and Burn. Transform and Execute are framework-only and must fail closed before attempt authority is consumed. On a development host with the GNU Windows target and MinGW installed, `cargo check --manifest-path src-tauri/Cargo.toml --tests --target x86_64-pc-windows-gnu` compiles the retained Windows safe-open and identity path. Cross-compilation is not native Windows behavioral proof.
+
+The canonical validation stack is:
+
+```bash
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo check --manifest-path src-tauri/Cargo.toml --bin pastey
+cargo check --manifest-path src-tauri/Cargo.toml --bin pastey --profile dev-fast
+cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture
+cargo check --manifest-path src-tauri/Cargo.toml --tests --target x86_64-pc-windows-gnu
+npm run build
+node scripts/run-natural-v1-tests.mjs
+node scripts/run-layer4-validation-matrix.mjs
+git diff --check
+```
+
+Native packaged Windows must separately exercise normal-file Search/Transfer, reparse/path substitution rejection, identity and digest checks, explicit movement, restart, and Burn. Native packaged macOS must exercise the corresponding descriptor-oriented no-follow and identity path. A two-device Mac↔Windows run must verify Search/Transfer continuation and that reviewed Transform/Execute plans fail closed without hidden movement. Do not label Darwin tests or Windows cross-compilation as physical E2E PASS.
 
 Provider health checks are Settings-driven and advisory-only: use a deliberately minimal configured request, verify validation reports, and confirm it neither creates a Bridge control event nor changes consent/execution state. Do not put API keys in fixtures, logs, or documentation.
 
-Linux capability probes and behavioral verification remain dormant test infrastructure for a future verified execution backend. The optional verification probe binary is feature-gated and is not packaged with the app. Neither has product authority, UI state, command surface, sidecars, or an availability signal. Unit, cross-compile, mock, and packaging verification **are not** live Linux isolation verification; a future backend requires its own explicit product and security decision before it can be installed.
+There is no current Agent sandbox, mutation adapter, runtime adapter, or process-containment implementation to validate. Those decisions belong to the future Agent phase.
 
 ## Smoke checks
 

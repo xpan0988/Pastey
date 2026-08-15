@@ -19,6 +19,7 @@ import type {
   FileBridgeRoutePayload,
   TextBridgeRoutePayload,
 } from "./bridgeRoutingRuntime";
+import type { ComposerBlock } from "./bridgePlanComposer";
 
 /** Public workspace projection. It contains reviewed plan semantics and safe
  * history only; execution grants and receiver-local resolution remain Rust
@@ -35,11 +36,7 @@ export interface BridgePlanWorkspace {
 export interface ComposedFileBridgePlanRequest {
   roomId: string;
   originalUserGoal: string;
-  blocks: Array<
-    | { primitive: "Search"; executionDevice: "selected_device"; filenameHint: string; extension: string; safeScopes: Array<"downloads" | "desktop" | "documents" | "pastey_shared"> }
-    | { primitive: "Transform"; intent: "extract readable text"; executionDevice: "requesting_device" | "selected_device" }
-    | { primitive: "Transfer"; source: "requesting_device" | "selected_device"; destination: "requesting_device" | "selected_device" | "pastey_shared"; landingMode: "pipeline_handoff" | "final_delivery" }
-  >;
+  blocks: ComposerBlock[];
 }
 
 export function createComposedFileBridgePlan(request: ComposedFileBridgePlanRequest): Promise<BridgePlanWorkspace> {
@@ -56,25 +53,8 @@ export function createDirectFileTransferBridgePlan(request: DirectFileTransferBr
   return invoke<BridgePlanWorkspace>("create_direct_file_transfer_bridge_plan", { request });
 }
 
-export interface SelectedPeerTransformAvailability {
-  peerSessionId: string;
-  status: "unknown" | "available" | "unavailable";
-  available: boolean;
-  reason: string;
-  acceptedInputMediaTypes: string[];
-  outputMediaType: string | null;
-}
-
 export function refreshSelectedPeerCapabilities(roomId: string, bridgeRoute: ControlBridgeRoutePayload): Promise<RoomControlDeliveryReceipt> {
   return invoke<RoomControlDeliveryReceipt>("refresh_selected_peer_capabilities", { roomId, bridgeRoute });
-}
-
-export function selectedPeerTransformAvailability(roomId: string): Promise<SelectedPeerTransformAvailability> {
-  return invoke<SelectedPeerTransformAvailability>("selected_peer_transform_availability", { roomId });
-}
-
-export function localTransformAvailability(): Promise<SelectedPeerTransformAvailability> {
-  return invoke<SelectedPeerTransformAvailability>("local_transform_availability");
 }
 
 export function listBridgePlanWorkspace(roomId: string): Promise<BridgePlanWorkspace> {

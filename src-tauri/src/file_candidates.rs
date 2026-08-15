@@ -12,8 +12,8 @@ use crate::{
     error::{AppError, AppResult},
     logging,
     object_refs::{self, EphemeralObjectStore, ObjectKind, ObjectRefDescriptor},
+    safe_file_identity,
     storage::AppPaths,
-    transform_registry, transform_sandbox,
 };
 
 const MAX_IDENTIFIER_LENGTH: usize = 256;
@@ -753,10 +753,14 @@ pub fn validate_bridge_plan_candidate_selection(
 #[derive(Clone, Debug)]
 pub(crate) struct BridgePlanPrivateFile {
     pub(crate) path: PathBuf,
-    scope_root: PathBuf,
+    pub(crate) scope_root: PathBuf,
     pub(crate) display_name: String,
     pub(crate) mime_type: String,
     pub(crate) size_bytes: u64,
+    pub(crate) logical_object_id: String,
+    pub(crate) revision: u64,
+    pub(crate) identity: safe_file_identity::SourceIdentity,
+    pub(crate) app_owned_temporary: bool,
 }
 
 /// Constructs a Rust-private input for a completed PipelinePrivate receive.
@@ -782,22 +786,55 @@ pub(crate) fn bridge_plan_private_pipeline_file(
             "Pipeline private object is invalid.".into(),
         ));
     }
+    let identity = safe_file_identity::capture_source_identity(
+        &canonical,
+        &root,
+        crate::storage::MAX_FILE_SIZE_BYTES,
+    )?;
     Ok(BridgePlanPrivateFile {
         path: canonical,
         scope_root: root,
         display_name,
         mime_type,
         size_bytes,
+        logical_object_id: "selected_file".into(),
+        revision: 1,
+        identity,
+        app_owned_temporary: true,
     })
 }
 
 pub(crate) fn cleanup_bridge_plan_private_pipeline_file(file: &BridgePlanPrivateFile) {
-    let _ = fs::remove_dir_all(&file.scope_root);
+    if file.app_owned_temporary {
+        let _ = fs::remove_dir_all(&file.scope_root);
+    }
 }
 
 pub(crate) fn cleanup_orphaned_pipeline_handoffs(temp_dir: &Path) {
     let root = temp_dir.join("pipeline-handoffs");
     let _ = fs::remove_dir_all(root);
+}
+
+/// Revalidates the exact Rust-private source immediately before an encrypted
+/// Transfer consumes it. Logical revision fields remain Core-owned metadata;
+/// they do not grant mutation or execution authority.
+pub(crate) fn revalidate_bridge_plan_private_file(file: &BridgePlanPrivateFile) -> AppResult<()> {
+    if file.logical_object_id.is_empty() || file.revision == 0 {
+        return Err(AppError::InvalidInput(
+            "Bridge Plan object revision binding is invalid.".into(),
+        ));
+    }
+    let observed = safe_file_identity::capture_source_identity(
+        &file.path,
+        &file.scope_root,
+        crate::storage::MAX_FILE_SIZE_BYTES,
+    )?;
+    if observed != file.identity || observed.byte_count != file.size_bytes {
+        return Err(AppError::InvalidInput(
+            "Bridge Plan candidate changed before Transfer.".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Captures a requester-selected local file for a direct Bridge Plan Transfer.
@@ -833,12 +870,21 @@ pub(crate) fn capture_bridge_plan_requester_file(
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_owned();
+    let identity = safe_file_identity::capture_source_identity(
+        &canonical,
+        &scope_root,
+        crate::storage::MAX_FILE_SIZE_BYTES,
+    )?;
     Ok(BridgePlanPrivateFile {
         path: canonical,
         scope_root,
         display_name,
         mime_type: bridge_plan_file_mime_type(&extension),
         size_bytes: metadata.len(),
+        logical_object_id: "selected_file".into(),
+        revision: 1,
+        identity,
+        app_owned_temporary: false,
     })
 }
 
@@ -896,154 +942,36 @@ pub(crate) fn resolve_bridge_plan_selected_file(
             "Bridge Plan candidate changed.".into(),
         ));
     }
+    let mime_type = bridge_plan_file_mime_type(&entry.extension);
+    let identity = safe_file_identity::capture_source_identity(
+        &canonical,
+        &entry.scope_root,
+        crate::storage::MAX_FILE_SIZE_BYTES,
+    )?;
     Ok(BridgePlanPrivateFile {
         path: canonical,
         scope_root: entry.scope_root.clone(),
         display_name: entry.display_name.clone(),
-        mime_type: bridge_plan_file_mime_type(&entry.extension),
+        mime_type,
         size_bytes: entry.size_bytes,
+        logical_object_id: "selected_file".into(),
+        revision: 1,
+        identity,
+        app_owned_temporary: false,
     })
 }
 
-/// Runs the selected Plan Transform through the Host-owned fixed readable-text
-/// capability. The selected source and generated output never cross this
-/// boundary: the return value is Rust-private and its backing output is owned
-/// by the ephemeral object store, so Burn/restart removes the authority.
-pub(crate) fn transform_bridge_plan_selected_file(
-    store: &mut BridgePlanCandidateStore,
-    paths: &AppPaths,
-    room_ref: &str,
-    requester_device_ref: &str,
-    receiver_device_ref: &str,
-    attempt_id: &str,
-    candidate_id: &str,
-    intent: &str,
-) -> AppResult<BridgePlanPrivateFile> {
-    let source = resolve_bridge_plan_selected_file(
-        store,
-        room_ref,
-        requester_device_ref,
-        receiver_device_ref,
-        attempt_id,
-        candidate_id,
-    )?;
-    transform_bridge_plan_private_file(store, paths, room_ref, receiver_device_ref, &source, intent)
-}
-
-/// Runs the same bounded Transform against a previously validated private
-/// object. PipelinePrivate inputs keep their owned root and therefore receive
-/// the identical identity/staging checks as a Search candidate.
-pub(crate) fn transform_bridge_plan_private_file(
-    store: &mut BridgePlanCandidateStore,
-    paths: &AppPaths,
-    room_ref: &str,
-    receiver_device_ref: &str,
-    source: &BridgePlanPrivateFile,
-    intent: &str,
-) -> AppResult<BridgePlanPrivateFile> {
-    if let Some(extension) = Path::new(&source.display_name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .filter(|extension| !extension.is_empty())
-    {
-        let observed = bridge_plan_file_mime_type(extension);
-        if observed != source.mime_type {
-            return Err(AppError::InvalidInput(
-                "The selected file type changed before Transform execution.".into(),
-            ));
-        }
-    }
-    let resolved = transform_registry::resolve_transform_intent(intent, &source.mime_type)
-        .ok_or_else(|| {
-            AppError::InvalidInput(
-                "The selected device cannot process this file with the requested Transform.".into(),
-            )
-        })?;
-    if resolved.implementation.implementation_id != "extract_readable_text_v1" {
-        return Err(AppError::InvalidInput(
-            "The selected device has no safe implementation for this Transform.".into(),
-        ));
-    }
-
-    let identity = transform_sandbox::capture_source_identity(
-        &source.path,
-        &source.scope_root,
-        transform_sandbox::FIXED_TEXT_STAGING_PROFILE.maximum_input_bytes,
-    )?;
-    let snapshot = transform_sandbox::prepare_staged_snapshot(
-        &paths.app_data_dir,
-        &source.path,
-        &source.scope_root,
-        &identity,
-        transform_sandbox::FIXED_TEXT_STAGING_PROFILE,
-    )?;
-    let execution = transform_sandbox::text_worker::run_fixed_text_worker(
-        &snapshot.input_path,
-        &snapshot.work_dir,
-    );
-    if execution.is_err() {
-        let _ = transform_sandbox::cleanup_staged_snapshot(&snapshot);
-        return Err(AppError::InvalidInput(
-            "The selected file could not be processed by the approved Transform.".into(),
-        ));
-    }
-    let output_path = snapshot.work_dir.join("output");
-    let metadata = fs::symlink_metadata(&output_path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > transform_sandbox::text_worker::MAX_TEXT_OUTPUT_BYTES as u64
-    {
-        let _ = transform_sandbox::cleanup_staged_snapshot(&snapshot);
-        return Err(AppError::InvalidInput(
-            "The approved Transform produced an invalid local result.".into(),
-        ));
-    }
-    let bytes = fs::read(&output_path)?;
-    if std::str::from_utf8(&bytes).is_err() || bytes.len() as u64 != metadata.len() {
-        let _ = transform_sandbox::cleanup_staged_snapshot(&snapshot);
-        return Err(AppError::InvalidInput(
-            "The approved Transform produced an invalid local result.".into(),
-        ));
-    }
-    let private_root = object_refs::create_transform_output_root(&paths.app_data_dir)?;
-    let private_output = private_root.join("output");
-    if fs::copy(&output_path, &private_output)? != metadata.len() {
-        let _ = fs::remove_dir_all(&private_root);
-        let _ = transform_sandbox::cleanup_staged_snapshot(&snapshot);
-        return Err(AppError::InvalidInput(
-            "The approved Transform result could not be retained locally.".into(),
-        ));
-    }
-    let registered = store.object_store.register_transform_output(
-        room_ref.into(),
-        receiver_device_ref.into(),
-        private_output.clone(),
-        private_root.clone(),
-        metadata.len(),
-        "readable-text.txt".into(),
-        CANDIDATE_PAYLOAD_STORE_TTL_SECONDS,
-    );
-    let _ = transform_sandbox::cleanup_staged_snapshot(&snapshot);
-    if let Err(error) = registered {
-        let _ = fs::remove_dir_all(&private_root);
-        return Err(error);
-    }
-    Ok(BridgePlanPrivateFile {
-        path: private_output,
-        scope_root: private_root,
-        display_name: "readable-text.txt".into(),
-        mime_type: "text/plain".into(),
-        size_bytes: metadata.len(),
-    })
-}
-
-fn bridge_plan_file_mime_type(extension: &str) -> String {
+pub(crate) fn bridge_plan_file_mime_type(extension: &str) -> String {
     match extension.to_ascii_lowercase().as_str() {
         "pdf" => "application/pdf",
         "txt" => "text/plain",
         "md" => "text/markdown",
         "json" => "application/json",
         "csv" => "text/csv",
+        "py" => "text/x-python",
+        "ts" | "tsx" => "text/typescript",
+        "js" | "jsx" => "text/javascript",
+        "rs" => "text/rust",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
@@ -1232,29 +1160,6 @@ mod tests {
             10,
         )
         .is_err());
-        fs::remove_dir_all(paths.app_data_dir).unwrap();
-    }
-
-    #[test]
-    fn transform_revalidates_candidate_media_type_before_staging() {
-        let paths = test_paths();
-        let source = BridgePlanPrivateFile {
-            path: paths.temp_dir.join("report.txt"),
-            scope_root: paths.temp_dir.clone(),
-            display_name: "report.txt".into(),
-            mime_type: "application/pdf".into(),
-            size_bytes: 1,
-        };
-        let error = transform_bridge_plan_private_file(
-            &mut BridgePlanCandidateStore::default(),
-            &paths,
-            "bridge",
-            "device",
-            &source,
-            "extract readable text",
-        )
-        .unwrap_err();
-        assert!(error.message().contains("file type changed"));
         fs::remove_dir_all(paths.app_data_dir).unwrap();
     }
 }

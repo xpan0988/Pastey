@@ -53,7 +53,7 @@ export function parseBridgePlanSearchTerminalResult(event: ReceivedRoomControlEv
 }
 
 export function bridgePlanSearchCandidateMode(primitives: readonly string[]): BridgePlanSearchCandidateMode {
-  return primitives.includes("Transfer") || primitives.includes("Transform") ? "selectable" : "result";
+  return primitives.includes("Transfer") || primitives.includes("Transform") || primitives.includes("Execute") ? "selectable" : "result";
 }
 
 export function terminalSearchPresentation(result: BridgePlanSearchTerminalResult): BridgePlanSearchTerminalPresentation {
