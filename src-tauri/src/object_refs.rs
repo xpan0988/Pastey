@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
 use crate::error::{AppError, AppResult};
 
 pub(crate) const OBJECT_REF_SCHEMA: &str = "pastey-object-ref-v1";
@@ -253,19 +258,38 @@ pub(crate) fn cleanup_orphaned_transform_objects(app_data_dir: &Path) -> AppResu
 
 pub(crate) fn create_transform_output_root(app_data_dir: &Path) -> AppResult<PathBuf> {
     let app_data = fs::canonicalize(app_data_dir)?;
+    validate_private_directory(&app_data)?;
     let parent = app_data.join(OUTPUT_ROOT_NAME);
     if !parent.exists() {
         fs::create_dir(&parent)?;
     }
+    validate_private_directory(&parent)?;
     let parent = fs::canonicalize(parent)?;
-    if !parent.starts_with(&app_data) {
+    if !parent.starts_with(&app_data) || parent == app_data {
         return Err(AppError::InvalidInput(
             "Transform object root escaped app data.".into(),
         ));
     }
     let root = parent.join(format!("object-output-{}", Uuid::new_v4()));
     fs::create_dir(&root)?;
+    validate_private_directory(&root)?;
     Ok(root)
+}
+
+fn validate_private_directory(path: &Path) -> AppResult<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppError::InvalidInput(
+            "Transform private directory is invalid.".into(),
+        ));
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(AppError::InvalidInput(
+            "Transform private directory contains a reparse point.".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_private_output(path: &Path, root: &Path, size_bytes: u64) -> AppResult<()> {
@@ -320,6 +344,12 @@ fn remove_tree(path: &Path) -> AppResult<()> {
     };
     if metadata.file_type().is_symlink() {
         return Err(AppError::InvalidInput("Refusing symlink cleanup.".into()));
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(AppError::InvalidInput(
+            "Refusing reparse-point cleanup.".into(),
+        ));
     }
     if metadata.is_file() {
         fs::remove_file(path)?;

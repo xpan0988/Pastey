@@ -941,6 +941,18 @@ pub(crate) fn transform_bridge_plan_private_file(
     source: &BridgePlanPrivateFile,
     intent: &str,
 ) -> AppResult<BridgePlanPrivateFile> {
+    if let Some(extension) = Path::new(&source.display_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty())
+    {
+        let observed = bridge_plan_file_mime_type(extension);
+        if observed != source.mime_type {
+            return Err(AppError::InvalidInput(
+                "The selected file type changed before Transform execution.".into(),
+            ));
+        }
+    }
     let resolved = transform_registry::resolve_transform_intent(intent, &source.mime_type)
         .ok_or_else(|| {
             AppError::InvalidInput(
@@ -1220,6 +1232,29 @@ mod tests {
             10,
         )
         .is_err());
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
+
+    #[test]
+    fn transform_revalidates_candidate_media_type_before_staging() {
+        let paths = test_paths();
+        let source = BridgePlanPrivateFile {
+            path: paths.temp_dir.join("report.txt"),
+            scope_root: paths.temp_dir.clone(),
+            display_name: "report.txt".into(),
+            mime_type: "application/pdf".into(),
+            size_bytes: 1,
+        };
+        let error = transform_bridge_plan_private_file(
+            &mut BridgePlanCandidateStore::default(),
+            &paths,
+            "bridge",
+            "device",
+            &source,
+            "extract readable text",
+        )
+        .unwrap_err();
+        assert!(error.message().contains("file type changed"));
         fs::remove_dir_all(paths.app_data_dir).unwrap();
     }
 }

@@ -65,7 +65,7 @@ pub(crate) fn local_projection(
     peer_session_id: String,
     observed_at: i64,
 ) -> PeerCapabilityProjection {
-    let available = cfg!(unix);
+    let available = cfg!(any(unix, windows));
     PeerCapabilityProjection {
         schema_version: PEER_CAPABILITY_SCHEMA.into(),
         peer_session_id,
@@ -241,7 +241,7 @@ mod tests {
     fn local_projection_matches_current_staging_platform() {
         assert_eq!(
             local_projection("peer".into(), 1).capabilities[0].available,
-            cfg!(unix)
+            cfg!(any(unix, windows))
         );
     }
 
@@ -256,7 +256,7 @@ mod tests {
             store
                 .selected_transform("room", "peer-one", "endpoint-one", 100)
                 .status,
-            if cfg!(unix) {
+            if cfg!(any(unix, windows)) {
                 "available"
             } else {
                 "unavailable"
@@ -331,7 +331,7 @@ mod tests {
             "unknown"
         );
         let fact = &local_projection("peer".into(), 1).capabilities[0];
-        if cfg!(unix) {
+        if cfg!(any(unix, windows)) {
             assert!(fact.available);
             assert_eq!(fact.unavailable_reason, None);
         } else {

@@ -225,7 +225,9 @@ fn bridge_plan_protocol_rejection_reason(error: &AppError) -> &'static str {
         "attempt_missing"
     } else if message.contains("update correlation mismatch") {
         "attempt_correlation_mismatch"
-    } else if message.contains("review not found") || message.contains("receiver review missing") {
+    } else if message.contains("review not found")
+        || message.contains("remote plan binding missing")
+    {
         "review_unknown_approval"
     } else if message.contains("revision mismatch") {
         "review_revision_hash_mismatch"
@@ -2238,7 +2240,6 @@ mod tests {
             bridge_id: revision.bridge_id.clone(),
             requester_device_ref: "source".into(),
             selected_device_ref: "target".into(),
-            receiver_required: true,
             // The requester may be one second ahead of the receiver. A
             // one-day immutable review must not become invalid at that
             // boundary solely because of ordinary device clock skew.
