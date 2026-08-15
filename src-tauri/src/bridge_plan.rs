@@ -6,15 +6,11 @@
 //! state remain in their existing ephemeral Host-owned stores.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-#[cfg(test)]
-use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[cfg(test)]
-use crate::storage;
 use crate::{
     error::{AppError, AppResult},
     models::PipelineHandoffMetadata,
@@ -25,10 +21,9 @@ mod protocol;
 pub(crate) use protocol::{
     accept_inbound_protocol_event, attempt_search_result_payload, attempt_start_payload,
     attempt_update_payload, consume_search_execution_grant, consume_transfer_execution_grant,
-    consume_transform_execution_grant, protocol_metadata, reconcile_protocol_startup,
-    record_outbound_protocol_event, review_request_payload, search_selection_payload,
-    transfer_start_payload, transfer_update_payload, transform_start_payload,
-    transform_update_payload, ProtocolSearchAuthorityStore,
+    protocol_metadata, reconcile_protocol_startup, record_outbound_protocol_event,
+    review_request_payload, search_selection_payload, transfer_start_payload,
+    transfer_update_payload, ProtocolSearchAuthorityStore,
 };
 
 const HASH_VERSION: &str = "bridge-plan-revision-hash-v1";
@@ -63,7 +58,6 @@ macro_rules! durable_text {
 
 durable_text!(RawUserGoal);
 durable_text!(GeneratedUserVisibleText);
-durable_text!(TransformIntentText);
 durable_text!(SafeLocationDescription);
 durable_text!(SafeActivitySummary);
 
@@ -78,7 +72,6 @@ macro_rules! durable_text_as_str {
 }
 
 durable_text_as_str!(GeneratedUserVisibleText);
-durable_text_as_str!(TransformIntentText);
 durable_text_as_str!(SafeLocationDescription);
 
 impl GeneratedUserVisibleText {
@@ -110,7 +103,6 @@ macro_rules! bounded_text_from {
 }
 
 bounded_text_from!(RawUserGoal);
-bounded_text_from!(TransformIntentText);
 bounded_text_from!(SafeLocationDescription);
 bounded_text_from!(SafeActivitySummary);
 
@@ -211,6 +203,7 @@ pub(crate) enum StepOperation {
     Search,
     Transform,
     Transfer,
+    Execute,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -318,12 +311,6 @@ pub(crate) enum TransferDestination {
         device_ref: String,
         user_visible_location_scope: SafeLocationDescription,
     },
-    /// A completed Transform may deliberately remain on the device that
-    /// produced it. This is not a network transfer and must never be lowered
-    /// into a fake requester return.
-    LeaveOnProducingDevice {
-        device_ref: String,
-    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -345,6 +332,17 @@ pub(crate) struct SearchIntent {
     pub(crate) query: GeneratedUserVisibleText,
     pub(crate) extensions: Vec<GeneratedUserVisibleText>,
     pub(crate) safe_scope_labels: Vec<SafeLocationDescription>,
+}
+
+/// A semantic dependency in the immutable Plan. It identifies the logical
+/// object revision a framework-only action consumes or would produce; it is
+/// not an ObjectRef, filesystem identity, capability grant, or claim that the
+/// future Agent action has executed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LogicalObjectRevision {
+    pub(crate) logical_object_id: String,
+    pub(crate) revision: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -373,9 +371,11 @@ pub(crate) enum BridgePlanStep {
         user_visible_action: GeneratedUserVisibleText,
         capability_requirements: Vec<CapabilityRequirement>,
         failure_behavior: StepFailureBehavior,
-        intent: TransformIntentText,
+        target: ObjectSelectionRule,
+        input_revision: LogicalObjectRevision,
+        output_revision: LogicalObjectRevision,
+        modification_intent: RawUserGoal,
         expected_input: ObjectContract,
-        expected_output: ObjectContract,
     },
     Transfer {
         step_id: String,
@@ -390,6 +390,20 @@ pub(crate) enum BridgePlanStep {
         source: ObjectSelectionRule,
         destination: TransferDestination,
     },
+    Execute {
+        step_id: String,
+        depends_on: Vec<String>,
+        input_slots: Vec<PlanSlot>,
+        output_slots: Vec<PlanSlot>,
+        source_device_ref: Option<String>,
+        execution_device_ref: String,
+        user_visible_action: GeneratedUserVisibleText,
+        capability_requirements: Vec<CapabilityRequirement>,
+        failure_behavior: StepFailureBehavior,
+        target: ObjectSelectionRule,
+        target_revision: LogicalObjectRevision,
+        execution_intent: RawUserGoal,
+    },
 }
 
 impl BridgePlanStep {
@@ -397,28 +411,32 @@ impl BridgePlanStep {
         match self {
             Self::Search { step_id, .. }
             | Self::Transform { step_id, .. }
-            | Self::Transfer { step_id, .. } => step_id,
+            | Self::Transfer { step_id, .. }
+            | Self::Execute { step_id, .. } => step_id,
         }
     }
     fn dependencies(&self) -> &[String] {
         match self {
             Self::Search { depends_on, .. }
             | Self::Transform { depends_on, .. }
-            | Self::Transfer { depends_on, .. } => depends_on,
+            | Self::Transfer { depends_on, .. }
+            | Self::Execute { depends_on, .. } => depends_on,
         }
     }
     fn inputs(&self) -> &[PlanSlot] {
         match self {
             Self::Search { input_slots, .. }
             | Self::Transform { input_slots, .. }
-            | Self::Transfer { input_slots, .. } => input_slots,
+            | Self::Transfer { input_slots, .. }
+            | Self::Execute { input_slots, .. } => input_slots,
         }
     }
     fn outputs(&self) -> &[PlanSlot] {
         match self {
             Self::Search { output_slots, .. }
             | Self::Transform { output_slots, .. }
-            | Self::Transfer { output_slots, .. } => output_slots,
+            | Self::Transfer { output_slots, .. }
+            | Self::Execute { output_slots, .. } => output_slots,
         }
     }
     fn operation(&self) -> StepOperation {
@@ -426,6 +444,7 @@ impl BridgePlanStep {
             Self::Search { .. } => StepOperation::Search,
             Self::Transform { .. } => StepOperation::Transform,
             Self::Transfer { .. } => StepOperation::Transfer,
+            Self::Execute { .. } => StepOperation::Execute,
         }
     }
     fn execution_device(&self) -> &str {
@@ -441,6 +460,10 @@ impl BridgePlanStep {
             | Self::Transfer {
                 execution_device_ref,
                 ..
+            }
+            | Self::Execute {
+                execution_device_ref,
+                ..
             } => execution_device_ref,
         }
     }
@@ -453,6 +476,9 @@ impl BridgePlanStep {
                 source_device_ref, ..
             }
             | Self::Transfer {
+                source_device_ref, ..
+            }
+            | Self::Execute {
                 source_device_ref, ..
             } => source_device_ref.as_deref(),
         }
@@ -499,12 +525,18 @@ pub(crate) enum ComposedFilePlanBlock {
     },
     Transform {
         execution_device_ref: String,
-        intent: String,
+        target_revision: LogicalObjectRevision,
+        modification_intent: String,
     },
     Transfer {
         source_device_ref: String,
         destination_device_ref: String,
         landing: ComposedTransferLanding,
+    },
+    Execute {
+        execution_device_ref: String,
+        target_revision: LogicalObjectRevision,
+        execution_intent: String,
     },
 }
 
@@ -648,21 +680,19 @@ pub(crate) fn build_composed_file_revision(
     let matches_bridge =
         |device: &str| device == requesting_device_ref || device == selected_device_ref;
     let downstream_exists = blocks.len() > 1;
-    let has_transform = blocks
-        .iter()
-        .any(|block| matches!(block, ComposedFilePlanBlock::Transform { .. }));
     let mut steps = Vec::with_capacity(blocks.len());
     let mut explanations = Vec::with_capacity(blocks.len());
     let mut current_slot: Option<(String, ObjectContract)> = None;
     let mut current_device: Option<String> = None;
+    let mut current_revision: Option<u64> = None;
     let mut previous_step: Option<String> = None;
-    let mut transform_count = 0_usize;
 
     for (index, block) in blocks.into_iter().enumerate() {
         let step_id = match &block {
             ComposedFilePlanBlock::Search { .. } => "search".to_owned(),
-            ComposedFilePlanBlock::Transform { .. } => "transform".to_owned(),
+            ComposedFilePlanBlock::Transform { .. } => format!("transform-{index}"),
             ComposedFilePlanBlock::Transfer { .. } => format!("transfer-{index}"),
+            ComposedFilePlanBlock::Execute { .. } => format!("execute-{index}"),
         };
         let depends_on = previous_step.iter().cloned().collect::<Vec<_>>();
         match block {
@@ -691,13 +721,6 @@ pub(crate) fn build_composed_file_revision(
                     return invalid_revision(
                         "Bridge Plan Search needs a filename or file description.",
                     );
-                }
-                if has_transform
-                    && extensions
-                        .iter()
-                        .any(|extension| extension.eq_ignore_ascii_case("pdf"))
-                {
-                    return invalid_revision("Extract readable text does not accept PDF input.");
                 }
                 let extensions = extensions
                     .into_iter()
@@ -752,6 +775,7 @@ pub(crate) fn build_composed_file_revision(
                 if downstream_exists {
                     current_slot = Some(("selected_file".into(), object));
                     current_device = Some(execution_device_ref.clone());
+                    current_revision = Some(1);
                 }
                 explanations.push(StepExplanation {
                     step_id: step_id.clone(),
@@ -769,17 +793,12 @@ pub(crate) fn build_composed_file_revision(
             }
             ComposedFilePlanBlock::Transform {
                 execution_device_ref,
-                intent,
+                target_revision,
+                modification_intent,
             } => {
-                transform_count += 1;
-                if transform_count > 1 {
+                if !matches_bridge(&execution_device_ref) {
                     return invalid_revision(
-                        "The current readable-text capability supports one Transform per plan.",
-                    );
-                }
-                if intent != "extract readable text" || !matches_bridge(&execution_device_ref) {
-                    return invalid_revision(
-                        "The composed Transform capability or execution device is unsupported.",
+                        "The composed Transform execution device is outside this Bridge.",
                     );
                 }
                 let (input_slot, input_contract) = current_slot.clone().ok_or_else(|| {
@@ -788,51 +807,67 @@ pub(crate) fn build_composed_file_revision(
                 if current_device.as_deref() != Some(execution_device_ref.as_str()) {
                     return invalid_revision("Transform input is not local to its approved execution device; add an explicit Transfer first.");
                 }
+                if current_revision != Some(target_revision.revision)
+                    || target_revision.logical_object_id != "selected_file"
+                {
+                    return invalid_revision(
+                        "Transform must consume the current logical object revision.",
+                    );
+                }
+                let modification_intent = RawUserGoal::from(modification_intent);
+                modification_intent.validate("Transform modification intent")?;
+                let output_revision = LogicalObjectRevision {
+                    logical_object_id: target_revision.logical_object_id.clone(),
+                    revision: target_revision.revision.checked_add(1).ok_or_else(|| {
+                        AppError::InvalidInput("Transform revision overflowed.".into())
+                    })?,
+                };
+                let output_slot_id = format!("transformed_file_{index}");
                 let output_contract = ObjectContract {
-                    object_type: GeneratedUserVisibleText::from_semantic("file"),
-                    media_types: vec![GeneratedUserVisibleText::from_semantic("text/plain")],
+                    object_type: input_contract.object_type.clone(),
+                    media_types: input_contract.media_types.clone(),
                     user_visible_description: GeneratedUserVisibleText::from_semantic(
-                        "readable text produced from the selected file",
+                        "the same logical file after the reviewed modification intent",
                     ),
                 };
                 steps.push(BridgePlanStep::Transform {
                     step_id: step_id.clone(),
                     depends_on,
                     input_slots: vec![PlanSlot {
-                        slot_id: input_slot,
+                        slot_id: input_slot.clone(),
                         object: input_contract.clone(),
                         cardinality: SlotCardinality::One,
                     }],
                     output_slots: vec![PlanSlot {
-                        slot_id: "transformed_file".into(),
+                        slot_id: output_slot_id.clone(),
                         object: output_contract.clone(),
                         cardinality: SlotCardinality::One,
                     }],
                     source_device_ref: Some(execution_device_ref.clone()),
                     execution_device_ref: execution_device_ref.clone(),
                     user_visible_action: GeneratedUserVisibleText::from_semantic(format!(
-                        "Extract readable text on {execution_device_ref}."
+                        "Authorize the reviewed modification intent on {execution_device_ref}."
                     )),
-                    capability_requirements: vec![CapabilityRequirement {
-                        category: GeneratedUserVisibleText::from_semantic("object_transform"),
-                        user_visible_requirement: GeneratedUserVisibleText::from_semantic(
-                            "Use the bounded local readable-text capability.",
-                        ),
-                    }],
-                    failure_behavior: StepFailureBehavior::StopPlan,
-                    intent: TransformIntentText::from(intent),
+                    capability_requirements: Vec::new(),
+                    failure_behavior: StepFailureBehavior::RequireNewRevision,
+                    target: ObjectSelectionRule::FromSlot {
+                        slot_id: input_slot,
+                    },
+                    input_revision: target_revision,
+                    output_revision: output_revision.clone(),
+                    modification_intent,
                     expected_input: input_contract,
-                    expected_output: output_contract.clone(),
                 });
-                current_slot = Some(("transformed_file".into(), output_contract));
+                current_slot = Some((output_slot_id, output_contract));
                 current_device = Some(execution_device_ref.clone());
+                current_revision = Some(output_revision.revision);
                 explanations.push(StepExplanation {
                     step_id: step_id.clone(),
                     action_summary: GeneratedUserVisibleText::from_semantic(format!(
-                        "Extract readable text on {execution_device_ref}."
+                        "Modify the selected file on {execution_device_ref}."
                     )),
                     expected_result: GeneratedUserVisibleText::from_semantic(
-                        "A private readable-text result remains on the approved execution device.",
+                        "If a future Agent implementation performs the reviewed intent, the same logical file advances one revision without moving. This step is not currently executable.",
                     ),
                 });
             }
@@ -935,6 +970,63 @@ pub(crate) fn build_composed_file_revision(
                     expected_result: GeneratedUserVisibleText::from_semantic(if pipeline { "A one-use private object is local to the following approved step." } else { "The approved final destination receives the object." }),
                 });
             }
+            ComposedFilePlanBlock::Execute {
+                execution_device_ref,
+                target_revision,
+                execution_intent,
+            } => {
+                if !matches_bridge(&execution_device_ref) {
+                    return invalid_revision(
+                        "The composed Execute execution device is outside this Bridge.",
+                    );
+                }
+                let (input_slot, input_contract) = current_slot.clone().ok_or_else(|| {
+                    AppError::InvalidInput("Execute needs a local input object.".into())
+                })?;
+                if current_device.as_deref() != Some(execution_device_ref.as_str()) {
+                    return invalid_revision("Execute input is not local to its approved execution device; add an explicit Transfer first.");
+                }
+                if current_revision != Some(target_revision.revision)
+                    || target_revision.logical_object_id != "selected_file"
+                {
+                    return invalid_revision(
+                        "Execute must consume the current logical object revision.",
+                    );
+                }
+                let execution_intent = RawUserGoal::from(execution_intent);
+                execution_intent.validate("Execute execution intent")?;
+                steps.push(BridgePlanStep::Execute {
+                    step_id: step_id.clone(),
+                    depends_on,
+                    input_slots: vec![PlanSlot {
+                        slot_id: input_slot.clone(),
+                        object: input_contract,
+                        cardinality: SlotCardinality::One,
+                    }],
+                    output_slots: Vec::new(),
+                    source_device_ref: Some(execution_device_ref.clone()),
+                    execution_device_ref: execution_device_ref.clone(),
+                    user_visible_action: GeneratedUserVisibleText::from_semantic(format!(
+                        "Authorize the reviewed execution intent on {execution_device_ref}."
+                    )),
+                    capability_requirements: Vec::new(),
+                    failure_behavior: StepFailureBehavior::RequireNewRevision,
+                    target: ObjectSelectionRule::FromSlot {
+                        slot_id: input_slot,
+                    },
+                    target_revision,
+                    execution_intent,
+                });
+                explanations.push(StepExplanation {
+                    step_id: step_id.clone(),
+                    action_summary: GeneratedUserVisibleText::from_semantic(format!(
+                        "Authorize execution intent on {execution_device_ref}."
+                    )),
+                    expected_result: GeneratedUserVisibleText::from_semantic(
+                        "The reviewed execution intent remains part of the immutable Plan, but is not currently executable without a future Agent implementation.",
+                    ),
+                });
+            }
         }
         previous_step = Some(step_id);
     }
@@ -958,6 +1050,7 @@ pub(crate) fn build_composed_file_revision(
             StepOperation::Search => "Search",
             StepOperation::Transform => "Transform",
             StepOperation::Transfer => "Transfer",
+            StepOperation::Execute => "Execute",
         })
         .collect::<Vec<_>>()
         .join(" → ");
@@ -988,6 +1081,17 @@ pub(crate) fn build_composed_file_revision(
     validate_revision(&revision)?;
     revision.revision_hash = canonical_revision_hash(&revision)?;
     Ok(revision)
+}
+
+/// Pastey Core can review these primitives, but it must not create attempt
+/// authority until a future Agent implementation can faithfully execute them.
+pub(crate) fn framework_execution_unavailable(revision: &BridgePlanRevision) -> bool {
+    revision.steps.iter().any(|step| {
+        matches!(
+            step,
+            BridgePlanStep::Transform { .. } | BridgePlanStep::Execute { .. }
+        )
+    })
 }
 
 /// Builds the supported file-based Bridge Plan shapes from bounded product
@@ -1256,36 +1360,6 @@ pub(crate) struct StepExecutionProjection {
     pub(crate) step_id: String,
     pub(crate) state: StepExecutionState,
     pub(crate) updated_at: i64,
-}
-
-#[derive(Clone, Debug)]
-#[cfg(test)]
-struct EphemeralStepAuthority {
-    authority_id: String,
-    bridge_id: String,
-    plan_id: String,
-    revision_id: String,
-    revision_hash: String,
-    approval_id: String,
-    attempt_id: String,
-    step_id: String,
-    operation: StepOperation,
-    source_device_ref: Option<String>,
-    execution_device_ref: String,
-    destination_device_ref: Option<String>,
-    input_slot_ids: Vec<String>,
-    output_slot_ids: Vec<String>,
-    object_selection_digest: String,
-    transform_contract_digest: String,
-    transfer_destination_digest: String,
-    expires_at: i64,
-    consumed: bool,
-}
-
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct EphemeralStepAuthorityStore {
-    grants: Mutex<HashMap<String, EphemeralStepAuthority>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1708,6 +1782,13 @@ fn canonicalize_step(step: &mut BridgePlanStep) {
             output_slots,
             capability_requirements,
             ..
+        }
+        | BridgePlanStep::Execute {
+            depends_on,
+            input_slots,
+            output_slots,
+            capability_requirements,
+            ..
         } => (
             depends_on,
             input_slots,
@@ -1734,13 +1815,8 @@ fn canonicalize_step(step: &mut BridgePlanStep) {
                 selection.allowed_object.media_types.sort();
             }
         }
-        BridgePlanStep::Transform {
-            expected_input,
-            expected_output,
-            ..
-        } => {
+        BridgePlanStep::Transform { expected_input, .. } => {
             expected_input.media_types.sort();
-            expected_output.media_types.sort();
         }
         BridgePlanStep::Transfer {
             source: ObjectSelectionRule::FutureUserSelection { object, .. },
@@ -1787,12 +1863,11 @@ fn step_output_device(step: &BridgePlanStep) -> AppResult<&str> {
             TransferDestination::PipelineHandoff { device_ref }
             | TransferDestination::RequestingDevice { device_ref }
             | TransferDestination::SelectedDevice { device_ref }
-            | TransferDestination::UserSelectedLocation { device_ref, .. }
-            | TransferDestination::LeaveOnProducingDevice { device_ref } => Ok(device_ref),
+            | TransferDestination::UserSelectedLocation { device_ref, .. } => Ok(device_ref),
         },
-        BridgePlanStep::Search { .. } | BridgePlanStep::Transform { .. } => {
-            Ok(step.execution_device())
-        }
+        BridgePlanStep::Search { .. }
+        | BridgePlanStep::Transform { .. }
+        | BridgePlanStep::Execute { .. } => Ok(step.execution_device()),
     }
 }
 
@@ -1819,6 +1894,7 @@ pub(crate) fn validate_revision(revision: &BridgePlanRevision) -> AppResult<()> 
     let mut steps = HashSet::new();
     let mut output_owner = HashMap::new();
     let mut output_location: HashMap<&str, String> = HashMap::new();
+    let mut logical_revisions: HashMap<String, LogicalObjectRevision> = HashMap::new();
     for step in &revision.steps {
         id(step.id(), "step id")?;
         if !steps.insert(step.id()) {
@@ -1917,6 +1993,13 @@ pub(crate) fn validate_revision(revision: &BridgePlanRevision) -> AppResult<()> 
                 step.execution_device().to_owned(),
             );
             validate_contract(&selection.allowed_object)?;
+            logical_revisions.insert(
+                selection.downstream_slot_id.clone(),
+                LogicalObjectRevision {
+                    logical_object_id: "selected_file".into(),
+                    revision: 1,
+                },
+            );
         }
         if let BridgePlanStep::Search {
             selection: None, ..
@@ -1965,7 +2048,9 @@ pub(crate) fn validate_revision(revision: &BridgePlanRevision) -> AppResult<()> 
             })?;
             if matches!(
                 step,
-                BridgePlanStep::Transform { .. } | BridgePlanStep::Transfer { .. }
+                BridgePlanStep::Transform { .. }
+                    | BridgePlanStep::Transfer { .. }
+                    | BridgePlanStep::Execute { .. }
             ) && step.source_device() != Some(location.as_str())
             {
                 return invalid("Bridge Plan step consumes an object at the wrong device.");
@@ -1978,6 +2063,51 @@ pub(crate) fn validate_revision(revision: &BridgePlanRevision) -> AppResult<()> 
         {
             if !step.inputs().iter().any(|input| input.slot_id == *slot_id) {
                 return invalid("Bridge Plan Transfer source slot is not an input slot.");
+            }
+        }
+        if let BridgePlanStep::Transform {
+            target: ObjectSelectionRule::FromSlot { slot_id },
+            input_revision,
+            output_revision,
+            output_slots,
+            ..
+        } = step
+        {
+            if !step.inputs().iter().any(|input| input.slot_id == *slot_id) {
+                return invalid("Bridge Plan action target slot is not an input slot.");
+            }
+            if logical_revisions.get(slot_id) != Some(input_revision) {
+                return invalid(
+                    "Bridge Plan Transform consumes the wrong logical object revision.",
+                );
+            }
+            for output in output_slots {
+                logical_revisions.insert(output.slot_id.clone(), output_revision.clone());
+            }
+        }
+        if let BridgePlanStep::Execute {
+            target: ObjectSelectionRule::FromSlot { slot_id },
+            target_revision,
+            ..
+        } = step
+        {
+            if !step.inputs().iter().any(|input| input.slot_id == *slot_id) {
+                return invalid("Bridge Plan action target slot is not an input slot.");
+            }
+            if logical_revisions.get(slot_id) != Some(target_revision) {
+                return invalid("Bridge Plan Execute consumes the wrong logical object revision.");
+            }
+        }
+        if let BridgePlanStep::Transfer {
+            source: ObjectSelectionRule::FromSlot { slot_id },
+            output_slots,
+            ..
+        } = step
+        {
+            if let Some(revision) = logical_revisions.get(slot_id).cloned() {
+                for output in output_slots {
+                    logical_revisions.insert(output.slot_id.clone(), revision.clone());
+                }
             }
         }
     }
@@ -2024,14 +2154,21 @@ fn validate_step_text(step: &BridgePlanStep) -> AppResult<()> {
         BridgePlanStep::Transform {
             user_visible_action,
             capability_requirements,
-            intent,
+            input_revision,
+            output_revision,
+            modification_intent,
             expected_input,
-            expected_output,
             ..
         } => {
-            intent.validate("Transform intent")?;
+            validate_logical_revision(input_revision, "Transform input revision")?;
+            validate_logical_revision(output_revision, "Transform output revision")?;
+            if input_revision.logical_object_id != output_revision.logical_object_id
+                || output_revision.revision != input_revision.revision.saturating_add(1)
+            {
+                return invalid("Bridge Plan Transform revision dependency is invalid.");
+            }
+            modification_intent.validate("Transform modification intent")?;
             validate_contract(expected_input)?;
-            validate_contract(expected_output)?;
             (user_visible_action, capability_requirements)
         }
         BridgePlanStep::Transfer {
@@ -2039,6 +2176,17 @@ fn validate_step_text(step: &BridgePlanStep) -> AppResult<()> {
             capability_requirements,
             ..
         } => (user_visible_action, capability_requirements),
+        BridgePlanStep::Execute {
+            user_visible_action,
+            capability_requirements,
+            target_revision,
+            execution_intent,
+            ..
+        } => {
+            validate_logical_revision(target_revision, "Execute target revision")?;
+            execution_intent.validate("Execute execution intent")?;
+            (user_visible_action, capability_requirements)
+        }
     };
     action.validate("step action")?;
     if requirements.len() > MAX_CAPABILITY_REQUIREMENTS {
@@ -2063,6 +2211,14 @@ fn validate_step_text(step: &BridgePlanStep) -> AppResult<()> {
         != requirements.len()
     {
         return invalid("Bridge Plan step has duplicate capability requirements.");
+    }
+    Ok(())
+}
+
+fn validate_logical_revision(revision: &LogicalObjectRevision, field: &str) -> AppResult<()> {
+    id(&revision.logical_object_id, field)?;
+    if revision.revision == 0 {
+        return invalid("Bridge Plan logical object revision must be positive.");
     }
     Ok(())
 }
@@ -2116,7 +2272,6 @@ fn validate_destination(
             user_visible_location_scope.validate("user-selected location scope")?;
             device_ref
         }
-        TransferDestination::LeaveOnProducingDevice { device_ref } => device_ref,
     };
     if !matches_device(device, revision) {
         return invalid("Bridge Plan v1 Transfer destination is outside its Bridge.");
@@ -2284,11 +2439,6 @@ impl<'a> BridgePlanStore<'a> {
         tx.commit()?;
         Ok(())
     }
-    #[cfg(test)]
-    pub(crate) fn get_plan(&self, plan_id: &str) -> AppResult<BridgePlan> {
-        let conn = self.connection()?;
-        conn.query_row("SELECT plan_id, bridge_id, requesting_device_ref, created_at FROM bridge_plans WHERE plan_id = ?1", [plan_id], |row| Ok(BridgePlan { plan_id: row.get(0)?, bridge_id: row.get(1)?, requesting_device_ref: row.get(2)?, created_at: row.get(3)? })).optional()?.ok_or_else(|| AppError::NotFound("Bridge Plan not found.".into()))
-    }
     pub(crate) fn list_attempt(&self, attempt_id: &str) -> AppResult<AttemptRecord> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
@@ -2382,41 +2532,6 @@ impl<'a> BridgePlanStore<'a> {
         tx.commit()?;
         Ok(())
     }
-    #[cfg(test)]
-    pub(crate) fn append_alternative_revision(
-        &self,
-        base_revision_id: &str,
-        mut alternative: BridgePlanRevision,
-        created_at: i64,
-    ) -> AppResult<BridgePlanRevision> {
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        let base = revision_row_tx(&tx, base_revision_id)?;
-        ensure_active_bridge_tx(&tx, &base.revision.bridge_id)?;
-        if alternative.plan_id != base.revision.plan_id
-            || alternative.bridge_id != base.revision.bridge_id
-            || alternative.revision_id == base_revision_id
-            || alternative.revision_number <= base.revision.revision_number
-        {
-            return Err(AppError::InvalidInput(
-                "Bridge Plan alternative does not derive from its base revision.".into(),
-            ));
-        }
-        if alternative
-            .alternative
-            .as_ref()
-            .map(|proposal| proposal.based_on_revision_id.as_str())
-            != Some(base_revision_id)
-        {
-            return Err(AppError::InvalidInput(
-                "Bridge Plan alternative must explain its base revision.".into(),
-            ));
-        }
-        alternative.revision_hash = canonical_revision_hash(&alternative)?;
-        tx.execute("INSERT INTO bridge_plan_revisions (revision_id, plan_id, bridge_id, revision_number, revision_hash, created_at, state, revision_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'proposed', ?7)", params![alternative.revision_id, alternative.plan_id, alternative.bridge_id, alternative.revision_number, alternative.revision_hash, created_at, json(&alternative)?])?;
-        tx.commit()?;
-        Ok(alternative)
-    }
     pub(crate) fn transition_revision(
         &self,
         revision_id: &str,
@@ -2501,95 +2616,6 @@ impl<'a> BridgePlanStore<'a> {
         )?;
         let state = ApprovalState::Valid;
         tx.execute("INSERT INTO bridge_plan_approvals (approval_id, plan_id, revision_id, bridge_id, created_at, state, approval_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![approval.approval_id, approval.plan_id, approval.revision_id, approval.bridge_id, created_at, state.as_str(), json(approval)?])?;
-        tx.commit()?;
-        Ok(())
-    }
-    #[cfg(test)]
-    pub(crate) fn transition_approval(
-        &self,
-        approval_id: &str,
-        next: ApprovalState,
-    ) -> AppResult<()> {
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        let approval = approval_row_tx(&tx, approval_id)?;
-        ensure_active_bridge_tx(&tx, &approval.approval.bridge_id)?;
-        let current = approval_state_tx(&tx, approval_id)?;
-        if !legal_approval(&current, &next) {
-            return invalid("Illegal Bridge Plan approval transition.");
-        }
-        let changed = tx.execute(
-            "UPDATE bridge_plan_approvals SET state = ?1 WHERE approval_id = ?2 AND state = ?3",
-            params![next.as_str(), approval_id, current.as_str()],
-        )?;
-        if changed != 1 {
-            return invalid("Bridge Plan approval transition became stale.");
-        }
-        tx.commit()?;
-        Ok(())
-    }
-    #[cfg(test)]
-    pub(crate) fn consume_approval_create_attempt(
-        &self,
-        attempt: &BridgePlanAttempt,
-        created_at: i64,
-    ) -> AppResult<()> {
-        validate_attempt(attempt)?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        ensure_active_bridge_tx(&tx, &attempt.bridge_id)?;
-        let approval = approval_row_tx(&tx, &attempt.approval_id)?;
-        let revision = revision_row_tx(&tx, &attempt.revision_id)?;
-        if approval.approval.plan_id != attempt.plan_id
-            || approval.approval.revision_id != attempt.revision_id
-            || approval.approval.revision_hash != attempt.revision_hash
-            || approval.approval.bridge_id != attempt.bridge_id
-            || revision.revision.revision_hash != attempt.revision_hash
-        {
-            return invalid("Bridge Plan attempt does not match its approval.");
-        }
-        validate_graph_projection(&attempt.graph_projection, &revision.revision)?;
-        if approval.state == ApprovalState::Valid && approval.approval.expires_at <= created_at {
-            let changed = tx.execute(
-                "UPDATE bridge_plan_approvals SET state = 'expired' WHERE approval_id = ?1 AND state = 'valid'",
-                [attempt.approval_id.as_str()],
-            )?;
-            if changed != 1 {
-                return invalid("Bridge Plan approval cannot be expired.");
-            }
-            tx.commit()?;
-            return Err(AppError::InvalidInput(
-                "Bridge Plan approval expired.".into(),
-            ));
-        }
-        if approval.state != ApprovalState::Valid {
-            return Err(AppError::InvalidInput(
-                "Bridge Plan approval cannot be consumed.".into(),
-            ));
-        }
-        limit_tx(
-            &tx,
-            "SELECT COUNT(*) FROM bridge_plan_attempts WHERE revision_id = ?1",
-            &attempt.revision_id,
-            MAX_ATTEMPTS_PER_REVISION,
-            "too many attempts for this revision",
-        )?;
-        let consumed = tx.execute("UPDATE bridge_plan_approvals SET state = 'consumed' WHERE approval_id = ?1 AND state = 'valid'", [attempt.approval_id.as_str()])?;
-        if consumed != 1 {
-            return invalid("Bridge Plan approval cannot be consumed.");
-        }
-        tx.execute("INSERT INTO bridge_plan_attempts (attempt_id, approval_id, plan_id, revision_id, bridge_id, created_at, state, attempt_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7)", params![attempt.attempt_id, attempt.approval_id, attempt.plan_id, attempt.revision_id, attempt.bridge_id, created_at, json(attempt)?])?;
-        for node in &attempt.graph_projection.nodes {
-            let state = if node.depends_on_node_ids.is_empty() {
-                StepExecutionState::Eligible
-            } else {
-                StepExecutionState::Pending
-            };
-            tx.execute(
-                "INSERT INTO bridge_plan_attempt_steps (attempt_id, step_id, state, updated_at) VALUES (?1, ?2, ?3, ?4)",
-                params![attempt.attempt_id, node.step_id, state.as_str(), created_at],
-            )?;
-        }
         tx.commit()?;
         Ok(())
     }
@@ -2816,235 +2842,6 @@ impl<'a> BridgePlanStore<'a> {
     }
 }
 
-#[cfg(test)]
-impl EphemeralStepAuthorityStore {
-    pub(crate) fn derive(
-        &self,
-        store: &BridgePlanStore<'_>,
-        attempt_id: &str,
-        step_id: &str,
-        now: i64,
-        expires_at: i64,
-    ) -> AppResult<String> {
-        if expires_at <= now {
-            return Err(AppError::InvalidInput(
-                "Bridge Plan step authority expiry is invalid.".into(),
-            ));
-        }
-        let attempt = store.list_attempt(attempt_id)?;
-        if matches!(
-            attempt.state,
-            AttemptState::Interrupted
-                | AttemptState::Completed
-                | AttemptState::Failed
-                | AttemptState::Cancelled
-                | AttemptState::Burned
-        ) {
-            return Err(AppError::InvalidInput(
-                "Bridge Plan attempt is not live.".into(),
-            ));
-        }
-        let step = attempt
-            .steps
-            .iter()
-            .find(|projection| projection.step_id == step_id)
-            .ok_or_else(|| AppError::NotFound("Bridge Plan step not found.".into()))?;
-        if step.state != StepExecutionState::Eligible {
-            return Err(AppError::InvalidInput(
-                "Bridge Plan step is not eligible.".into(),
-            ));
-        }
-        ensure_step_dependencies_completed(&attempt, step_id)?;
-        let node = attempt
-            .attempt
-            .graph_projection
-            .nodes
-            .iter()
-            .find(|node| node.step_id == step_id)
-            .ok_or_else(|| AppError::NotFound("Bridge Plan graph step not found.".into()))?;
-        store.transition_step(attempt_id, step_id, StepExecutionState::Authorized, now)?;
-        let authority_id = format!("ephemeral-step-authority:{}", uuid::Uuid::new_v4());
-        let digest = |value: Value| {
-            format!(
-                "sha256:{}",
-                blake3::hash(canonical_json(&value).as_bytes()).to_hex()
-            )
-        };
-        let authority = EphemeralStepAuthority {
-            authority_id: authority_id.clone(),
-            bridge_id: attempt.attempt.bridge_id.clone(),
-            plan_id: attempt.attempt.plan_id.clone(),
-            revision_id: attempt.attempt.revision_id.clone(),
-            revision_hash: attempt.attempt.revision_hash.clone(),
-            approval_id: attempt.attempt.approval_id.clone(),
-            attempt_id: attempt_id.into(),
-            step_id: step_id.into(),
-            operation: node.operation.clone(),
-            source_device_ref: node.source_device_ref.clone(),
-            execution_device_ref: node.execution_device_ref.clone(),
-            destination_device_ref: authority_destination_device(&node.step),
-            input_slot_ids: node
-                .input_slots
-                .iter()
-                .map(|slot| slot.slot_id.clone())
-                .collect(),
-            output_slot_ids: node
-                .output_slots
-                .iter()
-                .map(|slot| slot.slot_id.clone())
-                .collect(),
-            object_selection_digest: digest(
-                serde_json::to_value(&node.step).expect("semantic step serializes"),
-            ),
-            transform_contract_digest: digest(
-                serde_json::to_value(&node.step).expect("semantic step serializes"),
-            ),
-            transfer_destination_digest: digest(
-                serde_json::to_value(&node.step).expect("semantic step serializes"),
-            ),
-            expires_at,
-            consumed: false,
-        };
-        self.grants
-            .lock()
-            .map_err(|_| {
-                AppError::InvalidInput("Bridge Plan authority store is unavailable.".into())
-            })?
-            .insert(authority_id.clone(), authority);
-        Ok(authority_id)
-    }
-    pub(crate) fn consume(
-        &self,
-        store: &BridgePlanStore<'_>,
-        authority_id: &str,
-        now: i64,
-    ) -> AppResult<()> {
-        let mut grants = self.grants.lock().map_err(|_| {
-            AppError::InvalidInput("Bridge Plan authority store is unavailable.".into())
-        })?;
-        let authority = grants
-            .get_mut(authority_id)
-            .ok_or_else(|| AppError::NotFound("Bridge Plan authority not found.".into()))?;
-        if authority.consumed || authority.expires_at <= now {
-            return invalid("Bridge Plan authority is unavailable.");
-        }
-        let attempt = store.list_attempt(&authority.attempt_id)?;
-        let revision = store.get_revision(&authority.revision_id)?;
-        if attempt.attempt.bridge_id != authority.bridge_id
-            || attempt.attempt.plan_id != authority.plan_id
-            || attempt.attempt.revision_id != authority.revision_id
-            || attempt.attempt.revision_hash != authority.revision_hash
-            || attempt.attempt.approval_id != authority.approval_id
-            || revision.revision.revision_hash != authority.revision_hash
-            || validate_graph_projection(&attempt.attempt.graph_projection, &revision.revision)
-                .is_err()
-            || matches!(
-                attempt.state,
-                AttemptState::Interrupted
-                    | AttemptState::Completed
-                    | AttemptState::Failed
-                    | AttemptState::Cancelled
-                    | AttemptState::Burned
-            )
-        {
-            return invalid("Bridge Plan authority is no longer valid.");
-        }
-        if attempt
-            .steps
-            .iter()
-            .find(|step| step.step_id == authority.step_id)
-            .map(|step| &step.state)
-            != Some(&StepExecutionState::Authorized)
-        {
-            return invalid("Bridge Plan authority step is no longer authorized.");
-        }
-        let node = attempt
-            .attempt
-            .graph_projection
-            .nodes
-            .iter()
-            .find(|node| node.step_id == authority.step_id)
-            .ok_or_else(|| AppError::NotFound("Bridge Plan graph step not found.".into()))?;
-        let digest = |value: Value| {
-            format!(
-                "sha256:{}",
-                blake3::hash(canonical_json(&value).as_bytes()).to_hex()
-            )
-        };
-        if authority.authority_id != authority_id
-            || authority.operation != node.operation
-            || authority.source_device_ref != node.source_device_ref
-            || authority.execution_device_ref != node.execution_device_ref
-            || authority.destination_device_ref != authority_destination_device(&node.step)
-            || authority.input_slot_ids
-                != node
-                    .input_slots
-                    .iter()
-                    .map(|slot| slot.slot_id.clone())
-                    .collect::<Vec<_>>()
-            || authority.output_slot_ids
-                != node
-                    .output_slots
-                    .iter()
-                    .map(|slot| slot.slot_id.clone())
-                    .collect::<Vec<_>>()
-            || authority.object_selection_digest
-                != digest(serde_json::to_value(&node.step).expect("semantic step serializes"))
-            || authority.transform_contract_digest
-                != digest(serde_json::to_value(&node.step).expect("semantic step serializes"))
-            || authority.transfer_destination_digest
-                != digest(serde_json::to_value(&node.step).expect("semantic step serializes"))
-        {
-            grants.remove(authority_id);
-            return invalid("Bridge Plan authority binding no longer matches its approved step.");
-        }
-        authority.consumed = true;
-        Ok(())
-    }
-    fn purge_attempt(&self, attempt_id: &str) {
-        if let Ok(mut grants) = self.grants.lock() {
-            grants.retain(|_, authority| authority.attempt_id != attempt_id);
-        }
-    }
-    pub(crate) fn transition_attempt(
-        &self,
-        store: &BridgePlanStore<'_>,
-        attempt_id: &str,
-        next: AttemptState,
-        at: i64,
-    ) -> AppResult<()> {
-        store.transition_attempt(attempt_id, next.clone(), at)?;
-        if matches!(
-            next,
-            AttemptState::Interrupted
-                | AttemptState::Completed
-                | AttemptState::Failed
-                | AttemptState::Cancelled
-                | AttemptState::Burned
-        ) {
-            self.purge_attempt(attempt_id);
-        }
-        Ok(())
-    }
-    pub(crate) fn transition_step(
-        &self,
-        store: &BridgePlanStore<'_>,
-        attempt_id: &str,
-        step_id: &str,
-        next: StepExecutionState,
-        at: i64,
-    ) -> AppResult<()> {
-        store.transition_step(attempt_id, step_id, next.clone(), at)?;
-        if matches!(
-            next,
-            StepExecutionState::Failed | StepExecutionState::Cancelled
-        ) {
-            self.purge_attempt(attempt_id);
-        }
-        Ok(())
-    }
-}
-
 pub(crate) fn reconcile_startup(paths: &AppPaths, now: i64) -> AppResult<usize> {
     let mut conn = connection(paths)?;
     let tx = conn.transaction()?;
@@ -3235,17 +3032,6 @@ fn revision_state_tx(tx: &Transaction<'_>, revision_id: &str) -> AppResult<Revis
     .and_then(|value| revision_state_from(&value))
     .ok_or_else(|| AppError::NotFound("Bridge Plan revision not found.".into()))
 }
-#[cfg(test)]
-fn approval_state_tx(tx: &Transaction<'_>, approval_id: &str) -> AppResult<ApprovalState> {
-    tx.query_row(
-        "SELECT state FROM bridge_plan_approvals WHERE approval_id = ?1",
-        [approval_id],
-        |row| row.get::<_, String>(0),
-    )
-    .optional()?
-    .and_then(|value| approval_state_from(&value))
-    .ok_or_else(|| AppError::NotFound("Bridge Plan approval not found.".into()))
-}
 fn plan_state_from(value: &str) -> Option<BridgePlanState> {
     match value {
         "draft" => Some(BridgePlanState::Draft),
@@ -3319,28 +3105,6 @@ fn legal_revision(current: &RevisionState, next: &RevisionState) -> bool {
         )
     )
 }
-#[cfg(test)]
-fn legal_approval(current: &ApprovalState, next: &ApprovalState) -> bool {
-    matches!(
-        (current, next),
-        (
-            ApprovalState::AwaitingReceiver,
-            ApprovalState::Expired | ApprovalState::Revoked | ApprovalState::Burned
-        ) | (
-            ApprovalState::Valid,
-            ApprovalState::Consumed
-                | ApprovalState::Expired
-                | ApprovalState::Revoked
-                | ApprovalState::Burned
-        ) | (
-            ApprovalState::Denied
-                | ApprovalState::Expired
-                | ApprovalState::Revoked
-                | ApprovalState::Consumed,
-            ApprovalState::Burned
-        )
-    )
-}
 fn legal_attempt(current: &AttemptState, next: &AttemptState) -> bool {
     matches!(
         (current, next),
@@ -3386,19 +3150,6 @@ fn legal_step(current: &StepExecutionState, next: &StepExecutionState) -> bool {
                 | StepExecutionState::Cancelled
         )
     )
-}
-#[cfg(test)]
-fn authority_destination_device(step: &BridgePlanStep) -> Option<String> {
-    match step {
-        BridgePlanStep::Transfer { destination, .. } => Some(match destination {
-            TransferDestination::PipelineHandoff { device_ref }
-            | TransferDestination::RequestingDevice { device_ref }
-            | TransferDestination::SelectedDevice { device_ref }
-            | TransferDestination::UserSelectedLocation { device_ref, .. }
-            | TransferDestination::LeaveOnProducingDevice { device_ref } => device_ref.clone(),
-        }),
-        _ => None,
-    }
 }
 fn ensure_step_dependencies_completed(attempt: &AttemptRecord, step_id: &str) -> AppResult<()> {
     let node = attempt
@@ -3690,2166 +3441,286 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::sync::{Arc, Barrier};
 
-    fn paths() -> AppPaths {
-        let root =
-            std::env::temp_dir().join(format!("pastey-bridge-plan-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        AppPaths {
-            app_data_dir: root.clone(),
-            db_path: root.join("db.sqlite"),
-            payloads_dir: root.join("payloads"),
-            inbox_dir: root.join("inbox"),
-            temp_dir: root.join("temp"),
-            logs_dir: root.join("logs"),
-            config_path: root.join("config.json"),
-        }
-    }
-    fn contract() -> ObjectContract {
-        ObjectContract {
-            object_type: "file".into(),
-            media_types: vec!["text/plain".into(), "text/markdown".into()],
-            user_visible_description: "a matching document".into(),
-        }
-    }
-    fn revision() -> BridgePlanRevision {
-        let search = BridgePlanStep::Search {
-            step_id: "search".into(),
-            depends_on: vec![],
-            input_slots: vec![],
-            output_slots: vec![PlanSlot {
-                slot_id: "found".into(),
-                object: contract(),
-                cardinality: SlotCardinality::Many,
-            }],
-            source_device_ref: Some("selected".into()),
-            execution_device_ref: "selected".into(),
-            user_visible_action: "Search the selected device for matching documents.".into(),
-            capability_requirements: vec![CapabilityRequirement {
-                category: "object_search".into(),
-                user_visible_requirement: "Search approved locations.".into(),
-            }],
-            failure_behavior: StepFailureBehavior::StopPlan,
-            query: SearchIntent {
-                query: "report".into(),
-                extensions: vec!["pdf".into()],
-                safe_scope_labels: vec!["documents".into(), "downloads".into()],
-            },
-            selection: Some(BoundedSearchSelectionRule {
-                source_slot_id: "found".into(),
-                result_set_limit: 10,
-                allowed_object: contract(),
-                downstream_slot_id: "chosen".into(),
-            }),
-        };
-        let transfer = BridgePlanStep::Transfer {
-            step_id: "transfer".into(),
-            depends_on: vec!["search".into()],
-            input_slots: vec![PlanSlot {
-                slot_id: "chosen".into(),
-                object: contract(),
-                cardinality: SlotCardinality::One,
-            }],
-            output_slots: vec![],
-            source_device_ref: Some("selected".into()),
-            execution_device_ref: "selected".into(),
-            user_visible_action: "Send the selected document back to this device.".into(),
-            capability_requirements: vec![CapabilityRequirement {
-                category: "object_transfer".into(),
-                user_visible_requirement: "Transfer the selected result.".into(),
-            }],
-            failure_behavior: StepFailureBehavior::StopPlan,
-            source: ObjectSelectionRule::FromSlot {
-                slot_id: "chosen".into(),
-            },
-            destination: TransferDestination::RequestingDevice {
-                device_ref: "requester".into(),
-            },
-        };
-        let mut revision = BridgePlanRevision {
-            schema_version: "bridge-plan-v1".into(),
-            plan_id: "plan".into(),
-            revision_id: "revision".into(),
-            revision_number: 1,
-            revision_hash: String::new(),
-            bridge_id: "bridge".into(),
-            requesting_device_ref: "requester".into(),
-            selected_device_ref: "selected".into(),
-            original_user_goal: "Find my report and send it here.".into(),
-            presentation: BridgePlanPresentation {
-                title: "Find report".into(),
-                natural_language_plan:
-                    "Search the selected device, let me choose a report, then transfer it here."
-                        .into(),
-                step_explanations: vec![
-                    StepExplanation {
-                        step_id: "search".into(),
-                        action_summary: "Find matching reports.".into(),
-                        expected_result: "A bounded list of matching documents.".into(),
-                    },
-                    StepExplanation {
-                        step_id: "transfer".into(),
-                        action_summary: "Transfer the document here.".into(),
-                        expected_result: "The selected document arrives on this device.".into(),
-                    },
-                ],
-            },
-            expected_outcome: "A selected report is transferred to the requesting device.".into(),
-            search_selection_mode: SearchSelectionMode::BoundedInline,
-            steps: vec![search, transfer],
-            alternative: None,
-        };
-        revision.revision_hash = canonical_revision_hash(&revision).unwrap();
-        revision
-    }
-    fn transform_revision() -> BridgePlanRevision {
-        let mut revision = revision();
-        let transform = BridgePlanStep::Transform {
-            step_id: "transform".into(),
-            depends_on: vec!["search".into()],
-            input_slots: vec![PlanSlot {
-                slot_id: "chosen".into(),
-                object: contract(),
-                cardinality: SlotCardinality::One,
-            }],
-            output_slots: vec![PlanSlot {
-                slot_id: "transformed".into(),
-                object: contract(),
-                cardinality: SlotCardinality::One,
-            }],
-            source_device_ref: Some("selected".into()),
-            execution_device_ref: "selected".into(),
-            user_visible_action: "Summarize the selected document.".into(),
-            capability_requirements: vec![CapabilityRequirement {
-                category: "object_transform".into(),
-                user_visible_requirement: "Transform the selected result.".into(),
-            }],
-            failure_behavior: StepFailureBehavior::StopPlan,
-            intent: "Summarize the selected document.".into(),
-            expected_input: contract(),
-            expected_output: contract(),
-        };
-        if let BridgePlanStep::Transfer {
-            depends_on,
-            input_slots,
-            source,
-            ..
-        } = &mut revision.steps[1]
-        {
-            *depends_on = vec!["transform".into()];
-            input_slots[0].slot_id = "transformed".into();
-            *source = ObjectSelectionRule::FromSlot {
-                slot_id: "transformed".into(),
-            };
-        }
-        revision.steps.insert(1, transform);
-        revision.presentation.step_explanations.insert(
-            1,
-            StepExplanation {
-                step_id: "transform".into(),
-                action_summary: "Summarize the selected document.".into(),
-                expected_result: "A transformed document.".into(),
-            },
-        );
-        revision.revision_hash = canonical_revision_hash(&revision).unwrap();
-        revision
-    }
-    fn plan() -> BridgePlan {
-        BridgePlan {
-            plan_id: "plan".into(),
-            bridge_id: "bridge".into(),
-            requesting_device_ref: "requester".into(),
-            created_at: 10,
-        }
-    }
-    fn approval(revision: &BridgePlanRevision, id: &str) -> BridgePlanApproval {
-        BridgePlanApproval {
-            approval_id: id.into(),
-            plan_id: revision.plan_id.clone(),
-            revision_id: revision.revision_id.clone(),
-            revision_hash: revision.revision_hash.clone(),
-            bridge_id: revision.bridge_id.clone(),
-            requester_device_ref: revision.requesting_device_ref.clone(),
-            selected_device_ref: revision.selected_device_ref.clone(),
-            expires_at: 100,
-        }
-    }
-    fn attempt(revision: &BridgePlanRevision, approval_id: &str, id: &str) -> BridgePlanAttempt {
-        BridgePlanAttempt {
-            attempt_id: id.into(),
-            plan_id: revision.plan_id.clone(),
-            revision_id: revision.revision_id.clone(),
-            revision_hash: revision.revision_hash.clone(),
-            approval_id: approval_id.into(),
-            bridge_id: revision.bridge_id.clone(),
-            graph_projection: compile_graph_projection(revision).unwrap(),
-        }
-    }
-    fn store() -> (AppPaths, BridgePlanStore<'static>) {
-        let paths = Box::new(paths());
-        let leaked = Box::leak(paths);
-        storage::init_database(leaked).unwrap();
-        (leaked.clone(), BridgePlanStore::new(leaked))
-    }
-    fn ready(store: &BridgePlanStore<'_>) -> BridgePlanRevision {
-        let revision = revision();
-        store.create_plan(&plan(), BridgePlanState::Draft).unwrap();
-        store
-            .append_revision(&revision, RevisionState::Proposed, 11)
-            .unwrap();
-        store
-            .transition_plan("plan", BridgePlanState::Open)
-            .unwrap();
-        store
-            .transition_revision("revision", RevisionState::Available)
-            .unwrap();
-        revision
-    }
-
-    #[test]
-    fn canonical_hash_is_deterministic_and_semantic() {
-        let revision = revision();
-        assert_eq!(
-            canonical_revision_hash(&revision).unwrap(),
-            revision.revision_hash
-        );
-        let equivalent = revision.clone();
-        assert_eq!(
-            canonical_revision_hash(&equivalent).unwrap(),
-            revision.revision_hash
-        );
-        let mut reordered = revision.clone();
-        reordered.steps.reverse();
-        assert_ne!(
-            canonical_revision_hash(&reordered).unwrap(),
-            revision.revision_hash
-        );
-        let mut changed = revision.clone();
-        changed.expected_outcome.0.push('!');
-        assert_ne!(
-            canonical_revision_hash(&changed).unwrap(),
-            revision.revision_hash
-        );
-        let mut sets = revision.clone();
-        if let BridgePlanStep::Search { query, .. } = &mut sets.steps[0] {
-            query.safe_scope_labels.reverse();
-        }
-        assert_eq!(
-            canonical_revision_hash(&sets).unwrap(),
-            revision.revision_hash
-        );
-
-        let mut schema = revision.clone();
-        schema.schema_version = "bridge-plan-v2".into();
-        assert_ne!(
-            canonical_revision_hash(&schema).unwrap(),
-            revision.revision_hash
-        );
-        let mut goal = revision.clone();
-        goal.original_user_goal = "Find a different report.".into();
-        assert_ne!(
-            canonical_revision_hash(&goal).unwrap(),
-            revision.revision_hash
-        );
-        let mut presentation = revision.clone();
-        presentation.presentation.title = "Find another report".into();
-        assert_ne!(
-            canonical_revision_hash(&presentation).unwrap(),
-            revision.revision_hash
-        );
-        let mut explanation = revision.clone();
-        explanation.presentation.step_explanations[0].expected_result = "A single result.".into();
-        assert_ne!(
-            canonical_revision_hash(&explanation).unwrap(),
-            revision.revision_hash
-        );
-        let mut requirement = revision.clone();
-        if let BridgePlanStep::Search {
-            capability_requirements,
-            ..
-        } = &mut requirement.steps[0]
-        {
-            capability_requirements[0].user_visible_requirement = "Search documents only.".into();
-        }
-        assert_ne!(
-            canonical_revision_hash(&requirement).unwrap(),
-            revision.revision_hash
-        );
-        let mut selection = revision.clone();
-        if let BridgePlanStep::Search {
-            selection: Some(rule),
-            ..
-        } = &mut selection.steps[0]
-        {
-            rule.result_set_limit = 9;
-        }
-        assert_ne!(
-            canonical_revision_hash(&selection).unwrap(),
-            revision.revision_hash
-        );
-        let mut destination = revision.clone();
-        if let BridgePlanStep::Transfer { destination, .. } = &mut destination.steps[1] {
-            *destination = TransferDestination::SelectedDevice {
-                device_ref: "selected".into(),
-            };
-        }
-        assert_ne!(
-            canonical_revision_hash(&destination).unwrap(),
-            revision.revision_hash
-        );
-        let mut metadata_only = revision.clone();
-        metadata_only.revision_id = "another-revision".into();
-        metadata_only.revision_number = 2;
-        assert_eq!(
-            canonical_revision_hash(&metadata_only).unwrap(),
-            revision.revision_hash
-        );
-    }
-    #[test]
-    fn revision_validation_rejects_invalid_graph_and_private_fields() {
-        let mut invalid_revision = revision();
-        invalid_revision.presentation.step_explanations.pop();
-        assert!(validate_revision(&invalid_revision).is_err());
-        let mut cycle = revision();
-        if let BridgePlanStep::Search { depends_on, .. } = &mut cycle.steps[0] {
-            depends_on.push("transfer".into());
-        }
-        assert!(validate_revision(&cycle).is_err());
-        let mut invalid_selection = revision();
-        if let BridgePlanStep::Search {
-            selection: Some(selection),
-            ..
-        } = &mut invalid_selection.steps[0]
-        {
-            selection.source_slot_id = "not-a-search-output".into();
-        }
-        assert!(validate_revision(&invalid_selection).is_err());
-        let serialized = serde_json::to_string(&revision()).unwrap();
-        assert!(!serialized.contains("internal_execution"));
-        assert!(!serialized.contains("authority_token"));
-    }
-    #[test]
-    fn lifecycle_transitions_reject_illegal_moves() {
-        assert!(legal_plan(&BridgePlanState::Draft, &BridgePlanState::Open));
-        assert!(!legal_plan(
-            &BridgePlanState::Cancelled,
-            &BridgePlanState::Open
-        ));
-        assert!(legal_revision(
-            &RevisionState::Proposed,
-            &RevisionState::Available
-        ));
-        assert!(!legal_revision(
-            &RevisionState::Available,
-            &RevisionState::Proposed
-        ));
-        assert!(legal_approval(
-            &ApprovalState::Valid,
-            &ApprovalState::Consumed
-        ));
-        assert!(!legal_approval(
-            &ApprovalState::Consumed,
-            &ApprovalState::Valid
-        ));
-        assert!(legal_attempt(
-            &AttemptState::Created,
-            &AttemptState::Interrupted
-        ));
-        assert!(!legal_attempt(
-            &AttemptState::Completed,
-            &AttemptState::Running
-        ));
-    }
-    #[test]
-    fn store_enforces_immutability_scope_and_one_attempt_per_approval() {
-        let (paths, primary_store) = store();
-        let revision = ready(&primary_store);
-        assert!(primary_store
-            .append_revision(&revision, RevisionState::Proposed, 12)
-            .is_err());
-        assert!(connection(&paths)
-            .unwrap()
-            .execute(
-                "UPDATE bridge_plan_revisions SET revision_json = ?1 WHERE revision_id = ?2",
-                params!["{}", "revision"],
-            )
-            .is_err());
-        assert!(connection(&paths)
-            .unwrap()
-            .execute(
-                "DELETE FROM bridge_plan_revisions WHERE revision_id = ?1",
-                ["revision"]
-            )
-            .is_err());
-        assert!(connection(&paths)
-            .unwrap()
-            .execute("DELETE FROM bridge_plans WHERE plan_id = ?1", ["plan"])
-            .is_err());
-        assert!(connection(&paths)
-            .unwrap()
-            .execute(
-                "INSERT OR REPLACE INTO bridge_plan_revisions (revision_id, plan_id, bridge_id, revision_number, revision_hash, created_at, state, revision_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'proposed', ?7)",
-                params![revision.revision_id, revision.plan_id, revision.bridge_id, revision.revision_number, revision.revision_hash, 11, json(&revision).unwrap()],
-            )
-            .is_err());
-        let approved = approval(&revision, "approval");
-        primary_store.create_approval(&approved, 20).unwrap();
-        let first = attempt(&revision, "approval", "attempt");
-        primary_store
-            .consume_approval_create_attempt(&first, 21)
-            .unwrap();
-        assert!(connection(&paths)
-            .unwrap()
-            .execute(
-                "DELETE FROM bridge_plan_approvals WHERE approval_id = ?1",
-                ["approval"]
-            )
-            .is_err());
-        assert!(primary_store
-            .consume_approval_create_attempt(&attempt(&revision, "approval", "attempt-two"), 22)
-            .is_err());
-        let mut cross = approval(&revision, "cross");
-        cross.bridge_id = "other".into();
-        assert!(primary_store.create_approval(&cross, 20).is_err());
-    }
-    #[test]
-    fn approval_expiry_revocation_and_burn_fail_closed() {
-        let (_paths, store) = store();
-        let revision = ready(&store);
-        let expired = approval(&revision, "expired");
-        store.create_approval(&expired, 20).unwrap();
-        assert!(store
-            .consume_approval_create_attempt(&attempt(&revision, "expired", "expired-attempt"), 101)
-            .is_err());
-        assert_eq!(
-            store
-                .list_bridge("bridge")
-                .unwrap()
-                .approvals
-                .iter()
-                .find(|record| record.approval.approval_id == "expired")
-                .unwrap()
-                .state,
-            ApprovalState::Expired
-        );
-        let revoked = approval(&revision, "revoked");
-        store.create_approval(&revoked, 20).unwrap();
-        store
-            .transition_approval("revoked", ApprovalState::Revoked)
-            .unwrap();
-        assert!(store
-            .consume_approval_create_attempt(&attempt(&revision, "revoked", "revoked-attempt"), 21)
-            .is_err());
-        let burned = approval(&revision, "burned");
-        store.create_approval(&burned, 20).unwrap();
-        store
-            .transition_approval("burned", ApprovalState::Burned)
-            .unwrap();
-        assert!(store
-            .consume_approval_create_attempt(&attempt(&revision, "burned", "burned-attempt"), 21)
-            .is_err());
-    }
-    #[test]
-    fn failed_admission_does_not_consume_a_valid_approval() {
-        let (_paths, store) = store();
-        let revision = ready(&store);
-        let approval = approval(&revision, "approval");
-        store.create_approval(&approval, 20).unwrap();
-        let mut malformed = attempt(&revision, "approval", "bad-attempt");
-        malformed.graph_projection.nodes[1].operation = StepOperation::Transform;
-        assert!(store
-            .consume_approval_create_attempt(&malformed, 21)
-            .is_err());
-        store
-            .consume_approval_create_attempt(&attempt(&revision, "approval", "good-attempt"), 22)
-            .unwrap();
-    }
-    #[test]
-    fn concurrent_consumption_and_transitions_are_compare_and_swap() {
-        let (paths, primary_store) = store();
-        let revision = ready(&primary_store);
-        primary_store
-            .create_approval(&approval(&revision, "concurrent"), 20)
-            .unwrap();
-        let barrier = Arc::new(Barrier::new(2));
-        let handles = ["concurrent-a", "concurrent-b"].map(|attempt_id| {
-            let barrier = Arc::clone(&barrier);
-            let paths = paths.clone();
-            let revision = revision.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                BridgePlanStore::new(&paths)
-                    .consume_approval_create_attempt(
-                        &attempt(&revision, "concurrent", attempt_id),
-                        21,
-                    )
-                    .is_ok()
-            })
-        });
-        assert_eq!(
-            handles
-                .into_iter()
-                .filter_map(|handle| handle.join().ok())
-                .filter(|ok| *ok)
-                .count(),
-            1
-        );
-        let attempt_id = primary_store.list_bridge("bridge").unwrap().attempts[0]
-            .attempt
-            .attempt_id
-            .clone();
-        let barrier = Arc::new(Barrier::new(2));
-        let handles = [(), ()].map(|_| {
-            let barrier = Arc::clone(&barrier);
-            let paths = paths.clone();
-            let attempt_id = attempt_id.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                BridgePlanStore::new(&paths)
-                    .transition_attempt(&attempt_id, AttemptState::Running, 22)
-                    .is_ok()
-            })
-        });
-        assert_eq!(
-            handles
-                .into_iter()
-                .filter_map(|handle| handle.join().ok())
-                .filter(|ok| *ok)
-                .count(),
-            1
-        );
-    }
-    #[test]
-    fn restart_interrupts_only_live_attempts_and_is_idempotent() {
-        let (paths, store) = store();
-        let revision = ready(&store);
-        for (approval_id, attempt_id) in [("a1", "attempt-created"), ("a2", "attempt-running")] {
-            let approval = approval(&revision, approval_id);
-            store.create_approval(&approval, 20).unwrap();
-            store
-                .consume_approval_create_attempt(&attempt(&revision, approval_id, attempt_id), 21)
-                .unwrap();
-        }
-        store
-            .transition_attempt("attempt-running", AttemptState::Running, 22)
-            .unwrap();
-        assert_eq!(reconcile_startup(&paths, 30).unwrap(), 2);
-        assert_eq!(reconcile_startup(&paths, 31).unwrap(), 0);
-        let records = store.list_bridge("bridge").unwrap();
-        assert!(records
-            .attempts
-            .iter()
-            .all(|attempt| attempt.state == AttemptState::Interrupted));
-        assert_eq!(
-            records
-                .activities
-                .iter()
-                .filter(|activity| activity.kind == ActivityKind::AttemptInterrupted)
-                .count(),
-            2
-        );
-    }
-    #[test]
-    fn restart_cas_preserves_a_terminal_attempt() {
-        let (paths, store) = store();
-        let revision = ready(&store);
-        store
-            .create_approval(&approval(&revision, "terminal"), 20)
-            .unwrap();
-        store
-            .consume_approval_create_attempt(
-                &attempt(&revision, "terminal", "terminal-attempt"),
-                21,
-            )
-            .unwrap();
-        connection(&paths)
-            .unwrap()
-            .execute(
-                "UPDATE bridge_plan_attempts SET state = 'completed', ended_at = 22 WHERE attempt_id = ?1 AND state = 'created'",
-                ["terminal-attempt"],
-            )
-            .unwrap();
-        assert_eq!(reconcile_startup(&paths, 30).unwrap(), 0);
-        let records = store.list_bridge("bridge").unwrap();
-        assert_eq!(records.attempts[0].state, AttemptState::Completed);
-        assert!(records.activities.is_empty());
-    }
-    #[test]
-    fn restart_preserves_valid_unconsumed_approval() {
-        let (paths, store) = store();
-        let revision = ready(&store);
-        store
-            .create_approval(&approval(&revision, "valid"), 20)
-            .unwrap();
-        reconcile_startup(&paths, 30).unwrap();
-        let records = store.list_bridge("bridge").unwrap();
-        assert_eq!(records.approvals[0].state, ApprovalState::Valid);
-    }
-    #[test]
-    fn result_summaries_are_safe_and_bridge_bound() {
-        let (_paths, store) = store();
-        let revision = ready(&store);
-        store
-            .create_approval(&approval(&revision, "approval"), 20)
-            .unwrap();
-        store
-            .consume_approval_create_attempt(&attempt(&revision, "approval", "attempt"), 21)
-            .unwrap();
-        let result = BridgePlanResultSummary {
-            result_id: "result".into(),
-            bridge_id: "bridge".into(),
-            plan_id: "plan".into(),
-            revision_id: "revision".into(),
-            attempt_id: "attempt".into(),
-            step_id: "transfer".into(),
-            status: "completed".into(),
-            summary: "Document transferred.".into(),
-            produced_object_description: Some("A document was transferred.".into()),
-            created_at: 22,
-        };
-        store.append_result(&result).unwrap();
-        let mut cross = result.clone();
-        cross.result_id = "cross-result".into();
-        cross.bridge_id = "other".into();
-        assert!(store.append_result(&cross).is_err());
-        assert_eq!(store.list_bridge("bridge").unwrap().results.len(), 1);
-    }
-    #[test]
-    fn burn_delete_is_complete_and_retryable_after_failure() {
-        let (paths, store) = store();
-        let revision = ready(&store);
-        store
-            .create_plan(
-                &BridgePlan {
-                    plan_id: "other-plan".into(),
-                    bridge_id: "other-bridge".into(),
-                    requesting_device_ref: "requester".into(),
-                    created_at: 10,
-                },
-                BridgePlanState::Draft,
-            )
-            .unwrap();
-        let approval = approval(&revision, "approval");
-        store.create_approval(&approval, 20).unwrap();
-        store
-            .consume_approval_create_attempt(&attempt(&revision, "approval", "attempt"), 21)
-            .unwrap();
-        let activity = BridgePlanActivity {
-            activity_id: "activity".into(),
-            bridge_id: "bridge".into(),
-            plan_id: "plan".into(),
-            revision_id: "revision".into(),
-            attempt_id: Some("attempt".into()),
-            step_id: None,
-            kind: ActivityKind::AttemptCreated,
-            occurred_at: 22,
-            summary: "Attempt created.".into(),
-        };
-        store.append_activity(&activity).unwrap();
-        let conn = connection(&paths).unwrap();
-        conn.execute(
-            "INSERT INTO burned_bridges (room_id, burned_at) VALUES (?1, ?2)",
-            params!["bridge", 23],
-        )
-        .unwrap();
-        conn.execute_batch("CREATE TRIGGER fail_bridge_plan_delete BEFORE DELETE ON bridge_plans BEGIN SELECT RAISE(ABORT, 'fail'); END;").unwrap();
-        assert!(delete_bridge_records(&paths, "bridge").is_err());
-        conn.execute_batch("DROP TRIGGER fail_bridge_plan_delete;")
-            .unwrap();
-        delete_bridge_records(&paths, "bridge").unwrap();
-        assert!(store.list_bridge("bridge").unwrap().plans.is_empty());
-        assert_eq!(
-            store.get_plan("other-plan").unwrap().bridge_id,
-            "other-bridge"
-        );
-    }
-    #[test]
-    fn authority_cutoff_rejects_further_bridge_plan_mutation() {
-        let (paths, store) = store();
-        let revision = ready(&store);
-        let conn = connection(&paths).unwrap();
-        conn.execute(
-            "INSERT INTO burned_bridges (room_id, burned_at) VALUES (?1, ?2)",
-            params!["bridge", 30],
-        )
-        .unwrap();
-        assert!(store
-            .create_approval(&approval(&revision, "after-burn"), 31)
-            .is_err());
-        assert!(store
-            .append_activity(&BridgePlanActivity {
-                activity_id: "after-burn-activity".into(),
-                bridge_id: "bridge".into(),
-                plan_id: "plan".into(),
-                revision_id: "revision".into(),
-                attempt_id: None,
-                step_id: None,
-                kind: ActivityKind::RevisionProposed,
-                occurred_at: 31,
-                summary: "Must not be stored.".into(),
-            })
-            .is_err());
-        assert!(conn
-            .execute(
-                "UPDATE bridge_plan_revisions SET state = 'superseded' WHERE revision_id = ?1",
-                ["revision"],
-            )
-            .is_err());
-        let raw = approval(&revision, "after-burn-raw");
-        assert!(conn
-            .execute(
-                "INSERT INTO bridge_plan_approvals (approval_id, plan_id, revision_id, bridge_id, created_at, state, approval_json) VALUES (?1, ?2, ?3, ?4, ?5, 'valid', ?6)",
-                params![raw.approval_id, raw.plan_id, raw.revision_id, raw.bridge_id, 31, json(&raw).unwrap()],
-            )
-            .is_err());
-    }
-    #[test]
-    fn bounded_storage_rejects_uncontrolled_activity_growth() {
-        let (_paths, store) = store();
-        let _revision = ready(&store);
-        for index in 0..MAX_ACTIVITIES_PER_PLAN {
-            let activity = BridgePlanActivity {
-                activity_id: format!("a-{index}"),
-                bridge_id: "bridge".into(),
-                plan_id: "plan".into(),
-                revision_id: "revision".into(),
-                attempt_id: None,
-                step_id: None,
-                kind: ActivityKind::RevisionProposed,
-                occurred_at: index,
-                summary: "bounded activity".into(),
-            };
-            store.append_activity(&activity).unwrap();
-        }
-        let next = BridgePlanActivity {
-            activity_id: "overflow".into(),
-            bridge_id: "bridge".into(),
-            plan_id: "plan".into(),
-            revision_id: "revision".into(),
-            attempt_id: None,
-            step_id: None,
-            kind: ActivityKind::RevisionProposed,
-            occurred_at: 2_000,
-            summary: "overflow".into(),
-        };
-        assert!(store.append_activity(&next).is_err());
-    }
-    #[test]
-    fn restart_reserves_or_replaces_activity_capacity_for_interruption() {
-        let (paths, store) = store();
-        let revision = ready(&store);
-        for index in 0..MAX_ACTIVITIES_PER_PLAN {
-            store
-                .append_activity(&BridgePlanActivity {
-                    activity_id: format!("capacity-{index}"),
-                    bridge_id: "bridge".into(),
-                    plan_id: "plan".into(),
-                    revision_id: "revision".into(),
-                    attempt_id: None,
-                    step_id: None,
-                    kind: ActivityKind::RevisionProposed,
-                    occurred_at: index,
-                    summary: "bounded activity".into(),
-                })
-                .unwrap();
-        }
-        store
-            .create_approval(&approval(&revision, "restart-capacity"), 20)
-            .unwrap();
-        store
-            .consume_approval_create_attempt(
-                &attempt(&revision, "restart-capacity", "restart-attempt"),
-                21,
-            )
-            .unwrap();
-        assert_eq!(reconcile_startup(&paths, 30).unwrap(), 1);
-        let records = store.list_bridge("bridge").unwrap();
-        assert_eq!(records.activities.len() as i64, MAX_ACTIVITIES_PER_PLAN);
-        assert!(records
-            .activities
-            .iter()
-            .any(|activity| activity.activity_id == "restart-interrupt:restart-attempt"));
-    }
-    #[test]
-    fn typed_durable_text_preserves_user_prose_and_excludes_internal_types() {
-        let raw = RawUserGoal::from("Run rm -rf /tmp only if I explicitly approve it.");
-        assert!(raw.validate("raw goal").is_ok());
-        let generated = GeneratedUserVisibleText::from_semantic("Search approved documents.");
-        assert!(generated.validate("generated plan").is_ok());
-        assert!(id("object-ref-private", "plan id").is_err());
-        assert!(id("worker-runtime", "step id").is_err());
-        assert!(
-            TransformIntentText::from("Summarize the selected document.")
-                .validate("test")
-                .is_ok()
-        );
-        assert!(SafeLocationDescription::from("Downloads folder")
-            .validate("test")
-            .is_ok());
-    }
-    #[test]
-    fn rejects_oversized_nested_collections_and_unknown_step_references() {
-        let mut oversized = revision();
-        if let BridgePlanStep::Search { query, .. } = &mut oversized.steps[0] {
-            query.safe_scope_labels = (0..=MAX_SAFE_SCOPE_LABELS)
-                .map(|index| SafeLocationDescription::from(format!("scope-{index}")))
-                .collect();
-        }
-        assert!(validate_revision(&oversized).is_err());
-        let mut duplicate_dependencies = revision();
-        if let BridgePlanStep::Transfer { depends_on, .. } = &mut duplicate_dependencies.steps[1] {
-            depends_on.push("search".into());
-        }
-        assert!(validate_revision(&duplicate_dependencies).is_err());
-        let mut duplicate_scope = revision();
-        if let BridgePlanStep::Search { query, .. } = &mut duplicate_scope.steps[0] {
-            query
-                .safe_scope_labels
-                .push(query.safe_scope_labels[0].clone());
-        }
-        assert!(validate_revision(&duplicate_scope).is_err());
-        let mut duplicate_media_type = revision();
-        if let BridgePlanStep::Search { output_slots, .. } = &mut duplicate_media_type.steps[0] {
-            let media_type = output_slots[0].object.media_types[0].clone();
-            output_slots[0].object.media_types.push(media_type);
-        }
-        assert!(validate_revision(&duplicate_media_type).is_err());
-        let mut duplicate_requirement = revision();
-        if let BridgePlanStep::Search {
-            capability_requirements,
-            ..
-        } = &mut duplicate_requirement.steps[0]
-        {
-            capability_requirements.push(capability_requirements[0].clone());
-        }
-        assert!(validate_revision(&duplicate_requirement).is_err());
-        let mut duplicate_input = revision();
-        if let BridgePlanStep::Transfer { input_slots, .. } = &mut duplicate_input.steps[1] {
-            input_slots.push(input_slots[0].clone());
-        }
-        assert!(validate_revision(&duplicate_input).is_err());
-        let (_paths, store) = store();
-        let revision = ready(&store);
-        store
-            .create_approval(&approval(&revision, "approval"), 20)
-            .unwrap();
-        store
-            .consume_approval_create_attempt(&attempt(&revision, "approval", "attempt"), 21)
-            .unwrap();
-        let mut graph_duplicate_slots = attempt(&revision, "approval", "duplicate-graph");
-        let duplicate_slot = graph_duplicate_slots.graph_projection.nodes[1].input_slots[0].clone();
-        graph_duplicate_slots.graph_projection.nodes[1]
-            .input_slots
-            .push(duplicate_slot);
-        assert!(
-            validate_graph_projection(&graph_duplicate_slots.graph_projection, &revision).is_err()
-        );
-        let result = BridgePlanResultSummary {
-            result_id: "unknown-step".into(),
-            bridge_id: "bridge".into(),
-            plan_id: "plan".into(),
-            revision_id: "revision".into(),
-            attempt_id: "attempt".into(),
-            step_id: "missing".into(),
-            status: "completed".into(),
-            summary: "No result.".into(),
-            produced_object_description: None,
-            created_at: 22,
-        };
-        assert!(store.append_result(&result).is_err());
-    }
-
-    #[test]
-    fn phase2_compiles_admits_projects_steps_and_derives_one_use_authority() {
-        let (_paths, store) = store();
-        let revision = ready(&store);
-        let graph = compile_graph_projection(&revision).unwrap();
-        assert_eq!(graph.nodes.len(), revision.steps.len());
-        assert_eq!(compile_graph_projection(&revision).unwrap(), graph);
-        let mut widened = graph.clone();
-        widened.nodes[0].execution_device_ref = "requester".into();
-        assert!(validate_graph_projection(&widened, &revision).is_err());
-
-        store
-            .create_approval(&approval(&revision, "phase2"), 20)
-            .unwrap();
-        let attempt = store
-            .create_attempt_from_approval("phase2-attempt", "phase2", 21)
-            .unwrap();
-        assert_eq!(attempt.graph_projection, graph);
-        let record = store.list_attempt("phase2-attempt").unwrap();
-        assert_eq!(
-            record
-                .steps
-                .iter()
-                .find(|step| step.step_id == "search")
-                .unwrap()
-                .state,
-            StepExecutionState::Eligible
-        );
-        assert_eq!(
-            record
-                .steps
-                .iter()
-                .find(|step| step.step_id == "transfer")
-                .unwrap()
-                .state,
-            StepExecutionState::Pending
-        );
-
-        let authorities = EphemeralStepAuthorityStore::default();
-        let authority = authorities
-            .derive(&store, "phase2-attempt", "search", 22, 40)
-            .unwrap();
-        assert!(authorities.consume(&store, &authority, 23).is_ok());
-        assert!(authorities.consume(&store, &authority, 24).is_err());
-        store
-            .transition_step("phase2-attempt", "search", StepExecutionState::Running, 25)
-            .unwrap();
-        store
-            .transition_step(
-                "phase2-attempt",
-                "search",
-                StepExecutionState::Completed,
-                26,
-            )
-            .unwrap();
-        assert_eq!(
-            store
-                .list_attempt("phase2-attempt")
-                .unwrap()
-                .steps
-                .iter()
-                .find(|step| step.step_id == "transfer")
-                .unwrap()
-                .state,
-            StepExecutionState::Eligible
-        );
-
-        let mut alternative = revision.clone();
-        alternative.revision_id = "revision-alternative".into();
-        alternative.revision_number = 2;
-        alternative.revision_hash.clear();
-        alternative.alternative = Some(AlternativeProposal {
-            based_on_revision_id: "revision".into(),
-            change_explanation: "Use the same selected device with a revised bounded outcome."
-                .into(),
-        });
-        let alternative = store
-            .append_alternative_revision("revision", alternative, 30)
-            .unwrap();
-        assert_ne!(alternative.revision_hash, revision.revision_hash);
-        assert!(store
-            .create_approval(&approval(&alternative, "alternative-approval"), 31)
-            .is_err());
-    }
-
-    #[test]
-    fn phase2_step_sql_guards_reject_skips_stale_and_post_burn_updates() {
-        let (paths, store) = store();
-        let revision = ready(&store);
-        store
-            .create_approval(&approval(&revision, "step-sql"), 20)
-            .unwrap();
-        store
-            .create_attempt_from_approval("step-sql-attempt", "step-sql", 21)
-            .unwrap();
-        let conn = connection(&paths).unwrap();
-        assert!(conn.execute("UPDATE bridge_plan_attempt_steps SET state = 'completed' WHERE attempt_id = ?1 AND step_id = 'transfer'", ["step-sql-attempt"]).is_err());
-        assert!(conn.execute("UPDATE bridge_plan_attempt_steps SET state = 'running' WHERE attempt_id = ?1 AND step_id = 'search'", ["step-sql-attempt"]).is_err());
-        store
-            .transition_step(
-                "step-sql-attempt",
-                "search",
-                StepExecutionState::Authorized,
-                22,
-            )
-            .unwrap();
-        assert!(store
-            .transition_step(
-                "step-sql-attempt",
-                "search",
-                StepExecutionState::Authorized,
-                23
-            )
-            .is_err());
-        conn.execute(
-            "INSERT INTO burned_bridges (room_id, burned_at) VALUES (?1, ?2)",
-            params!["bridge", 24],
-        )
-        .unwrap();
-        assert!(conn.execute("UPDATE bridge_plan_attempt_steps SET state = 'running' WHERE attempt_id = ?1 AND step_id = 'search'", ["step-sql-attempt"]).is_err());
-    }
-
-    #[test]
-    fn phase2_admission_rejects_each_graph_semantic_mismatch_without_consuming() {
-        type GraphMutation = Box<dyn Fn(&mut BridgePlanAttempt)>;
-        let cases: Vec<(&str, bool, GraphMutation)> = vec![
-            (
-                "operation",
-                true,
-                Box::new(|a| a.graph_projection.nodes[0].operation = StepOperation::Transfer),
-            ),
-            (
-                "source device",
-                true,
-                Box::new(|a| {
-                    a.graph_projection.nodes[0].source_device_ref = Some("requester".into())
-                }),
-            ),
-            (
-                "execution device",
-                true,
-                Box::new(|a| a.graph_projection.nodes[0].execution_device_ref = "requester".into()),
-            ),
-            (
-                "input slots",
-                true,
-                Box::new(|a| a.graph_projection.nodes[1].input_slots[0].slot_id = "found".into()),
-            ),
-            (
-                "output slots",
-                true,
-                Box::new(|a| a.graph_projection.nodes[0].output_slots[0].slot_id = "other".into()),
-            ),
-            (
-                "dependencies",
-                true,
-                Box::new(|a| a.graph_projection.nodes[1].depends_on_node_ids.clear()),
-            ),
-            (
-                "object type",
-                true,
-                Box::new(|a| {
-                    a.graph_projection.nodes[0].output_slots[0]
-                        .object
-                        .object_type = "clipboard".into()
-                }),
-            ),
-            (
-                "media types",
-                true,
-                Box::new(|a| {
-                    a.graph_projection.nodes[0].output_slots[0]
-                        .object
-                        .media_types = vec!["image/png".into()]
-                }),
-            ),
-            (
-                "object constraints",
-                true,
-                Box::new(|a| {
-                    a.graph_projection.nodes[0].output_slots[0]
-                        .object
-                        .user_visible_description = "a different object".into()
-                }),
-            ),
-            (
-                "search query",
-                true,
-                Box::new(|a| {
-                    if let BridgePlanStep::Search { query, .. } =
-                        &mut a.graph_projection.nodes[0].step
-                    {
-                        query.query = "invoice".into();
-                    }
-                }),
-            ),
-            (
-                "selection rule",
-                true,
-                Box::new(|a| {
-                    if let BridgePlanStep::Search {
-                        selection: Some(rule),
-                        ..
-                    } = &mut a.graph_projection.nodes[0].step
-                    {
-                        rule.result_set_limit = 9;
-                    }
-                }),
-            ),
-            (
-                "capability requirements",
-                true,
-                Box::new(|a| {
-                    if let BridgePlanStep::Search {
-                        capability_requirements,
-                        ..
-                    } = &mut a.graph_projection.nodes[0].step
-                    {
-                        capability_requirements[0].category = "different".into();
-                    }
-                }),
-            ),
-            (
-                "failure behavior",
-                true,
-                Box::new(|a| {
-                    if let BridgePlanStep::Search {
-                        failure_behavior, ..
-                    } = &mut a.graph_projection.nodes[0].step
-                    {
-                        *failure_behavior = StepFailureBehavior::RequireNewRevision;
-                    }
-                }),
-            ),
-            (
-                "transfer source",
-                true,
-                Box::new(|a| {
-                    if let BridgePlanStep::Transfer { source, .. } =
-                        &mut a.graph_projection.nodes[1].step
-                    {
-                        *source = ObjectSelectionRule::FromSlot {
-                            slot_id: "found".into(),
-                        };
-                    }
-                }),
-            ),
-            (
-                "transfer destination",
-                true,
-                Box::new(|a| {
-                    if let BridgePlanStep::Transfer { destination, .. } =
-                        &mut a.graph_projection.nodes[1].step
-                    {
-                        *destination = TransferDestination::SelectedDevice {
-                            device_ref: "selected".into(),
-                        };
-                    }
-                }),
-            ),
-            (
-                "revision hash",
-                true,
-                Box::new(|a| a.revision_hash = "sha256:wrong-revision".into()),
-            ),
-            (
-                "graph hash",
-                false,
-                Box::new(|a| a.graph_projection.graph_hash = "sha256:wrong-graph".into()),
-            ),
-        ];
-
-        for (index, (name, recompute_hash, change)) in cases.into_iter().enumerate() {
-            let (_paths, store) = store();
-            let revision = ready(&store);
-            let approval_id = format!("semantic-mismatch-{index}");
-            let attempt_id = format!("semantic-attempt-{index}");
-            store
-                .create_approval(&approval(&revision, &approval_id), 20)
-                .unwrap();
-            let mut candidate = attempt(&revision, &approval_id, &attempt_id);
-            change(&mut candidate);
-            if recompute_hash {
-                candidate.graph_projection.graph_hash =
-                    canonical_graph_hash(&candidate.graph_projection).unwrap();
-            }
-            assert!(
-                store
-                    .consume_approval_create_attempt(&candidate, 21)
-                    .is_err(),
-                "{name}"
-            );
-            let conn = connection(store.paths).unwrap();
-            let state: String = conn
-                .query_row(
-                    "SELECT state FROM bridge_plan_approvals WHERE approval_id = ?1",
-                    [&approval_id],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(state, "valid", "{name}");
-            assert!(store.list_attempt(&attempt_id).is_err(), "{name}");
+    fn object_revision(revision: u64) -> LogicalObjectRevision {
+        LogicalObjectRevision {
+            logical_object_id: "selected_file".into(),
+            revision,
         }
     }
 
-    #[test]
-    fn phase2_concurrent_admission_creates_one_attempt_and_preserves_loser_state() {
-        let (paths, store) = store();
-        let revision = ready(&store);
-        store
-            .create_approval(&approval(&revision, "concurrent-admission"), 20)
-            .unwrap();
-        let barrier = Arc::new(Barrier::new(3));
-        let mut joins = Vec::new();
-        for index in 0..2 {
-            let paths = paths.clone();
-            let barrier = barrier.clone();
-            joins.push(std::thread::spawn(move || {
-                let store = BridgePlanStore::new(Box::leak(Box::new(paths)));
-                barrier.wait();
-                store.create_attempt_from_approval(
-                    &format!("concurrent-attempt-{index}"),
-                    "concurrent-admission",
-                    21,
-                )
-            }));
-        }
-        barrier.wait();
-        let outcomes = joins
-            .into_iter()
-            .map(|join| join.join().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
-        let conn = connection(&paths).unwrap();
-        let state: String = conn
-            .query_row("SELECT state FROM bridge_plan_approvals WHERE approval_id = 'concurrent-admission'", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(state, "consumed");
-        let records = (0..2)
-            .filter_map(|index| {
-                store
-                    .list_attempt(&format!("concurrent-attempt-{index}"))
-                    .ok()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].steps.len(), revision.steps.len());
-        assert!(records[0].steps.iter().all(|step| matches!(
-            step.state,
-            StepExecutionState::Eligible | StepExecutionState::Pending
-        )));
-    }
-
-    #[test]
-    fn phase2_transform_and_presentation_mismatches_leave_approval_unconsumed() {
-        type RevisionMutation = Box<dyn Fn(&mut BridgePlanRevision)>;
-        let cases: Vec<(&str, RevisionMutation)> = vec![
-            (
-                "transform intent",
-                Box::new(|r| {
-                    if let BridgePlanStep::Transform { intent, .. } = &mut r.steps[1] {
-                        *intent = "Extract tables instead.".into();
-                    }
-                }),
-            ),
-            (
-                "expected transform input",
-                Box::new(|r| {
-                    if let BridgePlanStep::Transform { expected_input, .. } = &mut r.steps[1] {
-                        expected_input.object_type = "image".into();
-                    }
-                }),
-            ),
-            (
-                "expected transform output",
-                Box::new(|r| {
-                    if let BridgePlanStep::Transform {
-                        expected_output, ..
-                    } = &mut r.steps[1]
-                    {
-                        expected_output.media_types = vec!["application/json".into()];
-                    }
-                }),
-            ),
-            (
-                "presentation missing step",
-                Box::new(|r| {
-                    r.presentation
-                        .step_explanations
-                        .retain(|p| p.step_id != "transform");
-                }),
-            ),
-            (
-                "presentation extra step",
-                Box::new(|r| {
-                    r.presentation.step_explanations.push(StepExplanation {
-                        step_id: "extra".into(),
-                        action_summary: "Extra.".into(),
-                        expected_result: "Extra.".into(),
-                    })
-                }),
-            ),
-            (
-                "presentation wrong step",
-                Box::new(|r| r.presentation.step_explanations[1].step_id = "transfer".into()),
-            ),
-            (
-                "presentation duplicate mapping",
-                Box::new(|r| r.presentation.step_explanations[2].step_id = "transform".into()),
-            ),
-        ];
-        for (index, (name, mutate)) in cases.into_iter().enumerate() {
-            let (_paths, store) = store();
-            let revision = transform_revision();
-            store.create_plan(&plan(), BridgePlanState::Draft).unwrap();
-            store
-                .append_revision(&revision, RevisionState::Proposed, 11)
-                .unwrap();
-            store
-                .transition_plan("plan", BridgePlanState::Open)
-                .unwrap();
-            store
-                .transition_revision("revision", RevisionState::Available)
-                .unwrap();
-            let approval_id = format!("transform-mismatch-{index}");
-            store
-                .create_approval(&approval(&revision, &approval_id), 20)
-                .unwrap();
-            let mut altered = revision.clone();
-            mutate(&mut altered);
-            altered.revision_hash = if name.starts_with("presentation") {
-                "sha256:presentation-mismatch".into()
-            } else {
-                canonical_revision_hash(&altered).unwrap()
-            };
-            let mut candidate = attempt(
-                &revision,
-                &approval_id,
-                &format!("transform-attempt-{index}"),
-            );
-            candidate.revision_hash = altered.revision_hash;
-            assert!(
-                store
-                    .consume_approval_create_attempt(&candidate, 21)
-                    .is_err(),
-                "{name}"
-            );
-            let conn = connection(store.paths).unwrap();
-            let state: String = conn
-                .query_row(
-                    "SELECT state FROM bridge_plan_approvals WHERE approval_id = ?1",
-                    [&approval_id],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(state, "valid", "{name}");
+    fn search(device: &str) -> ComposedFilePlanBlock {
+        ComposedFilePlanBlock::Search {
+            execution_device_ref: device.into(),
+            filename_hint: "project/example.py".into(),
+            extensions: vec!["py".into()],
+            safe_scope_labels: vec!["downloads".into()],
         }
     }
 
-    #[test]
-    fn phase2_authority_rejects_lifecycle_and_complete_binding_mismatches() {
-        let (_paths, store) = store();
-        let revision = ready(&store);
-        store
-            .create_approval(&approval(&revision, "authmatrix"), 20)
-            .unwrap();
-        store
-            .create_attempt_from_approval("authmatrix-attempt", "authmatrix", 21)
-            .unwrap();
-        let authorities = EphemeralStepAuthorityStore::default();
-        let id = authorities
-            .derive(&store, "authmatrix-attempt", "search", 22, 30)
-            .unwrap();
-        assert!(authorities.consume(&store, &id, 30).is_err());
-        authorities
-            .transition_step(
-                &store,
-                "authmatrix-attempt",
-                "search",
-                StepExecutionState::Running,
-                23,
-            )
-            .unwrap();
-        assert!(authorities.consume(&store, &id, 24).is_err());
-        let fresh = EphemeralStepAuthorityStore::default();
-        assert!(fresh.consume(&store, &id, 24).is_err());
-    }
-
-    #[test]
-    fn phase2_dependency_eligibility_matrix_requires_all_completed_predecessors() {
-        let (_paths, store) = store();
-        let revision = ready(&store);
-        store
-            .create_approval(&approval(&revision, "deps"), 20)
-            .unwrap();
-        store
-            .create_attempt_from_approval("deps-attempt", "deps", 21)
-            .unwrap();
-        let base = store.list_attempt("deps-attempt").unwrap();
-        let transfer = base.attempt.graph_projection.nodes[1].clone();
-        assert!(
-            ensure_step_dependencies_completed(&base, "search").is_ok(),
-            "no dependencies"
-        );
-        for state in [
-            StepExecutionState::Pending,
-            StepExecutionState::Eligible,
-            StepExecutionState::Authorized,
-            StepExecutionState::Running,
-            StepExecutionState::Failed,
-            StepExecutionState::Cancelled,
-        ] {
-            let mut record = base.clone();
-            record
-                .steps
-                .iter_mut()
-                .find(|s| s.step_id == "search")
-                .unwrap()
-                .state = state;
-            assert!(ensure_step_dependencies_completed(&record, "transfer").is_err());
-        }
-        let mut completed = base.clone();
-        completed
-            .steps
-            .iter_mut()
-            .find(|s| s.step_id == "search")
-            .unwrap()
-            .state = StepExecutionState::Completed;
-        assert!(ensure_step_dependencies_completed(&completed, "transfer").is_ok());
-        let mut multi = completed.clone();
-        let mut extra = transfer.clone();
-        extra.node_id = "node-extra".into();
-        extra.step_id = "extra".into();
-        multi.attempt.graph_projection.nodes.push(extra);
-        multi.attempt.graph_projection.nodes[1]
-            .depends_on_node_ids
-            .push("node-extra".into());
-        multi.steps.push(StepExecutionProjection {
-            attempt_id: "deps-attempt".into(),
-            step_id: "extra".into(),
-            state: StepExecutionState::Completed,
-            updated_at: 22,
-        });
-        assert!(
-            ensure_step_dependencies_completed(&multi, "transfer").is_ok(),
-            "multiple completed"
-        );
-        multi.steps.last_mut().unwrap().state = StepExecutionState::Failed;
-        assert!(
-            ensure_step_dependencies_completed(&multi, "transfer").is_err(),
-            "mixed completed and failed"
-        );
-        multi.steps.last_mut().unwrap().state = StepExecutionState::Cancelled;
-        assert!(
-            ensure_step_dependencies_completed(&multi, "transfer").is_err(),
-            "mixed completed and cancelled"
-        );
-        // CAS rejects a stale concurrent eligibility decision after the predecessor changed.
-        store
-            .transition_step("deps-attempt", "search", StepExecutionState::Authorized, 23)
-            .unwrap();
-        assert!(store
-            .transition_step("deps-attempt", "transfer", StepExecutionState::Eligible, 24)
-            .is_err());
-    }
-
-    #[test]
-    fn phase2_authority_binding_matrix_rejects_each_tampered_field() {
-        type Mutation = Box<dyn Fn(&mut EphemeralStepAuthority)>;
-        let cases: Vec<(&str, Mutation)> = vec![
-            ("bridge", Box::new(|a| a.bridge_id = "other".into())),
-            ("plan", Box::new(|a| a.plan_id = "other".into())),
-            ("revision", Box::new(|a| a.revision_id = "other".into())),
-            (
-                "revision hash",
-                Box::new(|a| a.revision_hash = "sha256:other".into()),
-            ),
-            ("approval", Box::new(|a| a.approval_id = "other".into())),
-            ("attempt", Box::new(|a| a.attempt_id = "other".into())),
-            ("step", Box::new(|a| a.step_id = "transfer".into())),
-            (
-                "operation",
-                Box::new(|a| a.operation = StepOperation::Transfer),
-            ),
-            (
-                "source device",
-                Box::new(|a| a.source_device_ref = Some("requester".into())),
-            ),
-            (
-                "execution device",
-                Box::new(|a| a.execution_device_ref = "requester".into()),
-            ),
-            (
-                "input slots",
-                Box::new(|a| a.input_slot_ids.push("other".into())),
-            ),
-            (
-                "output slots",
-                Box::new(|a| a.output_slot_ids.push("other".into())),
-            ),
-            (
-                "selection constraints",
-                Box::new(|a| a.object_selection_digest = "sha256:other".into()),
-            ),
-            (
-                "transform contract",
-                Box::new(|a| a.transform_contract_digest = "sha256:other".into()),
-            ),
-            (
-                "transfer destination",
-                Box::new(|a| a.transfer_destination_digest = "sha256:other".into()),
-            ),
-        ];
-        for (index, (name, mutate)) in cases.into_iter().enumerate() {
-            let (_paths, store) = store();
-            let revision = ready(&store);
-            let approval_id = format!("bind-{index}");
-            let attempt_id = format!("bindattempt-{index}");
-            store
-                .create_approval(&approval(&revision, &approval_id), 20)
-                .unwrap();
-            store
-                .create_attempt_from_approval(&attempt_id, &approval_id, 21)
-                .unwrap();
-            let authorities = EphemeralStepAuthorityStore::default();
-            let id = authorities
-                .derive(&store, &attempt_id, "search", 22, 40)
-                .unwrap();
-            mutate(authorities.grants.lock().unwrap().get_mut(&id).unwrap());
-            assert!(authorities.consume(&store, &id, 23).is_err(), "{name}");
+    fn transform(device: &str, revision: u64, intent: &str) -> ComposedFilePlanBlock {
+        ComposedFilePlanBlock::Transform {
+            execution_device_ref: device.into(),
+            target_revision: object_revision(revision),
+            modification_intent: intent.into(),
         }
     }
 
-    #[test]
-    fn phase2_authority_rejects_every_terminal_step_and_attempt_state() {
-        for terminal in [
-            StepExecutionState::Completed,
-            StepExecutionState::Failed,
-            StepExecutionState::Cancelled,
-        ] {
-            let (_paths, store) = store();
-            let revision = ready(&store);
-            let approval_id = format!("stepterminal-{}", terminal.as_str());
-            let attempt_id = format!("stepattempt-{}", terminal.as_str());
-            store
-                .create_approval(&approval(&revision, &approval_id), 20)
-                .unwrap();
-            store
-                .create_attempt_from_approval(&attempt_id, &approval_id, 21)
-                .unwrap();
-            let authorities = EphemeralStepAuthorityStore::default();
-            let id = authorities
-                .derive(&store, &attempt_id, "search", 22, 40)
-                .unwrap();
-            if terminal != StepExecutionState::Cancelled {
-                authorities
-                    .transition_step(
-                        &store,
-                        &attempt_id,
-                        "search",
-                        StepExecutionState::Running,
-                        23,
-                    )
-                    .unwrap();
-            }
-            authorities
-                .transition_step(&store, &attempt_id, "search", terminal, 24)
-                .unwrap();
-            assert!(authorities.consume(&store, &id, 25).is_err());
-        }
-        for terminal in [
-            AttemptState::Interrupted,
-            AttemptState::Completed,
-            AttemptState::Failed,
-            AttemptState::Cancelled,
-        ] {
-            let (_paths, store) = store();
-            let revision = ready(&store);
-            let approval_id = format!("attemptterminal-{}", terminal.as_str());
-            let attempt_id = format!("attemptstate-{}", terminal.as_str());
-            store
-                .create_approval(&approval(&revision, &approval_id), 20)
-                .unwrap();
-            store
-                .create_attempt_from_approval(&attempt_id, &approval_id, 21)
-                .unwrap();
-            let authorities = EphemeralStepAuthorityStore::default();
-            let id = authorities
-                .derive(&store, &attempt_id, "search", 22, 40)
-                .unwrap();
-            if terminal != AttemptState::Interrupted {
-                authorities
-                    .transition_attempt(&store, &attempt_id, AttemptState::Running, 23)
-                    .unwrap();
-            }
-            authorities
-                .transition_attempt(&store, &attempt_id, terminal, 24)
-                .unwrap();
-            assert!(authorities.consume(&store, &id, 25).is_err());
+    fn transfer(source: &str, destination: &str) -> ComposedFilePlanBlock {
+        ComposedFilePlanBlock::Transfer {
+            source_device_ref: source.into(),
+            destination_device_ref: destination.into(),
+            landing: ComposedTransferLanding::PipelinePrivate,
         }
     }
 
-    #[test]
-    fn phase2_expiry_and_burn_admission_ordering_are_fail_closed() {
-        let (paths, primary_store) = store();
-        let revision = ready(&primary_store);
-        let mut expired = approval(&revision, "expirywins");
-        expired.expires_at = 21;
-        primary_store.create_approval(&expired, 20).unwrap();
-        assert!(primary_store
-            .create_attempt_from_approval("expiry-attempt", "expirywins", 21)
-            .is_err());
-        let conn = connection(&paths).unwrap();
-        let state: String = conn
-            .query_row(
-                "SELECT state FROM bridge_plan_approvals WHERE approval_id = 'expirywins'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(state, "expired");
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM bridge_plan_attempts WHERE approval_id = 'expirywins'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM bridge_plan_attempt_steps", [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .unwrap(),
-            0
-        );
-        let admitted = approval(&revision, "admissionwins");
-        primary_store.create_approval(&admitted, 20).unwrap();
-        primary_store
-            .create_attempt_from_approval("admission-attempt", "admissionwins", 20)
-            .unwrap();
-        let state: String = conn
-            .query_row(
-                "SELECT state FROM bridge_plan_approvals WHERE approval_id = 'admissionwins'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(state, "consumed");
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM bridge_plan_attempt_steps WHERE attempt_id = 'admission-attempt'", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
-        let (_, burned_store) = self::store();
-        let burned_revision = ready(&burned_store);
-        burned_store
-            .create_approval(&approval(&burned_revision, "burnwins"), 20)
-            .unwrap();
-        let burned_conn = connection(burned_store.paths).unwrap();
-        burned_conn
-            .execute(
-                "INSERT INTO burned_bridges (room_id, burned_at) VALUES ('bridge', 21)",
-                [],
-            )
-            .unwrap();
-        assert!(burned_store
-            .create_attempt_from_approval("burn-attempt", "burnwins", 21)
-            .is_err());
-        assert_eq!(
-            burned_conn
-                .query_row(
-                    "SELECT state FROM bridge_plan_approvals WHERE approval_id = 'burnwins'",
-                    [],
-                    |r| r.get::<_, String>(0)
-                )
-                .unwrap(),
-            "valid"
-        );
-        assert_eq!(
-            burned_conn
-                .query_row("SELECT COUNT(*) FROM bridge_plan_attempts", [], |r| r
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
+    fn execute(device: &str, revision: u64, intent: &str) -> ComposedFilePlanBlock {
+        ComposedFilePlanBlock::Execute {
+            execution_device_ref: device.into(),
+            target_revision: object_revision(revision),
+            execution_intent: intent.into(),
+        }
     }
 
-    #[test]
-    fn phase2_raw_sql_immutability_boundary_matrix() {
-        let (paths, store) = store();
-        let revision = ready(&store);
-        store
-            .create_approval(&approval(&revision, "sqlmatrix"), 20)
-            .unwrap();
-        store
-            .create_attempt_from_approval("sqlmatrix-attempt", "sqlmatrix", 21)
-            .unwrap();
-        let conn = connection(&paths).unwrap();
-        assert!(conn.execute("UPDATE bridge_plan_attempts SET attempt_json = '{}' WHERE attempt_id = 'sqlmatrix-attempt'", []).is_err());
-        assert!(conn.execute("UPDATE bridge_plan_attempts SET revision_id = 'other' WHERE attempt_id = 'sqlmatrix-attempt'", []).is_err());
-        assert!(conn
-            .execute(
-                "DELETE FROM bridge_plan_revisions WHERE revision_id = 'revision'",
-                []
-            )
-            .is_err());
-        assert!(conn.execute("UPDATE bridge_plan_revisions SET revision_json = '{}' WHERE revision_id = 'revision'", []).is_err());
-        assert!(conn
-            .execute("DELETE FROM bridge_plans WHERE plan_id = 'plan'", [])
-            .is_err());
-        conn.execute(
-            "INSERT INTO burned_bridges (room_id, burned_at) VALUES ('bridge', 22)",
-            [],
-        )
-        .unwrap();
-        assert!(conn.execute("INSERT INTO bridge_plan_attempt_steps (attempt_id, step_id, state, updated_at) VALUES ('sqlmatrix-attempt', 'new', 'pending', 23)", []).is_err());
-        assert!(conn.execute("UPDATE bridge_plan_attempt_steps SET state = 'cancelled' WHERE attempt_id = 'sqlmatrix-attempt' AND step_id = 'search'", []).is_err());
-    }
-
-    #[test]
-    fn file_search_transfer_revision_binds_selection_and_requester_destination() {
-        let revision = build_file_plan_revision(
+    fn build(blocks: Vec<ComposedFilePlanBlock>) -> AppResult<BridgePlanRevision> {
+        build_composed_file_revision(
             "bridge".into(),
-            "requester".into(),
-            "selected".into(),
-            "Find the report and bring it here.".into(),
-            "report".into(),
-            vec!["pdf".into()],
-            vec!["documents".into()],
-            true,
+            "A".into(),
+            "B".into(),
+            "Work with example.py".into(),
+            blocks,
+        )
+    }
+
+    #[test]
+    fn four_primitive_types_are_distinct_and_validate() {
+        let revision = build(vec![
+            search("B"),
+            transfer("B", "A"),
+            transform("A", 1, "Use exponential backoff."),
+            execute("A", 2, "Validate the modified program."),
+        ])
+        .unwrap();
+        assert!(matches!(revision.steps[0], BridgePlanStep::Search { .. }));
+        assert!(matches!(revision.steps[1], BridgePlanStep::Transfer { .. }));
+        assert!(matches!(
+            revision.steps[2],
+            BridgePlanStep::Transform { .. }
+        ));
+        assert!(matches!(revision.steps[3], BridgePlanStep::Execute { .. }));
+        validate_revision(&revision).unwrap();
+    }
+
+    #[test]
+    fn search_only_and_direct_transfer_plans_remain_valid() {
+        let search_revision = build(vec![search("B")]).unwrap();
+        assert_eq!(search_revision.steps.len(), 1);
+        assert!(matches!(
+            search_revision.steps[0],
+            BridgePlanStep::Search { .. }
+        ));
+
+        let direct = build_direct_file_transfer_revision(
+            "bridge".into(),
+            "A".into(),
+            "B".into(),
+            "Send one file".into(),
         )
         .unwrap();
-        assert_eq!(
-            revision.search_selection_mode,
-            SearchSelectionMode::BoundedInline
-        );
-        assert_eq!(revision.steps.len(), 2);
-        let BridgePlanStep::Search {
-            selection: Some(selection),
-            ..
-        } = &revision.steps[0]
-        else {
-            panic!("file transfer plan must select one bounded Search result");
-        };
-        assert_eq!(selection.source_slot_id, "found");
-        assert_eq!(selection.downstream_slot_id, "selected_file");
-        let BridgePlanStep::Transfer {
-            depends_on,
-            input_slots,
-            source,
-            destination,
+        assert!(matches!(direct.steps[0], BridgePlanStep::Transfer { .. }));
+        validate_revision(&direct).unwrap();
+    }
+
+    #[test]
+    fn transform_is_generic_intent_and_advances_logical_revision_without_movement() {
+        let revision = build(vec![
+            search("B"),
+            transform("B", 1, "Change retry behavior to exponential backoff."),
+        ])
+        .unwrap();
+        let BridgePlanStep::Transform {
+            source_device_ref,
+            execution_device_ref,
+            input_revision,
+            output_revision,
+            modification_intent,
+            capability_requirements,
             ..
         } = &revision.steps[1]
         else {
-            panic!("file transfer plan must include Transfer");
+            panic!("expected Transform");
         };
-        assert_eq!(depends_on, &vec!["search"]);
-        assert_eq!(input_slots[0].slot_id, "selected_file");
+        assert_eq!(source_device_ref.as_deref(), Some("B"));
+        assert_eq!(execution_device_ref, "B");
+        assert_eq!(input_revision, &object_revision(1));
+        assert_eq!(output_revision, &object_revision(2));
         assert_eq!(
-            source,
-            &ObjectSelectionRule::FromSlot {
-                slot_id: "selected_file".into()
-            }
+            modification_intent.0,
+            "Change retry behavior to exponential backoff."
         );
-        assert_eq!(
-            destination,
-            &TransferDestination::RequestingDevice {
-                device_ref: "requester".into()
-            }
-        );
-        assert!(validate_revision(&revision).is_ok());
+        assert!(capability_requirements.is_empty());
+        assert!(!revision
+            .steps
+            .iter()
+            .any(|step| matches!(step, BridgePlanStep::Transfer { .. })));
     }
 
     #[test]
-    fn file_transform_transfer_revision_binds_generated_output_to_transfer() {
-        let revision = build_composed_file_revision(
-            "bridge".into(),
-            "requester".into(),
-            "selected".into(),
-            "Extract the readable text from my report and bring it here.".into(),
-            vec![
-                ComposedFilePlanBlock::Search {
-                    execution_device_ref: "selected".into(),
-                    filename_hint: "report".into(),
-                    extensions: vec!["txt".into()],
-                    safe_scope_labels: vec!["documents".into()],
-                },
-                ComposedFilePlanBlock::Transform {
-                    execution_device_ref: "selected".into(),
-                    intent: "extract readable text".into(),
-                },
-                ComposedFilePlanBlock::Transfer {
-                    source_device_ref: "selected".into(),
-                    destination_device_ref: "requester".into(),
-                    landing: ComposedTransferLanding::Inbox,
-                },
-            ],
-        )
+    fn no_transform_step_means_no_mutation_intent_or_revision_advance() {
+        let revision = build(vec![
+            search("B"),
+            execute("B", 1, "Inspect program behavior."),
+        ])
         .unwrap();
-        assert_eq!(revision.steps.len(), 3);
-        let BridgePlanStep::Transfer {
-            depends_on,
-            input_slots,
-            source,
-            destination,
+        assert!(!revision
+            .steps
+            .iter()
+            .any(|step| matches!(step, BridgePlanStep::Transform { .. })));
+        let BridgePlanStep::Execute {
+            target_revision, ..
+        } = &revision.steps[1]
+        else {
+            panic!("expected Execute");
+        };
+        assert_eq!(target_revision, &object_revision(1));
+    }
+
+    #[test]
+    fn execute_is_generic_intent_bound_to_the_current_revision() {
+        let revision = build(vec![
+            search("B"),
+            transform("B", 1, "Modify the selected source."),
+            execute(
+                "B",
+                2,
+                "Run or validate the modified object and report the result.",
+            ),
+        ])
+        .unwrap();
+        let BridgePlanStep::Execute {
+            target_revision,
+            execution_intent,
+            execution_device_ref,
+            capability_requirements,
             ..
         } = &revision.steps[2]
         else {
-            panic!("transform plan must end with Transfer");
+            panic!("expected Execute");
         };
-        assert_eq!(depends_on, &vec!["transform"]);
-        assert_eq!(input_slots[0].slot_id, "transformed_file");
+        assert_eq!(target_revision, &object_revision(2));
+        assert_eq!(execution_device_ref, "B");
         assert_eq!(
-            source,
-            &ObjectSelectionRule::FromSlot {
-                slot_id: "transformed_file".into()
-            }
+            execution_intent.0,
+            "Run or validate the modified object and report the result."
         );
-        assert_eq!(
-            destination,
-            &TransferDestination::RequestingDevice {
-                device_ref: "requester".into()
-            }
-        );
-        assert!(validate_revision(&revision).is_ok());
+        assert!(capability_requirements.is_empty());
     }
 
     #[test]
-    fn cross_device_transform_requires_an_explicit_private_transfer() {
-        assert!(build_composed_file_revision(
-            "bridge".into(),
-            "mac".into(),
-            "windows".into(),
-            "Find transform-test.txt and extract readable text on this Mac.".into(),
-            vec![
-                ComposedFilePlanBlock::Search {
-                    execution_device_ref: "windows".into(),
-                    filename_hint: "transform-test.txt".into(),
-                    extensions: vec!["txt".into()],
-                    safe_scope_labels: vec!["downloads".into()],
-                },
-                ComposedFilePlanBlock::Transform {
-                    execution_device_ref: "mac".into(),
-                    intent: "extract readable text".into(),
-                },
-            ],
-        )
-        .is_err());
+    fn cross_device_transform_and_execute_require_explicit_transfer() {
+        assert!(build(vec![search("B"), transform("A", 1, "Modify it.")]).is_err());
+        assert!(build(vec![search("B"), execute("A", 1, "Run it.")]).is_err());
+        assert!(build(vec![
+            search("B"),
+            transfer("B", "A"),
+            transform("A", 1, "Modify it."),
+            execute("A", 2, "Run it."),
+        ])
+        .is_ok());
+    }
 
-        let revision = build_composed_file_revision(
-            "bridge".into(),
-            "mac".into(),
-            "windows".into(),
-            "Find, explicitly transfer, then process transform-test.txt.".into(),
-            vec![
-                ComposedFilePlanBlock::Search {
-                    execution_device_ref: "windows".into(),
-                    filename_hint: "transform-test.txt".into(),
-                    extensions: vec!["txt".into()],
-                    safe_scope_labels: vec!["downloads".into()],
-                },
-                ComposedFilePlanBlock::Transfer {
-                    source_device_ref: "windows".into(),
-                    destination_device_ref: "mac".into(),
-                    landing: ComposedTransferLanding::PipelinePrivate,
-                },
-                ComposedFilePlanBlock::Transform {
-                    execution_device_ref: "mac".into(),
-                    intent: "extract readable text".into(),
-                },
-            ],
-        )
+    #[test]
+    fn wrong_or_stale_logical_revisions_fail_closed() {
+        assert!(build(vec![search("B"), transform("B", 2, "Modify it.")]).is_err());
+        assert!(build(vec![
+            search("B"),
+            transform("B", 1, "Modify it."),
+            execute("B", 1, "Run it."),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn same_host_search_transform_execute_contains_no_hidden_transfer() {
+        let revision = build(vec![
+            search("B"),
+            transform("B", 1, "Modify it."),
+            execute("B", 2, "Run it."),
+        ])
         .unwrap();
         assert_eq!(revision.steps.len(), 3);
-        let search = revision
+        assert!(!revision
             .steps
             .iter()
-            .find(|step| step.id() == "search")
-            .unwrap();
-        assert_eq!(search.execution_device(), "windows");
-        let pipeline = revision
-            .steps
-            .iter()
-            .find(|step| step.id() == "transfer-1")
-            .unwrap();
-        let BridgePlanStep::Transfer {
-            destination,
-            output_slots,
-            source_device_ref,
-            execution_device_ref,
-            ..
-        } = pipeline
-        else {
-            panic!("cross-device Transform must include a visible pipeline Transfer");
+            .any(|step| matches!(step, BridgePlanStep::Transfer { .. })));
+    }
+
+    #[test]
+    fn explicit_movement_is_preserved_as_pipeline_private_only_when_consumed() {
+        let revision = build(vec![
+            search("B"),
+            transfer("B", "A"),
+            transform("A", 1, "Modify it."),
+            execute("A", 2, "Run it."),
+        ])
+        .unwrap();
+        let BridgePlanStep::Transfer { destination, .. } = &revision.steps[1] else {
+            panic!("expected Transfer");
         };
-        assert_eq!(output_slots[0].slot_id, "pipeline_file_1");
-        assert_eq!(source_device_ref.as_deref(), Some("windows"));
-        assert_eq!(execution_device_ref, "windows");
-        assert_eq!(
-            destination,
-            &TransferDestination::PipelineHandoff {
-                device_ref: "mac".into()
-            }
+        assert!(
+            matches!(destination, TransferDestination::PipelineHandoff { device_ref } if device_ref == "A")
         );
-        let transform = revision
-            .steps
-            .iter()
-            .find(|step| step.id() == "transform")
-            .unwrap();
-        assert_eq!(transform.source_device(), Some("mac"));
-        assert_eq!(transform.execution_device(), "mac");
-        assert_eq!(
-            revision
-                .steps
-                .iter()
-                .filter(|step| matches!(
-                    step,
-                    BridgePlanStep::Transfer {
-                        destination: TransferDestination::PipelineHandoff { .. },
-                        ..
-                    }
-                ))
-                .count(),
-            1
-        );
-        assert_eq!(pipeline.source_device(), Some("windows"));
-        let round_trip: BridgePlanRevision =
-            serde_json::from_str(&serde_json::to_string(&revision).unwrap()).unwrap();
-        assert_eq!(round_trip, revision);
-        assert!(validate_revision(&revision).is_ok());
+        assert!(build(vec![search("B"), transfer("B", "A")]).is_err());
     }
 
     #[test]
-    fn pipeline_private_transfer_cannot_end_the_composed_flow() {
-        let result = build_composed_file_revision(
-            "bridge".into(),
-            "mac".into(),
-            "windows".into(),
-            "Move a private intermediate without a consumer.".into(),
-            vec![
-                ComposedFilePlanBlock::Search {
-                    execution_device_ref: "windows".into(),
-                    filename_hint: "report.txt".into(),
-                    extensions: vec!["txt".into()],
-                    safe_scope_labels: vec!["downloads".into()],
-                },
-                ComposedFilePlanBlock::Transfer {
-                    source_device_ref: "windows".into(),
-                    destination_device_ref: "mac".into(),
-                    landing: ComposedTransferLanding::PipelinePrivate,
-                },
-            ],
-        );
-        assert!(result.is_err());
+    fn semantic_intent_edits_change_the_immutable_revision_hash() {
+        let first = build(vec![search("B"), transform("B", 1, "Use fixed backoff.")]).unwrap();
+        let second = build(vec![
+            search("B"),
+            transform("B", 1, "Use exponential backoff."),
+        ])
+        .unwrap();
+        assert_ne!(first.revision_hash, second.revision_hash);
+
+        let first = build(vec![search("B"), execute("B", 1, "Run once.")]).unwrap();
+        let second = build(vec![
+            search("B"),
+            execute("B", 1, "Run and report validation."),
+        ])
+        .unwrap();
+        assert_ne!(first.revision_hash, second.revision_hash);
     }
 
     #[test]
-    fn same_device_search_transform_has_no_transfer_and_preserves_executor() {
-        for (requester, selected) in [("mac", "windows"), ("windows", "mac")] {
-            let revision = build_composed_file_revision(
-                "bridge".into(),
-                requester.into(),
-                selected.into(),
-                "Search and process on the selected object owner.".into(),
-                vec![
-                    ComposedFilePlanBlock::Search {
-                        execution_device_ref: selected.into(),
-                        filename_hint: "report.txt".into(),
-                        extensions: vec!["txt".into()],
-                        safe_scope_labels: vec!["downloads".into()],
-                    },
-                    ComposedFilePlanBlock::Transform {
-                        execution_device_ref: selected.into(),
-                        intent: "extract readable text".into(),
-                    },
-                ],
-            )
-            .unwrap();
-            assert_eq!(revision.steps.len(), 2);
-            assert!(!revision
-                .steps
-                .iter()
-                .any(|step| matches!(step, BridgePlanStep::Transfer { .. })));
-            assert_eq!(revision.steps[0].execution_device(), selected);
-            assert_eq!(revision.steps[1].execution_device(), selected);
-            let round_trip: BridgePlanRevision =
-                serde_json::from_str(&serde_json::to_string(&revision).unwrap()).unwrap();
-            assert_eq!(round_trip.steps[0].execution_device(), selected);
-            assert_eq!(round_trip.steps[1].execution_device(), selected);
+    fn generic_framework_steps_serialize_without_worker_or_runtime_schema() {
+        let revision = build(vec![
+            search("B"),
+            transform("B", 1, "Modify it."),
+            execute("B", 2, "Run it."),
+        ])
+        .unwrap();
+        let json = serde_json::to_string(&revision).unwrap();
+        for forbidden in [
+            "capabilityId",
+            "runtimeCapabilityId",
+            "startByte",
+            "replacementText",
+            "interpreter",
+            "shell",
+            "command",
+            "timeoutMs",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "unexpected concrete field: {forbidden}"
+            );
         }
-    }
-
-    #[test]
-    fn explicit_four_step_flow_preserves_every_location_and_movement() {
-        let revision = build_composed_file_revision(
-            "bridge".into(),
-            "mac".into(),
-            "windows".into(),
-            "Search Windows, move privately to Mac, process, then deliver to Windows.".into(),
-            vec![
-                ComposedFilePlanBlock::Search {
-                    execution_device_ref: "windows".into(),
-                    filename_hint: "report.txt".into(),
-                    extensions: vec!["txt".into()],
-                    safe_scope_labels: vec!["downloads".into()],
-                },
-                ComposedFilePlanBlock::Transfer {
-                    source_device_ref: "windows".into(),
-                    destination_device_ref: "mac".into(),
-                    landing: ComposedTransferLanding::PipelinePrivate,
-                },
-                ComposedFilePlanBlock::Transform {
-                    execution_device_ref: "mac".into(),
-                    intent: "extract readable text".into(),
-                },
-                ComposedFilePlanBlock::Transfer {
-                    source_device_ref: "mac".into(),
-                    destination_device_ref: "windows".into(),
-                    landing: ComposedTransferLanding::Inbox,
-                },
-            ],
-        )
-        .unwrap();
-        assert_eq!(revision.steps.len(), 4);
-        assert_eq!(revision.steps[0].execution_device(), "windows");
-        assert_eq!(revision.steps[1].source_device(), Some("windows"));
-        assert_eq!(step_output_device(&revision.steps[1]).unwrap(), "mac");
-        assert_eq!(revision.steps[2].execution_device(), "mac");
-        assert_eq!(revision.steps[3].source_device(), Some("mac"));
-        assert_eq!(step_output_device(&revision.steps[3]).unwrap(), "windows");
-        assert_eq!(
-            revision
-                .steps
-                .iter()
-                .filter(|step| matches!(
-                    step,
-                    BridgePlanStep::Transfer {
-                        destination: TransferDestination::PipelineHandoff { .. },
-                        ..
-                    }
-                ))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn composed_readable_text_rejects_pdf_before_revision_creation() {
-        let result = build_composed_file_revision(
-            "bridge".into(),
-            "mac".into(),
-            "windows".into(),
-            "Process report.pdf.".into(),
-            vec![
-                ComposedFilePlanBlock::Search {
-                    execution_device_ref: "windows".into(),
-                    filename_hint: "report.pdf".into(),
-                    extensions: vec!["pdf".into()],
-                    safe_scope_labels: vec!["downloads".into()],
-                },
-                ComposedFilePlanBlock::Transform {
-                    execution_device_ref: "windows".into(),
-                    intent: "extract readable text".into(),
-                },
-            ],
-        );
-        assert!(
-            matches!(result, Err(AppError::InvalidInput(message)) if message.contains("does not accept PDF"))
-        );
-    }
-
-    #[test]
-    fn executor_edit_withdraws_the_old_immutable_revision_before_new_approval() {
-        let (_, unapproved_store) = store();
-        let revision = ready(&unapproved_store);
-        unapproved_store
-            .withdraw_unapproved_revision(&revision.revision_id)
-            .unwrap();
-        assert_eq!(
-            unapproved_store
-                .get_revision(&revision.revision_id)
-                .unwrap()
-                .state,
-            RevisionState::Withdrawn
-        );
-
-        let (_, approved_store) = store();
-        let approved_revision = ready(&approved_store);
-        approved_store
-            .create_approval(&approval(&approved_revision, "approval"), 20)
-            .unwrap();
-        assert!(approved_store
-            .withdraw_unapproved_revision(&approved_revision.revision_id)
-            .is_err());
-        assert_eq!(
-            approved_store
-                .get_revision(&approved_revision.revision_id)
-                .unwrap()
-                .state,
-            RevisionState::Available
-        );
-    }
-
-    #[test]
-    fn transfer_edit_changes_semantic_hash_and_withdraws_old_revision() {
-        let (_, store) = store();
-        let revision = ready(&store);
-        let mut edited = revision.clone();
-        let transfer = edited
-            .steps
-            .iter_mut()
-            .find(|step| matches!(step, BridgePlanStep::Transfer { .. }))
-            .unwrap();
-        let BridgePlanStep::Transfer { destination, .. } = transfer else {
-            unreachable!()
-        };
-        *destination = TransferDestination::UserSelectedLocation {
-            device_ref: edited.selected_device_ref.clone(),
-            user_visible_location_scope: SafeLocationDescription::from("Pastey Shared"),
-        };
-        edited.revision_hash.clear();
-        let edited_hash = canonical_revision_hash(&edited).unwrap();
-        assert_ne!(edited_hash, revision.revision_hash);
-        store
-            .withdraw_unapproved_revision(&revision.revision_id)
-            .unwrap();
-        assert_eq!(
-            store.get_revision(&revision.revision_id).unwrap().state,
-            RevisionState::Withdrawn
-        );
-    }
-
-    #[test]
-    fn object_flow_rejects_a_transform_with_a_remote_input_location() {
-        let result = build_composed_file_revision(
-            "bridge".into(),
-            "mac".into(),
-            "windows".into(),
-            "Find transform-test.txt and extract readable text on this Mac.".into(),
-            vec![
-                ComposedFilePlanBlock::Search {
-                    execution_device_ref: "windows".into(),
-                    filename_hint: "transform-test.txt".into(),
-                    extensions: vec!["txt".into()],
-                    safe_scope_labels: vec!["downloads".into()],
-                },
-                ComposedFilePlanBlock::Transform {
-                    execution_device_ref: "mac".into(),
-                    intent: "extract readable text".into(),
-                },
-            ],
-        );
-        assert!(
-            matches!(result, Err(AppError::InvalidInput(message)) if message.contains("explicit Transfer"))
-        );
-    }
-
-    #[test]
-    fn direct_transfer_revision_binds_requester_selection_to_selected_device() {
-        let revision = build_direct_file_transfer_revision(
-            "bridge".into(),
-            "requester".into(),
-            "selected".into(),
-            "Send one local document to the selected device.".into(),
-        )
-        .unwrap();
-        assert_eq!(revision.steps.len(), 1);
-        let BridgePlanStep::Transfer {
-            depends_on,
-            source_device_ref,
-            execution_device_ref,
-            source,
-            destination,
-            ..
-        } = &revision.steps[0]
-        else {
-            panic!("direct plan must contain Transfer");
-        };
-        assert!(depends_on.is_empty());
-        assert_eq!(source_device_ref.as_deref(), Some("requester"));
-        assert_eq!(execution_device_ref, "requester");
-        assert!(matches!(
-            source,
-            ObjectSelectionRule::FutureUserSelection { .. }
+        assert!(json.contains("modification_intent"));
+        assert!(json.contains("execution_intent"));
+        assert!(framework_execution_unavailable(&revision));
+        assert!(!framework_execution_unavailable(
+            &build(vec![search("B")]).unwrap()
         ));
-        assert_eq!(
-            destination,
-            &TransferDestination::SelectedDevice {
-                device_ref: "selected".into()
-            }
-        );
-        assert!(validate_revision(&revision).is_ok());
     }
 }

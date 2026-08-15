@@ -1,78 +1,66 @@
 # Pastey architecture
 
-Pastey is a local-first desktop transfer and device workspace. Its architecture has five existing layers. This document owns the overall model and cross-layer boundaries; each layer document owns the mechanics of that layer.
+Pastey is a local-first desktop transfer and device workspace. Source code is authoritative for current behavior.
 
-## The five layers
+## Five layers
 
-| Layer | Responsibility | Canonical detail |
-| --- | --- | --- |
-| Layer 1 — Secure LAN transport | Encrypted, reliable LAN payload transfer. | [Layer 1](layers/layer-1-transfer.md) |
-| Layer 2 — Device intelligence | Factual device, link, and availability observations. | [Layer 2](layers/layer-2-device-intelligence.md) |
-| Layer 3 — Smart orchestration | Transfer planning, scheduling, and capacity allocation. | [Layer 3](layers/layer-3-orchestration.md) |
-| Layer 4 — Multi-device Bridge sessions and peer identity | Current-session peers, routing, and control transport. | [Layer 4](layers/layer-4-bridge.md) |
-| Layer 5 — Agent-assisted device workspace | Advisory planning, consent, bounded capabilities, and Transform authority. | [Layer 5](layers/layer-5-agent.md) |
+| Layer | Responsibility |
+| --- | --- |
+| 1 — Secure LAN transport | Encrypted payload transfer, framing, integrity, acknowledgement, and finalization. |
+| 2 — Device intelligence | Factual device, link, liveness, and capability observations. |
+| 3 — Smart orchestration | Transfer planning, scheduling, capacity, and queue lifecycle. |
+| 4 — Bridge | Current-session peers, routes, control transport, reconnect, replay, and Burn boundaries. |
+| 5 — Agent-assisted workspace | Guided Plan composition, immutable revisions, approval, object-flow validation, and future Agent integration. |
 
-### Layer 1 — Secure LAN transport
+Layer 2 facts are observations, not commands or authority. Layer 4 delivery is not consent. Layer 5 binds one complete immutable Plan to one requester Review & Run. Renderer state, provider output, ObjectRefs, and logs are never authority.
 
-Layer 1 owns LAN discovery and join plumbing where it is transport-owned; encrypted text, file, and image transfer; binary-v1; chunk framing; acknowledgement; finalization; integrity; and transfer lifecycle.
+## Canonical object-flow model
 
-### Layer 2 — Device intelligence
+```text
+Search     = find
+Transform  = modify
+Transfer   = move
+Execute    = run
+```
 
-Layer 2 owns factual observations: `DeviceProfile`, `DeviceCapabilities`, `LinkBenchmark`, liveness facts, endpoint availability facts, provider availability facts, remote Transform backend availability, and Developer Tools diagnostics. A remote Host computes its own Transform fact from its compiled production backend; Layer 2 does not rank devices, recommend peers, command the scheduler, grant trust, or grant execution authority.
+Every execution location, mutation intent, execution intent, and movement must appear in the approved immutable Plan. Search discovers an object at an explicit Host. Transform authorizes reviewed modification intent on the object's current Host and conceptually advances the same logical object revision. Transfer is the only primitive that changes location or landing. Execute consumes the exact current revision on an explicit Host.
 
-### Layer 3 — Smart orchestration
+Valid framework flows include:
 
-Layer 3 owns transfer planning, scheduler policy, runtime-window allocation, `MicroFlowGroup`, control-capacity reservation, queue lifecycle, and capacity accounting.
+```text
+Search @ B → Transform @ B
+Search @ B → Transform @ B → Execute @ B
+Search @ B → Transfer B → A → Transform @ A
+Search @ B → Transform @ B → Transfer B → A
+Search @ B → Transfer B → A → Transform @ A → Execute @ A
+```
 
-### Layer 4 — Multi-device Bridge sessions and peer identity
+A cross-device Transform or Execute is invalid unless an explicit earlier Transfer moved the object. Capability observations never repair or rewrite authored topology.
 
-Layer 4 owns Bridge lifecycle, current-session membership, selected-peer and selected-peers routing, ordinary-data broadcast, control transport, reconnect semantics, current-session provenance, paired-device display identity, replay/session boundaries, and the current-session binding for typed peer facts. It does not make facts durable pairing trust or execution authority.
+## Current implementation boundary
 
-### Layer 5 — Agent-assisted device workspace
+Search and Transfer are implemented. Their existing encrypted transfer, safe candidate selection, one-click Review & Run, and Rust-owned continuation remain live.
 
-Layer 2 owns factual local capability availability. Layer 4 transports those facts over the exact current peer session. Layer 5 owns manual Block Composer input, optional natural-v1 advisory proposals, durable object-flow Bridge Plans, Host validation, one complete requester approval, bounded current-Bridge session consent, Search/Transfer/Transform execution, and audit.
+Transform and Execute are Plan-framework primitives only. The Plan stores their target revision, explicit Host, and reviewed intent. Pastey Core does not choose a patch format, mutation adapter, runtime, shell, process, workspace, or containment policy. Starting any revision containing Transform or Execute fails closed before attempt creation or approval consumption with a clear Agent-unavailable error. Schema presence is never reported as execution availability.
 
-## Boundaries and dependencies
+## Immutable revision and dependency model
 
-Layer 1 supplies encrypted transport to Layers 3 and 4. Layer 2 supplies observations; it does not issue instructions to Layer 3. Layer 3 schedules ordinary transfer work over Layer 1 and reserves capacity for Layer 4/5 control demand. Layer 4 resolves the current-session peer route used by ordinary data and control messages. Layer 5 may request a selected-peer control operation, but it cannot turn membership or delivery into authority.
+The Composer authors an ordered dependency flow. Rust lowers it without inserting steps. The semantic revision hash covers device bindings, Transfer topology, logical object revisions, modification intent, and execution intent. Editing any of those semantics invalidates the prior unapproved revision.
 
-The frontend owns presentation, user intent, and defense-in-depth validation. Rust owns the durable Bridge Plan workspace, local transport, endpoint validation, receiver-local candidate bindings and filesystem operations, Transfer admission and private handoff, Transform admission, Plan approval records, and authoritative Transform output construction. Product plan and execution state do not live in renderer memory. The renderer receives only safe activity and opaque transfer projections; it never receives the private transfer source, candidate binding, resolved intent, implementation, or approval binding.
+Search creates logical object `selected_file` revision 1 at its Host. Each Transform consumes the exact current logical revision and declares the next revision at the same location. Execute consumes the exact current revision and does not create a filesystem result. Because Transform is not executable yet, its declared next revision is a Plan dependency, not a claim that bytes were changed.
 
-Capability availability is an observation, not authority. The local requester candidate comes directly from its Host-owned local projection; it is never represented by a remote query. A selected peer candidate comes from `pastey-peer-capabilities-v1`, exchanged as a typed query/response over current-session Room Control and stored only under the current Bridge plus selected `peer_session_id`. The remote projection contains only `schemaVersion`, the requester-correlated `peerSessionId`, an observation timestamp, and bounded capability records (`capabilityId`, `available`, accepted input media types, output media type, and an optional bounded unavailable reason code); it contains no paths, commands, private object references, approval IDs, grants, or secrets. The Composer keeps `Unknown`, `Available`, and `Unavailable` separate for both candidates and gates only the explicitly chosen Transform executor. Capability changes never rewrite draft topology. Restart, Burn, leave, endpoint/key change, or a new peer session makes the old remote observation unusable. Supported Unix and Windows builds advertise readable-text Transform only with their compiled secure staging backend.
+`PipelinePrivate` remains an implementation detail only for an explicit intermediate Transfer. It never appears as hidden movement or as a Transform output mechanism.
 
-The following invariants are deliberate fail-closed boundaries:
+## Security and lifecycle foundations
 
-- Device facts are not scheduler commands.
-- An encrypted session is not durable device identity.
-- Bridge membership is not execution authority.
-- Transport delivery is not consent.
-- Bridge Plan approval, current-session consent, and one-use step grants are not reusable authority.
-- Model output is not executable instruction.
-- `ObjectRef` is identity, not authority, consent, a lease, or a path.
-- Logs are not runtime state or authorization, and never contain receiver absolute paths.
+Rust retains paths, candidate identity, BLAKE3 digest, platform file identity, and ObjectRefs privately. The shared safe-file identity layer uses descriptor-oriented no-follow traversal on Unix and no-reparse component/final-handle validation on Windows, including volume/file index and link-count checks. Search and Transfer revalidate the exact private source before encrypted transfer.
 
-## High-level workflows
+Bridge/session binding, Plan/revision/attempt/step correlation, replay protection, TTL, one-use Search/Transfer authority, restart interruption, and Burn invalidation remain enforced. Candidate selection selects data and does not approve another action. The receiver has no repeated Allow, Apply, or Run controls.
 
-**Search.** Ask Bridge's manual composer supplies explicit bounded filename, extension, and reviewed scope labels. Rust constructs an immutable one-step Search revision from that bounded input; the requester approves the complete plan once, and the current-session receiver derives and consumes its one-use Search grant automatically. The result contains bounded safe candidate metadata, never paths, private bindings, or an object handle.
+## Capability projection
 
-**Search → Transfer.** This is a live file workflow. The requester selects one bounded, redacted Search result; the selected device validates that selection against its private Bridge Plan candidate store, then performs the approved Transfer through the existing encrypted transfer engine. The supported destinations are the requesting device or the selected device's approved Pastey Shared location.
+The current Host projection contains no concrete Transform or Execute capabilities. The generic bounded transport remains available for future Agent-owned observations. Capability facts answer only whether a Host currently performs a capability; they never authorize an action, select a Host, move an object, or rewrite the Plan.
 
-**Transfer (requesting device → selected device).** The requester can create a one-file Transfer Plan, choose its local source, and approve the complete plan once. The local source remains process-local and is revalidated before the existing encrypted Bridge transfer runs; it is invalidated by restart or Burn.
+## Evidence boundary
 
-**Explicit cross-device pipeline.** Search and Transform carry independent explicit execution devices in the immutable revision, but a Transform input must already be local to its executor. `Search @ B → Transform @ A` is invalid while the object exists only on B. The user may author `Search @ B → Transfer B → A (PipelinePrivate) → Transform @ A`; that ordinary visible Transfer reuses encrypted binary framing, lands under an app-owned ephemeral root, registers a one-use Rust-private object bound to Bridge/revision/attempt/step, and creates no Inbox or Pastey Shared item. Only an explicit final-delivery Transfer materializes a user-visible file. Rust derives transport authorities and ACKs from an approved Transfer, never a semantic movement absent from the revision.
-
-Windows readable-text staging preserves the Unix security goals with platform-native differences. Unix walks the approved scope using descriptor-relative `openat` plus `O_NOFOLLOW`. Windows rejects directory reparse points, opens the final candidate with `FILE_FLAG_OPEN_REPARSE_POINT`, denies write/delete sharing, validates regular-file and single-link attributes plus volume serial/file index from the handle, and checks the final handle path against the canonical approved scope. Both implementations recapture identity immediately before processing, enforce size and media bounds, hash the open source with BLAKE3, copy into app-private staging, and keep generated output private and ephemeral.
-
-## Current implementation status
-
-Layers 1–4 form the non-AI Pastey core. Layer 5 has live Rust-owned Search, bounded Transform, and Transfer Plan closures with durable approval/history and explicit per-step execution devices. Private object references and plan execution data never authorize the renderer. Ephemeral authority is Burn-purged.
-
-Linux isolation probes and behavioral verification are dormant test infrastructure for a future verified backend. They have no product authority, UI, command surface, sidecars, or production execution path. A future backend requires a separate product and security decision and native Linux verification.
-
-## Major non-goals
-
-Pastey does not currently provide cloud relay, durable route recovery, durable identity as authority, reusable approval, arbitrary shell/process/file/network execution, model-authored code execution, third-peer Transfer, dynamic expansion, background continuation, or a generic agent runtime. Pairing is display/recognition metadata, not routeability, approval, or execution authority.
-
-## Documentation map
-
-Use [reference.md](reference.md) for stable names, schemas, IDs, vocabularies, and source pointers. Use [development.md](development.md) for builds, tests, smoke checks, release procedure, and documentation maintenance. Historical release history remains in [CHANGELOG.md](../CHANGELOG.md).
+Automated tests validate the framework and current Search/Transfer behavior. Cross-compilation is not native platform behavior, and no automated result is physical Mac↔Windows E2E proof. See [Layer 5](layers/layer-5-agent.md), [reference](reference.md), and [development](development.md).

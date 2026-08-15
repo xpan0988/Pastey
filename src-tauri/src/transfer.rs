@@ -3879,38 +3879,29 @@ async fn finish_file_transfer_handler(
             &metadata.step_id,
             "registered",
         );
-        let continuation_state = ctx.state.clone();
         let cleanup_state = ctx.state.clone();
         let continuation_metadata = metadata.clone();
         tauri::async_runtime::spawn(async move {
-            if crate::commands::execute_pipeline_transform_after_handoff(
-                continuation_state,
-                continuation_metadata.clone(),
-            )
-            .await
-            .is_err()
+            crate::commands::log_pipeline_handoff(
+                "pipeline_receive_failed",
+                &continuation_metadata.bridge_id,
+                &continuation_metadata.attempt_id,
+                &continuation_metadata.step_id,
+                "framework_step_not_executable",
+            );
+            if let Ok(private) = cleanup_state
+                .bridge_plan_protocol_authority
+                .lock()
+                .consume_pipeline_input(&continuation_metadata)
             {
-                crate::commands::log_pipeline_handoff(
-                    "pipeline_receive_failed",
-                    &continuation_metadata.bridge_id,
-                    &continuation_metadata.attempt_id,
-                    &continuation_metadata.step_id,
-                    "pipeline_dependency_failed",
-                );
-                if let Ok(private) = cleanup_state
-                    .bridge_plan_protocol_authority
-                    .lock()
-                    .consume_pipeline_input(&continuation_metadata)
-                {
-                    crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&private);
-                }
-                let store = crate::bridge_plan::BridgePlanStore::new(&cleanup_state.paths);
-                let _ = store.transition_attempt(
-                    &continuation_metadata.attempt_id,
-                    crate::bridge_plan::AttemptState::Failed,
-                    crate::storage::now_ts(),
-                );
+                crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&private);
             }
+            let store = crate::bridge_plan::BridgePlanStore::new(&cleanup_state.paths);
+            let _ = store.transition_attempt(
+                &continuation_metadata.attempt_id,
+                crate::bridge_plan::AttemptState::Failed,
+                crate::storage::now_ts(),
+            );
         });
         emit_event(
             &ctx.state,

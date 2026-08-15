@@ -19,31 +19,26 @@ import type { ReceivedRoomControlEvent } from "../src/lib/types";
 import {
   SAFE_SEARCH_SCOPES,
   addPrimitive,
+  canAddPrimitive,
   manualBridgePlanInput,
   moveBlock,
   newSearchBlock,
+  newExecuteBlock,
   newTransformBlock,
   newTransferBlock,
   removeBlock,
   insertRequiredTransfer,
   reviewedObjectFlow,
   updateSearchBlock,
-  type TransformAvailability,
-  type TransformExecutorCapabilities,
 } from "../src/lib/bridgePlanComposer";
 
-const availableTransform: TransformAvailability = {
-  intent: "extract readable text", status: "available", available: true, reason: "available", hostLabel: "Host",
-};
-
-function executorCapabilities(
-  requesting: TransformAvailability = availableTransform,
-  selected: TransformAvailability = availableTransform,
-): TransformExecutorCapabilities {
-  return { requesting_device: requesting, selected_device: selected };
+function transformBlock(device: "requesting_device" | "selected_device" = "selected_device", revision = 1) {
+  return { ...newTransformBlock(device, revision), modificationIntent: "Change retry behavior to exponential backoff." };
 }
 
-const availableExecutorCapabilities = executorCapabilities();
+function executeBlock(device: "requesting_device" | "selected_device" = "selected_device", revision = 2) {
+  return { ...newExecuteBlock(device, revision), executionIntent: "Run or validate the object and report the result." };
+}
 
 function searchResultEvent(candidates: unknown[]): ReceivedRoomControlEvent {
   return {
@@ -83,17 +78,18 @@ function safeCandidate(overrides: Record<string, unknown> = {}) {
   };
 }
 
-test("Search → Transform → Transfer is valid bounded advisory vocabulary", () => {
+test("Search → Transform → Execute is valid framework vocabulary and unavailable for execution", () => {
   const plan = buildDeterministicAskBridgeNaturalV1Plan(
-    "Find report.pdf, extract readable text, and send it to me.",
+    "Find example.py, replace 'a' with 'b' at bytes 0-1, and run it.",
   );
   assert.equal(validateAskBridgeNaturalV1Plan(plan).valid, true);
-  assert.deepEqual(plan.steps.map((step) => step.primitive), ["Search", "Transform", "Transfer"]);
-  assert.equal(isSupportedBridgePlanAdvisory(plan), true);
+  assert.deepEqual(plan.steps.map((step) => step.primitive), ["Search", "Transform", "Execute"]);
+  assert.equal(plan.status, "unsupported_future");
+  assert.equal(isSupportedBridgePlanAdvisory(plan), false);
 });
 
-test("unsupported Transform advisory remains fail-closed", () => {
-  const plan = buildDeterministicAskBridgeNaturalV1Plan("Find report.pdf, translate it, and send it to me.");
+test("underspecified Transform advisory remains fail-closed", () => {
+  const plan = buildDeterministicAskBridgeNaturalV1Plan("Find example.py and modify it.");
   assert.equal(plan.status, "unsupported_future");
   assert.equal(isSupportedBridgePlanAdvisory(plan), false);
 });
@@ -122,7 +118,7 @@ test("natural Search to Transfer keeps an explicit filename separate from the tr
   assert.deepEqual(transfer, {
     primitive: "Transfer",
     destination: "requesting_device",
-    object: "search_result",
+    object: "selected_file",
   });
   assert.equal(isSupportedBridgePlanAdvisory(plan), true);
 });
@@ -167,10 +163,11 @@ test("pure Search exposes safe candidate metadata as non-interactive results", (
   assert.equal(metadata.confidence, "high");
 });
 
-test("Search followed by Transfer or Transform keeps candidate selection opaque", () => {
+test("Search followed by Transfer, Transform, or Execute keeps candidate selection opaque", () => {
   const [candidate] = parseBridgePlanSearchCandidates(searchResultEvent([safeCandidate()]));
   assert.equal(bridgePlanSearchCandidateMode(["Search", "Transfer"]), "selectable");
   assert.equal(bridgePlanSearchCandidateMode(["Search", "Transform"]), "selectable");
+  assert.equal(bridgePlanSearchCandidateMode(["Search", "Execute"]), "selectable");
   assert.deepEqual({ candidateId: selectedBridgePlanCandidateId(candidate!) }, { candidateId: "candidate-opaque-id" });
 });
 
@@ -203,41 +200,42 @@ test("zero-result Search is a successful terminal completion that replaces runna
 
 test("manual composer preserves bounded Search metadata in the authored blocks", () => {
   const search = updateSearchBlock(newSearchBlock(), { filenameHint: " Funding Statement.txt ", extension: "TXT", safeScopes: ["downloads"] });
-  const result = manualBridgePlanInput([search], availableExecutorCapabilities);
+  const result = manualBridgePlanInput([search]);
   assert.deepEqual(result.value?.blocks[0], { ...search, filenameHint: "Funding Statement.txt" });
   assert.deepEqual(SAFE_SEARCH_SCOPES.map((scope) => scope.value), ["downloads", "desktop", "documents", "pastey_shared"]);
 });
 
-test("Search@Windows → Transform@Windows defaults to locality and contains no Transfer", () => {
+test("Search@Windows → Transform@Windows preserves locality and contains no Transfer", () => {
   const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
-  const added = addPrimitive([search], "Transform");
-  assert.equal(added.blocks[1]?.primitive === "Transform" ? added.blocks[1].executionDevice : null, "selected_device");
-  const plan = manualBridgePlanInput(added.blocks, availableExecutorCapabilities).value!;
-  assert.deepEqual(plan.blocks.map((block) => block.primitive), ["Search", "Transform"]);
-  assert.deepEqual(reviewedObjectFlow(plan.blocks), ["Search @ selected_device", "Transform @ selected_device: extract readable text"]);
+  const result = manualBridgePlanInput([search, transformBlock("selected_device")]);
+  assert.deepEqual(result.value?.blocks.map((block) => block.primitive), ["Search", "Transform"]);
+  assert.deepEqual(reviewedObjectFlow(result.value!.blocks), [
+    "Search @ selected_device",
+    "Transform @ selected_device: revision 1 → 2; Change retry behavior to exponential backoff.",
+  ]);
+  assert.equal(JSON.stringify(result.value).includes("Transfer"), false);
 });
 
-test("capability facts never auto-select another Transform executor or insert movement", () => {
-  const localMac: TransformAvailability = { ...availableTransform, hostLabel: "Mac" };
-  const remoteWindows: TransformAvailability = { ...availableTransform, status: "unavailable", available: false, hostLabel: "Windows", reason: "platform_unsupported" };
+test("capability observations are not inputs to composition and cannot rewrite topology", () => {
   const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
-  const added = addPrimitive([search], "Transform");
-  assert.equal(added.blocks[1]?.primitive === "Transform" ? added.blocks[1].executionDevice : null, "selected_device");
-  assert.deepEqual(added.blocks.map((block) => block.primitive), ["Search", "Transform"]);
-  assert.equal(manualBridgePlanInput(added.blocks, executorCapabilities(localMac, remoteWindows)).error, "platform_unsupported");
+  const blocks = [search, transformBlock("selected_device")];
+  const before = JSON.stringify(blocks);
+  assert.equal(manualBridgePlanInput(blocks).error, undefined);
+  assert.equal(JSON.stringify(blocks), before);
+  assert.deepEqual(blocks.map((block) => block.primitive), ["Search", "Transform"]);
 });
 
 test("cross-device Transform without an explicit Transfer is invalid", () => {
   const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
-  assert.equal(
-    manualBridgePlanInput([search, newTransformBlock("requesting_device")], availableExecutorCapabilities).error,
-    "This file is currently on the selected device. Add a Transfer to the requesting device before processing it there.",
+  assert.match(
+    manualBridgePlanInput([search, transformBlock("requesting_device")]).error ?? "",
+    /Add an explicit Transfer/,
   );
 });
 
 test("Insert required Transfer is an explicit draft edit, not normalization", () => {
   const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
-  const invalid = [search, newTransformBlock("requesting_device")];
+  const invalid = [search, transformBlock("requesting_device")];
   assert.deepEqual(invalid.map((block) => block.primitive), ["Search", "Transform"]);
   const edited = insertRequiredTransfer(invalid, 1);
   assert.equal(edited.error, null);
@@ -248,51 +246,59 @@ test("Insert required Transfer is an explicit draft edit, not normalization", ()
 test("explicit PipelinePrivate Transfer makes cross-device Transform valid exactly once", () => {
   const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
   const handoff = { ...newTransferBlock("selected_device"), destination: "requesting_device" as const, landingMode: "pipeline_handoff" as const };
-  const blocks = [search, handoff, newTransformBlock("requesting_device")];
-  const first = manualBridgePlanInput(blocks, availableExecutorCapabilities).value!;
-  const second = manualBridgePlanInput(first.blocks, availableExecutorCapabilities).value!;
+  const blocks = [search, handoff, transformBlock("requesting_device")];
+  const first = manualBridgePlanInput(blocks).value!;
+  const second = manualBridgePlanInput(first.blocks).value!;
   assert.equal(first.blocks.filter((block) => block.primitive === "Transfer").length, 1);
   assert.equal(second.blocks.filter((block) => block.primitive === "Transfer").length, 1);
-  assert.deepEqual(reviewedObjectFlow(second.blocks), [
-    "Search @ selected_device",
-    "Transfer selected_device → requesting_device (pipeline_handoff)",
-    "Transform @ requesting_device: extract readable text",
-  ]);
 });
 
-test("PipelinePrivate is an intermediate Transfer and cannot end the object flow", () => {
+test("PipelinePrivate is an intermediate explicit Transfer and cannot end the flow", () => {
   const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
   const handoff = { ...newTransferBlock("selected_device"), destination: "requesting_device" as const, landingMode: "pipeline_handoff" as const };
   assert.equal(
-    manualBridgePlanInput([search, handoff], availableExecutorCapabilities).error,
+    manualBridgePlanInput([search, handoff]).error,
     "A private pipeline Transfer needs a following step that consumes its object.",
   );
 });
 
-test("capability changes do not rewrite authored topology; only chosen executor gates Review", () => {
-  const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
-  const blocks = [search, newTransformBlock("selected_device")];
-  const before = JSON.stringify(blocks);
-  const remoteUnavailable: TransformAvailability = { ...availableTransform, status: "unavailable", available: false, reason: "backend unavailable" };
-  assert.equal(manualBridgePlanInput(blocks, executorCapabilities(availableTransform, remoteUnavailable)).error, "backend unavailable");
-  assert.equal(JSON.stringify(blocks), before);
-});
-
-test("Unknown chosen executor fails closed", () => {
-  const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
-  const unknown: TransformAvailability = { ...availableTransform, status: "unknown", available: false, reason: "Checking capability…" };
-  assert.equal(manualBridgePlanInput([search, newTransformBlock("selected_device")], executorCapabilities(availableTransform, unknown)).error, "Checking capability…");
-});
-
-test("PDF readable-text preflight remains fail-closed", () => {
+test("Transform carries reviewed modification intent without patch or media schema", () => {
   const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.pdf", extension: "pdf" });
-  assert.equal(manualBridgePlanInput([search, newTransformBlock("selected_device")], availableExecutorCapabilities).error, "Extract readable text does not accept PDF input.");
+  const result = manualBridgePlanInput([search, transformBlock()]);
+  assert.equal(result.error, undefined);
+  const json = JSON.stringify(result.value);
+  assert.match(json, /modificationIntent/);
+  assert.equal(json.includes("startByte"), false);
+  assert.equal(json.includes("capabilityId"), false);
+});
+
+test("Execute consumes the post-Transform revision without runtime schema or hidden movement", () => {
+  const search = updateSearchBlock(newSearchBlock(), { filenameHint: "example.py", extension: "py" });
+  const result = manualBridgePlanInput([search, transformBlock(), executeBlock()]);
+  assert.deepEqual(result.value?.blocks.map((block) => block.primitive), ["Search", "Transform", "Execute"]);
+  assert.deepEqual(reviewedObjectFlow(result.value!.blocks), [
+    "Search @ selected_device",
+    "Transform @ selected_device: revision 1 → 2; Change retry behavior to exponential backoff.",
+    "Execute @ selected_device: revision 2; Run or validate the object and report the result.",
+  ]);
+  const json = JSON.stringify(result.value);
+  assert.equal(json.includes("runtimeCapabilityId"), false);
+  assert.equal(json.includes("timeoutMs"), false);
+  assert.equal(json.includes("Transfer"), false);
+});
+
+test("Execute rejects wrong revision and cross-device execution without movement", () => {
+  const search = updateSearchBlock(newSearchBlock(), { filenameHint: "example.py", extension: "py" });
+  const transform = transformBlock();
+  assert.match(manualBridgePlanInput([search, transform, executeBlock("selected_device", 1)]).error ?? "", /current logical object revision/);
+  assert.match(manualBridgePlanInput([search, transform, executeBlock("requesting_device", 2)]).error ?? "", /Add an explicit Transfer/);
+  assert.equal(canAddPrimitive([search], "Execute"), true);
 });
 
 test("dependency edits fail rather than reinterpret object ownership", () => {
-  assert.equal(addPrimitive([], "Transform").error, "Transform needs a selected input before it can run.");
-  assert.equal(addPrimitive([], "Transfer").error, "Transfer needs an available source before it can run.");
-  const blocks = [newSearchBlock(), newTransformBlock("selected_device"), newTransferBlock("selected_device")];
-  assert.equal(moveBlock(blocks, 2, 0).error, "Transfer needs an available source before it can run.");
-  assert.equal(removeBlock(blocks, 0).error, "Transform needs a selected input before it can run.");
+  assert.equal(addPrimitive([], "Transform").error, "Transform needs an available object before it can run.");
+  assert.equal(addPrimitive([], "Transfer").error, "Transfer needs an available object before it can run.");
+  const blocks = [newSearchBlock(), transformBlock("selected_device"), newTransferBlock("selected_device")];
+  assert.equal(moveBlock(blocks, 2, 0).error, "Transfer needs an available object before it can run.");
+  assert.equal(removeBlock(blocks, 0).error, "Transform needs an available object before it can run.");
 });

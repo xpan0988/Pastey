@@ -10,13 +10,13 @@ Bridge sessions are ephemeral. Devices join through nearby discovery or an 8-dig
 - Layer 2 — factual device and link intelligence
 - Layer 3 — transfer and control orchestration
 - Layer 4 — Bridge sessions, peers, routing, and control transport
-- Layer 5 — AI-assisted planning and bounded Transform workflows
+- Layer 5 — guided planning and bounded object workflows
 
-Layers 1–4 form the non-AI Pastey core. Layer 5 adds one Rust-owned Bridge Plan lifecycle for bounded Search, readable-text Transform, and Transfer. Immutable Plans, one requester approval, current-session consent, one-use grants, and attempts are the only Transform authority.
+Layers 1–4 form the non-AI Pastey core. Layer 5 adds one Rust-owned Bridge Plan lifecycle with four primitives: Search finds an object, Transform changes it, Transfer moves it, and Execute runs it. The immutable Plan, one requester approval, current-session binding, one-use grants, and attempt state are the only mutation or execution authority.
 
-Ask Bridge normally uses a guided **Search / Transform / Transfer** Block Composer; natural-v1 providers are optional and advisory only. The three primitives are dependency-ordered rather than selected from a workflow-name allowlist. Search discovers an object on its explicit device, Transform processes an object already local to its explicit executor, and only an authored Transfer may change device or landing domain. The Composer displays local and selected-peer Host-owned Transform facts independently, but capability observations never select an executor or insert movement. Rust validates the exact bounded flow, the requester approves its complete immutable revision once, and the current-session receiver executes eligible steps automatically.
+Ask Bridge normally uses a guided **Search / Transform / Transfer / Execute** Block Composer; natural-v1 providers are optional and advisory only. Search selects an object on an explicit Host. Transform records reviewed modification intent for that same logical object and conceptually advances its revision without moving it. Only an authored Transfer changes location. Execute records reviewed execution intent for the exact current revision without selecting a runtime. Capability observations never select an executor, add movement, or authorize a step.
 
-The only implemented Transform is fixed readable-text extraction through the approved Bridge Plan. Unix uses descriptor-relative no-follow opening; Windows uses no-reparse handle opening, write/delete share denial, final-handle scope validation, and volume/file-index identity. Both feed the same bounded BLAKE3-verified private snapshot and fixed Rust worker. Linux probes, cgroup helpers, launch-plan checks, and behavioral verification are dormant test infrastructure: they expose no product availability, command, UI, sidecar, or execution backend. Unsupported intents and incompatible inputs fail closed and do not execute.
+Search and Transfer are currently executable. Transform and Execute are Plan-framework primitives only: they can be composed and reviewed, but attempts containing either fail closed until a future Agent layer supplies an implementation. Pastey Core deliberately does not define patch formats, mutation workers, runtimes, shells, process launch, or containment policy.
 
 ## Documentation
 

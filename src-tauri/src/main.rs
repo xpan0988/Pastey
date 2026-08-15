@@ -17,11 +17,10 @@ mod models;
 mod object_refs;
 mod peer_capabilities;
 mod room_control;
+mod safe_file_identity;
 mod storage;
 mod transfer;
 mod transfer_tuning;
-mod transform_registry;
-mod transform_sandbox;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -42,13 +41,12 @@ use crate::{
         get_file_transfer_metadata, get_last_benchmark_results, get_room,
         get_room_control_session_context, join_room, leave_room, list_bridge_plan_workspace,
         list_nearby_devices, list_received_room_control_events, list_room_items, list_rooms,
-        local_transform_availability, log_frontend_diagnostic,
-        mark_bridge_peer_pairing_rotation_required, mark_join_prompt_rendered, open_logs_folder,
-        pair_bridge_peer, pending_join_requests, refresh_selected_peer_capabilities,
-        reject_nearby_join, request_nearby_join, reveal_in_folder, revoke_bridge_peer_pairing,
-        run_loopback_benchmark, run_peer_link_benchmark, select_bridge_plan_search_candidate,
-        selected_peer_transform_availability, send_file_to_room, send_text_to_room,
-        start_bridge_plan_attempt, update_config, update_transfer_window,
+        log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
+        mark_join_prompt_rendered, open_logs_folder, pair_bridge_peer, pending_join_requests,
+        refresh_selected_peer_capabilities, reject_nearby_join, request_nearby_join,
+        reveal_in_folder, revoke_bridge_peer_pairing, run_loopback_benchmark,
+        run_peer_link_benchmark, select_bridge_plan_search_candidate, send_file_to_room,
+        send_text_to_room, start_bridge_plan_attempt, update_config, update_transfer_window,
         withdraw_bridge_plan_revision, write_temp_file,
     },
     config::StoredConfig,
@@ -118,16 +116,6 @@ fn main() {
             let shortcut_label = default_shortcut_label();
             let paths = storage::init_app_paths(&app.handle())?;
             logging::init(paths.logs_dir.clone());
-            if transform_sandbox::cleanup_orphaned_transform_staging(&paths.app_data_dir).is_err() {
-                logging::write_error_line(
-                    "[pastey:transform-staging] event=orphan_cleanup_startup_failed location=transform_staging_root error_code=cleanup_failed",
-                );
-            }
-            if object_refs::cleanup_orphaned_transform_objects(&paths.app_data_dir).is_err() {
-                logging::write_error_line(
-                    "[pastey:transform-objects] event=orphan_cleanup_startup_failed location=transform_object_root error_code=cleanup_failed",
-                );
-            }
             storage::init_database(&paths)?;
             let config = config::load_or_create(&paths, shortcut_label)?;
             let effective_inbox_dir = config::effective_inbox_dir(&paths, &config);
@@ -167,15 +155,22 @@ fn main() {
                     file_candidates::BridgePlanCandidateStore::default(),
                 ),
                 bridge_plan_requester_sources: Mutex::new(HashMap::new()),
-                bridge_plan_protocol_authority: Mutex::new(bridge_plan::ProtocolSearchAuthorityStore::default()),
+                bridge_plan_protocol_authority: Mutex::new(
+                    bridge_plan::ProtocolSearchAuthorityStore::default(),
+                ),
                 peer_capabilities: Mutex::new(peer_capabilities::PeerCapabilityStore::default()),
             });
 
             app.manage(state.clone());
             let antenna_state = state.clone();
             tauri::async_runtime::spawn(async move {
-                if discovery::ensure_service(antenna_state.clone()).await.is_err() {
-                    logging::write_error_line("[pastey antenna] event=antenna_start error_code=service_unavailable");
+                if discovery::ensure_service(antenna_state.clone())
+                    .await
+                    .is_err()
+                {
+                    logging::write_error_line(
+                        "[pastey antenna] event=antenna_start error_code=service_unavailable",
+                    );
                     return;
                 }
                 discovery::start_antenna(antenna_state).await;
@@ -218,8 +213,6 @@ fn main() {
             create_composed_file_bridge_plan,
             create_direct_file_transfer_bridge_plan,
             refresh_selected_peer_capabilities,
-            selected_peer_transform_availability,
-            local_transform_availability,
             list_bridge_plan_workspace,
             approve_bridge_plan,
             withdraw_bridge_plan_revision,

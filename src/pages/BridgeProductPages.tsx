@@ -12,16 +12,12 @@ import {
   listBridgePlanWorkspace,
   listReceivedRoomControlEvents,
   listNearbyDevices,
-  localTransformAvailability,
   requestNearbyJoin,
   revealInFolder,
-  refreshSelectedPeerCapabilities,
   bindBridgePlanToSession,
   startBridgePlanAttempt,
   selectBridgePlanSearchCandidate,
-  selectedPeerTransformAvailability,
   sendTextToRoom,
-  type SelectedPeerTransformAvailability,
   withdrawBridgePlanRevision,
   writeTempFile,
 } from "../lib/tauri";
@@ -67,8 +63,6 @@ import {
   type ComposerBlock,
   type ComposerDevice,
   type SafeSearchScope,
-  type TransformAvailability,
-  type TransformExecutorCapabilities,
 } from "../lib/bridgePlanComposer";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
 import { formatCode, formatTimestamp } from "../lib/format";
@@ -784,149 +778,46 @@ function BridgePlanSenderPanel({
   inboxEvents: readonly ReceivedRoomControlEvent[];
 }) {
   const [blocks, setBlocks] = useState<ComposerBlock[]>([newSearchBlock()]);
-  const localTransformHostLabel = localDeviceProfile?.device_name?.trim() || localDeviceLabel(localDeviceProfile);
-  const selectedTransformHostLabel = selectedPeer?.displayName ?? "Selected device";
-  const [transformCapabilities, setTransformCapabilities] = useState<TransformExecutorCapabilities>(() => ({
-    requesting_device: unknownTransformAvailability("This device", "Checking this device capability…"),
-    selected_device: unknownTransformAvailability("Selected device", "Checking selected device capability…"),
-  }));
   const [revisionId, setRevisionId] = useState<string | null>(null);
   const [approvalId, setApprovalId] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
-  const [busy, setBusy] = useState<"plan" | "review" | "start" | null>(null);
-  const [approvalState, setApprovalState] = useState<string | null>(null);
-  const [resultSummary, setResultSummary] = useState<string | null>(null);
   const [attemptId, setAttemptId] = useState<string | null>(null);
   const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(null);
-  const [hasTransform, setHasTransform] = useState(false);
+  const [approvalState, setApprovalState] = useState<string | null>(null);
+  const [resultSummary, setResultSummary] = useState<string | null>(null);
   const [directTransfer, setDirectTransfer] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState<"plan" | "review" | "start" | null>(null);
+
+  const localHostLabel = localDeviceProfile?.device_name?.trim() || localDeviceLabel(localDeviceProfile);
+  const selectedHostLabel = selectedPeer?.displayName ?? "Selected device";
   const selectedPeerRoute = route?.target.kind === "selected_peer" ? route : null;
   const canPlan = enabled && Boolean(selectedPeer && selectedPeerRoute);
+  const composerDeviceLabel = (device: ComposerDevice) => device === "requesting_device" ? localHostLabel : selectedHostLabel;
+  const candidateMode = bridgePlanSearchCandidateMode(blocks.map((step) => step.primitive));
   const safeSearchCandidates = useMemo(
     () => inboxEvents.flatMap(parseBridgePlanSearchCandidates).filter((entry) => !attemptId || entry.attemptId === attemptId),
     [attemptId, inboxEvents],
   );
   const terminalSearchResult = useMemo(
-    () => inboxEvents
-      .flatMap((event) => {
-        const result = parseBridgePlanSearchTerminalResult(event);
-        return result ? [result] : [];
-      })
-      .find((entry) => entry.attemptId === attemptId) ?? null,
+    () => inboxEvents.flatMap((event) => {
+      const result = parseBridgePlanSearchTerminalResult(event);
+      return result ? [result] : [];
+    }).find((entry) => entry.attemptId === attemptId) ?? null,
     [attemptId, inboxEvents],
-  );
-  const candidateMode = bridgePlanSearchCandidateMode(blocks.map((step) => step.primitive));
-  const transformExecutor = blocks.find((step): step is Extract<ComposerBlock, { primitive: "Transform" }> => step.primitive === "Transform")?.executionDevice ?? "requesting_device";
-  const transformAvailability = transformCapabilities[transformExecutor];
-  const composerDeviceLabel = (device: ComposerDevice) => device === "requesting_device" ? localTransformHostLabel : selectedTransformHostLabel;
-  const reviewSearch = blocks.find((step) => step.primitive === "Search");
-  const reviewTransfer = blocks.find((step) => step.primitive === "Transfer");
-  const failedTransformAttemptIds = useMemo(
-    () => new Set(inboxEvents.flatMap(parseFailedBridgePlanTransform)),
-    [inboxEvents],
   );
 
   useEffect(() => {
-    if (revisionId && !approvalId) {
-      void withdrawBridgePlanRevision(room.id, revisionId).catch(() => undefined);
-    }
+    if (revisionId && !approvalId) void withdrawBridgePlanRevision(room.id, revisionId).catch(() => undefined);
     setBlocks([newSearchBlock()]);
     setRevisionId(null);
     setApprovalId(null);
-    setApprovalState(null);
-    setResultSummary(null);
     setAttemptId(null);
     setSelectedCandidateId(null);
+    setApprovalState(null);
+    setResultSummary(null);
     setDirectTransfer(false);
     setMessage(null);
   }, [room.id, selectedPeer?.peerSessionId]);
-
-  useEffect(() => {
-    let cancelled = false;
-    setTransformCapabilities({
-      requesting_device: unknownTransformAvailability(localTransformHostLabel, "Checking this device capability…"),
-      selected_device: unknownTransformAvailability(selectedTransformHostLabel, "Checking selected device capability…"),
-    });
-    if (!selectedPeerRoute || !selectedPeer) return;
-    let refreshing = false;
-    const refresh = async () => {
-      if (refreshing) return;
-      refreshing = true;
-      try {
-        const local = localTransformAvailability()
-          .then((observation) => {
-            if (!cancelled) setTransformCapabilities((current) => ({
-              ...current,
-              requesting_device: transformAvailabilityFromObservation(observation, localTransformHostLabel),
-            }));
-          })
-          .catch(() => {
-            if (!cancelled) setTransformCapabilities((current) => ({
-              ...current,
-              requesting_device: unknownTransformAvailability(localTransformHostLabel, "This device capability is unknown."),
-            }));
-          });
-        const remote = (async () => {
-          try {
-            await refreshSelectedPeerCapabilities(room.id, bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"));
-            for (let attempt = 0; attempt < 5 && !cancelled; attempt += 1) {
-              const observation = await selectedPeerTransformAvailability(room.id);
-              if (cancelled) return;
-              setTransformCapabilities((current) => ({
-                ...current,
-                selected_device: transformAvailabilityFromObservation(observation, selectedTransformHostLabel),
-              }));
-              if (observation.status !== "unknown") return;
-              await new Promise((resolve) => window.setTimeout(resolve, 300));
-            }
-          } catch {
-            if (!cancelled) setTransformCapabilities((current) => ({
-              ...current,
-              selected_device: unknownTransformAvailability(selectedTransformHostLabel, "Selected device capability is unknown."),
-            }));
-          }
-        })();
-        await Promise.all([local, remote]);
-      } finally {
-        refreshing = false;
-      }
-    };
-    void refresh();
-    const interval = window.setInterval(() => { void refresh(); }, 60_000);
-    return () => { cancelled = true; window.clearInterval(interval); };
-  }, [localTransformHostLabel, room.id, selectedPeer?.peerSessionId, selectedPeerRoute, selectedTransformHostLabel]);
-
-  function editBlocks(next: ComposerBlock[]) {
-    if (approvalId) {
-      setMessage("The approved revision is already running. Its execution devices cannot be changed.");
-      return;
-    }
-    if (revisionId) {
-      const staleRevisionId = revisionId;
-      void withdrawBridgePlanRevision(room.id, staleRevisionId).catch((error) => {
-        setMessage(error instanceof Error ? error.message : "Pastey could not withdraw the stale plan revision.");
-      });
-      setRevisionId(null);
-      setApprovalId(null);
-      setApprovalState(null);
-      setAttemptId(null);
-      setSelectedCandidateId(null);
-      setDirectTransfer(false);
-      setMessage("Plan semantics changed. Review creates a new immutable revision before approval.");
-    }
-    setBlocks(next);
-    const flowError = dependencyError(next);
-    if (flowError) setMessage(flowError);
-  }
-
-  useEffect(() => {
-    const hasDraftTransform = blocks.some((step) => step.primitive === "Transform");
-    if (!revisionId || approvalId || !hasDraftTransform || transformAvailability.status !== "unavailable") return;
-    const staleRevisionId = revisionId;
-    setRevisionId(null);
-    setMessage(`${transformAvailability.hostLabel} can no longer execute the reviewed Transform. Review a new revision after choosing an Available executor.`);
-    void withdrawBridgePlanRevision(room.id, staleRevisionId).catch(() => undefined);
-  }, [approvalId, blocks, revisionId, room.id, transformAvailability.hostLabel, transformAvailability.status]);
 
   useEffect(() => {
     if (!approvalId) return;
@@ -939,15 +830,12 @@ function BridgePlanSenderPanel({
           .map(parseBridgePlanApproval)
           .find((entry): entry is { approvalId: string; state: string } => entry?.approvalId === approvalId);
         if (approval) setApprovalState(approval.state);
-        const attemptIds = new Set(
-          workspace.attempts
-            .map(parseBridgePlanAttempt)
-            .filter((entry): entry is { approvalId: string; attemptId: string } => entry?.approvalId === approvalId)
-            .map((entry) => entry.attemptId),
-        );
-        const currentAttemptIds = [...attemptIds];
-        const latestAttemptId = currentAttemptIds.length > 0 ? currentAttemptIds[currentAttemptIds.length - 1] : null;
-        setAttemptId(latestAttemptId);
+        const attempts = workspace.attempts
+          .map(parseBridgePlanAttempt)
+          .filter((entry): entry is { approvalId: string; attemptId: string } => entry?.approvalId === approvalId);
+        const latest = attempts[attempts.length - 1]?.attemptId ?? null;
+        if (latest) setAttemptId(latest);
+        const attemptIds = new Set(attempts.map((entry) => entry.attemptId));
         const result = workspace.results
           .map(parseBridgePlanResult)
           .find((entry): entry is { attemptId: string; summary: string } => Boolean(entry && attemptIds.has(entry.attemptId)));
@@ -956,17 +844,9 @@ function BridgePlanSenderPanel({
         if (!cancelled) setMessage(error instanceof Error ? error.message : "Could not refresh the plan status.");
       }
     };
-    let timeout: number | null = null;
-    const poll = () => {
-      void refresh().finally(() => {
-        if (!cancelled) timeout = window.setTimeout(poll, 2_000);
-      });
-    };
-    poll();
-    return () => {
-      cancelled = true;
-      if (timeout !== null) window.clearTimeout(timeout);
-    };
+    const timer = window.setInterval(() => void refresh(), 2_000);
+    void refresh();
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, [approvalId, room.id]);
 
   useEffect(() => {
@@ -974,53 +854,66 @@ function BridgePlanSenderPanel({
     const presentation = terminalSearchPresentation(terminalSearchResult);
     setApprovalState(presentation.status);
     setResultSummary(presentation.summary);
-    setMessage(null);
   }, [terminalSearchResult]);
+
+  function editBlocks(next: ComposerBlock[]) {
+    if (approvalId) {
+      setMessage("This immutable revision has already been approved. Create a new Plan to change its semantics.");
+      return;
+    }
+    if (revisionId) {
+      void withdrawBridgePlanRevision(room.id, revisionId).catch(() => undefined);
+      setRevisionId(null);
+      setMessage("Plan semantics changed. Review creates a new immutable revision.");
+    }
+    setBlocks(next);
+    const error = dependencyError(next);
+    if (error) setMessage(error);
+  }
 
   async function createPlan() {
     if (!canPlan || !selectedPeerRoute) {
       setMessage(BRIDGE_PLAN_REQUIRES_ONE_SELECTED_DEVICE);
       return;
     }
-    const composed = manualBridgePlanInput(blocks, transformCapabilities);
-    if (!composed.value) { setMessage(composed.error ?? "Complete the bounded plan fields."); return; }
+    const composed = manualBridgePlanInput(blocks);
+    if (!composed.value) {
+      setMessage(composed.error ?? "Complete the Plan fields.");
+      return;
+    }
     setBusy("plan");
     setMessage(null);
     try {
-      const plan = composed.value;
-      const supportsTransform = plan.blocks.some((block) => block.primitive === "Transform");
-      const supportsTransfer = plan.blocks.some((block) => block.primitive === "Transfer");
       const workspace = await createComposedFileBridgePlan({
         roomId: room.id,
-        originalUserGoal: plan.originalUserGoal,
-        blocks: plan.blocks,
+        originalUserGoal: composed.value.originalUserGoal,
+        blocks: composed.value.blocks,
       });
-      const revision = workspace.revisions.map(parseBridgePlanRevision).filter((entry): entry is { revisionId: string; state: string } => entry?.state === "available").pop();
-      if (!revision) throw new Error("Pastey did not return the durable Search plan.");
+      const revision = workspace.revisions
+        .map(parseBridgePlanRevision)
+        .filter((entry): entry is { revisionId: string; state: string } => entry?.state === "available")
+        .pop();
+      if (!revision) throw new Error("Pastey did not return the immutable Plan revision.");
       setRevisionId(revision.revisionId);
       setApprovalId(null);
+      setAttemptId(null);
       setApprovalState(null);
       setResultSummary(null);
-      setAttemptId(null);
       setSelectedCandidateId(null);
-      setHasTransform(supportsTransform);
       setDirectTransfer(false);
-      setMessage(supportsTransform
-        ? supportsTransfer ? "Plan ready. Review the complete Search, Transform, and Transfer plan before sending it to the selected device." : "Plan ready. Review the complete Search and Transform plan before sending it to the selected device."
-        : supportsTransfer ? "Plan ready. Review the complete Search and Transfer plan before sending it to the selected device." : "Plan ready. Review the complete Search plan before sending it to the selected device.");
+      const frameworkOnly = blocks.some((step) => step.primitive === "Transform" || step.primitive === "Execute");
+      setMessage(frameworkOnly
+        ? "Plan ready. Transform and Execute intent are reviewable framework steps; execution is not yet available."
+        : "Plan ready. Review the complete Search and Transfer flow.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not create the Search plan.");
+      setMessage(error instanceof Error ? error.message : "Pastey could not create the Plan.");
     } finally {
       setBusy(null);
     }
   }
 
-  async function requestReview() {
+  async function reviewAndRun() {
     if (!revisionId || !selectedPeerRoute) return;
-    if (blocks.some((step) => step.primitive === "Transform") && (transformAvailability.status !== "available" || !transformAvailability.available)) {
-      setMessage(transformAvailability.reason);
-      return;
-    }
     setBusy("review");
     setMessage(null);
     try {
@@ -1039,8 +932,9 @@ function BridgePlanSenderPanel({
       );
       setAttemptId(nextAttemptId);
       setApprovalState("running");
-      setMessage("Approved plan started. Pastey is waiting only for a bounded Search result selection if needed.");
+      setMessage("Approved Plan started. Pastey will continue executable Search and Transfer steps automatically.");
     } catch (error) {
+      setApprovalState("execution unavailable");
       setMessage(bridgePlanControlErrorMessage(error));
     } finally {
       setBusy(null);
@@ -1059,16 +953,24 @@ function BridgePlanSenderPanel({
         originalUserGoal: "Transfer one selected local file to the selected device.",
         sourcePath: selected,
       });
-      const revision = workspace.revisions.map(parseBridgePlanRevision).filter((entry): entry is { revisionId: string; state: string } => entry?.state === "available").pop();
-      if (!revision) throw new Error("Pastey did not return the direct Transfer plan.");
+      const revision = workspace.revisions
+        .map(parseBridgePlanRevision)
+        .filter((entry): entry is { revisionId: string; state: string } => entry?.state === "available")
+        .pop();
+      if (!revision) throw new Error("Pastey did not return the direct Transfer Plan.");
       setBlocks([{ primitive: "Transfer", source: "requesting_device", destination: "selected_device", landingMode: "final_delivery" }]);
       setRevisionId(revision.revisionId);
-      setApprovalId(null); setApprovalState(null); setAttemptId(null); setSelectedCandidateId(null);
-      setHasTransform(false); setDirectTransfer(true);
-      setMessage("Plan ready. Review the complete Transfer plan before sending it to the selected device.");
+      setApprovalId(null);
+      setAttemptId(null);
+      setApprovalState(null);
+      setSelectedCandidateId(null);
+      setDirectTransfer(true);
+      setMessage("Plan ready. Review the explicit Transfer.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not create the direct Transfer plan.");
-    } finally { setBusy(null); }
+      setMessage(error instanceof Error ? error.message : "Pastey could not create the direct Transfer Plan.");
+    } finally {
+      setBusy(null);
+    }
   }
 
   async function selectCandidate(candidateId: string) {
@@ -1083,128 +985,129 @@ function BridgePlanSenderPanel({
         bridgeRoutePayload(selectedPeerRoute, "pastey-bridge-control-route-v1"),
       );
       setSelectedCandidateId(candidateId);
-      setMessage("Candidate selected. Pastey is continuing the approved object flow…");
+      setMessage("Candidate selected. Pastey is continuing the approved executable flow.");
     } catch (error) {
-      setMessage(bridgePlanTransferErrorMessage(error));
+      setMessage(bridgePlanControlErrorMessage(error));
     } finally {
       setBusy(null);
     }
   }
 
-  if (!enabled) return null;
   return (
-    <Card className="ask-bridge-card">
+    <Card className="ask-bridge-card" aria-label="Ask Bridge Composer">
       <div className="section-row">
         <div>
-          <h2>Ask Bridge</h2>
-          <p className="muted">Create one complete, reviewable plan for the selected device. Review &amp; Run gives the current Bridge session one bounded task to execute.</p>
+          <h2>Block Composer</h2>
+          <p className="muted">Search finds. Transform records modification intent. Transfer moves. Execute records execution intent.</p>
         </div>
-      </div>
-      <div className="button-row">
-        <button type="button" className="secondary-button" disabled={!canAddPrimitive(blocks, "Search")} onClick={() => editBlocks(addPrimitive(blocks, "Search").blocks)}>+ Search</button>
-        <button type="button" className="secondary-button" disabled={Boolean(approvalId) || !canAddPrimitive(blocks, "Transform")} onClick={() => editBlocks(addPrimitive(blocks, "Transform").blocks)}>+ Transform</button>
-        <button type="button" className="secondary-button" disabled={!canAddPrimitive(blocks, "Transfer")} onClick={() => editBlocks(addPrimitive(blocks, "Transfer").blocks)}>+ Transfer</button>
-        <button type="button" className="secondary-button" disabled={!canPlan || busy !== null} onClick={() => void createDirectTransferPlan()}>
-          Transfer local file
+        <button type="button" className="secondary-button" disabled={!canPlan || busy !== null || Boolean(approvalId)} onClick={() => void createDirectTransferPlan()}>
+          Direct Transfer
         </button>
       </div>
-      <div className="request-file-preview" data-testid="ask-bridge-block-composer">
+      <p className="muted">Transform and Execute are framework-defined but not executable until the future Agent layer exists. Pastey never inserts hidden movement.</p>
+      <div className="button-row" aria-label="Add Plan primitive">
+        {(["Search", "Transform", "Transfer", "Execute"] as const).map((primitive) => (
+          <button
+            key={primitive}
+            type="button"
+            className="secondary-button"
+            disabled={Boolean(approvalId) || !canAddPrimitive(blocks, primitive)}
+            onClick={() => {
+              const next = addPrimitive(blocks, primitive);
+              if (next.error) setMessage(next.error);
+              else editBlocks(next.blocks);
+            }}
+          >
+            + {primitive}
+          </button>
+        ))}
+      </div>
+
+      <div className="bridge-plan-block-list">
         {blocks.map((block, index) => (
-          <section key={`${block.primitive}-${index}`} className="bridge-plan-block">
-            <div className="section-row"><h3>{index + 1}. {block.primitive}</h3><div className="button-row"><button type="button" className="text-button" disabled={index === 0} onClick={() => { const next = moveBlock(blocks, index, index - 1); editBlocks(next.blocks); setMessage(next.error); }}>↑</button><button type="button" className="text-button" disabled={index === blocks.length - 1} onClick={() => { const next = moveBlock(blocks, index, index + 1); editBlocks(next.blocks); setMessage(next.error); }}>↓</button><button type="button" className="text-button" onClick={() => { const next = removeBlock(blocks, index); editBlocks(next.blocks); setMessage(next.error); }}>Remove</button></div></div>
-            {block.primitive === "Search" ? <div className="bridge-plan-block-fields"><label>Device<input value={selectedPeer?.displayName ?? "Selected device"} readOnly /></label><label>Look in<select aria-label="Reviewed Search scope" value={block.safeScopes[0] ?? "downloads"} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { safeScopes: [event.target.value as SafeSearchScope] }) : entry))}>{SAFE_SEARCH_SCOPES.map((scope) => <option key={scope.value} value={scope.value}>{scope.label}</option>)}</select></label><label>File name<input aria-label="Search filename" value={block.filenameHint} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { filenameHint: event.target.value }) : entry))} placeholder="Funding Statement.pdf" /></label><label>Type<input aria-label="Search extension" value={block.extension} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { extension: event.target.value }) : entry))} placeholder="pdf" /></label></div> : null}
-            {block.primitive === "Transform" ? <div className="bridge-plan-block-fields"><p>Process file: <strong>Extract readable text</strong></p><label>Process on:<select aria-label="Transform execution device" disabled={Boolean(approvalId)} value={block.executionDevice} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transform" ? { ...entry, executionDevice: event.target.value as ComposerDevice } : entry))}><option value="requesting_device">{localTransformHostLabel} — {transformCapabilityStatusLabel(transformCapabilities.requesting_device)}</option><option value="selected_device">{selectedTransformHostLabel} — {transformCapabilityStatusLabel(transformCapabilities.selected_device)}</option></select></label>{requiredTransferForTransform(blocks, index) ? <button type="button" className="secondary-button" onClick={() => { const next = insertRequiredTransfer(blocks, index); editBlocks(next.blocks); setMessage(next.error ?? "Explicit private Transfer inserted. Review its source, destination, and landing before approval."); }}>Insert required Transfer</button> : null}<div aria-label="Transform executor capabilities">{(["requesting_device", "selected_device"] as const).map((device) => { const capability = transformCapabilities[device]; return <p key={device} className={capability.status === "unknown" ? "muted" : capability.available ? "success-text" : "danger-text"}><strong>{composerDeviceLabel(device)}</strong>: {transformCapabilityStatusLabel(capability)}{capability.reason ? ` — ${capability.reason}` : ""}</p>; })}</div><p>Runs on: {transformAvailability.hostLabel}</p><p className={transformAvailability.status === "unknown" ? "muted" : transformAvailability.available ? "success-text" : "danger-text"}>Availability: {transformCapabilityStatusLabel(transformAvailability)}{transformAvailability.reason ? ` — ${transformAvailability.reason}` : ""}</p>{transformAvailability.acceptedInputMediaTypes?.length ? <p className="muted">Accepted input types: {transformAvailability.acceptedInputMediaTypes.join(", ")}. Candidate compatibility is rechecked by the execution Host.</p> : null}</div> : null}
-            {block.primitive === "Transfer" ? <div className="bridge-plan-block-fields"><p>From: <strong>{composerDeviceLabel(block.source)}</strong></p><label>Transfer mode:<select aria-label="Transfer landing mode" value={block.landingMode} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transfer" ? { ...entry, landingMode: event.target.value as "pipeline_handoff" | "final_delivery" } : entry))}><option value="final_delivery">Final delivery</option><option value="pipeline_handoff">Private pipeline handoff</option></select></label><label>Send to:<select aria-label="Transfer destination" value={block.destination} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transfer" ? { ...entry, destination: event.target.value as "requesting_device" | "selected_device" | "pastey_shared" } : entry))}><option value="requesting_device">{localTransformHostLabel}</option><option value="selected_device">{selectedTransformHostLabel}</option>{block.landingMode === "final_delivery" && block.source === "selected_device" ? <option value="pastey_shared">Pastey Shared on {selectedTransformHostLabel}</option> : null}</select></label><p className="muted">A private pipeline handoff is an explicit intermediate Transfer and creates no Inbox item. Final delivery creates a user-visible result.</p></div> : null}
+          <section className="bridge-plan-block" key={`${block.primitive}-${index}`}>
+            <div className="section-row">
+              <h3>{index + 1}. {block.primitive}</h3>
+              <div className="button-row">
+                <button type="button" className="text-button" disabled={index === 0 || Boolean(approvalId)} onClick={() => { const next = moveBlock(blocks, index, index - 1); if (next.error) setMessage(next.error); else editBlocks(next.blocks); }}>Up</button>
+                <button type="button" className="text-button" disabled={index === blocks.length - 1 || Boolean(approvalId)} onClick={() => { const next = moveBlock(blocks, index, index + 1); if (next.error) setMessage(next.error); else editBlocks(next.blocks); }}>Down</button>
+                <button type="button" className="text-button" disabled={Boolean(approvalId)} onClick={() => { const next = removeBlock(blocks, index); if (next.error) setMessage(next.error); else editBlocks(next.blocks); }}>Remove</button>
+              </div>
+            </div>
+
+            {block.primitive === "Search" ? (
+              <div className="bridge-plan-block-fields">
+                <p>Find an object on <strong>{selectedHostLabel}</strong>. Search does not modify or move it.</p>
+                <label>Locations<select multiple aria-label="Search locations" value={block.safeScopes} onChange={(event) => {
+                  const safeScopes = [...event.currentTarget.selectedOptions].map((option) => option.value as SafeSearchScope);
+                  editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { safeScopes }) : entry));
+                }}>{SAFE_SEARCH_SCOPES.map((scope) => <option key={scope.value} value={scope.value}>{scope.label}</option>)}</select></label>
+                <label>File name or description<input aria-label="Search filename" value={block.filenameHint} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { filenameHint: event.target.value }) : entry))} /></label>
+                <label>Optional extension<input aria-label="Search extension" value={block.extension} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Search" ? updateSearchBlock(entry, { extension: event.target.value }) : entry))} /></label>
+              </div>
+            ) : null}
+
+            {block.primitive === "Transform" ? (
+              <div className="bridge-plan-block-fields">
+                <p><strong>Modify the selected object.</strong> The intent advances the same logical object from revision {block.targetRevision.revision} to {block.targetRevision.revision + 1} without moving it.</p>
+                <label>Modify on<select aria-label="Transform execution device" value={block.executionDevice} disabled={Boolean(approvalId)} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transform" ? { ...entry, executionDevice: event.target.value as ComposerDevice } : entry))}><option value="requesting_device">{localHostLabel}</option><option value="selected_device">{selectedHostLabel}</option></select></label>
+                {requiredTransferForTransform(blocks, index) ? <button type="button" className="secondary-button" onClick={() => { const next = insertRequiredTransfer(blocks, index); editBlocks(next.blocks); setMessage(next.error ?? "Explicit PipelinePrivate Transfer inserted for review."); }}>Insert required Transfer</button> : null}
+                <label>Modification intent<textarea aria-label="Modification intent" maxLength={1024} value={block.modificationIntent} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transform" ? { ...entry, modificationIntent: event.target.value } : entry))} placeholder="Change the retry behavior to use exponential backoff." /></label>
+                <p className="muted">Framework defined · execution not yet available. No patch format or mutation worker is selected by Pastey Core.</p>
+              </div>
+            ) : null}
+
+            {block.primitive === "Transfer" ? (
+              <div className="bridge-plan-block-fields">
+                <p>From: <strong>{composerDeviceLabel(block.source)}</strong></p>
+                <label>Transfer mode<select aria-label="Transfer landing mode" value={block.landingMode} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transfer" ? { ...entry, landingMode: event.target.value as "pipeline_handoff" | "final_delivery" } : entry))}><option value="final_delivery">Final delivery</option><option value="pipeline_handoff">Private pipeline handoff</option></select></label>
+                <label>Move to<select aria-label="Transfer destination" value={block.destination} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transfer" ? { ...entry, destination: event.target.value as "requesting_device" | "selected_device" | "pastey_shared" } : entry))}><option value="requesting_device">{localHostLabel}</option><option value="selected_device">{selectedHostLabel}</option>{block.landingMode === "final_delivery" && block.source === "selected_device" ? <option value="pastey_shared">Pastey Shared on {selectedHostLabel}</option> : null}</select></label>
+                <p className="muted">PipelinePrivate is used only for this explicit intermediate Transfer.</p>
+              </div>
+            ) : null}
+
+            {block.primitive === "Execute" ? (
+              <div className="bridge-plan-block-fields">
+                <p><strong>Authorize execution intent for logical revision {block.targetRevision.revision}.</strong> Execute does not move the object or select a runtime.</p>
+                <label>Execute on<select aria-label="Execute device" value={block.executionDevice} disabled={Boolean(approvalId)} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Execute" ? { ...entry, executionDevice: event.target.value as ComposerDevice } : entry))}><option value="requesting_device">{localHostLabel}</option><option value="selected_device">{selectedHostLabel}</option></select></label>
+                <label>Execution intent<textarea aria-label="Execution intent" maxLength={1024} value={block.executionIntent} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Execute" ? { ...entry, executionIntent: event.target.value } : entry))} placeholder="Run or validate the modified object and report the result." /></label>
+                <p className="danger-text"><strong>Framework defined · execution not yet available.</strong> Pastey Core does not choose a runtime, shell, process, or containment policy.</p>
+              </div>
+            ) : null}
           </section>
         ))}
       </div>
-      <div className="button-row"><button type="button" className="primary-button" disabled={!canPlan || busy !== null || directTransfer || Boolean(approvalId) || (blocks.some((step) => step.primitive === "Transform") && (transformAvailability.status !== "available" || !transformAvailability.available))} onClick={() => void createPlan()}>{busy === "plan" ? "Building…" : "Review plan"}</button></div>
-      {!canPlan ? <p className="muted">Select one connected device to create a plan.</p> : null}
+
+      <button type="button" className="primary-button" disabled={!canPlan || busy !== null || directTransfer || Boolean(approvalId)} onClick={() => void createPlan()}>
+        {busy === "plan" ? "Building…" : "Review plan"}
+      </button>
+
       {revisionId ? (
         <div className="request-file-preview" data-testid="ask-bridge-plan-preview">
           <h3>Review plan</h3>
-          <p>{directTransfer ? "Transfer the one local file you chose to the selected device after your single Review & Run approval." : blocks.some((step) => step.primitive === "Transform") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then process it with the reviewed capability." : blocks.some((step) => step.primitive === "Transfer") ? "Search the selected device’s reviewed locations, let you choose one bounded result, then transfer it to the approved destination." : "Search the selected device’s reviewed locations for matching files and return a bounded summary."}</p>
-          {!directTransfer && reviewSearch?.primitive === "Search" ? (
-            <p className="muted">
-              Search: {reviewSearch.filenameHint} {reviewSearch.extension ? `(${reviewSearch.extension.toUpperCase()})` : ""} in {reviewSearch.safeScopes.join(", ")}.
-              {reviewTransfer?.primitive === "Transfer" ? ` First Transfer: ${composerDeviceLabel(reviewTransfer.source)} to ${reviewTransfer.destination === "pastey_shared" ? `Pastey Shared on ${selectedTransformHostLabel}` : composerDeviceLabel(reviewTransfer.destination)} (${reviewTransfer.landingMode === "pipeline_handoff" ? "private pipeline" : "final delivery"}).` : ""}
-            </p>
-          ) : null}
-          {!directTransfer ? (
-            <div aria-label="Reviewed object flow">
-              {blocks.map((step, index) => {
-                if (step.primitive === "Search") return <p key={`review-flow-${index}`}><strong>Search @ {composerDeviceLabel(step.executionDevice)}</strong></p>;
-                if (step.primitive === "Transform") return <p key={`review-flow-${index}`}><strong>Transform @ {composerDeviceLabel(step.executionDevice)}</strong><br /><span className="muted">Extract readable text</span></p>;
-                return <p key={`review-flow-${index}`}><strong>{step.landingMode === "pipeline_handoff" ? "Transfer · PipelinePrivate" : "Transfer · Final delivery"}</strong><br />{composerDeviceLabel(step.source)} → {step.destination === "pastey_shared" ? `Pastey Shared on ${selectedTransformHostLabel}` : composerDeviceLabel(step.destination)}</p>;
-              })}
-            </div>
-          ) : null}
-          {!approvalId ? (
-            <button type="button" className="primary-button" disabled={busy !== null || (blocks.some((step) => step.primitive === "Transform") && (transformAvailability.status !== "available" || !transformAvailability.available))} onClick={() => void requestReview()}>
-              {busy === "review" ? "Starting…" : "Review & Run"}
-            </button>
-          ) : null}
+          {blocks.map((step, index) => {
+            if (step.primitive === "Search") return <p key={index}><strong>Search @ {composerDeviceLabel(step.executionDevice)}</strong><br />{step.filenameHint}</p>;
+            if (step.primitive === "Transform") return <p key={index}><strong>Transform @ {composerDeviceLabel(step.executionDevice)}</strong><br />Modify selected object revision {step.targetRevision.revision} → {step.targetRevision.revision + 1}<br />Intent: “{step.modificationIntent}”<br /><span className="muted">Execution unavailable until Agent integration.</span></p>;
+            if (step.primitive === "Execute") return <p key={index}><strong>Execute @ {composerDeviceLabel(step.executionDevice)}</strong><br />Consume selected object revision {step.targetRevision.revision}<br />Intent: “{step.executionIntent}”<br /><span className="danger-text">Execution unavailable; no runtime is selected.</span></p>;
+            return <p key={index}><strong>{step.landingMode === "pipeline_handoff" ? "Transfer · PipelinePrivate" : "Transfer · Final delivery"}</strong><br />{composerDeviceLabel(step.source)} → {step.destination === "pastey_shared" ? `Pastey Shared on ${selectedHostLabel}` : composerDeviceLabel(step.destination)}</p>;
+          })}
+          {!approvalId ? <button type="button" className="primary-button" disabled={busy !== null} onClick={() => void reviewAndRun()}>{busy === "review" ? "Starting…" : "Review & Run"}</button> : null}
         </div>
       ) : null}
-      {approvalState === "running" ? <p className="muted">Search is running on the selected device.</p> : null}
-      {resultSummary && terminalSearchResult?.candidateCount !== 0 ? <p className="success-text">{resultSummary}</p> : null}
-      {terminalSearchResult?.candidateCount === 0 ? (
-        <div className="request-file-preview">
-          <h3>Search results</h3>
-          <p className="success-text">Search completed with no matching files.</p>
-        </div>
-      ) : null}
+
+      {approvalState ? <p className="muted">Plan state: {approvalState}</p> : null}
+      {resultSummary ? <p className="success-text">{resultSummary}</p> : null}
+      {terminalSearchResult?.candidateCount === 0 ? <div className="request-file-preview"><h3>Search results</h3><p className="success-text">Search completed with no matching files.</p></div> : null}
       {safeSearchCandidates.length > 0 && (candidateMode === "result" || !selectedCandidateId) ? (
         <div className="candidate-card-list">
           <h3>{candidateMode === "selectable" ? "Choose a file for the approved next step" : "Search results on the selected device"}</h3>
-          {candidateMode === "result" ? <p className="muted">These matching files remain on the selected device.</p> : null}
-          {safeSearchCandidates.map((candidate) => (
-            <SearchCandidateCard
-              key={candidate.candidateId}
-              candidate={candidate}
-              selectable={candidateMode === "selectable"}
-              disabled={busy !== null}
-              onSelect={candidateMode === "selectable" ? () => void selectCandidate(selectedBridgePlanCandidateId(candidate)) : undefined}
-            />
-          ))}
+          {safeSearchCandidates.map((candidate) => <SearchCandidateCard key={candidate.candidateId} candidate={candidate} selectable={candidateMode === "selectable"} disabled={busy !== null} onSelect={candidateMode === "selectable" ? () => void selectCandidate(selectedBridgePlanCandidateId(candidate)) : undefined} />)}
         </div>
       ) : null}
-      {hasTransform && attemptId && failedTransformAttemptIds.has(attemptId) ? (
-        <div className="request-file-preview"><h3>Processing unavailable</h3><p>The approved Transform could not run on its reviewed execution device. Edit the draft topology and create a new immutable Plan; Pastey will not switch devices or add a Transfer automatically.</p></div>
-      ) : null}
+      {!canPlan ? <p className="muted">Select one connected device to create a Plan.</p> : null}
       {message ? <p className="muted" role="status">{message}</p> : null}
     </Card>
   );
-}
-
-function unknownTransformAvailability(hostLabel: string, reason: string): TransformAvailability {
-  return {
-    intent: "extract readable text",
-    status: "unknown",
-    available: false,
-    reason,
-    hostLabel,
-  };
-}
-
-function transformAvailabilityFromObservation(
-  observation: SelectedPeerTransformAvailability,
-  hostLabel: string,
-): TransformAvailability {
-  return {
-    intent: "extract readable text",
-    status: observation.status,
-    available: observation.available,
-    reason: observation.reason,
-    hostLabel,
-    acceptedInputMediaTypes: observation.acceptedInputMediaTypes,
-    outputMediaType: observation.outputMediaType,
-  };
-}
-
-function transformCapabilityStatusLabel(capability: TransformAvailability): string {
-  if (capability.status === "unknown") return "Unknown";
-  return capability.available ? "Available" : "Unavailable";
 }
 
 function SearchCandidateCard({
@@ -1251,7 +1154,7 @@ function BridgePlanWorkspacePanel({ room }: { room: RoomInfo }) {
       setWorkspace({
         plans: records.revisions.map(parseBridgePlanWorkspaceRevision).filter((entry): entry is { description: string; state: string } => entry !== null),
         activity: records.activities.map(parseBridgePlanActivity).filter((entry): entry is string => entry !== null).slice(-8),
-        results: records.results.map(parseBridgePlanResult).filter((entry): entry is { attemptId: string; summary: string } => entry !== null).map((entry) => entry.summary).slice(-8),
+        results: records.results.map(parseBridgePlanResult).filter((entry): entry is NonNullable<ReturnType<typeof parseBridgePlanResult>> => entry !== null).map((entry) => entry.summary).slice(-8),
       });
       setError(null);
     } catch (cause) {
@@ -1312,12 +1215,6 @@ function parseBridgePlanAttempt(value: unknown): { approvalId: string; attemptId
 function parseBridgePlanResult(value: unknown): { attemptId: string; summary: string } | null {
   if (!isRecord(value) || typeof value.attempt_id !== "string" || typeof value.summary !== "string") return null;
   return { attemptId: value.attempt_id, summary: value.summary };
-}
-
-function parseFailedBridgePlanTransform(event: ReceivedRoomControlEvent): string[] {
-  if (event.kind !== "bridge_plan.step_failed") return [];
-  const payload = roomControlEventPayload(event.event);
-  return payload?.stepId === "transform" && typeof payload.attemptId === "string" ? [payload.attemptId] : [];
 }
 
 function roomControlEventPayload(event: unknown): Record<string, unknown> | null {

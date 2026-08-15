@@ -4,33 +4,22 @@
 //! worker, implementation, and sandbox field. Resolution is a host check, not
 //! an authorization decision.
 
-use std::{
-    collections::HashMap,
-    fs,
-    path::{Component, Path, PathBuf},
-};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
 use crate::error::{AppError, AppResult};
 
 pub(crate) const OBJECT_REF_SCHEMA: &str = "pastey-object-ref-v1";
 const OBJECT_REF_PREFIX: &str = "object-ref-";
-const OUTPUT_ROOT_NAME: &str = "transform-objects";
 const MAX_OBJECT_REF_LEN: usize = 128;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ObjectKind {
     FilesystemCandidate,
-    TransformOutput,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -51,14 +40,8 @@ pub(crate) struct ObjectRefDescriptor {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct TransformOutputObject {
-    pub(crate) private_output_root: PathBuf,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) enum EphemeralObjectEntry {
     FilesystemCandidate,
-    TransformOutput(TransformOutputObject),
 }
 
 #[derive(Clone, Debug)]
@@ -112,56 +95,11 @@ impl EphemeralObjectStore {
         Ok(descriptor)
     }
 
-    pub(crate) fn register_transform_output(
-        &mut self,
-        bridge_session_ref: String,
-        owner_device_ref: String,
-        private_output_path: PathBuf,
-        private_output_root: PathBuf,
-        size_bytes: u64,
-        display_name: String,
-        ttl_seconds: i64,
-    ) -> AppResult<ObjectRefDescriptor> {
-        validate_private_output(&private_output_path, &private_output_root, size_bytes)?;
-        let private_output_root = fs::canonicalize(private_output_root)?;
-        let created = OffsetDateTime::now_utc();
-        let expires = created + time::Duration::seconds(ttl_seconds.clamp(1, 600));
-        let descriptor = ObjectRefDescriptor {
-            schema_version: OBJECT_REF_SCHEMA.into(),
-            object_ref: new_object_ref(),
-            object_kind: ObjectKind::TransformOutput,
-            owner_device_ref,
-            bridge_session_ref,
-            media_type: "text/plain".into(),
-            size_bytes: Some(size_bytes),
-            display_name: Some(display_name),
-            created_at: created
-                .format(&Rfc3339)
-                .map_err(|_| AppError::InvalidInput("Invalid ObjectRef time.".into()))?,
-            expires_at: expires
-                .format(&Rfc3339)
-                .map_err(|_| AppError::InvalidInput("Invalid ObjectRef expiry.".into()))?,
-        };
-        validate_descriptor(&descriptor, created)?;
-        self.entries.insert(
-            descriptor.object_ref.clone(),
-            StoredObject {
-                descriptor: descriptor.clone(),
-                entry: EphemeralObjectEntry::TransformOutput(TransformOutputObject {
-                    private_output_root,
-                }),
-            },
-        );
-        Ok(descriptor)
-    }
-
     pub(crate) fn purge_object(&mut self, object_ref: &str) -> AppResult<bool> {
         let Some(stored) = self.entries.get(object_ref).cloned() else {
             return Ok(false);
         };
-        if let EphemeralObjectEntry::TransformOutput(output) = stored.entry {
-            cleanup_private_output(&output)?;
-        }
+        let _ = stored.entry;
         self.entries.remove(object_ref);
         Ok(true)
     }
@@ -237,140 +175,6 @@ pub(crate) fn validate_descriptor(
             "ObjectRef descriptor expired.".into(),
         ));
     }
-    Ok(())
-}
-
-pub(crate) fn cleanup_orphaned_transform_objects(app_data_dir: &Path) -> AppResult<usize> {
-    let root = app_data_dir.join(OUTPUT_ROOT_NAME);
-    let metadata = match fs::symlink_metadata(&root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error.into()),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(AppError::InvalidInput(
-            "Transform object root is invalid.".into(),
-        ));
-    }
-    remove_tree(&root)?;
-    Ok(1)
-}
-
-pub(crate) fn create_transform_output_root(app_data_dir: &Path) -> AppResult<PathBuf> {
-    let app_data = fs::canonicalize(app_data_dir)?;
-    validate_private_directory(&app_data)?;
-    let parent = app_data.join(OUTPUT_ROOT_NAME);
-    if !parent.exists() {
-        fs::create_dir(&parent)?;
-    }
-    validate_private_directory(&parent)?;
-    let parent = fs::canonicalize(parent)?;
-    if !parent.starts_with(&app_data) || parent == app_data {
-        return Err(AppError::InvalidInput(
-            "Transform object root escaped app data.".into(),
-        ));
-    }
-    let root = parent.join(format!("object-output-{}", Uuid::new_v4()));
-    fs::create_dir(&root)?;
-    validate_private_directory(&root)?;
-    Ok(root)
-}
-
-fn validate_private_directory(path: &Path) -> AppResult<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(AppError::InvalidInput(
-            "Transform private directory is invalid.".into(),
-        ));
-    }
-    #[cfg(windows)]
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(AppError::InvalidInput(
-            "Transform private directory contains a reparse point.".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_private_output(path: &Path, root: &Path, size_bytes: u64) -> AppResult<()> {
-    let root = fs::canonicalize(root)
-        .map_err(|_| AppError::InvalidInput("Transform output root is unavailable.".into()))?;
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|_| AppError::InvalidInput("Transform output is unavailable.".into()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != size_bytes {
-        return Err(AppError::InvalidInput(
-            "Transform output is invalid.".into(),
-        ));
-    }
-    let path = fs::canonicalize(path)
-        .map_err(|_| AppError::InvalidInput("Transform output is unavailable.".into()))?;
-    if !path.starts_with(&root) {
-        return Err(AppError::InvalidInput(
-            "Transform output escaped private storage.".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn cleanup_private_output(output: &TransformOutputObject) -> AppResult<()> {
-    let root = fs::canonicalize(&output.private_output_root).or_else(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            Ok(output.private_output_root.clone())
-        } else {
-            Err(error)
-        }
-    })?;
-    if !root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.strip_prefix("object-output-")
-                .and_then(|value| Uuid::parse_str(value).ok())
-                .is_some()
-        })
-    {
-        return Err(AppError::InvalidInput(
-            "Transform output cleanup root is invalid.".into(),
-        ));
-    }
-    remove_tree(&root)
-}
-
-fn remove_tree(path: &Path) -> AppResult<()> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    if metadata.file_type().is_symlink() {
-        return Err(AppError::InvalidInput("Refusing symlink cleanup.".into()));
-    }
-    #[cfg(windows)]
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(AppError::InvalidInput(
-            "Refusing reparse-point cleanup.".into(),
-        ));
-    }
-    if metadata.is_file() {
-        fs::remove_file(path)?;
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        return Err(AppError::InvalidInput(
-            "Refusing special-file cleanup.".into(),
-        ));
-    }
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        if Path::new(&entry.file_name())
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return Err(AppError::InvalidInput("Invalid cleanup child.".into()));
-        }
-        remove_tree(&entry.path())?;
-    }
-    fs::remove_dir(path)?;
     Ok(())
 }
 

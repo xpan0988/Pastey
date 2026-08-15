@@ -77,69 +77,6 @@ pub async fn refresh_selected_peer_capabilities(
     }
 }
 
-/// Returns only the fresh observation bound to the currently selected peer
-/// session. Missing, restarted, reconnected, or purged state is Unknown.
-#[tauri::command]
-pub fn selected_peer_transform_availability(
-    room_id: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<crate::peer_capabilities::SelectedPeerTransformAvailability, String> {
-    let context = crate::room_control::room_control_session_context(state.inner(), &room_id)
-        .map_err(|error| error.message())?;
-    Ok(state.peer_capabilities.lock().selected_transform(
-        &room_id,
-        &context.peer_route_ref,
-        &context.peer_observation_ref,
-        storage::now_ts(),
-    ))
-}
-
-/// A local production-backend fact for the requesting-device executor choice.
-/// It is a capability observation only and is never persisted as authority.
-#[tauri::command]
-pub fn local_transform_availability() -> crate::peer_capabilities::SelectedPeerTransformAvailability
-{
-    let projection = crate::peer_capabilities::local_projection("local".into(), storage::now_ts());
-    let capability = &projection.capabilities[0];
-    crate::peer_capabilities::SelectedPeerTransformAvailability {
-        peer_session_id: "local".into(),
-        status: if capability.available {
-            "available"
-        } else {
-            "unavailable"
-        },
-        available: capability.available,
-        reason: if capability.available {
-            "available"
-        } else {
-            "platform_unsupported"
-        },
-        accepted_input_media_types: capability.accepted_input_media_types.clone(),
-        output_media_type: Some(capability.output_media_type.clone()),
-    }
-}
-
-/// A selected-peer fact is only composition/admission input. This does not
-/// issue any execution authority; receiver-local Transform execution still
-/// revalidates its one-use grant, candidate, media type, and backend.
-fn require_selected_peer_transform_available(
-    state: &Arc<AppState>,
-    room_id: &str,
-    context: &RoomControlSessionContext,
-) -> Result<(), String> {
-    let observation = state.peer_capabilities.lock().selected_transform(
-        room_id,
-        &context.peer_route_ref,
-        &context.peer_observation_ref,
-        storage::now_ts(),
-    );
-    if observation.available {
-        Ok(())
-    } else {
-        Err(observation.reason.into())
-    }
-}
-
 fn bridge_plan_control_event(
     kind: &str,
     payload: Value,
@@ -264,13 +201,19 @@ pub enum ComposedFileBlockRequest {
         safe_scopes: Vec<String>,
     },
     Transform {
-        intent: String,
         execution_device: String,
+        target_revision: bridge_plan::LogicalObjectRevision,
+        modification_intent: String,
     },
     Transfer {
         source: String,
         destination: String,
         landing_mode: String,
+    },
+    Execute {
+        execution_device: String,
+        target_revision: bridge_plan::LogicalObjectRevision,
+        execution_intent: String,
     },
 }
 
@@ -1542,35 +1485,47 @@ pub fn create_composed_file_bridge_plan(
                 safe_scopes,
             } => {
                 if execution_device != "selected_device" {
-                    return Err("The current remote Search backend must execute on the selected device.".into());
+                    return Err(
+                        "The current remote Search backend must execute on the selected device."
+                            .into(),
+                    );
                 }
                 bridge_plan::ComposedFilePlanBlock::Search {
                     execution_device_ref: resolve_device(&execution_device)?,
                     filename_hint,
-                    extensions: (!extension.is_empty()).then_some(extension).into_iter().collect(),
+                    extensions: (!extension.is_empty())
+                        .then_some(extension)
+                        .into_iter()
+                        .collect(),
                     safe_scope_labels: safe_scopes,
                 }
             }
-            ComposedFileBlockRequest::Transform { intent, execution_device } => {
-                match execution_device.as_str() {
-                    "selected_device" => require_selected_peer_transform_available(state.inner(), &request.room_id, &context)?,
-                    "requesting_device" => {
-                        if !crate::peer_capabilities::local_projection("local".into(), storage::now_ts()).capabilities[0].available {
-                            return Err("This device cannot execute Extract readable text with its current secure Transform backend.".into());
-                        }
-                    }
-                    _ => return Err("Transform execution device is not part of this current Bridge.".into()),
-                }
-                bridge_plan::ComposedFilePlanBlock::Transform {
-                    execution_device_ref: resolve_device(&execution_device)?,
-                    intent,
-                }
-            }
-            ComposedFileBlockRequest::Transfer { source, destination, landing_mode } => {
-                let destination_role = if destination == "pastey_shared" { "selected_device" } else { destination.as_str() };
+            ComposedFileBlockRequest::Transform {
+                execution_device,
+                target_revision,
+                modification_intent,
+            } => bridge_plan::ComposedFilePlanBlock::Transform {
+                execution_device_ref: resolve_device(&execution_device)?,
+                target_revision,
+                modification_intent,
+            },
+            ComposedFileBlockRequest::Transfer {
+                source,
+                destination,
+                landing_mode,
+            } => {
+                let destination_role = if destination == "pastey_shared" {
+                    "selected_device"
+                } else {
+                    destination.as_str()
+                };
                 let landing = match landing_mode.as_str() {
-                    "pipeline_handoff" if destination != "pastey_shared" => bridge_plan::ComposedTransferLanding::PipelinePrivate,
-                    "final_delivery" if destination == "pastey_shared" => bridge_plan::ComposedTransferLanding::PasteyShared,
+                    "pipeline_handoff" if destination != "pastey_shared" => {
+                        bridge_plan::ComposedTransferLanding::PipelinePrivate
+                    }
+                    "final_delivery" if destination == "pastey_shared" => {
+                        bridge_plan::ComposedTransferLanding::PasteyShared
+                    }
                     "final_delivery" => bridge_plan::ComposedTransferLanding::Inbox,
                     _ => return Err("Composer Transfer landing mode is invalid.".into()),
                 };
@@ -1580,6 +1535,15 @@ pub fn create_composed_file_bridge_plan(
                     landing,
                 }
             }
+            ComposedFileBlockRequest::Execute {
+                execution_device,
+                target_revision,
+                execution_intent,
+            } => bridge_plan::ComposedFilePlanBlock::Execute {
+                execution_device_ref: resolve_device(&execution_device)?,
+                target_revision,
+                execution_intent,
+            },
         });
     }
     let revision = bridge_plan::build_composed_file_revision(
@@ -1781,6 +1745,15 @@ pub async fn start_bridge_plan_attempt(
     let state = state.inner().clone();
     let now = storage::now_ts();
     let store = bridge_plan::BridgePlanStore::new(&state.paths);
+    let approval = store
+        .get_approval(&approval_id)
+        .map_err(|error| error.message())?;
+    let revision = store
+        .get_revision(&approval.approval.revision_id)
+        .map_err(|error| error.message())?;
+    if bridge_plan::framework_execution_unavailable(&revision.revision) {
+        return Err("This immutable Plan contains Transform or Execute intent. Pastey Core can review these framework steps, but no Agent implementation is currently available to execute them.".into());
+    }
     let attempt = store
         .create_attempt_from_approval(&attempt_id, &approval_id, now)
         .map_err(|error| error.message())?;
@@ -1961,12 +1934,6 @@ pub async fn select_bridge_plan_search_candidate(
     } else if revision
         .steps
         .iter()
-        .any(|step| matches!(step, bridge_plan::BridgePlanStep::Transform { .. }))
-    {
-        start_bridge_plan_transform_attempt_inner(state, room_id, attempt_id, bridge_route).await?;
-    } else if revision
-        .steps
-        .iter()
         .any(|step| matches!(step, bridge_plan::BridgePlanStep::Transfer { .. }))
     {
         start_bridge_plan_transfer_attempt_inner(state, room_id, attempt_id, bridge_route).await?;
@@ -2126,6 +2093,8 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
         .ok_or_else(|| {
             "The selected local file is unavailable after restart or cancellation.".to_string()
         })?;
+    file_candidates::revalidate_bridge_plan_private_file(&private_file)
+        .map_err(|error| error.message())?;
     let metadata = std::fs::symlink_metadata(&private_file.path)
         .map_err(|_| "The selected local file is unavailable.".to_string())?;
     if metadata.file_type().is_symlink()
@@ -2248,102 +2217,6 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
             Err(error.message())
         }
     }
-}
-
-pub(crate) async fn start_bridge_plan_transform_attempt_inner(
-    state: Arc<AppState>,
-    room_id: String,
-    attempt_id: String,
-    bridge_route: Option<Value>,
-) -> Result<RoomControlDeliveryReceipt, String> {
-    let now = storage::now_ts();
-    let store = bridge_plan::BridgePlanStore::new(&state.paths);
-    let attempt = store
-        .list_attempt(&attempt_id)
-        .map_err(|error| error.message())?;
-    if attempt.attempt.bridge_id != room_id || attempt.state != bridge_plan::AttemptState::Running {
-        return Err("This approved plan is not ready to process a selected file.".into());
-    }
-    let transform_node = attempt
-        .attempt
-        .graph_projection
-        .nodes
-        .iter()
-        .find(|node| matches!(node.operation, bridge_plan::StepOperation::Transform))
-        .ok_or_else(|| "This plan has no supported Transform step.".to_string())?;
-    let transform = attempt
-        .steps
-        .iter()
-        .find(|step| step.step_id == transform_node.step_id)
-        .ok_or_else(|| "This plan has no durable Transform state.".to_string())?;
-    if transform.state != bridge_plan::StepExecutionState::Eligible {
-        return Err("Choose a completed Search result before starting Transform.".into());
-    }
-    let payload = bridge_plan::transform_start_payload(&state.paths, &room_id, &attempt_id, now)
-        .map_err(|error| error.message())?;
-    let context = crate::room_control::room_control_session_context(&state, &room_id)
-        .map_err(|error| error.message())?;
-    if transform_node.execution_device_ref != context.peer_session_ref {
-        return Err("This Transform requires a private pipeline handoff before it can start; the current executor cannot receive it through the final-delivery path.".into());
-    }
-    if context.local_session_ref
-        != payload
-            .get("requesterDeviceRef")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-        || context.peer_session_ref
-            != payload
-                .get("receiverDeviceRef")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-    {
-        return Err("The selected device session changed before Transform could start.".into());
-    }
-    let event = bridge_plan_control_event("bridge_plan.transform_start", payload, &context)
-        .map_err(|error| error.message())?;
-    log_bridge_plan_control(&event, "transform_start_dispatch");
-    let receipt = match crate::room_control::send_room_control_event(
-        state.clone(),
-        &room_id,
-        event.clone(),
-        bridge_route,
-    )
-    .await
-    {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            log_bridge_plan_control(&event, "transform_start_delivery_failed");
-            return Err(error.message());
-        }
-    };
-    log_bridge_plan_control(&event, "transform_start_delivered");
-    bridge_plan::record_outbound_protocol_event(
-        &state.paths,
-        "bridge_plan.transform_start",
-        &event,
-        now,
-    )
-    .map_err(|error| error.message())?;
-    log_bridge_plan_control(&event, "transform_start_correlated");
-    let refreshed = store
-        .list_attempt(&attempt_id)
-        .map_err(|error| error.message())?;
-    if refreshed
-        .steps
-        .iter()
-        .find(|step| step.step_id == transform.step_id)
-        .is_some_and(|step| step.state == bridge_plan::StepExecutionState::Eligible)
-    {
-        store
-            .transition_step(
-                &attempt_id,
-                &transform.step_id,
-                bridge_plan::StepExecutionState::Authorized,
-                now,
-            )
-            .map_err(|error| error.message())?;
-    }
-    Ok(receipt)
 }
 
 /// Internal Host-owned continuation used after authenticated attempt-start.
@@ -2522,18 +2395,23 @@ pub(crate) async fn execute_bridge_plan_search_attempt_inner(
         )
     };
     let terminal = send(kind, payload).map_err(|error| error.message())?;
-    crate::room_control::send_room_control_event(state, &room_id, terminal, bridge_route)
-        .await
-        .map_err(|error| {
-            log_bridge_plan_search_attempt(
-                "search_execution_failed",
-                &room_id,
-                &attempt_id,
-                "result_delivery_failed",
-                Some(result.candidates.len()),
-            );
-            error.message()
-        })?;
+    crate::room_control::send_room_control_event(
+        state.clone(),
+        &room_id,
+        terminal,
+        bridge_route.clone(),
+    )
+    .await
+    .map_err(|error| {
+        log_bridge_plan_search_attempt(
+            "search_execution_failed",
+            &room_id,
+            &attempt_id,
+            "result_delivery_failed",
+            Some(result.candidates.len()),
+        );
+        error.message()
+    })?;
     log_bridge_plan_search_attempt(
         "search_result_delivered",
         &room_id,
@@ -2541,449 +2419,6 @@ pub(crate) async fn execute_bridge_plan_search_attempt_inner(
         result.error_code.as_deref().unwrap_or("completed"),
         Some(result.candidates.len()),
     );
-    Ok(())
-}
-
-/// Executes one receiver-local Transform after consuming the grant derived
-/// from the authenticated complete-plan binding. The generated file is kept
-/// in receiver-private ephemeral storage; no path or ObjectRef crosses Room
-/// Control, and unsupported input or intent fails with a product-safe result.
-pub(crate) async fn execute_bridge_plan_transform_attempt_inner(
-    state: Arc<AppState>,
-    room_id: String,
-    attempt_id: String,
-    bridge_route: Option<Value>,
-) -> Result<bool, String> {
-    let grant = bridge_plan::consume_transform_execution_grant(
-        &state.paths,
-        &state.bridge_plan_protocol_authority.lock(),
-        &room_id,
-        &attempt_id,
-        storage::now_ts(),
-    )
-    .map_err(|error| error.message())?;
-    let context = crate::room_control::room_control_session_context(&state, &room_id)
-        .map_err(|error| error.message())?;
-    if context.local_session_ref != grant.receiver_device_ref
-        || context.peer_session_ref != grant.requester_device_ref
-    {
-        return Err("The requester session changed before Transform could run.".into());
-    }
-    let send = |kind: &str, payload: Value| -> Result<_, String> {
-        bridge_plan_control_event(kind, payload, &context).map_err(|error| error.message())
-    };
-    for (kind, payload) in [
-        (
-            "bridge_plan.attempt_ack",
-            bridge_plan::transform_update_payload(&grant, "bridge_plan.attempt_ack", None, None),
-        ),
-        (
-            "bridge_plan.step_progress",
-            bridge_plan::transform_update_payload(&grant, "bridge_plan.step_progress", None, None),
-        ),
-    ] {
-        let event = send(kind, payload.map_err(|error| error.message())?)?;
-        crate::room_control::send_room_control_event(
-            state.clone(),
-            &room_id,
-            event,
-            bridge_route.clone(),
-        )
-        .await
-        .map_err(|error| error.message())?;
-    }
-    let transformed = {
-        let mut candidates = state.bridge_plan_candidate_store.lock();
-        file_candidates::transform_bridge_plan_selected_file(
-            &mut candidates,
-            &state.paths,
-            &room_id,
-            &grant.requester_device_ref,
-            &grant.receiver_device_ref,
-            &grant.attempt_id,
-            &grant.candidate_id,
-            &grant.intent,
-        )
-    };
-    let (kind, payload, succeeded, failure_message) = match transformed {
-        Ok(output) => {
-            state
-                .bridge_plan_protocol_authority
-                .lock()
-                .retain_transform_output(&room_id, &attempt_id, output)
-                .map_err(|error| error.message())?;
-            (
-                "bridge_plan.step_result",
-                bridge_plan::transform_update_payload(
-                    &grant,
-                    "bridge_plan.step_result",
-                    Some("The selected file was processed and remains on the selected device."),
-                    None,
-                ),
-                true,
-                None,
-            )
-        }
-        Err(error) => {
-            let unsupported_input = error
-                .message()
-                .contains("cannot process this file with the requested Transform");
-            (
-                "bridge_plan.step_failed",
-                bridge_plan::transform_update_payload(
-                    &grant,
-                    "bridge_plan.step_failed",
-                    None,
-                    Some(if unsupported_input {
-                        "transform_input_unsupported"
-                    } else {
-                        "transform_unavailable_or_failed"
-                    }),
-                ),
-                false,
-                Some(if unsupported_input {
-                    "The selected file type is not supported by the approved Transform."
-                } else {
-                    "The approved Transform could not be completed on the selected device."
-                }),
-            )
-        }
-    };
-    let terminal = send(kind, payload.map_err(|error| error.message())?)?;
-    crate::room_control::send_room_control_event(state, &room_id, terminal, bridge_route)
-        .await
-        .map_err(|error| error.message())?;
-    if !succeeded {
-        return Err(failure_message
-            .unwrap_or("The approved Transform could not be completed on the selected device.")
-            .into());
-    }
-    Ok(true)
-}
-
-/// Continues a cross-device object flow after encrypted PipelinePrivate
-/// finalization. The input is obtained only from the receiver-private store;
-/// no control event or renderer value supplies a path or object reference.
-pub(crate) async fn execute_pipeline_transform_after_handoff(
-    state: Arc<AppState>,
-    metadata: crate::models::PipelineHandoffMetadata,
-) -> Result<(), String> {
-    let now = storage::now_ts();
-    log_pipeline_handoff(
-        "pipeline_dependency_activated",
-        &metadata.bridge_id,
-        &metadata.attempt_id,
-        &metadata.step_id,
-        "started",
-    );
-    let context = crate::room_control::room_control_session_context(&state, &metadata.bridge_id)
-        .map_err(|error| error.message())?;
-    if context.local_session_ref != metadata.destination_device_ref
-        || context.peer_session_ref != metadata.source_device_ref
-        || !crate::peer_capabilities::local_projection("local".into(), now).capabilities[0]
-            .available
-    {
-        return Err(
-            "Pipeline Transform is no longer available in this current Bridge session.".into(),
-        );
-    }
-    let store = bridge_plan::BridgePlanStore::new(&state.paths);
-    let revision = store
-        .get_revision(&metadata.revision_id)
-        .map_err(|error| error.message())?
-        .revision;
-    let transform = revision
-        .steps
-        .iter()
-        .find_map(|step| match step {
-            bridge_plan::BridgePlanStep::Transform {
-                step_id,
-                depends_on,
-                intent,
-                execution_device_ref,
-                ..
-            } if depends_on
-                .iter()
-                .any(|dependency| dependency == &metadata.step_id)
-                && execution_device_ref == &metadata.destination_device_ref =>
-            {
-                Some((step_id.clone(), intent.as_str().to_owned()))
-            }
-            _ => None,
-        })
-        .ok_or_else(|| "Pipeline handoff has no eligible local Transform.".to_string())?;
-    let attempt = store
-        .list_attempt(&metadata.attempt_id)
-        .map_err(|error| error.message())?;
-    let state_for = |step_id: &str| {
-        attempt
-            .steps
-            .iter()
-            .find(|step| step.step_id == step_id)
-            .map(|step| step.state.clone())
-    };
-    if state_for(&metadata.step_id) == Some(bridge_plan::StepExecutionState::Authorized) {
-        store
-            .transition_step(
-                &metadata.attempt_id,
-                &metadata.step_id,
-                bridge_plan::StepExecutionState::Running,
-                now,
-            )
-            .map_err(|error| error.message())?;
-        store
-            .transition_step(
-                &metadata.attempt_id,
-                &metadata.step_id,
-                bridge_plan::StepExecutionState::Completed,
-                now,
-            )
-            .map_err(|error| error.message())?;
-    }
-    let refreshed = store
-        .list_attempt(&metadata.attempt_id)
-        .map_err(|error| error.message())?;
-    if refreshed
-        .steps
-        .iter()
-        .find(|step| step.step_id == transform.0)
-        .is_some_and(|step| step.state == bridge_plan::StepExecutionState::Pending)
-    {
-        store
-            .transition_step(
-                &metadata.attempt_id,
-                &transform.0,
-                bridge_plan::StepExecutionState::Eligible,
-                now,
-            )
-            .map_err(|error| error.message())?;
-    }
-    store
-        .transition_step(
-            &metadata.attempt_id,
-            &transform.0,
-            bridge_plan::StepExecutionState::Authorized,
-            now,
-        )
-        .map_err(|error| error.message())?;
-    store
-        .transition_step(
-            &metadata.attempt_id,
-            &transform.0,
-            bridge_plan::StepExecutionState::Running,
-            now,
-        )
-        .map_err(|error| error.message())?;
-    // Consume only after every session, capability, revision, and state
-    // transition precondition has passed. From here the private root is
-    // deterministically cleaned immediately after Transform returns.
-    let input = state
-        .bridge_plan_protocol_authority
-        .lock()
-        .consume_pipeline_input(&metadata)
-        .map_err(|error| error.message())?;
-    let transformed = {
-        let mut candidates = state.bridge_plan_candidate_store.lock();
-        file_candidates::transform_bridge_plan_private_file(
-            &mut candidates,
-            &state.paths,
-            &metadata.bridge_id,
-            &metadata.destination_device_ref,
-            &input,
-            &transform.1,
-        )
-    };
-    file_candidates::cleanup_bridge_plan_private_pipeline_file(&input);
-    let output = transformed.map_err(|error| error.message())?;
-    state
-        .bridge_plan_protocol_authority
-        .lock()
-        .retain_transform_output(&metadata.bridge_id, &metadata.attempt_id, output)
-        .map_err(|error| error.message())?;
-    log_pipeline_handoff(
-        "pipeline_step_result_delivered",
-        &metadata.bridge_id,
-        &metadata.attempt_id,
-        &metadata.step_id,
-        "transform_completed",
-    );
-    store
-        .transition_step(
-            &metadata.attempt_id,
-            &transform.0,
-            bridge_plan::StepExecutionState::Completed,
-            storage::now_ts(),
-        )
-        .map_err(|error| error.message())?;
-    // Continue only an explicit authored final Transfer that consumes this
-    // Transform output. Same-device Inbox materialization and a network
-    // delivery back to the selected peer are distinct reviewed destinations.
-    if let Some((final_transfer_id, final_destination)) =
-        revision.steps.iter().find_map(|step| match step {
-            bridge_plan::BridgePlanStep::Transfer {
-                step_id,
-                depends_on,
-                destination,
-                ..
-            } if depends_on
-                .iter()
-                .any(|dependency| dependency == &transform.0) =>
-            {
-                Some((step_id.clone(), destination.clone()))
-            }
-            _ => None,
-        })
-    {
-        let refreshed = store
-            .list_attempt(&metadata.attempt_id)
-            .map_err(|error| error.message())?;
-        if refreshed
-            .steps
-            .iter()
-            .find(|step| step.step_id == final_transfer_id)
-            .is_some_and(|step| step.state == bridge_plan::StepExecutionState::Pending)
-        {
-            store
-                .transition_step(
-                    &metadata.attempt_id,
-                    &final_transfer_id,
-                    bridge_plan::StepExecutionState::Eligible,
-                    storage::now_ts(),
-                )
-                .map_err(|error| error.message())?;
-        }
-        store
-            .transition_step(
-                &metadata.attempt_id,
-                &final_transfer_id,
-                bridge_plan::StepExecutionState::Authorized,
-                storage::now_ts(),
-            )
-            .map_err(|error| error.message())?;
-        store
-            .transition_step(
-                &metadata.attempt_id,
-                &final_transfer_id,
-                bridge_plan::StepExecutionState::Running,
-                storage::now_ts(),
-            )
-            .map_err(|error| error.message())?;
-        let private_output = state
-            .bridge_plan_protocol_authority
-            .lock()
-            .consume_transform_output(&metadata.bridge_id, &metadata.attempt_id)
-            .map_err(|error| error.message())?;
-        let delivery = match final_destination {
-            bridge_plan::TransferDestination::RequestingDevice { device_ref }
-                if device_ref == metadata.destination_device_ref =>
-            {
-                let destination_dir = {
-                    let config = state.config.read();
-                    config::received_item_destination_dir(
-                        &state.paths,
-                        &config,
-                        Some(&private_output.mime_type),
-                    )
-                };
-                std::fs::create_dir_all(&destination_dir)
-                    .map_err(|_| "Could not create the final Inbox location.".to_string())?;
-                let final_path = storage::next_inbox_path_excluding(
-                    &destination_dir,
-                    Some(&private_output.display_name),
-                    &[],
-                )
-                .map_err(|error| error.to_string())?;
-                if std::fs::copy(&private_output.path, &final_path)
-                    .map_err(|_| "Could not deliver the transformed result.".to_string())?
-                    != private_output.size_bytes
-                {
-                    Err("Final transformed delivery was incomplete.".to_string())
-                } else {
-                    let master_key = {
-                        let config = state.config.read();
-                        config::master_key(&config).map_err(|error| error.message())?
-                    };
-                    storage::persist_incoming_file_item_metadata(
-                        &state.paths,
-                        &master_key,
-                        &metadata.bridge_id,
-                        &format!("bridge-plan-final-{}", uuid::Uuid::new_v4()),
-                        private_output.size_bytes,
-                        Some(private_output.display_name.clone()),
-                        Some(private_output.mime_type.clone()),
-                        storage::now_ts(),
-                        Some(final_path.display().to_string()),
-                    )
-                    .map_err(|error| error.message())?;
-                    Ok(())
-                }
-            }
-            bridge_plan::TransferDestination::SelectedDevice { device_ref }
-                if device_ref == metadata.source_device_ref =>
-            {
-                let context =
-                    crate::room_control::room_control_session_context(&state, &metadata.bridge_id)
-                        .map_err(|error| error.message())?;
-                let peers = storage::list_bridge_peer_endpoints(&state.paths, &metadata.bridge_id)
-                    .map_err(|error| error.message())?;
-                let endpoint = resolve_routeable_bridge_peer(
-                    &peers,
-                    &context.peer_route_ref,
-                    "Final Transfer",
-                )
-                .map_err(|error| error.message())?;
-                let master_key = {
-                    let config = state.config.read();
-                    config::master_key(&config).map_err(|error| error.message())?
-                };
-                let item = storage::create_outgoing_file_item_with_metadata(
-                    &state.paths,
-                    &master_key,
-                    &metadata.bridge_id,
-                    &private_output.path,
-                    Some(private_output.display_name.clone()),
-                    Some(private_output.mime_type.clone()),
-                )
-                .map_err(|error| error.message())?;
-                if item.size_bytes != private_output.size_bytes {
-                    Err("The transformed result changed before final Transfer.".into())
-                } else {
-                    transfer::send_room_file_to_bridge_peer_endpoint(
-                        state.clone(),
-                        &metadata.bridge_id,
-                        &item.id,
-                        &private_output.path,
-                        Some(format!("bridge-plan-final-{}", metadata.attempt_id)),
-                        None,
-                        endpoint,
-                    )
-                    .await
-                    .map_err(|error| error.message())
-                }
-            }
-            _ => Err(
-                "The explicit final Transfer destination is not supported by this object flow."
-                    .into(),
-            ),
-        };
-        file_candidates::cleanup_bridge_plan_private_pipeline_file(&private_output);
-        delivery?;
-        store
-            .transition_step(
-                &metadata.attempt_id,
-                &final_transfer_id,
-                bridge_plan::StepExecutionState::Completed,
-                storage::now_ts(),
-            )
-            .map_err(|error| error.message())?;
-        store
-            .transition_attempt(
-                &metadata.attempt_id,
-                bridge_plan::AttemptState::Completed,
-                storage::now_ts(),
-            )
-            .map_err(|error| error.message())?;
-    }
     Ok(())
 }
 
@@ -3070,28 +2505,25 @@ pub(crate) async fn execute_bridge_plan_transfer_attempt_inner(
     })?;
 
     let transfer_result: Result<(), AppError> = async {
-        let private_file = match grant.generated_file.clone() {
-            Some(output) => output,
-            None => {
-                let mut candidates = state.bridge_plan_candidate_store.lock();
-                file_candidates::resolve_bridge_plan_selected_file(
-                    &mut candidates,
+        let private_file = {
+            let mut candidates = state.bridge_plan_candidate_store.lock();
+            file_candidates::resolve_bridge_plan_selected_file(
+                &mut candidates,
+                &room_id,
+                &grant.requester_device_ref,
+                &grant.receiver_device_ref,
+                &grant.attempt_id,
+                &grant.candidate_id,
+            )
+            .map_err(|error| {
+                log_bridge_plan_transfer_attempt(
+                    "transfer_execution_failed",
                     &room_id,
-                    &grant.requester_device_ref,
-                    &grant.receiver_device_ref,
-                    &grant.attempt_id,
-                    &grant.candidate_id,
-                )
-                .map_err(|error| {
-                    log_bridge_plan_transfer_attempt(
-                        "transfer_execution_failed",
-                        &room_id,
-                        &attempt_id,
-                        bridge_plan_transfer_failure_code(&error),
-                    );
-                    error
-                })?
-            }
+                    &attempt_id,
+                    bridge_plan_transfer_failure_code(&error),
+                );
+                error
+            })?
         };
         log_bridge_plan_transfer_attempt(
             "transfer_candidate_resolved",
@@ -3099,6 +2531,7 @@ pub(crate) async fn execute_bridge_plan_transfer_attempt_inner(
             &attempt_id,
             "resolved",
         );
+        file_candidates::revalidate_bridge_plan_private_file(&private_file)?;
         match &grant.destination {
             bridge_plan::TransferDestination::RequestingDevice { .. } => {
                 let peers = storage::list_bridge_peer_endpoints(&state.paths, &room_id)?;
