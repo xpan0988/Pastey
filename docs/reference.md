@@ -47,9 +47,9 @@ A **candidate** is bounded, redacted discovery metadata. A live Search → Trans
 
 ## Transform vocabulary
 
-Natural-v1 carries only the bounded intent `extract readable text`. Host registry entry `extract_readable_text_v1` implements the supported text/plain, text/markdown, application/json, and text/csv to text/plain transition. In a Bridge Plan, the completed result remains an opaque selected-device-local output; a later approved Transfer may consume it, but raw process output is not a product result.
+Natural-v1 carries only the bounded intent `extract readable text`. Host registry entry `extract_readable_text_v1` implements the supported text/plain, text/markdown, application/json, and text/csv to text/plain transition. In a Bridge Plan, the completed result remains an opaque executor-local output; a later approved Transfer may consume it, but raw process output is not a product result.
 
-Unsupported Transform intents fail closed before staging or worker mutation and create an unapproved alternative Plan revision. The fixed readable-text worker accepts only an approved Bridge Plan Transform step. Raw worker output is Rust-only; only safe Plan result metadata crosses the product boundary.
+Unsupported Transform intents fail closed before staging or worker mutation. Unavailable capability and wrong-device input do not trigger fallback routing or a rewritten revision. The fixed readable-text worker accepts only an approved Bridge Plan Transform step whose input is already local through the approved object flow. Raw worker output is Rust-only; only safe Plan result metadata crosses the product boundary.
 
 Common bounded error/status vocabulary includes `route_expired`, `candidate_not_found`, `candidate_expired`, `candidate_changed`, `handoff_failed`, `rejected`, and `unsupported_future`. The exact Plan validator or Rust command is authoritative for which values are accepted on a particular path.
 

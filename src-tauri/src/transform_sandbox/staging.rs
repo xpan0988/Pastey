@@ -1,9 +1,11 @@
 use std::{
-    ffi::CString,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::ffi::CString;
 
 #[cfg(unix)]
 use std::os::{
@@ -11,6 +13,21 @@ use std::os::{
     unix::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
+    },
+};
+
+#[cfg(windows)]
+use std::os::windows::{
+    fs::{MetadataExt as WindowsMetadataExt, OpenOptionsExt as WindowsOpenOptionsExt},
+    io::AsRawHandle,
+};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::HANDLE,
+    Storage::FileSystem::{
+        GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_READ,
     },
 };
 
@@ -65,9 +82,9 @@ pub(crate) fn capture_source_identity(
     maximum_bytes: u64,
 ) -> AppResult<SourceIdentity> {
     let mut source = open_regular_source(source_path, scope_root)?;
-    let before = source_fingerprint(&source.metadata()?)?;
+    let before = source_fingerprint(&source)?;
     let (digest, byte_count) = digest_open_source(&mut source, maximum_bytes)?;
-    let after = source_fingerprint(&source.metadata()?)?;
+    let after = source_fingerprint(&source)?;
     if before != after || byte_count != before.byte_count {
         return Err(AppError::InvalidInput(
             "Artifact Transform candidate changed while its identity was captured.".into(),
@@ -97,7 +114,7 @@ pub(crate) fn prepare_staged_snapshot(
         ));
     }
     let mut source = open_regular_source(source_path, scope_root)?;
-    let before = source_fingerprint(&source.metadata()?)?;
+    let before = source_fingerprint(&source)?;
     if before != expected_identity.fingerprint || before.byte_count > profile.maximum_input_bytes {
         return Err(AppError::InvalidInput(
             "Artifact Transform candidate changed before staging.".into(),
@@ -146,6 +163,8 @@ pub(crate) fn canonical_staging_parent(app_data_dir: &Path) -> AppResult<PathBuf
     let app_data = fs::canonicalize(app_data_dir).map_err(|_| {
         AppError::InvalidInput("Transform staging app-data directory is unavailable.".into())
     })?;
+    #[cfg(windows)]
+    reject_windows_reparse_or_wrong_type(&app_data, true)?;
     let parent = app_data.join(STAGING_DIRECTORY_NAME);
     match fs::symlink_metadata(&parent) {
         Ok(metadata) => {
@@ -164,6 +183,8 @@ pub(crate) fn canonical_staging_parent(app_data_dir: &Path) -> AppResult<PathBuf
             "Transform staging parent escaped app data.".into(),
         ));
     }
+    #[cfg(windows)]
+    reject_windows_reparse_or_wrong_type(&canonical, true)?;
     set_private_directory_permissions(&canonical)?;
     Ok(canonical)
 }
@@ -172,6 +193,8 @@ pub(super) fn existing_staging_parent(app_data_dir: &Path) -> AppResult<Option<P
     let app_data = fs::canonicalize(app_data_dir).map_err(|_| {
         AppError::InvalidInput("Transform staging app-data directory is unavailable.".into())
     })?;
+    #[cfg(windows)]
+    reject_windows_reparse_or_wrong_type(&app_data, true)?;
     let parent = app_data.join(STAGING_DIRECTORY_NAME);
     let metadata = match fs::symlink_metadata(&parent) {
         Ok(metadata) => metadata,
@@ -189,6 +212,8 @@ pub(super) fn existing_staging_parent(app_data_dir: &Path) -> AppResult<Option<P
             "Transform staging parent escaped app data.".into(),
         ));
     }
+    #[cfg(windows)]
+    reject_windows_reparse_or_wrong_type(&canonical, true)?;
     Ok(Some(canonical))
 }
 
@@ -226,7 +251,7 @@ fn stage_open_source_with_before_copy<F: FnOnce()>(
     before_copy();
     let (digest, byte_count) =
         copy_open_source_to_staging(source, &mut destination, profile.maximum_input_bytes)?;
-    let after = source_fingerprint(&source.metadata()?)?;
+    let after = source_fingerprint(source)?;
     if before != after
         || before != expected_identity.fingerprint
         || byte_count != expected_identity.byte_count
@@ -304,7 +329,7 @@ fn open_regular_source(source_path: &Path, scope_root: &Path) -> AppResult<File>
             ));
         }
         let file = unsafe { File::from_raw_fd(fd) };
-        let fingerprint = source_fingerprint(&file.metadata()?)?;
+        let fingerprint = source_fingerprint(&file)?;
         if fingerprint.link_count != 1 {
             return Err(AppError::InvalidInput(
                 "Artifact Transform source has unsupported hard links.".into(),
@@ -312,7 +337,59 @@ fn open_regular_source(source_path: &Path, scope_root: &Path) -> AppResult<File>
         }
         return Ok(file);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let canonical_root = fs::canonicalize(scope_root).map_err(|_| {
+            AppError::InvalidInput("Artifact Transform source scope is unavailable.".into())
+        })?;
+        reject_windows_reparse_or_wrong_type(&canonical_root, true)?;
+        let relative = source_path.strip_prefix(scope_root).map_err(|_| {
+            AppError::InvalidInput("Artifact Transform source escaped its approved scope.".into())
+        })?;
+        let components = relative.components().collect::<Vec<_>>();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(AppError::InvalidInput(
+                "Artifact Transform source path is invalid.".into(),
+            ));
+        }
+        let mut checked = canonical_root.clone();
+        for component in &components[..components.len() - 1] {
+            checked.push(component.as_os_str());
+            reject_windows_reparse_or_wrong_type(&checked, true)?;
+        }
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+        let file = options.open(source_path).map_err(|_| {
+            AppError::InvalidInput("Artifact Transform source is unavailable or unsafe.".into())
+        })?;
+        let fingerprint = source_fingerprint(&file)?;
+        if fingerprint.link_count != 1 {
+            return Err(AppError::InvalidInput(
+                "Artifact Transform source has unsupported hard links.".into(),
+            ));
+        }
+        let opened_path = final_windows_handle_path(&file)?;
+        let expected_path = fs::canonicalize(source_path).map_err(|_| {
+            AppError::InvalidInput("Artifact Transform source changed while opening.".into())
+        })?;
+        let opened = normalized_windows_path(&opened_path);
+        let expected = normalized_windows_path(&expected_path);
+        let root = normalized_windows_path(&canonical_root);
+        if opened != expected || !windows_path_is_within(&opened, &root) {
+            return Err(AppError::InvalidInput(
+                "Artifact Transform source escaped its approved scope.".into(),
+            ));
+        }
+        return Ok(file);
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (source_path, scope_root);
         Err(AppError::InvalidInput(
@@ -321,7 +398,8 @@ fn open_regular_source(source_path: &Path, scope_root: &Path) -> AppResult<File>
     }
 }
 
-fn source_fingerprint(metadata: &fs::Metadata) -> AppResult<SourceFingerprint> {
+fn source_fingerprint(file: &File) -> AppResult<SourceFingerprint> {
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(AppError::InvalidInput(
             "Artifact Transform source must be a regular file.".into(),
@@ -353,7 +431,32 @@ fn source_fingerprint(metadata: &fs::Metadata) -> AppResult<SourceFingerprint> {
             link_count: metadata.nlink(),
         });
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, info.as_mut_ptr()) }
+            == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let info = unsafe { info.assume_init() };
+        if info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(AppError::InvalidInput(
+                "Artifact Transform source has an unsupported file type.".into(),
+            ));
+        }
+        return Ok(SourceFingerprint {
+            device: info.dwVolumeSerialNumber as u64,
+            inode: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+            byte_count: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
+            modified_seconds: info.ftLastWriteTime.dwHighDateTime as i64,
+            modified_nanoseconds: info.ftLastWriteTime.dwLowDateTime as i64,
+            changed_seconds: info.ftCreationTime.dwHighDateTime as i64,
+            changed_nanoseconds: info.ftCreationTime.dwLowDateTime as i64,
+            link_count: info.nNumberOfLinks as u64,
+        });
+    }
+    #[cfg(not(any(unix, windows)))]
     Ok(SourceFingerprint {
         device: 0,
         inode: 0,
@@ -364,6 +467,80 @@ fn source_fingerprint(metadata: &fs::Metadata) -> AppResult<SourceFingerprint> {
         changed_nanoseconds: 0,
         link_count: 1,
     })
+}
+
+#[cfg(windows)]
+fn reject_windows_reparse_or_wrong_type(path: &Path, expect_directory: bool) -> AppResult<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        AppError::InvalidInput("Artifact Transform source path is unavailable or unsafe.".into())
+    })?;
+    let attributes = metadata.file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || (attributes & FILE_ATTRIBUTE_DIRECTORY != 0) != expect_directory
+    {
+        return Err(AppError::InvalidInput(
+            "Artifact Transform source path contains an unsafe reparse point or file type.".into(),
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+    let opened = options.open(path)?;
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    if unsafe { GetFileInformationByHandle(opened.as_raw_handle() as HANDLE, info.as_mut_ptr()) }
+        == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let info = unsafe { info.assume_init() };
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != expect_directory
+    {
+        return Err(AppError::InvalidInput(
+            "Artifact Transform source path changed or contains a reparse point.".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn final_windows_handle_path(file: &File) -> AppResult<PathBuf> {
+    let handle = file.as_raw_handle() as HANDLE;
+    let required = unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, 0) };
+    if required == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut buffer = vec![0_u16; required as usize + 1];
+    let written =
+        unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    buffer.truncate(written as usize);
+    Ok(PathBuf::from(String::from_utf16(&buffer).map_err(
+        |_| AppError::InvalidInput("Artifact Transform source handle path is invalid.".into()),
+    )?))
+}
+
+#[cfg(windows)]
+fn normalized_windows_path(path: &Path) -> String {
+    let mut value = path.to_string_lossy().replace('/', "\\");
+    if let Some(without_prefix) = value.strip_prefix("\\\\?\\UNC\\") {
+        value = format!("\\\\{without_prefix}");
+    } else if let Some(without_prefix) = value.strip_prefix("\\\\?\\") {
+        value = without_prefix.to_owned();
+    }
+    value.trim_end_matches('\\').to_lowercase()
+}
+
+#[cfg(windows)]
+fn windows_path_is_within(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('\\'))
 }
 
 fn digest_open_source(source: &mut File, maximum_bytes: u64) -> AppResult<(String, u64)> {
@@ -442,6 +619,8 @@ fn create_private_dir(path: &Path) -> AppResult<()> {
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     }
     builder.create(path)?;
+    #[cfg(windows)]
+    reject_windows_reparse_or_wrong_type(path, true)?;
     set_private_directory_permissions(path)
 }
 
@@ -454,13 +633,19 @@ fn create_exclusive_staged_file(path: &Path) -> AppResult<File> {
             .mode(0o600)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        options
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+    }
     Ok(options.open(path)?)
 }
 
-fn set_private_directory_permissions(path: &Path) -> AppResult<()> {
+fn set_private_directory_permissions(_path: &Path) -> AppResult<()> {
     #[cfg(unix)]
     {
-        fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        fs::set_permissions(_path, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -493,7 +678,7 @@ mod tests {
     };
 
     fn root() -> PathBuf {
-        let root = PathBuf::from("/tmp").join(format!("pts-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("pts-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         root
     }
@@ -585,6 +770,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn deleted_source_after_descriptor_open_keeps_the_opened_bytes() {
         let root = root();
@@ -615,6 +801,7 @@ mod tests {
         )
         .is_err());
         fs::write(root.join("replacement"), b"first").unwrap();
+        fs::remove_file(&path).unwrap();
         fs::rename(root.join("replacement"), &path).unwrap();
         assert!(prepare_staged_snapshot(
             &root,
@@ -630,6 +817,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn staging_rejects_source_mutation_between_pre_and_post_copy_fstat() {
         let root = root();
@@ -638,7 +826,7 @@ mod tests {
         let parent = canonical_staging_parent(&root).unwrap();
         let (_, staging_root) = create_staging_root(&parent).unwrap();
         let mut opened = open_regular_source(&path, &scope).unwrap();
-        let before = source_fingerprint(&opened.metadata().unwrap()).unwrap();
+        let before = source_fingerprint(&opened).unwrap();
         assert!(stage_open_source_with_before_copy(
             &mut opened,
             &staging_root,
@@ -651,6 +839,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn staging_rejects_growth_beyond_the_profile_limit_during_copy() {
         let root = root();
@@ -659,7 +848,7 @@ mod tests {
         let parent = canonical_staging_parent(&root).unwrap();
         let (_, staging_root) = create_staging_root(&parent).unwrap();
         let mut opened = open_regular_source(&path, &scope).unwrap();
-        let before = source_fingerprint(&opened.metadata().unwrap()).unwrap();
+        let before = source_fingerprint(&opened).unwrap();
         assert!(stage_open_source_with_before_copy(
             &mut opened,
             &staging_root,
@@ -702,6 +891,46 @@ mod tests {
             );
         }
         cleanup_staged_snapshot(&snapshot).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_handle_denies_write_delete_and_revalidates_identity() {
+        let root = root();
+        let (scope, path) = source(&root, "candidate.txt", b"authorized");
+        let identity = capture_source_identity(&path, &scope, 1024).unwrap();
+        let opened = open_regular_source(&path, &scope).unwrap();
+        assert!(fs::write(&path, b"changed").is_err());
+        assert!(fs::remove_file(&path).is_err());
+        drop(opened);
+        fs::write(scope.join("replacement.txt"), b"authorized").unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::rename(scope.join("replacement.txt"), &path).unwrap();
+        assert!(prepare_staged_snapshot(
+            &root,
+            &path,
+            &scope,
+            &identity,
+            DETERMINISTIC_STAGED_INPUT_TEST,
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rejects_directory_and_reparse_inputs() {
+        let root = root();
+        let scope = root.join("source");
+        fs::create_dir(&scope).unwrap();
+        assert!(capture_source_identity(&scope, &root, 1024).is_err());
+        let target = scope.join("target.txt");
+        fs::write(&target, b"target").unwrap();
+        let link = scope.join("link.txt");
+        if std::os::windows::fs::symlink_file(&target, &link).is_ok() {
+            assert!(capture_source_identity(&link, &scope, 1024).is_err());
+        }
         let _ = fs::remove_dir_all(root);
     }
 }

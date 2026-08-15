@@ -32,18 +32,18 @@ export interface BridgePlanWorkspace {
   results: unknown[];
 }
 
-export interface FileSearchBridgePlanRequest {
+export interface ComposedFileBridgePlanRequest {
   roomId: string;
   originalUserGoal: string;
-  filenameHint: string;
-  extensions: string[];
-  safeScopes: Array<"downloads" | "desktop" | "documents" | "pastey_shared">;
-  transferToRequester: boolean;
-  transferDestination?: "requesting_device" | "selected_device";
+  blocks: Array<
+    | { primitive: "Search"; executionDevice: "selected_device"; filenameHint: string; extension: string; safeScopes: Array<"downloads" | "desktop" | "documents" | "pastey_shared"> }
+    | { primitive: "Transform"; intent: "extract readable text"; executionDevice: "requesting_device" | "selected_device" }
+    | { primitive: "Transfer"; source: "requesting_device" | "selected_device"; destination: "requesting_device" | "selected_device" | "pastey_shared"; landingMode: "pipeline_handoff" | "final_delivery" }
+  >;
 }
 
-export function createFileSearchBridgePlan(request: FileSearchBridgePlanRequest): Promise<BridgePlanWorkspace> {
-  return invoke<BridgePlanWorkspace>("create_file_search_bridge_plan", { request });
+export function createComposedFileBridgePlan(request: ComposedFileBridgePlanRequest): Promise<BridgePlanWorkspace> {
+  return invoke<BridgePlanWorkspace>("create_composed_file_bridge_plan", { request });
 }
 
 export interface DirectFileTransferBridgePlanRequest {
@@ -54,16 +54,6 @@ export interface DirectFileTransferBridgePlanRequest {
 
 export function createDirectFileTransferBridgePlan(request: DirectFileTransferBridgePlanRequest): Promise<BridgePlanWorkspace> {
   return invoke<BridgePlanWorkspace>("create_direct_file_transfer_bridge_plan", { request });
-}
-
-export interface FileTransformAlternativeBridgePlanRequest extends FileSearchBridgePlanRequest {
-  transformIntent: string;
-  /** The two current Bridge roles only; Rust resolves these to live sessions. */
-  transformExecutionDevice: "requesting_device" | "selected_device";
-}
-
-export function createFileTransformBridgePlan(request: FileTransformAlternativeBridgePlanRequest): Promise<BridgePlanWorkspace> {
-  return invoke<BridgePlanWorkspace>("create_file_transform_bridge_plan", { request });
 }
 
 export interface SelectedPeerTransformAvailability {
@@ -85,10 +75,6 @@ export function selectedPeerTransformAvailability(roomId: string): Promise<Selec
 
 export function localTransformAvailability(): Promise<SelectedPeerTransformAvailability> {
   return invoke<SelectedPeerTransformAvailability>("local_transform_availability");
-}
-
-export function proposeBridgePlanTransformFallback(revisionId: string): Promise<BridgePlanWorkspace> {
-  return invoke<BridgePlanWorkspace>("propose_bridge_plan_transform_fallback", { revisionId });
 }
 
 export function listBridgePlanWorkspace(roomId: string): Promise<BridgePlanWorkspace> {

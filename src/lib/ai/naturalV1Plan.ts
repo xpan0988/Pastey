@@ -160,8 +160,8 @@ export function validateAskBridgeNaturalV1Plan(value: unknown): AskBridgeNatural
   if (value.requiresUserConfirmation !== true) {
     errors.push("natural-v1 plans require user confirmation.");
   }
-  if (!Array.isArray(value.steps) || value.steps.length === 0 || value.steps.length > 3) {
-    errors.push("natural-v1 steps must contain one to three primitives.");
+  if (!Array.isArray(value.steps) || value.steps.length === 0 || value.steps.length > 16) {
+    errors.push("natural-v1 steps must contain one to sixteen primitives.");
   } else {
     value.steps.forEach((step, index) => validateStep(step, index, errors));
     validatePrimitiveOrder(value.steps, value.status, errors);
@@ -211,15 +211,10 @@ export function buildMockAskBridgeNaturalV1Plan(): AskBridgeNaturalV1Plan {
   return buildDeterministicAskBridgeNaturalV1Plan("Find the report pdf on the selected peer and transfer it to me.");
 }
 
-/** True only for the Bridge Plan shapes the sender UI can submit today. */
-export function isSupportedBridgePlanSubmission(plan: AskBridgeNaturalV1Plan): boolean {
-  if (plan.status !== "supported") return false;
-  const primitives = plan.steps.map((step) => step.primitive).join(",");
-  if (primitives === "Search" || primitives === "Search,Transform") return true;
-  const transfer = plan.steps[plan.steps.length - 1];
-  return (primitives === "Search,Transfer" || primitives === "Search,Transform,Transfer")
-    && transfer?.primitive === "Transfer"
-    && (transfer.destination === "requesting_device" || transfer.destination === "selected_device");
+/** Provider output is advisory only; this is vocabulary validation, not
+ * direct executability or approval eligibility. */
+export function isSupportedBridgePlanAdvisory(plan: AskBridgeNaturalV1Plan): boolean {
+  return plan.status === "supported" && validateAskBridgeNaturalV1Plan(plan).valid;
 }
 
 export async function generateMockAskBridgeNaturalV1Plan(userRequest: string): Promise<AiGenerateResult> {
@@ -346,21 +341,31 @@ function validatePrimitiveOrder(
   status: unknown,
   errors: string[],
 ) {
-  const primitives = steps.map((step) => isRecord(step) ? step.primitive : null);
-  const key = primitives.join(" -> ");
-  if (!["Search", "Search -> Transfer", "Search -> Transform", "Search -> Transform -> Transfer"].includes(key)) {
-    errors.push("natural-v1 supports bounded Search, Transform, and Transfer combinations only.");
+  const records = steps.filter(isRecord);
+  if (records.length !== steps.length || records[0]?.primitive !== "Search") {
+    errors.push("natural-v1 object flow must begin with Search.");
+    return;
   }
-  if (key === "Search -> Transform -> Transfer") {
-    const transform = steps[1] as Record<string, unknown>;
-    const transfer = steps[2] as Record<string, unknown>;
-    if (transform.intent !== "extract readable text" || transfer.object !== "transform_result") {
-      if (status !== "unsupported_future") errors.push("Unsupported Transform plans must be marked unsupported_future.");
-    } else if (status !== "supported") {
-      errors.push("extract readable text Transform plans must be marked supported.");
+  if (records.slice(1).some((step) => step.primitive === "Search")) {
+    errors.push("natural-v1 contains more than one object-flow root Search.");
+  }
+  let currentObject: AskBridgeNaturalV1TransferStep["object"] = "search_result";
+  let unsupportedTransform = false;
+  for (const step of records.slice(1)) {
+    if (step.primitive === "Transform") {
+      if (step.intent !== "extract readable text") unsupportedTransform = true;
+      currentObject = "transform_result";
+    } else if (step.primitive === "Transfer" && step.object !== currentObject) {
+      errors.push("natural-v1 Transfer must consume the object produced by the preceding dependency flow.");
     }
   }
-  if (status === "unsupported_future" && !primitives.includes("Transform")) {
+  if (unsupportedTransform && status !== "unsupported_future") {
+    errors.push("Unsupported Transform plans must be marked unsupported_future.");
+  }
+  if (!unsupportedTransform && records.some((step) => step.primitive === "Transform") && status !== "supported") {
+    errors.push("extract readable text Transform plans must be marked supported.");
+  }
+  if (status === "unsupported_future" && !records.some((step) => step.primitive === "Transform")) {
     errors.push("natural-v1 unsupported_future is reserved for unsupported Transform plans.");
   }
 }

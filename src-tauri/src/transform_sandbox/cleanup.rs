@@ -8,6 +8,11 @@ use crate::{
     logging,
 };
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
 use super::staging::{existing_staging_parent, is_valid_staging_id, StagedSnapshot};
 
 /// Deletes one Stage 1 snapshot. It is intentionally non-authoritative: this
@@ -86,6 +91,12 @@ fn remove_tree_without_following_symlinks(path: &Path) -> AppResult<()> {
     if metadata.file_type().is_symlink() {
         return Err(AppError::InvalidInput(
             "Transform staging cleanup refused a symlink.".into(),
+        ));
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(AppError::InvalidInput(
+            "Transform staging cleanup refused a reparse point.".into(),
         ));
     }
     if metadata.is_file() {
