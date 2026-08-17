@@ -28,6 +28,7 @@ import {
   newTransferBlock,
   removeBlock,
   insertRequiredTransfer,
+  requiredTransferForConsumer,
   reviewedObjectFlow,
   updateSearchBlock,
 } from "../src/lib/bridgePlanComposer";
@@ -86,6 +87,21 @@ test("Search → Transform → Execute is valid framework vocabulary and unavail
   assert.deepEqual(plan.steps.map((step) => step.primitive), ["Search", "Transform", "Execute"]);
   assert.equal(plan.status, "unsupported_future");
   assert.equal(isSupportedBridgePlanAdvisory(plan), false);
+});
+
+test("natural-v1 title is derived from the actual primitive sequence", () => {
+  const cases = [
+    ["Find report.pdf.", ["Search"]],
+    ["Find report.pdf and send it to me.", ["Search", "Transfer"]],
+    ["Find example.py and run it.", ["Search", "Execute"]],
+    ["Find example.py, change it, and run it.", ["Search", "Transform", "Execute"]],
+  ] as const;
+  for (const [request, expected] of cases) {
+    const plan = buildDeterministicAskBridgeNaturalV1Plan(request);
+    assert.deepEqual(plan.steps.map((step) => step.primitive), expected);
+    assert.equal(plan.title, expected.join(" → "));
+  }
+  assert.equal(buildDeterministicAskBridgeNaturalV1Plan("Find example.py and run it.").status, "unsupported_future");
 });
 
 test("underspecified Transform advisory remains fail-closed", () => {
@@ -237,10 +253,39 @@ test("Insert required Transfer is an explicit draft edit, not normalization", ()
   const search = updateSearchBlock(newSearchBlock(), { filenameHint: "report.txt", extension: "txt" });
   const invalid = [search, transformBlock("requesting_device")];
   assert.deepEqual(invalid.map((block) => block.primitive), ["Search", "Transform"]);
+  assert.equal(requiredTransferForConsumer(invalid, 1)?.landingMode, "pipeline_handoff");
   const edited = insertRequiredTransfer(invalid, 1);
   assert.equal(edited.error, null);
   assert.deepEqual(edited.blocks.map((block) => block.primitive), ["Search", "Transfer", "Transform"]);
   assert.equal(edited.blocks[1]?.primitive === "Transfer" ? edited.blocks[1].landingMode : null, "pipeline_handoff");
+});
+
+test("Execute cross-device convenience explicitly inserts one PipelinePrivate Transfer", () => {
+  const search = updateSearchBlock(newSearchBlock(), { filenameHint: "example.py", extension: "py" });
+  const invalid = [search, executeBlock("requesting_device", 1)];
+  assert.match(manualBridgePlanInput(invalid).error ?? "", /Add an explicit Transfer/);
+  assert.deepEqual(invalid.map((block) => block.primitive), ["Search", "Execute"]);
+
+  const required = requiredTransferForConsumer(invalid, 1);
+  assert.deepEqual(required, {
+    primitive: "Transfer",
+    source: "selected_device",
+    destination: "requesting_device",
+    landingMode: "pipeline_handoff",
+  });
+
+  const once = insertRequiredTransfer(invalid, 1);
+  assert.equal(once.error, null);
+  assert.deepEqual(once.blocks.map((block) => block.primitive), ["Search", "Transfer", "Execute"]);
+  assert.deepEqual(reviewedObjectFlow(once.blocks), [
+    "Search @ selected_device",
+    "Transfer selected_device → requesting_device (pipeline_handoff)",
+    "Execute @ requesting_device: revision 1; Run or validate the object and report the result.",
+  ]);
+
+  const twice = insertRequiredTransfer(once.blocks, 2);
+  assert.equal(twice.error, null);
+  assert.equal(twice.blocks.filter((block) => block.primitive === "Transfer").length, 1);
 });
 
 test("explicit PipelinePrivate Transfer makes cross-device Transform valid exactly once", () => {

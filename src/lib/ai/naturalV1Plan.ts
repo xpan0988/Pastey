@@ -210,13 +210,7 @@ export function buildDeterministicAskBridgeNaturalV1Plan(userRequest: string): A
   const unsupported = wantsTransform || wantsExecute;
   return {
     schemaVersion: "ask-bridge-natural-v1",
-    title: wantsExecute
-      ? "Search, Transform, Execute"
-      : wantsTransform
-        ? "Search and Transform"
-      : wantsTransfer
-        ? "Search and Transfer"
-        : "Search",
+    title: steps.map((step) => step.primitive).join(" → "),
     status: unsupported ? "unsupported_future" : "supported",
     requiresUserConfirmation: true,
     steps,

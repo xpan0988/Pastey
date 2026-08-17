@@ -81,20 +81,20 @@ export function newExecuteBlock(executionDevice: ComposerDevice = "selected_devi
   };
 }
 
-export function requiredTransferForTransform(blocks: readonly ComposerBlock[], index: number): TransferBlock | null {
-  const transform = blocks[index];
-  if (transform?.primitive !== "Transform") return null;
+export function requiredTransferForConsumer(blocks: readonly ComposerBlock[], index: number): TransferBlock | null {
+  const consumer = blocks[index];
+  if (consumer?.primitive !== "Transform" && consumer?.primitive !== "Execute") return null;
   const source = objectFlow(blocks.slice(0, index)).location;
-  if (!source || source === transform.executionDevice) return null;
-  return { primitive: "Transfer", source, destination: transform.executionDevice, landingMode: "pipeline_handoff" };
+  if (!source || source === consumer.executionDevice) return null;
+  return { primitive: "Transfer", source, destination: consumer.executionDevice, landingMode: "pipeline_handoff" };
 }
 
 /** Explicit convenience edit. Nothing is inserted until the user invokes it. */
-export function insertRequiredTransfer(blocks: readonly ComposerBlock[], transformIndex: number): { blocks: ComposerBlock[]; error: string | null } {
-  const transfer = requiredTransferForTransform(blocks, transformIndex);
+export function insertRequiredTransfer(blocks: readonly ComposerBlock[], consumerIndex: number): { blocks: ComposerBlock[]; error: string | null } {
+  const transfer = requiredTransferForConsumer(blocks, consumerIndex);
   if (!transfer) return { blocks: [...blocks], error: null };
   const next = [...blocks];
-  next.splice(transformIndex, 0, transfer);
+  next.splice(consumerIndex, 0, transfer);
   return { blocks: next, error: dependencyError(next) };
 }
 
