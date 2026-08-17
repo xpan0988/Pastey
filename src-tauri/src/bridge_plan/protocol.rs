@@ -10,10 +10,10 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{Map, Value};
 
 use super::{
-    canonical_json, canonical_revision_hash, connection, id, json, ActivityKind, AttemptState,
-    BridgePlanActivity, BridgePlanApproval, BridgePlanAttempt, BridgePlanResultSummary,
-    BridgePlanRevision, BridgePlanStep, BridgePlanStore, GeneratedUserVisibleText,
-    SafeActivitySummary, StepExecutionState,
+    canonical_json, canonical_revision_hash, connection, framework_execution_unavailable, id, json,
+    validate_revision, ActivityKind, AttemptState, BridgePlanActivity, BridgePlanApproval,
+    BridgePlanAttempt, BridgePlanResultSummary, BridgePlanRevision, BridgePlanStep,
+    BridgePlanStore, GeneratedUserVisibleText, SafeActivitySummary, StepExecutionState,
 };
 use crate::{
     error::{AppError, AppResult},
@@ -549,7 +549,10 @@ pub(crate) fn attempt_start_payload(
         Value::String(attempt.attempt_id.clone()),
     );
     payload.insert("searchStep".into(), serde_json::to_value(search)?);
-    payload.insert("stepDigest".into(), Value::String(step_digest(search)?));
+    payload.insert(
+        "searchStepDigest".into(),
+        Value::String(step_digest(search)?),
+    );
     payload.insert(
         "attemptNonce".into(),
         Value::String(format!("attempt-nonce-{}", uuid::Uuid::new_v4())),
@@ -1578,7 +1581,7 @@ fn accept_start(
 ) -> AppResult<()> {
     let attempt = start(value, common, now)?;
     let conn = connection(paths)?;
-    let review=conn.query_row("SELECT plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,search_step_digest,review_expires_at FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='receiver' AND approval_id=?2",params![common.bridge,attempt.approval],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?))).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan remote plan binding missing.".into()))?;
+    let review=conn.query_row("SELECT plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,search_step_digest,review_expires_at,revision_json FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='receiver' AND approval_id=?2",params![common.bridge,attempt.approval],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?,r.get::<_,String>(7)?))).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan remote plan binding missing.".into()))?;
     if review.0 != common.plan
         || review.1 != common.revision
         || review.2 != common.hash
@@ -1588,6 +1591,22 @@ fn accept_start(
         || review.6 <= now
     {
         return invalid("Bridge Plan attempt does not match the current Bridge plan binding.");
+    }
+    let revision: BridgePlanRevision = serde_json::from_str(&review.7)?;
+    validate_revision(&revision)?;
+    if canonical_revision_hash(&revision)? != review.2
+        || revision.plan_id != review.0
+        || revision.revision_id != review.1
+        || revision.bridge_id != common.bridge
+        || revision.requesting_device_ref != review.3
+        || revision.selected_device_ref != review.4
+    {
+        return invalid("Bridge Plan reviewed immutable revision is invalid.");
+    }
+    if framework_execution_unavailable(&revision) {
+        return invalid(
+            "Bridge Plan Transform and Execute framework steps are not currently executable.",
+        );
     }
     drop(conn);
     insert_attempt(paths, &attempt)?;
@@ -1620,13 +1639,20 @@ fn accept_transfer_start(
         return invalid("Bridge Plan Transfer does not match the current Bridge plan binding.");
     }
     let revision: BridgePlanRevision = serde_json::from_str(&review.0)?;
-    if revision.plan_id != common.plan
+    validate_revision(&revision)?;
+    if canonical_revision_hash(&revision)? != common.hash
+        || revision.plan_id != common.plan
         || revision.revision_id != common.revision
         || revision.revision_hash != common.hash
         || revision.requesting_device_ref != common.requester
         || revision.selected_device_ref != common.receiver
     {
         return invalid("Bridge Plan Transfer immutable plan binding mismatch.");
+    }
+    if framework_execution_unavailable(&revision) {
+        return invalid(
+            "Bridge Plan Transform and Execute framework steps are not currently executable.",
+        );
     }
     let step = revision
         .steps
@@ -1983,8 +2009,9 @@ mod tests {
     use super::*;
     use crate::{
         bridge_plan::{
-            build_direct_file_transfer_revision, build_file_search_revision, init_schema,
-            ApprovalState, BridgePlan, BridgePlanApproval, BridgePlanState, BridgePlanStore,
+            build_composed_file_revision, build_direct_file_transfer_revision,
+            build_file_search_revision, init_schema, ApprovalState, BridgePlan, BridgePlanApproval,
+            BridgePlanState, BridgePlanStore, ComposedFilePlanBlock, LogicalObjectRevision,
             RevisionState,
         },
         storage::AppPaths,
@@ -2084,6 +2111,105 @@ mod tests {
             approval,
             serde_json::json!({ "review": review }),
         )
+    }
+
+    fn framework_revision(consumer: &str) -> BridgePlanRevision {
+        let mut blocks = vec![ComposedFilePlanBlock::Search {
+            execution_device_ref: "receiver".into(),
+            filename_hint: "example.py".into(),
+            extensions: vec!["py".into()],
+            safe_scope_labels: vec!["downloads".into()],
+        }];
+        let target_revision = LogicalObjectRevision {
+            logical_object_id: "selected_file".into(),
+            revision: 1,
+        };
+        match consumer {
+            "Transform" => blocks.push(ComposedFilePlanBlock::Transform {
+                execution_device_ref: "receiver".into(),
+                target_revision,
+                modification_intent: "Modify the selected object.".into(),
+            }),
+            "Execute" => blocks.push(ComposedFilePlanBlock::Execute {
+                execution_device_ref: "receiver".into(),
+                target_revision,
+                execution_intent: "Run the selected object.".into(),
+            }),
+            _ => panic!("unexpected framework consumer"),
+        }
+        build_composed_file_revision(
+            "bridge".into(),
+            "requester".into(),
+            "receiver".into(),
+            format!("Search then {consumer}"),
+            blocks,
+        )
+        .unwrap()
+    }
+
+    fn assert_receiver_rejects_framework_search_start(revision: BridgePlanRevision) {
+        let (_requester, receiver, _approval, values) = protocol_round_trip(revision.clone());
+        let now = crate::storage::now_ts();
+        let review = values["review"].as_object().unwrap();
+        let start = serde_json::json!({
+            "schemaVersion": PROTOCOL_VERSION,
+            "bridgeId": revision.bridge_id,
+            "planId": revision.plan_id,
+            "revisionId": revision.revision_id,
+            "revisionHash": revision.revision_hash,
+            "requesterDeviceRef": "requester",
+            "receiverDeviceRef": "receiver",
+            "approvalId": "approval",
+            "attemptId": "malicious-attempt",
+            "searchStep": review["searchStep"].clone(),
+            "searchStepDigest": review["searchStepDigest"].clone(),
+            "attemptNonce": "otherwise-valid-manual-start",
+            "attemptExpiresAt": now + 600,
+        });
+        let event = outer("bridge_plan.attempt_start", start, "requester", "receiver");
+        let authorities = ProtocolSearchAuthorityStore::default();
+        let mut candidates = crate::file_candidates::BridgePlanCandidateStore::default();
+
+        let error = accept_inbound_protocol_event(
+            &receiver,
+            &authorities,
+            &mut candidates,
+            "bridge_plan.attempt_start",
+            &event,
+            now,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not currently executable"));
+
+        let conn = connection(&receiver).unwrap();
+        let review_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_protocol_reviews WHERE direction='receiver'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let attempt_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_protocol_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(review_count, 1);
+        assert_eq!(attempt_count, 0);
+        assert!(authorities.grants.lock().unwrap().is_empty());
+        assert!(candidates.entries.is_empty());
+    }
+
+    #[test]
+    fn receiver_rejects_reviewed_search_transform_manual_attempt_before_authority() {
+        assert_receiver_rejects_framework_search_start(framework_revision("Transform"));
+    }
+
+    #[test]
+    fn receiver_rejects_reviewed_search_execute_manual_attempt_before_authority() {
+        assert_receiver_rejects_framework_search_start(framework_revision("Execute"));
     }
 
     #[test]
@@ -2196,26 +2322,10 @@ mod tests {
             now,
         )
         .unwrap();
-        BridgePlanStore::new(&requester)
+        let attempt = BridgePlanStore::new(&requester)
             .create_attempt_from_approval("attempt", "approval", now)
             .unwrap();
-
-        let review_payload = review.as_object().unwrap();
-        let start = serde_json::json!({
-            "schemaVersion": PROTOCOL_VERSION,
-            "bridgeId": revision.bridge_id,
-            "planId": revision.plan_id,
-            "revisionId": revision.revision_id,
-            "revisionHash": revision.revision_hash,
-            "requesterDeviceRef": "requester",
-            "receiverDeviceRef": "receiver",
-            "approvalId": "approval",
-            "attemptId": "attempt",
-            "searchStep": review_payload["searchStep"].clone(),
-            "searchStepDigest": review_payload["searchStepDigest"].clone(),
-            "attemptNonce": "attempt-nonce",
-            "attemptExpiresAt": now + 600,
-        });
+        let start = attempt_start_payload(&requester, &attempt, now).unwrap();
         let start_event = outer(
             "bridge_plan.attempt_start",
             start.clone(),

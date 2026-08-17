@@ -58,7 +58,7 @@ import {
   moveBlock,
   newSearchBlock,
   removeBlock,
-  requiredTransferForTransform,
+  requiredTransferForConsumer,
   updateSearchBlock,
   type ComposerBlock,
   type ComposerDevice,
@@ -1051,7 +1051,7 @@ function BridgePlanSenderPanel({
               <div className="bridge-plan-block-fields">
                 <p><strong>Modify the selected object.</strong> The intent advances the same logical object from revision {block.targetRevision.revision} to {block.targetRevision.revision + 1} without moving it.</p>
                 <label>Modify on<select aria-label="Transform execution device" value={block.executionDevice} disabled={Boolean(approvalId)} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transform" ? { ...entry, executionDevice: event.target.value as ComposerDevice } : entry))}><option value="requesting_device">{localHostLabel}</option><option value="selected_device">{selectedHostLabel}</option></select></label>
-                {requiredTransferForTransform(blocks, index) ? <button type="button" className="secondary-button" onClick={() => { const next = insertRequiredTransfer(blocks, index); editBlocks(next.blocks); setMessage(next.error ?? "Explicit PipelinePrivate Transfer inserted for review."); }}>Insert required Transfer</button> : null}
+                {requiredTransferForConsumer(blocks, index) ? <button type="button" className="secondary-button" onClick={() => { const next = insertRequiredTransfer(blocks, index); editBlocks(next.blocks); setMessage(next.error ?? "Explicit PipelinePrivate Transfer inserted for review."); }}>Insert required Transfer</button> : null}
                 <label>Modification intent<textarea aria-label="Modification intent" maxLength={1024} value={block.modificationIntent} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Transform" ? { ...entry, modificationIntent: event.target.value } : entry))} placeholder="Change the retry behavior to use exponential backoff." /></label>
                 <p className="muted">Framework defined · execution not yet available. No patch format or mutation worker is selected by Pastey Core.</p>
               </div>
@@ -1070,6 +1070,7 @@ function BridgePlanSenderPanel({
               <div className="bridge-plan-block-fields">
                 <p><strong>Authorize execution intent for logical revision {block.targetRevision.revision}.</strong> Execute does not move the object or select a runtime.</p>
                 <label>Execute on<select aria-label="Execute device" value={block.executionDevice} disabled={Boolean(approvalId)} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Execute" ? { ...entry, executionDevice: event.target.value as ComposerDevice } : entry))}><option value="requesting_device">{localHostLabel}</option><option value="selected_device">{selectedHostLabel}</option></select></label>
+                {requiredTransferForConsumer(blocks, index) ? <button type="button" className="secondary-button" onClick={() => { const next = insertRequiredTransfer(blocks, index); editBlocks(next.blocks); setMessage(next.error ?? "Explicit PipelinePrivate Transfer inserted for review."); }}>Insert required Transfer</button> : null}
                 <label>Execution intent<textarea aria-label="Execution intent" maxLength={1024} value={block.executionIntent} onChange={(event) => editBlocks(blocks.map((entry, current) => current === index && entry.primitive === "Execute" ? { ...entry, executionIntent: event.target.value } : entry))} placeholder="Run or validate the modified object and report the result." /></label>
                 <p className="danger-text"><strong>Framework defined · execution not yet available.</strong> Pastey Core does not choose a runtime, shell, process, or containment policy.</p>
               </div>

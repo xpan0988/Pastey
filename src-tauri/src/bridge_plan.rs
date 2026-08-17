@@ -2642,6 +2642,12 @@ impl<'a> BridgePlanStore<'a> {
                 "Bridge Plan approval does not bind its immutable revision.".into(),
             ));
         }
+        if framework_execution_unavailable(&revision.revision) {
+            return Err(AppError::InvalidInput(
+                "Bridge Plan Transform and Execute framework steps are not currently executable."
+                    .into(),
+            ));
+        }
         if approval.state == ApprovalState::Valid && approval.approval.expires_at <= created_at {
             tx.execute("UPDATE bridge_plan_approvals SET state = 'expired' WHERE approval_id = ?1 AND state = 'valid'", [approval_id])?;
             tx.commit()?;
@@ -3441,6 +3447,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn object_revision(revision: u64) -> LogicalObjectRevision {
         LogicalObjectRevision {
@@ -3490,6 +3497,66 @@ mod tests {
             "Work with example.py".into(),
             blocks,
         )
+    }
+
+    fn store_paths() -> AppPaths {
+        let root =
+            std::env::temp_dir().join(format!("pastey-bridge-plan-store-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        AppPaths {
+            app_data_dir: root.clone(),
+            db_path: root.join("db.sqlite"),
+            payloads_dir: root.join("payloads"),
+            inbox_dir: root.join("inbox"),
+            temp_dir: root.join("temp"),
+            logs_dir: root.join("logs"),
+            config_path: root.join("config.json"),
+        }
+    }
+
+    fn persist_approved_revision(
+        paths: &AppPaths,
+        revision: &BridgePlanRevision,
+        approval_id: &str,
+        now: i64,
+    ) {
+        crate::storage::init_database(paths).unwrap();
+        let store = BridgePlanStore::new(paths);
+        store
+            .create_plan(
+                &BridgePlan {
+                    plan_id: revision.plan_id.clone(),
+                    bridge_id: revision.bridge_id.clone(),
+                    requesting_device_ref: revision.requesting_device_ref.clone(),
+                    created_at: now,
+                },
+                BridgePlanState::Draft,
+            )
+            .unwrap();
+        store
+            .append_revision(revision, RevisionState::Proposed, now)
+            .unwrap();
+        store
+            .transition_plan(&revision.plan_id, BridgePlanState::Open)
+            .unwrap();
+        store
+            .transition_revision(&revision.revision_id, RevisionState::Available)
+            .unwrap();
+        store
+            .create_approval(
+                &BridgePlanApproval {
+                    approval_id: approval_id.into(),
+                    plan_id: revision.plan_id.clone(),
+                    revision_id: revision.revision_id.clone(),
+                    revision_hash: revision.revision_hash.clone(),
+                    bridge_id: revision.bridge_id.clone(),
+                    requester_device_ref: revision.requesting_device_ref.clone(),
+                    selected_device_ref: revision.selected_device_ref.clone(),
+                    expires_at: now + 600,
+                },
+                now,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -3722,5 +3789,47 @@ mod tests {
         assert!(!framework_execution_unavailable(
             &build(vec![search("B")]).unwrap()
         ));
+    }
+
+    #[test]
+    fn store_rejects_framework_only_attempts_without_consuming_approval_or_creating_state() {
+        let revisions = [
+            build(vec![search("B"), transform("B", 1, "Modify it.")]).unwrap(),
+            build(vec![search("B"), execute("B", 1, "Run it.")]).unwrap(),
+        ];
+        for (index, revision) in revisions.iter().enumerate() {
+            let paths = store_paths();
+            let now = crate::storage::now_ts();
+            let approval_id = format!("approval-{index}");
+            let attempt_id = format!("attempt-{index}");
+            persist_approved_revision(&paths, revision, &approval_id, now);
+            let store = BridgePlanStore::new(&paths);
+
+            let error = store
+                .create_attempt_from_approval(&attempt_id, &approval_id, now)
+                .unwrap_err();
+            assert!(error.to_string().contains("not currently executable"));
+            assert_eq!(
+                store.get_approval(&approval_id).unwrap().state,
+                ApprovalState::Valid
+            );
+            assert!(store.list_attempt(&attempt_id).is_err());
+
+            let conn = connection(&paths).unwrap();
+            let attempt_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM bridge_plan_attempts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let step_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM bridge_plan_attempt_steps",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(attempt_count, 0);
+            assert_eq!(step_count, 0);
+        }
     }
 }
