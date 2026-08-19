@@ -54,6 +54,7 @@ cargo check --manifest-path src-tauri/Cargo.toml --tests --target x86_64-pc-wind
 npm run build
 node scripts/run-natural-v1-tests.mjs
 node scripts/run-layer4-validation-matrix.mjs
+node scripts/run-transfer-planner-tests.mjs
 git diff --check
 ```
 
@@ -61,7 +62,7 @@ Native packaged Windows must separately exercise normal-file Search/Transfer, re
 
 Provider health checks are Settings-driven and advisory-only: use a deliberately minimal configured request, verify validation reports, and confirm it neither creates a Bridge control event nor changes consent/execution state. Do not put API keys in fixtures, logs, or documentation.
 
-There is no current Agent sandbox, mutation adapter, runtime adapter, or process-containment implementation to validate. Those decisions belong to the future Agent phase.
+There is no current Host admission implementation, Host effect enforcement, Agent Harness, local-model runtime, Transform/Execute runtime, Developer Terminal, Headless daemon, sandbox, mutation adapter, runtime adapter, or process-containment implementation to validate. Their agreed dependency order and authority contracts live in [upper-architecture.md](upper-architecture.md); they are not current release capabilities.
 
 ## Smoke checks
 

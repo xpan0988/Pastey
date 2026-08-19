@@ -23,7 +23,7 @@ pub(crate) use protocol::{
     attempt_update_payload, consume_search_execution_grant, consume_transfer_execution_grant,
     protocol_metadata, reconcile_protocol_startup, record_outbound_protocol_event,
     review_request_payload, search_selection_payload, transfer_start_payload,
-    transfer_update_payload, ProtocolSearchAuthorityStore,
+    transfer_update_payload, InboundProtocolAction, ProtocolSearchAuthorityStore,
 };
 
 const HASH_VERSION: &str = "bridge-plan-revision-hash-v1";
@@ -407,7 +407,7 @@ pub(crate) enum BridgePlanStep {
 }
 
 impl BridgePlanStep {
-    fn id(&self) -> &str {
+    pub(crate) fn id(&self) -> &str {
         match self {
             Self::Search { step_id, .. }
             | Self::Transform { step_id, .. }
@@ -447,7 +447,7 @@ impl BridgePlanStep {
             Self::Execute { .. } => StepOperation::Execute,
         }
     }
-    fn execution_device(&self) -> &str {
+    pub(crate) fn execution_device(&self) -> &str {
         match self {
             Self::Search {
                 execution_device_ref,
@@ -2776,6 +2776,56 @@ impl<'a> BridgePlanStore<'a> {
         tx.commit()?;
         Ok(())
     }
+
+    /// Atomically claims the next dependency-eligible authored Transfer for
+    /// Host continuation. This is Layer-5 semantic admission only: it neither
+    /// schedules transport capacity nor starts the Layer-1 transfer engine.
+    pub(crate) fn authorize_next_eligible_transfer(
+        &self,
+        attempt_id: &str,
+        at: i64,
+    ) -> AppResult<Option<BridgePlanStep>> {
+        id(attempt_id, "attempt id")?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        let attempt = attempt_row_tx(&tx, attempt_id)?;
+        ensure_active_bridge_tx(&tx, &attempt.attempt.bridge_id)?;
+        if attempt.state != AttemptState::Running {
+            return Ok(None);
+        }
+        let revision = revision_row_tx(&tx, &attempt.attempt.revision_id)?.revision;
+        if framework_execution_unavailable(&revision) {
+            return Err(AppError::InvalidInput(
+                "Bridge Plan Transform and Execute framework steps are not currently executable."
+                    .into(),
+            ));
+        }
+        let next = attempt
+            .attempt
+            .graph_projection
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(node.operation, StepOperation::Transfer)
+                    && attempt.steps.iter().any(|step| {
+                        step.step_id == node.step_id && step.state == StepExecutionState::Eligible
+                    })
+            })
+            .map(|node| node.step.clone());
+        let Some(step) = next else {
+            return Ok(None);
+        };
+        ensure_step_dependencies_completed(&attempt, step.id())?;
+        let changed = tx.execute(
+            "UPDATE bridge_plan_attempt_steps SET state='authorized', updated_at=?1 WHERE attempt_id=?2 AND step_id=?3 AND state='eligible'",
+            params![at, attempt_id, step.id()],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        tx.commit()?;
+        Ok(Some(step))
+    }
     pub(crate) fn append_activity(&self, activity: &BridgePlanActivity) -> AppResult<()> {
         validate_activity(activity)?;
         let mut conn = self.connection()?;
@@ -3599,6 +3649,98 @@ mod tests {
     }
 
     #[test]
+    fn implemented_search_pipeline_final_transfer_continuation_is_claimed_exactly_once() {
+        let revision = build(vec![
+            search("B"),
+            transfer("B", "A"),
+            ComposedFilePlanBlock::Transfer {
+                source_device_ref: "A".into(),
+                destination_device_ref: "B".into(),
+                landing: ComposedTransferLanding::Inbox,
+            },
+        ])
+        .unwrap();
+        let paths = store_paths();
+        let now = crate::storage::now_ts();
+        persist_approved_revision(&paths, &revision, "approval", now);
+        let store = BridgePlanStore::new(&paths);
+        store
+            .create_attempt_from_approval("attempt", "approval", now)
+            .unwrap();
+        store
+            .transition_attempt("attempt", AttemptState::Running, now)
+            .unwrap();
+
+        store
+            .transition_step("attempt", "search", StepExecutionState::Authorized, now)
+            .unwrap();
+        store
+            .transition_step("attempt", "search", StepExecutionState::Running, now)
+            .unwrap();
+        store
+            .transition_step("attempt", "search", StepExecutionState::Completed, now)
+            .unwrap();
+
+        let first = store
+            .authorize_next_eligible_transfer("attempt", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.id(), "transfer-1");
+        assert!(store
+            .authorize_next_eligible_transfer("attempt", now)
+            .unwrap()
+            .is_none());
+        store
+            .transition_step("attempt", first.id(), StepExecutionState::Running, now)
+            .unwrap();
+        store
+            .transition_step("attempt", first.id(), StepExecutionState::Completed, now)
+            .unwrap();
+
+        let second = store
+            .authorize_next_eligible_transfer("attempt", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.id(), "transfer-2");
+        assert!(matches!(
+            &second,
+            BridgePlanStep::Transfer {
+                destination: TransferDestination::SelectedDevice { .. },
+                ..
+            }
+        ));
+        assert!(store
+            .authorize_next_eligible_transfer("attempt", now)
+            .unwrap()
+            .is_none());
+        store
+            .transition_step("attempt", second.id(), StepExecutionState::Running, now)
+            .unwrap();
+        store
+            .transition_step("attempt", second.id(), StepExecutionState::Completed, now)
+            .unwrap();
+        store
+            .transition_attempt("attempt", AttemptState::Completed, now)
+            .unwrap();
+
+        let completed = store.list_attempt("attempt").unwrap();
+        assert_eq!(completed.state, AttemptState::Completed);
+        assert!(completed
+            .steps
+            .iter()
+            .all(|step| step.state == StepExecutionState::Completed));
+        assert_eq!(
+            revision
+                .steps
+                .iter()
+                .filter(|step| matches!(step, BridgePlanStep::Transfer { .. }))
+                .count(),
+            2
+        );
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
+
+    #[test]
     fn transform_is_generic_intent_and_advances_logical_revision_without_movement() {
         let revision = build(vec![
             search("B"),
@@ -3796,6 +3938,18 @@ mod tests {
         let revisions = [
             build(vec![search("B"), transform("B", 1, "Modify it.")]).unwrap(),
             build(vec![search("B"), execute("B", 1, "Run it.")]).unwrap(),
+            build(vec![
+                search("B"),
+                transfer("B", "A"),
+                transform("A", 1, "Modify it."),
+            ])
+            .unwrap(),
+            build(vec![
+                search("B"),
+                transfer("B", "A"),
+                execute("A", 1, "Run it."),
+            ])
+            .unwrap(),
         ];
         for (index, revision) in revisions.iter().enumerate() {
             let paths = store_paths();

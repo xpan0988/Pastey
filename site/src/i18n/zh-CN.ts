@@ -116,7 +116,7 @@ export const zhCN = {
     stages: [
       ["ph-radar", "发现", "附近设备在同一局域网内广播并发现活动会话；8 位房间码仍可作为手动备用方式。"],
       ["ph-lock-key", "加密", "文本会转为字节；文件和图片保持为通用二进制数据；载荷在本地完成加密与解密。"],
-      ["ph-stack", "调度", "前端加权调度器规划排队中的文件类传输，同时让每个传输继续沿用既有的单文件路径。"],
+      ["ph-stack", "调度", "前端规划普通文件队列；同一个 Rust 容量边界在进入既有单文件路径前接纳普通与托管传输。"],
       ["ph-arrows-left-right", "传输", "binary-v1 在本地端点之间完成加密、分块、流式发送、确认与收尾；JSON/base64 保留为兼容回退路径。"]
     ],
     boundariesEyebrow: "当前边界",
@@ -126,7 +126,7 @@ export const zhCN = {
     experimentalLabel: "实验或诊断：",
     experimentalText: "非侵入式调度诊断，以及更广泛的设备能力相关工作。",
     notCurrentLabel: "当前未实现：",
-    notCurrentText: "云端中转、远程存储、后端调度、打包传输、binary-v2 或子流复用。",
+    notCurrentText: "云端中转、远程存储、打包传输、binary-v2、子流复用或第二套传输栈。",
     scheduler: "传输调度器",
     schedulerText: "阅读规划器与编排边界 →",
     validation: "验证记录",

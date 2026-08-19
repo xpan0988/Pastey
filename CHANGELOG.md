@@ -4,14 +4,54 @@ Detailed update and release history for Pastey.
 
 ## Unreleased
 
-- Hardened Burn as a receiver-host-owned, fail-closed cleanup boundary: it removes Bridge routes, membership, runtime control state, candidate/Transform authority, staging, queue projections, and durable Bridge content while preserving final user Inbox files and independent paired-device display identity.
-- Removed receiver absolute paths from cleanup and transfer logging, and reduced Layer 3 candidate-return queue metadata to an opaque non-authority operation projection.
-- Renamed product terminology from trusted devices to paired/previously connected devices so display identity is not mistaken for routeability, consent, or execution authority.
-- Realigned Bridge Plans around Search, Transform, Transfer, and Execute. Search and Transfer remain executable; Transform and Execute now carry generic reviewed intent and dependency semantics but fail closed until a future Agent implementation exists. Removed premature patch/runtime implementations while retaining safe file identity, explicit locality, PipelinePrivate Transfer, session correlation, one-use authority, restart, TTL, and Burn foundations.
+## 1.9.2 — Core architecture and Layer 5 semantic freeze — 2026-08-19
+
+### Added / Architecture
+
+- Froze the current Layer 1–5 semantic and authority baseline around four managed primitives: Search finds, Transform modifies, Transfer moves, and Execute runs. Search and Transfer are executable; Transform and Execute remain reviewable Plan-framework intents only.
+- Added the canonical coherent upper architecture covering future Managed Workspace, PM/Worker separation, HostRuntime, HostRef, Host admission, managed-object binding, Host effect enforcement, Headless adapters, and the separate Developer Mode authority domain. These are agreed future contracts, not implemented product capabilities.
+- Added a shared Rust Layer 3 transfer-capacity boundary for ordinary and managed Transfers, with one global window budget, active-transfer limits, and runtime resizing based only on bounded resource facts.
+- Made Layer 5 continuation primitive-neutral: immutable attempt state determines the next dependency-eligible authored Transfer, which is claimed atomically and dispatched exactly once. One attempt and its protocol state may contain multiple authored Transfer steps.
+
+### Fixed / Hardened
+
+- Made empty `0..N` capability projections valid throughout local creation, Room Control transport, receipt, and storage without indexing element zero, fabricating a fallback capability, or changing topology or authority.
+- Removed the historical Transform-centric PipelinePrivate continuation path. Completing an explicit private landing no longer assumes Transform or lets Layer 1/4 choose the next semantic step.
+- Replaced the weaker PipelinePrivate `File::open` plus digest path with the shared safe physical-file identity implementation, preserving BLAKE3 change detection and platform-specific no-follow/no-reparse identity checks.
+- Closed the managed-Transfer resource-policy bypass so ordinary and Layer 5 Transfers reach the same Rust capacity-admission boundary before Layer 1 transport.
+- Hardened framework-only admission at requester command, `BridgePlanStore::create_attempt_from_approval`, and receiver protocol boundaries. A reviewed Plan containing Transform or Execute is rejected as a whole before approval consumption, attempt/grant creation, candidate discovery, or other execution side effects.
+- Preserved Burn as a receiver-Host-owned fail-closed authority cutoff, removed receiver absolute paths from cleanup/transfer logging, and kept Layer 3 projection metadata opaque and non-authoritative.
+
+### Changed
+
+- Replaced earlier readable-text, patch-specific, and Python/runtime-specific interpretations with one generic Layer 5 model: Transform carries reviewed modification intent for the current logical object and declares N→N+1 at the same Host; Execute carries reviewed execution intent and consumes the exact current revision.
+- Kept movement explicit: PipelinePrivate is an authored intermediate Transfer landing, never Transform output, implicit fallback movement, or capability-driven topology repair.
+- Unified Search, direct Transfer, and PipelinePrivate consumption around retained safe identity, exact locality, session correlation, one-use authority, restart, TTL, and Burn foundations.
+- Clarified paired/previously connected devices as display identity rather than routeability, consent, or execution authority.
+
+### Security / Authority
+
+- Provider, model, renderer, capability facts, ObjectRefs, logs, and Layer 4 route/session state remain non-authority. One requester Review & Run binds the complete immutable semantic Plan.
+- Only an explicit authored Transfer changes object location. Capability observations cannot select a Host, add movement, grant approval, or rewrite topology.
+- Search and Transfer grants remain exact, one-use, and bound to Bridge/Plan/revision/attempt/step/session. Restart, expiry, disconnect, and Burn continue to invalidate process-local execution material as applicable.
+- Layer 5 owns semantic eligibility; Layer 3 owns transport capacity; Layer 4 supplies current authenticated/session transport context; Layer 1 performs encrypted byte transfer.
+
+### Documentation
+
+- Added `docs/upper-architecture.md` as the single source of truth for the agreed future architecture and its PM/Worker/Core, HostRuntime, HostRef, Host admission, object-binding, effect-enforcement, Headless, and Developer Mode boundaries.
+- Aligned the README, canonical architecture, layer contracts, reference, development workflow, public architecture copy, and release metadata with the current implementation.
+- Recorded the post-1.9.2 structural freeze separately from intentionally evolvable two-party, `selected_file`, protocol-v1, Tauri-container, admission-policy, effect-envelope, Harness, Terminal, and Headless representations.
+- Corrected the future dependency order to HostRuntime seam → HostRef contract → Host admission/object binding → Multi-Host schema/protocol v2 → effect/Terminal authority domains → concrete upper implementations.
+
+### Known limitations / Not implemented
+
+- There is no concrete Transform runtime, Execute runtime, Worker Harness, local-model runtime, Multi-Host Plan, Host admission implementation, Host effect enforcement, Developer Terminal, or Headless Host daemon.
+- Current Plan/schema/protocol and Composer remain two-party and Search-first around `requesting_device`, `selected_device`, and `selected_file`.
+- Automated tests and cross-compilation do not prove physical Mac↔Windows/Linux end-to-end behavior; no such physical E2E claim is made for this release.
 
 ## 1.9.1 — Layer 5 narrow product closure — 2026-07-08
 
-> Historical record. The capability, consent, Return, TaskGraph, and sidecar details below were superseded and physically removed by the Bridge Plan cleanup described in Unreleased; they are not current product behavior.
+> Historical record. The capability, consent, Return, TaskGraph, and sidecar details below were superseded and physically removed by the Bridge Plan architecture recorded in 1.9.2; they are not current product behavior.
 
 ### Added
 

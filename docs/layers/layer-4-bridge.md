@@ -26,14 +26,16 @@ Bridge control events are encrypted, typed current-session values separate from 
 
 Bridge Plan control messages remain exact selected-peer only. `selected_peers` and broadcast control routes are rejected. Layer 4 transports a Plan message; it does not authorize it. A delivery receipt says only that transport accepted or exposed an event—not that approval, execution, or a durable relationship exists.
 
+Room Control delivers correlated current-session completion/control events to the Layer 5 Host coordinator. It does not inspect Plan topology, assume PipelinePrivate is followed by Transform, choose the next primitive, or create semantic step authority.
+
 The Bridge detail panel uses one serialized control-inbox pump. Active nonterminal operations refresh automatically; focus/entry refresh and **Check for updates** are fallbacks. Processed or unchanged events do not create duplicate product-state updates or resend delivery.
 
 ## Lifecycle boundaries
 
-Leave, disconnect, burn, and startup recovery invalidate current-session work as applicable; they do not create durable history, durable route recovery, or authority. Burn first cuts authority off, then removes routes, active server/transfer state, room-control inbox/replay/rate state, candidate/Transform workflow state, Bridge membership, items, and reusable room material. It preserves user-saved final Inbox files and an independent paired-device display identity only. The durable Burn tombstone is opaque and non-sensitive; it is not product history. Replay, delivery receipts, control inbox entries, logs, and consent records cannot cross a Bridge session as authority.
+Leave, disconnect, burn, and startup recovery invalidate current-session work as applicable; they do not create durable history, durable route recovery, or authority. Burn first cuts authority off, then removes routes, active server/transfer state, room-control inbox/replay/rate state, candidate/Plan workflow state, Bridge membership, items, and reusable room material. It preserves user-saved final Inbox files and an independent paired-device display identity only. The durable Burn tombstone is opaque and non-sensitive; it is not product history. Replay, delivery receipts, control inbox entries, logs, and approval records cannot cross a Bridge session as authority.
 
 ## Current limitations
 
 Durable route recovery, auto-join, control-event fan-out, and full cryptographic key rotation are not implemented. Multi-target fan-out is limited to ordinary data. Two-device/package validation remains a required manual/release check.
 
-For exact vocabularies and schemas, see [reference.md](../reference.md). For Layer 5 consent and capabilities, see [Layer 5](layer-5-agent.md). For validation, see [development.md](../development.md).
+For exact vocabularies and schemas, see [reference.md](../reference.md). For Layer 5 semantic approval and step authority, see [Layer 5](layer-5-agent.md). For validation, see [development.md](../development.md).

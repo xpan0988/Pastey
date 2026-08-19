@@ -1,6 +1,6 @@
 # Pastey reference
 
-This document owns stable cross-layer terminology, identifiers, and compact source pointers. Source types and validators remain authoritative.
+This document owns stable cross-layer terminology, identifiers, and compact source pointers for the 1.9.2 structural freeze. Source types and validators remain authoritative.
 
 ## Canonical primitives
 
@@ -24,6 +24,7 @@ Only Transfer changes location. Transform conceptually advances the same logical
 | Safe private identity | `SourceIdentity` — `src-tauri/src/safe_file_identity.rs` |
 | Logical dependency | `LogicalObjectRevision` — `src-tauri/src/bridge_plan.rs` |
 | Capability transport | `pastey-peer-capabilities-v2` — `src-tauri/src/peer_capabilities.rs` |
+| Shared transfer capacity | `TransferCapacityCoordinator` — `src-tauri/src/transfer_orchestration.rs` |
 | Ordinary route | `BridgeRoute` — `src/lib/bridgeRouting.ts` |
 | Control route | `pastey-bridge-control-route-v1` — `src-tauri/src/room_control.rs` |
 
@@ -58,9 +59,17 @@ It does not select a runtime, executable, shell, cwd, environment, network polic
 
 One requester Review & Run binds the complete immutable Plan. Candidate selection chooses data only. Rust continues currently executable Search and Transfer steps automatically. Transform/Execute framework presence creates no generic persistent modification or process authority.
 
-Capability projections are bounded observations, never routing or authority. Local and peer observations remain independent, and the current projection truthfully contains no implemented Transform/Execute facts.
+Capability projections contain `0..N` bounded observations, never routing or authority. An empty projection is valid and creates no fallback fact, topology change, approval, or Host choice. Local and peer observations remain independent, and the current projection truthfully contains no implemented Transform/Execute facts.
 
 Private paths, safe-open handles, source fingerprints, digests, PipelinePrivate roots, ObjectRefs, grants, and continuation state remain Rust-private. The renderer receives reviewed semantics, redacted candidate metadata, and safe activity/result summaries.
+
+## Continuation and resource ownership
+
+Layer 5 derives next-step eligibility only from immutable Plan/attempt state and atomically claims the next authored Transfer. Layer 3 admits bounded transport capacity for both ordinary and managed Transfers. Layer 4 supplies current-session route/control delivery; Layer 1 moves bytes. No lower layer infers that PipelinePrivate is followed by Transform.
+
+## Managed object acquisition
+
+Search means finding. Object acquisition/binding is the Host-owned boundary that validates a physical artifact and associates it with a managed logical object/revision. Current `selected_file` and Search-first composition are implementation constraints. Future Inbox, drag/drop, local-selection, and generated-artifact roots do not add a fifth primitive and do not themselves grant Transform authority.
 
 ## Validation map
 
