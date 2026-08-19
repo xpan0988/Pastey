@@ -4,7 +4,7 @@
 //! no ObjectRef, path, token, worker, or transport material and is cleared on
 //! restart and Burn.
 
-use std::{collections::HashMap, io::Read, sync::Mutex};
+use std::{collections::HashMap, sync::Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{Map, Value};
@@ -37,6 +37,14 @@ pub(crate) struct ProtocolMetadata {
     pub(crate) replay_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InboundProtocolAction {
+    None,
+    ExecuteSearch { attempt_id: String },
+    ExecuteTransfer { attempt_id: String },
+    ContinueAttempt { attempt_id: String },
+}
+
 #[derive(Clone, Debug)]
 struct LocalSearchAuthority {
     bridge_id: String,
@@ -61,8 +69,8 @@ struct LocalPipelineInput {
     step_id: String,
     source_device_ref: String,
     destination_device_ref: String,
+    media_type: String,
     expires_at: i64,
-    digest: String,
     input: BridgePlanPrivateFile,
 }
 #[derive(Clone, Debug)]
@@ -327,13 +335,16 @@ impl ProtocolSearchAuthorityStore {
         metadata: &crate::models::PipelineHandoffMetadata,
         input: BridgePlanPrivateFile,
     ) -> AppResult<()> {
+        crate::file_candidates::revalidate_bridge_plan_private_file(&input)?;
+        if metadata.media_type.is_empty() || input.mime_type != metadata.media_type {
+            return invalid("Pipeline private object media binding is invalid.");
+        }
         let mut inputs = self.pipeline_inputs.lock().map_err(|_| {
             AppError::InvalidInput("Pipeline private object store is unavailable.".into())
         })?;
         if inputs.contains_key(&metadata.attempt_id) {
             return invalid("Pipeline private object was already registered.");
         }
-        let digest = private_pipeline_digest(&input)?;
         inputs.insert(
             metadata.attempt_id.clone(),
             LocalPipelineInput {
@@ -345,12 +356,50 @@ impl ProtocolSearchAuthorityStore {
                 step_id: metadata.step_id.clone(),
                 source_device_ref: metadata.source_device_ref.clone(),
                 destination_device_ref: metadata.destination_device_ref.clone(),
+                media_type: metadata.media_type.clone(),
                 expires_at: crate::storage::now_ts() + MAX_LIFETIME,
-                digest,
                 input,
             },
         );
         Ok(())
+    }
+
+    pub(crate) fn pipeline_input_metadata(
+        &self,
+        attempt_id: &str,
+    ) -> AppResult<Option<crate::models::PipelineHandoffMetadata>> {
+        let input = self
+            .pipeline_inputs
+            .lock()
+            .map_err(|_| {
+                AppError::InvalidInput("Pipeline private object store is unavailable.".into())
+            })?
+            .get(attempt_id)
+            .cloned();
+        let Some(input) = input else {
+            return Ok(None);
+        };
+        if input.expires_at <= crate::storage::now_ts()
+            || crate::file_candidates::revalidate_bridge_plan_private_file(&input.input).is_err()
+        {
+            if let Ok(mut inputs) = self.pipeline_inputs.lock() {
+                if let Some(stale) = inputs.remove(attempt_id) {
+                    crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&stale.input);
+                }
+            }
+            return invalid("Pipeline private object changed or expired before continuation.");
+        }
+        Ok(Some(crate::models::PipelineHandoffMetadata {
+            bridge_id: input.bridge_id,
+            plan_id: input.plan_id,
+            revision_id: input.revision_id,
+            revision_hash: input.revision_hash,
+            attempt_id: input.attempt_id,
+            step_id: input.step_id,
+            source_device_ref: input.source_device_ref,
+            destination_device_ref: input.destination_device_ref,
+            media_type: input.media_type,
+        }))
     }
 
     pub(crate) fn consume_pipeline_input(
@@ -373,43 +422,21 @@ impl ProtocolSearchAuthorityStore {
             || input.step_id != metadata.step_id
             || input.source_device_ref != metadata.source_device_ref
             || input.destination_device_ref != metadata.destination_device_ref
+            || input.media_type != metadata.media_type
         {
+            crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&input.input);
             return invalid("Pipeline private object crossed its Plan binding.");
         }
         if input.expires_at <= crate::storage::now_ts() {
             crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&input.input);
             return invalid("Pipeline private object expired.");
         }
-        if private_pipeline_digest(&input.input)? != input.digest {
+        if crate::file_candidates::revalidate_bridge_plan_private_file(&input.input).is_err() {
             crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&input.input);
             return invalid("Pipeline private object changed before it could be consumed.");
         }
         Ok(input.input)
     }
-}
-
-fn private_pipeline_digest(input: &BridgePlanPrivateFile) -> AppResult<String> {
-    let mut file = std::fs::File::open(&input.path)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut read_total = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        read_total = read_total.checked_add(read as u64).ok_or_else(|| {
-            AppError::InvalidInput("Pipeline private object size overflowed.".into())
-        })?;
-        if read_total > input.size_bytes {
-            return invalid("Pipeline private object changed before it could be consumed.");
-        }
-        hasher.update(&buffer[..read]);
-    }
-    if read_total != input.size_bytes {
-        return invalid("Pipeline private object changed before it could be consumed.");
-    }
-    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub(crate) fn review_request_payload(
@@ -588,46 +615,10 @@ pub(crate) fn search_selection_payload(
     )
 }
 
-/// Starts the already-approved Transfer step after the requester has selected
-/// one candidate from the bounded Search result. The selected candidate itself
-/// never crosses this boundary again: the receiver validates and resolves it
-/// from its private candidate store.
+/// Starts exactly the currently authorized authored Transfer. Source material
+/// never crosses this control boundary: the executing Host resolves either its
+/// selected candidate or its exact PipelinePrivate binding inside Rust.
 pub(crate) fn transfer_start_payload(
-    paths: &AppPaths,
-    bridge_id: &str,
-    attempt_id: &str,
-    now: i64,
-) -> AppResult<Value> {
-    let conn = connection(paths)?;
-    let stored=conn.query_row("SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,state FROM bridge_plan_protocol_attempts WHERE bridge_id=?1 AND attempt_id=?2",params![bridge_id,attempt_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?))).optional()?;
-    let Some(stored) = stored else {
-        return direct_transfer_start_payload(paths, bridge_id, attempt_id, now);
-    };
-    if stored.6 != "completed" {
-        return invalid("Bridge Plan Search must finish before Transfer can start.");
-    }
-    let revision_json:String=conn.query_row("SELECT revision_json FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='requester' AND approval_id=?2",params![bridge_id,stored.0],|r|r.get(0)).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan review record is unavailable.".into()))?;
-    let revision: BridgePlanRevision = serde_json::from_str(&revision_json)?;
-    let transfer = revision
-        .steps
-        .iter()
-        .find(|step| matches!(step, BridgePlanStep::Transfer { .. }))
-        .ok_or_else(|| {
-            AppError::InvalidInput("This plan has no supported Transfer step.".into())
-        })?;
-    let BridgePlanStep::Transfer { destination, .. } = transfer else {
-        return invalid("This plan has no supported Transfer step.");
-    };
-    let supported_destination = supported_transfer_destination(destination, &stored.4, &stored.5);
-    if !supported_destination {
-        return invalid("Bridge Plan Transfer destination crossed its device binding.");
-    }
-    Ok(
-        serde_json::json!({"schemaVersion":PROTOCOL_VERSION,"bridgeId":bridge_id,"planId":stored.1,"revisionId":stored.2,"revisionHash":stored.3,"requesterDeviceRef":stored.4,"receiverDeviceRef":stored.5,"approvalId":stored.0,"attemptId":attempt_id,"transferStep":transfer,"transferStepDigest":step_digest(transfer)?,"attemptNonce":format!("transfer-nonce-{}",uuid::Uuid::new_v4()),"attemptExpiresAt":now+MAX_LIFETIME}),
-    )
-}
-
-fn direct_transfer_start_payload(
     paths: &AppPaths,
     bridge_id: &str,
     attempt_id: &str,
@@ -636,43 +627,30 @@ fn direct_transfer_start_payload(
     let store = BridgePlanStore::new(paths);
     let attempt = store.list_attempt(attempt_id)?;
     if attempt.attempt.bridge_id != bridge_id || attempt.state != AttemptState::Running {
-        return invalid("Bridge Plan direct Transfer is unavailable.");
+        return invalid("Bridge Plan Transfer is unavailable.");
     }
     let revision = store.get_revision(&attempt.attempt.revision_id)?.revision;
     let transfer = revision
         .steps
         .iter()
-        .find(|step| matches!(step, BridgePlanStep::Transfer { .. }))
+        .find(|step| {
+            matches!(step, BridgePlanStep::Transfer { .. })
+                && attempt.steps.iter().any(|state| {
+                    state.step_id == step.id() && state.state == StepExecutionState::Authorized
+                })
+        })
         .ok_or_else(|| {
             AppError::InvalidInput("This plan has no supported Transfer step.".into())
         })?;
-    let eligible = attempt
-        .steps
-        .iter()
-        .find(|step| step.step_id == transfer.id())
-        .is_some_and(|step| {
-            matches!(
-                step.state,
-                StepExecutionState::Eligible | StepExecutionState::Authorized
-            )
-        });
-    if !eligible {
-        return invalid("Bridge Plan direct Transfer is not ready to start.");
-    }
-    let BridgePlanStep::Transfer {
-        source,
-        destination,
-        ..
-    } = transfer
-    else {
+    let BridgePlanStep::Transfer { destination, .. } = transfer else {
         unreachable!()
     };
-    if !matches!(
-        source,
-        super::ObjectSelectionRule::FutureUserSelection { .. }
-    ) || !matches!(destination, super::TransferDestination::SelectedDevice { device_ref } if device_ref == &revision.selected_device_ref)
-    {
-        return invalid("This direct Transfer binding is unavailable.");
+    if !supported_transfer_destination(
+        destination,
+        &revision.requesting_device_ref,
+        &revision.selected_device_ref,
+    ) {
+        return invalid("Bridge Plan Transfer destination crossed its device binding.");
     }
     Ok(
         serde_json::json!({"schemaVersion":PROTOCOL_VERSION,"bridgeId":bridge_id,"planId":attempt.attempt.plan_id,"revisionId":attempt.attempt.revision_id,"revisionHash":attempt.attempt.revision_hash,"requesterDeviceRef":revision.requesting_device_ref,"receiverDeviceRef":revision.selected_device_ref,"approvalId":attempt.attempt.approval_id,"attemptId":attempt_id,"transferStep":transfer,"transferStepDigest":step_digest(transfer)?,"attemptNonce":format!("transfer-nonce-{}",uuid::Uuid::new_v4()),"attemptExpiresAt":now+MAX_LIFETIME}),
@@ -773,7 +751,7 @@ pub(crate) fn consume_transfer_execution_grant(
 ) -> AppResult<TransferExecutionGrant> {
     let local = authorities.consume_transfer(bridge_id, attempt_id, now)?;
     let conn = connection(paths)?;
-    let stored=conn.query_row("SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,step_digest FROM bridge_plan_protocol_transfer_attempts WHERE bridge_id=?1 AND attempt_id=?2 AND state='accepted'",params![bridge_id,attempt_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?))).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan Transfer is unavailable.".into()))?;
+    let stored=conn.query_row("SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,step_digest FROM bridge_plan_protocol_transfer_steps WHERE bridge_id=?1 AND attempt_id=?2 AND state='accepted'",params![bridge_id,attempt_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?))).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan Transfer is unavailable.".into()))?;
     if local.step_id != stored.6 {
         return invalid("Bridge Plan Transfer authority does not match the attempt.");
     }
@@ -983,15 +961,22 @@ pub(crate) fn init_schema(conn: &Connection) -> AppResult<()> {
         expires_at INTEGER NOT NULL, state TEXT NOT NULL, terminal_summary TEXT,
         PRIMARY KEY (bridge_id, attempt_id), UNIQUE (bridge_id, attempt_nonce)
       );
-      CREATE TABLE IF NOT EXISTS bridge_plan_protocol_transfer_attempts (
+      CREATE TABLE IF NOT EXISTS bridge_plan_protocol_transfer_steps (
         bridge_id TEXT NOT NULL, attempt_id TEXT NOT NULL, approval_id TEXT NOT NULL,
         plan_id TEXT NOT NULL, revision_id TEXT NOT NULL, revision_hash TEXT NOT NULL,
         requester_device_ref TEXT NOT NULL, receiver_device_ref TEXT NOT NULL,
         step_id TEXT NOT NULL, step_digest TEXT NOT NULL, attempt_nonce TEXT NOT NULL,
         expires_at INTEGER NOT NULL, state TEXT NOT NULL, terminal_summary TEXT,
-        PRIMARY KEY (bridge_id, attempt_id), UNIQUE (bridge_id, attempt_nonce)
+        PRIMARY KEY (bridge_id, attempt_id, step_id), UNIQUE (bridge_id, attempt_nonce)
       );
     "#,
+    )?;
+    // Transfer protocol authority is process-local/non-resumable. Replacing
+    // the historical one-row-per-attempt table on upgrade cannot resume or
+    // broaden authority; it only removes records already invalid after restart.
+    conn.execute(
+        "DROP TABLE IF EXISTS bridge_plan_protocol_transfer_attempts",
+        [],
     )?;
     Ok(())
 }
@@ -1002,7 +987,7 @@ pub(crate) fn delete_bridge_records(tx: &Transaction<'_>, bridge_id: &str) -> Ap
         [bridge_id],
     )?;
     tx.execute(
-        "DELETE FROM bridge_plan_protocol_transfer_attempts WHERE bridge_id = ?1",
+        "DELETE FROM bridge_plan_protocol_transfer_steps WHERE bridge_id = ?1",
         [bridge_id],
     )?;
     tx.execute(
@@ -1015,7 +1000,7 @@ pub(crate) fn delete_bridge_records(tx: &Transaction<'_>, bridge_id: &str) -> Ap
 pub(crate) fn reconcile_protocol_startup(paths: &AppPaths, _now: i64) -> AppResult<usize> {
     let conn = connection(paths)?;
     let search = conn.execute("UPDATE bridge_plan_protocol_attempts SET state = 'interrupted', terminal_summary = 'application_restarted' WHERE state IN ('accepted','running')", [])?;
-    let transfer = conn.execute("UPDATE bridge_plan_protocol_transfer_attempts SET state = 'interrupted', terminal_summary = 'application_restarted' WHERE state IN ('accepted','running')", [])?;
+    let transfer = conn.execute("UPDATE bridge_plan_protocol_transfer_steps SET state = 'interrupted', terminal_summary = 'application_restarted' WHERE state IN ('accepted','running')", [])?;
     Ok(search + transfer)
 }
 
@@ -1149,9 +1134,9 @@ pub(crate) fn accept_inbound_protocol_event(
     kind: &str,
     event: &Value,
     now: i64,
-) -> AppResult<()> {
+) -> AppResult<InboundProtocolAction> {
     if !kind.starts_with("bridge_plan.") {
-        return Ok(());
+        return Ok(InboundProtocolAction::None);
     }
     let payload = payload(event)?;
     let bridge = string(payload, "bridgeId", 128)?;
@@ -1167,25 +1152,46 @@ pub(crate) fn accept_inbound_protocol_event(
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::InvalidInput("Invalid Bridge Plan protocol event.".into()))?;
     let common = common_for_event(payload, kind, &bridge, source, target)?;
-    match kind {
+    let action = match kind {
         "bridge_plan.review_request" => {
-            insert_review(paths, "receiver", &review(payload, &common, now)?)?
+            insert_review(paths, "receiver", &review(payload, &common, now)?)?;
+            InboundProtocolAction::None
         }
-        "bridge_plan.attempt_start" => accept_start(paths, authorities, payload, &common, now)?,
+        "bridge_plan.attempt_start" => {
+            accept_start(paths, authorities, payload, &common, now)?;
+            InboundProtocolAction::ExecuteSearch {
+                attempt_id: string(payload, "attemptId", 128)?,
+            }
+        }
         "bridge_plan.transfer_start" => {
-            accept_transfer_start(paths, authorities, payload, &common, now)?
+            if accept_transfer_start(paths, authorities, payload, &common, now)? {
+                InboundProtocolAction::ExecuteTransfer {
+                    attempt_id: string(payload, "attemptId", 128)?,
+                }
+            } else {
+                InboundProtocolAction::None
+            }
         }
         "bridge_plan.search_selection" => {
-            accept_selection(paths, authorities, candidates, payload, &common, now)?
+            accept_selection(paths, authorities, candidates, payload, &common, now)?;
+            InboundProtocolAction::None
         }
         "bridge_plan.attempt_ack"
         | "bridge_plan.step_progress"
         | "bridge_plan.step_result"
         | "bridge_plan.step_failed"
-        | "bridge_plan.cancel" => accept_update(paths, authorities, payload, &common, kind)?,
+        | "bridge_plan.cancel" => {
+            if accept_update(paths, authorities, payload, &common, kind)? {
+                InboundProtocolAction::ContinueAttempt {
+                    attempt_id: string(payload, "attemptId", 128)?,
+                }
+            } else {
+                InboundProtocolAction::None
+            }
+        }
         _ => return invalid("Unsupported Bridge Plan protocol event kind."),
-    }
-    Ok(())
+    };
+    Ok(action)
 }
 
 fn common(
@@ -1621,7 +1627,7 @@ fn insert_attempt(paths: &AppPaths, attempt: &Attempt) -> AppResult<()> {
 
 fn insert_transfer_attempt(paths: &AppPaths, attempt: &Attempt) -> AppResult<()> {
     let conn = connection(paths)?;
-    if conn.execute("INSERT OR IGNORE INTO bridge_plan_protocol_transfer_attempts (bridge_id,attempt_id,approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,step_digest,attempt_nonce,expires_at,state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'accepted')",params![attempt.common.bridge,attempt.id,attempt.approval,attempt.common.plan,attempt.common.revision,attempt.common.hash,attempt.common.requester,attempt.common.receiver,attempt.step,attempt.digest,attempt.nonce,attempt.expires])? !=1{return invalid("Bridge Plan Transfer replayed.");}
+    if conn.execute("INSERT OR IGNORE INTO bridge_plan_protocol_transfer_steps (bridge_id,attempt_id,approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,step_digest,attempt_nonce,expires_at,state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'accepted')",params![attempt.common.bridge,attempt.id,attempt.approval,attempt.common.plan,attempt.common.revision,attempt.common.hash,attempt.common.requester,attempt.common.receiver,attempt.step,attempt.digest,attempt.nonce,attempt.expires])? !=1{return invalid("Bridge Plan Transfer replayed.");}
     Ok(())
 }
 
@@ -1631,7 +1637,7 @@ fn accept_transfer_start(
     value: &Map<String, Value>,
     common: &Common,
     now: i64,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     let attempt = transfer_start(value, common, now)?;
     let conn = connection(paths)?;
     let review=conn.query_row("SELECT revision_json,review_expires_at FROM bridge_plan_protocol_reviews WHERE bridge_id=?1 AND direction='receiver' AND approval_id=?2",params![common.bridge,attempt.approval],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan remote plan binding missing.".into()))?;
@@ -1668,15 +1674,29 @@ fn accept_transfer_start(
     let BridgePlanStep::Transfer { source, .. } = step else {
         unreachable!()
     };
-    match source {
-        super::ObjectSelectionRule::FromSlot { slot_id } if slot_id == "selected_file" => {
+    let execute_here = step.execution_device() == common.receiver;
+    match (source, execute_here) {
+        (super::ObjectSelectionRule::FromSlot { slot_id }, true) if slot_id == "selected_file" => {
             authorities.selected_candidate_id(&common.bridge, &attempt.id, now)?;
         }
-        super::ObjectSelectionRule::FutureUserSelection { .. } => {}
+        (super::ObjectSelectionRule::FutureUserSelection { .. }, false)
+        | (super::ObjectSelectionRule::FromSlot { .. }, false) => {}
         _ => return invalid("Bridge Plan Transfer source is not available yet."),
     }
     insert_transfer_attempt(paths, &attempt)?;
-    authorities.grant_transfer(&common.bridge, &attempt.id, &attempt.step, attempt.expires)
+    if execute_here {
+        if let Err(error) =
+            authorities.grant_transfer(&common.bridge, &attempt.id, &attempt.step, attempt.expires)
+        {
+            let conn = connection(paths)?;
+            let _ = conn.execute(
+                "DELETE FROM bridge_plan_protocol_transfer_steps WHERE bridge_id=?1 AND attempt_id=?2 AND step_id=?3 AND state='accepted'",
+                params![common.bridge, attempt.id, attempt.step],
+            );
+            return Err(error);
+        }
+    }
+    Ok(execute_here)
 }
 
 fn accept_selection(
@@ -1725,10 +1745,10 @@ fn accept_update(
     value: &Map<String, Value>,
     common: &Common,
     kind: &str,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     let update = update(value, common, kind)?;
     let conn = connection(paths)?;
-    let stored=conn.query_row("SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,search_step_digest,state,'search' FROM bridge_plan_protocol_attempts WHERE bridge_id=?1 AND attempt_id=?2 AND step_id=?3 UNION ALL SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,step_digest,state,'transfer' FROM bridge_plan_protocol_transfer_attempts WHERE bridge_id=?1 AND attempt_id=?2 AND step_id=?3",params![common.bridge,update.id,update.step],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?))).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan attempt missing.".into()))?;
+    let stored=conn.query_row("SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,search_step_digest,state,'search' FROM bridge_plan_protocol_attempts WHERE bridge_id=?1 AND attempt_id=?2 AND step_id=?3 UNION ALL SELECT approval_id,plan_id,revision_id,revision_hash,requester_device_ref,receiver_device_ref,step_id,step_digest,state,'transfer' FROM bridge_plan_protocol_transfer_steps WHERE bridge_id=?1 AND attempt_id=?2 AND step_id=?3",params![common.bridge,update.id,update.step],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?))).optional()?.ok_or_else(||AppError::InvalidInput("Bridge Plan attempt missing.".into()))?;
     if stored.0 != update.approval
         || stored.1 != common.plan
         || stored.2 != common.revision
@@ -1741,7 +1761,7 @@ fn accept_update(
         return invalid("Bridge Plan update correlation mismatch.");
     }
     if kind == "bridge_plan.attempt_ack" {
-        return Ok(());
+        return Ok(false);
     }
     let legal = matches!(
         (stored.8.as_str(), update.state.as_str()),
@@ -1756,10 +1776,10 @@ fn accept_update(
     }
     let table = match stored.9.as_str() {
         "search" => "bridge_plan_protocol_attempts",
-        "transfer" => "bridge_plan_protocol_transfer_attempts",
+        "transfer" => "bridge_plan_protocol_transfer_steps",
         _ => return invalid("Bridge Plan execution kind is invalid."),
     };
-    if conn.execute(&format!("UPDATE {table} SET state=?1,terminal_summary=?2 WHERE bridge_id=?3 AND attempt_id=?4 AND state=?5"),params![update.state,update.summary,common.bridge,update.id,stored.8])? != 1 { return invalid("Bridge Plan update became stale."); }
+    if conn.execute(&format!("UPDATE {table} SET state=?1,terminal_summary=?2 WHERE bridge_id=?3 AND attempt_id=?4 AND step_id=?5 AND state=?6"),params![update.state,update.summary,common.bridge,update.id,update.step,stored.8])? != 1 { return invalid("Bridge Plan update became stale."); }
     let store = BridgePlanStore::new(paths);
     let at = crate::storage::now_ts();
     match update.state.as_str() {
@@ -1877,7 +1897,7 @@ fn accept_update(
         authorities.revoke(&update.id);
         authorities.revoke_transfer(&update.id);
     }
-    Ok(())
+    Ok(stored.9 == "transfer" && update.state == "completed")
 }
 
 fn payload(event: &Value) -> AppResult<&Map<String, Value>> {
@@ -2291,6 +2311,132 @@ mod tests {
     }
 
     #[test]
+    fn sequential_transfer_steps_have_distinct_protocol_rows_and_requester_step_has_no_grant() {
+        let revision = build_composed_file_revision(
+            "bridge".into(),
+            "requester".into(),
+            "receiver".into(),
+            "Return a searched file through an explicit private handoff".into(),
+            vec![
+                ComposedFilePlanBlock::Search {
+                    execution_device_ref: "receiver".into(),
+                    filename_hint: "example.py".into(),
+                    extensions: vec!["py".into()],
+                    safe_scope_labels: vec!["downloads".into()],
+                },
+                ComposedFilePlanBlock::Transfer {
+                    source_device_ref: "receiver".into(),
+                    destination_device_ref: "requester".into(),
+                    landing: super::super::ComposedTransferLanding::PipelinePrivate,
+                },
+                ComposedFilePlanBlock::Transfer {
+                    source_device_ref: "requester".into(),
+                    destination_device_ref: "receiver".into(),
+                    landing: super::super::ComposedTransferLanding::Inbox,
+                },
+            ],
+        )
+        .unwrap();
+        let (requester, receiver, approval, values) = protocol_round_trip(revision.clone());
+        let now = crate::storage::now_ts();
+        let store = BridgePlanStore::new(&requester);
+        store
+            .create_attempt_from_approval("attempt", &approval.approval_id, now)
+            .unwrap();
+        store
+            .transition_attempt("attempt", AttemptState::Running, now)
+            .unwrap();
+        store
+            .transition_step("attempt", "search", StepExecutionState::Authorized, now)
+            .unwrap();
+        store
+            .transition_step("attempt", "search", StepExecutionState::Running, now)
+            .unwrap();
+        store
+            .transition_step("attempt", "search", StepExecutionState::Completed, now)
+            .unwrap();
+        let first = store
+            .authorize_next_eligible_transfer("attempt", now)
+            .unwrap()
+            .unwrap();
+        let first_payload = transfer_start_payload(&requester, "bridge", "attempt", now).unwrap();
+        record_outbound_protocol_event(
+            &requester,
+            "bridge_plan.transfer_start",
+            &outer(
+                "bridge_plan.transfer_start",
+                first_payload,
+                "requester",
+                "receiver",
+            ),
+            now,
+        )
+        .unwrap();
+        store
+            .transition_step("attempt", first.id(), StepExecutionState::Running, now)
+            .unwrap();
+        store
+            .transition_step("attempt", first.id(), StepExecutionState::Completed, now)
+            .unwrap();
+        let second = store
+            .authorize_next_eligible_transfer("attempt", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.id(), "transfer-2");
+        let second_payload = transfer_start_payload(&requester, "bridge", "attempt", now).unwrap();
+        let second_event = outer(
+            "bridge_plan.transfer_start",
+            second_payload,
+            "requester",
+            "receiver",
+        );
+        record_outbound_protocol_event(
+            &requester,
+            "bridge_plan.transfer_start",
+            &second_event,
+            now,
+        )
+        .unwrap();
+
+        let conn = connection(&requester).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_protocol_transfer_steps WHERE bridge_id='bridge' AND attempt_id='attempt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2);
+        drop(conn);
+
+        let authorities = ProtocolSearchAuthorityStore::default();
+        let mut candidates = crate::file_candidates::BridgePlanCandidateStore::default();
+        assert_eq!(
+            accept_inbound_protocol_event(
+                &receiver,
+                &authorities,
+                &mut candidates,
+                "bridge_plan.transfer_start",
+                &second_event,
+                now,
+            )
+            .unwrap(),
+            InboundProtocolAction::None
+        );
+        assert!(consume_transfer_execution_grant(
+            &receiver,
+            &authorities,
+            "bridge",
+            "attempt",
+            now,
+        )
+        .is_err());
+        assert_eq!(values["review"]["revisionHash"], revision.revision_hash);
+        fs::remove_dir_all(requester.app_data_dir).unwrap();
+        fs::remove_dir_all(receiver.app_data_dir).unwrap();
+    }
+
+    #[test]
     fn requester_records_outbound_attempt_before_receiver_acknowledges_it() {
         let revision = build_file_search_revision(
             "bridge".into(),
@@ -2503,6 +2649,121 @@ mod tests {
         assert_eq!(consumed.size_bytes, 10);
         assert!(authorities.consume_pipeline_input(&metadata).is_err());
         crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&consumed);
+        assert!(!root.exists());
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
+
+    #[test]
+    fn pipeline_private_input_reuses_safe_identity_and_rejects_content_change() {
+        let paths = paths();
+        let root = paths.temp_dir.join("pipeline-handoffs").join("changed");
+        fs::create_dir_all(&root).unwrap();
+        let input_path = root.join("input");
+        fs::write(&input_path, b"before").unwrap();
+        let metadata = crate::models::PipelineHandoffMetadata {
+            bridge_id: "bridge".into(),
+            plan_id: "plan".into(),
+            revision_id: "revision".into(),
+            revision_hash: "hash".into(),
+            attempt_id: "attempt".into(),
+            step_id: "pipeline_transfer".into(),
+            source_device_ref: "windows-session".into(),
+            destination_device_ref: "mac-session".into(),
+            media_type: "text/plain".into(),
+        };
+        let file = crate::file_candidates::bridge_plan_private_pipeline_file(
+            input_path.clone(),
+            root.clone(),
+            "pipeline-input".into(),
+            "text/plain".into(),
+            6,
+        )
+        .unwrap();
+        let authorities = ProtocolSearchAuthorityStore::default();
+        authorities
+            .register_pipeline_input(&metadata, file)
+            .unwrap();
+        fs::write(&input_path, b"after!").unwrap();
+
+        assert!(authorities.consume_pipeline_input(&metadata).is_err());
+        assert!(!root.exists());
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
+
+    #[test]
+    fn pipeline_private_registration_rejects_expected_digest_mismatch() {
+        let paths = paths();
+        let root = paths.temp_dir.join("pipeline-handoffs").join("digest");
+        fs::create_dir_all(&root).unwrap();
+        let input_path = root.join("input");
+        fs::write(&input_path, b"content").unwrap();
+        let mut file = crate::file_candidates::bridge_plan_private_pipeline_file(
+            input_path,
+            root.clone(),
+            "pipeline-input".into(),
+            "text/plain".into(),
+            7,
+        )
+        .unwrap();
+        file.identity.digest = "blake3:incorrect".into();
+        let metadata = crate::models::PipelineHandoffMetadata {
+            bridge_id: "bridge".into(),
+            plan_id: "plan".into(),
+            revision_id: "revision".into(),
+            revision_hash: "hash".into(),
+            attempt_id: "attempt".into(),
+            step_id: "pipeline_transfer".into(),
+            source_device_ref: "windows-session".into(),
+            destination_device_ref: "mac-session".into(),
+            media_type: "text/plain".into(),
+        };
+
+        assert!(ProtocolSearchAuthorityStore::default()
+            .register_pipeline_input(&metadata, file)
+            .is_err());
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipeline_private_input_rejects_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let paths = paths();
+        let root = paths.temp_dir.join("pipeline-handoffs").join("link");
+        fs::create_dir_all(&root).unwrap();
+        let input_path = root.join("input");
+        let outside = paths.temp_dir.join("outside");
+        fs::write(&input_path, b"inside").unwrap();
+        fs::write(&outside, b"outside").unwrap();
+        let file = crate::file_candidates::bridge_plan_private_pipeline_file(
+            input_path.clone(),
+            root.clone(),
+            "pipeline-input".into(),
+            "text/plain".into(),
+            6,
+        )
+        .unwrap();
+        let metadata = crate::models::PipelineHandoffMetadata {
+            bridge_id: "bridge".into(),
+            plan_id: "plan".into(),
+            revision_id: "revision".into(),
+            revision_hash: "hash".into(),
+            attempt_id: "attempt".into(),
+            step_id: "pipeline_transfer".into(),
+            source_device_ref: "windows-session".into(),
+            destination_device_ref: "mac-session".into(),
+            media_type: "text/plain".into(),
+        };
+        let authorities = ProtocolSearchAuthorityStore::default();
+        authorities
+            .register_pipeline_input(&metadata, file)
+            .unwrap();
+        fs::remove_file(&input_path).unwrap();
+        symlink(&outside, &input_path).unwrap();
+
+        assert!(authorities.consume_pipeline_input(&metadata).is_err());
+        assert!(outside.exists());
         assert!(!root.exists());
         fs::remove_dir_all(paths.app_data_dir).unwrap();
     }

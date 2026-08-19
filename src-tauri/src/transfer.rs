@@ -569,7 +569,7 @@ pub async fn send_room_file_to_bridge_peer_endpoint(
     requested_window: Option<usize>,
     endpoint: BridgePeerTransferEndpoint,
 ) -> AppResult<()> {
-    send_room_file_to_bridge_peer_endpoint_with_landing(
+    send_room_file_to_bridge_peer_endpoint_with_orchestration(
         state,
         room_id,
         item_id,
@@ -578,6 +578,30 @@ pub async fn send_room_file_to_bridge_peer_endpoint(
         requested_window,
         endpoint,
         None,
+        crate::transfer_orchestration::TransferCapacityOrigin::Ordinary,
+    )
+    .await
+}
+
+pub(crate) async fn send_managed_room_file_to_bridge_peer_endpoint(
+    state: Arc<AppState>,
+    room_id: &str,
+    item_id: &str,
+    file_path: &Path,
+    queue_item_id: Option<String>,
+    requested_window: Option<usize>,
+    endpoint: BridgePeerTransferEndpoint,
+) -> AppResult<()> {
+    send_room_file_to_bridge_peer_endpoint_with_orchestration(
+        state,
+        room_id,
+        item_id,
+        file_path,
+        queue_item_id,
+        requested_window,
+        endpoint,
+        None,
+        crate::transfer_orchestration::TransferCapacityOrigin::Managed,
     )
     .await
 }
@@ -591,6 +615,31 @@ pub async fn send_room_file_to_bridge_peer_endpoint_with_landing(
     requested_window: Option<usize>,
     endpoint: BridgePeerTransferEndpoint,
     pipeline_handoff: Option<PipelineHandoffMetadata>,
+) -> AppResult<()> {
+    send_room_file_to_bridge_peer_endpoint_with_orchestration(
+        state,
+        room_id,
+        item_id,
+        file_path,
+        queue_item_id,
+        requested_window,
+        endpoint,
+        pipeline_handoff,
+        crate::transfer_orchestration::TransferCapacityOrigin::Managed,
+    )
+    .await
+}
+
+async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
+    state: Arc<AppState>,
+    room_id: &str,
+    item_id: &str,
+    file_path: &Path,
+    queue_item_id: Option<String>,
+    requested_window: Option<usize>,
+    endpoint: BridgePeerTransferEndpoint,
+    pipeline_handoff: Option<PipelineHandoffMetadata>,
+    capacity_origin: crate::transfer_orchestration::TransferCapacityOrigin,
 ) -> AppResult<()> {
     let room = storage::get_room_by_id(&state.paths, room_id)?;
     if room.status == RoomStatus::Burned {
@@ -630,7 +679,27 @@ pub async fn send_room_file_to_bridge_peer_endpoint_with_landing(
         .clone()
         .unwrap_or_else(|| "pastey_file".to_string());
     let cancel_token = CancellationToken::new();
-    let transfer_tuning = current_transfer_tuning(&state, requested_window);
+    let mut transfer_tuning = current_transfer_tuning(&state, requested_window);
+    let capacity_lease =
+        state
+            .transfer_capacity
+            .admit(crate::transfer_orchestration::TransferCapacityRequest {
+                transfer_id: transfer_id.clone(),
+                room_id: room_id.into(),
+                size_bytes: file_size,
+                requested_window: transfer_tuning.effective_window_size,
+                origin: capacity_origin,
+                diagnostic_override: matches!(
+                    transfer_tuning.override_source,
+                    transfer_tuning::TransferWindowOverrideSource::Env
+                        | transfer_tuning::TransferWindowOverrideSource::DevSettings
+                ),
+            })?;
+    transfer_tuning.effective_window_size = capacity_lease.effective_window();
+    logging::write_transfer_line(&format!(
+        "[pastey transfer][transfer_id={transfer_id}][room_id={room_id}] event=capacity_admitted origin={capacity_origin:?} effective_window={}",
+        transfer_tuning.effective_window_size
+    ));
     let runtime_window = Arc::new(AtomicUsize::new(transfer_tuning.effective_window_size));
     register_sender_transfer(
         &state,
@@ -2448,13 +2517,25 @@ pub fn update_transfer_window(
         transfer_tuning::TransferWindowOverrideSource::Env
             | transfer_tuning::TransferWindowOverrideSource::DevSettings
     );
+    let effective_request = if override_active {
+        requested_window
+    } else {
+        state
+            .transfer_capacity
+            .resize(transfer_id, requested_window)
+            .unwrap_or(requested_window)
+    };
     let transfers = state.active_file_transfers.lock();
-    let result = update_active_transfer_window(
+    let mut result = update_active_transfer_window(
         transfer_id,
-        requested_window,
+        effective_request,
         transfers.get(transfer_id),
         override_active,
     );
+    if !override_active && effective_request != requested_window {
+        result.requested_window = requested_window;
+        result.reason = "capacity_limited";
+    }
     Ok(result)
 }
 
@@ -3845,12 +3926,13 @@ async fn finish_file_transfer_handler(
                 );
             }
         };
-        if ctx
-            .state
-            .bridge_plan_protocol_authority
-            .lock()
-            .register_pipeline_input(metadata, private_file)
-            .is_err()
+        if crate::commands::register_pipeline_private_landing(
+            ctx.state.clone(),
+            room_id.clone(),
+            metadata.clone(),
+            private_file,
+        )
+        .is_err()
         {
             let _ = cleanup_pipeline_handoff_root(&final_path).await;
             crate::commands::log_pipeline_handoff(
@@ -3879,30 +3961,6 @@ async fn finish_file_transfer_handler(
             &metadata.step_id,
             "registered",
         );
-        let cleanup_state = ctx.state.clone();
-        let continuation_metadata = metadata.clone();
-        tauri::async_runtime::spawn(async move {
-            crate::commands::log_pipeline_handoff(
-                "pipeline_receive_failed",
-                &continuation_metadata.bridge_id,
-                &continuation_metadata.attempt_id,
-                &continuation_metadata.step_id,
-                "framework_step_not_executable",
-            );
-            if let Ok(private) = cleanup_state
-                .bridge_plan_protocol_authority
-                .lock()
-                .consume_pipeline_input(&continuation_metadata)
-            {
-                crate::file_candidates::cleanup_bridge_plan_private_pipeline_file(&private);
-            }
-            let store = crate::bridge_plan::BridgePlanStore::new(&cleanup_state.paths);
-            let _ = store.transition_attempt(
-                &continuation_metadata.attempt_id,
-                crate::bridge_plan::AttemptState::Failed,
-                crate::storage::now_ts(),
-            );
-        });
         emit_event(
             &ctx.state,
             &transfer,

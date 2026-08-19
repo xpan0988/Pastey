@@ -116,7 +116,7 @@ export const en = {
     stages: [
       ["ph-radar", "Discover", "Nearby devices advertise and discover active sessions on the same LAN. An 8-digit room code remains the manual fallback."],
       ["ph-lock-key", "Encrypt", "Text becomes bytes. Files and images remain generic binary data. Payload encryption and decryption happen locally."],
-      ["ph-stack", "Schedule", "A frontend-owned weighted scheduler plans queued file-like transfers while keeping each transfer on the established single-file path."],
+      ["ph-stack", "Schedule", "The frontend plans the ordinary file queue; one Rust capacity boundary admits both ordinary and managed transfers before the established single-file path."],
       ["ph-arrows-left-right", "Transfer", "Binary-v1 encrypts, chunks, streams, acknowledges, and finalizes files over the local peer endpoint. JSON/base64 remains a compatibility fallback."]
     ],
     boundariesEyebrow: "Current boundaries",
@@ -126,7 +126,7 @@ export const en = {
     experimentalLabel: "Experimental or diagnostic:",
     experimentalText: "planner shadow diagnostics and broader device-capability work.",
     notCurrentLabel: "Not current:",
-    notCurrentText: "cloud relay, remote storage, backend-owned scheduling, bundle transfer, binary-v2, or substream multiplexing.",
+    notCurrentText: "cloud relay, remote storage, bundle transfer, binary-v2, substream multiplexing, or a second transfer stack.",
     scheduler: "Transfer scheduler",
     schedulerText: "Read the planner and orchestration boundaries →",
     validation: "Validation notes",

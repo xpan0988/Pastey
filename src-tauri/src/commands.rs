@@ -1861,7 +1861,7 @@ pub async fn start_bridge_plan_attempt(
         .map_err(|error| error.message())?;
     log_bridge_plan_control(&event, "attempt_start_correlated");
     if is_requester_direct_transfer {
-        execute_direct_bridge_plan_transfer_attempt_inner(
+        execute_requester_bridge_plan_transfer_attempt_inner(
             state.clone(),
             attempt.bridge_id.clone(),
             attempt.attempt_id.clone(),
@@ -1921,17 +1921,7 @@ pub async fn select_bridge_plan_search_candidate(
         .get_revision(&attempt.attempt.revision_id)
         .map_err(|error| error.message())?
         .revision;
-    if revision.steps.iter().any(|step| {
-        matches!(
-            step,
-            bridge_plan::BridgePlanStep::Transfer {
-                destination: bridge_plan::TransferDestination::PipelineHandoff { .. },
-                ..
-            }
-        )
-    }) {
-        start_bridge_plan_transfer_attempt_inner(state, room_id, attempt_id, bridge_route).await?;
-    } else if revision
+    if revision
         .steps
         .iter()
         .any(|step| matches!(step, bridge_plan::BridgePlanStep::Transfer { .. }))
@@ -1955,24 +1945,22 @@ pub(crate) async fn start_bridge_plan_transfer_attempt_inner(
     if attempt.attempt.bridge_id != room_id || attempt.state != bridge_plan::AttemptState::Running {
         return Err("This approved plan is not ready to transfer a selected file.".into());
     }
-    let transfer_node = attempt
-        .attempt
-        .graph_projection
-        .nodes
-        .iter()
-        .find(|node| matches!(node.operation, bridge_plan::StepOperation::Transfer))
-        .ok_or_else(|| "This plan has no supported Transfer step.".to_string())?;
-    let transfer = attempt
-        .steps
-        .iter()
-        .find(|step| step.step_id == transfer_node.step_id)
-        .ok_or_else(|| "This plan has no durable Transfer state.".to_string())?;
-    if transfer.state != bridge_plan::StepExecutionState::Eligible {
-        return Err("Choose a completed Search result before starting Transfer.".into());
-    }
-    let payload = bridge_plan::transfer_start_payload(&state.paths, &room_id, &attempt_id, now)
-        .map_err(|error| error.message())?;
+    let revision = store
+        .get_revision(&attempt.attempt.revision_id)
+        .map_err(|error| error.message())?
+        .revision;
     let context = crate::room_control::room_control_session_context(&state, &room_id)
+        .map_err(|error| error.message())?;
+    if context.local_session_ref != revision.requesting_device_ref
+        || context.peer_session_ref != revision.selected_device_ref
+    {
+        return Err("The selected device session changed before Transfer could start.".into());
+    }
+    let transfer = store
+        .authorize_next_eligible_transfer(&attempt_id, now)
+        .map_err(|error| error.message())?
+        .ok_or_else(|| "This plan has no eligible authored Transfer step.".to_string())?;
+    let payload = bridge_plan::transfer_start_payload(&state.paths, &room_id, &attempt_id, now)
         .map_err(|error| error.message())?;
     if context.local_session_ref
         != payload
@@ -2001,6 +1989,21 @@ pub(crate) async fn start_bridge_plan_transfer_attempt_inner(
         Ok(receipt) => receipt,
         Err(error) => {
             log_bridge_plan_control(&event, "transfer_start_delivery_failed");
+            let failed_at = storage::now_ts();
+            let _ = store.transition_step(
+                &attempt_id,
+                transfer.id(),
+                bridge_plan::StepExecutionState::Running,
+                failed_at,
+            );
+            let _ = store.transition_step(
+                &attempt_id,
+                transfer.id(),
+                bridge_plan::StepExecutionState::Failed,
+                failed_at,
+            );
+            let _ =
+                store.transition_attempt(&attempt_id, bridge_plan::AttemptState::Failed, failed_at);
             return Err(error.message());
         }
     };
@@ -2013,34 +2016,169 @@ pub(crate) async fn start_bridge_plan_transfer_attempt_inner(
     )
     .map_err(|error| error.message())?;
     log_bridge_plan_control(&event, "transfer_start_correlated");
-    let refreshed = store
-        .list_attempt(&attempt_id)
-        .map_err(|error| error.message())?;
-    if refreshed
-        .steps
-        .iter()
-        .find(|step| step.step_id == transfer.step_id)
-        .is_some_and(|step| step.state == bridge_plan::StepExecutionState::Eligible)
-    {
-        store
-            .transition_step(
-                &attempt_id,
-                &transfer.step_id,
-                bridge_plan::StepExecutionState::Authorized,
-                now,
-            )
-            .map_err(|error| error.message())?;
+    if transfer.execution_device() == context.local_session_ref {
+        execute_requester_bridge_plan_transfer_attempt_inner(state, room_id, attempt_id).await?;
     }
     Ok(receipt)
 }
 
-/// Executes the requester-owned half of an approved direct Transfer. The
-/// source was captured when its immutable revision was created and is checked
-/// again here; no renderer path or receiver authority is accepted.
-/// Host-owned continuation for requester-local direct Transfers. This is
-/// called automatically by the single plan start, never as a renderer-driven
-/// second step.
-pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
+fn validate_pipeline_input_for_transfer(
+    revision: &bridge_plan::BridgePlanRevision,
+    transfer: &bridge_plan::BridgePlanStep,
+    attempt_id: &str,
+    metadata: &crate::models::PipelineHandoffMetadata,
+) -> Result<(), String> {
+    let bridge_plan::BridgePlanStep::Transfer {
+        depends_on,
+        source: bridge_plan::ObjectSelectionRule::FromSlot { slot_id },
+        execution_device_ref,
+        ..
+    } = transfer
+    else {
+        return Err("The PipelinePrivate consumer is not an authored Transfer.".into());
+    };
+    let producer = revision.steps.iter().find(|step| {
+        let bridge_plan::BridgePlanStep::Transfer {
+            step_id,
+            output_slots,
+            destination: bridge_plan::TransferDestination::PipelineHandoff { device_ref },
+            ..
+        } = step
+        else {
+            return false;
+        };
+        depends_on.iter().any(|dependency| dependency == step_id)
+            && output_slots.iter().any(|slot| slot.slot_id == *slot_id)
+            && device_ref == execution_device_ref
+    });
+    let Some(bridge_plan::BridgePlanStep::Transfer {
+        step_id,
+        execution_device_ref: source_device_ref,
+        destination: bridge_plan::TransferDestination::PipelineHandoff { device_ref },
+        ..
+    }) = producer
+    else {
+        return Err("The PipelinePrivate input is not produced by the reviewed dependency.".into());
+    };
+    if metadata.bridge_id != revision.bridge_id
+        || metadata.plan_id != revision.plan_id
+        || metadata.revision_id != revision.revision_id
+        || metadata.revision_hash != revision.revision_hash
+        || metadata.attempt_id != attempt_id
+        || metadata.step_id != *step_id
+        || metadata.source_device_ref != *source_device_ref
+        || metadata.destination_device_ref != *device_ref
+        || metadata.destination_device_ref != *execution_device_ref
+        || metadata.media_type.is_empty()
+    {
+        return Err("The PipelinePrivate input crossed its immutable Plan binding.".into());
+    }
+    Ok(())
+}
+
+fn continuation_transfer_is_ready(
+    state: &Arc<AppState>,
+    revision: &bridge_plan::BridgePlanRevision,
+    transfer: &bridge_plan::BridgePlanStep,
+    attempt_id: &str,
+) -> Result<bool, String> {
+    let bridge_plan::BridgePlanStep::Transfer { source, .. } = transfer else {
+        return Ok(false);
+    };
+    if transfer.execution_device() != revision.requesting_device_ref {
+        return Ok(false);
+    }
+    match source {
+        bridge_plan::ObjectSelectionRule::FutureUserSelection { .. } => Ok(state
+            .bridge_plan_requester_sources
+            .lock()
+            .contains_key(&revision.revision_id)),
+        bridge_plan::ObjectSelectionRule::FromSlot { .. } => {
+            let metadata = state
+                .bridge_plan_protocol_authority
+                .lock()
+                .pipeline_input_metadata(attempt_id)
+                .map_err(|error| error.message())?;
+            let Some(metadata) = metadata else {
+                return Ok(false);
+            };
+            validate_pipeline_input_for_transfer(revision, transfer, attempt_id, &metadata)?;
+            Ok(true)
+        }
+    }
+}
+
+struct PipelinePrivateCleanup(file_candidates::BridgePlanPrivateFile);
+
+impl Drop for PipelinePrivateCleanup {
+    fn drop(&mut self) {
+        file_candidates::cleanup_bridge_plan_private_pipeline_file(&self.0);
+    }
+}
+
+/// Layer-5 Host continuation boundary. It reads only the immutable attempt
+/// graph, claims one dependency-eligible authored Transfer, then delegates
+/// resource admission and bytes to Layers 3 and 1 respectively.
+pub(crate) async fn continue_bridge_plan_attempt_inner(
+    state: Arc<AppState>,
+    room_id: String,
+    attempt_id: String,
+    bridge_route: Option<Value>,
+) -> Result<bool, String> {
+    let store = bridge_plan::BridgePlanStore::new(&state.paths);
+    let attempt = store
+        .list_attempt(&attempt_id)
+        .map_err(|error| error.message())?;
+    if attempt.attempt.bridge_id != room_id || attempt.state != bridge_plan::AttemptState::Running {
+        return Ok(false);
+    }
+    let revision = store
+        .get_revision(&attempt.attempt.revision_id)
+        .map_err(|error| error.message())?
+        .revision;
+    if bridge_plan::framework_execution_unavailable(&revision) {
+        return Err(
+            "Bridge Plan Transform and Execute framework steps are not currently executable."
+                .into(),
+        );
+    }
+    let next = revision.steps.iter().find(|step| {
+        matches!(step, bridge_plan::BridgePlanStep::Transfer { .. })
+            && attempt.steps.iter().any(|state| {
+                state.step_id == step.id()
+                    && state.state == bridge_plan::StepExecutionState::Eligible
+            })
+    });
+    let Some(next) = next else {
+        return Ok(false);
+    };
+    if !continuation_transfer_is_ready(&state, &revision, next, &attempt_id)? {
+        return Ok(false);
+    }
+    start_bridge_plan_transfer_attempt_inner(state, room_id, attempt_id, bridge_route).await?;
+    Ok(true)
+}
+
+pub(crate) fn register_pipeline_private_landing(
+    state: Arc<AppState>,
+    room_id: String,
+    metadata: crate::models::PipelineHandoffMetadata,
+    private_file: file_candidates::BridgePlanPrivateFile,
+) -> AppResult<()> {
+    state
+        .bridge_plan_protocol_authority
+        .lock()
+        .register_pipeline_input(&metadata, private_file)?;
+    tauri::async_runtime::spawn(async move {
+        let _ = continue_bridge_plan_attempt_inner(state, room_id, metadata.attempt_id, None).await;
+    });
+    Ok(())
+}
+
+/// Executes one requester-local approved Transfer. A direct source is captured
+/// with its immutable revision; a PipelinePrivate source is consumed from its
+/// exact producer binding. No renderer path or receiver authority is accepted.
+pub(crate) async fn execute_requester_bridge_plan_transfer_attempt_inner(
     state: Arc<AppState>,
     room_id: String,
     attempt_id: String,
@@ -2051,7 +2189,7 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
         .list_attempt(&attempt_id)
         .map_err(|error| error.message())?;
     if attempt.attempt.bridge_id != room_id || attempt.state != bridge_plan::AttemptState::Running {
-        return Err("This direct Transfer plan is not running.".into());
+        return Err("This requester Transfer plan is not running.".into());
     }
     let revision = store
         .get_revision(&attempt.attempt.revision_id)
@@ -2060,7 +2198,13 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
     let transfer = revision
         .steps
         .iter()
-        .find(|step| matches!(step, bridge_plan::BridgePlanStep::Transfer { .. }))
+        .find(|step| {
+            matches!(step, bridge_plan::BridgePlanStep::Transfer { .. })
+                && attempt.steps.iter().any(|state| {
+                    state.step_id == step.id()
+                        && state.state == bridge_plan::StepExecutionState::Authorized
+                })
+        })
         .ok_or_else(|| "This plan has no Transfer step.".to_string())?;
     let bridge_plan::BridgePlanStep::Transfer {
         step_id,
@@ -2071,10 +2215,8 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
     else {
         unreachable!()
     };
-    if !matches!(
-        source,
-        bridge_plan::ObjectSelectionRule::FutureUserSelection { .. }
-    ) || !matches!(destination, bridge_plan::TransferDestination::SelectedDevice { device_ref } if device_ref == &revision.selected_device_ref)
+    if transfer.execution_device() != revision.requesting_device_ref
+        || !matches!(destination, bridge_plan::TransferDestination::SelectedDevice { device_ref } if device_ref == &revision.selected_device_ref)
     {
         return Err("This plan is not a supported requester Transfer.".into());
     }
@@ -2085,24 +2227,40 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
     {
         return Err("The selected device session changed before Transfer could run.".into());
     }
-    let private_file = state
-        .bridge_plan_requester_sources
-        .lock()
-        .get(&revision.revision_id)
-        .cloned()
-        .ok_or_else(|| {
-            "The selected local file is unavailable after restart or cancellation.".to_string()
-        })?;
+    let (private_file, pipeline_metadata) = match source {
+        bridge_plan::ObjectSelectionRule::FutureUserSelection { .. } => (
+            state
+                .bridge_plan_requester_sources
+                .lock()
+                .get(&revision.revision_id)
+                .cloned()
+                .ok_or_else(|| {
+                    "The selected local file is unavailable after restart or cancellation."
+                        .to_string()
+                })?,
+            None,
+        ),
+        bridge_plan::ObjectSelectionRule::FromSlot { .. } => {
+            let metadata = state
+                .bridge_plan_protocol_authority
+                .lock()
+                .pipeline_input_metadata(&attempt_id)
+                .map_err(|error| error.message())?
+                .ok_or_else(|| "The PipelinePrivate input is not available yet.".to_string())?;
+            validate_pipeline_input_for_transfer(&revision, transfer, &attempt_id, &metadata)?;
+            let private_file = state
+                .bridge_plan_protocol_authority
+                .lock()
+                .consume_pipeline_input(&metadata)
+                .map_err(|error| error.message())?;
+            (private_file, Some(metadata))
+        }
+    };
+    let _pipeline_cleanup = pipeline_metadata
+        .as_ref()
+        .map(|_| PipelinePrivateCleanup(private_file.clone()));
     file_candidates::revalidate_bridge_plan_private_file(&private_file)
         .map_err(|error| error.message())?;
-    let metadata = std::fs::symlink_metadata(&private_file.path)
-        .map_err(|_| "The selected local file is unavailable.".to_string())?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() != private_file.size_bytes
-    {
-        return Err("The selected local file changed before Transfer started.".into());
-    }
     store
         .transition_step(
             &attempt_id,
@@ -2128,7 +2286,7 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
         Some(private_file.mime_type.clone()),
     )
     .map_err(|error| error.message())?;
-    let sent = transfer::send_room_file_to_bridge_peer_endpoint(
+    let sent = transfer::send_managed_room_file_to_bridge_peer_endpoint(
         state.clone(),
         &room_id,
         &item.id,
@@ -2138,6 +2296,9 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
         endpoint,
     )
     .await;
+    if pipeline_metadata.is_some() {
+        let _ = storage::delete_room_item(&state.paths, &item.id);
+    }
     match sent {
         Ok(()) => {
             let completed_at = storage::now_ts();
@@ -2149,16 +2310,25 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
                     completed_at,
                 )
                 .map_err(|error| error.message())?;
-            store
-                .transition_attempt(
-                    &attempt_id,
-                    bridge_plan::AttemptState::Completed,
-                    completed_at,
-                )
+            let completed_attempt = store
+                .list_attempt(&attempt_id)
                 .map_err(|error| error.message())?;
+            if completed_attempt
+                .steps
+                .iter()
+                .all(|step| step.state == bridge_plan::StepExecutionState::Completed)
+            {
+                store
+                    .transition_attempt(
+                        &attempt_id,
+                        bridge_plan::AttemptState::Completed,
+                        completed_at,
+                    )
+                    .map_err(|error| error.message())?;
+            }
             store
                 .append_result(&BridgePlanResultSummary {
-                    result_id: format!("direct-transfer-result-{}", uuid::Uuid::new_v4()),
+                    result_id: format!("requester-transfer-result-{}", uuid::Uuid::new_v4()),
                     bridge_id: room_id.clone(),
                     plan_id: attempt.attempt.plan_id.clone(),
                     revision_id: revision.revision_id.clone(),
@@ -2176,7 +2346,7 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
                 .map_err(|error| error.message())?;
             store
                 .append_activity(&BridgePlanActivity {
-                    activity_id: format!("direct-transfer-completed-{}", uuid::Uuid::new_v4()),
+                    activity_id: format!("requester-transfer-completed-{}", uuid::Uuid::new_v4()),
                     bridge_id: room_id.clone(),
                     plan_id: attempt.attempt.plan_id.clone(),
                     revision_id: revision.revision_id.clone(),
@@ -2184,13 +2354,15 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
                     step_id: Some(step_id.clone()),
                     kind: ActivityKind::AttemptCompleted,
                     occurred_at: completed_at,
-                    summary: "Direct Transfer completed to the selected device.".into(),
+                    summary: "Requester-local Transfer completed to the selected device.".into(),
                 })
                 .map_err(|error| error.message())?;
-            state
-                .bridge_plan_requester_sources
-                .lock()
-                .remove(&revision.revision_id);
+            if pipeline_metadata.is_none() {
+                state
+                    .bridge_plan_requester_sources
+                    .lock()
+                    .remove(&revision.revision_id);
+            }
             Ok(true)
         }
         Err(error) => {
@@ -2204,7 +2376,7 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
             let _ =
                 store.transition_attempt(&attempt_id, bridge_plan::AttemptState::Failed, failed_at);
             let _ = store.append_activity(&BridgePlanActivity {
-                activity_id: format!("direct-transfer-failed-{}", uuid::Uuid::new_v4()),
+                activity_id: format!("requester-transfer-failed-{}", uuid::Uuid::new_v4()),
                 bridge_id: room_id.clone(),
                 plan_id: attempt.attempt.plan_id.clone(),
                 revision_id: revision.revision_id.clone(),
@@ -2212,7 +2384,7 @@ pub(crate) async fn execute_direct_bridge_plan_transfer_attempt_inner(
                 step_id: Some(step_id.clone()),
                 kind: ActivityKind::AttemptFailed,
                 occurred_at: failed_at,
-                summary: "Direct Transfer could not complete.".into(),
+                summary: "Requester-local Transfer could not complete.".into(),
             });
             Err(error.message())
         }
@@ -2591,7 +2763,7 @@ pub(crate) async fn execute_bridge_plan_transfer_attempt_inner(
                         "The selected file changed before Transfer started.".into(),
                     ));
                 }
-                transfer::send_room_file_to_bridge_peer_endpoint(
+                transfer::send_managed_room_file_to_bridge_peer_endpoint(
                     state.clone(),
                     &room_id,
                     &item.id,

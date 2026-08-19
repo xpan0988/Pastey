@@ -20,6 +20,7 @@ mod room_control;
 mod safe_file_identity;
 mod storage;
 mod transfer;
+mod transfer_orchestration;
 mod transfer_tuning;
 
 use std::{collections::HashMap, sync::Arc};
@@ -60,6 +61,7 @@ pub struct AppState {
     pub config: RwLock<StoredConfig>,
     pub active_servers: Mutex<HashMap<String, ActiveRoomServer>>,
     pub active_file_transfers: Mutex<HashMap<String, transfer::ActiveFileTransfer>>,
+    pub(crate) transfer_capacity: Arc<transfer_orchestration::TransferCapacityCoordinator>,
     pub discovery_handle: Mutex<Option<DiscoveryHandle>>,
     pub nearby_http_handle: Mutex<Option<NearbyHttpHandle>>,
     pub antenna_handle: Mutex<Option<DiscoveryHandle>>,
@@ -139,6 +141,9 @@ fn main() {
                 config: RwLock::new(config),
                 active_servers: Mutex::new(HashMap::new()),
                 active_file_transfers: Mutex::new(HashMap::new()),
+                transfer_capacity: Arc::new(
+                    transfer_orchestration::TransferCapacityCoordinator::default(),
+                ),
                 discovery_handle: Mutex::new(None),
                 nearby_http_handle: Mutex::new(None),
                 antenna_handle: Mutex::new(None),

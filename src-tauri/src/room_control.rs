@@ -115,6 +115,33 @@ fn peer_capability_fact_code(fact: &crate::peer_capabilities::HostCapabilityFact
     }
 }
 
+fn log_peer_capability_projection(
+    stage: &str,
+    projection: &crate::peer_capabilities::PeerCapabilityProjection,
+) {
+    if projection.capabilities.is_empty() {
+        log_peer_capability(stage, None, Some("empty_projection"));
+        return;
+    }
+    for fact in &projection.capabilities {
+        log_peer_capability(
+            stage,
+            Some(fact.available),
+            Some(peer_capability_fact_code(fact)),
+        );
+    }
+}
+
+fn local_peer_capability_response_projection(
+    peer_session_id: &str,
+    observed_at: i64,
+) -> AppResult<crate::peer_capabilities::PeerCapabilityProjection> {
+    let projection =
+        crate::peer_capabilities::local_projection(peer_session_id.into(), observed_at);
+    crate::peer_capabilities::validate_projection(&projection)?;
+    Ok(projection)
+}
+
 pub(crate) fn peer_capability_event(
     kind: &str,
     payload: Value,
@@ -1069,6 +1096,7 @@ pub async fn receive_room_control_event_handler(
     if validated.kind.starts_with("bridge_plan.") {
         log_bridge_plan_control_event(&validated, "inbound_validated");
     }
+    let mut protocol_action = crate::bridge_plan::InboundProtocolAction::None;
     if validated.kind == "peer_capability.response" {
         log_peer_capability("response_received", None, None);
         log_peer_capability("response_validated", None, None);
@@ -1090,8 +1118,6 @@ pub async fn receive_room_control_event_handler(
                     );
                 }
             };
-        let available = projection.capabilities[0].available;
-        let code = peer_capability_fact_code(&projection.capabilities[0]);
         if ctx
             .state
             .peer_capabilities
@@ -1100,7 +1126,7 @@ pub async fn receive_room_control_event_handler(
                 &room_id,
                 &inbound_peer.peer_session_id,
                 &peer_observation_ref(&inbound_peer),
-                projection,
+                projection.clone(),
                 storage::now_ts(),
             )
             .is_err()
@@ -1112,7 +1138,7 @@ pub async fn receive_room_control_event_handler(
                 "Invalid peer capability fact.",
             );
         }
-        log_peer_capability("projection_stored", Some(available), Some(code));
+        log_peer_capability_projection("projection_stored", &projection);
     } else if validated.kind == "peer_capability.query" {
         log_peer_capability("query_received", None, None);
         let peer_session_id = validated
@@ -1142,12 +1168,20 @@ pub async fn receive_room_control_event_handler(
         // inbound session id, so the requester can bind the fact to its
         // current selected remote peer after authenticated delivery.
         let projection =
-            crate::peer_capabilities::local_projection(peer_session_id.into(), storage::now_ts());
-        let available = projection.capabilities[0].available;
-        let code = peer_capability_fact_code(&projection.capabilities[0]);
-        log_peer_capability("local_projection_created", Some(available), Some(code));
+            match local_peer_capability_response_projection(peer_session_id, storage::now_ts()) {
+                Ok(projection) => projection,
+                Err(_) => {
+                    log_peer_capability("response_rejected", None, Some("construction_failed"));
+                    return control_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_capability",
+                        "Invalid peer capability response.",
+                    );
+                }
+            };
+        log_peer_capability_projection("local_projection_created", &projection);
         let payload =
-            serde_json::to_value(projection).expect("peer capability projection serializes");
+            serde_json::to_value(&projection).expect("peer capability projection serializes");
         let response =
             match peer_capability_event("peer_capability.response", payload, &response_context) {
                 Ok(response) => response,
@@ -1163,7 +1197,8 @@ pub async fn receive_room_control_event_handler(
         let response_route = selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
         let response_state = ctx.state.clone();
         let response_room_id = room_id.clone();
-        log_peer_capability("response_dispatch", Some(available), None);
+        let dispatched_projection = projection.clone();
+        log_peer_capability_projection("response_dispatch", &projection);
         tauri::async_runtime::spawn(async move {
             match send_room_control_event(
                 response_state,
@@ -1173,143 +1208,73 @@ pub async fn receive_room_control_event_handler(
             )
             .await
             {
-                Ok(_) => log_peer_capability("response_delivered", Some(available), None),
+                Ok(_) => {
+                    log_peer_capability_projection("response_delivered", &dispatched_projection)
+                }
                 Err(_) => log_peer_capability("response_rejected", None, Some("delivery_failed")),
             }
         });
-    } else if let Err(error) = crate::bridge_plan::accept_inbound_protocol_event(
-        &ctx.state.paths,
-        &ctx.state.bridge_plan_protocol_authority.lock(),
-        &mut ctx.state.bridge_plan_candidate_store.lock(),
-        &validated.kind,
-        &validated.event,
-        storage::now_ts(),
-    ) {
-        let reason = bridge_plan_protocol_rejection_reason(&error);
-        log_bridge_plan_validation_rejected(&validated.event, reason);
-        return control_error(
-            StatusCode::BAD_REQUEST,
-            reason,
-            "Bridge Plan review validation failed.",
-        );
+    } else {
+        protocol_action = match crate::bridge_plan::accept_inbound_protocol_event(
+            &ctx.state.paths,
+            &ctx.state.bridge_plan_protocol_authority.lock(),
+            &mut ctx.state.bridge_plan_candidate_store.lock(),
+            &validated.kind,
+            &validated.event,
+            storage::now_ts(),
+        ) {
+            Ok(action) => action,
+            Err(error) => {
+                let reason = bridge_plan_protocol_rejection_reason(&error);
+                log_bridge_plan_validation_rejected(&validated.event, reason);
+                return control_error(
+                    StatusCode::BAD_REQUEST,
+                    reason,
+                    "Bridge Plan review validation failed.",
+                );
+            }
+        };
     }
-    // A current-Bridge session has already granted the bounded primitive
-    // consent. Once the immutable attempt-start was authenticated and the
-    // receiver-local one-use Search grant was derived, execution is a Rust
-    // continuation—not a renderer button.
-    if matches!(
-        validated.kind.as_str(),
-        "bridge_plan.attempt_start" | "bridge_plan.transfer_start"
-    ) {
-        if let Some(attempt_id) = validated
-            .event
-            .get("payload")
-            .and_then(Value::as_object)
-            .and_then(|payload| payload.get("attemptId"))
-            .and_then(Value::as_str)
-            .filter(|attempt_id| !attempt_id.is_empty() && attempt_id.len() <= 128)
-        {
+    let return_route = selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
+    match protocol_action {
+        crate::bridge_plan::InboundProtocolAction::None => {}
+        crate::bridge_plan::InboundProtocolAction::ExecuteSearch { attempt_id } => {
             let execution_state = ctx.state.clone();
             let execution_room = room_id.clone();
-            let execution_attempt = attempt_id.to_owned();
-            let return_route = selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
-            match validated.kind.as_str() {
-                "bridge_plan.attempt_start" => {
-                    tauri::async_runtime::spawn(async move {
-                        let _ = crate::commands::execute_bridge_plan_search_attempt_inner(
-                            execution_state,
-                            execution_room,
-                            execution_attempt,
-                            Some(return_route),
-                        )
-                        .await;
-                    });
-                }
-                "bridge_plan.transfer_start" => {
-                    // A direct local-file Transfer is executed by the
-                    // requesting Host immediately after the one plan start.
-                    // The selected Host receives its correlated start for
-                    // validation only and must not consume a nonexistent
-                    // Search selection as a second execution path.
-                    let requester_local_source = validated
-                        .event
-                        .get("payload")
-                        .and_then(Value::as_object)
-                        .and_then(|payload| payload.get("transferStep"))
-                        .and_then(Value::as_object)
-                        .and_then(|step| step.get("source"))
-                        .and_then(Value::as_object)
-                        .and_then(|source| source.get("kind"))
-                        .and_then(Value::as_str)
-                        == Some("future_user_selection");
-                    if !requester_local_source {
-                        tauri::async_runtime::spawn(async move {
-                            let _ = crate::commands::execute_bridge_plan_transfer_attempt_inner(
-                                execution_state,
-                                execution_room,
-                                execution_attempt,
-                                Some(return_route),
-                            )
-                            .await;
-                        });
-                    }
-                }
-                _ => unreachable!(),
-            };
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::commands::execute_bridge_plan_search_attempt_inner(
+                    execution_state,
+                    execution_room,
+                    attempt_id,
+                    Some(return_route),
+                )
+                .await;
+            });
         }
-    }
-    // A completed remote Transform may make a final Transfer eligible on the
-    // requester. This is a Host continuation of the approved graph, not a
-    // renderer action. Search results deliberately do not take this branch:
-    // they still require requester data selection first.
-    if validated.kind == "bridge_plan.step_result"
-        && validated
-            .event
-            .get("payload")
-            .and_then(Value::as_object)
-            .and_then(|payload| payload.get("stepId"))
-            .and_then(Value::as_str)
-            == Some("transform")
-    {
-        if let Some(attempt_id) = validated
-            .event
-            .get("payload")
-            .and_then(Value::as_object)
-            .and_then(|payload| payload.get("attemptId"))
-            .and_then(Value::as_str)
-            .filter(|attempt_id| !attempt_id.is_empty() && attempt_id.len() <= 128)
-        {
+        crate::bridge_plan::InboundProtocolAction::ExecuteTransfer { attempt_id } => {
+            let execution_state = ctx.state.clone();
+            let execution_room = room_id.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::commands::execute_bridge_plan_transfer_attempt_inner(
+                    execution_state,
+                    execution_room,
+                    attempt_id,
+                    Some(return_route),
+                )
+                .await;
+            });
+        }
+        crate::bridge_plan::InboundProtocolAction::ContinueAttempt { attempt_id } => {
             let continuation_state = ctx.state.clone();
             let continuation_room = room_id.clone();
-            let continuation_attempt = attempt_id.to_owned();
-            let continuation_route =
-                selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
             tauri::async_runtime::spawn(async move {
-                let store = crate::bridge_plan::BridgePlanStore::new(&continuation_state.paths);
-                if store
-                    .list_attempt(&continuation_attempt)
-                    .ok()
-                    .is_some_and(|attempt| {
-                        attempt.steps.iter().any(|step| {
-                            matches!(step.state, crate::bridge_plan::StepExecutionState::Eligible)
-                                && attempt.attempt.graph_projection.nodes.iter().any(|node| {
-                                    node.step_id == step.step_id
-                                        && matches!(
-                                            node.operation,
-                                            crate::bridge_plan::StepOperation::Transfer
-                                        )
-                                })
-                        })
-                    })
-                {
-                    let _ = crate::commands::start_bridge_plan_transfer_attempt_inner(
-                        continuation_state,
-                        continuation_room,
-                        continuation_attempt,
-                        Some(continuation_route),
-                    )
-                    .await;
-                }
+                let _ = crate::commands::continue_bridge_plan_attempt_inner(
+                    continuation_state,
+                    continuation_room,
+                    attempt_id,
+                    Some(return_route),
+                )
+                .await;
             });
         }
     }
@@ -2146,13 +2111,15 @@ mod tests {
             peer_observation_ref: "route-binding".into(),
             peer_connected: true,
         };
+        let empty_projection = crate::peer_capabilities::local_projection(
+            "selected-peer-session".into(),
+            now.unix_timestamp(),
+        );
+        assert!(empty_projection.capabilities.is_empty());
+        log_peer_capability_projection("test_empty_projection", &empty_projection);
         let valid = peer_capability_event(
             "peer_capability.response",
-            serde_json::to_value(crate::peer_capabilities::local_projection(
-                "selected-peer-session".into(),
-                now.unix_timestamp(),
-            ))
-            .unwrap(),
+            serde_json::to_value(empty_projection).unwrap(),
             &context,
         )
         .unwrap();
@@ -2175,6 +2142,21 @@ mod tests {
         )
         .unwrap();
         assert!(validate_control_event(malformed, "room", "source", "target", now).is_err());
+    }
+
+    #[test]
+    fn room_control_query_builds_a_valid_empty_projection_without_fallback_fact() {
+        let projection =
+            local_peer_capability_response_projection("selected-peer-session", 1).unwrap();
+        assert_eq!(projection.peer_session_id, "selected-peer-session");
+        assert!(projection.capabilities.is_empty());
+        let encoded = serde_json::to_string(&projection).unwrap();
+        let decoded: crate::peer_capabilities::PeerCapabilityProjection =
+            serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.capabilities.is_empty());
+        for forbidden in ["authority", "topology", "deviceSelection", "fallback"] {
+            assert!(!encoded.contains(forbidden));
+        }
     }
 
     #[test]

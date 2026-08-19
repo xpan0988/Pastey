@@ -12,11 +12,18 @@ Bridge sessions are ephemeral. Devices join through nearby discovery or an 8-dig
 - Layer 4 — Bridge sessions, peers, routing, and control transport
 - Layer 5 — guided planning and bounded object workflows
 
-Layers 1–4 form the non-AI Pastey core. Layer 5 adds one Rust-owned Bridge Plan lifecycle with four primitives: Search finds an object, Transform changes it, Transfer moves it, and Execute runs it. The immutable Plan, one requester approval, current-session binding, one-use grants, and attempt state are the only mutation or execution authority.
+Pastey 1.9.2 freezes the Layer 1–5 semantic and authority baseline. Layers 1–4 provide transport, factual device observations, shared transfer-resource orchestration, and current-session Bridge infrastructure. Layer 5 adds one Rust-owned Bridge Plan lifecycle with four primitives: Search finds an object, Transform changes it, Transfer moves it, and Execute runs it. The immutable Plan, one requester approval, current-session binding, one-use grants, and attempt state are the only managed mutation or execution authority.
 
 Ask Bridge normally uses a guided **Search / Transform / Transfer / Execute** Block Composer; natural-v1 providers are optional and advisory only. Search selects an object on an explicit Host. Transform records reviewed modification intent for that same logical object and conceptually advances its revision without moving it. Only an authored Transfer changes location. Execute records reviewed execution intent for the exact current revision without selecting a runtime. Capability observations never select an executor, add movement, or authorize a step.
 
-Search and Transfer are currently executable. Transform and Execute are Plan-framework primitives only: they can be composed and reviewed, but attempts containing either fail closed until a future Agent layer supplies an implementation. Pastey Core deliberately does not define patch formats, mutation workers, runtimes, shells, process launch, or containment policy.
+Search and Transfer are currently executable. Ordinary and managed Transfers share a Rust Layer 3 capacity boundary before encrypted transport. Safe physical identity, restart invalidation, and Burn boundaries remain Host-owned. Transform and Execute are Plan-framework primitives only: they can be composed and reviewed, but a Plan containing either fails closed as a whole before approval consumption, execution authority, or side effects. Pastey Core deliberately does not define patch formats, mutation workers, runtimes, shells, process launch, or containment policy.
+
+The agreed but not implemented upper architecture includes PM/Worker Agent separation, a UI-independent HostRuntime, HostRef/Multi-Host representation, generic managed-object binding, Host admission and effect enforcement, Headless Hosts, and a separate human-controlled Developer Terminal authority. None of these future contracts is advertised as a current runtime capability. See the [upper architecture](docs/upper-architecture.md).
+
+| 1.9.2 status | Scope |
+| --- | --- |
+| Implemented now | Bridge/session and encrypted-transfer foundations, Search, Transfer, immutable Plan/Review authority, shared Layer 3 capacity, safe physical identity, and restart/Burn invalidation. |
+| Framework or future | Transform, Execute, PM/Worker Agent runtimes, Multi-Host, Host admission/effect enforcement, Headless Host, and Developer Terminal. |
 
 ## Documentation
 
@@ -25,7 +32,8 @@ Search and Transfer are currently executable. Transform and Execute are Plan-fra
 - [Layer 2 — device intelligence](docs/layers/layer-2-device-intelligence.md)
 - [Layer 3 — orchestration](docs/layers/layer-3-orchestration.md)
 - [Layer 4 — Bridge](docs/layers/layer-4-bridge.md)
-- [Layer 5 — agent workspace](docs/layers/layer-5-agent.md)
+- [Layer 5 — managed semantic workspace](docs/layers/layer-5-agent.md)
+- [Upper product and runtime architecture](docs/upper-architecture.md)
 - [Reference](docs/reference.md)
 - [Development and release](docs/development.md)
 - [Product website](site/README.md)

@@ -85,6 +85,20 @@ impl PeerCapabilityStore {
         self.projections
             .retain(|(stored_room, _, _), _| stored_room != room_id);
     }
+
+    #[cfg(test)]
+    pub(crate) fn projection(
+        &self,
+        room_id: &str,
+        peer_session_id: &str,
+        peer_observation_ref: &str,
+    ) -> Option<&PeerCapabilityProjection> {
+        self.projections.get(&(
+            room_id.into(),
+            peer_session_id.into(),
+            peer_observation_ref.into(),
+        ))
+    }
 }
 
 pub(crate) fn validate_projection(projection: &PeerCapabilityProjection) -> AppResult<()> {
@@ -135,6 +149,9 @@ mod tests {
         assert!(projection.capabilities.is_empty());
         assert!(validate_projection(&projection).is_ok());
         let json = serde_json::to_string(&projection).unwrap();
+        let decoded: PeerCapabilityProjection = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, projection);
+        assert!(decoded.capabilities.is_empty());
         for forbidden in [
             "objectRef",
             "path",
@@ -144,6 +161,19 @@ mod tests {
         ] {
             assert!(!json.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn empty_projection_is_received_and_stored_without_fabricating_a_fact() {
+        let projection = local_projection("peer".into(), 10);
+        let mut store = PeerCapabilityStore::default();
+        store
+            .observe("room", "peer", "observation", projection, 10)
+            .unwrap();
+
+        let stored = store.projection("room", "peer", "observation").unwrap();
+        assert!(stored.capabilities.is_empty());
+        assert_eq!(stored.peer_session_id, "peer");
     }
 
     #[test]
