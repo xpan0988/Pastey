@@ -14,6 +14,8 @@ Pastey is a local-first desktop transfer and device workspace. Source code is au
 
 Layer 2 facts are observations, not commands or authority. Layer 4 delivery is not consent. Layer 5 binds one complete immutable Plan to one requester Review & Run. Renderer state, provider output, ObjectRefs, and logs are never authority.
 
+Developer Mode v0 is an upper Host capability domain parallel to Layer 5. It reuses Layer 4 identity/session/encrypted control and Burn lifecycle but requires separate two-human admission and a dedicated terminal grant. It creates no Plan step or managed revision. See [Developer Mode](developer-mode.md).
+
 ## Canonical object-flow model
 
 ```text
@@ -78,9 +80,9 @@ The current Host projection contains no concrete Transform or Execute capabiliti
 
 ## 1.9.2 freeze boundary
 
-Structurally frozen after 1.9.2 are the four primitive meanings, explicit Transfer-only movement, immutable reviewed topology, logical revision semantics, semantic approval, non-authoritative provider/renderer/capability facts, route-not-consent separation, Layer 5 eligibility before Layer 3 capacity, exact attempt/step authority, safe physical identity, restart/session/Burn invalidation principles, and separation of Agent authority from future Developer Terminal authority.
+Structurally frozen after 1.9.2 are the four primitive meanings, explicit Transfer-only movement, immutable reviewed topology, logical revision semantics, semantic approval, non-authoritative provider/renderer/capability facts, route-not-consent separation, Layer 5 eligibility before Layer 3 capacity, exact attempt/step authority, safe physical identity, restart/session/Burn invalidation principles, and separation of Agent authority from Developer Terminal authority.
 
-Intentionally evolvable are the two-party `requesting_device` / `selected_device` model, `selected_file` and Search-first root, protocol/schema v1 representation, Tauri `AppState` runtime container, exact Host admission policy, effect-envelope implementation, Agent Harness, Terminal implementation, and Headless deployment. See the canonical [upper architecture](upper-architecture.md) for the agreed future contracts and dependency order.
+Intentionally evolvable are the two-party `requesting_device` / `selected_device` model, `selected_file` and Search-first root, protocol/schema v1 representation, the broader Tauri `AppState` runtime container, durable Host identity, generic/headless Host admission policy, effect-envelope implementation, Agent Harness, richer/persistent Terminal implementation, and Headless deployment. Developer Mode v0 now supplies only the first narrow HostRuntime/Host-binding/terminal slice. See the canonical [upper architecture](upper-architecture.md) for the agreed future contracts and dependency order.
 
 ## Evidence boundary
 

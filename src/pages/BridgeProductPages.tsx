@@ -3,21 +3,29 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
 import {
   copyTextToClipboard,
+  acceptDeveloperTerminal,
   approveBridgePlan,
   createComposedFileBridgePlan,
   createDirectFileTransferBridgePlan,
   getDeviceProfile,
+  getDeveloperTerminalWorkspace,
   getRoomControlSessionContext,
   joinRoom,
   listBridgePlanWorkspace,
   listReceivedRoomControlEvents,
   listNearbyDevices,
   requestNearbyJoin,
+  requestDeveloperTerminal,
+  resizeDeveloperTerminal,
   revealInFolder,
   bindBridgePlanToSession,
   startBridgePlanAttempt,
   selectBridgePlanSearchCandidate,
   sendTextToRoom,
+  sendDeveloperTerminalInput,
+  closeDeveloperTerminal,
+  denyDeveloperTerminal,
+  enterDeveloperMode,
   withdrawBridgePlanRevision,
   writeTempFile,
 } from "../lib/tauri";
@@ -79,6 +87,9 @@ import type { TransferQueueInput, TransferQueueItem } from "../lib/transferSched
 import type {
   FileTransferProgressEvent,
   DeviceProfile,
+  DeveloperModeUiSession,
+  DeveloperTerminalSession,
+  DeveloperTerminalWorkspace,
   JoinRequestPrompt,
   NearbyDevice,
   RoomControlSessionContext,
@@ -387,6 +398,7 @@ export function BridgeDetailPage({
   const refreshInFlightRef = useRef(false);
   const refreshBridgeControlInboxRef = useRef<() => Promise<void>>(async () => {});
   const [bridgePlanInboxBatch, setBridgePlanInboxBatch] = useState<ReceivedRoomControlEvent[]>([]);
+  const [developerTerminalWorkspace, setDeveloperTerminalWorkspace] = useState<DeveloperTerminalWorkspace>({ pendingRequests: [], sessions: [] });
   const [localDeviceProfile, setLocalDeviceProfile] = useState<DeviceProfile | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const enqueueDroppedFilesRef = useRef<(paths: string[]) => void>(() => {});
@@ -610,6 +622,7 @@ export function BridgeDetailPage({
     const previous = controlSessionRef.current;
     if (previous?.localSessionRef !== nextSession?.localSessionRef || previous?.peerSessionRef !== nextSession?.peerSessionRef) {
       setBridgePlanInboxBatch([]);
+      setDeveloperTerminalWorkspace({ pendingRequests: [], sessions: [] });
     }
     controlSessionRef.current = nextSession;
     setControlSession(nextSession);
@@ -624,7 +637,11 @@ export function BridgeDetailPage({
     if (refreshInFlightRef.current) return;
     refreshInFlightRef.current = true;
     try {
-      const events = await listReceivedRoomControlEvents(currentSession.roomId);
+      const [events, terminalWorkspace] = await Promise.all([
+        listReceivedRoomControlEvents(currentSession.roomId),
+        getDeveloperTerminalWorkspace(currentSession.roomId),
+      ]);
+      setDeveloperTerminalWorkspace(terminalWorkspace);
       const bridgePlanEvents = events.filter((event) => event.kind.startsWith("bridge_plan."));
       if (bridgePlanEvents.length > 0) {
         setBridgePlanInboxBatch((current) => {
@@ -727,6 +744,13 @@ export function BridgeDetailPage({
 
       <BridgePlanWorkspacePanel room={room} />
 
+      <DeveloperModePanel
+        room={room}
+        peers={remotePeers}
+        workspace={developerTerminalWorkspace}
+        onWorkspaceChange={setDeveloperTerminalWorkspace}
+      />
+
       <Card className="recent-activity-card">
         <div className="section-row">
           <h2>Recent activity</h2>
@@ -739,6 +763,177 @@ export function BridgeDetailPage({
       </Card>
     </section>
   );
+}
+
+function DeveloperModePanel({
+  room,
+  peers,
+  workspace,
+  onWorkspaceChange,
+}: {
+  room: RoomInfo;
+  peers: readonly BridgePeerSession[];
+  workspace: DeveloperTerminalWorkspace;
+  onWorkspaceChange: (workspace: DeveloperTerminalWorkspace) => void;
+}) {
+  const [uiSession, setUiSession] = useState<DeveloperModeUiSession | null>(null);
+  const [selectedPeerId, setSelectedPeerId] = useState<string>(peers[0]?.peerSessionId ?? "");
+  const [error, setError] = useState<string | null>(null);
+  const terminalRef = useRef<HTMLPreElement | null>(null);
+  const activeController = workspace.sessions.find(
+    (session) => session.role === "controller" && session.state === "active",
+  );
+
+  useEffect(() => {
+    if (!peers.some((peer) => peer.peerSessionId === selectedPeerId)) {
+      setSelectedPeerId(peers[0]?.peerSessionId ?? "");
+    }
+  }, [peers, selectedPeerId]);
+
+  useEffect(() => {
+    const element = terminalRef.current;
+    if (!element || !activeController || !uiSession || typeof ResizeObserver === "undefined") return;
+    let previous = "";
+    const observer = new ResizeObserver(([entry]) => {
+      if (!entry) return;
+      const cols = Math.max(20, Math.min(500, Math.floor(entry.contentRect.width / 8)));
+      const rows = Math.max(5, Math.min(500, Math.floor(entry.contentRect.height / 18)));
+      const current = `${cols}:${rows}`;
+      if (current === previous) return;
+      previous = current;
+      void resizeDeveloperTerminal(activeController.terminalSessionId, uiSession.token, cols, rows).catch(() => {});
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [activeController?.terminalSessionId, uiSession?.token]);
+
+  useEffect(() => {
+    const element = terminalRef.current;
+    if (element) element.scrollTop = element.scrollHeight;
+  }, [activeController?.output]);
+
+  async function activate() {
+    setError(null);
+    try {
+      setUiSession(await enterDeveloperMode(room.id));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  async function requestOpen() {
+    if (!uiSession || !selectedPeerId) return;
+    setError(null);
+    try {
+      onWorkspaceChange(await requestDeveloperTerminal(room.id, selectedPeerId, uiSession.token));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  async function decide(sessionId: string, accepted: boolean) {
+    if (!uiSession) return;
+    setError(null);
+    try {
+      if (accepted) {
+        await acceptDeveloperTerminal(room.id, sessionId, uiSession.token, 100, 30);
+      } else {
+        await denyDeveloperTerminal(sessionId, uiSession.token);
+      }
+      onWorkspaceChange(await getDeveloperTerminalWorkspace(room.id));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  async function close(session: DeveloperTerminalSession) {
+    if (!uiSession) return;
+    setError(null);
+    try {
+      await closeDeveloperTerminal(session.terminalSessionId, uiSession.token);
+      onWorkspaceChange(await getDeveloperTerminalWorkspace(room.id));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
+  function sendKey(event: React.KeyboardEvent<HTMLPreElement>) {
+    if (!activeController || !uiSession || event.metaKey) return;
+    const special: Record<string, string> = {
+      Enter: "\r",
+      Backspace: "\u007f",
+      Tab: "\t",
+      ArrowUp: "\u001b[A",
+      ArrowDown: "\u001b[B",
+      ArrowRight: "\u001b[C",
+      ArrowLeft: "\u001b[D",
+      Escape: "\u001b",
+    };
+    const lower = event.key.toLowerCase();
+    const controlInput = event.ctrlKey && lower.length === 1 && lower >= "a" && lower <= "z"
+      ? String.fromCharCode(lower.charCodeAt(0) - 96)
+      : "";
+    const input = controlInput || special[event.key] || (event.key.length === 1 ? event.key : "");
+    if (!input) return;
+    event.preventDefault();
+    const bytes = [...new TextEncoder().encode(input)];
+    void sendDeveloperTerminalInput(activeController.terminalSessionId, uiSession.token, bytes)
+      .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
+  }
+
+  return (
+    <Card className="developer-mode-card" aria-label="Developer Mode">
+      <div className="section-row">
+        <div>
+          <h2>Developer Mode</h2>
+          <p className="muted">Broad manual control of one current linked Host. This is separate from Ask Bridge and Agent authority.</p>
+        </div>
+        {!uiSession ? (
+          <button type="button" className="danger-button" onClick={() => void activate()}>Enter Developer Mode</button>
+        ) : <StatusChip tone="warning">Human-authorized</StatusChip>}
+      </div>
+      <p className="developer-warning">Commands run with the Pastey Host user's normal privileges. Terminal effects do not create managed revisions.</p>
+      {uiSession ? (
+        <div className="developer-controls">
+          <select value={selectedPeerId} onChange={(event) => setSelectedPeerId(event.target.value)} aria-label="Developer terminal target Host">
+            {peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}
+          </select>
+          <button type="button" className="secondary-button" disabled={!selectedPeerId} onClick={() => void requestOpen()}>Request terminal</button>
+        </div>
+      ) : null}
+      {workspace.pendingRequests.map((pending) => (
+        <div key={pending.terminalSessionId} className="developer-admission">
+          <div><strong>Terminal access requested</strong><p className="muted">A current Bridge peer requests broad manual shell control.</p></div>
+          <div className="button-row">
+            <button type="button" className="secondary-button" disabled={!uiSession} onClick={() => void decide(pending.terminalSessionId, false)}>Deny</button>
+            <button type="button" className="danger-button" disabled={!uiSession} onClick={() => void decide(pending.terminalSessionId, true)}>Allow terminal</button>
+          </div>
+        </div>
+      ))}
+      {workspace.sessions.filter((session) => session.role === "controller").map((session) => (
+        <div key={session.terminalSessionId} className="developer-terminal-session">
+          <div className="section-row">
+            <p><strong>{session.environmentLabel ?? "Remote shell"}</strong> · {session.state.replace(/_/g, " ")}</p>
+            {session.state === "active" || session.state === "awaiting_admission" ? (
+              <button type="button" className="danger-button" onClick={() => void close(session)}>Close</button>
+            ) : null}
+          </div>
+          <pre
+            ref={session.state === "active" ? terminalRef : undefined}
+            className="developer-terminal-output"
+            tabIndex={session.state === "active" ? 0 : -1}
+            onKeyDown={sendKey}
+            aria-label="Remote developer terminal"
+          >{terminalDisplay(session.output) || (session.state === "awaiting_admission" ? "Waiting for the remote Host to allow this terminal…" : "")}</pre>
+        </div>
+      ))}
+      {error ? <p className="danger-text">{error}</p> : null}
+    </Card>
+  );
+}
+
+function terminalDisplay(value: string): string {
+  return value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
 function BridgePlanReceiverPanel({

@@ -28,6 +28,8 @@ Bridge Plan control messages remain exact selected-peer only. `selected_peers` a
 
 Room Control delivers correlated current-session completion/control events to the Layer 5 Host coordinator. It does not inspect Plan topology, assume PipelinePrivate is followed by Transform, choose the next primitive, or create semantic step authority.
 
+Developer Mode v0 reuses the same current-session peer resolution, authenticated encrypted Room Control envelope, event expiry, and replay boundary for a distinct `developer_terminal` message family. Terminal frames are delivered directly to the UI-independent terminal service, with separate bounded streaming rate/buffer state; they do not enter ordinary Room Control inbox or Bridge item history. Layer 4 transport still does not grant terminal consent: the remote human admission and `DeveloperTerminalGrant` are owned above this layer. See [Developer Mode](../developer-mode.md).
+
 The Bridge detail panel uses one serialized control-inbox pump. Active nonterminal operations refresh automatically; focus/entry refresh and **Check for updates** are fallbacks. Processed or unchanged events do not create duplicate product-state updates or resend delivery.
 
 ## Lifecycle boundaries

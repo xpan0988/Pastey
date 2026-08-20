@@ -18,12 +18,12 @@ Ask Bridge normally uses a guided **Search / Transform / Transfer / Execute** Bl
 
 Search and Transfer are currently executable. Ordinary and managed Transfers share a Rust Layer 3 capacity boundary before encrypted transport. Safe physical identity, restart invalidation, and Burn boundaries remain Host-owned. Transform and Execute are Plan-framework primitives only: they can be composed and reviewed, but a Plan containing either fails closed as a whole before approval consumption, execution authority, or side effects. Pastey Core deliberately does not define patch formats, mutation workers, runtimes, shells, process launch, or containment policy.
 
-The agreed but not implemented upper architecture includes PM/Worker Agent separation, a UI-independent HostRuntime, HostRef/Multi-Host representation, generic managed-object binding, Host admission and effect enforcement, Headless Hosts, and a separate human-controlled Developer Terminal authority. None of these future contracts is advertised as a current runtime capability. See the [upper architecture](docs/upper-architecture.md).
+The first post-freeze upper-layer slice is Developer Mode v0: a human can request a real PTY/native-console terminal on one current linked Host, the remote human must explicitly admit it, and a dedicated process-local terminal grant remains disjoint from Layer 5 and Agent authority. Unix uses a real PTY; Windows uses the ConPTY-backed PowerShell path. See [Developer Mode](docs/developer-mode.md). The broader PM/Worker Agent, durable HostRef/Multi-Host, generic managed-object binding, effect enforcement, Headless Host, and Agent runtime architecture remains future work; see the [upper architecture](docs/upper-architecture.md).
 
 | 1.9.2 status | Scope |
 | --- | --- |
-| Implemented now | Bridge/session and encrypted-transfer foundations, Search, Transfer, immutable Plan/Review authority, shared Layer 3 capacity, safe physical identity, and restart/Burn invalidation. |
-| Framework or future | Transform, Execute, PM/Worker Agent runtimes, Multi-Host, Host admission/effect enforcement, Headless Host, and Developer Terminal. |
+| Implemented now | Bridge/session and encrypted-transfer foundations, Search, Transfer, immutable Plan/Review authority, shared Layer 3 capacity, safe physical identity, restart/Burn invalidation, and human-only Developer Mode v0. |
+| Framework or future | Transform, Execute, PM/Worker Agent runtimes, Multi-Host, generic Host admission/effect enforcement, and Headless Host. |
 
 ## Documentation
 
@@ -34,6 +34,7 @@ The agreed but not implemented upper architecture includes PM/Worker Agent separ
 - [Layer 4 — Bridge](docs/layers/layer-4-bridge.md)
 - [Layer 5 — managed semantic workspace](docs/layers/layer-5-agent.md)
 - [Upper product and runtime architecture](docs/upper-architecture.md)
+- [Developer Mode v0](docs/developer-mode.md)
 - [Reference](docs/reference.md)
 - [Development and release](docs/development.md)
 - [Product website](site/README.md)

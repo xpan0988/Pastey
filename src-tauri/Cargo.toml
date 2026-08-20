@@ -11,6 +11,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 axum = { version = "0.7", features = ["json"] }
+anyhow = "1"
 base64 = "0.22"
 blake3 = "1.5"
 chacha20poly1305 = { version = "0.10", features = ["std"] }
@@ -22,6 +23,7 @@ http = "1"
 libc = "0.2"
 mime_guess = "2.0"
 parking_lot = "0.12"
+portable-pty = "0.9"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

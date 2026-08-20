@@ -83,6 +83,44 @@ export interface ReceivedRoomControlEvent {
   event: unknown;
 }
 
+export interface DeveloperModeUiSession {
+  token: string;
+  roomId: string;
+  expiresAt: number;
+}
+
+export type DeveloperTerminalRole = "controller" | "host";
+export type DeveloperTerminalState =
+  | "awaiting_admission"
+  | "active"
+  | "denied"
+  | "exited"
+  | "closed"
+  | "disconnected";
+
+export interface DeveloperTerminalPendingRequest {
+  terminalSessionId: string;
+  controllerHostRef: string;
+  targetHostRef: string;
+  expiresAt: number;
+}
+
+export interface DeveloperTerminalSession {
+  terminalSessionId: string;
+  role: DeveloperTerminalRole;
+  state: DeveloperTerminalState;
+  targetHostRef: string;
+  environmentLabel?: string | null;
+  output: string;
+  terminationReason?: string | null;
+  expiresAt: number;
+}
+
+export interface DeveloperTerminalWorkspace {
+  pendingRequests: DeveloperTerminalPendingRequest[];
+  sessions: DeveloperTerminalSession[];
+}
+
 export interface NearbyDevice {
   device_id: string;
   display_name: string;

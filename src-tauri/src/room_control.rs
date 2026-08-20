@@ -55,9 +55,20 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "bridge_plan.step_result",
     "bridge_plan.step_failed",
     "bridge_plan.cancel",
+    "developer_terminal.open_request",
+    "developer_terminal.open_accepted",
+    "developer_terminal.open_denied",
+    "developer_terminal.input",
+    "developer_terminal.output",
+    "developer_terminal.resize",
+    "developer_terminal.exit",
+    "developer_terminal.close",
 ];
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
 const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
+const DEVELOPER_TERMINAL_PROTOCOL_FAMILY: &str = "developer_terminal";
+const MAX_TERMINAL_EVENTS_PER_MINUTE: usize = 3_000;
+const MAX_TERMINAL_BURST_EVENTS: usize = 256;
 
 /// Writes only fixed capability metadata and reason codes. In particular, it
 /// never includes a transport key, endpoint, route binding, path, or grant.
@@ -354,6 +365,9 @@ struct RoomControlRoomState {
     seen_request_ids: VecDeque<String>,
     seen_request_id_set: HashSet<String>,
     received_at_seconds: VecDeque<i64>,
+    terminal_seen_event_ids: VecDeque<String>,
+    terminal_seen_event_id_set: HashSet<String>,
+    terminal_received_at_seconds: VecDeque<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -703,6 +717,39 @@ pub fn room_control_session_context(
     })
 }
 
+pub(crate) fn room_control_session_context_for_peer(
+    state: &Arc<AppState>,
+    room_id: &str,
+    peer_session_id: &str,
+) -> AppResult<RoomControlSessionContext> {
+    let room = storage::get_room_by_id(&state.paths, room_id)?;
+    if room.status != RoomStatus::Active {
+        return Err(AppError::InvalidInput("Room is not active.".into()));
+    }
+    let _ = storage::sync_legacy_bridge_peer_endpoint(&state.paths, &room)?;
+    let peers = storage::list_bridge_peer_endpoints(&state.paths, room_id)?;
+    let route = selected_peer_control_route(room_id, peer_session_id);
+    let peer = resolve_room_control_route(Some(&route), room_id, &room, &peers)?;
+    let local_key = state
+        .active_servers
+        .lock()
+        .get(room_id)
+        .map(|server| server.transport_public_key())
+        .ok_or_else(|| AppError::InvalidInput("Room session is unavailable.".into()))?;
+    Ok(RoomControlSessionContext {
+        room_id: room_id.to_string(),
+        local_session_ref: session_ref(&local_key),
+        peer_session_ref: session_ref(&peer.transport_public_key),
+        peer_route_ref: peer.peer_session_id.clone(),
+        peer_observation_ref: peer_observation_ref(&peer),
+        peer_connected: true,
+    })
+}
+
+pub(crate) fn selected_peer_route(room_id: &str, peer_session_id: &str) -> Value {
+    selected_peer_control_route(room_id, peer_session_id)
+}
+
 /// Opaque current-route binding for non-authorizing peer observations. It is
 /// derived from the route endpoint as well as session/key, so an endpoint
 /// change cannot reuse a fact observed for the old route.
@@ -870,6 +917,7 @@ pub fn list_received_room_control_events(
 
 pub fn clear_room_control_state(state: &Arc<AppState>, room_id: &str) {
     state.room_control.lock().rooms.remove(room_id);
+    state.host_runtime.purge_room(room_id);
 }
 
 pub async fn receive_room_control_event_handler(
@@ -1071,6 +1119,17 @@ pub async fn receive_room_control_event_handler(
             if let Some(stage) = peer_capability_rejection_stage(&event) {
                 log_peer_capability(stage, None, Some(peer_capability_rejection_code(&message)));
             }
+            if event
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("developer_terminal."))
+            {
+                return control_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_terminal_event",
+                    "Invalid Developer Terminal event.",
+                );
+            }
             let reason = bridge_plan_validation_reason(&message);
             if event
                 .get("kind")
@@ -1095,6 +1154,100 @@ pub async fn receive_room_control_event_handler(
     };
     if validated.kind.starts_with("bridge_plan.") {
         log_bridge_plan_control_event(&validated, "inbound_validated");
+    }
+    if validated.kind.starts_with("developer_terminal.") {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        {
+            let mut runtime = ctx.state.room_control.lock();
+            let room_state = runtime.rooms.entry(room_id.clone()).or_default();
+            if room_state
+                .terminal_seen_event_id_set
+                .contains(&validated.event_id)
+            {
+                return control_error(
+                    StatusCode::CONFLICT,
+                    "event_replayed",
+                    "Room control event was already received.",
+                );
+            }
+            if !accept_terminal_rate_limited_event(room_state, now) {
+                return control_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limited",
+                    "Developer Terminal event rate exceeded.",
+                );
+            }
+            record_replay_id(
+                &mut room_state.terminal_seen_event_ids,
+                &mut room_state.terminal_seen_event_id_set,
+                validated.event_id.clone(),
+            );
+        }
+        let message = match validated
+            .event
+            .get("payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| {
+                crate::developer_terminal::validate_wire_message(&validated.kind, payload).ok()
+            }) {
+            Some(message) => message,
+            None => {
+                return control_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_terminal_event",
+                    "Invalid Developer Terminal event.",
+                )
+            }
+        };
+        let host_to_controller = matches!(
+            validated.kind.as_str(),
+            "developer_terminal.open_accepted"
+                | "developer_terminal.open_denied"
+                | "developer_terminal.output"
+                | "developer_terminal.exit"
+        );
+        let binding = if host_to_controller {
+            crate::host_runtime::inbound_controller_binding(
+                &room_id,
+                &validated.target_peer_ref,
+                &validated.source_device_ref,
+                &inbound_peer.peer_session_id,
+            )
+        } else {
+            crate::host_runtime::inbound_controller_binding(
+                &room_id,
+                &validated.source_device_ref,
+                &validated.target_peer_ref,
+                &inbound_peer.peer_session_id,
+            )
+        };
+        let service = &ctx.state.host_runtime.developer_terminal;
+        let accepted = match validated.kind.as_str() {
+            "developer_terminal.open_request" => {
+                service.receive_open_request(binding, &message, now)
+            }
+            "developer_terminal.open_accepted" => service.receive_accepted(&binding, &message, now),
+            "developer_terminal.open_denied" => service.receive_denied(&binding, &message),
+            "developer_terminal.input" => service.receive_input(&binding, &message, now),
+            "developer_terminal.output" => service.receive_output(&binding, &message),
+            "developer_terminal.resize" => service.receive_resize(&binding, &message, now),
+            "developer_terminal.exit" => service.receive_exit(&binding, &message),
+            "developer_terminal.close" => service.receive_close(&binding, &message),
+            _ => Err(AppError::InvalidInput(
+                "Unsupported Developer Terminal event.".into(),
+            )),
+        };
+        if accepted.is_err() {
+            return control_error(
+                StatusCode::BAD_REQUEST,
+                "terminal_authority_rejected",
+                "Developer Terminal authority rejected the event.",
+            );
+        }
+        // Terminal traffic is delivered directly to the process-local Host
+        // service. It is intentionally absent from ordinary room history and
+        // the bounded Room Control inbox.
+        return encrypted_receipt_response(&event_key, &validated.event_id, &now_iso());
     }
     let mut protocol_action = crate::bridge_plan::InboundProtocolAction::None;
     if validated.kind == "peer_capability.response" {
@@ -1359,7 +1512,10 @@ fn validate_control_event(
         .unwrap_or_default();
     require_exact_fields(
         object,
-        if raw_kind.starts_with("bridge_plan.") || raw_kind.starts_with("peer_capability.") {
+        if raw_kind.starts_with("bridge_plan.")
+            || raw_kind.starts_with("peer_capability.")
+            || raw_kind.starts_with("developer_terminal.")
+        {
             &[
                 "schemaVersion",
                 "eventId",
@@ -1483,6 +1639,16 @@ fn validate_control_event(
                 ))
             }
         }
+        (None, None)
+    } else if kind.starts_with("developer_terminal.") {
+        if string_field(object, "protocolFamily")? != DEVELOPER_TERMINAL_PROTOCOL_FAMILY
+            || object.get("previewOnly") != Some(&Value::Bool(false))
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid Developer Terminal protocol event.".into(),
+            ));
+        }
+        let _ = crate::developer_terminal::validate_wire_message(&kind, payload)?;
         (None, None)
     } else {
         return Err(AppError::InvalidInput(
@@ -1666,6 +1832,28 @@ fn accept_rate_limited_event(room: &mut RoomControlRoomState, now_seconds: i64) 
     true
 }
 
+fn accept_terminal_rate_limited_event(room: &mut RoomControlRoomState, now_seconds: i64) -> bool {
+    while room
+        .terminal_received_at_seconds
+        .front()
+        .is_some_and(|timestamp| *timestamp <= now_seconds - 60)
+    {
+        room.terminal_received_at_seconds.pop_front();
+    }
+    let burst_count = room
+        .terminal_received_at_seconds
+        .iter()
+        .filter(|timestamp| **timestamp > now_seconds - 2)
+        .count();
+    if room.terminal_received_at_seconds.len() >= MAX_TERMINAL_EVENTS_PER_MINUTE
+        || burst_count >= MAX_TERMINAL_BURST_EVENTS
+    {
+        return false;
+    }
+    room.terminal_received_at_seconds.push_back(now_seconds);
+    true
+}
+
 fn require_exact_fields(object: &Map<String, Value>, fields: &[&str]) -> AppResult<()> {
     if object.len() != fields.len() || fields.iter().any(|field| !object.contains_key(*field)) {
         return Err(AppError::InvalidInput(
@@ -1760,6 +1948,58 @@ mod tests {
             local_burned_at: None,
             peer_burned_at: None,
         }
+    }
+
+    #[test]
+    fn terminal_stream_rate_and_replay_state_is_separate_from_room_inbox() {
+        let mut room = RoomControlRoomState::default();
+        assert!(accept_terminal_rate_limited_event(&mut room, 10));
+        record_replay_id(
+            &mut room.terminal_seen_event_ids,
+            &mut room.terminal_seen_event_id_set,
+            "terminal-event".into(),
+        );
+        assert!(room.terminal_seen_event_id_set.contains("terminal-event"));
+        assert!(room.inbox.is_empty());
+        assert!(room.received_at_seconds.is_empty());
+    }
+
+    #[test]
+    fn production_terminal_event_and_receiver_schema_agree() {
+        let context = RoomControlSessionContext {
+            room_id: "room".into(),
+            local_session_ref: "controller-session".into(),
+            peer_session_ref: "host-session".into(),
+            peer_route_ref: "peer".into(),
+            peer_observation_ref: "observation".into(),
+            peer_connected: true,
+        };
+        let binding = crate::host_runtime::HostSessionBinding::new(
+            "room",
+            "controller-session",
+            "host-session",
+            "peer",
+        );
+        let service = crate::developer_terminal::DeveloperTerminalService::default();
+        let ui = service.enter_mode("room", storage::now_ts());
+        let message = service
+            .request_open(&ui.token, binding, storage::now_ts())
+            .unwrap();
+        let event = crate::developer_terminal::terminal_event(
+            "developer_terminal.open_request",
+            &message,
+            &context,
+        )
+        .unwrap();
+        let validated = validate_control_event(
+            event,
+            "room",
+            "controller-session",
+            "host-session",
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        assert_eq!(validated.kind, "developer_terminal.open_request");
     }
 
     fn selected_route(peer_session_id: &str) -> Value {

@@ -11,6 +11,8 @@ Layer 5 owns guided Plan composition, optional advisory proposals, immutable obj
 
 Only Transfer moves the object. Transform never selects another Host or creates an unrelated derivative. Execute is never hidden inside Transform or Transfer.
 
+Developer Mode v0 is not part of Layer 5. Its human-only terminal grant cannot be created from a Plan approval or step grant, and terminal commands/results create no logical revision, primitive completion, or managed lineage. See [Developer Mode](../developer-mode.md).
+
 ## Composer and Review
 
 The primary UX is the editable four-primitive Block Composer. Transform presents Target, Modify on, logical revision, and Modification intent. Execute presents Target, Execute on, logical revision, and Execution intent. Neither presents byte offsets, patch-worker details, interpreter controls, shell commands, arguments, cwd, environment, timeout, or process settings.
