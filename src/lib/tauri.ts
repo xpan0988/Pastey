@@ -5,6 +5,8 @@ import type {
   CapabilityProbeMode,
   DeviceCapabilities,
   DeviceProfile,
+  DeveloperModeUiSession,
+  DeveloperTerminalWorkspace,
   JoinRequestPrompt,
   LinkBenchmarkResult,
   NearbyDevice,
@@ -180,6 +182,74 @@ export async function listReceivedRoomControlEvents(
   roomId: string,
 ): Promise<ReceivedRoomControlEvent[]> {
   return invoke("list_received_room_control_events", { roomId });
+}
+
+export function enterDeveloperMode(roomId: string): Promise<DeveloperModeUiSession> {
+  return invoke("enter_developer_mode", { roomId });
+}
+
+export function getDeveloperTerminalWorkspace(roomId: string): Promise<DeveloperTerminalWorkspace> {
+  return invoke("get_developer_terminal_workspace", { roomId });
+}
+
+export function requestDeveloperTerminal(
+  roomId: string,
+  peerSessionId: string,
+  developerUiToken: string,
+): Promise<DeveloperTerminalWorkspace> {
+  return invoke("request_developer_terminal", { roomId, peerSessionId, developerUiToken });
+}
+
+export function acceptDeveloperTerminal(
+  roomId: string,
+  terminalSessionId: string,
+  developerUiToken: string,
+  cols: number,
+  rows: number,
+): Promise<boolean> {
+  return invoke("accept_developer_terminal", {
+    roomId,
+    terminalSessionId,
+    developerUiToken,
+    cols,
+    rows,
+  });
+}
+
+export function denyDeveloperTerminal(
+  terminalSessionId: string,
+  developerUiToken: string,
+): Promise<boolean> {
+  return invoke("deny_developer_terminal", { terminalSessionId, developerUiToken });
+}
+
+export function sendDeveloperTerminalInput(
+  terminalSessionId: string,
+  developerUiToken: string,
+  bytes: number[],
+): Promise<boolean> {
+  return invoke("send_developer_terminal_input", { terminalSessionId, developerUiToken, bytes });
+}
+
+export function resizeDeveloperTerminal(
+  terminalSessionId: string,
+  developerUiToken: string,
+  cols: number,
+  rows: number,
+): Promise<boolean> {
+  return invoke("resize_developer_terminal", {
+    terminalSessionId,
+    developerUiToken,
+    cols,
+    rows,
+  });
+}
+
+export function closeDeveloperTerminal(
+  terminalSessionId: string,
+  developerUiToken: string,
+): Promise<boolean> {
+  return invoke("close_developer_terminal", { terminalSessionId, developerUiToken });
 }
 
 export async function sendFileToRoom(roomId: string, path: string, options?: SendFileOptions): Promise<RoomItem> {

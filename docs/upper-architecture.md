@@ -2,7 +2,7 @@
 
 本文是 Pastey 1.9.2 在 Layer 1–5 语义与权限合同结构冻结之后的上层架构规范。它以当前本地代码为依据，定义未来 Managed Workspace、Agent、Host Runtime、Developer Mode、Multi-Host 与通用托管对象接入之间的边界。
 
-除“当前实现”小节明确说明的能力外，本文描述的是已经达成一致、但尚未实现的未来架构。特别是：当前只有 Search 与 Transfer 可执行；Transform 与 Execute 仍只有 Plan 框架，任何包含二者的不可变 Plan 都会在执行准入前整体 fail closed。本文不宣称 Agent Harness、Headless Host、Developer Terminal、Host admission policy 或 Multi-Host protocol 已经存在。
+除“当前实现”小节明确说明的能力外，本文描述的是已经达成一致、但尚未实现的未来架构。特别是：当前只有 Search 与 Transfer 可执行；Transform 与 Execute 仍只有 Plan 框架，任何包含二者的不可变 Plan 都会在执行准入前整体 fail closed。Developer Mode v0 已实现 desktop-to-desktop 的人工 PTY/ConPTY 路径与独立权限域，但本文不宣称 Agent Harness、Headless Host、generic Host admission policy 或 Multi-Host protocol 已经存在。
 
 ## 1. 架构结论
 
@@ -12,7 +12,7 @@
 
 - **接口抽取**：把当前由 Tauri `AppState`、invoke command 与窗口事件承载的 Host 服务抽成 UI 无关的 Host Runtime；为未来 Worker 提供一个受 Core 控制的调用缝隙。
 - **表示迁移**：把 `requesting_device` / `selected_device` 升级为多参与 Host 表示，把 `selected_file` / Search-first 根升级为通用托管对象绑定。
-- **新权限域**：增加 Host admission、受约束的 effect/tool enforcement，以及与 Managed Workspace 分离的 Developer Terminal authority。
+- **新权限域**：Developer Terminal v0 已增加与 Managed Workspace 分离的人工 authority；generic/headless Host admission 与受约束的 Agent effect/tool enforcement 仍待实现。
 
 这些工作都不能倒置现有依赖方向，也不能把 Agent、renderer 或 Layer 4 session 提升为 Pastey 权限来源。
 
@@ -88,7 +88,7 @@
 | HostRuntime | 配置/路径/session/runtime state | Layer 1–5 Host 服务 | desktop app 或 daemon | 承载 Core 权限，不由 UI 决定 | 依赖窗口存在；把事件展示当状态真相 | 当前 `AppState` 与 setup 中可复用的 Rust 服务 |
 | Desktop Adapter | OS 桌面生命周期、Tauri invoke/events | UI 命令适配、通知、tray/window | Tauri shell | 无新增 Core 权限 | 在 renderer 重建 authority/state machine | `main.rs`, Tauri command wrappers, plugins |
 | Headless Adapter | service config、daemon lifecycle、RPC/log sink | 同一 HostRuntime 的非 GUI 容器 | service manager | 无新增 Core 权限 | 复制 Layer 1–5；跳过 Host admission | 未来 adapter；共享 HostRuntime |
-| Developer Terminal | 人工请求、Host admission、独立 session grant | PTY/console stream 与退出状态 | Terminal service | 广泛但短期、人工授予 | 声称 managed lineage；由 Agent 进入；成为第五原语 | 新权限域，平行于 Layer 5，复用 Layer 4/HostRuntime |
+| Developer Terminal | 人工请求、Developer v0 Host admission、独立 session grant | PTY/console stream 与退出状态 | `DeveloperTerminalService` | 广泛但短期、人工授予 | 声称 managed lineage；由 Agent 进入；成为第五原语 | 已实现 v0；平行于 Layer 5，复用 Layer 4/`HostRuntimeState` |
 | Layer 2 facts | Host 观测 | 有界事实 | HostRuntime | 无权限 | 路由、批准、拓扑改写 | `peer_capabilities.rs`, `capability_probe.rs`, `device_profile.rs` |
 
 ## 4. 权限模型
@@ -173,7 +173,7 @@ Developer Terminal  X→ managed revision lineage
 | HostRuntime | `AppState`, startup/recovery/cleanup/Burn, stores and runtimes | 核心服务可复用，容器不可直接无 UI 使用 | 抽取 UI 无关 runtime state/service；注入 path、event sink 与 task spawning |
 | Desktop adapter | `main.rs` setup/invoke registration、tray/window/plugins | 是，作为 adapter | Tauri commands 变为薄调用；保留桌面专属生命周期 |
 | Headless adapter | 无 | 否 | 新 service binary/adapter，复用同一 HostRuntime；不复制 Core |
-| Developer Terminal | 无；Layer 4 只有通用控制和文件传输基础 | 否 | 新独立 authority 与流式 terminal channel；复用身份/crypto/session/Burn，不穿过 Agent |
+| Developer Terminal | `developer_terminal.rs`, `host_runtime.rs`, Room Control typed branch, Bridge Developer UI | v0 可用 | durable HostRef、headless admission、持久 session 与完整 terminal emulator 仍需后续孤立扩展；不得穿过 Agent |
 | Host admission | receiver review/start 校验具有部分准入位置，但没有通用 policy | 位置可复用，接口需新增 | 在本地 grant/副作用之前增加 exact Plan/Host-bound admission decision |
 | Multi-Host identity | `requesting_device_ref`, `selected_device_ref`, step device refs, current Bridge refs | 语义可复用，v1 表示不够 | Plan schema v2 + protocol v2 的 participant/HostRef 与 session binding |
 | Managed object import | candidate/requester/pipeline stores、ObjectRef、safe identity、Inbox persistence | 安全基础可复用，入口不通用 | generic acquisition/binding service；不再把 Search 或 `selected_file` 当唯一根 |
@@ -228,7 +228,7 @@ PM 负责 WHAT / WHERE / ORDER。Worker 只在 Core 原子认领一个已批准 
 
 ## 7. Developer Mode
 
-Developer Mode 应是**平行于 Layer 5、位于 Layer 4 与 HostRuntime 之上的独立 Host capability domain**。
+Developer Mode v0 已实现为**平行于 Layer 5、位于 Layer 4 与 HostRuntime 之上的独立 Host capability domain**。其当前协议、权限和生命周期以 [Developer Mode](developer-mode.md) 为准；以下仍是长期边界。
 
 它复用：
 
@@ -243,7 +243,7 @@ Developer Mode 应是**平行于 Layer 5、位于 Layer 4 与 HostRuntime 之上
 - Agent Harness 作为 terminal transport；
 - logical revision 追踪任意 shell 副作用。
 
-当前文件 transfer framing/control inbox 不能被假定为 PTY transport。未来 terminal channel 是新能力，但应复用已有会话身份、密钥与 Burn 生命周期，而不是建立第二套 peer/session 系统。
+当前 v0 复用 Room Control 的会话身份、加密 envelope、route、expiry 与 replay 基础，并用独立 typed delivery 分支绕过普通 control inbox/history。它没有建立第二套 peer/session/crypto 系统。未来若引入更高吞吐量的专用流式 channel，仍必须保留同样的 identity、admission、grant 与 Burn 合同。
 
 ## 8. Multi-Host 模型
 
@@ -319,7 +319,7 @@ Acquisition/binding 是进入 managed workspace 的前置 Core 操作，不是�
 - Layer 5 Plan/approval/attempt/protocol authority stores 与 Host coordinator；
 - ObjectRef、candidate、safe identity 与 managed object binding；
 - storage paths/config、startup reconciliation、restart invalidation、cleanup/TTL；
-- 未来 Host admission、Worker tool enforcement 与 Terminal service；
+- 当前 Developer Terminal service，以及未来 generic Host admission 与 Worker tool enforcement；
 - UI-independent event/result stream。
 
 ### 10.2 DesktopAdapter / TauriShell 应拥有
@@ -468,7 +468,7 @@ Review & Run
 | Host identity / HostRef contract | 表示合同先行 | current device refs、Bridge identity/session | 否；必须先于 Host admission，不能把 admission 固化在 temporary two-party roles 上 |
 | Host admission | 新权限域 | receiver admission、HostRuntime | 否；在 HostRef/HostSessionBinding 合同之后增加额外 fail-closed 条件 |
 | semantic/effect envelope 与 Host tool enforcement | 新权限域 | exact step grants、safe identity、Burn | 否；实现 Transform/Execute 所需但不在本阶段设计 policy |
-| Developer Terminal authority/channel | 新权限域 | HostRuntime、Layer 4 identity/session/Burn | 否；平行于 Layer 5 |
+| Developer Terminal authority/channel | 新权限域（v0 已实现） | `host_runtime.rs`, `developer_terminal.rs`, Layer 4 identity/session/Burn | 否；平行于 Layer 5；后续只扩展 headless/persistence 表示 |
 | Headless adapter/service binary | 孤立接口抽取后的新 adapter | runtime bootstrap | 否 |
 
 没有发现必须改变四原语、显式 Transfer 或 immutable authority 模型的 fundamental conflict。
@@ -541,11 +541,11 @@ Review & Run
 
 ### Phase 5 — Effect / control capability domains
 
-分别定义并实现 Worker Host effect enforcement、semantic/effect envelope 和 Developer Terminal authority/channel。Managed Agent effect authority 与人工 Terminal authority 不得合并或相互升级。
+Developer Terminal v0 authority/channel 已作为独立人工权限域实现。此阶段剩余工作是定义并实现 Worker Host effect enforcement 与 semantic/effect envelope；Managed Agent effect authority 与人工 Terminal authority 不得合并或相互升级。
 
 ### Phase 6 — Concrete upper implementations
 
-只有完成上述基础后，才实现 Headless Host daemon/service、本地 2–4B interpreter、Codex-style Worker Harness、具体 Transform/Execute capability 或 Developer Terminal UI/runtime。
+只有完成上述基础后，才实现 Headless Host daemon/service、本地 2–4B interpreter、Codex-style Worker Harness 或具体 Transform/Execute capability。Developer Terminal v0 已完成最小 desktop vertical slice；headless admission、持久 session 与更完整 terminal emulator 仍依赖后续 HostRuntime/HostRef 工作。
 
 此顺序是依赖关系，不是功能承诺或完整实施计划。
 
@@ -566,6 +566,6 @@ Review & Run
 - requester command、store-level attempt admission 与 receiver protocol 均保留深层校验；
 - next-step continuation 依据 immutable attempt state，managed/ordinary Transfer 共用 Layer 3 capacity boundary；
 - capability projection 可为空且始终是 observation；
-- 没有 Agent Harness、Worker runtime、shell/process runtime、patch/mutation engine 或 Developer Terminal 实现。
+- 没有 Agent Harness、Worker runtime、managed shell/process runtime 或 patch/mutation engine。Developer Mode v0 的人工 PTY/ConPTY runtime 是独立权限域，不是 Execute/Agent implementation。
 
-Multi-Host、generic object import、Host admission policy、Agent effect envelope、Headless Host 与 Developer Mode 仍是概念合同，尚无运行证据。自动化与 cross-compilation 不能证明物理 Mac↔Windows/Linux E2E。
+Multi-Host、generic object import、generic/headless Host admission policy、Agent effect envelope 与 Headless Host 仍是概念合同。Developer Mode v0 有本机 Unix PTY 自动化和 Windows cross-compile 证据，但自动化与 cross-compilation 不能证明物理 Mac↔Windows/Linux E2E。

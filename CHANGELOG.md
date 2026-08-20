@@ -4,6 +4,28 @@ Detailed update and release history for Pastey.
 
 ## Unreleased
 
+### Added
+
+- Implemented Developer Mode v0 as a human-only authority domain parallel to Layer 5: explicit local entry, exact current Host/session binding, remote human admission, a dedicated process-local `DeveloperTerminalGrant`, and a minimal UI-independent `HostRuntimeState` terminal service.
+- Added typed open/accept/deny/input/output/resize/exit/close terminal messages over the existing authenticated encrypted Bridge control transport. Terminal streams bypass ordinary room history and use bounded frames, buffers, sequencing, replay checks, and backpressure.
+- Added real Unix PTY support with a bounded Host-owned shell policy and Windows PowerShell support through the native ConPTY backend.
+- Added a minimal Bridge Developer Mode UI for Host selection, admission, terminal interaction, resize, state display, and explicit close.
+
+### Security / Authority
+
+- Layer 4 route/session state remains insufficient for terminal access. Terminal authority requires explicit human UI sessions on both devices and an exact Host/session/terminal-bound grant.
+- Disconnect, leave, restart, expiry, explicit close, and Burn revoke terminal authority and terminate Host PTYs. There is no transparent resume.
+- Developer Terminal authority cannot be derived from provider/model output, capability facts, Layer 5 Plan approval, or step grants; terminal effects do not claim managed revision lineage.
+
+### Documentation
+
+- Added `docs/developer-mode.md` as the canonical v0 protocol, authority, platform, lifecycle, and evidence contract; aligned the architecture, upper architecture, Layer 4/5, and README status.
+
+### Known limitations
+
+- Developer Mode v0 is desktop-to-desktop. There is no headless admission policy, persistent/resumable terminal, full browser terminal emulator, arbitrary process API, Agent access, or privilege escalation.
+- Windows/ConPTY is cross-compiled but not physically runtime-tested in this work; no physical Mac↔Windows/Linux E2E claim is made.
+
 ## 1.9.2 — Core architecture and Layer 5 semantic freeze — 2026-08-19
 
 ### Added / Architecture

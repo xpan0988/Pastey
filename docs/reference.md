@@ -27,8 +27,13 @@ Only Transfer changes location. Transform conceptually advances the same logical
 | Shared transfer capacity | `TransferCapacityCoordinator` — `src-tauri/src/transfer_orchestration.rs` |
 | Ordinary route | `BridgeRoute` — `src/lib/bridgeRouting.ts` |
 | Control route | `pastey-bridge-control-route-v1` — `src-tauri/src/room_control.rs` |
+| Developer Terminal protocol | `developer_terminal` / `pastey-developer-terminal-v0` — `src-tauri/src/developer_terminal.rs` |
+| Developer Host identity | `HostRef`, `HostSessionBinding` — `src-tauri/src/host_runtime.rs` |
+| Developer Terminal authority | private `DeveloperTerminalGrant` — `src-tauri/src/developer_terminal.rs` |
 
 There are currently no concrete Transform or Execute capability identifiers.
+
+Developer Terminal identifiers are a separate human-only authority domain. They are not Layer 5 capability identifiers, Plan primitives, or runtime availability facts.
 
 ## Framework schemas
 
@@ -82,3 +87,4 @@ Search means finding. Object acquisition/binding is the Host-owned boundary that
 | Safe selection and identity | `src-tauri/src/file_candidates.rs`, `safe_file_identity.rs` | Rust candidate/identity tests |
 | Capability facts | `src-tauri/src/peer_capabilities.rs` | Rust projection tests |
 | Burn/restart | `src-tauri/src/bridge_plan.rs`, `object_refs.rs`, `room_control.rs` | Rust lifecycle/cleanup tests |
+| Developer Terminal | `src-tauri/src/developer_terminal.rs`, `host_runtime.rs`, `room_control.rs` | Rust terminal authority/protocol/PTY tests and Windows cross-compile |

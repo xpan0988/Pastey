@@ -62,7 +62,7 @@ Native packaged Windows must separately exercise normal-file Search/Transfer, re
 
 Provider health checks are Settings-driven and advisory-only: use a deliberately minimal configured request, verify validation reports, and confirm it neither creates a Bridge control event nor changes consent/execution state. Do not put API keys in fixtures, logs, or documentation.
 
-There is no current Host admission implementation, Host effect enforcement, Agent Harness, local-model runtime, Transform/Execute runtime, Developer Terminal, Headless daemon, sandbox, mutation adapter, runtime adapter, or process-containment implementation to validate. Their agreed dependency order and authority contracts live in [upper-architecture.md](upper-architecture.md); they are not current release capabilities.
+There is no generic/headless Host admission implementation, Host effect enforcement, Agent Harness, local-model runtime, Transform/Execute runtime, Headless daemon, Agent sandbox, mutation adapter, managed runtime adapter, or process-containment implementation to validate. Developer Mode v0 is now a separate human-only desktop capability with its own focused Rust tests, Unix PTY runtime evidence, and Windows cross-compile gate; see [developer-mode.md](developer-mode.md). The remaining dependency order and authority contracts live in [upper-architecture.md](upper-architecture.md).
 
 ## Smoke checks
 

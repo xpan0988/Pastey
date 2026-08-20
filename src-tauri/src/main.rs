@@ -6,11 +6,13 @@ mod commands;
 mod config;
 mod crypto;
 mod dev_tools;
+mod developer_terminal;
 mod device_profile;
 mod diagnostics;
 mod discovery;
 mod error;
 mod file_candidates;
+mod host_runtime;
 mod link_benchmark;
 mod logging;
 mod models;
@@ -35,18 +37,21 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 
 use crate::{
     commands::{
-        accept_nearby_join, approve_bridge_plan, bind_bridge_plan_to_session, burn_room,
-        cancel_transfer, check_for_updates, copy_last_error, copy_text_to_clipboard,
+        accept_developer_terminal, accept_nearby_join, approve_bridge_plan,
+        bind_bridge_plan_to_session, burn_room, cancel_transfer, check_for_updates,
+        close_developer_terminal, copy_last_error, copy_text_to_clipboard,
         create_composed_file_bridge_plan, create_direct_file_transfer_bridge_plan, create_room,
-        delete_temp_file, get_config, get_device_capabilities, get_device_profile,
+        delete_temp_file, deny_developer_terminal, enter_developer_mode, get_config,
+        get_developer_terminal_workspace, get_device_capabilities, get_device_profile,
         get_file_transfer_metadata, get_last_benchmark_results, get_room,
         get_room_control_session_context, join_room, leave_room, list_bridge_plan_workspace,
         list_nearby_devices, list_received_room_control_events, list_room_items, list_rooms,
         log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
         mark_join_prompt_rendered, open_logs_folder, pair_bridge_peer, pending_join_requests,
-        refresh_selected_peer_capabilities, reject_nearby_join, request_nearby_join,
-        reveal_in_folder, revoke_bridge_peer_pairing, run_loopback_benchmark,
-        run_peer_link_benchmark, select_bridge_plan_search_candidate, send_file_to_room,
+        refresh_selected_peer_capabilities, reject_nearby_join, request_developer_terminal,
+        request_nearby_join, resize_developer_terminal, reveal_in_folder,
+        revoke_bridge_peer_pairing, run_loopback_benchmark, run_peer_link_benchmark,
+        select_bridge_plan_search_candidate, send_developer_terminal_input, send_file_to_room,
         send_text_to_room, start_bridge_plan_attempt, update_config, update_transfer_window,
         withdraw_bridge_plan_revision, write_temp_file,
     },
@@ -82,6 +87,7 @@ pub struct AppState {
     /// Phase 3A receiver-local Search grants. They are process-local only.
     pub(crate) bridge_plan_protocol_authority: Mutex<bridge_plan::ProtocolSearchAuthorityStore>,
     pub(crate) peer_capabilities: Mutex<peer_capabilities::PeerCapabilityStore>,
+    pub(crate) host_runtime: Arc<host_runtime::HostRuntimeState>,
 }
 
 pub struct ActiveRoomServer {
@@ -164,6 +170,7 @@ fn main() {
                     bridge_plan::ProtocolSearchAuthorityStore::default(),
                 ),
                 peer_capabilities: Mutex::new(peer_capabilities::PeerCapabilityStore::default()),
+                host_runtime: Arc::new(host_runtime::HostRuntimeState::default()),
             });
 
             app.manage(state.clone());
@@ -226,6 +233,14 @@ fn main() {
             select_bridge_plan_search_candidate,
             get_room_control_session_context,
             list_received_room_control_events,
+            enter_developer_mode,
+            get_developer_terminal_workspace,
+            request_developer_terminal,
+            accept_developer_terminal,
+            deny_developer_terminal,
+            send_developer_terminal_input,
+            resize_developer_terminal,
+            close_developer_terminal,
             cancel_transfer,
             update_transfer_window,
             write_temp_file,
@@ -257,6 +272,7 @@ fn main() {
                     .lock()
                     .object_store
                     .purge_all();
+                state.host_runtime.shutdown_all();
             }
         }
     });

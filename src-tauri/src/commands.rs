@@ -3026,6 +3026,302 @@ pub fn list_received_room_control_events(
 }
 
 #[tauri::command]
+pub fn enter_developer_mode(
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::developer_terminal::DeveloperModeUiSession, String> {
+    // Requiring an active current-session Bridge here ensures that a renderer
+    // cannot mint even UI-scoped Developer Mode authority for an unavailable
+    // room. This token is never exposed to provider/planner interfaces.
+    let room = storage::get_room_by_id(&state.paths, &room_id).map_err(|error| error.message())?;
+    if room.status != RoomStatus::Active
+        || !state.active_servers.lock().contains_key(&room_id)
+        || !storage::list_bridge_peer_endpoints(&state.paths, &room_id)
+            .map_err(|error| error.message())?
+            .iter()
+            .any(|peer| peer.liveness == BridgePeerLiveness::Connected)
+    {
+        return Err("Developer Mode requires a current connected Bridge Host.".into());
+    }
+    Ok(state
+        .host_runtime
+        .developer_terminal
+        .enter_mode(&room_id, storage::now_ts()))
+}
+
+#[tauri::command]
+pub fn get_developer_terminal_workspace(
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::developer_terminal::DeveloperTerminalWorkspace, String> {
+    Ok(state
+        .host_runtime
+        .developer_terminal
+        .workspace(&room_id, storage::now_ts()))
+}
+
+async fn send_developer_terminal_message(
+    state: Arc<AppState>,
+    binding: &crate::host_runtime::HostSessionBinding,
+    kind: &str,
+    message: &crate::developer_terminal::TerminalMessage,
+) -> AppResult<RoomControlDeliveryReceipt> {
+    let context = crate::room_control::room_control_session_context_for_peer(
+        &state,
+        &binding.room_id,
+        &binding.peer_route_ref,
+    )?;
+    let event = crate::developer_terminal::terminal_event(kind, message, &context)?;
+    crate::room_control::send_room_control_event(
+        state,
+        &binding.room_id,
+        event,
+        Some(crate::room_control::selected_peer_route(
+            &binding.room_id,
+            &binding.peer_route_ref,
+        )),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn request_developer_terminal(
+    room_id: String,
+    peer_session_id: String,
+    developer_ui_token: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::developer_terminal::DeveloperTerminalWorkspace, String> {
+    let state = state.inner().clone();
+    let binding =
+        crate::host_runtime::current_controller_binding(&state, &room_id, &peer_session_id)
+            .map_err(|error| error.message())?;
+    let message = state
+        .host_runtime
+        .developer_terminal
+        .request_open(&developer_ui_token, binding.clone(), storage::now_ts())
+        .map_err(|error| error.message())?;
+    if let Err(error) = send_developer_terminal_message(
+        state.clone(),
+        &binding,
+        "developer_terminal.open_request",
+        &message,
+    )
+    .await
+    {
+        state
+            .host_runtime
+            .developer_terminal
+            .abort_controller_session(&message.terminal_session_id, "delivery_failed");
+        return Err(error.message());
+    }
+    Ok(state
+        .host_runtime
+        .developer_terminal
+        .workspace(&room_id, storage::now_ts()))
+}
+
+#[tauri::command]
+pub async fn deny_developer_terminal(
+    terminal_session_id: String,
+    developer_ui_token: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    let (binding, message) = state
+        .host_runtime
+        .developer_terminal
+        .deny_open(&developer_ui_token, &terminal_session_id, storage::now_ts())
+        .map_err(|error| error.message())?;
+    send_developer_terminal_message(state, &binding, "developer_terminal.open_denied", &message)
+        .await
+        .map(|_| true)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub async fn accept_developer_terminal(
+    room_id: String,
+    terminal_session_id: String,
+    developer_ui_token: String,
+    cols: u16,
+    rows: u16,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    let pending_binding = state
+        .host_runtime
+        .developer_terminal
+        .pending_binding(&terminal_session_id)
+        .filter(|binding| binding.room_id == room_id)
+        .ok_or_else(|| "Developer terminal request is unavailable.".to_string())?;
+    let binding = crate::host_runtime::current_target_binding(
+        &state,
+        &room_id,
+        &pending_binding.peer_route_ref,
+    )
+    .map_err(|error| error.message())?;
+    let (message, mut events) = state
+        .host_runtime
+        .developer_terminal
+        .accept_open(
+            &developer_ui_token,
+            &terminal_session_id,
+            &binding,
+            cols,
+            rows,
+            storage::now_ts(),
+        )
+        .map_err(|error| error.message())?;
+    if let Err(error) = send_developer_terminal_message(
+        state.clone(),
+        &binding,
+        "developer_terminal.open_accepted",
+        &message,
+    )
+    .await
+    {
+        state
+            .host_runtime
+            .developer_terminal
+            .abort_host_session(&terminal_session_id);
+        return Err(error.message());
+    }
+    let pump_state = state.clone();
+    let pump_session_id = terminal_session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = events.recv().await {
+            let prepared = match event {
+                crate::developer_terminal::PtyRuntimeEvent::Output(bytes) => pump_state
+                    .host_runtime
+                    .developer_terminal
+                    .prepare_output(&pump_session_id, &bytes, storage::now_ts())
+                    .map(|(binding, message)| (binding, message, "developer_terminal.output")),
+                crate::developer_terminal::PtyRuntimeEvent::Exit(status) => pump_state
+                    .host_runtime
+                    .developer_terminal
+                    .prepare_exit(&pump_session_id, status)
+                    .map(|(binding, message)| (binding, message, "developer_terminal.exit")),
+            };
+            let Ok((binding, message, kind)) = prepared else {
+                break;
+            };
+            if send_developer_terminal_message(pump_state.clone(), &binding, kind, &message)
+                .await
+                .is_err()
+            {
+                pump_state
+                    .host_runtime
+                    .developer_terminal
+                    .abort_host_session(&pump_session_id);
+                break;
+            }
+            if kind == "developer_terminal.exit" {
+                pump_state
+                    .host_runtime
+                    .developer_terminal
+                    .finish_host_session(&pump_session_id);
+                break;
+            }
+        }
+    });
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn send_developer_terminal_input(
+    terminal_session_id: String,
+    developer_ui_token: String,
+    bytes: Vec<u8>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    let (binding, message) = state
+        .host_runtime
+        .developer_terminal
+        .prepare_input(
+            &developer_ui_token,
+            &terminal_session_id,
+            &bytes,
+            storage::now_ts(),
+        )
+        .map_err(|error| error.message())?;
+    match send_developer_terminal_message(
+        state.clone(),
+        &binding,
+        "developer_terminal.input",
+        &message,
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            state
+                .host_runtime
+                .developer_terminal
+                .abort_controller_session(&terminal_session_id, "transport_disconnected");
+            Err(error.message())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn resize_developer_terminal(
+    terminal_session_id: String,
+    developer_ui_token: String,
+    cols: u16,
+    rows: u16,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    let (binding, message) = state
+        .host_runtime
+        .developer_terminal
+        .prepare_resize(
+            &developer_ui_token,
+            &terminal_session_id,
+            cols,
+            rows,
+            storage::now_ts(),
+        )
+        .map_err(|error| error.message())?;
+    match send_developer_terminal_message(
+        state.clone(),
+        &binding,
+        "developer_terminal.resize",
+        &message,
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            state
+                .host_runtime
+                .developer_terminal
+                .abort_controller_session(&terminal_session_id, "transport_disconnected");
+            Err(error.message())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn close_developer_terminal(
+    terminal_session_id: String,
+    developer_ui_token: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    let (binding, message) = state
+        .host_runtime
+        .developer_terminal
+        .close_from_controller(&developer_ui_token, &terminal_session_id, storage::now_ts())
+        .map_err(|error| error.message())?;
+    send_developer_terminal_message(state, &binding, "developer_terminal.close", &message)
+        .await
+        .map(|_| true)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
 pub fn write_temp_file(
     file_name: String,
     bytes: Vec<u8>,
@@ -3074,6 +3370,7 @@ pub(crate) fn purge_bridge_runtime_authority(
     room_id: &str,
 ) -> AppResult<()> {
     state.room_control.lock().purge_room(room_id);
+    state.host_runtime.purge_room(room_id);
 
     let mut first_error = None;
     let mut candidates = state.bridge_plan_candidate_store.lock();
