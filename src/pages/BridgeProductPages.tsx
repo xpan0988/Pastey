@@ -1,6 +1,6 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
 import {
   copyTextToClipboard,
   acceptDeveloperTerminal,
@@ -101,6 +101,7 @@ import type {
 type PrimaryRoute = "bridge" | "activity" | "devices" | "settings";
 type BridgeTargetSelectionMode = "selected_peer" | "selected_peers" | "broadcast_bridge";
 const BRIDGE_PLAN_REQUIRES_ONE_SELECTED_DEVICE = "Ask Bridge requires one selected device.";
+const DeveloperTerminalViewport = lazy(() => import("../components/DeveloperTerminalViewport"));
 
 function bridgePlanControlErrorMessage(error: unknown): string {
   if (bridgeRouteErrorCodeFromMessage(error)) {
@@ -779,38 +780,22 @@ function DeveloperModePanel({
   const [uiSession, setUiSession] = useState<DeveloperModeUiSession | null>(null);
   const [selectedPeerId, setSelectedPeerId] = useState<string>(peers[0]?.peerSessionId ?? "");
   const [error, setError] = useState<string | null>(null);
-  const terminalRef = useRef<HTMLPreElement | null>(null);
   const activeController = workspace.sessions.find(
     (session) => session.role === "controller" && session.state === "active",
   );
+  const currentController = activeController ?? workspace.sessions.find(
+    (session) => session.role === "controller" && session.state === "awaiting_admission",
+  );
+  const controlledHostName = peers.find(
+    (peer) => peer.peerSessionId === selectedPeerId,
+  )?.displayName ?? "Current linked Host";
 
   useEffect(() => {
+    if (currentController) return;
     if (!peers.some((peer) => peer.peerSessionId === selectedPeerId)) {
       setSelectedPeerId(peers[0]?.peerSessionId ?? "");
     }
-  }, [peers, selectedPeerId]);
-
-  useEffect(() => {
-    const element = terminalRef.current;
-    if (!element || !activeController || !uiSession || typeof ResizeObserver === "undefined") return;
-    let previous = "";
-    const observer = new ResizeObserver(([entry]) => {
-      if (!entry) return;
-      const cols = Math.max(20, Math.min(500, Math.floor(entry.contentRect.width / 8)));
-      const rows = Math.max(5, Math.min(500, Math.floor(entry.contentRect.height / 18)));
-      const current = `${cols}:${rows}`;
-      if (current === previous) return;
-      previous = current;
-      void resizeDeveloperTerminal(activeController.terminalSessionId, uiSession.token, cols, rows).catch(() => {});
-    });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [activeController?.terminalSessionId, uiSession?.token]);
-
-  useEffect(() => {
-    const element = terminalRef.current;
-    if (element) element.scrollTop = element.scrollHeight;
-  }, [activeController?.output]);
+  }, [currentController, peers, selectedPeerId]);
 
   async function activate() {
     setError(null);
@@ -857,27 +842,15 @@ function DeveloperModePanel({
     }
   }
 
-  function sendKey(event: React.KeyboardEvent<HTMLPreElement>) {
-    if (!activeController || !uiSession || event.metaKey) return;
-    const special: Record<string, string> = {
-      Enter: "\r",
-      Backspace: "\u007f",
-      Tab: "\t",
-      ArrowUp: "\u001b[A",
-      ArrowDown: "\u001b[B",
-      ArrowRight: "\u001b[C",
-      ArrowLeft: "\u001b[D",
-      Escape: "\u001b",
-    };
-    const lower = event.key.toLowerCase();
-    const controlInput = event.ctrlKey && lower.length === 1 && lower >= "a" && lower <= "z"
-      ? String.fromCharCode(lower.charCodeAt(0) - 96)
-      : "";
-    const input = controlInput || special[event.key] || (event.key.length === 1 ? event.key : "");
-    if (!input) return;
-    event.preventDefault();
-    const bytes = [...new TextEncoder().encode(input)];
+  function sendTerminalInput(bytes: number[]) {
+    if (!activeController || !uiSession) return;
     void sendDeveloperTerminalInput(activeController.terminalSessionId, uiSession.token, bytes)
+      .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
+  }
+
+  function sendTerminalResize(cols: number, rows: number) {
+    if (!activeController || !uiSession) return;
+    void resizeDeveloperTerminal(activeController.terminalSessionId, uiSession.token, cols, rows)
       .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
   }
 
@@ -893,7 +866,7 @@ function DeveloperModePanel({
         ) : <StatusChip tone="warning">Human-authorized</StatusChip>}
       </div>
       <p className="developer-warning">Commands run with the Pastey Host user's normal privileges. Terminal effects do not create managed revisions.</p>
-      {uiSession ? (
+      {uiSession && !currentController ? (
         <div className="developer-controls">
           <select value={selectedPeerId} onChange={(event) => setSelectedPeerId(event.target.value)} aria-label="Developer terminal target Host">
             {peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}
@@ -910,30 +883,33 @@ function DeveloperModePanel({
           </div>
         </div>
       ))}
-      {workspace.sessions.filter((session) => session.role === "controller").map((session) => (
-        <div key={session.terminalSessionId} className="developer-terminal-session">
+      {currentController ? (
+        <div key={currentController.terminalSessionId} className="developer-terminal-session">
           <div className="section-row">
-            <p><strong>{session.environmentLabel ?? "Remote shell"}</strong> · {session.state.replace(/_/g, " ")}</p>
-            {session.state === "active" || session.state === "awaiting_admission" ? (
-              <button type="button" className="danger-button" onClick={() => void close(session)}>Close</button>
-            ) : null}
+            <div className="developer-terminal-identity">
+              <p><strong>Connected Host: {controlledHostName}</strong></p>
+              <p className="muted">Shell: {currentController.environmentLabel ?? "Waiting for Host"} · Status: {currentController.state.replace(/_/g, " ")}</p>
+            </div>
+            <button type="button" className="danger-button" onClick={() => void close(currentController)}>Close</button>
           </div>
-          <pre
-            ref={session.state === "active" ? terminalRef : undefined}
-            className="developer-terminal-output"
-            tabIndex={session.state === "active" ? 0 : -1}
-            onKeyDown={sendKey}
-            aria-label="Remote developer terminal"
-          >{terminalDisplay(session.output) || (session.state === "awaiting_admission" ? "Waiting for the remote Host to allow this terminal…" : "")}</pre>
+          {currentController.state === "active" ? (
+            <Suspense fallback={<div className="developer-terminal-waiting">Opening terminal emulator…</div>}>
+              <DeveloperTerminalViewport
+                terminalSessionId={currentController.terminalSessionId}
+                environmentLabel={currentController.environmentLabel}
+                output={currentController.output}
+                onInput={sendTerminalInput}
+                onResize={sendTerminalResize}
+              />
+            </Suspense>
+          ) : (
+            <div className="developer-terminal-waiting">Waiting for the remote Host to allow this terminal…</div>
+          )}
         </div>
-      ))}
+      ) : null}
       {error ? <p className="danger-text">{error}</p> : null}
     </Card>
   );
-}
-
-function terminalDisplay(value: string): string {
-  return value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
 function BridgePlanReceiverPanel({

@@ -11,6 +11,12 @@ Detailed update and release history for Pastey.
 - Added real Unix PTY support with a bounded Host-owned shell policy and Windows PowerShell support through the native ConPTY backend.
 - Added a minimal Bridge Developer Mode UI for Host selection, admission, terminal interaction, resize, state display, and explicit close.
 
+### Fixed / Changed
+
+- Replaced the custom `<pre>` terminal renderer, ANSI-stripping regex, and manual React key map with lazy-loaded `@xterm/xterm` plus `@xterm/addon-fit`. xterm now owns VT rendering, the blinking cursor, native terminal key sequences, focus, wrapping, and resize fitting.
+- Active Developer Mode now identifies the controlled Host, shell, and state while hiding fresh-request controls. Terminal input is forwarded only from focused xterm `onData`, and resize delivery is debounced.
+- Traced the reported blank PowerShell viewport from ConPTY through the bounded output queue, typed Layer 4 frame, controller buffer, and xterm write boundary. No Pastey backend loss was identified; physical Windows confirmation remains pending.
+
 ### Security / Authority
 
 - Layer 4 route/session state remains insufficient for terminal access. Terminal authority requires explicit human UI sessions on both devices and an exact Host/session/terminal-bound grant.
@@ -23,8 +29,8 @@ Detailed update and release history for Pastey.
 
 ### Known limitations
 
-- Developer Mode v0 is desktop-to-desktop. There is no headless admission policy, persistent/resumable terminal, full browser terminal emulator, arbitrary process API, Agent access, or privilege escalation.
-- Windows/ConPTY is cross-compiled but not physically runtime-tested in this work; no physical Mac↔Windows/Linux E2E claim is made.
+- Developer Mode v0 is desktop-to-desktop. There is no headless admission policy, persistent/resumable or multi-tab terminal, arbitrary process API, Agent access, or privilege escalation.
+- Windows/ConPTY is cross-compiled but the reported blank-screen path has not been physically retested after the xterm integration; no new physical Mac↔Windows/Linux E2E PASS claim is made.
 
 ## 1.9.2 — Core architecture and Layer 5 semantic freeze — 2026-08-19
 
