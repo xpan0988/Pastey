@@ -27,6 +27,14 @@ const matrixAreas = [
     ],
   },
   {
+    id: "developer-terminal-emulation",
+    covers: [
+      "xterm output and native input bytes",
+      "terminal focus and active-session presentation",
+      "bounded fit/resize forwarding",
+    ],
+  },
+  {
     id: "backend-route-and-durable-boundaries",
     covers: [
       "current-session bridge_peers endpoint table",
@@ -94,6 +102,9 @@ try {
   await bundleAndRun("queue-children-and-terminal-state", [
     "tests/transferSchedulerExecution.test.ts",
     "tests/transferPlanner.test.ts",
+  ]);
+  await bundleAndRun("developer-terminal-emulation", [
+    "tests/developerTerminalFrontend.test.ts",
   ]);
   run("Rust ordinary data route tests", "cargo", [
     "test",

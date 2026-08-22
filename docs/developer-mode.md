@@ -58,11 +58,36 @@ Current bounds are deliberately narrow:
 
 Terminal content and absolute local paths are not written to ordinary Pastey logs or history.
 
+## Terminal emulator frontend
+
+The controller uses the maintained `@xterm/xterm` emulator with `@xterm/addon-fit`. xterm owns VT/ANSI parsing, cursor state and blinking, carriage-return/newline behavior, line wrapping, erase and cursor-movement sequences, Backspace/Delete, navigation keys, Home/End, Tab, and Ctrl-key terminal data. Pastey does not maintain a parallel key map or VT parser.
+
+The integration is deliberately narrow:
+
+```text
+xterm onData(data)
+  → UTF-8 bytes
+  → developer_terminal.input
+
+container resize
+  → FitAddon rows/cols
+  → bounded debounce
+  → developer_terminal.resize
+
+developer_terminal.output
+  → bounded controller snapshot delta
+  → xterm.write(data)
+```
+
+The emulator is loaded only when an active terminal exists. It uses a 5,000-line scrollback bound. A changed bounded backend snapshot resets the emulator rather than duplicating or retaining unbounded React history. Clicking the terminal focuses xterm, active sessions are focused automatically, and only focused xterm `onData` is forwarded. Active-session presentation identifies the controlled Host, shell, and state while hiding the fresh Host-selector/request controls.
+
 ## Platform behavior
 
 On Unix-like Hosts, Pastey opens a real native PTY. `$SHELL` is used only when it resolves to a Host-owned allowed shell path; otherwise the Host selects an allowed local fallback such as `/bin/sh`. The Host opens in the user's home directory and supplies its own terminal environment. The requester cannot supply a binary, argv, cwd, or environment.
 
 On Windows, `portable-pty` uses the native ConPTY backend and Pastey selects `powershell.exe`. The requester cannot select another executable. Windows GNU cross-compilation verifies the code path, but this is not physical Windows runtime evidence.
+
+The reported first Mac-controller-to-Windows-Host E2E reached an active PowerShell session but showed a blank custom-renderer viewport. Source tracing confirms that the Host reader forwards ConPTY bytes through the bounded PTY queue, typed output frames, Layer 4 delivery, sequence-checked controller buffer, and now `xterm.write()`. No Pastey-owned backend loss point was found in this pass. xterm enables its ConPTY compatibility mode for PowerShell sessions, but the blank-screen symptom remains pending physical Windows retest. When no startup prompt has arrived, the active UI permits input and suggests typing a command such as `echo hello`; the protocol is unchanged.
 
 Pastey performs no privilege escalation. The shell has only the privileges of the account running the Pastey Host process.
 
@@ -84,6 +109,38 @@ No natural-v1, provider, planner, capability fact, Bridge route, or Layer 5 comm
 
 ## v0 limitations
 
-Developer Mode v0 is desktop-to-desktop and supports one terminal view per active controller session. It does not provide session persistence, transparent reconnect, tmux integration, terminal recording, multi-tab management, sudo automation, arbitrary remote process launch, custom shell/cwd/environment selection, a headless admission policy, or Agent access. The minimal renderer strips common ANSI control sequences for readable output; it is not a full terminal emulator. Explicit Bridge leave/stop and Burn revoke immediately; an otherwise silent idle network partition is observed on the next terminal/control frame, an existing route-lifecycle notification, or bounded expiry because v0 adds no terminal heartbeat.
+Developer Mode v0 is desktop-to-desktop and supports one terminal view per active controller session. It does not provide session persistence, transparent reconnect, tmux integration, terminal recording, multi-tab management, sudo automation, arbitrary remote process launch, custom shell/cwd/environment selection, a headless admission policy, or Agent access. Explicit Bridge leave/stop and Burn revoke immediately; an otherwise silent idle network partition is observed on the next terminal/control frame, an existing route-lifecycle notification, or bounded expiry because v0 adds no terminal heartbeat.
 
 Physical Mac-to-Windows/Linux cross-device behavior remains a release/manual evidence boundary.
+
+## Manual validation checklist
+
+This checklist is intentionally unclaimed until performed on physical devices.
+
+### Windows controller to macOS Host
+
+- [ ] zsh prompt and VT formatting render correctly
+- [ ] real blinking cursor and clear click-to-focus state
+- [ ] Backspace, Delete, arrows, Home/End, Tab, Ctrl+C, Ctrl+D, and Ctrl+L
+- [ ] `cd`, multiline output, long output, and Unicode input/output
+- [ ] terminal resize reaches the remote PTY
+- [ ] explicit close terminates the session
+- [ ] reconnect requires new admission
+
+### macOS controller to Windows Host
+
+- [ ] PowerShell prompt is visible
+- [ ] if the initial prompt is absent, typed input and output still work
+- [ ] `echo hello`, `Get-Location`, `Get-ChildItem`, and `cd`
+- [ ] Backspace, Delete, arrows, Home/End, Tab, Ctrl+C, Ctrl+D, and Ctrl+L
+- [ ] Unicode and Chinese output
+- [ ] terminal resize reaches ConPTY
+- [ ] explicit close terminates the session
+- [ ] Burn and disconnect terminate the session
+
+### Transfer contention
+
+- [ ] terminal remains responsive during an ordinary Pastey file Transfer
+- [ ] file Transfer continues to make progress
+- [ ] terminal queue and emulator history remain bounded
+- [ ] Room Control is not starved

@@ -1112,25 +1112,52 @@ button.candidate-metadata-card:hover,
   gap: 10px;
 }
 
-.developer-terminal-output {
-  min-height: 320px;
-  max-height: 520px;
+.developer-terminal-identity p {
   margin: 0;
-  overflow: auto;
-  padding: 14px;
-  border: 1px solid #28364d;
-  border-radius: 10px;
-  outline: none;
-  background: #0d1420;
-  color: #e6edf7;
-  font: 13px/1.45 "SFMono-Regular", Consolas, monospace;
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 
-.developer-terminal-output:focus {
+.developer-terminal-viewport {
+  overflow: hidden;
+  border: 1px solid #28364d;
+  border-radius: 10px;
+  background: #0d1420;
+}
+
+.developer-terminal-viewport.focused {
   border-color: #6ea8ff;
   box-shadow: 0 0 0 3px rgba(31, 111, 255, 0.2);
+}
+
+.developer-terminal-xterm {
+  height: 360px;
+  padding: 12px;
+}
+
+.developer-terminal-focus-hint {
+  margin: 0;
+  padding: 7px 12px;
+  border-top: 1px solid #28364d;
+  color: #9aa8ba;
+  font-size: 12px;
+}
+
+.developer-terminal-startup-hint {
+  margin: 0;
+  padding: 7px 12px;
+  border-top: 1px solid #28364d;
+  color: #b7c4d6;
+  font-size: 12px;
+}
+
+.developer-terminal-waiting {
+  min-height: 120px;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  border: 1px solid #28364d;
+  border-radius: 10px;
+  background: #0d1420;
+  color: #9aa8ba;
 }
 
 .secondary-action-grid {

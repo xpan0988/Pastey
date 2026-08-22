@@ -173,7 +173,7 @@ Developer Terminal  X→ managed revision lineage
 | HostRuntime | `AppState`, startup/recovery/cleanup/Burn, stores, runtimes | Core services are reusable; the container is not yet UI-independent | Extract runtime state/services and inject paths, event sink, and task spawning |
 | Desktop adapter | `main.rs` setup/invoke registration, tray/window/plugins | Yes as an adapter | Make Tauri commands thin wrappers and retain desktop-specific lifecycle |
 | Headless adapter | Not implemented | No | Add a service binary/adapter sharing HostRuntime rather than copying Core |
-| Developer Terminal | `developer_terminal.rs`, `host_runtime.rs`, Room Control typed branch, Bridge Developer UI | v0 is usable | Later isolated additions for durable HostRef, headless admission, persistence, and a full terminal emulator; never pass through Agent authority |
+| Developer Terminal | `developer_terminal.rs`, `host_runtime.rs`, Room Control typed branch, xterm-based Bridge Developer UI | v0 is usable | Later isolated additions for durable HostRef, headless admission, persistence, and richer session management; never pass through Agent authority |
 | Host admission | Receiver review/start checks provide a partial location, but no generic policy exists | Location is reusable; interface is missing | Add an exact Plan/Host-bound decision before creating local grants or effects |
 | Multi-Host identity | `requesting_device_ref`, `selected_device_ref`, step device refs, current Bridge refs | Semantics are reusable; v1 representation is insufficient | Plan schema v2 and protocol v2 participants/HostRef/session binding |
 | Managed object import | Candidate/requester/pipeline stores, ObjectRef, safe identity, Inbox persistence | Security foundations are reusable; acquisition entry is not generic | Generic acquisition/binding service; Search and `selected_file` must not remain the only root |
@@ -545,7 +545,7 @@ Developer Terminal v0 authority/channel already exists as an independent human a
 
 ### Phase 6 — Concrete upper implementations
 
-Only after those foundations should work begin on a Headless Host daemon/service, local 2–4B interpreter, Codex-style Worker Harness, or concrete Transform/Execute capability. Developer Terminal v0 is the first desktop vertical slice; headless admission, persistent sessions, and a fuller terminal emulator still depend on later HostRuntime/HostRef work.
+Only after those foundations should work begin on a Headless Host daemon/service, local 2–4B interpreter, Codex-style Worker Harness, or concrete Transform/Execute capability. Developer Terminal v0 is the first desktop vertical slice; headless admission, persistent sessions, and richer terminal-session management still depend on later HostRuntime/HostRef work.
 
 This order describes architectural dependencies, not a feature commitment or comprehensive implementation plan.
 

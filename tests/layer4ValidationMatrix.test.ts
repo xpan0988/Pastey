@@ -28,6 +28,7 @@ test("Layer 4 validation runner keeps matrix evidence grouped by invariant", () 
   for (const area of [
     "ordinary-data-routing",
     "queue-children-and-terminal-state",
+    "developer-terminal-emulation",
     "backend-route-and-durable-boundaries",
   ]) {
     assert.match(runner, new RegExp(area));
@@ -36,6 +37,7 @@ test("Layer 4 validation runner keeps matrix evidence grouped by invariant", () 
   assert.match(runner, /bridgeRoutingRuntime\.test\.ts/);
   assert.match(runner, /bridgeDetailPolling\.test\.ts/);
   assert.match(runner, /transferSchedulerExecution\.test\.ts/);
+  assert.match(runner, /developerTerminalFrontend\.test\.ts/);
   assert.match(runner, /room_control::tests::/);
   assert.match(runner, /storage::tests::/);
   assert.match(runner, /bridge_route_payload/);
