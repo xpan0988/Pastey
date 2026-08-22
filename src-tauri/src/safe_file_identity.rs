@@ -4,7 +4,7 @@ use std::{
     path::{Component, Path},
 };
 
-#[cfg(test)]
+#[cfg(any(test, windows))]
 use std::path::PathBuf;
 
 #[cfg(unix)]

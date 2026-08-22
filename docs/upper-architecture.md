@@ -1,22 +1,22 @@
-# Pastey 上层产品与运行时架构
+# Pastey Upper Product and Runtime Architecture
 
-本文是 Pastey 1.9.2 在 Layer 1–5 语义与权限合同结构冻结之后的上层架构规范。它以当前本地代码为依据，定义未来 Managed Workspace、Agent、Host Runtime、Developer Mode、Multi-Host 与通用托管对象接入之间的边界。
+This is Pastey 1.9.2's canonical upper-architecture specification following the structural freeze of the Layer 1–5 semantic and authority contracts. It is grounded in the current local code and defines the boundaries among the future Managed Workspace, Agents, Host Runtime, Developer Mode, Multi-Host support, and generic managed-object acquisition.
 
-除“当前实现”小节明确说明的能力外，本文描述的是已经达成一致、但尚未实现的未来架构。特别是：当前只有 Search 与 Transfer 可执行；Transform 与 Execute 仍只有 Plan 框架，任何包含二者的不可变 Plan 都会在执行准入前整体 fail closed。Developer Mode v0 已实现 desktop-to-desktop 的人工 PTY/ConPTY 路径与独立权限域，但本文不宣称 Agent Harness、Headless Host、generic Host admission policy 或 Multi-Host protocol 已经存在。
+Except where a section explicitly says that a capability is implemented, this document describes agreed future architecture rather than current product behavior. Today, only Search and Transfer execute. Transform and Execute remain Plan-framework concepts, and every immutable Plan containing either one fails closed as a whole before execution admission. Developer Mode v0 implements a desktop-to-desktop human PTY/ConPTY path with a separate authority domain. This document does not claim that an Agent Harness, Headless Host, generic Host admission policy, or Multi-Host protocol exists.
 
-## 1. 架构结论
+## 1. Architecture verdict
 
-当前 Layer 1–5 可以直接承载一致的上层架构，不需要改变已经冻结的四原语语义、显式拓扑、不可变 Plan、逻辑修订或权限边界。
+The current Layer 1–5 contracts can support one coherent upper architecture without changing the frozen four-primitive semantics, explicit topology, immutable Plan, logical revisions, or authority boundaries.
 
-未来工作的性质分为三类：
+Future work falls into three categories:
 
-- **接口抽取**：把当前由 Tauri `AppState`、invoke command 与窗口事件承载的 Host 服务抽成 UI 无关的 Host Runtime；为未来 Worker 提供一个受 Core 控制的调用缝隙。
-- **表示迁移**：把 `requesting_device` / `selected_device` 升级为多参与 Host 表示，把 `selected_file` / Search-first 根升级为通用托管对象绑定。
-- **新权限域**：Developer Terminal v0 已增加与 Managed Workspace 分离的人工 authority；generic/headless Host admission 与受约束的 Agent effect/tool enforcement 仍待实现。
+- **Interface extraction:** move Host services currently held by Tauri `AppState`, invoke commands, and window events behind a UI-independent Host Runtime boundary; expose a Core-controlled attachment point for a future Worker.
+- **Representation migration:** evolve `requesting_device` / `selected_device` into a participant-based Host representation, and evolve `selected_file` / Search-first roots into generic managed-object binding.
+- **New authority domains:** Developer Terminal v0 already adds a human authority domain separate from Managed Workspace. Generic/headless Host admission and constrained Agent effect/tool enforcement remain future work.
 
-这些工作都不能倒置现有依赖方向，也不能把 Agent、renderer 或 Layer 4 session 提升为 Pastey 权限来源。
+None of this work may invert existing dependency direction or promote an Agent, renderer, or Layer 4 session into a Pastey authority source.
 
-## 2. 单一规范架构
+## 2. Canonical architecture
 
 ```text
                                       USER
@@ -70,30 +70,30 @@
                                                   HOST(S)
 ```
 
-图中的 Worker Harness 与 Terminal Service 是两个不相交的权限域。Host Runtime 是共享运行容器，不是新的语义层；它承载现有 Layer 1–5 Host 侧服务及未来 Host 侧能力。Desktop/Headless 只是适配器。
+Worker Harness and Terminal Service are disjoint authority domains. Host Runtime is a shared runtime container, not a new semantic layer. It hosts the current Layer 1–5 Host services and future Host-side capabilities. Desktop and Headless are adapters.
 
-## 3. 组件责任
+## 3. Component responsibilities
 
-| 组件 | 输入 | 输出 | 生命周期所有者 | 权限级别 | 禁止职责 | 当前连接点 |
+| Component | Input | Output | Lifecycle owner | Authority | Forbidden responsibilities | Current attachment point |
 | --- | --- | --- | --- | --- | --- | --- |
-| Managed Workspace UI | 用户交互、可展示对象与设备 | 编辑中的候选流程、Review 动作 | Desktop adapter | 无执行权限 | 生成 ObjectRef、approval、grant；隐藏移动 | `BridgeProductPages.tsx`, `bridgePlanComposer.ts`, `tauri.ts` |
-| Local Intent Interpreter | 用户语言、受限事实词汇表 | `CandidateSemanticPlan` | requester 客户端 | 提案权限为零 | 文件/网络/进程工具；自动云升级；批准或运行 | `naturalV1Plan.ts` 的确定性 schema/validator seam |
-| PM / Planner Agent | 用户目标、可公开的 Host/对象事实 | WHAT/WHERE/ORDER 候选 Plan | requester 显式选择的 planner run | 提案权限为零 | 创建 grant；运行工具；重写已批准 Plan | natural-v1/provider advisory pipeline；未来 adapter |
-| Pastey Core | 候选 Plan、对象绑定、当前 session、用户决定 | 不可变 revision、approval、attempt、step authority、lineage | Host Runtime | 唯一 managed authority owner | 把 route/capability/provider 结果当批准 | `bridge_plan.rs`, `commands.rs`, `bridge_plan/protocol.rs` |
-| Managed Object Binder | Host-local physical artifact 与安全身份 | logical object、revision、location、session binding | Pastey Core / Host Runtime | 只绑定对象，不授予行为 | 把 import 当 Transform；暴露私有路径；隐式 Transfer | `object_refs.rs`, `file_candidates.rs`, `safe_file_identity.rs`; future generic import seam |
-| Host Admission | exact approved Plan/Host fragment、Host identity/session、local policy | admit/deny/约束，锚定 Plan hash | 每个执行 Host | Host-local admission authority | 修改 Plan、增加步骤、以 route 代替 policy | 当前 receiver `accept_start` 之前的未来接口 |
-| Layer 5 Host Coordinator | immutable attempt state、完成事件 | 原子领取并分派下一个已创作 eligible step | Host Runtime | attempt/step correlation authority | 通用调度；隐藏步骤；绕过全 Plan fail-closed | `continue_bridge_plan_attempt_inner`, `authorize_next_eligible_transfer` |
-| Worker Agent Harness | 单个已批准 Transform/Execute 描述、受限观察 | tool requests、observations、result/failure proposal | Worker run | 无 Host 权限；只有请求能力 | 选择 Host；改 topology；获得 Terminal grant；登记修订 | 未来接在 Host coordinator 的 primitive dispatch seam |
-| Host Effect / Tool Enforcement | exact step grant、semantic/effect envelope、tool request | 受控副作用、验证后的结果证据 | Host Runtime | 实际 effect authority | 让 Harness 自证权限；扩展语义边界 | 新权限域；复用 identity/grant/Burn 基础 |
-| HostRuntime | 配置/路径/session/runtime state | Layer 1–5 Host 服务 | desktop app 或 daemon | 承载 Core 权限，不由 UI 决定 | 依赖窗口存在；把事件展示当状态真相 | 当前 `AppState` 与 setup 中可复用的 Rust 服务 |
-| Desktop Adapter | OS 桌面生命周期、Tauri invoke/events | UI 命令适配、通知、tray/window | Tauri shell | 无新增 Core 权限 | 在 renderer 重建 authority/state machine | `main.rs`, Tauri command wrappers, plugins |
-| Headless Adapter | service config、daemon lifecycle、RPC/log sink | 同一 HostRuntime 的非 GUI 容器 | service manager | 无新增 Core 权限 | 复制 Layer 1–5；跳过 Host admission | 未来 adapter；共享 HostRuntime |
-| Developer Terminal | 人工请求、Developer v0 Host admission、独立 session grant | PTY/console stream 与退出状态 | `DeveloperTerminalService` | 广泛但短期、人工授予 | 声称 managed lineage；由 Agent 进入；成为第五原语 | 已实现 v0；平行于 Layer 5，复用 Layer 4/`HostRuntimeState` |
-| Layer 2 facts | Host 观测 | 有界事实 | HostRuntime | 无权限 | 路由、批准、拓扑改写 | `peer_capabilities.rs`, `capability_probe.rs`, `device_profile.rs` |
+| Managed Workspace UI | User interaction and displayable objects/Hosts | Edited candidate flow and Review action | Desktop adapter | No execution authority | Minting ObjectRefs, approvals, or grants; hiding movement | `BridgeProductPages.tsx`, `bridgePlanComposer.ts`, `tauri.ts` |
+| Local Intent Interpreter | User language and a bounded fact vocabulary | `CandidateSemanticPlan` | Requester client | Proposal only | File/network/process tools; automatic cloud escalation; approval or execution | Deterministic schema/validator seam in `naturalV1Plan.ts` |
+| PM / Planner Agent | User goal and public Host/object facts | WHAT/WHERE/ORDER candidate Plan | Explicitly selected requester-side planner run | Proposal only | Creating grants; running tools; rewriting an approved Plan | Natural-v1/provider advisory pipeline; future adapter |
+| Pastey Core | Candidate Plan, object bindings, current sessions, user decision | Immutable revision, approval, attempt, step authority, lineage | Host Runtime | Sole managed authority owner | Treating route/capability/provider output as approval | `bridge_plan.rs`, `commands.rs`, `bridge_plan/protocol.rs` |
+| Managed Object Binder | Host-local physical artifact and safe identity | Logical object, revision, location, session binding | Pastey Core / Host Runtime | Object binding only | Treating import as Transform; exposing private paths; implicit Transfer | `object_refs.rs`, `file_candidates.rs`, `safe_file_identity.rs`; future generic import seam |
+| Host Admission | Exact approved Plan/Host fragment, Host identity/session, local policy | Admit/deny/constraints anchored to the Plan hash | Each execution Host | Host-local admission | Modifying the Plan; adding steps; treating a route as policy | Future interface before receiver `accept_start` creates local authority |
+| Layer 5 Host Coordinator | Immutable attempt state and completion events | Atomic claim and dispatch of the next authored eligible step | Host Runtime | Attempt/step correlation authority | Generic scheduling; hidden steps; bypassing whole-Plan fail-closed admission | `continue_bridge_plan_attempt_inner`, `authorize_next_eligible_transfer` |
+| Worker Agent Harness | One approved Transform/Execute descriptor and bounded observations | Tool requests, observations, result/failure proposal | Worker run | No Host authority; request capability only | Selecting a Host; changing topology; obtaining Terminal grants; registering revisions | Future primitive-dispatch seam in the Host coordinator |
+| Host Effect / Tool Enforcement | Exact step grant, semantic/effect envelope, tool request | Constrained effect and validated result evidence | Host Runtime | Actual effect authority | Letting the Harness self-authorize; expanding the semantic boundary | New authority domain reusing identity/grant/Burn foundations |
+| HostRuntime | Configuration, paths, sessions, runtime state | Layer 1–5 Host services | Desktop app or daemon | Carries Core authority; UI does not decide it | Requiring a window; treating rendered events as authoritative state | Reusable Rust services currently held by `AppState` and setup |
+| Desktop Adapter | Desktop lifecycle and Tauri invoke/events | UI command adaptation, notifications, tray/window | Tauri shell | No additional Core authority | Rebuilding authority/state machines in the renderer | `main.rs`, Tauri command wrappers, plugins |
+| Headless Adapter | Service configuration, daemon lifecycle, RPC/log sink | Non-GUI container for the same HostRuntime | Service manager | No additional Core authority | Duplicating Layer 1–5; bypassing Host admission | Future adapter sharing HostRuntime |
+| Developer Terminal | Human request, Developer v0 Host admission, separate session grant | PTY/console stream and exit status | `DeveloperTerminalService` | Broad, short-lived, human-granted | Claiming managed lineage; Agent entry; becoming a fifth primitive | Implemented v0 parallel to Layer 5, reusing Layer 4 and `HostRuntimeState` |
+| Layer 2 facts | Host observations | Bounded facts | HostRuntime | None | Routing, approval, or topology changes | `peer_capabilities.rs`, `capability_probe.rs`, `device_profile.rs` |
 
-## 4. 权限模型
+## 4. Authority model
 
-### 4.1 权限链
+### 4.1 Managed authority chain
 
 ```text
 PM / local interpreter / renderer
@@ -123,13 +123,13 @@ Layer 5 attempt / one-use step authority
                                             verified result / lineage
 ```
 
-Requester workflow approval与 Host admission 都必须成功。前者回答“用户批准了什么整体语义和拓扑”；后者回答“此 Host 是否根据本地策略接纳被批准且明确绑定给它的工作”。Layer 4 当前 route/session 只提供身份、传送与活性上下文，不能替代任何一个决定。
+Requester workflow approval and Host admission must both succeed. The first answers what complete semantics and topology the user approved. The second answers whether a Host accepts the work explicitly bound to it under local policy. A current Layer 4 route/session provides identity, delivery, and liveness context; it cannot replace either decision.
 
-Harness tool permission 只描述 Worker 可请求哪些工具。真正的 filesystem/process/network 等 effect authority 必须由 Host Runtime 在每次请求时用 exact Plan/revision/attempt/step、Host、object revision、expiry 与本地 admission 重新约束。未来 semantic/effect envelope 属于 Pastey Core 与 Host enforcement 的边界，而不是 PM prompt 或 Harness 内部状态。
+Harness tool permission only describes which tools a Worker may request. Host Runtime must constrain actual filesystem, process, network, and other effect authority for every request using the exact Plan/revision/attempt/step, Host, object revision, expiry, and local admission. The future semantic/effect envelope belongs at the Pastey Core and Host-enforcement boundary, not inside a PM prompt or Harness state.
 
-Managed approval 是语义授权，不必等同于 exact patch、command、argv、cwd 或 runtime。例如用户批准“修复这个项目直到测试通过”，并不自动允许修改系统配置、访问任意网络目标、安装任意系统软件包或修改无关文件。未来 Host Effect Enforcement 必须把已批准语义编译/约束为具体 effect envelope 并逐次执行；不能为了回避该问题而把 exact patch/command 强塞进冻结的 Layer 5 Plan 语义。
+Managed approval is semantic and need not equal approval of an exact patch, command, argv, cwd, or runtime. Approval of “fix this project until the tests pass” does not automatically allow system configuration changes, arbitrary network access, arbitrary package installation, or unrelated file mutation. Future Host Effect Enforcement must compile or constrain approved semantics into a concrete effect envelope and enforce each effect. Exact patches or commands must not be forced into the frozen Layer 5 Plan merely to avoid this problem.
 
-### 4.2 Developer Terminal 权限链
+### 4.2 Developer Terminal authority chain
 
 ```text
 human explicit Developer Mode request
@@ -146,9 +146,9 @@ terminal channel / PTY / native console
         └─ cancel / disconnect / expiry / Burn → terminal authority ends
 ```
 
-Terminal grant 不派生自 Layer 5 Plan，也不能转换为 Agent step grant。Terminal 内任意副作用不得自动登记为受管理对象修订。
+A Terminal grant is not derived from a Layer 5 Plan and cannot be converted into an Agent step grant. Terminal side effects must not be registered automatically as managed-object revisions.
 
-### 4.3 禁止的升级路径
+### 4.3 Forbidden escalation paths
 
 ```text
 PM Agent             X→ execution/step grant
@@ -162,46 +162,46 @@ Renderer/provider    X→ immutable revision / ObjectRef / grant
 Developer Terminal  X→ managed revision lineage
 ```
 
-## 5. 与当前仓库的接口映射
+## 5. Interface map to the current repository
 
-| 上层组件 | 当前代码/接口 | 是否可直接使用 | 最小抽取或变化 |
+| Upper component | Current code/interface | Suitable as-is? | Smallest extraction or change |
 | --- | --- | --- | --- |
-| PM Agent | `src/lib/ai/naturalV1Plan.ts`, provider instruction/risk scanner, provider adapter | 部分；提案/验证边界正确 | 把 planner provider 明确适配为统一 candidate-plan producer；不进入 Rust authority |
-| Worker Agent | 当前无实现 | 否，但 Core seam 已存在 | 在 Host coordinator 的 primitive dispatch 后增加单步 `WorkerRun` 接口；输入锚定 exact step，输出只为请求/结果提案 |
-| Local Intent Interpreter | natural-v1 schema、deterministic builder、strict validator | 适合作为 v1 起点 | 将模型后端做成显式本地 adapter；逐步解除 Search-first/two-role 表示，不授予工具 |
-| Agent Harness | 当前无 reasoning/tool loop | 否 | 新增 Pastey-facing harness adapter；Host tool broker 保留真实权限 |
-| HostRuntime | `AppState`, startup/recovery/cleanup/Burn, stores and runtimes | 核心服务可复用，容器不可直接无 UI 使用 | 抽取 UI 无关 runtime state/service；注入 path、event sink 与 task spawning |
-| Desktop adapter | `main.rs` setup/invoke registration、tray/window/plugins | 是，作为 adapter | Tauri commands 变为薄调用；保留桌面专属生命周期 |
-| Headless adapter | 无 | 否 | 新 service binary/adapter，复用同一 HostRuntime；不复制 Core |
-| Developer Terminal | `developer_terminal.rs`, `host_runtime.rs`, Room Control typed branch, Bridge Developer UI | v0 可用 | durable HostRef、headless admission、持久 session 与完整 terminal emulator 仍需后续孤立扩展；不得穿过 Agent |
-| Host admission | receiver review/start 校验具有部分准入位置，但没有通用 policy | 位置可复用，接口需新增 | 在本地 grant/副作用之前增加 exact Plan/Host-bound admission decision |
-| Multi-Host identity | `requesting_device_ref`, `selected_device_ref`, step device refs, current Bridge refs | 语义可复用，v1 表示不够 | Plan schema v2 + protocol v2 的 participant/HostRef 与 session binding |
-| Managed object import | candidate/requester/pipeline stores、ObjectRef、safe identity、Inbox persistence | 安全基础可复用，入口不通用 | generic acquisition/binding service；不再把 Search 或 `selected_file` 当唯一根 |
-| Semantic/effect policy | semantic intents、attempt/step grants、safe object identity | 基础正确，effect envelope 未实现 | 新 Core-owned envelope/compiler + Host enforcement；不在 Provider/Harness 中定义 authority |
+| PM Agent | `src/lib/ai/naturalV1Plan.ts`, provider instruction/risk scanner, provider adapter | Partly; proposal and validation boundaries are correct | Adapt planner providers into one candidate-Plan producer without entering Rust authority |
+| Worker Agent | Not implemented | No, but the Core seam exists | Add a single-step `WorkerRun` interface after primitive dispatch; exact-step input and request/result-proposal output only |
+| Local Intent Interpreter | Natural-v1 schema, deterministic builder, strict validator | Good v1 starting point | Add an explicit local-model adapter; later remove Search-first/two-role representation without granting tools |
+| Agent Harness | No reasoning/tool loop | No | Add a Pastey-facing Harness adapter while the Host tool broker retains authority |
+| HostRuntime | `AppState`, startup/recovery/cleanup/Burn, stores, runtimes | Core services are reusable; the container is not yet UI-independent | Extract runtime state/services and inject paths, event sink, and task spawning |
+| Desktop adapter | `main.rs` setup/invoke registration, tray/window/plugins | Yes as an adapter | Make Tauri commands thin wrappers and retain desktop-specific lifecycle |
+| Headless adapter | Not implemented | No | Add a service binary/adapter sharing HostRuntime rather than copying Core |
+| Developer Terminal | `developer_terminal.rs`, `host_runtime.rs`, Room Control typed branch, Bridge Developer UI | v0 is usable | Later isolated additions for durable HostRef, headless admission, persistence, and a full terminal emulator; never pass through Agent authority |
+| Host admission | Receiver review/start checks provide a partial location, but no generic policy exists | Location is reusable; interface is missing | Add an exact Plan/Host-bound decision before creating local grants or effects |
+| Multi-Host identity | `requesting_device_ref`, `selected_device_ref`, step device refs, current Bridge refs | Semantics are reusable; v1 representation is insufficient | Plan schema v2 and protocol v2 participants/HostRef/session binding |
+| Managed object import | Candidate/requester/pipeline stores, ObjectRef, safe identity, Inbox persistence | Security foundations are reusable; acquisition entry is not generic | Generic acquisition/binding service; Search and `selected_file` must not remain the only root |
+| Semantic/effect policy | Semantic intents, attempt/step grants, safe object identity | Foundations are correct; effect envelope is absent | New Core-owned envelope/compiler and Host enforcement; authority must not be defined in Provider/Harness code |
 
-### 5.1 当前可保留的具体边界
+### 5.1 Concrete boundaries to retain
 
-- `BridgePlanRevision`、`BridgePlanStep`、`LogicalObjectRevision`、canonical semantic hash：继续作为 managed semantic IR 和授权锚点。
-- `BridgePlanStore::create_attempt_from_approval`：继续作为 Core attempt admission 的深层防线。
-- receiver `accept_start`：继续作为 Host 侧 current-session protocol admission；未来 Host policy 放在创建本地 attempt/grant 之前。
-- `BridgePlanStore::authorize_next_eligible_transfer` 与 `continue_bridge_plan_attempt_inner`：证明当前可以从 immutable attempt state 原子领取下一步骤；未来只抽取 primitive-neutral dispatch，不扩展成通用 scheduler。
-- `TransferCapacityCoordinator`：继续作为 Layer 3 资源边界；semantic eligibility 不下沉。
-- `ObjectRefStore`、candidate stores 与 `safe_file_identity`：继续作为 Host 私有对象解析和物理身份基础；不向 renderer/Harness 暴露路径。
-- Room Control：继续作为 Layer 4 typed encrypted control transport，不理解 PM/Worker 语义。
+- `BridgePlanRevision`, `BridgePlanStep`, `LogicalObjectRevision`, and the canonical semantic hash remain the managed semantic IR and authority anchors.
+- `BridgePlanStore::create_attempt_from_approval` remains the deep Core attempt-admission defense.
+- Receiver `accept_start` remains current-session Host-side protocol admission. Future Host policy belongs before local attempts or grants are created.
+- `BridgePlanStore::authorize_next_eligible_transfer` and `continue_bridge_plan_attempt_inner` already atomically claim the next step from immutable attempt state. Future extraction should provide primitive-neutral dispatch, not a generic scheduler.
+- `TransferCapacityCoordinator` remains the Layer 3 resource boundary. Semantic eligibility does not move down.
+- `ObjectRefStore`, candidate stores, and `safe_file_identity` remain Host-private object resolution and physical-identity foundations. Paths stay hidden from renderer and Harness.
+- Room Control remains Layer 4 typed encrypted control transport and does not understand PM/Worker semantics.
 
-### 5.2 当前需要隔离的 Tauri 交叉点
+### 5.2 Tauri crossings to isolate
 
-- `AppState` 同时持有 `AppHandle` 与 Core stores/runtime。
-- `main.rs` setup 同时负责 path bootstrap、DB/recovery、Burn cleanup、discovery、tray/window/plugin。
-- `commands.rs` 以 `tauri::State<Arc<AppState>>` 暴露业务入口。
-- `discovery.rs` 与 `transfer.rs` 直接通过 `AppHandle.emit` 发 UI 事件。
-- cleanup、commands、room control 使用 `tauri::async_runtime::spawn`。
+- `AppState` holds both `AppHandle` and Core stores/runtimes.
+- `main.rs` setup owns path bootstrap, database/recovery, Burn cleanup, discovery, tray/window, and plugins.
+- `commands.rs` exposes business entry points through `tauri::State<Arc<AppState>>`.
+- `discovery.rs` and `transfer.rs` emit UI events directly through `AppHandle.emit`.
+- Cleanup, commands, and Room Control use `tauri::async_runtime::spawn`.
 
-这些是实现容器耦合，不是 Layer 1–5 语义冲突。最小解法是注入 `HostEventSink`、显式 `AppPaths`、runtime task interface，并把 command wrapper 与 service function 分开。
+These are implementation-container couplings, not Layer 1–5 semantic conflicts. The smallest solution is to inject a `HostEventSink`, explicit `AppPaths`, and a runtime task interface, while separating command wrappers from service functions.
 
-## 6. Managed Workspace 数据与控制流
+## 6. Managed Workspace data and control flow
 
-Managed Workspace 的所有入口最终只产生候选 Plan 或对象绑定请求：
+All Managed Workspace entry points ultimately produce only a candidate Plan or an object-binding request:
 
 ```text
 GUI block edits ──────────────┐
@@ -222,34 +222,34 @@ Explicit PM Agent ────────────┘
                       Host coordinator / per-step execution
 ```
 
-GUI、local model 与 PM 共享相同的 proposal contract，但可以有不同体验。任何来源都不能直接构造 process-local ObjectRef、consume approval 或 create grant。Rust/Core 负责把用户可读 Host/object 选择解析到 current-session 身份，把语义 lower 到不可变 revision，并重新验证。
+GUI, local model, and PM share the same proposal contract while supporting different experiences. None may construct a process-local ObjectRef, consume approval, or create a grant. Rust/Core resolves user-readable Host/object selections into current-session identities, lowers semantics into an immutable revision, and revalidates them.
 
-PM 负责 WHAT / WHERE / ORDER。Worker 只在 Core 原子认领一个已批准 Transform/Execute step 后负责 HOW。Worker 完成 Transform 后，只有 Core 在验证真实 effect/result 后才能登记同一 logical object 的 N+1；Execute 读取 exact current revision，结果默认是执行结果而不是另一个 filesystem object。
+PM owns WHAT / WHERE / ORDER. Worker owns HOW only after Core atomically claims one approved Transform/Execute step. After a Worker performs Transform, only Core may register N+1 for the same logical object after validating the real effect and result. Execute consumes the exact current revision and produces an execution result by default, not another filesystem object.
 
 ## 7. Developer Mode
 
-Developer Mode v0 已实现为**平行于 Layer 5、位于 Layer 4 与 HostRuntime 之上的独立 Host capability domain**。其当前协议、权限和生命周期以 [Developer Mode](developer-mode.md) 为准；以下仍是长期边界。
+Developer Mode v0 is implemented as an independent Host capability domain parallel to Layer 5 and above Layer 4 and HostRuntime. [Developer Mode](developer-mode.md) is the canonical description of its current protocol, authority, and lifecycle. The following are long-term boundaries.
 
-它复用：
+It reuses:
 
-- Layer 4 current-session Host identity、route 生命周期、encrypted control foundation、disconnect/replay/Burn 边界；
-- HostRuntime 的配置、任务、审计与本地 admission；
-- 必要时由 Layer 1/4 演进出的适合交互流量的加密 channel。
+- Layer 4 current-session Host identity, route lifecycle, encrypted control foundation, and disconnect/replay/Burn boundaries;
+- HostRuntime configuration, tasks, auditing, and local admission;
+- when needed, an encrypted interactive channel evolved from Layer 1/4 foundations.
 
-它不复用：
+It does not reuse:
 
-- 四原语来分类每条 shell 指令；
-- managed Plan approval 作为 terminal grant；
-- Agent Harness 作为 terminal transport；
-- logical revision 追踪任意 shell 副作用。
+- the four primitives to classify each shell command;
+- managed Plan approval as a Terminal grant;
+- Agent Harness as terminal transport;
+- logical revisions to track arbitrary shell side effects.
 
-当前 v0 复用 Room Control 的会话身份、加密 envelope、route、expiry 与 replay 基础，并用独立 typed delivery 分支绕过普通 control inbox/history。它没有建立第二套 peer/session/crypto 系统。未来若引入更高吞吐量的专用流式 channel，仍必须保留同样的 identity、admission、grant 与 Burn 合同。
+Current v0 reuses Room Control session identity, encrypted envelopes, routes, expiry, and replay foundations. A distinct typed delivery branch bypasses the ordinary control inbox/history. It does not establish another peer, session, or crypto system. Any future higher-throughput streaming channel must preserve the same identity, admission, grant, and Burn contracts.
 
-## 8. Multi-Host 模型
+## 8. Multi-Host model
 
-当前 v1 的两方结构不是未来 Host ontology：顶层 `requesting_device_ref` / `selected_device_ref`、前端 `requesting` / `selected` role、协议中的 requester/receiver correlation、Bridge peer persistence 都以一次会话中的一对角色组织。
+The current v1 two-party structure is not the future Host ontology. Top-level `requesting_device_ref` / `selected_device_ref`, frontend `requesting` / `selected` roles, requester/receiver protocol correlation, and Bridge peer persistence are organized around a pair of roles in one session.
 
-未来概念模型应为：
+The future conceptual model is:
 
 ```text
 PlanRevision
@@ -265,36 +265,36 @@ HostSessionBinding
   HostRef + current Bridge/session/peer identity + expiry
 ```
 
-`HostRef` 是 Core-owned Plan participant identity，不是 route，不是 capability fact，也不应仅等于当前 display-only durable pairing。批准时每个 HostRef 必须绑定到被审查的身份；执行时用 current-session binding 重新关联并验证。
+`HostRef` is Core-owned Plan-participant identity. It is not a route or capability fact and must not be reduced to current display-only durable pairing. Approval binds every HostRef to the reviewed identity; execution re-associates and verifies it using the current-session binding.
 
-### 8.1 保持不变
+### 8.1 Contracts that remain unchanged
 
-- immutable revision 与 semantic hash；
-- 每步显式 Host 与依赖；
-- 只有 Transfer 改 location；
-- exact Plan/revision/attempt/step authority；
-- Layer 4 session binding 与 Layer 5 consent 分离；
-- capability facts 只作为观察。
+- immutable revision and semantic hash;
+- explicit Host and dependencies for every step;
+- only Transfer changes location;
+- exact Plan/revision/attempt/step authority;
+- separation of Layer 4 session binding from Layer 5 consent;
+- capability facts as observations only.
 
-### 8.2 迁移建议
+### 8.2 Migration recommendation
 
-采用 **Plan schema v2 + Bridge Plan protocol v2**，而不是在 v1 内就地扩大。理由：v1 的 exact hash、deny-unknown serialization、顶层 two-party refs、逐消息 requester/selected correlation、receiver persistence 与 replay key 都是权限合同的一部分。v2 应与 v1 明确共存或显式拒绝，不能把旧 revision 静默重解释。
+Use **Plan schema v2 plus Bridge Plan protocol v2**, not an in-place expansion of v1. The v1 exact hash, deny-unknown serialization, top-level two-party refs, per-message requester/selected correlation, receiver persistence, and replay keys are authority contracts. v2 must coexist explicitly with v1 or reject it explicitly; it must not silently reinterpret an old revision.
 
-每个 Host 可以收到完整不可变 revision，或收到锚定 full-plan hash 的 Host projection；两种选择都必须保留对完整拓扑与 exact step 的可验证关联。Layer 4 仍只负责把协议消息送到对应 current-session peer。
+Each Host may receive the complete immutable revision or a Host projection anchored to the full-Plan hash. Either approach must retain verifiable linkage to the complete topology and exact step. Layer 4 remains responsible only for delivering protocol messages to the corresponding current-session peer.
 
-## 9. Managed Object 接入模型
+## 9. Managed-object acquisition model
 
-必须区分以下概念：
+These concepts are distinct:
 
-| 概念 | 定义 | 权限含义 |
+| Concept | Definition | Authority meaning |
 | --- | --- | --- |
-| Physical Artifact | 某 Host 上的真实文件/目录/字节 | 本身不是行为授权 |
-| Managed Logical Object | Core-owned 稳定逻辑身份 | 用于 Plan 引用与 lineage |
-| Logical Revision | 对逻辑对象状态的有序语义版本 | 必须由验证过的 acquisition/effect 建立 |
-| Host Location | exact revision 当前存在的 Host | 只有显式 Transfer 可改变 |
-| Session Binding | 当前 Host 进程内把 opaque reference 解析到安全物理身份的短期绑定 | 不可作为 approval/grant |
+| Physical Artifact | Real file, directory, or bytes on a Host | Not behavior authority by itself |
+| Managed Logical Object | Stable Core-owned logical identity | Used by Plans and lineage |
+| Logical Revision | Ordered semantic version of a logical object | Established only by validated acquisition/effect |
+| Host Location | Host currently containing the exact revision | Changed only by explicit Transfer |
+| Session Binding | Short-lived process-local resolution of an opaque reference to safe physical identity | Not approval or a grant |
 
-可能的 acquisition 路径：
+Possible acquisition paths are:
 
 ```text
 Search result ──────────────┐
@@ -305,45 +305,45 @@ future generated artifact ──┘              │
                          ManagedLogicalObject revision N @ Host
 ```
 
-Acquisition/binding 是进入 managed workspace 的前置 Core 操作，不是第五原语，也不等于 Transform。Search 仍是“find”原语；它只是能产生对象绑定的一种行为。普通 Bridge transfer 先按现有机制把 physical artifact 落到 Inbox；以后只有用户或受验证的 workflow 明确 import/bind 后，它才成为 managed logical object。
+Acquisition/binding is a Core boundary before entry into Managed Workspace. It is not a fifth primitive and is not Transform. Search remains the “find” primitive and is only one behavior that can produce an object binding. An ordinary Bridge transfer first lands a physical artifact in Inbox. It becomes a managed logical object only after a user or validated workflow explicitly imports or binds it.
 
-当前 `selected_file`、`ObjectKind::FilesystemCandidate`、Search-first Composer 与 direct transfer source binding 都是 MVP 表示。未来应抽成 generic root/input slot 与 object-binding service，同时复用 safe identity、ObjectRef privacy 与 location rules。
+Current `selected_file`, `ObjectKind::FilesystemCandidate`, Search-first Composer, and direct-transfer source binding are MVP representations. They should later become a generic root/input slot and object-binding service while retaining safe identity, ObjectRef privacy, and location rules.
 
-## 10. HostRuntime 模型
+## 10. HostRuntime model
 
-### 10.1 PasteyHostRuntime 应拥有
+### 10.1 PasteyHostRuntime should own
 
-- Layer 1 transfer engine 与 Layer 3 capacity coordinator；
-- Layer 2 factual probes 与 capability store；
-- Layer 4 Room Control、peer/session/runtime、replay 与 Burn；
-- Layer 5 Plan/approval/attempt/protocol authority stores 与 Host coordinator；
-- ObjectRef、candidate、safe identity 与 managed object binding；
-- storage paths/config、startup reconciliation、restart invalidation、cleanup/TTL；
-- 当前 Developer Terminal service，以及未来 generic Host admission 与 Worker tool enforcement；
-- UI-independent event/result stream。
+- Layer 1 transfer engine and Layer 3 capacity coordinator;
+- Layer 2 factual probes and capability store;
+- Layer 4 Room Control, peer/session runtime, replay, and Burn;
+- Layer 5 Plan/approval/attempt/protocol authority stores and Host coordinator;
+- ObjectRef, candidates, safe identity, and managed-object binding;
+- storage paths/configuration, startup reconciliation, restart invalidation, cleanup, and TTL;
+- current Developer Terminal service and future generic Host admission and Worker tool enforcement;
+- a UI-independent event/result stream.
 
-### 10.2 DesktopAdapter / TauriShell 应拥有
+### 10.2 DesktopAdapter / TauriShell should own
 
-- `tauri::Builder`、state injection 与 invoke registration；
-- window/tray/global shortcut；
-- dialog/opener/clipboard/update/autostart plugins；
-- OS desktop path discovery；
-- 把 runtime events 映射为 frontend events；
-- 把 invoke DTO 映射到 HostRuntime service calls。
+- `tauri::Builder`, state injection, and invoke registration;
+- window, tray, and global shortcuts;
+- dialog, opener, clipboard, update, and autostart plugins;
+- desktop path discovery;
+- mapping runtime events to frontend events;
+- mapping invoke DTOs to HostRuntime service calls.
 
-### 10.3 HeadlessAdapter 应拥有
+### 10.3 HeadlessAdapter should own
 
-- daemon/service startup 与 shutdown；
-- service config 与 path provider；
-- RPC/CLI/admin adapter；
-- structured log/event sink；
-- 与 Desktop 相同的 HostRuntime initialization/reconciliation。
+- daemon/service startup and shutdown;
+- service configuration and path provider;
+- RPC/CLI/admin adapter;
+- structured log/event sink;
+- the same HostRuntime initialization and reconciliation as Desktop.
 
-当前抽取成本是中等但局部：安全与语义模块多数已经是普通 Rust；主要耦合集中于 `AppState`、setup、Tauri command wrapper、event emission、path bootstrap 与 async spawning。正确抽取不会改变冻结语义。
+The extraction cost is moderate but localized. Most security and semantic modules are ordinary Rust. Coupling is concentrated in `AppState`, setup, Tauri command wrappers, event emission, path bootstrap, and asynchronous spawning. Correct extraction does not change frozen semantics.
 
-## 11. Agent Harness 模型
+## 11. Agent Harness model
 
-### 11.1 PM 与 Worker
+### 11.1 PM and Worker
 
 ```text
 PM Agent
@@ -362,29 +362,29 @@ Pastey Core + Host Enforcement
   authority: authoritative
 ```
 
-`StepWorkDescriptor` 至少应锚定 Plan ID、revision hash、attempt、step、Host、semantic intent、input logical revision 与 effect-envelope reference。它不是可转授权 bearer token；Host tool broker 对每个请求仍校验 process-local grant、expiry/session/Burn。
+`StepWorkDescriptor` should anchor at least the Plan ID, revision hash, attempt, step, Host, semantic intent, input logical revision, and effect-envelope reference. It is not a transferable bearer token. The Host tool broker still validates the process-local grant, expiry/session, and Burn state for each request.
 
-### 11.2 Harness 可拥有
+### 11.2 Harness may own
 
-- model/provider lifecycle；
-- reasoning/context/observation loop；
-- tool selection 与 request construction；
-- retry/self-correction；
-- Worker run 内部状态。
+- model/provider lifecycle;
+- reasoning/context/observation loop;
+- tool selection and request construction;
+- retries and self-correction;
+- internal Worker-run state.
 
-### 11.3 Harness 不可拥有
+### 11.3 Harness must not own
 
-- Plan topology、Host selection 或 hidden Transfer；
-- semantic approval、Host admission 或 step grant creation；
-- object identity/revision registration；
-- Developer Mode escalation；
-- 绕过 Host tool enforcement 的 raw filesystem/process/network authority。
+- Plan topology, Host selection, or hidden Transfer;
+- semantic approval, Host admission, or step-grant creation;
+- object identity or revision registration;
+- Developer Mode escalation;
+- raw filesystem/process/network authority that bypasses Host tool enforcement.
 
-当前 Host coordinator 的“读取 immutable attempt → 原子认领下一 eligible step → 按 primitive dispatch”是未来调用 Harness 的正确位置。只需把 command/Tauri 依赖从 coordinator service 抽离，并在 Transform/Execute 真正实现时增加受控 dispatch。Harness 不得复制 `BridgePlanStore` 或成为第二个 Layer 5 Core。
+The current Host coordinator sequence—read immutable attempt, atomically claim the next eligible step, dispatch by primitive—is the correct future Harness invocation point. Only command/Tauri dependencies need to be separated from the coordinator service, followed by controlled Transform/Execute dispatch when those implementations exist. Harness must not copy `BridgePlanStore` or become a second Layer 5 Core.
 
-## 12. 本地 2–4B 模型角色
+## 12. Local 2–4B model role
 
-本地小模型只走简化提案链：
+The small local model follows a deliberately simpler proposal path:
 
 ```text
 user language
@@ -400,172 +400,172 @@ Rust/Core lowering
 Review & Run
 ```
 
-当前 natural-v1 已提供重要基础：受限 schema、严格 validator、risk scanner、实际原语序列标题、Transform/Execute `unsupported_future`、provider 输出非权限。它仍有 Search-first、two-role 与 TypeScript-only proposal shape 等 MVP 假设，需要随 object-root/Multi-Host 表示迁移。
+Current natural-v1 already provides a bounded schema, strict validator, risk scanner, titles derived from the actual primitive sequence, Transform/Execute `unsupported_future`, and provider-output non-authority. It still has Search-first, two-role, and TypeScript-only proposal-shape assumptions that must evolve with object-root and Multi-Host representation.
 
-本地 interpreter 默认不获得 Worker tool loop、filesystem、shell、network 或云 provider。强 Agent 必须由用户显式选择；禁止 local-to-cloud 自动升级。云/本地模型的差异只影响 proposal producer 或 Harness adapter，不影响 Core authority。
+The local interpreter receives no Worker tool loop, filesystem, shell, network, or cloud provider by default. A strong Agent requires explicit user selection; automatic local-to-cloud escalation is forbidden. Cloud versus local models affect only the proposal producer or Harness adapter, never Core authority.
 
-## 13. 具体场景
+## 13. Scenario walkthroughs
 
-### A. 本地助手：在 PC 找昨天的报告并发到 laptop
+### A. Local assistant: find yesterday's report on PC and send it to laptop
 
-1. UI 把语言与用户可选 Host 事实交给本地 interpreter。
-2. interpreter 提出 `Search @ PC → Transfer PC → laptop`；没有权限。
-3. Core 解析 Host/session、验证 scope/dependency/location，生成不可变 revision。
-4. 用户在 Review & Run 批准 exact Plan。
-5. PC 与 laptop 的 Host admission 分别接纳其相关工作；route 本身不构成接纳。
-6. Layer 5 建立 attempt/Search grant；candidate selection 只选择对象。
-7. authored Transfer 变为 eligible；Layer 3 给出 capacity，Layer 4 提供 current route，Layer 1 加密传输。
-8. Core 记录完成与目标 location。任何层都没有插入移动。
+1. UI passes user language and selectable Host facts to the local interpreter.
+2. Interpreter proposes `Search @ PC → Transfer PC → laptop` and has no authority.
+3. Core resolves Host/session, validates scope/dependencies/location, and creates an immutable revision.
+4. User approves the exact Plan in Review & Run.
+5. PC and laptop Host admission independently accept their work; route existence is not admission.
+6. Layer 5 creates attempt/Search authority; candidate selection selects data only.
+7. The authored Transfer becomes eligible. Layer 3 grants capacity, Layer 4 provides the current route, and Layer 1 performs encrypted transfer.
+8. Core records completion and target location. No layer inserts movement.
 
-### B. 强 Agent：在 Linux 修项目，再到 Mac 运行测试
+### B. Strong Agent: fix a project on Linux, then run tests on Mac
 
-1. 用户显式选择强 PM；PM 提出 `Transform @ Linux → Transfer Linux→Mac → Execute @ Mac`，并引用已绑定项目对象（也可以显式先 Search）。
-2. Core 验证 exact input revision、Host locality 与显式 Transfer，生成 Review。
-3. 用户批准；每个 Host 独立 admission。
-4. Linux Core 为 exact Transform step 建立 authority，Worker Harness 决定 HOW，并通过 Host tool enforcement 请求受限操作。
-5. 只有 effect 验证成功后，Core 登记同一 logical object 的 N+1 @ Linux。
-6. authored Transfer 经 Layer 3/4/1 把 N+1 移到 Mac。
-7. Mac Worker 接收 exact Execute step 与 N+1，Harness 决定 HOW；Core 记录受验证 execution result，不默认创建文件对象。
-8. Worker 不能改成另一 Host、跳过 Transfer 或新增步骤。
+1. User explicitly selects a strong PM. PM proposes `Transform @ Linux → Transfer Linux→Mac → Execute @ Mac` against an already bound project object, optionally preceded by explicit Search.
+2. Core validates the exact input revision, Host locality, and explicit Transfer, then creates Review.
+3. User approves and every Host admits its own work.
+4. Linux Core creates authority for the exact Transform step. Worker Harness chooses HOW and requests constrained operations through Host tool enforcement.
+5. Core registers N+1 for the same logical object at Linux only after validating effect and result evidence.
+6. The authored Transfer moves N+1 to Mac through Layers 3/4/1.
+7. Mac Worker receives the exact Execute step and N+1. Harness chooses HOW; Core records a validated execution result rather than creating a filesystem object by default.
+8. Worker cannot select another Host, skip Transfer, or add a step.
 
-当前 Transform/Execute 未实现，因此这类 Plan 现在仍在 attempt admission 前整体拒绝；以上是未来合同，不是当前功能声明。
+Transform and Execute are not implemented today, so such a Plan currently fails closed as a whole before attempt admission. This is a future contract, not a current feature claim.
 
-### C. drag/drop 后再让 Agent 修改
+### C. Agent operation after drag/drop
 
-1. 用户通过普通 Bridge drag/drop 发送文件；现有 Transfer 将 physical artifact 落入 receiver Inbox。
-2. 后续用户选择“刚发送的文件”。未来 object binder 在 receiver Host 上安全重验 physical identity，并建立 logical object revision/location/session binding。
-3. UI/PM 从该 bound object 开始提出 Transform Plan；不需要虚构 Search step。
-4. import/binding 不授予修改；仍需 immutable Review、requester approval、Host admission 与 exact step authority。
+1. User sends a file through ordinary Bridge drag/drop; existing Transfer lands the physical artifact in receiver Inbox.
+2. User later selects “the file I just sent.” A future object binder safely revalidates physical identity on the receiver Host and establishes logical-object revision/location/session binding.
+3. UI/PM proposes Transform starting from that bound object; no fabricated Search step is required.
+4. Import/binding does not authorize modification. Immutable Review, requester approval, Host admission, and exact step authority are still required.
 
 ### D. Headless Linux Developer Mode
 
-1. Headless daemon 已通过现有 Bridge enrollment/session 基础连接。
-2. Mac 上的用户显式进入 Developer Mode 并选择 Host。
-3. Host admission 根据 exact current identity/session 与本地 terminal policy 决定是否建立独立 `DeveloperTerminalGrant`。
-4. Terminal service 打开 native PTY/console，流量走专用加密 channel。
-5. 用户退出、session 断开、expiry 或 Burn 时 grant 与 PTY/process tree 按未来 terminal policy 终止。
-6. Agent 和 Layer 5 Plan 均不参与；terminal 副作用不伪装成 managed lineage。
+1. A Headless daemon has joined through existing Bridge enrollment/session foundations.
+2. User on Mac explicitly enters Developer Mode and selects the Host.
+3. Host admission uses the exact current identity/session and local terminal policy to decide whether to create a separate `DeveloperTerminalGrant`.
+4. Terminal service opens a native PTY/console and sends traffic through an encrypted channel.
+5. User exit, session loss, expiry, or Burn terminates the grant and PTY/process tree under terminal policy.
+6. Agent and Layer 5 Plan are not involved; terminal side effects do not masquerade as managed lineage.
 
 ### E. Headless Linux Managed Agent Mode
 
-1. PM 提案、Core validation、Review、approval 与 Host admission 与 Desktop Host 相同。
-2. Layer 2/Host probes 把 OS、工具、liveness 等有界观察传给 Worker Harness；这些只是事实。
-3. Worker 在 exact semantic step 内根据观察选择 HOW，所有真实 tool request 都经过 Host enforcement。
-4. 未知 Linux 环境导致 observation/unsupported/denied，而不是 capability 驱动换 Host 或 hidden Transfer。
-5. Core 独立记录 authoritative state 与 result lineage；Headless adapter 只提供 service lifecycle 与 remote presentation channel。
+1. PM proposal, Core validation, Review, approval, and Host admission match the Desktop Host path.
+2. Layer 2/Host probes send bounded OS, tool, and liveness observations to Worker Harness; these remain facts only.
+3. Worker chooses HOW inside the exact semantic step, and every real tool request passes through Host enforcement.
+4. An unknown Linux environment produces an observation, unsupported result, or denial—not capability-driven Host switching or hidden Transfer.
+5. Core independently records authoritative state and result lineage. Headless adapter supplies only service lifecycle and remote presentation.
 
-## 14. 未来接口变化分类
+## 14. Future interface-change classification
 
-| 变化 | 分类 | 当前触点 | 是否改变冻结语义 |
+| Change | Classification | Current touchpoint | Changes frozen semantics? |
 | --- | --- | --- | --- |
-| `HostRuntimeState` / service 从 `AppState` 分离 | 孤立接口抽取 | `main.rs`, `commands.rs` | 否 |
-| `HostEventSink`、path provider、runtime spawner | 孤立接口抽取 | `main.rs`, `discovery.rs`, `transfer.rs`, cleanup | 否 |
-| Tauri command wrapper 与业务 service 分离 | 孤立接口抽取 | `commands.rs`, invoke registration | 否 |
-| primitive-neutral coordinator dispatch seam | 孤立接口抽取 | `continue_bridge_plan_attempt_inner`, `BridgePlanStore` | 否；必须保留 whole-plan fail-closed 直到实现存在 |
-| Worker Harness adapter + tool request/result contract | 孤立接口抽取 | 未来接 coordinator；复用 attempt/step correlation | 否 |
-| two-party → HostRef/participants | 表示迁移（schema v2/protocol v2） | `bridge_plan.rs`, protocol, storage, composer/UI | 否 |
-| Search-first `selected_file` → generic bound input | 表示迁移 | composer, revision builder, ObjectRef/candidate/Inbox | 否 |
-| Host identity / HostRef contract | 表示合同先行 | current device refs、Bridge identity/session | 否；必须先于 Host admission，不能把 admission 固化在 temporary two-party roles 上 |
-| Host admission | 新权限域 | receiver admission、HostRuntime | 否；在 HostRef/HostSessionBinding 合同之后增加额外 fail-closed 条件 |
-| semantic/effect envelope 与 Host tool enforcement | 新权限域 | exact step grants、safe identity、Burn | 否；实现 Transform/Execute 所需但不在本阶段设计 policy |
-| Developer Terminal authority/channel | 新权限域（v0 已实现） | `host_runtime.rs`, `developer_terminal.rs`, Layer 4 identity/session/Burn | 否；平行于 Layer 5；后续只扩展 headless/persistence 表示 |
-| Headless adapter/service binary | 孤立接口抽取后的新 adapter | runtime bootstrap | 否 |
+| Separate `HostRuntimeState` / services from `AppState` | Isolated interface extraction | `main.rs`, `commands.rs` | No |
+| `HostEventSink`, path provider, runtime spawner | Isolated interface extraction | `main.rs`, `discovery.rs`, `transfer.rs`, cleanup | No |
+| Separate Tauri command wrappers from business services | Isolated interface extraction | `commands.rs`, invoke registration | No |
+| Primitive-neutral coordinator dispatch seam | Isolated interface extraction | `continue_bridge_plan_attempt_inner`, `BridgePlanStore` | No; whole-Plan fail-closed remains until implementations exist |
+| Worker Harness adapter and tool request/result contract | Isolated interface extraction | Future coordinator attachment; existing attempt/step correlation | No |
+| Two-party to HostRef/participants | Representation migration: schema v2/protocol v2 | `bridge_plan.rs`, protocol, storage, composer/UI | No |
+| Search-first `selected_file` to generic bound input | Representation migration | Composer, revision builder, ObjectRef/candidates/Inbox | No |
+| Host identity / HostRef contract | Representation-contract prerequisite | Current device refs and Bridge identity/session | No; it must precede Host admission and must not freeze temporary two-party roles |
+| Host admission | New authority domain | Receiver admission and HostRuntime | No; adds another fail-closed condition after HostRef/HostSessionBinding exists |
+| Semantic/effect envelope and Host tool enforcement | New authority domain | Exact step grants, safe identity, Burn | No; needed before Transform/Execute implementation, but policy is not designed here |
+| Developer Terminal authority/channel | New authority domain, v0 implemented | `host_runtime.rs`, `developer_terminal.rs`, Layer 4 identity/session/Burn | No; parallel to Layer 5; future work only extends headless/persistence representation |
+| Headless adapter/service binary | New adapter after isolated extraction | Runtime bootstrap | No |
 
-没有发现必须改变四原语、显式 Transfer 或 immutable authority 模型的 fundamental conflict。
+No fundamental conflict requires changing the four primitives, explicit Transfer, or immutable authority model.
 
-## 15. 编码代理必须遵守的架构不变量
+## 15. Canonical invariants for coding agents
 
-1. Search=find，Transform=modify，Transfer=move，Execute=run；它们是内部 managed IR，不是用户命令语言。
-2. 只有不可变 Plan 中显式创作的 Transfer 才能改变 object location；不得 capability-driven、Agent-driven 或 convenience-driven 自动移动。
-3. Transform 消耗 exact N，在同一 Host 概念性地产生 N+1；Execute 消耗 exact current revision 且不默认产生 filesystem object。
-4. provider、PM、local model、Worker、renderer、capability fact、ObjectRef 与 Layer 4 route 都不是 authority。
-5. Core 独占 Host/object identity、logical revision、topology、semantic hash、approval、attempt、step grant 与 result lineage。
-6. requester approval、Host admission、Layer 5 step authority、Harness tool permission、effect enforcement、DeveloperTerminalGrant 是不同权限域。
-7. Worker 只能为一个 exact approved semantic step 决定 HOW；不得改 Host、拓扑、语义范围或添加 Transfer。
-8. Harness 不得持有或生成持久 Host authority；每个 effect request 由 Host enforcement fail closed。
-9. Developer Mode 平行于 Layer 5，只有人类显式进入；Agent 不能获得或升级为 terminal authority。
-10. Layer 5 决定 semantic eligibility；Layer 3 决定 transport capacity；Layer 4 提供 current-session route/control；Layer 1 执行加密 transfer；Layer 2 只提供事实。
-11. Tauri/Headless adapters 不得拥有或重建 Core authority。
-12. physical path、safe identity 与 ObjectRef resolution 保留在 owning Host；跨边界只传 opaque、bounded、correlated references。
-13. acquisition/binding 不是第五原语，也不是 modification authority；Search 不是唯一对象来源。
-14. Multi-Host migration 必须保持 explicit per-step Host、full semantic hash、session correlation 与 per-step authority，不能静默重解释 v1。
-15. Transform/Execute 在真实 Host implementation 与 enforcement 存在前仍是 whole-plan non-executable；不得部分执行前置 Search/Transfer。
-16. restart、disconnect、expiry 与 Burn 必须使 process-local execution material/terminal authority fail closed。
+1. Search=find, Transform=modify, Transfer=move, Execute=run. They are internal managed IR, not a user command language.
+2. Only an explicitly authored Transfer in the immutable Plan changes object location. Capability-, Agent-, or convenience-driven automatic movement is forbidden.
+3. Transform consumes exact N and conceptually produces N+1 on the same Host. Execute consumes the exact current revision and does not create a filesystem object by default.
+4. Provider, PM, local model, Worker, renderer, capability facts, ObjectRefs, and Layer 4 routes are not authority.
+5. Core exclusively owns Host/object identity, logical revisions, topology, semantic hashes, approvals, attempts, step grants, and result lineage.
+6. Requester approval, Host admission, Layer 5 step authority, Harness tool permission, effect enforcement, and `DeveloperTerminalGrant` are distinct authority domains.
+7. Worker decides HOW for one exact approved semantic step only. It cannot change Host, topology, semantic scope, or add Transfer.
+8. Harness cannot hold or generate durable Host authority. Host enforcement checks every effect request and fails closed.
+9. Developer Mode is parallel to Layer 5 and entered explicitly by a human. An Agent cannot obtain or escalate into terminal authority.
+10. Layer 5 decides semantic eligibility; Layer 3 decides transport capacity; Layer 4 supplies current-session routing/control; Layer 1 performs encrypted transfer; Layer 2 supplies facts only.
+11. Tauri and Headless adapters cannot own or reconstruct Core authority.
+12. Physical paths, safe identity, and ObjectRef resolution remain on the owning Host. Only opaque, bounded, correlated references cross boundaries.
+13. Acquisition/binding is not a fifth primitive or modification authority. Search is not the only object source.
+14. Multi-Host migration must preserve explicit per-step Host, full semantic hash, session correlation, and per-step authority. It cannot silently reinterpret v1.
+15. Transform/Execute remain whole-Plan non-executable until real Host implementations and enforcement exist. Preceding Search/Transfer steps cannot execute partially.
+16. Restart, disconnect, expiry, and Burn invalidate process-local execution material and terminal authority fail closed.
 
-## 16. Freeze 边界
+## 16. Freeze boundary
 
-### 16.1 结构冻结
+### 16.1 Structurally frozen
 
-- 四 primitive 的语义与 location rules；
-- immutable semantic Plan、reviewed topology 与 logical revision dependency；
-- provider/model/renderer non-authority；
-- capability observation non-authority；
-- Layer 4 route/session 与 Layer 5 approval 分离；
-- requester approval、Host-local execution authority 与 per-step grants 分离；
-- Layer 5 eligibility → Layer 3 capacity → Layer 4 session/control → Layer 1 transport 的依赖方向；
-- safe object identity、one-use authority、restart/Burn fail-closed foundations。
-- Agent authority 与 Developer Terminal authority 永久分离。
+- semantics and location rules of the four primitives;
+- immutable semantic Plan, reviewed topology, and logical-revision dependencies;
+- provider/model/renderer non-authority;
+- capability-observation non-authority;
+- separation of Layer 4 route/session from Layer 5 approval;
+- separation of requester approval, Host-local execution authority, and per-step grants;
+- dependency direction: Layer 5 eligibility → Layer 3 capacity → Layer 4 session/control → Layer 1 transport;
+- safe object identity, one-use authority, restart/Burn fail-closed foundations;
+- permanent separation of Agent authority from Developer Terminal authority.
 
-### 16.2 有意不冻结
+### 16.2 Intentionally evolvable
 
-- `requesting_device` / `selected_device` 的 two-party schema；
-- `selected_file`、Search-first Composer 与 filesystem-candidate-only root；
-- Bridge Plan protocol v1 的 requester/receiver wire representation；
-- `AppState` / Tauri-only Host container；
-- Host admission policy 的规则语言；
-- future semantic/effect envelope、tool set、Harness/provider 实现；
-- Developer Terminal channel 与 containment；
-- Headless deployment/management 机制。
+- two-party `requesting_device` / `selected_device` schema;
+- `selected_file`, Search-first Composer, and filesystem-candidate-only root;
+- requester/receiver wire representation in Bridge Plan protocol v1;
+- `AppState` / Tauri-only Host container;
+- Host admission policy language;
+- future semantic/effect envelope, tool set, Harness, and provider implementation;
+- Developer Terminal channel and containment;
+- Headless deployment and management.
 
-表示迁移不得借机改变结构冻结的语义合同。
+Representation migrations must not change the structurally frozen semantic contracts.
 
-## 17. 实现依赖顺序
+## 17. Implementation dependency order
 
 ### Phase 1 — HostRuntime seam
 
-从当前 Tauri `AppState` 抽取/定义 UI-independent HostRuntime boundary，保持现有 Desktop 行为。本阶段不实现 Headless deployment。
+Extract or define a UI-independent HostRuntime boundary from current Tauri `AppState` while retaining existing Desktop behavior. Do not implement Headless deployment in this phase.
 
 ### Phase 2 — Host identity / HostRef contract
 
-先定义 `HostRef`、Plan participants、`HostSessionBinding`，以及 durable/logical Host identity 与当前 Layer 4 session binding 的区别。此阶段可以先完成合同设计，不要求立即迁移全部 wire/storage 表示。
+Define `HostRef`, Plan participants, `HostSessionBinding`, and the distinction between durable/logical Host identity and current Layer 4 session binding. This phase may begin as contract work without immediately migrating all wire/storage representation.
 
-**Host admission 不得直接围绕临时 `requesting_device` / `selected_device` 表示实现。** 否则本地 policy 和 grant 会错误固化 two-party role，而不是绑定稳定的 Plan participant/Host identity。
+**Host admission must not be implemented directly around temporary `requesting_device` / `selected_device`.** Doing so would freeze local policy and grants around two-party roles instead of stable Plan-participant/Host identity.
 
-### Phase 3 — Host admission + generic managed-object binding
+### Phase 3 — Host admission plus generic managed-object binding
 
-在 Host identity 边界确定后，定义 Host-local admission 与通用 managed object acquisition/binding。Binding 必须能扩展到 Search、Inbox、drag/drop、本地选择和 future generated artifact；它不是第五 primitive。
+After the Host identity boundary exists, define Host-local admission and generic managed-object acquisition/binding. Binding must later support Search, Inbox, drag/drop, local selection, and generated artifacts. It is not a fifth primitive.
 
 ### Phase 4 — Multi-Host representation migration
 
-把 two-party Plan、schema、protocol、persistence/correlation 迁移到 HostRef/participants、Plan schema v2 与 Bridge Plan protocol v2，同时保持 immutable Plan、exact Host、explicit Transfer、route-not-consent 和 exact step authority。
+Migrate two-party Plan, schema, protocol, persistence, and correlation to HostRef/participants, Plan schema v2, and Bridge Plan protocol v2 while preserving immutable Plan, exact Host binding, explicit Transfer, route-not-consent, and exact step authority.
 
-### Phase 5 — Effect / control capability domains
+### Phase 5 — Effect and control authority domains
 
-Developer Terminal v0 authority/channel 已作为独立人工权限域实现。此阶段剩余工作是定义并实现 Worker Host effect enforcement 与 semantic/effect envelope；Managed Agent effect authority 与人工 Terminal authority 不得合并或相互升级。
+Developer Terminal v0 authority/channel already exists as an independent human authority domain. Remaining work in this phase is Worker Host effect enforcement and the semantic/effect envelope. Managed Agent effect authority and human Terminal authority must never merge or escalate into one another.
 
 ### Phase 6 — Concrete upper implementations
 
-只有完成上述基础后，才实现 Headless Host daemon/service、本地 2–4B interpreter、Codex-style Worker Harness 或具体 Transform/Execute capability。Developer Terminal v0 已完成最小 desktop vertical slice；headless admission、持久 session 与更完整 terminal emulator 仍依赖后续 HostRuntime/HostRef 工作。
+Only after those foundations should work begin on a Headless Host daemon/service, local 2–4B interpreter, Codex-style Worker Harness, or concrete Transform/Execute capability. Developer Terminal v0 is the first desktop vertical slice; headless admission, persistent sessions, and a fuller terminal emulator still depend on later HostRuntime/HostRef work.
 
-此顺序是依赖关系，不是功能承诺或完整实施计划。
+This order describes architectural dependencies, not a feature commitment or comprehensive implementation plan.
 
-## 18. 代码证据与当前状态
+## 18. Code evidence and current status
 
-本设计核对了当前本地工作树中的：
+This architecture was checked against the current local working tree, including:
 
-- runtime/container：`src-tauri/src/main.rs`、`AppState`、Tauri setup/commands/events/paths；
-- Layer 5：`bridge_plan.rs`、`bridge_plan/protocol.rs`、`commands.rs` 的 revision、approval、attempt、receiver admission、continuation；
-- lower layers：`transfer.rs`、`transfer_orchestration.rs`、`room_control.rs`、`peer_capabilities.rs`、storage/session/Burn；
-- object/security：`object_refs.rs`、`file_candidates.rs`、`safe_file_identity.rs`；
-- frontend/planning：`bridgePlanComposer.ts`、`BridgeProductPages.tsx`、natural-v1、provider instruction/risk scanner、ordinary transfer/Inbox paths；
-- canonical layer/reference/development documentation。
+- runtime/container: `src-tauri/src/main.rs`, `AppState`, Tauri setup/commands/events/paths;
+- Layer 5: revision, approval, attempt, receiver admission, and continuation in `bridge_plan.rs`, `bridge_plan/protocol.rs`, and `commands.rs`;
+- lower layers: `transfer.rs`, `transfer_orchestration.rs`, `room_control.rs`, `peer_capabilities.rs`, and storage/session/Burn paths;
+- object/security: `object_refs.rs`, `file_candidates.rs`, `safe_file_identity.rs`;
+- frontend/planning: `bridgePlanComposer.ts`, `BridgeProductPages.tsx`, natural-v1, provider instruction/risk scanner, and ordinary transfer/Inbox paths;
+- canonical layer, reference, and development documentation.
 
-代码证据确认当前：
+Code evidence confirms that:
 
-- Search/Transfer 可执行；Transform/Execute framework-only 且 whole-plan fail closed；
-- requester command、store-level attempt admission 与 receiver protocol 均保留深层校验；
-- next-step continuation 依据 immutable attempt state，managed/ordinary Transfer 共用 Layer 3 capacity boundary；
-- capability projection 可为空且始终是 observation；
-- 没有 Agent Harness、Worker runtime、managed shell/process runtime 或 patch/mutation engine。Developer Mode v0 的人工 PTY/ConPTY runtime 是独立权限域，不是 Execute/Agent implementation。
+- Search and Transfer execute; Transform and Execute are framework-only and whole-Plan fail closed;
+- requester command, store-level attempt admission, and receiver protocol retain independent deep validation;
+- next-step continuation comes from immutable attempt state, and managed/ordinary Transfer share the Layer 3 capacity boundary;
+- capability projection may be empty and remains observational;
+- no Agent Harness, Worker runtime, managed shell/process runtime, or patch/mutation engine exists. Developer Mode v0's human PTY/ConPTY runtime is a separate authority domain, not an Execute or Agent implementation.
 
-Multi-Host、generic object import、generic/headless Host admission policy、Agent effect envelope 与 Headless Host 仍是概念合同。Developer Mode v0 有本机 Unix PTY 自动化和 Windows cross-compile 证据，但自动化与 cross-compilation 不能证明物理 Mac↔Windows/Linux E2E。
+Multi-Host, generic object import, generic/headless Host admission policy, Agent effect envelope, and Headless Host remain conceptual contracts. Developer Mode v0 has local Unix PTY automation and Windows cross-compilation evidence, but automation and cross-compilation do not prove physical Mac-to-Windows/Linux end-to-end behavior.
