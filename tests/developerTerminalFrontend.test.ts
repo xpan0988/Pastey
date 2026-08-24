@@ -8,6 +8,7 @@ import {
   MAX_TERMINAL_INPUT_FRAME_BYTES,
   OrderedTerminalInputWriter,
   TerminalInputBackpressureError,
+  terminalDimensionsEqual,
   terminalInputBytes,
 } from "../src/lib/developerTerminalFrontend";
 
@@ -119,6 +120,13 @@ test("terminal output events decode bounded binary frames", () => {
   assert.equal(decodeTerminalOutputFrame(btoa("x".repeat(MAX_TERMINAL_INPUT_FRAME_BYTES + 1))), null);
 });
 
+test("terminal resize dimensions suppress identical remote resize reports", () => {
+  assert.equal(terminalDimensionsEqual(null, { cols: 80, rows: 24 }), false);
+  assert.equal(terminalDimensionsEqual({ cols: 80, rows: 24 }, { cols: 80, rows: 24 }), true);
+  assert.equal(terminalDimensionsEqual({ cols: 80, rows: 24 }, { cols: 81, rows: 24 }), false);
+  assert.equal(terminalDimensionsEqual({ cols: 80, rows: 24 }, { cols: 80, rows: 25 }), false);
+});
+
 test("xterm input data is UTF-8 encoded without manual key remapping", () => {
   for (const sequence of [
     "\u007f",
@@ -149,7 +157,7 @@ test("Developer Terminal delegates VT rendering input and cursor behavior to xte
   assert.match(component, /terminal\.onData\(\(data\)/);
   assert.match(component, /inputRef\.current\(terminalInputBytes\(data\)\)/);
   assert.match(component, /listen<DeveloperTerminalOutputEvent>\(DEVELOPER_TERMINAL_OUTPUT_EVENT/);
-  assert.match(component, /terminal\.write\(bytes\)/);
+  assert.match(component, /terminal\.write\(bytes, \(\) => \{/);
   assert.match(component, /outputSequence <= lastOutputSequenceRef\.current/);
   assert.match(component, /windowsPty: environmentLabel === "PowerShell" \? \{ backend: "conpty" \}/);
   assert.doesNotMatch(component, /onKeyDown=/);
@@ -167,11 +175,33 @@ test("Developer Terminal focus is explicit and uses the emulator cursor", () => 
 
 test("Developer Terminal resize uses FitAddon and a bounded debounce", () => {
   const component = readFileSync("src/components/DeveloperTerminalViewport.tsx", "utf8");
+  const styles = readFileSync("src/styles.css", "utf8");
 
   assert.match(component, /new FitAddon\(\)/);
   assert.match(component, /terminal\.onResize\(\(\{ cols, rows \}\)/);
   assert.match(component, /RESIZE_DEBOUNCE_MS = 80/);
-  assert.match(component, /resizeRef\.current\(cols, rows\)/);
+  assert.match(component, /terminalDimensionsEqual\(lastReportedResize, next\)/);
+  assert.match(component, /resizeRef\.current\(next\.cols, next\.rows\)/);
+  assert.match(component, /new ResizeObserver\(scheduleFit\)/);
+  assert.match(component, /observer\?\.observe\(container\)/);
+  assert.match(component, /observer\?\.observe\(container\.parentElement\)/);
+  assert.match(component, /document\.fonts\?\.ready\.then\(scheduleFit\)/);
+  assert.match(component, /settledFitFrame = window\.requestAnimationFrame\(fitAndRefresh\)/);
+  assert.match(component, /terminal\.refresh\(0, terminal\.rows - 1\)/);
+  assert.match(component, /terminal\.write\(bytes, \(\) => \{/);
+  assert.match(component, /postOutputFitPending = false/);
+  assert.match(component, /terminal\.write\(output, \(\) => fitRequestRef\.current\(\)\)/);
+  assert.match(styles, /\.developer-terminal-xterm > \.xterm[\s\S]*padding: 12px/);
+  assert.match(styles, /\.developer-terminal-xterm \{\s*height: 360px;\s*\}/);
+});
+
+test("Developer Terminal fit lifecycle is recreated for each opened session and disposed on close", () => {
+  const component = readFileSync("src/components/DeveloperTerminalViewport.tsx", "utf8");
+  assert.match(component, /\[environmentLabel, roomId, terminalSessionId\]/);
+  assert.match(component, /observer\?\.disconnect\(\)/);
+  assert.match(component, /window\.cancelAnimationFrame\(firstFitFrame\)/);
+  assert.match(component, /window\.cancelAnimationFrame\(settledFitFrame\)/);
+  assert.match(component, /fitRequestRef\.current = \(\) => \{\}/);
 });
 
 test("active Developer Terminal UI hides fresh-request controls and identifies the Host", () => {

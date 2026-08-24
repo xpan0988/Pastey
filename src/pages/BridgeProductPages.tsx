@@ -1965,15 +1965,15 @@ function bridgeSessionId(room: RoomInfo): string {
 
 function bridgeStatus(room: RoomInfo): { label: string; tone: "success" | "neutral" | "warning" | "danger" } {
   if (room.status === "burned") return { label: "Offline", tone: "neutral" };
-  if (room.status === "peer_left") return { label: "Peer left", tone: "neutral" };
+  if (room.status === "peer_left") return { label: "Local only", tone: "neutral" };
   if (room.peer_connected) return { label: "Connected", tone: "success" };
   return { label: "Waiting for peer", tone: "warning" };
 }
 
 function bridgeMemberSummary(room: RoomInfo): { title: string; detail: string } {
-  const remoteNames = connectedRemoteMembers(room).map((peer) => peer.displayName?.trim()).filter(Boolean) as string[];
-  if (remoteNames.length === 0 && room.peer_device_name) {
-    return { title: `${room.peer_device_name} - 1 member`, detail: "Recent" };
+  const remoteNames = currentRemoteMembers(room).map((peer) => peer.displayName?.trim()).filter(Boolean) as string[];
+  if (remoteNames.length === 0 && room.status === "peer_left") {
+    return { title: "Local-only Bridge - 1 member", detail: "This device remains" };
   }
   if (remoteNames.length <= 1) {
     return { title: `${remoteNames[0] ?? "No devices yet"} - ${remoteNames.length || 0} member${remoteNames.length === 1 ? "" : "s"}`, detail: remoteNames.length ? "Current Bridge member" : "Waiting for a device" };
@@ -1987,11 +1987,17 @@ function connectedRemoteMembers(room: RoomInfo) {
   return (room.peers ?? []).filter((peer) => peer.connected && peer.liveness === "connected");
 }
 
+function currentRemoteMembers(room: RoomInfo) {
+  return (room.peers ?? []).filter((peer) => !["left", "stale", "expired"].includes(peer.liveness));
+}
+
 function bridgeSubtitle(room: RoomInfo): string {
-  const members = connectedRemoteMembers(room);
-  if (members.length === 1) return `Connected to ${members[0].displayName ?? room.peer_device_name ?? "device"}`;
-  if (members.length > 1) return `${members.length} members connected`;
-  return room.peer_device_name ? `Recent device: ${room.peer_device_name}` : "Waiting for another device";
+  const connected = connectedRemoteMembers(room);
+  if (connected.length === 1) return `Connected to ${connected[0].displayName ?? room.peer_device_name ?? "device"}`;
+  if (connected.length > 1) return `${connected.length} members connected`;
+  const current = currentRemoteMembers(room);
+  if (current.length > 0) return `${current.length} current member${current.length === 1 ? "" : "s"} disconnected`;
+  return room.status === "peer_left" ? "No remote Bridge members" : "Waiting for another device";
 }
 
 function targetSummary(route: BridgeRoute | null, peers: BridgePeerSession[]): string {

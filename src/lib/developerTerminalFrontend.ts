@@ -10,6 +10,18 @@ export interface DeveloperTerminalOutputEvent {
   dataBase64: string;
 }
 
+export interface TerminalDimensions {
+  cols: number;
+  rows: number;
+}
+
+export function terminalDimensionsEqual(
+  left: TerminalDimensions | null,
+  right: TerminalDimensions,
+): boolean {
+  return left?.cols === right.cols && left.rows === right.rows;
+}
+
 export class TerminalInputBackpressureError extends Error {
   constructor() {
     super("Developer terminal input queue is full. Wait for pending input to be delivered.");

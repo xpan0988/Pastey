@@ -328,8 +328,6 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
             post(diagnostics_pipeline_benchmark_handler)
                 .layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES)),
         )
-        .route("/rooms/:room_id/burn", post(remote_burn_handler))
-        .route("/rooms/:room_id/leave", post(remote_leave_handler))
         .with_state(RoomServerContext {
             state: state.clone(),
             room_id: room.id.clone(),
@@ -2539,21 +2537,6 @@ pub fn update_transfer_window(
     Ok(result)
 }
 
-pub async fn notify_room_burn_with_peer(peer_host: &str, peer_port: u16, room_id: &str) {
-    notify_room_event(peer_host, peer_port, room_id, "burn").await;
-}
-
-pub async fn notify_room_leave(state: Arc<AppState>, room_id: &str) {
-    let Ok(room) = storage::get_room_by_id(&state.paths, room_id) else {
-        return;
-    };
-    let (Some(peer_host), Some(peer_port)) = (room.peer_host, room.peer_port) else {
-        return;
-    };
-
-    notify_room_event(&peer_host, peer_port, room_id, "leave").await;
-}
-
 pub async fn cancel_room_transfers(
     state: Arc<AppState>,
     room_id: &str,
@@ -2646,15 +2629,6 @@ fn active_receiver_final_paths(state: &Arc<AppState>) -> Vec<PathBuf> {
             ActiveFileTransferKind::Sender { .. } => None,
         })
         .collect()
-}
-
-async fn notify_room_event(peer_host: &str, peer_port: u16, room_id: &str, action: &str) {
-    let _ = reqwest::Client::new()
-        .post(format!(
-            "http://{peer_host}:{peer_port}/rooms/{room_id}/{action}"
-        ))
-        .send()
-        .await;
 }
 
 fn map_missing_payload_error(error: std::io::Error) -> AppError {
@@ -4109,51 +4083,6 @@ async fn cancel_file_transfer_handler(
         Some(message),
     );
     Json(TransferOkResponse { ok: true }).into_response()
-}
-
-async fn remote_burn_handler(
-    AxumPath(room_id): AxumPath<String>,
-    State(ctx): State<RoomServerContext>,
-) -> Result<StatusCode, StatusCode> {
-    if room_id != ctx.room_id {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    crate::commands::burn_bridge_scope(ctx.state.clone(), &room_id, false, false)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let state = ctx.state.clone();
-    tokio::spawn(async move {
-        let _ = stop_room_server(state, &room_id).await;
-    });
-    Ok(StatusCode::OK)
-}
-
-async fn remote_leave_handler(
-    AxumPath(room_id): AxumPath<String>,
-    State(ctx): State<RoomServerContext>,
-) -> Result<StatusCode, StatusCode> {
-    if room_id != ctx.room_id {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    // Legacy/internal peer disconnect signal. The user-facing room lifecycle is
-    // Burn Room; a peer disappearing should surface as interrupted connection.
-    let _ = cancel_room_transfers(
-        ctx.state.clone(),
-        &room_id,
-        "Peer disconnected.",
-        false,
-        Some("peer_disconnected"),
-    )
-    .await;
-    storage::mark_peer_left(&ctx.state.paths, &room_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let state = ctx.state.clone();
-    tokio::spawn(async move {
-        let _ = stop_room_server(state, &room_id).await;
-    });
-    Ok(StatusCode::OK)
 }
 
 fn unavailable_room_response(state: &Arc<AppState>, room_id: &str) -> Option<Response> {

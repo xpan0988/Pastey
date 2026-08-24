@@ -64,10 +64,13 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "developer_terminal.resize",
     "developer_terminal.exit",
     "developer_terminal.close",
+    "bridge_membership.departure",
 ];
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
 const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
 const DEVELOPER_TERMINAL_PROTOCOL_FAMILY: &str = "developer_terminal";
+const BRIDGE_MEMBERSHIP_PROTOCOL_FAMILY: &str = "bridge_membership";
+const BRIDGE_MEMBERSHIP_SCHEMA: &str = "pastey-bridge-membership-v1";
 const MAX_TERMINAL_EVENTS_PER_MINUTE: usize = 3_000;
 const MAX_TERMINAL_BURST_EVENTS: usize = 256;
 
@@ -172,6 +175,44 @@ pub(crate) fn peer_capability_event(
         "expiresAt": (now + time::Duration::seconds(MAX_EVENT_LIFETIME_SECONDS)).format(&Rfc3339).map_err(|_| AppError::InvalidInput("Invalid capability event time.".into()))?,
         "previewOnly": false,
         "payload": payload,
+    }))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BridgeDepartureKind {
+    Leave,
+    Burn,
+}
+
+impl BridgeDepartureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Leave => "leave",
+            Self::Burn => "burn",
+        }
+    }
+}
+
+pub(crate) fn bridge_departure_event(
+    kind: BridgeDepartureKind,
+    context: &RoomControlSessionContext,
+) -> AppResult<Value> {
+    let now = OffsetDateTime::now_utc();
+    Ok(serde_json::json!({
+        "schemaVersion": ROOM_CONTROL_SCHEMA,
+        "eventId": format!("bridge-membership-event-{}", uuid::Uuid::new_v4()),
+        "kind": "bridge_membership.departure",
+        "protocolFamily": BRIDGE_MEMBERSHIP_PROTOCOL_FAMILY,
+        "roomRef": context.room_id,
+        "sourceDeviceRef": context.local_session_ref,
+        "targetPeerRef": context.peer_session_ref,
+        "createdAt": now.format(&Rfc3339).map_err(|_| AppError::InvalidInput("Invalid Bridge departure event time.".into()))?,
+        "expiresAt": (now + time::Duration::seconds(MAX_EVENT_LIFETIME_SECONDS)).format(&Rfc3339).map_err(|_| AppError::InvalidInput("Invalid Bridge departure event time.".into()))?,
+        "previewOnly": false,
+        "payload": {
+            "schemaVersion": BRIDGE_MEMBERSHIP_SCHEMA,
+            "departureKind": kind.as_str(),
+        },
     }))
 }
 
@@ -397,6 +438,16 @@ pub struct RoomControlDeliveryReceipt {
     pub event_id: String,
     pub accepted_for_local_inbox: bool,
     pub received_at: String,
+}
+
+/// A fully authenticated and encrypted current-session delivery captured
+/// before local Burn removes route/key material. It contains no reusable
+/// authority and can deliver only the already-validated event to one endpoint.
+pub(crate) struct PreparedRoomControlDelivery {
+    endpoint_url: String,
+    body: Vec<u8>,
+    event_key: [u8; 32],
+    event_id: String,
 }
 
 #[cfg(test)]
@@ -793,6 +844,16 @@ async fn send_room_control_event_internal(
     event: Value,
     bridge_route: Option<Value>,
 ) -> AppResult<RoomControlDeliveryReceipt> {
+    let delivery = prepare_room_control_event(&state, room_id, event, bridge_route)?;
+    deliver_prepared_room_control_event(delivery).await
+}
+
+fn prepare_room_control_event(
+    state: &Arc<AppState>,
+    room_id: &str,
+    event: Value,
+    bridge_route: Option<Value>,
+) -> AppResult<PreparedRoomControlDelivery> {
     let room = storage::get_room_by_id(&state.paths, room_id)?;
     if room.status != RoomStatus::Active {
         return Err(AppError::InvalidInput("Room is not active.".into()));
@@ -840,19 +901,41 @@ async fn send_room_control_event_internal(
         ));
     }
 
+    Ok(PreparedRoomControlDelivery {
+        endpoint_url: format!(
+            "http://{}:{}/rooms/{room_id}/control-events",
+            peer.host, peer.port
+        ),
+        body,
+        event_key,
+        event_id: validated.event_id,
+    })
+}
+
+pub(crate) fn prepare_bridge_departure_delivery(
+    state: &Arc<AppState>,
+    room_id: &str,
+    kind: BridgeDepartureKind,
+) -> AppResult<PreparedRoomControlDelivery> {
+    let context = room_control_session_context(state, room_id)?;
+    let route = selected_peer_control_route(room_id, &context.peer_route_ref);
+    let event = bridge_departure_event(kind, &context)?;
+    prepare_room_control_event(state, room_id, event, Some(route))
+}
+
+pub(crate) async fn deliver_prepared_room_control_event(
+    delivery: PreparedRoomControlDelivery,
+) -> AppResult<RoomControlDeliveryReceipt> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|_| AppError::Network("Room control transport unavailable.".into()))?;
     let response = client
-        .post(format!(
-            "http://{}:{}/rooms/{room_id}/control-events",
-            peer.host, peer.port
-        ))
+        .post(&delivery.endpoint_url)
         .header(header::CONTENT_TYPE.as_str(), CONTROL_CONTENT_TYPE)
         .header(header::ACCEPT.as_str(), CONTROL_RECEIPT_CONTENT_TYPE)
-        .body(body)
+        .body(delivery.body)
         .send()
         .await
         .map_err(|error| {
@@ -889,12 +972,13 @@ async fn send_room_control_event_internal(
         .map_err(|_| AppError::Network("Room control receipt is invalid.".into()))?;
     let receipt_nonce = crypto::decode_nonce(&receipt_envelope.receipt_nonce)
         .map_err(|_| AppError::Network("Room control receipt is invalid.".into()))?;
-    let receipt_plaintext = crypto::decrypt_bytes(&receipt_ciphertext, &event_key, &receipt_nonce)
-        .map_err(|_| AppError::Network("Room control receipt is invalid.".into()))?;
+    let receipt_plaintext =
+        crypto::decrypt_bytes(&receipt_ciphertext, &delivery.event_key, &receipt_nonce)
+            .map_err(|_| AppError::Network("Room control receipt is invalid.".into()))?;
     let receipt: RoomControlDeliveryReceipt = serde_json::from_slice(&receipt_plaintext)
         .map_err(|_| AppError::Network("Room control receipt is invalid.".into()))?;
     if receipt.schema_version != CONTROL_DELIVERY_SCHEMA
-        || receipt.event_id != validated.event_id
+        || receipt.event_id != delivery.event_id
         || !receipt.accepted_for_local_inbox
     {
         return Err(AppError::Network("Room control receipt is invalid.".into()));
@@ -1131,6 +1215,17 @@ pub async fn receive_room_control_event_handler(
                     "Invalid Developer Terminal event.",
                 );
             }
+            if event
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("bridge_membership."))
+            {
+                return control_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_membership_event",
+                    "Invalid Bridge membership event.",
+                );
+            }
             let reason = bridge_plan_validation_reason(&message);
             if event
                 .get("kind")
@@ -1155,6 +1250,79 @@ pub async fn receive_room_control_event_handler(
     };
     if validated.kind.starts_with("bridge_plan.") {
         log_bridge_plan_control_event(&validated, "inbound_validated");
+    }
+    if validated.kind == "bridge_membership.departure" {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        {
+            let mut runtime = ctx.state.room_control.lock();
+            let room_state = runtime.rooms.entry(room_id.clone()).or_default();
+            if is_replayed(room_state, &validated) {
+                return control_error(
+                    StatusCode::CONFLICT,
+                    "event_replayed",
+                    "Room control event was already received.",
+                );
+            }
+            if !accept_rate_limited_event(room_state, now) {
+                return control_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limited",
+                    "Room control event rate exceeded.",
+                );
+            }
+            record_replay_id(
+                &mut room_state.seen_event_ids,
+                &mut room_state.seen_event_id_set,
+                validated.event_id.clone(),
+            );
+        }
+
+        let removed = match storage::remove_departed_bridge_peer(
+            &ctx.state.paths,
+            &room_id,
+            &inbound_peer.peer_session_id,
+        ) {
+            Ok(removed) => removed,
+            Err(_) => {
+                let mut runtime = ctx.state.room_control.lock();
+                if let Some(room_state) = runtime.rooms.get_mut(&room_id) {
+                    forget_replay_id(
+                        &mut room_state.seen_event_ids,
+                        &mut room_state.seen_event_id_set,
+                        &validated.event_id,
+                    );
+                }
+                return control_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "membership_update_failed",
+                    "Bridge membership update failed.",
+                );
+            }
+        };
+        if !removed {
+            return control_error(
+                StatusCode::CONFLICT,
+                "event_replayed",
+                "Room control event was already received.",
+            );
+        }
+
+        let _ = crate::transfer::cancel_room_transfers(
+            ctx.state.clone(),
+            &room_id,
+            "Peer left the Bridge.",
+            false,
+            Some("peer_disconnected"),
+        )
+        .await;
+        if crate::commands::purge_bridge_runtime_authority(&ctx.state, &room_id).is_err() {
+            return control_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "membership_cleanup_failed",
+                "Bridge membership cleanup failed.",
+            );
+        }
+        return encrypted_receipt_response(&event_key, &validated.event_id, &now_iso());
     }
     if validated.kind.starts_with("developer_terminal.") {
         let now = OffsetDateTime::now_utc().unix_timestamp();
@@ -1528,6 +1696,7 @@ fn validate_control_event(
         if raw_kind.starts_with("bridge_plan.")
             || raw_kind.starts_with("peer_capability.")
             || raw_kind.starts_with("developer_terminal.")
+            || raw_kind.starts_with("bridge_membership.")
         {
             &[
                 "schemaVersion",
@@ -1662,6 +1831,23 @@ fn validate_control_event(
             ));
         }
         let _ = crate::developer_terminal::validate_wire_message(&kind, payload)?;
+        (None, None)
+    } else if kind == "bridge_membership.departure" {
+        if string_field(object, "protocolFamily")? != BRIDGE_MEMBERSHIP_PROTOCOL_FAMILY
+            || object.get("previewOnly") != Some(&Value::Bool(false))
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid Bridge membership protocol event.".into(),
+            ));
+        }
+        require_exact_fields(payload, &["schemaVersion", "departureKind"])?;
+        if string_field(payload, "schemaVersion")? != BRIDGE_MEMBERSHIP_SCHEMA
+            || !matches!(string_field(payload, "departureKind")?, "leave" | "burn")
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid Bridge departure event.".into(),
+            ));
+        }
         (None, None)
     } else {
         return Err(AppError::InvalidInput(
@@ -1845,6 +2031,11 @@ fn record_replay_id(queue: &mut VecDeque<String>, set: &mut HashSet<String>, id:
     }
 }
 
+fn forget_replay_id(queue: &mut VecDeque<String>, set: &mut HashSet<String>, id: &str) {
+    set.remove(id);
+    queue.retain(|candidate| candidate != id);
+}
+
 fn is_replayed(room: &RoomControlRoomState, event: &ValidatedControlEvent) -> bool {
     room.seen_event_id_set.contains(&event.event_id)
         || event
@@ -2007,6 +2198,56 @@ mod tests {
         assert!(room.terminal_seen_event_id_set.contains("terminal-event"));
         assert!(room.inbox.is_empty());
         assert!(room.received_at_seconds.is_empty());
+    }
+
+    #[test]
+    fn bridge_departure_event_is_typed_session_bound_and_replay_protected() {
+        let now = OffsetDateTime::now_utc();
+        let context = RoomControlSessionContext {
+            room_id: "room".into(),
+            local_session_ref: "source".into(),
+            peer_session_ref: "target".into(),
+            peer_route_ref: "peer".into(),
+            peer_observation_ref: "observation".into(),
+            peer_connected: true,
+        };
+        for kind in [BridgeDepartureKind::Leave, BridgeDepartureKind::Burn] {
+            let event = bridge_departure_event(kind, &context).unwrap();
+            let validated = validate_control_event(event, "room", "source", "target", now).unwrap();
+            assert_eq!(validated.kind, "bridge_membership.departure");
+            let mut room = RoomControlRoomState::default();
+            assert!(!is_replayed(&room, &validated));
+            record_replay_id(
+                &mut room.seen_event_ids,
+                &mut room.seen_event_id_set,
+                validated.event_id.clone(),
+            );
+            assert!(is_replayed(&room, &validated));
+            assert!(room.inbox.is_empty());
+        }
+
+        let wrong_session = bridge_departure_event(BridgeDepartureKind::Leave, &context).unwrap();
+        assert!(validate_control_event(wrong_session, "room", "other", "target", now).is_err());
+    }
+
+    #[test]
+    fn bridge_departure_rejects_unknown_semantics_and_authority_fields() {
+        let now = OffsetDateTime::now_utc();
+        let context = RoomControlSessionContext {
+            room_id: "room".into(),
+            local_session_ref: "source".into(),
+            peer_session_ref: "target".into(),
+            peer_route_ref: "peer".into(),
+            peer_observation_ref: "observation".into(),
+            peer_connected: true,
+        };
+        let mut unknown = bridge_departure_event(BridgeDepartureKind::Leave, &context).unwrap();
+        unknown["payload"]["departureKind"] = Value::String("disconnect".into());
+        assert!(validate_control_event(unknown, "room", "source", "target", now).is_err());
+
+        let mut authority = bridge_departure_event(BridgeDepartureKind::Burn, &context).unwrap();
+        authority["payload"]["authorityToken"] = Value::String("forbidden".into());
+        assert!(validate_control_event(authority, "room", "source", "target", now).is_err());
     }
 
     #[test]
