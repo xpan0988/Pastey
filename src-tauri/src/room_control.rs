@@ -15,6 +15,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tauri::Emitter;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
@@ -1173,7 +1174,7 @@ pub async fn receive_room_control_event_handler(
             if !accept_terminal_rate_limited_event(room_state, now) {
                 return control_error(
                     StatusCode::TOO_MANY_REQUESTS,
-                    "rate_limited",
+                    "terminal_rate_limited",
                     "Developer Terminal event rate exceeded.",
                 );
             }
@@ -1237,12 +1238,24 @@ pub async fn receive_room_control_event_handler(
                 "Unsupported Developer Terminal event.".into(),
             )),
         };
-        if accepted.is_err() {
-            return control_error(
-                StatusCode::BAD_REQUEST,
-                "terminal_authority_rejected",
-                "Developer Terminal authority rejected the event.",
-            );
+        if let Err(error) = accepted {
+            let (status, code, message) = terminal_control_rejection(&error);
+            return control_error(status, code, message);
+        }
+        if validated.kind == "developer_terminal.output" {
+            if let Ok(output) =
+                crate::developer_terminal::DeveloperTerminalOutputUiEvent::from_message(
+                    &room_id, &message,
+                )
+            {
+                // This local, non-persistent UI notification does not change
+                // terminal authority. The bounded workspace snapshot remains
+                // the fallback if the renderer misses an event.
+                let _ = ctx
+                    .state
+                    .app_handle
+                    .emit(crate::developer_terminal::OUTPUT_UI_EVENT, output);
+            }
         }
         // Terminal traffic is delivered directly to the process-local Host
         // service. It is intentionally absent from ordinary room history and
@@ -1731,6 +1744,34 @@ fn control_error(status: StatusCode, code: &'static str, message: &'static str) 
         .into_response()
 }
 
+fn terminal_control_rejection(error: &AppError) -> (StatusCode, &'static str, &'static str) {
+    let message = error.message();
+    if message.contains("sequence mismatch") {
+        return (
+            StatusCode::CONFLICT,
+            "terminal_sequence_rejected",
+            "Developer Terminal sequence was rejected.",
+        );
+    }
+    if message.contains("authority")
+        || message.contains("grant")
+        || message.contains("session is unavailable")
+        || message.contains("Host session binding")
+        || message.contains("Host mismatch")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "terminal_authority_rejected",
+            "Developer Terminal authority rejected the event.",
+        );
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        "terminal_event_rejected",
+        "Developer Terminal rejected the event.",
+    )
+}
+
 async fn control_response_failure(response: reqwest::Response) -> AppError {
     let status = response.status();
     let error_code = if response.content_length().unwrap_or(0) <= MAX_CONTROL_RESPONSE_BYTES as u64
@@ -1750,7 +1791,11 @@ async fn control_response_failure(response: reqwest::Response) -> AppError {
         Some("event_replayed") => "Room control event was already received.",
         Some("session_mismatch") => "Room control session mismatch.",
         Some("inbox_full") => "Room control inbox is full.",
+        Some("terminal_rate_limited") => "Developer Terminal flow-control limit was reached.",
         Some("rate_limited") => "Room control rate limit was reached.",
+        Some("terminal_sequence_rejected") => "Developer Terminal sequence was rejected.",
+        Some("terminal_authority_rejected") => "Developer Terminal authority rejected the event.",
+        Some("terminal_event_rejected") => "Developer Terminal rejected the event.",
         Some("request_too_large" | "event_too_large") => "Room control event is too large.",
         Some("review_revision_hash_mismatch") => {
             "Bridge Plan review validation failed: review_revision_hash_mismatch."
@@ -1962,6 +2007,41 @@ mod tests {
         assert!(room.terminal_seen_event_id_set.contains("terminal-event"));
         assert!(room.inbox.is_empty());
         assert!(room.received_at_seconds.is_empty());
+    }
+
+    #[test]
+    fn terminal_stream_rate_limit_allows_bounded_bursts_and_rejects_excess() {
+        let mut room = RoomControlRoomState::default();
+        for _ in 0..MAX_TERMINAL_BURST_EVENTS {
+            assert!(accept_terminal_rate_limited_event(&mut room, 10));
+        }
+        assert!(!accept_terminal_rate_limited_event(&mut room, 10));
+        assert!(accept_terminal_rate_limited_event(&mut room, 13));
+        assert!(room.received_at_seconds.is_empty());
+    }
+
+    #[test]
+    fn terminal_rejections_keep_flow_sequence_and_authority_categories_distinct() {
+        assert_eq!(
+            terminal_control_rejection(&AppError::InvalidInput(
+                "Developer terminal input sequence mismatch.".into(),
+            )),
+            (
+                StatusCode::CONFLICT,
+                "terminal_sequence_rejected",
+                "Developer Terminal sequence was rejected.",
+            )
+        );
+        assert_eq!(
+            terminal_control_rejection(&AppError::InvalidInput(
+                "Developer terminal authority is unavailable.".into(),
+            )),
+            (
+                StatusCode::FORBIDDEN,
+                "terminal_authority_rejected",
+                "Developer Terminal authority rejected the event.",
+            )
+        );
     }
 
     #[test]

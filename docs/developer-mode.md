@@ -53,7 +53,8 @@ Current bounds are deliberately narrow:
 - 8 KiB maximum input/output frame;
 - 64-frame bounded PTY output channel, providing backpressure to the blocking reader;
 - 512 KiB bounded controller display buffer;
-- bounded terminal event rate and burst cache;
+- a terminal-specific receiver limit of 3,000 events per minute and 256 events per two-second burst, separate from the ordinary Room Control inbox limit;
+- a 64 KiB controller input queue that coalesces small xterm events into ordered frames and stops without retry on delivery failure;
 - 30-minute UI-session lifetime, 2-minute admission request lifetime, and 30-minute terminal grant/session lifetime.
 
 Terminal content and absolute local paths are not written to ordinary Pastey logs or history.
@@ -67,7 +68,8 @@ The integration is deliberately narrow:
 ```text
 xterm onData(data)
   → UTF-8 bytes
-  → developer_terminal.input
+  → bounded ordered single writer
+  → developer_terminal.input (at most 8 KiB per frame)
 
 container resize
   → FitAddon rows/cols
@@ -75,11 +77,16 @@ container resize
   → developer_terminal.resize
 
 developer_terminal.output
-  → bounded controller snapshot delta
+  → sequence-checked bounded controller buffer
+  → bounded local Tauri output event
   → xterm.write(data)
 ```
 
-The emulator is loaded only when an active terminal exists. It uses a 5,000-line scrollback bound. A changed bounded backend snapshot resets the emulator rather than duplicating or retaining unbounded React history. Clicking the terminal focuses xterm, active sessions are focused automatically, and only focused xterm `onData` is forwarded. Active-session presentation identifies the controlled Host, shell, and state while hiding the fresh Host-selector/request controls.
+The emulator is loaded only when an active terminal exists. It uses a 5,000-line scrollback bound. Input has one in-flight Tauri invoke per terminal session; rapid key events and allowed paste data are coalesced and chunked without changing byte order. Queue overflow is reported as input backpressure, not as lost authority. Close, disconnect, and Burn cancel queued input without retry; strict receiver sequence and replay validation remain unchanged.
+
+Validated output is pushed from the controller Rust process to xterm through a non-persistent local Tauri event. This does not increase network polling cadence: remote terminal frames still use the existing authenticated Room Control transport. The existing 512 KiB workspace output snapshot and its normal Bridge-detail poll remain only a bounded resynchronization fallback when a local UI event is missed. A newer snapshot resets xterm at the corresponding output sequence rather than duplicating history. Clicking the terminal focuses xterm, active sessions are focused automatically, and only focused xterm `onData` is forwarded. Active-session presentation identifies the controlled Host, shell, and state while hiding the fresh Host-selector/request controls.
+
+The 30-minute UI and active-session lifetimes are fixed security bounds. Terminal input does not refresh either lifetime. The one-use start grant is consumed when the Host PTY is created; subsequent input is authorized by the correlated active Host session, which retains the consumed grant only as its process-local binding and revocation record.
 
 ## Platform behavior
 
@@ -87,7 +94,7 @@ On Unix-like Hosts, Pastey opens a real native PTY. `$SHELL` is used only when i
 
 On Windows, `portable-pty` uses the native ConPTY backend and Pastey selects `powershell.exe`. The requester cannot select another executable. Windows GNU cross-compilation verifies the code path, but this is not physical Windows runtime evidence.
 
-The reported first Mac-controller-to-Windows-Host E2E reached an active PowerShell session but showed a blank custom-renderer viewport. Source tracing confirms that the Host reader forwards ConPTY bytes through the bounded PTY queue, typed output frames, Layer 4 delivery, sequence-checked controller buffer, and now `xterm.write()`. No Pastey-owned backend loss point was found in this pass. xterm enables its ConPTY compatibility mode for PowerShell sessions, but the blank-screen symptom remains pending physical Windows retest. When no startup prompt has arrived, the active UI permits input and suggests typing a command such as `echo hello`; the protocol is unchanged.
+The reported Mac-controller-to-Windows-Host physical E2E now reaches and interacts with an active PowerShell terminal. Normal typing works; the rapid-input ordering fix and event-driven local output path in this change still require the physical stress retest below. xterm enables its ConPTY compatibility mode for PowerShell sessions. When no startup prompt has arrived, the active UI permits input and suggests typing a command such as `echo hello`; the protocol is unchanged.
 
 Pastey performs no privilege escalation. The shell has only the privileges of the account running the Pastey Host process.
 
@@ -137,6 +144,15 @@ This checklist is intentionally unclaimed until performed on physical devices.
 - [ ] terminal resize reaches ConPTY
 - [ ] explicit close terminates the session
 - [ ] Burn and disconnect terminate the session
+
+### Rapid-input and revocation stress
+
+- [ ] type normally at high speed; each character arrives once and in order
+- [ ] hold a printable key, then rapidly press Backspace
+- [ ] paste a long allowed command; frames remain ordered and no frame exceeds 8 KiB
+- [ ] send Ctrl+C while output is active
+- [ ] repeat while closing the terminal, burning the Bridge, and disconnecting the network; queued input does not continue after revocation
+- [ ] compare local echo, command-result, and sustained-output latency without increasing Bridge workspace polling frequency
 
 ### Transfer contention
 

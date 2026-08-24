@@ -29,7 +29,8 @@ const matrixAreas = [
   {
     id: "developer-terminal-emulation",
     covers: [
-      "xterm output and native input bytes",
+      "ordered bounded xterm input, paste, and cancellation",
+      "event-driven bounded output with snapshot resynchronization",
       "terminal focus and active-session presentation",
       "bounded fit/resize forwarding",
     ],

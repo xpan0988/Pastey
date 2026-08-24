@@ -1,26 +1,33 @@
 import { FitAddon } from "@xterm/addon-fit";
+import { listen } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useEffect, useRef, useState } from "react";
 
 import {
+  decodeTerminalOutputFrame,
+  DEVELOPER_TERMINAL_OUTPUT_EVENT,
+  type DeveloperTerminalOutputEvent,
   terminalInputBytes,
-  terminalOutputUpdate,
 } from "../lib/developerTerminalFrontend";
 
 const TERMINAL_SCROLLBACK_LINES = 5_000;
 const RESIZE_DEBOUNCE_MS = 80;
 
 export function DeveloperTerminalViewport({
+  roomId,
   terminalSessionId,
   environmentLabel,
   output,
+  outputSequence,
   onInput,
   onResize,
 }: {
+  roomId: string;
   terminalSessionId: string;
   environmentLabel?: string | null;
   output: string;
+  outputSequence: number;
   onInput: (bytes: number[]) => void;
   onResize: (cols: number, rows: number) => void;
 }) {
@@ -28,7 +35,7 @@ export function DeveloperTerminalViewport({
   const terminalRef = useRef<Terminal | null>(null);
   const inputRef = useRef(onInput);
   const resizeRef = useRef(onResize);
-  const previousOutputRef = useRef("");
+  const lastOutputSequenceRef = useRef(0);
   const focusedRef = useRef(false);
   const [focused, setFocused] = useState(false);
 
@@ -60,7 +67,7 @@ export function DeveloperTerminalViewport({
     terminal.loadAddon(fitAddon);
     terminal.open(container);
     terminalRef.current = terminal;
-    previousOutputRef.current = "";
+    lastOutputSequenceRef.current = 0;
 
     const textarea = terminal.textarea;
     const setTerminalFocus = (next: boolean) => {
@@ -75,6 +82,24 @@ export function DeveloperTerminalViewport({
     const dataSubscription = terminal.onData((data) => {
       if (!focusedRef.current) return;
       inputRef.current(terminalInputBytes(data));
+    });
+
+    let unlistenOutput: (() => void) | undefined;
+    let outputListenerCancelled = false;
+    void listen<DeveloperTerminalOutputEvent>(DEVELOPER_TERMINAL_OUTPUT_EVENT, (event) => {
+      const frame = event.payload;
+      if (
+        frame.roomId !== roomId
+        || frame.terminalSessionId !== terminalSessionId
+        || frame.sequence !== lastOutputSequenceRef.current + 1
+      ) return;
+      const bytes = decodeTerminalOutputFrame(frame.dataBase64);
+      if (!bytes) return;
+      terminal.write(bytes);
+      lastOutputSequenceRef.current = frame.sequence;
+    }).then((unlisten) => {
+      if (outputListenerCancelled) unlisten();
+      else unlistenOutput = unlisten;
     });
 
     let resizeTimer: number | undefined;
@@ -107,22 +132,23 @@ export function DeveloperTerminalViewport({
       textarea?.removeEventListener("blur", handleBlur);
       dataSubscription.dispose();
       resizeSubscription.dispose();
+      outputListenerCancelled = true;
+      unlistenOutput?.();
       terminal.dispose();
       terminalRef.current = null;
-      previousOutputRef.current = "";
+      lastOutputSequenceRef.current = 0;
       focusedRef.current = false;
     };
-  }, [environmentLabel, terminalSessionId]);
+  }, [environmentLabel, roomId, terminalSessionId]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
     if (!terminal) return;
-    const update = terminalOutputUpdate(previousOutputRef.current, output);
-    previousOutputRef.current = output;
-    if (update.kind === "none") return;
-    if (update.kind === "reset") terminal.reset();
-    terminal.write(update.data);
-  }, [output, terminalSessionId]);
+    if (outputSequence <= lastOutputSequenceRef.current) return;
+    terminal.reset();
+    terminal.write(output);
+    lastOutputSequenceRef.current = outputSequence;
+  }, [output, outputSequence, terminalSessionId]);
 
   return (
     <div className={`developer-terminal-viewport${focused ? " focused" : ""}`}>
