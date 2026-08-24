@@ -73,6 +73,10 @@ import {
   type SafeSearchScope,
 } from "../lib/bridgePlanComposer";
 import { FILE_TOO_LARGE_MESSAGE, MAX_FILE_SIZE_BYTES } from "../lib/constants";
+import {
+  OrderedTerminalInputWriter,
+  TerminalInputBackpressureError,
+} from "../lib/developerTerminalFrontend";
 import { formatCode, formatTimestamp } from "../lib/format";
 import {
   bridgePlanSearchCandidateMode,
@@ -780,6 +784,7 @@ function DeveloperModePanel({
   const [uiSession, setUiSession] = useState<DeveloperModeUiSession | null>(null);
   const [selectedPeerId, setSelectedPeerId] = useState<string>(peers[0]?.peerSessionId ?? "");
   const [error, setError] = useState<string | null>(null);
+  const terminalInputWriterRef = useRef<OrderedTerminalInputWriter | null>(null);
   const activeController = workspace.sessions.find(
     (session) => session.role === "controller" && session.state === "active",
   );
@@ -796,6 +801,25 @@ function DeveloperModePanel({
       setSelectedPeerId(peers[0]?.peerSessionId ?? "");
     }
   }, [currentController, peers, selectedPeerId]);
+
+  useEffect(() => {
+    terminalInputWriterRef.current?.cancel();
+    terminalInputWriterRef.current = null;
+    if (!activeController || !uiSession) return;
+    const writer = new OrderedTerminalInputWriter(
+      (frame) => sendDeveloperTerminalInput(
+        activeController.terminalSessionId,
+        uiSession.token,
+        frame,
+      ),
+      (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
+    );
+    terminalInputWriterRef.current = writer;
+    return () => {
+      writer.cancel();
+      if (terminalInputWriterRef.current === writer) terminalInputWriterRef.current = null;
+    };
+  }, [activeController?.terminalSessionId, uiSession?.token]);
 
   async function activate() {
     setError(null);
@@ -833,6 +857,7 @@ function DeveloperModePanel({
 
   async function close(session: DeveloperTerminalSession) {
     if (!uiSession) return;
+    terminalInputWriterRef.current?.cancel();
     setError(null);
     try {
       await closeDeveloperTerminal(session.terminalSessionId, uiSession.token);
@@ -843,9 +868,14 @@ function DeveloperModePanel({
   }
 
   function sendTerminalInput(bytes: number[]) {
-    if (!activeController || !uiSession) return;
-    void sendDeveloperTerminalInput(activeController.terminalSessionId, uiSession.token, bytes)
-      .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
+    if (!terminalInputWriterRef.current) return;
+    try {
+      terminalInputWriterRef.current.enqueue(bytes);
+    } catch (cause) {
+      setError(cause instanceof TerminalInputBackpressureError
+        ? cause.message
+        : cause instanceof Error ? cause.message : String(cause));
+    }
   }
 
   function sendTerminalResize(cols: number, rows: number) {
@@ -895,9 +925,11 @@ function DeveloperModePanel({
           {currentController.state === "active" ? (
             <Suspense fallback={<div className="developer-terminal-waiting">Opening terminal emulator…</div>}>
               <DeveloperTerminalViewport
+                roomId={room.id}
                 terminalSessionId={currentController.terminalSessionId}
                 environmentLabel={currentController.environmentLabel}
                 output={currentController.output}
+                outputSequence={currentController.outputSequence}
                 onInput={sendTerminalInput}
                 onResize={sendTerminalResize}
               />

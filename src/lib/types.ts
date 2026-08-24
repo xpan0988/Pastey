@@ -112,6 +112,7 @@ export interface DeveloperTerminalSession {
   targetHostRef: string;
   environmentLabel?: string | null;
   output: string;
+  outputSequence: number;
   terminationReason?: string | null;
   expiresAt: number;
 }

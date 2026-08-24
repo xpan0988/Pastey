@@ -25,6 +25,7 @@ use crate::{
 
 pub const PROTOCOL_FAMILY: &str = "developer_terminal";
 pub const PAYLOAD_SCHEMA: &str = "pastey-developer-terminal-v0";
+pub const OUTPUT_UI_EVENT: &str = "pastey://developer-terminal-output";
 pub const EVENT_KINDS: &[&str] = &[
     "developer_terminal.open_request",
     "developer_terminal.open_accepted",
@@ -75,8 +76,41 @@ pub struct TerminalSessionProjection {
     pub target_host_ref: String,
     pub environment_label: Option<String>,
     pub output: String,
+    pub output_sequence: u64,
     pub termination_reason: Option<String>,
     pub expires_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeveloperTerminalOutputUiEvent {
+    pub room_id: String,
+    pub terminal_session_id: String,
+    pub sequence: u64,
+    pub data_base64: String,
+}
+
+impl DeveloperTerminalOutputUiEvent {
+    pub fn from_message(room_id: &str, message: &TerminalMessage) -> AppResult<Self> {
+        let data_base64 = message
+            .data_base64
+            .clone()
+            .ok_or_else(|| AppError::InvalidInput("Developer terminal frame is missing.".into()))?;
+        let bytes = STANDARD
+            .decode(&data_base64)
+            .map_err(|_| AppError::InvalidInput("Developer terminal frame is invalid.".into()))?;
+        if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES || message.sequence == 0 {
+            return Err(AppError::InvalidInput(
+                "Developer terminal frame is too large.".into(),
+            ));
+        }
+        Ok(Self {
+            room_id: room_id.into(),
+            terminal_session_id: message.terminal_session_id.clone(),
+            sequence: message.sequence,
+            data_base64,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -743,6 +777,7 @@ impl DeveloperTerminalService {
                     &session.output.iter().copied().collect::<Vec<_>>(),
                 )
                 .into_owned(),
+                output_sequence: session.last_output_sequence,
                 termination_reason: session.termination_reason.clone(),
                 expires_at: session.expires_at,
             })
@@ -759,6 +794,7 @@ impl DeveloperTerminalService {
                     target_host_ref: session.binding.target_host.0.clone(),
                     environment_label: Some(session.environment_label.clone()),
                     output: String::new(),
+                    output_sequence: 0,
                     termination_reason: session.termination_reason.clone(),
                     expires_at: session.grant.expires_at,
                 }),
@@ -1309,6 +1345,84 @@ mod tests {
     }
 
     #[test]
+    fn rapid_controller_input_allocation_keeps_authority_and_sequence_order() {
+        let service = DeveloperTerminalService::default();
+        let ui = service.enter_mode("room", 10);
+        let open = service.request_open(&ui.token, binding(), 10).unwrap();
+        {
+            let mut state = service.state.lock();
+            state
+                .controller_sessions
+                .get_mut(&open.terminal_session_id)
+                .unwrap()
+                .state = TerminalState::Active;
+        }
+        for expected_sequence in 1..=600 {
+            let (_, input) = service
+                .prepare_input(&ui.token, &open.terminal_session_id, b"x", 10)
+                .unwrap();
+            assert_eq!(input.sequence, expected_sequence);
+        }
+        let state = service.state.lock();
+        let session = state
+            .controller_sessions
+            .get(&open.terminal_session_id)
+            .unwrap();
+        assert_eq!(session.state, TerminalState::Active);
+        assert_eq!(session.next_input_sequence, 601);
+    }
+
+    #[test]
+    fn terminal_input_does_not_extend_fixed_security_lifetimes() {
+        let service = DeveloperTerminalService::default();
+        let ui = service.enter_mode("room", 10);
+        let open = service.request_open(&ui.token, binding(), 10).unwrap();
+        let original_expiry = {
+            let mut state = service.state.lock();
+            let session = state
+                .controller_sessions
+                .get_mut(&open.terminal_session_id)
+                .unwrap();
+            session.state = TerminalState::Active;
+            session.expires_at
+        };
+        service
+            .prepare_input(&ui.token, &open.terminal_session_id, b"x", 11)
+            .unwrap();
+        assert_eq!(
+            service
+                .state
+                .lock()
+                .controller_sessions
+                .get(&open.terminal_session_id)
+                .unwrap()
+                .expires_at,
+            original_expiry
+        );
+        assert!(service
+            .prepare_input(&ui.token, &open.terminal_session_id, b"x", original_expiry,)
+            .is_err());
+    }
+
+    #[test]
+    fn output_ui_event_is_bounded_and_contains_only_correlated_frame_data() {
+        let mut message = TerminalMessage::base(&binding(), "developer-terminal:test");
+        message.sequence = 7;
+        message.data_base64 = Some(STANDARD.encode(b"bounded output"));
+        let event = DeveloperTerminalOutputUiEvent::from_message("room", &message).unwrap();
+        assert_eq!(event.room_id, "room");
+        assert_eq!(event.terminal_session_id, "developer-terminal:test");
+        assert_eq!(event.sequence, 7);
+        assert_eq!(
+            STANDARD.decode(event.data_base64).unwrap(),
+            b"bounded output"
+        );
+
+        message.data_base64 = Some(STANDARD.encode(vec![0; MAX_FRAME_BYTES + 1]));
+        assert!(DeveloperTerminalOutputUiEvent::from_message("room", &message).is_err());
+    }
+
+    #[test]
     fn purge_room_models_disconnect_and_burn_revocation() {
         let service = DeveloperTerminalService::default();
         let ui = service.enter_mode("room", 10);
@@ -1353,6 +1467,12 @@ mod tests {
             )
             .unwrap();
         service.receive_input(&binding(), &input, 10).unwrap();
+        {
+            let state = service.state.lock();
+            let host = state.host_sessions.get(&open.terminal_session_id).unwrap();
+            assert!(host.grant.consumed_for_start);
+            assert!(!host.grant.revoked);
+        }
         assert!(service.receive_input(&binding(), &input, 10).is_err());
 
         let (_, resize) = service
@@ -1364,7 +1484,14 @@ mod tests {
             .prepare_output(&open.terminal_session_id, b"ok", 10)
             .unwrap();
         service.receive_output(&binding(), &output).unwrap();
-        assert_eq!(service.workspace("room", 10).sessions[0].output, "ok");
+        let workspace = service.workspace("room", 10);
+        let controller = workspace
+            .sessions
+            .iter()
+            .find(|session| session.role == TerminalRole::Controller)
+            .unwrap();
+        assert_eq!(controller.output, "ok");
+        assert_eq!(controller.output_sequence, 1);
 
         let (_, close) = service
             .close_from_controller(&controller_ui.token, &open.terminal_session_id, 10)

@@ -13,6 +13,10 @@ Detailed update and release history for Pastey.
 
 ### Fixed / Changed
 
+- Serialized xterm input through a bounded one-writer queue. Rapid typing, key repeat, and allowed paste data now preserve byte order, coalesce small events, and use at most 8 KiB per wire frame without weakening strict receiver sequencing or replay rejection.
+- Corrected the rapid-input failure path where concurrent Tauri invokes could deliver strict sequence frames out of order, a valid receiver rejection disconnected the controller session, and later concurrent input obscured the cause as `Developer terminal authority is unavailable`.
+- Classified terminal flow-control, sequence, authority, and generic event rejection separately. The first rejected send stops queued input without hidden retry, so a rate or sequence failure is not overwritten by a later authority error.
+- Replaced output visibility through the 1.6-second workspace poll with bounded local Tauri output events written directly to xterm. The existing bounded controller snapshot remains a resynchronization fallback; network terminal transport cadence is unchanged.
 - Replaced the custom `<pre>` terminal renderer, ANSI-stripping regex, and manual React key map with lazy-loaded `@xterm/xterm` plus `@xterm/addon-fit`. xterm now owns VT rendering, the blinking cursor, native terminal key sequences, focus, wrapping, and resize fitting.
 - Active Developer Mode now identifies the controlled Host, shell, and state while hiding fresh-request controls. Terminal input is forwarded only from focused xterm `onData`, and resize delivery is debounced.
 - Traced the reported blank PowerShell viewport from ConPTY through the bounded output queue, typed Layer 4 frame, controller buffer, and xterm write boundary. No Pastey backend loss was identified; physical Windows confirmation remains pending.
@@ -30,7 +34,7 @@ Detailed update and release history for Pastey.
 ### Known limitations
 
 - Developer Mode v0 is desktop-to-desktop. There is no headless admission policy, persistent/resumable or multi-tab terminal, arbitrary process API, Agent access, or privilege escalation.
-- Windows/ConPTY is cross-compiled but the reported blank-screen path has not been physically retested after the xterm integration; no new physical Mac↔Windows/Linux E2E PASS claim is made.
+- A reported Mac-controller-to-Windows-Host run confirms interactive PowerShell and normal typing. Rapid-input ordering, paste, revocation-under-load, and the new local output-event path still require physical cross-device stress retesting; no complete physical Mac↔Windows/Linux E2E PASS claim is made.
 
 ## 1.9.2 — Core architecture and Layer 5 semantic freeze — 2026-08-19
 

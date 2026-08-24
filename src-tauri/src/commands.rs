@@ -3084,6 +3084,21 @@ async fn send_developer_terminal_message(
     .await
 }
 
+fn developer_terminal_delivery_failure_reason(error: &AppError) -> &'static str {
+    let message = error.message();
+    if message.contains("flow-control") || message.contains("rate limit") {
+        "flow_control_rejected"
+    } else if message.contains("sequence") {
+        "sequence_rejected"
+    } else if message.contains("authority") {
+        "remote_authority_rejected"
+    } else if matches!(error, AppError::Timeout(_) | AppError::Network(_)) {
+        "transport_disconnected"
+    } else {
+        "delivery_failed"
+    }
+}
+
 #[tauri::command]
 pub async fn request_developer_terminal(
     room_id: String,
@@ -3255,10 +3270,11 @@ pub async fn send_developer_terminal_input(
     {
         Ok(_) => Ok(true),
         Err(error) => {
+            let reason = developer_terminal_delivery_failure_reason(&error);
             state
                 .host_runtime
                 .developer_terminal
-                .abort_controller_session(&terminal_session_id, "transport_disconnected");
+                .abort_controller_session(&terminal_session_id, reason);
             Err(error.message())
         }
     }
@@ -3294,10 +3310,11 @@ pub async fn resize_developer_terminal(
     {
         Ok(_) => Ok(true),
         Err(error) => {
+            let reason = developer_terminal_delivery_failure_reason(&error);
             state
                 .host_runtime
                 .developer_terminal
-                .abort_controller_session(&terminal_session_id, "transport_disconnected");
+                .abort_controller_session(&terminal_session_id, reason);
             Err(error.message())
         }
     }
@@ -4547,5 +4564,33 @@ mod tests {
             "[pastey:agent-bridge] event=summary url=file:///Users/pastey-secret/Documents/private.pdf"
         )
         .is_err());
+    }
+
+    #[test]
+    fn developer_terminal_delivery_failures_preserve_bounded_diagnostic_category() {
+        assert_eq!(
+            developer_terminal_delivery_failure_reason(&AppError::Network(
+                "Developer Terminal flow-control limit was reached.".into(),
+            )),
+            "flow_control_rejected"
+        );
+        assert_eq!(
+            developer_terminal_delivery_failure_reason(&AppError::Network(
+                "Developer Terminal sequence was rejected.".into(),
+            )),
+            "sequence_rejected"
+        );
+        assert_eq!(
+            developer_terminal_delivery_failure_reason(&AppError::Network(
+                "Developer Terminal authority rejected the event.".into(),
+            )),
+            "remote_authority_rejected"
+        );
+        assert_eq!(
+            developer_terminal_delivery_failure_reason(&AppError::Timeout(
+                "Room control delivery timed out.".into(),
+            )),
+            "transport_disconnected"
+        );
     }
 }
