@@ -13,6 +13,8 @@ Detailed update and release history for Pastey.
 
 ### Fixed / Changed
 
+- Corrected intermittent Developer Terminal bottom-row clipping by aligning xterm padding with FitAddon geometry, observing the terminal container and active-layout wrapper, performing a bounded post-layout/font-ready fit and redraw, and suppressing duplicate remote resize reports.
+- Replaced legacy unauthenticated remote `/leave` and `/burn` callbacks with a typed, encrypted, replay-checked current-session `bridge_membership.departure` event. An explicit local leave/Burn now removes only the authenticated departing peer from the survivor's current membership and revokes its runtime authority; it never remotely Burns the survivor's Bridge. Temporary disconnect continues to retain membership for reconnect.
 - Serialized xterm input through a bounded one-writer queue. Rapid typing, key repeat, and allowed paste data now preserve byte order, coalesce small events, and use at most 8 KiB per wire frame without weakening strict receiver sequencing or replay rejection.
 - Corrected the rapid-input failure path where concurrent Tauri invokes could deliver strict sequence frames out of order, a valid receiver rejection disconnected the controller session, and later concurrent input obscured the cause as `Developer terminal authority is unavailable`.
 - Classified terminal flow-control, sequence, authority, and generic event rejection separately. The first rejected send stops queued input without hidden retry, so a rate or sequence failure is not overwritten by a later authority error.

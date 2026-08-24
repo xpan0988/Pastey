@@ -5,7 +5,7 @@ use std::{
 };
 
 use mime_guess::MimeGuess;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use sanitize_filename::sanitize;
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
@@ -390,46 +390,103 @@ pub fn update_room_peer(
     Ok(())
 }
 
-pub fn mark_peer_left(paths: &AppPaths, room_id: &str) -> AppResult<()> {
-    let conn = connection(paths)?;
-    conn.execute(
-        r#"
-        UPDATE rooms
-        SET peer_host = NULL,
-            peer_port = NULL,
-            peer_transport_public_key = NULL,
-            status = ?1
-        WHERE id = ?2 AND status != 'burned'
-        "#,
-        params![RoomStatus::PeerLeft.as_str(), room_id],
+/// Removes one authenticated current-session peer from Bridge membership.
+/// Durable paired-device identity is intentionally stored separately and is
+/// not deleted. Other current members, including temporarily disconnected
+/// members, remain in the Bridge.
+pub fn remove_departed_bridge_peer(
+    paths: &AppPaths,
+    room_id: &str,
+    peer_session_id: &str,
+) -> AppResult<bool> {
+    let mut conn = connection(paths)?;
+    let tx = conn.transaction()?;
+    let removed = tx.execute(
+        "DELETE FROM bridge_peers WHERE room_id = ?1 AND peer_session_id = ?2",
+        params![room_id, peer_session_id],
     )?;
-    conn.execute(
-        "UPDATE bridge_peers SET liveness = ?1, endpoint_host = NULL, endpoint_port = NULL, transport_public_key = NULL, updated_at = ?2 WHERE room_id = ?3",
-        params![BridgePeerLiveness::Left.as_str(), now_ts(), room_id],
-    )?;
-    Ok(())
-}
+    if removed == 0 {
+        tx.commit()?;
+        return Ok(false);
+    }
 
-#[cfg(test)]
-pub fn mark_peer_burned(paths: &AppPaths, room_id: &str) -> AppResult<()> {
-    let conn = connection(paths)?;
-    conn.execute(
-        r#"
-        UPDATE rooms
-        SET peer_host = NULL,
-            peer_port = NULL,
-            peer_transport_public_key = NULL,
-            status = ?1,
-            peer_burned_at = ?2
-        WHERE id = ?3 AND status != 'burned'
-        "#,
-        params![RoomStatus::PeerLeft.as_str(), now_ts(), room_id],
+    let remaining_members = tx.query_row(
+        "SELECT COUNT(*) FROM bridge_peers WHERE room_id = ?1 AND liveness IN ('connected', 'reconnecting', 'disconnected')",
+        [room_id],
+        |row| row.get::<_, i64>(0),
     )?;
-    conn.execute(
-        "UPDATE bridge_peers SET liveness = ?1, endpoint_host = NULL, endpoint_port = NULL, transport_public_key = NULL, updated_at = ?2 WHERE room_id = ?3",
-        params![BridgePeerLiveness::Left.as_str(), now_ts(), room_id],
-    )?;
-    Ok(())
+    let connected_peer = tx
+        .query_row(
+            r#"
+            SELECT display_name, endpoint_host, endpoint_port, transport_public_key
+            FROM bridge_peers
+            WHERE room_id = ?1
+              AND liveness = 'connected'
+              AND endpoint_host IS NOT NULL
+              AND endpoint_port IS NOT NULL
+              AND transport_public_key IS NOT NULL
+            ORDER BY updated_at DESC, peer_session_id DESC
+            LIMIT 1
+            "#,
+            [room_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    if let Some((display_name, host, port, transport_key)) = connected_peer {
+        tx.execute(
+            r#"
+            UPDATE rooms
+            SET peer_device_name = ?1,
+                peer_host = ?2,
+                peer_port = ?3,
+                peer_transport_public_key = ?4,
+                status = 'active',
+                peer_burned_at = NULL
+            WHERE id = ?5 AND status != 'burned'
+            "#,
+            params![display_name, host, port, transport_key, room_id],
+        )?;
+    } else {
+        let status = if remaining_members > 0 {
+            RoomStatus::Active
+        } else {
+            RoomStatus::PeerLeft
+        };
+        let remaining_name = if remaining_members > 0 {
+            tx.query_row(
+                "SELECT display_name FROM bridge_peers WHERE room_id = ?1 AND liveness IN ('connected', 'reconnecting', 'disconnected') ORDER BY updated_at DESC, peer_session_id DESC LIMIT 1",
+                [room_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        } else {
+            None
+        };
+        tx.execute(
+            r#"
+            UPDATE rooms
+            SET peer_device_name = ?1,
+                peer_host = NULL,
+                peer_port = NULL,
+                peer_transport_public_key = NULL,
+                status = ?2,
+                peer_burned_at = NULL
+            WHERE id = ?3 AND status != 'burned'
+            "#,
+            params![remaining_name, status.as_str(), room_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
 }
 
 pub fn legacy_bridge_peer_session_id(room_id: &str) -> String {
@@ -1215,18 +1272,6 @@ pub fn burned_bridge_ids(paths: &AppPaths) -> AppResult<Vec<String>> {
     Ok(ids)
 }
 
-pub fn leave_room(paths: &AppPaths, room_id: &str) -> AppResult<Option<StoredRoom>> {
-    let room = get_room_by_id(paths, room_id).ok();
-    if room.is_none() {
-        return Ok(None);
-    }
-
-    // Internal disconnect cleanup only. Product-level room ending is Burn Room,
-    // while this path preserves metadata and saved Inbox output.
-    mark_peer_left(paths, room_id)?;
-    Ok(room)
-}
-
 pub fn cleanup_expired_rooms_except(
     paths: &AppPaths,
     excluded_room_ids: &[String],
@@ -1378,9 +1423,16 @@ pub fn room_to_info_with_bridge_peers(
     let mut info = room_to_info(room, master_key)?;
     let mut peers = Vec::new();
     for peer in list_bridge_peer_endpoints(paths, &room_id)? {
+        if matches!(
+            peer.liveness,
+            BridgePeerLiveness::Left | BridgePeerLiveness::Stale | BridgePeerLiveness::Expired
+        ) {
+            continue;
+        }
         let identity = active_durable_identity_for_peer(paths, &peer)?;
         peers.push(bridge_peer_endpoint_to_info(peer, identity));
     }
+    info.peer_connected = peers.iter().any(|peer| peer.connected);
     info.peers = peers;
     Ok(info)
 }
@@ -2403,10 +2455,10 @@ mod tests {
         assert!(info.peers.iter().any(|peer| {
             peer.peer_session_id == "legacy-room-peer:room:reconnect:1" && peer.connected
         }));
-        assert!(info.peers.iter().any(|peer| {
-            peer.peer_session_id == "legacy-room-peer:room"
-                && peer.liveness == BridgePeerLiveness::Stale
-        }));
+        assert!(info
+            .peers
+            .iter()
+            .all(|peer| peer.peer_session_id != "legacy-room-peer:room"));
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 
@@ -2667,10 +2719,10 @@ mod tests {
                 && peer.durable_identity_id.as_deref()
                     == Some(identity.durable_identity_id.as_str())
         }));
-        assert!(info.peers.iter().any(|peer| {
-            peer.peer_session_id == "legacy-room-peer:room"
-                && peer.liveness == BridgePeerLiveness::Stale
-        }));
+        assert!(info
+            .peers
+            .iter()
+            .all(|peer| peer.peer_session_id != "legacy-room-peer:room"));
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 
@@ -2734,8 +2786,8 @@ mod tests {
     }
 
     #[test]
-    fn peer_left_marks_bridge_peers_unrouteable_without_durable_trust() {
-        let paths = test_paths("pastey_bridge_peer_table_left");
+    fn authenticated_departure_removes_current_membership_but_preserves_known_identity() {
+        let paths = test_paths("pastey_bridge_peer_authenticated_departure");
         init_database(&paths).unwrap();
         let master_key = crypto::random_key();
         create_room(
@@ -2758,16 +2810,128 @@ mod tests {
             RoomStatus::Active,
         )
         .unwrap();
+        let identity = pair_bridge_peer(
+            &paths,
+            "room",
+            "legacy-room-peer:room",
+            Some("Known laptop"),
+        )
+        .unwrap();
 
-        mark_peer_left(&paths, "room").unwrap();
+        assert!(remove_departed_bridge_peer(&paths, "room", "legacy-room-peer:room").unwrap());
 
         let peers = list_bridge_peer_endpoints(&paths, "room").unwrap();
+        assert!(peers.is_empty());
+        let room = get_room_by_id(&paths, "room").unwrap();
+        assert_eq!(room.status, RoomStatus::PeerLeft);
+        assert_eq!(room.peer_device_name, None);
+        assert_eq!(room.peer_host, None);
+        assert_eq!(room.peer_transport_public_key, None);
+        let info = room_to_info_with_bridge_peers(&paths, room, &master_key).unwrap();
+        assert!(info.peers.is_empty());
+        assert!(!info.peer_connected);
+        assert_eq!(
+            get_bridge_durable_identity(&paths, &identity.durable_identity_id)
+                .unwrap()
+                .display_label,
+            "Known laptop"
+        );
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn authenticated_departure_does_not_remove_unrelated_current_members() {
+        let paths = test_paths("pastey_bridge_peer_departure_keeps_other_members");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        update_room_peer(
+            &paths,
+            "room",
+            Some("127.0.0.1"),
+            Some(9000),
+            Some("Departing"),
+            Some("peer-key-a"),
+            RoomStatus::Active,
+        )
+        .unwrap();
+        upsert_bridge_peer_endpoint(
+            &paths,
+            &StoredBridgePeerEndpoint {
+                room_id: "room".into(),
+                peer_session_id: "peer:b".into(),
+                display_name: Some("Remaining".into()),
+                endpoint_host: Some("127.0.0.2".into()),
+                endpoint_port: Some(9001),
+                transport_public_key: Some("peer-key-b".into()),
+                liveness: BridgePeerLiveness::Connected,
+                join_method: BridgePeerJoinMethod::NearbyAccept,
+                durable_identity_id: None,
+                updated_at: now_ts() + 1,
+            },
+        )
+        .unwrap();
+
+        assert!(remove_departed_bridge_peer(&paths, "room", "legacy-room-peer:room").unwrap());
+        let peers = list_bridge_peer_endpoints(&paths, "room").unwrap();
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].liveness, BridgePeerLiveness::Left);
-        assert_eq!(peers[0].endpoint_host, None);
-        assert_eq!(peers[0].endpoint_port, None);
-        assert_eq!(peers[0].transport_public_key, None);
-        assert_eq!(peers[0].durable_identity_id, None);
+        assert_eq!(peers[0].peer_session_id, "peer:b");
+        let room = get_room_by_id(&paths, "room").unwrap();
+        assert_eq!(room.status, RoomStatus::Active);
+        assert_eq!(room.peer_device_name.as_deref(), Some("Remaining"));
+        assert_eq!(
+            room.peer_transport_public_key.as_deref(),
+            Some("peer-key-b")
+        );
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn temporary_disconnect_retains_current_membership_for_reconnect() {
+        let paths = test_paths("pastey_bridge_peer_disconnect_retains_membership");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        update_room_peer(
+            &paths,
+            "room",
+            Some("127.0.0.1"),
+            Some(9000),
+            Some("Device"),
+            Some("peer-key"),
+            RoomStatus::Active,
+        )
+        .unwrap();
+        let conn = connection(&paths).unwrap();
+        conn.execute(
+            "UPDATE bridge_peers SET liveness = 'disconnected', endpoint_host = NULL, endpoint_port = NULL WHERE room_id = 'room'",
+            [],
+        )
+        .unwrap();
+
+        let room = get_room_by_id(&paths, "room").unwrap();
+        let info = room_to_info_with_bridge_peers(&paths, room, &master_key).unwrap();
+        assert_eq!(info.peers.len(), 1);
+        assert_eq!(info.peers[0].liveness, BridgePeerLiveness::Disconnected);
+        assert!(!info.peers[0].connected);
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 
@@ -2802,47 +2966,6 @@ mod tests {
         let peers = list_bridge_peer_endpoints(&paths, "room").unwrap();
         assert!(peers.is_empty());
         assert!(is_burned_bridge(&paths, "room").unwrap());
-        let _ = fs::remove_dir_all(paths.app_data_dir);
-    }
-
-    #[test]
-    fn peer_burn_marks_bridge_peers_left_without_durable_trust() {
-        let paths = test_paths("pastey_bridge_peer_table_peer_burn");
-        init_database(&paths).unwrap();
-        let master_key = crypto::random_key();
-        create_room(
-            &paths,
-            &master_key,
-            "123456",
-            5,
-            LocalRole::Creator,
-            Some("room".into()),
-            None,
-        )
-        .unwrap();
-        update_room_peer(
-            &paths,
-            "room",
-            Some("127.0.0.1"),
-            Some(9000),
-            Some("Device"),
-            Some("peer-key"),
-            RoomStatus::Active,
-        )
-        .unwrap();
-
-        mark_peer_burned(&paths, "room").unwrap();
-
-        let peers = list_bridge_peer_endpoints(&paths, "room").unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].liveness, BridgePeerLiveness::Left);
-        assert_eq!(peers[0].endpoint_host, None);
-        assert_eq!(peers[0].endpoint_port, None);
-        assert_eq!(peers[0].transport_public_key, None);
-        assert_eq!(peers[0].durable_identity_id, None);
-        let room = get_room_by_id(&paths, "room").unwrap();
-        assert_eq!(room.status, RoomStatus::PeerLeft);
-        assert!(room.peer_burned_at.is_some());
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 

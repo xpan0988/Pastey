@@ -8,6 +8,8 @@ An accepted peer is admitted through a nearby accept, 8-digit join, or equivalen
 
 Bridge is not durable history. The peer table holds the current-session endpoint, liveness, join method, `peer_session_id`, and optional paired-device display reference. On reconnect with a changed host, port, or transport public key, Pastey creates a new `peer_session_id`, marks the old route stale, clears its endpoint/key material, and rejects old routes as expired. Old routes do not rebind. Startup recovery expires prior connected rows and clears runtime endpoint material.
 
+Temporary route loss changes liveness/reachability but does not by itself remove current Bridge membership. Explicit leave/Burn is different: before local cleanup removes route keys, the departing Host creates a typed encrypted `bridge_membership.departure` event bound to the exact authenticated current session. The receiver deletes only that peer's current membership/route, revokes Bridge-scoped runtime authority bound to the departed session, and retains its own local Bridge. Paired-device display identity may remain separately. The event is a membership fact, never permission to Burn another Host.
+
 Liveness values are `connected`, `reconnecting`, `disconnected`, `left`, `stale`, and `expired`. Only a connected peer with endpoint/key material is routeable.
 
 ## Paired-device display identity
@@ -34,7 +36,7 @@ The Bridge detail panel uses one serialized control-inbox pump. Active nontermin
 
 ## Lifecycle boundaries
 
-Leave, disconnect, burn, and startup recovery invalidate current-session work as applicable; they do not create durable history, durable route recovery, or authority. Burn first cuts authority off, then removes routes, active server/transfer state, room-control inbox/replay/rate state, candidate/Plan workflow state, Bridge membership, items, and reusable room material. It preserves user-saved final Inbox files and an independent paired-device display identity only. The durable Burn tombstone is opaque and non-sensitive; it is not product history. Replay, delivery receipts, control inbox entries, logs, and approval records cannot cross a Bridge session as authority.
+Disconnect, explicit departure, Burn, and startup recovery invalidate current-session work as applicable; they do not create durable route recovery or authority. Disconnect retains membership for a possible reconnect. Explicit authenticated departure removes the departing peer from current membership but does not delete the survivor's Bridge. Local Burn first cuts local authority off, then removes that Host's routes, active server/transfer state, room-control inbox/replay/rate state, candidate/Plan workflow state, Bridge membership, items, and reusable room material. It preserves user-saved final Inbox files and an independent paired-device display identity only. The durable Burn tombstone is opaque and non-sensitive; it is not product history. Replay, delivery receipts, control inbox entries, logs, and approval records cannot cross a Bridge session as authority.
 
 ## Current limitations
 

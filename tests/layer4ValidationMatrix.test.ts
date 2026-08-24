@@ -42,3 +42,19 @@ test("Layer 4 validation runner keeps matrix evidence grouped by invariant", () 
   assert.match(runner, /storage::tests::/);
   assert.match(runner, /bridge_route_payload/);
 });
+
+test("explicit Bridge departure is authenticated membership convergence, not remote Burn", () => {
+  const roomControl = readFileSync("src-tauri/src/room_control.rs", "utf8");
+  const transfer = readFileSync("src-tauri/src/transfer.rs", "utf8");
+  const commands = readFileSync("src-tauri/src/commands.rs", "utf8");
+
+  assert.match(roomControl, /"bridge_membership\.departure"/);
+  assert.match(roomControl, /remove_departed_bridge_peer/);
+  assert.match(roomControl, /purge_bridge_runtime_authority/);
+  assert.match(commands, /prepare_bridge_departure_delivery/);
+  assert.match(commands, /deliver_prepared_room_control_event/);
+  assert.doesNotMatch(transfer, /rooms\/:room_id\/burn/);
+  assert.doesNotMatch(transfer, /rooms\/:room_id\/leave/);
+  assert.doesNotMatch(transfer, /remote_burn_handler/);
+  assert.doesNotMatch(transfer, /remote_leave_handler/);
+});

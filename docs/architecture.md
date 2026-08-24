@@ -16,6 +16,8 @@ Layer 2 facts are observations, not commands or authority. Layer 4 delivery is n
 
 Developer Mode v0 is an upper Host capability domain parallel to Layer 5. It reuses Layer 4 identity/session/encrypted control and Burn lifecycle but requires separate two-human admission and a dedicated terminal grant. It creates no Plan step or managed revision. See [Developer Mode](developer-mode.md).
 
+Bridge departure is also current-session and authenticated. Temporary disconnect retains membership for reconnect; explicit leave/Burn removes only the departing peer from the survivor's current membership and revokes authority bound to that peer. Burn remains local destructive cleanup and cannot be requested remotely as a control shortcut.
+
 ## Canonical object-flow model
 
 ```text

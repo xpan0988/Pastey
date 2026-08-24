@@ -1130,7 +1130,12 @@ button.candidate-metadata-card:hover,
 
 .developer-terminal-xterm {
   height: 360px;
+}
+
+/* FitAddon subtracts padding from xterm's own element, not its parent. */
+.developer-terminal-xterm > .xterm {
   padding: 12px;
+  box-sizing: border-box;
 }
 
 .developer-terminal-focus-hint {

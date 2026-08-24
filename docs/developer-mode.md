@@ -72,7 +72,9 @@ xterm onData(data)
   → developer_terminal.input (at most 8 KiB per frame)
 
 container resize
-  → FitAddon rows/cols
+  → ResizeObserver on the xterm container/layout wrapper
+  → bounded post-layout FitAddon fit + redraw
+  → changed rows/cols only
   → bounded debounce
   → developer_terminal.resize
 
@@ -84,7 +86,7 @@ developer_terminal.output
 
 The emulator is loaded only when an active terminal exists. It uses a 5,000-line scrollback bound. Input has one in-flight Tauri invoke per terminal session; rapid key events and allowed paste data are coalesced and chunked without changing byte order. Queue overflow is reported as input backpressure, not as lost authority. Close, disconnect, and Burn cancel queued input without retry; strict receiver sequence and replay validation remain unchanged.
 
-Validated output is pushed from the controller Rust process to xterm through a non-persistent local Tauri event. This does not increase network polling cadence: remote terminal frames still use the existing authenticated Room Control transport. The existing 512 KiB workspace output snapshot and its normal Bridge-detail poll remain only a bounded resynchronization fallback when a local UI event is missed. A newer snapshot resets xterm at the corresponding output sequence rather than duplicating history. Clicking the terminal focuses xterm, active sessions are focused automatically, and only focused xterm `onData` is forwarded. Active-session presentation identifies the controlled Host, shell, and state while hiding the fresh Host-selector/request controls.
+Validated output is pushed from the controller Rust process to xterm through a non-persistent local Tauri event. This does not increase network polling cadence: remote terminal frames still use the existing authenticated Room Control transport. The existing 512 KiB workspace output snapshot and its normal Bridge-detail poll remain only a bounded resynchronization fallback when a local UI event is missed. A newer snapshot resets xterm at the corresponding output sequence rather than duplicating history. The active terminal fits from its container at mount, after the active-layout transition, after fonts settle, on observed container/layout size changes, and once after first output; it does not fit on every output frame. Identical row/column results are not resent to the Host. Clicking the terminal focuses xterm, active sessions are focused automatically, and only focused xterm `onData` is forwarded. Active-session presentation identifies the controlled Host, shell, and state while hiding the fresh Host-selector/request controls.
 
 The 30-minute UI and active-session lifetimes are fixed security bounds. Terminal input does not refresh either lifetime. The one-use start grant is consumed when the Host PTY is created; subsequent input is authorized by the correlated active Host session, which retains the consumed grant only as its process-local binding and revocation record.
 
@@ -103,9 +105,10 @@ Pastey performs no privilege escalation. The shell has only the privileges of th
 - **Open:** both humans explicitly enter/accept; the Host consumes one start grant and starts the PTY.
 - **Deny:** the pending request becomes terminal and creates no grant or process.
 - **Close/exit:** authority is revoked, the PTY/process is terminated or observed exited, and late frames are rejected.
-- **Disconnect/leave:** Room Control teardown purges terminal state and terminates the Host PTY.
+- **Temporary disconnect:** terminal state and the PTY are revoked under the existing fail-closed lifecycle, but Bridge membership is retained so the peer may reconnect through a new current route/session.
+- **Explicit leave:** the leaving device performs its own local destructive cleanup and sends an authenticated membership-departure event captured before route material is removed. The remaining Host removes only that exact peer's current membership/route and purges authority bound to it; it does not Burn its own Bridge.
 - **Restart:** all terminal UI sessions, grants, bindings, and PTYs are process-local and are not restored.
-- **Burn:** Burn cuts authority off and purges terminal state/PTY through the same Bridge cleanup boundary. Late traffic cannot recreate it.
+- **Burn:** Burn cuts local authority off and purges local terminal state/PTY through the same Bridge cleanup boundary. If a current peer is reachable, the authenticated departure fact updates that peer's membership; it cannot trigger a full remote Burn. Late traffic cannot recreate the departed binding.
 - **Reconnect:** there is no transparent resume; a new human admission and grant are required.
 
 ## Managed Workspace and Agent separation

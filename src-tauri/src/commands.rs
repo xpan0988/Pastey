@@ -3375,8 +3375,21 @@ pub fn delete_temp_file(path: String, state: State<'_, Arc<AppState>>) -> Result
 
 #[tauri::command]
 pub async fn burn_room(room_id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
-    run_async(async move { burn_bridge_scope(state.inner().clone(), &room_id, true, true).await })
-        .await
+    run_async(async move {
+        let state = state.inner().clone();
+        let departure = crate::room_control::prepare_bridge_departure_delivery(
+            &state,
+            &room_id,
+            crate::room_control::BridgeDepartureKind::Burn,
+        )
+        .ok();
+        let result = burn_bridge_scope(state, &room_id, true).await;
+        if let Some(delivery) = departure {
+            let _ = crate::room_control::deliver_prepared_room_control_event(delivery).await;
+        }
+        result
+    })
+    .await
 }
 
 /// Purges all ephemeral execution authority for one Bridge. Lock acquisition
@@ -3412,11 +3425,7 @@ pub(crate) async fn burn_bridge_scope(
     state: Arc<AppState>,
     room_id: &str,
     stop_server: bool,
-    notify_peer: bool,
 ) -> AppResult<bool> {
-    let peer = storage::get_room_by_id(&state.paths, room_id)
-        .ok()
-        .and_then(|room| room.peer_host.zip(room.peer_port));
     if !storage::cut_off_bridge_authority(&state.paths, room_id)? {
         return Ok(false);
     }
@@ -3444,11 +3453,6 @@ pub(crate) async fn burn_bridge_scope(
     if let Err(error) = storage::finalize_burned_room(&state.paths, room_id, &effective_inbox_dir) {
         cleanup_error.get_or_insert(error);
     }
-    if notify_peer {
-        if let Some((peer_host, peer_port)) = peer {
-            let _ = transfer::notify_room_burn_with_peer(&peer_host, peer_port, room_id).await;
-        }
-    }
     if let Some(error) = cleanup_error {
         return Err(error);
     }
@@ -3458,20 +3462,18 @@ pub(crate) async fn burn_bridge_scope(
 #[tauri::command]
 pub async fn leave_room(room_id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
     run_async(async move {
-        // Internal legacy disconnect cleanup. This is not a user-facing room
-        // lifecycle action; Burn Room is the product-level terminal action.
-        let _ = transfer::cancel_room_transfers(
-            state.inner().clone(),
+        let state = state.inner().clone();
+        let departure = crate::room_control::prepare_bridge_departure_delivery(
+            &state,
             &room_id,
-            "Transfer cancelled",
-            true,
-            Some("peer_disconnected"),
+            crate::room_control::BridgeDepartureKind::Leave,
         )
-        .await;
-        transfer::notify_room_leave(state.inner().clone(), &room_id).await;
-        let removed = storage::leave_room(&state.paths, &room_id)?.is_some();
-        let _ = transfer::stop_room_server(state.inner().clone(), &room_id).await;
-        Ok(removed)
+        .ok();
+        let result = burn_bridge_scope(state, &room_id, true).await;
+        if let Some(delivery) = departure {
+            let _ = crate::room_control::deliver_prepared_room_control_event(delivery).await;
+        }
+        result
     })
     .await
 }

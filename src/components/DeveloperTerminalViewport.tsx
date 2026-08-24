@@ -7,7 +7,9 @@ import { useEffect, useRef, useState } from "react";
 import {
   decodeTerminalOutputFrame,
   DEVELOPER_TERMINAL_OUTPUT_EVENT,
+  terminalDimensionsEqual,
   type DeveloperTerminalOutputEvent,
+  type TerminalDimensions,
   terminalInputBytes,
 } from "../lib/developerTerminalFrontend";
 
@@ -33,6 +35,7 @@ export function DeveloperTerminalViewport({
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
+  const fitRequestRef = useRef<() => void>(() => {});
   const inputRef = useRef(onInput);
   const resizeRef = useRef(onResize);
   const lastOutputSequenceRef = useRef(0);
@@ -68,6 +71,7 @@ export function DeveloperTerminalViewport({
     terminal.open(container);
     terminalRef.current = terminal;
     lastOutputSequenceRef.current = 0;
+    let postOutputFitPending = true;
 
     const textarea = terminal.textarea;
     const setTerminalFocus = (next: boolean) => {
@@ -84,6 +88,49 @@ export function DeveloperTerminalViewport({
       inputRef.current(terminalInputBytes(data));
     });
 
+    let resizeTimer: number | undefined;
+    let pendingResize: TerminalDimensions | null = null;
+    let lastReportedResize: TerminalDimensions | null = null;
+    const resizeSubscription = terminal.onResize(({ cols, rows }) => {
+      pendingResize = { cols, rows };
+      if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        const next = pendingResize;
+        pendingResize = null;
+        if (!next || terminalDimensionsEqual(lastReportedResize, next)) return;
+        lastReportedResize = next;
+        resizeRef.current(next.cols, next.rows);
+      }, RESIZE_DEBOUNCE_MS);
+    });
+
+    let firstFitFrame = 0;
+    let settledFitFrame = 0;
+    let disposed = false;
+    const fitAndRefresh = () => {
+      if (!container.isConnected || container.clientWidth === 0 || container.clientHeight === 0) return;
+      fitAddon.fit();
+      if (terminal.rows > 0) terminal.refresh(0, terminal.rows - 1);
+    };
+    const scheduleFit = () => {
+      if (disposed) return;
+      window.cancelAnimationFrame(firstFitFrame);
+      window.cancelAnimationFrame(settledFitFrame);
+      firstFitFrame = window.requestAnimationFrame(() => {
+        fitAndRefresh();
+        // One additional frame covers the active-session layout transition and
+        // font metric stabilization without fitting continuously on output.
+        settledFitFrame = window.requestAnimationFrame(fitAndRefresh);
+      });
+    };
+    fitRequestRef.current = scheduleFit;
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(scheduleFit);
+    observer?.observe(container);
+    if (container.parentElement) observer?.observe(container.parentElement);
+    scheduleFit();
+    void document.fonts?.ready.then(scheduleFit);
+
     let unlistenOutput: (() => void) | undefined;
     let outputListenerCancelled = false;
     void listen<DeveloperTerminalOutputEvent>(DEVELOPER_TERMINAL_OUTPUT_EVENT, (event) => {
@@ -95,38 +142,24 @@ export function DeveloperTerminalViewport({
       ) return;
       const bytes = decodeTerminalOutputFrame(frame.dataBase64);
       if (!bytes) return;
-      terminal.write(bytes);
+      terminal.write(bytes, () => {
+        if (!postOutputFitPending) return;
+        postOutputFitPending = false;
+        scheduleFit();
+      });
       lastOutputSequenceRef.current = frame.sequence;
     }).then((unlisten) => {
       if (outputListenerCancelled) unlisten();
       else unlistenOutput = unlisten;
     });
 
-    let resizeTimer: number | undefined;
-    const resizeSubscription = terminal.onResize(({ cols, rows }) => {
-      if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
-      resizeTimer = window.setTimeout(() => {
-        resizeRef.current(cols, rows);
-      }, RESIZE_DEBOUNCE_MS);
-    });
-
-    let animationFrame = 0;
-    const fit = () => {
-      window.cancelAnimationFrame(animationFrame);
-      animationFrame = window.requestAnimationFrame(() => {
-        if (container.isConnected) fitAddon.fit();
-      });
-    };
-    const observer = typeof ResizeObserver === "undefined"
-      ? null
-      : new ResizeObserver(fit);
-    observer?.observe(container);
-    fit();
     window.requestAnimationFrame(() => terminal.focus());
 
     return () => {
+      disposed = true;
       observer?.disconnect();
-      window.cancelAnimationFrame(animationFrame);
+      window.cancelAnimationFrame(firstFitFrame);
+      window.cancelAnimationFrame(settledFitFrame);
       if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
       textarea?.removeEventListener("focus", handleFocus);
       textarea?.removeEventListener("blur", handleBlur);
@@ -136,6 +169,7 @@ export function DeveloperTerminalViewport({
       unlistenOutput?.();
       terminal.dispose();
       terminalRef.current = null;
+      fitRequestRef.current = () => {};
       lastOutputSequenceRef.current = 0;
       focusedRef.current = false;
     };
@@ -146,7 +180,7 @@ export function DeveloperTerminalViewport({
     if (!terminal) return;
     if (outputSequence <= lastOutputSequenceRef.current) return;
     terminal.reset();
-    terminal.write(output);
+    terminal.write(output, () => fitRequestRef.current());
     lastOutputSequenceRef.current = outputSequence;
   }, [output, outputSequence, terminalSessionId]);
 
