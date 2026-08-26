@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::{
     error::{AppError, AppResult},
+    host_identity::{project_legacy_plan_participants, HostRef, LegacyPlanParticipantProjection},
     models::PipelineHandoffMetadata,
     storage::AppPaths,
 };
@@ -439,7 +440,7 @@ impl BridgePlanStep {
             | Self::Execute { output_slots, .. } => output_slots,
         }
     }
-    fn operation(&self) -> StepOperation {
+    pub(crate) fn operation(&self) -> StepOperation {
         match self {
             Self::Search { .. } => StepOperation::Search,
             Self::Transform { .. } => StepOperation::Transform,
@@ -1648,6 +1649,7 @@ fn create_delete_guards(conn: &Connection) -> AppResult<()> {
         BEGIN SELECT RAISE(ABORT, 'Bridge Plan results are removed only by scoped Burn'); END;
         "#,
     )?;
+    crate::bridge_plan_v2::init_schema(conn)?;
     Ok(())
 }
 
@@ -1666,6 +1668,24 @@ pub(crate) fn canonical_revision_hash(revision: &BridgePlanRevision) -> AppResul
         "{HASH_VERSION}:{}",
         blake3::hash(format!("{HASH_VERSION}\0{canonical}").as_bytes()).to_hex()
     ))
+}
+
+/// Additive Phase 2 view of current v1 device tokens. This never enters the
+/// revision payload, persistence, protocol, or semantic hash. Phase 4 will
+/// replace it with native participants rather than reinterpreting v1.
+#[allow(dead_code)]
+pub(crate) fn legacy_participant_projection(
+    revision: &BridgePlanRevision,
+    resolved_hosts: &BTreeMap<String, HostRef>,
+) -> AppResult<Vec<LegacyPlanParticipantProjection>> {
+    project_legacy_plan_participants(
+        &revision.plan_id,
+        [
+            revision.requesting_device_ref.clone(),
+            revision.selected_device_ref.clone(),
+        ],
+        resolved_hosts,
+    )
 }
 
 /// Deterministically lowers one immutable revision into a platform-neutral
@@ -2619,9 +2639,11 @@ impl<'a> BridgePlanStore<'a> {
         tx.commit()?;
         Ok(())
     }
-    /// Phase 2 admission boundary. The graph is compiled from the stored
+    /// Deep attempt-creation defense. The graph is compiled from the stored
     /// immutable revision inside the same transaction that consumes approval
-    /// and creates the attempt; callers cannot supply a graph.
+    /// and creates the attempt; callers cannot supply a graph. Generic Host
+    /// admission is a distinct HostRuntime boundary and does not replace this
+    /// requester-side approval check.
     pub(crate) fn create_attempt_from_approval(
         &self,
         attempt_id: &str,
@@ -2956,7 +2978,8 @@ pub(crate) fn reconcile_startup(paths: &AppPaths, now: i64) -> AppResult<usize> 
         tx.execute("INSERT OR IGNORE INTO bridge_plan_activities (activity_id, bridge_id, plan_id, revision_id, attempt_id, occurred_at, activity_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![activity.activity_id, activity.bridge_id, activity.plan_id, activity.revision_id, activity.attempt_id, activity.occurred_at, json(&activity)?])?;
     }
     tx.commit()?;
-    Ok(interrupted_count)
+    let v2_interrupted = crate::bridge_plan_v2::reconcile_startup(paths)?;
+    Ok(interrupted_count + v2_interrupted)
 }
 pub(crate) fn delete_bridge_records(paths: &AppPaths, bridge_id: &str) -> AppResult<()> {
     let mut conn = connection(paths)?;
@@ -2971,6 +2994,7 @@ pub(crate) fn delete_bridge_records(paths: &AppPaths, bridge_id: &str) -> AppRes
     }
     drop_delete_guards(&tx)?;
     protocol::delete_bridge_records(&tx, bridge_id)?;
+    crate::bridge_plan_v2::delete_bridge_records(&tx, bridge_id)?;
     tx.execute("DELETE FROM bridge_plans WHERE bridge_id = ?1", [bridge_id])?;
     create_delete_guards(&tx)?;
     tx.commit()?;
@@ -3899,6 +3923,30 @@ mod tests {
         ])
         .unwrap();
         assert_ne!(first.revision_hash, second.revision_hash);
+    }
+
+    #[test]
+    fn phase_two_participant_projection_does_not_reinterpret_v1_hashes() {
+        let revision = build(vec![search("B")]).unwrap();
+        let original_hash = canonical_revision_hash(&revision).unwrap();
+        let resolved = BTreeMap::from([
+            (
+                revision.requesting_device_ref.clone(),
+                HostRef::from_device_id("requesting-host").unwrap(),
+            ),
+            (
+                revision.selected_device_ref.clone(),
+                HostRef::from_device_id("selected-host").unwrap(),
+            ),
+        ]);
+
+        let participants = legacy_participant_projection(&revision, &resolved).unwrap();
+        assert_eq!(participants.len(), 2);
+        assert!(participants
+            .iter()
+            .all(|participant| participant.host_ref.is_some()));
+        assert_eq!(canonical_revision_hash(&revision).unwrap(), original_hash);
+        assert_eq!(revision.revision_hash, original_hash);
     }
 
     #[test]

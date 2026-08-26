@@ -2,17 +2,40 @@
 
 Detailed update and release history for Pastey.
 
+Version 1.9.2 is the previous frozen Layer 1–5 baseline. The current `Unreleased` section is the 1.9.3 Phase 1–5 architecture, runtime, and security foundation scope. Version 2.0.0 is reserved for the planned Phase 6 managed Agent product milestone; Phase 6 is not implemented.
+
 ## Unreleased
 
 ### Added
 
-- Implemented Developer Mode v0 as a human-only authority domain parallel to Layer 5: explicit local entry, exact current Host/session binding, remote human admission, a dedicated process-local `DeveloperTerminalGrant`, and a minimal UI-independent `HostRuntimeState` terminal service.
+- Implemented Phase 5's generic managed authority substrate: domain-separated exact authority contexts and envelopes, monotone policy intersection, managed-run lifecycle, resource/process/network effect dimensions, deterministic tool lowering, replay/sequence/budget control, and ordered Host-authenticated evidence.
+- Added Host-private managed revision, workspace overlay, output-slot, and scratch resolution over the existing managed-object and safe-identity boundary. Authoritative revisions remain immutable; only Core may accept sealed output as future lineage.
+- Added an unattached real macOS execution-world adapter with contained process lifecycle and a Host-owned independently scoped TCP/DNS broker. Linux and Windows execution worlds fail closed as unavailable; execution worlds retain no ambient/raw network authority.
+- Added a crate-private one-use v2 managed-step claim and result-validation seam. Core alone may validate evidence and register exact same-Host Transform N+1 or an Execute result; no Tauri, Layer 4, PM, Worker, or live product caller reaches it.
+
+- Implemented Phase 4 as a parallel native `bridge-plan-v2` representation with Plan-scoped `HostRef` participants, generic managed-object roots, explicit per-step Host topology, exact logical revisions, dependencies, and a distinct `bridge-plan-revision-hash-v2` domain. V1 schema, hashes, protocol, UI, and Search/Transfer execution remain unchanged.
+- Added Bridge Plan protocol v2 review/start events and separate immutable revision, approval, review, replay, and attempt persistence. Authenticated sender/target HostRefs must match the current session, and an exact correlated attempt start requires fresh Host admission before an accepted attempt record exists.
+- Added v2 topology and lifecycle validation for participant/Host mismatch, stale sessions, hidden movement, exact Transfer revision/location tracking, review/admission correlation, v1/v2 replay isolation, whole-Plan Transform/Execute denial, restart interruption, and Burn deletion.
+- Implemented Phase 3 generic Host-local admission over an exact stored approval, immutable Plan revision/hash, Plan participant/HostRef, and freshly revalidated HostSessionBinding. Admit decisions contain only exact Host-bound Search/Transfer work and bounded constraints; denial is fail closed and no admission is a step grant or modification authority.
+- Added a Host-private generic managed-object acquisition/binding service for Search results, Inbox items, drag/drop, local selection, generated roots, and exact Transfer receipts. Current direct local selection and selected Search results use its v1 compatibility adapter without changing `selected_file`, Plan hashes, protocol payloads, or Transfer behavior.
+- Implemented the additive Phase 2 Host identity contract: a Core-owned `HostRef` derived from the persistent installation identity, Plan-scoped role-neutral participant references, and an exact expiring `HostSessionBinding` over logical Hosts plus the current Layer 4 session/route.
+- Added an optional backward-compatible HostRef exchange to the existing room join handshake and a nullable logical Host association on current `bridge_peers`. Legacy peers may omit the field; no Bridge Plan v1 payload, protocol message, schema, or revision hash changed.
+- Implemented the Phase 1 UI-independent `HostRuntime` seam. The existing Layer 1–5 stores/services, Developer Terminal service, startup reconciliation, shutdown invalidation, explicit paths/configuration, Host event sink, and runtime task spawning now live behind one Host-owned container while Desktop behavior remains Tauri-backed.
+- Implemented Developer Mode v0 as a human-only authority domain parallel to Layer 5: explicit local entry, exact current Host/session binding, remote human admission, a dedicated process-local `DeveloperTerminalGrant`, and the UI-independent `HostRuntime` terminal service.
 - Added typed open/accept/deny/input/output/resize/exit/close terminal messages over the existing authenticated encrypted Bridge control transport. Terminal streams bypass ordinary room history and use bounded frames, buffers, sequencing, replay checks, and backpressure.
 - Added real Unix PTY support with a bounded Host-owned shell policy and Windows PowerShell support through the native ConPTY backend.
 - Added a minimal Bridge Developer Mode UI for Host selection, admission, terminal interaction, resize, state display, and explicit close.
 
 ### Fixed / Changed
 
+- Renamed the roadmap-derived `phase5_v2.rs` module to `managed_execution.rs`, renamed `Phase5AuthorityStateV1` to the durable `EffectAuthorityStateV1`, and replaced the process-private `phase5-managed-resources` directory label with `managed-execution-resources`. Frozen attachment/hash-domain strings remain unchanged.
+- Normalized Cargo, Tauri, npm, and lockfile application metadata to 1.9.3 and aligned canonical documentation around the 1.9.2 baseline, 1.9.3 Phase 1–5 foundations, and planned 2.0.0 Phase 6 boundary.
+- Kept v2 Layer 4 delivery separate from topology and consent: the wire carries logical participants while the receiving Host resolves current session evidence locally. V2 admission creates no execution/step grant, so current Search/Transfer behavior remains exclusively on the unchanged v1 compatibility path.
+- Kept generic Host admission distinct from requester approval, Layer 4 identity/liveness, capability facts, object presence, and one-use step grants. Bridge Plan v1 retains its exact receiver review/start authority path; mandatory native admission attaches with schema/protocol v2 rather than reinterpreting v1.
+- Preserved Host-private paths and ObjectRef privacy while adding explicit logical object revision and Host location. Acquisition always creates revision 1 for a new root; only an explicit Transfer receipt may rebind an existing exact revision, and acquisition never creates N+1.
+- Separated the Developer Terminal's existing session-derived v0 endpoint/binding types from durable `HostRef` and managed Plan identity. Terminal grants, wire messages, two-human admission, restart/disconnect/Burn revocation, and Layer 5 separation are unchanged.
+- Added fail-closed Host identity/session validation for malformed or self-identical identity, conflicting association within one current peer session, stale/replaced routes, disconnect, restart recovery, expiry, and Burn. Route and liveness remain evidence only and create no admission or Layer 5 authority.
+- Reduced Tauri coupling to the Desktop bootstrap and invoke adapter: `main.rs` now owns window/plugin/path discovery plus concrete event/task adapters, while discovery, transfers, Room Control terminal notifications, cleanup, startup, and Host background dispatch use the injected runtime interfaces. That Phase 1 extraction added no identity, admission, Multi-Host, Headless, Worker, or Transform/Execute behavior.
 - Corrected intermittent Developer Terminal bottom-row clipping by aligning xterm padding with FitAddon geometry, observing the terminal container and active-layout wrapper, performing a bounded post-layout/font-ready fit and redraw, and suppressing duplicate remote resize reports.
 - Replaced legacy unauthenticated remote `/leave` and `/burn` callbacks with a typed, encrypted, replay-checked current-session `bridge_membership.departure` event. An explicit local leave/Burn now removes only the authenticated departing peer from the survivor's current membership and revokes its runtime authority; it never remotely Burns the survivor's Bridge. Temporary disconnect continues to retain membership for reconnect.
 - Serialized xterm input through a bounded one-writer queue. Rapid typing, key repeat, and allowed paste data now preserve byte order, coalesce small events, and use at most 8 KiB per wire frame without weakening strict receiver sequencing or replay rejection.
@@ -37,6 +60,7 @@ Detailed update and release history for Pastey.
 
 - Developer Mode v0 is desktop-to-desktop. There is no headless admission policy, persistent/resumable or multi-tab terminal, arbitrary process API, Agent access, or privilege escalation.
 - A reported Mac-controller-to-Windows-Host run confirms interactive PowerShell and normal typing. Rapid-input ordering, paste, revocation-under-load, and the new local output-event path still require physical cross-device stress retesting; no complete physical Mac↔Windows/Linux E2E PASS claim is made.
+- The 1.9.3 managed authority substrate is not a live Agent product path. Worker Harness, managed Transform/Execute coordination, PM/planner integration, and the v2 product/UI flow begin with the planned Phase 6 / 2.0.0 milestone.
 
 ## 1.9.2 — Core architecture and Layer 5 semantic freeze — 2026-08-19
 

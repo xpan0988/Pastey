@@ -6,7 +6,7 @@ Bridge is Pastey's ephemeral, current-session device workspace. This document ow
 
 An accepted peer is admitted through a nearby accept, 8-digit join, or equivalent explicit session join. A routeable peer additionally has a current connected endpoint and transport key in `bridge_peers`. Neither accepted nor routeable means a known, paired, consented, or execution-authorized device.
 
-Bridge is not durable history. The peer table holds the current-session endpoint, liveness, join method, `peer_session_id`, and optional paired-device display reference. On reconnect with a changed host, port, or transport public key, Pastey creates a new `peer_session_id`, marks the old route stale, clears its endpoint/key material, and rejects old routes as expired. Old routes do not rebind. Startup recovery expires prior connected rows and clears runtime endpoint material.
+Bridge is not durable history. The peer table holds the current-session endpoint, liveness, join method, `peer_session_id`, optional logical `HostRef` association, and optional paired-device display reference. The HostRef is learned through an additive join-handshake field and is identity only: it does not make the row routeable, paired, admitted, approved, or capable. Older peers may omit it. On reconnect with a changed host, port, or transport public key, Pastey creates a new `peer_session_id`, marks the old route stale, clears its endpoint/key material, and rejects old routes as expired. Old routes do not rebind; the new current session must establish its own HostRef association. Startup recovery expires prior connected rows and clears runtime endpoint material.
 
 Temporary route loss changes liveness/reachability but does not by itself remove current Bridge membership. Explicit leave/Burn is different: before local cleanup removes route keys, the departing Host creates a typed encrypted `bridge_membership.departure` event bound to the exact authenticated current session. The receiver deletes only that peer's current membership/route, revokes Bridge-scoped runtime authority bound to the departed session, and retains its own local Bridge. Paired-device display identity may remain separately. The event is a membership fact, never permission to Burn another Host.
 
@@ -28,6 +28,8 @@ Bridge control events are encrypted, typed current-session values separate from 
 
 Bridge Plan control messages remain exact selected-peer only. `selected_peers` and broadcast control routes are rejected. Layer 4 transports a Plan message; it does not authorize it. A delivery receipt says only that transport accepted or exposed an event—not that approval, execution, or a durable relationship exists.
 
+Bridge Plan v1 and v2 coexist explicitly. V1 retains its existing `bridge_plan.*` event kinds and requester/selected-session payload contract. V2 uses only `bridge_plan.v2.review_request` and `bridge_plan.v2.attempt_start`, carries its own exact protocol version and Plan participants, and uses a separate replay namespace. On inbound v2 delivery, Layer 4 resolves the authenticated peer's current `HostSessionBinding`; Core verifies that binding against the reviewed sender/target HostRefs and performs Host admission. Layer 4 does not derive participants, approve the Plan, choose a Host, insert Transfer, or create an execution grant.
+
 Room Control delivers correlated current-session completion/control events to the Layer 5 Host coordinator. It does not inspect Plan topology, assume PipelinePrivate is followed by Transform, choose the next primitive, or create semantic step authority.
 
 Developer Mode v0 reuses the same current-session peer resolution, authenticated encrypted Room Control envelope, event expiry, and replay boundary for a distinct `developer_terminal` message family. Terminal frames are delivered directly to the UI-independent terminal service, with separate bounded streaming rate/buffer state; they do not enter ordinary Room Control inbox or Bridge item history. Layer 4 transport still does not grant terminal consent: the remote human admission and `DeveloperTerminalGrant` are owned above this layer. See [Developer Mode](../developer-mode.md).
@@ -40,6 +42,6 @@ Disconnect, explicit departure, Burn, and startup recovery invalidate current-se
 
 ## Current limitations
 
-Durable route recovery, auto-join, control-event fan-out, and full cryptographic key rotation are not implemented. Multi-target fan-out is limited to ordinary data. Two-device/package validation remains a required manual/release check.
+Durable route recovery, auto-join, control-event fan-out, full cryptographic key rotation, and v2 Composer/outbound execution dispatch are not implemented. Multi-target fan-out is limited to ordinary data; each v2 Host-bound review/start delivery resolves one explicit current peer. Two-device/package validation remains a required manual/release check.
 
 For exact vocabularies and schemas, see [reference.md](../reference.md). For Layer 5 semantic approval and step authority, see [Layer 5](layer-5-agent.md). For validation, see [development.md](../development.md).

@@ -55,6 +55,7 @@ npm run build
 node scripts/run-natural-v1-tests.mjs
 node scripts/run-layer4-validation-matrix.mjs
 node scripts/run-transfer-planner-tests.mjs
+npm run check:version
 git diff --check
 ```
 
@@ -62,7 +63,9 @@ Native packaged Windows must separately exercise normal-file Search/Transfer, re
 
 Provider health checks are Settings-driven and advisory-only: use a deliberately minimal configured request, verify validation reports, and confirm it neither creates a Bridge control event nor changes consent/execution state. Do not put API keys in fixtures, logs, or documentation.
 
-There is no generic/headless Host admission implementation, Host effect enforcement, Agent Harness, local-model runtime, Transform/Execute runtime, Headless daemon, Agent sandbox, mutation adapter, managed runtime adapter, or process-containment implementation to validate. Developer Mode v0 is now a separate human-only desktop capability with its own focused Rust tests, Unix PTY runtime evidence, and Windows cross-compile gate; see [developer-mode.md](developer-mode.md). The remaining dependency order and authority contracts live in [upper-architecture.md](upper-architecture.md).
+Version 1.9.3 includes focused Rust contract and conformance tests for Host identity/admission, managed-object acquisition, native schema/protocol v2, generic effect authority, Host-private resources, the macOS execution world, the independently scoped network broker, and Core-owned managed result validation. These are an unattached substrate: the live v2 protocol path still declares Transform/Execute unavailable, and no Worker, PM, v2 product dispatcher, or live managed Transform/Execute product path exists. Linux and Windows execution-world adapters remain explicitly unavailable. Developer Mode v0 remains a separate human-only desktop capability; see [developer-mode.md](developer-mode.md).
+
+Release numbering is: 1.9.2 previous frozen baseline; 1.9.3 completed Phase 1–5 foundations; planned 2.0.0 Phase 6 Worker/managed Agent product milestone. Do not treat process-local Step 8 claims or Host effect backends as proof that Phase 6 is reachable. The dependency order and authority contracts live in [upper-architecture.md](upper-architecture.md).
 
 ## Smoke checks
 

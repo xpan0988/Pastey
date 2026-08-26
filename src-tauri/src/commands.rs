@@ -18,7 +18,9 @@ use crate::{
     diagnostics, discovery,
     error::{AppError, AppResult},
     file_candidates::{self, BridgePlanSearchRequest},
+    host_runtime::HostRuntime as AppState,
     link_benchmark, logging,
+    managed_objects::{HostArtifactAcquisition, ManagedObjectAcquisitionKind},
     models::{
         AppConfig, BridgeDeliveryContentKind, BridgeDeliveryOutcome, BridgeDeliveryOutcomeStatus,
         BridgeDeliveryTargetKind, BridgePeerLiveness, BridgeSendAggregateStatus,
@@ -28,7 +30,7 @@ use crate::{
     room_control::{
         ReceivedRoomControlEvent, RoomControlDeliveryReceipt, RoomControlSessionContext,
     },
-    storage, transfer, AppState,
+    storage, transfer,
 };
 
 const RELEASES_URL: &str = "https://github.com/xpan0988/Pastey/releases";
@@ -774,6 +776,11 @@ pub async fn join_room(code: String, state: State<'_, Arc<AppState>>) -> Result<
             discovered.port,
         )
         .await?;
+        let peer_host_ref = response
+            .host_ref
+            .as_deref()
+            .map(|value| crate::host_identity::HostRef::parse_peer(value, &state.local_host_ref))
+            .transpose()?;
 
         storage::update_room_peer(
             &state.paths,
@@ -784,6 +791,9 @@ pub async fn join_room(code: String, state: State<'_, Arc<AppState>>) -> Result<
             Some(&discovered.transport_public_key),
             crate::models::RoomStatus::Active,
         )?;
+        if let Some(host_ref) = peer_host_ref.as_ref() {
+            storage::bind_legacy_room_peer_host_ref(&state.paths, &room.id, host_ref.as_str())?;
+        }
 
         let updated = storage::get_room_by_id(&state.paths, &room.id)?;
         storage::room_to_info_with_bridge_peers(&state.paths, updated, &master_key)
@@ -846,7 +856,7 @@ pub async fn request_nearby_join(
             Some(expires_at),
         )?;
         transfer::start_room_server(state.inner().clone(), &room.id).await?;
-        transfer::announce_join(
+        let join_response = transfer::announce_join(
             state.inner().clone(),
             &room.id,
             &source.ip().to_string(),
@@ -860,6 +870,11 @@ pub async fn request_nearby_join(
                 "Device found, but this network may block direct local connections.".into(),
             )
         })?;
+        let peer_host_ref = join_response
+            .host_ref
+            .as_deref()
+            .map(|value| crate::host_identity::HostRef::parse_peer(value, &state.local_host_ref))
+            .transpose()?;
 
         storage::update_room_peer(
             &state.paths,
@@ -870,6 +885,9 @@ pub async fn request_nearby_join(
             Some(&transport_public_key),
             crate::models::RoomStatus::Active,
         )?;
+        if let Some(host_ref) = peer_host_ref.as_ref() {
+            storage::bind_legacy_room_peer_host_ref(&state.paths, &room.id, host_ref.as_str())?;
+        }
 
         logging::write_transfer_line("[pastey antenna] event=join_accepted");
         let updated = storage::get_room_by_id(&state.paths, &room.id)?;
@@ -1592,24 +1610,74 @@ pub fn create_direct_file_transfer_bridge_plan(
     request: DirectFileTransferBridgePlanRequest,
     state: State<'_, Arc<AppState>>,
 ) -> Result<BridgePlanRecords, String> {
-    let context = crate::room_control::room_control_session_context(&state, &request.room_id)
+    let room_id = request.room_id.clone();
+    let context = crate::room_control::room_control_session_context(&state, &room_id)
         .map_err(|error| error.message())?;
     let source = file_candidates::capture_bridge_plan_requester_file(request.source_path.into())
         .map_err(|error| error.message())?;
     let revision = bridge_plan::build_direct_file_transfer_revision(
-        request.room_id,
+        room_id.clone(),
         context.local_session_ref,
         context.peer_session_ref,
         request.original_user_goal,
     )
     .map_err(|error| error.message())?;
     let revision_id = revision.revision_id.clone();
+    let source = bind_legacy_v1_managed_object(
+        state.inner(),
+        &room_id,
+        &revision_id,
+        &revision_id,
+        ManagedObjectAcquisitionKind::LocalSelection,
+        source,
+    )
+    .map_err(|error| error.message())?;
     let records = create_bridge_plan(revision, state.clone())?;
     state
         .bridge_plan_requester_sources
         .lock()
         .insert(revision_id, source);
     Ok(records)
+}
+
+/// Compatibility adapter from current v1 private-file inputs into the generic
+/// managed-object binder. The returned file retains v1's `selected_file` /
+/// revision 1 projection, while the binder owns a generic logical identity and
+/// Host location outside the frozen Plan hash and wire contract.
+fn bind_legacy_v1_managed_object(
+    state: &Arc<AppState>,
+    bridge_id: &str,
+    plan_revision_id: &str,
+    source_ref: &str,
+    kind: ManagedObjectAcquisitionKind,
+    file: file_candidates::BridgePlanPrivateFile,
+) -> AppResult<file_candidates::BridgePlanPrivateFile> {
+    let now = storage::now_ts();
+    let input = HostArtifactAcquisition {
+        kind,
+        source_ref: source_ref.to_string(),
+        bridge_id: Some(bridge_id.to_string()),
+        path: file.path.clone(),
+        scope_root: file.scope_root.clone(),
+        display_name: file.display_name.clone(),
+        media_type: file.mime_type.clone(),
+        expires_at: now + 10 * 60,
+        app_owned_temporary: file.app_owned_temporary,
+    };
+    let mut binder = state.managed_objects.lock();
+    let acquisition = binder.acquire_legacy_v1_root(input, plan_revision_id, now)?;
+    let artifact = binder.resolve(&acquisition, now)?;
+    Ok(file_candidates::BridgePlanPrivateFile {
+        path: artifact.path,
+        scope_root: artifact.scope_root,
+        display_name: artifact.display_name,
+        mime_type: artifact.media_type,
+        size_bytes: artifact.size_bytes,
+        logical_object_id: "selected_file".into(),
+        revision: 1,
+        identity: artifact.identity,
+        app_owned_temporary: artifact.app_owned_temporary,
+    })
 }
 
 #[tauri::command]
@@ -2169,8 +2237,10 @@ pub(crate) fn register_pipeline_private_landing(
         .bridge_plan_protocol_authority
         .lock()
         .register_pipeline_input(&metadata, private_file)?;
-    tauri::async_runtime::spawn(async move {
-        let _ = continue_bridge_plan_attempt_inner(state, room_id, metadata.attempt_id, None).await;
+    let task_state = state.clone();
+    state.spawn(async move {
+        let _ = continue_bridge_plan_attempt_inner(task_state, room_id, metadata.attempt_id, None)
+            .await;
     });
     Ok(())
 }
@@ -2677,7 +2747,7 @@ pub(crate) async fn execute_bridge_plan_transfer_attempt_inner(
     })?;
 
     let transfer_result: Result<(), AppError> = async {
-        let private_file = {
+        let candidate_file = {
             let mut candidates = state.bridge_plan_candidate_store.lock();
             file_candidates::resolve_bridge_plan_selected_file(
                 &mut candidates,
@@ -2697,6 +2767,14 @@ pub(crate) async fn execute_bridge_plan_transfer_attempt_inner(
                 error
             })?
         };
+        let private_file = bind_legacy_v1_managed_object(
+            &state,
+            &room_id,
+            &grant.revision_id,
+            &grant.candidate_id,
+            ManagedObjectAcquisitionKind::SearchResult,
+            candidate_file,
+        )?;
         log_bridge_plan_transfer_attempt(
             "transfer_candidate_resolved",
             &room_id,
@@ -3044,7 +3122,6 @@ pub fn enter_developer_mode(
         return Err("Developer Mode requires a current connected Bridge Host.".into());
     }
     Ok(state
-        .host_runtime
         .developer_terminal
         .enter_mode(&room_id, storage::now_ts()))
 }
@@ -3055,14 +3132,13 @@ pub fn get_developer_terminal_workspace(
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::developer_terminal::DeveloperTerminalWorkspace, String> {
     Ok(state
-        .host_runtime
         .developer_terminal
         .workspace(&room_id, storage::now_ts()))
 }
 
 async fn send_developer_terminal_message(
     state: Arc<AppState>,
-    binding: &crate::host_runtime::HostSessionBinding,
+    binding: &crate::host_runtime::DeveloperTerminalBinding,
     kind: &str,
     message: &crate::developer_terminal::TerminalMessage,
 ) -> AppResult<RoomControlDeliveryReceipt> {
@@ -3111,7 +3187,6 @@ pub async fn request_developer_terminal(
         crate::host_runtime::current_controller_binding(&state, &room_id, &peer_session_id)
             .map_err(|error| error.message())?;
     let message = state
-        .host_runtime
         .developer_terminal
         .request_open(&developer_ui_token, binding.clone(), storage::now_ts())
         .map_err(|error| error.message())?;
@@ -3124,13 +3199,11 @@ pub async fn request_developer_terminal(
     .await
     {
         state
-            .host_runtime
             .developer_terminal
             .abort_controller_session(&message.terminal_session_id, "delivery_failed");
         return Err(error.message());
     }
     Ok(state
-        .host_runtime
         .developer_terminal
         .workspace(&room_id, storage::now_ts()))
 }
@@ -3143,7 +3216,6 @@ pub async fn deny_developer_terminal(
 ) -> Result<bool, String> {
     let state = state.inner().clone();
     let (binding, message) = state
-        .host_runtime
         .developer_terminal
         .deny_open(&developer_ui_token, &terminal_session_id, storage::now_ts())
         .map_err(|error| error.message())?;
@@ -3164,7 +3236,6 @@ pub async fn accept_developer_terminal(
 ) -> Result<bool, String> {
     let state = state.inner().clone();
     let pending_binding = state
-        .host_runtime
         .developer_terminal
         .pending_binding(&terminal_session_id)
         .filter(|binding| binding.room_id == room_id)
@@ -3176,7 +3247,6 @@ pub async fn accept_developer_terminal(
     )
     .map_err(|error| error.message())?;
     let (message, mut events) = state
-        .host_runtime
         .developer_terminal
         .accept_open(
             &developer_ui_token,
@@ -3196,23 +3266,20 @@ pub async fn accept_developer_terminal(
     .await
     {
         state
-            .host_runtime
             .developer_terminal
             .abort_host_session(&terminal_session_id);
         return Err(error.message());
     }
     let pump_state = state.clone();
     let pump_session_id = terminal_session_id.clone();
-    tauri::async_runtime::spawn(async move {
+    state.spawn(async move {
         while let Some(event) = events.recv().await {
             let prepared = match event {
                 crate::developer_terminal::PtyRuntimeEvent::Output(bytes) => pump_state
-                    .host_runtime
                     .developer_terminal
                     .prepare_output(&pump_session_id, &bytes, storage::now_ts())
                     .map(|(binding, message)| (binding, message, "developer_terminal.output")),
                 crate::developer_terminal::PtyRuntimeEvent::Exit(status) => pump_state
-                    .host_runtime
                     .developer_terminal
                     .prepare_exit(&pump_session_id, status)
                     .map(|(binding, message)| (binding, message, "developer_terminal.exit")),
@@ -3225,14 +3292,12 @@ pub async fn accept_developer_terminal(
                 .is_err()
             {
                 pump_state
-                    .host_runtime
                     .developer_terminal
                     .abort_host_session(&pump_session_id);
                 break;
             }
             if kind == "developer_terminal.exit" {
                 pump_state
-                    .host_runtime
                     .developer_terminal
                     .finish_host_session(&pump_session_id);
                 break;
@@ -3251,7 +3316,6 @@ pub async fn send_developer_terminal_input(
 ) -> Result<bool, String> {
     let state = state.inner().clone();
     let (binding, message) = state
-        .host_runtime
         .developer_terminal
         .prepare_input(
             &developer_ui_token,
@@ -3272,7 +3336,6 @@ pub async fn send_developer_terminal_input(
         Err(error) => {
             let reason = developer_terminal_delivery_failure_reason(&error);
             state
-                .host_runtime
                 .developer_terminal
                 .abort_controller_session(&terminal_session_id, reason);
             Err(error.message())
@@ -3290,7 +3353,6 @@ pub async fn resize_developer_terminal(
 ) -> Result<bool, String> {
     let state = state.inner().clone();
     let (binding, message) = state
-        .host_runtime
         .developer_terminal
         .prepare_resize(
             &developer_ui_token,
@@ -3312,7 +3374,6 @@ pub async fn resize_developer_terminal(
         Err(error) => {
             let reason = developer_terminal_delivery_failure_reason(&error);
             state
-                .host_runtime
                 .developer_terminal
                 .abort_controller_session(&terminal_session_id, reason);
             Err(error.message())
@@ -3328,7 +3389,6 @@ pub async fn close_developer_terminal(
 ) -> Result<bool, String> {
     let state = state.inner().clone();
     let (binding, message) = state
-        .host_runtime
         .developer_terminal
         .close_from_controller(&developer_ui_token, &terminal_session_id, storage::now_ts())
         .map_err(|error| error.message())?;
@@ -3400,7 +3460,7 @@ pub(crate) fn purge_bridge_runtime_authority(
     room_id: &str,
 ) -> AppResult<()> {
     state.room_control.lock().purge_room(room_id);
-    state.host_runtime.purge_room(room_id);
+    state.purge_room(room_id);
 
     let mut first_error = None;
     let mut candidates = state.bridge_plan_candidate_store.lock();
@@ -3544,7 +3604,7 @@ pub async fn get_device_profile(
 
         let config = state.config.read().clone();
         let mode = diagnostics_profile_mode(force_refresh);
-        let profile = tauri::async_runtime::spawn_blocking(move || {
+        let profile = tokio::task::spawn_blocking(move || {
             device_profile::local_device_profile_with_mode(&config, mode)
         })
         .await
@@ -3582,7 +3642,7 @@ pub async fn get_device_capabilities(
             diagnostics_profile_mode(force_refresh || capability_mode == CapabilityProbeMode::Full);
         let cached_profile =
             cached_profile_for_capability_probe(&state, force_refresh, capability_mode);
-        let (profile, capabilities) = tauri::async_runtime::spawn_blocking(move || {
+        let (profile, capabilities) = tokio::task::spawn_blocking(move || {
             let profile = cached_profile.unwrap_or_else(|| {
                 device_profile::local_device_profile_with_mode(&config, profile_mode)
             });
@@ -3959,6 +4019,7 @@ mod tests {
             transport_public_key: Some("peer-key".into()),
             liveness: BridgePeerLiveness::Connected,
             join_method: crate::models::BridgePeerJoinMethod::NearbyAccept,
+            logical_host_ref: None,
             durable_identity_id: None,
             updated_at: 1,
         }]
@@ -3986,6 +4047,7 @@ mod tests {
             transport_public_key: Some("peer-key-2".into()),
             liveness: BridgePeerLiveness::Connected,
             join_method: crate::models::BridgePeerJoinMethod::NearbyAccept,
+            logical_host_ref: None,
             durable_identity_id: None,
             updated_at: 2,
         }
@@ -4509,6 +4571,32 @@ mod tests {
         assert_eq!(
             targets.endpoints[0].peer_session_id,
             "legacy-room-peer:room-1"
+        );
+    }
+
+    #[test]
+    fn host_ref_cannot_imply_trust_admission_or_routeability() {
+        let route = matching_bridge_route(FILE_BRIDGE_ROUTE_SCHEMA_VERSION);
+        let room = bridge_route_room();
+        let mut peers = bridge_route_peers();
+        peers[0].logical_host_ref = Some(
+            crate::host_identity::HostRef::from_device_id("claimed-host")
+                .unwrap()
+                .as_str()
+                .to_string(),
+        );
+        peers[0].liveness = BridgePeerLiveness::Disconnected;
+        assert_eq!(peers[0].durable_identity_id, None);
+        assert_route_error_code(
+            validate_bridge_route_payload(
+                Some(&route),
+                "room-1",
+                &room,
+                &peers,
+                FILE_BRIDGE_ROUTE_SCHEMA_VERSION,
+                "file",
+            ),
+            BridgeRouteErrorCode::PeerUnrouteable,
         );
     }
 

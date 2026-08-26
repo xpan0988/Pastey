@@ -13,7 +13,8 @@ use crate::{
     crypto,
     diagnostics::{quality_label, BenchmarkMode, LinkBenchmarkResult},
     error::{AppError, AppResult},
-    storage, transfer_tuning, AppState,
+    host_runtime::HostRuntime as AppState,
+    storage, transfer_tuning,
 };
 
 const DEFAULT_DURATION_SECS: u64 = 5;

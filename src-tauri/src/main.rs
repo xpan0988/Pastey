@@ -1,4 +1,5 @@
 mod bridge_plan;
+mod bridge_plan_v2;
 mod capability_probe;
 mod chunk_frame;
 mod cleanup;
@@ -10,12 +11,20 @@ mod developer_terminal;
 mod device_profile;
 mod diagnostics;
 mod discovery;
+mod effect_authority;
 mod error;
+mod execution_world;
 mod file_candidates;
+mod host_admission;
+mod host_identity;
 mod host_runtime;
 mod link_benchmark;
 mod logging;
+mod managed_execution;
+mod managed_objects;
+mod managed_resources;
 mod models;
+mod network_broker;
 mod object_refs;
 mod peer_capabilities;
 mod room_control;
@@ -25,9 +34,8 @@ mod transfer;
 mod transfer_orchestration;
 mod transfer_tuning;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
-use parking_lot::{Mutex, RwLock};
 use tauri::{
     menu::MenuBuilder,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -55,64 +63,31 @@ use crate::{
         send_text_to_room, start_bridge_plan_attempt, update_config, update_transfer_window,
         withdraw_bridge_plan_revision, write_temp_file,
     },
-    config::StoredConfig,
     error::{AppError, AppResult},
+    host_runtime::{HostEvent, HostEventSink, HostRuntime, RuntimeTask, RuntimeTaskSpawner},
     storage::AppPaths,
 };
 
-pub struct AppState {
-    pub app_handle: AppHandle,
-    pub paths: AppPaths,
-    pub config: RwLock<StoredConfig>,
-    pub active_servers: Mutex<HashMap<String, ActiveRoomServer>>,
-    pub active_file_transfers: Mutex<HashMap<String, transfer::ActiveFileTransfer>>,
-    pub(crate) transfer_capacity: Arc<transfer_orchestration::TransferCapacityCoordinator>,
-    pub discovery_handle: Mutex<Option<DiscoveryHandle>>,
-    pub nearby_http_handle: Mutex<Option<NearbyHttpHandle>>,
-    pub antenna_handle: Mutex<Option<DiscoveryHandle>>,
-    pub nearby_devices: Mutex<HashMap<String, discovery::NearbyDeviceRecord>>,
-    pub pending_join_requests: Mutex<HashMap<String, discovery::PendingJoinRequest>>,
-    pub outgoing_join_requests: Mutex<HashMap<String, discovery::OutgoingJoinRequest>>,
-    pub terminal_transfer_reasons: Mutex<HashMap<String, transfer::TerminalTransferReason>>,
-    pub diagnostics_refresh: tokio::sync::Mutex<()>,
-    pub latest_device_profile: Mutex<Option<diagnostics::DeviceProfile>>,
-    pub latest_device_capabilities: Mutex<Option<diagnostics::DeviceCapabilities>>,
-    pub latest_benchmark_results: Mutex<HashMap<String, diagnostics::LinkBenchmarkResult>>,
-    pub room_control: Mutex<room_control::RoomControlRuntimeState>,
-    pub bridge_plan_candidate_store: Mutex<file_candidates::BridgePlanCandidateStore>,
-    /// Requester-local direct-Transfer sources keyed by immutable revision.
-    /// They are process-local and therefore invalidated by restart.
-    pub(crate) bridge_plan_requester_sources:
-        Mutex<HashMap<String, file_candidates::BridgePlanPrivateFile>>,
-    /// Phase 3A receiver-local Search grants. They are process-local only.
-    pub(crate) bridge_plan_protocol_authority: Mutex<bridge_plan::ProtocolSearchAuthorityStore>,
-    pub(crate) peer_capabilities: Mutex<peer_capabilities::PeerCapabilityStore>,
-    pub(crate) host_runtime: Arc<host_runtime::HostRuntimeState>,
+const APP_DATA_DIR_ENV: &str = "PASTEY_APP_DATA_DIR";
+
+struct TauriHostEventSink {
+    app_handle: AppHandle,
 }
 
-pub struct ActiveRoomServer {
-    pub room_id: String,
-    pub room_code_hash: String,
-    pub port: u16,
-    pub started_at: i64,
-    pub expires_at: i64,
-    pub transport_secret: [u8; 32],
-    pub shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-}
-
-impl ActiveRoomServer {
-    pub fn transport_public_key(&self) -> String {
-        crate::crypto::encode_key(&crate::crypto::transport_public_key(&self.transport_secret))
+impl HostEventSink for TauriHostEventSink {
+    fn emit(&self, event: HostEvent) -> AppResult<()> {
+        self.app_handle
+            .emit(event.name, event.payload)
+            .map_err(|error| AppError::InvalidInput(format!("failed to emit Host event: {error}")))
     }
 }
 
-pub struct DiscoveryHandle {
-    pub shutdown: tokio::sync::oneshot::Sender<()>,
-}
+struct TauriRuntimeTaskSpawner;
 
-pub struct NearbyHttpHandle {
-    pub shutdown: tokio::sync::oneshot::Sender<()>,
-    pub port: u16,
+impl RuntimeTaskSpawner for TauriRuntimeTaskSpawner {
+    fn spawn(&self, task: RuntimeTask) {
+        tauri::async_runtime::spawn(task);
+    }
 }
 
 fn main() {
@@ -122,60 +97,19 @@ fn main() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let shortcut_label = default_shortcut_label();
-            let paths = storage::init_app_paths(&app.handle())?;
-            logging::init(paths.logs_dir.clone());
-            storage::init_database(&paths)?;
-            let config = config::load_or_create(&paths, shortcut_label)?;
-            let effective_inbox_dir = config::effective_inbox_dir(&paths, &config);
-            storage::run_startup_recovery(&paths, &effective_inbox_dir)?;
-            // A prior Burn may have cut authority off before a later cleanup
-            // failed. Retry durable cleanup and purge its crash journal before
-            // exposing any runtime state.
-            for room_id in storage::burned_bridge_ids(&paths)? {
-                storage::finalize_burned_room(&paths, &room_id, &effective_inbox_dir)?;
-            }
-            // Bridge Plan workspace records are durable, while active attempts
-            // are deliberately non-resumable across a Host restart. Burned
-            // Bridges are finalized first, so restart reconciliation can never
-            // add activity to a Bridge whose authority has been cut off.
-            bridge_plan::reconcile_startup(&paths, storage::now_ts())?;
-            bridge_plan::reconcile_protocol_startup(&paths, storage::now_ts())?;
-            file_candidates::cleanup_orphaned_pipeline_handoffs(&paths.temp_dir);
-            let state = Arc::new(AppState {
-                app_handle: app.handle().clone(),
+            let paths = desktop_app_paths(app.handle())?;
+            let state = HostRuntime::initialize(
                 paths,
-                config: RwLock::new(config),
-                active_servers: Mutex::new(HashMap::new()),
-                active_file_transfers: Mutex::new(HashMap::new()),
-                transfer_capacity: Arc::new(
-                    transfer_orchestration::TransferCapacityCoordinator::default(),
-                ),
-                discovery_handle: Mutex::new(None),
-                nearby_http_handle: Mutex::new(None),
-                antenna_handle: Mutex::new(None),
-                nearby_devices: Mutex::new(HashMap::new()),
-                pending_join_requests: Mutex::new(HashMap::new()),
-                outgoing_join_requests: Mutex::new(HashMap::new()),
-                terminal_transfer_reasons: Mutex::new(HashMap::new()),
-                diagnostics_refresh: tokio::sync::Mutex::new(()),
-                latest_device_profile: Mutex::new(None),
-                latest_device_capabilities: Mutex::new(None),
-                latest_benchmark_results: Mutex::new(HashMap::new()),
-                room_control: Mutex::new(room_control::RoomControlRuntimeState::default()),
-                bridge_plan_candidate_store: Mutex::new(
-                    file_candidates::BridgePlanCandidateStore::default(),
-                ),
-                bridge_plan_requester_sources: Mutex::new(HashMap::new()),
-                bridge_plan_protocol_authority: Mutex::new(
-                    bridge_plan::ProtocolSearchAuthorityStore::default(),
-                ),
-                peer_capabilities: Mutex::new(peer_capabilities::PeerCapabilityStore::default()),
-                host_runtime: Arc::new(host_runtime::HostRuntimeState::default()),
-            });
+                shortcut_label,
+                Arc::new(TauriHostEventSink {
+                    app_handle: app.handle().clone(),
+                }),
+                Arc::new(TauriRuntimeTaskSpawner),
+            )?;
 
             app.manage(state.clone());
             let antenna_state = state.clone();
-            tauri::async_runtime::spawn(async move {
+            state.spawn(async move {
                 if discovery::ensure_service(antenna_state.clone())
                     .await
                     .is_err()
@@ -189,17 +123,18 @@ fn main() {
             });
             install_global_shortcut(app.handle())?;
             install_tray(app.handle())?;
-            cleanup::start_cleanup_scheduler(app.handle().clone());
+            cleanup::start_cleanup_scheduler(state);
             Ok(())
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let app = window.app_handle().clone();
-                if let Some(state) = app.try_state::<Arc<AppState>>() {
+                if let Some(state) = app.try_state::<Arc<HostRuntime>>() {
                     let state = state.inner().clone();
-                    tauri::async_runtime::spawn(async move {
-                        discovery::stop_antenna(state).await;
+                    let task_state = state.clone();
+                    state.spawn(async move {
+                        discovery::stop_antenna(task_state).await;
                     });
                 }
                 let _ = window.hide();
@@ -266,13 +201,8 @@ fn main() {
         .expect("error while building pastey");
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
-            if let Some(state) = app_handle.try_state::<Arc<AppState>>() {
-                let _ = state
-                    .bridge_plan_candidate_store
-                    .lock()
-                    .object_store
-                    .purge_all();
-                state.host_runtime.shutdown_all();
+            if let Some(state) = app_handle.try_state::<Arc<HostRuntime>>() {
+                state.shutdown_all();
             }
         }
     });
@@ -360,18 +290,20 @@ fn toggle_main_window(app: &AppHandle, target: &str) -> AppResult<()> {
         window
             .hide()
             .map_err(|error| AppError::InvalidInput(format!("failed to hide window: {error}")))?;
-        let state = app.state::<Arc<AppState>>().inner().clone();
-        tauri::async_runtime::spawn(async move {
-            discovery::stop_antenna(state).await;
+        let state = app.state::<Arc<HostRuntime>>().inner().clone();
+        let task_state = state.clone();
+        state.spawn(async move {
+            discovery::stop_antenna(task_state).await;
         });
     } else {
         window
             .show()
             .map_err(|error| AppError::InvalidInput(format!("failed to show window: {error}")))?;
-        let state = app.state::<Arc<AppState>>().inner().clone();
-        tauri::async_runtime::spawn(async move {
-            if discovery::ensure_service(state.clone()).await.is_ok() {
-                discovery::start_antenna(state).await;
+        let state = app.state::<Arc<HostRuntime>>().inner().clone();
+        let task_state = state.clone();
+        state.spawn(async move {
+            if discovery::ensure_service(task_state.clone()).await.is_ok() {
+                discovery::start_antenna(task_state).await;
             }
         });
         let _ = window.unminimize();
@@ -399,4 +331,61 @@ fn default_shortcut() -> Shortcut {
 
 fn default_shortcut_label() -> &'static str {
     "CommandOrControl+Shift+V"
+}
+
+fn desktop_app_paths(app: &AppHandle) -> AppResult<AppPaths> {
+    let default_app_data_dir = app.path().app_data_dir().map_err(|error| {
+        AppError::InvalidInput(format!("unable to resolve app data directory: {error}"))
+    })?;
+    let app_data_dir_override = desktop_app_data_dir_override()?;
+    let app_data_dir = app_data_dir_override
+        .clone()
+        .unwrap_or(default_app_data_dir);
+    let logs_dir = app_data_dir_override
+        .as_ref()
+        .map(|dir| dir.join("logs"))
+        .unwrap_or_else(|| desktop_default_logs_dir(&app_data_dir));
+    let paths = AppPaths::new(app_data_dir, logs_dir);
+    paths.ensure_directories()?;
+    Ok(paths)
+}
+
+fn desktop_app_data_dir_override() -> AppResult<Option<PathBuf>> {
+    let Some(value) = std::env::var_os(APP_DATA_DIR_ENV) else {
+        return Ok(None);
+    };
+    let display = value.to_string_lossy();
+    if display.trim().is_empty() {
+        return Err(AppError::InvalidInput(format!(
+            "{APP_DATA_DIR_ENV} must not be empty"
+        )));
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(Some(path))
+    } else {
+        Ok(Some(std::env::current_dir()?.join(path)))
+    }
+}
+
+fn desktop_default_logs_dir(app_data_dir: &std::path::Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("pastey")
+                .join("logs");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data).join("pastey").join("logs");
+        }
+    }
+
+    app_data_dir.join("logs")
 }

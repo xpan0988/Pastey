@@ -16,7 +16,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use socket2::{Domain, Protocol, Socket, Type};
-use tauri::Emitter;
 use tokio::{
     net::{TcpListener, UdpSocket},
     sync::oneshot,
@@ -25,9 +24,10 @@ use tokio::{
 
 use crate::{
     error::{AppError, AppResult},
+    host_runtime::{DiscoveryHandle, HostRuntime as AppState, NearbyHttpHandle},
     logging,
     models::{DiscoveryRequest, DiscoveryResponse, JoinRequestPrompt, NearbyDevice},
-    storage, AppState,
+    storage,
 };
 
 const DISCOVERY_PORT: u16 = 48392;
@@ -129,7 +129,7 @@ pub async fn ensure_service(state: Arc<AppState>) -> AppResult<()> {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let service_state = state.clone();
 
-        tokio::spawn(async move {
+        state.spawn(async move {
             let mut buffer = vec![0u8; 4096];
 
             loop {
@@ -151,7 +151,7 @@ pub async fn ensure_service(state: Arc<AppState>) -> AppResult<()> {
 
         let mut handle = state.discovery_handle.lock();
         if handle.is_none() {
-            *handle = Some(crate::DiscoveryHandle {
+            *handle = Some(DiscoveryHandle {
                 shutdown: shutdown_tx,
             });
             logging::write_transfer_line("[pastey antenna] event=antenna_start");
@@ -208,7 +208,7 @@ async fn ensure_join_request_service(state: Arc<AppState>) -> AppResult<()> {
         .port();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    state.spawn(async move {
         let server = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -221,7 +221,7 @@ async fn ensure_join_request_service(state: Arc<AppState>) -> AppResult<()> {
 
     let mut handle = state.nearby_http_handle.lock();
     if handle.is_none() {
-        *handle = Some(crate::NearbyHttpHandle {
+        *handle = Some(NearbyHttpHandle {
             shutdown: shutdown_tx,
             port,
         });
@@ -281,12 +281,12 @@ pub async fn start_antenna(state: Arc<AppState>) {
     ));
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-    state.antenna_handle.lock().replace(crate::DiscoveryHandle {
+    state.antenna_handle.lock().replace(DiscoveryHandle {
         shutdown: shutdown_tx,
     });
     let beacon_state = state.clone();
 
-    tokio::spawn(async move {
+    state.spawn(async move {
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
@@ -679,7 +679,7 @@ fn surface_join_request(state: Arc<AppState>, request: NearbyJoinRequest, source
     logging::write_transfer_line(&format!(
         "[pastey antenna] event=join_request_received source={source}"
     ));
-    let _ = state.app_handle.emit(JOIN_REQUEST_EVENT, prompt);
+    let _ = state.emit(JOIN_REQUEST_EVENT, &prompt);
     logging::write_transfer_line("[pastey antenna] event=join_request_emitted_to_ui");
 }
 

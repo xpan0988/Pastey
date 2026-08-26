@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     error::{AppError, AppResult},
-    host_runtime::HostSessionBinding,
+    host_runtime::DeveloperTerminalBinding,
     room_control::RoomControlSessionContext,
 };
 
@@ -149,7 +149,7 @@ pub struct TerminalMessage {
 }
 
 impl TerminalMessage {
-    fn base(binding: &HostSessionBinding, terminal_session_id: &str) -> Self {
+    fn base(binding: &DeveloperTerminalBinding, terminal_session_id: &str) -> Self {
         Self {
             schema_version: PAYLOAD_SCHEMA.into(),
             terminal_session_id: terminal_session_id.into(),
@@ -174,12 +174,12 @@ struct UiSessionRecord {
 
 #[derive(Clone)]
 struct PendingRequest {
-    binding: HostSessionBinding,
+    binding: DeveloperTerminalBinding,
     expires_at: i64,
 }
 
 struct ControllerSession {
-    binding: HostSessionBinding,
+    binding: DeveloperTerminalBinding,
     ui_token: String,
     state: TerminalState,
     environment_label: Option<String>,
@@ -195,14 +195,14 @@ struct ControllerSession {
 struct DeveloperTerminalGrant {
     grant_id: String,
     terminal_session_id: String,
-    binding: HostSessionBinding,
+    binding: DeveloperTerminalBinding,
     expires_at: i64,
     consumed_for_start: bool,
     revoked: bool,
 }
 
 struct HostSession {
-    binding: HostSessionBinding,
+    binding: DeveloperTerminalBinding,
     grant: DeveloperTerminalGrant,
     process: Arc<PtyProcess>,
     last_input_sequence: u64,
@@ -294,7 +294,7 @@ impl DeveloperTerminalService {
     pub fn request_open(
         &self,
         ui_token: &str,
-        binding: HostSessionBinding,
+        binding: DeveloperTerminalBinding,
         now: i64,
     ) -> AppResult<TerminalMessage> {
         self.require_ui_session(ui_token, &binding.room_id, now)?;
@@ -320,7 +320,7 @@ impl DeveloperTerminalService {
 
     pub fn receive_open_request(
         &self,
-        binding: HostSessionBinding,
+        binding: DeveloperTerminalBinding,
         message: &TerminalMessage,
         now: i64,
     ) -> AppResult<()> {
@@ -350,7 +350,7 @@ impl DeveloperTerminalService {
         ui_token: &str,
         terminal_session_id: &str,
         now: i64,
-    ) -> AppResult<(HostSessionBinding, TerminalMessage)> {
+    ) -> AppResult<(DeveloperTerminalBinding, TerminalMessage)> {
         let mut state = self.state.lock();
         let pending = state
             .pending
@@ -371,7 +371,7 @@ impl DeveloperTerminalService {
         &self,
         ui_token: &str,
         terminal_session_id: &str,
-        current_binding: &HostSessionBinding,
+        current_binding: &DeveloperTerminalBinding,
         cols: u16,
         rows: u16,
         now: i64,
@@ -422,7 +422,7 @@ impl DeveloperTerminalService {
 
     pub fn receive_accepted(
         &self,
-        binding: &HostSessionBinding,
+        binding: &DeveloperTerminalBinding,
         message: &TerminalMessage,
         now: i64,
     ) -> AppResult<()> {
@@ -447,7 +447,7 @@ impl DeveloperTerminalService {
 
     pub fn receive_denied(
         &self,
-        binding: &HostSessionBinding,
+        binding: &DeveloperTerminalBinding,
         message: &TerminalMessage,
     ) -> AppResult<()> {
         validate_message_binding(message, binding)?;
@@ -474,7 +474,7 @@ impl DeveloperTerminalService {
         terminal_session_id: &str,
         bytes: &[u8],
         now: i64,
-    ) -> AppResult<(HostSessionBinding, TerminalMessage)> {
+    ) -> AppResult<(DeveloperTerminalBinding, TerminalMessage)> {
         if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
             return Err(AppError::InvalidInput(
                 "Developer terminal input is too large.".into(),
@@ -505,7 +505,7 @@ impl DeveloperTerminalService {
 
     pub fn receive_input(
         &self,
-        binding: &HostSessionBinding,
+        binding: &DeveloperTerminalBinding,
         message: &TerminalMessage,
         now: i64,
     ) -> AppResult<()> {
@@ -530,7 +530,7 @@ impl DeveloperTerminalService {
         cols: u16,
         rows: u16,
         now: i64,
-    ) -> AppResult<(HostSessionBinding, TerminalMessage)> {
+    ) -> AppResult<(DeveloperTerminalBinding, TerminalMessage)> {
         validate_size(cols, rows)?;
         let mut state = self.state.lock();
         let session = state
@@ -558,7 +558,7 @@ impl DeveloperTerminalService {
 
     pub fn receive_resize(
         &self,
-        binding: &HostSessionBinding,
+        binding: &DeveloperTerminalBinding,
         message: &TerminalMessage,
         now: i64,
     ) -> AppResult<()> {
@@ -584,7 +584,7 @@ impl DeveloperTerminalService {
         terminal_session_id: &str,
         bytes: &[u8],
         now: i64,
-    ) -> AppResult<(HostSessionBinding, TerminalMessage)> {
+    ) -> AppResult<(DeveloperTerminalBinding, TerminalMessage)> {
         if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
             return Err(AppError::InvalidInput(
                 "Developer terminal output is too large.".into(),
@@ -608,7 +608,7 @@ impl DeveloperTerminalService {
 
     pub fn receive_output(
         &self,
-        binding: &HostSessionBinding,
+        binding: &DeveloperTerminalBinding,
         message: &TerminalMessage,
     ) -> AppResult<()> {
         validate_message_binding(message, binding)?;
@@ -647,7 +647,7 @@ impl DeveloperTerminalService {
         &self,
         terminal_session_id: &str,
         exit_status: i32,
-    ) -> AppResult<(HostSessionBinding, TerminalMessage)> {
+    ) -> AppResult<(DeveloperTerminalBinding, TerminalMessage)> {
         let mut state = self.state.lock();
         let session = state
             .host_sessions
@@ -667,7 +667,7 @@ impl DeveloperTerminalService {
 
     pub fn receive_exit(
         &self,
-        binding: &HostSessionBinding,
+        binding: &DeveloperTerminalBinding,
         message: &TerminalMessage,
     ) -> AppResult<()> {
         validate_message_binding(message, binding)?;
@@ -693,7 +693,7 @@ impl DeveloperTerminalService {
         ui_token: &str,
         terminal_session_id: &str,
         now: i64,
-    ) -> AppResult<(HostSessionBinding, TerminalMessage)> {
+    ) -> AppResult<(DeveloperTerminalBinding, TerminalMessage)> {
         let mut state = self.state.lock();
         let session = state
             .controller_sessions
@@ -724,7 +724,7 @@ impl DeveloperTerminalService {
 
     pub fn receive_close(
         &self,
-        binding: &HostSessionBinding,
+        binding: &DeveloperTerminalBinding,
         message: &TerminalMessage,
     ) -> AppResult<()> {
         validate_message_binding(message, binding)?;
@@ -858,7 +858,7 @@ impl DeveloperTerminalService {
         self.state.lock().host_sessions.remove(terminal_session_id);
     }
 
-    pub fn pending_binding(&self, terminal_session_id: &str) -> Option<HostSessionBinding> {
+    pub fn pending_binding(&self, terminal_session_id: &str) -> Option<DeveloperTerminalBinding> {
         self.state
             .lock()
             .pending
@@ -909,7 +909,7 @@ fn require_ui_session_in_state(
 
 fn require_grant(
     grant: &DeveloperTerminalGrant,
-    binding: &HostSessionBinding,
+    binding: &DeveloperTerminalBinding,
     terminal_session_id: &str,
     now: i64,
 ) -> AppResult<()> {
@@ -929,7 +929,7 @@ fn require_grant(
 
 fn require_active_host_session<'a>(
     state: &'a mut TerminalStateStore,
-    binding: &HostSessionBinding,
+    binding: &DeveloperTerminalBinding,
     message: &TerminalMessage,
     now: i64,
 ) -> AppResult<&'a mut HostSession> {
@@ -1032,7 +1032,7 @@ fn require_message_shape(
 
 fn validate_message_binding(
     message: &TerminalMessage,
-    binding: &HostSessionBinding,
+    binding: &DeveloperTerminalBinding,
 ) -> AppResult<()> {
     if message.binding_ref != binding.binding_ref
         || message.controller_host_ref != binding.controller_host.0
@@ -1223,8 +1223,8 @@ fn pty_error(error: anyhow::Error) -> AppError {
 mod tests {
     use super::*;
 
-    fn binding() -> HostSessionBinding {
-        HostSessionBinding::new("room", "controller-session", "host-session", "peer")
+    fn binding() -> DeveloperTerminalBinding {
+        DeveloperTerminalBinding::new("room", "controller-session", "host-session", "peer")
     }
 
     #[test]
@@ -1240,7 +1240,8 @@ mod tests {
         let service = DeveloperTerminalService::default();
         let ui = service.enter_mode("room", 10);
         let message = service.request_open(&ui.token, binding(), 10).unwrap();
-        let wrong = HostSessionBinding::new("room", "controller-session", "other-host", "peer");
+        let wrong =
+            DeveloperTerminalBinding::new("room", "controller-session", "other-host", "peer");
         assert!(service.receive_accepted(&wrong, &message, 10).is_err());
     }
 

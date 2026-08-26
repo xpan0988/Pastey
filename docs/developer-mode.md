@@ -1,6 +1,6 @@
 # Developer Mode v0
 
-Developer Mode is Pastey's human-controlled remote terminal capability. It is a separate Host capability domain built above the current Bridge foundations. It is **not** a fifth Layer 5 primitive, a special Execute step, a managed object workflow, or an Agent escape hatch.
+Developer Mode is Pastey's human-controlled remote terminal capability. It is a separate Host capability domain built above the current Bridge foundations. In 1.9.3 it remains permanently disjoint from the completed Phase 1–5 managed-authority substrate. It is **not** a fifth Layer 5 primitive, a special Execute step, a managed object workflow, or an Agent escape hatch.
 
 ## Current implementation
 
@@ -15,21 +15,21 @@ human enters Developer Mode
   → native Host-owned shell
 ```
 
-The controller and Host both require an explicit process-local Developer Mode UI session. A connected route is necessary but insufficient. The remote Host creates the terminal grant only after its local user accepts the pending request. The grant is a dedicated type bound to the controller and target `HostRef`, exact current `HostSessionBinding`, Bridge, terminal session identifier, expiry, and one start. It is not a Layer 5 step grant and cannot create Layer 5 approval, revision, or object lineage.
+The controller and Host both require an explicit process-local Developer Mode UI session. A connected route is necessary but insufficient. The remote Host creates the terminal grant only after its local user accepts the pending request. The grant is a dedicated type bound to the controller and target `DeveloperHostRef`, exact current `DeveloperTerminalBinding`, Bridge, terminal session identifier, expiry, and one start. It is not a Layer 5 step grant and cannot create Layer 5 approval, revision, or object lineage.
 
-Developer Mode v0 introduces a minimal UI-independent `HostRuntimeState` that owns `DeveloperTerminalService`. Tauri `AppState` still owns the wider desktop runtime container, paths, commands, event glue, and existing Layer 1–5 services. This is the first narrow HostRuntime seam, not a headless runtime extraction.
+Developer Mode's `DeveloperTerminalService` is now owned by the UI-independent `HostRuntime` together with the existing Layer 1–5 Host services. Tauri supplies only the Desktop lifecycle, invoke adapter, window/plugin behavior, path discovery, and concrete event/task adapters. This is an interface extraction, not a Headless Host implementation.
 
 ## Host identity and current-session binding
 
-`HostRef` and `HostSessionBinding` are Developer Mode v0 contracts, separate from Layer 5's temporary `requesting_device` / `selected_device` representation.
+Developer Mode v0 deliberately retains `DeveloperHostRef` and `DeveloperTerminalBinding`, separate from both the durable Phase 2 identity contract and Layer 5's temporary `requesting_device` / `selected_device` representation.
 
-- `HostRef` identifies the controller or target Host for this runtime generation.
-- `HostSessionBinding` binds those Host refs to the exact current Layer 4 session refs and selected peer route.
+- `DeveloperHostRef` identifies the controller or target from its current transport identity for this runtime generation.
+- `DeveloperTerminalBinding` binds those endpoint refs to the exact current Layer 4 session refs and selected peer route.
 - a route or liveness observation is not authority;
 - a changed transport/session identity produces a different binding and old frames fail closed;
-- the current v0 `HostRef` derives from current transport identity and is not yet the future durable Multi-Host `HostRef` contract.
+- the Core-owned durable `HostRef` and generic `HostSessionBinding` do not replace, create, or satisfy Developer Terminal authority.
 
-Layer 5 Plan schema v1 is unchanged.
+Layer 5 Plan schema v1 and the Developer Terminal wire contract are unchanged.
 
 ## Typed protocol and transport
 
