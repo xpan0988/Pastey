@@ -7,7 +7,6 @@ use std::{
 use mime_guess::MimeGuess;
 use rusqlite::{params, Connection, OptionalExtension};
 use sanitize_filename::sanitize;
-use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
 use crate::{
@@ -26,8 +25,6 @@ pub const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 pub const MAX_FILE_SIZE_MESSAGE: &str = "File too large. Max supported size: 10GB.";
 const ROOM_FILE_DELETE_ERROR: &str = "Could not delete local room files. Check folder permissions.";
 const MANUAL_BURN_ROOM_LIFETIME_SECS: i64 = 100 * 365 * 24 * 60 * 60;
-const APP_DATA_DIR_ENV: &str = "PASTEY_APP_DATA_DIR";
-
 #[derive(Clone, Debug)]
 pub struct AppPaths {
     pub app_data_dir: PathBuf,
@@ -39,75 +36,27 @@ pub struct AppPaths {
     pub config_path: PathBuf,
 }
 
-pub fn init_app_paths(app: &AppHandle) -> AppResult<AppPaths> {
-    let default_app_data_dir = app.path().app_data_dir().map_err(|error| {
-        AppError::InvalidInput(format!("unable to resolve app data directory: {error}"))
-    })?;
-    let app_data_dir_override = app_data_dir_override()?;
-    let app_data_dir = app_data_dir_override
-        .clone()
-        .unwrap_or(default_app_data_dir);
-    let payloads_dir = app_data_dir.join("payloads");
-    let inbox_dir = app_data_dir.join("inbox");
-    let temp_dir = app_data_dir.join("temp");
-    let logs_dir = app_data_dir_override
-        .as_ref()
-        .map(|dir| dir.join("logs"))
-        .unwrap_or_else(|| default_logs_dir(&app_data_dir));
-    fs::create_dir_all(&payloads_dir)?;
-    fs::create_dir_all(&inbox_dir)?;
-    fs::create_dir_all(&temp_dir)?;
-    fs::create_dir_all(&logs_dir)?;
-
-    Ok(AppPaths {
-        db_path: app_data_dir.join("db.sqlite"),
-        config_path: app_data_dir.join("config.json"),
-        app_data_dir,
-        payloads_dir,
-        inbox_dir,
-        temp_dir,
-        logs_dir,
-    })
-}
-
-fn app_data_dir_override() -> AppResult<Option<PathBuf>> {
-    let Some(value) = std::env::var_os(APP_DATA_DIR_ENV) else {
-        return Ok(None);
-    };
-    let display = value.to_string_lossy();
-    if display.trim().is_empty() {
-        return Err(AppError::InvalidInput(format!(
-            "{APP_DATA_DIR_ENV} must not be empty"
-        )));
-    }
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        Ok(Some(path))
-    } else {
-        Ok(Some(std::env::current_dir()?.join(path)))
-    }
-}
-
-fn default_logs_dir(app_data_dir: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join("pastey")
-                .join("logs");
+impl AppPaths {
+    /// Builds the complete Host path set from adapter-supplied roots.
+    pub fn new(app_data_dir: PathBuf, logs_dir: PathBuf) -> Self {
+        Self {
+            db_path: app_data_dir.join("db.sqlite"),
+            payloads_dir: app_data_dir.join("payloads"),
+            inbox_dir: app_data_dir.join("inbox"),
+            temp_dir: app_data_dir.join("temp"),
+            config_path: app_data_dir.join("config.json"),
+            app_data_dir,
+            logs_dir,
         }
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(local_app_data).join("pastey").join("logs");
-        }
+    pub fn ensure_directories(&self) -> AppResult<()> {
+        fs::create_dir_all(&self.payloads_dir)?;
+        fs::create_dir_all(&self.inbox_dir)?;
+        fs::create_dir_all(&self.temp_dir)?;
+        fs::create_dir_all(&self.logs_dir)?;
+        Ok(())
     }
-
-    app_data_dir.join("logs")
 }
 
 pub fn init_database(paths: &AppPaths) -> AppResult<()> {
@@ -161,6 +110,7 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             transport_public_key TEXT,
             liveness TEXT NOT NULL,
             join_method TEXT NOT NULL,
+            logical_host_ref TEXT,
             durable_identity_id TEXT,
             updated_at INTEGER NOT NULL,
             PRIMARY KEY(room_id, peer_session_id),
@@ -195,6 +145,7 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
         "#,
     )?;
     ensure_room_schema(&conn)?;
+    ensure_bridge_peer_schema(&conn)?;
     bridge_plan::init_schema(&conn)?;
     migrate_room_statuses(&conn)?;
     backfill_legacy_bridge_peers(&conn)?;
@@ -663,6 +614,10 @@ pub fn sync_legacy_bridge_peer_endpoint(
         })
         .map(|peer| peer.peer_session_id.clone())
         .unwrap_or_else(|| next_legacy_bridge_peer_session_id(&room.id, &peers));
+    let logical_host_ref = peers
+        .iter()
+        .find(|peer| peer.peer_session_id == peer_session_id)
+        .and_then(|peer| peer.logical_host_ref.clone());
 
     if peers
         .iter()
@@ -685,6 +640,7 @@ pub fn sync_legacy_bridge_peer_endpoint(
             BridgePeerLiveness::Disconnected
         },
         join_method: join_method_for_room(room),
+        logical_host_ref,
         durable_identity_id,
         updated_at: now_ts(),
     };
@@ -849,10 +805,11 @@ pub fn upsert_bridge_peer_endpoint(
             transport_public_key,
             liveness,
             join_method,
+            logical_host_ref,
             durable_identity_id,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         ON CONFLICT(room_id, peer_session_id) DO UPDATE SET
             display_name = excluded.display_name,
             endpoint_host = excluded.endpoint_host,
@@ -860,6 +817,7 @@ pub fn upsert_bridge_peer_endpoint(
             transport_public_key = excluded.transport_public_key,
             liveness = excluded.liveness,
             join_method = excluded.join_method,
+            logical_host_ref = COALESCE(excluded.logical_host_ref, bridge_peers.logical_host_ref),
             durable_identity_id = excluded.durable_identity_id,
             updated_at = excluded.updated_at
         "#,
@@ -872,6 +830,7 @@ pub fn upsert_bridge_peer_endpoint(
             peer.transport_public_key,
             peer.liveness.as_str(),
             peer.join_method.as_str(),
+            peer.logical_host_ref,
             peer.durable_identity_id,
             peer.updated_at,
         ],
@@ -895,6 +854,7 @@ pub fn list_bridge_peer_endpoints(
             transport_public_key,
             liveness,
             join_method,
+            logical_host_ref,
             durable_identity_id,
             updated_at
         FROM bridge_peers
@@ -905,6 +865,48 @@ pub fn list_bridge_peer_endpoints(
 
     let rows = stmt.query_map([room_id], row_to_bridge_peer_endpoint)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Associates a logical HostRef with one exact current peer session. This does
+/// not change liveness, routing, pairing, approval, or any Layer 5 authority.
+pub fn bind_bridge_peer_host_ref(
+    paths: &AppPaths,
+    room_id: &str,
+    peer_session_id: &str,
+    host_ref: &str,
+) -> AppResult<()> {
+    crate::host_identity::HostRef::parse(host_ref.to_string())?;
+    let conn = connection(paths)?;
+    let changed = conn.execute(
+        r#"
+        UPDATE bridge_peers
+        SET logical_host_ref = ?1, updated_at = ?2
+        WHERE room_id = ?3
+          AND peer_session_id = ?4
+          AND liveness = 'connected'
+          AND (logical_host_ref IS NULL OR logical_host_ref = ?1)
+        "#,
+        params![host_ref, now_ts(), room_id, peer_session_id],
+    )?;
+    if changed != 1 {
+        return Err(AppError::InvalidInput(
+            "Current peer session is unavailable for Host binding.".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Compatibility adapter for the current two-party room projection. Phase 4
+/// will replace this with participant-aware peer selection.
+pub fn bind_legacy_room_peer_host_ref(
+    paths: &AppPaths,
+    room_id: &str,
+    host_ref: &str,
+) -> AppResult<()> {
+    let room = get_room_by_id(paths, room_id)?;
+    let peer = sync_legacy_bridge_peer_endpoint(paths, &room)?
+        .ok_or_else(|| AppError::InvalidInput("Current peer session is unavailable.".into()))?;
+    bind_bridge_peer_host_ref(paths, room_id, &peer.peer_session_id, host_ref)
 }
 
 pub fn set_room_status(paths: &AppPaths, room_id: &str, status: RoomStatus) -> AppResult<()> {
@@ -1865,6 +1867,21 @@ fn ensure_room_schema(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn ensure_bridge_peer_schema(conn: &Connection) -> AppResult<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(bridge_peers)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if !columns.iter().any(|column| column == "logical_host_ref") {
+        conn.execute(
+            "ALTER TABLE bridge_peers ADD COLUMN logical_host_ref TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_room_statuses(conn: &Connection) -> AppResult<()> {
     conn.execute(
         "UPDATE rooms SET status = 'active' WHERE status IN ('waiting', 'connected')",
@@ -1893,6 +1910,7 @@ fn backfill_legacy_bridge_peers(conn: &Connection) -> AppResult<()> {
             transport_public_key,
             liveness,
             join_method,
+            logical_host_ref,
             durable_identity_id,
             updated_at
         )
@@ -1905,6 +1923,7 @@ fn backfill_legacy_bridge_peers(conn: &Connection) -> AppResult<()> {
             peer_transport_public_key,
             CASE WHEN status = 'active' THEN 'connected' ELSE 'disconnected' END,
             CASE WHEN local_role = 'joined' THEN 'manual_code' ELSE 'nearby_accept' END,
+            NULL,
             NULL,
             ?1
         FROM rooms
@@ -2154,8 +2173,9 @@ fn row_to_bridge_peer_endpoint(
         liveness: BridgePeerLiveness::from_db(&liveness).unwrap_or(BridgePeerLiveness::Stale),
         join_method: BridgePeerJoinMethod::from_db(&join_method)
             .unwrap_or(BridgePeerJoinMethod::ManualCode),
-        durable_identity_id: row.get(8)?,
-        updated_at: row.get(9)?,
+        logical_host_ref: row.get(8)?,
+        durable_identity_id: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -2232,6 +2252,42 @@ mod tests {
             logs_dir: root.join("logs"),
             config_path: root.join("config.json"),
         }
+    }
+
+    #[test]
+    fn phase_two_adds_nullable_host_identity_to_existing_peer_schema() {
+        let paths = test_paths("pastey_bridge_host_ref_schema_migration");
+        let conn = Connection::open(&paths.db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE bridge_peers (
+                room_id TEXT NOT NULL,
+                peer_session_id TEXT NOT NULL,
+                display_name TEXT,
+                endpoint_host TEXT,
+                endpoint_port INTEGER,
+                transport_public_key TEXT,
+                liveness TEXT NOT NULL,
+                join_method TEXT NOT NULL,
+                durable_identity_id TEXT,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(room_id, peer_session_id)
+            );
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        init_database(&paths).unwrap();
+        let conn = connection(&paths).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(bridge_peers)").unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "logical_host_ref"));
+        let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 
     #[test]
@@ -2679,6 +2735,8 @@ mod tests {
             Some("Known laptop"),
         )
         .unwrap();
+        let host_ref = crate::host_identity::HostRef::from_device_id("known-host").unwrap();
+        bind_legacy_room_peer_host_ref(&paths, "room", host_ref.as_str()).unwrap();
 
         update_room_peer(
             &paths,
@@ -2702,11 +2760,21 @@ mod tests {
             .unwrap();
         assert_eq!(old.liveness, BridgePeerLiveness::Stale);
         assert_eq!(old.endpoint_host, None);
+        assert_eq!(old.logical_host_ref.as_deref(), Some(host_ref.as_str()));
         assert_eq!(
             current.durable_identity_id.as_deref(),
             Some(identity.durable_identity_id.as_str())
         );
         assert_eq!(current.liveness, BridgePeerLiveness::Connected);
+        assert_eq!(current.logical_host_ref, None);
+        bind_bridge_peer_host_ref(&paths, "room", &current.peer_session_id, host_ref.as_str())
+            .unwrap();
+        let rebound = list_bridge_peer_endpoints(&paths, "room")
+            .unwrap()
+            .into_iter()
+            .find(|peer| peer.peer_session_id == current.peer_session_id)
+            .unwrap();
+        assert_eq!(rebound.logical_host_ref.as_deref(), Some(host_ref.as_str()));
         let info = room_to_info_with_bridge_peers(
             &paths,
             get_room_by_id(&paths, "room").unwrap(),
@@ -2875,6 +2943,7 @@ mod tests {
                 transport_public_key: Some("peer-key-b".into()),
                 liveness: BridgePeerLiveness::Connected,
                 join_method: BridgePeerJoinMethod::NearbyAccept,
+                logical_host_ref: None,
                 durable_identity_id: None,
                 updated_at: now_ts() + 1,
             },
@@ -2920,6 +2989,8 @@ mod tests {
             RoomStatus::Active,
         )
         .unwrap();
+        let host_ref = crate::host_identity::HostRef::from_device_id("peer-host").unwrap();
+        bind_legacy_room_peer_host_ref(&paths, "room", host_ref.as_str()).unwrap();
         let conn = connection(&paths).unwrap();
         conn.execute(
             "UPDATE bridge_peers SET liveness = 'disconnected', endpoint_host = NULL, endpoint_port = NULL WHERE room_id = 'room'",
@@ -2932,6 +3003,59 @@ mod tests {
         assert_eq!(info.peers.len(), 1);
         assert_eq!(info.peers[0].liveness, BridgePeerLiveness::Disconnected);
         assert!(!info.peers[0].connected);
+        let peer = list_bridge_peer_endpoints(&paths, "room")
+            .unwrap()
+            .remove(0);
+        assert_eq!(peer.logical_host_ref.as_deref(), Some(host_ref.as_str()));
+        assert!(bind_bridge_peer_host_ref(
+            &paths,
+            "room",
+            &peer.peer_session_id,
+            host_ref.as_str(),
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn conflicting_host_ref_association_and_restart_recovery_fail_closed() {
+        let paths = test_paths("pastey_bridge_host_identity_restart");
+        init_database(&paths).unwrap();
+        create_room(
+            &paths,
+            &crypto::random_key(),
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        update_room_peer(
+            &paths,
+            "room",
+            Some("127.0.0.1"),
+            Some(9000),
+            Some("Device"),
+            Some("peer-key"),
+            RoomStatus::Active,
+        )
+        .unwrap();
+        let first = crate::host_identity::HostRef::from_device_id("peer-a").unwrap();
+        let mismatch = crate::host_identity::HostRef::from_device_id("peer-b").unwrap();
+        bind_legacy_room_peer_host_ref(&paths, "room", first.as_str()).unwrap();
+        assert!(bind_legacy_room_peer_host_ref(&paths, "room", mismatch.as_str()).is_err());
+
+        run_startup_recovery(&paths, &paths.inbox_dir).unwrap();
+        let peer = list_bridge_peer_endpoints(&paths, "room")
+            .unwrap()
+            .remove(0);
+        assert_eq!(peer.liveness, BridgePeerLiveness::Expired);
+        assert_eq!(peer.logical_host_ref.as_deref(), Some(first.as_str()));
+        assert!(
+            bind_bridge_peer_host_ref(&paths, "room", &peer.peer_session_id, first.as_str(),)
+                .is_err()
+        );
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 
@@ -2960,6 +3084,8 @@ mod tests {
             RoomStatus::Active,
         )
         .unwrap();
+        let host_ref = crate::host_identity::HostRef::from_device_id("burned-peer").unwrap();
+        bind_legacy_room_peer_host_ref(&paths, "room", host_ref.as_str()).unwrap();
 
         burn_room(&paths, "room", &paths.inbox_dir).unwrap();
 

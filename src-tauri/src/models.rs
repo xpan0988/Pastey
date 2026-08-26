@@ -388,6 +388,9 @@ pub struct StoredBridgePeerEndpoint {
     pub transport_public_key: Option<String>,
     pub liveness: BridgePeerLiveness,
     pub join_method: BridgePeerJoinMethod,
+    /// Core logical identity learned from the peer. It is separate from the
+    /// current route/session and display-only pairing metadata.
+    pub logical_host_ref: Option<String>,
     pub durable_identity_id: Option<String>,
     pub updated_at: i64,
 }
@@ -523,6 +526,9 @@ pub struct JoinRoomRequest {
     pub port: u16,
     pub device_name: String,
     pub transport_public_key: String,
+    /// Additive Phase 2 compatibility field. Older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -530,6 +536,9 @@ pub struct JoinRoomResponse {
     pub device_name: String,
     pub expires_at: i64,
     pub transport_public_key: String,
+    /// Additive Phase 2 compatibility field. Older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

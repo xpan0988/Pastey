@@ -19,7 +19,6 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
 use tokio::{
     fs::OpenOptions,
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
@@ -35,6 +34,7 @@ use crate::{
     },
     config, crypto, discovery,
     error::{AppError, AppResult},
+    host_runtime::{ActiveRoomServer, HostRuntime as AppState},
     link_benchmark, logging,
     models::{
         ChunkAckResponse, ChunkUploadRequest, FileTransferFinishRequest, FileTransferProgressEvent,
@@ -43,7 +43,6 @@ use crate::{
     },
     storage,
     transfer_tuning::{self, TransferTuning},
-    ActiveRoomServer, AppState,
 };
 
 pub const DEFAULT_CHUNK_SIZE_BYTES: u64 = 4 * 1024 * 1024;
@@ -343,7 +342,7 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    state.spawn(async move {
         let server = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -413,6 +412,7 @@ pub async fn announce_join(
             port: snapshot.port,
             device_name: device_name(),
             transport_public_key: snapshot.transport_public_key,
+            host_ref: Some(state.local_host_ref.as_str().to_string()),
         })
         .send()
         .await?;
@@ -2684,6 +2684,13 @@ async fn join_handler(
         return Err(StatusCode::GONE);
     }
 
+    let request_host_ref = request
+        .host_ref
+        .as_deref()
+        .map(|value| crate::host_identity::HostRef::parse_peer(value, &ctx.state.local_host_ref))
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
     let snapshot = room_server_snapshot(&ctx.state, &room_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     crate::room_control::clear_room_control_state(&ctx.state, &room_id);
@@ -2697,11 +2704,16 @@ async fn join_handler(
         RoomStatus::Active,
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(host_ref) = request_host_ref.as_ref() {
+        storage::bind_legacy_room_peer_host_ref(&ctx.state.paths, &room_id, host_ref.as_str())
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    }
 
     Ok(Json(JoinRoomResponse {
         device_name: device_name(),
         expires_at: room.expires_at,
         transport_public_key: snapshot.transport_public_key,
+        host_ref: Some(ctx.state.local_host_ref.as_str().to_string()),
     }))
 }
 
@@ -3639,7 +3651,7 @@ async fn receive_file_chunk_handler(
     };
     let ui_emit_started = Instant::now();
     if let Some(event) = maybe_event {
-        let _ = ctx.state.app_handle.emit(TRANSFER_EVENT, event);
+        let _ = ctx.state.emit(TRANSFER_EVENT, &event);
     }
     let ui_emit_elapsed = ui_emit_started.elapsed();
     dev_log_receiver_chunk_timing(
@@ -4616,7 +4628,7 @@ fn emit_progress(
             eta_seconds,
             error_message,
         );
-        let _ = state.app_handle.emit(TRANSFER_EVENT, event);
+        let _ = state.emit(TRANSFER_EVENT, &event);
     } else {
         log_late_event_ignored(transfer_id, "", "progress");
     }
@@ -4646,7 +4658,7 @@ fn emit_event(
         eta_seconds,
         error_message,
     );
-    let _ = state.app_handle.emit(TRANSFER_EVENT, event);
+    let _ = state.emit(TRANSFER_EVENT, &event);
 }
 
 fn record_receiver_chunk_timing(
@@ -5059,6 +5071,40 @@ mod tests {
         task::{Context, Poll},
     };
     use tokio::io::ReadBuf;
+
+    #[test]
+    fn phase_two_join_identity_fields_are_backward_compatible() {
+        let legacy_request: JoinRoomRequest = serde_json::from_value(serde_json::json!({
+            "port": 9000,
+            "device_name": "Legacy peer",
+            "transport_public_key": "peer-key"
+        }))
+        .unwrap();
+        let legacy_response: JoinRoomResponse = serde_json::from_value(serde_json::json!({
+            "device_name": "Legacy peer",
+            "expires_at": 100,
+            "transport_public_key": "peer-key"
+        }))
+        .unwrap();
+        assert_eq!(legacy_request.host_ref, None);
+        assert_eq!(legacy_response.host_ref, None);
+
+        let current = JoinRoomRequest {
+            port: 9000,
+            device_name: "Current peer".into(),
+            transport_public_key: "peer-key".into(),
+            host_ref: Some(
+                crate::host_identity::HostRef::from_device_id("current-peer")
+                    .unwrap()
+                    .as_str()
+                    .to_string(),
+            ),
+        };
+        assert!(serde_json::to_value(current)
+            .unwrap()
+            .get("host_ref")
+            .is_some());
+    }
 
     struct ShortAsyncReader {
         data: Vec<u8>,

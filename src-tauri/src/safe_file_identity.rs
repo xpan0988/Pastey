@@ -78,6 +78,58 @@ pub(crate) fn capture_source_identity(
     })
 }
 
+/// Reads an exact previously captured regular file through the same
+/// descriptor-relative, no-follow path used for identity capture. Callers get
+/// bytes only when the identity is unchanged before, during, and after the
+/// read; the physical path never needs to leave the Host-private resolver.
+pub(crate) fn read_source_if_identity_matches(
+    source_path: &Path,
+    scope_root: &Path,
+    expected: &SourceIdentity,
+    maximum_bytes: u64,
+) -> AppResult<Vec<u8>> {
+    let mut source = open_regular_source(source_path, scope_root)?;
+    let before = source_fingerprint(&source)?;
+    if before != expected.fingerprint || expected.byte_count > maximum_bytes {
+        return Err(AppError::InvalidInput(
+            "Safe file source identity is stale or mismatched.".into(),
+        ));
+    }
+    source.seek(SeekFrom::Start(0))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let next_len = bytes
+            .len()
+            .checked_add(read)
+            .ok_or_else(|| AppError::InvalidInput("Safe file source is too large.".into()))?;
+        if next_len as u64 > maximum_bytes {
+            return Err(AppError::InvalidInput(
+                "Safe file source exceeds the identity limit.".into(),
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    let after = source_fingerprint(&source)?;
+    let digest = hasher.finalize().to_hex().to_string();
+    if before != after
+        || after != expected.fingerprint
+        || bytes.len() as u64 != expected.byte_count
+        || digest != expected.digest
+    {
+        return Err(AppError::InvalidInput(
+            "Safe file source changed while it was read.".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Creates an immutable, normalized receiver-local copy. The source is opened
 /// once by descriptor and is never reopened by path while bytes are copied.
 fn open_regular_source(source_path: &Path, scope_root: &Path) -> AppResult<File> {

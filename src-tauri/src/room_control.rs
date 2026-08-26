@@ -15,17 +15,16 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tauri::Emitter;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     crypto,
     error::{AppError, AppResult},
+    host_runtime::HostRuntime as AppState,
     logging,
     models::{BridgePeerLiveness, RoomStatus, StoredBridgePeerEndpoint},
     storage,
     transfer::RoomServerContext,
-    AppState,
 };
 
 pub const MAX_CONTROL_REQUEST_BYTES: usize = 96 * 1024;
@@ -56,6 +55,8 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "bridge_plan.step_result",
     "bridge_plan.step_failed",
     "bridge_plan.cancel",
+    "bridge_plan.v2.review_request",
+    "bridge_plan.v2.attempt_start",
     "developer_terminal.open_request",
     "developer_terminal.open_accepted",
     "developer_terminal.open_denied",
@@ -1002,7 +1003,7 @@ pub fn list_received_room_control_events(
 
 pub fn clear_room_control_state(state: &Arc<AppState>, room_id: &str) {
     state.room_control.lock().rooms.remove(room_id);
-    state.host_runtime.purge_room(room_id);
+    state.purge_room(room_id);
 }
 
 pub async fn receive_room_control_event_handler(
@@ -1390,7 +1391,7 @@ pub async fn receive_room_control_event_handler(
                 &inbound_peer.peer_session_id,
             )
         };
-        let service = &ctx.state.host_runtime.developer_terminal;
+        let service = &ctx.state.developer_terminal;
         let accepted = match validated.kind.as_str() {
             "developer_terminal.open_request" => {
                 service.receive_open_request(binding, &message, now)
@@ -1421,8 +1422,7 @@ pub async fn receive_room_control_event_handler(
                 // the fallback if the renderer misses an event.
                 let _ = ctx
                     .state
-                    .app_handle
-                    .emit(crate::developer_terminal::OUTPUT_UI_EVENT, output);
+                    .emit(crate::developer_terminal::OUTPUT_UI_EVENT, &output);
             }
         }
         // Terminal traffic is delivered directly to the process-local Host
@@ -1533,7 +1533,7 @@ pub async fn receive_room_control_event_handler(
         let response_room_id = room_id.clone();
         let dispatched_projection = projection.clone();
         log_peer_capability_projection("response_dispatch", &projection);
-        tauri::async_runtime::spawn(async move {
+        ctx.state.spawn(async move {
             match send_room_control_event(
                 response_state,
                 &response_room_id,
@@ -1548,6 +1548,76 @@ pub async fn receive_room_control_event_handler(
                 Err(_) => log_peer_capability("response_rejected", None, Some("delivery_failed")),
             }
         });
+    } else if validated.kind.starts_with("bridge_plan.v2.") {
+        let now = storage::now_ts();
+        let captured_binding = match crate::host_runtime::current_host_session_binding(
+            &ctx.state,
+            &room_id,
+            &inbound_peer.peer_session_id,
+        ) {
+            Ok(binding) => binding,
+            Err(_) => {
+                return control_error(
+                    StatusCode::FORBIDDEN,
+                    "host_binding_unavailable",
+                    "Bridge Plan v2 Host binding is unavailable.",
+                )
+            }
+        };
+        let payload = validated
+            .event
+            .get("payload")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let accepted = match validated.kind.as_str() {
+            "bridge_plan.v2.review_request" => {
+                serde_json::from_value(payload)
+                    .map_err(AppError::from)
+                    .and_then(|review| {
+                        crate::bridge_plan_v2::BridgePlanV2Store::new(&ctx.state.paths)
+                            .record_review(&review, &captured_binding, now)
+                    })
+            }
+            "bridge_plan.v2.attempt_start" => {
+                let current_binding = crate::host_runtime::current_host_session_binding(
+                    &ctx.state,
+                    &room_id,
+                    &inbound_peer.peer_session_id,
+                );
+                serde_json::from_value(payload)
+                    .map_err(AppError::from)
+                    .and_then(|start| {
+                        let current_binding = current_binding?;
+                        match crate::bridge_plan_v2::BridgePlanV2Store::new(&ctx.state.paths)
+                            .accept_attempt_start(
+                                &start,
+                                &captured_binding,
+                                &current_binding,
+                                &ctx.state.host_admission,
+                                now,
+                            )? {
+                            crate::bridge_plan_v2::AttemptStartDecisionV2::Accepted(_) => Ok(()),
+                            crate::bridge_plan_v2::AttemptStartDecisionV2::Denied(_) => {
+                                Err(AppError::InvalidInput(
+                                    "Bridge Plan v2 Host admission denied.".into(),
+                                ))
+                            }
+                        }
+                    })
+            }
+            _ => Err(AppError::InvalidInput(
+                "Unsupported Bridge Plan protocol v2 event.".into(),
+            )),
+        };
+        if let Err(error) = accepted {
+            let reason = bridge_plan_protocol_rejection_reason(&error);
+            log_bridge_plan_validation_rejected(&validated.event, reason);
+            return control_error(
+                StatusCode::BAD_REQUEST,
+                reason,
+                "Bridge Plan v2 validation or Host admission failed.",
+            );
+        }
     } else {
         protocol_action = match crate::bridge_plan::accept_inbound_protocol_event(
             &ctx.state.paths,
@@ -1575,7 +1645,7 @@ pub async fn receive_room_control_event_handler(
         crate::bridge_plan::InboundProtocolAction::ExecuteSearch { attempt_id } => {
             let execution_state = ctx.state.clone();
             let execution_room = room_id.clone();
-            tauri::async_runtime::spawn(async move {
+            ctx.state.spawn(async move {
                 let _ = crate::commands::execute_bridge_plan_search_attempt_inner(
                     execution_state,
                     execution_room,
@@ -1588,7 +1658,7 @@ pub async fn receive_room_control_event_handler(
         crate::bridge_plan::InboundProtocolAction::ExecuteTransfer { attempt_id } => {
             let execution_state = ctx.state.clone();
             let execution_room = room_id.clone();
-            tauri::async_runtime::spawn(async move {
+            ctx.state.spawn(async move {
                 let _ = crate::commands::execute_bridge_plan_transfer_attempt_inner(
                     execution_state,
                     execution_room,
@@ -1601,7 +1671,7 @@ pub async fn receive_room_control_event_handler(
         crate::bridge_plan::InboundProtocolAction::ContinueAttempt { attempt_id } => {
             let continuation_state = ctx.state.clone();
             let continuation_room = room_id.clone();
-            tauri::async_runtime::spawn(async move {
+            ctx.state.spawn(async move {
                 let _ = crate::commands::continue_bridge_plan_attempt_inner(
                     continuation_state,
                     continuation_room,
@@ -1779,15 +1849,26 @@ fn validate_control_event(
                 "Invalid Bridge Plan protocol event.".into(),
             ));
         }
-        let metadata = crate::bridge_plan::protocol_metadata(
-            &kind,
-            payload,
-            expected_room,
-            expected_source,
-            expected_target,
-            now.unix_timestamp(),
-        )?;
-        (None, Some(metadata.replay_id))
+        let replay_id = if kind.starts_with("bridge_plan.v2.") {
+            crate::bridge_plan_v2::protocol_metadata(
+                &kind,
+                payload,
+                expected_room,
+                now.unix_timestamp(),
+            )?
+            .replay_id
+        } else {
+            crate::bridge_plan::protocol_metadata(
+                &kind,
+                payload,
+                expected_room,
+                expected_source,
+                expected_target,
+                now.unix_timestamp(),
+            )?
+            .replay_id
+        };
+        (None, Some(replay_id))
     } else if kind.starts_with("peer_capability.") {
         if string_field(object, "protocolFamily")? != PEER_CAPABILITY_PROTOCOL_FAMILY
             || object.get("previewOnly") != Some(&Value::Bool(false))
@@ -2161,6 +2242,7 @@ mod tests {
             transport_public_key: Some("target-key".into()),
             liveness: BridgePeerLiveness::Connected,
             join_method: crate::models::BridgePeerJoinMethod::NearbyAccept,
+            logical_host_ref: None,
             durable_identity_id: None,
             updated_at: 1,
         }
@@ -2295,7 +2377,7 @@ mod tests {
             peer_observation_ref: "observation".into(),
             peer_connected: true,
         };
-        let binding = crate::host_runtime::HostSessionBinding::new(
+        let binding = crate::host_runtime::DeveloperTerminalBinding::new(
             "room",
             "controller-session",
             "host-session",
@@ -2659,6 +2741,8 @@ mod tests {
     fn receiver_review_decision_is_not_a_live_room_control_event() {
         assert!(!ALLOWED_EVENT_KINDS.contains(&"bridge_plan.review_decision"));
         assert!(ALLOWED_EVENT_KINDS.contains(&"bridge_plan.review_request"));
+        assert!(ALLOWED_EVENT_KINDS.contains(&"bridge_plan.v2.review_request"));
+        assert!(ALLOWED_EVENT_KINDS.contains(&"bridge_plan.v2.attempt_start"));
     }
 
     #[test]

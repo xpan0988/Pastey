@@ -1,15 +1,14 @@
 use std::{sync::Arc, time::Duration};
 
-use tauri::{AppHandle, Manager};
-
-use crate::{error::AppResult, transfer, AppState};
+use crate::{error::AppResult, host_runtime::HostRuntime as AppState, transfer};
 
 const CLEANUP_INTERVAL_SECS: u64 = 120;
 
-pub fn start_cleanup_scheduler(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
+pub fn start_cleanup_scheduler(state: Arc<AppState>) {
+    let scheduler_state = state.clone();
+    state.spawn(async move {
         loop {
-            if let Err(error) = run_cleanup_once(&app).await {
+            if let Err(error) = run_cleanup_once(&scheduler_state).await {
                 eprintln!("cleanup failed: {error}");
             }
 
@@ -18,9 +17,8 @@ pub fn start_cleanup_scheduler(app: AppHandle) {
     });
 }
 
-pub async fn run_cleanup_once(app: &AppHandle) -> AppResult<()> {
-    let state = app.state::<Arc<AppState>>().inner().clone();
-    let active_transfer_room_ids = transfer::active_transfer_room_ids(&state);
+pub async fn run_cleanup_once(state: &Arc<AppState>) -> AppResult<()> {
+    let active_transfer_room_ids = transfer::active_transfer_room_ids(state);
     let expired_room_ids =
         crate::storage::cleanup_expired_rooms_except(&state.paths, &active_transfer_room_ids)?;
 
