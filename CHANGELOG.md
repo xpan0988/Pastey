@@ -62,7 +62,7 @@ Version 1.9.2 is the previous frozen Layer 1–5 baseline. The current `Unreleas
 - A reported Mac-controller-to-Windows-Host run confirms interactive PowerShell and normal typing. Rapid-input ordering, paste, revocation-under-load, and the new local output-event path still require physical cross-device stress retesting; no complete physical Mac↔Windows/Linux E2E PASS claim is made.
 - The 1.9.3 managed authority substrate is not a live Agent product path. Worker Harness, managed Transform/Execute coordination, PM/planner integration, and the v2 product/UI flow begin with the planned Phase 6 / 2.0.0 milestone.
 
-## 1.9.2 — Core architecture and Layer 5 semantic freeze — 2026-08-19
+## 1.9.2 — 2026-08-26
 
 ### Added / Architecture
 
