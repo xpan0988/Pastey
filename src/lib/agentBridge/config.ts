@@ -1,6 +1,8 @@
 import { useSyncExternalStore } from "react";
 
-export type AgentBridgeProviderKind = "mock" | "cloud";
+/** This renderer-side shape is retained only for non-authoritative compatibility
+ * helpers. Production provider selection is Host-owned and is not read here. */
+export type AgentBridgeProviderKind = "cloud";
 export type AgentBridgeLogLevel = "off" | "errors" | "standard" | "verbose";
 
 export interface AgentBridgeRuntimeConfig {
@@ -13,8 +15,8 @@ export interface AgentBridgeRuntimeConfig {
 }
 
 let config: AgentBridgeRuntimeConfig = {
-  enabled: true,
-  providerKind: "mock",
+  enabled: false,
+  providerKind: "cloud",
   cloudBaseUrl: "https://api.openai.com/v1",
   cloudModel: "",
   cloudApiKey: "",

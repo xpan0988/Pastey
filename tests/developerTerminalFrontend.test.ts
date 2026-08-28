@@ -175,7 +175,7 @@ test("Developer Terminal focus is explicit and uses the emulator cursor", () => 
 
 test("Developer Terminal resize uses FitAddon and a bounded debounce", () => {
   const component = readFileSync("src/components/DeveloperTerminalViewport.tsx", "utf8");
-  const styles = readFileSync("src/styles.css", "utf8");
+  const styles = readFileSync("src/features/workspace/workspace-v2.css", "utf8");
 
   assert.match(component, /new FitAddon\(\)/);
   assert.match(component, /terminal\.onResize\(\(\{ cols, rows \}\)/);
@@ -192,7 +192,7 @@ test("Developer Terminal resize uses FitAddon and a bounded debounce", () => {
   assert.match(component, /postOutputFitPending = false/);
   assert.match(component, /terminal\.write\(output, \(\) => fitRequestRef\.current\(\)\)/);
   assert.match(styles, /\.developer-terminal-xterm > \.xterm[\s\S]*padding: 12px/);
-  assert.match(styles, /\.developer-terminal-xterm \{\s*height: 360px;\s*\}/);
+  assert.match(styles, /\.developer-terminal-xterm \{\s*height: 430px;\s*\}/);
 });
 
 test("Developer Terminal fit lifecycle is recreated for each opened session and disposed on close", () => {
@@ -205,20 +205,13 @@ test("Developer Terminal fit lifecycle is recreated for each opened session and 
 });
 
 test("active Developer Terminal UI hides fresh-request controls and identifies the Host", () => {
-  const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
-  const panel = pages.slice(
-    pages.indexOf("function DeveloperModePanel"),
-    pages.indexOf("function BridgePlanReceiverPanel"),
-  );
+  const panel = readFileSync("src/features/workspace/DeveloperModeScreen.tsx", "utf8");
 
-  assert.match(panel, /uiSession && !currentController/);
-  assert.match(panel, /Connected Host: \{controlledHostName\}/);
-  assert.match(panel, /Shell: \{currentController\.environmentLabel/);
-  assert.match(panel, /Status: \{currentController\.state/);
+  assert.match(panel, /Human-only, current-session terminal access/);
+  assert.match(panel, /separate from Agent Task, Worker, Execute, Plan authority/);
+  assert.match(panel, /End session/);
+  assert.match(panel, /Request terminal admission/);
   assert.match(panel, /<DeveloperTerminalViewport/);
-  assert.match(panel, /new OrderedTerminalInputWriter\(/);
-  assert.match(panel, /terminalInputWriterRef\.current\?\.cancel\(\)/);
-  assert.doesNotMatch(panel, /void sendDeveloperTerminalInput\(/);
-  assert.doesNotMatch(panel, /function sendKey/);
-  assert.doesNotMatch(panel, /terminalDisplay/);
+  assert.match(panel, /closeDeveloperTerminal/);
+  assert.match(panel, /Burn Bridge is a separate destructive action/);
 });

@@ -1,10 +1,9 @@
-//! Phase 5 step 6 platform execution worlds.
+//! Platform execution worlds for the live managed Worker path.
 //!
-//! This service is deliberately not attached to live v2 Plan dispatch. It is
-//! reachable only through the generic `HostEffectBackendV1` port after Core
-//! has installed and activated an exact EffectEnvelope. Platform adapters
-//! either verify every required confinement property or report unavailable;
-//! there is no direct-process fallback.
+//! The service is reachable only through the generic `HostEffectBackendV1`
+//! port after Core installs and activates an exact EffectEnvelope. Platform
+//! adapters either verify every required confinement property or report
+//! unavailable; there is no direct-process fallback.
 
 #![allow(dead_code)] // Step 8 is the first live product attachment.
 
@@ -13,7 +12,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -21,6 +20,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::process::Stdio;
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -39,7 +41,7 @@ use crate::{
     },
 };
 
-const EXECUTION_WORLD_VERSION: &str = "pastey-execution-world-v1";
+pub(crate) const EXECUTION_WORLD_VERSION: &str = "pastey-execution-world-v1";
 const MAX_ARGUMENTS: usize = 256;
 const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_ENV_BINDINGS: usize = 128;
@@ -109,6 +111,8 @@ struct ProvisionedWorldV1 {
     mounts: Vec<ExecutionWorldMountV1>,
     resource_identity_refs: HashMap<ResourceHandleRefV1, String>,
     invocations: HashMap<String, ManagedProcessInvocationV1>,
+    #[cfg(windows)]
+    windows: Arc<crate::windows_execution_world::WindowsWorldV1>,
     revoked: bool,
 }
 
@@ -136,9 +140,7 @@ struct ManagedProcessV1 {
     argv_digest: String,
     environment_digest: String,
     process_ref: String,
-    child: Mutex<Child>,
-    #[cfg(unix)]
-    process_group: i32,
+    child: Mutex<PlatformChildV1>,
     stdout: Arc<StreamCaptureV1>,
     stderr: Arc<StreamCaptureV1>,
     terminal: Mutex<Option<TerminalObservationV1>>,
@@ -153,22 +155,57 @@ struct ManagedProcessV1 {
 impl ManagedProcessV1 {
     fn terminate_tree(&self) -> bool {
         self.cancel.store(true, Ordering::SeqCst);
-        #[cfg(unix)]
-        unsafe {
-            // A negative pid addresses exactly the process group created by
-            // the adapter. No arbitrary Host pid supplied by a requester is
-            // ever used here.
-            libc::kill(-self.process_group, libc::SIGKILL) == 0
-                || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        }
-        #[cfg(windows)]
-        {
-            let _ = self.child.lock().kill();
-            true
-        }
-        #[cfg(not(any(unix, windows)))]
-        false
+        self.child.lock().terminate_tree()
     }
+}
+
+enum PlatformChildV1 {
+    #[cfg(unix)]
+    Unix {
+        child: std::process::Child,
+        process_group: i32,
+    },
+    #[cfg(windows)]
+    Windows(crate::windows_execution_world::WindowsProcessV1),
+}
+
+impl PlatformChildV1 {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix { child, .. } => child.try_wait(),
+            #[cfg(windows)]
+            Self::Windows(child) => child.try_wait(),
+        }
+    }
+
+    fn terminate_tree(&mut self) -> bool {
+        match self {
+            #[cfg(unix)]
+            Self::Unix { process_group, .. } => unsafe {
+                // A negative pid addresses exactly the process group created
+                // by the adapter. No requester-controlled Host pid is used.
+                libc::kill(-*process_group, libc::SIGKILL) == 0
+                    || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            },
+            #[cfg(windows)]
+            Self::Windows(child) => child.terminate_tree(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_id(&self) -> i32 {
+        match self {
+            Self::Unix { process_group, .. } => *process_group,
+        }
+    }
+}
+
+struct SpawnedPlatformProcessV1 {
+    child: PlatformChildV1,
+    stdin: Option<Box<dyn Write + Send>>,
+    stdout: Box<dyn Read + Send>,
+    stderr: Box<dyn Read + Send>,
 }
 
 #[derive(Default)]
@@ -260,6 +297,20 @@ impl ExecutionWorldServiceV1 {
             .map(|grant| (grant.handle_ref.clone(), grant.safe_identity_ref.clone()))
             .collect::<HashMap<_, _>>();
         let mounts = resolver.lease_execution_world_mounts(authority, objects, &access, &grants)?;
+        #[cfg(windows)]
+        let (mounts, windows) =
+            match crate::windows_execution_world::prepare_world(world_ref, &mounts) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let _ = resolver.release_execution_world_mounts(
+                        objects,
+                        &access,
+                        &synthetic_request_id()?,
+                        &mounts,
+                    );
+                    return Err(error);
+                }
+            };
         let owner = WorldOwnerV1 {
             envelope_ref: access.envelope_ref.clone(),
             run_ref: access.run_control_ref.clone(),
@@ -288,6 +339,8 @@ impl ExecutionWorldServiceV1 {
                 mounts,
                 resource_identity_refs,
                 invocations: HashMap::new(),
+                #[cfg(windows)]
+                windows,
                 revoked: false,
             },
         );
@@ -412,9 +465,19 @@ impl ExecutionWorldServiceV1 {
                 executable_identity_ref,
             )
         };
+        #[cfg(windows)]
+        let windows = self
+            .state
+            .lock()
+            .worlds
+            .get(world_ref)
+            .map(|world| world.windows.clone())
+            .ok_or_else(|| AppError::InvalidInput("Execution world is unavailable.".into()))?;
         if !matches!(
             availability.kind,
-            PlatformWorldKindV1::MacOsSandboxExec | PlatformWorldKindV1::LinuxBubblewrapCgroupV2
+            PlatformWorldKindV1::MacOsSandboxExec
+                | PlatformWorldKindV1::LinuxBubblewrapCgroupV2
+                | PlatformWorldKindV1::WindowsAppContainer
         ) || request.requested_budget_slice.process_spawns != 1
             || request.requested_budget_slice.wall_millis == 0
         {
@@ -435,7 +498,7 @@ impl ExecutionWorldServiceV1 {
             .find(|mount| mount.handle_ref == invocation.executable_handle)
             .ok_or_else(|| AppError::InvalidInput("Executable mount is unavailable.".into()))?;
         let cwd = resolve_working_directory(&mounts, &invocation)?;
-        let mut command = build_platform_command(
+        let mut spawned = spawn_platform_process(
             &availability,
             &grant,
             &mounts,
@@ -443,26 +506,11 @@ impl ExecutionWorldServiceV1 {
             &invocation,
             cwd.as_deref(),
             request,
+            #[cfg(windows)]
+            windows,
         )?;
-        command
-            .env_clear()
-            .stdin(if invocation.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (name, value) in &invocation.environment {
-            command.env(name, value);
-        }
-        let mut child = command.spawn().map_err(|_| {
-            AppError::InvalidInput("Verified execution world failed to spawn.".into())
-        })?;
-        #[cfg(unix)]
-        let process_group = child.id() as i32;
         if let Some(stdin) = invocation.stdin {
-            let mut input = child.stdin.take().ok_or_else(|| {
+            let mut input = spawned.stdin.take().ok_or_else(|| {
                 AppError::InvalidInput("Contained process stdin pipe is unavailable.".into())
             })?;
             input.write_all(&stdin)?;
@@ -474,20 +522,8 @@ impl ExecutionWorldServiceV1 {
             .saturating_sub(stdout_cap);
         let stdout = Arc::new(StreamCaptureV1::default());
         let stderr = Arc::new(StreamCaptureV1::default());
-        start_capture(
-            child.stdout.take().ok_or_else(|| {
-                AppError::InvalidInput("Contained process stdout pipe is unavailable.".into())
-            })?,
-            stdout.clone(),
-            stdout_cap,
-        );
-        start_capture(
-            child.stderr.take().ok_or_else(|| {
-                AppError::InvalidInput("Contained process stderr pipe is unavailable.".into())
-            })?,
-            stderr.clone(),
-            stderr_cap,
-        );
+        start_capture(spawned.stdout, stdout.clone(), stdout_cap);
+        start_capture(spawned.stderr, stderr.clone(), stderr_cap);
         let process = Arc::new(ManagedProcessV1 {
             owner: world_owner,
             world_ref: world_ref.clone(),
@@ -496,9 +532,7 @@ impl ExecutionWorldServiceV1 {
             argv_digest: argv_digest.clone(),
             environment_digest: environment_digest.clone(),
             process_ref: process_ref.clone(),
-            child: Mutex::new(child),
-            #[cfg(unix)]
-            process_group,
+            child: Mutex::new(spawned.child),
             stdout,
             stderr,
             terminal: Mutex::new(None),
@@ -807,7 +841,30 @@ pub(crate) fn validate_invocation(invocation: &ManagedProcessInvocationV1) -> Ap
             || !name
                 .bytes()
                 .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
-            || matches!(upper.as_str(), "HOME" | "PATH" | "TMPDIR" | "SSH_AUTH_SOCK")
+            || matches!(
+                upper.as_str(),
+                "HOME"
+                    | "PATH"
+                    | "PATHEXT"
+                    | "TMP"
+                    | "TEMP"
+                    | "TMPDIR"
+                    | "USERPROFILE"
+                    | "HOMEDRIVE"
+                    | "HOMEPATH"
+                    | "APPDATA"
+                    | "LOCALAPPDATA"
+                    | "PROGRAMDATA"
+                    | "COMSPEC"
+                    | "SYSTEMROOT"
+                    | "WINDIR"
+                    | "SSH_AUTH_SOCK"
+                    | "PSMODULEPATH"
+            )
+            || upper.contains("TOKEN")
+            || upper.contains("SECRET")
+            || upper.contains("PASSWORD")
+            || upper.ends_with("_KEY")
             || upper.starts_with("LD_")
             || upper.starts_with("DYLD_")
         {
@@ -891,7 +948,7 @@ fn validate_request_owner(owner: &WorldOwnerV1, request: &EffectRequestV1) -> Ap
     Ok(())
 }
 
-fn required_properties() -> BTreeSet<ConfinementPropertyV1> {
+pub(crate) fn required_properties() -> BTreeSet<ConfinementPropertyV1> {
     [
         ConfinementPropertyV1::NoAmbientFilesystem,
         ConfinementPropertyV1::EmptyEnvironment,
@@ -910,15 +967,7 @@ fn platform_availability() -> ExecutionWorldAvailabilityV1 {
     #[cfg(target_os = "linux")]
     return linux_availability();
     #[cfg(target_os = "windows")]
-    return ExecutionWorldAvailabilityV1 {
-        kind: PlatformWorldKindV1::WindowsAppContainer,
-        available: false,
-        identity_digest: "pastey-windows-appcontainer-unavailable-v1".into(),
-        verified_properties: BTreeSet::new(),
-        unavailable_reason: Some(
-            "A capabilityless AppContainer plus Job Object adapter is not implemented.".into(),
-        ),
-    };
+    return crate::windows_execution_world::availability(required_properties());
     #[allow(unreachable_code)]
     ExecutionWorldAvailabilityV1 {
         kind: PlatformWorldKindV1::Unsupported,
@@ -926,6 +975,98 @@ fn platform_availability() -> ExecutionWorldAvailabilityV1 {
         identity_digest: "pastey-platform-world-unavailable-v1".into(),
         verified_properties: BTreeSet::new(),
         unavailable_reason: Some("This Host platform has no verified execution world.".into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_platform_process(
+    availability: &ExecutionWorldAvailabilityV1,
+    grant: &ExecutionWorldGrantV1,
+    mounts: &[ExecutionWorldMountV1],
+    executable: &ExecutionWorldMountV1,
+    invocation: &ManagedProcessInvocationV1,
+    cwd: Option<&Path>,
+    request: &EffectRequestV1,
+    #[cfg(windows)] windows: Arc<crate::windows_execution_world::WindowsWorldV1>,
+) -> AppResult<SpawnedPlatformProcessV1> {
+    #[cfg(windows)]
+    if availability.kind == PlatformWorldKindV1::WindowsAppContainer {
+        let spawned = crate::windows_execution_world::spawn(
+            windows,
+            &executable.source_path,
+            &invocation.argv,
+            &invocation.environment,
+            invocation.stdin.is_some(),
+            cwd,
+            request.requested_budget_slice.cpu_millis,
+            request.requested_budget_slice.memory_byte_millis
+                / request.requested_budget_slice.wall_millis.max(1),
+        )?;
+        return Ok(SpawnedPlatformProcessV1 {
+            child: PlatformChildV1::Windows(spawned.process),
+            stdin: spawned
+                .stdin
+                .map(|file| Box::new(file) as Box<dyn Write + Send>),
+            stdout: Box::new(spawned.stdout),
+            stderr: Box::new(spawned.stderr),
+        });
+    }
+    #[cfg(unix)]
+    {
+        let mut command = build_platform_command(
+            availability,
+            grant,
+            mounts,
+            executable,
+            invocation,
+            cwd,
+            request,
+        )?;
+        command
+            .env_clear()
+            .stdin(if invocation.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (name, value) in &invocation.environment {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().map_err(|_| {
+            AppError::InvalidInput("Verified execution world failed to spawn.".into())
+        })?;
+        let process_group = child.id() as i32;
+        return Ok(SpawnedPlatformProcessV1 {
+            stdin: child
+                .stdin
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn Write + Send>),
+            stdout: Box::new(child.stdout.take().ok_or_else(|| {
+                AppError::InvalidInput("Contained process stdout pipe is unavailable.".into())
+            })?),
+            stderr: Box::new(child.stderr.take().ok_or_else(|| {
+                AppError::InvalidInput("Contained process stderr pipe is unavailable.".into())
+            })?),
+            child: PlatformChildV1::Unix {
+                child,
+                process_group,
+            },
+        });
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (
+            availability,
+            grant,
+            mounts,
+            executable,
+            invocation,
+            cwd,
+            request,
+        );
+        unavailable("No verified platform execution-world adapter is available.")
     }
 }
 
@@ -1382,7 +1523,7 @@ fn process_memory_bytes(process: &ManagedProcessV1) -> u64 {
     let size = std::mem::size_of::<ProcTaskInfo>() as i32;
     let read = unsafe {
         proc_pidinfo(
-            process.process_group,
+            process.child.lock().process_id(),
             4,
             0,
             (&mut info as *mut ProcTaskInfo).cast(),
@@ -1539,7 +1680,7 @@ fn empty_digest() -> String {
     blake3::hash(&[]).to_hex().to_string()
 }
 
-fn domain_hash<T: Serialize>(domain: &str, value: &T) -> AppResult<String> {
+pub(crate) fn domain_hash<T: Serialize>(domain: &str, value: &T) -> AppResult<String> {
     let canonical = serde_json::to_vec(value)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain.as_bytes());
@@ -1571,6 +1712,22 @@ mod tests {
         assert!(capture.exceeded.load(Ordering::SeqCst));
         assert!(capture.excerpt.lock().len() <= MAX_MODEL_PROCESS_EXCERPT_BYTES);
         assert!(capture.digest.lock().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_unc_device_and_escape_selectors_are_rejected() {
+        for selector in [
+            r"C:\host.txt",
+            r"C:drive-relative.txt",
+            r"\\server\share\host.txt",
+            r"\\?\C:\host.txt",
+            "../host.txt",
+            "nested/../host.txt",
+        ] {
+            assert!(validate_selector(selector).is_err(), "accepted {selector}");
+        }
+        assert!(validate_selector("project/source.py").is_ok());
     }
 }
 

@@ -1887,6 +1887,47 @@ impl EffectAuthorityStateV1 {
         Ok(record.grant.clone())
     }
 
+    /// Read-only projection helper for Host-private adapters. It intersects an
+    /// already validated resource grant with the envelope's existing effect
+    /// bounds. The returned verbs are descriptive only and cannot authorize an
+    /// effect or change either authority source.
+    pub(crate) fn validate_resource_projection_attachment(
+        &self,
+        handle_ref: &ResourceHandleRefV1,
+        expected_kind: ResourceKindV1,
+        envelope_ref: &EffectEnvelopeRefV1,
+        run_control_ref: &ManagedRunRefV1,
+        context: &AuthorityContextV1,
+        current: &CurrentHostAuthorityV1,
+    ) -> AppResult<(ResourceGrantV1, BTreeSet<ResourceVerbV1>)> {
+        let grant = self.validate_resource_attachment(
+            handle_ref,
+            expected_kind,
+            envelope_ref,
+            run_control_ref,
+            context,
+            current,
+        )?;
+        let envelope = self
+            .envelopes
+            .get(envelope_ref)
+            .ok_or_else(|| AppError::InvalidInput("Effect envelope is unavailable.".into()))?;
+        let bounded = envelope
+            .effect_bounds
+            .iter()
+            .filter_map(|bound| match bound.capability {
+                EffectCapabilityV1::Resource(verb) => Some(verb),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let effective = grant
+            .allowed_verbs
+            .intersection(&bounded)
+            .copied()
+            .collect();
+        Ok((grant, effective))
+    }
+
     /// Revalidates an exact process-local execution-world attachment. It
     /// returns only grants already present in the immutable envelope; it does
     /// not mint process, resource, or network authority.
@@ -2823,6 +2864,26 @@ mod tests {
             relative_selector: "src/main.rs".into(),
             value_digest: None,
         })
+    }
+
+    #[test]
+    fn resource_projection_intersects_grant_verbs_with_envelope_bounds() {
+        let fixture = fixture(false);
+        let (grant, effective) = fixture
+            .state
+            .validate_resource_projection_attachment(
+                &fixture.output,
+                ResourceKindV1::OutputSlot,
+                &fixture.envelope.envelope_ref,
+                &fixture.envelope.run_control_ref,
+                &fixture.context,
+                &fixture.current,
+            )
+            .unwrap();
+        assert!(grant.allowed_verbs.contains(&ResourceVerbV1::Create));
+        assert!(grant.allowed_verbs.contains(&ResourceVerbV1::Replace));
+        assert!(!effective.contains(&ResourceVerbV1::Create));
+        assert!(effective.contains(&ResourceVerbV1::Replace));
     }
 
     fn read_budget(bytes: u64) -> EffectBudgetsV1 {

@@ -34,6 +34,10 @@ use crate::{
         ExecutableBindingSpecV1, ManagedResourceAccessV1, ManagedResourceResolverV1,
         SealedOutputEvidenceV1,
     },
+    managed_workspace::{
+        ManagedRunWorkspaceV1, ManagedWorkspaceProcessBindingV1,
+        ManagedWorkspaceResourceAttachmentV1, WorkerWorkspaceAliasV1,
+    },
     storage::AppPaths,
 };
 
@@ -75,6 +79,10 @@ pub(crate) struct ManagedStepGrantV1 {
     /// Opaque Harness capability projection. The physical executable and all
     /// mounts remain Host-private in the already provisioned world.
     pub(crate) process_world: Option<ManagedProcessWorldGrantV1>,
+    /// Host-local run workspace derived from the already installed envelope.
+    /// It aggregates existing attachments and exposes a non-authoritative
+    /// alias projection to the Harness; it is not an independent grant.
+    pub(crate) workspace: ManagedRunWorkspaceV1,
 }
 
 #[derive(Clone, Debug)]
@@ -205,6 +213,7 @@ impl HostRuntime {
             .as_ref()
             .is_some_and(|availability| !availability.available)
         {
+            let _ = authority.revoke_run(&draft.run_control_ref);
             return Err(AppError::InvalidInput(
                 "Required platform execution world is unavailable.".into(),
             ));
@@ -254,6 +263,34 @@ impl HostRuntime {
         } else {
             None
         };
+        let scratch_grant = if process_spec.is_some() {
+            Some(
+                authority.mint_resource_grant(
+                    &draft,
+                    ResourceGrantSpecV1 {
+                        host_ref: self.local_host_ref.clone(),
+                        kind: ResourceKindV1::Scratch,
+                        safe_identity_ref: domain_hash(
+                            "pastey-phase5-v2-process-scratch-v1",
+                            &(draft.context_ref.as_str(), draft.run_control_ref.as_str()),
+                        )?,
+                        selector_prefix: ".".into(),
+                        allowed_verbs: [
+                            ResourceVerbV1::Inspect,
+                            ResourceVerbV1::Read,
+                            ResourceVerbV1::Create,
+                            ResourceVerbV1::Replace,
+                        ]
+                        .into_iter()
+                        .collect(),
+                        budgets,
+                        expires_at: source.expires_at,
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
         let executable_grant = if let Some(spec) = process_spec {
             Some(
                 authority.mint_resource_grant(
@@ -278,6 +315,9 @@ impl HostRuntime {
         };
         let mut resources = vec![input_grant.clone()];
         if let Some(grant) = &output_grant {
+            resources.push(grant.clone());
+        }
+        if let Some(grant) = &scratch_grant {
             resources.push(grant.clone());
         }
         if let Some(grant) = &executable_grant {
@@ -382,6 +422,18 @@ impl HostRuntime {
                 return Err(error);
             }
         }
+        if let Some(grant) = &scratch_grant {
+            if let Err(error) = resolver.provision_scratch(
+                &authority,
+                &access,
+                &grant.handle_ref,
+                budgets.write_bytes,
+            ) {
+                resolver.purge_run(&envelope.run_control_ref);
+                let _ = authority.revoke_run(&envelope.run_control_ref);
+                return Err(error);
+            }
+        }
         if let (Some(grant), Some(spec)) = (&executable_grant, process_spec) {
             if let Err(error) = resolver.bind_executable(
                 &authority,
@@ -394,6 +446,49 @@ impl HostRuntime {
                 return Err(error);
             }
         }
+        let process_world = executable_grant
+            .as_ref()
+            .map(|grant| ManagedProcessWorldGrantV1 {
+                world_ref: envelope.world.world_ref.clone(),
+                executable_handle: grant.handle_ref.clone(),
+            });
+        let mut workspace_attachments = vec![ManagedWorkspaceResourceAttachmentV1 {
+            alias: WorkerWorkspaceAliasV1::Input,
+            kind: ResourceKindV1::ManagedRevision,
+            handle_ref: input_grant.handle_ref.clone(),
+        }];
+        if let Some(output) = &output_grant {
+            workspace_attachments.push(ManagedWorkspaceResourceAttachmentV1 {
+                alias: WorkerWorkspaceAliasV1::Output,
+                kind: ResourceKindV1::OutputSlot,
+                handle_ref: output.handle_ref.clone(),
+            });
+        }
+        if let Some(scratch) = &scratch_grant {
+            workspace_attachments.push(ManagedWorkspaceResourceAttachmentV1 {
+                alias: WorkerWorkspaceAliasV1::Scratch,
+                kind: ResourceKindV1::Scratch,
+                handle_ref: scratch.handle_ref.clone(),
+            });
+        }
+        let workspace = match ManagedRunWorkspaceV1::derive(
+            &authority,
+            access.clone(),
+            workspace_attachments,
+            process_world
+                .as_ref()
+                .map(|process| ManagedWorkspaceProcessBindingV1 {
+                    world_ref: process.world_ref.clone(),
+                    executable_handle: process.executable_handle.clone(),
+                }),
+        ) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                resolver.purge_run(&envelope.run_control_ref);
+                let _ = authority.revoke_run(&envelope.run_control_ref);
+                return Err(error);
+            }
+        };
         if process_spec.is_some() {
             if let Err(error) = self.execution_worlds.provision_world(
                 &authority,
@@ -410,6 +505,8 @@ impl HostRuntime {
         drop(resolver);
         drop(objects);
         if let Err(error) = insert_claim(&self.paths, &access, operation, request.now) {
+            self.execution_worlds
+                .terminate_run(&envelope.run_control_ref);
             self.managed_resources
                 .lock()
                 .purge_run(&envelope.run_control_ref);
@@ -441,10 +538,8 @@ impl HostRuntime {
             transform_intent,
             operation_intent,
             output_revision,
-            process_world: executable_grant.map(|grant| ManagedProcessWorldGrantV1 {
-                world_ref: envelope.world.world_ref,
-                executable_handle: grant.handle_ref,
-            }),
+            process_world,
+            workspace,
         })
     }
 
@@ -1460,6 +1555,257 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn managed_workspace_projection_resolves_only_exact_envelope_resources() {
+        let fixture = fixture(transform_then_execute_steps);
+        let grant = claim(&fixture, "transform", fixture.input.clone());
+        let projection = grant.workspace.projection();
+        let authority = fixture.runtime.effect_authority.lock();
+        assert_eq!(
+            grant
+                .workspace
+                .resolve(
+                    &authority,
+                    &projection,
+                    WorkerWorkspaceAliasV1::Input,
+                    crate::managed_workspace::WorkerWorkspaceOperationV1::Read,
+                    ".",
+                )
+                .unwrap(),
+            grant.input_handle
+        );
+        assert_eq!(
+            grant
+                .workspace
+                .resolve(
+                    &authority,
+                    &projection,
+                    WorkerWorkspaceAliasV1::Output,
+                    crate::managed_workspace::WorkerWorkspaceOperationV1::Create,
+                    "result.txt",
+                )
+                .unwrap(),
+            grant.output_slot.clone().unwrap()
+        );
+        let encoded = serde_json::to_string(&projection).unwrap();
+        for forbidden in [
+            "handle",
+            "hostRef",
+            "session",
+            "bridge",
+            "envelope",
+            "runControl",
+            "safeIdentity",
+            "transfer",
+            "/Users/",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "leaked {forbidden}: {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_workspace_rejects_selector_escape_alias_substitution_and_widening() {
+        let fixture = fixture(transform_then_execute_steps);
+        let grant = claim(&fixture, "transform", fixture.input.clone());
+        let projection = grant.workspace.projection();
+        let authority = fixture.runtime.effect_authority.lock();
+        for selector in [
+            "/tmp/escape",
+            "../escape",
+            "nested/../escape",
+            "file:///tmp/x",
+        ] {
+            assert!(grant
+                .workspace
+                .resolve(
+                    &authority,
+                    &projection,
+                    WorkerWorkspaceAliasV1::Output,
+                    crate::managed_workspace::WorkerWorkspaceOperationV1::Create,
+                    selector,
+                )
+                .is_err());
+        }
+        assert!(grant
+            .workspace
+            .resolve(
+                &authority,
+                &projection,
+                WorkerWorkspaceAliasV1::Input,
+                crate::managed_workspace::WorkerWorkspaceOperationV1::Create,
+                ".",
+            )
+            .is_err());
+        assert!(grant
+            .workspace
+            .resolve(
+                &authority,
+                &projection,
+                WorkerWorkspaceAliasV1::Workspace,
+                crate::managed_workspace::WorkerWorkspaceOperationV1::Read,
+                ".",
+            )
+            .is_err());
+        assert!(grant
+            .workspace
+            .resolve(
+                &authority,
+                &projection,
+                WorkerWorkspaceAliasV1::Input,
+                crate::managed_workspace::WorkerWorkspaceOperationV1::Read,
+                "child.txt",
+            )
+            .is_err());
+        let mut widened = projection.clone();
+        widened.resources[0]
+            .operations
+            .insert(crate::managed_workspace::WorkerWorkspaceOperationV1::Create);
+        assert!(grant
+            .workspace
+            .resolve(
+                &authority,
+                &widened,
+                WorkerWorkspaceAliasV1::Input,
+                crate::managed_workspace::WorkerWorkspaceOperationV1::Read,
+                ".",
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn managed_workspace_rejects_cross_run_handle_projection_and_host_substitution() {
+        let first = fixture(transform_then_execute_steps);
+        let first_grant = claim(&first, "transform", first.input.clone());
+        let stale_projection = first_grant.workspace.projection();
+        let second = fixture(transform_then_execute_steps);
+        let second_grant = claim(&second, "transform", second.input.clone());
+        let second_authority = second.runtime.effect_authority.lock();
+        assert!(second_grant
+            .workspace
+            .resolve(
+                &second_authority,
+                &stale_projection,
+                WorkerWorkspaceAliasV1::Input,
+                crate::managed_workspace::WorkerWorkspaceOperationV1::Read,
+                ".",
+            )
+            .is_err());
+        assert!(ManagedRunWorkspaceV1::derive(
+            &second_authority,
+            second_grant.access.clone(),
+            vec![ManagedWorkspaceResourceAttachmentV1 {
+                alias: WorkerWorkspaceAliasV1::Input,
+                kind: ResourceKindV1::ManagedRevision,
+                handle_ref: first_grant.input_handle.clone(),
+            }],
+            None,
+        )
+        .is_err());
+        assert!(ManagedRunWorkspaceV1::derive(
+            &second_authority,
+            second_grant.access.clone(),
+            vec![
+                ManagedWorkspaceResourceAttachmentV1 {
+                    alias: WorkerWorkspaceAliasV1::Input,
+                    kind: ResourceKindV1::ManagedRevision,
+                    handle_ref: second_grant.input_handle.clone(),
+                },
+                ManagedWorkspaceResourceAttachmentV1 {
+                    alias: WorkerWorkspaceAliasV1::Output,
+                    kind: ResourceKindV1::OutputSlot,
+                    handle_ref: first_grant.output_slot.clone().unwrap(),
+                },
+            ],
+            None,
+        )
+        .is_err());
+        let mut wrong_host_access = second_grant.access.clone();
+        wrong_host_access.context.host_ref =
+            HostRef::from_device_id("workspace-other-host").unwrap();
+        assert!(ManagedRunWorkspaceV1::derive(
+            &second_authority,
+            wrong_host_access,
+            vec![ManagedWorkspaceResourceAttachmentV1 {
+                alias: WorkerWorkspaceAliasV1::Input,
+                kind: ResourceKindV1::ManagedRevision,
+                handle_ref: second_grant.input_handle.clone(),
+            }],
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cancellation_burn_and_restart_make_old_workspace_projections_unusable() {
+        let cancelled = fixture(transform_then_execute_steps);
+        let cancelled_grant = claim(&cancelled, "transform", cancelled.input.clone());
+        let cancelled_projection = cancelled_grant.workspace.projection();
+        cancelled
+            .runtime
+            .cancel_managed_run(&cancelled_grant.access.run_control_ref)
+            .unwrap();
+        assert!(cancelled_grant
+            .workspace
+            .resolve(
+                &cancelled.runtime.effect_authority.lock(),
+                &cancelled_projection,
+                WorkerWorkspaceAliasV1::Input,
+                crate::managed_workspace::WorkerWorkspaceOperationV1::Read,
+                ".",
+            )
+            .is_err());
+
+        let burned = fixture(transform_then_execute_steps);
+        let burned_grant = claim(&burned, "transform", burned.input.clone());
+        let burned_projection = burned_grant.workspace.projection();
+        burned.runtime.purge_room(BRIDGE);
+        assert!(burned_grant
+            .workspace
+            .resolve(
+                &burned.runtime.effect_authority.lock(),
+                &burned_projection,
+                WorkerWorkspaceAliasV1::Input,
+                crate::managed_workspace::WorkerWorkspaceOperationV1::Read,
+                ".",
+            )
+            .is_err());
+
+        let disconnected = fixture(transform_then_execute_steps);
+        let disconnected_grant = claim(&disconnected, "transform", disconnected.input.clone());
+        let disconnected_projection = disconnected_grant.workspace.projection();
+        disconnected
+            .runtime
+            .revoke_managed_session(&disconnected.binding.binding_ref);
+        assert!(disconnected_grant
+            .workspace
+            .resolve(
+                &disconnected.runtime.effect_authority.lock(),
+                &disconnected_projection,
+                WorkerWorkspaceAliasV1::Input,
+                crate::managed_workspace::WorkerWorkspaceOperationV1::Read,
+                ".",
+            )
+            .is_err());
+
+        let restarted = fixture(transform_then_execute_steps);
+        let restarted_grant = claim(&restarted, "transform", restarted.input.clone());
+        let restarted_projection = restarted_grant.workspace.projection();
+        restarted.runtime.shutdown_all();
+        assert!(restarted_grant
+            .workspace
+            .resolve(
+                &restarted.runtime.effect_authority.lock(),
+                &restarted_projection,
+                WorkerWorkspaceAliasV1::Input,
+                crate::managed_workspace::WorkerWorkspaceOperationV1::Read,
+                ".",
+            )
+            .is_err());
+    }
+
     fn requests_for_output(
         grant: &ManagedStepGrantV1,
         bytes: &[u8],
@@ -1683,6 +2029,14 @@ mod tests {
         assert!(!tool_schemas.contains("process"));
         assert!(!tool_schemas.contains("network"));
         assert!(!tool_schemas.contains("artifact"));
+        let workspace = serde_json::to_string(&provider.requests[0].workspace).unwrap();
+        assert!(workspace.contains("pastey-managed-workspace-v1"));
+        assert!(workspace.contains("\"alias\":\"input\""));
+        assert!(workspace.contains("\"alias\":\"output\""));
+        assert!(!workspace.contains("handle"));
+        assert!(!workspace.contains("hostRef"));
+        assert!(!workspace.contains("runControl"));
+        assert!(!workspace.contains("transfer"));
     }
 
     #[test]
@@ -1810,6 +2164,10 @@ mod tests {
                 ..
             }) if state == "failed"
         )));
+        let workspace = serde_json::to_string(&provider.requests[0].workspace).unwrap();
+        assert!(workspace.contains("\"alias\":\"scratch\""));
+        assert!(!workspace.contains("handle"));
+        assert!(!workspace.contains("path"));
     }
 
     #[test]

@@ -26,28 +26,19 @@ test("selected peers change only when the current route is no longer routeable",
   assert.deepEqual(reconcileSelectedPeerIds(current, []), []);
 });
 
-test("Bridge detail owns one interval with cleanup on session change and unmount", () => {
-  const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
-  const detail = pages.slice(
-    pages.indexOf("export function BridgeDetailPage"),
-    pages.indexOf("function BridgePlanReceiverPanel"),
-  );
-  assert.equal(detail.match(/window\.setInterval/g)?.length, 1);
-  assert.match(detail, /bridgePollingIntervalMs\(roomControlPollingActive\)/);
-  assert.match(detail, /if \(interval !== null\) window\.clearInterval\(interval\)/);
-  assert.match(detail, /window\.removeEventListener\("focus", refresh\)/);
-  assert.match(detail, /refreshBridgeControlInboxRef\.current = refreshBridgeControlInbox/);
-  assert.match(detail, /\[controlSession, roomControlPollingActive\]/);
+test("native-v2 lifecycle polling is scoped to one opened revision and cleaned up", () => {
+  const component = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  assert.equal(component.match(/window\.setInterval/g)?.length, 1);
+  assert.match(component, /revisionId \? window\.setInterval\(\(\) => void refresh\(revisionId\), 2_000\) : null/);
+  assert.match(component, /if \(interval !== null\) window\.clearInterval\(interval\)/);
+  assert.match(component, /pastey:\/\/native-v2-plan-status/);
+  assert.match(component, /event\.payload\.revisionId === revisionId/);
 });
 
-test("drag-drop listener registration is stable and cleans up async registration races", () => {
-  const pages = readFileSync("src/pages/BridgeProductPages.tsx", "utf8");
-  const detail = pages.slice(
-    pages.indexOf("export function BridgeDetailPage"),
-    pages.indexOf("function BridgePlanReceiverPanel"),
-  );
-  assert.match(detail, /onDragDropEvent/);
-  assert.match(detail, /if \(cancelled\) \{\s*fn\(\)/);
-  assert.match(detail, /\}, \[room\.id\]\)/);
-  assert.match(detail, /enqueueDroppedFilesRef\.current/);
+test("Send and Agent Task keep their routing semantics separate", () => {
+  const component = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  assert.match(component, /Send mode targets one selected device/);
+  assert.match(component, /Agent Tasks use the whole Plan scope/);
+  assert.match(component, /target: \{ kind: "selected_peer"/);
+  assert.match(component, /bridgeTargetKind: "selected_peer"/);
 });

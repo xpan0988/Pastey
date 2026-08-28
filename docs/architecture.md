@@ -86,6 +86,10 @@ Cancellation, expiry, provider revocation, session replacement, disconnect, Burn
 
 ## Managed Workspace and Developer Mode
 
+A managed Worker workspace is a Host-local, run-local ABI, not a distributed filesystem. Core derives one Host-private `ManagedRunWorkspaceV1` only from the exact active `EffectEnvelope`, current run/Host/session authority, and already attached managed resources and execution world. Its model-visible projection contains bounded logical aliases, resource roles, permitted operation vocabulary, and relative-selector facts; it contains no Host path, resource handle, physical identity, grant, credential, topology, or cross-Host reference. Alias resolution revalidates the current attachment and then enters the existing EffectRequest enforcement path, so the projection cannot authorize or widen an effect.
+
+Cancellation, session invalidation, disconnect, Burn, shutdown, restart, and authoritative completion revoke the underlying run/resources and make an old workspace projection unusable. Moving an authored step to another Host creates a different local run and projection. Only the managed object revision may move, and only through authored Transfer; overlays, output slots, scratch state, and workspace aliases never move or become shared state.
+
 Developer Mode v0 is a separate human-controlled Host capability above Layer 4, parallel to Layer 5. It is not a fifth primitive, a special Execute, a managed-object workflow, or an Agent escape hatch.
 
 ```text
@@ -109,7 +113,7 @@ Close/exit, disconnect, explicit departure, session replacement, Burn, shutdown,
 | --- | --- | --- | --- |
 | Search/Transfer safe identity and encrypted transfer | Implemented | Implemented where the desktop product is supported | Implemented; cross-compiled checks do not replace native proof |
 | Managed Resource effects | Implemented | Implemented | Implemented |
-| Managed contained Process execution | Available only after the local `sandbox-exec` confinement probe succeeds | Unavailable; fails closed | Unavailable; fails closed |
+| Managed contained Process execution | Available only after the local `sandbox-exec` confinement probe succeeds | Unavailable; fails closed | Adapter compiled; runtime availability requires the native product-binary AppContainer/ACL/handle-list/Job/NoRawNetwork conformance probe to succeed, otherwise fails closed |
 | Worker task Network effects | Not exposed | Not exposed | Not exposed |
 | Developer Terminal | Native PTY | Native PTY path | ConPTY/PowerShell |
 
@@ -119,8 +123,8 @@ The Host-owned network broker exists as an independent Phase 5 authority domain,
 
 The 1.9.3 development backend implements the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, bounded Worker Harness, configured streaming provider adapter, durable generation-bound provider configuration, live managed receiver coordination, deterministic multi-Host product orchestration, and proposal-only Natural-v2 lowering.
 
-V1 remains isolated and unchanged: its product executes Search/Transfer and rejects Transform/Execute. Native-v2 compose/approve/start/status/cancel Tauri commands exist, but only the Natural-v2 candidate command currently has a frontend wrapper. Provider configuration, provider health presentation, and exact managed process binding are still Host-private backend seams. Requester-local authored primitives fail readiness because requester self-admission/execution is not implemented.
+V1 remains isolated and unchanged: its product executes Search/Transfer and rejects Transform/Execute. The 2.0 renderer can open an existing native-v2 revision and drive Review approval, readiness start, authoritative status, and cancellation through the registered Tauri commands. Draft discovery/origination, renderer-safe PM context and detailed topology, and result content projection are not yet exposed. Provider configuration, provider health presentation, and exact managed process binding are still Host-private backend seams. Requester-local authored primitives fail readiness because requester self-admission/execution is not implemented.
 
-Remaining 2.0 product work includes the Figma-derived Agent/Review/status/cancellation UI, non-secret provider settings and health presentation, Host-owned executable binding/configuration, product recovery for coordination delivery failures, and native physical multi-Host validation. Independently future capabilities include verified Linux/Windows managed execution worlds, Worker network tools, subagent policy, and Headless Host. None is implied by the current backend.
+Remaining 2.0 product work includes renderer-safe Draft/PM/topology/result projections, non-secret provider settings and health presentation, Host-owned executable binding/configuration, product recovery for coordination delivery failures, native packaged Windows ExecutionWorld evidence, and physical multi-Host validation. Independently future capabilities include a verified Linux managed execution world, Worker network tools, subagent policy, and Headless Host. None is implied by the current backend.
 
 See [Layer 5](layers/layer-5-agent.md) for the managed contracts, [development](development.md) for validation and physical smoke procedures, and [reference](reference.md) for concrete identifiers and bounds.
