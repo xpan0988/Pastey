@@ -32,7 +32,7 @@ Bridge Plan v1 and v2 coexist explicitly. V1 retains its existing `bridge_plan.*
 
 Room Control delivers correlated current-session completion/control events to the Layer 5 Host coordinator. It does not inspect Plan topology, assume PipelinePrivate is followed by Transform, choose the next primitive, or create semantic step authority.
 
-Developer Mode v0 reuses the same current-session peer resolution, authenticated encrypted Room Control envelope, event expiry, and replay boundary for a distinct `developer_terminal` message family. Terminal frames are delivered directly to the UI-independent terminal service, with separate bounded streaming rate/buffer state; they do not enter ordinary Room Control inbox or Bridge item history. Layer 4 transport still does not grant terminal consent: the remote human admission and `DeveloperTerminalGrant` are owned above this layer. See [Developer Mode](../developer-mode.md).
+Developer Mode v0 reuses the same current-session peer resolution, authenticated encrypted Room Control envelope, event expiry, and replay boundary for a distinct `developer_terminal` message family. Terminal frames are delivered directly to the UI-independent terminal service, with separate bounded streaming rate/buffer state; they do not enter ordinary Room Control inbox or Bridge item history. Layer 4 transport still does not grant terminal consent: the remote human admission and `DeveloperTerminalGrant` are owned above this layer. See [architecture](../architecture.md#managed-workspace-and-developer-mode).
 
 The Bridge detail panel uses one serialized control-inbox pump. Active nonterminal operations refresh automatically; focus/entry refresh and **Check for updates** are fallbacks. Processed or unchanged events do not create duplicate product-state updates or resend delivery.
 
@@ -42,6 +42,6 @@ Disconnect, explicit departure, Burn, and startup recovery invalidate current-se
 
 ## Current limitations
 
-Durable route recovery, auto-join, control-event fan-out, full cryptographic key rotation, and v2 Composer/outbound execution dispatch are not implemented. Multi-target fan-out is limited to ordinary data; each v2 Host-bound review/start delivery resolves one explicit current peer. Two-device/package validation remains a required manual/release check.
+Durable route recovery, auto-join, generic control-event fan-out, and full cryptographic key rotation are not implemented. Phase 6.6 coordinates an authored v2 Plan by sending separate exact review/readiness/start/commit events to each current Host route; it does not turn Room Control into broadcast authority. Multi-target fan-out remains limited to ordinary data. Two-device/package validation remains a required manual/release check.
 
 For exact vocabularies and schemas, see [reference.md](../reference.md). For Layer 5 semantic approval and step authority, see [Layer 5](layer-5-agent.md). For validation, see [development.md](../development.md).

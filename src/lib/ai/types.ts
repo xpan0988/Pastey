@@ -109,7 +109,10 @@ export interface AiGenerateRequest {
   context: AiContextSnapshot;
   contextPolicy: AiContextPolicy;
   allowedActionKinds: AiActionKind[];
-  outputSchema: "ai-action-plan-v1" | "ask-bridge-natural-v1";
+  outputSchema: "ai-action-plan-v1" | "ask-bridge-natural-v1" | "candidate-semantic-plan-v2";
+  /** Bounded proposal facts only. Provider implementations must never treat
+   * this projection as authority or pass it into an EffectRequest. */
+  proposalContext?: unknown;
   userRequest: string;
 }
 

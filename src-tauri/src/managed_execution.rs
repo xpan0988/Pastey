@@ -5,7 +5,7 @@
 //! Execute step, constructs the existing process-local EffectAuthority, and
 //! accepts only Host-authenticated evidence plus a proposal-only Worker result.
 
-#![allow(dead_code)] // No product Worker/PM attachment exists yet.
+#![allow(dead_code)] // Core keeps this broader than the current crate-private Worker caller.
 
 use std::collections::BTreeSet;
 
@@ -20,8 +20,8 @@ use crate::{
         CurrentHostAuthorityV1, EffectBoundV1, EffectBudgetsV1, EffectCapabilityV1,
         EffectEnvelopeCompileRequestV1, EffectEnvelopeRefV1, ExecutionWorldGrantV1,
         ManagedInputRevisionV1, ManagedRunRefV1, ManagedSemanticOperationV1, NetworkAuthorityV1,
-        ResourceGrantSpecV1, ResourceHandleRefV1, ResourceKindV1, ResourceVerbV1, ResultContractV1,
-        EFFECT_AUTHORITY_VERSION,
+        ProcessVerbV1, ResourceGrantSpecV1, ResourceHandleRefV1, ResourceKindV1, ResourceVerbV1,
+        ResultContractV1, EFFECT_AUTHORITY_VERSION,
     },
     error::{AppError, AppResult},
     host_admission::{
@@ -31,7 +31,8 @@ use crate::{
     host_runtime::HostRuntime,
     managed_objects::{ManagedLogicalObjectRevision, ManagedObjectAcquisition},
     managed_resources::{
-        ManagedResourceAccessV1, ManagedResourceResolverV1, SealedOutputEvidenceV1,
+        ExecutableBindingSpecV1, ManagedResourceAccessV1, ManagedResourceResolverV1,
+        SealedOutputEvidenceV1,
     },
     storage::AppPaths,
 };
@@ -48,6 +49,15 @@ pub(crate) struct ManagedStepClaimRequestV1 {
     pub(crate) captured_binding: HostSessionBinding,
     pub(crate) current_binding: HostSessionBinding,
     pub(crate) now: i64,
+    /// Host-private, preselected execution-world entry point. It is supplied
+    /// by the future coordinator, never by a Worker/provider, and is bound
+    /// into the immutable envelope before the run becomes active.
+    pub(crate) process_world: Option<ManagedProcessWorldSpecV1>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedProcessWorldSpecV1 {
+    pub(crate) executable: ExecutableBindingSpecV1,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +66,21 @@ pub(crate) struct ManagedStepGrantV1 {
     pub(crate) access: ManagedResourceAccessV1,
     pub(crate) input_handle: ResourceHandleRefV1,
     pub(crate) output_slot: Option<ResourceHandleRefV1>,
+    /// Model-visible semantic projection for the one Transform step. This is
+    /// not a Plan, grant, path, or Host-selection capability.
+    pub(crate) transform_intent: Option<String>,
+    /// One exact semantic intent projection for the already claimed primitive.
+    pub(crate) operation_intent: String,
+    pub(crate) output_revision: Option<u64>,
+    /// Opaque Harness capability projection. The physical executable and all
+    /// mounts remain Host-private in the already provisioned world.
+    pub(crate) process_world: Option<ManagedProcessWorldGrantV1>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedProcessWorldGrantV1 {
+    pub(crate) world_ref: crate::effect_authority::ExecutionWorldRefV1,
+    pub(crate) executable_handle: ResourceHandleRefV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -173,6 +198,17 @@ impl HostRuntime {
         let mut authority = self.effect_authority.lock();
         let draft = authority.begin_run(context.clone())?;
         let budgets = step_budgets();
+        let process_spec = request.process_world.as_ref();
+        let process_availability = process_spec
+            .map(|_| crate::execution_world::ExecutionWorldServiceV1::platform_availability());
+        if process_availability
+            .as_ref()
+            .is_some_and(|availability| !availability.available)
+        {
+            return Err(AppError::InvalidInput(
+                "Required platform execution world is unavailable.".into(),
+            ));
+        }
         let input_grant = authority.mint_resource_grant(
             &draft,
             ResourceGrantSpecV1 {
@@ -218,26 +254,62 @@ impl HostRuntime {
         } else {
             None
         };
+        let executable_grant = if let Some(spec) = process_spec {
+            Some(
+                authority.mint_resource_grant(
+                    &draft,
+                    ResourceGrantSpecV1 {
+                        host_ref: self.local_host_ref.clone(),
+                        kind: ResourceKindV1::Executable,
+                        safe_identity_ref: ManagedResourceResolverV1::executable_identity_ref(
+                            &spec.executable,
+                        )?,
+                        selector_prefix: ".".into(),
+                        allowed_verbs: [ResourceVerbV1::Inspect, ResourceVerbV1::Read]
+                            .into_iter()
+                            .collect(),
+                        budgets,
+                        expires_at: source.expires_at,
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
         let mut resources = vec![input_grant.clone()];
         if let Some(grant) = &output_grant {
             resources.push(grant.clone());
         }
-        let world_ref = execution_world_ref_for(&draft, NO_WORKER_WORLD_IDENTITY)?;
+        if let Some(grant) = &executable_grant {
+            resources.push(grant.clone());
+        }
+        let world_identity = process_availability
+            .as_ref()
+            .map(|availability| availability.identity_digest.as_str())
+            .unwrap_or(NO_WORKER_WORLD_IDENTITY);
+        let world_ref = execution_world_ref_for(&draft, world_identity)?;
         let world = ExecutionWorldGrantV1 {
             world_ref,
             context_ref: draft.context_ref.clone(),
             run_control_ref: draft.run_control_ref.clone(),
-            world_identity_digest: NO_WORKER_WORLD_IDENTITY.into(),
+            world_identity_digest: world_identity.into(),
             mounted_resources: resources
+                .iter()
+                .filter(|grant| grant.kind != ResourceKindV1::Executable)
+                .map(|grant| grant.handle_ref.clone())
+                .collect(),
+            executable_resources: executable_grant
                 .iter()
                 .map(|grant| grant.handle_ref.clone())
                 .collect(),
-            executable_resources: BTreeSet::new(),
             required_properties: all_confinement_properties(),
             budgets,
             expires_at: source.expires_at,
         };
-        let bounds = resource_bounds();
+        let mut bounds = resource_bounds();
+        if process_spec.is_some() {
+            bounds.extend(process_bounds());
+        }
         let base = AuthorityCeilingV1 {
             context_ref: draft.context_ref.clone(),
             source_snapshot_ref: "phase5-v2-semantic-ceiling-v1".into(),
@@ -253,7 +325,7 @@ impl HostRuntime {
         let mut host_ceiling = base.clone();
         host_ceiling.source_snapshot_ref = HOST_POLICY_SNAPSHOT.into();
         let mut confinement_ceiling = base.clone();
-        confinement_ceiling.source_snapshot_ref = NO_WORKER_WORLD_IDENTITY.into();
+        confinement_ceiling.source_snapshot_ref = world_identity.into();
         let result_contract = match operation {
             ManagedSemanticOperationV1::Transform => ResultContractV1::Transform {
                 input: context.input_revisions[0].clone(),
@@ -310,6 +382,31 @@ impl HostRuntime {
                 return Err(error);
             }
         }
+        if let (Some(grant), Some(spec)) = (&executable_grant, process_spec) {
+            if let Err(error) = resolver.bind_executable(
+                &authority,
+                &access,
+                &grant.handle_ref,
+                spec.executable.clone(),
+            ) {
+                resolver.purge_run(&envelope.run_control_ref);
+                let _ = authority.revoke_run(&envelope.run_control_ref);
+                return Err(error);
+            }
+        }
+        if process_spec.is_some() {
+            if let Err(error) = self.execution_worlds.provision_world(
+                &authority,
+                &mut resolver,
+                &mut objects,
+                access.clone(),
+                &envelope.world.world_ref,
+            ) {
+                resolver.purge_run(&envelope.run_control_ref);
+                let _ = authority.revoke_run(&envelope.run_control_ref);
+                return Err(error);
+            }
+        }
         drop(resolver);
         drop(objects);
         if let Err(error) = insert_claim(&self.paths, &access, operation, request.now) {
@@ -319,11 +416,35 @@ impl HostRuntime {
             let _ = authority.revoke_run(&envelope.run_control_ref);
             return Err(error);
         }
+        let transform_intent = match &source.step {
+            PlanStepV2::Transform {
+                modification_intent,
+                ..
+            } => Some(modification_intent.clone()),
+            _ => None,
+        };
+        let operation_intent = match &source.step {
+            PlanStepV2::Transform {
+                modification_intent,
+                ..
+            } => modification_intent.clone(),
+            PlanStepV2::Execute {
+                execution_intent, ..
+            } => execution_intent.clone(),
+            _ => unreachable!("managed claim validated primitive"),
+        };
         Ok(ManagedStepGrantV1 {
             operation,
             access,
             input_handle: input_grant.handle_ref,
             output_slot: output_grant.map(|grant| grant.handle_ref),
+            transform_intent,
+            operation_intent,
+            output_revision,
+            process_world: executable_grant.map(|grant| ManagedProcessWorldGrantV1 {
+                world_ref: envelope.world.world_ref,
+                executable_handle: grant.handle_ref,
+            }),
         })
     }
 
@@ -333,6 +454,7 @@ impl HostRuntime {
         current_binding: HostSessionBinding,
         now: i64,
     ) -> AppResult<ManagedObjectAcquisition> {
+        let _completion_guard = self.managed_completion_lock.lock();
         let source = load_completion_source(
             &self.paths,
             &proposal.attempt_id,
@@ -452,6 +574,7 @@ impl HostRuntime {
         current_binding: HostSessionBinding,
         now: i64,
     ) -> AppResult<AuthoritativeExecuteResultV1> {
+        let _completion_guard = self.managed_completion_lock.lock();
         let source = load_completion_source(
             &self.paths,
             &proposal.attempt_id,
@@ -789,10 +912,13 @@ fn persist_transform_result(
             now
         ],
     )?;
-    tx.execute(
+    let changed = tx.execute(
         "UPDATE bridge_plan_v2_managed_step_claims SET state = 'completed', evidence_head = ?3, completed_at = ?4 WHERE attempt_id = ?1 AND step_id = ?2 AND state = 'claimed'",
         params![proposal.attempt_id, proposal.step_id, proposal.evidence_head, now],
     )?;
+    if changed != 1 {
+        return invalid("Transform completion lost its exact one-use claim.");
+    }
     tx.commit()?;
     Ok(())
 }
@@ -815,10 +941,13 @@ fn persist_execute_result(
             result.result_schema_ref, result.result_digest, result.evidence_head,
             serde_json::to_string(result)?, now],
     )?;
-    tx.execute(
+    let changed = tx.execute(
         "UPDATE bridge_plan_v2_managed_step_claims SET state = 'completed', evidence_head = ?3, completed_at = ?4 WHERE attempt_id = ?1 AND step_id = ?2 AND state = 'claimed'",
         params![proposal.attempt_id, proposal.step_id, proposal.evidence_head, now],
     )?;
+    if changed != 1 {
+        return invalid("Execute completion lost its exact one-use claim.");
+    }
     tx.commit()?;
     Ok(())
 }
@@ -951,6 +1080,26 @@ fn resource_bounds() -> Vec<EffectBoundV1> {
     .collect()
 }
 
+fn process_bounds() -> Vec<EffectBoundV1> {
+    [ProcessVerbV1::Spawn, ProcessVerbV1::Signal]
+        .into_iter()
+        .map(|verb| EffectBoundV1 {
+            capability: EffectCapabilityV1::Process(verb),
+            max_per_request: EffectBudgetsV1 {
+                requests: 1,
+                process_spawns: u64::from(verb == ProcessVerbV1::Spawn),
+                process_signals: u64::from(verb == ProcessVerbV1::Signal),
+                read_bytes: 32 * 1024,
+                write_bytes: 1024 * 1024,
+                cpu_millis: 30_000,
+                memory_byte_millis: 8 * 1024 * 1024 * 30_000,
+                wall_millis: 30_000,
+                ..Default::default()
+            },
+        })
+        .collect()
+}
+
 fn all_confinement_properties() -> BTreeSet<ConfinementPropertyV1> {
     [
         ConfinementPropertyV1::NoAmbientFilesystem,
@@ -986,7 +1135,9 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+
+    use base64::Engine as _;
 
     use super::*;
     use crate::{
@@ -1004,9 +1155,14 @@ mod tests {
         host_identity::{PlanParticipantRef, PlanParticipants},
         host_runtime::{HostEvent, HostEventSink, RuntimeTask, RuntimeTaskSpawner},
         managed_objects::{HostArtifactAcquisition, ManagedObjectAcquisitionKind},
-        managed_resources::HostManagedResourceBackendV1,
+        managed_resources::{ExecutableBindingSpecV1, HostManagedResourceBackendV1},
         models::LocalRole,
         storage,
+        worker_harness::{
+            WorkerProviderErrorKindV1, WorkerProviderErrorV1, WorkerProviderResponseV1,
+            WorkerProviderTurnV1, WorkerProviderV1, WorkerResourceAliasV1, WorkerRunLimitsV1,
+            WorkerToolCallV1,
+        },
     };
 
     const NOW: i64 = 20_000;
@@ -1037,6 +1193,44 @@ mod tests {
     impl HostEffectBackendV1 for LostAfterIntent {
         fn apply(&mut self, _request: &crate::effect_authority::EffectRequestV1) -> BackendApplyV1 {
             BackendApplyV1::LostAfterIntent
+        }
+    }
+
+    struct ScriptedWorkerProvider {
+        responses: VecDeque<Result<WorkerProviderResponseV1, WorkerProviderErrorV1>>,
+        requests: Vec<crate::worker_harness::WorkerProviderRequestV1>,
+    }
+
+    impl WorkerProviderV1 for ScriptedWorkerProvider {
+        fn next_turn(
+            &mut self,
+            request: crate::worker_harness::WorkerProviderRequestV1,
+            _cancellation: &crate::worker_harness::WorkerHarnessRunV1,
+        ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
+            self.requests.push(request);
+            self.responses
+                .pop_front()
+                .expect("scripted Worker response")
+                .map(WorkerProviderTurnV1::scripted)
+        }
+    }
+
+    struct CancellingWorkerProvider;
+
+    impl WorkerProviderV1 for CancellingWorkerProvider {
+        fn next_turn(
+            &mut self,
+            _request: crate::worker_harness::WorkerProviderRequestV1,
+            cancellation: &crate::worker_harness::WorkerHarnessRunV1,
+        ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
+            cancellation.cancel();
+            Ok(WorkerProviderTurnV1::scripted(
+                WorkerProviderResponseV1::ToolCall {
+                    call: WorkerToolCallV1::Read {
+                        resource: WorkerResourceAliasV1::Input,
+                    },
+                },
+            ))
         }
     }
 
@@ -1077,7 +1271,7 @@ mod tests {
                 dev_tools_enabled: false,
                 micro_flow_group_mode: "off".into(),
                 shortcut: "test".into(),
-                app_secret: "test".into(),
+                app_secret: crate::crypto::encode_key(&[9u8; 32]),
                 device_id: "step8-local".into(),
             },
             Arc::new(Sink),
@@ -1261,6 +1455,7 @@ mod tests {
                 captured_binding: fixture.binding.clone(),
                 current_binding: fixture.binding.clone(),
                 now: NOW + 2,
+                process_world: None,
             })
             .unwrap()
     }
@@ -1390,6 +1585,314 @@ mod tests {
         )
     }
 
+    fn worker_claim_request(fixture: &Fixture) -> ManagedStepClaimRequestV1 {
+        ManagedStepClaimRequestV1 {
+            attempt_id: fixture.start.attempt_id.clone(),
+            step_id: "transform".into(),
+            input: fixture.input.clone(),
+            captured_binding: fixture.binding.clone(),
+            current_binding: fixture.binding.clone(),
+            now: NOW + 2,
+            process_world: None,
+        }
+    }
+
+    fn worker_process_claim_request(
+        fixture: &Fixture,
+        step_id: &str,
+        input: ManagedObjectAcquisition,
+        executable: &str,
+    ) -> ManagedStepClaimRequestV1 {
+        ManagedStepClaimRequestV1 {
+            attempt_id: fixture.start.attempt_id.clone(),
+            step_id: step_id.into(),
+            input,
+            captured_binding: fixture.binding.clone(),
+            current_binding: fixture.binding.clone(),
+            now: NOW + 2,
+            process_world: Some(ManagedProcessWorldSpecV1 {
+                executable: ExecutableBindingSpecV1 {
+                    executable_path: PathBuf::from(executable),
+                    scope_root: PathBuf::from("/usr/bin"),
+                },
+            }),
+        }
+    }
+
+    fn worker_script(output: &[u8]) -> ScriptedWorkerProvider {
+        ScriptedWorkerProvider {
+            responses: VecDeque::from([
+                Err(WorkerProviderErrorV1 {
+                    kind: WorkerProviderErrorKindV1::Retryable,
+                }),
+                Ok(WorkerProviderResponseV1::ToolCall {
+                    call: WorkerToolCallV1::Read {
+                        resource: WorkerResourceAliasV1::Input,
+                    },
+                }),
+                Ok(WorkerProviderResponseV1::ToolCall {
+                    call: WorkerToolCallV1::Create {
+                        relative_selector: "result.txt".into(),
+                        content_base64: base64::engine::general_purpose::STANDARD.encode(output),
+                    },
+                }),
+                Ok(WorkerProviderResponseV1::Final {
+                    output_selector: "result.txt".into(),
+                    display_name: "result.txt".into(),
+                    media_type: "text/plain".into(),
+                }),
+            ]),
+            requests: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn worker_harness_runs_one_same_host_transform_through_resource_effects_only() {
+        let fixture = fixture(transform_then_execute_steps);
+        let mut provider = worker_script(b"revision two from worker");
+        let result = fixture
+            .runtime
+            .run_v2_transform_worker(
+                worker_claim_request(&fixture),
+                WorkerRunLimitsV1::default(),
+                &mut provider,
+            )
+            .unwrap();
+        assert_eq!(result.object.revision, 2);
+        assert_eq!(result.object.host_ref, fixture.runtime.local_host_ref);
+        let artifact = fixture
+            .runtime
+            .managed_objects
+            .lock()
+            .resolve(&result, NOW + 3)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(artifact.path).unwrap(),
+            b"revision two from worker"
+        );
+        assert_eq!(provider.requests.len(), 4);
+        assert!(provider.requests[0]
+            .system_instructions
+            .contains("cannot claim work"));
+        assert!(provider.requests[1].history.iter().any(|turn| matches!(
+            turn.observation,
+            Some(crate::worker_harness::WorkerObservationV1::ProviderRetry { .. })
+        )));
+        let tool_schemas = serde_json::to_string(&provider.requests[0].tools).unwrap();
+        assert!(tool_schemas.contains("resource_read"));
+        assert!(!tool_schemas.contains("process"));
+        assert!(!tool_schemas.contains("network"));
+        assert!(!tool_schemas.contains("artifact"));
+    }
+
+    #[test]
+    fn worker_cancellation_prevents_dispatch_and_interrupts_the_claim() {
+        let fixture = fixture(transform_then_execute_steps);
+        let mut provider = CancellingWorkerProvider;
+        assert!(fixture
+            .runtime
+            .run_v2_transform_worker(
+                worker_claim_request(&fixture),
+                WorkerRunLimitsV1::default(),
+                &mut provider,
+            )
+            .is_err());
+        let state: String = connection(&fixture.runtime.paths)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM bridge_plan_v2_managed_step_claims WHERE attempt_id = ?1 AND step_id = 'transform'",
+                [&fixture.start.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "interrupted");
+        let results: i64 = connection(&fixture.runtime.paths)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_transform_results",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(results, 0);
+    }
+
+    #[test]
+    fn provider_context_overflow_compacts_once_then_retries_without_authority_change() {
+        let fixture = fixture(transform_then_execute_steps);
+        let output = b"after compacted provider context";
+        let mut provider = ScriptedWorkerProvider {
+            responses: VecDeque::from([
+                Ok(WorkerProviderResponseV1::ToolCall {
+                    call: WorkerToolCallV1::Read {
+                        resource: WorkerResourceAliasV1::Input,
+                    },
+                }),
+                Err(WorkerProviderErrorV1 {
+                    kind: WorkerProviderErrorKindV1::ContextOverflow,
+                }),
+                Ok(WorkerProviderResponseV1::ToolCall {
+                    call: WorkerToolCallV1::Create {
+                        relative_selector: "result.txt".into(),
+                        content_base64: base64::engine::general_purpose::STANDARD.encode(output),
+                    },
+                }),
+                Ok(WorkerProviderResponseV1::Final {
+                    output_selector: "result.txt".into(),
+                    display_name: "result.txt".into(),
+                    media_type: "text/plain".into(),
+                }),
+            ]),
+            requests: Vec::new(),
+        };
+        let result = fixture.runtime.run_v2_transform_worker(
+            worker_claim_request(&fixture),
+            WorkerRunLimitsV1::default(),
+            &mut provider,
+        );
+        assert!(result.is_ok());
+        assert!(provider.requests[2].history.iter().any(|turn| matches!(
+            turn.observation,
+            Some(crate::worker_harness::WorkerObservationV1::Compacted { .. })
+        )));
+        let projected = serde_json::to_string(&provider.requests[2]).unwrap();
+        assert!(!projected.contains("NetworkGrant"));
+        assert!(!projected.contains("ResourceHandleRef"));
+    }
+
+    #[test]
+    fn process_failure_becomes_observation_then_worker_self_corrects_with_resource_output() {
+        if !crate::execution_world::ExecutionWorldServiceV1::platform_availability().available {
+            return;
+        }
+        let fixture = fixture(transform_then_execute_steps);
+        let output = b"corrected after contained failure";
+        let mut provider = ScriptedWorkerProvider {
+            responses: VecDeque::from([
+                Ok(WorkerProviderResponseV1::ToolCall {
+                    call: WorkerToolCallV1::ProcessSpawn {
+                        arguments: vec![],
+                        environment: Default::default(),
+                        stdin_base64: None,
+                        working_directory: None,
+                    },
+                }),
+                Ok(WorkerProviderResponseV1::ToolCall {
+                    call: WorkerToolCallV1::Create {
+                        relative_selector: "result.txt".into(),
+                        content_base64: base64::engine::general_purpose::STANDARD.encode(output),
+                    },
+                }),
+                Ok(WorkerProviderResponseV1::Final {
+                    output_selector: "result.txt".into(),
+                    display_name: "result.txt".into(),
+                    media_type: "text/plain".into(),
+                }),
+            ]),
+            requests: Vec::new(),
+        };
+        let result = fixture.runtime.run_v2_transform_worker(
+            worker_process_claim_request(
+                &fixture,
+                "transform",
+                fixture.input.clone(),
+                "/usr/bin/false",
+            ),
+            WorkerRunLimitsV1::default(),
+            &mut provider,
+        );
+        assert!(result.is_ok());
+        assert!(provider.requests[1].history.iter().any(|turn| matches!(
+            turn.observation,
+            Some(crate::worker_harness::WorkerObservationV1::Process {
+                state: Some(ref state),
+                exit_code: Some(1),
+                ..
+            }) if state == "failed"
+        )));
+    }
+
+    #[test]
+    fn process_worker_fails_closed_when_the_verified_world_is_unavailable() {
+        if crate::execution_world::ExecutionWorldServiceV1::platform_availability().available {
+            return;
+        }
+        let fixture = fixture(transform_then_execute_steps);
+        let mut provider = ScriptedWorkerProvider {
+            responses: VecDeque::new(),
+            requests: Vec::new(),
+        };
+        assert!(fixture
+            .runtime
+            .run_v2_transform_worker(
+                worker_process_claim_request(
+                    &fixture,
+                    "transform",
+                    fixture.input.clone(),
+                    "/usr/bin/false",
+                ),
+                WorkerRunLimitsV1::default(),
+                &mut provider,
+            )
+            .is_err());
+        assert!(provider.requests.is_empty());
+    }
+
+    #[test]
+    fn execute_worker_records_result_without_managed_lineage() {
+        if !crate::execution_world::ExecutionWorldServiceV1::platform_availability().available {
+            return;
+        }
+        let fixture = fixture(transform_then_execute_steps);
+        let transform_grant = claim(&fixture, "transform", fixture.input.clone());
+        let (proposal, _) = produce_transform(&fixture, &transform_grant);
+        let transformed = fixture
+            .runtime
+            .finalize_v2_transform(proposal, fixture.binding.clone(), NOW + 4)
+            .unwrap();
+        let mut provider = ScriptedWorkerProvider {
+            responses: VecDeque::from([
+                Ok(WorkerProviderResponseV1::ToolCall {
+                    call: WorkerToolCallV1::ProcessSpawn {
+                        arguments: vec![],
+                        environment: Default::default(),
+                        stdin_base64: None,
+                        working_directory: None,
+                    },
+                }),
+                Ok(WorkerProviderResponseV1::FinalExecute),
+            ]),
+            requests: Vec::new(),
+        };
+        let result = fixture
+            .runtime
+            .run_v2_execute_worker(
+                worker_process_claim_request(
+                    &fixture,
+                    "execute",
+                    transformed.clone(),
+                    "/usr/bin/true",
+                ),
+                WorkerRunLimitsV1::default(),
+                &mut provider,
+            )
+            .unwrap();
+        assert_eq!(
+            result.input.logical_object_id,
+            transformed.object.logical_object_id
+        );
+        assert_eq!(result.input.revision, transformed.object.revision);
+        let revisions: i64 = connection(&fixture.runtime.paths)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_transform_results",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revisions, 1);
+    }
+
     #[test]
     fn exact_claim_is_one_use_and_rejects_session_host_step_and_revision_substitution() {
         let fixture = fixture(transform_then_execute_steps);
@@ -1404,6 +1907,7 @@ mod tests {
                 captured_binding: fixture.binding.clone(),
                 current_binding: fixture.binding.clone(),
                 now: NOW + 3,
+                process_world: None,
             })
             .is_err());
         let mut wrong_revision = fixture.input.clone();
@@ -1417,6 +1921,7 @@ mod tests {
                 captured_binding: fixture.binding.clone(),
                 current_binding: fixture.binding.clone(),
                 now: NOW + 3,
+                process_world: None,
             })
             .is_err());
         let wrong_session = HostSessionBinding::new(
@@ -1438,6 +1943,7 @@ mod tests {
                 captured_binding: fixture.binding.clone(),
                 current_binding: wrong_session,
                 now: NOW + 3,
+                process_world: None,
             })
             .is_err());
     }
@@ -1454,6 +1960,7 @@ mod tests {
                 captured_binding: fixture.binding.clone(),
                 current_binding: fixture.binding.clone(),
                 now: NOW + 2,
+                process_world: None,
             })
             .is_err());
         let grant = claim(&fixture, "transform", fixture.input.clone());

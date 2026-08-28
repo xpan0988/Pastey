@@ -28,9 +28,9 @@ use serde::Serialize;
 use crate::{
     effect_authority::{
         BackendApplyV1, BackendEffectOutcomeV1, ConfinementPropertyV1, EffectAuthorityStateV1,
-        EffectDecisionV1, EffectEnvelopeRefV1, EffectFactsV1, EffectRequestKindV1, EffectRequestV1,
-        ExecutionWorldGrantV1, ExecutionWorldRefV1, HostEffectBackendV1, ManagedRunRefV1,
-        ProcessEffectV1, ResourceHandleRefV1, ResourceKindV1,
+        EffectDecisionV1, EffectEnvelopeRefV1, EffectFactsV1, EffectRequestIdV1,
+        EffectRequestKindV1, EffectRequestV1, ExecutionWorldGrantV1, ExecutionWorldRefV1,
+        HostEffectBackendV1, ManagedRunRefV1, ProcessEffectV1, ResourceHandleRefV1, ResourceKindV1,
     },
     error::{AppError, AppResult},
     managed_objects::ManagedObjectBindingService,
@@ -45,6 +45,7 @@ const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_ENV_BINDINGS: usize = 128;
 const MAX_ENV_BYTES: usize = 64 * 1024;
 const MAX_STDIN_BYTES: usize = 1024 * 1024;
+const MAX_MODEL_PROCESS_EXCERPT_BYTES: usize = 4 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,7 +92,7 @@ impl ManagedProcessInvocationV1 {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct WorldOwnerV1 {
     envelope_ref: EffectEnvelopeRefV1,
     run_ref: ManagedRunRefV1,
@@ -116,6 +117,8 @@ struct StreamCaptureV1 {
     bytes: AtomicU64,
     exceeded: AtomicBool,
     digest: Mutex<Option<String>>,
+    excerpt: Mutex<Vec<u8>>,
+    finished: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +144,7 @@ struct ManagedProcessV1 {
     terminal: Mutex<Option<TerminalObservationV1>>,
     cancel: AtomicBool,
     wall_deadline: Instant,
+    started_at: Instant,
     memory_bytes_limit: u64,
     write_bytes_limit: u64,
     mounts: Vec<ExecutionWorldMountV1>,
@@ -171,7 +175,23 @@ impl ManagedProcessV1 {
 struct ExecutionWorldStateV1 {
     worlds: HashMap<ExecutionWorldRefV1, ProvisionedWorldV1>,
     processes: HashMap<String, Arc<ManagedProcessV1>>,
+    completed: HashMap<EffectRequestIdV1, CompletedProcessObservationV1>,
     next_process_nonce: u64,
+}
+
+/// Non-authoritative, model-visible feedback produced only after an allowed
+/// contained process reaches a terminal state. Effect evidence remains in
+/// `EffectAuthorityStateV1`; this copy has no handle, path, or authority use.
+#[derive(Clone, Debug)]
+pub(crate) struct CompletedProcessObservationV1 {
+    owner: WorldOwnerV1,
+    pub(crate) state: String,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) stdout_excerpt: Vec<u8>,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_excerpt: Vec<u8>,
+    pub(crate) stderr_truncated: bool,
+    pub(crate) duration_millis: u64,
 }
 
 /// Shared process-local world controller. Lifecycle methods require no
@@ -315,7 +335,12 @@ impl ExecutionWorldServiceV1 {
         Ok((argv_digest, environment_digest, stdin_digest))
     }
 
-    fn apply_spawn(&self, request: &EffectRequestV1) -> AppResult<BackendEffectOutcomeV1> {
+    fn apply_spawn(
+        &self,
+        resolver: &mut ManagedResourceResolverV1,
+        objects: &mut ManagedObjectBindingService,
+        request: &EffectRequestV1,
+    ) -> AppResult<BackendEffectOutcomeV1> {
         let EffectRequestKindV1::Process(ProcessEffectV1::Spawn {
             world_ref,
             executable_handle,
@@ -480,6 +505,7 @@ impl ExecutionWorldServiceV1 {
             cancel: AtomicBool::new(false),
             wall_deadline: Instant::now()
                 + Duration::from_millis(request.requested_budget_slice.wall_millis),
+            started_at: Instant::now(),
             memory_bytes_limit: request.requested_budget_slice.memory_byte_millis
                 / request.requested_budget_slice.wall_millis.max(1),
             write_bytes_limit: request.requested_budget_slice.write_bytes,
@@ -490,23 +516,73 @@ impl ExecutionWorldServiceV1 {
             .processes
             .insert(process_ref.clone(), process.clone());
         monitor_process(process);
-        Ok(process_outcome(
-            world_ref,
-            &process_ref,
-            &availability.identity_digest,
-            &executable_identity_ref,
-            argv_digest,
-            environment_digest,
-            "running",
-            None,
-            0,
-            empty_digest(),
-            0,
-            empty_digest(),
-            false,
-            empty_digest(),
-            "contained_process_spawned",
+        let process = self
+            .state
+            .lock()
+            .processes
+            .get(&process_ref)
+            .cloned()
+            .ok_or_else(|| AppError::InvalidInput("Contained process was unavailable.".into()))?;
+        let observation = wait_for_terminal(
+            &process,
+            Duration::from_millis(
+                request
+                    .requested_budget_slice
+                    .wall_millis
+                    .saturating_add(5_000),
+            ),
+        )?;
+        wait_for_captures(&process, Duration::from_secs(1));
+        let world_access = {
+            let state = self.state.lock();
+            state
+                .worlds
+                .get(world_ref)
+                .map(|world| world.access.clone())
+                .ok_or_else(|| AppError::InvalidInput("Execution world was revoked.".into()))?
+        };
+        let resource_facts = resolver.release_execution_world_mounts(
+            objects,
+            &world_access,
+            &request.request_id,
+            &process.mounts,
+        )?;
+        let resource_effect_digest =
+            domain_hash("pastey-process-resource-effects-v1", &resource_facts)?;
+        let completed = CompletedProcessObservationV1 {
+            owner: process.owner.clone(),
+            state: observation.state.clone(),
+            exit_code: observation.exit_code,
+            stdout_excerpt: process.stdout.excerpt.lock().clone(),
+            stdout_truncated: process.stdout.exceeded.load(Ordering::SeqCst),
+            stderr_excerpt: process.stderr.excerpt.lock().clone(),
+            stderr_truncated: process.stderr.exceeded.load(Ordering::SeqCst),
+            duration_millis: process.started_at.elapsed().as_millis() as u64,
+        };
+        let mut state = self.state.lock();
+        state.processes.remove(&process_ref);
+        state
+            .completed
+            .insert(request.request_id.clone(), completed);
+        Ok(terminal_process_outcome(
+            &process,
+            observation,
+            resource_effect_digest,
+            "contained_process_exited",
         ))
+    }
+
+    pub(crate) fn take_completed_observation(
+        &self,
+        access: &ManagedResourceAccessV1,
+        request_id: &EffectRequestIdV1,
+    ) -> AppResult<Option<CompletedProcessObservationV1>> {
+        let mut state = self.state.lock();
+        let Some(observation) = state.completed.get(request_id) else {
+            return Ok(None);
+        };
+        validate_world_owner(&observation.owner, access)?;
+        Ok(state.completed.remove(request_id))
     }
 
     fn apply_signal(
@@ -633,6 +709,9 @@ impl ExecutionWorldServiceV1 {
         for process in &processes {
             state.processes.remove(&process.process_ref);
         }
+        state
+            .completed
+            .retain(|_, observation| !predicate(&observation.owner));
         for world_ref in world_refs {
             state.worlds.remove(&world_ref);
         }
@@ -676,7 +755,8 @@ impl HostEffectBackendV1 for HostManagedProcessBackendV1<'_> {
     fn apply(&mut self, request: &EffectRequestV1) -> BackendApplyV1 {
         let outcome = match &request.effect {
             EffectRequestKindV1::Process(ProcessEffectV1::Spawn { .. }) => {
-                self.worlds.apply_spawn(request)
+                self.worlds
+                    .apply_spawn(self.resolver, self.objects, request)
             }
             EffectRequestKindV1::Process(ProcessEffectV1::Signal { .. }) => self
                 .worlds
@@ -1121,6 +1201,14 @@ fn start_capture(reader: impl Read + Send + 'static, capture: Arc<StreamCaptureV
                     let accepted = count.min(remaining);
                     if accepted > 0 {
                         hasher.update(&buffer[..accepted]);
+                        let excerpt_remaining = MAX_MODEL_PROCESS_EXCERPT_BYTES
+                            .saturating_sub(capture.excerpt.lock().len());
+                        if excerpt_remaining > 0 {
+                            capture
+                                .excerpt
+                                .lock()
+                                .extend_from_slice(&buffer[..accepted.min(excerpt_remaining)]);
+                        }
                         captured += accepted as u64;
                         capture.bytes.store(captured, Ordering::SeqCst);
                     }
@@ -1132,6 +1220,7 @@ fn start_capture(reader: impl Read + Send + 'static, capture: Arc<StreamCaptureV
             }
         }
         *capture.digest.lock() = Some(hasher.finalize().to_hex().to_string());
+        capture.finished.store(true, Ordering::SeqCst);
     });
 }
 
@@ -1330,6 +1419,16 @@ fn wait_for_terminal(
     }
 }
 
+fn wait_for_captures(process: &ManagedProcessV1, maximum: Duration) {
+    let deadline = Instant::now() + maximum;
+    while (!process.stdout.finished.load(Ordering::SeqCst)
+        || !process.stderr.finished.load(Ordering::SeqCst))
+        && Instant::now() < deadline
+    {
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
 fn terminal_process_outcome(
     process: &ManagedProcessV1,
     observation: TerminalObservationV1,
@@ -1448,6 +1547,31 @@ fn domain_hash<T: Serialize>(domain: &str, value: &T) -> AppResult<String> {
     hasher.update(&(canonical.len() as u64).to_be_bytes());
     hasher.update(&canonical);
     Ok(format!("{domain}:{}", hasher.finalize().to_hex()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Cursor, sync::Arc, time::Duration};
+
+    use super::*;
+
+    #[test]
+    fn stream_capture_bounds_model_excerpt_and_marks_overflow() {
+        let capture = Arc::new(StreamCaptureV1::default());
+        start_capture(
+            Cursor::new(vec![b'x'; MAX_MODEL_PROCESS_EXCERPT_BYTES + 32]),
+            capture.clone(),
+            (MAX_MODEL_PROCESS_EXCERPT_BYTES + 8) as u64,
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !capture.finished.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(POLL_INTERVAL);
+        }
+        assert!(capture.finished.load(Ordering::SeqCst));
+        assert!(capture.exceeded.load(Ordering::SeqCst));
+        assert!(capture.excerpt.lock().len() <= MAX_MODEL_PROCESS_EXCERPT_BYTES);
+        assert!(capture.digest.lock().is_some());
+    }
 }
 
 fn invalid<T>(message: &str) -> AppResult<T> {

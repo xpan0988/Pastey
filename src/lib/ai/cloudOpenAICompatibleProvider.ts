@@ -1,5 +1,5 @@
 import { buildCloudSafeAiContextSnapshot } from "./contextSnapshot";
-import { NATURAL_V1_PROVIDER_INSTRUCTIONS } from "./providerInstructionPack";
+import { NATURAL_V1_PROVIDER_INSTRUCTIONS, NATURAL_V2_PROVIDER_INSTRUCTIONS } from "./providerInstructionPack";
 import type {
   AiGenerateRequest,
   AiGenerateResult,
@@ -144,7 +144,9 @@ export function buildOpenAICompatibleChatRequest(
         role: "system",
         content: request.outputSchema === "ask-bridge-natural-v1"
           ? NATURAL_V1_PROVIDER_INSTRUCTIONS
-          : ADVISORY_SYSTEM_PROMPT
+          : request.outputSchema === "candidate-semantic-plan-v2"
+            ? NATURAL_V2_PROVIDER_INSTRUCTIONS
+            : ADVISORY_SYSTEM_PROMPT
       },
       {
         role: "user",
@@ -157,9 +159,13 @@ export function buildOpenAICompatibleChatRequest(
             includeAbsolutePaths: false,
             includeSecrets: false
           },
-          context: cloudContext,
-          allowedActionKinds: [...request.allowedActionKinds],
-          outputSchema: request.outputSchema
+          ...(request.outputSchema === "candidate-semantic-plan-v2"
+            ? {}
+            : { context: cloudContext, allowedActionKinds: [...request.allowedActionKinds] }),
+          outputSchema: request.outputSchema,
+          ...(request.outputSchema === "candidate-semantic-plan-v2"
+            ? { proposalContext: request.proposalContext }
+            : {})
         })
       }
     ],

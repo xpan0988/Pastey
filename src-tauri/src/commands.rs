@@ -79,6 +79,78 @@ pub async fn refresh_selected_peer_capabilities(
     }
 }
 
+/// Deterministically seals an explicitly authored native-v2 Plan. This command
+/// does not plan, select Hosts, bind providers, or consume execution authority.
+#[tauri::command]
+pub fn compose_native_v2_plan(
+    request: crate::native_v2_orchestration::NativeV2ComposeRequestV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_v2_orchestration::NativeV2PlanStatusV1, String> {
+    state
+        .compose_native_v2_product_plan(request, storage::now_ts())
+        .map_err(|error| error.message())
+}
+
+/// Resolves an untrusted alias-only Natural-v2 proposal and creates a native-v2
+/// Draft review candidate. It cannot approve or start the resulting revision.
+#[tauri::command]
+pub fn compose_natural_v2_candidate(
+    request: crate::natural_v2::NaturalV2ComposeCandidateRequestV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::natural_v2::NaturalV2CandidateReviewV1, String> {
+    state
+        .compose_natural_v2_candidate(request, storage::now_ts())
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn approve_native_v2_plan(
+    revision_id: String,
+    approval_id: String,
+    expires_at: i64,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_v2_orchestration::NativeV2PlanStatusV1, String> {
+    state
+        .approve_native_v2_product_plan(&revision_id, &approval_id, expires_at, storage::now_ts())
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub async fn start_native_v2_plan_attempt(
+    approval_id: String,
+    attempt_id: String,
+    expires_at: i64,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_v2_orchestration::NativeV2PlanStatusV1, String> {
+    state
+        .inner()
+        .start_native_v2_product_attempt(&approval_id, &attempt_id, expires_at, storage::now_ts())
+        .await
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn get_native_v2_plan_status(
+    revision_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_v2_orchestration::NativeV2PlanStatusV1, String> {
+    state
+        .native_v2_product_status(&revision_id)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub async fn cancel_native_v2_plan_attempt(
+    attempt_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_v2_orchestration::NativeV2PlanStatusV1, String> {
+    state
+        .inner()
+        .cancel_native_v2_product_attempt(&attempt_id, storage::now_ts())
+        .await
+        .map_err(|error| error.message())
+}
+
 fn bridge_plan_control_event(
     kind: &str,
     payload: Value,

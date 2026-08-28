@@ -133,6 +133,26 @@ impl ManagedObjectBindingService {
         self.acquire(input, logical_object_id, 1, None, now)
     }
 
+    /// Core-owned binding of one authored native-v2 Search output. The logical
+    /// identity and revision come from the immutable Plan; candidate/model
+    /// data cannot choose either value. This is acquisition, not Transform
+    /// lineage, and therefore accepts only SearchResult revision 1.
+    pub(crate) fn bind_authored_search_revision(
+        &mut self,
+        input: HostArtifactAcquisition,
+        logical_object_id: String,
+        revision: u64,
+        now: i64,
+    ) -> AppResult<ManagedObjectAcquisition> {
+        if input.kind != ManagedObjectAcquisitionKind::SearchResult || revision != 1 {
+            return Err(AppError::InvalidInput(
+                "Only an authored Search result may establish revision 1.".into(),
+            ));
+        }
+        validate_managed_object_id(&logical_object_id)?;
+        self.acquire(input, logical_object_id, revision, None, now)
+    }
+
     /// Re-establishes the same exact logical revision at this Host after an
     /// explicit Transfer. It cannot create N+1 and requires the expected
     /// content identity from Core-owned lineage.
@@ -263,6 +283,38 @@ impl ManagedObjectBindingService {
             ));
         }
         Ok(stored.artifact.clone())
+    }
+
+    /// Coordinator-only lookup of one already acquired exact local revision.
+    /// Logical identity is not a bearer token: ambiguity, expiry, Bridge
+    /// substitution, or changed physical identity all fail closed.
+    pub(crate) fn acquisition_for_revision(
+        &mut self,
+        bridge_id: &str,
+        logical_object_id: &str,
+        revision: u64,
+        now: i64,
+    ) -> AppResult<ManagedObjectAcquisition> {
+        self.prune_expired(now);
+        let matches = self
+            .bindings
+            .values()
+            .filter(|stored| {
+                stored.bridge_id.as_deref() == Some(bridge_id)
+                    && stored.acquisition.object.logical_object_id == logical_object_id
+                    && stored.acquisition.object.revision == revision
+                    && stored.acquisition.binding.expires_at > now
+            })
+            .map(|stored| stored.acquisition.clone())
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(AppError::InvalidInput(
+                "Exact managed object revision binding is unavailable or ambiguous.".into(),
+            ));
+        }
+        let acquisition = matches.into_iter().next().expect("one exact binding");
+        self.resolve(&acquisition, now)?;
+        Ok(acquisition)
     }
 
     pub(crate) fn purge_bridge(&mut self, bridge_id: &str) -> usize {

@@ -1,99 +1,112 @@
 # Pastey reference
 
-This document owns stable cross-layer terminology, identifiers, and compact source pointers. Version 1.9.2 is the previous frozen semantic baseline; version 1.9.3 adds the completed Phase 1–5 foundations without changing it. Version 2.0.0 is reserved for the planned Phase 6 Agent product milestone. Source types and validators remain authoritative.
+This document owns concrete identifiers, bounds, configuration facts, and source pointers. Source types and validators remain authoritative; architecture is in [architecture](architecture.md) and [Layer 5](layers/layer-5-agent.md).
 
-## Canonical primitives
+## Versions and schemas
 
-| Primitive | Meaning | Current execution state |
-| --- | --- | --- |
-| Search | Find/select an object on an explicit Host. | Implemented |
-| Transform | Authorize reviewed modification intent for the selected object on its current explicit Host. | Plan framework only |
-| Transfer | Move the current object revision to an explicit device or landing. | Implemented |
-| Execute | Authorize reviewed execution intent for the exact current revision on an explicit Host. | Plan framework only |
-
-Only Transfer changes location. Transform conceptually advances the same logical object revision. Execute consumes the exact current revision. No Transform step means no mutation authority; no Execute step means no execution authority.
-
-## Stable identifiers and source map
-
-| Boundary | Current value / source |
+| Boundary | Value / source |
 | --- | --- |
-| Natural proposal | `ask-bridge-natural-v1` — `src/lib/ai/naturalV1Plan.ts` |
-| Provider vocabulary | `Search`, `Transform`, `Transfer`, `Execute` |
-| Plan schema/hash v1 | `bridge-plan-v1` / `bridge-plan-revision-hash-v1:*` — `src-tauri/src/bridge_plan.rs` |
-| Plan protocol v1 | `pastey-bridge-plan-protocol-v1` — `src-tauri/src/bridge_plan/protocol.rs` |
-| Plan schema/hash v2 | `bridge-plan-v2` / `bridge-plan-revision-hash-v2:*` — `src-tauri/src/bridge_plan_v2.rs` |
-| Plan protocol v2 | `pastey-bridge-plan-protocol-v2`; `bridge_plan.v2.review_request` / `bridge_plan.v2.attempt_start` — `src-tauri/src/bridge_plan_v2.rs` |
-| Candidate binding | `BridgePlanCandidateStore` — `src-tauri/src/file_candidates.rs` |
-| Safe private identity | `SourceIdentity` — `src-tauri/src/safe_file_identity.rs` |
-| Logical dependency | v1 `LogicalObjectRevision`; v2 `ManagedObjectRevisionV2` / `PlanRootV2` — Plan modules |
-| Capability transport | `pastey-peer-capabilities-v2` — `src-tauri/src/peer_capabilities.rs` |
-| Shared transfer capacity | `TransferCapacityCoordinator` — `src-tauri/src/transfer_orchestration.rs` |
-| Ordinary route | `BridgeRoute` — `src/lib/bridgeRouting.ts` |
-| Control route | `pastey-bridge-control-route-v1` — `src-tauri/src/room_control.rs` |
-| Logical Host identity | `HostRef`, `PlanParticipantRef`, `HostSessionBinding` — `src-tauri/src/host_identity.rs` |
-| Developer Terminal protocol | `developer_terminal` / `pastey-developer-terminal-v0` — `src-tauri/src/developer_terminal.rs` |
-| Developer terminal endpoint identity | `DeveloperHostRef`, `DeveloperTerminalBinding` — `src-tauri/src/host_runtime.rs` |
-| Developer Terminal authority | private `DeveloperTerminalGrant` — `src-tauri/src/developer_terminal.rs` |
-| Managed effect authority | `AuthorityContextV1`, `EffectEnvelopeV1`, `EffectAuthorityStateV1` — `src-tauri/src/effect_authority.rs` |
-| Managed resources | `ManagedResourceResolverV1` — `src-tauri/src/managed_resources.rs` |
-| Managed process/network backends | `ExecutionWorldServiceV1`, `NetworkBrokerServiceV1` — `src-tauri/src/execution_world.rs`, `src-tauri/src/network_broker.rs` |
-| Core managed result seam | one-use v2 claim/evidence/result validation — `src-tauri/src/managed_execution.rs` |
+| Packaged application metadata | `src-tauri/Cargo.toml`, mirrored by `package.json`, `src-tauri/tauri.conf.json`, and lockfiles |
+| Natural-v1 proposal | `ask-bridge-natural-v1` — `src/lib/ai/naturalV1Plan.ts` |
+| Natural-v2 candidate | `CandidateSemanticPlanV2` — `src/lib/ai/naturalV2Plan.ts`; Core resolution in `src-tauri/src/natural_v2.rs` |
+| Plan v1 | `bridge-plan-v1`; `bridge-plan-revision-hash-v1:*` |
+| Plan protocol v1 | `pastey-bridge-plan-protocol-v1` |
+| Plan v2 | `bridge-plan-v2`; `bridge-plan-revision-hash-v2:*` |
+| Plan protocol v2 | `pastey-bridge-plan-protocol-v2` |
+| Product status DTO/event | `pastey-native-v2-product-v1`; `pastey://native-v2-plan-status` |
+| Worker status event | `pastey-managed-worker-status-v1`; `pastey://managed-worker-status` |
+| Provider config | `pastey-worker-provider-config-v1` |
+| Peer capability facts | `pastey-peer-capabilities-v2` |
+| Room Control route | `pastey-bridge-control-route-v1` |
 
-There are currently no concrete Transform or Execute capability identifiers.
+## Native-v2 commands
 
-Developer Terminal identifiers are a separate human-only authority domain. They are not Layer 5 capability identifiers, Plan primitives, or runtime availability facts.
+Registered Tauri commands:
 
-## Framework schemas
+- `compose_natural_v2_candidate`
+- `compose_native_v2_plan`
+- `approve_native_v2_plan`
+- `start_native_v2_plan_attempt`
+- `get_native_v2_plan_status`
+- `cancel_native_v2_plan_attempt`
 
-Conceptually, Transform carries:
+Only the Natural-v2 candidate command currently has a TypeScript wrapper in `src/lib/tauri.ts`. The remaining commands are backend seams for the later product UI.
 
-```text
-target
-executionDevice
-input logical revision
-output logical revision
-modificationIntent
-```
+`NativeV2PlanStatusV1` exposes only: schema/Plan/revision/hash, optional approval and attempt ids, state, optional current step, completed/total step counts, ready/total Host counts, bounded code, and update time. It contains no credential, path, ObjectRef, grant, EffectEnvelope, or evidence.
 
-It preserves location and declares the next same-object revision. The intent is bounded reviewed text, not a patch, command, path, or implementation selection.
+Native-v2 Room Control kinds are:
 
-Conceptually, Execute carries:
+- `bridge_plan.v2.review_request`
+- `bridge_plan.v2.readiness_request` / `bridge_plan.v2.readiness_result`
+- `bridge_plan.v2.attempt_start` / `bridge_plan.v2.attempt_prepared` / `bridge_plan.v2.attempt_commit`
+- `bridge_plan.v2.step_result` / `bridge_plan.v2.step_failure` / `bridge_plan.v2.step_commit`
+- `bridge_plan.v2.attempt_cancel`
 
-```text
-target
-executionDevice
-target logical revision
-executionIntent
-```
+The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bounded to 128 characters and product semantic text to 1,024 characters by the native-v2 service.
 
-It does not select a runtime, executable, shell, cwd, environment, network policy, or process. The 1.9.3 Core substrate can derive exact managed authority and validate evidence, but product attempts containing either primitive still fail closed until the planned Phase 6 Agent path exists.
+## Host and managed authority source map
 
-## Authority, routing, and visibility
+| Boundary | Primary source |
+| --- | --- |
+| `HostRuntime` and lifecycle | `src-tauri/src/host_runtime.rs` |
+| `HostRef`, `PlanParticipantRef`, `HostSessionBinding` | `src-tauri/src/host_identity.rs` |
+| Host admission | `src-tauri/src/host_admission.rs` |
+| Plan schema/protocol v2 | `src-tauri/src/bridge_plan_v2.rs` |
+| Native-v2 product orchestration | `src-tauri/src/native_v2_orchestration.rs` |
+| Managed Worker coordination | `src-tauri/src/managed_worker_coordinator.rs` |
+| Managed objects | `src-tauri/src/managed_objects.rs` |
+| Safe physical identity | `src-tauri/src/safe_file_identity.rs` |
+| Effect contracts and state | `src-tauri/src/effect_authority.rs` |
+| Resource backend | `src-tauri/src/managed_resources.rs` |
+| Process world | `src-tauri/src/execution_world.rs` |
+| Network broker | `src-tauri/src/network_broker.rs` |
+| Core claim/result finalizer | `src-tauri/src/managed_execution.rs` |
+| Worker Harness/provider | `src-tauri/src/worker_harness.rs`, `worker_provider.rs` |
+| Provider configuration | `src-tauri/src/worker_provider_config.rs` |
 
-One requester Review & Run binds the complete immutable Plan. Candidate selection chooses data only. Rust continues currently executable Search and Transfer steps automatically. Transform/Execute framework presence creates no generic persistent modification or process authority.
+## Provider configuration facts
 
-Capability projections contain `0..N` bounded observations, never routing or authority. An empty projection is valid and creates no fallback fact, topology change, approval, or Host choice. Local and peer observations remain independent, and the current projection truthfully contains no implemented Transform/Execute facts.
+The Host service stores non-secret provider id, generation, config digest, HTTPS base URL, model, timeout, output-token limit, health, and timestamps in SQLite. The API key is stored separately as authenticated ciphertext under the existing Host master key. Exact generations are immutable run bindings; update increments generation, delete revokes active bindings, and stale references fail closed.
 
-Private paths, safe-open handles, source fingerprints, digests, PipelinePrivate roots, ObjectRefs, grants, and continuation state remain Rust-private. The renderer receives reviewed semantics, redacted candidate metadata, and safe activity/result summaries.
+Accepted production endpoints must use HTTPS and valid bounded model/config values. Provider health has `unknown`, `healthy`, and `unhealthy` states. The health probe performs no Worker task effect. There is no product configuration command/UI yet, and environment-variable provider loading is limited to an ignored opt-in development smoke test.
 
-## Continuation and resource ownership
+## Developer Terminal protocol and bounds
 
-Layer 5 derives next-step eligibility only from immutable Plan/attempt state and atomically claims the next authored Transfer. Layer 3 admits bounded transport capacity for both ordinary and managed Transfers. Layer 4 supplies current-session route/control delivery; Layer 1 moves bytes. No lower layer infers that PipelinePrivate is followed by Transform.
+Protocol family/version: `developer_terminal` / `pastey-developer-terminal-v0`.
 
-## Managed object acquisition
+Message kinds:
 
-Search means finding. Object acquisition/binding is the Host-owned boundary that validates a physical artifact and associates it with a managed logical object/revision. V1 retains `selected_file` and Search-first composition. V2 generic `PlanRootV2` identifies an exact logical revision and participant location without embedding a physical path, ObjectRef, or private binding. Inbox, drag/drop, local-selection, and generated-artifact roots do not add a fifth primitive and do not themselves grant Transform authority.
+- `developer_terminal.open_request`
+- `developer_terminal.open_accepted`
+- `developer_terminal.open_denied`
+- `developer_terminal.input`
+- `developer_terminal.output`
+- `developer_terminal.resize`
+- `developer_terminal.exit`
+- `developer_terminal.close`
+
+Current limits:
+
+- 8 KiB maximum input/output frame;
+- 64-frame bounded Host PTY output channel;
+- 512 KiB bounded controller display buffer;
+- 3,000 receiver events per minute and 256 events per two-second burst;
+- 64 KiB ordered controller input queue;
+- 5,000-line xterm scrollback;
+- 30-minute UI and active-session lifetime;
+- 2-minute admission-request lifetime.
+
+The frontend uses `@xterm/xterm` and `@xterm/addon-fit`. Host shell selection is Host-owned: an allowed `$SHELL` or safe fallback on Unix, and PowerShell through ConPTY on Windows. Terminal content and absolute paths are excluded from ordinary Pastey logs/history.
 
 ## Validation map
 
-| Boundary | Primary source | Focused validation |
-| --- | --- | --- |
-| Composer/object flow | `src/lib/bridgePlanComposer.ts` | `tests/naturalV1Plan.test.ts` |
-| Natural proposals | `src/lib/ai/naturalV1Plan.ts`, `providerInstructionPack.ts` | `scripts/run-natural-v1-tests.mjs` |
-| Plan lifecycle/schema v1/v2 | `src-tauri/src/bridge_plan.rs`, `bridge_plan_v2.rs` | Rust Bridge Plan v1/v2 tests |
-| Search/Transfer protocol | `src-tauri/src/bridge_plan/protocol.rs`, `commands.rs`, `transfer.rs` | Rust protocol/transfer tests |
-| V2 review/admission protocol | `src-tauri/src/bridge_plan_v2.rs`, `host_admission.rs`, `room_control.rs` | Rust v2 identity/topology/replay/restart/Burn tests |
-| Safe selection and identity | `src-tauri/src/file_candidates.rs`, `safe_file_identity.rs` | Rust candidate/identity tests |
-| Capability facts | `src-tauri/src/peer_capabilities.rs` | Rust projection tests |
-| Burn/restart | `src-tauri/src/bridge_plan.rs`, `object_refs.rs`, `room_control.rs` | Rust lifecycle/cleanup tests |
-| Developer Terminal | `src-tauri/src/developer_terminal.rs`, `host_runtime.rs`, `room_control.rs` | Rust terminal authority/protocol/PTY tests and Windows cross-compile |
+| Boundary | Focused validation |
+| --- | --- |
+| Natural proposals | `scripts/run-natural-v1-tests.mjs`, `scripts/run-natural-v2-tests.mjs`, Rust `natural_v2` tests |
+| Plan lifecycle and native-v2 orchestration | Rust `bridge_plan`, `bridge_plan_v2`, `native_v2_orchestration`, and `managed_worker_coordinator` tests |
+| Worker/provider/configuration | Rust `worker_harness`, `worker_provider`, and `worker_provider_config` tests |
+| Effects/results | Rust `effect_authority`, `managed_resources`, `execution_world`, `network_broker`, and `managed_execution` tests |
+| Layer 4 and transfer | `scripts/run-layer4-validation-matrix.mjs`, `scripts/run-transfer-planner-tests.mjs`, Rust transport/protocol tests |
+| Developer Terminal | Rust terminal/HostRuntime tests plus native physical platform checks |
+
+The full contributor and physical validation procedure is in [development](development.md).

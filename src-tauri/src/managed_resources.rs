@@ -468,6 +468,28 @@ impl ManagedResourceResolverV1 {
         self.reads.remove(request_id)
     }
 
+    /// Removes a not-yet-consumed Worker write staging buffer after Host
+    /// enforcement denied or reported the effect unavailable. The staged bytes
+    /// are not an effect and must not prevent a later, different in-run tool
+    /// request from self-correcting.
+    pub(crate) fn discard_staged_write_payload(
+        &mut self,
+        access: &ManagedResourceAccessV1,
+        handle_ref: &ResourceHandleRefV1,
+        content_digest: &str,
+    ) -> AppResult<()> {
+        let key = staged_key(&access.run_control_ref, handle_ref, content_digest);
+        let Some(staged) = self.staged_payloads.get(&key) else {
+            return Ok(());
+        };
+        if staged.handle_ref != *handle_ref {
+            return invalid("Staged resource payload owner was substituted.");
+        }
+        validate_owner(&staged.owner, access)?;
+        self.staged_payloads.remove(&key);
+        Ok(())
+    }
+
     pub(crate) fn seal_output_slot(
         &mut self,
         authority: &EffectAuthorityStateV1,

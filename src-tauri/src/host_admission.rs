@@ -148,7 +148,7 @@ impl ManagedPrimitiveAvailabilityV1 {
         }
     }
 
-    fn supports(&self, revision: &PlanRevisionV2, step: &PlanStepV2) -> bool {
+    pub(crate) fn supports(&self, revision: &PlanRevisionV2, step: &PlanStepV2) -> bool {
         let host_ref = match step {
             PlanStepV2::Transform { host, .. } | PlanStepV2::Execute { host, .. } => {
                 let Some(participant) = participant_for_ref(revision, host) else {

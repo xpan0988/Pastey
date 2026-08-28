@@ -23,7 +23,10 @@ mod logging;
 mod managed_execution;
 mod managed_objects;
 mod managed_resources;
+mod managed_worker_coordinator;
 mod models;
+mod native_v2_orchestration;
+mod natural_v2;
 mod network_broker;
 mod object_refs;
 mod peer_capabilities;
@@ -33,6 +36,9 @@ mod storage;
 mod transfer;
 mod transfer_orchestration;
 mod transfer_tuning;
+mod worker_harness;
+mod worker_provider;
+mod worker_provider_config;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -45,23 +51,25 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 
 use crate::{
     commands::{
-        accept_developer_terminal, accept_nearby_join, approve_bridge_plan,
-        bind_bridge_plan_to_session, burn_room, cancel_transfer, check_for_updates,
-        close_developer_terminal, copy_last_error, copy_text_to_clipboard,
+        accept_developer_terminal, accept_nearby_join, approve_bridge_plan, approve_native_v2_plan,
+        bind_bridge_plan_to_session, burn_room, cancel_native_v2_plan_attempt, cancel_transfer,
+        check_for_updates, close_developer_terminal, compose_native_v2_plan,
+        compose_natural_v2_candidate, copy_last_error, copy_text_to_clipboard,
         create_composed_file_bridge_plan, create_direct_file_transfer_bridge_plan, create_room,
         delete_temp_file, deny_developer_terminal, enter_developer_mode, get_config,
         get_developer_terminal_workspace, get_device_capabilities, get_device_profile,
-        get_file_transfer_metadata, get_last_benchmark_results, get_room,
-        get_room_control_session_context, join_room, leave_room, list_bridge_plan_workspace,
-        list_nearby_devices, list_received_room_control_events, list_room_items, list_rooms,
-        log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
-        mark_join_prompt_rendered, open_logs_folder, pair_bridge_peer, pending_join_requests,
-        refresh_selected_peer_capabilities, reject_nearby_join, request_developer_terminal,
-        request_nearby_join, resize_developer_terminal, reveal_in_folder,
-        revoke_bridge_peer_pairing, run_loopback_benchmark, run_peer_link_benchmark,
-        select_bridge_plan_search_candidate, send_developer_terminal_input, send_file_to_room,
-        send_text_to_room, start_bridge_plan_attempt, update_config, update_transfer_window,
-        withdraw_bridge_plan_revision, write_temp_file,
+        get_file_transfer_metadata, get_last_benchmark_results, get_native_v2_plan_status,
+        get_room, get_room_control_session_context, join_room, leave_room,
+        list_bridge_plan_workspace, list_nearby_devices, list_received_room_control_events,
+        list_room_items, list_rooms, log_frontend_diagnostic,
+        mark_bridge_peer_pairing_rotation_required, mark_join_prompt_rendered, open_logs_folder,
+        pair_bridge_peer, pending_join_requests, refresh_selected_peer_capabilities,
+        reject_nearby_join, request_developer_terminal, request_nearby_join,
+        resize_developer_terminal, reveal_in_folder, revoke_bridge_peer_pairing,
+        run_loopback_benchmark, run_peer_link_benchmark, select_bridge_plan_search_candidate,
+        send_developer_terminal_input, send_file_to_room, send_text_to_room,
+        start_bridge_plan_attempt, start_native_v2_plan_attempt, update_config,
+        update_transfer_window, withdraw_bridge_plan_revision, write_temp_file,
     },
     error::{AppError, AppResult},
     host_runtime::{HostEvent, HostEventSink, HostRuntime, RuntimeTask, RuntimeTaskSpawner},
@@ -160,6 +168,12 @@ fn main() {
             create_composed_file_bridge_plan,
             create_direct_file_transfer_bridge_plan,
             refresh_selected_peer_capabilities,
+            compose_natural_v2_candidate,
+            compose_native_v2_plan,
+            approve_native_v2_plan,
+            start_native_v2_plan_attempt,
+            get_native_v2_plan_status,
+            cancel_native_v2_plan_attempt,
             list_bridge_plan_workspace,
             approve_bridge_plan,
             withdraw_bridge_plan_revision,

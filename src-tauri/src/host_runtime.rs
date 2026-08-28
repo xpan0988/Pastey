@@ -12,10 +12,17 @@ use crate::{
     execution_world, file_candidates,
     host_admission::{HostAdmissionDecision, HostAdmissionRequest, HostAdmissionService},
     host_identity::{HostRef, HostSessionBinding},
-    logging, managed_objects, managed_resources, network_broker, peer_capabilities, room_control,
-    storage,
+    logging,
+    managed_execution::ManagedProcessWorldSpecV1,
+    managed_objects, managed_resources, network_broker, peer_capabilities, room_control, storage,
     storage::AppPaths,
     transfer, transfer_orchestration,
+    worker_harness::WorkerHarnessRunV1,
+    worker_provider::OpenAICompatibleStreamingWorkerProviderV1,
+    worker_provider_config::{
+        WorkerProviderConfigServiceV1, WorkerProviderHealthStateV1, WorkerProviderMetadataV1,
+        WorkerProviderSelectionV1,
+    },
 };
 
 /// A UI-independent notification emitted by Host/Core services.
@@ -89,6 +96,20 @@ pub struct HostRuntime {
     /// and copy-on-write overlays only in this process. Declaration after the
     /// world controller preserves kill-before-root-removal drop ordering.
     pub(crate) managed_resources: Mutex<managed_resources::ManagedResourceResolverV1>,
+    /// Process-local model cancellation state for the one-step Worker Harness.
+    /// It is not a Core grant or a durable authority record.
+    pub(crate) worker_harness_runs:
+        Mutex<HashMap<effect_authority::ManagedRunRefV1, WorkerHarnessRunV1>>,
+    /// Serializes terminal attempt cancellation/revocation against Core result
+    /// attachment so a late proposal cannot race a terminal lifecycle edge.
+    pub(crate) managed_completion_lock: Mutex<()>,
+    /// Host-private, process-local executable bindings for exact v2 steps.
+    /// Paths never enter Plan/provider/event state and restart clears them.
+    pub(crate) managed_worker_process_specs:
+        Mutex<HashMap<(String, String), ManagedProcessWorldSpecV1>>,
+    /// Durable Host control-plane configuration and process-local immutable
+    /// provider bindings. It is not Plan/effect/network authority.
+    pub(crate) worker_provider_configs: WorkerProviderConfigServiceV1,
     pub developer_terminal: crate::developer_terminal::DeveloperTerminalService,
     event_sink: Arc<dyn HostEventSink>,
     task_spawner: Arc<dyn RuntimeTaskSpawner>,
@@ -131,6 +152,8 @@ impl HostRuntime {
     ) -> AppResult<Self> {
         let local_host_ref = HostRef::from_device_id(&config.device_id)?;
         let managed_resource_root = paths.temp_dir.join("managed-execution-resources");
+        let worker_provider_configs =
+            WorkerProviderConfigServiceV1::new(paths.clone(), config::master_key(&config)?)?;
         Ok(Self {
             paths,
             local_host_ref: local_host_ref.clone(),
@@ -170,6 +193,10 @@ impl HostRuntime {
             managed_resources: Mutex::new(managed_resources::ManagedResourceResolverV1::new(
                 managed_resource_root,
             )),
+            worker_harness_runs: Mutex::new(HashMap::new()),
+            managed_completion_lock: Mutex::new(()),
+            managed_worker_process_specs: Mutex::new(HashMap::new()),
+            worker_provider_configs,
             developer_terminal: crate::developer_terminal::DeveloperTerminalService::default(),
             event_sink,
             task_spawner,
@@ -188,6 +215,20 @@ impl HostRuntime {
     }
 
     pub fn purge_room(&self, room_id: &str) {
+        let _completion_guard = self.managed_completion_lock.lock();
+        crate::native_v2_orchestration::interrupt_attempts_for_bridge(
+            &self.paths,
+            room_id,
+            "bridge_revoked",
+            crate::storage::now_ts(),
+        );
+        crate::managed_worker_coordinator::interrupt_worker_attempts_for_bridge(
+            &self.paths,
+            room_id,
+            "bridge_revoked",
+        );
+        self.managed_worker_process_specs.lock().clear();
+        self.cancel_worker_runs_for_bridge(room_id);
         self.execution_worlds.terminate_bridge(room_id);
         self.network_broker.terminate_bridge(room_id);
         self.effect_authority.lock().revoke_bridge(room_id);
@@ -196,24 +237,40 @@ impl HostRuntime {
         self.developer_terminal.purge_room(room_id);
     }
 
-    /// Phase 5 lifecycle coordinator seam. No live v2 caller exists until
-    /// Step 8, but termination is intentionally ordered before authority
+    /// Phase 5 lifecycle coordinator seam used by the live v2 Worker path.
+    /// Termination is intentionally ordered before authority
     /// revocation so an in-flight tree or brokered socket cannot survive
     /// cancellation.
-    #[allow(dead_code)] // Step 8 attaches the coordinator caller.
     pub(crate) fn cancel_managed_run(
         &self,
         run_ref: &effect_authority::ManagedRunRefV1,
     ) -> AppResult<()> {
+        self.cancel_worker_run(run_ref);
         self.execution_worlds.terminate_run(run_ref);
         self.network_broker.terminate_run(run_ref);
         self.managed_resources.lock().purge_run(run_ref);
         crate::managed_execution::interrupt_claim_for_run(&self.paths, run_ref);
-        self.effect_authority.lock().cancel_run(run_ref)
+        self.effect_authority
+            .lock()
+            .cancel_run_or_confirm_terminal(run_ref)
     }
 
-    #[allow(dead_code)] // Step 8 attaches the coordinator caller.
+    #[allow(dead_code)] // Transport/session monitors and later UI adapters call this Host seam.
     pub(crate) fn revoke_managed_session(&self, session_binding_ref: &str) {
+        let _completion_guard = self.managed_completion_lock.lock();
+        crate::native_v2_orchestration::interrupt_attempts_for_session(
+            &self.paths,
+            session_binding_ref,
+            "session_revoked",
+            crate::storage::now_ts(),
+        );
+        crate::managed_worker_coordinator::interrupt_worker_attempts_for_session(
+            &self.paths,
+            session_binding_ref,
+            "session_revoked",
+        );
+        self.managed_worker_process_specs.lock().clear();
+        self.cancel_worker_runs_for_session(session_binding_ref);
         let mut run_refs = self
             .execution_worlds
             .run_refs_for_session(session_binding_ref);
@@ -242,6 +299,18 @@ impl HostRuntime {
     }
 
     pub fn shutdown_all(&self) {
+        let _completion_guard = self.managed_completion_lock.lock();
+        crate::native_v2_orchestration::interrupt_all_attempts(
+            &self.paths,
+            "host_shutdown",
+            crate::storage::now_ts(),
+        );
+        crate::managed_worker_coordinator::interrupt_all_worker_attempts(
+            &self.paths,
+            "host_shutdown",
+        );
+        self.managed_worker_process_specs.lock().clear();
+        self.cancel_all_worker_runs();
         let _ = self
             .bridge_plan_candidate_store
             .lock()
@@ -253,6 +322,78 @@ impl HostRuntime {
         self.effect_authority.lock().revoke_all();
         self.managed_resources.lock().purge_all();
         self.developer_terminal.shutdown_all();
+    }
+
+    pub(crate) fn register_worker_run(
+        &self,
+        run_ref: effect_authority::ManagedRunRefV1,
+        bridge_id: String,
+        session_binding_ref: String,
+    ) -> WorkerHarnessRunV1 {
+        let record = WorkerHarnessRunV1::new(bridge_id, session_binding_ref);
+        self.worker_harness_runs
+            .lock()
+            .insert(run_ref, record.clone());
+        record
+    }
+
+    pub(crate) fn unregister_worker_run(&self, run_ref: &effect_authority::ManagedRunRefV1) {
+        self.worker_harness_runs.lock().remove(run_ref);
+    }
+
+    fn cancel_worker_run(&self, run_ref: &effect_authority::ManagedRunRefV1) {
+        if let Some(record) = self.worker_harness_runs.lock().get(run_ref) {
+            record.cancel();
+        }
+    }
+
+    fn cancel_worker_runs_for_bridge(&self, bridge_id: &str) {
+        for record in self.worker_harness_runs.lock().values() {
+            if record.bridge_id() == bridge_id {
+                record.cancel();
+            }
+        }
+    }
+
+    #[allow(dead_code)] // Used with the managed-session revocation seam above.
+    fn cancel_worker_runs_for_session(&self, session_binding_ref: &str) {
+        for record in self.worker_harness_runs.lock().values() {
+            if record.session_binding_ref() == session_binding_ref {
+                record.cancel();
+            }
+        }
+    }
+
+    fn cancel_all_worker_runs(&self) {
+        for record in self.worker_harness_runs.lock().values() {
+            record.cancel();
+        }
+    }
+
+    /// Non-secret Host control-plane projection for later settings UI work.
+    /// This is deliberately crate-private and does not make Worker execution
+    /// or provider mutation reachable from a product command.
+    #[allow(dead_code)] // Later settings adapter; intentionally not a Tauri command yet.
+    pub(crate) fn worker_provider_metadata(&self) -> AppResult<Vec<WorkerProviderMetadataV1>> {
+        self.worker_provider_configs.list_metadata()
+    }
+
+    /// Explicit no-effect provider probe. Provider HTTPS is Host Harness
+    /// infrastructure and cannot be reused as a Worker NetworkGrant.
+    #[allow(dead_code)] // Later settings adapter; intentionally not a Tauri command yet.
+    pub(crate) fn probe_worker_provider(
+        &self,
+        selection: &WorkerProviderSelectionV1,
+    ) -> AppResult<WorkerProviderMetadataV1> {
+        let binding = self.worker_provider_configs.resolve(selection)?;
+        let provider = OpenAICompatibleStreamingWorkerProviderV1::from_binding(binding)?;
+        let health = if provider.health_probe().is_ok() {
+            WorkerProviderHealthStateV1::Healthy
+        } else {
+            WorkerProviderHealthStateV1::Unhealthy
+        };
+        self.worker_provider_configs
+            .record_health(&selection.config_ref, health)
     }
 }
 
@@ -388,7 +529,7 @@ pub fn inbound_controller_binding(
 /// Absence, disconnect, restart recovery, stale route replacement, expiry, or
 /// Burn all fail closed. Constructing this value grants no Plan authority.
 pub fn current_host_session_binding(
-    state: &Arc<HostRuntime>,
+    state: &HostRuntime,
     room_id: &str,
     peer_session_id: &str,
 ) -> AppResult<HostSessionBinding> {
@@ -416,7 +557,7 @@ pub fn current_host_session_binding(
 
 #[allow(dead_code)]
 pub fn validate_current_host_session_binding(
-    state: &Arc<HostRuntime>,
+    state: &HostRuntime,
     captured: &HostSessionBinding,
     now: i64,
 ) -> AppResult<()> {
@@ -484,7 +625,7 @@ mod tests {
             dev_tools_enabled: false,
             micro_flow_group_mode: "off".into(),
             shortcut: "test".into(),
-            app_secret: "test".into(),
+            app_secret: crate::crypto::encode_key(&[7u8; 32]),
             device_id: "test-device".into(),
         }
     }
@@ -641,14 +782,13 @@ mod tests {
     fn runtime_events_and_tasks_use_injected_adapters() {
         let events = Arc::new(RecordingEventSink::default());
         let tasks = Arc::new(RecordingTaskSpawner::default());
-        let data_dir = std::env::temp_dir().join("pastey-host-runtime-test");
-        let runtime = HostRuntime::new(
-            AppPaths::new(data_dir.clone(), data_dir.join("logs")),
-            test_config(),
-            events.clone(),
-            tasks.clone(),
-        )
-        .unwrap();
+        let data_dir =
+            std::env::temp_dir().join(format!("pastey-host-runtime-test-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths::new(data_dir.clone(), data_dir.join("logs"));
+        paths.ensure_directories().unwrap();
+        storage::init_database(&paths).unwrap();
+        let runtime =
+            HostRuntime::new(paths, test_config(), events.clone(), tasks.clone()).unwrap();
 
         runtime
             .emit("host-runtime-test", &serde_json::json!({ "ok": true }))

@@ -57,6 +57,13 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "bridge_plan.cancel",
     "bridge_plan.v2.review_request",
     "bridge_plan.v2.attempt_start",
+    "bridge_plan.v2.readiness_request",
+    "bridge_plan.v2.readiness_result",
+    "bridge_plan.v2.attempt_prepared",
+    "bridge_plan.v2.attempt_commit",
+    "bridge_plan.v2.step_result",
+    "bridge_plan.v2.step_commit",
+    "bridge_plan.v2.attempt_cancel",
     "developer_terminal.open_request",
     "developer_terminal.open_accepted",
     "developer_terminal.open_denied",
@@ -771,7 +778,7 @@ pub fn room_control_session_context(
 }
 
 pub(crate) fn room_control_session_context_for_peer(
-    state: &Arc<AppState>,
+    state: &AppState,
     room_id: &str,
     peer_session_id: &str,
 ) -> AppResult<RoomControlSessionContext> {
@@ -797,6 +804,30 @@ pub(crate) fn room_control_session_context_for_peer(
         peer_observation_ref: peer_observation_ref(&peer),
         peer_connected: true,
     })
+}
+
+/// Resolves the exact authenticated file-transfer sender to its current
+/// logical peer session. This is used only to validate native-v2 Transfer
+/// landing metadata; the transport key is never Plan or effect authority.
+pub(crate) fn room_control_session_context_for_transport_key(
+    state: &AppState,
+    room_id: &str,
+    transport_public_key: &str,
+) -> AppResult<RoomControlSessionContext> {
+    let peers = storage::list_bridge_peer_endpoints(&state.paths, room_id)?;
+    let mut matches = peers.iter().filter(|peer| {
+        peer.transport_public_key.as_deref() == Some(transport_public_key)
+            && peer.liveness == crate::models::BridgePeerLiveness::Connected
+    });
+    let peer = matches
+        .next()
+        .ok_or_else(|| AppError::InvalidInput("Transfer sender session is unavailable.".into()))?;
+    if matches.next().is_some() {
+        return Err(AppError::InvalidInput(
+            "Transfer sender session is ambiguous.".into(),
+        ));
+    }
+    room_control_session_context_for_peer(state, room_id, &peer.peer_session_id)
 }
 
 pub(crate) fn selected_peer_route(room_id: &str, peer_session_id: &str) -> Value {
@@ -1569,6 +1600,10 @@ pub async fn receive_room_control_event_handler(
             .get("payload")
             .cloned()
             .unwrap_or(Value::Null);
+        let mut native_response: Option<(&'static str, Value)> = None;
+        let mut native_events = Vec::new();
+        let mut committed_attempt: Option<String> = None;
+        let mut cancelled_transfer: Option<String> = None;
         let accepted = match validated.kind.as_str() {
             "bridge_plan.v2.review_request" => {
                 serde_json::from_value(payload)
@@ -1586,17 +1621,47 @@ pub async fn receive_room_control_event_handler(
                 );
                 serde_json::from_value(payload)
                     .map_err(AppError::from)
-                    .and_then(|start| {
+                    .and_then(|start: crate::bridge_plan_v2::AttemptStartV2| {
                         let current_binding = current_binding?;
-                        match crate::bridge_plan_v2::BridgePlanV2Store::new(&ctx.state.paths)
-                            .accept_attempt_start(
-                                &start,
-                                &captured_binding,
-                                &current_binding,
-                                &ctx.state.host_admission,
+                        let coordinated =
+                            crate::native_v2_orchestration::coordinated_receiver_review(
+                                &ctx.state.paths,
+                                &start.correlation_id,
+                                &start.attempt_id,
+                            )?;
+                        let decision = if coordinated {
+                            ctx.state.accept_live_v2_managed_attempt_deferred(
+                                start.clone(),
+                                captured_binding.clone(),
+                                current_binding,
                                 now,
-                            )? {
-                            crate::bridge_plan_v2::AttemptStartDecisionV2::Accepted(_) => Ok(()),
+                            )?
+                        } else {
+                            ctx.state.accept_live_v2_managed_attempt(
+                                start.clone(),
+                                captured_binding.clone(),
+                                current_binding,
+                                now,
+                            )?
+                        };
+                        match decision {
+                            crate::bridge_plan_v2::AttemptStartDecisionV2::Accepted(accepted) => {
+                                if coordinated {
+                                    let prepared =
+                                        crate::native_v2_orchestration::record_receiver_prepared(
+                                            &ctx.state.paths,
+                                            &start,
+                                            &accepted,
+                                            &captured_binding,
+                                            now,
+                                        )?;
+                                    native_response = Some((
+                                        crate::native_v2_orchestration::PREPARED_KIND,
+                                        serde_json::to_value(prepared)?,
+                                    ));
+                                }
+                                Ok(())
+                            }
                             crate::bridge_plan_v2::AttemptStartDecisionV2::Denied(_) => {
                                 Err(AppError::InvalidInput(
                                     "Bridge Plan v2 Host admission denied.".into(),
@@ -1605,6 +1670,112 @@ pub async fn receive_room_control_event_handler(
                         }
                     })
             }
+            crate::native_v2_orchestration::READINESS_REQUEST_KIND => {
+                serde_json::from_value(payload)
+                    .map_err(AppError::from)
+                    .and_then(|request| {
+                        let result = crate::native_v2_orchestration::accept_readiness_request(
+                            &ctx.state,
+                            request,
+                            &captured_binding,
+                            now,
+                        )?;
+                        native_response = Some((
+                            crate::native_v2_orchestration::READINESS_KIND,
+                            serde_json::to_value(result)?,
+                        ));
+                        Ok(())
+                    })
+            }
+            crate::native_v2_orchestration::READINESS_KIND => serde_json::from_value(payload)
+                .map_err(AppError::from)
+                .and_then(|result| {
+                    native_events = crate::native_v2_orchestration::accept_requester_readiness(
+                        &ctx.state,
+                        result,
+                        &captured_binding,
+                        now,
+                    )?;
+                    Ok(())
+                }),
+            crate::native_v2_orchestration::PREPARED_KIND => serde_json::from_value(payload)
+                .map_err(AppError::from)
+                .and_then(|prepared| {
+                    native_events = crate::native_v2_orchestration::accept_requester_prepared(
+                        &ctx.state,
+                        prepared,
+                        &captured_binding,
+                        now,
+                    )?;
+                    Ok(())
+                }),
+            crate::native_v2_orchestration::COMMIT_KIND => serde_json::from_value(payload)
+                .map_err(AppError::from)
+                .and_then(
+                    |commit: crate::native_v2_orchestration::NativeV2AttemptCommitV1| {
+                        crate::native_v2_orchestration::accept_receiver_commit(
+                            &ctx.state,
+                            &commit,
+                            &captured_binding,
+                            now,
+                        )?;
+                        committed_attempt = Some(commit.attempt_id);
+                        Ok(())
+                    },
+                ),
+            crate::native_v2_orchestration::STEP_RESULT_KIND => serde_json::from_value(payload)
+                .map_err(AppError::from)
+                .and_then(|result| {
+                    native_events = crate::native_v2_orchestration::accept_requester_step_result(
+                        &ctx.state,
+                        result,
+                        &captured_binding,
+                        now,
+                    )?;
+                    Ok(())
+                }),
+            crate::native_v2_orchestration::STEP_FAILURE_KIND => serde_json::from_value(payload)
+                .map_err(AppError::from)
+                .and_then(|failure| {
+                    native_events = crate::native_v2_orchestration::accept_requester_step_failure(
+                        &ctx.state,
+                        failure,
+                        &captured_binding,
+                        now,
+                    )?;
+                    Ok(())
+                }),
+            crate::native_v2_orchestration::STEP_COMMIT_KIND => serde_json::from_value(payload)
+                .map_err(AppError::from)
+                .and_then(
+                    |commit: crate::native_v2_orchestration::NativeV2StepCommitV1| {
+                        crate::native_v2_orchestration::accept_receiver_step_commit(
+                            &ctx.state,
+                            &commit,
+                            &captured_binding,
+                            now,
+                        )?;
+                        committed_attempt = Some(commit.attempt_id);
+                        Ok(())
+                    },
+                ),
+            crate::native_v2_orchestration::CANCEL_KIND => serde_json::from_value(payload)
+                .map_err(AppError::from)
+                .and_then(
+                    |cancel: crate::native_v2_orchestration::NativeV2AttemptCancelV1| {
+                        cancelled_transfer =
+                            crate::native_v2_orchestration::accept_receiver_cancel(
+                                &ctx.state,
+                                &cancel,
+                                &captured_binding,
+                                now,
+                            )?;
+                        let _ = ctx
+                            .state
+                            .cancel_live_v2_managed_attempt(&cancel.attempt_id, now);
+                        Ok(())
+                    },
+                ),
             _ => Err(AppError::InvalidInput(
                 "Unsupported Bridge Plan protocol v2 event.".into(),
             )),
@@ -1617,6 +1788,76 @@ pub async fn receive_room_control_event_handler(
                 reason,
                 "Bridge Plan v2 validation or Host admission failed.",
             );
+        }
+        if let Some((kind, payload)) = native_response {
+            let response_context = match room_control_session_context_for_peer(
+                &ctx.state,
+                &room_id,
+                &inbound_peer.peer_session_id,
+            ) {
+                Ok(context) => context,
+                Err(_) => {
+                    return control_error(
+                        StatusCode::GONE,
+                        "host_binding_unavailable",
+                        "Native v2 response route is unavailable.",
+                    )
+                }
+            };
+            let response = match crate::native_v2_orchestration::control_event_for_session(
+                kind,
+                payload,
+                &response_context,
+            ) {
+                Ok(event) => event,
+                Err(_) => {
+                    return control_error(
+                        StatusCode::BAD_REQUEST,
+                        "native_v2_response_invalid",
+                        "Native v2 response could not be constructed.",
+                    )
+                }
+            };
+            let response_state = ctx.state.clone();
+            let response_room = room_id.clone();
+            let response_route =
+                selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
+            ctx.state.spawn(async move {
+                let _ = send_room_control_event(
+                    response_state,
+                    &response_room,
+                    response,
+                    Some(response_route),
+                )
+                .await;
+            });
+        }
+        crate::native_v2_orchestration::spawn_native_v2_events(ctx.state.clone(), native_events);
+        if let Some(attempt_id) = validated
+            .event
+            .get("payload")
+            .and_then(|payload| payload.get("attemptId"))
+            .and_then(Value::as_str)
+        {
+            crate::native_v2_orchestration::emit_product_status_for_attempt(&ctx.state, attempt_id);
+        }
+        if let Some(attempt_id) = committed_attempt {
+            crate::native_v2_orchestration::start_receiver_attempt(
+                ctx.state.clone(),
+                attempt_id,
+                captured_binding.clone(),
+            );
+        }
+        if let Some(transfer_id) = cancelled_transfer {
+            let cancel_state = ctx.state.clone();
+            ctx.state.spawn(async move {
+                let _ = crate::transfer::cancel_transfer(
+                    cancel_state,
+                    &transfer_id,
+                    Some("native_v2_requester_cancelled".into()),
+                )
+                .await;
+            });
         }
     } else {
         protocol_action = match crate::bridge_plan::accept_inbound_protocol_event(
