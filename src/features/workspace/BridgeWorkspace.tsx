@@ -18,11 +18,12 @@ interface BridgeWorkspaceProps {
   onCreate: () => void;
   onJoin: () => void;
   onRefresh: () => Promise<void>;
+  onLeave: (room: RoomInfo) => Promise<void>;
   onBurn: (room: RoomInfo) => Promise<void>;
   onEnqueue: (roomId: string, inputs: TransferQueueInput[]) => void;
 }
 
-export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoin, onRefresh, onBurn, onEnqueue }: BridgeWorkspaceProps) {
+export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoin, onRefresh, onLeave, onBurn, onEnqueue }: BridgeWorkspaceProps) {
   const [composerMode, setComposerMode] = useState<"send" | "task">("send");
   const [text, setText] = useState("");
   const [selectedPeerId, setSelectedPeerId] = useState("");
@@ -86,6 +87,12 @@ export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoi
     if (confirmed) await onBurn(room);
   }
 
+  async function leaveBridge() {
+    if (!room) return;
+    const confirmed = window.confirm(`Leave Bridge ${bridgeCode(room)}?\n\nThis device will leave the current Bridge session. Received user-owned files remain. This does not burn the Bridge or cancel a managed task.`);
+    if (confirmed) await onLeave(room);
+  }
+
   if (!room) return <EmptyBridge onCreate={onCreate} onJoin={onJoin} />;
 
   const recent = items.filter((item) => item.room_id === room.id).slice(0, 4);
@@ -98,7 +105,7 @@ export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoi
         <div><h1>Bridge {bridgeCode(room)}</h1><p>{bridgeDeviceCount(room)} devices · current-session workspace</p></div>
         {task.status && ["checking_readiness", "preparing", "running"].includes(task.status.state)
           ? <button type="button" className="v2-button" disabled={task.busy !== null} onClick={() => void task.cancel()}>{task.busy === "cancel" ? "Cancelling…" : "Stop task"}</button>
-          : <button type="button" className="v2-button danger" onClick={() => void burnBridge()}>Burn</button>}
+          : <div className="v2-bridge-session-actions"><button type="button" className="v2-button" onClick={() => void leaveBridge()}>Leave</button><button type="button" className="v2-button danger" onClick={() => void burnBridge()}>Burn</button></div>}
       </header>
       <div className="v2-thread-shell">
         <div className="v2-thread">

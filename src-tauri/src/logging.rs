@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -11,11 +12,13 @@ use parking_lot::Mutex;
 const LOG_FILE_NAME: &str = "pastey.log";
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const ROTATED_LOGS_TO_KEEP: usize = 2;
+const MAX_CHANGED_TRANSFER_LINES: usize = 4_096;
 
 #[derive(Default)]
 struct LogState {
     logs_dir: Option<PathBuf>,
     last_error: Option<String>,
+    changed_transfer_lines: HashMap<String, String>,
 }
 
 static LOG_STATE: OnceLock<Mutex<LogState>> = OnceLock::new();
@@ -29,6 +32,40 @@ pub fn init(logs_dir: PathBuf) {
 
 pub fn write_transfer_line(line: &str) {
     write_line(line, false);
+}
+
+/// Writes a diagnostic only when its authoritative projection changes. This is
+/// intended for read-path diagnostics that may be recomputed by renderer
+/// polling; it preserves real state changes without turning reads into events.
+pub fn write_transfer_line_if_changed(key: &str, line: &str) {
+    let should_write = {
+        let mut state = log_state().lock();
+        record_changed_transfer_line(&mut state, key, line)
+    };
+    if !should_write {
+        return;
+    }
+
+    #[cfg(debug_assertions)]
+    eprintln!("{line}");
+    write_line(line, false);
+}
+
+fn record_changed_transfer_line(state: &mut LogState, key: &str, line: &str) -> bool {
+    if state
+        .changed_transfer_lines
+        .get(key)
+        .is_some_and(|last| last == line)
+    {
+        return false;
+    }
+    if state.changed_transfer_lines.len() >= MAX_CHANGED_TRANSFER_LINES {
+        state.changed_transfer_lines.clear();
+    }
+    state
+        .changed_transfer_lines
+        .insert(key.to_string(), line.to_string());
+    true
 }
 
 pub fn write_error_line(line: &str) {
@@ -163,5 +200,17 @@ mod tests {
         assert!(latest.contains("event=final_error"));
         assert!(latest.contains("Transfer timed out."));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn changed_transfer_diagnostics_are_idempotent_until_projection_changes() {
+        let mut state = LogState::default();
+        let key = "room_item_render_kind:item-a";
+        let first = "event=room_item_render_kind status=sent";
+        let changed = "event=room_item_render_kind status=failed";
+
+        assert!(record_changed_transfer_line(&mut state, key, first));
+        assert!(!record_changed_transfer_line(&mut state, key, first));
+        assert!(record_changed_transfer_line(&mut state, key, changed));
     }
 }

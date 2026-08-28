@@ -1556,11 +1556,7 @@ fn dev_log_room_item_render_kind(
         "[pastey transfer][receiver][transfer_id={item_id}] event=room_item_render_kind item_kind={item_kind} status={} path_kind={path_kind} error_message={error_message:?}",
         status.as_str()
     );
-
-    #[cfg(debug_assertions)]
-    eprintln!("{line}");
-
-    logging::write_transfer_line(&line);
+    logging::write_transfer_line_if_changed(&format!("room_item_render_kind:{item_id}"), &line);
 }
 
 pub fn next_inbox_path(base_dir: &Path, display_name: Option<&str>) -> AppResult<PathBuf> {

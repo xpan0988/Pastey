@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useAgentTaskLifecycle } from "./AgentTaskLifecycle";
 import { BridgeWorkspace } from "./BridgeWorkspace";
 import { DeveloperContextPanel, DeveloperModeScreen } from "./DeveloperModeScreen";
@@ -39,6 +39,11 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
   const inboxCount = props.activityItems.filter((item) => item.direction === "incoming").length;
   const fullWidth = SETTINGS_ROUTES.has(route) || route === "new-bridge" || route === "inbox";
 
+  useEffect(() => {
+    if (!props.focusRequest?.token) return;
+    setRoute(props.focusRequest.target === "settings" ? "settings" : "bridge");
+  }, [props.focusRequest]);
+
   const taskSummary = useMemo(() => task.status && task.presentation ? {
     eyebrow: task.status.state === "draft" ? "Action required" : "Task",
     title: task.presentation.label,
@@ -74,6 +79,17 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
     }
   }
 
+  async function joinNearbyDevice(deviceId: string) {
+    setMessage(null);
+    try {
+      await props.onJoinNearbyDevice(deviceId);
+      setRoute("bridge");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Pastey could not join this nearby device.");
+      throw error;
+    }
+  }
+
   function openBridge(room: NonNullable<typeof activeRoom>) {
     setRoute("bridge");
     void props.onOpenBridge(room);
@@ -85,12 +101,12 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
       <BridgeNavigation route={route} rooms={props.rooms} activeRoom={activeRoom} inboxCount={inboxCount} onNavigate={navigate} onOpenBridge={openBridge} />
       <main className="v2-main">
         {message ? <p className="v2-global-message">{message}</p> : null}
-        {route === "bridge" ? <BridgeWorkspace room={activeRoom} items={props.roomItems} queueItems={props.queueItems} task={task} onCreate={() => void createBridge()} onJoin={() => navigate("new-bridge")} onRefresh={props.onRefreshBridge} onBurn={props.onBurnBridge} onEnqueue={props.onEnqueueTransferInputs} /> : null}
-        {route === "activity" ? <ActivityScreen items={props.activityItems} transfers={props.transfers} queueItems={props.queueItems} /> : null}
+        {route === "bridge" ? <BridgeWorkspace room={activeRoom} items={props.roomItems} queueItems={props.queueItems} task={task} onCreate={() => void createBridge()} onJoin={() => navigate("new-bridge")} onRefresh={props.onRefreshBridge} onLeave={props.onLeaveBridge} onBurn={props.onBurnBridge} onEnqueue={props.onEnqueueTransferInputs} /> : null}
+        {route === "activity" ? <ActivityScreen items={props.activityItems} transfers={props.transfers} queueItems={props.queueItems} onRevealInFolder={props.onRevealInFolder} /> : null}
         {route === "devices" ? <DevicesScreen room={activeRoom} onAddDevice={() => navigate("new-bridge")} /> : null}
-        {route === "new-bridge" ? <NewBridgeScreen onCreate={createBridge} onJoin={joinBridge} /> : null}
+        {route === "new-bridge" ? <NewBridgeScreen onCreate={createBridge} onJoin={joinBridge} onListNearby={props.onListNearbyDevices} onJoinNearby={joinNearbyDevice} nearbyDiscoveryAvailable={props.nearbyDiscoveryAvailable} /> : null}
         {route === "developer" ? <DeveloperModeScreen room={activeRoom} /> : null}
-        {route === "inbox" ? <InboxScreen items={props.activityItems} inboxDir={props.config.inbox_dir} /> : null}
+        {route === "inbox" ? <InboxScreen items={props.activityItems} inboxDir={props.config.inbox_dir} onRevealInFolder={props.onRevealInFolder} /> : null}
         {route === "settings" ? <SettingsOverview config={props.config} onNavigate={navigate} /> : null}
         {route === "settings-diagnostics" ? <DiagnosticsSettings onNavigate={navigate} /> : null}
         {route === "settings-provider" ? <ProviderSettings onNavigate={navigate} /> : null}

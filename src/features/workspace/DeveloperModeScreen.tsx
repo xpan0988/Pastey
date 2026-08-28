@@ -20,30 +20,34 @@ export function DeveloperModeScreen({ room }: { room: RoomInfo | null }) {
   const [error, setError] = useState<string | null>(null);
   const inputWriterRef = useRef<OrderedTerminalInputWriter | null>(null);
   const active = workspace.sessions.find((entry) => entry.role === "controller" && (entry.state === "active" || entry.state === "awaiting_admission"));
+  const roomId = room?.id ?? null;
+  const sessionToken = session?.token ?? null;
+  const activeTerminalSessionId = active?.terminalSessionId ?? null;
+  const activeState = active?.state ?? null;
 
   useEffect(() => {
     if (!peers.some((peer) => peer.peerSessionId === selectedPeerId)) setSelectedPeerId(peers[0]?.peerSessionId ?? "");
   }, [peers, selectedPeerId]);
 
   useEffect(() => {
-    if (!room || !session) return;
-    const refresh = () => void getDeveloperTerminalWorkspace(room.id).then(setWorkspace).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
+    if (!roomId || !sessionToken) return;
+    const refresh = () => void getDeveloperTerminalWorkspace(roomId).then(setWorkspace).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
     refresh();
     const timer = window.setInterval(refresh, 2_000);
     return () => window.clearInterval(timer);
-  }, [room, session]);
+  }, [roomId, sessionToken]);
 
   useEffect(() => {
     inputWriterRef.current?.cancel();
     inputWriterRef.current = null;
-    if (!active || active.state !== "active" || !session) return;
+    if (!activeTerminalSessionId || activeState !== "active" || !sessionToken) return;
     const writer = new OrderedTerminalInputWriter(
-      (frame) => sendDeveloperTerminalInput(active.terminalSessionId, session.token, frame),
+      (frame) => sendDeveloperTerminalInput(activeTerminalSessionId, sessionToken, frame),
       (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
     );
     inputWriterRef.current = writer;
     return () => { writer.cancel(); if (inputWriterRef.current === writer) inputWriterRef.current = null; };
-  }, [active, session]);
+  }, [activeState, activeTerminalSessionId, sessionToken]);
 
   async function enter() {
     if (!room) return;

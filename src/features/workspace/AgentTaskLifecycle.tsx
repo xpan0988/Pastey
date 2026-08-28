@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   approveNativeV2Plan,
   cancelNativeV2PlanAttempt,
@@ -8,6 +8,7 @@ import {
   type NativeV2PlanStatus,
   type NativeV2ProductState,
 } from "../../lib/tauri";
+import { ownAsyncDisposer } from "../../lib/subscriptionLifecycle";
 
 const ONE_DAY_SECONDS = 24 * 60 * 60;
 
@@ -39,6 +40,11 @@ export function useAgentTaskLifecycle() {
   const [status, setStatus] = useState<NativeV2PlanStatus | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState<"open" | "approve" | "start" | "cancel" | null>(null);
+  const revisionIdRef = useRef(revisionId);
+
+  useEffect(() => {
+    revisionIdRef.current = revisionId;
+  }, [revisionId]);
 
   const refresh = useCallback(async (id = revisionId) => {
     if (!id) return;
@@ -54,18 +60,21 @@ export function useAgentTaskLifecycle() {
     if (!hasTauriRuntime()) return;
     if (revisionId) void refresh(revisionId);
     const interval = revisionId ? window.setInterval(() => void refresh(revisionId), 2_000) : null;
-    let dispose: (() => void) | undefined;
-    void listen<NativeV2PlanStatus>("pastey://native-v2-plan-status", (event) => {
-      if (revisionId === null || event.payload.revisionId === revisionId) {
+    return () => {
+      if (interval !== null) window.clearInterval(interval);
+    };
+  }, [refresh, revisionId]);
+
+  useEffect(() => {
+    if (!hasTauriRuntime()) return;
+    const dispose = ownAsyncDisposer(listen<NativeV2PlanStatus>("pastey://native-v2-plan-status", (event) => {
+      if (revisionIdRef.current === null || event.payload.revisionId === revisionIdRef.current) {
         setRevisionId(event.payload.revisionId);
         setStatus(event.payload);
       }
-    }).then((unlisten) => { dispose = unlisten; });
-    return () => {
-      if (interval !== null) window.clearInterval(interval);
-      dispose?.();
-    };
-  }, [refresh, revisionId]);
+    }));
+    return dispose;
+  }, []);
 
   const openRevision = useCallback(async () => {
     const nextId = revisionInput.trim();
