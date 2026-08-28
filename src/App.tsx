@@ -2,15 +2,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useEffect, useRef, useState } from "react";
 import type { MutableRefObject } from "react";
-import { AppShell } from "./components/AppShell";
-import type { PrimaryView } from "./components/PrimarySidebar";
-import {
-  ActivityPage,
-  BridgeDetailPage,
-  BridgePage,
-  DevicesProductPage,
-} from "./pages/BridgeProductPages";
-import { SettingsPage } from "./pages/SettingsPage";
+import { WorkspaceV2 } from "./features/workspace/WorkspaceV2";
+import "./features/workspace/workspace-v2.css";
 import {
   acceptNearbyJoin,
   burnRoom,
@@ -59,7 +52,6 @@ import {
   planRunnableTransferLaunches,
   queuedItemsNeedingMetadata,
   recordMicroFlowGroupChildTerminal,
-  selectRoomTransferQueue,
   summarizeMicroFlowGroupPlanning,
   type TransferLaunchPlannerResult,
   type TransferQueueInput,
@@ -95,6 +87,26 @@ interface FocusPayload {
   target?: "home" | "settings";
 }
 
+const BROWSER_PREVIEW_CONFIG: AppConfig = {
+  default_expiry_minutes: 15,
+  inbox_dir: null,
+  auto_burn_after_download: false,
+  save_received_files_to_inbox: true,
+  save_received_images_to_inbox: true,
+  transfer_window_override: null,
+  dev_tools_enabled: false,
+  micro_flow_group_mode: "dynamic",
+  shortcut: "Unavailable in browser preview",
+  app_data_path: "",
+  app_version: "2.0 preview",
+};
+
+function hasTauriRuntime(): boolean {
+  return typeof window !== "undefined" && (
+    "__TAURI_INTERNALS__" in window || "__TAURI__" in window
+  );
+}
+
 interface RuntimeWindowDiagnosticStats {
   transferId?: string;
   roomId: string;
@@ -112,7 +124,6 @@ type RuntimeWindowTerminalStatus = Extract<TransferQueueItemStatus, "completed" 
 
 function App() {
   const [view, setView] = useState<View>({ screen: "primary" });
-  const [activePrimaryView, setActivePrimaryView] = useState<PrimaryView>("bridge");
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [rooms, setRooms] = useState<RoomInfo[]>([]);
   const [currentRoom, setCurrentRoom] = useState<RoomInfo | null>(null);
@@ -122,7 +133,6 @@ function App() {
   const [transfers, setTransfers] = useState<Record<string, FileTransferProgressEvent>>({});
   const [scheduler, setScheduler] = useState<TransferSchedulerState>(() => createTransferSchedulerState());
   const [joinRequest, setJoinRequest] = useState<JoinRequestPrompt | null>(null);
-  const [focusToken, setFocusToken] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const closedRoomIdsRef = useRef<Set<string>>(new Set());
   const schedulerRef = useRef(scheduler);
@@ -155,6 +165,10 @@ function App() {
 
   useEffect(() => {
     async function load() {
+      if (!hasTauriRuntime()) {
+        setConfig(BROWSER_PREVIEW_CONFIG);
+        return;
+      }
       try {
         const [nextConfig, nextRooms] = await Promise.all([getConfig(), listRooms()]);
         setConfig(nextConfig);
@@ -242,6 +256,7 @@ function App() {
   }, [activeBridgeRoomId]);
 
   useEffect(() => {
+    if (!hasTauriRuntime()) return;
     void pendingJoinRequests().then((requests) => {
       if (requests.length > 0) {
         setJoinRequest(requests[0]);
@@ -250,15 +265,14 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!hasTauriRuntime()) return;
     let unlistenFocus: (() => void) | undefined;
     let unlistenTransfer: (() => void) | undefined;
     let unlistenJoinRequest: (() => void) | undefined;
 
     void listen<FocusPayload>("pastey://focus", (event) => {
-      const target = event.payload.target ?? "home";
+      void event.payload.target;
       setView({ screen: "primary" });
-      setActivePrimaryView(target === "settings" ? "settings" : "bridge");
-      setFocusToken((value) => value + 1);
     }).then((fn) => {
       unlistenFocus = fn;
     });
@@ -1317,7 +1331,6 @@ function App() {
     }
     closedRoomIdsRef.current.add(room.id);
     setView({ screen: "primary" });
-    setActivePrimaryView("bridge");
     if (activeBridgeRoomId === room.id) {
       setActiveBridgeRoomId("");
     }
@@ -1362,21 +1375,9 @@ function App() {
     }
   }
 
-  const transferEvents = Object.values(transfers);
-  const schedulerItems = Object.values(scheduler.items);
-  const activeQueueItems = schedulerItems.filter(isActiveQueueItem);
-  const approvalCount = joinRequest ? 1 : 0;
-  const connectedRooms = rooms.filter((room) => room.peer_connected);
-
-  function selectPrimaryView(nextView: PrimaryView) {
-    setActivePrimaryView(nextView);
-    setView({ screen: "primary" });
-  }
-
   async function handleConnectionJoined(room: RoomInfo) {
     closedRoomIdsRef.current.delete(room.id);
     setActiveBridgeRoomId(room.id);
-    setActivePrimaryView("bridge");
     setView({ screen: "primary" });
     await refreshRooms();
   }
@@ -1388,69 +1389,6 @@ function App() {
       </div>
     );
   }
-
-  const shellContent = view.screen === "bridge-detail" && currentRoom ? (
-    <BridgeDetailPage
-      room={currentRoom}
-      items={roomItems}
-      transfers={transferEvents.filter((transfer) => transfer.room_id === currentRoom.id)}
-      queueItems={selectRoomTransferQueue(scheduler, currentRoom.id).items}
-      onBack={() => {
-        setView({ screen: "primary" });
-        void refreshRooms();
-      }}
-      onRefresh={refreshCurrentRoom}
-      onLeaveOrBurn={handleLeaveOrBurnBridge}
-      onEnqueueTransferInputs={enqueueRoomTransferInputs}
-      onOpenActivity={() => {
-        setActivePrimaryView("activity");
-        setView({ screen: "primary" });
-      }}
-      askBridgeBetaEnabled={config.dev_tools_enabled}
-    />
-  ) : (
-    <>
-      {activePrimaryView === "bridge" ? (
-        <BridgePage
-          rooms={rooms}
-          roomItems={activityRoomItems}
-          queueItems={schedulerItems}
-          onCreateBridge={handleCreateBridge}
-          onOpenBridge={(room) => void openRoom(room)}
-          onJoinBridge={handleJoinBridge}
-          onSelectView={selectPrimaryView}
-        />
-      ) : null}
-      {activePrimaryView === "devices" ? (
-        <DevicesProductPage
-          rooms={rooms}
-          activeBridgeRoomId={activeBridgeRoomId}
-          shouldFocus={focusToken > 0}
-          onOpenBridge={(room) => void openRoom(room)}
-          onJoinBridge={handleJoinBridge}
-          onConnectionJoined={(room) => void handleConnectionJoined(room)}
-        />
-      ) : null}
-      {activePrimaryView === "activity" ? (
-        <ActivityPage
-          rooms={rooms}
-          roomItems={activityRoomItems}
-          transfers={transferEvents}
-          queueItems={schedulerItems}
-        />
-      ) : null}
-      {activePrimaryView === "settings" ? (
-        <SettingsPage
-          config={config}
-          onConfigChange={setConfig}
-          onJoinWithCode={() => {
-            setActivePrimaryView("devices");
-            setFocusToken((value) => value + 1);
-          }}
-        />
-      ) : null}
-    </>
-  );
 
   return (
     <div className="app-shell workstation-app">
@@ -1474,20 +1412,21 @@ function App() {
         </div>
       ) : null}
 
-      <AppShell
-        activeView={activePrimaryView}
-        topStatus={{
-          thisDevice: "This device",
-          thisDeviceStatus: `Pastey ${config.app_version}`,
-          peerDiscovery: `${connectedRooms.length} connected`,
-          peerDiscoveryStatus: rooms.length > 0 ? `${rooms.length} connection${rooms.length === 1 ? "" : "s"} known` : "Discovery ready",
-          approvalsCount: approvalCount,
-          queueCount: activeQueueItems.length,
-        }}
-        onSelectView={selectPrimaryView}
-      >
-        {shellContent}
-      </AppShell>
+      <WorkspaceV2
+        config={config}
+        rooms={rooms}
+        room={currentRoom}
+        roomItems={roomItems}
+        activityItems={activityRoomItems}
+        transfers={Object.values(transfers)}
+        queueItems={Object.values(scheduler.items)}
+        onCreateBridge={handleCreateBridge}
+        onJoinBridge={handleJoinBridge}
+        onOpenBridge={openRoom}
+        onRefreshBridge={refreshCurrentRoom}
+        onBurnBridge={(room) => handleLeaveOrBurnBridge(room, "burn")}
+        onEnqueueTransferInputs={enqueueRoomTransferInputs}
+      />
     </div>
   );
 }

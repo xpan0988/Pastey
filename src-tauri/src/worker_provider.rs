@@ -682,6 +682,7 @@ mod tests {
                 semantic_intent: "test".into(),
                 input_revision: 1,
             },
+            workspace: crate::managed_workspace::WorkerWorkspaceProjectionV1::empty_for_test(),
             tools: vec![WorkerToolSchemaV1 {
                 name: "resource_read".into(),
                 description: "read".into(),

@@ -54,13 +54,19 @@ Core derives `StepWorkDescriptorV1`, `AuthorityContextV1`, one `ManagedRunRefV1`
 
 ### Resource
 
-The Worker sees aliases, never Host paths. The current catalog supports bounded inspect/read/create/replace operations over exact input, workspace, output, or scratch handles. `ManagedResourceResolverV1` resolves them under Host-private roots, revalidates managed object identity, enforces quotas and generations, and records ordered evidence. Output sealing does not itself create lineage.
+`ManagedRunWorkspaceV1` is the Host-private workspace/lifetime aggregation for one exact active run. It is derived from the existing authority context, EffectEnvelope resource attachments, effect bounds, budgets, optional execution-world binding, and current lifecycle state. It mints no grant or permission. The ABI distinguishes managed input, workspace/overlay, output, and scratch roles. The current live claim projects its exact immutable input, a Transform OutputSlot where applicable, and a run-local Scratch resource for a process-backed step so both macOS and Windows have a writable ephemeral working-directory role. Workspace/overlay remains an available Host-private resource role but is not yet added to the current Harness claim.
+
+`WorkerWorkspaceProjectionV1` is the bounded model-visible view. It exposes only logical aliases, resource roles, the operation vocabulary that is present in both the resource grant and current envelope bounds, and whether relative selectors are meaningful. It contains no Host path, Host/session identity, raw resource handle, safe physical identity, EffectEnvelope internals, credential, Bridge topology, or resource from another run or Host.
+
+Every Worker resource request resolves `alias + relative selector → current run projection → Host-private resource attachment → existing Resource Effect enforcement → backend`. Resolution rejects a stale or substituted projection, alias/role mismatch, absolute or escaping selector, revoked run, changed Host/session, and cross-run handle before effect dispatch. The EffectRequest still requires the exact current envelope, run sequence, budgets, resource grant, Host/session authority, and backend enforcement; the projection never authorizes an effect.
+
+Managed input revision N remains immutable. Mutations stay in existing private overlay/output mechanisms, Scratch cannot become lineage, and output sealing alone creates no lineage. Only Core may accept a sealed Transform result. Cancellation, disconnect/session invalidation, Burn, shutdown, restart, run termination, and authoritative completion revoke the underlying attachments, so a prior projection cannot be reused. A step on another Host receives a new Host-local workspace projection; no workspace state is inherited or transferred.
 
 ### Process
 
 The current model-visible process catalog exposes one `process_spawn` request only when Core has prebound an exact executable identity and execution-world specification to the exact revision/step. The model cannot choose an executable, raw shell, Host path, ambient environment, cwd, network policy, or terminal. Pure lowering produces the existing `ProcessEffect::Spawn`; signal/termination remains Host lifecycle authority and is not a general model tool.
 
-`ExecutionWorldServiceV1` mounts exact resource leases, uses mutable overlays, bounds output/resources/time, denies raw network, and terminates the process tree before run revocation. macOS is available only when its local confinement probe verifies the required properties. Linux and Windows fail closed.
+`ExecutionWorldServiceV1` mounts exact resource leases, uses mutable overlays, bounds output/resources/time, denies raw network, and terminates the process tree before run revocation. macOS is available only when its local confinement probe verifies the required properties. The Windows adapter derives a unique run-private AppContainer SID without registering ambient profile storage, copies only exact leased resources into an ACL-scoped private world, creates the exact executable suspended with a capabilityless AppContainer identity and an explicit stdio-only inherited-handle list, assigns it to a non-breakaway kill-on-close Job with CPU/memory/process/UI limits, then resumes it. The Job owns all descendants and is terminated on completion, timeout, cancellation, revocation, Burn, or shutdown. Windows reports available only when the native product binary proves projected read/read-only behavior, unrelated-file denial, empty environment, omitted-handle denial, process-count/descendant containment, and capabilityless `WSAEACCES` network denial. Cross-compilation does not satisfy that probe. Linux remains unavailable.
 
 ### Network
 
@@ -85,7 +91,7 @@ StepWorkDescriptor + bounded resource/semantic projection
   → Core-only finalizer
 ```
 
-`TurnAssembler` builds stable Worker instructions, the exact step projection, bounded resource facts, currently usable schemas, and ordered observations. It never discovers an ambient repository or injects full topology, paths, grants, credentials, or terminal data. `WorkerSessionLog` is process-local model-visible history, not an authority record.
+`TurnAssembler` builds stable Worker instructions, the exact step projection, the bounded `WorkerWorkspaceProjectionV1`, schemas derived from that projection, and ordered observations. `WorkerToolCatalogV1` resolves the existing inspect/read/create/replace/process calls only through the Host-private workspace aggregation before lowering them to the existing effect boundary. It never discovers an ambient repository or injects full topology, paths, handles, grants, credentials, or terminal data. `WorkerSessionLog` is process-local model-visible history, not an authority record.
 
 The provider-neutral adapter normalizes text deltas, fragmented tool-call identifiers/names/arguments, finish reason, bounded usage, errors, and cancellation. Only a completely assembled, syntactically valid, schema-valid tool call can dispatch. Partial, malformed, interrupted, or cancelled calls produce no effect.
 
@@ -145,15 +151,15 @@ Distributed delivery failure remains a product-recovery limitation: the sender c
 
 | Can today | Intentionally unavailable or incomplete |
 | --- | --- |
-| Deterministic native-v2 Draft/Review/approval/status/cancel backend | Full Agent/Figma UI and frontend wrappers for the complete lifecycle |
+| Deterministic native-v2 Draft/Review/approval/readiness/status/cancel backend and 2.0 lifecycle UI for an opened revision | Renderer-safe Draft discovery/origination, PM context, reviewed topology, and result projection |
 | Proposal-only local/provider Natural-v2 to an unapproved Draft | PM/provider selection and settings presentation |
 | Whole-Plan remote readiness, prepare, admission, commit, and exact continuation | Requester-local primitive execution/self-admission |
 | Remote Search and authored encrypted Transfer with exact receipt | Automatic/inferred movement or topology repair |
-| Same-Host Resource Worker Transform; contained Process on verified macOS | Product-configured executable binding; Linux/Windows process worlds |
+| Same-Host Resource Worker Transform; contained Process on verified macOS; Windows adapter gated by its native runtime conformance probe | Product-configured executable binding; native packaged Windows proof; Linux process world |
 | Execute through Core with no lineage when an exact process binding exists | Raw shell/terminal/process authority |
 | Durable generation-bound provider state and streaming adapter | Product provider configuration/health UI |
 | Phase 5 Host network broker | Worker network tools or automatic task egress |
 | Cancellation/revocation/restart/Burn fail closed in state and Core authority | Guaranteed cross-partition cancellation delivery and richer recovery |
-| Bounded non-secret product/Worker status events | Full result/lifecycle presentation |
+| Bounded non-secret product/Worker status events and authoritative lifecycle presentation | Result content projection and richer interrupted/recovery detail |
 
 Subagents, Headless Host, Worker network, Developer Terminal conversion, task-specific patch/document engines, and task/command allowlists are absent. Automated tests validate contracts and local integration; they are not physical multi-device proof. See [development](../development.md) for the gated physical smoke procedure.

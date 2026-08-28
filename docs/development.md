@@ -32,6 +32,8 @@ git diff --check
 
 The Windows cross-check requires the GNU target and MinGW toolchain. It proves compilation, not native Windows confinement, safe-open behavior, packaging, or physical E2E.
 
+On a native Windows checkout, run `cargo test --manifest-path src-tauri/Cargo.toml --test windows_execution_world -- --nocapture`. The integration test launches the actual Pastey product binary with its private verifier. Success requires the capabilityless AppContainer, exact staged-resource ACLs, stdio-only inherited-handle list, suspended-before-Job assignment, Job resource/process limits, unrelated-file denial, empty environment, descendant cleanup, and native `WSAEACCES` NoRawNetwork probe to pass. A failed or unavailable probe keeps managed Process execution unavailable; a GNU cross-build is never a substitute for this test.
+
 ## Transfer and Layer 4 validation
 
 Transfer planner scenarios can also be replayed with:
@@ -64,12 +66,12 @@ Do not start or claim this smoke as reproducible until all of these are true:
 
 - the product can create/select a durable provider configuration on B and C and run the no-effect health probe;
 - the product can bind the exact reviewed Transform/Execute steps to Host-owned process specifications where Process is required;
-- B and C report a verified execution world for those specifications (currently macOS only; Linux/Windows fail closed);
+- B and C report a verified execution world for those specifications (macOS after its local probe; Windows only after its native product-binary probe; Linux fails closed);
 - the frontend or an approved test driver exposes compose/review/approve/start/status/cancel without bypassing the registered Tauri commands;
 - every authored step runs on a remote receiver Host; requester-local self-admission/execution is unavailable;
 - three packaged instances have distinct HostRefs, one active Bridge, current unambiguous routes, and the exact managed root already bound at B.
 
-The repository does not currently satisfy the first three product-surface requirements end to end: provider configuration/health and process binding are Host-private seams, and no full Agent lifecycle UI exists. The backend contracts can be tested, but the A→B→C physical managed smoke is therefore **not yet runnable as a normal product flow**.
+The repository does not currently satisfy the first three product-surface requirements end to end: provider configuration/health and process binding remain Host-private seams. The 2.0 UI can operate the authoritative lifecycle for an existing revision, but Draft origination and the detailed topology/result projections required for this smoke are not renderer-exposed. The backend contracts can be tested, but the A→B→C physical managed smoke is therefore **not yet runnable as a normal product flow**.
 
 ### Procedure once the gate is implemented
 

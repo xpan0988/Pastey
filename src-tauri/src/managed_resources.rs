@@ -316,7 +316,7 @@ impl ManagedResourceResolverV1 {
     ) -> AppResult<()> {
         let grant = validate_attachment(authority, access, handle_ref, ResourceKindV1::Workspace)?;
         validate_exact_input(&access.context, &spec.acquisition)?;
-        validate_selector(&spec.initial_selector)?;
+        validate_managed_resource_selector(&spec.initial_selector)?;
         let artifact = objects.resolve(&spec.acquisition, access.current.now)?;
         if grant.safe_identity_ref != Self::workspace_identity_ref(&spec.acquisition, &artifact)? {
             return invalid("Workspace safe identity does not match its resource grant.");
@@ -499,7 +499,7 @@ impl ManagedResourceResolverV1 {
         evidence: &EffectEvidenceV1,
     ) -> AppResult<SealedOutputEvidenceV1> {
         validate_attachment(authority, access, handle_ref, ResourceKindV1::OutputSlot)?;
-        validate_selector(relative_selector)?;
+        validate_managed_resource_selector(relative_selector)?;
         authority.validate_terminal_resource_evidence(
             evidence,
             handle_ref,
@@ -953,7 +953,7 @@ impl ManagedResourceResolverV1 {
                 "managed_resource_backend_has_no_process_or_network",
             ));
         };
-        validate_selector(&effect.relative_selector)?;
+        validate_managed_resource_selector(&effect.relative_selector)?;
         let backing = self.backings.get(&effect.handle_ref).ok_or_else(|| {
             AppError::InvalidInput("Managed resource backing is unavailable.".into())
         })?;
@@ -1263,7 +1263,7 @@ fn validate_quota(quota: u64, ceiling: u64) -> AppResult<()> {
     Ok(())
 }
 
-fn validate_selector(selector: &str) -> AppResult<()> {
+pub(crate) fn validate_managed_resource_selector(selector: &str) -> AppResult<()> {
     if selector.is_empty()
         || selector.len() > MAX_SELECTOR_BYTES
         || selector.contains('\0')
@@ -1400,7 +1400,7 @@ fn scan_regular_tree(root: &Path, quota_bytes: u64) -> AppResult<BTreeMap<String
                 .map(|component| component.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            validate_selector(&selector)?;
+            validate_managed_resource_selector(&selector)?;
             let remaining = quota_bytes.saturating_sub(total);
             let identity =
                 safe_file_identity::capture_source_identity(&path, &canonical_root, remaining)?;
@@ -1538,7 +1538,7 @@ fn write_private_file(
     bytes: &[u8],
     generation: u64,
 ) -> AppResult<PrivateFileV1> {
-    validate_selector(selector)?;
+    validate_managed_resource_selector(selector)?;
     if selector == "." {
         return invalid("A mutable private file requires a relative selector.");
     }
@@ -1777,9 +1777,19 @@ mod tests {
                 .unwrap();
         let workspace_identity =
             ManagedResourceResolverV1::workspace_identity_ref(&acquisition, &artifact).unwrap();
+        #[cfg(not(windows))]
         let executable_spec = ExecutableBindingSpecV1 {
             executable_path: PathBuf::from("/bin/sh"),
             scope_root: PathBuf::from("/bin"),
+        };
+        #[cfg(windows)]
+        let executable_spec = {
+            let executable_path = std::env::current_exe().unwrap();
+            let scope_root = executable_path.parent().unwrap().to_owned();
+            ExecutableBindingSpecV1 {
+                executable_path,
+                scope_root,
+            }
         };
         let executable_identity =
             ManagedResourceResolverV1::executable_identity_ref(&executable_spec).unwrap();
@@ -2638,7 +2648,17 @@ mod tests {
                 .is_err());
         }
 
-        for name in ["HOME", "PATH", "SSH_AUTH_SOCK", "DYLD_INSERT_LIBRARIES"] {
+        for name in [
+            "HOME",
+            "PATH",
+            "USERPROFILE",
+            "TEMP",
+            "APPDATA",
+            "SYSTEMROOT",
+            "SSH_AUTH_SOCK",
+            "AWS_SECRET_ACCESS_KEY",
+            "DYLD_INSERT_LIBRARIES",
+        ] {
             let invocation = ManagedProcessInvocationV1 {
                 executable_handle: fixture.executable.clone(),
                 argv: vec![],

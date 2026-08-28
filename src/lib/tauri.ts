@@ -110,6 +110,59 @@ export interface BridgePlanWorkspace {
   results: unknown[];
 }
 
+/** Authoritative, Host-owned lifecycle projection for a native-v2 Plan. */
+export type NativeV2ProductState =
+  | "draft"
+  | "approved"
+  | "checking_readiness"
+  | "preparing"
+  | "running"
+  | "completed"
+  | "failed"
+  | "interrupted"
+  | "cancelled";
+
+export interface NativeV2PlanStatus {
+  schemaVersion: "pastey-native-v2-product-v1";
+  planId: string;
+  revisionId: string;
+  revisionHash: string;
+  approvalId?: string | null;
+  attemptId?: string | null;
+  state: NativeV2ProductState;
+  currentStepId?: string | null;
+  completedSteps: number;
+  totalSteps: number;
+  readyHosts: number;
+  totalHosts: number;
+  code?: string | null;
+  updatedAt: number;
+}
+
+export function getNativeV2PlanStatus(revisionId: string): Promise<NativeV2PlanStatus> {
+  return invoke("get_native_v2_plan_status", { revisionId });
+}
+
+export function approveNativeV2Plan(
+  revisionId: string,
+  approvalId: string,
+  expiresAt: number,
+): Promise<NativeV2PlanStatus> {
+  return invoke("approve_native_v2_plan", { revisionId, approvalId, expiresAt });
+}
+
+export function startNativeV2PlanAttempt(
+  approvalId: string,
+  attemptId: string,
+  expiresAt: number,
+): Promise<NativeV2PlanStatus> {
+  return invoke("start_native_v2_plan_attempt", { approvalId, attemptId, expiresAt });
+}
+
+export function cancelNativeV2PlanAttempt(attemptId: string): Promise<NativeV2PlanStatus> {
+  return invoke("cancel_native_v2_plan_attempt", { attemptId });
+}
+
 export interface ComposedFileBridgePlanRequest {
   roomId: string;
   originalUserGoal: string;

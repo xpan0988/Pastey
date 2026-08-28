@@ -37,7 +37,12 @@ use crate::{
         ManagedStepClaimRequestV1, ManagedStepGrantV1, TransformResultProposalV1,
     },
     managed_resources::HostManagedResourceBackendV1,
+    managed_workspace::{
+        ManagedRunWorkspaceV1, WorkerWorkspaceOperationV1, WorkerWorkspaceProjectionV1,
+    },
 };
+
+pub(crate) use crate::managed_workspace::WorkerWorkspaceAliasV1 as WorkerResourceAliasV1;
 
 const WORKER_HARNESS_VERSION: &str = "pastey-worker-harness-v1";
 const WORKER_RESOURCE_ADAPTER_VERSION: &str = "pastey-worker-resource-adapter-v1";
@@ -104,13 +109,6 @@ pub(crate) struct WorkerToolSchemaV1 {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) input_schema: serde_json::Value,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WorkerResourceAliasV1 {
-    Input,
-    Output,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -266,6 +264,7 @@ pub(crate) struct WorkerTurnRecordV1 {
 pub(crate) struct WorkerProviderRequestV1 {
     pub(crate) system_instructions: String,
     pub(crate) step: WorkerStepProjectionV1,
+    pub(crate) workspace: WorkerWorkspaceProjectionV1,
     pub(crate) tools: Vec<WorkerToolSchemaV1>,
     pub(crate) history: Vec<WorkerTurnRecordV1>,
 }
@@ -307,6 +306,7 @@ impl WorkerTurnAssemblerV1 {
                 semantic_intent: input.grant.operation_intent.clone(),
                 input_revision: input.grant.access.context.input_revisions[0].revision,
             },
+            workspace: catalog.workspace_projection(),
             tools: catalog.schemas(),
             history: session.visible_turns(),
         }
@@ -377,9 +377,7 @@ impl WorkerSessionLogV1 {
 }
 
 struct WorkerToolCatalogV1 {
-    input_handle: crate::effect_authority::ResourceHandleRefV1,
-    output_handle: Option<crate::effect_authority::ResourceHandleRefV1>,
-    process_world: Option<crate::managed_execution::ManagedProcessWorldGrantV1>,
+    workspace: ManagedRunWorkspaceV1,
 }
 
 struct PreparedWorkerToolRequestV1 {
@@ -400,29 +398,41 @@ struct StagedWorkerWriteV1 {
 impl WorkerToolCatalogV1 {
     fn from_grant(grant: &ManagedStepGrantV1) -> AppResult<Self> {
         Ok(Self {
-            input_handle: grant.input_handle.clone(),
-            output_handle: grant.output_slot.clone(),
-            process_world: grant.process_world.clone(),
+            workspace: grant.workspace.clone(),
         })
     }
 
+    fn workspace_projection(&self) -> WorkerWorkspaceProjectionV1 {
+        self.workspace.projection()
+    }
+
     fn schemas(&self) -> Vec<WorkerToolSchemaV1> {
-        let mut schemas = worker_resource_schemas(self.output_handle.is_some());
-        if self.process_world.is_some() {
-            schemas.push(worker_process_schema(self.output_handle.is_some()));
+        let projection = self.workspace.projection();
+        let mut schemas = worker_resource_schemas(&projection);
+        if self.workspace.process().is_some() {
+            schemas.push(worker_process_schema(&projection));
         }
         schemas
     }
 
-    fn prepare(&self, call: WorkerToolCallV1) -> AppResult<PreparedWorkerToolRequestV1> {
+    fn prepare(
+        &self,
+        authority: &crate::effect_authority::EffectAuthorityStateV1,
+        call: WorkerToolCallV1,
+    ) -> AppResult<PreparedWorkerToolRequestV1> {
         if matches!(call, WorkerToolCallV1::ProcessSpawn { .. }) {
-            return self.prepare_process(call);
+            return self.prepare_process(authority, call);
         }
         let (tool_name, verb, handle_ref, selector, content, expects_read, operation) = match call {
             WorkerToolCallV1::Inspect { resource } => (
                 "resource_inspect",
                 ResourceVerbV1::Inspect,
-                self.handle_for(resource)?,
+                self.handle_for(
+                    authority,
+                    resource,
+                    WorkerWorkspaceOperationV1::Inspect,
+                    ".",
+                )?,
                 ".".into(),
                 None,
                 true,
@@ -431,7 +441,7 @@ impl WorkerToolCatalogV1 {
             WorkerToolCallV1::Read { resource } => (
                 "resource_read",
                 ResourceVerbV1::Read,
-                self.handle_for(resource)?,
+                self.handle_for(authority, resource, WorkerWorkspaceOperationV1::Read, ".")?,
                 ".".into(),
                 None,
                 true,
@@ -443,9 +453,12 @@ impl WorkerToolCatalogV1 {
             } => (
                 "resource_create",
                 ResourceVerbV1::Create,
-                self.output_handle.clone().ok_or_else(|| {
-                    AppError::InvalidInput("Execute has no Transform output resource.".into())
-                })?,
+                self.handle_for(
+                    authority,
+                    WorkerResourceAliasV1::Output,
+                    WorkerWorkspaceOperationV1::Create,
+                    &relative_selector,
+                )?,
                 relative_selector,
                 Some(decode_content(&content_base64)?),
                 false,
@@ -457,9 +470,12 @@ impl WorkerToolCatalogV1 {
             } => (
                 "resource_replace",
                 ResourceVerbV1::Replace,
-                self.output_handle.clone().ok_or_else(|| {
-                    AppError::InvalidInput("Execute has no Transform output resource.".into())
-                })?,
+                self.handle_for(
+                    authority,
+                    WorkerResourceAliasV1::Output,
+                    WorkerWorkspaceOperationV1::Replace,
+                    &relative_selector,
+                )?,
                 relative_selector,
                 Some(decode_content(&content_base64)?),
                 false,
@@ -511,7 +527,11 @@ impl WorkerToolCatalogV1 {
         })
     }
 
-    fn prepare_process(&self, call: WorkerToolCallV1) -> AppResult<PreparedWorkerToolRequestV1> {
+    fn prepare_process(
+        &self,
+        authority: &crate::effect_authority::EffectAuthorityStateV1,
+        call: WorkerToolCallV1,
+    ) -> AppResult<PreparedWorkerToolRequestV1> {
         let WorkerToolCallV1::ProcessSpawn {
             arguments,
             environment,
@@ -521,11 +541,14 @@ impl WorkerToolCatalogV1 {
         else {
             return invalid("Expected a contained process tool request.");
         };
-        let process = self.process_world.as_ref().ok_or_else(|| {
+        let process = self.workspace.resolve_process(authority).map_err(|_| {
             AppError::InvalidInput("Contained process authority is unavailable.".into())
         })?;
         let (working_directory_handle, working_directory_selector) = match working_directory {
-            Some(alias) => (Some(self.handle_for(alias)?), Some(".".into())),
+            Some(alias) => (
+                Some(self.handle_for(authority, alias, WorkerWorkspaceOperationV1::Read, ".")?),
+                Some(".".into()),
+            ),
             None => (None, None),
         };
         Ok(PreparedWorkerToolRequestV1 {
@@ -547,14 +570,18 @@ impl WorkerToolCatalogV1 {
 
     fn handle_for(
         &self,
+        authority: &crate::effect_authority::EffectAuthorityStateV1,
         alias: WorkerResourceAliasV1,
+        operation: WorkerWorkspaceOperationV1,
+        relative_selector: &str,
     ) -> AppResult<crate::effect_authority::ResourceHandleRefV1> {
-        match alias {
-            WorkerResourceAliasV1::Input => Ok(self.input_handle.clone()),
-            WorkerResourceAliasV1::Output => self.output_handle.clone().ok_or_else(|| {
-                AppError::InvalidInput("Execute has no Transform output resource.".into())
-            }),
-        }
+        self.workspace.resolve(
+            authority,
+            &self.workspace.projection(),
+            alias,
+            operation,
+            relative_selector,
+        )
     }
 }
 
@@ -802,7 +829,11 @@ impl WorkerRunControllerV1 {
                     match response.clone() {
                         WorkerProviderResponseV1::ToolCall { call } => {
                             ensure_worker_active(runtime, &input, cancellation)?;
-                            match catalog.prepare(call) {
+                            let prepared = {
+                                let authority = runtime.effect_authority.lock();
+                                catalog.prepare(&authority, call)
+                            };
+                            match prepared {
                                 Err(_) => session.push(
                                     WorkerTurnRecordV1 {
                                         response: Some(response),
@@ -1155,25 +1186,26 @@ fn schema(name: &str, description: &str, input_schema: serde_json::Value) -> Wor
     }
 }
 
-fn worker_resource_schemas(has_output: bool) -> Vec<WorkerToolSchemaV1> {
-    let resources = if has_output {
-        vec!["input", "output"]
-    } else {
-        vec!["input"]
-    };
+fn worker_resource_schemas(projection: &WorkerWorkspaceProjectionV1) -> Vec<WorkerToolSchemaV1> {
+    let inspect_resources = projection.resources_for(WorkerWorkspaceOperationV1::Inspect);
+    let read_resources = projection.resources_for(WorkerWorkspaceOperationV1::Read);
     let mut schemas = vec![
         schema(
             "resource_inspect",
             "Inspect the bounded input or output resource.",
-            json!({"resource":{"enum":resources}}),
+            json!({"resource":{"enum":inspect_resources}}),
         ),
         schema(
             "resource_read",
             "Read bounded text from the input or output resource.",
-            json!({"resource":{"enum":resources}}),
+            json!({"resource":{"enum":read_resources}}),
         ),
     ];
-    if has_output {
+    let create_resources = projection.resources_for(WorkerWorkspaceOperationV1::Create);
+    let replace_resources = projection.resources_for(WorkerWorkspaceOperationV1::Replace);
+    if create_resources.contains(&WorkerResourceAliasV1::Output)
+        && replace_resources.contains(&WorkerResourceAliasV1::Output)
+    {
         schemas.extend([
             schema(
                 "resource_create",
@@ -1190,12 +1222,8 @@ fn worker_resource_schemas(has_output: bool) -> Vec<WorkerToolSchemaV1> {
     schemas
 }
 
-fn worker_process_schema(has_output: bool) -> WorkerToolSchemaV1 {
-    let directories = if has_output {
-        vec!["input", "output"]
-    } else {
-        vec!["input"]
-    };
+fn worker_process_schema(projection: &WorkerWorkspaceProjectionV1) -> WorkerToolSchemaV1 {
+    let directories = projection.resources_for(WorkerWorkspaceOperationV1::Read);
     schema(
         "process_spawn",
         "Run the one Host-bound contained entrypoint with bounded arguments and explicit environment. No executable name, filesystem location, interactive session, or remote connection access is available.",
@@ -1302,7 +1330,9 @@ fn redact_process_excerpt(bytes: Vec<u8>) -> Option<String> {
         .map(|token| {
             let body = token.trim_end_matches(char::is_whitespace);
             let suffix = &token[body.len()..];
-            if body.contains('/') {
+            let windows_drive_path = body.as_bytes().get(1).is_some_and(|value| *value == b':')
+                && body.as_bytes().first().is_some_and(u8::is_ascii_alphabetic);
+            if body.contains('/') || body.contains('\\') || windows_drive_path {
                 format!("[redacted-path]{suffix}")
             } else {
                 token.to_owned()
@@ -1376,7 +1406,8 @@ mod tests {
 
     #[test]
     fn resource_catalog_exposes_only_aliases_and_no_authority_handles() {
-        let serialized = serde_json::to_string(&worker_resource_schemas(true)).unwrap();
+        let projection = WorkerWorkspaceProjectionV1::input_output_for_test(true);
+        let serialized = serde_json::to_string(&worker_resource_schemas(&projection)).unwrap();
         assert!(serialized.contains("resource_read"));
         assert!(!serialized.contains("handle_ref"));
         assert!(!serialized.contains("process"));
@@ -1385,7 +1416,8 @@ mod tests {
 
     #[test]
     fn process_schema_has_no_executable_path_network_or_terminal_authority() {
-        let serialized = serde_json::to_string(&worker_process_schema(true)).unwrap();
+        let projection = WorkerWorkspaceProjectionV1::input_output_for_test(true);
+        let serialized = serde_json::to_string(&worker_process_schema(&projection)).unwrap();
         assert!(serialized.contains("process_spawn"));
         assert!(!serialized.contains("executable_handle"));
         assert!(!serialized.contains("path"));
@@ -1395,9 +1427,10 @@ mod tests {
 
     #[test]
     fn process_schema_is_deterministic_and_has_no_network_effect() {
+        let projection = WorkerWorkspaceProjectionV1::input_output_for_test(true);
         assert_eq!(
-            serde_json::to_string(&worker_process_schema(true)).unwrap(),
-            serde_json::to_string(&worker_process_schema(true)).unwrap(),
+            serde_json::to_string(&worker_process_schema(&projection)).unwrap(),
+            serde_json::to_string(&worker_process_schema(&projection)).unwrap(),
         );
     }
 
@@ -1406,6 +1439,13 @@ mod tests {
         let excerpt = redact_process_excerpt(b"ok /Users/example/private.txt\n".to_vec()).unwrap();
         assert!(excerpt.contains("[redacted-path]"));
         assert!(!excerpt.contains("/Users/example"));
+        let windows = redact_process_excerpt(
+            br"ok C:\Users\example\private.txt \\server\share\private.txt".to_vec(),
+        )
+        .unwrap();
+        assert!(!windows.contains("C:"));
+        assert!(!windows.contains("\\server"));
+        assert_eq!(windows.matches("[redacted-path]").count(), 2);
         assert_eq!(MAX_PROJECTED_READ_BYTES, 16 * 1024);
     }
 

@@ -24,6 +24,7 @@ mod managed_execution;
 mod managed_objects;
 mod managed_resources;
 mod managed_worker_coordinator;
+mod managed_workspace;
 mod models;
 mod native_v2_orchestration;
 mod natural_v2;
@@ -36,6 +37,8 @@ mod storage;
 mod transfer;
 mod transfer_orchestration;
 mod transfer_tuning;
+#[cfg(windows)]
+mod windows_execution_world;
 mod worker_harness;
 mod worker_provider;
 mod worker_provider_config;
@@ -99,6 +102,10 @@ impl RuntimeTaskSpawner for TauriRuntimeTaskSpawner {
 }
 
 fn main() {
+    #[cfg(windows)]
+    if windows_execution_world::run_probe_helper_if_requested() {
+        return;
+    }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
