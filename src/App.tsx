@@ -15,12 +15,15 @@ import {
   getRoom,
   joinRoom,
   leaveRoom,
+  listNearbyDevices,
   listRoomItems,
   listRooms,
   logFrontendDiagnostic,
   markJoinPromptRendered,
   pendingJoinRequests,
   rejectNearbyJoin,
+  revealInFolder,
+  requestNearbyJoin,
   sendFileToRoom,
   updateTransferWindow
 } from "./lib/tauri";
@@ -69,7 +72,9 @@ import {
 } from "./lib/bridgeRoutingRuntime";
 import { formatBridgeRouteErrorForUser } from "./lib/bridgeRouting";
 import { mergeTransferEvent } from "./lib/transferState";
-import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, NearbyDevice, RoomInfo, RoomItem } from "./lib/types";
+import { mergeRoomItems, reconcileRoomItems, reconcileRooms, reconcileValue } from "./lib/authoritativeSnapshots";
+import { disposeAll, ownAsyncDisposer } from "./lib/subscriptionLifecycle";
+import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, RoomInfo, RoomItem } from "./lib/types";
 
 type View =
   | { screen: "primary" }
@@ -133,11 +138,14 @@ function App() {
   const [transfers, setTransfers] = useState<Record<string, FileTransferProgressEvent>>({});
   const [scheduler, setScheduler] = useState<TransferSchedulerState>(() => createTransferSchedulerState());
   const [joinRequest, setJoinRequest] = useState<JoinRequestPrompt | null>(null);
+  const [workspaceFocusRequest, setWorkspaceFocusRequest] = useState<{ target: "home" | "settings"; token: number }>({ target: "home", token: 0 });
   const [error, setError] = useState<string | null>(null);
   const closedRoomIdsRef = useRef<Set<string>>(new Set());
   const schedulerRef = useRef(scheduler);
+  const transfersRef = useRef(transfers);
   const roomsRef = useRef(rooms);
   const viewRef = useRef(view);
+  const activeBridgeRoomIdRef = useRef(activeBridgeRoomId);
   const launchingQueueItemWindowsRef = useRef<Map<string, number>>(new Map());
   const metadataPreflightItemIdsRef = useRef<Set<string>>(new Set());
   const cancellingQueueTransferIdsRef = useRef<Set<string>>(new Set());
@@ -156,6 +164,14 @@ function App() {
     roomsRef.current = rooms;
   }, [rooms]);
 
+  useEffect(() => {
+    transfersRef.current = transfers;
+  }, [transfers]);
+
+  useEffect(() => {
+    activeBridgeRoomIdRef.current = activeBridgeRoomId;
+  }, [activeBridgeRoomId]);
+
   function updateSchedulerState(updater: (current: TransferSchedulerState) => TransferSchedulerState): TransferSchedulerState {
     const next = updater(schedulerRef.current);
     schedulerRef.current = next;
@@ -172,7 +188,7 @@ function App() {
       try {
         const [nextConfig, nextRooms] = await Promise.all([getConfig(), listRooms()]);
         setConfig(nextConfig);
-        setRooms(nextRooms);
+        setRooms((current) => reconcileRooms(current, nextRooms));
         const connected = nextRooms.filter((room) => room.peer_connected);
         if (connected.length === 1) {
           setActiveBridgeRoomId((current) => current || connected[0].id);
@@ -186,42 +202,53 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!hasTauriRuntime()) return;
     let cancelled = false;
+    let inFlight = false;
 
-    async function loadActivityItems() {
-      const activeRooms = rooms.filter((room) => room.status !== "burned");
-      const settled = await Promise.allSettled(activeRooms.map((room) => listRoomItems(room.id)));
-      if (cancelled) return;
-      setActivityRoomItems(settled.flatMap((result) => result.status === "fulfilled" ? result.value : []));
-    }
-
-    void loadActivityItems();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [rooms]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadActiveBridge() {
-      if (!activeBridgeRoomId) {
-        setCurrentRoom(null);
-        setRoomItems([]);
-        return;
-      }
-
+    async function loadBridgeSnapshot() {
+      if (inFlight) return;
+      inFlight = true;
       try {
-        const [nextRoom, nextItems, nextRooms] = await Promise.all([
-          getRoom(activeBridgeRoomId),
-          listRoomItems(activeBridgeRoomId),
-          listRooms(),
-        ]);
+        const nextRooms = await listRooms();
+        const visibleRooms = nextRooms.filter((room) => room.status !== "burned");
+        const settled = await Promise.allSettled(visibleRooms.map(async (room) => ({
+          roomId: room.id,
+          items: await listRoomItems(room.id),
+        })));
         if (cancelled) return;
-        setCurrentRoom(nextRoom);
-        setRoomItems(nextItems);
-        setRooms(nextRooms);
+        const itemsByRoom = new Map<string, RoomItem[]>();
+        for (const result of settled) {
+          if (result.status === "fulfilled") itemsByRoom.set(result.value.roomId, result.value.items);
+        }
+        const successfulRoomIds = new Set(itemsByRoom.keys());
+        const nextActivityItems = [...itemsByRoom.values()]
+          .flat()
+          .sort((left, right) => right.created_at - left.created_at);
+        setRooms((current) => reconcileRooms(current, nextRooms));
+        setActivityRoomItems((current) => reconcileRoomItems(
+          current,
+          [...nextActivityItems, ...current.filter((item) => !successfulRoomIds.has(item.room_id))]
+            .sort((left, right) => right.created_at - left.created_at),
+        ));
+
+        if (!activeBridgeRoomId) {
+          setCurrentRoom((current) => reconcileValue(current, null));
+          setRoomItems((current) => reconcileRoomItems(current, []));
+          return;
+        }
+
+        const nextRoom = nextRooms.find((room) => room.id === activeBridgeRoomId) ?? null;
+        if (!nextRoom) {
+          setActiveBridgeRoomId("");
+          setCurrentRoom(null);
+          setRoomItems([]);
+          return;
+        }
+        setCurrentRoom((current) => reconcileValue(current, nextRoom));
+        if (itemsByRoom.has(activeBridgeRoomId)) {
+          setRoomItems((current) => reconcileRoomItems(current, itemsByRoom.get(activeBridgeRoomId) ?? []));
+        }
       } catch (err) {
         if (cancelled) return;
         const message = err instanceof Error ? err.message : String(err);
@@ -237,16 +264,14 @@ function App() {
           return;
         }
         setError(message);
+      } finally {
+        inFlight = false;
       }
     }
 
-    void loadActiveBridge();
-    if (!activeBridgeRoomId) return () => {
-      cancelled = true;
-    };
-
+    void loadBridgeSnapshot();
     const interval = window.setInterval(() => {
-      void loadActiveBridge();
+      void loadBridgeSnapshot();
     }, 2000);
 
     return () => {
@@ -266,51 +291,45 @@ function App() {
 
   useEffect(() => {
     if (!hasTauriRuntime()) return;
-    let unlistenFocus: (() => void) | undefined;
-    let unlistenTransfer: (() => void) | undefined;
-    let unlistenJoinRequest: (() => void) | undefined;
-
-    void listen<FocusPayload>("pastey://focus", (event) => {
-      void event.payload.target;
-      setView({ screen: "primary" });
-    }).then((fn) => {
-      unlistenFocus = fn;
-    });
-
-    void listen<FileTransferProgressEvent>("pastey://transfer-progress", (event) => {
-      if (closedRoomIdsRef.current.has(event.payload.room_id)) {
-        return;
-      }
-      recordRuntimeWindowTransferId(event.payload);
-      setTransfers((current) => mergeTransferEvent(current, event.payload, closedRoomIdsRef.current));
-      updateSchedulerState((current) => correlateTransferProgress(current, {
-        roomId: event.payload.room_id,
-        queueItemId: event.payload.queue_item_id,
-        direction: event.payload.direction,
-        fileName: event.payload.file_name,
-        fileSize: event.payload.file_size,
-        transferId: event.payload.transfer_id,
-        status: event.payload.status
-      }));
-      if (event.payload.status === "completed") {
-        void refreshCurrentRoom();
-      }
-    }).then((fn) => {
-      unlistenTransfer = fn;
-    });
-
-    void listen<JoinRequestPrompt>("pastey://join-request", (event) => {
-      setJoinRequest(event.payload);
-    }).then((fn) => {
-      unlistenJoinRequest = fn;
-    });
+    const disposers = [
+      ownAsyncDisposer(listen<FocusPayload>("pastey://focus", (event) => {
+        const target = event.payload.target ?? "home";
+        setView({ screen: "primary" });
+        setWorkspaceFocusRequest((current) => ({ target, token: current.token + 1 }));
+      })),
+      ownAsyncDisposer(listen<FileTransferProgressEvent>("pastey://transfer-progress", (event) => {
+        if (closedRoomIdsRef.current.has(event.payload.room_id)) {
+          return;
+        }
+        recordRuntimeWindowTransferId(event.payload);
+        const previousTransfer = transfersRef.current[event.payload.transfer_id];
+        const nextTransfers = mergeTransferEvent(transfersRef.current, event.payload, closedRoomIdsRef.current);
+        if (nextTransfers !== transfersRef.current) {
+          transfersRef.current = nextTransfers;
+          setTransfers(nextTransfers);
+        }
+        updateSchedulerState((current) => correlateTransferProgress(current, {
+          roomId: event.payload.room_id,
+          queueItemId: event.payload.queue_item_id,
+          direction: event.payload.direction,
+          fileName: event.payload.file_name,
+          fileSize: event.payload.file_size,
+          transferId: event.payload.transfer_id,
+          status: event.payload.status
+        }));
+        if (event.payload.status === "completed" && previousTransfer?.status !== "completed") {
+          void refreshCurrentRoom();
+        }
+      })),
+      ownAsyncDisposer(listen<JoinRequestPrompt>("pastey://join-request", (event) => {
+        setJoinRequest(event.payload);
+      })),
+    ];
 
     return () => {
-      if (unlistenFocus) unlistenFocus();
-      if (unlistenTransfer) unlistenTransfer();
-      if (unlistenJoinRequest) unlistenJoinRequest();
+      disposeAll(disposers);
     };
-  }, [view]);
+  }, []);
 
   useEffect(() => {
     const metadataItems = queuedItemsNeedingMetadata(
@@ -497,7 +516,7 @@ function App() {
 
   async function refreshRooms(selectedRoomId?: string): Promise<RoomInfo | null> {
     const nextRooms = await listRooms();
-    setRooms(nextRooms);
+    setRooms((current) => reconcileRooms(current, nextRooms));
 
     if (selectedRoomId) {
       const match = nextRooms.find((room) => room.id === selectedRoomId) ?? null;
@@ -515,8 +534,8 @@ function App() {
     try {
       const [nextRoom, nextItems] = await Promise.all([getRoom(room.id), listRoomItems(room.id)]);
       setCurrentRoom(nextRoom);
-      setRoomItems(nextItems);
-      setActivityRoomItems((current) => mergeActivityItems(current, nextItems));
+      setRoomItems((current) => reconcileRoomItems(current, nextItems));
+      setActivityRoomItems((current) => mergeRoomItems(current, nextItems));
       await refreshRooms(room.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -524,17 +543,18 @@ function App() {
   }
 
   async function refreshCurrentRoom() {
-    const targetRoomId = view.screen === "bridge-detail" ? view.roomId : activeBridgeRoomId;
+    const currentView = viewRef.current;
+    const targetRoomId = currentView.screen === "bridge-detail" ? currentView.roomId : activeBridgeRoomIdRef.current;
     if (!targetRoomId) return;
     try {
       const [nextRoom, nextItems] = await Promise.all([getRoom(targetRoomId), listRoomItems(targetRoomId)]);
       setCurrentRoom(nextRoom);
-      setRoomItems(nextItems);
-      setActivityRoomItems((current) => mergeActivityItems(current, nextItems));
+      setRoomItems((current) => reconcileRoomItems(current, nextItems));
+      setActivityRoomItems((current) => mergeRoomItems(current, nextItems));
       const visibleRoom = await refreshRooms(targetRoomId);
       if (!visibleRoom) {
         setView({ screen: "primary" });
-        if (activeBridgeRoomId === targetRoomId) {
+        if (activeBridgeRoomIdRef.current === targetRoomId) {
           setActiveBridgeRoomId("");
         }
         setRoomItems([]);
@@ -547,7 +567,7 @@ function App() {
         message === "File is no longer available."
       ) {
         setView({ screen: "primary" });
-        if (activeBridgeRoomId === targetRoomId) {
+        if (activeBridgeRoomIdRef.current === targetRoomId) {
           setActiveBridgeRoomId("");
         }
         setCurrentRoom(null);
@@ -561,7 +581,7 @@ function App() {
 
   async function refreshRoomAfterQueueItem(roomId: string) {
     const currentView = viewRef.current;
-    if ((currentView.screen !== "bridge-detail" || currentView.roomId !== roomId) && activeBridgeRoomId !== roomId) {
+    if ((currentView.screen !== "bridge-detail" || currentView.roomId !== roomId) && activeBridgeRoomIdRef.current !== roomId) {
       await refreshRooms();
       return;
     }
@@ -569,8 +589,8 @@ function App() {
     try {
       const [nextRoom, nextItems] = await Promise.all([getRoom(roomId), listRoomItems(roomId)]);
       setCurrentRoom(nextRoom);
-      setRoomItems(nextItems);
-      setActivityRoomItems((current) => mergeActivityItems(current, nextItems));
+      setRoomItems((current) => reconcileRoomItems(current, nextItems));
+      setActivityRoomItems((current) => mergeRoomItems(current, nextItems));
       const visibleRoom = await refreshRooms(roomId);
       if (!visibleRoom) {
         setView({ screen: "primary" });
@@ -1331,12 +1351,14 @@ function App() {
     }
     closedRoomIdsRef.current.add(room.id);
     setView({ screen: "primary" });
-    if (activeBridgeRoomId === room.id) {
+    if (activeBridgeRoomIdRef.current === room.id) {
       setActiveBridgeRoomId("");
     }
     setCurrentRoom(null);
     setRoomItems([]);
-    setTransfers((current) => Object.fromEntries(Object.entries(current).filter(([, transfer]) => transfer.room_id !== room.id)));
+    const remainingTransfers = Object.fromEntries(Object.entries(transfersRef.current).filter(([, transfer]) => transfer.room_id !== room.id));
+    transfersRef.current = remainingTransfers;
+    setTransfers(remainingTransfers);
     await refreshRooms();
   }
 
@@ -1348,6 +1370,11 @@ function App() {
   async function handleJoinBridge(code: string) {
     const room = await joinRoom(code);
     await openRoom(room);
+  }
+
+  async function handleJoinNearbyDevice(deviceId: string) {
+    const room = await requestNearbyJoin(deviceId);
+    await handleConnectionJoined(room);
   }
 
   async function handleAcceptJoinRequest(request: JoinRequestPrompt) {
@@ -1420,23 +1447,21 @@ function App() {
         activityItems={activityRoomItems}
         transfers={Object.values(transfers)}
         queueItems={Object.values(scheduler.items)}
+        focusRequest={workspaceFocusRequest}
         onCreateBridge={handleCreateBridge}
         onJoinBridge={handleJoinBridge}
+        onListNearbyDevices={listNearbyDevices}
+        onJoinNearbyDevice={handleJoinNearbyDevice}
+        nearbyDiscoveryAvailable={hasTauriRuntime()}
         onOpenBridge={openRoom}
         onRefreshBridge={refreshCurrentRoom}
+        onRevealInFolder={revealInFolder}
+        onLeaveBridge={(room) => handleLeaveOrBurnBridge(room, "leave")}
         onBurnBridge={(room) => handleLeaveOrBurnBridge(room, "burn")}
         onEnqueueTransferInputs={enqueueRoomTransferInputs}
       />
     </div>
   );
-}
-
-function mergeActivityItems(current: RoomItem[], nextItems: RoomItem[]): RoomItem[] {
-  const nextById = new Map(current.map((item) => [item.id, item]));
-  for (const item of nextItems) {
-    nextById.set(item.id, item);
-  }
-  return [...nextById.values()].sort((a, b) => b.created_at - a.created_at);
 }
 
 function isActiveQueueItem(item: TransferQueueItem): boolean {

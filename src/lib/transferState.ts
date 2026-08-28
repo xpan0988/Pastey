@@ -19,6 +19,9 @@ export function mergeTransferEvent(
   if (existing && isTerminalTransferStatus(existing.status)) {
     return current;
   }
+  if (existing && JSON.stringify(existing) === JSON.stringify(next)) {
+    return current;
+  }
 
   return {
     ...current,

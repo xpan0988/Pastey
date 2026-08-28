@@ -12,6 +12,7 @@ import {
   type TerminalDimensions,
   terminalInputBytes,
 } from "../lib/developerTerminalFrontend";
+import { ownAsyncDisposer } from "../lib/subscriptionLifecycle";
 
 const TERMINAL_SCROLLBACK_LINES = 5_000;
 const RESIZE_DEBOUNCE_MS = 80;
@@ -131,9 +132,7 @@ export function DeveloperTerminalViewport({
     scheduleFit();
     void document.fonts?.ready.then(scheduleFit);
 
-    let unlistenOutput: (() => void) | undefined;
-    let outputListenerCancelled = false;
-    void listen<DeveloperTerminalOutputEvent>(DEVELOPER_TERMINAL_OUTPUT_EVENT, (event) => {
+    const disposeOutputListener = ownAsyncDisposer(listen<DeveloperTerminalOutputEvent>(DEVELOPER_TERMINAL_OUTPUT_EVENT, (event) => {
       const frame = event.payload;
       if (
         frame.roomId !== roomId
@@ -148,10 +147,7 @@ export function DeveloperTerminalViewport({
         scheduleFit();
       });
       lastOutputSequenceRef.current = frame.sequence;
-    }).then((unlisten) => {
-      if (outputListenerCancelled) unlisten();
-      else unlistenOutput = unlisten;
-    });
+    }));
 
     window.requestAnimationFrame(() => terminal.focus());
 
@@ -165,8 +161,7 @@ export function DeveloperTerminalViewport({
       textarea?.removeEventListener("blur", handleBlur);
       dataSubscription.dispose();
       resizeSubscription.dispose();
-      outputListenerCancelled = true;
-      unlistenOutput?.();
+      disposeOutputListener();
       terminal.dispose();
       terminalRef.current = null;
       fitRequestRef.current = () => {};

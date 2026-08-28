@@ -122,6 +122,7 @@ button { color: inherit; }
 .v2-workspace-header, .v2-screen-header { height: 73px; padding: 0 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #343439; }
 .v2-workspace-header h1, .v2-screen-header h1, .v2-settings-header h1 { margin: 0; font-size: 17px; line-height: 1.2; letter-spacing: -.012em; }
 .v2-workspace-header p, .v2-screen-header p, .v2-settings-header p { margin: 3px 0 0; color: #8e8c95; font-size: 11px; }
+.v2-bridge-session-actions { display: flex; gap: 8px; }
 .v2-screen-header h1 { font-size: 20px; }
 
 .v2-button { min-height: 35px; padding: 0 10px; border: 1px solid #424248; border-radius: 8px; background: #2a2a2e; color: #efedf2; font-size: 12px; font-weight: 650; cursor: pointer; }
@@ -220,8 +221,18 @@ button { color: inherit; }
 .v2-device-detail-card p { margin: 3px 0 10px; color: #d5d3d8; font-size: 11px; }
 
 .v2-new-bridge-body { padding: 43px 40px; }
+.v2-nearby-list { margin-bottom: 21px; display: grid; gap: 8px; }
 .v2-nearby-empty { min-height: 64px; margin-bottom: 21px; display: flex; align-items: center; justify-content: space-between; }
+.v2-nearby-list .v2-nearby-empty { margin-bottom: 0; }
 .v2-nearby-empty p { margin: 0; color: #9997a0; font-size: 12px; }
+.v2-nearby-device { min-height: 76px; padding: 10px 12px; display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; gap: 12px; align-items: center; border: 1px solid #3d3d43; border-radius: 11px; background: #222225; }
+.v2-nearby-device .v2-device-icon { width: 38px; height: 46px; border-radius: 8px; }
+.v2-nearby-device strong, .v2-nearby-device small, .v2-nearby-status { display: block; }
+.v2-nearby-device strong { font-size: 13px; }
+.v2-nearby-device small { margin-top: 3px; color: #8f8d96; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.v2-nearby-status { margin-top: 5px; color: #929099; font-size: 10px; }
+.v2-nearby-status.ready { color: #a8cdb4; }
+.v2-nearby-status .v2-dot { margin-right: 5px; }
 .v2-join-card { min-height: 132px; padding: 16px; border: 1px solid #3d3d43; }
 .v2-join-card > strong, .v2-join-card > small { display: block; }
 .v2-join-card > small { margin-top: 10px; color: #8f8d96; font-size: 10px; }
