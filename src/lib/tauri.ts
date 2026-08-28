@@ -22,6 +22,81 @@ import type {
   TextBridgeRoutePayload,
 } from "./bridgeRoutingRuntime";
 import type { ComposerBlock } from "./bridgePlanComposer";
+import type { CandidateSemanticPlanV2, NaturalV2Operation } from "./ai/naturalV2Plan";
+
+export interface NaturalV2HostSelection {
+  alias: string;
+  hostRef: string;
+  displayName: string;
+  capabilityFacts: string[];
+}
+
+export interface NaturalV2RootSelection {
+  rootAlias: string;
+  objectAlias: string;
+  logicalObjectId: string;
+  revision: number;
+  hostAlias: string;
+  displayName: string;
+}
+
+export interface NaturalV2ComposeCandidateRequest {
+  planId: string;
+  revisionId: string;
+  revisionNumber: number;
+  bridgeId: string;
+  requesterHostAlias: string;
+  originalUserGoal: string;
+  context: {
+    hosts: NaturalV2HostSelection[];
+    roots: NaturalV2RootSelection[];
+    allowedOperations: NaturalV2Operation[];
+    allowedTransferRoutes: Array<{ sourceHostAlias: string; destinationHostAlias: string }>;
+    allowedScopeLabels: string[];
+  };
+  candidate: CandidateSemanticPlanV2;
+}
+
+export interface NaturalV2CandidateReview {
+  schemaVersion: "pastey-natural-v2-review-v1";
+  title: string;
+  draft: {
+    schemaVersion: string;
+    planId: string;
+    revisionId: string;
+    revisionHash: string;
+    approvalId?: string | null;
+    attemptId?: string | null;
+    state: "draft";
+    currentStepId?: string | null;
+    completedSteps: number;
+    totalSteps: number;
+    readyHosts: number;
+    totalHosts: number;
+    code?: string | null;
+    updatedAt: number;
+  };
+  affectedHosts: Array<{ hostAlias: string; displayName: string }>;
+  topology: Array<{
+    stepAlias: string;
+    operation: NaturalV2Operation;
+    hostAliases: string[];
+    dependsOn: string[];
+    inputAlias?: string | null;
+    outputAlias?: string | null;
+  }>;
+  movements: Array<{
+    stepAlias: string;
+    objectAlias: string;
+    sourceHostAlias: string;
+    destinationHostAlias: string;
+  }>;
+}
+
+/** Proposal lowering only. A successful response is still an unapproved Draft. */
+export function composeNaturalV2Candidate(request: NaturalV2ComposeCandidateRequest): Promise<NaturalV2CandidateReview> {
+  return invoke<NaturalV2CandidateReview>("compose_natural_v2_candidate", { request });
+}
 
 /** Public workspace projection. It contains reviewed plan semantics and safe
  * history only; execution grants and receiver-local resolution remain Rust

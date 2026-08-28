@@ -588,6 +588,12 @@ pub struct FileTransferStartRequest {
     /// Rust-owned, bounded binding for a non-user-visible Plan handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_handoff: Option<PipelineHandoffMetadata>,
+    /// Native-v2 managed Transfer binding. It is absent from every v1 and
+    /// ordinary transfer and contains only immutable logical correlation—no
+    /// path, handle, grant, credential, or provider configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) native_v2_transfer:
+        Option<crate::native_v2_orchestration::NativeV2TransferMetadataV1>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

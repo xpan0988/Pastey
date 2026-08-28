@@ -532,6 +532,43 @@ impl<'a> BridgePlanV2Store<'a> {
         Ok(())
     }
 
+    /// Read-only coordinator projection used solely to derive a Host-owned
+    /// whole-Plan availability snapshot before attempt authority is accepted.
+    pub(crate) fn reviewed_revision_for_start(
+        &self,
+        start: &AttemptStartV2,
+        now: i64,
+    ) -> AppResult<PlanRevisionV2> {
+        validate_attempt_start(start, now)?;
+        let review: ReviewRequestV2 = connection(self.paths)?
+            .query_row(
+                "SELECT review_json FROM bridge_plan_v2_protocol_reviews
+                 WHERE bridge_id = ?1 AND correlation_id = ?2",
+                params![start.bridge_id, start.correlation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?
+            .ok_or_else(|| {
+                AppError::InvalidInput("Bridge Plan v2 review correlation is unavailable.".into())
+            })?;
+        if start.request_nonce != review.request_nonce
+            || start.approval_id != review.approval.approval_id
+            || start.plan_id != review.revision.plan_id
+            || start.revision_id != review.revision.revision_id
+            || start.revision_hash != review.revision.revision_hash
+            || start.bridge_id != review.revision.bridge_id
+            || start.sender != review.sender
+            || start.target != review.target
+            || start.expires_at > review.approval.expires_at
+        {
+            return invalid("Bridge Plan v2 attempt does not match the exact reviewed Plan.");
+        }
+        verify_sealed_revision(&review.revision)?;
+        Ok(review.revision)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn accept_attempt_start(
         &self,
@@ -689,7 +726,14 @@ pub(crate) fn protocol_metadata(
                 replay_id: format!("v2:start:{}", start.message_id),
             })
         }
-        _ => invalid("Unsupported Bridge Plan protocol v2 event."),
+        _ => Ok(ProtocolMetadataV2 {
+            replay_id: crate::native_v2_orchestration::protocol_replay_id(
+                kind,
+                payload,
+                expected_bridge,
+                now,
+            )?,
+        }),
     }
 }
 
@@ -768,6 +812,24 @@ pub(crate) fn init_schema(conn: &Connection) -> AppResult<()> {
             PRIMARY KEY(attempt_id, step_id),
             FOREIGN KEY(attempt_id, step_id) REFERENCES bridge_plan_v2_managed_step_claims(attempt_id, step_id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS bridge_plan_v2_worker_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            provider_id TEXT NOT NULL, provider_generation INTEGER NOT NULL,
+            provider_config_digest TEXT NOT NULL, provider_model TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN
+                ('accepted','running','waiting','completed','failed','interrupted','cancelled')),
+            failure_code TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            FOREIGN KEY(attempt_id) REFERENCES bridge_plan_v2_attempts(attempt_id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS bridge_plan_v2_worker_dispatches (
+            attempt_id TEXT NOT NULL, step_id TEXT NOT NULL,
+            operation TEXT NOT NULL CHECK(operation IN ('transform','execute')),
+            state TEXT NOT NULL CHECK(state IN
+                ('dispatching','completed','failed','interrupted','cancelled')),
+            failure_code TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            PRIMARY KEY(attempt_id, step_id),
+            FOREIGN KEY(attempt_id) REFERENCES bridge_plan_v2_attempts(attempt_id) ON DELETE CASCADE
+        );
         CREATE TRIGGER IF NOT EXISTS bridge_plan_v2_revision_immutable
         BEFORE UPDATE ON bridge_plan_v2_revisions
         BEGIN SELECT RAISE(ABORT, 'Bridge Plan v2 revision is immutable'); END;
@@ -799,8 +861,42 @@ pub(crate) fn init_schema(conn: &Connection) -> AppResult<()> {
         BEFORE UPDATE OF state ON bridge_plan_v2_managed_step_claims
         WHEN NOT (OLD.state = 'claimed' AND NEW.state IN ('completed','failed','interrupted'))
         BEGIN SELECT RAISE(ABORT, 'Illegal Bridge Plan v2 managed claim transition'); END;
+        CREATE TRIGGER IF NOT EXISTS bridge_plan_v2_worker_attempt_authority_immutable
+        BEFORE UPDATE OF attempt_id, provider_id, provider_generation,
+            provider_config_digest, provider_model, created_at
+        ON bridge_plan_v2_worker_attempts
+        BEGIN SELECT RAISE(ABORT, 'Bridge Plan v2 Worker binding is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS bridge_plan_v2_worker_attempt_state_guard
+        BEFORE UPDATE OF state ON bridge_plan_v2_worker_attempts
+        WHEN NOT (
+            (OLD.state = 'accepted' AND NEW.state IN
+                ('running','waiting','completed','failed','interrupted','cancelled')) OR
+            (OLD.state = 'running' AND NEW.state IN
+                ('waiting','completed','failed','interrupted','cancelled')) OR
+            (OLD.state = 'waiting' AND NEW.state IN
+                ('running','completed','failed','interrupted','cancelled'))
+        )
+        BEGIN SELECT RAISE(ABORT, 'Illegal Bridge Plan v2 Worker attempt transition'); END;
+        CREATE TRIGGER IF NOT EXISTS bridge_plan_v2_worker_attempt_terminal_guard
+        BEFORE UPDATE ON bridge_plan_v2_worker_attempts
+        WHEN OLD.state IN ('completed','failed','interrupted','cancelled')
+        BEGIN SELECT RAISE(ABORT, 'Terminal Bridge Plan v2 Worker attempt is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS bridge_plan_v2_worker_dispatch_authority_immutable
+        BEFORE UPDATE OF attempt_id, step_id, operation, created_at
+        ON bridge_plan_v2_worker_dispatches
+        BEGIN SELECT RAISE(ABORT, 'Bridge Plan v2 Worker dispatch is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS bridge_plan_v2_worker_dispatch_state_guard
+        BEFORE UPDATE OF state ON bridge_plan_v2_worker_dispatches
+        WHEN NOT (OLD.state = 'dispatching' AND NEW.state IN
+            ('completed','failed','interrupted','cancelled'))
+        BEGIN SELECT RAISE(ABORT, 'Illegal Bridge Plan v2 Worker dispatch transition'); END;
+        CREATE TRIGGER IF NOT EXISTS bridge_plan_v2_worker_dispatch_terminal_guard
+        BEFORE UPDATE ON bridge_plan_v2_worker_dispatches
+        WHEN OLD.state IN ('completed','failed','interrupted','cancelled')
+        BEGIN SELECT RAISE(ABORT, 'Terminal Bridge Plan v2 Worker dispatch is immutable'); END;
         "#,
     )?;
+    crate::native_v2_orchestration::init_schema(conn)?;
     Ok(())
 }
 
@@ -814,10 +910,24 @@ pub(crate) fn reconcile_startup(paths: &AppPaths) -> AppResult<usize> {
         "UPDATE bridge_plan_v2_managed_step_claims SET state = 'interrupted' WHERE state = 'claimed'",
         [],
     )?;
-    Ok(attempts)
+    conn.execute(
+        "UPDATE bridge_plan_v2_worker_attempts SET state = 'interrupted',
+         failure_code = 'host_restarted', updated_at = ?1
+         WHERE state IN ('accepted','running','waiting')",
+        [crate::storage::now_ts()],
+    )?;
+    conn.execute(
+        "UPDATE bridge_plan_v2_worker_dispatches SET state = 'interrupted',
+         failure_code = 'host_restarted', updated_at = ?1
+         WHERE state = 'dispatching'",
+        [crate::storage::now_ts()],
+    )?;
+    Ok(attempts
+        + crate::native_v2_orchestration::reconcile_startup(paths, crate::storage::now_ts())?)
 }
 
 pub(crate) fn delete_bridge_records(tx: &Transaction<'_>, bridge_id: &str) -> AppResult<()> {
+    crate::native_v2_orchestration::delete_bridge_records(tx, bridge_id)?;
     tx.execute(
         "DELETE FROM bridge_plan_v2_managed_step_claims WHERE attempt_id IN (SELECT attempt_id FROM bridge_plan_v2_attempts WHERE bridge_id = ?1)",
         [bridge_id],

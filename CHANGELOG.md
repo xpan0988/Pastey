@@ -2,7 +2,7 @@
 
 Detailed update and release history for Pastey.
 
-Version 1.9.2 is the previous frozen Layer 1–5 baseline. The current `Unreleased` section is the 1.9.3 Phase 1–5 architecture, runtime, and security foundation scope. Version 2.0.0 is reserved for the planned Phase 6 managed Agent product milestone; Phase 6 is not implemented.
+Version 1.9.2 is the previous frozen Layer 1–5 baseline. The current `Unreleased` section covers the 1.9.3 Phase 1–5 foundation plus the incremental Phase 6.1–6.7 Worker Harness, coordinator, deterministic native-v2 product backend, and proposal-only Natural-v2 integration. Version 2.0.0 remains reserved for the complete managed Agent product milestone.
 
 ## Unreleased
 
@@ -11,7 +11,12 @@ Version 1.9.2 is the previous frozen Layer 1–5 baseline. The current `Unreleas
 - Implemented Phase 5's generic managed authority substrate: domain-separated exact authority contexts and envelopes, monotone policy intersection, managed-run lifecycle, resource/process/network effect dimensions, deterministic tool lowering, replay/sequence/budget control, and ordered Host-authenticated evidence.
 - Added Host-private managed revision, workspace overlay, output-slot, and scratch resolution over the existing managed-object and safe-identity boundary. Authoritative revisions remain immutable; only Core may accept sealed output as future lineage.
 - Added an unattached real macOS execution-world adapter with contained process lifecycle and a Host-owned independently scoped TCP/DNS broker. Linux and Windows execution worlds fail closed as unavailable; execution worlds retain no ambient/raw network authority.
-- Added a crate-private one-use v2 managed-step claim and result-validation seam. Core alone may validate evidence and register exact same-Host Transform N+1 or an Execute result; no Tauri, Layer 4, PM, Worker, or live product caller reaches it.
+- Added a one-use v2 managed-step claim and result-validation seam. Core alone may validate evidence and register exact same-Host Transform N+1 or an Execute result.
+- Implemented the Phase 6 Worker Harness with bounded context/session state, provider-neutral streaming turns, alias-only Resource tools, optional exact Host-bound contained Process, structured observations, retry/compaction/cancellation, and Core-only result proposals.
+- Added durable Host-owned provider configuration and exact generation/model selection with separate authenticated-encrypted credentials, bounded health metadata, immutable run bindings, and revocation.
+- Attached authenticated inbound native-v2 managed attempts to a Host coordinator. It performs whole-Plan provider/Host/platform availability before admission, persists an immutable provider reference, atomically reserves one eligible local Transform/Execute, invokes one Worker run, and continues only after Core completion. Bounded lifecycle events and a Host cancellation seam are present; v1 is unchanged.
+- Added deterministic native-v2 composition and requester orchestration with exact approval/revision/session correlation, complete-Plan readiness, two-stage remote prepare/commit, authored Search and Transfer execution, remote managed-step dispatch, exact result/commit propagation, bounded product status, and minimal compose/approve/start/status/cancel commands. An exact Transfer receipt is required before the destination accepts the same-revision commit; no implicit movement or Worker topology authority was added.
+- Added proposal-only Natural-v2 local/provider interpretation with an alias-only candidate schema, strict validation and risk scanning, deterministic Core Host/object/revision/Transfer resolution, bounded topology review data, and lowering only to an unapproved native-v2 Draft.
 
 - Implemented Phase 4 as a parallel native `bridge-plan-v2` representation with Plan-scoped `HostRef` participants, generic managed-object roots, explicit per-step Host topology, exact logical revisions, dependencies, and a distinct `bridge-plan-revision-hash-v2` domain. V1 schema, hashes, protocol, UI, and Search/Transfer execution remain unchanged.
 - Added Bridge Plan protocol v2 review/start events and separate immutable revision, approval, review, replay, and attempt persistence. Authenticated sender/target HostRefs must match the current session, and an exact correlated attempt start requires fresh Host admission before an accepted attempt record exists.
@@ -28,8 +33,10 @@ Version 1.9.2 is the previous frozen Layer 1–5 baseline. The current `Unreleas
 
 ### Fixed / Changed
 
+- Made whole-Plan readiness reject every requester-local authored primitive until requester self-admission/execution exists. This closes a false-ready Search/Transfer path that could commit and then wait forever without adding requester execution authority.
+- Consolidated current architecture, managed-Agent contracts, contributor procedures, and concrete reference facts into their four canonical documents; merged the still-useful Developer Mode contract and removed superseded architecture documents and links.
 - Renamed the roadmap-derived `phase5_v2.rs` module to `managed_execution.rs`, renamed `Phase5AuthorityStateV1` to the durable `EffectAuthorityStateV1`, and replaced the process-private `phase5-managed-resources` directory label with `managed-execution-resources`. Frozen attachment/hash-domain strings remain unchanged.
-- Normalized Cargo, Tauri, npm, and lockfile application metadata to 1.9.3 and aligned canonical documentation around the 1.9.2 baseline, 1.9.3 Phase 1–5 foundations, and planned 2.0.0 Phase 6 boundary.
+- Aligned canonical documentation around the 1.9.2 packaged baseline, the 1.9.3 development foundations, and the 2.0.0 managed Agent product boundary.
 - Kept v2 Layer 4 delivery separate from topology and consent: the wire carries logical participants while the receiving Host resolves current session evidence locally. V2 admission creates no execution/step grant, so current Search/Transfer behavior remains exclusively on the unchanged v1 compatibility path.
 - Kept generic Host admission distinct from requester approval, Layer 4 identity/liveness, capability facts, object presence, and one-use step grants. Bridge Plan v1 retains its exact receiver review/start authority path; mandatory native admission attaches with schema/protocol v2 rather than reinterpreting v1.
 - Preserved Host-private paths and ObjectRef privacy while adding explicit logical object revision and Host location. Acquisition always creates revision 1 for a new root; only an explicit Transfer receipt may rebind an existing exact revision, and acquisition never creates N+1.
@@ -54,20 +61,21 @@ Version 1.9.2 is the previous frozen Layer 1–5 baseline. The current `Unreleas
 
 ### Documentation
 
-- Added `docs/developer-mode.md` as the canonical v0 protocol, authority, platform, lifecycle, and evidence contract; aligned the architecture, upper architecture, Layer 4/5, and README status.
+- Documented the Developer Mode v0 protocol, authority, platform, lifecycle, and evidence contract across the canonical architecture, Layer 4/5, and product status documentation.
 
 ### Known limitations
 
 - Developer Mode v0 is desktop-to-desktop. There is no headless admission policy, persistent/resumable or multi-tab terminal, arbitrary process API, Agent access, or privilege escalation.
 - A reported Mac-controller-to-Windows-Host run confirms interactive PowerShell and normal typing. Rapid-input ordering, paste, revocation-under-load, and the new local output-event path still require physical cross-device stress retesting; no complete physical Mac↔Windows/Linux E2E PASS claim is made.
-- The 1.9.3 managed authority substrate is not a live Agent product path. Worker Harness, managed Transform/Execute coordination, PM/planner integration, and the v2 product/UI flow begin with the planned Phase 6 / 2.0.0 milestone.
+- Phase 6.6 exposes a deterministic native-v2 backend/Tauri service. It remains separate from the full Agent/provider-settings UI; Worker network tools, subagents, Headless Host, and Developer Terminal integration remain absent. Linux/Windows process-backed steps remain unavailable pending verified execution worlds.
+- Phase 6.7 adds a strict alias-only `CandidateSemanticPlanV2`, constrained local interpretation, an explicitly selected proposal-provider adapter, deterministic Rust Host/object/revision/Transfer resolution, and a bounded topology/movement review DTO. The new Tauri seam creates only an unapproved native-v2 Draft; Natural-v1 is unchanged and provider output cannot dispatch the Phase 6.6 execution path.
 
 ## 1.9.2 — 2026-08-26
 
 ### Added / Architecture
 
 - Froze the current Layer 1–5 semantic and authority baseline around four managed primitives: Search finds, Transform modifies, Transfer moves, and Execute runs. Search and Transfer are executable; Transform and Execute remain reviewable Plan-framework intents only.
-- Added the canonical coherent upper architecture covering future Managed Workspace, PM/Worker separation, HostRuntime, HostRef, Host admission, managed-object binding, Host effect enforcement, Headless adapters, and the separate Developer Mode authority domain. These are agreed future contracts, not implemented product capabilities.
+- Added canonical architecture documentation for the then-future Managed Workspace, PM/Worker separation, HostRuntime, HostRef, Host admission, managed-object binding, Host effect enforcement, Headless adapters, and separate Developer Mode authority domain.
 - Added a shared Rust Layer 3 transfer-capacity boundary for ordinary and managed Transfers, with one global window budget, active-transfer limits, and runtime resizing based only on bounded resource facts.
 - Made Layer 5 continuation primitive-neutral: immutable attempt state determines the next dependency-eligible authored Transfer, which is claimed atomically and dispatched exactly once. One attempt and its protocol state may contain multiple authored Transfer steps.
 
@@ -96,7 +104,7 @@ Version 1.9.2 is the previous frozen Layer 1–5 baseline. The current `Unreleas
 
 ### Documentation
 
-- Added `docs/upper-architecture.md` as the single source of truth for the agreed future architecture and its PM/Worker/Core, HostRuntime, HostRef, Host admission, object-binding, effect-enforcement, Headless, and Developer Mode boundaries.
+- Recorded the agreed PM/Worker/Core, HostRuntime, HostRef, Host admission, object-binding, effect-enforcement, Headless, and Developer Mode boundaries in the canonical architecture documentation.
 - Aligned the README, canonical architecture, layer contracts, reference, development workflow, public architecture copy, and release metadata with the current implementation.
 - Recorded the post-1.9.2 structural freeze separately from intentionally evolvable two-party, `selected_file`, protocol-v1, Tauri-container, admission-policy, effect-envelope, Harness, Terminal, and Headless representations.
 - Corrected the future dependency order to HostRuntime seam → HostRef contract → Host admission/object binding → Multi-Host schema/protocol v2 → effect/Terminal authority domains → concrete upper implementations.

@@ -7,7 +7,7 @@
 //! independently scoped brokered network effects live in `network_broker`.
 //! No live Bridge Plan dispatch is attached.
 
-#![allow(dead_code)] // Live v2 step grants remain intentionally unavailable.
+#![allow(dead_code)] // The generic authority surface is broader than the live Worker catalog.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -31,6 +31,18 @@ macro_rules! opaque_ref {
         impl $name {
             pub(crate) fn as_str(&self) -> &str {
                 &self.0
+            }
+
+            pub(crate) fn from_stored(value: String) -> AppResult<Self> {
+                if value.trim().is_empty()
+                    || value.len() > MAX_ID_LEN
+                    || value.chars().any(char::is_control)
+                {
+                    return Err(AppError::InvalidInput(
+                        "Stored effect authority reference is invalid.".into(),
+                    ));
+                }
+                Ok(Self(value))
             }
         }
     };
@@ -1547,6 +1559,31 @@ impl EffectAuthorityStateV1 {
         run.state = ManagedRunStateV1::Cancelling;
         self.revoke_run_resources(run_ref);
         Ok(())
+    }
+
+    /// Host lifecycle cancellation may race the Harness's own error cleanup
+    /// after the Host has already made the durable attempt terminal. Treat an
+    /// already cancelling/terminal run as settled, while still rejecting an
+    /// unknown or never-activated run.
+    pub(crate) fn cancel_run_or_confirm_terminal(
+        &mut self,
+        run_ref: &ManagedRunRefV1,
+    ) -> AppResult<()> {
+        let state = self
+            .runs
+            .get(run_ref)
+            .map(|run| run.state)
+            .ok_or_else(|| AppError::InvalidInput("Managed run is unavailable.".into()))?;
+        match state {
+            ManagedRunStateV1::Active => self.cancel_run(run_ref),
+            ManagedRunStateV1::Cancelling
+            | ManagedRunStateV1::Finished
+            | ManagedRunStateV1::Revoked
+            | ManagedRunStateV1::Interrupted => Ok(()),
+            ManagedRunStateV1::Created => {
+                invalid("Only an activated managed run may settle cancellation.")
+            }
+        }
     }
 
     pub(crate) fn finish_run(&mut self, run_ref: &ManagedRunRefV1) -> AppResult<()> {
