@@ -24,7 +24,7 @@ The live durable Bridge Plan Search → Transfer workflow reuses this encrypted 
 
 ## Cancellation, recovery, and failure
 
-Cancellation, disconnect, burn, and terminal guards keep interrupted work from becoming active again. Burn removes the Bridge session's local encrypted payloads, transient received files, partial files, Bridge items, and active receiver transfer state. User-saved Inbox output remains user-owned and is not removed by Burn.
+Cancellation, disconnect, burn, and terminal guards keep interrupted work from becoming active again. Burn removes the Bridge session's local encrypted payloads, transient received files, partial files, Bridge items, and active receiver transfer state. Each Bridge payload key is separately wrapped by the existing installation secret and is removed at the authority cutoff, so deleted Bridge ciphertext is not recoverable through retained Pastey key state. User-saved Inbox output remains user-owned and is not removed by Burn. This is logical deletion plus cryptographic erasure of Pastey-managed Bridge recoverability; it is not a physical secure-erase guarantee for SQLite/WAL/journal or filesystem blocks.
 
 Startup recovery clears stale active-transfer state and partial files. It does not recreate active work or durable routes. A route that expires or becomes unavailable fails according to the current-session route policy rather than rebinding to a later endpoint.
 

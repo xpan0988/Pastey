@@ -10,7 +10,7 @@ import {
   sendDeveloperTerminalInput,
 } from "../../lib/tauri";
 import type { DeveloperModeUiSession, DeveloperTerminalWorkspace, RoomInfo } from "../../lib/types";
-import { bridgeCode, roomPeers } from "./workspaceViewModel";
+import { roomPeers } from "./workspaceViewModel";
 
 export function DeveloperModeScreen({ room }: { room: RoomInfo | null }) {
   const peers = useMemo(() => roomPeers(room), [room]);
@@ -85,8 +85,4 @@ export function DeveloperModeScreen({ room }: { room: RoomInfo | null }) {
       </div>
     </section>
   );
-}
-
-export function DeveloperContextPanel({ room, activeTarget }: { room: RoomInfo | null; activeTarget?: string | null }) {
-  return <aside className="v2-context-panel"><p className="v2-eyebrow">Current Bridge</p><div className="v2-context-status"><span><i className={`v2-dot ${room?.peer_connected ? "connected" : ""}`} /> {room?.peer_connected ? "Connected" : room ? "Waiting" : "Unavailable"}</span><small>{room ? bridgeCode(room) : "No Bridge selected"}</small></div><div className="v2-developer-context"><small>Developer session</small><strong>{activeTarget ? `Live on ${activeTarget}` : "No live terminal"}</strong><p>Human terminal grant</p><p>Not Agent / Plan authority</p></div><div className="v2-context-section"><small>Session boundary</small><strong>Human-only, current session</strong><p>Developer Mode admission is never reused as managed Agent authority.</p></div></aside>;
 }

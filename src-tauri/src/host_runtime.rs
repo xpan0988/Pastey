@@ -127,6 +127,7 @@ impl HostRuntime {
         logging::init(paths.logs_dir.clone());
         storage::init_database(&paths)?;
         let config = config::load_or_create(&paths, default_shortcut_label)?;
+        storage::migrate_bridge_payload_keys(&paths, &config::master_key(&config)?)?;
         let effective_inbox_dir = config::effective_inbox_dir(&paths, &config);
         storage::run_startup_recovery(&paths, &effective_inbox_dir)?;
 
@@ -228,13 +229,25 @@ impl HostRuntime {
             "bridge_revoked",
         );
         self.managed_worker_process_specs.lock().clear();
-        self.cancel_worker_runs_for_bridge(room_id);
+        let mut worker_runs = self.worker_harness_runs.lock();
+        for record in worker_runs.values() {
+            if record.bridge_id() == room_id {
+                record.cancel();
+            }
+        }
+        worker_runs.retain(|_, record| record.bridge_id() != room_id);
+        drop(worker_runs);
         self.execution_worlds.terminate_bridge(room_id);
         self.network_broker.terminate_bridge(room_id);
         self.effect_authority.lock().revoke_bridge(room_id);
         self.managed_resources.lock().purge_bridge(room_id);
         self.managed_objects.lock().purge_bridge(room_id);
         self.developer_terminal.purge_room(room_id);
+        self.terminal_transfer_reasons.lock().clear();
+    }
+
+    pub(crate) fn clear_terminal_transfer_reasons(&self) {
+        self.terminal_transfer_reasons.lock().clear();
     }
 
     /// Phase 5 lifecycle coordinator seam used by the live v2 Worker path.
@@ -344,14 +357,6 @@ impl HostRuntime {
     fn cancel_worker_run(&self, run_ref: &effect_authority::ManagedRunRefV1) {
         if let Some(record) = self.worker_harness_runs.lock().get(run_ref) {
             record.cancel();
-        }
-    }
-
-    fn cancel_worker_runs_for_bridge(&self, bridge_id: &str) {
-        for record in self.worker_harness_runs.lock().values() {
-            if record.bridge_id() == bridge_id {
-                record.cancel();
-            }
         }
     }
 
@@ -803,6 +808,34 @@ mod tests {
             runtime.local_host_ref,
             HostRef::from_device_id("test-device").unwrap()
         );
+    }
+
+    #[test]
+    fn burn_purges_worker_run_registry_after_cancellation() {
+        let root = std::env::temp_dir().join(format!(
+            "pastey-host-runtime-burn-worker-run-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::new(root.clone(), root.join("logs"));
+        paths.ensure_directories().unwrap();
+        storage::init_database(&paths).unwrap();
+        let runtime = HostRuntime::new(
+            paths.clone(),
+            test_config(),
+            Arc::new(RecordingEventSink::default()),
+            Arc::new(RecordingTaskSpawner::default()),
+        )
+        .unwrap();
+        let run_ref =
+            crate::effect_authority::ManagedRunRefV1::from_stored("burn-run".into()).unwrap();
+        let run =
+            runtime.register_worker_run(run_ref.clone(), "bridge".into(), "session-binding".into());
+
+        runtime.purge_room("bridge");
+
+        assert!(run.is_cancelled());
+        assert!(runtime.worker_harness_runs.lock().is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

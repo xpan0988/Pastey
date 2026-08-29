@@ -3655,6 +3655,48 @@ pub(crate) fn init_schema(conn: &Connection) -> AppResult<()> {
 }
 
 pub(crate) fn delete_bridge_records(tx: &Transaction<'_>, bridge_id: &str) -> AppResult<()> {
+    // Product revisions use a separate table family from the protocol-plan
+    // revisions below. Their un-FK'd steps and receiver records must be
+    // deleted explicitly so a burned Bridge cannot retain replayable results.
+    tx.execute(
+        "DELETE FROM native_v2_external_dispatches WHERE attempt_id IN
+         (SELECT attempt_id FROM native_v2_product_attempts WHERE revision_id IN
+          (SELECT revision_id FROM native_v2_product_revisions WHERE bridge_id = ?1)
+          UNION SELECT attempt_id FROM native_v2_receiver_attempts WHERE revision_id IN
+          (SELECT revision_id FROM native_v2_product_revisions WHERE bridge_id = ?1))",
+        [bridge_id],
+    )?;
+    tx.execute(
+        "DELETE FROM native_v2_transfer_receipts WHERE attempt_id IN
+         (SELECT attempt_id FROM native_v2_product_attempts WHERE revision_id IN
+          (SELECT revision_id FROM native_v2_product_revisions WHERE bridge_id = ?1)
+          UNION SELECT attempt_id FROM native_v2_receiver_attempts WHERE revision_id IN
+          (SELECT revision_id FROM native_v2_product_revisions WHERE bridge_id = ?1))",
+        [bridge_id],
+    )?;
+    tx.execute(
+        "DELETE FROM native_v2_step_commits WHERE attempt_id IN
+         (SELECT attempt_id FROM native_v2_product_attempts WHERE revision_id IN
+          (SELECT revision_id FROM native_v2_product_revisions WHERE bridge_id = ?1)
+          UNION SELECT attempt_id FROM native_v2_receiver_attempts WHERE revision_id IN
+          (SELECT revision_id FROM native_v2_product_revisions WHERE bridge_id = ?1))",
+        [bridge_id],
+    )?;
+    tx.execute(
+        "DELETE FROM native_v2_receiver_reviews WHERE revision_id IN
+         (SELECT revision_id FROM native_v2_product_revisions WHERE bridge_id = ?1)",
+        [bridge_id],
+    )?;
+    tx.execute(
+        "DELETE FROM native_v2_receiver_attempts WHERE revision_id IN
+         (SELECT revision_id FROM native_v2_product_revisions WHERE bridge_id = ?1)",
+        [bridge_id],
+    )?;
+    tx.execute(
+        "DELETE FROM native_v2_product_steps WHERE revision_id IN
+         (SELECT revision_id FROM native_v2_product_revisions WHERE bridge_id = ?1)",
+        [bridge_id],
+    )?;
     tx.execute(
         "DELETE FROM native_v2_external_dispatches WHERE attempt_id IN
          (SELECT attempt_id FROM native_v2_receiver_attempts WHERE revision_id IN
@@ -4407,6 +4449,100 @@ mod tests {
             &destination_host.host_ref,
         )
         .unwrap());
+    }
+
+    #[test]
+    fn burn_deletes_product_revision_steps_and_replay_records() {
+        let paths = paths("native-v2-burn-cleanup");
+        let revision = compose_revision(compose([&host("a"), &host("b"), &host("c")])).unwrap();
+        seed_running_product(&paths, &revision);
+        let step_id = "burn-extra".to_string();
+        let conn = connection(&paths).unwrap();
+        conn.execute(
+            "INSERT INTO native_v2_product_steps
+             (revision_id, attempt_id, step_id, operation, state, completion_ref, updated_at)
+             VALUES (?1, 'attempt-native-v2', ?2, 'transfer', 'completed', 'completion-product', ?3)",
+            params![revision.revision_id, step_id, NOW],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO native_v2_receiver_attempts
+             (attempt_id, revision_id, revision_hash, approval_id, requester_participant_ref,
+              target_participant_ref, session_binding_ref, session_binding_json, state,
+              failure_code, expires_at, created_at, updated_at)
+             VALUES ('receiver-product', ?1, ?2, 'approval-native-v2', 'participant-a',
+                     'participant-b', 'binding-product', '{}', 'completed', NULL, ?3, ?4, ?4)",
+            params![
+                revision.revision_id,
+                revision.revision_hash,
+                NOW + 1_000,
+                NOW
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO native_v2_receiver_reviews
+             (correlation_id, attempt_id, revision_id, revision_hash, approval_id,
+              requester_participant_ref, target_participant_ref, session_binding_json,
+              readiness_state, readiness_code, expires_at, created_at)
+             VALUES ('correlation-product', 'receiver-product', ?1, ?2, 'approval-native-v2',
+                     'participant-a', 'participant-b', '{}', 'ready', NULL, ?3, ?4)",
+            params![
+                revision.revision_id,
+                revision.revision_hash,
+                NOW + 1_000,
+                NOW
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO native_v2_transfer_receipts
+             (attempt_id, step_id, revision_id, revision_hash, logical_object_id,
+              object_revision, content_digest, destination_host_ref, binding_ref, received_at)
+             VALUES ('receiver-product', ?1, ?2, ?3, 'managed-object:v1:receipt', 1,
+                     'digest-product', 'host-b', 'binding-product-receipt', ?4)",
+            params![step_id, revision.revision_id, revision.revision_hash, NOW],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO native_v2_step_commits
+             (attempt_id, step_id, revision_id, revision_hash, completion_ref, operation,
+              host_ref, result_json, state, committed_at)
+             VALUES ('receiver-product', ?1, ?2, ?3, 'commit-product', 'transfer',
+                     'host-b', '{}', 'committed', ?4)",
+            params![step_id, revision.revision_id, revision.revision_hash, NOW],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO native_v2_external_dispatches
+             (attempt_id, step_id, operation, state, transfer_id, failure_code, created_at, updated_at)
+             VALUES ('receiver-product', ?1, 'transfer', 'completed', 'transfer-product', NULL, ?2, ?2)",
+            params![step_id, NOW],
+        )
+        .unwrap();
+        drop(conn);
+
+        storage::cut_off_bridge_authority(&paths, "bridge-native-v2").unwrap();
+        crate::bridge_plan::delete_bridge_records(&paths, "bridge-native-v2").unwrap();
+
+        let conn = connection(&paths).unwrap();
+        for table in [
+            "native_v2_product_revisions",
+            "native_v2_product_steps",
+            "native_v2_receiver_attempts",
+            "native_v2_receiver_reviews",
+            "native_v2_transfer_receipts",
+            "native_v2_step_commits",
+            "native_v2_external_dispatches",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "Burn retained rows in {table}");
+        }
+        let _ = std::fs::remove_dir_all(paths.app_data_dir);
     }
 
     #[test]

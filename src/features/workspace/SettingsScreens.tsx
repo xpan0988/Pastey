@@ -1,9 +1,35 @@
+import { useState } from "react";
+import type { ReactNode } from "react";
+import { updateConfig } from "../../lib/tauri";
 import type { AppConfig } from "../../lib/types";
 import type { NavigateWorkspace, WorkspaceRoute } from "./workspaceTypes";
 
-interface SettingsProps { config: AppConfig; onNavigate: NavigateWorkspace }
+interface SettingsProps {
+  config: AppConfig;
+  onNavigate: NavigateWorkspace;
+  onConfigChange: (config: AppConfig) => void;
+}
 
-export function SettingsOverview({ config, onNavigate }: SettingsProps) {
+type ConfigKey = "save_received_files_to_inbox" | "save_received_images_to_inbox" | "auto_burn_after_download" | "dev_tools_enabled";
+
+export function SettingsOverview({ config, onNavigate, onConfigChange }: SettingsProps) {
+  const [pendingKey, setPendingKey] = useState<ConfigKey | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function changeConfig(key: ConfigKey, value: boolean) {
+    if (pendingKey) return;
+    setPendingKey(key);
+    setError(null);
+    try {
+      const authoritative = await updateConfig({ ...config, [key]: value });
+      onConfigChange(authoritative);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError));
+    } finally {
+      setPendingKey(null);
+    }
+  }
+
   return (
     <SettingsFrame title="Settings" description="Configure how Pastey works across your devices.">
       <div className="v2-settings-columns">
@@ -15,13 +41,13 @@ export function SettingsOverview({ config, onNavigate }: SettingsProps) {
           </SettingsGroup>
           <SettingsGroup title="Receiving">
             <SettingsRow title="Receiving folder" description="Current user-owned destination." value={config.inbox_dir ? "Custom" : "Default"} />
-            <SettingsRow title="Save received files" description="Persist received files to the receiving folder." value={config.save_received_files_to_inbox ? "On" : "Off"} />
-            <SettingsRow title="Save received images" description="Persist received images to the receiving folder." value={config.save_received_images_to_inbox ? "On" : "Off"} />
+            <ConfigToggleRow title="Save received files" description="Persist received files to the receiving folder." checked={config.save_received_files_to_inbox} disabled={pendingKey !== null} onChange={(value) => void changeConfig("save_received_files_to_inbox", value)} />
+            <ConfigToggleRow title="Save received images" description="Persist received images to the receiving folder." checked={config.save_received_images_to_inbox} disabled={pendingKey !== null} onChange={(value) => void changeConfig("save_received_images_to_inbox", value)} />
             <SettingsRow title="Open receiving folder" description="Open the current receiving destination." value="Unavailable" />
           </SettingsGroup>
           <SettingsGroup title="Transfers">
             <SettingsRow title="Max concurrent transfers" description="Pastey manages concurrency automatically." value={config.transfer_window_override ? String(config.transfer_window_override) : "Automatic"} />
-            <SettingsRow title="Burn defaults" description="Default cleanup behavior for new Bridges." value={config.auto_burn_after_download ? "On" : "Off"} />
+            <ConfigToggleRow title="Burn defaults" description="Default cleanup behavior for new Bridges." checked={config.auto_burn_after_download} disabled={pendingKey !== null} onChange={(value) => void changeConfig("auto_burn_after_download", value)} />
           </SettingsGroup>
         </div>
         <div>
@@ -35,6 +61,7 @@ export function SettingsOverview({ config, onNavigate }: SettingsProps) {
             <SettingsLink title="Task provider" description="Host-owned planning provider configuration." value="Open" route="settings-provider" onNavigate={onNavigate} />
           </SettingsGroup>
           <SettingsGroup title="Advanced">
+            <ConfigToggleRow title="Developer tools" description="Show renderer-facing diagnostics controls; terminal admission remains separate." checked={config.dev_tools_enabled} disabled={pendingKey !== null} onChange={(value) => void changeConfig("dev_tools_enabled", value)} />
             <SettingsLink title="Diagnostics" description="Logging and renderer-safe diagnostics." value="Open" route="settings-diagnostics" onNavigate={onNavigate} />
             <SettingsLink title="Transfer diagnostics" description="Existing transfer scheduler controls." value="Open" route="settings-transfer" onNavigate={onNavigate} />
             <SettingsLink title="Troubleshooting" description="Device state, errors, and local checks." value="Open" route="settings-troubleshooting" onNavigate={onNavigate} />
@@ -42,6 +69,7 @@ export function SettingsOverview({ config, onNavigate }: SettingsProps) {
           </SettingsGroup>
         </div>
       </div>
+      {error ? <p className="v2-error" role="alert">{error}</p> : null}
     </SettingsFrame>
   );
 }
@@ -54,7 +82,7 @@ export function ProviderSettings({ onNavigate }: Pick<SettingsProps, "onNavigate
   return <SettingsFrame title="Task Provider" description="Global runtime configuration for reviewed Bridge tasks." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="Agent runtime"><SettingsRow title="Enabled" description="Managed Plan support is controlled by the Host." value="State unavailable" /></SettingsGroup><SettingsGroup title="Provider"><section className="v2-provider-unavailable"><strong>Provider configuration is unavailable to this renderer.</strong><p>The current backend does not expose safe selected provider, model, health, or revocation state. Credentials remain hidden, and Pastey does not use a production fallback provider.</p><span>Not configured / unavailable</span></section></SettingsGroup><SettingsGroup title="Authority"><SettingsRow title="Provider selection" description="A ready provider proposes a Plan; it never grants Agent authority." value="No authority" /><SettingsRow title="Agent Plan approval" description="Requester approval remains independently required." value="Always required" /></SettingsGroup></div></SettingsFrame>;
 }
 
-export function TransferSettings({ config, onNavigate }: SettingsProps) {
+export function TransferSettings({ config, onNavigate }: Pick<SettingsProps, "config" | "onNavigate">) {
   return <SettingsFrame title="Transfer Diagnostics" description="Advanced transport scheduling and pipeline controls." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="Transfer behaviour"><SettingsRow title="Transfer diagnostics" description="Advanced transfer behavior setting." value={config.micro_flow_group_mode === "dynamic" ? "Dynamic" : "Fixed"} /></SettingsGroup><SettingsGroup title="Pipeline depth"><SettingsRow title="Transfer window" description="Options: 1 · 2 · 4 · 8 · 16 · Custom" value={config.transfer_window_override ? String(config.transfer_window_override) : "Default / Auto"} /></SettingsGroup><p className="v2-settings-note">These controls tune the existing explicit transfer runtime; they do not create a shared filesystem or separate movement path.</p></div></SettingsFrame>;
 }
 
@@ -62,20 +90,24 @@ export function TroubleshootingSettings({ onNavigate }: Pick<SettingsProps, "onN
   return <SettingsFrame title="Troubleshooting" description="Inspect this Host and run local diagnostics." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="This device"><SettingsRow title="Device" value="This device" /><SettingsRow title="Platform" value={navigator.platform || "Unavailable"} /><SettingsRow title="Power" value="Not projected" /></SettingsGroup><SettingsGroup title="Last local test"><UnavailableRows names={["Mode", "Quality", "Average"]} /></SettingsGroup><SettingsGroup title="Local benchmark"><SettingsRow title="Benchmark mode" description="Localhost baseline only; no LAN or internet." value="Unavailable" /><SettingsRow title="Duration" value="Target 5s standard" /></SettingsGroup><button type="button" className="v2-button primary" disabled>Run local test</button></div></SettingsFrame>;
 }
 
-export function AboutSettings({ config, onNavigate }: SettingsProps) {
+export function AboutSettings({ config, onNavigate }: Pick<SettingsProps, "config" | "onNavigate">) {
   return <SettingsFrame title="About" description="Application information and maintenance." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="Pastey"><SettingsRow title="Version" value={config.app_version} /><SettingsRow title="Application data" description="Reveal" value={config.app_data_path || "Unavailable"} /></SettingsGroup><SettingsGroup title="Updates"><SettingsRow title="Update status" value="Not renderer-exposed" /><SettingsRow title="Check for updates" value="Unavailable" /></SettingsGroup><SettingsGroup title="Diagnostics"><SettingsLink title="Logs folder" value="Open" route="settings-diagnostics" onNavigate={onNavigate} /><SettingsLink title="Troubleshooting" value="Open" route="settings-troubleshooting" onNavigate={onNavigate} /></SettingsGroup></div></SettingsFrame>;
 }
 
-function SettingsFrame({ title, description, onBack, children }: { title: string; description: string; onBack?: () => void; children: React.ReactNode }) {
-  return <section className="v2-screen v2-settings-screen"><header className="v2-settings-header">{onBack ? <button type="button" onClick={onBack}>Settings&nbsp; /&nbsp;</button> : null}<h1>{title}</h1><p>{description}</p></header><div className="v2-settings-body">{children}</div></section>;
+function SettingsFrame({ title, description, onBack, children }: { title: string; description: string; onBack?: () => void; children: ReactNode }) {
+  return <section className="v2-screen v2-settings-screen"><header className="v2-screen-header"><div className="v2-settings-heading">{onBack ? <button type="button" className="v2-settings-back" onClick={onBack}>Settings&nbsp; /</button> : null}<div><h1>{title}</h1><p>{description}</p></div></div></header><div className="v2-screen-body v2-settings-body">{children}</div></section>;
 }
 
-function SettingsGroup({ title, children }: { title: string; children: React.ReactNode }) {
+function SettingsGroup({ title, children }: { title: string; children: ReactNode }) {
   return <section className="v2-settings-group"><h2>{title}</h2><div>{children}</div></section>;
 }
 
 function SettingsRow({ title, description, value, status }: { title: string; description?: string; value: string; status?: "ready" }) {
   return <div className="v2-settings-row"><span><strong>{title}</strong>{description ? <small>{description}</small> : null}</span><b>{status ? <i className="v2-dot connected" /> : null}{value}</b></div>;
+}
+
+function ConfigToggleRow({ title, description, checked, disabled, onChange }: { title: string; description?: string; checked: boolean; disabled: boolean; onChange: (value: boolean) => void }) {
+  return <div className="v2-settings-row"><span><strong>{title}</strong>{description ? <small>{description}</small> : null}</span><button type="button" className={`v2-switch ${checked ? "on" : ""}`} role="switch" aria-checked={checked} aria-label={title} disabled={disabled} onClick={() => onChange(!checked)}><i /></button></div>;
 }
 
 function SettingsLink({ route, onNavigate, ...row }: { title: string; description?: string; value: string; route: WorkspaceRoute; onNavigate: NavigateWorkspace }) {

@@ -59,20 +59,6 @@ function DeviceRow({ name, meta, detail, connected }: { name: string; meta: stri
   return <article className="v2-device-row"><div className="v2-device-icon" /><div><strong>{name}</strong><small>{meta}</small><p>{detail}</p></div><i className={`v2-dot ${connected ? "connected" : ""}`} /></article>;
 }
 
-export function DeviceDetailPanel({ room, onDeveloper }: { room: RoomInfo | null; onDeveloper: () => void }) {
-  const peers = useMemo(() => roomPeers(room), [room]);
-  const selected = peers[0] ?? null;
-  return (
-    <aside className="v2-context-panel v2-device-detail-panel">
-      <p className="v2-eyebrow">Current Bridge</p>
-      <div className="v2-context-status"><span><i className={`v2-dot ${room?.peer_connected ? "connected" : ""}`} /> {room?.peer_connected ? "Connected" : room ? "Waiting" : "Unavailable"}</span><small>{room ? bridgeCode(room) : "No Bridge selected"}</small></div>
-      <div className="v2-context-section"><small>Devices</small><strong>{room ? peers.length + 1 : 0} current members</strong></div>
-      {selected ? <section className="v2-device-detail-card"><strong>{selected.displayName}</strong><small>Current-session member</small><hr /><label>Managed Agent</label><p>Availability not renderer-exposed</p><label>Transfer</label><p>{selected.liveness === "connected" ? "Connected route available" : "Unavailable"}</p><label>Developer Mode</label><p>Availability not renderer-exposed</p></section> : <p className="v2-context-empty">Select a connected device to view renderer-safe details.</p>}
-      <button type="button" className="v2-button v2-full-button" disabled={!selected} onClick={onDeveloper}>Open Developer Mode</button>
-    </aside>
-  );
-}
-
 export function NewBridgeScreen({
   onCreate,
   onJoin,
@@ -142,7 +128,7 @@ export function NewBridgeScreen({
           {nearbyDevices.length === 0 ? <div className="v2-nearby-empty"><p>{nearbyMessage}</p><button type="button" className="v2-button" disabled={busy} onClick={() => void run(onCreate)}>Create with code</button></div> : null}
         </div>
         <h2>Join manually</h2>
-        <section className="v2-join-card"><strong>Enter an 8-digit Bridge code</strong><small>Session permission ends when the Bridge is burned, left, or reconnected.</small><div><input value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="4829 1736" aria-label="Bridge code" /><button type="button" className="v2-button primary" disabled={code.length !== 8 || busy} onClick={() => void run(() => onJoin(code))}>Join</button></div></section>
+        <section className="v2-join-card"><strong>Enter an 8-digit Bridge code</strong><small>Session permission ends when the Bridge is burned or the current session is replaced.</small><div><input value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="4829 1736" aria-label="Bridge code" /><button type="button" className="v2-button primary" disabled={code.length !== 8 || busy} onClick={() => void run(() => onJoin(code))}>Join</button></div></section>
         {message ? <p className="v2-error">{message}</p> : null}
       </div>
     </section>
@@ -167,7 +153,6 @@ export function InboxScreen({ items, inboxDir, onRevealInFolder }: { items: Room
       <header className="v2-screen-header"><div><h1>Inbox</h1><p>Received text, images, and files across Bridges.</p></div><button type="button" className="v2-button" disabled={!folderTarget || !onRevealInFolder} onClick={() => { if (folderTarget && onRevealInFolder) void onRevealInFolder(folderTarget); }}>Open folder</button></header>
       <div className="v2-filterbar">{(["all", "text", "images", "files"] as const).map((value) => <button key={value} type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{value[0].toUpperCase() + value.slice(1)} <span>{value === "all" ? received.length : value === "text" ? received.filter((item) => item.payload_type === "text").length : received.filter((item) => item.payload_type === "file").length}</span></button>)}</div>
       <div className="v2-screen-body v2-inbox-body"><h2>Today</h2>{filtered.map((item) => <MessageCard key={item.id} item={item} />)}{filtered.length === 0 ? <EmptyRow text="No received items in this view." /> : null}</div>
-      <aside className="v2-inbox-context"><p className="v2-eyebrow">Inbox</p><h2>{received.length} items</h2><p>{inboxDir ?? "Receiving folder not configured"}</p><hr /><p>Session-only items disappear when their Bridge ends. Saved user-owned files remain.</p><hr /><p>Items retain their source Bridge; Pastey does not imply shared storage.</p></aside>
     </section>
   );
 }
