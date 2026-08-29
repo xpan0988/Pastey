@@ -2897,7 +2897,17 @@ async fn diagnostics_ping_handler(
         return response;
     }
 
-    StatusCode::OK.into_response()
+    let transport_public_key = {
+        let servers = ctx.state.active_servers.lock();
+        let Some(server) = servers.get(&room_id) else {
+            return StatusCode::GONE.into_response();
+        };
+        server.transport_public_key()
+    };
+    Json(serde_json::json!({
+        "transportPublicKey": transport_public_key,
+    }))
+    .into_response()
 }
 
 async fn diagnostics_raw_benchmark_handler(

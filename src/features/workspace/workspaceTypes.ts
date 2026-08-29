@@ -6,7 +6,6 @@ export type WorkspaceRoute =
   | "activity"
   | "devices"
   | "new-bridge"
-  | "developer"
   | "inbox"
   | "settings"
   | "settings-diagnostics"

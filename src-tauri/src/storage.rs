@@ -623,9 +623,7 @@ pub fn sync_legacy_bridge_peer_endpoint(
         .rev()
         .find(|peer| {
             bridge_peer_endpoint_matches(peer, endpoint_host, endpoint_port, transport_public_key)
-                && peer.liveness != BridgePeerLiveness::Stale
-                && peer.liveness != BridgePeerLiveness::Expired
-                && peer.liveness != BridgePeerLiveness::Left
+                && peer.liveness == BridgePeerLiveness::Connected
         })
         .map(|peer| peer.peer_session_id.clone())
         .unwrap_or_else(|| next_legacy_bridge_peer_session_id(&room.id, &peers));
@@ -1402,14 +1400,55 @@ pub fn cleanup_transient_received_files(paths: &AppPaths) -> AppResult<usize> {
 pub fn mark_rooms_left_on_startup(paths: &AppPaths) -> AppResult<usize> {
     let conn = connection(paths)?;
     let updated = conn.execute(
-        "UPDATE rooms SET status = 'peer_left', peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL WHERE status IN ('active', 'peer_left', 'waiting', 'connected', 'left') AND peer_host IS NOT NULL",
+        "UPDATE rooms SET status = 'active', peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL WHERE status IN ('active', 'peer_left', 'waiting', 'connected', 'left') AND peer_host IS NOT NULL",
         [],
     )?;
     conn.execute(
-        "UPDATE bridge_peers SET liveness = 'expired', endpoint_host = NULL, endpoint_port = NULL, transport_public_key = NULL, updated_at = ?1 WHERE liveness = 'connected'",
+        "UPDATE bridge_peers SET liveness = 'disconnected', endpoint_host = NULL, endpoint_port = NULL, transport_public_key = NULL, updated_at = ?1 WHERE liveness IN ('connected', 'reconnecting')",
         [now_ts()],
     )?;
     Ok(updated)
+}
+
+/// Invalidates one exact live route while preserving logical Bridge membership
+/// and display-only durable identity. A reconnect must create a new peer session.
+pub fn mark_bridge_peer_reconnecting(
+    paths: &AppPaths,
+    room_id: &str,
+    peer_session_id: &str,
+) -> AppResult<bool> {
+    let mut conn = connection(paths)?;
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "UPDATE bridge_peers SET liveness = 'reconnecting', endpoint_host = NULL, endpoint_port = NULL, transport_public_key = NULL, updated_at = ?1 WHERE room_id = ?2 AND peer_session_id = ?3 AND liveness = 'connected'",
+        params![now_ts(), room_id, peer_session_id],
+    )?;
+    if changed > 0 {
+        tx.execute(
+            "UPDATE rooms SET status = 'active', peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL WHERE id = ?1 AND status != 'burned'",
+            [room_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed > 0)
+}
+
+pub fn mark_bridge_reconnect_failed(paths: &AppPaths, room_id: &str) -> AppResult<usize> {
+    let conn = connection(paths)?;
+    conn.execute(
+        "UPDATE bridge_peers SET liveness = 'disconnected', updated_at = ?1 WHERE room_id = ?2 AND liveness = 'reconnecting'",
+        params![now_ts(), room_id],
+    )
+    .map_err(Into::into)
+}
+
+pub fn mark_bridge_reconnect_started(paths: &AppPaths, room_id: &str) -> AppResult<usize> {
+    let conn = connection(paths)?;
+    conn.execute(
+        "UPDATE bridge_peers SET liveness = 'reconnecting', updated_at = ?1 WHERE room_id = ?2 AND liveness = 'disconnected'",
+        params![now_ts(), room_id],
+    )
+    .map_err(Into::into)
 }
 
 pub fn encrypted_file_path(paths: &AppPaths, relative_path: &str) -> PathBuf {
@@ -2672,6 +2711,70 @@ mod tests {
     }
 
     #[test]
+    fn restart_invalidates_exact_session_and_same_endpoint_creates_one_fresh_projection() {
+        let paths = test_paths("pastey_bridge_restart_fresh_exact_session");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Joined,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        update_room_peer(
+            &paths,
+            "room",
+            Some("127.0.0.1"),
+            Some(9000),
+            Some("Device"),
+            Some("peer-key-a"),
+            RoomStatus::Active,
+        )
+        .unwrap();
+
+        mark_rooms_left_on_startup(&paths).unwrap();
+        let disconnected = list_bridge_peer_endpoints(&paths, "room").unwrap();
+        assert_eq!(disconnected.len(), 1);
+        assert_eq!(disconnected[0].liveness, BridgePeerLiveness::Disconnected);
+        assert_eq!(disconnected[0].endpoint_port, None);
+
+        update_room_peer(
+            &paths,
+            "room",
+            Some("127.0.0.1"),
+            Some(9000),
+            Some("Device"),
+            Some("peer-key-b"),
+            RoomStatus::Active,
+        )
+        .unwrap();
+
+        let stored = list_bridge_peer_endpoints(&paths, "room").unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().any(|peer| {
+            peer.peer_session_id == "legacy-room-peer:room"
+                && peer.liveness == BridgePeerLiveness::Stale
+        }));
+        assert!(stored.iter().any(|peer| {
+            peer.peer_session_id == "legacy-room-peer:room:reconnect:1"
+                && peer.liveness == BridgePeerLiveness::Connected
+                && peer.transport_public_key.as_deref() == Some("peer-key-b")
+        }));
+        let room = get_room_by_id(&paths, "room").unwrap();
+        let projected = room_to_info_with_bridge_peers(&paths, room, &master_key).unwrap();
+        assert_eq!(projected.peers.len(), 1);
+        assert_eq!(
+            projected.peers[0].peer_session_id,
+            "legacy-room-peer:room:reconnect:1"
+        );
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
     fn pairing_current_session_peer_creates_display_identity_only() {
         let paths = test_paths("pastey_bridge_pairing_creates_identity");
         init_database(&paths).unwrap();
@@ -3203,7 +3306,7 @@ mod tests {
         let peer = list_bridge_peer_endpoints(&paths, "room")
             .unwrap()
             .remove(0);
-        assert_eq!(peer.liveness, BridgePeerLiveness::Expired);
+        assert_eq!(peer.liveness, BridgePeerLiveness::Disconnected);
         assert_eq!(peer.logical_host_ref.as_deref(), Some(first.as_str()));
         assert!(
             bind_bridge_peer_host_ref(&paths, "room", &peer.peer_session_id, first.as_str(),)
@@ -3687,7 +3790,7 @@ mod tests {
         );
         let peers = list_bridge_peer_endpoints(&paths, "room").unwrap();
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].liveness, BridgePeerLiveness::Expired);
+        assert_eq!(peers[0].liveness, BridgePeerLiveness::Disconnected);
         assert_eq!(peers[0].endpoint_host, None);
         assert_eq!(peers[0].endpoint_port, None);
         assert_eq!(peers[0].transport_public_key, None);

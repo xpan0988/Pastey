@@ -101,7 +101,15 @@ Retain non-secret logs/status exports, revision/hash, receipt metadata, and scre
 
 ## Ordinary two-device smoke
 
-With packaged builds on two supported desktops, create/join a Bridge, exercise nearby/code join, ordinary text/file transfer, Search/Transfer Review & Run, disconnect/reconnect route expiry, explicit departure, and Burn. Verify paired-device display identity neither auto-joins nor authorizes a capability.
+With packaged builds on two supported desktops, record the logical Bridge id and current exact peer-session ids where diagnostics expose them, then verify:
+
+1. Connect A/B, Quit B normally, and confirm A leaves healthy Connected state. Restart B and confirm both retain the same logical Bridge, establish fresh exact sessions, converge on one member each, show no duplicate peer, and reject every old route.
+2. Open New Bridge and confirm no Bridge is created. Exercise Nearby request/remote Accept and manual 8-digit join separately; each successful action creates or joins exactly one Bridge. Confirm Devices remains inspection-only and cannot create a Bridge.
+3. From A's selected Bridge, switch the central workspace to Developer Mode and request B. Confirm B sees Accept/Deny without first opening Developer Mode. Accept once, run a harmless command, inspect output, and End session. Request again, Deny, and confirm A receives a terminal denied state and B starts no PTY.
+4. Navigate Bridge → Inbox → Devices → Settings → Bridge → Developer Mode → Bridge while transferring a few items and disconnecting/reconnecting. Confirm one selected Bridge/context, no duplicate listeners, members, items, or requests, no stale send target, and no lifecycle mutation from navigation.
+5. Burn locally and confirm immediate removal from every local renderer surface, rejection of late events, and no claim that the remote Host also burned.
+
+Also exercise Search/Transfer Review & Run, explicit departure, and ordinary text/file transfer. Verify paired-device display identity neither auto-joins nor authorizes a capability. Record failures; do not infer packaged or physical PASS from automated tests.
 
 Native packaged Windows must separately exercise normal-file Search/Transfer, reparse/path substitution rejection, identity/digest checks, explicit movement, restart, and Burn. Native packaged macOS must exercise the descriptor-oriented no-follow and identity path.
 

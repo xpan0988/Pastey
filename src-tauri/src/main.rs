@@ -1,3 +1,4 @@
+mod bridge_lifecycle;
 mod bridge_plan;
 mod bridge_plan_v2;
 mod capability_probe;
@@ -134,6 +135,10 @@ fn main() {
                     return;
                 }
                 discovery::start_antenna(antenna_state).await;
+            });
+            let lifecycle_state = state.clone();
+            state.spawn(async move {
+                bridge_lifecycle::start(lifecycle_state).await;
             });
             install_global_shortcut(app.handle())?;
             install_tray(app.handle())?;

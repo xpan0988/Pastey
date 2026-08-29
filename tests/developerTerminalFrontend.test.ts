@@ -207,11 +207,11 @@ test("Developer Terminal fit lifecycle is recreated for each opened session and 
 test("active Developer Terminal UI hides fresh-request controls and identifies the Host", () => {
   const panel = readFileSync("src/features/workspace/DeveloperModeScreen.tsx", "utf8");
 
-  assert.match(panel, /Human-only, current-session terminal access/);
+  assert.match(panel, /human-controlled current-session grant inside this Bridge/);
   assert.match(panel, /separate from Agent Task, Worker, Execute, Plan authority/);
   assert.match(panel, /End session/);
   assert.match(panel, /Request terminal admission/);
   assert.match(panel, /<DeveloperTerminalViewport/);
   assert.match(panel, /closeDeveloperTerminal/);
-  assert.match(panel, /Burn Bridge is a separate destructive action/);
+  assert.match(panel, /Burn remains a separate destructive local Bridge action/);
 });

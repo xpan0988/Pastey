@@ -92,6 +92,8 @@ Cancellation, session invalidation, disconnect, Burn, shutdown, restart, and aut
 
 Developer Mode v0 is a separate human-controlled Host capability above Layer 4, parallel to Layer 5. It is not a fifth primitive, a special Execute, a managed-object workflow, or an Agent escape hatch.
 
+The product embeds Developer Mode as an alternate central workspace inside the selected Bridge; it is not a standalone route. This visual placement preserves the current Bridge/sidebar/device context but does not merge authority domains. The target Host can observe an authenticated pending admission before entering Developer Mode, while Accept or Deny still requires an explicit Host-local interaction and the existing receiver-side Developer Mode UI authority.
+
 ```text
 human controller enters Developer Mode
   → chooses one current Bridge Host

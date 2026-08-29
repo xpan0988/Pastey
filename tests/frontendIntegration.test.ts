@@ -3,9 +3,11 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { mergeRoomItems, reconcileRoomItems, reconcileRooms } from "../src/lib/authoritativeSnapshots";
+import { chooseInitialBridgeId, reconcileSelectedBridgeId, visibleBridgeRooms } from "../src/lib/bridgeSelection";
 import { ownAsyncDisposer } from "../src/lib/subscriptionLifecycle";
 import { mergeTransferEvent } from "../src/lib/transferState";
-import type { FileTransferProgressEvent, RoomInfo, RoomItem } from "../src/lib/types";
+import { uniqueNearbyDevices } from "../src/features/workspace/workspaceViewModel";
+import type { FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../src/lib/types";
 
 function room(peerConnected: boolean): RoomInfo {
   return {
@@ -104,12 +106,78 @@ test("new Bridge view consumes the real renderer-safe nearby discovery binding",
   assert.match(screen, /onListNearby\(\)/);
   assert.match(screen, /onJoinNearby\(device\.device_id\)/);
   assert.match(screen, /device\.display_name/);
-  assert.match(screen, /Find nearby devices/);
+  assert.match(screen, /\? "Refreshing…" : "Refresh"/);
+  assert.match(screen, /run\("create", onCreate\)/);
+  assert.match(screen, /A new Bridge and 8-digit code are created only after this explicit action/);
+  assert.doesNotMatch(screen, /useEffect[\s\S]{0,800}onCreate\(/);
   assert.doesNotMatch(screen, /Scan nearby.*disabled/);
   assert.doesNotMatch(screen, /Nearby discovery results are not exposed/);
   assert.match(app, /onListNearbyDevices=\{listNearbyDevices\}/);
   assert.match(app, /nearbyDiscoveryAvailable=\{hasTauriRuntime\(\)\}/);
   assert.match(app, /requestNearbyJoin\(deviceId\)/);
+});
+
+test("nearby refresh deduplicates one physical device without mutating Bridge state", () => {
+  const device: NearbyDevice = {
+    device_id: "device-a",
+    display_name: "Laptop",
+    platform: "macOS",
+    app_version: "1.9.2",
+    availability: "Available",
+    capabilities: ["nearby_join"],
+    last_seen_seconds_ago: 0,
+    compatible: true,
+  };
+  const duplicate = { ...device, display_name: "Laptop refreshed", last_seen_seconds_ago: 1 };
+  assert.deepEqual(uniqueNearbyDevices([device, duplicate]), [duplicate]);
+});
+
+test("Devices is inspection-only and navigation cannot create or join a Bridge", () => {
+  const screens = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
+  const workspace = readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8");
+  const devicesBody = screens.slice(screens.indexOf("export function DevicesScreen"), screens.indexOf("export function NewBridgeScreen"));
+  assert.doesNotMatch(devicesBody, /onCreate|onJoin|onListNearby|onJoinNearby|Add device|Find nearby/);
+  assert.match(devicesBody, /Device admission is not supported from this view/);
+  assert.match(workspace, /route === "devices" \? <DevicesScreen room=\{activeRoom\}/);
+});
+
+test("opening New Bridge is a choice view; creation is wired only to explicit Create", () => {
+  const screens = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
+  const workspace = readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8");
+  const bridge = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  assert.match(workspace, /route === "new-bridge" \? <NewBridgeScreen onCreate=\{createBridge\}/);
+  assert.match(screens, /onClick=\{\(\) => void run\("create", onCreate\)\}/);
+  assert.match(bridge, /onNewBridge/);
+  assert.doesNotMatch(bridge, /onCreateBridge|createRoom/);
+});
+
+test("selection reconciliation removes a burned Bridge and ignores late snapshots", () => {
+  const active = room(true);
+  const other = { ...room(false), id: "room-b" };
+  assert.equal(chooseInitialBridgeId([active, other], "room-a"), "room-a");
+  assert.equal(reconcileSelectedBridgeId("room-a", [active, other], new Set(["room-a"])), "");
+  assert.deepEqual(visibleBridgeRooms([active, other], new Set(["room-a"])).map((entry) => entry.id), ["room-b"]);
+  assert.equal(reconcileSelectedBridgeId("room-a", [active], new Set(["room-a"])), "");
+});
+
+test("Developer Mode stays inside the selected Bridge and receiver observation is token-free", () => {
+  const routeTypes = readFileSync("src/features/workspace/workspaceTypes.ts", "utf8");
+  const workspace = readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8");
+  const bridge = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  assert.doesNotMatch(routeTypes, /"developer"/);
+  assert.doesNotMatch(workspace, /route === "developer"/);
+  assert.match(workspace, /bridgeMode === "developer"/);
+  assert.match(bridge, /developerMode \? <DeveloperModeScreen/);
+  assert.match(workspace, /getDeveloperTerminalWorkspace\(roomId\)/);
+  assert.match(workspace, /Developer Mode request/);
+  assert.match(workspace, />Deny</);
+  assert.match(workspace, /Accept/);
+});
+
+test("Bridge send selection never falls back from a stale session to another peer", () => {
+  const bridge = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  assert.match(bridge, /peers\.find\(\(peer\) => peer\.peerSessionId === selectedPeerId\) \?\? null/);
+  assert.doesNotMatch(bridge, /peerSessionId === selectedPeerId\) \?\? peers\[0\]/);
 });
 
 test("nearby polling and native subscriptions have explicit remount cleanup", () => {

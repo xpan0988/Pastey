@@ -53,6 +53,9 @@ button { color: inherit; }
 
 .v2-main { position: relative; grid-column: 2; grid-row: 1; min-width: 0; min-height: 0; overflow: hidden; border-bottom: 1px solid #37373c; }
 .v2-global-message { position: absolute; z-index: 4; top: 12px; left: 16px; right: 16px; margin: 0; padding: 8px 12px; border: 1px solid #725d2f; border-radius: 6px; background: #2d271b; color: #efc563; font-size: 12px; }
+.v2-admission-banner { margin: 12px 18px 0; padding: 12px 14px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 1px solid #b44b55; border-radius: 9px; background: #2c2025; }
+.v2-admission-banner p { margin: 4px 0 0; color: #c7bec5; font-size: 11px; }
+.v2-admission-banner > div:last-child { display: flex; gap: 8px; }
 
 .v2-context-panel {
   grid-column: 3;
@@ -257,6 +260,7 @@ button { color: inherit; }
 .v2-terminal > header strong { display: flex; align-items: center; gap: 8px; }
 .v2-terminal > header span { color: #42d48a; font-size: 10px; text-transform: uppercase; }
 .v2-terminal > p { padding: 18px; color: #aaa8b0; font-size: 12px; }
+.v2-terminal > footer { padding: 9px 12px; display: flex; justify-content: flex-end; border-top: 1px solid #303037; }
 .v2-terminal-unavailable > p { color: #74727b; }
 .v2-developer-footnote { color: #777680; font-size: 10px; }
 .v2-developer-context { margin: 0 0 14px; padding: 13px 11px; display: grid; gap: 8px; border: 1px solid #e34955; border-radius: 10px; background: #222225; }
