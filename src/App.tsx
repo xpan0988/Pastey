@@ -14,7 +14,6 @@ import {
   getFileTransferMetadata,
   getRoom,
   joinRoom,
-  leaveRoom,
   listNearbyDevices,
   listRoomItems,
   listRooms,
@@ -212,6 +211,7 @@ function App() {
       try {
         const nextRooms = await listRooms();
         const visibleRooms = nextRooms.filter((room) => room.status !== "burned");
+        const visibleRoomIds = new Set(visibleRooms.map((room) => room.id));
         const settled = await Promise.allSettled(visibleRooms.map(async (room) => ({
           roomId: room.id,
           items: await listRoomItems(room.id),
@@ -228,7 +228,7 @@ function App() {
         setRooms((current) => reconcileRooms(current, nextRooms));
         setActivityRoomItems((current) => reconcileRoomItems(
           current,
-          [...nextActivityItems, ...current.filter((item) => !successfulRoomIds.has(item.room_id))]
+          [...nextActivityItems, ...current.filter((item) => visibleRoomIds.has(item.room_id) && !successfulRoomIds.has(item.room_id))]
             .sort((left, right) => right.created_at - left.created_at),
         ));
 
@@ -1341,14 +1341,19 @@ function App() {
     });
   }
 
-  async function handleLeaveOrBurnBridge(room: RoomInfo, action: "leave" | "burn") {
-    emitRuntimeWindowSummariesForRoom(room.id, "interrupted", action === "leave" ? "bridge_left" : "bridge_burned");
+  async function handleBurnBridge(room: RoomInfo) {
+    emitRuntimeWindowSummariesForRoom(room.id, "interrupted", "bridge_burned");
     updateSchedulerState((current) => clearQueuedItemsForRoom(current, room.id));
-    if (action === "leave") {
-      await leaveRoom(room.id);
-    } else {
+    let burnError: unknown = null;
+    try {
       await burnRoom(room.id);
+    } catch (error) {
+      burnError = error;
     }
+
+    // The backend cuts authority off before cleanup. Clear renderer-owned
+    // projections even when a later cleanup step reports an error, so a
+    // partially cleaned Bridge cannot remain usable or readable in the UI.
     closedRoomIdsRef.current.add(room.id);
     setView({ screen: "primary" });
     if (activeBridgeRoomIdRef.current === room.id) {
@@ -1356,10 +1361,16 @@ function App() {
     }
     setCurrentRoom(null);
     setRoomItems([]);
+    setActivityRoomItems((current) => current.filter((item) => item.room_id !== room.id));
     const remainingTransfers = Object.fromEntries(Object.entries(transfersRef.current).filter(([, transfer]) => transfer.room_id !== room.id));
     transfersRef.current = remainingTransfers;
     setTransfers(remainingTransfers);
-    await refreshRooms();
+    try {
+      await refreshRooms();
+    } catch (error) {
+      burnError ??= error;
+    }
+    if (burnError) setError(burnError instanceof Error ? burnError.message : String(burnError));
   }
 
   async function handleCreateBridge() {
@@ -1456,8 +1467,8 @@ function App() {
         onOpenBridge={openRoom}
         onRefreshBridge={refreshCurrentRoom}
         onRevealInFolder={revealInFolder}
-        onLeaveBridge={(room) => handleLeaveOrBurnBridge(room, "leave")}
-        onBurnBridge={(room) => handleLeaveOrBurnBridge(room, "burn")}
+        onBurnBridge={handleBurnBridge}
+        onConfigChange={setConfig}
         onEnqueueTransferInputs={enqueueRoomTransferInputs}
       />
     </div>

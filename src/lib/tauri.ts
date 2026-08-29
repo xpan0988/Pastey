@@ -425,10 +425,6 @@ export async function burnRoom(roomId: string): Promise<boolean> {
   return invoke("burn_room", { roomId });
 }
 
-export async function leaveRoom(roomId: string): Promise<boolean> {
-  return invoke("leave_room", { roomId });
-}
-
 export async function getConfig(): Promise<AppConfig> {
   return invoke("get_config");
 }

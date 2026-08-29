@@ -162,12 +162,22 @@ pub fn create_room(
     expires_at_override: Option<i64>,
 ) -> AppResult<StoredRoom> {
     let id = room_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    if is_burned_bridge(paths, &id)? {
+        return Err(AppError::InvalidInput("Bridge is burned.".into()));
+    }
+    let existing_room = get_room_by_id(paths, &id).is_ok();
+    if existing_room {
+        ensure_bridge_payload_key(paths, master_key, &id)?;
+    } else {
+        let key = crypto::random_key();
+        write_bridge_payload_key(paths, master_key, &id, &key)?;
+    }
     let now = now_ts();
     let _ = expiry_minutes;
     let expires_at = expires_at_override.unwrap_or(now + MANUAL_BURN_ROOM_LIFETIME_SECS);
     let (wrapped_room_code, code_nonce) = crypto::wrap_bytes(code.as_bytes(), master_key)?;
     let room = StoredRoom {
-        id,
+        id: id.clone(),
         room_code_hash: crypto::hash_code(code),
         created_at: now,
         expires_at,
@@ -185,7 +195,7 @@ pub fn create_room(
     };
 
     let conn = connection(paths)?;
-    conn.execute(
+    if let Err(error) = conn.execute(
         r#"
         INSERT INTO rooms (
             id,
@@ -231,7 +241,12 @@ pub fn create_room(
             room.local_burned_at,
             room.peer_burned_at
         ],
-    )?;
+    ) {
+        if !existing_room {
+            let _ = delete_bridge_payload_key(paths, &id);
+        }
+        return Err(error.into());
+    }
 
     get_room_by_id(paths, &room.id)
 }
@@ -930,6 +945,18 @@ pub fn set_room_status(paths: &AppPaths, room_id: &str, status: RoomStatus) -> A
 
 pub fn list_room_items(paths: &AppPaths, room_id: &str) -> AppResult<Vec<StoredRoomItem>> {
     let conn = connection(paths)?;
+    let active = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rooms WHERE id = ?1 AND status != 'burned')",
+        [room_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if active == 0 {
+        return Ok(Vec::new());
+    }
+    list_room_items_query(&conn, room_id)
+}
+
+fn list_room_items_query(conn: &Connection, room_id: &str) -> AppResult<Vec<StoredRoomItem>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT
@@ -978,6 +1005,11 @@ pub fn get_room_item_by_id(paths: &AppPaths, item_id: &str) -> AppResult<StoredR
             saved_path
         FROM room_items
         WHERE id = ?1
+          AND EXISTS(
+              SELECT 1 FROM rooms
+              WHERE rooms.id = room_items.room_id
+                AND rooms.status != 'burned'
+          )
         "#,
         [item_id],
         row_to_room_item,
@@ -988,7 +1020,7 @@ pub fn get_room_item_by_id(paths: &AppPaths, item_id: &str) -> AppResult<StoredR
 pub fn room_item_exists(paths: &AppPaths, item_id: &str) -> AppResult<bool> {
     let conn = connection(paths)?;
     let exists = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM room_items WHERE id = ?1)",
+        "SELECT EXISTS(SELECT 1 FROM room_items JOIN rooms ON rooms.id = room_items.room_id WHERE room_items.id = ?1 AND rooms.status != 'burned')",
         [item_id],
         |row| row.get::<_, i64>(0),
     )?;
@@ -1241,6 +1273,10 @@ pub fn finalize_burned_room(
     if !is_burned_bridge(paths, room_id)? {
         return Err(AppError::InvalidInput("Bridge is not burned.".into()));
     }
+    // Remove the only Bridge-specific wrapping key before any remaining
+    // cleanup can fail. Deleted ciphertext or SQLite pages are no longer
+    // decryptable through retained Pastey key state after this point.
+    delete_bridge_payload_key(paths, room_id)?;
     // Bridge Plan data is Bridge-scoped workspace history. It must be removed
     // after the authority cutoff and before the room can be finalized. Any
     // deletion failure leaves the burned tombstone in place for retry.
@@ -1380,13 +1416,126 @@ pub fn encrypted_file_path(paths: &AppPaths, relative_path: &str) -> PathBuf {
     paths.app_data_dir.join(relative_path)
 }
 
+fn bridge_payload_dir(paths: &AppPaths, room_id: &str) -> AppResult<PathBuf> {
+    if room_id.is_empty()
+        || room_id == "."
+        || room_id == ".."
+        || room_id.contains('/')
+        || room_id.contains('\\')
+    {
+        return Err(AppError::InvalidInput("invalid Bridge identifier".into()));
+    }
+    Ok(paths.payloads_dir.join(room_id))
+}
+
+fn bridge_payload_key_path(paths: &AppPaths, room_id: &str) -> AppResult<PathBuf> {
+    Ok(bridge_payload_dir(paths, room_id)?.join(".bridge-key"))
+}
+
+fn write_bridge_payload_key(
+    paths: &AppPaths,
+    master_key: &[u8; 32],
+    room_id: &str,
+    bridge_key: &[u8; 32],
+) -> AppResult<()> {
+    let path = bridge_payload_key_path(paths, room_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let (wrapped, nonce) = crypto::wrap_bytes(bridge_key, master_key)?;
+    fs::write(path, format!("{wrapped}\n{nonce}"))?;
+    Ok(())
+}
+
+fn read_bridge_payload_key(
+    paths: &AppPaths,
+    room_id: &str,
+    master_key: &[u8; 32],
+) -> AppResult<[u8; 32]> {
+    let encoded = fs::read_to_string(bridge_payload_key_path(paths, room_id)?)?;
+    let (wrapped, nonce) = encoded
+        .trim()
+        .split_once('\n')
+        .ok_or_else(|| AppError::Crypto("invalid Bridge payload key record".into()))?;
+    let bytes = crypto::unwrap_bytes(wrapped, nonce, master_key)?;
+    bytes
+        .try_into()
+        .map_err(|_| AppError::Crypto("Bridge payload key had invalid length".into()))
+}
+
+fn delete_bridge_payload_key(paths: &AppPaths, room_id: &str) -> AppResult<()> {
+    remove_file_if_exists(&bridge_payload_key_path(paths, room_id)?)?;
+    Ok(())
+}
+
+/// Creates the per-Bridge wrapping key and upgrades legacy item key records in
+/// place. The installation master key remains only the wrapper for this key;
+/// Burn can therefore remove the Bridge key without rotating unrelated Bridges.
+pub fn migrate_bridge_payload_keys(paths: &AppPaths, master_key: &[u8; 32]) -> AppResult<()> {
+    for room in list_rooms(paths)? {
+        ensure_bridge_payload_key(paths, master_key, &room.id)?;
+    }
+    Ok(())
+}
+
+fn ensure_bridge_payload_key(
+    paths: &AppPaths,
+    master_key: &[u8; 32],
+    room_id: &str,
+) -> AppResult<[u8; 32]> {
+    let bridge_key = match read_bridge_payload_key(paths, room_id, master_key) {
+        Ok(key) => key,
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            let key = crypto::random_key();
+            write_bridge_payload_key(paths, master_key, room_id, &key)?;
+            key
+        }
+        Err(error) => return Err(error),
+    };
+
+    let items = list_room_items(paths, room_id)?;
+    let mut conn = connection(paths)?;
+    let tx = conn.transaction()?;
+    for item in items {
+        if crypto::unwrap_bytes(&item.wrapped_key, &item.key_nonce, &bridge_key).is_ok() {
+            continue;
+        }
+        let legacy_key = crypto::unwrap_bytes(&item.wrapped_key, &item.key_nonce, master_key)?;
+        let (wrapped_key, key_nonce) = crypto::wrap_bytes(&legacy_key, &bridge_key)?;
+        tx.execute(
+            "UPDATE room_items SET wrapped_key = ?1, key_nonce = ?2 WHERE id = ?3",
+            params![wrapped_key, key_nonce, item.id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(bridge_key)
+}
+
 pub fn read_room_code(room: &StoredRoom, master_key: &[u8; 32]) -> AppResult<String> {
     let bytes = crypto::unwrap_bytes(&room.wrapped_room_code, &room.code_nonce, master_key)?;
     String::from_utf8(bytes).map_err(Into::into)
 }
 
-pub fn read_room_item_key(item: &StoredRoomItem, master_key: &[u8; 32]) -> AppResult<[u8; 32]> {
-    let bytes = crypto::unwrap_bytes(&item.wrapped_key, &item.key_nonce, master_key)?;
+pub fn read_room_item_key(
+    paths: &AppPaths,
+    item: &StoredRoomItem,
+    master_key: &[u8; 32],
+) -> AppResult<[u8; 32]> {
+    let wrapping_key = match read_bridge_payload_key(paths, &item.room_id, master_key) {
+        Ok(key) => key,
+        // Items written before per-Bridge keys were introduced remain readable
+        // until their room is migrated at startup or explicitly burned.
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            if is_burned_bridge(paths, &item.room_id)? {
+                return Err(AppError::Crypto(
+                    "Bridge payload key is unavailable.".into(),
+                ));
+            }
+            *master_key
+        }
+        Err(error) => return Err(error),
+    };
+    let bytes = crypto::unwrap_bytes(&item.wrapped_key, &item.key_nonce, &wrapping_key)?;
     bytes
         .try_into()
         .map_err(|_| AppError::Crypto("payload key had invalid length".into()))
@@ -1514,7 +1663,7 @@ fn decode_legacy_text_item(
     master_key: &[u8; 32],
     item: &StoredRoomItem,
 ) -> AppResult<String> {
-    let key = read_room_item_key(item, master_key)
+    let key = read_room_item_key(paths, item, master_key)
         .map_err(|_| AppError::InvalidInput("Could not decode received text".into()))?;
     let nonce = crypto::decode_nonce(&item.nonce)
         .map_err(|_| AppError::InvalidInput("Could not decode received text".into()))?;
@@ -1690,10 +1839,11 @@ fn persist_room_item_with_size(
         fs::create_dir_all(parent)?;
     }
 
+    let wrapping_key = read_bridge_payload_key(paths, room_id, master_key)?;
     let payload_key = crypto::random_key();
     let (ciphertext, payload_nonce) = crypto::encrypt_bytes(plaintext, &payload_key)?;
     fs::write(&absolute_path, ciphertext)?;
-    let (wrapped_key, key_nonce) = crypto::wrap_bytes(&payload_key, master_key)?;
+    let (wrapped_key, key_nonce) = crypto::wrap_bytes(&payload_key, &wrapping_key)?;
     let (created_at, saved_path) = created_saved_override.unwrap_or_else(|| (now_ts(), None));
 
     let item = StoredRoomItem {
@@ -1956,11 +2106,18 @@ fn delete_payload_file(paths: &AppPaths, relative_path: &str) -> AppResult<()> {
 }
 
 fn delete_room_files(paths: &AppPaths, room_id: &str, effective_inbox_dir: &Path) -> AppResult<()> {
-    let items = list_room_items(paths, room_id)?;
+    let conn = connection(paths)?;
+    let items = list_room_items_query(&conn, room_id)?;
     for item in items {
         delete_room_item_payload(paths, room_id, &item)?;
         delete_room_item_transient_saved_file(paths, room_id, &item)?;
         delete_room_item_part_files(paths, room_id, effective_inbox_dir, &item)?;
+    }
+    drop(conn);
+    let payload_dir = bridge_payload_dir(paths, room_id)?;
+    if payload_dir.exists() {
+        fs::remove_dir_all(payload_dir)
+            .map_err(|_| AppError::InvalidInput(ROOM_FILE_DELETE_ERROR.into()))?;
     }
     Ok(())
 }
@@ -3563,6 +3720,16 @@ mod tests {
 
         burn_room(&paths, "room", &paths.inbox_dir).unwrap();
         assert!(is_burned_bridge(&paths, "room").unwrap());
+        assert!(create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .is_err());
         assert!(set_room_status(&paths, "room", RoomStatus::Active).is_err());
         assert!(get_room_by_id(&paths, "room").is_err());
         assert!(persist_incoming_file_item_metadata(
@@ -3578,6 +3745,120 @@ mod tests {
         )
         .is_err());
         assert!(list_room_items(&paths, "room").unwrap().is_empty());
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn ordinary_restart_preserves_active_bridge_and_received_text() {
+        let paths = test_paths("pastey_restart_preserves_bridge_content");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        persist_incoming_item(
+            &paths,
+            &master_key,
+            "room",
+            "clipboard-text",
+            PayloadType::Text,
+            b"ordinary restart content",
+            None,
+            Some("text/plain".into()),
+            now_ts(),
+            None,
+        )
+        .unwrap();
+
+        // A normal Host restart is not Burn: durable Bridge history remains
+        // readable until the explicit destructive lifecycle action occurs.
+        init_database(&paths).unwrap();
+        run_startup_recovery(&paths, &paths.inbox_dir).unwrap();
+        assert_eq!(list_rooms(&paths).unwrap().len(), 1);
+        let items = list_room_items(&paths, "room").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            room_item_to_info(&paths, &master_key, items[0].clone())
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("ordinary restart content")
+        );
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn burned_bridge_content_is_absent_after_restart_and_bridge_key_erasure() {
+        let paths = test_paths("pastey_burn_restart_content");
+        init_database(&paths).unwrap();
+        let master_key = crypto::random_key();
+        create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some("room".into()),
+            None,
+        )
+        .unwrap();
+        let item = persist_incoming_item(
+            &paths,
+            &master_key,
+            "room",
+            "clipboard-text",
+            PayloadType::Text,
+            b"bug bash native send",
+            None,
+            Some("text/plain".into()),
+            now_ts(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            room_item_to_info(&paths, &master_key, item.clone())
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("bug bash native send")
+        );
+        assert!(paths.payloads_dir.join("room").join(".bridge-key").exists());
+
+        burn_room(&paths, "room", &paths.inbox_dir).unwrap();
+
+        // Re-run the storage/startup boundary to exercise the same observable
+        // projections used by the Host after a restart.
+        init_database(&paths).unwrap();
+        run_startup_recovery(&paths, &paths.inbox_dir).unwrap();
+        assert!(list_rooms(&paths).unwrap().is_empty());
+        assert!(list_room_items(&paths, "room").unwrap().is_empty());
+        assert!(!paths.payloads_dir.join("room").exists());
+        assert!(read_room_item_key(&paths, &item, &master_key).is_err());
+        // A detached pre-Burn item object cannot expose plaintext after Burn;
+        // its renderer conversion reports a failed decode with no text.
+        let detached_info = room_item_to_info(&paths, &master_key, item).unwrap();
+        assert_eq!(detached_info.text, None);
+        assert_eq!(detached_info.status, RoomItemStatus::Failed);
+        let detached = persist_incoming_item(
+            &paths,
+            &master_key,
+            "room",
+            "must-not-revive",
+            PayloadType::Text,
+            b"should fail",
+            None,
+            Some("text/plain".into()),
+            now_ts(),
+            None,
+        );
+        assert!(detached.is_err());
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 }

@@ -462,7 +462,7 @@ pub async fn send_room_item_to_bridge_peer_endpoint(
         let config = state.config.read();
         config::master_key(&config)?
     };
-    let payload_key = storage::read_room_item_key(&item, &master_key)?;
+    let payload_key = storage::read_room_item_key(&state.paths, &item, &master_key)?;
     let snapshot = room_server_snapshot(&state, room_id)?;
     let receiver_public_key = crypto::decode_key(&endpoint.transport_public_key)?;
     let (wrapped_session_key, transport_nonce, sender_public_key) =
@@ -686,7 +686,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
         let config = state.config.read();
         config::master_key(&config)?
     };
-    let payload_key = storage::read_room_item_key(&item, &master_key)?;
+    let payload_key = storage::read_room_item_key(&state.paths, &item, &master_key)?;
     let snapshot = room_server_snapshot(&state, room_id)?;
     let receiver_public_key = crypto::decode_key(&endpoint.transport_public_key)?;
     let (wrapped_session_key, transport_nonce, sender_public_key) =

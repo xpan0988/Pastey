@@ -18,12 +18,12 @@ interface BridgeWorkspaceProps {
   onCreate: () => void;
   onJoin: () => void;
   onRefresh: () => Promise<void>;
-  onLeave: (room: RoomInfo) => Promise<void>;
+  onDeveloper: () => void;
   onBurn: (room: RoomInfo) => Promise<void>;
   onEnqueue: (roomId: string, inputs: TransferQueueInput[]) => void;
 }
 
-export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoin, onRefresh, onLeave, onBurn, onEnqueue }: BridgeWorkspaceProps) {
+export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoin, onRefresh, onDeveloper, onBurn, onEnqueue }: BridgeWorkspaceProps) {
   const [composerMode, setComposerMode] = useState<"send" | "task">("send");
   const [text, setText] = useState("");
   const [selectedPeerId, setSelectedPeerId] = useState("");
@@ -83,14 +83,8 @@ export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoi
 
   async function burnBridge() {
     if (!room) return;
-    const confirmed = window.confirm(`Burn Bridge ${bridgeCode(room)}?\n\nThis permanently removes local Bridge state. It does not cancel a task or end a Developer Mode session.`);
+    const confirmed = window.confirm(`Burn Bridge ${bridgeCode(room)}?\n\nThis permanently removes the Bridge content, membership, authority, and current-session state from this device. Explicitly saved user-owned files remain outside Bridge storage.`);
     if (confirmed) await onBurn(room);
-  }
-
-  async function leaveBridge() {
-    if (!room) return;
-    const confirmed = window.confirm(`Leave Bridge ${bridgeCode(room)}?\n\nThis device will leave the current Bridge session. Received user-owned files remain. This does not burn the Bridge or cancel a managed task.`);
-    if (confirmed) await onLeave(room);
   }
 
   if (!room) return <EmptyBridge onCreate={onCreate} onJoin={onJoin} />;
@@ -103,9 +97,12 @@ export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoi
     <section className="v2-workspace-page">
       <header className="v2-workspace-header">
         <div><h1>Bridge {bridgeCode(room)}</h1><p>{bridgeDeviceCount(room)} devices · current-session workspace</p></div>
-        {task.status && ["checking_readiness", "preparing", "running"].includes(task.status.state)
-          ? <button type="button" className="v2-button" disabled={task.busy !== null} onClick={() => void task.cancel()}>{task.busy === "cancel" ? "Cancelling…" : "Stop task"}</button>
-          : <div className="v2-bridge-session-actions"><button type="button" className="v2-button" onClick={() => void leaveBridge()}>Leave</button><button type="button" className="v2-button danger" onClick={() => void burnBridge()}>Burn</button></div>}
+        <div className="v2-bridge-session-actions">
+          {task.status && ["checking_readiness", "preparing", "running"].includes(task.status.state)
+            ? <button type="button" className="v2-button" disabled={task.busy !== null} onClick={() => void task.cancel()}>{task.busy === "cancel" ? "Cancelling…" : "Stop task"}</button>
+            : null}
+          <button type="button" className="v2-button danger" onClick={() => void burnBridge()}>Burn</button>
+        </div>
       </header>
       <div className="v2-thread-shell">
         <div className="v2-thread">
@@ -131,6 +128,7 @@ export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoi
           task={task}
           onFiles={() => void chooseFiles()}
           onSend={() => void sendText()}
+          onDeveloper={onDeveloper}
         />
         {message || task.message ? <p className="v2-error" role="status">{message ?? task.message}</p> : null}
       </div>
@@ -189,7 +187,7 @@ function ResultCard({ task }: { task: AgentTaskController }) {
   );
 }
 
-function TaskComposer({ mode, onMode, text, onText, peers, selectedPeerId, onPeer, disabled, task, onFiles, onSend }: {
+function TaskComposer({ mode, onMode, text, onText, peers, selectedPeerId, onPeer, disabled, task, onFiles, onSend, onDeveloper }: {
   mode: "send" | "task";
   onMode: (mode: "send" | "task") => void;
   text: string;
@@ -201,6 +199,7 @@ function TaskComposer({ mode, onMode, text, onText, peers, selectedPeerId, onPee
   task: AgentTaskController;
   onFiles: () => void;
   onSend: () => void;
+  onDeveloper: () => void;
 }) {
   return (
     <section className="v2-composer">
@@ -213,10 +212,10 @@ function TaskComposer({ mode, onMode, text, onText, peers, selectedPeerId, onPee
         <button type="button" className="v2-square-button" disabled={mode === "send" && disabled} onClick={mode === "send" ? onFiles : undefined}>＋</button>
         <label className="v2-mode-select"><select value={mode} onChange={(event) => onMode(event.target.value as "send" | "task")}><option value="send">Send</option><option value="task">Task</option></select></label>
         {mode === "send" ? (
-          <><label className="v2-target-select"><select value={selectedPeerId} onChange={(event) => onPeer(event.target.value)} disabled={!peers.length}>{peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></label><button type="button" className="v2-send-button" disabled={disabled || !text.trim()} onClick={onSend}>↑</button></>
+          <><label className="v2-target-select"><select value={selectedPeerId} onChange={(event) => onPeer(event.target.value)} disabled={!peers.length}>{peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></label><button type="button" className="v2-developer-button" onClick={onDeveloper}>Developer Mode</button><button type="button" className="v2-send-button" disabled={disabled || !text.trim()} onClick={onSend}>↑</button></>
         ) : <><span className="v2-plan-scope">Whole Plan · PM selects Hosts</span><button type="button" className="v2-send-button" disabled={task.busy !== null || (!task.status && !task.revisionInput.trim())} onClick={() => void (task.status ? task.refresh() : task.openRevision())}>{task.status ? "↻" : "↑"}</button></>}
       </div>
-      <small className="v2-composer-help">{mode === "send" ? "Send mode targets one selected device. Agent Tasks use the whole Plan scope." : "Task mode opens an authoritative immutable Draft; it is not permanently bound to the Send destination."}</small>
+      <small className="v2-composer-help">{mode === "send" ? "Send mode targets one selected device. Developer Mode is human-only current-session terminal access; it does not grant Agent, Plan, or Execute authority." : "Agent Tasks use the whole Plan scope. Task mode opens an authoritative immutable Draft; it is not permanently bound to the Send destination."}</small>
     </section>
   );
 }

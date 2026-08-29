@@ -11,15 +11,6 @@ interface BridgeNavigationProps {
   onOpenBridge: (room: RoomInfo) => void;
 }
 
-export function WindowTitlebar({ title }: { title: string }) {
-  return (
-    <header className="v2-window-titlebar">
-      <span className="v2-window-controls" aria-hidden="true"><i /><i /><i /></span>
-      <span>{title}</span>
-    </header>
-  );
-}
-
 export function BridgeNavigation({ route, rooms, activeRoom, inboxCount, onNavigate, onOpenBridge }: BridgeNavigationProps) {
   const activeRooms = rooms.filter((room) => room.status !== "burned");
   return (
@@ -28,6 +19,9 @@ export function BridgeNavigation({ route, rooms, activeRoom, inboxCount, onNavig
       <button type="button" className="v2-new-bridge" onClick={() => onNavigate("new-bridge")}>＋ New Bridge</button>
       <button type="button" className={`v2-nav-item ${route === "inbox" ? "active" : ""}`} onClick={() => onNavigate("inbox")}>
         <span>↓&nbsp;&nbsp;Inbox</span>{inboxCount > 0 ? <b>{inboxCount}</b> : null}
+      </button>
+      <button type="button" className={`v2-nav-item ${route === "devices" ? "active" : ""}`} onClick={() => onNavigate("devices")}>
+        <span>▣&nbsp;&nbsp;Devices</span>
       </button>
       <p className="v2-nav-label">Bridges</p>
       <div className="v2-bridge-list">
@@ -80,7 +74,7 @@ export function BridgeContextPanel({ room, route, activeCount, pendingCount, tas
         <span><strong>Activity</strong><small>{activeCount} active · {pendingCount} pending</small></span><b>→</b>
       </button>
       <button type="button" className={`v2-context-link ${route === "devices" ? "active" : ""}`} onClick={() => onNavigate("devices")}>
-        <span><strong>Devices</strong><small>{deviceCount} connected</small></span><b>{route === "devices" ? "⌃" : "⌄"}</b>
+        <span><strong>Devices</strong><small>{deviceCount} current members</small></span><b>→</b>
       </button>
       {room ? (
         <div className="v2-context-devices">

@@ -3578,6 +3578,7 @@ pub(crate) async fn burn_bridge_scope(
     {
         cleanup_error.get_or_insert(error);
     }
+    state.clear_terminal_transfer_reasons();
     let effective_inbox_dir = {
         let config = state.config.read();
         config::effective_inbox_dir(&state.paths, &config)
@@ -3591,7 +3592,10 @@ pub(crate) async fn burn_bridge_scope(
     Ok(true)
 }
 
-#[tauri::command]
+// Kept as an internal compatibility path for older protocol departure
+// messages. Burn is the only normal product lifecycle action; this command is
+// deliberately not registered with Tauri and has no renderer binding.
+#[allow(dead_code)]
 pub async fn leave_room(room_id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
     run_async(async move {
         let state = state.inner().clone();

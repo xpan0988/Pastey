@@ -32,35 +32,9 @@ export interface WorkspaceV2Props {
   onOpenBridge: (room: RoomInfo) => Promise<void>;
   onRefreshBridge: () => Promise<void>;
   onRevealInFolder: (path: string) => Promise<void>;
-  onLeaveBridge: (room: RoomInfo) => Promise<void>;
   onBurnBridge: (room: RoomInfo) => Promise<void>;
+  onConfigChange: (config: AppConfig) => void;
   onEnqueueTransferInputs: (roomId: string, inputs: TransferQueueInput[]) => void;
 }
 
 export type NavigateWorkspace = (route: WorkspaceRoute) => void;
-
-export const SETTINGS_ROUTES = new Set<WorkspaceRoute>([
-  "settings",
-  "settings-diagnostics",
-  "settings-provider",
-  "settings-transfer",
-  "settings-troubleshooting",
-  "settings-about",
-]);
-
-export function routeTitle(route: WorkspaceRoute): string {
-  return ({
-    bridge: "Bridge Overview",
-    activity: "Activity",
-    devices: "Devices Expanded",
-    "new-bridge": "New Bridge / Join",
-    developer: "Developer Mode",
-    inbox: "Inbox",
-    settings: "Settings",
-    "settings-diagnostics": "Diagnostics",
-    "settings-provider": "Task Provider",
-    "settings-transfer": "Transfer Diagnostics",
-    "settings-troubleshooting": "Troubleshooting",
-    "settings-about": "About",
-  })[route];
-}
