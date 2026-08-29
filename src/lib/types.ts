@@ -102,6 +102,7 @@ export interface DeveloperTerminalPendingRequest {
   terminalSessionId: string;
   controllerHostRef: string;
   targetHostRef: string;
+  requestingPeerSessionId: string;
   expiresAt: number;
 }
 

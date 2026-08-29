@@ -6,8 +6,10 @@ import { legacyRoomToBridgePeerCollection } from "../../lib/bridgeRoomAdapter";
 import { sendTextToRoom } from "../../lib/tauri";
 import type { TransferQueueInput, TransferQueueItem } from "../../lib/transferScheduler";
 import type { RoomInfo, RoomItem } from "../../lib/types";
+import type { DeveloperModeUiSession, DeveloperTerminalWorkspace } from "../../lib/types";
 import type { AgentTaskController } from "./AgentTaskLifecycle";
 import { StatusBadge } from "./AgentTaskLifecycle";
+import { DeveloperModeScreen } from "./DeveloperModeScreen";
 import { bridgeCode, bridgeDeviceCount, fileName, formatBytes, formatClock, roomPeers } from "./workspaceViewModel";
 
 interface BridgeWorkspaceProps {
@@ -15,22 +17,28 @@ interface BridgeWorkspaceProps {
   items: RoomItem[];
   queueItems: TransferQueueItem[];
   task: AgentTaskController;
-  onCreate: () => void;
-  onJoin: () => void;
+  developerMode: boolean;
+  developerSession: DeveloperModeUiSession | null;
+  developerWorkspace: DeveloperTerminalWorkspace;
+  onDeveloperSession: (session: DeveloperModeUiSession) => void;
+  onRefreshDeveloper: () => Promise<void>;
+  onNewBridge: () => void;
   onRefresh: () => Promise<void>;
   onDeveloper: () => void;
   onBurn: (room: RoomInfo) => Promise<void>;
   onEnqueue: (roomId: string, inputs: TransferQueueInput[]) => void;
 }
 
-export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoin, onRefresh, onDeveloper, onBurn, onEnqueue }: BridgeWorkspaceProps) {
+export function BridgeWorkspace({ room, items, queueItems, task, developerMode, developerSession, developerWorkspace, onDeveloperSession, onRefreshDeveloper, onNewBridge, onRefresh, onDeveloper, onBurn, onEnqueue }: BridgeWorkspaceProps) {
   const [composerMode, setComposerMode] = useState<"send" | "task">("send");
   const [text, setText] = useState("");
   const [selectedPeerId, setSelectedPeerId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const peers = useMemo(() => roomPeers(room), [room]);
-  const selectedPeer = peers.find((peer) => peer.peerSessionId === selectedPeerId) ?? peers[0] ?? null;
+  // A stale selection is temporarily unavailable until the selection effect
+  // adopts the fresh exact peer id. Never route one render through peers[0].
+  const selectedPeer = peers.find((peer) => peer.peerSessionId === selectedPeerId) ?? null;
 
   useEffect(() => {
     if (!peers.some((peer) => peer.peerSessionId === selectedPeerId)) setSelectedPeerId(peers[0]?.peerSessionId ?? "");
@@ -87,7 +95,7 @@ export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoi
     if (confirmed) await onBurn(room);
   }
 
-  if (!room) return <EmptyBridge onCreate={onCreate} onJoin={onJoin} />;
+  if (!room) return <EmptyBridge onNewBridge={onNewBridge} />;
 
   const recent = items.filter((item) => item.room_id === room.id).slice(0, 4);
   const queued = queueItems.filter((item) => item.roomId === room.id && ["queued", "preparing", "sending"].includes(item.status));
@@ -96,15 +104,16 @@ export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoi
   return (
     <section className="v2-workspace-page">
       <header className="v2-workspace-header">
-        <div><h1>Bridge {bridgeCode(room)}</h1><p>{bridgeDeviceCount(room)} devices · current-session workspace</p></div>
+        <div><h1>Bridge {bridgeCode(room)}</h1><p>{bridgeDeviceCount(room)} devices · {developerMode ? "Developer Mode workspace" : "current-session workspace"}</p></div>
         <div className="v2-bridge-session-actions">
+          {developerMode ? <button type="button" className="v2-button" onClick={onDeveloper}>Bridge workspace</button> : null}
           {task.status && ["checking_readiness", "preparing", "running"].includes(task.status.state)
             ? <button type="button" className="v2-button" disabled={task.busy !== null} onClick={() => void task.cancel()}>{task.busy === "cancel" ? "Cancelling…" : "Stop task"}</button>
             : null}
           <button type="button" className="v2-button danger" onClick={() => void burnBridge()}>Burn</button>
         </div>
       </header>
-      <div className="v2-thread-shell">
+      {developerMode ? <DeveloperModeScreen room={room} session={developerSession} workspace={developerWorkspace} onSession={onDeveloperSession} onRefresh={onRefreshDeveloper} /> : <div className="v2-thread-shell">
         <div className="v2-thread">
           {hasManagedTask ? <TaskConversation task={task} /> : (
             <>
@@ -131,7 +140,7 @@ export function BridgeWorkspace({ room, items, queueItems, task, onCreate, onJoi
           onDeveloper={onDeveloper}
         />
         {message || task.message ? <p className="v2-error" role="status">{message ?? task.message}</p> : null}
-      </div>
+      </div>}
     </section>
   );
 }
@@ -212,7 +221,7 @@ function TaskComposer({ mode, onMode, text, onText, peers, selectedPeerId, onPee
         <button type="button" className="v2-square-button" disabled={mode === "send" && disabled} onClick={mode === "send" ? onFiles : undefined}>＋</button>
         <label className="v2-mode-select"><select value={mode} onChange={(event) => onMode(event.target.value as "send" | "task")}><option value="send">Send</option><option value="task">Task</option></select></label>
         {mode === "send" ? (
-          <><label className="v2-target-select"><select value={selectedPeerId} onChange={(event) => onPeer(event.target.value)} disabled={!peers.length}>{peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></label><button type="button" className="v2-developer-button" onClick={onDeveloper}>Developer Mode</button><button type="button" className="v2-send-button" disabled={disabled || !text.trim()} onClick={onSend}>↑</button></>
+          <><label className="v2-target-select"><select value={selectedPeerId} onChange={(event) => onPeer(event.target.value)} disabled={!peers.length}>{peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></label><button type="button" className="v2-developer-button" disabled={!peers.length} onClick={onDeveloper}>Developer Mode</button><button type="button" className="v2-send-button" disabled={disabled || !text.trim()} onClick={onSend}>↑</button></>
         ) : <><span className="v2-plan-scope">Whole Plan · PM selects Hosts</span><button type="button" className="v2-send-button" disabled={task.busy !== null || (!task.status && !task.revisionInput.trim())} onClick={() => void (task.status ? task.refresh() : task.openRevision())}>{task.status ? "↻" : "↑"}</button></>}
       </div>
       <small className="v2-composer-help">{mode === "send" ? "Send mode targets one selected device. Developer Mode is human-only current-session terminal access; it does not grant Agent, Plan, or Execute authority." : "Agent Tasks use the whole Plan scope. Task mode opens an authoritative immutable Draft; it is not permanently bound to the Send destination."}</small>
@@ -229,6 +238,6 @@ export function TransferMessage({ name, status }: { name: string; status: string
   return <article className="v2-message-card"><div><i className="v2-dot live" /><strong>{name}</strong><small>{status.replace(/_/g, " ")}</small></div><div className="v2-progress-track"><i /></div></article>;
 }
 
-function EmptyBridge({ onCreate, onJoin }: { onCreate: () => void; onJoin: () => void }) {
-  return <section className="v2-empty-bridge"><h1>No Bridge selected</h1><p>Create a current-session Bridge, or join one with its 8-digit code.</p><div><button type="button" className="v2-button primary" onClick={onCreate}>New Bridge</button><button type="button" className="v2-button" onClick={onJoin}>Join with code</button></div></section>;
+function EmptyBridge({ onNewBridge }: { onNewBridge: () => void }) {
+  return <section className="v2-empty-bridge"><h1>No Bridge selected</h1><p>Open New Bridge to choose Nearby, join by code, or explicitly create a code.</p><div><button type="button" className="v2-button primary" onClick={onNewBridge}>New Bridge</button></div></section>;
 }

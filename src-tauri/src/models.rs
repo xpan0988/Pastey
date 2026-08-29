@@ -508,6 +508,10 @@ pub struct DiscoveryRequest {
     pub kind: String,
     pub request_id: String,
     pub room_code_hash: String,
+    #[serde(default)]
+    pub requester_device_id: Option<String>,
+    #[serde(default)]
+    pub expected_room_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

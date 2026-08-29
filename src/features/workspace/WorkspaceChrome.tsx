@@ -1,5 +1,5 @@
 import type { RoomInfo } from "../../lib/types";
-import { bridgeCode, bridgeLabel, roomPeers } from "./workspaceViewModel";
+import { bridgeCode, bridgeLabel, roomMembers } from "./workspaceViewModel";
 import type { NavigateWorkspace, WorkspaceRoute } from "./workspaceTypes";
 
 interface BridgeNavigationProps {
@@ -26,7 +26,7 @@ export function BridgeNavigation({ route, rooms, activeRoom, inboxCount, onNavig
       <p className="v2-nav-label">Bridges</p>
       <div className="v2-bridge-list">
         {activeRooms.map((room) => (
-          <button key={room.id} type="button" className={`v2-bridge-nav ${activeRoom?.id === room.id && !route.startsWith("settings") && route !== "inbox" && route !== "new-bridge" ? "active" : ""}`} onClick={() => onOpenBridge(room)}>
+          <button key={room.id} type="button" className={`v2-bridge-nav ${activeRoom?.id === room.id && route === "bridge" ? "active" : ""}`} onClick={() => onOpenBridge(room)}>
             <i className={room.peer_connected ? "connected" : ""} />
             <span>{bridgeLabel(room)}</span>
           </button>
@@ -53,15 +53,16 @@ interface BridgeContextPanelProps {
 }
 
 export function BridgeContextPanel({ room, route, activeCount, pendingCount, taskSummary, onNavigate }: BridgeContextPanelProps) {
-  const peers = roomPeers(room);
+  const peers = roomMembers(room);
   const deviceCount = room ? peers.length + 1 : 0;
+  const peerState = room?.peer_connected ? "Connected" : peers.some((peer) => peer.liveness === "reconnecting") ? "Reconnecting" : peers.some((peer) => peer.liveness === "disconnected") ? "Disconnected" : room ? "Waiting" : "Unavailable";
   return (
     <aside className="v2-context-panel">
       <p className="v2-eyebrow">Current Bridge</p>
-      <div className="v2-context-status"><span><i className={`v2-dot ${room?.peer_connected ? "connected" : ""}`} /> {room?.peer_connected ? "Connected" : room ? "Waiting" : "Unavailable"}</span><small>{room ? bridgeCode(room) : "No Bridge selected"}</small></div>
+      <div className="v2-context-status"><span><i className={`v2-dot ${room?.peer_connected ? "connected" : peerState === "Reconnecting" ? "pending" : ""}`} /> {peerState}</span><small>{room ? bridgeCode(room) : "No Bridge selected"}</small></div>
       <div className="v2-context-section">
         <small>Network</small>
-        <strong><i className={`v2-dot ${room?.peer_connected ? "connected" : ""}`} /> {room ? (room.peer_connected ? "Local network · Ready" : "Awaiting a connected device") : "Host data unavailable"}</strong>
+        <strong><i className={`v2-dot ${room?.peer_connected ? "connected" : ""}`} /> {room ? (room.peer_connected ? "Local network · Ready" : peers.length > 0 ? "No routeable peer session" : "Awaiting a connected device") : "Host data unavailable"}</strong>
         <small>Session</small>
         <strong><i className="v2-dot pending" /> Current session only</strong>
       </div>

@@ -825,7 +825,12 @@ pub async fn join_room(code: String, state: State<'_, Arc<AppState>>) -> Result<
     run_async(async move {
         let compact = normalize_code(&code)?;
         let room_code_hash = crypto::hash_code(&compact);
-        let (source, discovered) = discovery::discover_room(room_code_hash).await?;
+        let (source, discovered) = discovery::discover_room(
+            room_code_hash,
+            Some(discovery::local_device_id(state.inner())),
+            None,
+        )
+        .await?;
         let master_key = {
             let config = state.config.read();
             config::master_key(&config)?

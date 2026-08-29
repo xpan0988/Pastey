@@ -73,6 +73,7 @@ import { formatBridgeRouteErrorForUser } from "./lib/bridgeRouting";
 import { mergeTransferEvent } from "./lib/transferState";
 import { mergeRoomItems, reconcileRoomItems, reconcileRooms, reconcileValue } from "./lib/authoritativeSnapshots";
 import { disposeAll, ownAsyncDisposer } from "./lib/subscriptionLifecycle";
+import { chooseInitialBridgeId, reconcileSelectedBridgeId, visibleBridgeRooms } from "./lib/bridgeSelection";
 import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, RoomInfo, RoomItem } from "./lib/types";
 
 type View =
@@ -104,6 +105,8 @@ const BROWSER_PREVIEW_CONFIG: AppConfig = {
   app_data_path: "",
   app_version: "2.0 preview",
 };
+
+const SELECTED_BRIDGE_STORAGE_KEY = "pastey:selected-bridge-v1";
 
 function hasTauriRuntime(): boolean {
   return typeof window !== "undefined" && (
@@ -137,6 +140,7 @@ function App() {
   const [transfers, setTransfers] = useState<Record<string, FileTransferProgressEvent>>({});
   const [scheduler, setScheduler] = useState<TransferSchedulerState>(() => createTransferSchedulerState());
   const [joinRequest, setJoinRequest] = useState<JoinRequestPrompt | null>(null);
+  const [joinRequestBusy, setJoinRequestBusy] = useState<string | null>(null);
   const [workspaceFocusRequest, setWorkspaceFocusRequest] = useState<{ target: "home" | "settings"; token: number }>({ target: "home", token: 0 });
   const [error, setError] = useState<string | null>(null);
   const closedRoomIdsRef = useRef<Set<string>>(new Set());
@@ -187,10 +191,13 @@ function App() {
       try {
         const [nextConfig, nextRooms] = await Promise.all([getConfig(), listRooms()]);
         setConfig(nextConfig);
-        setRooms((current) => reconcileRooms(current, nextRooms));
-        const connected = nextRooms.filter((room) => room.peer_connected);
-        if (connected.length === 1) {
-          setActiveBridgeRoomId((current) => current || connected[0].id);
+        const visibleRooms = visibleBridgeRooms(nextRooms, closedRoomIdsRef.current);
+        setRooms((current) => reconcileRooms(current, visibleRooms));
+        const selectedRoomId = chooseInitialBridgeId(visibleRooms, window.localStorage.getItem(SELECTED_BRIDGE_STORAGE_KEY));
+        if (selectedRoomId) {
+          activeBridgeRoomIdRef.current = selectedRoomId;
+          setActiveBridgeRoomId(selectedRoomId);
+          setCurrentRoom(visibleRooms.find((room) => room.id === selectedRoomId) ?? null);
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
@@ -199,6 +206,11 @@ function App() {
 
     void load();
   }, []);
+
+  useEffect(() => {
+    if (activeBridgeRoomId) window.localStorage.setItem(SELECTED_BRIDGE_STORAGE_KEY, activeBridgeRoomId);
+    else window.localStorage.removeItem(SELECTED_BRIDGE_STORAGE_KEY);
+  }, [activeBridgeRoomId]);
 
   useEffect(() => {
     if (!hasTauriRuntime()) return;
@@ -210,7 +222,7 @@ function App() {
       inFlight = true;
       try {
         const nextRooms = await listRooms();
-        const visibleRooms = nextRooms.filter((room) => room.status !== "burned");
+        const visibleRooms = visibleBridgeRooms(nextRooms, closedRoomIdsRef.current);
         const visibleRoomIds = new Set(visibleRooms.map((room) => room.id));
         const settled = await Promise.allSettled(visibleRooms.map(async (room) => ({
           roomId: room.id,
@@ -225,7 +237,7 @@ function App() {
         const nextActivityItems = [...itemsByRoom.values()]
           .flat()
           .sort((left, right) => right.created_at - left.created_at);
-        setRooms((current) => reconcileRooms(current, nextRooms));
+        setRooms((current) => reconcileRooms(current, visibleRooms));
         setActivityRoomItems((current) => reconcileRoomItems(
           current,
           [...nextActivityItems, ...current.filter((item) => visibleRoomIds.has(item.room_id) && !successfulRoomIds.has(item.room_id))]
@@ -238,8 +250,10 @@ function App() {
           return;
         }
 
-        const nextRoom = nextRooms.find((room) => room.id === activeBridgeRoomId) ?? null;
-        if (!nextRoom) {
+        const reconciledRoomId = reconcileSelectedBridgeId(activeBridgeRoomId, visibleRooms, closedRoomIdsRef.current);
+        const nextRoom = visibleRooms.find((room) => room.id === reconciledRoomId) ?? null;
+        if (!reconciledRoomId || !nextRoom) {
+          activeBridgeRoomIdRef.current = "";
           setActiveBridgeRoomId("");
           setCurrentRoom(null);
           setRoomItems([]);
@@ -258,6 +272,7 @@ function App() {
           message === "File is no longer available."
         ) {
           setActiveBridgeRoomId("");
+          activeBridgeRoomIdRef.current = "";
           setCurrentRoom(null);
           setRoomItems([]);
           await refreshRooms();
@@ -516,11 +531,12 @@ function App() {
 
   async function refreshRooms(selectedRoomId?: string): Promise<RoomInfo | null> {
     const nextRooms = await listRooms();
-    setRooms((current) => reconcileRooms(current, nextRooms));
+    const visibleRooms = visibleBridgeRooms(nextRooms, closedRoomIdsRef.current);
+    setRooms((current) => reconcileRooms(current, visibleRooms));
 
     if (selectedRoomId) {
-      const match = nextRooms.find((room) => room.id === selectedRoomId) ?? null;
-      setCurrentRoom(match);
+      const match = visibleRooms.find((room) => room.id === selectedRoomId) ?? null;
+      if (activeBridgeRoomIdRef.current === selectedRoomId && !closedRoomIdsRef.current.has(selectedRoomId)) setCurrentRoom(match);
       return match;
     }
 
@@ -529,10 +545,14 @@ function App() {
 
   async function openRoom(room: RoomInfo) {
     closedRoomIdsRef.current.delete(room.id);
+    activeBridgeRoomIdRef.current = room.id;
     setActiveBridgeRoomId(room.id);
+    setCurrentRoom(room);
+    setRoomItems([]);
     setView({ screen: "bridge-detail", roomId: room.id });
     try {
       const [nextRoom, nextItems] = await Promise.all([getRoom(room.id), listRoomItems(room.id)]);
+      if (closedRoomIdsRef.current.has(room.id) || activeBridgeRoomIdRef.current !== room.id) return;
       setCurrentRoom(nextRoom);
       setRoomItems((current) => reconcileRoomItems(current, nextItems));
       setActivityRoomItems((current) => mergeRoomItems(current, nextItems));
@@ -548,6 +568,7 @@ function App() {
     if (!targetRoomId) return;
     try {
       const [nextRoom, nextItems] = await Promise.all([getRoom(targetRoomId), listRoomItems(targetRoomId)]);
+      if (closedRoomIdsRef.current.has(targetRoomId) || activeBridgeRoomIdRef.current !== targetRoomId) return;
       setCurrentRoom(nextRoom);
       setRoomItems((current) => reconcileRoomItems(current, nextItems));
       setActivityRoomItems((current) => mergeRoomItems(current, nextItems));
@@ -556,6 +577,7 @@ function App() {
         setView({ screen: "primary" });
         if (activeBridgeRoomIdRef.current === targetRoomId) {
           setActiveBridgeRoomId("");
+          activeBridgeRoomIdRef.current = "";
         }
         setRoomItems([]);
       }
@@ -569,6 +591,7 @@ function App() {
         setView({ screen: "primary" });
         if (activeBridgeRoomIdRef.current === targetRoomId) {
           setActiveBridgeRoomId("");
+          activeBridgeRoomIdRef.current = "";
         }
         setCurrentRoom(null);
         setRoomItems([]);
@@ -1344,19 +1367,13 @@ function App() {
   async function handleBurnBridge(room: RoomInfo) {
     emitRuntimeWindowSummariesForRoom(room.id, "interrupted", "bridge_burned");
     updateSchedulerState((current) => clearQueuedItemsForRoom(current, room.id));
-    let burnError: unknown = null;
-    try {
-      await burnRoom(room.id);
-    } catch (error) {
-      burnError = error;
-    }
-
-    // The backend cuts authority off before cleanup. Clear renderer-owned
-    // projections even when a later cleanup step reports an error, so a
-    // partially cleaned Bridge cannot remain usable or readable in the UI.
+    // Close the renderer projection before awaiting backend cleanup. Backend
+    // Burn cuts authority first; this local tombstone also rejects late polls
+    // and events while the command is still completing.
     closedRoomIdsRef.current.add(room.id);
     setView({ screen: "primary" });
     if (activeBridgeRoomIdRef.current === room.id) {
+      activeBridgeRoomIdRef.current = "";
       setActiveBridgeRoomId("");
     }
     setCurrentRoom(null);
@@ -1365,6 +1382,12 @@ function App() {
     const remainingTransfers = Object.fromEntries(Object.entries(transfersRef.current).filter(([, transfer]) => transfer.room_id !== room.id));
     transfersRef.current = remainingTransfers;
     setTransfers(remainingTransfers);
+    let burnError: unknown = null;
+    try {
+      await burnRoom(room.id);
+    } catch (error) {
+      burnError = error;
+    }
     try {
       await refreshRooms();
     } catch (error) {
@@ -1389,6 +1412,8 @@ function App() {
   }
 
   async function handleAcceptJoinRequest(request: JoinRequestPrompt) {
+    if (joinRequestBusy) return;
+    setJoinRequestBusy(request.request_id);
     try {
       const room = await acceptNearbyJoin(request.request_id);
       setJoinRequest(null);
@@ -1396,26 +1421,40 @@ function App() {
     } catch (err) {
       setJoinRequest(null);
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setJoinRequestBusy(null);
     }
   }
 
   useEffect(() => {
-    if (joinRequest) {
-      void markJoinPromptRendered();
+    if (!joinRequest) return;
+    void markJoinPromptRendered();
+    const remainingMs = (joinRequest.expires_at * 1_000) - Date.now();
+    if (remainingMs <= 0) {
+      setJoinRequest(null);
+      return;
     }
+    const timer = window.setTimeout(() => setJoinRequest((current) => current?.request_id === joinRequest.request_id ? null : current), remainingMs);
+    return () => window.clearTimeout(timer);
   }, [joinRequest]);
 
   async function handleRejectJoinRequest(request: JoinRequestPrompt) {
+    if (joinRequestBusy) return;
+    setJoinRequestBusy(request.request_id);
     try {
       await rejectNearbyJoin(request.request_id);
     } finally {
       setJoinRequest(null);
+      setJoinRequestBusy(null);
     }
   }
 
   async function handleConnectionJoined(room: RoomInfo) {
     closedRoomIdsRef.current.delete(room.id);
+    activeBridgeRoomIdRef.current = room.id;
     setActiveBridgeRoomId(room.id);
+    setCurrentRoom(room);
+    setRoomItems([]);
     setView({ screen: "primary" });
     await refreshRooms();
   }
@@ -1440,10 +1479,10 @@ function App() {
             </span>
           </div>
           <div className="row gap">
-            <button className="primary-button" onClick={() => void handleAcceptJoinRequest(joinRequest)}>
-              Accept
+            <button className="primary-button" disabled={joinRequestBusy !== null} onClick={() => void handleAcceptJoinRequest(joinRequest)}>
+              {joinRequestBusy ? "Responding…" : "Accept"}
             </button>
-            <button className="ghost-button" onClick={() => void handleRejectJoinRequest(joinRequest)}>
+            <button className="ghost-button" disabled={joinRequestBusy !== null} onClick={() => void handleRejectJoinRequest(joinRequest)}>
               Reject
             </button>
           </div>

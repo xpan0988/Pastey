@@ -34,6 +34,7 @@ const DISCOVERY_PORT: u16 = 48392;
 const BEACON_INTERVAL_SECS: u64 = 2;
 const BEACON_TTL_SECS: i64 = 12;
 const JOIN_REQUEST_TIMEOUT_SECS: u64 = 30;
+const JOIN_REQUEST_REPLAY_TTL_SECS: i64 = 300;
 const JOIN_REQUEST_CONNECT_TIMEOUT_SECS: u64 = 5;
 const JOIN_REQUEST_EVENT: &str = "pastey://join-request";
 
@@ -493,7 +494,11 @@ pub async fn send_join_response(
     Ok(())
 }
 
-pub async fn discover_room(room_code_hash: String) -> AppResult<(SocketAddr, DiscoveryResponse)> {
+pub async fn discover_room(
+    room_code_hash: String,
+    requester_device_id: Option<String>,
+    expected_room_id: Option<String>,
+) -> AppResult<(SocketAddr, DiscoveryResponse)> {
     let socket = UdpSocket::bind(("0.0.0.0", 0))
         .await
         .map_err(|error| AppError::Network(format!("unable to open discovery socket: {error}")))?;
@@ -505,6 +510,8 @@ pub async fn discover_room(room_code_hash: String) -> AppResult<(SocketAddr, Dis
         kind: "discover_room".to_string(),
         request_id: uuid::Uuid::new_v4().to_string(),
         room_code_hash,
+        requester_device_id,
+        expected_room_id,
     };
     let request_id = request.request_id.clone();
     let payload = serde_json::to_vec(&request)?;
@@ -564,12 +571,21 @@ async fn handle_room_discovery(
     let Ok(request) = serde_json::from_value::<DiscoveryRequest>(value) else {
         return;
     };
+    if request.requester_device_id.as_deref() == Some(local_device_id(&state).as_str()) {
+        return;
+    }
 
     let response = {
         let servers = state.active_servers.lock();
         servers
             .values()
-            .find(|server| server.room_code_hash == request.room_code_hash)
+            .find(|server| {
+                server.room_code_hash == request.room_code_hash
+                    && request
+                        .expected_room_id
+                        .as_deref()
+                        .map_or(true, |room_id| server.room_id == room_id)
+            })
             .map(|server| DiscoveryResponse {
                 kind: "room_offer".to_string(),
                 request_id: request.request_id.clone(),
@@ -655,6 +671,16 @@ fn surface_join_request(state: Arc<AppState>, request: NearbyJoinRequest, source
         logging::write_transfer_line("[pastey antenna] event=simultaneous_join_detected");
     }
     let now = storage::now_ts();
+    let expires_at = now + JOIN_REQUEST_TIMEOUT_SECS as i64;
+    if !claim_nearby_join_request(
+        &mut state.seen_nearby_join_requests.lock(),
+        &request.request_id,
+        now,
+        now + JOIN_REQUEST_REPLAY_TTL_SECS,
+    ) {
+        logging::write_transfer_line("[pastey antenna] event=join_request_replay_rejected");
+        return;
+    }
     let pending = PendingJoinRequest {
         request_id: request.request_id.clone(),
         source,
@@ -662,7 +688,7 @@ fn surface_join_request(state: Arc<AppState>, request: NearbyJoinRequest, source
         platform: request.platform,
         app_version: request.app_version,
         received_at: now,
-        expires_at: now + JOIN_REQUEST_TIMEOUT_SECS as i64,
+        expires_at,
     };
     let prompt = JoinRequestPrompt {
         request_id: pending.request_id.clone(),
@@ -681,6 +707,20 @@ fn surface_join_request(state: Arc<AppState>, request: NearbyJoinRequest, source
     ));
     let _ = state.emit(JOIN_REQUEST_EVENT, &prompt);
     logging::write_transfer_line("[pastey antenna] event=join_request_emitted_to_ui");
+}
+
+fn claim_nearby_join_request(
+    seen: &mut HashMap<String, i64>,
+    request_id: &str,
+    now: i64,
+    expires_at: i64,
+) -> bool {
+    seen.retain(|_, seen_expires_at| *seen_expires_at > now);
+    if request_id.trim().is_empty() || request_id.len() > 128 || seen.contains_key(request_id) {
+        return false;
+    }
+    seen.insert(request_id.to_string(), expires_at);
+    true
 }
 
 fn current_beacon(state: &Arc<AppState>) -> NearbyBeacon {
@@ -1046,6 +1086,15 @@ mod tests {
         assert!(response.room_id.is_none());
         assert!(response.room_code.is_none());
         assert!(response.transport_public_key.is_none());
+    }
+
+    #[test]
+    fn nearby_join_request_id_is_one_use_until_its_expiry() {
+        let mut seen = HashMap::new();
+        assert!(claim_nearby_join_request(&mut seen, "request-a", 10, 310));
+        assert!(!claim_nearby_join_request(&mut seen, "request-a", 40, 340));
+        assert!(claim_nearby_join_request(&mut seen, "request-a", 310, 610));
+        assert!(!claim_nearby_join_request(&mut seen, "", 310, 610));
     }
 
     #[test]

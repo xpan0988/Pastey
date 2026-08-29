@@ -64,6 +64,7 @@ pub struct PendingTerminalProjection {
     pub terminal_session_id: String,
     pub controller_host_ref: String,
     pub target_host_ref: String,
+    pub requesting_peer_session_id: String,
     pub expires_at: i64,
 }
 
@@ -299,7 +300,19 @@ impl DeveloperTerminalService {
     ) -> AppResult<TerminalMessage> {
         self.require_ui_session(ui_token, &binding.room_id, now)?;
         let terminal_session_id = format!("developer-terminal:{}", uuid::Uuid::new_v4());
-        self.state.lock().controller_sessions.insert(
+        let mut state = self.state.lock();
+        if state.controller_sessions.values().any(|session| {
+            session.binding.room_id == binding.room_id
+                && matches!(
+                    session.state,
+                    TerminalState::AwaitingAdmission | TerminalState::Active
+                )
+        }) {
+            return Err(AppError::InvalidInput(
+                "A Developer terminal request is already active for this Bridge.".into(),
+            ));
+        }
+        state.controller_sessions.insert(
             terminal_session_id.clone(),
             ControllerSession {
                 binding: binding.clone(),
@@ -760,6 +773,7 @@ impl DeveloperTerminalService {
                 terminal_session_id: id.clone(),
                 controller_host_ref: pending.binding.controller_host.0.clone(),
                 target_host_ref: pending.binding.target_host.0.clone(),
+                requesting_peer_session_id: pending.binding.peer_route_ref.clone(),
                 expires_at: pending.expires_at,
             })
             .collect();
@@ -1311,7 +1325,13 @@ mod tests {
         assert!(service
             .deny_open("wrong-token", &message.terminal_session_id, 10)
             .is_err());
-        assert_eq!(service.workspace("room", 10).pending_requests.len(), 1);
+        let receiver_workspace = service.workspace("room", 10);
+        assert_eq!(receiver_workspace.pending_requests.len(), 1);
+        assert_eq!(
+            receiver_workspace.pending_requests[0].requesting_peer_session_id,
+            "peer"
+        );
+        assert!(service.state.lock().host_sessions.is_empty());
         let host_ui = service.enter_mode("room", 10);
         let (_, denied) = service
             .deny_open(&host_ui.token, &message.terminal_session_id, 10)
@@ -1320,6 +1340,37 @@ mod tests {
         let workspace = service.workspace("room", 10);
         assert!(workspace.pending_requests.is_empty());
         assert_eq!(workspace.sessions[0].state, TerminalState::Denied);
+        assert!(service.state.lock().host_sessions.is_empty());
+    }
+
+    #[test]
+    fn pending_request_is_observable_without_receiver_ui_token_and_expires_closed() {
+        let service = DeveloperTerminalService::default();
+        let controller_ui = service.enter_mode("room", 10);
+        let message = service
+            .request_open(&controller_ui.token, binding(), 10)
+            .unwrap();
+        service
+            .receive_open_request(binding(), &message, 10)
+            .unwrap();
+
+        assert_eq!(service.workspace("room", 10).pending_requests.len(), 1);
+        assert!(service
+            .workspace("room", 10 + OPEN_REQUEST_TTL_SECONDS + 1)
+            .pending_requests
+            .is_empty());
+        let host_ui = service.enter_mode("room", 10 + OPEN_REQUEST_TTL_SECONDS + 1);
+        assert!(service
+            .accept_open(
+                &host_ui.token,
+                &message.terminal_session_id,
+                &binding(),
+                80,
+                24,
+                10 + OPEN_REQUEST_TTL_SECONDS + 1,
+            )
+            .is_err());
+        assert!(service.state.lock().host_sessions.is_empty());
     }
 
     #[test]
@@ -1333,6 +1384,29 @@ mod tests {
         assert!(service
             .receive_open_request(binding(), &message, 10)
             .is_err());
+    }
+
+    #[test]
+    fn duplicate_controller_request_is_rejected_until_the_first_is_terminal() {
+        let service = DeveloperTerminalService::default();
+        let controller_ui = service.enter_mode("room", 10);
+        let message = service
+            .request_open(&controller_ui.token, binding(), 10)
+            .unwrap();
+        assert!(service
+            .request_open(&controller_ui.token, binding(), 10)
+            .is_err());
+        service
+            .receive_open_request(binding(), &message, 10)
+            .unwrap();
+        let host_ui = service.enter_mode("room", 10);
+        let (_, denied) = service
+            .deny_open(&host_ui.token, &message.terminal_session_id, 10)
+            .unwrap();
+        service.receive_denied(&binding(), &denied).unwrap();
+        assert!(service
+            .request_open(&controller_ui.token, binding(), 11)
+            .is_ok());
     }
 
     #[test]

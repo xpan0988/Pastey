@@ -1,11 +1,24 @@
 import { getRouteableBridgePeers, type BridgePeerSession } from "../../lib/bridgePeers";
 import { legacyRoomToBridgePeerCollection } from "../../lib/bridgeRoomAdapter";
-import type { RoomInfo } from "../../lib/types";
+import type { NearbyDevice, RoomInfo } from "../../lib/types";
+
+export function uniqueNearbyDevices(devices: readonly NearbyDevice[]): NearbyDevice[] {
+  return [...new Map(devices.map((device) => [device.device_id, device])).values()];
+}
 
 export function roomPeers(room: RoomInfo | null): BridgePeerSession[] {
   if (!room) return [];
   try {
     return [...getRouteableBridgePeers(legacyRoomToBridgePeerCollection(room))];
+  } catch {
+    return [];
+  }
+}
+
+export function roomMembers(room: RoomInfo | null): BridgePeerSession[] {
+  if (!room) return [];
+  try {
+    return [...legacyRoomToBridgePeerCollection(room).peers];
   } catch {
     return [];
   }
@@ -17,11 +30,11 @@ export function bridgeCode(room: RoomInfo): string {
 }
 
 export function bridgeDeviceCount(room: RoomInfo): number {
-  return roomPeers(room).length + 1;
+  return roomMembers(room).length + 1;
 }
 
 export function bridgeLabel(room: RoomInfo): string {
-  const peers = roomPeers(room);
+  const peers = roomMembers(room);
   const summary = peers.length === 0
     ? "Waiting for device"
     : peers.length === 1

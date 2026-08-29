@@ -1,4 +1,9 @@
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+};
 
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -64,8 +69,12 @@ pub struct HostRuntime {
     pub discovery_handle: Mutex<Option<DiscoveryHandle>>,
     pub nearby_http_handle: Mutex<Option<NearbyHttpHandle>>,
     pub antenna_handle: Mutex<Option<DiscoveryHandle>>,
+    pub bridge_lifecycle_handle: Mutex<Option<DiscoveryHandle>>,
+    pub(crate) bridge_reconnect_attempts: Mutex<HashMap<String, u8>>,
+    pub(crate) bridge_reconnect_rotations: Mutex<HashSet<String>>,
     pub nearby_devices: Mutex<HashMap<String, discovery::NearbyDeviceRecord>>,
     pub pending_join_requests: Mutex<HashMap<String, discovery::PendingJoinRequest>>,
+    pub(crate) seen_nearby_join_requests: Mutex<HashMap<String, i64>>,
     pub outgoing_join_requests: Mutex<HashMap<String, discovery::OutgoingJoinRequest>>,
     pub terminal_transfer_reasons: Mutex<HashMap<String, transfer::TerminalTransferReason>>,
     pub diagnostics_refresh: tokio::sync::Mutex<()>,
@@ -167,8 +176,12 @@ impl HostRuntime {
             discovery_handle: Mutex::new(None),
             nearby_http_handle: Mutex::new(None),
             antenna_handle: Mutex::new(None),
+            bridge_lifecycle_handle: Mutex::new(None),
+            bridge_reconnect_attempts: Mutex::new(HashMap::new()),
+            bridge_reconnect_rotations: Mutex::new(HashSet::new()),
             nearby_devices: Mutex::new(HashMap::new()),
             pending_join_requests: Mutex::new(HashMap::new()),
+            seen_nearby_join_requests: Mutex::new(HashMap::new()),
             outgoing_join_requests: Mutex::new(HashMap::new()),
             terminal_transfer_reasons: Mutex::new(HashMap::new()),
             diagnostics_refresh: tokio::sync::Mutex::new(()),
@@ -335,6 +348,23 @@ impl HostRuntime {
         self.effect_authority.lock().revoke_all();
         self.managed_resources.lock().purge_all();
         self.developer_terminal.shutdown_all();
+        if let Some(handle) = self.bridge_lifecycle_handle.lock().take() {
+            let _ = handle.shutdown.send(());
+        }
+        if let Some(handle) = self.antenna_handle.lock().take() {
+            let _ = handle.shutdown.send(());
+        }
+        if let Some(handle) = self.discovery_handle.lock().take() {
+            let _ = handle.shutdown.send(());
+        }
+        if let Some(handle) = self.nearby_http_handle.lock().take() {
+            let _ = handle.shutdown.send(());
+        }
+        for mut server in self.active_servers.lock().drain().map(|(_, server)| server) {
+            if let Some(shutdown) = server.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+        }
     }
 
     pub(crate) fn register_worker_run(
