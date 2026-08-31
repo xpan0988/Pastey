@@ -54,7 +54,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) enum PlatformWorldKindV1 {
     MacOsSandboxExec,
     LinuxBubblewrapCgroupV2,
-    WindowsAppContainer,
+    WindowsRestrictedPrincipal,
     Unsupported,
 }
 
@@ -477,7 +477,7 @@ impl ExecutionWorldServiceV1 {
             availability.kind,
             PlatformWorldKindV1::MacOsSandboxExec
                 | PlatformWorldKindV1::LinuxBubblewrapCgroupV2
-                | PlatformWorldKindV1::WindowsAppContainer
+                | PlatformWorldKindV1::WindowsRestrictedPrincipal
         ) || request.requested_budget_slice.process_spawns != 1
             || request.requested_budget_slice.wall_millis == 0
         {
@@ -832,6 +832,7 @@ pub(crate) fn validate_invocation(invocation: &ManagedProcessInvocationV1) -> Ap
     {
         return invalid("Managed process invocation exceeds structural bounds.");
     }
+    let mut normalized_environment_names = BTreeSet::new();
     for (name, value) in &invocation.environment {
         let upper = name.to_ascii_uppercase();
         if name.is_empty()
@@ -867,6 +868,7 @@ pub(crate) fn validate_invocation(invocation: &ManagedProcessInvocationV1) -> Ap
             || upper.ends_with("_KEY")
             || upper.starts_with("LD_")
             || upper.starts_with("DYLD_")
+            || !normalized_environment_names.insert(upper)
         {
             return invalid("Managed process environment binding is unsafe.");
         }
@@ -990,7 +992,7 @@ fn spawn_platform_process(
     #[cfg(windows)] windows: Arc<crate::windows_execution_world::WindowsWorldV1>,
 ) -> AppResult<SpawnedPlatformProcessV1> {
     #[cfg(windows)]
-    if availability.kind == PlatformWorldKindV1::WindowsAppContainer {
+    if availability.kind == PlatformWorldKindV1::WindowsRestrictedPrincipal {
         let spawned = crate::windows_execution_world::spawn(
             windows,
             &executable.source_path,
@@ -1712,6 +1714,23 @@ mod tests {
         assert!(capture.exceeded.load(Ordering::SeqCst));
         assert!(capture.excerpt.lock().len() <= MAX_MODEL_PROCESS_EXCERPT_BYTES);
         assert!(capture.digest.lock().is_some());
+    }
+
+    #[test]
+    fn environment_names_are_unique_under_windows_case_folding() {
+        let executable_handle = serde_json::from_value(serde_json::json!("tool-handle")).unwrap();
+        let invocation = ManagedProcessInvocationV1 {
+            executable_handle,
+            argv: Vec::new(),
+            environment: BTreeMap::from([
+                ("PASTEY_MODE".into(), "one".into()),
+                ("pastey_mode".into(), "two".into()),
+            ]),
+            stdin: None,
+            working_directory_handle: None,
+            working_directory_selector: None,
+        };
+        assert!(validate_invocation(&invocation).is_err());
     }
 
     #[cfg(windows)]

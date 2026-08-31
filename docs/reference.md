@@ -59,6 +59,7 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 | Effect contracts and state | `src-tauri/src/effect_authority.rs` |
 | Resource backend | `src-tauri/src/managed_resources.rs` |
 | Process world | `src-tauri/src/execution_world.rs` |
+| Windows restricted-principal process backend and setup | `src-tauri/src/windows_execution_world.rs`; principal `PasteySandboxOffline`; firewall rule `pastey_sandbox_offline_block_outbound_v1`; setup command `--pastey-setup-windows-execution-world-v1` |
 | Network broker | `src-tauri/src/network_broker.rs` |
 | Core claim/result finalizer | `src-tauri/src/managed_execution.rs` |
 | Worker Harness/provider | `src-tauri/src/worker_harness.rs`, `worker_provider.rs` |
@@ -105,7 +106,7 @@ The frontend uses `@xterm/xterm` and `@xterm/addon-fit`. Host shell selection is
 | Natural proposals | `scripts/run-natural-v1-tests.mjs`, `scripts/run-natural-v2-tests.mjs`, Rust `natural_v2` tests |
 | Plan lifecycle and native-v2 orchestration | Rust `bridge_plan`, `bridge_plan_v2`, `native_v2_orchestration`, and `managed_worker_coordinator` tests |
 | Worker/provider/configuration | Rust `worker_harness`, `worker_provider`, and `worker_provider_config` tests |
-| Effects/results | Rust `effect_authority`, `managed_resources`, `execution_world`, `network_broker`, and `managed_execution` tests |
+| Effects/results | Rust `effect_authority`, `managed_resources`, `execution_world`, `network_broker`, and `managed_execution` tests; opt-in native Windows `windows_execution_world` integration test |
 | Layer 4 and transfer | `scripts/run-layer4-validation-matrix.mjs`, `scripts/run-transfer-planner-tests.mjs`, Rust transport/protocol tests |
 | Developer Terminal | Rust terminal/HostRuntime tests plus native physical platform checks |
 
