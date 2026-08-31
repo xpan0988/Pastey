@@ -30,9 +30,23 @@ npm run check:version
 git diff --check
 ```
 
-The Windows cross-check requires the GNU target and MinGW toolchain. It proves compilation, not native Windows confinement, safe-open behavior, packaging, or physical E2E.
+The Windows cross-check requires the GNU target and MinGW toolchain. It proves compilation, not native Windows confinement, safe-open behavior, machine setup, packaging, or physical E2E.
 
-On a native Windows checkout, run `cargo test --manifest-path src-tauri/Cargo.toml --test windows_execution_world -- --nocapture`. The integration test launches the actual Pastey product binary with its private verifier. Success requires the capabilityless AppContainer, exact staged-resource ACLs, stdio-only inherited-handle list, suspended-before-Job assignment, Job resource/process limits, unrelated-file denial, empty environment, descendant cleanup, and native `WSAEACCES` NoRawNetwork probe to pass. A failed or unavailable probe keeps managed Process execution unavailable; a GNU cross-build is never a substitute for this test.
+Windows managed Process execution first requires a one-time setup run by the same Windows user that will run Pastey. Build the product binary, open an elevated PowerShell in the checkout, and run:
+
+```powershell
+.\src-tauri\target\release\pastey.exe --pastey-setup-windows-execution-world-v1
+```
+
+The command reconciles `PasteySandboxOffline`, its deny-logon rights, the protected ProgramData roots/credential record, and the account-scoped outbound-block firewall rule. It prints `PASTEY_WINDOWS_EXECUTION_WORLD_SETUP_OK` only after reconciliation, firewall verification, and protected marker commit succeed. Re-running the command is safe for the same marker/account identity; substituted, stale, ineffective, or partially managed policy fails closed. Restart Pastey after setup so its process-local availability result is refreshed.
+
+Then run the opt-in native conformance test:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --test windows_execution_world -- --ignored --nocapture
+```
+
+The integration test launches the actual Pastey product binary with its private verifier. Success requires exact staged-resource ACLs, fresh cross-run logon-SID denial, a maximum-privilege-disabled `WRITE_RESTRICTED` Worker token, read-only input, writable scratch/output, Host/private-state denial, a Host-synthesized environment, per-run stdio pipes and stdio-only inherited-handle list, suspended-before-Job assignment, non-breakaway Job resource/process limits, full descendant cleanup, and native firewall `WSAEACCES` NoRawNetwork probes. A failed or unavailable probe keeps managed Process execution unavailable. This native test is the next evidence gate after automated validation; a GNU cross-build is never a substitute.
 
 ## Transfer and Layer 4 validation
 

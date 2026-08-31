@@ -115,7 +115,7 @@ Close/exit, disconnect, explicit departure, session replacement, Burn, shutdown,
 | --- | --- | --- | --- |
 | Search/Transfer safe identity and encrypted transfer | Implemented | Implemented where the desktop product is supported | Implemented; cross-compiled checks do not replace native proof |
 | Managed Resource effects | Implemented | Implemented | Implemented |
-| Managed contained Process execution | Available only after the local `sandbox-exec` confinement probe succeeds | Unavailable; fails closed | Adapter compiled; runtime availability requires the native product-binary AppContainer/ACL/handle-list/Job/NoRawNetwork conformance probe to succeed, otherwise fails closed |
+| Managed contained Process execution | Available only after the local `sandbox-exec` confinement probe succeeds | Unavailable; fails closed | Restricted-principal adapter implemented; availability requires elevated machine setup and the native product-binary ACL/restricted-token/firewall/handle-list/Job/NoRawNetwork conformance probe, otherwise fails closed |
 | Worker task Network effects | Not exposed | Not exposed | Not exposed |
 | Developer Terminal | Native PTY | Native PTY path | ConPTY/PowerShell |
 
