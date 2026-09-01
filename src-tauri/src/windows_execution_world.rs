@@ -65,9 +65,10 @@ use windows_sys::Win32::{
     },
     NetworkManagement::NetManagement::{
         NERR_Success, NERR_UserNotFound, NetApiBufferFree, NetUserAdd, NetUserGetInfo,
-        NetUserSetInfo, UF_DONT_EXPIRE_PASSWD, UF_NORMAL_ACCOUNT, UF_NOT_DELEGATED,
-        UF_PASSWD_CANT_CHANGE, UF_SCRIPT, USER_INFO_1, USER_INFO_1003, USER_INFO_1008, USER_INFO_4,
-        USER_PRIV_USER,
+        NetUserGetLocalGroups, NetUserSetInfo, LG_INCLUDE_INDIRECT, MAX_PREFERRED_LENGTH,
+        UF_DONT_EXPIRE_PASSWD, UF_NORMAL_ACCOUNT, UF_NOT_DELEGATED, UF_PASSWD_CANT_CHANGE,
+        UF_SCRIPT, USER_INFO_1, USER_INFO_1003, USER_INFO_1008, USER_INFO_4, USER_PRIV_ADMIN,
+        USER_PRIV_GUEST, USER_PRIV_USER,
     },
     Security::{
         AllocateAndInitializeSid,
@@ -141,8 +142,8 @@ use crate::{
     execution_world::{ExecutionWorldAvailabilityV1, PlatformWorldKindV1, EXECUTION_WORLD_VERSION},
     managed_resources::ExecutionWorldMountV1,
     windows_setup_state::{
-        select_setup_plan, validate_exact_local_user_identity, RecoveryEvidenceV1, RecoveryStageV1,
-        SetupEvidenceV1, SetupPlanV1,
+        select_setup_plan, validate_exact_local_user_identity, LegacyPrivilegeClassV1,
+        RecoveryEvidenceV1, RecoveryStageV1, SetupEvidenceV1, SetupPlanV1,
     },
 };
 
@@ -169,6 +170,19 @@ const ACCOUNT_SETUP_FLAGS: u32 = UF_SCRIPT
     | UF_DONT_EXPIRE_PASSWD
     | UF_PASSWD_CANT_CHANGE
     | UF_NOT_DELEGATED;
+const PRIVILEGED_LOCAL_GROUP_SIDS: &[&str] = &[
+    "S-1-5-32-544", // Administrators
+    "S-1-5-32-547", // Power Users
+    "S-1-5-32-548", // Account Operators
+    "S-1-5-32-549", // Server Operators
+    "S-1-5-32-550", // Print Operators
+    "S-1-5-32-551", // Backup Operators
+    "S-1-5-32-552", // Replicators
+    "S-1-5-32-555", // Remote Desktop Users
+    "S-1-5-32-556", // Network Configuration Operators
+    "S-1-5-32-578", // Hyper-V Administrators
+    "S-1-5-32-580", // Remote Management Users
+];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -223,7 +237,6 @@ struct LocalAccountV1 {
     name: String,
     sid: Vec<u8>,
     sid_string: String,
-    privilege: u32,
     comment: String,
     flags: u32,
     home_dir: String,
@@ -233,7 +246,6 @@ struct LocalAccountV1 {
 impl LocalAccountV1 {
     fn matches_legacy_partial_fingerprint(&self) -> bool {
         self.name.eq_ignore_ascii_case(SANDBOX_USERNAME)
-            && self.privilege == USER_PRIV_USER
             && self.comment == "Pastey managed Worker offline sandbox principal"
             && self.flags == ACCOUNT_SETUP_FLAGS
             && self.home_dir.is_empty()
@@ -1235,25 +1247,22 @@ fn validate_sandbox_base_token(token: &OwnedHandle) -> AppResult<()> {
     if token_user_sid(token)? != lookup_account_sid(SANDBOX_USERNAME)? {
         return unavailable("Windows sandbox bootstrap has the wrong principal identity.");
     }
-    for privileged_group in [
-        "S-1-5-32-544",
-        "S-1-5-32-547",
-        "S-1-5-32-548",
-        "S-1-5-32-549",
-        "S-1-5-32-550",
-        "S-1-5-32-551",
-        "S-1-5-32-552",
-        "S-1-5-32-556",
-        "S-1-5-32-578",
-        "S-1-5-32-580",
-    ] {
-        let sid = sid_from_string(privileged_group)?;
-        let mut member = 0;
-        if unsafe { CheckTokenMembership(raw(token), sid_ptr(&sid), &mut member) } == 0 {
-            return unavailable("Windows sandbox group-membership verification failed.");
-        }
-        if member != 0 {
-            return unavailable("Windows sandbox principal belongs to a privileged local group.");
+    reject_privileged_token_groups(token)
+}
+
+fn reject_privileged_token_groups(token: &OwnedHandle) -> AppResult<()> {
+    let buffer = token_information(token, TokenGroups)?;
+    let groups = unsafe { &*(buffer.as_ptr().cast::<TOKEN_GROUPS>()) };
+    let entries =
+        unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize) };
+    for privileged_group in PRIVILEGED_LOCAL_GROUP_SIDS {
+        let privileged_sid = sid_from_string(privileged_group)?;
+        for entry in entries {
+            if copy_sid(entry.Sid)? == privileged_sid {
+                return unavailable(
+                    "Windows sandbox principal belongs to a privileged local group.",
+                );
+            }
         }
     }
     Ok(())
@@ -2375,6 +2384,38 @@ impl Drop for NetApiBufferV1 {
     }
 }
 
+fn query_local_group_membership_count(name: &str) -> AppResult<u32> {
+    let name_wide = wide(name);
+    let mut buffer = ptr::null_mut();
+    let mut entries_read = 0_u32;
+    let mut total_entries = 0_u32;
+    let status = unsafe {
+        NetUserGetLocalGroups(
+            ptr::null(),
+            name_wide.as_ptr(),
+            0,
+            LG_INCLUDE_INDIRECT,
+            &mut buffer,
+            MAX_PREFERRED_LENGTH,
+            &mut entries_read,
+            &mut total_entries,
+        )
+    };
+    let _buffer = NetApiBufferV1(buffer);
+    if status != NERR_Success {
+        return net_api_failure(
+            "NetUserGetLocalGroups(local Pastey sandbox account)",
+            status,
+        );
+    }
+    if entries_read != total_entries {
+        return unavailable(
+            "NetUserGetLocalGroups returned incomplete local sandbox group membership.",
+        );
+    }
+    Ok(entries_read)
+}
+
 fn lookup_local_account(name: &str) -> AppResult<Option<LocalAccountV1>> {
     let name_wide = wide(name);
     let mut buffer = ptr::null_mut();
@@ -2393,11 +2434,21 @@ fn lookup_local_account(name: &str) -> AppResult<Option<LocalAccountV1>> {
     let returned_name = wide_ptr_string(info.usri4_name)?;
     let valid_sid =
         !info.usri4_user_sid.is_null() && unsafe { IsValidSid(info.usri4_user_sid) } != 0;
+    let local_group_membership_count = query_local_group_membership_count(name)?;
+    let legacy_privilege = match info.usri4_priv {
+        USER_PRIV_GUEST => LegacyPrivilegeClassV1::Guest,
+        USER_PRIV_USER => LegacyPrivilegeClassV1::User,
+        USER_PRIV_ADMIN => LegacyPrivilegeClassV1::Administrator,
+        _ => LegacyPrivilegeClassV1::Unknown,
+    };
     validate_exact_local_user_identity(
         name,
         &returned_name,
-        info.usri4_priv == USER_PRIV_USER,
         valid_sid,
+        legacy_privilege,
+        info.usri4_flags == ACCOUNT_SETUP_FLAGS,
+        info.usri4_auth_flags == 0,
+        local_group_membership_count,
     )
     .map_err(|reason| {
         AppError::InvalidInput(format!(
@@ -2410,7 +2461,6 @@ fn lookup_local_account(name: &str) -> AppResult<Option<LocalAccountV1>> {
         name: returned_name,
         sid,
         sid_string,
-        privilege: info.usri4_priv,
         comment: wide_ptr_string(info.usri4_comment)?,
         flags: info.usri4_flags,
         home_dir: wide_ptr_string(info.usri4_home_dir)?,
@@ -2479,7 +2529,7 @@ fn authenticate_local_account(password: &str, expected_sid: &[u8]) -> AppResult<
             "Windows sandbox credential proof returned a substituted principal identity.",
         );
     }
-    Ok(())
+    reject_privileged_token_groups(&token)
 }
 
 fn wide_ptr_string(value: *const u16) -> AppResult<String> {
