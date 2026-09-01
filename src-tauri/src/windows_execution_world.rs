@@ -887,7 +887,6 @@ fn spawn_runner_suspended(
     let args = vec![RUNNER_CLI.to_string(), control_pipe.to_string()];
     let mut command_line = windows_command_line(runner_path, &args);
     let cwd = wide_os(cwd.as_os_str());
-    let environment = [0_u16, 0_u16];
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
@@ -902,7 +901,7 @@ fn spawn_runner_suspended(
             runner_wide.as_ptr(),
             command_line.as_mut_ptr(),
             CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            environment.as_ptr().cast(),
+            trusted_bootstrap_environment(),
             cwd.as_ptr(),
             &startup,
             &mut process,
@@ -924,6 +923,12 @@ fn spawn_runner_suspended(
     let process_handle = unsafe { owned(process.hProcess)? };
     let thread_handle = unsafe { owned(process.hThread)? };
     Ok((process_handle, thread_handle))
+}
+
+fn trusted_bootstrap_environment() -> *const c_void {
+    // The bootstrap's Windows-created environment is transport-only and never
+    // contributes bindings to RunnerLaunchV1 or the restricted Worker.
+    ptr::null()
 }
 
 fn create_private_desktop(logon_sid: &[u8]) -> AppResult<(PrivateDesktopV1, String)> {
@@ -1091,7 +1096,7 @@ fn runner_main(control_pipe: &str) -> AppResult<()> {
     )?;
     let executable = wide_os(launch.executable.as_os_str());
     let mut command_line = windows_command_line(&launch.executable, &launch.argv);
-    let environment = environment_block(&launch.environment);
+    let environment = restricted_worker_environment_block(&launch);
     let cwd = launch.cwd.as_ref().map(|value| wide_os(value.as_os_str()));
     let mut desktop = wide(&desktop_name);
     let mut startup = STARTUPINFOEXW::default();
@@ -2690,6 +2695,10 @@ fn environment_block(environment: &BTreeMap<String, String>) -> Vec<u16> {
     block
 }
 
+fn restricted_worker_environment_block(launch: &RunnerLaunchV1) -> Vec<u16> {
+    environment_block(&launch.environment)
+}
+
 fn windows_command_line(executable: &Path, argv: &[String]) -> Vec<u16> {
     let mut value = quote_windows(executable.as_os_str());
     for argument in argv {
@@ -3255,6 +3264,29 @@ mod tests {
         assert_eq!(quote_windows(OsStr::new("a b")), "\"a b\"");
         assert_eq!(quote_windows(OsStr::new("a\\\"b")), "\"a\\\\\\\"b\"");
         assert_eq!(environment_block(&BTreeMap::new()), vec![0, 0]);
+    }
+
+    #[test]
+    fn bootstrap_and_worker_environment_sources_remain_distinct() {
+        assert!(trusted_bootstrap_environment().is_null());
+
+        let launch = RunnerLaunchV1 {
+            version: WINDOWS_WORLD_ADAPTER_VERSION.into(),
+            executable: PathBuf::from(r"C:\Pastey\worker.exe"),
+            argv: Vec::new(),
+            environment: BTreeMap::from([
+                ("PASTEY_ALLOWED_PROBE".into(), "ok".into()),
+                ("SYSTEMROOT".into(), r"C:\Windows".into()),
+            ]),
+            cwd: None,
+            stdin_pipe: "stdin".into(),
+            stdout_pipe: "stdout".into(),
+            stderr_pipe: "stderr".into(),
+        };
+
+        let block = String::from_utf16_lossy(&restricted_worker_environment_block(&launch));
+        assert_eq!(block, "PASTEY_ALLOWED_PROBE=ok\0SYSTEMROOT=C:\\Windows\0\0");
+        assert!(!block.contains("PASTEY_HOST_SECRET_SENTINEL"));
     }
 
     #[test]
