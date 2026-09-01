@@ -40,6 +40,8 @@ mod transfer_orchestration;
 mod transfer_tuning;
 #[cfg(windows)]
 mod windows_execution_world;
+#[cfg(any(windows, test))]
+mod windows_setup_state;
 mod worker_harness;
 mod worker_provider;
 mod worker_provider_config;

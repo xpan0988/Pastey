@@ -38,7 +38,7 @@ Windows managed Process execution first requires a one-time setup run by the sam
 .\src-tauri\target\release\pastey.exe --pastey-setup-windows-execution-world-v1
 ```
 
-The command reconciles `PasteySandboxOffline`, its deny-logon rights, the protected ProgramData roots/credential record, and the account-scoped outbound-block firewall rule. It prints `PASTEY_WINDOWS_EXECUTION_WORLD_SETUP_OK` only after reconciliation, firewall verification, and protected marker commit succeed. Re-running the command is safe for the same marker/account identity; substituted, stale, ineffective, or partially managed policy fails closed. Restart Pastey after setup so its process-local availability result is refreshed.
+The command resolves `PasteySandboxOffline` directly from the local Windows account database, then reconciles its deny-logon rights, the protected ProgramData roots/credential record, and the account-scoped outbound-block firewall rule. It writes an atomic, Host-user DPAPI-bound provisional record before creating or changing the account, binds that record to the exact local user SID after credential proof, and atomically commits `setup.json` only after reconciliation and firewall verification succeed. Re-running the command resumes an authenticated Pastey-created partial setup or revalidates the same final marker/account identity; unrelated pre-existing accounts and substituted or stale SIDs fail closed. A narrowly checked legacy recovery path covers an account created by the earlier setup implementation before it could write provisional state. Restart Pastey after setup so its process-local availability result is refreshed.
 
 Then run the opt-in native conformance test:
 

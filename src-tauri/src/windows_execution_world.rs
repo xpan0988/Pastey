@@ -64,9 +64,10 @@ use windows_sys::Win32::{
         STILL_ACTIVE,
     },
     NetworkManagement::NetManagement::{
-        NERR_Success, NERR_UserExists, NetUserAdd, NetUserSetInfo, UF_DONT_EXPIRE_PASSWD,
-        UF_NORMAL_ACCOUNT, UF_NOT_DELEGATED, UF_PASSWD_CANT_CHANGE, UF_SCRIPT, USER_INFO_1,
-        USER_INFO_1003, USER_INFO_1008, USER_PRIV_USER,
+        NERR_Success, NERR_UserNotFound, NetApiBufferFree, NetUserAdd, NetUserGetInfo,
+        NetUserSetInfo, UF_DONT_EXPIRE_PASSWD, UF_NORMAL_ACCOUNT, UF_NOT_DELEGATED,
+        UF_PASSWD_CANT_CHANGE, UF_SCRIPT, USER_INFO_1, USER_INFO_1003, USER_INFO_1008, USER_INFO_4,
+        USER_PRIV_USER,
     },
     Security::{
         AllocateAndInitializeSid,
@@ -84,12 +85,13 @@ use windows_sys::Win32::{
             CryptProtectData, CryptUnprotectData, CRYPTPROTECT_LOCAL_MACHINE,
             CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
         },
-        FreeSid, GetLengthSid, GetTokenInformation, IsTokenRestricted, LookupAccountNameW,
+        FreeSid, GetLengthSid, GetTokenInformation, IsTokenRestricted, IsValidSid, LogonUserW,
         TokenGroups, TokenUser, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-        DISABLE_MAX_PRIVILEGE, LUA_TOKEN, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_NT_AUTHORITY, SID_AND_ATTRIBUTES,
-        SID_NAME_USE, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY,
-        TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, WRITE_RESTRICTED,
+        DISABLE_MAX_PRIVILEGE, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LUA_TOKEN,
+        OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SECURITY_ATTRIBUTES, SECURITY_NT_AUTHORITY, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT,
+        TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_QUERY,
+        TOKEN_USER, WRITE_RESTRICTED,
     },
     Storage::FileSystem::{
         CreateFileW, MoveFileExW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
@@ -138,6 +140,10 @@ use crate::{
     error::{AppError, AppResult},
     execution_world::{ExecutionWorldAvailabilityV1, PlatformWorldKindV1, EXECUTION_WORLD_VERSION},
     managed_resources::ExecutionWorldMountV1,
+    windows_setup_state::{
+        select_setup_plan, validate_exact_local_user_identity, RecoveryEvidenceV1, RecoveryStageV1,
+        SetupEvidenceV1, SetupPlanV1,
+    },
 };
 
 const WINDOWS_WORLD_ADAPTER_VERSION: &str = "pastey-windows-restricted-principal-job-v1";
@@ -177,11 +183,26 @@ struct SetupMarkerV1 {
     firewall_rule_name: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SetupRecoveryV1 {
+    version: u32,
+    username: String,
+    host_sid: String,
+    encrypted_password: String,
+    managed_root: PathBuf,
+    runner_root: PathBuf,
+    firewall_rule_name: String,
+    stage: RecoveryStageV1,
+    account_sid: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct SetupPathsV1 {
     base: PathBuf,
     secrets: PathBuf,
     marker: PathBuf,
+    recovery: PathBuf,
     managed_root: PathBuf,
     runner_root: PathBuf,
 }
@@ -195,6 +216,29 @@ struct WindowsSetupV1 {
     administrators_sid: Vec<u8>,
     owner_rights_sid: Vec<u8>,
     paths: SetupPathsV1,
+}
+
+#[derive(Clone, Debug)]
+struct LocalAccountV1 {
+    name: String,
+    sid: Vec<u8>,
+    sid_string: String,
+    privilege: u32,
+    comment: String,
+    flags: u32,
+    home_dir: String,
+    script_path: String,
+}
+
+impl LocalAccountV1 {
+    fn matches_legacy_partial_fingerprint(&self) -> bool {
+        self.name.eq_ignore_ascii_case(SANDBOX_USERNAME)
+            && self.privilege == USER_PRIV_USER
+            && self.comment == "Pastey managed Worker offline sandbox principal"
+            && self.flags == ACCOUNT_SETUP_FLAGS
+            && self.home_dir.is_empty()
+            && self.script_path.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1353,6 +1397,7 @@ fn setup_paths() -> AppResult<SetupPathsV1> {
     let secrets = base.join("secrets");
     Ok(SetupPathsV1 {
         marker: secrets.join("setup.json"),
+        recovery: secrets.join("setup.provisional.json"),
         managed_root: base.join("runs"),
         runner_root: base.join("runner"),
         base,
@@ -1403,40 +1448,151 @@ fn run_elevated_setup() -> AppResult<()> {
     let host_token = current_process_query_token()?;
     let host_sid = token_user_sid(&host_token)?;
     let host_sid_string = sid_to_string(sid_ptr(&host_sid))?;
-    let existing = match fs::read(&paths.marker) {
-        Ok(bytes) => {
-            let marker: SetupMarkerV1 = serde_json::from_slice(&bytes)?;
-            if marker.version != SETUP_VERSION
-                || marker.username != SANDBOX_USERNAME
-                || marker.host_sid != host_sid_string
-                || marker.managed_root != paths.managed_root
-                || marker.runner_root != paths.runner_root
-                || marker.firewall_rule_name != FIREWALL_RULE_NAME
-            {
-                return unavailable(
-                    "Existing Windows ExecutionWorld setup belongs to a different identity or version.",
-                );
-            }
-            let account_sid = lookup_account_sid(SANDBOX_USERNAME)?;
-            if marker.account_sid != sid_to_string(sid_ptr(&account_sid))? {
-                return unavailable("Existing Windows sandbox principal identity was replaced.");
-            }
-            Some(marker)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    if existing.is_none() && lookup_account_sid(SANDBOX_USERNAME).is_ok() {
-        return unavailable(
-            "The Pastey sandbox principal already exists without a valid Pastey setup marker.",
-        );
+    let existing: Option<SetupMarkerV1> = read_optional_json(&paths.marker)?;
+    if let Some(marker) = existing.as_ref() {
+        validate_setup_marker(marker, &paths, &host_sid_string)?;
     }
-    let mut password = match existing.as_ref() {
-        Some(marker) => decrypt_password(&marker.encrypted_password)?,
-        None => generate_password(),
-    };
-    reconcile_account(&password)?;
-    let account_sid = lookup_account_sid(SANDBOX_USERNAME)?;
+    let recovery: Option<SetupRecoveryV1> = read_optional_json(&paths.recovery)?;
+    if let Some(provisional) = recovery.as_ref() {
+        validate_setup_recovery(provisional, &paths, &host_sid_string)?;
+    }
+    let local_account = lookup_local_account(SANDBOX_USERNAME)?;
+    // The prior implementation created the account before it created this
+    // ExecutionWorldV1 root. This one-time compatibility case is deliberately
+    // narrower than the account metadata alone so an arbitrary marker-less
+    // installation is never adopted.
+    let legacy_account_fingerprint = local_account
+        .as_ref()
+        .is_some_and(LocalAccountV1::matches_legacy_partial_fingerprint);
+    let legacy_fingerprint_matches = legacy_account_fingerprint
+        && (recovery.as_ref().is_some_and(|provisional| {
+            provisional.stage == RecoveryStageV1::LegacyPasswordRotationPending
+        }) || (existing.is_none() && recovery.is_none() && !paths.base.exists()));
+    let plan = select_setup_plan(SetupEvidenceV1 {
+        final_account_sid: existing.as_ref().map(|marker| marker.account_sid.clone()),
+        recovery: recovery.as_ref().map(|provisional| RecoveryEvidenceV1 {
+            stage: provisional.stage,
+            account_sid: provisional.account_sid.clone(),
+        }),
+        local_account_sid: local_account
+            .as_ref()
+            .map(|account| account.sid_string.clone()),
+        legacy_fingerprint_matches,
+    })
+    .map_err(|reason| {
+        AppError::InvalidInput(format!(
+            "Windows ExecutionWorld setup state is not safely resumable: {reason}."
+        ))
+    })?;
+
+    let mut password;
+    let account_sid;
+    match plan {
+        SetupPlanV1::Repeat {
+            account_sid: expected_sid,
+        } => {
+            let marker = existing.as_ref().ok_or_else(|| {
+                AppError::InvalidInput("Windows setup marker disappeared during setup.".into())
+            })?;
+            password = decrypt_password(&marker.encrypted_password)?;
+            account_sid = require_local_account_sid(&expected_sid)?;
+            set_account_password(&password)?;
+        }
+        SetupPlanV1::Fresh => {
+            ensure_protected_setup_state_dirs(&paths, &host_sid)?;
+            password = generate_password();
+            write_setup_recovery(
+                &paths,
+                &setup_recovery(
+                    &paths,
+                    &host_sid_string,
+                    &password,
+                    RecoveryStageV1::AccountPending,
+                    None,
+                )?,
+                &host_sid,
+            )?;
+            create_account(&password)?;
+            let account = require_local_account()?;
+            authenticate_local_account(&password, &account.sid)?;
+            write_bound_recovery(&paths, &host_sid_string, &host_sid, &password, &account)?;
+            account_sid = account.sid;
+        }
+        SetupPlanV1::ResumeCreate => {
+            let provisional = recovery.as_ref().ok_or_else(|| {
+                AppError::InvalidInput("Windows provisional setup state disappeared.".into())
+            })?;
+            password = decrypt_password(&provisional.encrypted_password)?;
+            create_account(&password)?;
+            let account = require_local_account()?;
+            authenticate_local_account(&password, &account.sid)?;
+            write_bound_recovery(&paths, &host_sid_string, &host_sid, &password, &account)?;
+            account_sid = account.sid;
+        }
+        SetupPlanV1::ResumeAuthenticate {
+            account_sid: expected_sid,
+        } => {
+            let provisional = recovery.as_ref().ok_or_else(|| {
+                AppError::InvalidInput("Windows provisional setup state disappeared.".into())
+            })?;
+            password = decrypt_password(&provisional.encrypted_password)?;
+            account_sid = require_local_account_sid(&expected_sid)?;
+            authenticate_local_account(&password, &account_sid)?;
+            write_bound_recovery(
+                &paths,
+                &host_sid_string,
+                &host_sid,
+                &password,
+                &require_local_account()?,
+            )?;
+        }
+        SetupPlanV1::BeginLegacyRecovery {
+            account_sid: expected_sid,
+        } => {
+            ensure_protected_setup_state_dirs(&paths, &host_sid)?;
+            password = generate_password();
+            write_setup_recovery(
+                &paths,
+                &setup_recovery(
+                    &paths,
+                    &host_sid_string,
+                    &password,
+                    RecoveryStageV1::LegacyPasswordRotationPending,
+                    Some(expected_sid.clone()),
+                )?,
+                &host_sid,
+            )?;
+            account_sid = require_legacy_partial_account_sid(&expected_sid)?;
+            set_account_password(&password)?;
+            authenticate_local_account(&password, &account_sid)?;
+            write_bound_recovery(
+                &paths,
+                &host_sid_string,
+                &host_sid,
+                &password,
+                &require_local_account()?,
+            )?;
+        }
+        SetupPlanV1::ResumeLegacyRotation {
+            account_sid: expected_sid,
+        } => {
+            let provisional = recovery.as_ref().ok_or_else(|| {
+                AppError::InvalidInput("Windows provisional setup state disappeared.".into())
+            })?;
+            password = decrypt_password(&provisional.encrypted_password)?;
+            account_sid = require_legacy_partial_account_sid(&expected_sid)?;
+            set_account_password(&password)?;
+            authenticate_local_account(&password, &account_sid)?;
+            write_bound_recovery(
+                &paths,
+                &host_sid_string,
+                &host_sid,
+                &password,
+                &require_local_account()?,
+            )?;
+        }
+    }
+    reconcile_account_flags()?;
     let account_sid_string = sid_to_string(sid_ptr(&account_sid))?;
     let system_sid = sid_from_string("S-1-5-18")?;
     let administrators_sid = sid_from_string("S-1-5-32-544")?;
@@ -1502,6 +1658,7 @@ fn run_elevated_setup() -> AppResult<()> {
     let mut marker = setup.marker;
     marker.encrypted_password = encrypted_password;
     write_setup_marker(&paths, &marker, &setup.host_sid)?;
+    remove_setup_recovery(&paths)?;
     Ok(())
 }
 
@@ -1547,7 +1704,113 @@ fn load_setup() -> AppResult<WindowsSetupV1> {
     })
 }
 
-fn reconcile_account(password: &str) -> AppResult<()> {
+fn read_optional_json<T: serde::de::DeserializeOwned>(path: &Path) -> AppResult<Option<T>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_setup_marker(
+    marker: &SetupMarkerV1,
+    paths: &SetupPathsV1,
+    host_sid: &str,
+) -> AppResult<()> {
+    if marker.version != SETUP_VERSION
+        || marker.username != SANDBOX_USERNAME
+        || marker.host_sid != host_sid
+        || marker.managed_root != paths.managed_root
+        || marker.runner_root != paths.runner_root
+        || marker.firewall_rule_name != FIREWALL_RULE_NAME
+    {
+        return unavailable(
+            "Existing Windows ExecutionWorld setup belongs to a different identity or version.",
+        );
+    }
+    Ok(())
+}
+
+fn validate_setup_recovery(
+    recovery: &SetupRecoveryV1,
+    paths: &SetupPathsV1,
+    host_sid: &str,
+) -> AppResult<()> {
+    if recovery.version != SETUP_VERSION
+        || recovery.username != SANDBOX_USERNAME
+        || recovery.host_sid != host_sid
+        || recovery.managed_root != paths.managed_root
+        || recovery.runner_root != paths.runner_root
+        || recovery.firewall_rule_name != FIREWALL_RULE_NAME
+        || recovery.encrypted_password.is_empty()
+    {
+        return unavailable(
+            "Windows ExecutionWorld provisional setup state is stale or substituted.",
+        );
+    }
+    Ok(())
+}
+
+fn setup_recovery(
+    paths: &SetupPathsV1,
+    host_sid: &str,
+    password: &str,
+    stage: RecoveryStageV1,
+    account_sid: Option<String>,
+) -> AppResult<SetupRecoveryV1> {
+    Ok(SetupRecoveryV1 {
+        version: SETUP_VERSION,
+        username: SANDBOX_USERNAME.into(),
+        host_sid: host_sid.into(),
+        // Provisional state is additionally bound to the exact Host user's DPAPI
+        // profile. Its Host SID and protected ProgramData ACL are validated before
+        // the credential can authorize a resumed account mutation.
+        encrypted_password: encrypt_recovery_password(password)?,
+        managed_root: paths.managed_root.clone(),
+        runner_root: paths.runner_root.clone(),
+        firewall_rule_name: FIREWALL_RULE_NAME.into(),
+        stage,
+        account_sid,
+    })
+}
+
+fn write_bound_recovery(
+    paths: &SetupPathsV1,
+    host_sid_string: &str,
+    host_sid: &[u8],
+    password: &str,
+    account: &LocalAccountV1,
+) -> AppResult<()> {
+    write_setup_recovery(
+        paths,
+        &setup_recovery(
+            paths,
+            host_sid_string,
+            password,
+            RecoveryStageV1::Bound,
+            Some(account.sid_string.clone()),
+        )?,
+        host_sid,
+    )
+}
+
+fn ensure_protected_setup_state_dirs(paths: &SetupPathsV1, host_sid: &[u8]) -> AppResult<()> {
+    fs::create_dir_all(&paths.secrets)?;
+    let entries = protected_setup_state_entries(host_sid)?;
+    set_exact_dacl(&paths.base, &entries, true)?;
+    set_exact_dacl(&paths.secrets, &entries, true)
+}
+
+fn protected_setup_state_entries(host_sid: &[u8]) -> AppResult<Vec<(Vec<u8>, u32)>> {
+    Ok(vec![
+        (host_sid.to_vec(), FILE_ALL_ACCESS),
+        (sid_from_string("S-1-5-18")?, FILE_ALL_ACCESS),
+        (sid_from_string("S-1-5-32-544")?, FILE_ALL_ACCESS),
+        (sid_from_string("S-1-3-4")?, READ_CONTROL),
+    ])
+}
+
+fn create_account(password: &str) -> AppResult<()> {
     let mut username = wide(SANDBOX_USERNAME);
     let mut password_wide = wide(password);
     let mut comment = wide("Pastey managed Worker offline sandbox principal");
@@ -1570,28 +1833,39 @@ fn reconcile_account(password: &str) -> AppResult<()> {
             &mut parameter,
         )
     };
-    if result != NERR_Success && result != NERR_UserExists {
-        password_wide.fill(0);
-        return unavailable("Windows could not create the Pastey sandbox principal.");
+    password_wide.fill(0);
+    if result != NERR_Success {
+        return net_api_failure("NetUserAdd(local Pastey sandbox account)", result);
     }
-    if result == NERR_UserExists {
-        let mut password_info = USER_INFO_1003 {
-            usri1003_password: password_wide.as_mut_ptr(),
-        };
-        if unsafe {
-            NetUserSetInfo(
-                ptr::null(),
-                username.as_ptr(),
-                1003,
-                (&mut password_info as *mut USER_INFO_1003).cast(),
-                &mut parameter,
-            )
-        } != NERR_Success
-        {
-            password_wide.fill(0);
-            return unavailable("Windows could not reconcile the Pastey sandbox credential.");
-        }
+    Ok(())
+}
+
+fn set_account_password(password: &str) -> AppResult<()> {
+    let username = wide(SANDBOX_USERNAME);
+    let mut password_wide = wide(password);
+    let mut password_info = USER_INFO_1003 {
+        usri1003_password: password_wide.as_mut_ptr(),
+    };
+    let mut parameter = 0_u32;
+    let result = unsafe {
+        NetUserSetInfo(
+            ptr::null(),
+            username.as_ptr(),
+            1003,
+            (&mut password_info as *mut USER_INFO_1003).cast(),
+            &mut parameter,
+        )
+    };
+    password_wide.fill(0);
+    if result != NERR_Success {
+        return net_api_failure("NetUserSetInfo(local Pastey sandbox credential)", result);
     }
+    Ok(())
+}
+
+fn reconcile_account_flags() -> AppResult<()> {
+    let username = wide(SANDBOX_USERNAME);
+    let mut parameter = 0_u32;
     let mut flags = USER_INFO_1008 {
         usri1008_flags: ACCOUNT_SETUP_FLAGS,
     };
@@ -1604,9 +1878,8 @@ fn reconcile_account(password: &str) -> AppResult<()> {
             &mut parameter,
         )
     };
-    password_wide.fill(0);
     if flags_result != NERR_Success {
-        return unavailable("Windows could not reconcile the Pastey sandbox account flags.");
+        return net_api_failure("NetUserSetInfo(local Pastey sandbox flags)", flags_result);
     }
     Ok(())
 }
@@ -1694,37 +1967,81 @@ fn write_setup_marker(
     marker: &SetupMarkerV1,
     host_sid: &[u8],
 ) -> AppResult<()> {
-    let temp = paths
-        .secrets
-        .join(format!("setup-{}.tmp", uuid::Uuid::new_v4()));
-    fs::write(&temp, serde_json::to_vec(marker)?)?;
-    set_exact_dacl(
-        &temp,
-        &[
-            (host_sid.to_vec(), FILE_ALL_ACCESS),
-            (sid_from_string("S-1-5-18")?, FILE_ALL_ACCESS),
-            (sid_from_string("S-1-5-32-544")?, FILE_ALL_ACCESS),
-            (sid_from_string("S-1-3-4")?, READ_CONTROL),
-        ],
-        false,
-    )?;
+    write_protected_setup_json(
+        &paths.secrets,
+        &paths.marker,
+        "setup",
+        marker,
+        host_sid,
+        "final setup marker",
+    )
+}
+
+fn write_setup_recovery(
+    paths: &SetupPathsV1,
+    recovery: &SetupRecoveryV1,
+    host_sid: &[u8],
+) -> AppResult<()> {
+    write_protected_setup_json(
+        &paths.secrets,
+        &paths.recovery,
+        "setup-provisional",
+        recovery,
+        host_sid,
+        "provisional setup state",
+    )
+}
+
+fn write_protected_setup_json<T: Serialize>(
+    secrets: &Path,
+    destination: &Path,
+    temp_prefix: &str,
+    value: &T,
+    host_sid: &[u8],
+    description: &str,
+) -> AppResult<()> {
+    let temp = secrets.join(format!("{temp_prefix}-{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(&temp, serde_json::to_vec(value)?)?;
+    set_exact_dacl(&temp, &protected_setup_state_entries(host_sid)?, false)?;
     let temp_wide = wide_os(temp.as_os_str());
-    let marker_wide = wide_os(paths.marker.as_os_str());
+    let destination_wide = wide_os(destination.as_os_str());
     if unsafe {
         MoveFileExW(
             temp_wide.as_ptr(),
-            marker_wide.as_ptr(),
+            destination_wide.as_ptr(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     } == 0
     {
         let _ = fs::remove_file(&temp);
-        return unavailable("Windows could not atomically commit the protected setup marker.");
+        return Err(AppError::InvalidInput(format!(
+            "Windows could not atomically commit the protected {description}: {}",
+            io::Error::last_os_error()
+        )));
     }
     Ok(())
 }
 
+fn remove_setup_recovery(paths: &SetupPathsV1) -> AppResult<()> {
+    match fs::remove_file(&paths.recovery) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn encrypt_password(password: &str) -> AppResult<String> {
+    encrypt_password_with_flags(
+        password,
+        CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN,
+    )
+}
+
+fn encrypt_recovery_password(password: &str) -> AppResult<String> {
+    encrypt_password_with_flags(password, CRYPTPROTECT_UI_FORBIDDEN)
+}
+
+fn encrypt_password_with_flags(password: &str, flags: u32) -> AppResult<String> {
     let mut bytes = password.as_bytes().to_vec();
     let input = CRYPT_INTEGER_BLOB {
         cbData: bytes.len() as u32,
@@ -1738,7 +2055,7 @@ fn encrypt_password(password: &str) -> AppResult<String> {
             ptr::null(),
             ptr::null(),
             ptr::null(),
-            CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN,
+            flags,
             &mut output,
         )
     } == 0
@@ -1781,9 +2098,17 @@ fn decrypt_password(encrypted: &str) -> AppResult<String> {
         unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
     unsafe { LocalFree(output.pbData as HLOCAL) };
     encrypted.fill(0);
-    let password = String::from_utf8(clear.clone())
-        .map_err(|_| AppError::InvalidInput("Windows sandbox credential is invalid.".into()))?;
+    let password = match String::from_utf8(clear.clone()) {
+        Ok(password) => password,
+        Err(_) => {
+            clear.fill(0);
+            return unavailable("Windows sandbox credential is invalid.");
+        }
+    };
     clear.fill(0);
+    if password.is_empty() {
+        return unavailable("Windows sandbox credential record is empty.");
+    }
     Ok(password)
 }
 
@@ -2040,43 +2365,151 @@ fn set_exact_dacl(path: &Path, entries: &[(Vec<u8>, u32)], directory: bool) -> A
     Ok(())
 }
 
+struct NetApiBufferV1(*mut u8);
+
+impl Drop for NetApiBufferV1 {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { NetApiBufferFree(self.0.cast()) };
+        }
+    }
+}
+
+fn lookup_local_account(name: &str) -> AppResult<Option<LocalAccountV1>> {
+    let name_wide = wide(name);
+    let mut buffer = ptr::null_mut();
+    let status = unsafe { NetUserGetInfo(ptr::null(), name_wide.as_ptr(), 4, &mut buffer) };
+    if status == NERR_UserNotFound {
+        return Ok(None);
+    }
+    if status != NERR_Success {
+        return net_api_failure("NetUserGetInfo(local Pastey sandbox account)", status);
+    }
+    if buffer.is_null() {
+        return unavailable("NetUserGetInfo returned an empty local account record.");
+    }
+    let buffer = NetApiBufferV1(buffer);
+    let info = unsafe { &*(buffer.0.cast::<USER_INFO_4>()) };
+    let returned_name = wide_ptr_string(info.usri4_name)?;
+    let valid_sid =
+        !info.usri4_user_sid.is_null() && unsafe { IsValidSid(info.usri4_user_sid) } != 0;
+    validate_exact_local_user_identity(
+        name,
+        &returned_name,
+        info.usri4_priv == USER_PRIV_USER,
+        valid_sid,
+    )
+    .map_err(|reason| {
+        AppError::InvalidInput(format!(
+            "NetUserGetInfo did not resolve the exact local Pastey sandbox user: {reason}."
+        ))
+    })?;
+    let sid = copy_sid(info.usri4_user_sid)?;
+    let sid_string = sid_to_string(sid_ptr(&sid))?;
+    Ok(Some(LocalAccountV1 {
+        name: returned_name,
+        sid,
+        sid_string,
+        privilege: info.usri4_priv,
+        comment: wide_ptr_string(info.usri4_comment)?,
+        flags: info.usri4_flags,
+        home_dir: wide_ptr_string(info.usri4_home_dir)?,
+        script_path: wide_ptr_string(info.usri4_script_path)?,
+    }))
+}
+
 fn lookup_account_sid(name: &str) -> AppResult<Vec<u8>> {
-    let qualified = format!(".\\{name}");
-    let name = wide(&qualified);
-    let mut sid_bytes = 0_u32;
-    let mut domain_chars = 0_u32;
-    let mut use_type: SID_NAME_USE = 0;
-    unsafe {
-        LookupAccountNameW(
-            ptr::null(),
-            name.as_ptr(),
-            ptr::null_mut(),
-            &mut sid_bytes,
-            ptr::null_mut(),
-            &mut domain_chars,
-            &mut use_type,
+    lookup_local_account(name)?
+        .map(|account| account.sid)
+        .ok_or_else(|| {
+            AppError::InvalidInput(format!(
+                "NetUserGetInfo could not find the exact local {name} user (NET_API_STATUS {NERR_UserNotFound})."
+            ))
+        })
+}
+
+fn require_local_account() -> AppResult<LocalAccountV1> {
+    lookup_local_account(SANDBOX_USERNAME)?.ok_or_else(|| {
+        AppError::InvalidInput(format!(
+            "NetUserGetInfo could not find the exact local {SANDBOX_USERNAME} user (NET_API_STATUS {NERR_UserNotFound})."
+        ))
+    })
+}
+
+fn require_local_account_sid(expected_sid: &str) -> AppResult<Vec<u8>> {
+    let account = require_local_account()?;
+    if account.sid_string != expected_sid {
+        return unavailable("Windows sandbox principal identity was replaced during setup.");
+    }
+    Ok(account.sid)
+}
+
+fn require_legacy_partial_account_sid(expected_sid: &str) -> AppResult<Vec<u8>> {
+    let account = require_local_account()?;
+    if account.sid_string != expected_sid || !account.matches_legacy_partial_fingerprint() {
+        return unavailable(
+            "The pre-marker Windows sandbox account no longer matches Pastey's legacy partial-setup fingerprint.",
+        );
+    }
+    Ok(account.sid)
+}
+
+fn authenticate_local_account(password: &str, expected_sid: &[u8]) -> AppResult<()> {
+    let username = wide(SANDBOX_USERNAME);
+    let domain = wide(".");
+    let mut password_wide = wide(password);
+    let mut token = ptr::null_mut();
+    let authenticated = unsafe {
+        LogonUserW(
+            username.as_ptr(),
+            domain.as_ptr(),
+            password_wide.as_ptr(),
+            LOGON32_LOGON_INTERACTIVE,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut token,
         )
     };
-    if sid_bytes == 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
-        return unavailable("Windows account SID sizing failed.");
+    password_wide.fill(0);
+    if authenticated == 0 {
+        return win32_failure("LogonUserW(local Pastey sandbox credential proof)");
     }
-    let mut sid = vec![0_u8; sid_bytes as usize];
-    let mut domain = vec![0_u16; domain_chars as usize];
-    if unsafe {
-        LookupAccountNameW(
-            ptr::null(),
-            name.as_ptr(),
-            sid.as_mut_ptr().cast(),
-            &mut sid_bytes,
-            domain.as_mut_ptr(),
-            &mut domain_chars,
-            &mut use_type,
-        )
-    } == 0
-    {
-        return unavailable("Windows account SID lookup failed.");
+    let token = unsafe { owned(token)? };
+    if token_user_sid(&token)? != expected_sid {
+        return unavailable(
+            "Windows sandbox credential proof returned a substituted principal identity.",
+        );
     }
-    Ok(sid)
+    Ok(())
+}
+
+fn wide_ptr_string(value: *const u16) -> AppResult<String> {
+    if value.is_null() {
+        return Ok(String::new());
+    }
+    let mut length = 0_usize;
+    while length < 32_768 && unsafe { *value.add(length) } != 0 {
+        length += 1;
+    }
+    if length == 32_768 {
+        return unavailable("Windows local account metadata exceeded its safety bound.");
+    }
+    String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) })
+        .map_err(|_| AppError::InvalidInput("Windows local account metadata is not UTF-16.".into()))
+}
+
+fn net_api_failure<T>(operation: &str, status: u32) -> AppResult<T> {
+    Err(AppError::InvalidInput(format!(
+        "{operation} failed with NET_API_STATUS {status}: {}",
+        io::Error::from_raw_os_error(status as i32)
+    )))
+}
+
+fn win32_failure<T>(operation: &str) -> AppResult<T> {
+    let status = unsafe { GetLastError() };
+    Err(AppError::InvalidInput(format!(
+        "{operation} failed with Win32 error {status}: {}",
+        io::Error::from_raw_os_error(status as i32)
+    )))
 }
 
 fn sid_from_string(value: &str) -> AppResult<Vec<u8>> {
