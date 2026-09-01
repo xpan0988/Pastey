@@ -37,8 +37,8 @@ The deterministic native-v2 Composer accepts only explicit HostRefs, roots, and 
 One requester approval binds the complete immutable revision. Attempt start then follows a fail-closed distributed barrier:
 
 1. The requester resolves every participant to one current, unambiguous `HostSessionBinding`.
-2. Each Host evaluates all roots, transfer counterparts, required provider generation/model, process binding, and verified platform world for the complete Plan.
-3. Any unavailable requirement fails the whole Plan before an earlier Search, Transfer, or managed step can execute.
+2. Each Host validates the complete immutable Plan and its exact participant/session correlation, then evaluates roots, transfer counterparts, provider generation/model, process binding, and verified platform world only where required by its own authored fragment.
+3. Any Host-local requirement reported unavailable fails the whole Plan before an earlier Search, Transfer, or managed step can execute; availability on another Host cannot satisfy it.
 4. Each remote receiver validates the exact review correlation and creates Host admission in prepared state.
 5. Only after every Host is prepared does the requester send commit; receivers execute nothing before it.
 

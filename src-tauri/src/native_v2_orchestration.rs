@@ -3962,9 +3962,28 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{models::LocalRole, storage};
+    use crate::{
+        config::StoredConfig,
+        host_runtime::{HostEvent, HostEventSink, RuntimeTask, RuntimeTaskSpawner},
+        models::LocalRole,
+        storage,
+    };
 
     const NOW: i64 = 10_000;
+
+    struct NoopEventSink;
+
+    impl HostEventSink for NoopEventSink {
+        fn emit(&self, _event: HostEvent) -> AppResult<()> {
+            Ok(())
+        }
+    }
+
+    struct NoopTaskSpawner;
+
+    impl RuntimeTaskSpawner for NoopTaskSpawner {
+        fn spawn(&self, _task: RuntimeTask) {}
+    }
 
     fn host(value: &str) -> HostRef {
         HostRef::from_device_id(value).unwrap()
@@ -4047,6 +4066,31 @@ mod tests {
         )
         .unwrap();
         paths
+    }
+
+    fn requester_runtime(paths: AppPaths, device_id: &str) -> Arc<HostRuntime> {
+        Arc::new(
+            HostRuntime::new(
+                paths,
+                StoredConfig {
+                    version: 5,
+                    default_expiry_minutes: 15,
+                    inbox_dir: None,
+                    auto_burn_after_download: false,
+                    save_received_files_to_inbox: true,
+                    save_received_images_to_inbox: true,
+                    transfer_window_override: None,
+                    dev_tools_enabled: false,
+                    micro_flow_group_mode: "off".into(),
+                    shortcut: "test".into(),
+                    app_secret: crate::crypto::encode_key(&[19u8; 32]),
+                    device_id: device_id.into(),
+                },
+                Arc::new(NoopEventSink),
+                Arc::new(NoopTaskSpawner),
+            )
+            .unwrap(),
+        )
     }
 
     fn seed_running_product(paths: &AppPaths, revision: &PlanRevisionV2) {
@@ -4173,6 +4217,171 @@ mod tests {
         tx.commit().unwrap();
         assert_eq!(state("transfer-b-c"), "eligible");
         assert_eq!(state("execute-c"), "pending");
+    }
+
+    #[test]
+    fn one_receivers_local_readiness_rejection_fails_the_whole_plan_barrier() {
+        let paths = paths("native-v2-whole-plan-readiness-rejection");
+        let runtime = requester_runtime(paths.clone(), "a");
+        let requester_host = host("a");
+        let transform_host = host("b");
+        let execute_host = host("c");
+        let revision =
+            compose_revision(compose([&requester_host, &transform_host, &execute_host])).unwrap();
+        let store = NativeV2ProductStore::new(&paths);
+        store.create_draft(&revision, &requester_host, NOW).unwrap();
+        let approval = store
+            .approve(
+                &revision.revision_id,
+                "approval-readiness",
+                NOW + 1_000,
+                NOW,
+            )
+            .unwrap();
+        let transform_participant = participant_for_ref(
+            &revision,
+            &PlanParticipantRef::for_host(&revision.plan_id, &transform_host).unwrap(),
+        )
+        .unwrap()
+        .participant_ref
+        .clone();
+        let execute_participant = participant_for_ref(
+            &revision,
+            &PlanParticipantRef::for_host(&revision.plan_id, &execute_host).unwrap(),
+        )
+        .unwrap()
+        .participant_ref
+        .clone();
+        let transform_binding = crate::host_identity::HostSessionBinding::new(
+            &revision.bridge_id,
+            requester_host.clone(),
+            transform_host.clone(),
+            "requester-session-b",
+            "receiver-session-b",
+            "route-b",
+            NOW + 1_000,
+        )
+        .unwrap();
+        let execute_binding = crate::host_identity::HostSessionBinding::new(
+            &revision.bridge_id,
+            requester_host.clone(),
+            execute_host.clone(),
+            "requester-session-c",
+            "receiver-session-c",
+            "route-c",
+            NOW + 1_000,
+        )
+        .unwrap();
+        let conn = connection(&paths).unwrap();
+        conn.execute(
+            "INSERT INTO native_v2_product_attempts
+             (attempt_id, approval_id, revision_id, revision_hash, state, failure_code,
+              expires_at, created_at, updated_at)
+             VALUES ('attempt-readiness', ?1, ?2, ?3, 'checking_readiness', NULL,
+                     ?4, ?5, ?5)",
+            params![
+                approval.approval_id,
+                revision.revision_id,
+                revision.revision_hash,
+                NOW + 1_000,
+                NOW
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE native_v2_product_revisions SET state = 'checking_readiness',
+             updated_at = ?2 WHERE revision_id = ?1",
+            params![revision.revision_id, NOW],
+        )
+        .unwrap();
+        for (participant, host_ref, route, binding, correlation) in [
+            (
+                &transform_participant,
+                &transform_host,
+                "route-b",
+                &transform_binding,
+                "correlation-b",
+            ),
+            (
+                &execute_participant,
+                &execute_host,
+                "route-c",
+                &execute_binding,
+                "correlation-c",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO native_v2_product_hosts
+                 (attempt_id, participant_ref, host_ref, peer_route_ref, session_binding_ref,
+                  session_binding_json, review_correlation_id, readiness_state,
+                  admission_state, updated_at)
+                 VALUES ('attempt-readiness', ?1, ?2, ?3, ?4, ?5, ?6,
+                         'pending', 'pending', ?7)",
+                params![
+                    participant.as_str(),
+                    host_ref.as_str(),
+                    route,
+                    binding.binding_ref,
+                    serde_json::to_string(binding).unwrap(),
+                    correlation,
+                    NOW
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let events = accept_requester_readiness(
+            &runtime,
+            NativeV2ReadinessV1 {
+                protocol_version: PROTOCOL_VERSION.into(),
+                message_id: "readiness-result-b".into(),
+                correlation_id: "correlation-b".into(),
+                attempt_id: "attempt-readiness".into(),
+                approval_id: approval.approval_id,
+                plan_id: revision.plan_id.clone(),
+                revision_id: revision.revision_id.clone(),
+                revision_hash: revision.revision_hash.clone(),
+                bridge_id: revision.bridge_id.clone(),
+                participant: transform_participant.clone(),
+                host_ref: transform_host,
+                session_binding_ref: transform_binding.binding_ref.clone(),
+                ready: false,
+                code: Some("managed_platform_unavailable".into()),
+                expires_at: NOW + 500,
+            },
+            &transform_binding,
+            NOW + 1,
+        )
+        .unwrap();
+        assert!(events.is_empty());
+        let attempt: (String, String) = connection(&paths)
+            .unwrap()
+            .query_row(
+                "SELECT state, failure_code FROM native_v2_product_attempts
+                 WHERE attempt_id = 'attempt-readiness'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempt, ("failed".into(), "whole_plan_unavailable".into()));
+        let host_states: Vec<(String, String)> = connection(&paths)
+            .unwrap()
+            .prepare(
+                "SELECT participant_ref, readiness_state FROM native_v2_product_hosts
+                 WHERE attempt_id = 'attempt-readiness' ORDER BY participant_ref",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            host_states.contains(&(transform_participant.as_str().into(), "unavailable".into()))
+        );
+        assert!(host_states.contains(&(execute_participant.as_str().into(), "pending".into())));
+        drop(runtime);
+        std::fs::remove_dir_all(paths.app_data_dir).unwrap();
     }
 
     #[test]

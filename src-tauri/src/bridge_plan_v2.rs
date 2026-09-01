@@ -589,8 +589,9 @@ impl<'a> BridgePlanV2Store<'a> {
     }
 
     /// Core-only Step 8 admission attachment. The protocol-facing path above
-    /// always supplies an unavailable snapshot and therefore retains the
-    /// Phase 4 whole-Plan denial. No availability fact is read from wire data.
+    /// always supplies an unavailable snapshot and therefore retains
+    /// fail-closed denial for locally bound managed work. No availability fact
+    /// is read from wire data.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn accept_attempt_start_with_availability(
         &self,
@@ -1809,7 +1810,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_semantics_fail_the_whole_plan_before_any_attempt() {
+    fn unsupported_local_semantics_fail_before_attempt_but_remote_semantics_do_not() {
         let mut transform_plan = all_four_revision();
         transform_plan.steps.truncate(2);
         transform_plan.revision_hash.clear();
@@ -1830,61 +1831,83 @@ mod tests {
         execute_plan.revision_hash.clear();
         execute_plan = seal_revision(execute_plan).unwrap();
 
-        for (label, revision) in [
-            ("pastey-v2-whole-plan-transform", transform_plan),
-            ("pastey-v2-whole-plan-execute", execute_plan),
-        ] {
-            let paths = paths(label);
+        let transform_paths = paths("pastey-v2-local-transform-unavailable");
+        let local_host = host("source");
+        let review = review_for(&transform_plan, participant(&transform_plan, &local_host));
+        let store = BridgePlanV2Store::new(&transform_paths);
+        record_review(&store, &review, &local_host);
+        let transform_binding = binding(&transform_plan, &local_host, "unsupported-transform");
+        assert_eq!(
+            denial_code(
+                store
+                    .accept_attempt_start(
+                        &start_for(&review),
+                        &transform_binding,
+                        &transform_binding,
+                        &HostAdmissionService::new(local_host),
+                        NOW,
+                    )
+                    .unwrap()
+            ),
+            HostAdmissionDenialCode::UnsupportedOperation
+        );
+        assert!(store.attempt_state("attempt-v2").unwrap().is_none());
+
+        let conn = Connection::open(&transform_paths.db_path).unwrap();
+        let v1_attempts: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM bridge_plan_protocol_attempts) + (SELECT COUNT(*) FROM bridge_plan_protocol_transfer_steps)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v1_attempts, 0);
+        let authorities = crate::bridge_plan::ProtocolSearchAuthorityStore::default();
+        assert!(crate::bridge_plan::consume_search_execution_grant(
+            &transform_paths,
+            &authorities,
+            "bridge-v2",
+            "attempt-v2",
+            NOW,
+        )
+        .is_err());
+        assert!(crate::bridge_plan::consume_transfer_execution_grant(
+            &transform_paths,
+            &authorities,
+            "bridge-v2",
+            "attempt-v2",
+            NOW,
+        )
+        .is_err());
+        std::fs::remove_dir_all(transform_paths.app_data_dir).unwrap();
+
+        // The source Host owns only the Transfer fragment. Execute remains
+        // globally validated but its availability belongs to the destination.
+        let execute_paths = paths("pastey-v2-remote-execute-does-not-block-source");
+        {
             let local_host = host("source");
-            let review = review_for(&revision, participant(&revision, &local_host));
-            let store = BridgePlanV2Store::new(&paths);
+            let review = review_for(&execute_plan, participant(&execute_plan, &local_host));
+            let store = BridgePlanV2Store::new(&execute_paths);
             record_review(&store, &review, &local_host);
-            let binding = binding(&revision, &local_host, "unsupported");
+            let binding = binding(&execute_plan, &local_host, "remote-execute");
+            assert!(matches!(
+                store
+                    .accept_attempt_start(
+                        &start_for(&review),
+                        &binding,
+                        &binding,
+                        &HostAdmissionService::new(local_host),
+                        NOW,
+                    )
+                    .unwrap(),
+                AttemptStartDecisionV2::Accepted(_)
+            ));
             assert_eq!(
-                denial_code(
-                    store
-                        .accept_attempt_start(
-                            &start_for(&review),
-                            &binding,
-                            &binding,
-                            &HostAdmissionService::new(local_host),
-                            NOW,
-                        )
-                        .unwrap()
-                ),
-                HostAdmissionDenialCode::UnsupportedOperation
+                store.attempt_state("attempt-v2").unwrap().as_deref(),
+                Some("accepted")
             );
-            assert!(store.attempt_state("attempt-v2").unwrap().is_none());
-
-            let conn = Connection::open(&paths.db_path).unwrap();
-            let v1_attempts: i64 = conn
-                .query_row(
-                    "SELECT (SELECT COUNT(*) FROM bridge_plan_protocol_attempts) + (SELECT COUNT(*) FROM bridge_plan_protocol_transfer_steps)",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(v1_attempts, 0);
-
-            let authorities = crate::bridge_plan::ProtocolSearchAuthorityStore::default();
-            assert!(crate::bridge_plan::consume_search_execution_grant(
-                &paths,
-                &authorities,
-                "bridge-v2",
-                "attempt-v2",
-                NOW,
-            )
-            .is_err());
-            assert!(crate::bridge_plan::consume_transfer_execution_grant(
-                &paths,
-                &authorities,
-                "bridge-v2",
-                "attempt-v2",
-                NOW,
-            )
-            .is_err());
-            std::fs::remove_dir_all(paths.app_data_dir).unwrap();
         }
+        std::fs::remove_dir_all(execute_paths.app_data_dir).unwrap();
     }
 
     #[test]
