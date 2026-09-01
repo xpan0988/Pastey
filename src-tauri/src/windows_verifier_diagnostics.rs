@@ -42,6 +42,22 @@ pub(crate) fn probe_parent_failure_reason(code: Option<i32>) -> &'static str {
     }
 }
 
+pub(crate) fn create_process_with_logon_failure_reason(code: u32) -> String {
+    let label = match code {
+        2 => "application file not found",
+        3 => "application path not found",
+        5 => "access denied",
+        193 => "invalid executable format",
+        1314 => "required privilege not held",
+        1326 => "user name or password incorrect",
+        1327 => "account restriction",
+        1331 => "account disabled",
+        1385 => "logon type not granted",
+        _ => "unclassified process-logon failure",
+    };
+    format!("CreateProcessWithLogonW failed with Win32 error {code} ({label}).")
+}
+
 fn contains_private_path(value: &str) -> bool {
     let bytes = value.as_bytes();
     let windows_drive_path = bytes.windows(3).any(|window| {
@@ -95,6 +111,22 @@ mod tests {
         let underlying =
             "Windows native conformance probe spawn failed: LogonUserW returned Win32 error 1326.";
         assert_eq!(verifier_failure_reason(underlying), underlying);
+    }
+
+    #[test]
+    fn create_process_with_logon_diagnostic_retains_code_and_only_static_context() {
+        assert_eq!(
+            create_process_with_logon_failure_reason(1385),
+            "CreateProcessWithLogonW failed with Win32 error 1385 (logon type not granted)."
+        );
+        assert_eq!(
+            create_process_with_logon_failure_reason(5),
+            "CreateProcessWithLogonW failed with Win32 error 5 (access denied)."
+        );
+        assert_eq!(
+            create_process_with_logon_failure_reason(65_535),
+            "CreateProcessWithLogonW failed with Win32 error 65535 (unclassified process-logon failure)."
+        );
     }
 
     #[test]
