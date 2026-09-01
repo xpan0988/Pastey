@@ -145,6 +145,9 @@ use crate::{
         select_setup_plan, validate_exact_local_user_identity, LegacyPrivilegeClassV1,
         RecoveryEvidenceV1, RecoveryStageV1, SetupEvidenceV1, SetupPlanV1,
     },
+    windows_verifier_diagnostics::{
+        probe_parent_failure_reason, production_unavailable_reason, verifier_failure_reason,
+    },
 };
 
 const WINDOWS_WORLD_ADAPTER_VERSION: &str = "pastey-windows-restricted-principal-job-v1";
@@ -463,15 +466,12 @@ pub(crate) fn availability(
                 verified_properties: required,
                 unavailable_reason: None,
             },
-            Err(_) => ExecutionWorldAvailabilityV1 {
+            Err(error) => ExecutionWorldAvailabilityV1 {
                 kind: PlatformWorldKindV1::WindowsRestrictedPrincipal,
                 available: false,
                 identity_digest: "pastey-windows-restricted-principal-unverified-v1".into(),
                 verified_properties: BTreeSet::new(),
-                unavailable_reason: Some(
-                    "The elevated PasteySandboxOffline setup or native restricted-token, ACL, Firewall, handle-list, Job, descendant, filesystem, and NoRawNetwork conformance probe did not complete successfully."
-                        .into(),
-                ),
+                unavailable_reason: Some(production_unavailable_reason(&error.to_string())),
             },
         })
         .clone()
@@ -2742,29 +2742,66 @@ fn raw(handle: &OwnedHandle) -> HANDLE {
     handle.as_raw_handle() as HANDLE
 }
 
+fn probe_phase<T>(phase: &'static str, result: AppResult<T>) -> AppResult<T> {
+    result.map_err(|error| {
+        AppError::InvalidInput(format!(
+            "Windows native conformance probe phase {phase} failed: {}",
+            verifier_failure_reason(&error.to_string())
+        ))
+    })
+}
+
 fn native_conformance_probe(required: &BTreeSet<ConfinementPropertyV1>) -> AppResult<String> {
-    let setup = load_setup()?;
-    let current = std::env::current_exe()?;
+    let setup = probe_phase("load_setup", load_setup())?;
+    let current = probe_phase(
+        "resolve_verifier_executable",
+        std::env::current_exe().map_err(AppError::from),
+    )?;
     let probe_root = std::env::temp_dir().join(format!(
         "pastey-windows-world-probe-{}",
         uuid::Uuid::new_v4()
     ));
-    fs::create_dir(&probe_root)?;
-    set_exact_dacl(&probe_root, &host_only_entries(&setup), true)?;
+    probe_phase(
+        "create_probe_root",
+        fs::create_dir(&probe_root).map_err(AppError::from),
+    )?;
+    probe_phase(
+        "protect_probe_root_acl",
+        set_exact_dacl(&probe_root, &host_only_entries(&setup), true),
+    )?;
     let denied = probe_root.join("host-secret.txt");
-    fs::write(&denied, b"must remain denied")?;
-    set_exact_dacl(&denied, &host_only_entries(&setup), false)?;
+    probe_phase(
+        "stage_denied_host_file",
+        fs::write(&denied, b"must remain denied").map_err(AppError::from),
+    )?;
+    probe_phase(
+        "protect_denied_host_file_acl",
+        set_exact_dacl(&denied, &host_only_entries(&setup), false),
+    )?;
     let source_root = probe_root.join("sources");
     let scratch_root = source_root.join("scratch");
     let output_root = source_root.join("output");
-    fs::create_dir_all(&scratch_root)?;
-    fs::create_dir_all(&output_root)?;
+    probe_phase(
+        "create_probe_scratch_source",
+        fs::create_dir_all(&scratch_root).map_err(AppError::from),
+    )?;
+    probe_phase(
+        "create_probe_output_source",
+        fs::create_dir_all(&output_root).map_err(AppError::from),
+    )?;
     let input = source_root.join("input.txt");
-    fs::write(&input, b"probe-input")?;
-    let world_a_ref: ExecutionWorldRefV1 =
-        serde_json::from_value(serde_json::json!("probe-world-a"))?;
-    let world_b_ref: ExecutionWorldRefV1 =
-        serde_json::from_value(serde_json::json!("probe-world-b"))?;
+    probe_phase(
+        "stage_probe_input",
+        fs::write(&input, b"probe-input").map_err(AppError::from),
+    )?;
+    let world_a_ref: ExecutionWorldRefV1 = probe_phase(
+        "construct_primary_world_ref",
+        serde_json::from_value(serde_json::json!("probe-world-a")).map_err(AppError::from),
+    )?;
+    let world_b_ref: ExecutionWorldRefV1 = probe_phase(
+        "construct_secondary_world_ref",
+        serde_json::from_value(serde_json::json!("probe-world-b")).map_err(AppError::from),
+    )?;
     let mounts_a = vec![
         probe_mount(
             "probe-a-executable",
@@ -2792,9 +2829,15 @@ fn native_conformance_probe(required: &BTreeSet<ConfinementPropertyV1>) -> AppRe
         ),
     ];
     let other_input = source_root.join("other-input.txt");
-    fs::write(&other_input, b"other-run-secret")?;
+    probe_phase(
+        "stage_cross_run_input",
+        fs::write(&other_input, b"other-run-secret").map_err(AppError::from),
+    )?;
     let other_scratch = source_root.join("other-scratch");
-    fs::create_dir(&other_scratch)?;
+    probe_phase(
+        "create_cross_run_scratch_source",
+        fs::create_dir(&other_scratch).map_err(AppError::from),
+    )?;
     let mounts_b = vec![
         probe_mount(
             "probe-b-executable",
@@ -2816,27 +2859,39 @@ fn native_conformance_probe(required: &BTreeSet<ConfinementPropertyV1>) -> AppRe
         ),
     ];
     let result = (|| -> AppResult<String> {
-        let (prepared_b, world_b) = prepare_world(&world_b_ref, &mounts_b)?;
+        let (prepared_b, world_b) = probe_phase(
+            "prepare_secondary_workspace",
+            prepare_world(&world_b_ref, &mounts_b),
+        )?;
         let executable_b = find_mount(&prepared_b, ResourceKindV1::Executable)?;
         let scratch_b = find_mount(&prepared_b, ResourceKindV1::Scratch)?;
         let input_b = find_mount(&prepared_b, ResourceKindV1::ManagedRevision)?;
-        let mut sleeping = spawn(
-            world_b,
-            &executable_b.source_path,
-            &[TEST_SLEEP.into()],
-            &BTreeMap::new(),
-            false,
-            Some(&scratch_b.source_path),
-            10_000,
-            256 * 1024 * 1024,
+        let mut sleeping = probe_phase(
+            "spawn_secondary_contained_process",
+            spawn(
+                world_b,
+                &executable_b.source_path,
+                &[TEST_SLEEP.into()],
+                &BTreeMap::new(),
+                false,
+                Some(&scratch_b.source_path),
+                10_000,
+                256 * 1024 * 1024,
+            ),
         )?;
-        let (prepared_a, world_a) = prepare_world(&world_a_ref, &mounts_a)?;
+        let (prepared_a, world_a) = probe_phase(
+            "prepare_primary_workspace",
+            prepare_world(&world_a_ref, &mounts_a),
+        )?;
         let executable_a = find_mount(&prepared_a, ResourceKindV1::Executable)?;
         let input_a = find_mount(&prepared_a, ResourceKindV1::ManagedRevision)?;
         let scratch_a = find_mount(&prepared_a, ResourceKindV1::Scratch)?;
         let output_a = find_mount(&prepared_a, ResourceKindV1::OutputSlot)?;
         let marker = scratch_a.source_path.join("detached-child-marker.txt");
-        let sentinel = File::open(&denied)?;
+        let sentinel = probe_phase(
+            "open_noninherited_handle_sentinel",
+            File::open(&denied).map_err(AppError::from),
+        )?;
         unsafe {
             SetHandleInformation(
                 sentinel.as_raw_handle() as HANDLE,
@@ -2858,20 +2913,26 @@ fn native_conformance_probe(required: &BTreeSet<ConfinementPropertyV1>) -> AppRe
             executable_a.source_path.to_string_lossy().into_owned(),
         ];
         let environment = BTreeMap::from([("PASTEY_ALLOWED_PROBE".into(), "ok".into())]);
-        let mut spawned = spawn(
-            world_a,
-            &executable_a.source_path,
-            &args,
-            &environment,
-            false,
-            Some(&scratch_a.source_path),
-            4_000,
-            256 * 1024 * 1024,
+        let mut spawned = probe_phase(
+            "spawn_primary_conformance_process",
+            spawn(
+                world_a,
+                &executable_a.source_path,
+                &args,
+                &environment,
+                false,
+                Some(&scratch_a.source_path),
+                4_000,
+                256 * 1024 * 1024,
+            ),
         )?;
         std::env::remove_var("PASTEY_HOST_SECRET_SENTINEL");
         let deadline = Instant::now() + Duration::from_secs(8);
         let status = loop {
-            if let Some(status) = spawned.process.try_wait()? {
+            if let Some(status) = probe_phase(
+                "wait_for_primary_conformance_process",
+                spawned.process.try_wait().map_err(AppError::from),
+            )? {
                 break status;
             }
             if Instant::now() >= deadline {
@@ -2884,29 +2945,42 @@ fn native_conformance_probe(required: &BTreeSet<ConfinementPropertyV1>) -> AppRe
         spawned.process.terminate_tree();
         sleeping.process.terminate_tree();
         thread::sleep(Duration::from_millis(1_400));
-        if !status.success()
-            || marker.exists()
-            || fs::read(scratch_a.source_path.join("scratch-ok.txt"))
-                .ok()
-                .as_deref()
-                != Some(b"scratch")
-            || fs::read(output_a.source_path.join("output-ok.txt"))
-                .ok()
-                .as_deref()
-                != Some(b"output")
-        {
-            return unavailable("Windows native confinement behavior was incomplete.");
+        if !status.success() {
+            return unavailable(probe_parent_failure_reason(status.code()));
         }
-        let bytes = fs::read(&current)?;
-        crate::execution_world::domain_hash(
-            "pastey-windows-execution-world-identity-v2",
-            &(
-                WINDOWS_WORLD_ADAPTER_VERSION,
-                EXECUTION_WORLD_VERSION,
-                required,
-                setup.marker.account_sid,
-                setup.marker.firewall_rule_name,
-                blake3::hash(&bytes).to_hex().to_string(),
+        if marker.exists() {
+            return unavailable("Windows Worker descendant survived Job termination.");
+        }
+        if fs::read(scratch_a.source_path.join("scratch-ok.txt"))
+            .ok()
+            .as_deref()
+            != Some(b"scratch")
+        {
+            return unavailable("Windows Worker scratch projection check was incomplete.");
+        }
+        if fs::read(output_a.source_path.join("output-ok.txt"))
+            .ok()
+            .as_deref()
+            != Some(b"output")
+        {
+            return unavailable("Windows Worker output projection check was incomplete.");
+        }
+        let bytes = probe_phase(
+            "read_verified_executable_identity",
+            fs::read(&current).map_err(AppError::from),
+        )?;
+        probe_phase(
+            "finalize_verified_identity",
+            crate::execution_world::domain_hash(
+                "pastey-windows-execution-world-identity-v2",
+                &(
+                    WINDOWS_WORLD_ADAPTER_VERSION,
+                    EXECUTION_WORLD_VERSION,
+                    required,
+                    setup.marker.account_sid,
+                    setup.marker.firewall_rule_name,
+                    blake3::hash(&bytes).to_hex().to_string(),
+                ),
             ),
         )
     })();
@@ -2962,19 +3036,19 @@ pub(crate) fn run_probe_helper_if_requested() -> bool {
             }
         },
         Some(VERIFICATION_CLI) => {
-            let availability = availability(crate::execution_world::required_properties());
-            if availability.available {
-                println!("PASTEY_WINDOWS_EXECUTION_WORLD_VERIFIED");
-                std::process::exit(0);
+            match native_conformance_probe(&crate::execution_world::required_properties()) {
+                Ok(_) => {
+                    println!("PASTEY_WINDOWS_EXECUTION_WORLD_VERIFIED");
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "PASTEY_WINDOWS_EXECUTION_WORLD_VERIFY_FAILED:\n{}",
+                        verifier_failure_reason(&error.to_string())
+                    );
+                    std::process::exit(1);
+                }
             }
-            eprintln!(
-                "PASTEY_WINDOWS_EXECUTION_WORLD_UNAVAILABLE: {}",
-                availability
-                    .unavailable_reason
-                    .as_deref()
-                    .unwrap_or("native conformance failed")
-            );
-            std::process::exit(1);
         }
         Some(RUNNER_CLI) => {
             let Some(control_pipe) = arguments.get(2) else {
@@ -3015,121 +3089,129 @@ pub(crate) fn run_probe_helper_if_requested() -> bool {
 }
 
 fn run_probe_parent(arguments: &[String]) -> ! {
-    let success = (|| -> bool {
-        let (
-            Some(input),
-            Some(scratch),
-            Some(output),
-            Some(denied),
-            Some(private_state),
-            Some(other_run),
-            Some(marker),
-            Some(sentinel),
-            Some(executable),
-        ) = (
-            arguments.get(2),
-            arguments.get(3),
-            arguments.get(4),
-            arguments.get(5),
-            arguments.get(6),
-            arguments.get(7),
-            arguments.get(8),
-            arguments.get(9),
-            arguments.get(10),
+    std::process::exit(probe_parent_exit_code(arguments));
+}
+
+fn probe_parent_exit_code(arguments: &[String]) -> i32 {
+    let (
+        Some(input),
+        Some(scratch),
+        Some(output),
+        Some(denied),
+        Some(private_state),
+        Some(other_run),
+        Some(marker),
+        Some(sentinel),
+        Some(executable),
+    ) = (
+        arguments.get(2),
+        arguments.get(3),
+        arguments.get(4),
+        arguments.get(5),
+        arguments.get(6),
+        arguments.get(7),
+        arguments.get(8),
+        arguments.get(9),
+        arguments.get(10),
+    )
+    else {
+        return 92;
+    };
+    if fs::read(input).ok().as_deref() != Some(b"probe-input")
+        || fs::write(input, b"mutated").is_ok()
+        || fs::write(Path::new(scratch).join("scratch-ok.txt"), b"scratch").is_err()
+        || fs::write(Path::new(output).join("output-ok.txt"), b"output").is_err()
+        || can_open_for_acl_rewrite(&Path::new(scratch).join("scratch-ok.txt"))
+        || fs::read(denied).is_ok()
+        || fs::write(denied, b"mutated").is_ok()
+        || fs::read(private_state).is_ok()
+        || fs::read(other_run).is_ok()
+    {
+        return 92;
+    }
+    if std::env::var("PASTEY_HOST_SECRET_SENTINEL").is_ok()
+        || std::env::var("PASTEY_ALLOWED_PROBE").ok().as_deref() != Some("ok")
+    {
+        return 93;
+    }
+    let allowed = [
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "PASTEY_ALLOWED_PROBE",
+    ];
+    if std::env::vars().any(|(name, _)| {
+        !allowed
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&name))
+    }) {
+        return 93;
+    }
+    let sentinel = sentinel.parse::<usize>().ok().unwrap_or_default() as HANDLE;
+    let mut flags = 0_u32;
+    if unsafe { GetHandleInformation(sentinel, &mut flags) } != 0 {
+        return 94;
+    }
+    for address in [
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9),
+    ] {
+        let result = TcpStream::connect_timeout(&address, Duration::from_millis(500));
+        if result.as_ref().err().and_then(io::Error::raw_os_error) != Some(10013) {
+            return 95;
+        }
+    }
+    if std::process::Command::new(executable)
+        .arg(PROBE_CHILD)
+        .arg(marker)
+        .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
+        .env_clear()
+        .spawn()
+        .is_ok()
+    {
+        return 96;
+    }
+    let child = std::process::Command::new(executable)
+        .arg(PROBE_CHILD)
+        .arg(marker)
+        .env_clear()
+        .spawn();
+    let Ok(child) = child else {
+        return 97;
+    };
+    let mut contained = 0;
+    if unsafe {
+        IsProcessInJob(
+            child.as_raw_handle() as HANDLE,
+            ptr::null_mut(),
+            &mut contained,
         )
-        else {
-            return false;
-        };
-        if fs::read(input).ok().as_deref() != Some(b"probe-input")
-            || fs::write(input, b"mutated").is_ok()
-            || fs::write(Path::new(scratch).join("scratch-ok.txt"), b"scratch").is_err()
-            || fs::write(Path::new(output).join("output-ok.txt"), b"output").is_err()
-            || can_open_for_acl_rewrite(&Path::new(scratch).join("scratch-ok.txt"))
-            || fs::read(denied).is_ok()
-            || fs::write(denied, b"mutated").is_ok()
-            || fs::read(private_state).is_ok()
-            || fs::read(other_run).is_ok()
-            || std::env::var("PASTEY_HOST_SECRET_SENTINEL").is_ok()
-            || std::env::var("PASTEY_ALLOWED_PROBE").ok().as_deref() != Some("ok")
-        {
-            return false;
-        }
-        let allowed = [
-            "SYSTEMROOT",
-            "WINDIR",
-            "TEMP",
-            "TMP",
-            "USERPROFILE",
-            "APPDATA",
-            "LOCALAPPDATA",
-            "PATH",
-            "PATHEXT",
-            "PASTEY_ALLOWED_PROBE",
-        ];
-        if std::env::vars().any(|(name, _)| {
-            !allowed
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(&name))
-        }) {
-            return false;
-        }
-        let sentinel = sentinel.parse::<usize>().ok().unwrap_or_default() as HANDLE;
-        let mut flags = 0_u32;
-        if unsafe { GetHandleInformation(sentinel, &mut flags) } != 0 {
-            return false;
-        }
-        for address in [
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9),
-        ] {
-            let result = TcpStream::connect_timeout(&address, Duration::from_millis(500));
-            if result.as_ref().err().and_then(io::Error::raw_os_error) != Some(10013) {
-                return false;
-            }
-        }
-        if std::process::Command::new(executable)
-            .arg(PROBE_CHILD)
-            .arg(marker)
-            .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
-            .env_clear()
-            .spawn()
-            .is_ok()
-        {
-            return false;
-        }
-        let child = std::process::Command::new(executable)
-            .arg(PROBE_CHILD)
-            .arg(marker)
-            .env_clear()
-            .spawn();
-        let Ok(child) = child else {
-            return false;
-        };
-        let mut contained = 0;
-        if unsafe {
-            IsProcessInJob(
-                child.as_raw_handle() as HANDLE,
-                ptr::null_mut(),
-                &mut contained,
-            )
-        } == 0
-            || contained == 0
-        {
-            return false;
-        }
-        let spawned = (0..(MAX_JOB_PROCESSES + 4))
-            .filter(|_| {
-                std::process::Command::new(executable)
-                    .arg(PROBE_CHILD)
-                    .arg(marker)
-                    .env_clear()
-                    .spawn()
-                    .is_ok()
-            })
-            .count();
-        spawned > 0 && spawned < (MAX_JOB_PROCESSES + 4) as usize
-    })();
-    std::process::exit(if success { 0 } else { 92 });
+    } == 0
+        || contained == 0
+    {
+        return 98;
+    }
+    let spawned = (0..(MAX_JOB_PROCESSES + 4))
+        .filter(|_| {
+            std::process::Command::new(executable)
+                .arg(PROBE_CHILD)
+                .arg(marker)
+                .env_clear()
+                .spawn()
+                .is_ok()
+        })
+        .count();
+    if spawned > 0 && spawned < (MAX_JOB_PROCESSES + 4) as usize {
+        0
+    } else {
+        99
+    }
 }
 
 fn can_open_for_acl_rewrite(path: &Path) -> bool {

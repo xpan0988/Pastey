@@ -42,6 +42,8 @@ mod transfer_tuning;
 mod windows_execution_world;
 #[cfg(any(windows, test))]
 mod windows_setup_state;
+#[cfg(any(windows, test))]
+mod windows_verifier_diagnostics;
 mod worker_harness;
 mod worker_provider;
 mod worker_provider_config;
