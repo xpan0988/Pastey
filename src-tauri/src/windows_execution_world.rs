@@ -146,7 +146,8 @@ use crate::{
         RecoveryEvidenceV1, RecoveryStageV1, SetupEvidenceV1, SetupPlanV1,
     },
     windows_verifier_diagnostics::{
-        probe_parent_failure_reason, production_unavailable_reason, verifier_failure_reason,
+        create_process_with_logon_failure_reason, probe_parent_failure_reason,
+        production_unavailable_reason, verifier_failure_reason,
     },
 };
 
@@ -907,11 +908,18 @@ fn spawn_runner_suspended(
             &mut process,
         )
     };
+    let create_error = if created == 0 {
+        Some(unsafe { GetLastError() })
+    } else {
+        None
+    };
     password_wide.fill(0);
     let mut password = password.into_bytes();
     password.fill(0);
-    if created == 0 {
-        return unavailable("Windows could not log on the Pastey sandbox bootstrap account.");
+    if let Some(status) = create_error {
+        return Err(AppError::InvalidInput(
+            create_process_with_logon_failure_reason(status),
+        ));
     }
     let process_handle = unsafe { owned(process.hProcess)? };
     let thread_handle = unsafe { owned(process.hThread)? };
