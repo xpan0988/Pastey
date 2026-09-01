@@ -456,30 +456,32 @@ impl HostAdmissionService {
             ));
         }
 
-        // Unsupported semantics fail the complete Plan, including Hosts whose
-        // own local fragment would otherwise contain only Search or Transfer.
-        if revision
-            .steps
-            .iter()
-            .any(|step| !availability.supports(revision, step))
-        {
-            return Ok(deny(
-                HostAdmissionDenialCode::UnsupportedOperation,
-                "This HostRuntime cannot safely provide every primitive required by the v2 Plan.",
-            ));
-        }
-        let work = revision
+        // The sealed revision above is the whole-Plan semantic authority. This
+        // process-local snapshot proves availability only for work admitted here.
+        let local_steps = revision
             .steps
             .iter()
             .filter(|step| step.binds_participant(&request.participant_ref))
-            .map(admitted_work_v2)
-            .collect::<AppResult<Vec<_>>>()?;
-        if work.is_empty() {
+            .collect::<Vec<_>>();
+        if local_steps.is_empty() {
             return Ok(deny(
                 HostAdmissionDenialCode::NoHostBoundWork,
                 "The v2 Plan contains no work bound to this Host.",
             ));
         }
+        if local_steps
+            .iter()
+            .any(|step| !availability.supports(revision, step))
+        {
+            return Ok(deny(
+                HostAdmissionDenialCode::UnsupportedOperation,
+                "This HostRuntime cannot safely provide a primitive required by its v2 Plan fragment.",
+            ));
+        }
+        let work = local_steps
+            .into_iter()
+            .map(admitted_work_v2)
+            .collect::<AppResult<Vec<_>>>()?;
         let expires_at = approval.expires_at.min(request.session_binding.expires_at);
         if expires_at <= now {
             return Ok(deny(
@@ -590,6 +592,8 @@ mod tests {
     use super::*;
     use crate::{
         bridge_plan::{BridgePlan, BridgePlanApproval, BridgePlanState, RevisionState},
+        bridge_plan_v2::{seal_revision, ManagedObjectRevisionV2, PlanRootV2, PLAN_SCHEMA_VERSION},
+        host_identity::PlanParticipants,
         models::LocalRole,
         storage,
     };
@@ -714,6 +718,183 @@ mod tests {
         match decision {
             HostAdmissionDecision::Deny(denial) => denial.code,
             HostAdmissionDecision::Admit(_) => panic!("expected denial"),
+        }
+    }
+
+    struct V2AdmissionFixture {
+        revision: PlanRevisionV2,
+        approval: PlanApprovalV2,
+        transform_host: HostRef,
+        execute_host: HostRef,
+        execute_participant: PlanParticipantRef,
+        transform_binding: HostSessionBinding,
+        execute_binding: HostSessionBinding,
+        transform_request: HostAdmissionRequestV2,
+        execute_request: HostAdmissionRequestV2,
+        now: i64,
+    }
+
+    fn v2_admission_fixture(search_transfer_only: bool) -> V2AdmissionFixture {
+        let now = 10_000;
+        let plan_id = if search_transfer_only {
+            "plan-v2-search-transfer"
+        } else {
+            "plan-v2-heterogeneous"
+        };
+        let requester_host = host("requester-v2");
+        let transform_host = host("transform-v2");
+        let execute_host = host("execute-v2");
+        let participants = PlanParticipants::new(
+            plan_id,
+            [
+                requester_host.clone(),
+                transform_host.clone(),
+                execute_host.clone(),
+            ],
+        )
+        .unwrap();
+        let requester = PlanParticipantRef::for_host(plan_id, &requester_host).unwrap();
+        let transform_participant = PlanParticipantRef::for_host(plan_id, &transform_host).unwrap();
+        let execute_participant = PlanParticipantRef::for_host(plan_id, &execute_host).unwrap();
+        let input = ManagedObjectRevisionV2 {
+            logical_object_id: "managed-project".into(),
+            revision: 1,
+        };
+        let output = ManagedObjectRevisionV2 {
+            logical_object_id: input.logical_object_id.clone(),
+            revision: 2,
+        };
+        let (roots, steps) = if search_transfer_only {
+            (
+                Vec::new(),
+                vec![
+                    PlanStepV2::Search {
+                        step_id: "search-b".into(),
+                        depends_on: Vec::new(),
+                        host: transform_participant.clone(),
+                        output: input.clone(),
+                        query: "project.txt".into(),
+                        safe_scope_labels: vec!["documents".into()],
+                    },
+                    PlanStepV2::Transfer {
+                        step_id: "transfer-b-c".into(),
+                        depends_on: vec!["search-b".into()],
+                        source: transform_participant.clone(),
+                        destination: execute_participant.clone(),
+                        input: input.clone(),
+                        output: input.clone(),
+                    },
+                ],
+            )
+        } else {
+            (
+                vec![PlanRootV2 {
+                    root_id: "project-root".into(),
+                    object: input.clone(),
+                    host: transform_participant.clone(),
+                }],
+                vec![
+                    PlanStepV2::Transform {
+                        step_id: "transform-b".into(),
+                        depends_on: Vec::new(),
+                        host: transform_participant.clone(),
+                        input: input.clone(),
+                        output: output.clone(),
+                        modification_intent: "Apply the reviewed change.".into(),
+                    },
+                    PlanStepV2::Transfer {
+                        step_id: "transfer-b-c".into(),
+                        depends_on: vec!["transform-b".into()],
+                        source: transform_participant.clone(),
+                        destination: execute_participant.clone(),
+                        input: output.clone(),
+                        output: output.clone(),
+                    },
+                    PlanStepV2::Execute {
+                        step_id: "execute-c".into(),
+                        depends_on: vec!["transfer-b-c".into()],
+                        host: execute_participant.clone(),
+                        target: output,
+                        execution_intent: "Run the reviewed validation.".into(),
+                    },
+                ],
+            )
+        };
+        let revision = seal_revision(PlanRevisionV2 {
+            schema_version: PLAN_SCHEMA_VERSION.into(),
+            plan_id: plan_id.into(),
+            revision_id: format!("revision-{plan_id}"),
+            revision_number: 1,
+            revision_hash: String::new(),
+            bridge_id: "bridge-v2-admission".into(),
+            requester: requester.clone(),
+            participants,
+            roots,
+            original_user_goal: "Use exact authored Host placement.".into(),
+            expected_outcome: "Each Host admits only its exact fragment.".into(),
+            steps,
+        })
+        .unwrap();
+        let approval = PlanApprovalV2 {
+            approval_id: format!("approval-{plan_id}"),
+            plan_id: revision.plan_id.clone(),
+            revision_id: revision.revision_id.clone(),
+            revision_hash: revision.revision_hash.clone(),
+            bridge_id: revision.bridge_id.clone(),
+            requester,
+            expires_at: now + 600,
+        };
+        let transform_binding = HostSessionBinding::new(
+            &revision.bridge_id,
+            transform_host.clone(),
+            requester_host.clone(),
+            "transform-session",
+            "requester-transform-session",
+            "requester-transform-route",
+            now + 600,
+        )
+        .unwrap();
+        let execute_binding = HostSessionBinding::new(
+            &revision.bridge_id,
+            execute_host.clone(),
+            requester_host.clone(),
+            "execute-session",
+            "requester-execute-session",
+            "requester-execute-route",
+            now + 600,
+        )
+        .unwrap();
+        let transform_request = HostAdmissionRequestV2 {
+            approval_id: approval.approval_id.clone(),
+            plan_id: revision.plan_id.clone(),
+            revision_id: revision.revision_id.clone(),
+            revision_hash: revision.revision_hash.clone(),
+            host_ref: transform_host.clone(),
+            participant_ref: transform_participant.clone(),
+            protocol_correlation_id: "correlation-transform".into(),
+            session_binding: transform_binding.clone(),
+        };
+        let execute_request = HostAdmissionRequestV2 {
+            approval_id: approval.approval_id.clone(),
+            plan_id: revision.plan_id.clone(),
+            revision_id: revision.revision_id.clone(),
+            revision_hash: revision.revision_hash.clone(),
+            host_ref: execute_host.clone(),
+            participant_ref: execute_participant.clone(),
+            protocol_correlation_id: "correlation-execute".into(),
+            session_binding: execute_binding.clone(),
+        };
+        V2AdmissionFixture {
+            revision,
+            approval,
+            transform_host,
+            execute_host,
+            execute_participant,
+            transform_binding,
+            execute_binding,
+            transform_request,
+            execute_request,
+            now,
         }
     }
 
@@ -902,5 +1083,173 @@ mod tests {
             HostAdmissionDenialCode::UnsupportedOperation
         );
         let _ = std::fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn heterogeneous_v2_hosts_admit_only_their_exact_managed_fragments() {
+        let fixture = v2_admission_fixture(false);
+        let transform_decision = HostAdmissionService::new(fixture.transform_host.clone())
+            .evaluate_v2_with_availability(
+                &fixture.revision,
+                &fixture.approval,
+                &fixture.transform_request,
+                &fixture.transform_binding,
+                ManagedPrimitiveAvailabilityV1::verified_attachment(
+                    fixture.transform_host.clone(),
+                    true,
+                    false,
+                ),
+                fixture.now,
+            )
+            .unwrap();
+        let transform_admission = transform_decision.admitted().unwrap();
+        assert_eq!(
+            transform_admission
+                .work
+                .iter()
+                .map(|item| item.operation.clone())
+                .collect::<Vec<_>>(),
+            vec![StepOperation::Transform, StepOperation::Transfer]
+        );
+
+        let execute_decision = HostAdmissionService::new(fixture.execute_host.clone())
+            .evaluate_v2_with_availability(
+                &fixture.revision,
+                &fixture.approval,
+                &fixture.execute_request,
+                &fixture.execute_binding,
+                ManagedPrimitiveAvailabilityV1::verified_attachment(
+                    fixture.execute_host.clone(),
+                    false,
+                    true,
+                ),
+                fixture.now,
+            )
+            .unwrap();
+        let execute_admission = execute_decision.admitted().unwrap();
+        assert_eq!(
+            execute_admission
+                .work
+                .iter()
+                .map(|item| item.operation.clone())
+                .collect::<Vec<_>>(),
+            vec![StepOperation::Transfer, StepOperation::Execute]
+        );
+    }
+
+    #[test]
+    fn v2_transform_host_rejects_missing_local_transform_availability() {
+        let fixture = v2_admission_fixture(false);
+        let decision = HostAdmissionService::new(fixture.transform_host.clone())
+            .evaluate_v2_with_availability(
+                &fixture.revision,
+                &fixture.approval,
+                &fixture.transform_request,
+                &fixture.transform_binding,
+                ManagedPrimitiveAvailabilityV1::verified_attachment(
+                    fixture.transform_host,
+                    false,
+                    true,
+                ),
+                fixture.now,
+            )
+            .unwrap();
+        assert_eq!(
+            denial_code(decision),
+            HostAdmissionDenialCode::UnsupportedOperation
+        );
+    }
+
+    #[test]
+    fn v2_execute_host_rejects_missing_local_execute_availability() {
+        let fixture = v2_admission_fixture(false);
+        let decision = HostAdmissionService::new(fixture.execute_host.clone())
+            .evaluate_v2_with_availability(
+                &fixture.revision,
+                &fixture.approval,
+                &fixture.execute_request,
+                &fixture.execute_binding,
+                ManagedPrimitiveAvailabilityV1::verified_attachment(
+                    fixture.execute_host,
+                    true,
+                    false,
+                ),
+                fixture.now,
+            )
+            .unwrap();
+        assert_eq!(
+            denial_code(decision),
+            HostAdmissionDenialCode::UnsupportedOperation
+        );
+    }
+
+    #[test]
+    fn another_hosts_v2_availability_cannot_satisfy_local_work() {
+        let fixture = v2_admission_fixture(false);
+        let decision = HostAdmissionService::new(fixture.transform_host.clone())
+            .evaluate_v2_with_availability(
+                &fixture.revision,
+                &fixture.approval,
+                &fixture.transform_request,
+                &fixture.transform_binding,
+                ManagedPrimitiveAvailabilityV1::verified_attachment(
+                    fixture.execute_host,
+                    true,
+                    true,
+                ),
+                fixture.now,
+            )
+            .unwrap();
+        assert_eq!(
+            denial_code(decision),
+            HostAdmissionDenialCode::UnsupportedOperation
+        );
+    }
+
+    #[test]
+    fn v2_host_cannot_request_admission_for_another_hosts_participant() {
+        let fixture = v2_admission_fixture(false);
+        let mut substituted = fixture.transform_request.clone();
+        substituted.participant_ref = fixture.execute_participant;
+        let decision = HostAdmissionService::new(fixture.transform_host.clone())
+            .evaluate_v2_with_availability(
+                &fixture.revision,
+                &fixture.approval,
+                &substituted,
+                &fixture.transform_binding,
+                ManagedPrimitiveAvailabilityV1::verified_attachment(
+                    fixture.transform_host,
+                    true,
+                    true,
+                ),
+                fixture.now,
+            )
+            .unwrap();
+        assert_eq!(denial_code(decision), HostAdmissionDenialCode::HostMismatch);
+    }
+
+    #[test]
+    fn v2_search_transfer_fragment_needs_no_managed_primitive_availability() {
+        let fixture = v2_admission_fixture(true);
+        let decision = HostAdmissionService::new(fixture.transform_host)
+            .evaluate_v2_with_availability(
+                &fixture.revision,
+                &fixture.approval,
+                &fixture.transform_request,
+                &fixture.transform_binding,
+                ManagedPrimitiveAvailabilityV1::unavailable(),
+                fixture.now,
+            )
+            .unwrap();
+        let admission = decision.admitted().unwrap();
+        assert_eq!(
+            admission
+                .work
+                .iter()
+                .map(|item| item.operation.clone())
+                .collect::<Vec<_>>(),
+            vec![StepOperation::Search, StepOperation::Transfer]
+        );
+        assert!(!admission.constraints.modification_authority);
     }
 }
