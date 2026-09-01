@@ -14,6 +14,14 @@ pub(crate) enum RecoveryStageV1 {
     Bound,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LegacyPrivilegeClassV1 {
+    Guest,
+    User,
+    Administrator,
+    Unknown,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryEvidenceV1 {
     pub(crate) stage: RecoveryStageV1,
@@ -41,17 +49,32 @@ pub(crate) enum SetupPlanV1 {
 pub(crate) fn validate_exact_local_user_identity(
     requested_name: &str,
     returned_name: &str,
-    user_privilege: bool,
     valid_sid: bool,
+    legacy_privilege: LegacyPrivilegeClassV1,
+    exact_managed_flags: bool,
+    operator_authority_clear: bool,
+    local_group_membership_count: u32,
 ) -> Result<(), &'static str> {
     if !requested_name.eq_ignore_ascii_case(returned_name) {
         return Err("local account lookup returned a different account name");
     }
-    if !user_privilege {
-        return Err("local account lookup did not return a standard user");
-    }
     if !valid_sid {
         return Err("local account lookup returned an invalid SID");
+    }
+    if !matches!(
+        legacy_privilege,
+        LegacyPrivilegeClassV1::Guest | LegacyPrivilegeClassV1::User
+    ) {
+        return Err("local account lookup reported an administrator or unknown privilege class");
+    }
+    if !exact_managed_flags {
+        return Err("local account flags do not match the managed sandbox account shape");
+    }
+    if !operator_authority_clear {
+        return Err("local account has operator authority");
+    }
+    if local_group_membership_count != 0 {
+        return Err("local account has unexpected direct or indirect local-group membership");
     }
     Ok(())
 }
@@ -128,35 +151,107 @@ mod tests {
     }
 
     #[test]
-    fn exact_local_sid_resolution_requires_requested_user_name_type_and_valid_sid() {
+    fn expected_non_privileged_local_account_without_users_membership_is_accepted() {
         assert_eq!(
             validate_exact_local_user_identity(
                 "PasteySandboxOffline",
                 "PasteySandboxOffline",
                 true,
-                true
+                LegacyPrivilegeClassV1::Guest,
+                true,
+                true,
+                0,
             ),
             Ok(())
         );
+        assert_eq!(
+            validate_exact_local_user_identity(
+                "PasteySandboxOffline",
+                "PasteySandboxOffline",
+                true,
+                LegacyPrivilegeClassV1::User,
+                true,
+                true,
+                0,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn administrator_operator_and_group_authority_are_rejected() {
+        assert!(validate_exact_local_user_identity(
+            "PasteySandboxOffline",
+            "PasteySandboxOffline",
+            true,
+            LegacyPrivilegeClassV1::Administrator,
+            true,
+            true,
+            0,
+        )
+        .is_err());
+        assert!(validate_exact_local_user_identity(
+            "PasteySandboxOffline",
+            "PasteySandboxOffline",
+            true,
+            LegacyPrivilegeClassV1::Unknown,
+            true,
+            true,
+            0,
+        )
+        .is_err());
+        assert!(validate_exact_local_user_identity(
+            "PasteySandboxOffline",
+            "PasteySandboxOffline",
+            true,
+            LegacyPrivilegeClassV1::Guest,
+            true,
+            false,
+            0,
+        )
+        .is_err());
+        assert!(validate_exact_local_user_identity(
+            "PasteySandboxOffline",
+            "PasteySandboxOffline",
+            true,
+            LegacyPrivilegeClassV1::Guest,
+            true,
+            true,
+            1,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn changed_name_invalid_sid_and_changed_flags_are_rejected() {
         assert!(validate_exact_local_user_identity(
             "PasteySandboxOffline",
             "DOMAIN\\PasteySandboxOffline",
             true,
-            true
+            LegacyPrivilegeClassV1::Guest,
+            true,
+            true,
+            0,
         )
         .is_err());
         assert!(validate_exact_local_user_identity(
             "PasteySandboxOffline",
             "PasteySandboxOffline",
             false,
-            true
+            LegacyPrivilegeClassV1::Guest,
+            true,
+            true,
+            0,
         )
         .is_err());
         assert!(validate_exact_local_user_identity(
             "PasteySandboxOffline",
             "PasteySandboxOffline",
             true,
-            false
+            LegacyPrivilegeClassV1::Guest,
+            false,
+            true,
+            0,
         )
         .is_err());
     }
@@ -220,6 +315,14 @@ mod tests {
             select_setup_plan(value),
             Err("an unrelated pre-existing sandbox account was found")
         );
+    }
+
+    #[test]
+    fn unexpected_legacy_fingerprint_is_not_recoverable() {
+        let mut value = evidence();
+        value.local_account_sid = Some("S-1-5-21-1-1004".into());
+        value.legacy_fingerprint_matches = false;
+        assert!(select_setup_plan(value).is_err());
     }
 
     #[test]
