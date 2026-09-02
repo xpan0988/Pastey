@@ -49,6 +49,11 @@ const WORKER_RESOURCE_ADAPTER_VERSION: &str = "pastey-worker-resource-adapter-v1
 const WORKER_PROCESS_ADAPTER_VERSION: &str = "pastey-worker-process-adapter-v1";
 const MAX_PROJECTED_READ_BYTES: usize = 16 * 1024;
 
+#[cfg(test)]
+pub(crate) fn projected_read_bytes_for_tests() -> u64 {
+    MAX_PROJECTED_READ_BYTES as u64
+}
+
 /// Process-local cancellation state owned by `HostRuntime`. It has no grant,
 /// cannot create a run, and is discarded at completion/restart.
 #[derive(Clone, Debug)]

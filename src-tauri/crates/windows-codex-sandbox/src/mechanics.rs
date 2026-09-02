@@ -44,6 +44,12 @@ pub fn run_host_setup(sandbox_home: &Path, host_username: &str) -> Result<()> {
     )
 }
 
+/// Converts an elevated runner spawn failure into the fixed diagnostic schema
+/// permitted at Pastey's explicit verifier boundary.
+pub fn spawn_failure_diagnostic(error: &anyhow::Error) -> String {
+    crate::runner_client::bounded_spawn_failure_diagnostic(error)
+}
+
 pub async fn spawn(launch: WindowsSandboxLaunch) -> Result<SpawnedProcess> {
     if !setup_is_complete(&launch.sandbox_home) {
         anyhow::bail!("Windows sandbox setup is missing or out of date");

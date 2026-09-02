@@ -115,7 +115,7 @@ Close/exit, disconnect, explicit departure, session replacement, Burn, shutdown,
 | --- | --- | --- | --- |
 | Search/Transfer safe identity and encrypted transfer | Implemented | Implemented where the desktop product is supported | Implemented; cross-compiled checks do not replace native proof |
 | Managed Resource effects | Implemented | Implemented | Implemented |
-| Managed contained Process execution | Available only after the local `sandbox-exec` confinement probe succeeds | Unavailable; fails closed | `WindowsCodexBackendV1` over the pinned Codex-derived sandbox; availability requires Host-owned elevated setup and Pastey's native product-binary resource/environment/I/O/cancellation/NoRawNetwork conformance probe, otherwise fails closed |
+| Managed contained Process execution | Available only after the local `sandbox-exec` confinement probe succeeds | Unavailable; fails closed | `WindowsCodexBackendV1` over the pinned Codex-derived sandbox; availability requires Host-owned elevated setup and Pastey's native resource/environment/I/O/cancellation/NoRawNetwork conformance probe. The native Windows Stage 1–5 path, including production Managed Execute, has been physically demonstrated. Setup or runtime failure fails closed; there is no unsandboxed fallback. |
 | Worker task Network effects | Not exposed | Not exposed | Not exposed |
 | Developer Terminal | Native PTY | Native PTY path | ConPTY/PowerShell |
 
@@ -127,6 +127,6 @@ The 1.9.3 development backend implements the Host/identity/object substrate, nat
 
 V1 remains isolated and unchanged: its product executes Search/Transfer and rejects Transform/Execute. The 2.0 renderer can open an existing native-v2 revision and drive Review approval, readiness start, authoritative status, and cancellation through the registered Tauri commands. Draft discovery/origination, renderer-safe PM context and detailed topology, and result content projection are not yet exposed. Provider configuration, provider health presentation, and exact managed process binding are still Host-private backend seams. Requester-local authored primitives fail readiness because requester self-admission/execution is not implemented.
 
-Remaining 2.0 product work includes renderer-safe Draft/PM/topology/result projections, non-secret provider settings and health presentation, Host-owned executable binding/configuration, product recovery for coordination delivery failures, native packaged Windows ExecutionWorld evidence, and physical multi-Host validation. Independently future capabilities include a verified Linux managed execution world, Worker network tools, subagent policy, and Headless Host. None is implied by the current backend.
+Remaining 2.0 product work includes renderer-safe Draft/PM/topology/result projections, non-secret provider settings and health presentation, Host-owned executable binding/configuration, product recovery for coordination delivery failures, and physical multi-Host validation. Independently future capabilities include a verified Linux managed execution world, Worker network tools, subagent policy, and Headless Host. None is implied by the current backend.
 
 See [Layer 5](layers/layer-5-agent.md) for the managed contracts, [development](development.md) for validation and physical smoke procedures, and [reference](reference.md) for concrete identifiers and bounds.

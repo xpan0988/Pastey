@@ -1392,6 +1392,328 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_os = "windows", feature = "native-windows-acceptance"))]
+    const STAGE5_TEST_CODEX_RUNNER_ENV: &str = "PASTEY_WINDOWS_TEST_CODEX_RUNNER_EXE";
+
+    #[cfg(all(target_os = "windows", feature = "native-windows-acceptance"))]
+    struct Stage5RunnerSiblingGuard {
+        destination: PathBuf,
+        backup: Option<PathBuf>,
+    }
+
+    #[cfg(all(target_os = "windows", feature = "native-windows-acceptance"))]
+    impl Stage5RunnerSiblingGuard {
+        fn install(
+            current_test: &std::path::Path,
+            installed_runner: &std::path::Path,
+        ) -> std::io::Result<Self> {
+            if !installed_runner.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "The Stage 5 Codex command runner source is unavailable.",
+                ));
+            }
+            let parent = current_test.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "The Cargo Stage 5 test executable has no parent directory.",
+                )
+            })?;
+            let destination = parent.join("codex-command-runner.exe");
+            if destination.exists() && !destination.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "The Cargo Stage 5 runner sibling is not a regular file.",
+                ));
+            }
+            let backup = if destination.is_file() {
+                let backup = parent.join(format!(
+                    ".pastey-stage5-codex-command-runner-backup-{}.exe",
+                    uuid::Uuid::new_v4()
+                ));
+                std::fs::rename(&destination, &backup)?;
+                Some(backup)
+            } else {
+                None
+            };
+
+            if let Err(error) = std::fs::copy(installed_runner, &destination) {
+                if let Some(backup) = &backup {
+                    let _ = std::fs::rename(backup, &destination);
+                }
+                return Err(error);
+            }
+
+            Ok(Self {
+                destination,
+                backup,
+            })
+        }
+    }
+
+    #[cfg(all(target_os = "windows", feature = "native-windows-acceptance"))]
+    impl Drop for Stage5RunnerSiblingGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.destination);
+            if let Some(backup) = &self.backup {
+                let _ = std::fs::rename(backup, &self.destination);
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "windows", feature = "native-windows-acceptance"))]
+    fn stage5_runner_guard_test_root() -> TestRoot {
+        let root = std::env::temp_dir().join(format!(
+            "pastey-stage5-runner-guard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create Stage 5 runner guard test root");
+        TestRoot(root)
+    }
+
+    #[cfg(all(target_os = "windows", feature = "native-windows-acceptance"))]
+    #[test]
+    fn stage5_runner_guard_restores_a_preexisting_sibling() {
+        let root = stage5_runner_guard_test_root();
+        let current_test = root.0.join("pastey-test.exe");
+        let installed_runner = root.0.join("installed-codex-command-runner.exe");
+        let sibling = root.0.join("codex-command-runner.exe");
+        std::fs::write(&installed_runner, b"installed runner").unwrap();
+        std::fs::write(&sibling, b"preexisting helper").unwrap();
+
+        {
+            let guard = Stage5RunnerSiblingGuard::install(&current_test, &installed_runner)
+                .expect("install Stage 5 test runner");
+            assert_eq!(
+                std::fs::read(&guard.destination).unwrap(),
+                b"installed runner"
+            );
+        }
+
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"preexisting helper");
+    }
+
+    #[cfg(all(target_os = "windows", feature = "native-windows-acceptance"))]
+    #[test]
+    fn stage5_runner_guard_removes_only_its_test_created_sibling() {
+        let root = stage5_runner_guard_test_root();
+        let current_test = root.0.join("pastey-test.exe");
+        let installed_runner = root.0.join("installed-codex-command-runner.exe");
+        let sibling = root.0.join("codex-command-runner.exe");
+        std::fs::write(&installed_runner, b"installed runner").unwrap();
+
+        {
+            let guard = Stage5RunnerSiblingGuard::install(&current_test, &installed_runner)
+                .expect("install Stage 5 test runner");
+            assert!(guard.destination.is_file());
+        }
+
+        assert!(!sibling.exists());
+    }
+
+    #[cfg(all(target_os = "windows", feature = "native-windows-acceptance"))]
+    fn emit_stage5_evidence_diagnostic(fixture: &Fixture, provider: &ScriptedProvider) {
+        let (evidence, envelope) = {
+            let authority = fixture.runtime.effect_authority.lock();
+            let mut evidence = authority.effect_evidence_for_tests();
+            evidence.sort_by_key(|item| item.sequence);
+            let envelope = evidence
+                .first()
+                .and_then(|item| authority.effect_envelope_for_tests(&item.envelope_ref));
+            (evidence, envelope)
+        };
+        if let Some(envelope) = envelope {
+            let input_grant = envelope.resources.iter().find(|grant| {
+                grant.selector_prefix == "."
+                    && grant
+                        .allowed_verbs
+                        .contains(&crate::effect_authority::ResourceVerbV1::Read)
+            });
+            let read_bound = envelope.effect_bounds.iter().find(|bound| {
+                bound.capability
+                    == crate::effect_authority::EffectCapabilityV1::Resource(
+                        crate::effect_authority::ResourceVerbV1::Read,
+                    )
+            });
+            println!(
+                "STAGE5_RESOURCE_GRANT_READ_BYTES={}",
+                input_grant.map_or(0, |grant| grant.budgets.read_bytes)
+            );
+            println!(
+                "STAGE5_RESOURCE_BOUND_READ_BYTES={}",
+                read_bound.map_or(0, |bound| bound.max_per_request.read_bytes)
+            );
+        }
+        for item in evidence {
+            let decision = match item.decision {
+                crate::effect_authority::EffectDecisionV1::Allowed => "Allowed",
+                crate::effect_authority::EffectDecisionV1::Denied => "Denied",
+                crate::effect_authority::EffectDecisionV1::Unavailable => "Unavailable",
+            };
+            let (family, verb) = match &item.facts {
+                crate::effect_authority::EffectFactsV1::Resource { .. } => {
+                    ("resource", "not_recorded")
+                }
+                crate::effect_authority::EffectFactsV1::Process { .. } => {
+                    ("process", "not_recorded")
+                }
+                crate::effect_authority::EffectFactsV1::ContainedProcess { .. } => {
+                    ("process", "spawn")
+                }
+                crate::effect_authority::EffectFactsV1::Network { .. }
+                | crate::effect_authority::EffectFactsV1::BrokeredNetwork { .. } => {
+                    ("network", "not_recorded")
+                }
+                crate::effect_authority::EffectFactsV1::None => ("none", "not_recorded"),
+            };
+            println!("STAGE5_EVIDENCE_SEQUENCE={}", item.sequence);
+            println!("STAGE5_EVIDENCE_DECISION={decision}");
+            println!("STAGE5_EVIDENCE_EFFECT_FAMILY={family}");
+            println!("STAGE5_EVIDENCE_EFFECT_VERB={verb}");
+            println!("STAGE5_EVIDENCE_SUMMARY={}", item.actual_effect_summary);
+            if let crate::effect_authority::EffectFactsV1::ContainedProcess {
+                state,
+                exit_code,
+                stdout_digest,
+                stderr_digest,
+                termination_requested,
+                network_denied,
+                ..
+            } = item.facts
+            {
+                println!("STAGE5_PROCESS_STATE={state}");
+                println!(
+                    "STAGE5_PROCESS_EXIT_CODE={}",
+                    exit_code.map_or_else(|| "none".into(), |value| value.to_string())
+                );
+                println!("STAGE5_PROCESS_TERMINATION_REQUESTED={termination_requested}");
+                println!("STAGE5_PROCESS_NETWORK_DENIED={network_denied}");
+                println!("STAGE5_PROCESS_STDOUT_DIGEST={stdout_digest}");
+                println!("STAGE5_PROCESS_STDERR_DIGEST={stderr_digest}");
+            }
+        }
+
+        if let Some(request) = provider.requests.last() {
+            for turn in &request.history {
+                if matches!(
+                    &turn.response,
+                    Some(WorkerProviderResponseV1::ToolCall {
+                        call: WorkerToolCallV1::Read {
+                            resource: WorkerResourceAliasV1::Input,
+                        },
+                    })
+                ) {
+                    println!("STAGE5_RESOURCE_VERB=read");
+                    println!("STAGE5_RESOURCE_SELECTOR=.");
+                    println!(
+                        "STAGE5_RESOURCE_REQUEST_READ_BYTES={}",
+                        crate::worker_harness::projected_read_bytes_for_tests()
+                    );
+                }
+                if let Some(WorkerObservationV1::Resource {
+                    operation,
+                    decision,
+                    generation,
+                    content_digest,
+                    bytes,
+                    truncated,
+                    ..
+                }) = &turn.observation
+                {
+                    println!("STAGE5_WORKER_RESOURCE_OPERATION={operation}");
+                    println!("STAGE5_WORKER_RESOURCE_DECISION={decision}");
+                    println!(
+                        "STAGE5_WORKER_RESOURCE_GENERATION={}",
+                        generation.map_or_else(|| "none".into(), |value| value.to_string())
+                    );
+                    println!(
+                        "STAGE5_WORKER_RESOURCE_CONTENT_DIGEST={}",
+                        content_digest.as_deref().unwrap_or("none")
+                    );
+                    println!(
+                        "STAGE5_WORKER_RESOURCE_BYTES={}",
+                        bytes.map_or_else(|| "none".into(), |value| value.to_string())
+                    );
+                    println!("STAGE5_WORKER_RESOURCE_TRUNCATED={truncated}");
+                }
+                if let Some(WorkerObservationV1::Process {
+                    decision,
+                    state,
+                    exit_code,
+                    stdout_digest,
+                    stderr_digest,
+                    termination_requested,
+                    network_denied,
+                    ..
+                }) = &turn.observation
+                {
+                    println!("STAGE5_WORKER_PROCESS_DECISION={decision}");
+                    println!(
+                        "STAGE5_WORKER_PROCESS_STATE={}",
+                        state.as_deref().unwrap_or("none")
+                    );
+                    println!(
+                        "STAGE5_WORKER_PROCESS_EXIT_CODE={}",
+                        exit_code.map_or_else(|| "none".into(), |value| value.to_string())
+                    );
+                    println!(
+                        "STAGE5_WORKER_PROCESS_TERMINATION_REQUESTED={}",
+                        termination_requested
+                            .map_or_else(|| "none".into(), |value| value.to_string())
+                    );
+                    println!("STAGE5_WORKER_PROCESS_NETWORK_DENIED={network_denied}");
+                    println!(
+                        "STAGE5_WORKER_PROCESS_STDOUT_DIGEST={}",
+                        stdout_digest.as_deref().unwrap_or("none")
+                    );
+                    println!(
+                        "STAGE5_WORKER_PROCESS_STDERR_DIGEST={}",
+                        stderr_digest.as_deref().unwrap_or("none")
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "windows", feature = "native-windows-acceptance"))]
+    fn emit_stage5_availability_diagnostic() {
+        let Some(diagnostic) =
+            crate::windows_codex_backend::native_probe_launch_diagnostic_for_tests()
+        else {
+            println!("STAGE5_AVAILABILITY_PROBE_PHASE=none_recorded");
+            return;
+        };
+        println!("STAGE5_AVAILABILITY_PROBE_PHASE={}", diagnostic.phase);
+        println!(
+            "STAGE5_AVAILABILITY_PROCESS_LAUNCH_OPERATION={}",
+            diagnostic.operation
+        );
+        println!(
+            "STAGE5_AVAILABILITY_WINDOWS_ERROR_CODES={}",
+            diagnostic.windows_error_codes
+        );
+        println!(
+            "STAGE5_AVAILABILITY_SANITIZED_MESSAGES={}",
+            diagnostic.sanitized_messages
+        );
+        println!(
+            "STAGE5_AVAILABILITY_CREDENTIAL_REFRESH_ATTEMPTED={}",
+            diagnostic.credential_refresh_attempted
+        );
+        println!(
+            "STAGE5_AVAILABILITY_RETRY_SPAWN_ATTEMPTED={}",
+            diagnostic.retry_spawn_attempted
+        );
+        println!(
+            "STAGE5_AVAILABILITY_RUNNER_PROCESS_CREATED={}",
+            diagnostic.runner_process_created
+        );
+        println!(
+            "STAGE5_AVAILABILITY_SANITIZED_ERROR={}",
+            diagnostic.sanitized_error
+        );
+    }
+
     struct Fixture {
         _root: TestRoot,
         runtime: Arc<HostRuntime>,
@@ -2417,19 +2739,58 @@ mod tests {
             .expect("resolve the Cargo test executable")
             .canonicalize()
             .expect("canonicalize the Cargo test executable");
+        let installed_runner = std::env::var_os(STAGE5_TEST_CODEX_RUNNER_ENV)
+            .map(PathBuf::from)
+            .expect("Stage 5 must supply the installed Codex command runner path");
+        let stage5_runner_guard =
+            Stage5RunnerSiblingGuard::install(&current_test, &installed_runner).expect(
+                "place the installed Codex command runner beside the Cargo Stage 5 test executable",
+            );
+        println!("STAGE5_TEST_EXE={}", current_test.display());
+        println!(
+            "STAGE5_TEST_RUNNER={}",
+            stage5_runner_guard.destination.display()
+        );
+        println!(
+            "STAGE5_TEST_RUNNER_EXISTS={}",
+            stage5_runner_guard.destination.is_file()
+        );
         let profile_dir = current_test
             .parent()
             .and_then(|path| path.parent())
             .expect("Cargo test executable must be under the profile deps directory");
-        let probe = profile_dir.join("pastey-managed-execute-probe.exe");
+        let cargo_probe = profile_dir.join("pastey-managed-execute-probe.exe");
         assert!(
-            probe.is_file(),
+            cargo_probe.is_file(),
             "build the acceptance probe first with `cargo build --manifest-path src-tauri/Cargo.toml --features native-windows-acceptance --bin pastey-managed-execute-probe`; expected {}",
-            probe.display()
+            cargo_probe.display()
         );
-        let probe = probe
+        let cargo_probe = cargo_probe
             .canonicalize()
             .expect("canonicalize the Managed Execute probe");
+        let private_probe_root = TestRoot(
+            std::env::temp_dir().join(format!("pastey-stage5-probe-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&private_probe_root.0)
+            .expect("create the private Managed Execute probe fixture directory");
+        let scope_root = private_probe_root
+            .0
+            .canonicalize()
+            .expect("canonicalize the private Managed Execute probe fixture directory");
+        let probe = scope_root.join("pastey-managed-execute-probe.exe");
+        std::fs::copy(&cargo_probe, &probe)
+            .expect("copy the Cargo-built Managed Execute probe into the private fixture");
+        let probe = probe
+            .canonicalize()
+            .expect("canonicalize the private Managed Execute probe copy");
+        assert_ne!(
+            probe, cargo_probe,
+            "the acceptance fixture must not authorize the raw Cargo artifact"
+        );
+        assert!(
+            probe.starts_with(&scope_root),
+            "the copied probe must remain inside its private fixture directory"
+        );
         let product = profile_dir.join("pastey.exe");
         assert!(
             product.is_file(),
@@ -2440,14 +2801,11 @@ mod tests {
             .canonicalize()
             .expect("canonicalize the Pastey product verifier executable");
         std::env::set_var("PASTEY_WINDOWS_NATIVE_VERIFIER_EXE_FOR_TESTS", product);
-        let scope_root = probe
-            .parent()
-            .expect("the Managed Execute probe must have a parent directory")
-            .to_path_buf();
         let executable = ExecutableBindingSpecV1 {
             executable_path: probe,
-            scope_root,
+            scope_root: scope_root.clone(),
         };
+        assert_eq!(executable.scope_root, scope_root);
         let expected_executable_identity =
             crate::managed_resources::ManagedResourceResolverV1::executable_identity_ref(
                 &executable,
@@ -2474,6 +2832,9 @@ mod tests {
             availability.kind,
             crate::execution_world::PlatformWorldKindV1::WindowsCodexSandbox
         );
+        if !availability.available {
+            emit_stage5_availability_diagnostic();
+        }
         assert!(
             availability.available,
             "the production Codex Windows backend is unavailable: {:?}",
@@ -2505,18 +2866,20 @@ mod tests {
             ]),
             requests: Vec::new(),
         };
-        assert_eq!(
-            fixture
-                .runtime
-                .dispatch_next_v2_managed_with_provider(
-                    &fixture.start.attempt_id,
-                    fixture.binding.clone(),
-                    &mut provider,
-                    storage::now_ts(),
-                )
-                .expect("complete the production Managed Execute path"),
-            StepOperation::Execute
+        let dispatch = fixture.runtime.dispatch_next_v2_managed_with_provider(
+            &fixture.start.attempt_id,
+            fixture.binding.clone(),
+            &mut provider,
+            storage::now_ts(),
         );
+        let dispatch = match dispatch {
+            Ok(operation) => operation,
+            Err(error) => {
+                emit_stage5_evidence_diagnostic(&fixture, &provider);
+                panic!("complete the production Managed Execute path: {error}");
+            }
+        };
+        assert_eq!(dispatch, StepOperation::Execute);
 
         let final_request = provider
             .requests
@@ -2694,6 +3057,7 @@ mod tests {
         let world_source = include_str!("execution_world.rs");
         assert!(world_source.contains("there is no direct-process fallback"));
         assert!(!world_source.contains("std::process::Command::new"));
+        drop(stage5_runner_guard);
     }
 
     #[test]
