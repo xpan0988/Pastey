@@ -1341,8 +1341,10 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     use crate::managed_resources::ExecutableBindingSpecV1;
+    #[cfg(all(target_os = "windows", feature = "native-windows-acceptance"))]
+    use crate::worker_harness::WorkerObservationV1;
     use crate::{
         bridge_plan_v2::{
             seal_revision, ManagedObjectRevisionV2, PlanApprovalV2, PlanRootV2, ReviewRequestV2,
@@ -2401,6 +2403,297 @@ mod tests {
             )
             .unwrap();
         assert_eq!((transform_results, execute_results), (0, 1));
+    }
+
+    #[cfg(all(target_os = "windows", feature = "native-windows-acceptance"))]
+    #[test]
+    #[ignore = "requires the Host-owned Codex sandbox setup on a configured native Windows host"]
+    fn native_windows_managed_execute_through_codex_backend() {
+        const PROBE_STDIN: &[u8] = b"pastey-managed-execute-stdin-v1";
+        const PROBE_STDOUT: &str = "PASTEY_MANAGED_EXECUTE_STDOUT_V1";
+        const PROBE_STDERR: &str = "PASTEY_MANAGED_EXECUTE_STDERR_V1";
+
+        let current_test = std::env::current_exe()
+            .expect("resolve the Cargo test executable")
+            .canonicalize()
+            .expect("canonicalize the Cargo test executable");
+        let profile_dir = current_test
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("Cargo test executable must be under the profile deps directory");
+        let probe = profile_dir.join("pastey-managed-execute-probe.exe");
+        assert!(
+            probe.is_file(),
+            "build the acceptance probe first with `cargo build --manifest-path src-tauri/Cargo.toml --features native-windows-acceptance --bin pastey-managed-execute-probe`; expected {}",
+            probe.display()
+        );
+        let probe = probe
+            .canonicalize()
+            .expect("canonicalize the Managed Execute probe");
+        let product = profile_dir.join("pastey.exe");
+        assert!(
+            product.is_file(),
+            "build the Pastey product binary first; expected {}",
+            product.display()
+        );
+        let product = product
+            .canonicalize()
+            .expect("canonicalize the Pastey product verifier executable");
+        std::env::set_var("PASTEY_WINDOWS_NATIVE_VERIFIER_EXE_FOR_TESTS", product);
+        let scope_root = probe
+            .parent()
+            .expect("the Managed Execute probe must have a parent directory")
+            .to_path_buf();
+        let executable = ExecutableBindingSpecV1 {
+            executable_path: probe,
+            scope_root,
+        };
+        let expected_executable_identity =
+            crate::managed_resources::ManagedResourceResolverV1::executable_identity_ref(
+                &executable,
+            )
+            .expect("capture the exact probe executable identity");
+
+        let fixture = fixture(execute_steps);
+        let expected_input = match &fixture.revision.steps[0] {
+            PlanStepV2::Execute { target, .. } => target.clone(),
+            _ => panic!("fixture must contain one Execute step"),
+        };
+        fixture
+            .runtime
+            .bind_v2_managed_process_step(
+                &fixture.revision.revision_id,
+                "execute",
+                ManagedProcessWorldSpecV1 { executable },
+            )
+            .expect("bind the exact Cargo-built probe to the exact approved Execute step");
+
+        let availability = fixture.runtime.execution_worlds.platform_availability();
+        std::env::remove_var("PASTEY_WINDOWS_NATIVE_VERIFIER_EXE_FOR_TESTS");
+        assert_eq!(
+            availability.kind,
+            crate::execution_world::PlatformWorldKindV1::WindowsCodexSandbox
+        );
+        assert!(
+            availability.available,
+            "the production Codex Windows backend is unavailable: {:?}",
+            availability.unavailable_reason
+        );
+        assert!(matches!(
+            accept(&fixture),
+            AttemptStartDecisionV2::Accepted(_)
+        ));
+
+        let mut provider = ScriptedProvider {
+            responses: VecDeque::from([
+                Ok(WorkerProviderResponseV1::ToolCall {
+                    call: WorkerToolCallV1::Read {
+                        resource: WorkerResourceAliasV1::Input,
+                    },
+                }),
+                Ok(WorkerProviderResponseV1::ToolCall {
+                    call: WorkerToolCallV1::ProcessSpawn {
+                        arguments: vec![],
+                        environment: Default::default(),
+                        stdin_base64: Some(
+                            base64::engine::general_purpose::STANDARD.encode(PROBE_STDIN),
+                        ),
+                        working_directory: Some(WorkerResourceAliasV1::Scratch),
+                    },
+                }),
+                Ok(WorkerProviderResponseV1::FinalExecute),
+            ]),
+            requests: Vec::new(),
+        };
+        assert_eq!(
+            fixture
+                .runtime
+                .dispatch_next_v2_managed_with_provider(
+                    &fixture.start.attempt_id,
+                    fixture.binding.clone(),
+                    &mut provider,
+                    storage::now_ts(),
+                )
+                .expect("complete the production Managed Execute path"),
+            StepOperation::Execute
+        );
+
+        let final_request = provider
+            .requests
+            .last()
+            .expect("the scripted provider must reach FinalExecute");
+        let resource_observation = final_request.history.iter().find_map(|turn| {
+            if let Some(WorkerObservationV1::Resource {
+                decision,
+                text,
+                truncated,
+                ..
+            }) = &turn.observation
+            {
+                Some((decision, text, truncated))
+            } else {
+                None
+            }
+        });
+        let (resource_decision, resource_text, resource_truncated) =
+            resource_observation.expect("normal input resource observation");
+        assert_eq!(resource_decision, "allowed");
+        assert_eq!(resource_text.as_deref(), Some("revision one"));
+        assert!(!resource_truncated);
+
+        let process_observation = final_request.history.iter().find_map(|turn| {
+            if let Some(WorkerObservationV1::Process {
+                decision,
+                state,
+                exit_code,
+                stdout_digest,
+                stdout_excerpt,
+                stdout_truncated,
+                stderr_digest,
+                stderr_excerpt,
+                stderr_truncated,
+                termination_requested,
+                network_denied,
+                ..
+            }) = &turn.observation
+            {
+                Some((
+                    decision,
+                    state,
+                    exit_code,
+                    stdout_digest,
+                    stdout_excerpt,
+                    stdout_truncated,
+                    stderr_digest,
+                    stderr_excerpt,
+                    stderr_truncated,
+                    termination_requested,
+                    network_denied,
+                ))
+            } else {
+                None
+            }
+        });
+        let (
+            process_decision,
+            process_state,
+            exit_code,
+            stdout_digest,
+            stdout_excerpt,
+            stdout_truncated,
+            stderr_digest,
+            stderr_excerpt,
+            stderr_truncated,
+            termination_requested,
+            network_denied,
+        ) = process_observation.expect("normal contained-process observation");
+        assert_eq!(process_decision, "allowed");
+        assert_eq!(process_state.as_deref(), Some("exited"));
+        assert_eq!(*exit_code, Some(0));
+        assert!(stdout_digest.is_some());
+        assert!(stdout_excerpt
+            .as_deref()
+            .is_some_and(|output| output.contains(PROBE_STDOUT)));
+        assert!(!stdout_truncated);
+        assert!(stderr_digest.is_some());
+        assert!(stderr_excerpt
+            .as_deref()
+            .is_some_and(|output| output.contains(PROBE_STDERR)));
+        assert!(!stderr_truncated);
+        assert_eq!(*termination_requested, Some(false));
+        assert!(*network_denied);
+
+        let conn = connection(&fixture.runtime.paths).unwrap();
+        let (input_logical_object_id, input_revision, result_json): (String, u64, String) = conn
+            .query_row(
+                "SELECT input_logical_object_id, input_revision, result_json
+                 FROM bridge_plan_v2_execute_results
+                 WHERE attempt_id = ?1 AND step_id = 'execute'",
+                [&fixture.start.attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("Core must persist the normal authoritative Execute result");
+        assert_eq!(input_logical_object_id, expected_input.logical_object_id);
+        assert_eq!(input_revision, expected_input.revision);
+        let result: crate::managed_execution::AuthoritativeExecuteResultV1 =
+            serde_json::from_str(&result_json).expect("parse the authoritative Execute result");
+        assert_eq!(
+            result.input.logical_object_id,
+            expected_input.logical_object_id
+        );
+        assert_eq!(result.input.revision, expected_input.revision);
+        assert_eq!(result.status, "completed");
+        assert!(!result.result_digest.is_empty());
+        assert!(!result.evidence_head.is_empty());
+        assert_eq!(result.result_digest, result.evidence_head);
+
+        let evidence = fixture
+            .runtime
+            .effect_authority
+            .lock()
+            .effect_evidence_for_tests();
+        let contained_process = evidence.iter().find_map(|item| {
+            if let crate::effect_authority::EffectFactsV1::ContainedProcess {
+                executable_identity_ref,
+                state,
+                exit_code,
+                network_denied,
+                ..
+            } = &item.facts
+            {
+                Some((
+                    item,
+                    executable_identity_ref,
+                    state,
+                    exit_code,
+                    network_denied,
+                ))
+            } else {
+                None
+            }
+        });
+        let (process_evidence, executable_identity_ref, state, exit_code, network_denied) =
+            contained_process.expect("Host-authenticated contained-process evidence");
+        assert_eq!(executable_identity_ref, &expected_executable_identity);
+        assert_eq!(state, "exited");
+        assert_eq!(*exit_code, Some(0));
+        assert!(*network_denied);
+        assert_eq!(process_evidence.evidence_digest, result.result_digest);
+
+        let transform_results: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_transform_results",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transform_results, 0, "Execute must not advance lineage");
+        drop(conn);
+        let bridge_id = fixture.binding.bridge_id.clone();
+        let mut objects = fixture.runtime.managed_objects.lock();
+        assert!(objects
+            .acquisition_for_revision(
+                &bridge_id,
+                &expected_input.logical_object_id,
+                expected_input.revision,
+                storage::now_ts(),
+            )
+            .is_ok());
+        assert!(objects
+            .acquisition_for_revision(
+                &bridge_id,
+                &expected_input.logical_object_id,
+                expected_input.revision + 1,
+                storage::now_ts(),
+            )
+            .is_err());
+
+        let backend_source = include_str!("execution_backend.rs");
+        assert!(backend_source
+            .contains("return Arc::new(crate::windows_codex_backend::WindowsCodexBackendV1)"));
+        let world_source = include_str!("execution_world.rs");
+        assert!(world_source.contains("there is no direct-process fallback"));
+        assert!(!world_source.contains("std::process::Command::new"));
     }
 
     #[test]

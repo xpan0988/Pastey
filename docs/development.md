@@ -48,6 +48,18 @@ cargo test --manifest-path src-tauri/Cargo.toml --test windows_execution_world -
 
 The integration test launches the actual Pastey product binary with its private verifier. It verifies only Pastey's adopted backend contract: authorized resource read/write projection, absence of an intentionally inherited Host environment sentinel and kernel-handle sentinel, external and loopback raw-network `WSAEACCES` denial, and a termination request that reaches an observed terminal session. It does not claim the deleted Pastey restricted-principal/bootstrap/Job design. The explicit verifier CLI reports only bounded diagnostics; production availability remains fail closed behind its generic unavailable reason. A failed or unavailable probe keeps managed Process execution unavailable. This native test is the next evidence gate after automated validation; a GNU cross-build is never a substitute.
 
+After that conformance test passes, run the opt-in native Managed Execute acceptance test from the repository root in the same non-elevated PowerShell and with the packaged Codex sidecar directory still prepended to `PATH`:
+
+```powershell
+cargo build --manifest-path .\src-tauri\Cargo.toml --features native-windows-acceptance --bin pastey --bin pastey-managed-execute-probe
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+cargo test --manifest-path .\src-tauri\Cargo.toml --features native-windows-acceptance --bin pastey managed_worker_coordinator::tests::native_windows_managed_execute_through_codex_backend -- --exact --ignored --nocapture
+```
+
+Administrator privileges are not required for this acceptance stage; use the same Windows user whose Host-owned elevated setup already completed. Success ends with `test managed_worker_coordinator::tests::native_windows_managed_execute_through_codex_backend ... ok` and a test result containing `1 passed; 0 failed`. The test binds the exact Cargo-built probe executable to the exact immutable Execute step through the Host-private process-spec seam, then uses normal admission, EffectEnvelope compilation, resource observation, managed Process enforcement, evidence, and Core finalization. It asserts bounded stdin, stdout and stderr, the Codex backend kind, the authored input revision, and absence of a new lineage revision. The feature-gated probe is not included in ordinary product builds or Tauri packaging.
+
+On failure, preserve the complete output from both commands, the complete Stage 4 verifier output, `Get-Command codex-command-runner.exe,codex-windows-sandbox-setup.exe | Format-List *`, `$env:PATH`, `rustc -vV`, and `cargo -vV`. Do not include sandbox credentials, provider credentials, Bridge secrets, Host-private resource paths, or raw authority/evidence objects.
+
 ## Transfer and Layer 4 validation
 
 Transfer planner scenarios can also be replayed with:

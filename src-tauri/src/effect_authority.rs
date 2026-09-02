@@ -2325,6 +2325,11 @@ impl EffectAuthorityStateV1 {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn effect_evidence_for_tests(&self) -> Vec<EffectEvidenceV1> {
+        self.evidence.values().flatten().cloned().collect()
+    }
+
     /// Requires a complete, successful, ordered evidence chain for an active
     /// run. Write-ahead intents without terminal evidence are indeterminate;
     /// denied/unavailable effects cannot support semantic success.
