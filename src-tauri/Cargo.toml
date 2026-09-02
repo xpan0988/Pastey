@@ -6,6 +6,13 @@ authors = ["xpan0988"]
 edition = "2021"
 default-run = "pastey"
 
+[[bin]]
+name = "pastey-managed-execute-probe"
+path = "src/bin/pastey-managed-execute-probe.rs"
+required-features = ["native-windows-acceptance"]
+test = false
+bench = false
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -55,6 +62,7 @@ windows-sys = { version = "0.61.2", features = [
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+native-windows-acceptance = []
 
 [profile.dev-fast]
 inherits = "dev"

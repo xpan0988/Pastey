@@ -289,6 +289,11 @@ fn path_argument(path: &Path, label: &str) -> AppResult<String> {
 }
 
 fn native_conformance_probe(sandbox_home: &Path) -> AppResult<()> {
+    #[cfg(test)]
+    let current_exe = std::env::var_os("PASTEY_WINDOWS_NATIVE_VERIFIER_EXE_FOR_TESTS")
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_exe()?);
+    #[cfg(not(test))]
     let current_exe = std::env::current_exe()?;
     let probe_root = sandbox_home.join("pastey-native-probe");
     let input = probe_root.join("input.txt");
