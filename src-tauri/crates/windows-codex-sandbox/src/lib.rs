@@ -29,6 +29,7 @@ pub mod permissions {
 #[cfg(target_os = "windows")]
 pub use mechanics::{
     WindowsSandboxLaunch, run_host_setup, setup_is_complete, spawn as spawn_sandboxed_process,
+    spawn_failure_diagnostic,
 };
 
 #[cfg(target_os = "windows")]

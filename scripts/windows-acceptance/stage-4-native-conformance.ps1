@@ -13,6 +13,11 @@ Invoke-PasteyAcceptanceStage -StageNumber 4 -Body {
     Assert-PasteySetupPrerequisite -RepositoryRoot $Context.RepositoryRoot
 
     $originalPath = $env:PATH
+    $hadTestRunnerOverride = Test-Path Env:PASTEY_WINDOWS_TEST_CODEX_RUNNER_EXE
+    $originalTestRunnerOverride = $null
+    if ($hadTestRunnerOverride) {
+        $originalTestRunnerOverride = $env:PASTEY_WINDOWS_TEST_CODEX_RUNNER_EXE
+    }
     try {
         $runnerDirectory = Split-Path -Parent $runner
         $env:PATH = "$runnerDirectory;$originalPath"
@@ -23,6 +28,8 @@ Invoke-PasteyAcceptanceStage -StageNumber 4 -Body {
         Write-Host "RESOLVED_CODEX_COMMAND_RUNNER=$($resolvedRunner.Path)"
         $null = Invoke-PasteyPackagedVerifier -Installation $installation -FailureClassification "BLOCKED"
 
+        $env:PASTEY_WINDOWS_TEST_CODEX_RUNNER_EXE = $runner
+        Write-Host "STAGE4_TEST_CODEX_COMMAND_RUNNER=$runner"
         $testName = "native_windows_codex_execution_world_conformance"
         $test = Invoke-PasteyCommand -FilePath $cargo -ArgumentList @(
             "test", "--manifest-path", "src-tauri/Cargo.toml", "--test", "windows_execution_world",
@@ -37,6 +44,12 @@ Invoke-PasteyAcceptanceStage -StageNumber 4 -Body {
     }
     finally {
         $env:PATH = $originalPath
+        if ($hadTestRunnerOverride) {
+            $env:PASTEY_WINDOWS_TEST_CODEX_RUNNER_EXE = $originalTestRunnerOverride
+        }
+        else {
+            Remove-Item Env:PASTEY_WINDOWS_TEST_CODEX_RUNNER_EXE -ErrorAction SilentlyContinue
+        }
         Copy-PasteySandboxDiagnostics -Context $Context
     }
 }

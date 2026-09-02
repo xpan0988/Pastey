@@ -94,6 +94,30 @@ impl std::fmt::Display for RunnerStartupError {
 
 impl std::error::Error for RunnerStartupError {}
 
+#[derive(Debug)]
+enum RunnerSpawnRetryOutcome {
+    RefreshFailed(anyhow::Error),
+    RetrySpawnFailed(anyhow::Error),
+}
+
+#[derive(Debug)]
+struct RunnerSpawnRetryError {
+    first_attempt: anyhow::Error,
+    outcome: RunnerSpawnRetryOutcome,
+}
+
+impl std::fmt::Display for RunnerSpawnRetryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("runner spawn refresh/retry failed")
+    }
+}
+
+impl std::error::Error for RunnerSpawnRetryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.first_attempt.as_ref())
+    }
+}
+
 pub(crate) struct RunnerTransport {
     pipe_write: File,
     pipe_read: File,
@@ -142,9 +166,130 @@ pub(crate) fn retry_runner_spawn_once<T>(
 ) -> Result<T> {
     match spawn(sandbox_creds) {
         Ok(result) => Ok(result),
-        Err(err) if is_refreshable_sandbox_creds_error(&err, command) => spawn(refresh()?),
+        Err(first_attempt) if is_refreshable_sandbox_creds_error(&first_attempt, command) => {
+            let refreshed_creds = match refresh() {
+                Ok(creds) => creds,
+                Err(refresh_error) => {
+                    return Err(anyhow::Error::new(RunnerSpawnRetryError {
+                        first_attempt,
+                        outcome: RunnerSpawnRetryOutcome::RefreshFailed(refresh_error),
+                    }));
+                }
+            };
+            spawn(refreshed_creds).map_err(|retry_error| {
+                anyhow::Error::new(RunnerSpawnRetryError {
+                    first_attempt,
+                    outcome: RunnerSpawnRetryOutcome::RetrySpawnFailed(retry_error),
+                })
+            })
+        }
         Err(err) => Err(err),
     }
+}
+
+/// Returns a bounded, secret-free summary suitable for the Pastey verifier.
+///
+/// This deliberately recognizes only runner launch classifications. It never
+/// forwards raw runner payloads, credentials, pipe identifiers, paths, or
+/// arbitrary child output through the product diagnostic boundary.
+pub(crate) fn bounded_spawn_failure_diagnostic(error: &anyhow::Error) -> String {
+    if let Some(retry_error) = find_error::<RunnerSpawnRetryError>(error) {
+        let first_attempt = summarize_spawn_error(&retry_error.first_attempt);
+        return match &retry_error.outcome {
+            RunnerSpawnRetryOutcome::RefreshFailed(refresh_error) => format!(
+                "first_attempt={first_attempt}; credential_refresh_attempted=true; credential_refresh=failed({}); retry_spawn_attempted=false",
+                summarize_refresh_error(refresh_error)
+            ),
+            RunnerSpawnRetryOutcome::RetrySpawnFailed(retry_error) => format!(
+                "first_attempt={first_attempt}; credential_refresh_attempted=true; credential_refresh=completed; retry_spawn_attempted=true; retry_failure={}",
+                summarize_spawn_error(retry_error)
+            ),
+        };
+    }
+
+    format!(
+        "first_attempt={}; credential_refresh_attempted=false; retry_spawn_attempted=false",
+        summarize_spawn_error(error)
+    )
+}
+
+fn find_error<T: std::error::Error + 'static>(error: &anyhow::Error) -> Option<&T> {
+    error.chain().find_map(|cause| cause.downcast_ref::<T>())
+}
+
+fn summarize_spawn_error(error: &anyhow::Error) -> String {
+    if let Some(error) = find_error::<RunnerLogonError>(error) {
+        return format!("runner_logon(CreateProcessWithLogonW_error={})", error.code);
+    }
+    if let Some(error) = find_error::<RunnerStartupError>(error) {
+        let windows_error_code = error
+            .payload
+            .windows_error_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "none".into());
+        return format!(
+            "runner_startup(stage={:?}, message={}, windows_error_code={windows_error_code})",
+            error.payload.stage,
+            bounded_runner_startup_message(&error.payload.message),
+        );
+    }
+    classify_internal_spawn_error(error)
+}
+
+fn bounded_runner_startup_message(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if message.contains("createprocessasuserw") {
+        "CreateProcessAsUserW_failed"
+    } else if message.contains("private desktop") {
+        "private_desktop_failure"
+    } else if message.contains("timed out")
+        && (message.contains("pipe") || message.contains("spawn_ready"))
+    {
+        "runner_pipe_handshake_timeout"
+    } else if message.contains("spawn_ready") {
+        "runner_spawn_ready_failure"
+    } else if message.contains("pipe") {
+        "runner_pipe_handshake_failure"
+    } else {
+        "runner_startup_failure"
+    }
+}
+
+fn summarize_refresh_error(error: &anyhow::Error) -> &'static str {
+    if error_chain_contains(
+        error,
+        "sandbox users missing or incompatible with marker version",
+    ) {
+        "sandbox_users_missing_or_incompatible"
+    } else if error_chain_contains(error, "sandbox user login failed") {
+        "sandbox_users_removed_for_credential_refresh"
+    } else if error_chain_contains(error, "windows sandbox setup is missing or out of date") {
+        "sandbox_setup_missing_or_out_of_date"
+    } else {
+        "credential_refresh_failed"
+    }
+}
+
+fn classify_internal_spawn_error(error: &anyhow::Error) -> String {
+    if error_chain_contains(error, "private desktop") {
+        "private_desktop_failure".into()
+    } else if error_chain_contains(error, "timed out")
+        && (error_chain_contains(error, "pipe") || error_chain_contains(error, "spawn_ready"))
+    {
+        "runner_pipe_handshake_timeout".into()
+    } else if error_chain_contains(error, "spawn_ready") || error_chain_contains(error, "pipe") {
+        "runner_pipe_handshake_failure".into()
+    } else if error_chain_contains(error, "windows sandbox setup is missing or out of date") {
+        "sandbox_setup_missing_or_out_of_date".into()
+    } else {
+        "runner_spawn_failure".into()
+    }
+}
+
+fn error_chain_contains(error: &anyhow::Error, needle: &str) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().to_ascii_lowercase().contains(needle))
 }
 
 impl RunnerTransport {
@@ -496,10 +641,14 @@ fn wait_for_complete_frame(pipe_read: &File, timeout: Duration) -> Result<()> {
 mod tests {
     use super::RunnerLogonError;
     use super::RunnerStartupError;
+    use super::bounded_spawn_failure_diagnostic;
     use super::is_refreshable_sandbox_creds_error;
+    use super::retry_runner_spawn_once;
+    use crate::identity::SandboxCreds;
     use crate::ipc_framed::ErrorPayload;
     use crate::ipc_framed::ErrorStage;
     use pretty_assertions::assert_eq;
+    use std::cell::Cell;
     use windows_sys::Win32::Foundation::ERROR_LOGON_FAILURE;
     use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
     use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
@@ -556,6 +705,70 @@ mod tests {
                 is_refreshable_sandbox_creds_error(&err, &command)
             }),
             [false, false]
+        );
+    }
+
+    fn sandbox_creds() -> SandboxCreds {
+        SandboxCreds {
+            username: "diagnostic-test-user".into(),
+            password: "diagnostic-test-password".into(),
+        }
+    }
+
+    #[test]
+    fn retry_diagnostic_preserves_first_and_retry_spawn_failures() {
+        let attempts = Cell::new(0);
+        let error = retry_runner_spawn_once(
+            sandbox_creds(),
+            &["cmd.exe".into()],
+            |_| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err::<(), _>(anyhow::Error::new(RunnerStartupError::new(ErrorPayload {
+                        message: "CreateProcessAsUserW failed for private input".into(),
+                        stage: ErrorStage::SpawnChild,
+                        windows_error_code: Some(ERROR_NO_SUCH_LOGON_SESSION),
+                    })))
+                } else {
+                    Err(anyhow::Error::new(RunnerLogonError {
+                        code: ERROR_LOGON_FAILURE,
+                    }))
+                }
+            },
+            || Ok(sandbox_creds()),
+        )
+        .unwrap_err();
+
+        let diagnostic = bounded_spawn_failure_diagnostic(&error);
+        assert_eq!(
+            diagnostic,
+            "first_attempt=runner_startup(stage=SpawnChild, message=CreateProcessAsUserW_failed, windows_error_code=1312); credential_refresh_attempted=true; credential_refresh=completed; retry_spawn_attempted=true; retry_failure=runner_logon(CreateProcessWithLogonW_error=1326)"
+        );
+        assert!(!diagnostic.contains("diagnostic-test-password"));
+        assert!(!diagnostic.contains("private input"));
+    }
+
+    #[test]
+    fn retry_diagnostic_preserves_first_failure_when_credential_refresh_fails() {
+        let error = retry_runner_spawn_once(
+            sandbox_creds(),
+            &["cmd.exe".into()],
+            |_| {
+                Err::<(), _>(anyhow::Error::new(RunnerLogonError {
+                    code: ERROR_LOGON_FAILURE,
+                }))
+            },
+            || {
+                Err(anyhow::anyhow!(
+                    "sandbox users missing or incompatible with marker version"
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            bounded_spawn_failure_diagnostic(&error),
+            "first_attempt=runner_logon(CreateProcessWithLogonW_error=1326); credential_refresh_attempted=true; credential_refresh=failed(sandbox_users_missing_or_incompatible); retry_spawn_attempted=false"
         );
     }
 }

@@ -112,11 +112,11 @@ function Invoke-PasteyCommand {
     $display = @($FilePath) + $ArgumentList
     Write-Host ("COMMAND: " + ($display -join " "))
     $previousErrorActionPreference = $ErrorActionPreference
+    $exitCode = $null
     try {
         # Windows PowerShell 5.1 promotes redirected native stderr under "Stop".
         # Let the native exit code decide success while this one process runs.
         $ErrorActionPreference = "Continue"
-        $LASTEXITCODE = $null
         $output = @(& $FilePath @ArgumentList 2>&1)
         $exitCode = $LASTEXITCODE
     }

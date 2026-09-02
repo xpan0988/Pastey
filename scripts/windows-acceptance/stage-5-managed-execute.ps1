@@ -13,6 +13,11 @@ Invoke-PasteyAcceptanceStage -StageNumber 5 -Body {
     Assert-PasteySetupPrerequisite -RepositoryRoot $Context.RepositoryRoot
 
     $originalPath = $env:PATH
+    $hadTestRunnerOverride = Test-Path Env:PASTEY_WINDOWS_TEST_CODEX_RUNNER_EXE
+    $originalTestRunnerOverride = $null
+    if ($hadTestRunnerOverride) {
+        $originalTestRunnerOverride = $env:PASTEY_WINDOWS_TEST_CODEX_RUNNER_EXE
+    }
     try {
         $runnerDirectory = Split-Path -Parent $runner
         $env:PATH = "$runnerDirectory;$originalPath"
@@ -31,6 +36,8 @@ Invoke-PasteyAcceptanceStage -StageNumber 5 -Body {
             Stop-PasteyAcceptanceFailed "The opt-in Managed Execute acceptance binaries failed to build."
         }
 
+        $env:PASTEY_WINDOWS_TEST_CODEX_RUNNER_EXE = $runner
+        Write-Host "STAGE5_TEST_CODEX_COMMAND_RUNNER=$runner"
         $testName = "managed_worker_coordinator::tests::native_windows_managed_execute_through_codex_backend"
         $test = Invoke-PasteyCommand -FilePath $cargo -ArgumentList @(
             "test", "--manifest-path", "src-tauri/Cargo.toml", "--features", "native-windows-acceptance",
@@ -44,6 +51,12 @@ Invoke-PasteyAcceptanceStage -StageNumber 5 -Body {
     }
     finally {
         $env:PATH = $originalPath
+        if ($hadTestRunnerOverride) {
+            $env:PASTEY_WINDOWS_TEST_CODEX_RUNNER_EXE = $originalTestRunnerOverride
+        }
+        else {
+            Remove-Item Env:PASTEY_WINDOWS_TEST_CODEX_RUNNER_EXE -ErrorAction SilentlyContinue
+        }
         Copy-PasteySandboxDiagnostics -Context $Context
     }
 }

@@ -2330,6 +2330,14 @@ impl EffectAuthorityStateV1 {
         self.evidence.values().flatten().cloned().collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn effect_envelope_for_tests(
+        &self,
+        envelope_ref: &EffectEnvelopeRefV1,
+    ) -> Option<EffectEnvelopeV1> {
+        self.envelopes.get(envelope_ref).cloned()
+    }
+
     /// Requires a complete, successful, ordered evidence chain for an active
     /// run. Write-ahead intents without terminal evidence are indeterminate;
     /// denied/unavailable effects cannot support semantic success.

@@ -194,7 +194,12 @@ pub(crate) struct ManagedResourceResolverV1 {
     backings: HashMap<ResourceHandleRefV1, HostResourceBackingV1>,
     staged_payloads: HashMap<String, StagedPayloadV1>,
     reads: HashMap<EffectRequestIdV1, HostResourceReadV1>,
+    /// Every resource currently attached to an execution world. This preserves
+    /// the one-world/one-lease topology invariant, including read-only mounts.
     world_leases: HashSet<ResourceHandleRefV1>,
+    /// World mounts that have a writable private overlay and therefore cannot
+    /// safely be accessed through ordinary Host-side resource effects.
+    exclusive_world_leases: HashSet<ResourceHandleRefV1>,
 }
 
 impl ManagedResourceResolverV1 {
@@ -205,6 +210,7 @@ impl ManagedResourceResolverV1 {
             staged_payloads: HashMap::new(),
             reads: HashMap::new(),
             world_leases: HashSet::new(),
+            exclusive_world_leases: HashSet::new(),
         }
     }
 
@@ -757,6 +763,12 @@ impl ManagedResourceResolverV1 {
             });
         }
         self.world_leases.extend(requested);
+        self.exclusive_world_leases.extend(
+            mounts
+                .iter()
+                .filter(|mount| mount.writable)
+                .map(|mount| mount.handle_ref.clone()),
+        );
         Ok(mounts)
     }
 
@@ -780,6 +792,7 @@ impl ManagedResourceResolverV1 {
                 Err(_) => {}
             }
             self.world_leases.remove(&mount.handle_ref);
+            self.exclusive_world_leases.remove(&mount.handle_ref);
             if mount.private_overlay {
                 let _ = fs::remove_dir_all(&mount.source_path);
             }
@@ -897,6 +910,7 @@ impl ManagedResourceResolverV1 {
         self.staged_payloads.clear();
         self.reads.clear();
         self.world_leases.clear();
+        self.exclusive_world_leases.clear();
         let _ = fs::remove_dir_all(&self.process_root);
         handles.len()
     }
@@ -912,6 +926,8 @@ impl ManagedResourceResolverV1 {
         self.staged_payloads
             .retain(|_, payload| !handles.contains(&payload.handle_ref));
         self.world_leases.retain(|handle| !handles.contains(handle));
+        self.exclusive_world_leases
+            .retain(|handle| !handles.contains(handle));
     }
 
     fn allocate_root(&self, handle_ref: &ResourceHandleRefV1) -> AppResult<PathBuf> {
@@ -957,7 +973,7 @@ impl ManagedResourceResolverV1 {
         let backing = self.backings.get(&effect.handle_ref).ok_or_else(|| {
             AppError::InvalidInput("Managed resource backing is unavailable.".into())
         })?;
-        if self.world_leases.contains(&effect.handle_ref) {
+        if self.exclusive_world_leases.contains(&effect.handle_ref) {
             return invalid("Managed resource is exclusively leased to an execution world.");
         }
         validate_request_owner(backing.owner(), request)?;
@@ -2057,6 +2073,24 @@ mod tests {
             .unwrap()
     }
 
+    fn world_grant(
+        fixture: &Fixture,
+        handle_ref: &ResourceHandleRefV1,
+        kind: ResourceKindV1,
+    ) -> ResourceGrantV1 {
+        fixture
+            .authority
+            .validate_resource_attachment(
+                handle_ref,
+                kind,
+                &fixture.access.envelope_ref,
+                &fixture.access.run_control_ref,
+                &fixture.access.context,
+                &fixture.access.current,
+            )
+            .unwrap()
+    }
+
     #[test]
     fn selectors_reject_absolute_traversal_and_symlink_escape() {
         for selector in ["../escape", "/absolute", "a/../../escape", "file:secret"] {
@@ -2161,6 +2195,219 @@ mod tests {
             enforce(&mut fixture, &req).decision,
             EffectDecisionV1::Denied
         );
+    }
+
+    #[test]
+    fn read_only_managed_revision_world_mount_allows_authorized_host_read() {
+        let mut fixture = fixture();
+        fixture
+            .resolver
+            .bind_managed_revision(
+                &fixture.authority,
+                &mut fixture.objects,
+                &fixture.access,
+                &fixture.managed,
+                fixture.acquisition.clone(),
+            )
+            .unwrap();
+        let grant = world_grant(&fixture, &fixture.managed, ResourceKindV1::ManagedRevision);
+        let mounts = fixture
+            .resolver
+            .lease_execution_world_mounts(
+                &fixture.authority,
+                &mut fixture.objects,
+                &fixture.access,
+                &[grant],
+            )
+            .unwrap();
+        assert!(fixture.resolver.world_leases.contains(&fixture.managed));
+        assert!(!fixture
+            .resolver
+            .exclusive_world_leases
+            .contains(&fixture.managed));
+
+        let request = request(
+            &fixture,
+            0,
+            ResourceVerbV1::Read,
+            fixture.managed.clone(),
+            ".",
+            None,
+            vec![],
+            request_budget(4096, 0),
+        );
+        let evidence = enforce(&mut fixture, &request);
+        assert_eq!(evidence.decision, EffectDecisionV1::Allowed);
+        assert!(matches!(
+            evidence.facts,
+            EffectFactsV1::Resource {
+                generation: 1,
+                ref content_digest,
+                bytes,
+                ..
+            } if content_digest == &digest_bytes(b"authoritative revision N")
+                && bytes == b"authoritative revision N".len() as u64
+        ));
+        let read = fixture.resolver.reads.get(&request.request_id).unwrap();
+        assert_eq!(read.bytes, b"authoritative revision N");
+        assert_eq!(
+            read.content_digest,
+            digest_bytes(b"authoritative revision N")
+        );
+
+        fixture
+            .resolver
+            .release_execution_world_mounts(
+                &mut fixture.objects,
+                &fixture.access,
+                &request.request_id,
+                &mounts,
+            )
+            .unwrap();
+        assert!(!fixture.resolver.world_leases.contains(&fixture.managed));
+        assert!(!fixture
+            .resolver
+            .exclusive_world_leases
+            .contains(&fixture.managed));
+    }
+
+    #[test]
+    fn writable_world_mount_remains_exclusive_from_host_resource_effects() {
+        let mut fixture = fixture();
+        fixture
+            .resolver
+            .provision_scratch(&fixture.authority, &fixture.access, &fixture.scratch, 4096)
+            .unwrap();
+        let grant = world_grant(&fixture, &fixture.scratch, ResourceKindV1::Scratch);
+        let mounts = fixture
+            .resolver
+            .lease_execution_world_mounts(
+                &fixture.authority,
+                &mut fixture.objects,
+                &fixture.access,
+                &[grant],
+            )
+            .unwrap();
+        assert!(fixture.resolver.world_leases.contains(&fixture.scratch));
+        assert!(fixture
+            .resolver
+            .exclusive_world_leases
+            .contains(&fixture.scratch));
+
+        let request = request(
+            &fixture,
+            0,
+            ResourceVerbV1::Inspect,
+            fixture.scratch.clone(),
+            ".",
+            None,
+            vec![],
+            request_budget(1, 0),
+        );
+        assert_eq!(
+            enforce(&mut fixture, &request).decision,
+            EffectDecisionV1::Denied
+        );
+
+        fixture
+            .resolver
+            .release_execution_world_mounts(
+                &mut fixture.objects,
+                &fixture.access,
+                &request.request_id,
+                &mounts,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn world_leases_reject_duplicates_and_release_both_lease_kinds() {
+        let mut fixture = fixture();
+        fixture
+            .resolver
+            .bind_managed_revision(
+                &fixture.authority,
+                &mut fixture.objects,
+                &fixture.access,
+                &fixture.managed,
+                fixture.acquisition.clone(),
+            )
+            .unwrap();
+        fixture
+            .resolver
+            .provision_scratch(&fixture.authority, &fixture.access, &fixture.scratch, 4096)
+            .unwrap();
+        let managed = world_grant(&fixture, &fixture.managed, ResourceKindV1::ManagedRevision);
+        let scratch = world_grant(&fixture, &fixture.scratch, ResourceKindV1::Scratch);
+        let mounts = fixture
+            .resolver
+            .lease_execution_world_mounts(
+                &fixture.authority,
+                &mut fixture.objects,
+                &fixture.access,
+                &[managed.clone(), scratch.clone()],
+            )
+            .unwrap();
+        assert!(fixture.resolver.world_leases.contains(&fixture.managed));
+        assert!(fixture.resolver.world_leases.contains(&fixture.scratch));
+        assert!(!fixture
+            .resolver
+            .exclusive_world_leases
+            .contains(&fixture.managed));
+        assert!(fixture
+            .resolver
+            .exclusive_world_leases
+            .contains(&fixture.scratch));
+        assert!(fixture
+            .resolver
+            .lease_execution_world_mounts(
+                &fixture.authority,
+                &mut fixture.objects,
+                &fixture.access,
+                &[managed.clone()],
+            )
+            .is_err());
+
+        let request_id: EffectRequestIdV1 =
+            serde_json::from_value(serde_json::json!("pastey-test-release-world-leases")).unwrap();
+        fixture
+            .resolver
+            .release_execution_world_mounts(
+                &mut fixture.objects,
+                &fixture.access,
+                &request_id,
+                &mounts,
+            )
+            .unwrap();
+        assert!(!fixture.resolver.world_leases.contains(&fixture.managed));
+        assert!(!fixture.resolver.world_leases.contains(&fixture.scratch));
+        assert!(!fixture
+            .resolver
+            .exclusive_world_leases
+            .contains(&fixture.managed));
+        assert!(!fixture
+            .resolver
+            .exclusive_world_leases
+            .contains(&fixture.scratch));
+
+        let released_mounts = fixture
+            .resolver
+            .lease_execution_world_mounts(
+                &fixture.authority,
+                &mut fixture.objects,
+                &fixture.access,
+                &[managed, scratch],
+            )
+            .unwrap();
+        fixture
+            .resolver
+            .release_execution_world_mounts(
+                &mut fixture.objects,
+                &fixture.access,
+                &request_id,
+                &released_mounts,
+            )
+            .unwrap();
     }
 
     #[test]
