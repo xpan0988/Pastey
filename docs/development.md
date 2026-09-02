@@ -9,7 +9,7 @@ npm install
 npm run tauri:dev
 ```
 
-Use `npm run tauri:dev-fast` only for local transfer-throughput work. Build the frontend with `npm run build`, a desktop package with `npm run tauri:build`, and a checked package with `npm run build:checked`. Linux release hosts use `npm run build:checked:linux`.
+Use `npm run tauri:dev-fast` only for local transfer-throughput work. Build the frontend with `npm run build`, a desktop package with `npm run tauri:build`, and a checked package with `npm run build:checked`. Linux release hosts use `npm run build:checked:linux`. Windows packages use `npm run tauri:build:windows`; that command first builds and stages the pinned Codex command-runner and setup sidecars, then supplies their `externalBin` bundle configuration to Tauri.
 
 ## Validation stack
 
@@ -32,13 +32,13 @@ git diff --check
 
 The Windows cross-check requires the GNU target and MinGW toolchain. It proves compilation, not native Windows confinement, safe-open behavior, machine setup, packaging, or physical E2E.
 
-Windows managed Process execution first requires a one-time setup run by the same Windows user that will run Pastey. Build the product binary, open an elevated PowerShell in the checkout, and run:
+Windows managed Process execution first requires the bundled Codex helper sidecars and one Host-owned setup run by the same Windows user that will run Pastey. Build with `npm run tauri:build:windows`, open an elevated PowerShell, and run the packaged product binary with:
 
 ```powershell
-.\src-tauri\target\release\pastey.exe --pastey-setup-windows-execution-world-v1
+.\Pastey.exe --pastey-setup-windows-codex-sandbox-v1
 ```
 
-The command resolves `PasteySandboxOffline` directly from the local Windows account database, requires its exact managed account flags with no operator authority or direct/indirect local-group memberships, then reconciles its deny-logon rights, the protected ProgramData roots/credential record, and the account-scoped outbound-block firewall rule. Pastey does not require or add membership in `BUILTIN\Users`; after credential proof it instead rejects privileged well-known group SIDs in the exact logged-on token. It writes an atomic, Host-user DPAPI-bound provisional record before creating or changing the account, binds that record to the exact local user SID after credential proof, and atomically commits `setup.json` only after reconciliation and firewall verification succeed. Re-running the command resumes an authenticated Pastey-created partial setup or revalidates the same final marker/account identity; unrelated pre-existing accounts and substituted or stale SIDs fail closed. A narrowly checked legacy recovery path covers an account created by the earlier setup implementation before it could write provisional state. Restart Pastey after setup so its process-local availability result is refreshed.
+The command invokes the retained upstream-derived provisioning transaction for the Codex Windows sandbox identities, credentials, ACL/capability state, Firewall/WFP state, and helper state. Pastey does not select or reinterpret those mechanics. Runtime launch never auto-elevates: absent or stale setup fails closed until the Host operator reruns this command. Restart Pastey after setup so its process-local availability result is refreshed. Source provenance and the upstream update procedure are in `src-tauri/crates/windows-codex-sandbox/UPSTREAM.md`.
 
 Then run the opt-in native conformance test:
 
@@ -46,7 +46,7 @@ Then run the opt-in native conformance test:
 cargo test --manifest-path src-tauri/Cargo.toml --test windows_execution_world -- --ignored --nocapture
 ```
 
-The integration test launches the actual Pastey product binary with its private verifier. Success requires exact staged-resource ACLs, fresh cross-run logon-SID denial, a maximum-privilege-disabled `WRITE_RESTRICTED` Worker token, read-only input, writable scratch/output, Host/private-state denial, a Host-synthesized environment, per-run stdio pipes and stdio-only inherited-handle list, suspended-before-Job assignment, non-breakaway Job resource/process limits, full descendant cleanup, and native firewall `WSAEACCES` NoRawNetwork probes. The explicit verifier CLI reports a bounded phase/API reason when this probe fails; production availability remains fail closed behind its generic unavailable reason. A failed or unavailable probe keeps managed Process execution unavailable. This native test is the next evidence gate after automated validation; a GNU cross-build is never a substitute.
+The integration test launches the actual Pastey product binary with its private verifier. It verifies only Pastey's adopted backend contract: authorized resource read/write projection, absence of an intentionally inherited Host environment sentinel and kernel-handle sentinel, external and loopback raw-network `WSAEACCES` denial, and a termination request that reaches an observed terminal session. It does not claim the deleted Pastey restricted-principal/bootstrap/Job design. The explicit verifier CLI reports only bounded diagnostics; production availability remains fail closed behind its generic unavailable reason. A failed or unavailable probe keeps managed Process execution unavailable. This native test is the next evidence gate after automated validation; a GNU cross-build is never a substitute.
 
 ## Transfer and Layer 4 validation
 

@@ -282,11 +282,11 @@ pub(crate) struct ResourceGrantV1 {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ConfinementPropertyV1 {
-    NoAmbientFilesystem,
-    EmptyEnvironment,
-    NoInheritedDescriptors,
-    ContainedProcessTree,
-    NoDaemonSurvival,
+    AuthorizedResourceProjection,
+    AuthorityNeutralEnvironment,
+    ExplicitProcessIo,
+    PlatformSandboxedProcess,
+    CancellableProcessSession,
     NoRawNetwork,
 }
 
@@ -1282,7 +1282,7 @@ pub(crate) enum EffectFactsV1 {
         stdout_bytes: u64,
         stderr_digest: String,
         stderr_bytes: u64,
-        descendants_terminated: bool,
+        termination_requested: bool,
         network_denied: bool,
         resource_effect_digest: String,
     },
@@ -2752,11 +2752,11 @@ mod tests {
             .collect(),
             executable_resources: [executable.handle_ref.clone()].into_iter().collect(),
             required_properties: [
-                ConfinementPropertyV1::NoAmbientFilesystem,
-                ConfinementPropertyV1::EmptyEnvironment,
-                ConfinementPropertyV1::NoInheritedDescriptors,
-                ConfinementPropertyV1::ContainedProcessTree,
-                ConfinementPropertyV1::NoDaemonSurvival,
+                ConfinementPropertyV1::AuthorizedResourceProjection,
+                ConfinementPropertyV1::AuthorityNeutralEnvironment,
+                ConfinementPropertyV1::ExplicitProcessIo,
+                ConfinementPropertyV1::PlatformSandboxedProcess,
+                ConfinementPropertyV1::CancellableProcessSession,
                 ConfinementPropertyV1::NoRawNetwork,
             ]
             .into_iter()

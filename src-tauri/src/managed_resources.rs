@@ -1666,12 +1666,19 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     #[cfg(target_os = "macos")]
     use std::time::Duration;
+    use std::{
+        collections::BTreeSet,
+        io::Cursor,
+        process::ExitStatus,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     use super::*;
-    #[cfg(target_os = "macos")]
     use crate::execution_world::HostManagedProcessBackendV1;
     use crate::{
         effect_authority::{
@@ -1683,7 +1690,14 @@ mod tests {
             ResourceGrantSpecV1, ResultContractV1, StepWorkDescriptorV1, ToolEffectIntentV1,
             ToolRequestV1, EFFECT_AUTHORITY_VERSION,
         },
-        execution_world::{ExecutionWorldServiceV1, ManagedProcessInvocationV1},
+        execution_backend::{
+            PlatformExecutionBackendV1, PlatformExecutionWorldV1, PlatformProcessLaunchV1,
+            PlatformProcessV1, PreparedPlatformWorldV1, SpawnedPlatformProcessV1,
+        },
+        execution_world::{
+            ExecutionWorldAvailabilityV1, ExecutionWorldServiceV1, ManagedProcessInvocationV1,
+            PlatformWorldKindV1,
+        },
         host_identity::{HostRef, HostSessionBinding, PlanParticipantRef},
         managed_objects::{HostArtifactAcquisition, ManagedObjectAcquisitionKind},
     };
@@ -1734,6 +1748,13 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        let identity = ExecutionWorldServiceV1::default()
+            .platform_availability()
+            .identity_digest;
+        fixture_with_world_identity(&identity)
+    }
+
+    fn fixture_with_world_identity(world_identity: &str) -> Fixture {
         let now = crate::storage::now_ts();
         let root = std::env::temp_dir().join(format!("pastey-step5-{}", Uuid::new_v4()));
         let source_root = root.join("source");
@@ -1880,8 +1901,6 @@ mod tests {
             scratch.clone(),
             executable.clone(),
         ];
-        let availability = ExecutionWorldServiceV1::platform_availability();
-        let world_identity = availability.identity_digest.as_str();
         let world = ExecutionWorldGrantV1 {
             world_ref: execution_world_ref_for(&draft, world_identity).unwrap(),
             context_ref: draft.context_ref.clone(),
@@ -1894,11 +1913,11 @@ mod tests {
                 .collect(),
             executable_resources: [executable.handle_ref.clone()].into_iter().collect(),
             required_properties: [
-                ConfinementPropertyV1::NoAmbientFilesystem,
-                ConfinementPropertyV1::EmptyEnvironment,
-                ConfinementPropertyV1::NoInheritedDescriptors,
-                ConfinementPropertyV1::ContainedProcessTree,
-                ConfinementPropertyV1::NoDaemonSurvival,
+                ConfinementPropertyV1::AuthorizedResourceProjection,
+                ConfinementPropertyV1::AuthorityNeutralEnvironment,
+                ConfinementPropertyV1::ExplicitProcessIo,
+                ConfinementPropertyV1::PlatformSandboxedProcess,
+                ConfinementPropertyV1::CancellableProcessSession,
                 ConfinementPropertyV1::NoRawNetwork,
             ]
             .into_iter()
@@ -2589,15 +2608,173 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BackendCallCounts {
+        prepares: AtomicUsize,
+        spawns: AtomicUsize,
+        terminations: AtomicUsize,
+    }
+
+    struct RecordingExecutionBackend {
+        available: bool,
+        calls: Arc<BackendCallCounts>,
+    }
+
+    impl PlatformExecutionBackendV1 for RecordingExecutionBackend {
+        fn availability(
+            &self,
+            required: &BTreeSet<ConfinementPropertyV1>,
+        ) -> ExecutionWorldAvailabilityV1 {
+            ExecutionWorldAvailabilityV1 {
+                kind: PlatformWorldKindV1::MacOsSandboxExec,
+                available: self.available,
+                identity_digest: "recording-platform-world-v1".into(),
+                verified_properties: if self.available {
+                    required.clone()
+                } else {
+                    BTreeSet::new()
+                },
+                unavailable_reason: (!self.available)
+                    .then(|| "recording backend unavailable".into()),
+            }
+        }
+
+        fn prepare_world(
+            &self,
+            availability: &ExecutionWorldAvailabilityV1,
+            _world_ref: &ExecutionWorldRefV1,
+            mounts: &[ExecutionWorldMountV1],
+        ) -> AppResult<PreparedPlatformWorldV1> {
+            self.calls.prepares.fetch_add(1, Ordering::SeqCst);
+            if !availability.available {
+                return Err(AppError::InvalidInput(
+                    "recording backend is unavailable".into(),
+                ));
+            }
+            Ok(PreparedPlatformWorldV1 {
+                mounts: mounts.to_vec(),
+                world: Arc::new(RecordingExecutionWorld {
+                    calls: self.calls.clone(),
+                }),
+            })
+        }
+    }
+
+    struct RecordingExecutionWorld {
+        calls: Arc<BackendCallCounts>,
+    }
+
+    impl PlatformExecutionWorldV1 for RecordingExecutionWorld {
+        fn spawn(
+            &self,
+            _launch: PlatformProcessLaunchV1<'_>,
+        ) -> AppResult<SpawnedPlatformProcessV1> {
+            self.calls.spawns.fetch_add(1, Ordering::SeqCst);
+            Ok(SpawnedPlatformProcessV1 {
+                process: Box::new(RecordingProcess {
+                    calls: self.calls.clone(),
+                }),
+                stdin: None,
+                stdout: Box::new(Cursor::new(b"backend-neutral-stdout".to_vec())),
+                stderr: Box::new(Cursor::new(Vec::new())),
+            })
+        }
+    }
+
+    struct RecordingProcess {
+        calls: Arc<BackendCallCounts>,
+    }
+
+    impl PlatformProcessV1 for RecordingProcess {
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            Ok(Some(successful_exit_status()))
+        }
+
+        fn request_termination(&mut self) {
+            self.calls.terminations.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn successful_exit_status() -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(0)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(0)
+        }
+    }
+
+    #[test]
+    fn provisioning_and_spawn_reach_only_the_selected_platform_backend() {
+        let calls = Arc::new(BackendCallCounts::default());
+        let worlds = ExecutionWorldServiceV1::with_backend(Arc::new(RecordingExecutionBackend {
+            available: true,
+            calls: calls.clone(),
+        }));
+        let mut fixture = fixture_with_world_identity("recording-platform-world-v1");
+        provision_process_world(&mut fixture, &worlds).unwrap();
+        assert_eq!(calls.prepares.load(Ordering::SeqCst), 1);
+
+        let invocation = ManagedProcessInvocationV1 {
+            executable_handle: fixture.executable.clone(),
+            argv: Vec::new(),
+            environment: BTreeMap::new(),
+            stdin: None,
+            working_directory_handle: None,
+            working_directory_selector: None,
+        };
+        worlds
+            .stage_invocation(&fixture.access, &fixture.world, invocation.clone())
+            .unwrap();
+        let spawn = process_request(
+            &fixture,
+            0,
+            spawn_effect(&fixture, &invocation),
+            process_budget(4096, 2_000),
+        );
+        let evidence = {
+            let mut backend = HostManagedProcessBackendV1::new(
+                &worlds,
+                &mut fixture.resolver,
+                &mut fixture.objects,
+            );
+            fixture
+                .authority
+                .enforce(&spawn, &fixture.access.current, &mut backend)
+                .unwrap()
+        };
+        assert_eq!(evidence.decision, EffectDecisionV1::Allowed);
+        assert_eq!(calls.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.terminations.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unavailable_platform_backend_fails_before_prepare_and_has_no_fallback() {
+        let calls = Arc::new(BackendCallCounts::default());
+        let worlds = ExecutionWorldServiceV1::with_backend(Arc::new(RecordingExecutionBackend {
+            available: false,
+            calls: calls.clone(),
+        }));
+        let mut fixture = fixture_with_world_identity("recording-platform-world-v1");
+        assert!(provision_process_world(&mut fixture, &worlds).is_err());
+        assert_eq!(calls.prepares.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.terminations.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn execution_world_conformance_is_complete_or_unavailable() {
-        let availability = ExecutionWorldServiceV1::platform_availability();
+        let availability = ExecutionWorldServiceV1::default().platform_availability();
         let required = [
-            ConfinementPropertyV1::NoAmbientFilesystem,
-            ConfinementPropertyV1::EmptyEnvironment,
-            ConfinementPropertyV1::NoInheritedDescriptors,
-            ConfinementPropertyV1::ContainedProcessTree,
-            ConfinementPropertyV1::NoDaemonSurvival,
+            ConfinementPropertyV1::AuthorizedResourceProjection,
+            ConfinementPropertyV1::AuthorityNeutralEnvironment,
+            ConfinementPropertyV1::ExplicitProcessIo,
+            ConfinementPropertyV1::PlatformSandboxedProcess,
+            ConfinementPropertyV1::CancellableProcessSession,
             ConfinementPropertyV1::NoRawNetwork,
         ]
         .into_iter()
@@ -2615,7 +2792,7 @@ mod tests {
     fn world_context_substitution_and_dangerous_environment_are_rejected() {
         let mut fixture = process_fixture();
         let worlds = ExecutionWorldServiceV1::default();
-        if ExecutionWorldServiceV1::platform_availability().available {
+        if worlds.platform_availability().available {
             provision_process_world(&mut fixture, &worlds).unwrap();
             let mut wrong = fixture.access.clone();
             wrong.context.attempt_id = "substituted-attempt".into();
@@ -2678,7 +2855,7 @@ mod tests {
     fn real_world_denies_ambient_host_and_network_and_emits_ordered_process_evidence() {
         let mut fixture = process_fixture();
         let worlds = ExecutionWorldServiceV1::default();
-        if !ExecutionWorldServiceV1::platform_availability().available {
+        if !worlds.platform_availability().available {
             assert!(provision_process_world(&mut fixture, &worlds).is_err());
             return;
         }
@@ -2762,7 +2939,7 @@ mod tests {
             matches!(
                 terminal.facts,
                 EffectFactsV1::ContainedProcess {
-                    descendants_terminated: true,
+                    termination_requested: true,
                     network_denied: true,
                     exit_code: Some(0),
                     ref state,
@@ -2794,7 +2971,7 @@ mod tests {
     fn output_budget_external_signal_and_burn_cleanup_fail_closed() {
         let mut fixture = fixture();
         let worlds = ExecutionWorldServiceV1::default();
-        if !ExecutionWorldServiceV1::platform_availability().available {
+        if !worlds.platform_availability().available {
             assert!(provision_process_world(&mut fixture, &worlds).is_err());
             return;
         }
@@ -2882,7 +3059,7 @@ mod tests {
                 EffectFactsV1::ContainedProcess {
                     ref state,
                     stdout_bytes: 32,
-                    descendants_terminated: true,
+                    termination_requested: true,
                     ..
                 } if state == "output_budget_exceeded"
             ),
@@ -2934,10 +3111,10 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn wall_expiry_and_run_cancellation_terminate_the_contained_tree() {
+    fn wall_expiry_and_run_cancellation_request_platform_session_termination() {
         let mut fixture = process_fixture();
         let worlds = ExecutionWorldServiceV1::default();
-        if !ExecutionWorldServiceV1::platform_availability().available {
+        if !worlds.platform_availability().available {
             assert!(provision_process_world(&mut fixture, &worlds).is_err());
             return;
         }
@@ -3001,7 +3178,7 @@ mod tests {
             terminal.facts,
             EffectFactsV1::ContainedProcess {
                 ref state,
-                descendants_terminated: true,
+                termination_requested: true,
                 ..
             } if state == "wall_time_expired"
         ));
@@ -3050,7 +3227,7 @@ mod tests {
     fn contained_process_write_budget_is_hard_bounded() {
         let mut fixture = process_fixture();
         let worlds = ExecutionWorldServiceV1::default();
-        if !ExecutionWorldServiceV1::platform_availability().available {
+        if !worlds.platform_availability().available {
             assert!(provision_process_world(&mut fixture, &worlds).is_err());
             return;
         }

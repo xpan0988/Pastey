@@ -12,7 +12,6 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -20,9 +19,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-#[cfg(unix)]
-use std::process::Stdio;
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -35,6 +31,10 @@ use crate::{
         HostEffectBackendV1, ManagedRunRefV1, ProcessEffectV1, ResourceHandleRefV1, ResourceKindV1,
     },
     error::{AppError, AppResult},
+    execution_backend::{
+        host_platform_execution_backend, PlatformExecutionBackendV1, PlatformExecutionWorldV1,
+        PlatformProcessLaunchV1, PlatformProcessV1,
+    },
     managed_objects::ManagedObjectBindingService,
     managed_resources::{
         ExecutionWorldMountV1, ManagedResourceAccessV1, ManagedResourceResolverV1,
@@ -54,7 +54,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) enum PlatformWorldKindV1 {
     MacOsSandboxExec,
     LinuxBubblewrapCgroupV2,
-    WindowsRestrictedPrincipal,
+    WindowsCodexSandbox,
     Unsupported,
 }
 
@@ -111,8 +111,7 @@ struct ProvisionedWorldV1 {
     mounts: Vec<ExecutionWorldMountV1>,
     resource_identity_refs: HashMap<ResourceHandleRefV1, String>,
     invocations: HashMap<String, ManagedProcessInvocationV1>,
-    #[cfg(windows)]
-    windows: Arc<crate::windows_execution_world::WindowsWorldV1>,
+    platform_world: Arc<dyn PlatformExecutionWorldV1>,
     revoked: bool,
 }
 
@@ -129,7 +128,7 @@ struct StreamCaptureV1 {
 struct TerminalObservationV1 {
     state: String,
     exit_code: Option<i32>,
-    descendants_terminated: bool,
+    termination_requested: bool,
 }
 
 struct ManagedProcessV1 {
@@ -140,7 +139,7 @@ struct ManagedProcessV1 {
     argv_digest: String,
     environment_digest: String,
     process_ref: String,
-    child: Mutex<PlatformChildV1>,
+    child: Mutex<Box<dyn PlatformProcessV1>>,
     stdout: Arc<StreamCaptureV1>,
     stderr: Arc<StreamCaptureV1>,
     terminal: Mutex<Option<TerminalObservationV1>>,
@@ -153,59 +152,10 @@ struct ManagedProcessV1 {
 }
 
 impl ManagedProcessV1 {
-    fn terminate_tree(&self) -> bool {
+    fn request_termination(&self) {
         self.cancel.store(true, Ordering::SeqCst);
-        self.child.lock().terminate_tree()
+        self.child.lock().request_termination();
     }
-}
-
-enum PlatformChildV1 {
-    #[cfg(unix)]
-    Unix {
-        child: std::process::Child,
-        process_group: i32,
-    },
-    #[cfg(windows)]
-    Windows(crate::windows_execution_world::WindowsProcessV1),
-}
-
-impl PlatformChildV1 {
-    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        match self {
-            #[cfg(unix)]
-            Self::Unix { child, .. } => child.try_wait(),
-            #[cfg(windows)]
-            Self::Windows(child) => child.try_wait(),
-        }
-    }
-
-    fn terminate_tree(&mut self) -> bool {
-        match self {
-            #[cfg(unix)]
-            Self::Unix { process_group, .. } => unsafe {
-                // A negative pid addresses exactly the process group created
-                // by the adapter. No requester-controlled Host pid is used.
-                libc::kill(-*process_group, libc::SIGKILL) == 0
-                    || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            },
-            #[cfg(windows)]
-            Self::Windows(child) => child.terminate_tree(),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn process_id(&self) -> i32 {
-        match self {
-            Self::Unix { process_group, .. } => *process_group,
-        }
-    }
-}
-
-struct SpawnedPlatformProcessV1 {
-    child: PlatformChildV1,
-    stdin: Option<Box<dyn Write + Send>>,
-    stdout: Box<dyn Read + Send>,
-    stderr: Box<dyn Read + Send>,
 }
 
 #[derive(Default)]
@@ -232,23 +182,33 @@ pub(crate) struct CompletedProcessObservationV1 {
 }
 
 /// Shared process-local world controller. Lifecycle methods require no
-/// EffectAuthority lock, so Burn/disconnect/shutdown can kill an in-flight
-/// process tree before revoking or deleting its resource roots.
+/// EffectAuthority lock, so Burn/disconnect/shutdown can request termination
+/// and observe the session before revoking or deleting its resource roots.
 pub(crate) struct ExecutionWorldServiceV1 {
+    backend: Arc<dyn PlatformExecutionBackendV1>,
     state: Mutex<ExecutionWorldStateV1>,
 }
 
 impl Default for ExecutionWorldServiceV1 {
     fn default() -> Self {
         Self {
+            backend: host_platform_execution_backend(),
             state: Mutex::new(ExecutionWorldStateV1::default()),
         }
     }
 }
 
 impl ExecutionWorldServiceV1 {
-    pub(crate) fn platform_availability() -> ExecutionWorldAvailabilityV1 {
-        platform_availability()
+    pub(crate) fn platform_availability(&self) -> ExecutionWorldAvailabilityV1 {
+        self.backend.availability(&required_properties())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_backend(backend: Arc<dyn PlatformExecutionBackendV1>) -> Self {
+        Self {
+            backend,
+            state: Mutex::new(ExecutionWorldStateV1::default()),
+        }
     }
 
     pub(crate) fn provision_world(
@@ -266,7 +226,7 @@ impl ExecutionWorldServiceV1 {
             &access.context,
             &access.current,
         )?;
-        let availability = platform_availability();
+        let availability = self.platform_availability();
         let all_required = required_properties();
         if !availability.available
             || availability.identity_digest != grant.world_identity_digest
@@ -296,21 +256,24 @@ impl ExecutionWorldServiceV1 {
             .iter()
             .map(|grant| (grant.handle_ref.clone(), grant.safe_identity_ref.clone()))
             .collect::<HashMap<_, _>>();
-        let mounts = resolver.lease_execution_world_mounts(authority, objects, &access, &grants)?;
-        #[cfg(windows)]
-        let (mounts, windows) =
-            match crate::windows_execution_world::prepare_world(world_ref, &mounts) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    let _ = resolver.release_execution_world_mounts(
-                        objects,
-                        &access,
-                        &synthetic_request_id()?,
-                        &mounts,
-                    );
-                    return Err(error);
-                }
-            };
+        let leased_mounts =
+            resolver.lease_execution_world_mounts(authority, objects, &access, &grants)?;
+        let prepared = match self
+            .backend
+            .prepare_world(&availability, world_ref, &leased_mounts)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = resolver.release_execution_world_mounts(
+                    objects,
+                    &access,
+                    &synthetic_request_id()?,
+                    &leased_mounts,
+                );
+                return Err(error);
+            }
+        };
+        let mounts = prepared.mounts;
         let owner = WorldOwnerV1 {
             envelope_ref: access.envelope_ref.clone(),
             run_ref: access.run_control_ref.clone(),
@@ -339,8 +302,7 @@ impl ExecutionWorldServiceV1 {
                 mounts,
                 resource_identity_refs,
                 invocations: HashMap::new(),
-                #[cfg(windows)]
-                windows,
+                platform_world: prepared.world,
                 revoked: false,
             },
         );
@@ -420,6 +382,7 @@ impl ExecutionWorldServiceV1 {
             availability,
             mounts,
             invocation,
+            platform_world,
             process_ref,
             executable_identity_ref,
         ) = {
@@ -461,23 +424,16 @@ impl ExecutionWorldServiceV1 {
                 world.availability.clone(),
                 world.mounts.clone(),
                 invocation,
+                world.platform_world.clone(),
                 process_ref,
                 executable_identity_ref,
             )
         };
-        #[cfg(windows)]
-        let windows = self
-            .state
-            .lock()
-            .worlds
-            .get(world_ref)
-            .map(|world| world.windows.clone())
-            .ok_or_else(|| AppError::InvalidInput("Execution world is unavailable.".into()))?;
         if !matches!(
             availability.kind,
             PlatformWorldKindV1::MacOsSandboxExec
                 | PlatformWorldKindV1::LinuxBubblewrapCgroupV2
-                | PlatformWorldKindV1::WindowsRestrictedPrincipal
+                | PlatformWorldKindV1::WindowsCodexSandbox
         ) || request.requested_budget_slice.process_spawns != 1
             || request.requested_budget_slice.wall_millis == 0
         {
@@ -498,22 +454,23 @@ impl ExecutionWorldServiceV1 {
             .find(|mount| mount.handle_ref == invocation.executable_handle)
             .ok_or_else(|| AppError::InvalidInput("Executable mount is unavailable.".into()))?;
         let cwd = resolve_working_directory(&mounts, &invocation)?;
-        let mut spawned = spawn_platform_process(
-            &availability,
-            &grant,
-            &mounts,
-            executable_mount,
-            &invocation,
-            cwd.as_deref(),
-            request,
-            #[cfg(windows)]
-            windows,
-        )?;
+        let mut spawned = platform_world.spawn(PlatformProcessLaunchV1 {
+            mounts: &mounts,
+            executable: executable_mount,
+            invocation: &invocation,
+            cwd: cwd.as_deref(),
+            cpu_millis: request.requested_budget_slice.cpu_millis,
+            memory_bytes: request.requested_budget_slice.memory_byte_millis
+                / request.requested_budget_slice.wall_millis.max(1),
+            write_bytes: request.requested_budget_slice.write_bytes,
+        })?;
         if let Some(stdin) = invocation.stdin {
             let mut input = spawned.stdin.take().ok_or_else(|| {
                 AppError::InvalidInput("Contained process stdin pipe is unavailable.".into())
             })?;
             input.write_all(&stdin)?;
+            drop(input);
+            spawned.process.close_stdin();
         }
         let stdout_cap = request.requested_budget_slice.read_bytes / 2;
         let stderr_cap = request
@@ -532,7 +489,7 @@ impl ExecutionWorldServiceV1 {
             argv_digest: argv_digest.clone(),
             environment_digest: environment_digest.clone(),
             process_ref: process_ref.clone(),
-            child: Mutex::new(spawned.child),
+            child: Mutex::new(spawned.process),
             stdout,
             stderr,
             terminal: Mutex::new(None),
@@ -647,7 +604,7 @@ impl ExecutionWorldServiceV1 {
         if process.world_ref != *world_ref || process.process_ref != *process_ref {
             return invalid("Managed process world or identity was substituted.");
         }
-        process.terminate_tree();
+        process.request_termination();
         let observation = wait_for_terminal(&process, Duration::from_secs(5))?;
         let world_access = {
             let state = self.state.lock();
@@ -736,7 +693,7 @@ impl ExecutionWorldServiceV1 {
             (processes, world_refs)
         };
         for process in &processes {
-            process.terminate_tree();
+            process.request_termination();
             let _ = wait_for_terminal(process, Duration::from_secs(5));
         }
         let mut state = self.state.lock();
@@ -952,382 +909,15 @@ fn validate_request_owner(owner: &WorldOwnerV1, request: &EffectRequestV1) -> Ap
 
 pub(crate) fn required_properties() -> BTreeSet<ConfinementPropertyV1> {
     [
-        ConfinementPropertyV1::NoAmbientFilesystem,
-        ConfinementPropertyV1::EmptyEnvironment,
-        ConfinementPropertyV1::NoInheritedDescriptors,
-        ConfinementPropertyV1::ContainedProcessTree,
-        ConfinementPropertyV1::NoDaemonSurvival,
+        ConfinementPropertyV1::AuthorizedResourceProjection,
+        ConfinementPropertyV1::AuthorityNeutralEnvironment,
+        ConfinementPropertyV1::ExplicitProcessIo,
+        ConfinementPropertyV1::PlatformSandboxedProcess,
+        ConfinementPropertyV1::CancellableProcessSession,
         ConfinementPropertyV1::NoRawNetwork,
     ]
     .into_iter()
     .collect()
-}
-
-fn platform_availability() -> ExecutionWorldAvailabilityV1 {
-    #[cfg(target_os = "macos")]
-    return macos_availability();
-    #[cfg(target_os = "linux")]
-    return linux_availability();
-    #[cfg(target_os = "windows")]
-    return crate::windows_execution_world::availability(required_properties());
-    #[allow(unreachable_code)]
-    ExecutionWorldAvailabilityV1 {
-        kind: PlatformWorldKindV1::Unsupported,
-        available: false,
-        identity_digest: "pastey-platform-world-unavailable-v1".into(),
-        verified_properties: BTreeSet::new(),
-        unavailable_reason: Some("This Host platform has no verified execution world.".into()),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_platform_process(
-    availability: &ExecutionWorldAvailabilityV1,
-    grant: &ExecutionWorldGrantV1,
-    mounts: &[ExecutionWorldMountV1],
-    executable: &ExecutionWorldMountV1,
-    invocation: &ManagedProcessInvocationV1,
-    cwd: Option<&Path>,
-    request: &EffectRequestV1,
-    #[cfg(windows)] windows: Arc<crate::windows_execution_world::WindowsWorldV1>,
-) -> AppResult<SpawnedPlatformProcessV1> {
-    #[cfg(windows)]
-    if availability.kind == PlatformWorldKindV1::WindowsRestrictedPrincipal {
-        let spawned = crate::windows_execution_world::spawn(
-            windows,
-            &executable.source_path,
-            &invocation.argv,
-            &invocation.environment,
-            invocation.stdin.is_some(),
-            cwd,
-            request.requested_budget_slice.cpu_millis,
-            request.requested_budget_slice.memory_byte_millis
-                / request.requested_budget_slice.wall_millis.max(1),
-        )?;
-        return Ok(SpawnedPlatformProcessV1 {
-            child: PlatformChildV1::Windows(spawned.process),
-            stdin: spawned
-                .stdin
-                .map(|file| Box::new(file) as Box<dyn Write + Send>),
-            stdout: Box::new(spawned.stdout),
-            stderr: Box::new(spawned.stderr),
-        });
-    }
-    #[cfg(unix)]
-    {
-        let mut command = build_platform_command(
-            availability,
-            grant,
-            mounts,
-            executable,
-            invocation,
-            cwd,
-            request,
-        )?;
-        command
-            .env_clear()
-            .stdin(if invocation.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (name, value) in &invocation.environment {
-            command.env(name, value);
-        }
-        let mut child = command.spawn().map_err(|_| {
-            AppError::InvalidInput("Verified execution world failed to spawn.".into())
-        })?;
-        let process_group = child.id() as i32;
-        return Ok(SpawnedPlatformProcessV1 {
-            stdin: child
-                .stdin
-                .take()
-                .map(|pipe| Box::new(pipe) as Box<dyn Write + Send>),
-            stdout: Box::new(child.stdout.take().ok_or_else(|| {
-                AppError::InvalidInput("Contained process stdout pipe is unavailable.".into())
-            })?),
-            stderr: Box::new(child.stderr.take().ok_or_else(|| {
-                AppError::InvalidInput("Contained process stderr pipe is unavailable.".into())
-            })?),
-            child: PlatformChildV1::Unix {
-                child,
-                process_group,
-            },
-        });
-    }
-    #[allow(unreachable_code)]
-    {
-        let _ = (
-            availability,
-            grant,
-            mounts,
-            executable,
-            invocation,
-            cwd,
-            request,
-        );
-        unavailable("No verified platform execution-world adapter is available.")
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_availability() -> ExecutionWorldAvailabilityV1 {
-    let path = Path::new("/usr/bin/sandbox-exec");
-    let result = (|| -> AppResult<String> {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let metadata = fs::symlink_metadata(path)?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != 0
-            || metadata.permissions().mode() & 0o022 != 0
-        {
-            return invalid("macOS sandbox-exec identity is unsafe.");
-        }
-        let bytes = fs::read(path)?;
-        let probe = Command::new(path)
-            .args([
-                "-p",
-                "(version 1)(deny default)(deny network*)(allow process-exec)(allow file-read* (literal \"/usr/bin/true\") (subpath \"/System\") (subpath \"/usr/lib\") (subpath \"/private/var/db/dyld\"))",
-                "/usr/bin/true",
-            ])
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !probe.success() {
-            return unavailable("The macOS sandbox behavioral probe failed.");
-        }
-        domain_hash(
-            "pastey-macos-sandbox-exec-world-v1",
-            &(
-                blake3::hash(&bytes).to_hex().to_string(),
-                EXECUTION_WORLD_VERSION,
-                required_properties(),
-            ),
-        )
-    })();
-    match result {
-        Ok(identity_digest) => ExecutionWorldAvailabilityV1 {
-            kind: PlatformWorldKindV1::MacOsSandboxExec,
-            available: true,
-            identity_digest,
-            verified_properties: required_properties(),
-            unavailable_reason: None,
-        },
-        Err(_) => ExecutionWorldAvailabilityV1 {
-            kind: PlatformWorldKindV1::MacOsSandboxExec,
-            available: false,
-            identity_digest: "pastey-macos-sandbox-exec-unavailable-v1".into(),
-            verified_properties: BTreeSet::new(),
-            unavailable_reason: Some("sandbox-exec is missing or has an unsafe identity.".into()),
-        },
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn linux_availability() -> ExecutionWorldAvailabilityV1 {
-    ExecutionWorldAvailabilityV1 {
-        kind: PlatformWorldKindV1::LinuxBubblewrapCgroupV2,
-        available: false,
-        identity_digest: "pastey-linux-bubblewrap-cgroup-v2-unavailable-v1".into(),
-        verified_properties: BTreeSet::new(),
-        unavailable_reason: Some(
-            "The bubblewrap adapter remains unavailable until delegated cgroup-v2 attachment and native Linux conformance are implemented and verified."
-                .into(),
-        ),
-    }
-}
-
-fn build_platform_command(
-    availability: &ExecutionWorldAvailabilityV1,
-    grant: &ExecutionWorldGrantV1,
-    mounts: &[ExecutionWorldMountV1],
-    executable: &ExecutionWorldMountV1,
-    invocation: &ManagedProcessInvocationV1,
-    cwd: Option<&Path>,
-    request: &EffectRequestV1,
-) -> AppResult<Command> {
-    #[cfg(target_os = "macos")]
-    if availability.kind == PlatformWorldKindV1::MacOsSandboxExec {
-        let profile = macos_profile(mounts, executable)?;
-        let mut command = Command::new("/usr/bin/sandbox-exec");
-        command.arg("-p").arg(profile).arg(&executable.source_path);
-        command.args(&invocation.argv);
-        if let Some(cwd) = cwd {
-            command.current_dir(cwd);
-        }
-        configure_unix_process(&mut command, request, grant)?;
-        return Ok(command);
-    }
-    #[cfg(target_os = "linux")]
-    if availability.kind == PlatformWorldKindV1::LinuxBubblewrapCgroupV2 {
-        let bwrap = if Path::new("/usr/bin/bwrap").is_file() {
-            "/usr/bin/bwrap"
-        } else {
-            "/bin/bwrap"
-        };
-        let mut command = Command::new(bwrap);
-        command.args([
-            "--die-with-parent",
-            "--new-session",
-            "--unshare-all",
-            "--clearenv",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--proc",
-            "/proc",
-            "--dir",
-            "/dev",
-            "--dir",
-            "/tmp",
-        ]);
-        for mount in mounts {
-            let target = format!("/pastey/resources/{}", mount.mount_name);
-            command
-                .arg(if mount.writable {
-                    "--bind"
-                } else {
-                    "--ro-bind"
-                })
-                .arg(&mount.source_path)
-                .arg(target);
-        }
-        let target_executable = format!("/pastey/resources/{}", executable.mount_name);
-        if let (Some(handle), Some(selector)) = (
-            invocation.working_directory_handle.as_ref(),
-            invocation.working_directory_selector.as_deref(),
-        ) {
-            let mount = mounts
-                .iter()
-                .find(|mount| mount.handle_ref == *handle)
-                .ok_or_else(|| {
-                    AppError::InvalidInput("Working directory mount is unavailable.".into())
-                })?;
-            let mut target = format!("/pastey/resources/{}", mount.mount_name);
-            if selector != "." {
-                target.push('/');
-                target.push_str(selector);
-            }
-            command.arg("--chdir").arg(target);
-        }
-        command
-            .arg("--")
-            .arg(target_executable)
-            .args(&invocation.argv);
-        configure_unix_process(&mut command, request, grant)?;
-        return Ok(command);
-    }
-    let _ = (
-        availability,
-        grant,
-        mounts,
-        executable,
-        invocation,
-        cwd,
-        request,
-    );
-    unavailable("No verified platform execution-world adapter is available.")
-}
-
-#[cfg(target_os = "macos")]
-fn macos_profile(
-    mounts: &[ExecutionWorldMountV1],
-    executable: &ExecutionWorldMountV1,
-) -> AppResult<String> {
-    fn literal(path: &Path) -> AppResult<String> {
-        let value = path.to_str().ok_or_else(|| {
-            AppError::InvalidInput("Execution world path is not valid UTF-8.".into())
-        })?;
-        Ok(format!(
-            "\"{}\"",
-            value.replace('\\', "\\\\").replace('"', "\\\"")
-        ))
-    }
-    let mut profile = String::from(
-        "(version 1)\n(deny default)\n(deny network*)\n(allow signal (target self))\n(allow sysctl-read)\n(allow file-read* (subpath \"/System\") (subpath \"/usr/lib\") (subpath \"/private/var/db/dyld\"))\n",
-    );
-    profile.push_str(&format!(
-        "(allow file-read* (literal {0}))\n(allow process-exec (literal {0}))\n",
-        literal(&executable.source_path)?
-    ));
-    if let Ok(canonical) = executable.source_path.canonicalize() {
-        profile.push_str(&format!(
-            "(allow file-read* (literal {0}))\n(allow process-exec (literal {0}))\n",
-            literal(&canonical)?
-        ));
-    }
-    for mount in mounts {
-        let path = literal(&mount.source_path)?;
-        profile.push_str(&format!(
-            "(allow file-read* (subpath {path}) (literal {path}))\n"
-        ));
-        if mount.writable {
-            profile.push_str(&format!(
-                "(allow file-write* (subpath {path}) (literal {path}))\n"
-            ));
-        }
-    }
-    Ok(profile)
-}
-
-#[cfg(unix)]
-fn configure_unix_process(
-    command: &mut Command,
-    request: &EffectRequestV1,
-    _grant: &ExecutionWorldGrantV1,
-) -> AppResult<()> {
-    use std::os::unix::process::CommandExt;
-    let wall = request.requested_budget_slice.wall_millis.max(1);
-    let cpu_seconds = request
-        .requested_budget_slice
-        .cpu_millis
-        .saturating_add(999)
-        / 1000;
-    let memory_bytes = request
-        .requested_budget_slice
-        .memory_byte_millis
-        .checked_div(wall)
-        .unwrap_or(0);
-    let write_bytes = request.requested_budget_slice.write_bytes;
-    if cpu_seconds == 0 || memory_bytes < 1024 * 1024 {
-        return unavailable("Reserved process CPU or memory budget cannot form a safe limit.");
-    }
-    unsafe {
-        command.pre_exec(move || {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            set_limit(libc::RLIMIT_CPU, cpu_seconds, cpu_seconds)?;
-            #[cfg(target_os = "macos")]
-            let _ = memory_bytes;
-            #[cfg(not(target_os = "macos"))]
-            set_limit(libc::RLIMIT_AS, memory_bytes, memory_bytes)?;
-            set_limit(libc::RLIMIT_NOFILE, 32, 32)?;
-            set_limit(libc::RLIMIT_FSIZE, write_bytes, write_bytes)?;
-            let maximum_fd = libc::sysconf(libc::_SC_OPEN_MAX).clamp(3, 65_536);
-            for fd in 3..maximum_fd {
-                libc::close(fd as i32);
-            }
-            Ok(())
-        });
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-unsafe fn set_limit(resource: libc::c_int, soft: u64, hard: u64) -> std::io::Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: soft as libc::rlim_t,
-        rlim_max: hard as libc::rlim_t,
-    };
-    if libc::setrlimit(resource as _, &limit) != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 fn start_capture(reader: impl Read + Send + 'static, capture: Arc<StreamCaptureV1>, cap: u64) {
@@ -1371,6 +961,7 @@ fn monitor_process(process: Arc<ManagedProcessV1>) {
     thread::spawn(move || {
         let mut memory_exceeded = false;
         let mut resource_exceeded = false;
+        let mut termination_requested = false;
         loop {
             let exceeded = process.stdout.exceeded.load(Ordering::SeqCst)
                 || process.stderr.exceeded.load(Ordering::SeqCst);
@@ -1379,9 +970,6 @@ fn monitor_process(process: Arc<ManagedProcessV1>) {
             match status {
                 Ok(Some(status)) => {
                     let was_cancelled = process.cancel.load(Ordering::SeqCst);
-                    // Kill the group again after the leader exits. This closes the
-                    // common daemonization escape where descendants outlive it.
-                    let descendants_terminated = process.terminate_tree();
                     let state = if exceeded {
                         "output_budget_exceeded"
                     } else if memory_exceeded {
@@ -1392,7 +980,9 @@ fn monitor_process(process: Arc<ManagedProcessV1>) {
                         "wall_time_expired"
                     } else if was_cancelled {
                         "cancelled"
-                    } else if let Some(budget_state) = exit_budget_state(&status) {
+                    } else if let Some(budget_state) =
+                        crate::execution_backend::exit_budget_state(&status)
+                    {
                         budget_state
                     } else if status.success() {
                         "exited"
@@ -1402,12 +992,16 @@ fn monitor_process(process: Arc<ManagedProcessV1>) {
                     *process.terminal.lock() = Some(TerminalObservationV1 {
                         state: state.into(),
                         exit_code: status.code(),
-                        descendants_terminated,
+                        termination_requested,
                     });
                     break;
                 }
                 Ok(None) => {
-                    memory_exceeded |= process_memory_bytes(&process) > process.memory_bytes_limit;
+                    memory_exceeded |= process
+                        .child
+                        .lock()
+                        .resident_memory_bytes()
+                        .is_some_and(|bytes| bytes > process.memory_bytes_limit);
                     resource_exceeded |= mounted_write_bytes(&process) > process.write_bytes_limit;
                     if exceeded
                         || expired
@@ -1415,37 +1009,24 @@ fn monitor_process(process: Arc<ManagedProcessV1>) {
                         || resource_exceeded
                         || process.cancel.load(Ordering::SeqCst)
                     {
-                        process.terminate_tree();
+                        process.request_termination();
+                        termination_requested = true;
                     }
                     thread::sleep(POLL_INTERVAL)
                 }
                 Err(_) => {
-                    process.terminate_tree();
+                    process.request_termination();
+                    termination_requested = true;
                     *process.terminal.lock() = Some(TerminalObservationV1 {
                         state: "indeterminate".into(),
                         exit_code: None,
-                        descendants_terminated: true,
+                        termination_requested,
                     });
                     break;
                 }
             }
         }
     });
-}
-
-#[cfg(unix)]
-fn exit_budget_state(status: &ExitStatus) -> Option<&'static str> {
-    use std::os::unix::process::ExitStatusExt;
-    match status.signal() {
-        Some(libc::SIGXFSZ) => Some("resource_budget_exceeded"),
-        Some(libc::SIGXCPU) => Some("cpu_budget_exceeded"),
-        _ => None,
-    }
-}
-
-#[cfg(not(unix))]
-fn exit_budget_state(_status: &ExitStatus) -> Option<&'static str> {
-    None
 }
 
 fn mounted_write_bytes(process: &ManagedProcessV1) -> u64 {
@@ -1488,63 +1069,6 @@ fn mounted_write_bytes(process: &ManagedProcessV1) -> u64 {
     growth
 }
 
-#[cfg(target_os = "macos")]
-fn process_memory_bytes(process: &ManagedProcessV1) -> u64 {
-    #[repr(C)]
-    #[derive(Default)]
-    struct ProcTaskInfo {
-        virtual_size: u64,
-        resident_size: u64,
-        total_user: u64,
-        total_system: u64,
-        threads_user: u64,
-        threads_system: u64,
-        policy: i32,
-        faults: i32,
-        pageins: i32,
-        cow_faults: i32,
-        messages_sent: i32,
-        messages_received: i32,
-        syscalls_mach: i32,
-        syscalls_unix: i32,
-        csw: i32,
-        threadnum: i32,
-        numrunning: i32,
-        priority: i32,
-    }
-    unsafe extern "C" {
-        fn proc_pidinfo(
-            pid: i32,
-            flavor: i32,
-            arg: u64,
-            buffer: *mut std::ffi::c_void,
-            buffersize: i32,
-        ) -> i32;
-    }
-    let mut info = ProcTaskInfo::default();
-    let size = std::mem::size_of::<ProcTaskInfo>() as i32;
-    let read = unsafe {
-        proc_pidinfo(
-            process.child.lock().process_id(),
-            4,
-            0,
-            (&mut info as *mut ProcTaskInfo).cast(),
-            size,
-        )
-    };
-    if read == size {
-        info.resident_size
-    } else {
-        // Losing resource observability is itself fail-closed.
-        u64::MAX
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn process_memory_bytes(_process: &ManagedProcessV1) -> u64 {
-    0
-}
-
 fn wait_for_terminal(
     process: &ManagedProcessV1,
     maximum: Duration,
@@ -1555,8 +1079,8 @@ fn wait_for_terminal(
             return Ok(observation);
         }
         if Instant::now() >= deadline {
-            process.terminate_tree();
-            return invalid("Managed process tree did not terminate reliably.");
+            process.request_termination();
+            return invalid("Managed process session did not reach a terminal state reliably.");
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -1603,7 +1127,7 @@ fn terminal_process_outcome(
         stdout_digest,
         process.stderr.bytes.load(Ordering::SeqCst),
         stderr_digest,
-        observation.descendants_terminated,
+        observation.termination_requested,
         resource_effect_digest,
         summary,
     )
@@ -1623,7 +1147,7 @@ fn process_outcome(
     stdout_digest: String,
     stderr_bytes: u64,
     stderr_digest: String,
-    descendants_terminated: bool,
+    termination_requested: bool,
     resource_effect_digest: String,
     summary: &str,
 ) -> BackendEffectOutcomeV1 {
@@ -1643,7 +1167,7 @@ fn process_outcome(
             stdout_bytes,
             stderr_digest,
             stderr_bytes,
-            descendants_terminated,
+            termination_requested,
             network_denied: true,
             resource_effect_digest,
         },
@@ -1694,7 +1218,15 @@ pub(crate) fn domain_hash<T: Serialize>(domain: &str, value: &T) -> AppResult<St
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, sync::Arc, time::Duration};
+    use std::{
+        io::Cursor,
+        process::ExitStatus,
+        sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use super::*;
 
@@ -1731,6 +1263,56 @@ mod tests {
             working_directory_selector: None,
         };
         assert!(validate_invocation(&invocation).is_err());
+    }
+
+    struct CancellationProcess {
+        terminations: Arc<AtomicUsize>,
+    }
+
+    impl PlatformProcessV1 for CancellationProcess {
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            Ok(None)
+        }
+
+        fn request_termination(&mut self) {
+            self.terminations.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn managed_cancellation_terminates_through_the_platform_process() {
+        let terminations = Arc::new(AtomicUsize::new(0));
+        let process = ManagedProcessV1 {
+            owner: WorldOwnerV1 {
+                envelope_ref: serde_json::from_value(serde_json::json!("test-envelope")).unwrap(),
+                run_ref: serde_json::from_value(serde_json::json!("test-run")).unwrap(),
+                context_ref: "test-context".into(),
+                bridge_id: "test-bridge".into(),
+                session_binding_ref: "test-session".into(),
+            },
+            world_ref: serde_json::from_value(serde_json::json!("test-world")).unwrap(),
+            world_identity_digest: "test-world-identity".into(),
+            executable_identity_ref: "test-executable".into(),
+            argv_digest: "test-argv".into(),
+            environment_digest: "test-environment".into(),
+            process_ref: "test-process".into(),
+            child: Mutex::new(Box::new(CancellationProcess {
+                terminations: terminations.clone(),
+            })),
+            stdout: Arc::new(StreamCaptureV1::default()),
+            stderr: Arc::new(StreamCaptureV1::default()),
+            terminal: Mutex::new(None),
+            cancel: AtomicBool::new(false),
+            wall_deadline: Instant::now() + Duration::from_secs(1),
+            started_at: Instant::now(),
+            memory_bytes_limit: 1024 * 1024,
+            write_bytes_limit: 1024,
+            mounts: Vec::new(),
+        };
+
+        process.request_termination();
+        assert!(process.cancel.load(Ordering::SeqCst));
+        assert_eq!(terminations.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[cfg(windows)]

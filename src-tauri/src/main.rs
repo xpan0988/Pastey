@@ -14,6 +14,7 @@ mod diagnostics;
 mod discovery;
 mod effect_authority;
 mod error;
+mod execution_backend;
 mod execution_world;
 mod file_candidates;
 mod host_admission;
@@ -39,9 +40,7 @@ mod transfer;
 mod transfer_orchestration;
 mod transfer_tuning;
 #[cfg(windows)]
-mod windows_execution_world;
-#[cfg(any(windows, test))]
-mod windows_setup_state;
+mod windows_codex_backend;
 #[cfg(any(windows, test))]
 mod windows_verifier_diagnostics;
 mod worker_harness;
@@ -107,7 +106,7 @@ impl RuntimeTaskSpawner for TauriRuntimeTaskSpawner {
 
 fn main() {
     #[cfg(windows)]
-    if windows_execution_world::run_probe_helper_if_requested() {
+    if windows_codex_backend::run_helper_if_requested() {
         return;
     }
     let app = tauri::Builder::default()

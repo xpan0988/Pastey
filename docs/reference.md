@@ -58,8 +58,9 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 | Safe physical identity | `src-tauri/src/safe_file_identity.rs` |
 | Effect contracts and state | `src-tauri/src/effect_authority.rs` |
 | Resource backend | `src-tauri/src/managed_resources.rs` |
-| Process world | `src-tauri/src/execution_world.rs` |
-| Windows restricted-principal process backend and setup | `src-tauri/src/windows_execution_world.rs`; principal `PasteySandboxOffline`; firewall rule `pastey_sandbox_offline_block_outbound_v1`; setup command `--pastey-setup-windows-execution-world-v1` |
+| Process world controller | `src-tauri/src/execution_world.rs` |
+| Platform execution backend seam | `src-tauri/src/execution_backend.rs` |
+| Windows Codex-derived process backend and setup | Pastey adapter `src-tauri/src/windows_codex_backend.rs`; pinned mechanics `src-tauri/crates/windows-codex-sandbox/`; setup command `--pastey-setup-windows-codex-sandbox-v1`; verifier command `--pastey-verify-windows-codex-sandbox-v1` |
 | Network broker | `src-tauri/src/network_broker.rs` |
 | Core claim/result finalizer | `src-tauri/src/managed_execution.rs` |
 | Worker Harness/provider | `src-tauri/src/worker_harness.rs`, `worker_provider.rs` |

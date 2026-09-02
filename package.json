@@ -10,6 +10,7 @@
     "tauri:dev-fast": "npm run tauri -- dev -- --profile dev-fast",
     "build": "tsc && vite build",
     "tauri:build": "npm run tauri -- build",
+    "tauri:build:windows": "node scripts/prepare-windows-codex-sandbox.mjs && npm run tauri -- build --config src-tauri/tauri.windows-bundle.conf.json",
     "check:version": "node scripts/check-version-consistency.mjs",
     "release:version": "node scripts/release-version.mjs",
     "build:checked": "npm run check:version && npm run tauri:build && node scripts/check-build-size.mjs",

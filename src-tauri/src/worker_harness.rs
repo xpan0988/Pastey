@@ -237,7 +237,7 @@ pub(crate) enum WorkerObservationV1 {
         stderr_excerpt: Option<String>,
         stderr_truncated: bool,
         duration_millis: Option<u64>,
-        descendants_terminated: Option<bool>,
+        termination_requested: Option<bool>,
         network_denied: bool,
     },
     Rejected {
@@ -686,7 +686,7 @@ impl EffectDispatchBridgeV1 {
                     exit_code,
                     stdout_digest,
                     stderr_digest,
-                    descendants_terminated,
+                    termination_requested,
                     network_denied,
                     ..
                 } if evidence.decision == EffectDecisionV1::Allowed => {
@@ -700,7 +700,7 @@ impl EffectDispatchBridgeV1 {
                         Some(stdout_digest.clone()),
                         Some(stderr_digest.clone()),
                         completed,
-                        Some(*descendants_terminated),
+                        Some(*termination_requested),
                         *network_denied,
                     )
                 }
@@ -1294,7 +1294,7 @@ fn process_observation(
     stdout_digest: Option<String>,
     stderr_digest: Option<String>,
     completed: Option<CompletedProcessObservationV1>,
-    descendants_terminated: Option<bool>,
+    termination_requested: Option<bool>,
     network_denied: bool,
 ) -> WorkerObservationV1 {
     let (stdout_excerpt, stdout_truncated, stderr_excerpt, stderr_truncated, duration_millis) =
@@ -1318,7 +1318,7 @@ fn process_observation(
         stderr_excerpt,
         stderr_truncated,
         duration_millis,
-        descendants_terminated,
+        termination_requested,
         network_denied,
     }
 }

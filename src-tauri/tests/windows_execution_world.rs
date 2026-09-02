@@ -1,10 +1,9 @@
 #[cfg(windows)]
 #[test]
-#[ignore = "requires the one-time elevated sandbox-principal setup on a native Windows host"]
-fn native_windows_restricted_principal_execution_world_conformance() {
+#[ignore = "requires the Host-owned Codex sandbox setup on a configured native Windows host"]
+fn native_windows_codex_execution_world_conformance() {
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_pastey"))
-        .arg("--pastey-verify-windows-execution-world-v1")
-        .env_clear()
+        .arg("--pastey-verify-windows-codex-sandbox-v1")
         .status()
         .expect("start the Pastey Windows ExecutionWorld verifier");
     assert!(

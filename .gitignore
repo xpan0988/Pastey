@@ -3,7 +3,9 @@ dist
 .generated/
 .DS_Store
 src-tauri/target
+src-tauri/crates/*/target
 src-tauri/gen
+src-tauri/binaries/*.exe
 *.log
 tests/fixtures/transfer-corpus/generated/
 *.pastey-fixture.tmp
