@@ -1,11 +1,11 @@
-//! Pure diagnostic policy for the explicit Windows ExecutionWorld verifier.
+//! Diagnostic policy for the Codex-derived Windows ExecutionWorld verifier.
 //!
 //! Production availability deliberately discards native probe details. The
 //! human-invoked verifier may preserve a bounded, single-line reason, but it
 //! must not echo paths or authority/credential-bearing state.
 
 pub(crate) const PRODUCTION_UNAVAILABLE_REASON: &str =
-    "The elevated PasteySandboxOffline setup or native restricted-token, ACL, Firewall, handle-list, Job, descendant, filesystem, and NoRawNetwork conformance probe did not complete successfully.";
+    "The Host-owned Codex Windows sandbox setup or Pastey native resource-projection, environment, standard-I/O, process-session, cancellation, and NoRawNetwork conformance probe did not complete successfully.";
 
 const WITHHELD_DIAGNOSTIC: &str =
     "Windows native conformance failed, but its detail was withheld by the verifier diagnostic boundary.";
@@ -26,36 +26,6 @@ pub(crate) fn verifier_failure_reason(underlying: &str) -> String {
         return WITHHELD_DIAGNOSTIC.into();
     }
     reason.into()
-}
-
-pub(crate) fn probe_parent_failure_reason(code: Option<i32>) -> &'static str {
-    match code {
-        Some(92) => "Windows Worker probe arguments or filesystem confinement check failed.",
-        Some(93) => "Windows Worker probe environment confinement check failed.",
-        Some(94) => "Windows Worker probe inherited-handle confinement check failed.",
-        Some(95) => "Windows Worker probe NoRawNetwork check failed.",
-        Some(96) => "Windows Worker probe Job breakaway check failed.",
-        Some(97) => "Windows Worker probe could not create its contained descendant.",
-        Some(98) => "Windows Worker probe descendant was not contained in a Job.",
-        Some(99) => "Windows Worker probe Job active-process limit check failed.",
-        _ => "Windows Worker confinement probe exited unsuccessfully.",
-    }
-}
-
-pub(crate) fn create_process_with_logon_failure_reason(code: u32) -> String {
-    let label = match code {
-        2 => "application file not found",
-        3 => "application path not found",
-        5 => "access denied",
-        193 => "invalid executable format",
-        1314 => "required privilege not held",
-        1326 => "user name or password incorrect",
-        1327 => "account restriction",
-        1331 => "account disabled",
-        1385 => "logon type not granted",
-        _ => "unclassified process-logon failure",
-    };
-    format!("CreateProcessWithLogonW failed with Win32 error {code} ({label}).")
 }
 
 fn contains_private_path(value: &str) -> bool {
@@ -111,22 +81,6 @@ mod tests {
         let underlying =
             "Windows native conformance probe spawn failed: LogonUserW returned Win32 error 1326.";
         assert_eq!(verifier_failure_reason(underlying), underlying);
-    }
-
-    #[test]
-    fn create_process_with_logon_diagnostic_retains_code_and_only_static_context() {
-        assert_eq!(
-            create_process_with_logon_failure_reason(1385),
-            "CreateProcessWithLogonW failed with Win32 error 1385 (logon type not granted)."
-        );
-        assert_eq!(
-            create_process_with_logon_failure_reason(5),
-            "CreateProcessWithLogonW failed with Win32 error 5 (access denied)."
-        );
-        assert_eq!(
-            create_process_with_logon_failure_reason(65_535),
-            "CreateProcessWithLogonW failed with Win32 error 65535 (unclassified process-logon failure)."
-        );
     }
 
     #[test]

@@ -18,7 +18,6 @@ use crate::{
         AttemptStartDecisionV2, AttemptStartV2, BridgePlanV2Store, PlanRevisionV2, PlanStepV2,
     },
     error::{AppError, AppResult},
-    execution_world::ExecutionWorldServiceV1,
     host_admission::ManagedPrimitiveAvailabilityV1,
     host_identity::HostSessionBinding,
     host_runtime::{current_host_session_binding, HostRuntime},
@@ -222,7 +221,7 @@ impl HostRuntime {
         if !provider_available {
             return Ok(ManagedPrimitiveAvailabilityV1::unavailable());
         }
-        let platform = ExecutionWorldServiceV1::platform_availability();
+        let platform = self.execution_worlds.platform_availability();
         let specs = self.managed_worker_process_specs.lock();
         let transform = revision.steps.iter().all(|step| match step {
             PlanStepV2::Transform { step_id, .. } => {
@@ -2236,7 +2235,12 @@ mod tests {
                 },
             )
             .unwrap();
-        if !ExecutionWorldServiceV1::platform_availability().available {
+        if !fixture
+            .runtime
+            .execution_worlds
+            .platform_availability()
+            .available
+        {
             assert!(matches!(
                 accept(&fixture),
                 AttemptStartDecisionV2::Denied(_)
@@ -2339,7 +2343,12 @@ mod tests {
                 },
             )
             .unwrap();
-        if !ExecutionWorldServiceV1::platform_availability().available {
+        if !fixture
+            .runtime
+            .execution_worlds
+            .platform_availability()
+            .available
+        {
             assert!(matches!(
                 accept(&fixture),
                 AttemptStartDecisionV2::Denied(_)

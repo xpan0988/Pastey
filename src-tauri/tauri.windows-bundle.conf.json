@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "externalBin": [
+      "binaries/codex-command-runner",
+      "binaries/codex-windows-sandbox-setup"
+    ]
+  }
+}

@@ -207,8 +207,8 @@ impl HostRuntime {
         let draft = authority.begin_run(context.clone())?;
         let budgets = step_budgets();
         let process_spec = request.process_world.as_ref();
-        let process_availability = process_spec
-            .map(|_| crate::execution_world::ExecutionWorldServiceV1::platform_availability());
+        let process_availability =
+            process_spec.map(|_| self.execution_worlds.platform_availability());
         if process_availability
             .as_ref()
             .is_some_and(|availability| !availability.available)
@@ -1197,11 +1197,11 @@ fn process_bounds() -> Vec<EffectBoundV1> {
 
 fn all_confinement_properties() -> BTreeSet<ConfinementPropertyV1> {
     [
-        ConfinementPropertyV1::NoAmbientFilesystem,
-        ConfinementPropertyV1::EmptyEnvironment,
-        ConfinementPropertyV1::NoInheritedDescriptors,
-        ConfinementPropertyV1::ContainedProcessTree,
-        ConfinementPropertyV1::NoDaemonSurvival,
+        ConfinementPropertyV1::AuthorizedResourceProjection,
+        ConfinementPropertyV1::AuthorityNeutralEnvironment,
+        ConfinementPropertyV1::ExplicitProcessIo,
+        ConfinementPropertyV1::PlatformSandboxedProcess,
+        ConfinementPropertyV1::CancellableProcessSession,
         ConfinementPropertyV1::NoRawNetwork,
     ]
     .into_iter()
@@ -2116,10 +2116,15 @@ mod tests {
 
     #[test]
     fn process_failure_becomes_observation_then_worker_self_corrects_with_resource_output() {
-        if !crate::execution_world::ExecutionWorldServiceV1::platform_availability().available {
+        let fixture = fixture(transform_then_execute_steps);
+        if !fixture
+            .runtime
+            .execution_worlds
+            .platform_availability()
+            .available
+        {
             return;
         }
-        let fixture = fixture(transform_then_execute_steps);
         let output = b"corrected after contained failure";
         let mut provider = ScriptedWorkerProvider {
             responses: VecDeque::from([
@@ -2172,10 +2177,15 @@ mod tests {
 
     #[test]
     fn process_worker_fails_closed_when_the_verified_world_is_unavailable() {
-        if crate::execution_world::ExecutionWorldServiceV1::platform_availability().available {
+        let fixture = fixture(transform_then_execute_steps);
+        if fixture
+            .runtime
+            .execution_worlds
+            .platform_availability()
+            .available
+        {
             return;
         }
-        let fixture = fixture(transform_then_execute_steps);
         let mut provider = ScriptedWorkerProvider {
             responses: VecDeque::new(),
             requests: Vec::new(),
@@ -2198,10 +2208,15 @@ mod tests {
 
     #[test]
     fn execute_worker_records_result_without_managed_lineage() {
-        if !crate::execution_world::ExecutionWorldServiceV1::platform_availability().available {
+        let fixture = fixture(transform_then_execute_steps);
+        if !fixture
+            .runtime
+            .execution_worlds
+            .platform_availability()
+            .available
+        {
             return;
         }
-        let fixture = fixture(transform_then_execute_steps);
         let transform_grant = claim(&fixture, "transform", fixture.input.clone());
         let (proposal, _) = produce_transform(&fixture, &transform_grant);
         let transformed = fixture
