@@ -32,33 +32,39 @@ git diff --check
 
 The Windows cross-check requires the GNU target and MinGW toolchain. It proves compilation, not native Windows confinement, safe-open behavior, machine setup, packaging, or physical E2E.
 
-Windows managed Process execution first requires the bundled Codex helper sidecars and one Host-owned setup run by the same Windows user that will run Pastey. Build with `npm run tauri:build:windows`, open an elevated PowerShell, and run the packaged product binary with:
+Native Windows acceptance is five stop-on-failure scripts run from the repository root. Each run writes a self-contained log and safe sandbox diagnostics under the gitignored `artifacts/windows-acceptance/` directory and ends with a stable `PASTEY_ACCEPTANCE_STAGE_<N>_(PASS|FAIL|BLOCKED)` token. Exit codes are `0` for PASS, `1` when the intended stage ran and failed, and `2` when required product or Host state is absent.
 
-```powershell
-.\Pastey.exe --pastey-setup-windows-codex-sandbox-v1
-```
+1. In a normal, non-elevated PowerShell, build, package, and install the current production bundle:
 
-The command invokes the retained upstream-derived provisioning transaction for the Codex Windows sandbox identities, credentials, ACL/capability state, Firewall/WFP state, and helper state. Pastey does not select or reinterpret those mechanics. Runtime launch never auto-elevates: absent or stale setup fails closed until the Host operator reruns this command. Restart Pastey after setup so its process-local availability result is refreshed. Source provenance and the upstream update procedure are in `src-tauri/crates/windows-codex-sandbox/UPSTREAM.md`.
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\windows-acceptance\stage-1-build-install.ps1
+   ```
 
-Then run the opt-in native conformance test:
+2. In an Administrator PowerShell opened under the same Windows user, run Host-owned sandbox setup:
 
-```powershell
-cargo test --manifest-path src-tauri/Cargo.toml --test windows_execution_world -- --ignored --nocapture
-```
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\windows-acceptance\stage-2-elevated-setup.ps1
+   ```
 
-The integration test launches the actual Pastey product binary with its private verifier. It verifies only Pastey's adopted backend contract: authorized resource read/write projection, absence of an intentionally inherited Host environment sentinel and kernel-handle sentinel, external and loopback raw-network `WSAEACCES` denial, and a termination request that reaches an observed terminal session. It does not claim the deleted Pastey restricted-principal/bootstrap/Job design. The explicit verifier CLI reports only bounded diagnostics; production availability remains fail closed behind its generic unavailable reason. A failed or unavailable probe keeps managed Process execution unavailable. This native test is the next evidence gate after automated validation; a GNU cross-build is never a substitute.
+3. Return to a normal PowerShell and run the packaged verifier:
 
-After that conformance test passes, run the opt-in native Managed Execute acceptance test from the repository root in the same non-elevated PowerShell and with the packaged Codex sidecar directory still prepended to `PATH`:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\windows-acceptance\stage-3-packaged-verifier.ps1
+   ```
 
-```powershell
-cargo build --manifest-path .\src-tauri\Cargo.toml --features native-windows-acceptance --bin pastey --bin pastey-managed-execute-probe
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-cargo test --manifest-path .\src-tauri\Cargo.toml --features native-windows-acceptance --bin pastey managed_worker_coordinator::tests::native_windows_managed_execute_through_codex_backend -- --exact --ignored --nocapture
-```
+4. Run the exact ignored native Windows conformance test:
 
-Administrator privileges are not required for this acceptance stage; use the same Windows user whose Host-owned elevated setup already completed. Success ends with `test managed_worker_coordinator::tests::native_windows_managed_execute_through_codex_backend ... ok` and a test result containing `1 passed; 0 failed`. The test binds the exact Cargo-built probe executable to the exact immutable Execute step through the Host-private process-spec seam, then uses normal admission, EffectEnvelope compilation, resource observation, managed Process enforcement, evidence, and Core finalization. It asserts bounded stdin, stdout and stderr, the Codex backend kind, the authored input revision, and absence of a new lineage revision. The feature-gated probe is not included in ordinary product builds or Tauri packaging.
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\windows-acceptance\stage-4-native-conformance.ps1
+   ```
 
-On failure, preserve the complete output from both commands, the complete Stage 4 verifier output, `Get-Command codex-command-runner.exe,codex-windows-sandbox-setup.exe | Format-List *`, `$env:PATH`, `rustc -vV`, and `cargo -vV`. Do not include sandbox credentials, provider credentials, Bridge secrets, Host-private resource paths, or raw authority/evidence objects.
+5. Build the opt-in probe and run the exact production-path Managed Execute acceptance test:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\windows-acceptance\stage-5-managed-execute.ps1
+   ```
+
+Stage 1 intentionally uses `npm ci` and the unchanged `npm run tauri:build:windows` production path, so packaging failures are Stage 1 FAIL results rather than hidden workarounds. Stage 2 requires the real setup success token and never reads or copies `.sandbox-secrets/sandbox_users.json`. Stages 3–5 require current installation/setup state and re-run the packaged verifier; Stages 4–5 prepend the installed command-runner directory only to their own process environment. The conformance and Managed Execute assertions remain those implemented by the existing Rust tests. A failed or unavailable verifier keeps managed Process execution unavailable. Source provenance and the upstream update procedure are in `src-tauri/crates/windows-codex-sandbox/UPSTREAM.md`; GNU cross-compilation is never a substitute for these native stages.
 
 ## Transfer and Layer 4 validation
 

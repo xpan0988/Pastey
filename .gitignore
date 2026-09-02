@@ -9,6 +9,7 @@ src-tauri/binaries/*.exe
 *.log
 tests/fixtures/transfer-corpus/generated/
 *.pastey-fixture.tmp
+artifacts/windows-acceptance/
 
 # ProGraph generated local index
 .prograph/
