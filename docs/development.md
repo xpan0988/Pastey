@@ -1,6 +1,6 @@
 # Development, validation, and release
 
-Architecture belongs in [architecture](architecture.md), managed contracts in [Layer 5](layers/layer-5-agent.md), and concrete identifiers/configuration in [reference](reference.md).
+Architecture belongs in [architecture](architecture.md), managed contracts in [Layer 5](layers/layer-5-agent.md), Windows platform semantics in [Windows managed execution](platform/windows-managed-execution.md), and concrete identifiers/configuration in [reference](reference.md).
 
 ## Setup and builds
 
@@ -66,7 +66,7 @@ Native Windows acceptance is five stop-on-failure scripts run from the repositor
 
 Stage 1 intentionally uses `npm ci` and the unchanged `npm run tauri:build:windows` production package/install path, so packaging failures are Stage 1 FAIL results rather than hidden workarounds. Stage 2 is the explicit elevated, Host-owned Codex sandbox setup; it never reads, copies, or prints `.sandbox-secrets/sandbox_users.json`. Stage 3 runs the installed packaged verifier. Stage 4 runs native conformance through the production backend. Stage 5 builds the opt-in Managed Execute probe and runs the exact ignored production-path Managed Execute test.
 
-For Stage 5, the acceptance script passes the installed production `codex-command-runner.exe` path through a test-only harness. When required by Cargo's test layout, the test materializes a temporary normal sibling helper beside the actual hashed Cargo test executable. This is harness-only and does not change production helper-resolution semantics. A failed or unavailable verifier keeps managed Process execution unavailable. Source provenance and the upstream update procedure are in `src-tauri/crates/windows-codex-sandbox/UPSTREAM.md`; GNU cross-compilation is never a substitute for these native stages.
+A failed or unavailable verifier keeps managed Process execution unavailable. Windows semantics and limitations are in [Windows managed execution](platform/windows-managed-execution.md); source provenance and the upstream update procedure are in [`UPSTREAM.md`](../src-tauri/crates/windows-codex-sandbox/UPSTREAM.md). GNU cross-compilation is never a substitute for these native stages.
 
 ### Windows v1 managed-execution acceptance baseline
 
@@ -82,9 +82,9 @@ Stage 5 PASS
 
 Stage 5 proves the production Managed Execute path with an exact ManagedRevision Host read; a read-only world projection that coexists with that authorized Host read; exact executable identity; Windows Codex sandbox availability; authorized working-directory/resource projection; stdin delivery; bounded stdout/stderr capture; process exit observation; NoRawNetwork; Allowed process/resource evidence; Execute finalization with no lineage; and no unrestricted or unsandboxed fallback. This is the Windows v1 managed-execution acceptance baseline, not physical multi-Host proof.
 
-Windows v1 follows the adopted Codex sandbox filesystem semantics. It is not claimed to prevent every read outside Pastey's projected resources; OS/platform-default readable areas may remain readable but mint no Pastey authority. `AuthorityNeutralEnvironment` is not a literally empty environment. `CancellableProcessSession` is weaker than the old strict NoDaemonSurvival contract, and the adopted backend does not claim live descendant CPU/RSS accounting. Codex sandbox setup or credential lifecycle can become stale or incompatible, so runtime availability must fail closed. If native acceptance reports stale or missing sandbox credentials, or Win32 logon error `1326`, rerun Stage 2 elevated setup and then resume from the failing native stage. Never inspect `sandbox_users.json` to diagnose or recover that state.
+If native acceptance reports stale or missing sandbox credentials, or Win32 logon error `1326`, rerun Stage 2 elevated setup and then resume from the failing native stage. Never inspect `sandbox_users.json` to diagnose or recover that state.
 
-Windows v1 bring-up is closed. Do not proactively refactor or harden Codex-derived Windows internals. Future Windows work should be triggered only by a concrete product regression, an authority/fail-closed violation, an upstream Codex update, or a required product capability. Primary new ExecutionWorld engineering focus can move to macOS/Linux and the remaining 2.0 product surface.
+Windows v1 Stage 1–5 acceptance is complete. Future Windows work should be triggered by a product regression, an authority or fail-closed violation, an upstream Codex update, or a required product capability rather than speculative sandbox refactoring.
 
 ## Transfer and Layer 4 validation
 

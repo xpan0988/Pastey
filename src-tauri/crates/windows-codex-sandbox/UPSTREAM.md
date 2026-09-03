@@ -28,9 +28,9 @@ the derived crate.
 5. Run formatting, all applicable derived-crate tests, the Windows GNU
    compile-only check, Pastey's focused ExecutionWorld tests, and Pastey's full
    Rust/frontend validation.
-6. On a configured native Windows Host, rebuild the two helper sidecars, run
-   the explicit elevated setup, and run Pastey's ignored native conformance
-   test before treating the new upstream revision as available in production.
+6. On a configured native Windows Host, run the complete Stage 1–5 acceptance
+   procedure in `docs/development.md` before treating the new upstream revision
+   as available in production.
 
 Cross-compilation and upstream unit tests do not constitute native Windows
 confinement evidence.

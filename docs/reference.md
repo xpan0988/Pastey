@@ -1,6 +1,6 @@
 # Pastey reference
 
-This document owns concrete identifiers, bounds, configuration facts, and source pointers. Source types and validators remain authoritative; architecture is in [architecture](architecture.md) and [Layer 5](layers/layer-5-agent.md).
+This document owns concrete identifiers, bounds, configuration facts, and source pointers. Source types and validators remain authoritative; architecture is in [architecture](architecture.md), [Layer 5](layers/layer-5-agent.md), and [Windows managed execution](platform/windows-managed-execution.md).
 
 ## Versions and schemas
 
@@ -60,7 +60,7 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 | Resource backend | `src-tauri/src/managed_resources.rs` |
 | Process world controller | `src-tauri/src/execution_world.rs` |
 | Platform execution backend seam | `src-tauri/src/execution_backend.rs` |
-| Windows Codex-derived process backend and setup | Pastey adapter `src-tauri/src/windows_codex_backend.rs`; pinned mechanics `src-tauri/crates/windows-codex-sandbox/`; setup command `--pastey-setup-windows-codex-sandbox-v1`; verifier command `--pastey-verify-windows-codex-sandbox-v1` |
+| Windows Codex-derived process backend and setup | Pastey adapter `src-tauri/src/windows_codex_backend.rs`; pinned mechanics `src-tauri/crates/windows-codex-sandbox/`; setup command `--pastey-setup-windows-codex-sandbox-v1`; verifier command `--pastey-verify-windows-codex-sandbox-v1`; provenance `UPSTREAM.md`; local divergence `PATCHES.md` |
 | Network broker | `src-tauri/src/network_broker.rs` |
 | Core claim/result finalizer | `src-tauri/src/managed_execution.rs` |
 | Worker Harness/provider | `src-tauri/src/worker_harness.rs`, `worker_provider.rs` |

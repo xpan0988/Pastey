@@ -2,6 +2,20 @@
 
 Layer 5 owns semantic Plan composition, optional proposal interpretation, immutable object-flow revisions, one complete requester approval, Host admission, exact attempt/step authority, managed execution, authoritative completion, and dependency continuation. It does not own transport routes, raw Host resources, or Developer Terminal authority.
 
+## Responsibility and locality
+
+| Role | Canonical responsibility |
+| --- | --- |
+| PM | WHAT / WHERE / ORDER. It may propose semantic structure, but has no effect tools and no direct approval or start authority. |
+| Worker | HOW for one already-authorized and claimed step. It cannot choose Host, topology, Transfer, approval, grants, lineage, or successor dispatch. |
+| Core | Identity, topology, authority, admission, effect enforcement, evidence, result, lineage, and authoritative completion. |
+
+PM and Worker may propose or request. Only Core authorizes and finalizes authoritative state; DONE and authoritative completion belong to Core, not PM.
+
+Local execution is a transport/dispatch optimization, not an authority exception. A future requester-local or self-admitted path may optimize transport, dispatch, or IPC, but it must still satisfy the same semantic Plan authority, exact Host/step binding, admission, `EffectEnvelope` resource/process authority, evidence, completion, and lineage rules as remote execution. Locality must never bypass Core authority.
+
+Current requester-local primitives remain unavailable because the self-admission/executor path is not implemented. Readiness rejects them rather than admitting a Plan that would stall.
+
 ## Semantic model
 
 | Primitive | Contract |
@@ -42,7 +56,7 @@ One requester approval binds the complete immutable revision. Attempt start then
 4. Each remote receiver validates the exact review correlation and creates Host admission in prepared state.
 5. Only after every Host is prepared does the requester send commit; receivers execute nothing before it.
 
-Search/Transfer-only Plans do not require a Worker provider. A resource-only Transform requires a provider but not a process world. A process-backed Transform and every current Execute require a Host-private exact revision/step process binding and a verified execution world. Requester-local primitives are currently unavailable because the requester has no self-admission/executor path; readiness rejects them instead of admitting a plan that would stall.
+Search/Transfer-only Plans do not require a Worker provider. A resource-only Transform requires a provider but not a process world. A process-backed Transform and every current Execute require a Host-private exact revision/step process binding and a verified execution world.
 
 Review, readiness, prepared, commit, result, failure, step-commit, and cancellation messages carry the exact Plan, revision/hash, approval, attempt, participant, Host/session binding, TTL, and correlation appropriate to the transition. Replays and substitutions fail closed.
 
@@ -68,15 +82,11 @@ Managed input revision N remains immutable. Mutations stay in existing private o
 
 The current model-visible process catalog exposes one `process_spawn` request only when Core has prebound an exact executable identity and execution-world specification to the exact revision/step. The model cannot choose an executable, raw shell, Host path, ambient environment, cwd, network policy, or terminal. Pure lowering produces the existing `ProcessEffect::Spawn`; signal/termination remains Host lifecycle authority and is not a general model tool.
 
-`ExecutionWorldServiceV1` owns the generic execution semantics: it validates exact authority and resource leases, uses mutable overlays, applies Pastey wall/output/write budgets and available platform observations, records evidence, owns cancellation, and waits for an observed terminal state before run revocation. It delegates only platform world preparation, process launch, standard-I/O transport, termination requests, and platform observations through `PlatformExecutionBackendV1`. The backend receives already-authorized mounts and launch data, mints no authority, and has no unsandboxed fallback; unavailable preparation or launch fails closed. The adopted Codex session API does not expose live descendant RSS/CPU accounting, so the Windows backend does not claim those legacy Job-budget observations; the upstream process mechanics are not redesigned to synthesize them. macOS is available only when its local confinement probe verifies the required properties.
+`ExecutionWorldServiceV1` owns the generic execution semantics: it validates exact authority and resource leases, uses mutable overlays, applies Pastey wall/output/write budgets and available platform observations, records evidence, owns cancellation, and waits for an observed terminal state before run revocation. It delegates only platform world preparation, process launch, standard-I/O transport, termination requests, and platform observations through `PlatformExecutionBackendV1`. The backend receives already-authorized mounts and launch data, mints or widens no authority, and has no unsandboxed fallback; unavailable preparation or launch fails closed.
 
-Windows uses `WindowsCodexBackendV1`, a thin adapter over the standalone upstream-derived crate in `src-tauri/crates/windows-codex-sandbox/`. Its source is pinned to `openai/codex@ddf8a67ab09cd76b8adc0969f11ee1271179aba7`; provenance and the bounded integration differences are recorded in that crate's `UPSTREAM.md` and `PATCHES.md`. Pastey maps the exact executable, arguments, authorized working-directory resource, environment, and already-leased resource roots into the mechanics API. A missing authorized cwd fails closed instead of falling back to the executable's Host directory. Codex's private permission/profile types are configuration inside the derived crate and are never EffectEnvelope, grant, revision, Worker, or lineage authority. Native Windows acceptance now verifies this Codex-backed production Managed Execute path through the packaged Stage 1–5 procedure; it is not a physical multi-device Agent validation.
+Every available backend must attest to `AuthorizedResourceProjection`, `AuthorityNeutralEnvironment`, `ExplicitProcessIo`, `PlatformSandboxedProcess`, `CancellableProcessSession`, and `NoRawNetwork`. Authority-neutral means no authority-bearing state is introduced, not that every operational environment value is absent. Cancellable means Core can request termination through the backend and observe a terminal state; stronger descendant-destruction or resource-accounting claims require separate platform evidence.
 
-The Codex-derived layer retains the upstream elevated Windows sandbox path: its setup identities and credentials, ACL/capability reconciliation, command runner, private desktop, WFP/Firewall network confinement, standard-I/O bridge, and process-session/Job mechanics. Setup is an explicit Host-owned elevated operation; a Worker launch cannot request elevation. Missing or stale setup fails closed. Pastey's exact input/scratch/output/tool leases remain the only resource projection supplied by Core; Codex does not discover a repository or expand those semantic attachments. Upstream-required Windows/platform read roots can remain OS-readable, which does not mint a Pastey resource grant.
-
-The effective environment is not empty. Pastey supplies only the exact authorized invocation map and intentionally inserts no provider, Bridge, Developer Terminal, EffectEnvelope, Host-private authority, or Pastey credential state. The retained upstream path then applies its null-device normalization, non-interactive pager values, network-confinement variables, inherited `PATH`/`PATHEXT` defaults when absent, and Git safe-directory configuration. These operational values are not Pastey authority and do not change the exact executable binding.
-
-The generic confinement contract therefore names requirements Pastey can truthfully consume: `AuthorizedResourceProjection`, `AuthorityNeutralEnvironment`, `ExplicitProcessIo`, `PlatformSandboxedProcess`, `CancellableProcessSession`, and `NoRawNetwork`. `CancellableProcessSession` means Pastey can request termination through the backend and observe the session reaching terminal state; it is not a claim that the old Pastey non-breakaway Job or no-daemon-survival policy remains. Evidence records `termination_requested` instead of claiming descendant destruction. Windows reports available only after Codex setup is complete and Pastey's native product-binary probe verifies authorized read/write projection, absence of a Host-only environment sentinel and inherited sentinel handle, raw external and loopback network denial, and a functioning termination request. For Windows v1, the native verifier accepts Winsock `10013` (`WSAEACCES`) and `10106` (`WSAEPROVIDERFAILEDINIT`) as NoRawNetwork enforcement outcomes; a connection success, absent raw error, or any other raw error remains a failure, and the diagnostic retains the observed code. Cross-compilation and derived-crate tests do not satisfy that native gate. Linux remains unavailable.
+Windows uses `WindowsCodexBackendV1` to implement this platform seam over a Codex-derived sandbox. It receives the exact executable, invocation, working directory, environment, and resource roots already authorized by Core. Availability requires Host-owned setup and native conformance; setup or launch failure has no unrestricted fallback. See [Windows managed execution](../platform/windows-managed-execution.md) for the platform semantics and truthful limitations. macOS is available only when its local confinement probe succeeds; Linux remains unavailable.
 
 ### Network
 
@@ -135,7 +145,7 @@ Core then:
 - rejects implicit Host switching or model-invented movement;
 - calls the native-v2 Composer only to create an unapproved Draft.
 
-The review DTO exposes bounded topology, movements, and affected Hosts for presentation. Capability facts remain observations and cannot authorize execution or movement. PM owns WHAT/WHERE/ORDER only and has no tools or direct path to approval/start.
+The review DTO exposes bounded topology, movements, and affected Hosts for presentation. Capability facts remain observations and cannot authorize execution or movement.
 
 ## Native-v2 orchestration and completion
 
