@@ -29,6 +29,13 @@ Only the following local divergences are intentional:
    target. They do not change process behavior.
 7. **Rust edition lint bridge.** The derived sandbox crate temporarily allows
    `unsafe_op_in_unsafe_fn` while compiling the pinned source as Rust 2024.
+8. **Structured runner startup failure and bounded credential recovery.** The
+   elevated runner reports the failing startup stage and optional Win32 error
+   code to its client. Recognized credential/logon failures receive at most one
+   credential refresh and retry; the verifier receives only a bounded,
+   secret-free classification of the initial, refresh, and retry outcomes.
+   Missing or out-of-date Host setup still fails closed and requires Pastey's
+   explicit elevated setup operation.
 
 The helper names, account/setup design, ACL and capability mechanics, WFP and
 Firewall mechanics, private desktop behavior, command runner, process session,

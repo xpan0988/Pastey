@@ -32,6 +32,8 @@ Core evidence/result acceptance → requester step commit → next authored depe
 
 Renderer state, model/provider output, logs, routes, tool schemas, and capability projections never mint authority.
 
+Execution locality does not change this chain. Local execution is only a transport, dispatch, or IPC optimization; it must satisfy the same Layer 5 authority and admission contract as remote execution.
+
 ## HostRuntime and the multi-Host model
 
 `HostRuntime` is the UI-independent Host service owner. It owns Host identity, current session resolution, managed-object bindings, Plan stores, admission, effect authority, resource/process/network backends, Worker/provider services, native-v2 coordination, lifecycle revocation, and Developer Terminal state. Tauri is the desktop invoke/event/task adapter; extracting `HostRuntime` did not create a Headless Host.
@@ -115,7 +117,7 @@ Close/exit, disconnect, explicit departure, session replacement, Burn, shutdown,
 | --- | --- | --- | --- |
 | Search/Transfer safe identity and encrypted transfer | Implemented | Implemented where the desktop product is supported | Implemented; cross-compiled checks do not replace native proof |
 | Managed Resource effects | Implemented | Implemented | Implemented |
-| Managed contained Process execution | Available only after the local `sandbox-exec` confinement probe succeeds | Unavailable; fails closed | `WindowsCodexBackendV1` over the pinned Codex-derived sandbox; availability requires Host-owned elevated setup and Pastey's native resource/environment/I/O/cancellation/NoRawNetwork conformance probe. The native Windows Stage 1–5 path, including production Managed Execute, has been physically demonstrated. Setup or runtime failure fails closed; there is no unsandboxed fallback. |
+| Managed contained Process execution | Available only after the local `sandbox-exec` confinement probe succeeds | Unavailable; fails closed | [Codex-derived managed execution](platform/windows-managed-execution.md), gated by Host-owned setup and native conformance. Windows v1 Managed Execute acceptance exists; failure is fail-closed with no unsandboxed fallback. |
 | Worker task Network effects | Not exposed | Not exposed | Not exposed |
 | Developer Terminal | Native PTY | Native PTY path | ConPTY/PowerShell |
 
@@ -125,7 +127,7 @@ The Host-owned network broker exists as an independent Phase 5 authority domain,
 
 The 1.9.3 development backend implements the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, bounded Worker Harness, configured streaming provider adapter, durable generation-bound provider configuration, live managed receiver coordination, deterministic multi-Host product orchestration, and proposal-only Natural-v2 lowering.
 
-V1 remains isolated and unchanged: its product executes Search/Transfer and rejects Transform/Execute. The 2.0 renderer can open an existing native-v2 revision and drive Review approval, readiness start, authoritative status, and cancellation through the registered Tauri commands. Draft discovery/origination, renderer-safe PM context and detailed topology, and result content projection are not yet exposed. Provider configuration, provider health presentation, and exact managed process binding are still Host-private backend seams. Requester-local authored primitives fail readiness because requester self-admission/execution is not implemented.
+V1 remains isolated and unchanged: its product executes Search/Transfer and rejects Transform/Execute. The 2.0 renderer can open an existing native-v2 revision and drive Review approval, readiness start, authoritative status, and cancellation through the registered Tauri commands. Draft discovery/origination, renderer-safe PM context and detailed topology, and result content projection are not yet exposed. Provider configuration, provider health presentation, and exact managed process binding are still Host-private backend seams.
 
 Remaining 2.0 product work includes renderer-safe Draft/PM/topology/result projections, non-secret provider settings and health presentation, Host-owned executable binding/configuration, product recovery for coordination delivery failures, and physical multi-Host validation. Independently future capabilities include a verified Linux managed execution world, Worker network tools, subagent policy, and Headless Host. None is implied by the current backend.
 
