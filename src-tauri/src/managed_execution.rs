@@ -839,6 +839,7 @@ fn load_claim_source(
         return invalid("Managed v2 participant or Host was substituted.");
     }
     let admission_request = HostAdmissionRequestV2 {
+        attempt_id: request.attempt_id.clone(),
         approval_id: approval.approval_id.clone(),
         plan_id: revision.plan_id.clone(),
         revision_id: revision.revision_id.clone(),
@@ -877,11 +878,22 @@ fn load_claim_source(
     {
         return invalid("Managed v2 step is not exact Host-bound managed work.");
     }
+    let coordinated: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM native_v2_receiver_attempts WHERE attempt_id = ?1)",
+        [&request.attempt_id],
+        |row| row.get(0),
+    )?;
     for dependency in step.dependencies() {
-        let complete: i64 = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM bridge_plan_v2_managed_step_claims WHERE attempt_id = ?1 AND step_id = ?2 AND state = 'completed')",
-            params![request.attempt_id, dependency], |row| row.get(0))?;
-        if complete == 0 {
+        let complete = if coordinated == 1 {
+            crate::native_v2_orchestration::committed_step(&conn, &request.attempt_id, dependency)?
+        } else {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM bridge_plan_v2_managed_step_claims WHERE attempt_id = ?1 AND step_id = ?2 AND state = 'completed')",
+                params![request.attempt_id, dependency],
+                |row| row.get::<_, i64>(0),
+            )? == 1
+        };
+        if !complete {
             return invalid("Managed v2 step dependencies are not authoritatively complete.");
         }
     }

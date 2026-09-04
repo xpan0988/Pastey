@@ -20,7 +20,7 @@ use crate::{
     error::{AppError, AppResult},
     host_admission::ManagedPrimitiveAvailabilityV1,
     host_identity::HostSessionBinding,
-    host_runtime::{current_host_session_binding, HostRuntime},
+    host_runtime::{current_managed_host_session_binding, HostRuntime},
     managed_execution::{ManagedProcessWorldSpecV1, ManagedStepClaimRequestV1},
     storage,
     worker_harness::{WorkerProviderV1, WorkerRunLimitsV1},
@@ -151,6 +151,10 @@ impl HostRuntime {
             matches!(
                 step,
                 PlanStepV2::Transform { .. } | PlanStepV2::Execute { .. }
+            ) && crate::native_v2_orchestration::step_runs_on_host(
+                &revision,
+                step,
+                &self.local_host_ref,
             )
         }) {
             return store.accept_attempt_start(
@@ -401,7 +405,7 @@ impl HostRuntime {
                                 let result_binding = captured.clone();
                                 self.spawn(async move {
                                     let _ =
-                                        crate::native_v2_orchestration::submit_remote_step_result(
+                                        crate::native_v2_orchestration::submit_coordinated_step_result(
                                             runtime,
                                             result_binding,
                                             result,
@@ -436,12 +440,8 @@ impl HostRuntime {
                             ManagedWorkerCoordinatorStateV1::Interrupted,
                             "provider_revoked",
                         )
-                    } else if current_host_session_binding(
-                        self.as_ref(),
-                        &captured.bridge_id,
-                        &captured.peer_route_ref,
-                    )
-                    .is_err()
+                    } else if current_managed_host_session_binding(self.as_ref(), &captured)
+                        .is_err()
                     {
                         (
                             ManagedWorkerCoordinatorStateV1::Interrupted,
@@ -492,7 +492,7 @@ impl HostRuntime {
         let step_id = step_id.map(str::to_string);
         let code = code.to_string();
         self.spawn(async move {
-            let _ = crate::native_v2_orchestration::submit_remote_attempt_failure(
+            let _ = crate::native_v2_orchestration::submit_coordinated_attempt_failure(
                 runtime,
                 binding,
                 &attempt_id,
@@ -512,8 +512,7 @@ impl HostRuntime {
         now: i64,
     ) -> AppResult<()> {
         ensure_worker_attempt_active(&self.paths, attempt_id)?;
-        let current =
-            current_host_session_binding(self, &captured.bridge_id, &captured.peer_route_ref)?;
+        let current = current_managed_host_session_binding(self, &captured)?;
         captured.validate_current(&current, now)?;
         let input = step_input(step)?;
         let acquisition = self.managed_objects.lock().acquisition_for_revision(
@@ -568,8 +567,7 @@ impl HostRuntime {
             return invalid("No managed v2 step is eligible for dispatch.");
         };
         let operation = step.operation();
-        let current =
-            current_host_session_binding(self, &captured.bridge_id, &captured.peer_route_ref)?;
+        let current = current_managed_host_session_binding(self, &captured)?;
         captured.validate_current(&current, now)?;
         let input = step_input(&step)?;
         let acquisition = self.managed_objects.lock().acquisition_for_revision(
@@ -2142,6 +2140,30 @@ mod tests {
         }]
     }
 
+    fn local_transfer_remote_execute_steps(
+        input: &ManagedObjectRevisionV2,
+        local: &PlanParticipantRef,
+        requester: &PlanParticipantRef,
+    ) -> Vec<PlanStepV2> {
+        vec![
+            PlanStepV2::Transfer {
+                step_id: "transfer".into(),
+                depends_on: vec![],
+                source: local.clone(),
+                destination: requester.clone(),
+                input: input.clone(),
+                output: input.clone(),
+            },
+            PlanStepV2::Execute {
+                step_id: "remote-execute".into(),
+                depends_on: vec!["transfer".into()],
+                host: requester.clone(),
+                target: input.clone(),
+                execution_intent: "Run remotely after the explicit Transfer.".into(),
+            },
+        ]
+    }
+
     fn accept(fixture: &Fixture) -> AttemptStartDecisionV2 {
         fixture
             .runtime
@@ -3079,6 +3101,29 @@ mod tests {
     #[test]
     fn non_managed_v2_admission_does_not_require_or_create_a_worker_binding() {
         let fixture = fixture(transfer_steps);
+        fixture
+            .runtime
+            .worker_provider_configs
+            .delete(&fixture.selection.config_ref)
+            .unwrap();
+        assert!(matches!(
+            accept(&fixture),
+            AttemptStartDecisionV2::Accepted(_)
+        ));
+        let worker_attempts: i64 = connection(&fixture.runtime.paths)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_worker_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(worker_attempts, 0);
+    }
+
+    #[test]
+    fn another_hosts_managed_step_does_not_require_this_hosts_provider() {
+        let fixture = fixture(local_transfer_remote_execute_steps);
         fixture
             .runtime
             .worker_provider_configs

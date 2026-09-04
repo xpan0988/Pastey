@@ -120,7 +120,7 @@ Do not start or claim this smoke as reproducible until all of these are true:
 - the product can bind the exact reviewed Transform/Execute steps to Host-owned process specifications where Process is required;
 - B and C report a verified execution world for those specifications (macOS after its local probe; Windows only after its native product-binary probe; Linux fails closed);
 - the frontend or an approved test driver exposes compose/review/approve/start/status/cancel without bypassing the registered Tauri commands;
-- every authored step runs on a remote receiver Host; requester-local self-admission/execution is unavailable;
+- requester-local authored work, if included in an additional smoke case, uses direct self-admission against the same lifecycle and does not send a Room Control message to itself; the canonical A→B→C case below still keeps all authored steps on remote B/C so it exercises real cross-device delivery;
 - three packaged instances have distinct HostRefs, one active Bridge, current unambiguous routes, and the exact managed root already bound at B.
 
 The repository does not currently satisfy the first three product-surface requirements end to end: provider configuration/health and process binding remain Host-private seams. The 2.0 UI can operate the authoritative lifecycle for an existing revision, but Draft origination and the detailed topology/result projections required for this smoke are not renderer-exposed. The backend contracts can be tested, but the A→B→C physical managed smoke is therefore **not yet runnable as a normal product flow**.

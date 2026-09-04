@@ -509,9 +509,28 @@ impl<'a> BridgePlanV2Store<'a> {
         current_binding: &HostSessionBinding,
         now: i64,
     ) -> AppResult<()> {
-        validate_review(review, now)?;
+        self.record_review_with_mode(review, current_binding, now, false)
+    }
+
+    pub(crate) fn record_local_review(
+        &self,
+        review: &ReviewRequestV2,
+        current_binding: &HostSessionBinding,
+        now: i64,
+    ) -> AppResult<()> {
+        self.record_review_with_mode(review, current_binding, now, true)
+    }
+
+    fn record_review_with_mode(
+        &self,
+        review: &ReviewRequestV2,
+        current_binding: &HostSessionBinding,
+        now: i64,
+        allow_requester_local: bool,
+    ) -> AppResult<()> {
+        validate_review(review, now, allow_requester_local)?;
         ensure_active_bridge(self.paths, &review.revision.bridge_id)?;
-        validate_review_binding(review, current_binding, now)?;
+        validate_review_binding(review, current_binding, now, allow_requester_local)?;
         let mut conn = connection(self.paths)?;
         let tx = conn.transaction()?;
         let revision_json = serde_json::to_string(&review.revision)?;
@@ -652,6 +671,7 @@ impl<'a> BridgePlanV2Store<'a> {
         )?;
 
         let request = HostAdmissionRequestV2 {
+            attempt_id: start.attempt_id.clone(),
             approval_id: start.approval_id.clone(),
             plan_id: start.plan_id.clone(),
             revision_id: start.revision_id.clone(),
@@ -709,7 +729,7 @@ pub(crate) fn protocol_metadata(
     match kind {
         "bridge_plan.v2.review_request" => {
             let review: ReviewRequestV2 = serde_json::from_value(payload)?;
-            validate_review(&review, now)?;
+            validate_review(&review, now, false)?;
             if review.revision.bridge_id != expected_bridge {
                 return invalid("Bridge Plan v2 review crossed Bridge scope.");
             }
@@ -956,7 +976,11 @@ pub(crate) fn delete_bridge_records(tx: &Transaction<'_>, bridge_id: &str) -> Ap
     Ok(())
 }
 
-fn validate_review(review: &ReviewRequestV2, now: i64) -> AppResult<()> {
+fn validate_review(
+    review: &ReviewRequestV2,
+    now: i64,
+    allow_requester_local: bool,
+) -> AppResult<()> {
     if review.protocol_version != PROTOCOL_VERSION {
         return invalid("Bridge Plan protocol v2 requires its exact protocol version.");
     }
@@ -970,7 +994,8 @@ fn validate_review(review: &ReviewRequestV2, now: i64) -> AppResult<()> {
     verify_sealed_revision(&review.revision)?;
     validate_approval(&review.approval, &review.revision, now)?;
     if review.sender != review.revision.requester
-        || review.target == review.sender
+        || (review.target == review.sender && !allow_requester_local)
+        || (allow_requester_local && review.target != review.sender)
         || participant_for_ref(&review.revision, &review.target).is_none()
     {
         return invalid("Bridge Plan protocol v2 review participants are invalid.");
@@ -982,6 +1007,7 @@ fn validate_review_binding(
     review: &ReviewRequestV2,
     binding: &HostSessionBinding,
     now: i64,
+    allow_requester_local: bool,
 ) -> AppResult<()> {
     if binding.expires_at <= now || binding.bridge_id != review.revision.bridge_id {
         return invalid("Bridge Plan v2 review session binding is unavailable.");
@@ -990,7 +1016,16 @@ fn validate_review_binding(
         .ok_or_else(|| AppError::InvalidInput("Bridge Plan v2 sender is unavailable.".into()))?;
     let target = participant_for_ref(&review.revision, &review.target)
         .ok_or_else(|| AppError::InvalidInput("Bridge Plan v2 target is unavailable.".into()))?;
-    if sender.host_ref != binding.peer_host_ref || target.host_ref != binding.local_host_ref {
+    let participants_match = if allow_requester_local {
+        binding.is_requester_local()
+            && sender.host_ref == binding.local_host_ref
+            && target.host_ref == binding.local_host_ref
+    } else {
+        !binding.is_requester_local()
+            && sender.host_ref == binding.peer_host_ref
+            && target.host_ref == binding.local_host_ref
+    };
+    if !participants_match {
         return invalid("Bridge Plan v2 participants do not match the current Host session.");
     }
     Ok(())
@@ -1591,7 +1626,9 @@ mod tests {
         let AttemptStartDecisionV2::Accepted(accepted) = decision else {
             panic!("expected admission-backed acceptance");
         };
-        assert!(accepted.admission_ref.starts_with("host-admission:v2:"));
+        assert!(accepted
+            .admission_ref
+            .starts_with("host-admission:v2-attempt-bound:"));
         assert_eq!(
             store.attempt_state(&start.attempt_id).unwrap().as_deref(),
             Some("accepted")
