@@ -26,6 +26,7 @@ use crate::{
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostAdmissionRequestV2 {
+    pub attempt_id: String,
     pub approval_id: String,
     pub plan_id: String,
     pub revision_id: String,
@@ -443,16 +444,29 @@ impl HostAdmissionService {
                 "The v2 Plan participant does not identify this Host.",
             ));
         }
-        if requester_host(revision)? != &request.session_binding.peer_host_ref {
+        let requester_host = requester_host(revision)?;
+        if request.session_binding.is_requester_local() {
+            if &request.participant_ref != &revision.requester
+                || requester_host != &self.local_host_ref
+            {
+                return Ok(deny(
+                    HostAdmissionDenialCode::SessionMismatch,
+                    "Requester-local admission is not bound to the exact requester participant.",
+                ));
+            }
+        } else if requester_host != &request.session_binding.peer_host_ref
+            || request.participant_ref == revision.requester
+        {
             return Ok(deny(
                 HostAdmissionDenialCode::SessionMismatch,
                 "The current Layer 4 peer is not the approved v2 requester Host.",
             ));
         }
-        if request.protocol_correlation_id.trim().is_empty() {
+        if request.attempt_id.trim().is_empty() || request.protocol_correlation_id.trim().is_empty()
+        {
             return Ok(deny(
                 HostAdmissionDenialCode::ApprovalMismatch,
-                "The v2 protocol correlation is unavailable.",
+                "The v2 attempt or protocol correlation is unavailable.",
             ));
         }
 
@@ -561,8 +575,9 @@ fn admission_ref_v2(
     constraints: &HostAdmissionConstraints,
 ) -> AppResult<String> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"pastey-host-admission-v2\0");
+    hasher.update(b"pastey-host-admission-v2-attempt-bound-v1\0");
     for value in [
+        request.attempt_id.as_str(),
         request.approval_id.as_str(),
         request.plan_id.as_str(),
         request.revision_id.as_str(),
@@ -577,7 +592,10 @@ fn admission_ref_v2(
     }
     hasher.update(&serde_json::to_vec(work)?);
     hasher.update(&serde_json::to_vec(constraints)?);
-    Ok(format!("host-admission:v2:{}", hasher.finalize().to_hex()))
+    Ok(format!(
+        "host-admission:v2-attempt-bound:{}",
+        hasher.finalize().to_hex()
+    ))
 }
 
 fn deny(code: HostAdmissionDenialCode, summary: &str) -> HostAdmissionDecision {
@@ -865,6 +883,7 @@ mod tests {
         )
         .unwrap();
         let transform_request = HostAdmissionRequestV2 {
+            attempt_id: "attempt-transform".into(),
             approval_id: approval.approval_id.clone(),
             plan_id: revision.plan_id.clone(),
             revision_id: revision.revision_id.clone(),
@@ -875,6 +894,7 @@ mod tests {
             session_binding: transform_binding.clone(),
         };
         let execute_request = HostAdmissionRequestV2 {
+            attempt_id: "attempt-execute".into(),
             approval_id: approval.approval_id.clone(),
             plan_id: revision.plan_id.clone(),
             revision_id: revision.revision_id.clone(),
@@ -1251,5 +1271,48 @@ mod tests {
             vec![StepOperation::Search, StepOperation::Transfer]
         );
         assert!(!admission.constraints.modification_authority);
+    }
+
+    #[test]
+    fn v2_admission_reference_is_attempt_bound() {
+        let fixture = v2_admission_fixture(false);
+        let service = HostAdmissionService::new(fixture.transform_host.clone());
+        let first = service
+            .evaluate_v2_with_availability(
+                &fixture.revision,
+                &fixture.approval,
+                &fixture.transform_request,
+                &fixture.transform_binding,
+                ManagedPrimitiveAvailabilityV1::verified_attachment(
+                    fixture.transform_host.clone(),
+                    true,
+                    true,
+                ),
+                fixture.now,
+            )
+            .unwrap();
+        let mut substituted = fixture.transform_request.clone();
+        substituted.attempt_id = "attempt-transform-substituted".into();
+        let second = service
+            .evaluate_v2_with_availability(
+                &fixture.revision,
+                &fixture.approval,
+                &substituted,
+                &fixture.transform_binding,
+                ManagedPrimitiveAvailabilityV1::verified_attachment(
+                    fixture.transform_host,
+                    true,
+                    true,
+                ),
+                fixture.now,
+            )
+            .unwrap();
+
+        let first = first.admitted().unwrap();
+        let second = second.admitted().unwrap();
+        assert!(first
+            .admission_ref
+            .starts_with("host-admission:v2-attempt-bound:"));
+        assert_ne!(first.admission_ref, second.admission_ref);
     }
 }

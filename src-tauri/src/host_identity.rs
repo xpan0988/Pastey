@@ -153,9 +153,16 @@ pub struct HostSessionBinding {
     pub peer_route_ref: String,
     pub expires_at: i64,
     pub binding_ref: String,
+    /// Symmetric, non-authoritative correlation for the two endpoints of an
+    /// exact Bridge session. Unlike `binding_ref`, this deliberately excludes
+    /// direction and route so opposite sides can compare the same wire value.
+    #[serde(default)]
+    pub session_pair_ref: String,
 }
 
 impl HostSessionBinding {
+    pub const REQUESTER_LOCAL_ROUTE_PREFIX: &'static str = "requester-local:v1:";
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         bridge_id: &str,
@@ -182,6 +189,13 @@ impl HostSessionBinding {
             ));
         }
 
+        let session_pair_ref = session_pair_ref(
+            bridge_id,
+            &local_host_ref,
+            local_session_ref,
+            &peer_host_ref,
+            peer_session_ref,
+        );
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"pastey-host-session-binding-v1\0");
         for value in [
@@ -206,7 +220,60 @@ impl HostSessionBinding {
             peer_route_ref: peer_route_ref.to_string(),
             expires_at,
             binding_ref: format!("host-session-binding:v1:{}", hasher.finalize().to_hex()),
+            session_pair_ref,
         })
+    }
+
+    /// Constructs the process-local requester self-admission binding. It is
+    /// intentionally not a transport route and cannot be constructed by the
+    /// peer-binding constructor above.
+    pub fn new_requester_local(
+        bridge_id: &str,
+        host_ref: HostRef,
+        runtime_session_ref: &str,
+        expires_at: i64,
+    ) -> AppResult<Self> {
+        if bridge_id.trim().is_empty() || runtime_session_ref.trim().is_empty() || expires_at <= 0 {
+            return Err(AppError::InvalidInput(
+                "Requester-local Host session binding is incomplete.".into(),
+            ));
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"pastey-requester-local-host-session-binding-v1\0");
+        for value in [bridge_id, host_ref.as_str(), runtime_session_ref] {
+            hasher.update(value.as_bytes());
+            hasher.update(b"\0");
+        }
+        hasher.update(&expires_at.to_le_bytes());
+        let digest = hasher.finalize().to_hex().to_string();
+        Ok(Self {
+            bridge_id: bridge_id.to_string(),
+            local_host_ref: host_ref.clone(),
+            peer_host_ref: host_ref.clone(),
+            local_session_ref: runtime_session_ref.to_string(),
+            peer_session_ref: runtime_session_ref.to_string(),
+            peer_route_ref: format!("{}{}", Self::REQUESTER_LOCAL_ROUTE_PREFIX, digest),
+            expires_at,
+            binding_ref: format!("requester-local-host-session-binding:v1:{digest}"),
+            session_pair_ref: session_pair_ref(
+                bridge_id,
+                &host_ref,
+                runtime_session_ref,
+                &host_ref,
+                runtime_session_ref,
+            ),
+        })
+    }
+
+    pub fn is_requester_local(&self) -> bool {
+        self.local_host_ref == self.peer_host_ref
+            && self.local_session_ref == self.peer_session_ref
+            && self
+                .peer_route_ref
+                .starts_with(Self::REQUESTER_LOCAL_ROUTE_PREFIX)
+            && self
+                .binding_ref
+                .starts_with("requester-local-host-session-binding:v1:")
     }
 
     /// Validates a previously captured binding against a freshly resolved
@@ -225,6 +292,31 @@ impl HostSessionBinding {
         }
         Ok(())
     }
+}
+
+fn session_pair_ref(
+    bridge_id: &str,
+    first_host_ref: &HostRef,
+    first_session_ref: &str,
+    second_host_ref: &HostRef,
+    second_session_ref: &str,
+) -> String {
+    let mut endpoints = [
+        (first_host_ref.as_str(), first_session_ref),
+        (second_host_ref.as_str(), second_session_ref),
+    ];
+    endpoints.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"pastey-host-session-pair-ref-v1\0");
+    hasher.update(bridge_id.as_bytes());
+    hasher.update(b"\0");
+    for (host_ref, session_ref) in endpoints {
+        hasher.update(host_ref.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(session_ref.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("host-session-pair:v1:{}", hasher.finalize().to_hex())
 }
 
 /// Role-neutral projection for a legacy Plan device token. It is deliberately
@@ -358,7 +450,83 @@ mod tests {
         ] {
             assert!(!object.contains_key(forbidden));
         }
-        assert_eq!(object.len(), 8);
+        assert_eq!(object.len(), 9);
+    }
+
+    #[test]
+    fn opposite_session_bindings_remain_directional_but_share_wire_correlation() {
+        let alpha = host("alpha");
+        let beta = host("beta");
+        let alpha_view = HostSessionBinding::new(
+            "bridge",
+            alpha.clone(),
+            beta.clone(),
+            "alpha-session",
+            "beta-session",
+            "route-to-beta",
+            100,
+        )
+        .unwrap();
+        let beta_view = HostSessionBinding::new(
+            "bridge",
+            beta,
+            alpha,
+            "beta-session",
+            "alpha-session",
+            "route-to-alpha",
+            100,
+        )
+        .unwrap();
+
+        assert_ne!(alpha_view.binding_ref, beta_view.binding_ref);
+        assert_eq!(alpha_view.session_pair_ref, beta_view.session_pair_ref);
+        assert!(alpha_view.validate_current(&beta_view, 1).is_err());
+    }
+
+    #[test]
+    fn session_pair_correlation_is_bridge_and_session_exact_but_route_neutral() {
+        let captured = binding("peer", "peer-session", "route-a");
+        let route_changed = binding("peer", "peer-session", "route-b");
+        let session_changed = binding("peer", "new-peer-session", "route-a");
+        let other_bridge = HostSessionBinding::new(
+            "other-bridge",
+            host("local"),
+            host("peer"),
+            "local-session",
+            "peer-session",
+            "route-a",
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(captured.session_pair_ref, route_changed.session_pair_ref);
+        assert_ne!(captured.binding_ref, route_changed.binding_ref);
+        assert_ne!(captured.session_pair_ref, session_changed.session_pair_ref);
+        assert_ne!(captured.session_pair_ref, other_bridge.session_pair_ref);
+        assert!(captured.validate_current(&session_changed, 1).is_err());
+    }
+
+    #[test]
+    fn requester_local_binding_is_process_session_exact_and_non_routable() {
+        let local = host("local");
+        let captured = HostSessionBinding::new_requester_local(
+            "bridge",
+            local.clone(),
+            "runtime-session-a",
+            100,
+        )
+        .unwrap();
+        let restarted =
+            HostSessionBinding::new_requester_local("bridge", local, "runtime-session-b", 100)
+                .unwrap();
+
+        assert!(captured.is_requester_local());
+        assert!(captured
+            .peer_route_ref
+            .starts_with(HostSessionBinding::REQUESTER_LOCAL_ROUTE_PREFIX));
+        assert_ne!(captured.binding_ref, restarted.binding_ref);
+        assert_ne!(captured.session_pair_ref, restarted.session_pair_ref);
+        assert!(captured.validate_current(&restarted, 1).is_err());
     }
 
     #[test]

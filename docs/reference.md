@@ -42,6 +42,10 @@ Native-v2 Room Control kinds are:
 - `bridge_plan.v2.step_result` / `bridge_plan.v2.step_failure` / `bridge_plan.v2.step_commit`
 - `bridge_plan.v2.attempt_cancel`
 
+Requester-local transitions use `NativeV2CoordinatorActionV1` directly and never send the reserved `requester-local:v1:*` route through Room Control. `HostSessionBinding.binding_ref` is the full directional Host-private authority reference. `HostSessionBinding.session_pair_ref` is the symmetric cross-side correlation for readiness, prepared, step-result, and step-failure payloads; it is derived from the exact Bridge plus both Host/session endpoints, excludes routes, and is not authority. Requester-local bindings use the domain-separated `requester-local-host-session-binding:v1:*` reference and a fresh `HostRuntime` process session.
+
+Native-v2 Host admission is bound to `attempt_id` as well as the exact approval, Plan revision/hash, participant, Host/session binding, TTL, and local authored fragment. Current admission references use `host-admission:v2-attempt-bound:*`; changing an attempt cannot reuse an admission.
+
 The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bounded to 128 characters and product semantic text to 1,024 characters by the native-v2 service.
 
 ## Host and managed authority source map
@@ -105,7 +109,7 @@ The frontend uses `@xterm/xterm` and `@xterm/addon-fit`. Host shell selection is
 | Boundary | Focused validation |
 | --- | --- |
 | Natural proposals | `scripts/run-natural-v1-tests.mjs`, `scripts/run-natural-v2-tests.mjs`, Rust `natural_v2` tests |
-| Plan lifecycle and native-v2 orchestration | Rust `bridge_plan`, `bridge_plan_v2`, `native_v2_orchestration`, and `managed_worker_coordinator` tests |
+| Plan lifecycle and native-v2 orchestration | Rust `host_identity`, `host_runtime`, `host_admission`, `bridge_plan`, `bridge_plan_v2`, `native_v2_orchestration`, and `managed_worker_coordinator` tests |
 | Worker/provider/configuration | Rust `worker_harness`, `worker_provider`, and `worker_provider_config` tests |
 | Effects/results | Rust `effect_authority`, `managed_resources`, `execution_world`, `network_broker`, and `managed_execution` tests; opt-in native Windows `windows_execution_world` integration test |
 | Layer 4 and transfer | `scripts/run-layer4-validation-matrix.mjs`, `scripts/run-transfer-planner-tests.mjs`, Rust transport/protocol tests |

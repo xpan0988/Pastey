@@ -62,6 +62,9 @@ pub struct HostRuntime {
     /// Durable logical identity for this installation. It is not a route,
     /// current session, capability observation, or paired-device label.
     pub local_host_ref: HostRef,
+    /// Fresh process identity used only for requester-local self-admission.
+    /// It is never serialized, advertised, or accepted as a peer route.
+    pub(crate) runtime_session_ref: String,
     pub config: RwLock<StoredConfig>,
     pub active_servers: Mutex<HashMap<String, ActiveRoomServer>>,
     pub active_file_transfers: Mutex<HashMap<String, transfer::ActiveFileTransfer>>,
@@ -167,6 +170,7 @@ impl HostRuntime {
         Ok(Self {
             paths,
             local_host_ref: local_host_ref.clone(),
+            runtime_session_ref: format!("host-runtime-session:v1:{}", uuid::Uuid::new_v4()),
             config: RwLock::new(config),
             active_servers: Mutex::new(HashMap::new()),
             active_file_transfers: Mutex::new(HashMap::new()),
@@ -590,6 +594,39 @@ pub fn current_host_session_binding(
     )
 }
 
+/// Resolves the current process-local requester binding for one active Bridge.
+/// The reserved route is an identity marker only and must never enter Layer 4.
+pub(crate) fn current_requester_local_session_binding(
+    state: &HostRuntime,
+    room_id: &str,
+) -> AppResult<HostSessionBinding> {
+    let room = storage::get_room_by_id(&state.paths, room_id)?;
+    if room.status != crate::models::RoomStatus::Active {
+        return Err(crate::error::AppError::InvalidInput(
+            "Requester-local Bridge is unavailable.".into(),
+        ));
+    }
+    HostSessionBinding::new_requester_local(
+        room_id,
+        state.local_host_ref.clone(),
+        &state.runtime_session_ref,
+        room.expires_at,
+    )
+}
+
+/// Re-resolves either the requester-local process binding or an ordinary
+/// directional peer binding without treating the local marker as routable.
+pub(crate) fn current_managed_host_session_binding(
+    state: &HostRuntime,
+    captured: &HostSessionBinding,
+) -> AppResult<HostSessionBinding> {
+    if captured.is_requester_local() {
+        current_requester_local_session_binding(state, &captured.bridge_id)
+    } else {
+        current_host_session_binding(state, &captured.bridge_id, &captured.peer_route_ref)
+    }
+}
+
 #[allow(dead_code)]
 pub fn validate_current_host_session_binding(
     state: &HostRuntime,
@@ -810,6 +847,57 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(runtime.local_host_ref, durable_local_host_ref);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn requester_local_binding_changes_on_runtime_restart_and_cannot_route() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "pastey-requester-local-binding-lifecycle-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::new(data_dir.clone(), data_dir.join("logs"));
+        paths.ensure_directories().unwrap();
+        storage::init_database(&paths).unwrap();
+        let room = storage::create_room(
+            &paths,
+            &crate::crypto::random_key(),
+            "123456",
+            5,
+            crate::models::LocalRole::Creator,
+            Some("requester-local-room".into()),
+            Some(storage::now_ts() + 300),
+        )
+        .unwrap();
+        let first_runtime = HostRuntime::new(
+            paths.clone(),
+            test_config(),
+            Arc::new(RecordingEventSink::default()),
+            Arc::new(RecordingTaskSpawner::default()),
+        )
+        .unwrap();
+        let first = current_requester_local_session_binding(&first_runtime, &room.id).unwrap();
+        let restarted_runtime = HostRuntime::new(
+            paths,
+            test_config(),
+            Arc::new(RecordingEventSink::default()),
+            Arc::new(RecordingTaskSpawner::default()),
+        )
+        .unwrap();
+        let restarted =
+            current_requester_local_session_binding(&restarted_runtime, &room.id).unwrap();
+
+        assert_eq!(first.local_host_ref, restarted.local_host_ref);
+        assert_ne!(first.local_session_ref, restarted.local_session_ref);
+        assert_ne!(first.binding_ref, restarted.binding_ref);
+        assert_ne!(first.session_pair_ref, restarted.session_pair_ref);
+        assert!(first
+            .validate_current(&restarted, storage::now_ts())
+            .is_err());
+        assert!(
+            current_host_session_binding(&restarted_runtime, &room.id, &first.peer_route_ref)
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
