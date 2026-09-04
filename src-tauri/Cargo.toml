@@ -13,6 +13,12 @@ required-features = ["native-windows-acceptance"]
 test = false
 bench = false
 
+[[bin]]
+name = "pastey-native-v2-physical-harness"
+path = "src/bin/pastey-native-v2-physical-harness.rs"
+test = false
+bench = false
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

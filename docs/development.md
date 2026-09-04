@@ -104,6 +104,70 @@ For a single-machine dual-instance smoke, create/join a Bridge and exercise sele
 - A local dual-instance run covers desktop wiring, current-session Room Control, ordinary Transfer, and protocol interaction on one machine. It does not prove independent physical Hosts, LAN failure behavior, native Windows, or a verified managed process world on another platform.
 - Physical multi-device proof requires packaged builds on the named devices and a recorded run of the procedure below. Do not report PASS from unit tests, Darwin-only integration, cross-compilation, or source inspection.
 
+## Mac requester ↔ Windows native-v2 physical acceptance harness
+
+`pastey-native-v2-physical-harness` is a source-built, headless acceptance adapter. It initializes the same production `HostRuntime`, Bridge lifecycle, native-v2 orchestration, Search adapter, encrypted Transfer path, and Core SQLite stores as the desktop app. It does not mock a peer, create an authority bypass, alter admission, or configure a provider. Use one clean, dedicated `PASTEY_APP_DATA_DIR` on each physical machine; do not point it at normal user data.
+
+The current Bridge still has to be created and joined by the normal product flow before starting the headless Hosts. For a same-commit source run, launch each desktop app with the exact dedicated data directory, create/join one Bridge, record its id, then close the desktop apps before running the headless processes. The `host` command prints its HostRef; start the Windows Host first, then the Mac requester. The `host` process remains open until it is stopped with Ctrl+C.
+
+```bash
+# macOS: run once to create/join the Bridge in the dedicated data directory, then quit it.
+PASTEY_APP_DATA_DIR=/absolute/path/to/mac-app-data npm run tauri:dev
+
+# macOS: start the requester-side real Host.
+scripts/native-v2-physical/run-mac.sh host \
+  --app-data-dir /absolute/path/to/mac-app-data --bridge-id BRIDGE_ID
+
+# A second macOS terminal. HOSTREF_WINDOWS is printed by the Windows `host` command.
+scripts/native-v2-physical/run-mac.sh run --profile a \
+  --app-data-dir /absolute/path/to/mac-app-data --bridge-id BRIDGE_ID \
+  --remote-host-ref HOSTREF_WINDOWS --run-id RUN_ID \
+  --report-dir /absolute/path/to/reports --product-executable /absolute/path/to/Pastey.app/Contents/MacOS/pastey
+```
+
+```powershell
+# Windows PowerShell: run once to create/join the same Bridge, then quit it.
+$env:PASTEY_APP_DATA_DIR = 'C:\physical\windows-app-data'
+npm run tauri:dev
+
+# Windows PowerShell: start the remote real Host.
+.\scripts\native-v2-physical\run-windows.ps1 host `
+  --app-data-dir C:\physical\windows-app-data --bridge-id BRIDGE_ID
+
+# After the Mac run, while the Windows Host is still running, use another PowerShell.
+.\scripts\native-v2-physical\run-windows.ps1 collect --profile a --role windows-host `
+  --app-data-dir C:\physical\windows-app-data --attempt-id ATTEMPT_ID `
+  --report-dir C:\physical\reports --product-executable C:\Path\To\pastey.exe
+```
+
+The requester `run` command creates one deterministic real file in its dedicated `shared/` fixture scope, seals a two-step Profile A (`Search @ Mac → explicit Transfer Mac → Windows`) Plan, makes the ordinary approval/start calls, and waits for a terminal Core state. It never supplies a direct receiver result. Copy the Windows JSON report to the Mac report directory by an operator-approved channel, then make the only PASS/FAIL decision from both databases:
+
+```bash
+scripts/native-v2-physical/run-mac.sh verify --profile a \
+  --requester-report /absolute/path/to/reports/native-v2-physical-requester-ATTEMPT_ID.json \
+  --windows-report /absolute/path/to/reports/native-v2-physical-windows-host-ATTEMPT_ID.json \
+  --output-dir /absolute/path/to/reports
+```
+
+The reports are `pastey-native-v2-physical-evidence-v1` JSON plus a concise text summary. They contain git/harness/product identity, local HostRef and bridge session data, Plan/revision/approval/attempt ids, readiness/admission state, step/dispatch/commit counts, Transfer digest and exact destination receipt, and final Core state. The Profile B report additionally contains managed claim/evidence metadata, Execute result digest, and the authoritative count of successor managed-object lineage. The report deliberately excludes credentials, private paths, ObjectRefs, grants, raw terminal content, and raw evidence internals.
+
+`verify` produces `PASS` only if requester Core says one completed exact revision; every participant is ready and committed; the expected number of unique authoritative step commits exists; Windows has exactly one matching receipt; database integrity is `ok`; and, for Profile B, Windows has exactly one Execute result and zero successor-lineage rows. Individual machine reports never say PASS.
+
+Profile B uses the same sequence with `--profile b` and the same `RUN_ID`/`ATTEMPT_ID` on each machine:
+
+```bash
+scripts/native-v2-physical/run-mac.sh run --profile b \
+  --app-data-dir /absolute/path/to/mac-app-data --bridge-id BRIDGE_ID \
+  --remote-host-ref HOSTREF_WINDOWS --run-id RUN_ID \
+  --report-dir /absolute/path/to/reports
+scripts/native-v2-physical/run-mac.sh verify --profile b \
+  --requester-report /absolute/path/to/reports/native-v2-physical-requester-ATTEMPT_ID.json \
+  --windows-report /absolute/path/to/reports/native-v2-physical-windows-host-ATTEMPT_ID.json \
+  --output-dir /absolute/path/to/reports
+```
+
+It prepares `Search @ Mac → Transfer → Execute @ Windows`, but it remains fail-closed until the existing Windows Host has a real selected provider generation, health, exact process binding, verified production execution-world availability, and the native Windows Stage 1–5 baseline. The harness does not read credentials or create those Host-private bindings. The current product has no configuration/origination surface for those provider/process bindings, so Profile B is a prepared physical path rather than a runnable PASS case. A `provider_unavailable` or `managed_platform_unavailable` state is a correct BLOCKED/FAIL-precondition outcome, not a reason to weaken the gate. Do not claim Profile B PASS until that setup and a two-machine run have actually occurred.
+
 ## Phase 6 physical multi-Host smoke
 
 The target scenario is:

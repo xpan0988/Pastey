@@ -18,6 +18,7 @@ use crate::{
     storage::AppPaths,
 };
 
+#[path = "bridge_plan/protocol.rs"]
 mod protocol;
 pub(crate) use protocol::{
     accept_inbound_protocol_event, attempt_search_result_payload, attempt_start_payload,
