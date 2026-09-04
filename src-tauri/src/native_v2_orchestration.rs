@@ -4180,9 +4180,16 @@ mod tests {
     use crate::{
         config::StoredConfig,
         host_runtime::{HostEvent, HostEventSink, RuntimeTask, RuntimeTaskSpawner},
+        managed_objects::{HostArtifactAcquisition, ManagedObjectAcquisitionKind},
         models::LocalRole,
         storage,
+        worker_harness::{
+            WorkerHarnessRunV1, WorkerProviderErrorV1, WorkerProviderResponseV1,
+            WorkerProviderTurnV1, WorkerProviderV1, WorkerResourceAliasV1, WorkerToolCallV1,
+        },
+        worker_provider_config::{WorkerProviderConfigWriteV1, WorkerProviderSelectionV1},
     };
+    use base64::Engine as _;
 
     const NOW: i64 = 10_000;
 
@@ -4306,6 +4313,193 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    struct RequesterLocalTransformFixture {
+        paths: AppPaths,
+        runtime: Arc<HostRuntime>,
+        revision: PlanRevisionV2,
+        binding: crate::host_identity::HostSessionBinding,
+        attempt_id: String,
+    }
+
+    struct RequesterLocalTransformProvider {
+        responses: VecDeque<WorkerProviderResponseV1>,
+    }
+
+    impl RequesterLocalTransformProvider {
+        fn exact_revision_two() -> Self {
+            Self {
+                responses: VecDeque::from([
+                    WorkerProviderResponseV1::ToolCall {
+                        call: WorkerToolCallV1::Read {
+                            resource: WorkerResourceAliasV1::Input,
+                        },
+                    },
+                    WorkerProviderResponseV1::ToolCall {
+                        call: WorkerToolCallV1::Create {
+                            relative_selector: "result.txt".into(),
+                            content_base64: base64::engine::general_purpose::STANDARD
+                                .encode(b"revision two"),
+                        },
+                    },
+                    WorkerProviderResponseV1::Final {
+                        output_selector: "result.txt".into(),
+                        display_name: "result.txt".into(),
+                        media_type: "text/plain".into(),
+                    },
+                ]),
+            }
+        }
+    }
+
+    impl WorkerProviderV1 for RequesterLocalTransformProvider {
+        fn next_turn(
+            &mut self,
+            _request: crate::worker_harness::WorkerProviderRequestV1,
+            _cancellation: &WorkerHarnessRunV1,
+        ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
+            Ok(WorkerProviderTurnV1::scripted(
+                self.responses
+                    .pop_front()
+                    .expect("requester-local Transform provider response"),
+            ))
+        }
+    }
+
+    async fn requester_local_transform_fixture(
+        label: &str,
+        include_successor: bool,
+    ) -> RequesterLocalTransformFixture {
+        let paths = paths(label);
+        let now = storage::now_ts();
+        connection(&paths)
+            .unwrap()
+            .execute(
+                "UPDATE rooms SET expires_at = ?2 WHERE id = ?1",
+                params!["bridge-native-v2", now + 3_600],
+            )
+            .unwrap();
+        let runtime = requester_runtime(paths.clone(), "requester-local-transform");
+        let requester = runtime.local_host_ref.clone();
+        let artifact_root = paths.app_data_dir.join("transform-input");
+        std::fs::create_dir_all(&artifact_root).unwrap();
+        let artifact = artifact_root.join("input.txt");
+        std::fs::write(&artifact, b"revision one").unwrap();
+        let acquisition = runtime
+            .managed_objects
+            .lock()
+            .acquire_new(
+                HostArtifactAcquisition {
+                    kind: ManagedObjectAcquisitionKind::LocalSelection,
+                    source_ref: "requester-local-transform-input".into(),
+                    bridge_id: Some("bridge-native-v2".into()),
+                    path: artifact,
+                    scope_root: artifact_root,
+                    display_name: "input.txt".into(),
+                    media_type: "text/plain".into(),
+                    expires_at: now + 3_000,
+                    app_owned_temporary: false,
+                },
+                now,
+            )
+            .unwrap();
+        let input = NativeV2ObjectRevisionDtoV1 {
+            logical_object_id: acquisition.object.logical_object_id,
+            revision: acquisition.object.revision,
+        };
+        let output = NativeV2ObjectRevisionDtoV1 {
+            logical_object_id: input.logical_object_id.clone(),
+            revision: input.revision + 1,
+        };
+        let mut steps = vec![NativeV2StepDraftV1::Transform {
+            step_id: "transform-requester".into(),
+            depends_on: Vec::new(),
+            host_ref: requester.as_str().into(),
+            input: input.clone(),
+            output: output.clone(),
+            modification_intent: "Produce the exact approved next revision.".into(),
+        }];
+        if include_successor {
+            steps.push(NativeV2StepDraftV1::Transform {
+                step_id: "transform-successor".into(),
+                depends_on: vec!["transform-requester".into()],
+                host_ref: requester.as_str().into(),
+                input: output.clone(),
+                output: NativeV2ObjectRevisionDtoV1 {
+                    logical_object_id: output.logical_object_id.clone(),
+                    revision: output.revision + 1,
+                },
+                modification_intent: "Produce the second approved revision.".into(),
+            });
+        }
+        let revision = compose_revision(NativeV2ComposeRequestV1 {
+            plan_id: "requester-local-transform-plan".into(),
+            revision_id: "requester-local-transform-revision".into(),
+            revision_number: 1,
+            bridge_id: "bridge-native-v2".into(),
+            requester_host_ref: requester.as_str().into(),
+            participant_host_refs: vec![requester.as_str().into()],
+            roots: vec![NativeV2RootDraftV1 {
+                root_id: "transform-input".into(),
+                object: input,
+                host_ref: requester.as_str().into(),
+            }],
+            original_user_goal: "Transform the requester-local artifact.".into(),
+            expected_outcome: "Core finalizes the exact next revision.".into(),
+            steps,
+        })
+        .unwrap();
+        let metadata = runtime
+            .worker_provider_configs
+            .create(WorkerProviderConfigWriteV1 {
+                provider_id: "requester-local-test-provider".into(),
+                base_url: "https://provider.example.test/v1".into(),
+                model: "model-a".into(),
+                api_key: "test-secret".into(),
+                timeout_millis: 10_000,
+                max_output_tokens: 512,
+            })
+            .unwrap();
+        runtime
+            .worker_provider_configs
+            .select_for_managed_workers(&WorkerProviderSelectionV1 {
+                config_ref: metadata.config_ref,
+                model: metadata.model,
+            })
+            .unwrap();
+        let store = NativeV2ProductStore::new(&paths);
+        store.create_draft(&revision, &requester, now).unwrap();
+        store
+            .approve(
+                &revision.revision_id,
+                "approval-requester-local-transform",
+                now + 600,
+                now,
+            )
+            .unwrap();
+        let attempt_id = "attempt-requester-local-transform".to_string();
+        let started = runtime
+            .start_native_v2_product_attempt(
+                "approval-requester-local-transform",
+                &attempt_id,
+                now + 600,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.state, NativeV2ProductStateV1::Running);
+        let binding = receiver_attempt_binding(&paths, &attempt_id)
+            .unwrap()
+            .unwrap();
+        assert!(binding.is_requester_local());
+        RequesterLocalTransformFixture {
+            paths,
+            runtime,
+            revision,
+            binding,
+            attempt_id,
+        }
     }
 
     fn seed_running_product(paths: &AppPaths, revision: &PlanRevisionV2) {
@@ -4915,6 +5109,134 @@ mod tests {
         assert_eq!(commits, 1);
         assert_eq!(receiver_state, "completed");
         let _ = std::fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[tokio::test]
+    async fn requester_local_live_transform_finalizes_exact_n_plus_one_and_commits() {
+        let fixture =
+            requester_local_transform_fixture("native-v2-requester-local-live-transform", false)
+                .await;
+        let mut provider = RequesterLocalTransformProvider::exact_revision_two();
+        let operation = fixture
+            .runtime
+            .dispatch_next_v2_managed_with_provider(
+                &fixture.attempt_id,
+                fixture.binding.clone(),
+                &mut provider,
+                storage::now_ts(),
+            )
+            .unwrap();
+        assert_eq!(operation, StepOperation::Transform);
+        assert!(provider.responses.is_empty());
+
+        let result = managed_step_result(
+            &fixture.runtime,
+            &fixture.attempt_id,
+            &fixture.revision.steps[0],
+            &fixture.binding,
+            storage::now_ts(),
+        )
+        .unwrap();
+        let output = result.object.as_ref().expect("Transform output");
+        let PlanStepV2::Transform {
+            input,
+            output: authored_output,
+            ..
+        } = &fixture.revision.steps[0]
+        else {
+            panic!("expected Transform");
+        };
+        assert_eq!(output, authored_output);
+        assert_eq!(output.logical_object_id, input.logical_object_id);
+        assert_eq!(output.revision, input.revision + 1);
+
+        submit_coordinated_step_result(fixture.runtime.clone(), fixture.binding.clone(), result)
+            .await
+            .unwrap();
+        let status = NativeV2ProductStore::new(&fixture.paths)
+            .status_for_revision(&fixture.revision.revision_id)
+            .unwrap();
+        assert_eq!(status.state, NativeV2ProductStateV1::Completed);
+        assert_eq!(status.completed_steps, 1);
+        let conn = connection(&fixture.paths).unwrap();
+        let transform_results: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_transform_results
+                 WHERE attempt_id = ?1 AND step_id = 'transform-requester'
+                   AND logical_object_id = ?2 AND output_revision = ?3",
+                params![
+                    fixture.attempt_id,
+                    authored_output.logical_object_id,
+                    authored_output.revision
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let commits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM native_v2_step_commits
+                 WHERE attempt_id = ?1 AND step_id = 'transform-requester'",
+                [&fixture.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transform_results, 1);
+        assert_eq!(commits, 1);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(fixture.paths.app_data_dir);
+    }
+
+    #[tokio::test]
+    async fn requester_local_restarted_session_cannot_finalize_or_unlock_successor() {
+        let fixture =
+            requester_local_transform_fixture("native-v2-requester-local-stale-transform", true)
+                .await;
+        let restarted = requester_runtime(fixture.paths.clone(), "requester-local-transform");
+        let current =
+            crate::host_runtime::current_managed_host_session_binding(&restarted, &fixture.binding)
+                .unwrap();
+        assert_ne!(current.local_session_ref, fixture.binding.local_session_ref);
+        let mut provider = RequesterLocalTransformProvider::exact_revision_two();
+        let error = restarted
+            .dispatch_next_v2_managed_with_provider(
+                &fixture.attempt_id,
+                fixture.binding.clone(),
+                &mut provider,
+                storage::now_ts(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("session"));
+        assert_eq!(provider.responses.len(), 3);
+
+        let conn = connection(&fixture.paths).unwrap();
+        let transform_results: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_transform_results
+                 WHERE attempt_id = ?1",
+                [&fixture.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let commits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM native_v2_step_commits WHERE attempt_id = ?1",
+                [&fixture.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let successor_state: String = conn
+            .query_row(
+                "SELECT state FROM native_v2_product_steps
+                 WHERE attempt_id = ?1 AND step_id = 'transform-successor'",
+                [&fixture.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transform_results, 0);
+        assert_eq!(commits, 0);
+        assert_eq!(successor_state, "pending");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(fixture.paths.app_data_dir);
     }
 
     #[test]

@@ -2281,6 +2281,72 @@ mod tests {
     }
 
     #[test]
+    fn remote_managed_worker_accepts_current_peer_binding_and_rejects_stale_peer_binding() {
+        let current = fixture(transform_steps);
+        assert!(matches!(
+            accept(&current),
+            AttemptStartDecisionV2::Accepted(_)
+        ));
+        let mut current_provider = transform_script();
+        assert_eq!(
+            current
+                .runtime
+                .dispatch_next_v2_managed_with_provider(
+                    &current.start.attempt_id,
+                    current.binding.clone(),
+                    &mut current_provider,
+                    storage::now_ts(),
+                )
+                .unwrap(),
+            StepOperation::Transform
+        );
+        assert!(!current_provider.requests.is_empty());
+
+        let stale = fixture(transform_steps);
+        assert!(matches!(
+            accept(&stale),
+            AttemptStartDecisionV2::Accepted(_)
+        ));
+        storage::update_room_peer(
+            &stale.runtime.paths,
+            &stale.binding.bridge_id,
+            Some("127.0.0.1"),
+            Some(9_001),
+            Some("Requester"),
+            Some("requester-key-reconnected"),
+            RoomStatus::Active,
+        )
+        .unwrap();
+        storage::bind_legacy_room_peer_host_ref(
+            &stale.runtime.paths,
+            &stale.binding.bridge_id,
+            stale.binding.peer_host_ref.as_str(),
+        )
+        .unwrap();
+        let mut stale_provider = transform_script();
+        assert!(stale
+            .runtime
+            .dispatch_next_v2_managed_with_provider(
+                &stale.start.attempt_id,
+                stale.binding.clone(),
+                &mut stale_provider,
+                storage::now_ts(),
+            )
+            .is_err());
+        assert!(stale_provider.requests.is_empty());
+        let results: i64 = connection(&stale.runtime.paths)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_transform_results
+                 WHERE attempt_id = ?1",
+                [&stale.start.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(results, 0);
+    }
+
+    #[test]
     fn cancellation_and_host_or_provider_substitution_are_terminal_before_model_dispatch() {
         let cancelled = fixture(transform_steps);
         assert!(matches!(
