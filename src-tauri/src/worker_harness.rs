@@ -1373,11 +1373,12 @@ fn ensure_worker_active(
 ) -> AppResult<()> {
     ensure_active(cancellation)?;
     if input.live_revalidation {
-        crate::host_runtime::validate_current_host_session_binding(
+        let now = crate::storage::now_ts();
+        let current = crate::host_runtime::current_managed_host_session_binding(
             runtime,
             &input.current_binding,
-            crate::storage::now_ts(),
         )?;
+        input.current_binding.validate_current(&current, now)?;
     }
     Ok(())
 }
@@ -1392,11 +1393,8 @@ fn completion_binding(
         return Ok((input.current_binding.clone(), input.now));
     }
     let now = crate::storage::now_ts();
-    let current = crate::host_runtime::current_host_session_binding(
-        runtime,
-        &input.current_binding.bridge_id,
-        &input.current_binding.peer_route_ref,
-    )?;
+    let current =
+        crate::host_runtime::current_managed_host_session_binding(runtime, &input.current_binding)?;
     input.current_binding.validate_current(&current, now)?;
     Ok((current, now))
 }
