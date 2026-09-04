@@ -108,17 +108,14 @@ For a single-machine dual-instance smoke, create/join a Bridge and exercise sele
 
 `pastey-native-v2-physical-harness` is a source-built, headless acceptance adapter. It initializes the same production `HostRuntime`, Bridge lifecycle, native-v2 orchestration, Search adapter, encrypted Transfer path, and Core SQLite stores as the desktop app. It does not mock a peer, create an authority bypass, alter admission, or configure a provider. Use one clean, dedicated `PASTEY_APP_DATA_DIR` on each physical machine; do not point it at normal user data.
 
-The current Bridge still has to be created and joined by the normal product flow before starting the headless Hosts. For a same-commit source run, launch each desktop app with the exact dedicated data directory, create/join one Bridge, record its id, then close the desktop apps before running the headless processes. The `host` command prints its HostRef; start the Windows Host first, then the Mac requester. The `host` process remains open until it is stopped with Ctrl+C.
+The current Bridge still has to be created and joined by the normal product flow before starting the headless Hosts. For a same-commit source run, launch each desktop app with the exact dedicated data directory, create/join one Bridge, record its id, then close the desktop apps before running the headless processes. Start the persistent Windows `host` first; its command prints the Windows HostRef and remains open until stopped with Ctrl+C. On macOS, run only `run`: it starts and owns the sole requester `HostRuntime` for that app-data directory. The harness rejects `host` anywhere but Windows and `run` anywhere but macOS, preventing the erroneous Mac `host` plus `run` pairing.
 
 ```bash
 # macOS: run once to create/join the Bridge in the dedicated data directory, then quit it.
 PASTEY_APP_DATA_DIR=/absolute/path/to/mac-app-data npm run tauri:dev
 
-# macOS: start the requester-side real Host.
-scripts/native-v2-physical/run-mac.sh host \
-  --app-data-dir /absolute/path/to/mac-app-data --bridge-id BRIDGE_ID
-
-# A second macOS terminal. HOSTREF_WINDOWS is printed by the Windows `host` command.
+# macOS: this command starts the requester-side real HostRuntime itself.
+# HOSTREF_WINDOWS is printed by the persistent Windows `host` command.
 scripts/native-v2-physical/run-mac.sh run --profile a \
   --app-data-dir /absolute/path/to/mac-app-data --bridge-id BRIDGE_ID \
   --remote-host-ref HOSTREF_WINDOWS --run-id RUN_ID \
@@ -149,9 +146,9 @@ scripts/native-v2-physical/run-mac.sh verify --profile a \
   --output-dir /absolute/path/to/reports
 ```
 
-The reports are `pastey-native-v2-physical-evidence-v1` JSON plus a concise text summary. They contain git/harness/product identity, local HostRef and bridge session data, Plan/revision/approval/attempt ids, readiness/admission state, step/dispatch/commit counts, Transfer digest and exact destination receipt, and final Core state. The Profile B report additionally contains managed claim/evidence metadata, Execute result digest, and the authoritative count of successor managed-object lineage. The report deliberately excludes credentials, private paths, ObjectRefs, grants, raw terminal content, and raw evidence internals.
+The reports are `pastey-native-v2-physical-evidence-v1` JSON plus a concise text summary. They contain launch-time git commit and clean/dirty worktree state, harness/product identity, local HostRef and bridge session data, Plan/revision/approval/attempt ids, readiness/admission state, step/dispatch/commit counts, Transfer digest and exact destination receipt, and final Core state. The Profile B report additionally contains managed claim/evidence metadata, Execute result digest, and the authoritative count of successor managed-object lineage. The report deliberately excludes credentials, private paths, ObjectRefs, grants, raw terminal content, and raw evidence internals.
 
-`verify` produces `PASS` only if requester Core says one completed exact revision; every participant is ready and committed; the expected number of unique authoritative step commits exists; Windows has exactly one matching receipt; database integrity is `ok`; and, for Profile B, Windows has exactly one Execute result and zero successor-lineage rows. Individual machine reports never say PASS.
+`verify` produces `PASS` only if both reports have the exact evidence schema and requested profile; the requester is macOS and role `requester`; the remote report is Windows and role `windows-host`; both source-built launches recorded one equal, present git commit and a clean worktree; and the two local HostRefs are distinct. It additionally requires requester Core to name exactly those two ready, committed participant Hosts and one completed exact revision; the expected number of unique authoritative step commits; exactly one Windows `transfer-mac-windows` receipt with a non-empty content digest and the exact destination HostRef; and `ok` SQLite integrity. For Profile B it also requires exactly one Windows Execute result with a non-empty result digest and zero successor-lineage rows. Individual machine reports never say PASS.
 
 Profile B uses the same sequence with `--profile b` and the same `RUN_ID`/`ATTEMPT_ID` on each machine:
 
