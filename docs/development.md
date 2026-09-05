@@ -108,43 +108,76 @@ For a single-machine dual-instance smoke, create/join a Bridge and exercise sele
 
 `pastey-native-v2-physical-harness` is a source-built, headless acceptance adapter. It initializes the same production `HostRuntime`, Bridge lifecycle, native-v2 orchestration, Search adapter, encrypted Transfer path, and Core SQLite stores as the desktop app. It does not mock a peer, create an authority bypass, alter admission, or configure a provider. Use one clean, dedicated `PASTEY_APP_DATA_DIR` on each physical machine; do not point it at normal user data.
 
-The current Bridge still has to be created and joined by the normal product flow before starting the headless Hosts. For a same-commit source run, launch each desktop app with the exact dedicated data directory, create/join one Bridge, record its id, then close the desktop apps before running the headless processes. Start the persistent Windows `host` first; its command prints the Windows HostRef and remains open until stopped with Ctrl+C. On macOS, run only `run`: it starts and owns the sole requester `HostRuntime` for that app-data directory. The harness rejects `host` anywhere but Windows and `run` anywhere but macOS, preventing the erroneous Mac `host` plus `run` pairing.
+The current Bridge still has to be created and joined by the normal product flow before starting the headless Hosts. For a same-commit source run, launch each desktop app with its dedicated data directory, create/join one Bridge, record its id, then close both desktop apps. Bridge creation/join is intentionally not automated. Profile A's primary workflow is one wrapper command on Windows, one on macOS, then one verifier command; the wrappers require clean source worktrees before launch. Their defaults are `C:\pastey-physical\windows-app-data` / `C:\pastey-physical\reports` on Windows and `~/pastey-physical/mac-app-data` / `~/pastey-physical/reports` on macOS.
+
+### Profile A primary workflow
+
+1. On each physical machine, use the normal desktop product with the matching dedicated app-data directory to create/join one Bridge, record `BRIDGE_ID`, then close both apps. For example:
 
 ```bash
-# macOS: run once to create/join the Bridge in the dedicated data directory, then quit it.
-PASTEY_APP_DATA_DIR=/absolute/path/to/mac-app-data npm run tauri:dev
-
-# macOS: this command starts the requester-side real HostRuntime itself.
-# HOSTREF_WINDOWS is printed by the persistent Windows `host` command.
-scripts/native-v2-physical/run-mac.sh run --profile a \
-  --app-data-dir /absolute/path/to/mac-app-data --bridge-id BRIDGE_ID \
-  --remote-host-ref HOSTREF_WINDOWS --run-id RUN_ID \
-  --report-dir /absolute/path/to/reports --product-executable /absolute/path/to/Pastey.app/Contents/MacOS/pastey
+# macOS UI setup only; close the app after creating/joining the Bridge.
+PASTEY_APP_DATA_DIR="$HOME/pastey-physical/mac-app-data" npm run tauri:dev
 ```
 
 ```powershell
-# Windows PowerShell: run once to create/join the same Bridge, then quit it.
-$env:PASTEY_APP_DATA_DIR = 'C:\physical\windows-app-data'
+# Windows UI setup only; close the app after joining the same Bridge.
+$env:PASTEY_APP_DATA_DIR = 'C:\pastey-physical\windows-app-data'
 npm run tauri:dev
-
-# Windows PowerShell: start the remote real Host.
-.\scripts\native-v2-physical\run-windows.ps1 host `
-  --app-data-dir C:\physical\windows-app-data --bridge-id BRIDGE_ID
-
-# After the Mac run, while the Windows Host is still running, use another PowerShell.
-.\scripts\native-v2-physical\run-windows.ps1 collect --profile a --role windows-host `
-  --app-data-dir C:\physical\windows-app-data --attempt-id ATTEMPT_ID `
-  --report-dir C:\physical\reports --product-executable C:\Path\To\pastey.exe
 ```
 
-The requester `run` command creates one deterministic real file in its dedicated `shared/` fixture scope, seals a two-step Profile A (`Search @ Mac → explicit Transfer Mac → Windows`) Plan, makes the ordinary approval/start calls, and waits for a terminal Core state. It never supplies a direct receiver result. Copy the Windows JSON report to the Mac report directory by an operator-approved channel, then make the only PASS/FAIL decision from both databases:
+2. On Windows, run the one wrapper command below and leave it running. It prints `WINDOWS_HOST_REF=...`.
+
+```powershell
+# Windows: leave this one command running. It prints WINDOWS_HOST_REF=... .
+.\scripts\native-v2-physical\profile-a-windows.ps1 -BridgeId BRIDGE_ID -RunId RUN_ID
+```
+
+3. Copy the printed `WINDOWS_HOST_REF` into the following Mac command. The Mac wrapper starts the sole requester `HostRuntime` through `run`; do not start a separate Mac `host`.
 
 ```bash
-scripts/native-v2-physical/run-mac.sh verify --profile a \
-  --requester-report /absolute/path/to/reports/native-v2-physical-requester-ATTEMPT_ID.json \
-  --windows-report /absolute/path/to/reports/native-v2-physical-windows-host-ATTEMPT_ID.json \
-  --output-dir /absolute/path/to/reports
+# macOS
+scripts/native-v2-physical/profile-a-mac.sh \
+  --bridge-id BRIDGE_ID --windows-host-ref WINDOWS_HOST_REF --run-id RUN_ID
 ```
+
+The Windows wrapper derives `physical-native-v2-attempt-RUN_ID`, waits until the real Host reports its exact HostRef, then waits for the receiver attempt and receipt-bearing state through the existing Rust `collect` command. It prints `WINDOWS_EVIDENCE_JSON=...` and stops its child Host when it has collected final evidence or aborts. The Mac wrapper derives the requester evidence path and prints the exact Windows evidence filename required below.
+
+4. Copy that Windows JSON file to the Mac report directory with an operator-approved channel outside Pastey. Then invoke the authoritative verifier; the wrapper only derives filenames and forwards the result.
+
+```bash
+# macOS
+scripts/native-v2-physical/profile-a-verify.sh --run-id RUN_ID
+```
+
+Use `--app-data-dir DIR` and `--report-dir DIR` on the Mac wrapper, `-AppDataDir DIR` and `-ReportDir DIR` on the Windows wrapper, or `--report-dir DIR` on the verifier to override defaults. Keep these dedicated directories separate from normal user app data.
+
+### Profile A manual/troubleshooting fallback
+
+The wrappers do not replace the Rust harness. If an operator needs to investigate an interrupted run, the equivalent lower-level commands remain available. Start the Windows Host first and keep it open; on macOS use only `run` (it owns the requester `HostRuntime`).
+
+```powershell
+.\scripts\native-v2-physical\run-windows.ps1 host `
+  --app-data-dir C:\pastey-physical\windows-app-data --bridge-id BRIDGE_ID
+
+# After the Mac run, collect Windows evidence in another PowerShell.
+.\scripts\native-v2-physical\run-windows.ps1 collect --profile a --role windows-host `
+  --app-data-dir C:\pastey-physical\windows-app-data `
+  --attempt-id physical-native-v2-attempt-RUN_ID --report-dir C:\pastey-physical\reports
+```
+
+```bash
+scripts/native-v2-physical/run-mac.sh run --profile a \
+  --app-data-dir "$HOME/pastey-physical/mac-app-data" --bridge-id BRIDGE_ID \
+  --remote-host-ref WINDOWS_HOST_REF --run-id RUN_ID \
+  --report-dir "$HOME/pastey-physical/reports"
+
+scripts/native-v2-physical/run-mac.sh verify --profile a \
+  --requester-report "$HOME/pastey-physical/reports/native-v2-physical-requester-physical-native-v2-attempt-RUN_ID.json" \
+  --windows-report "$HOME/pastey-physical/reports/native-v2-physical-windows-host-physical-native-v2-attempt-RUN_ID.json" \
+  --output-dir "$HOME/pastey-physical/reports"
+```
+
+The requester `run` command creates one deterministic real file in its dedicated `shared/` fixture scope, seals a two-step Profile A (`Search @ Mac → explicit Transfer Mac → Windows`) Plan, makes the ordinary approval/start calls, and waits for a terminal Core state. It never supplies a direct receiver result.
 
 The reports are `pastey-native-v2-physical-evidence-v1` JSON plus a concise text summary. They contain launch-time git commit and clean/dirty worktree state, harness/product identity, local HostRef and bridge session data, Plan/revision/approval/attempt ids, readiness/admission state, step/dispatch/commit counts, Transfer digest and exact destination receipt, and final Core state. The Profile B report additionally contains managed claim/evidence metadata, Execute result digest, and the authoritative count of successor managed-object lineage. The report deliberately excludes credentials, private paths, ObjectRefs, grants, raw terminal content, and raw evidence internals.
 
