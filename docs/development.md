@@ -140,7 +140,7 @@ scripts/native-v2-physical/profile-a-mac.sh \
   --bridge-id BRIDGE_ID --windows-host-ref WINDOWS_HOST_REF --run-id RUN_ID
 ```
 
-The Windows wrapper derives `physical-native-v2-attempt-RUN_ID`, waits until the real Host reports its exact HostRef, then waits for the receiver attempt and receipt-bearing state through the existing Rust `collect` command. It prints `WINDOWS_EVIDENCE_JSON=...` and stops its child Host when it has collected final evidence or aborts. The Mac wrapper derives the requester evidence path and prints the exact Windows evidence filename required below.
+The Windows wrapper derives `physical-native-v2-attempt-RUN_ID`, waits until the real Host reports its exact HostRef, then waits through the existing Rust `collect` command for the exact receiver attempt, one digest-bearing `transfer-mac-windows` receipt, and one committed `transfer-mac-windows` authoritative step-commit row. It prints `WINDOWS_EVIDENCE_JSON=...` and stops its child Host only after that final evidence collection or on abort. The Mac wrapper derives the requester evidence path and prints the exact Windows evidence filename required below.
 
 4. Copy that Windows JSON file to the Mac report directory with an operator-approved channel outside Pastey. Then invoke the authoritative verifier; the wrapper only derives filenames and forwards the result.
 

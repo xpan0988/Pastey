@@ -9,7 +9,9 @@ param(
     [string]$RunId,
 
     [string]$AppDataDir = "C:\pastey-physical\windows-app-data",
-    [string]$ReportDir = "C:\pastey-physical\reports"
+    [string]$ReportDir = "C:\pastey-physical\reports",
+
+    [switch]$SelfCheck
 )
 
 Set-StrictMode -Version Latest
@@ -21,6 +23,7 @@ $harnessName = "pastey-native-v2-physical-harness"
 $attemptId = "physical-native-v2-attempt-$RunId"
 $windowsEvidence = Join-Path $ReportDir "native-v2-physical-windows-host-$attemptId.json"
 $hostProcess = $null
+$physicalHostReadyPattern = 'PHYSICAL_HOST_READY\s+git_commit=\S+\s+host_ref=(\S+)\s+bridge_id='
 
 function Assert-CleanWorktree {
     Set-Location $repositoryRoot
@@ -45,13 +48,49 @@ function Invoke-HarnessCollect {
 function ConvertTo-WindowsCommandLine {
     param([string[]]$Arguments)
 
+    $quote = [string][char]34
     $quoted = foreach ($argument in $Arguments) {
-        if ($argument.Contains('"')) {
+        if ($argument.Contains($quote)) {
             throw "Double quotes are not supported in physical harness arguments."
         }
-        '"' + ($argument -replace '(\\*)$', '$1$1') + '"'
+        $quote + ($argument -replace '(\\*)$', '$1$1') + $quote
     }
     return ($quoted -join ' ')
+}
+
+function Get-WindowsHostRef {
+    param([AllowEmptyString()][string]$Output)
+
+    $ready = [regex]::Match($Output, $physicalHostReadyPattern)
+    if ($ready.Success) {
+        return $ready.Groups[1].Value
+    }
+    return $null
+}
+
+function Invoke-WrapperSelfCheck {
+    $quote = [string][char]34
+    $literalBackslashQuote = ([string][char]92) + $quote
+    $hostArguments = ConvertTo-WindowsCommandLine @(
+        "host", "--app-data-dir", "C:\Program Files\Pastey", "--bridge-id", "bridge-self-check"
+    )
+    $expectedHostArguments = @(
+        "${quote}host${quote}", "${quote}--app-data-dir${quote}",
+        "${quote}C:\Program Files\Pastey${quote}", "${quote}--bridge-id${quote}",
+        "${quote}bridge-self-check${quote}"
+    ) -join ' '
+    if ($hostArguments -ne $expectedHostArguments -or $hostArguments.Contains($literalBackslashQuote)) {
+        throw "Windows command-line quoting self-check failed."
+    }
+    $trailingBackslashArguments = ConvertTo-WindowsCommandLine @("C:\physical\")
+    if ($trailingBackslashArguments -ne ("${quote}C:\physical\\${quote}")) {
+        throw "Windows trailing-backslash quoting self-check failed."
+    }
+    $hostRef = Get-WindowsHostRef -Output "PHYSICAL_HOST_READY git_commit=abc123 host_ref=windows-host-self-check bridge_id=bridge-self-check"
+    if ($hostRef -ne "windows-host-self-check") {
+        throw "Windows HostRef readiness parsing self-check failed."
+    }
+    Write-Host "PROFILE_A_WINDOWS_SELF_CHECK_PASS"
 }
 
 function Stop-HostProcess {
@@ -59,6 +98,11 @@ function Stop-HostProcess {
         Stop-Process -Id $hostProcess.Id -ErrorAction SilentlyContinue
         $hostProcess.WaitForExit(5000)
     }
+}
+
+if ($SelfCheck) {
+    Invoke-WrapperSelfCheck
+    return
 }
 
 try {
@@ -100,9 +144,8 @@ try {
             throw "Windows physical Host exited before readiness. See $stderrPath"
         }
         if (Test-Path -LiteralPath $stdoutPath) {
-            $ready = [regex]::Match((Get-Content -LiteralPath $stdoutPath -Raw), "PHYSICAL_HOST_READY\\s+git_commit=\\S+\\s+host_ref=(\\S+)\\s+bridge_id=")
-            if ($ready.Success) {
-                $windowsHostRef = $ready.Groups[1].Value
+            $windowsHostRef = Get-WindowsHostRef -Output (Get-Content -LiteralPath $stdoutPath -Raw)
+            if (-not [string]::IsNullOrWhiteSpace($windowsHostRef)) {
                 break
             }
         }
@@ -130,13 +173,19 @@ try {
                     Write-Host "WINDOWS_ATTEMPT_OBSERVED=$attemptId"
                     $attemptObserved = $true
                 }
-                $receiverRecords = @($report.attempt.receiverRecords)
+                $receiverRecords = @($report.attempt.receiverRecords | Where-Object {
+                    $_.attemptId -eq $attemptId
+                })
                 $matchingReceipts = @($report.transferReceipts | Where-Object {
                     $_.stepId -eq "transfer-mac-windows" -and
                     -not [string]::IsNullOrWhiteSpace([string]$_.contentDigest)
                 })
-                if ($receiverRecords.Count -ge 1 -and $matchingReceipts.Count -eq 1) {
+                $matchingStepCommits = @($report.stepCommits | Where-Object {
+                    $_.stepId -eq "transfer-mac-windows" -and $_.state -eq "committed"
+                })
+                if ($receiverRecords.Count -eq 1 -and $matchingReceipts.Count -eq 1 -and $matchingStepCommits.Count -eq 1) {
                     $receiverEvidenceReady = $true
+                    Write-Host "WINDOWS_TRANSFER_COMMIT_OBSERVED=transfer-mac-windows"
                     break
                 }
             }
