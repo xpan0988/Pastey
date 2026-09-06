@@ -9,7 +9,7 @@
 #![allow(dead_code)] // The service is intentionally broader than the first UI command seam.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::Arc,
 };
 
@@ -808,16 +808,21 @@ impl<'a> NativeV2ProductStore<'a> {
     }
 }
 
+/// An exact remote dispatch request captured while Core changes authoritative
+/// state.  It deliberately carries no materialized Room Control event: context
+/// resolution may synchronize legacy peer data through a separate SQLite
+/// writer, so it must happen only after the authoritative transaction commits.
 #[derive(Clone)]
-pub(crate) struct NativeV2OutboundEventV1 {
+pub(crate) struct NativeV2RemoteIntentV1 {
     pub(crate) room_id: String,
-    pub(crate) peer_route_ref: String,
-    pub(crate) event: Value,
+    pub(crate) binding: HostSessionBinding,
+    pub(crate) kind: &'static str,
+    pub(crate) payload: Value,
 }
 
 #[derive(Clone)]
 pub(crate) enum NativeV2CoordinatorActionV1 {
-    RemoteEvent(NativeV2OutboundEventV1),
+    RemoteIntent(NativeV2RemoteIntentV1),
     LocalReadiness {
         review: ReviewRequestV2,
         request: NativeV2ReadinessRequestV1,
@@ -1067,6 +1072,102 @@ impl HostRuntime {
     }
 }
 
+/// Revalidate every captured Host freshness before an authority transaction is
+/// opened. Remote resolution may synchronize a legacy peer endpoint through a
+/// separate SQLite connection, so doing it under the transaction would create
+/// a nested writer. The transaction compares its stored JSON with this exact
+/// capture before using it, and remote intent materialization validates again
+/// after commit.
+fn prevalidate_product_host_freshness(
+    runtime: &HostRuntime,
+    attempt_id: &str,
+    now: i64,
+) -> AppResult<HashMap<String, HostExecutionFreshness>> {
+    let conn = connection(&runtime.paths)?;
+    let mut statement = conn.prepare(
+        "SELECT participant_ref, session_binding_json
+         FROM native_v2_product_hosts WHERE attempt_id = ?1",
+    )?;
+    let rows = statement
+        .query_map([attempt_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut validated = HashMap::with_capacity(rows.len());
+    for (participant_ref, binding_json) in rows {
+        let freshness: HostExecutionFreshness = serde_json::from_str(&binding_json)?;
+        let current = crate::host_runtime::current_host_execution_freshness(runtime, &freshness)?;
+        freshness.validate_current(&current, now)?;
+        if validated.insert(participant_ref, freshness).is_some() {
+            return invalid("Native v2 attempt has duplicate Host participants.");
+        }
+    }
+    Ok(validated)
+}
+
+fn prevalidated_freshness_for(
+    validated: &HashMap<String, HostExecutionFreshness>,
+    participant_ref: &str,
+    stored_json: &str,
+) -> AppResult<HostExecutionFreshness> {
+    let stored: HostExecutionFreshness = serde_json::from_str(stored_json)?;
+    let captured = validated.get(participant_ref).ok_or_else(|| {
+        AppError::InvalidInput("Native v2 Host freshness was not prevalidated.".into())
+    })?;
+    if captured != &stored {
+        return invalid("Native v2 Host freshness changed during authority update.");
+    }
+    Ok(stored)
+}
+
+fn readiness_result_will_open_preparation(
+    paths: &AppPaths,
+    attempt_id: &str,
+    participant_ref: &str,
+) -> AppResult<bool> {
+    connection(paths)?
+        .query_row(
+            "SELECT EXISTS(
+             SELECT 1 FROM native_v2_product_attempts a
+             JOIN native_v2_product_hosts h ON h.attempt_id = a.attempt_id
+             WHERE a.attempt_id = ?1 AND a.state = 'checking_readiness'
+             AND h.participant_ref = ?2 AND h.readiness_state = 'pending'
+         ) AND NOT EXISTS(
+             SELECT 1 FROM native_v2_product_hosts
+             WHERE attempt_id = ?1 AND participant_ref != ?2
+             AND readiness_state != 'ready'
+         )",
+            params![attempt_id, participant_ref],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value == 1)
+        .map_err(Into::into)
+}
+
+fn prepared_result_will_open_commit(
+    paths: &AppPaths,
+    attempt_id: &str,
+    participant_ref: &str,
+) -> AppResult<bool> {
+    connection(paths)?
+        .query_row(
+            "SELECT EXISTS(
+             SELECT 1 FROM native_v2_product_attempts a
+             JOIN native_v2_product_hosts h ON h.attempt_id = a.attempt_id
+             WHERE a.attempt_id = ?1 AND a.state = 'preparing'
+             AND h.participant_ref = ?2 AND h.admission_state = 'pending'
+         ) AND NOT EXISTS(
+             SELECT 1 FROM native_v2_product_hosts
+             WHERE attempt_id = ?1 AND participant_ref != ?2
+             AND admission_state != 'prepared'
+         )",
+            params![attempt_id, participant_ref],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value == 1)
+        .map_err(Into::into)
+}
+
 fn terminate_requester_attempt(
     runtime: &HostRuntime,
     attempt_id: &str,
@@ -1078,6 +1179,7 @@ fn terminate_requester_attempt(
         return invalid("Native v2 terminal state is invalid.");
     }
     text(code, "terminal code")?;
+    let validated_freshness = prevalidate_product_host_freshness(runtime, attempt_id, now)?;
     let mut conn = connection(&runtime.paths)?;
     let tx = conn.transaction()?;
     let row = tx
@@ -1141,9 +1243,8 @@ fn terminate_requester_attempt(
     drop(statement);
     let mut events = Vec::new();
     for (participant_ref, peer_route_ref, binding_json) in rows {
-        let freshness: HostExecutionFreshness = serde_json::from_str(&binding_json)?;
-        let current = crate::host_runtime::current_host_execution_freshness(runtime, &freshness)?;
-        freshness.validate_current(&current, now)?;
+        let freshness =
+            prevalidated_freshness_for(&validated_freshness, &participant_ref, &binding_json)?;
         let target = revision
             .participants
             .as_slice()
@@ -1166,20 +1267,18 @@ fn terminate_requester_attempt(
             expires_at: row.3,
         };
         if let Some(peer_route_ref) = peer_route_ref {
-            let context = crate::room_control::room_control_session_context_for_peer(
-                runtime,
-                &revision.bridge_id,
-                &peer_route_ref,
-            )?;
-            events.push(NativeV2CoordinatorActionV1::RemoteEvent(
-                NativeV2OutboundEventV1 {
+            let binding = freshness.as_remote().ok_or_else(|| {
+                AppError::InvalidInput("Native v2 remote cancel binding is unavailable.".into())
+            })?;
+            if binding.peer_route_ref != peer_route_ref {
+                return invalid("Native v2 remote cancel route binding is stale.");
+            }
+            events.push(NativeV2CoordinatorActionV1::RemoteIntent(
+                NativeV2RemoteIntentV1 {
                     room_id: revision.bridge_id.clone(),
-                    peer_route_ref,
-                    event: native_v2_control_event(
-                        CANCEL_KIND,
-                        serde_json::to_value(cancel)?,
-                        &context,
-                    )?,
+                    binding: binding.clone(),
+                    kind: CANCEL_KIND,
+                    payload: serde_json::to_value(cancel)?,
                 },
             ));
         } else if let HostExecutionFreshness::Local(freshness) = freshness {
@@ -1451,31 +1550,20 @@ fn prepare_requester_attempt(
                 });
             }
             HostExecutionFreshness::Remote(binding) => {
-                let context = crate::room_control::room_control_session_context_for_peer(
-                    runtime,
-                    &revision.bridge_id,
-                    &binding.peer_route_ref,
-                )?;
-                outbound.push(NativeV2CoordinatorActionV1::RemoteEvent(
-                    NativeV2OutboundEventV1 {
+                outbound.push(NativeV2CoordinatorActionV1::RemoteIntent(
+                    NativeV2RemoteIntentV1 {
                         room_id: revision.bridge_id.clone(),
-                        peer_route_ref: binding.peer_route_ref.clone(),
-                        event: native_v2_control_event(
-                            "bridge_plan.v2.review_request",
-                            serde_json::to_value(review)?,
-                            &context,
-                        )?,
+                        binding: binding.clone(),
+                        kind: "bridge_plan.v2.review_request",
+                        payload: serde_json::to_value(review)?,
                     },
                 ));
-                outbound.push(NativeV2CoordinatorActionV1::RemoteEvent(
-                    NativeV2OutboundEventV1 {
+                outbound.push(NativeV2CoordinatorActionV1::RemoteIntent(
+                    NativeV2RemoteIntentV1 {
                         room_id: revision.bridge_id.clone(),
-                        peer_route_ref: binding.peer_route_ref,
-                        event: native_v2_control_event(
-                            READINESS_REQUEST_KIND,
-                            serde_json::to_value(readiness)?,
-                            &context,
-                        )?,
+                        binding,
+                        kind: READINESS_REQUEST_KIND,
+                        payload: serde_json::to_value(readiness)?,
                     },
                 ));
             }
@@ -1485,19 +1573,43 @@ fn prepare_requester_attempt(
     Ok(outbound)
 }
 
-async fn send_native_v2_event(
-    runtime: Arc<HostRuntime>,
-    outbound: NativeV2OutboundEventV1,
-) -> AppResult<crate::room_control::RoomControlDeliveryReceipt> {
-    let route =
-        crate::room_control::selected_peer_route(&outbound.room_id, &outbound.peer_route_ref);
-    crate::room_control::send_room_control_event(
+fn materialize_native_v2_remote_event(
+    runtime: &HostRuntime,
+    intent: &NativeV2RemoteIntentV1,
+) -> AppResult<Value> {
+    if intent.room_id != intent.binding.bridge_id {
+        return invalid("Native v2 remote dispatch Bridge binding is invalid.");
+    }
+    let now = crate::storage::now_ts();
+    let current = crate::host_runtime::current_host_session_binding(
         runtime,
-        &outbound.room_id,
-        outbound.event,
-        Some(route),
-    )
-    .await
+        &intent.binding.bridge_id,
+        &intent.binding.peer_route_ref,
+    )?;
+    intent.binding.validate_current(&current, now)?;
+    let context = crate::room_control::room_control_session_context_for_peer(
+        runtime,
+        &intent.room_id,
+        &intent.binding.peer_route_ref,
+    )?;
+    if context.room_id != intent.binding.bridge_id
+        || context.local_session_ref != intent.binding.local_session_ref
+        || context.peer_session_ref != intent.binding.peer_session_ref
+        || context.peer_route_ref != intent.binding.peer_route_ref
+    {
+        return invalid("Native v2 remote dispatch session binding is stale.");
+    }
+    native_v2_control_event(intent.kind, intent.payload.clone(), &context)
+}
+
+async fn send_native_v2_intent(
+    runtime: Arc<HostRuntime>,
+    intent: NativeV2RemoteIntentV1,
+) -> AppResult<crate::room_control::RoomControlDeliveryReceipt> {
+    let event = materialize_native_v2_remote_event(&runtime, &intent)?;
+    let route =
+        crate::room_control::selected_peer_route(&intent.room_id, &intent.binding.peer_route_ref);
+    crate::room_control::send_room_control_event(runtime, &intent.room_id, event, Some(route)).await
 }
 
 fn peer_binding_for_host(
@@ -2027,18 +2139,13 @@ pub(crate) async fn submit_coordinated_step_result(
         .as_remote()
         .expect("remote freshness matched above");
     let result = remote_step_result(result, &captured.session_pair_ref)?;
-    let context = crate::room_control::room_control_session_context_for_peer(
-        &runtime,
-        &captured.bridge_id,
-        &captured.peer_route_ref,
-    )?;
-    let event = native_v2_control_event(STEP_RESULT_KIND, serde_json::to_value(result)?, &context)?;
-    send_native_v2_event(
+    send_native_v2_intent(
         runtime,
-        NativeV2OutboundEventV1 {
+        NativeV2RemoteIntentV1 {
             room_id: captured.bridge_id.clone(),
-            peer_route_ref: captured.peer_route_ref.clone(),
-            event,
+            binding: captured.clone(),
+            kind: STEP_RESULT_KIND,
+            payload: serde_json::to_value(result)?,
         },
     )
     .await?;
@@ -2105,19 +2212,13 @@ pub(crate) async fn submit_coordinated_attempt_failure(
     let captured = captured.as_remote().ok_or_else(|| {
         AppError::InvalidInput("Local failure requires direct Core submission.".into())
     })?;
-    let context = crate::room_control::room_control_session_context_for_peer(
-        &runtime,
-        &revision.bridge_id,
-        &captured.peer_route_ref,
-    )?;
-    let event =
-        native_v2_control_event(STEP_FAILURE_KIND, serde_json::to_value(failure)?, &context)?;
-    send_native_v2_event(
+    send_native_v2_intent(
         runtime,
-        NativeV2OutboundEventV1 {
+        NativeV2RemoteIntentV1 {
             room_id: revision.bridge_id,
-            peer_route_ref: captured.peer_route_ref.clone(),
-            event,
+            binding: captured.clone(),
+            kind: STEP_FAILURE_KIND,
+            payload: serde_json::to_value(failure)?,
         },
     )
     .await?;
@@ -2628,6 +2729,20 @@ fn accept_requester_readiness_core(
     if result.expires_at <= now || result.bridge_id != captured.bridge_id() {
         return invalid("Native v2 readiness authority is invalid.");
     }
+    let validated_freshness = if result.ready
+        && readiness_result_will_open_preparation(
+            &runtime.paths,
+            &result.attempt_id,
+            result.participant.as_str(),
+        )? {
+        Some(prevalidate_product_host_freshness(
+            runtime,
+            &result.attempt_id,
+            now,
+        )?)
+    } else {
+        None
+    };
     let mut conn = connection(&runtime.paths)?;
     let tx = conn.transaction()?;
     let row = tx
@@ -2741,10 +2856,12 @@ fn accept_requester_readiness_core(
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
     let mut events = Vec::new();
+    let validated_freshness = validated_freshness.as_ref().ok_or_else(|| {
+        AppError::InvalidInput("Native v2 Host freshness changed before preparation.".into())
+    })?;
     for (participant_ref, peer_route_ref, binding_json, review_json) in rows {
-        let freshness: HostExecutionFreshness = serde_json::from_str(&binding_json)?;
-        let current = crate::host_runtime::current_host_execution_freshness(runtime, &freshness)?;
-        freshness.validate_current(&current, now)?;
+        let freshness =
+            prevalidated_freshness_for(&validated_freshness, &participant_ref, &binding_json)?;
         let review: ReviewRequestV2 = serde_json::from_str(&review_json)?;
         let start = AttemptStartV2 {
             protocol_version: PROTOCOL_VERSION.into(),
@@ -2779,20 +2896,18 @@ fn accept_requester_readiness_core(
             ],
         )?;
         if let Some(peer_route_ref) = peer_route_ref {
-            let context = crate::room_control::room_control_session_context_for_peer(
-                runtime,
-                &revision.bridge_id,
-                &peer_route_ref,
-            )?;
-            events.push(NativeV2CoordinatorActionV1::RemoteEvent(
-                NativeV2OutboundEventV1 {
+            let binding = freshness.as_remote().ok_or_else(|| {
+                AppError::InvalidInput("Native v2 remote start binding is unavailable.".into())
+            })?;
+            if binding.peer_route_ref != peer_route_ref {
+                return invalid("Native v2 remote start route binding is stale.");
+            }
+            events.push(NativeV2CoordinatorActionV1::RemoteIntent(
+                NativeV2RemoteIntentV1 {
                     room_id: revision.bridge_id.clone(),
-                    peer_route_ref,
-                    event: native_v2_control_event(
-                        "bridge_plan.v2.attempt_start",
-                        serde_json::to_value(start)?,
-                        &context,
-                    )?,
+                    binding: binding.clone(),
+                    kind: "bridge_plan.v2.attempt_start",
+                    payload: serde_json::to_value(start)?,
                 },
             ));
         } else if let HostExecutionFreshness::Local(freshness) = freshness {
@@ -2993,6 +3108,19 @@ fn accept_requester_prepared_core(
     {
         return invalid("Native v2 prepared authority is invalid.");
     }
+    let validated_freshness = if prepared_result_will_open_commit(
+        &runtime.paths,
+        &prepared.attempt_id,
+        prepared.participant.as_str(),
+    )? {
+        Some(prevalidate_product_host_freshness(
+            runtime,
+            &prepared.attempt_id,
+            now,
+        )?)
+    } else {
+        None
+    };
     let mut conn = connection(&runtime.paths)?;
     let tx = conn.transaction()?;
     let row = tx
@@ -3079,10 +3207,12 @@ fn accept_requester_prepared_core(
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
     let mut events = Vec::new();
+    let validated_freshness = validated_freshness.as_ref().ok_or_else(|| {
+        AppError::InvalidInput("Native v2 Host freshness changed before attempt commit.".into())
+    })?;
     for (participant_ref, peer_route_ref, binding_json) in rows {
-        let freshness: HostExecutionFreshness = serde_json::from_str(&binding_json)?;
-        let current = crate::host_runtime::current_host_execution_freshness(runtime, &freshness)?;
-        freshness.validate_current(&current, now)?;
+        let freshness =
+            prevalidated_freshness_for(&validated_freshness, &participant_ref, &binding_json)?;
         let target = revision
             .participants
             .as_slice()
@@ -3105,20 +3235,18 @@ fn accept_requester_prepared_core(
             expires_at: row.3,
         };
         if let Some(peer_route_ref) = peer_route_ref {
-            let context = crate::room_control::room_control_session_context_for_peer(
-                runtime,
-                &revision.bridge_id,
-                &peer_route_ref,
-            )?;
-            events.push(NativeV2CoordinatorActionV1::RemoteEvent(
-                NativeV2OutboundEventV1 {
+            let binding = freshness.as_remote().ok_or_else(|| {
+                AppError::InvalidInput("Native v2 remote commit binding is unavailable.".into())
+            })?;
+            if binding.peer_route_ref != peer_route_ref {
+                return invalid("Native v2 remote commit route binding is stale.");
+            }
+            events.push(NativeV2CoordinatorActionV1::RemoteIntent(
+                NativeV2RemoteIntentV1 {
                     room_id: revision.bridge_id.clone(),
-                    peer_route_ref,
-                    event: native_v2_control_event(
-                        COMMIT_KIND,
-                        serde_json::to_value(commit)?,
-                        &context,
-                    )?,
+                    binding: binding.clone(),
+                    kind: COMMIT_KIND,
+                    payload: serde_json::to_value(commit)?,
                 },
             ));
         } else if let HostExecutionFreshness::Local(freshness) = freshness {
@@ -3240,6 +3368,7 @@ fn accept_requester_step_result_core(
     if result.bridge_id != captured.bridge_id() {
         return invalid("Native v2 step result runtime authority is invalid.");
     }
+    let validated_freshness = prevalidate_product_host_freshness(runtime, &result.attempt_id, now)?;
     let mut conn = connection(&runtime.paths)?;
     let tx = conn.transaction()?;
     let row = tx
@@ -3317,10 +3446,11 @@ fn accept_requester_step_result_core(
             ],
             |value| value.get(0),
         )?;
-        let local_freshness: HostExecutionFreshness = serde_json::from_str(&local_binding_json)?;
-        let current =
-            crate::host_runtime::current_host_execution_freshness(runtime, &local_freshness)?;
-        local_freshness.validate_current(&current, now)?;
+        let local_freshness = prevalidated_freshness_for(
+            &validated_freshness,
+            local_participant.participant_ref.as_str(),
+            &local_binding_json,
+        )?;
         validate_receiver_host_step_commit_prerequisites(
             &tx,
             runtime,
@@ -3406,9 +3536,8 @@ fn accept_requester_step_result_core(
     drop(statement);
     let mut events = Vec::new();
     for (participant_ref, peer_route_ref, binding_json) in rows {
-        let freshness: HostExecutionFreshness = serde_json::from_str(&binding_json)?;
-        let current = crate::host_runtime::current_host_execution_freshness(runtime, &freshness)?;
-        freshness.validate_current(&current, now)?;
+        let freshness =
+            prevalidated_freshness_for(&validated_freshness, &participant_ref, &binding_json)?;
         let target = revision
             .participants
             .as_slice()
@@ -3423,6 +3552,9 @@ fn accept_requester_step_result_core(
                     "Native v2 remote step-commit binding is unavailable.".into(),
                 )
             })?;
+            if binding.peer_route_ref != peer_route_ref {
+                return invalid("Native v2 remote step-commit route binding is stale.");
+            }
             let wire_result = match &remote_result {
                 Some(result) => result.clone(),
                 None => remote_step_result(result.clone(), &binding.session_pair_ref)?,
@@ -3441,20 +3573,12 @@ fn accept_requester_step_result_core(
                 result: wire_result,
                 expires_at: row.3,
             };
-            let context = crate::room_control::room_control_session_context_for_peer(
-                runtime,
-                &revision.bridge_id,
-                &peer_route_ref,
-            )?;
-            events.push(NativeV2CoordinatorActionV1::RemoteEvent(
-                NativeV2OutboundEventV1 {
+            events.push(NativeV2CoordinatorActionV1::RemoteIntent(
+                NativeV2RemoteIntentV1 {
                     room_id: revision.bridge_id.clone(),
-                    peer_route_ref,
-                    event: native_v2_control_event(
-                        STEP_COMMIT_KIND,
-                        serde_json::to_value(commit)?,
-                        &context,
-                    )?,
+                    binding: binding.clone(),
+                    kind: STEP_COMMIT_KIND,
+                    payload: serde_json::to_value(commit)?,
                 },
             ));
         } else if let HostExecutionFreshness::Local(freshness) = freshness {
@@ -3764,10 +3888,9 @@ pub(crate) fn spawn_native_v2_events(
 
 fn action_attempt_id(action: Option<&NativeV2CoordinatorActionV1>) -> Option<String> {
     match action? {
-        NativeV2CoordinatorActionV1::RemoteEvent(event) => event
-            .event
-            .get("payload")
-            .and_then(|payload| payload.get("attemptId"))
+        NativeV2CoordinatorActionV1::RemoteIntent(intent) => intent
+            .payload
+            .get("attemptId")
             .and_then(Value::as_str)
             .map(str::to_string),
         NativeV2CoordinatorActionV1::LocalReadiness { request, .. } => {
@@ -3792,8 +3915,8 @@ async fn dispatch_native_v2_actions(
     while let Some(action) = pending.pop_front() {
         let now = crate::storage::now_ts();
         match action {
-            NativeV2CoordinatorActionV1::RemoteEvent(event) => {
-                send_native_v2_event(runtime.clone(), event).await?;
+            NativeV2CoordinatorActionV1::RemoteIntent(intent) => {
+                send_native_v2_intent(runtime.clone(), intent).await?;
             }
             NativeV2CoordinatorActionV1::LocalReadiness {
                 review,
@@ -4728,9 +4851,11 @@ mod tests {
     use super::*;
     use crate::{
         config::StoredConfig,
-        host_runtime::{HostEvent, HostEventSink, RuntimeTask, RuntimeTaskSpawner},
+        host_runtime::{
+            ActiveRoomServer, HostEvent, HostEventSink, RuntimeTask, RuntimeTaskSpawner,
+        },
         managed_objects::{HostArtifactAcquisition, ManagedObjectAcquisitionKind},
-        models::LocalRole,
+        models::{BridgePeerJoinMethod, BridgePeerLiveness, LocalRole, StoredBridgePeerEndpoint},
         storage,
         worker_harness::{
             WorkerHarnessRunV1, WorkerProviderErrorV1, WorkerProviderResponseV1,
@@ -4862,6 +4987,407 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn install_remote_room_control_peer(
+        runtime: &HostRuntime,
+        remote_host: &HostRef,
+        peer_route_ref: &str,
+        now: i64,
+    ) -> HostSessionBinding {
+        let local_secret = crate::crypto::random_key();
+        runtime.active_servers.lock().insert(
+            "bridge-native-v2".into(),
+            ActiveRoomServer {
+                room_id: "bridge-native-v2".into(),
+                room_code_hash: "test-room-code".into(),
+                port: 9,
+                started_at: now,
+                expires_at: now + 3_600,
+                transport_secret: local_secret,
+                shutdown: None,
+            },
+        );
+        let remote_secret = crate::crypto::random_key();
+        let remote_public_key =
+            crate::crypto::encode_key(&crate::crypto::transport_public_key(&remote_secret));
+        storage::upsert_bridge_peer_endpoint(
+            &runtime.paths,
+            &StoredBridgePeerEndpoint {
+                room_id: "bridge-native-v2".into(),
+                peer_session_id: peer_route_ref.into(),
+                display_name: Some("remote-test-host".into()),
+                endpoint_host: Some("127.0.0.1".into()),
+                endpoint_port: Some(9),
+                transport_public_key: Some(remote_public_key.clone()),
+                liveness: BridgePeerLiveness::Connected,
+                join_method: BridgePeerJoinMethod::ManualCode,
+                logical_host_ref: Some(remote_host.as_str().into()),
+                durable_identity_id: None,
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        // Exercise the legacy synchronization write which originally collided
+        // with requester authority transactions on a second SQLite connection.
+        connection(&runtime.paths)
+            .unwrap()
+            .execute(
+                "UPDATE rooms SET peer_host = ?2, peer_port = ?3,
+                 peer_transport_public_key = ?4 WHERE id = ?1",
+                params!["bridge-native-v2", "127.0.0.1", 9, remote_public_key],
+            )
+            .unwrap();
+        peer_binding_for_host(runtime, "bridge-native-v2", remote_host, now).unwrap()
+    }
+
+    fn remote_search_revision(runtime: &HostRuntime, remote_host: &HostRef) -> PlanRevisionV2 {
+        let object = NativeV2ObjectRevisionDtoV1 {
+            logical_object_id: format!("managed-object:v1:{}", "f".repeat(64)),
+            revision: 1,
+        };
+        compose_revision(NativeV2ComposeRequestV1 {
+            plan_id: "remote-sqlite-plan".into(),
+            revision_id: "remote-sqlite-revision".into(),
+            revision_number: 1,
+            bridge_id: "bridge-native-v2".into(),
+            requester_host_ref: runtime.local_host_ref.as_str().into(),
+            participant_host_refs: vec![
+                runtime.local_host_ref.as_str().into(),
+                remote_host.as_str().into(),
+            ],
+            roots: Vec::new(),
+            original_user_goal: "Search on the exact remote Host.".into(),
+            expected_outcome: "Core commits one exact Search result.".into(),
+            steps: vec![NativeV2StepDraftV1::Search {
+                step_id: "search-remote".into(),
+                depends_on: Vec::new(),
+                host_ref: remote_host.as_str().into(),
+                output: object,
+                query: "report.txt".into(),
+                safe_scope_labels: vec!["documents".into()],
+            }],
+        })
+        .unwrap()
+    }
+
+    fn remote_intent(
+        actions: &[NativeV2CoordinatorActionV1],
+        kind: &str,
+    ) -> NativeV2RemoteIntentV1 {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                NativeV2CoordinatorActionV1::RemoteIntent(intent) if intent.kind == kind => {
+                    Some(intent.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing remote intent {kind}"))
+    }
+
+    fn seed_remote_search_running(
+        runtime: &HostRuntime,
+        remote_host: &HostRef,
+        remote_binding: &HostSessionBinding,
+        now: i64,
+    ) -> (PlanRevisionV2, PlanApprovalV2) {
+        let revision = remote_search_revision(runtime, remote_host);
+        let requester = crate::bridge_plan_v2::requester_host(&revision).unwrap();
+        let store = NativeV2ProductStore::new(&runtime.paths);
+        store.create_draft(&revision, requester, now).unwrap();
+        let approval = store
+            .approve(
+                &revision.revision_id,
+                "approval-remote-sqlite",
+                now + 600,
+                now,
+            )
+            .unwrap();
+        let local_freshness =
+            crate::host_runtime::current_local_execution_freshness(runtime, &revision.bridge_id)
+                .unwrap();
+        let conn = connection(&runtime.paths).unwrap();
+        conn.execute(
+            "INSERT INTO native_v2_product_attempts
+             (attempt_id, approval_id, revision_id, revision_hash, state, failure_code,
+              expires_at, created_at, updated_at)
+             VALUES ('attempt-remote-sqlite', ?1, ?2, ?3, 'running', NULL, ?4, ?5, ?5)",
+            params![
+                approval.approval_id,
+                revision.revision_id,
+                revision.revision_hash,
+                now + 600,
+                now
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE native_v2_product_revisions SET state = 'running' WHERE revision_id = ?1",
+            [revision.revision_id.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM native_v2_product_steps WHERE revision_id = ?1",
+            [revision.revision_id.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO native_v2_product_steps
+             (revision_id, attempt_id, step_id, operation, state, completion_ref, updated_at)
+             VALUES (?1, 'attempt-remote-sqlite', 'search-remote', 'search', 'eligible', NULL, ?2)",
+            params![revision.revision_id, now],
+        )
+        .unwrap();
+        for (participant, host_ref, route, freshness) in [
+            (
+                PlanParticipantRef::for_host(&revision.plan_id, remote_host).unwrap(),
+                remote_host.clone(),
+                Some(remote_binding.peer_route_ref.as_str()),
+                HostExecutionFreshness::Remote(remote_binding.clone()),
+            ),
+            (
+                PlanParticipantRef::for_host(&revision.plan_id, &runtime.local_host_ref).unwrap(),
+                runtime.local_host_ref.clone(),
+                None,
+                HostExecutionFreshness::Local(local_freshness),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO native_v2_product_hosts
+                 (attempt_id, participant_ref, host_ref, peer_route_ref, session_binding_ref,
+                  session_binding_json, readiness_state, admission_state, updated_at)
+                 VALUES ('attempt-remote-sqlite', ?1, ?2, ?3, ?4, ?5,
+                         'ready', 'committed', ?6)",
+                params![
+                    participant.as_str(),
+                    host_ref.as_str(),
+                    route,
+                    freshness.authority_ref(),
+                    serde_json::to_string(&freshness).unwrap(),
+                    now
+                ],
+            )
+            .unwrap();
+        }
+        (revision, approval)
+    }
+
+    #[test]
+    fn file_backed_remote_attempt_preparation_commits_before_context_materialization() {
+        let paths = paths("native-v2-sqlite-prepare");
+        let now = storage::now_ts();
+        connection(&paths)
+            .unwrap()
+            .execute(
+                "UPDATE rooms SET expires_at = ?2 WHERE id = ?1",
+                params!["bridge-native-v2", now + 3_600],
+            )
+            .unwrap();
+        let runtime = requester_runtime(paths.clone(), "sqlite-requester");
+        let remote_host = host("sqlite-remote");
+        let _binding =
+            install_remote_room_control_peer(&runtime, &remote_host, "sqlite-remote-route", now);
+        let revision = remote_search_revision(&runtime, &remote_host);
+        let store = NativeV2ProductStore::new(&paths);
+        store
+            .create_draft(&revision, &runtime.local_host_ref, now)
+            .unwrap();
+        store
+            .approve(
+                &revision.revision_id,
+                "approval-sqlite-prepare",
+                now + 600,
+                now,
+            )
+            .unwrap();
+
+        let actions = prepare_requester_attempt(
+            &runtime,
+            "approval-sqlite-prepare",
+            "attempt-sqlite-prepare",
+            now + 600,
+            now,
+        )
+        .unwrap();
+        let intent = remote_intent(&actions, "bridge_plan.v2.review_request");
+        let event = materialize_native_v2_remote_event(&runtime, &intent).unwrap();
+        assert_eq!(
+            event.get("kind").and_then(Value::as_str),
+            Some("bridge_plan.v2.review_request")
+        );
+        let state: String = connection(&paths)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM native_v2_product_attempts WHERE attempt_id = 'attempt-sqlite-prepare'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "checking_readiness");
+    }
+
+    #[test]
+    fn file_backed_remote_step_commit_materializes_after_authoritative_commit() {
+        let paths = paths("native-v2-sqlite-step-commit");
+        let now = storage::now_ts();
+        connection(&paths)
+            .unwrap()
+            .execute(
+                "UPDATE rooms SET expires_at = ?2 WHERE id = ?1",
+                params!["bridge-native-v2", now + 3_600],
+            )
+            .unwrap();
+        let runtime = requester_runtime(paths.clone(), "sqlite-step-requester");
+        let remote_host = host("sqlite-step-remote");
+        let binding =
+            install_remote_room_control_peer(&runtime, &remote_host, "sqlite-step-route", now);
+        let (revision, approval) =
+            seed_remote_search_running(&runtime, &remote_host, &binding, now);
+        let remote_participant =
+            PlanParticipantRef::for_host(&revision.plan_id, &remote_host).unwrap();
+        let step = revision.steps.first().unwrap();
+        let output = match step {
+            PlanStepV2::Search { output, .. } => output.clone(),
+            _ => panic!("remote SQLite fixture must use Search"),
+        };
+        let result = build_step_result(
+            &revision,
+            &approval,
+            "attempt-remote-sqlite",
+            step,
+            remote_participant,
+            remote_host,
+            Some(output),
+            Some("search-content-digest".into()),
+            None,
+            binding.session_pair_ref.clone(),
+            now,
+        )
+        .unwrap();
+
+        let actions = accept_requester_step_result(&runtime, result, &binding, now).unwrap();
+        let intent = remote_intent(&actions, STEP_COMMIT_KIND);
+        let event = materialize_native_v2_remote_event(&runtime, &intent).unwrap();
+        assert_eq!(
+            event.get("kind").and_then(Value::as_str),
+            Some(STEP_COMMIT_KIND)
+        );
+        let commits: i64 = connection(&paths)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM native_v2_step_commits WHERE attempt_id = 'attempt-remote-sqlite'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(commits, 1);
+    }
+
+    #[test]
+    fn file_backed_terminal_propagation_commits_before_remote_context_materialization() {
+        let paths = paths("native-v2-sqlite-cancel");
+        let now = storage::now_ts();
+        connection(&paths)
+            .unwrap()
+            .execute(
+                "UPDATE rooms SET expires_at = ?2 WHERE id = ?1",
+                params!["bridge-native-v2", now + 3_600],
+            )
+            .unwrap();
+        let runtime = requester_runtime(paths.clone(), "sqlite-cancel-requester");
+        let remote_host = host("sqlite-cancel-remote");
+        let _binding =
+            install_remote_room_control_peer(&runtime, &remote_host, "sqlite-cancel-route", now);
+        let revision = remote_search_revision(&runtime, &remote_host);
+        let store = NativeV2ProductStore::new(&paths);
+        store
+            .create_draft(&revision, &runtime.local_host_ref, now)
+            .unwrap();
+        store
+            .approve(
+                &revision.revision_id,
+                "approval-sqlite-cancel",
+                now + 600,
+                now,
+            )
+            .unwrap();
+        prepare_requester_attempt(
+            &runtime,
+            "approval-sqlite-cancel",
+            "attempt-sqlite-cancel",
+            now + 600,
+            now,
+        )
+        .unwrap();
+
+        let actions = terminate_requester_attempt(
+            &runtime,
+            "attempt-sqlite-cancel",
+            "cancelled",
+            "user_cancelled",
+            now,
+        )
+        .unwrap();
+        let intent = remote_intent(&actions, CANCEL_KIND);
+        assert!(materialize_native_v2_remote_event(&runtime, &intent).is_ok());
+        let state: String = connection(&paths)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM native_v2_product_attempts WHERE attempt_id = 'attempt-sqlite-cancel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "cancelled");
+    }
+
+    #[test]
+    fn remote_intent_fails_closed_when_exact_route_session_is_substituted() {
+        let paths = paths("native-v2-sqlite-substitution");
+        let now = storage::now_ts();
+        connection(&paths)
+            .unwrap()
+            .execute(
+                "UPDATE rooms SET expires_at = ?2 WHERE id = ?1",
+                params!["bridge-native-v2", now + 3_600],
+            )
+            .unwrap();
+        let runtime = requester_runtime(paths.clone(), "sqlite-substitution-requester");
+        let remote_host = host("sqlite-substitution-remote");
+        let binding = install_remote_room_control_peer(
+            &runtime,
+            &remote_host,
+            "sqlite-substitution-route",
+            now,
+        );
+        let intent = NativeV2RemoteIntentV1 {
+            room_id: binding.bridge_id.clone(),
+            binding: binding.clone(),
+            kind: READINESS_REQUEST_KIND,
+            payload: serde_json::json!({ "attemptId": "attempt-sqlite-substitution" }),
+        };
+        let replacement_secret = crate::crypto::random_key();
+        storage::upsert_bridge_peer_endpoint(
+            &paths,
+            &StoredBridgePeerEndpoint {
+                room_id: binding.bridge_id.clone(),
+                peer_session_id: binding.peer_route_ref.clone(),
+                display_name: Some("substituted-remote".into()),
+                endpoint_host: Some("127.0.0.1".into()),
+                endpoint_port: Some(9),
+                transport_public_key: Some(crate::crypto::encode_key(
+                    &crate::crypto::transport_public_key(&replacement_secret),
+                )),
+                liveness: BridgePeerLiveness::Connected,
+                join_method: BridgePeerJoinMethod::ManualCode,
+                logical_host_ref: Some(remote_host.as_str().into()),
+                durable_identity_id: None,
+                updated_at: now + 1,
+            },
+        )
+        .unwrap();
+        assert!(materialize_native_v2_remote_event(&runtime, &intent).is_err());
     }
 
     struct RequesterLocalTransformFixture {
