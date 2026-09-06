@@ -42,7 +42,7 @@ Native-v2 Room Control kinds are:
 - `bridge_plan.v2.step_result` / `bridge_plan.v2.step_failure` / `bridge_plan.v2.step_commit`
 - `bridge_plan.v2.attempt_cancel`
 
-Requester-local transitions use `NativeV2CoordinatorActionV1` directly and never send the reserved `requester-local:v1:*` route through Room Control. `HostSessionBinding.binding_ref` is the full directional Host-private authority reference. `HostSessionBinding.session_pair_ref` is the symmetric cross-side correlation for readiness, prepared, step-result, and step-failure payloads; it is derived from the exact Bridge plus both Host/session endpoints, excludes routes, and is not authority. Requester-local bindings use the domain-separated `requester-local-host-session-binding:v1:*` reference and a fresh `HostRuntime` process session.
+Local-Host transitions use `NativeV2CoordinatorActionV1` directly and do not create a route, Room Control event, `HostSessionBinding`, or `session_pair_ref`. Their freshness is one opaque `LocalRuntimeRef` tied to the durable local `HostRef` and current HostRuntime generation. Remote transitions are unchanged: `HostSessionBinding.binding_ref` is the full directional Host-private authority reference, while `HostSessionBinding.session_pair_ref` is the symmetric cross-side correlation for readiness, prepared, step-result, and step-failure payloads. It is derived from the exact Bridge plus both Host/session endpoints, excludes routes, and is not authority.
 
 Native-v2 Host admission is bound to `attempt_id` as well as the exact approval, Plan revision/hash, participant, Host/session binding, TTL, and local authored fragment. Current admission references use `host-admission:v2-attempt-bound:*`; changing an attempt cannot reuse an admission.
 

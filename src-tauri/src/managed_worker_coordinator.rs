@@ -19,8 +19,8 @@ use crate::{
     },
     error::{AppError, AppResult},
     host_admission::ManagedPrimitiveAvailabilityV1,
-    host_identity::HostSessionBinding,
-    host_runtime::{current_managed_host_session_binding, HostRuntime},
+    host_identity::{HostExecutionFreshness, HostSessionBinding, LocalExecutionFreshness},
+    host_runtime::{current_host_execution_freshness, HostRuntime},
     managed_execution::{ManagedProcessWorldSpecV1, ManagedStepClaimRequestV1},
     storage,
     worker_harness::{WorkerProviderV1, WorkerRunLimitsV1},
@@ -111,8 +111,8 @@ impl HostRuntime {
     ) -> AppResult<AttemptStartDecisionV2> {
         self.accept_live_v2_managed_attempt_mode(
             start,
-            captured_binding,
-            current_binding,
+            HostExecutionFreshness::Remote(captured_binding),
+            HostExecutionFreshness::Remote(current_binding),
             now,
             true,
         )
@@ -130,8 +130,26 @@ impl HostRuntime {
     ) -> AppResult<AttemptStartDecisionV2> {
         self.accept_live_v2_managed_attempt_mode(
             start,
-            captured_binding,
-            current_binding,
+            HostExecutionFreshness::Remote(captured_binding),
+            HostExecutionFreshness::Remote(current_binding),
+            now,
+            false,
+        )
+    }
+
+    /// Direct local counterpart to remote attempt delivery. It retains the
+    /// same admission/availability barrier but carries no peer session proof.
+    pub(crate) fn accept_local_live_v2_managed_attempt_deferred(
+        self: &Arc<Self>,
+        start: AttemptStartV2,
+        captured_freshness: LocalExecutionFreshness,
+        current_freshness: LocalExecutionFreshness,
+        now: i64,
+    ) -> AppResult<AttemptStartDecisionV2> {
+        self.accept_live_v2_managed_attempt_mode(
+            start,
+            HostExecutionFreshness::Local(captured_freshness),
+            HostExecutionFreshness::Local(current_freshness),
             now,
             false,
         )
@@ -140,8 +158,8 @@ impl HostRuntime {
     fn accept_live_v2_managed_attempt_mode(
         self: &Arc<Self>,
         start: AttemptStartV2,
-        captured_binding: HostSessionBinding,
-        current_binding: HostSessionBinding,
+        captured_binding: HostExecutionFreshness,
+        current_binding: HostExecutionFreshness,
         now: i64,
         auto_start: bool,
     ) -> AppResult<AttemptStartDecisionV2> {
@@ -157,11 +175,12 @@ impl HostRuntime {
                 &self.local_host_ref,
             )
         }) {
-            return store.accept_attempt_start(
+            return store.accept_attempt_start_with_freshness(
                 &start,
                 &captured_binding,
                 &current_binding,
                 &self.host_admission,
+                ManagedPrimitiveAvailabilityV1::unavailable(),
                 now,
             );
         }
@@ -172,7 +191,7 @@ impl HostRuntime {
         // admission. The temporary binding is dropped without a model call.
         drop(self.worker_provider_configs.resolve(&selection)?);
         let availability = self.managed_worker_plan_availability(&revision, &selection)?;
-        let decision = store.accept_attempt_start_with_availability(
+        let decision = store.accept_attempt_start_with_freshness(
             &start,
             &captured_binding,
             &current_binding,
@@ -259,7 +278,7 @@ impl HostRuntime {
     pub(crate) fn drive_live_v2_attempt(
         self: Arc<Self>,
         attempt_id: String,
-        captured: HostSessionBinding,
+        captured: HostExecutionFreshness,
     ) {
         loop {
             let now = storage::now_ts();
@@ -396,7 +415,6 @@ impl HostRuntime {
                             &self,
                             &attempt_id,
                             &step,
-                            &captured,
                             storage::now_ts(),
                         );
                         match result {
@@ -440,9 +458,7 @@ impl HostRuntime {
                             ManagedWorkerCoordinatorStateV1::Interrupted,
                             "provider_revoked",
                         )
-                    } else if current_managed_host_session_binding(self.as_ref(), &captured)
-                        .is_err()
-                    {
+                    } else if current_host_execution_freshness(self.as_ref(), &captured).is_err() {
                         (
                             ManagedWorkerCoordinatorStateV1::Interrupted,
                             "session_revoked",
@@ -475,7 +491,7 @@ impl HostRuntime {
         self: &Arc<Self>,
         attempt_id: &str,
         step_id: Option<&str>,
-        captured: &HostSessionBinding,
+        captured: &HostExecutionFreshness,
         code: &str,
     ) {
         let coordinated = connection(&self.paths)
@@ -507,16 +523,16 @@ impl HostRuntime {
         &self,
         attempt_id: &str,
         step: &PlanStepV2,
-        captured: &HostSessionBinding,
+        captured: &HostExecutionFreshness,
         binding: ResolvedWorkerProviderBindingV1,
         now: i64,
     ) -> AppResult<()> {
         ensure_worker_attempt_active(&self.paths, attempt_id)?;
-        let current = current_managed_host_session_binding(self, &captured)?;
+        let current = current_host_execution_freshness(self, captured)?;
         captured.validate_current(&current, now)?;
         let input = step_input(step)?;
         let acquisition = self.managed_objects.lock().acquisition_for_revision(
-            &captured.bridge_id,
+            captured.bridge_id(),
             &input.logical_object_id,
             input.revision,
             now,
@@ -550,10 +566,11 @@ impl HostRuntime {
     pub(crate) fn dispatch_next_v2_managed_with_provider<P: WorkerProviderV1>(
         &self,
         attempt_id: &str,
-        captured: HostSessionBinding,
+        captured: impl Into<HostExecutionFreshness>,
         provider: &mut P,
         now: i64,
     ) -> AppResult<StepOperation> {
+        let captured = captured.into();
         let selection = worker_attempt_selection(&self.paths, attempt_id)?;
         drop(self.worker_provider_configs.resolve(&selection)?);
         let NextDispatchV1::Managed(step) = reserve_next_dispatch(
@@ -567,11 +584,11 @@ impl HostRuntime {
             return invalid("No managed v2 step is eligible for dispatch.");
         };
         let operation = step.operation();
-        let current = current_managed_host_session_binding(self, &captured)?;
+        let current = current_host_execution_freshness(self, &captured)?;
         captured.validate_current(&current, now)?;
         let input = step_input(&step)?;
         let acquisition = self.managed_objects.lock().acquisition_for_revision(
-            &captured.bridge_id,
+            captured.bridge_id(),
             &input.logical_object_id,
             input.revision,
             now,

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{AppError, AppResult},
-    host_identity::{HostRef, HostSessionBinding, PlanParticipantRef},
+    host_identity::{HostExecutionFreshness, HostRef, PlanParticipantRef},
 };
 
 pub(crate) const EFFECT_AUTHORITY_VERSION: &str = "pastey-effect-authority-v1";
@@ -1379,7 +1379,7 @@ impl HostEffectBackendV1 for UnavailableProductionEffectBackendV1 {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CurrentHostAuthorityV1 {
-    pub(crate) session_binding: HostSessionBinding,
+    pub(crate) execution_freshness: HostExecutionFreshness,
     pub(crate) bridge_active: bool,
     pub(crate) burned: bool,
     pub(crate) disconnected: bool,
@@ -1821,10 +1821,10 @@ impl EffectAuthorityStateV1 {
             || current.disconnected
             || current.restarted
             || current.now >= request.context.expires_at
-            || current.session_binding.binding_ref != request.context.session_binding_ref
-            || current.session_binding.bridge_id != request.context.bridge_id
-            || current.session_binding.local_host_ref != request.context.host_ref
-            || current.session_binding.expires_at <= current.now
+            || current.execution_freshness.authority_ref() != request.context.session_binding_ref
+            || current.execution_freshness.bridge_id() != request.context.bridge_id
+            || current.execution_freshness.local_host_ref() != &request.context.host_ref
+            || current.execution_freshness.expires_at() <= current.now
         {
             return invalid("Effect request context, Host, session, or lifecycle is mismatched.");
         }
@@ -1875,10 +1875,10 @@ impl EffectAuthorityStateV1 {
             || current.burned
             || current.disconnected
             || current.restarted
-            || current.session_binding.binding_ref != context.session_binding_ref
-            || current.session_binding.bridge_id != context.bridge_id
-            || current.session_binding.local_host_ref != context.host_ref
-            || current.session_binding.expires_at <= current.now
+            || current.execution_freshness.authority_ref() != context.session_binding_ref
+            || current.execution_freshness.bridge_id() != context.bridge_id
+            || current.execution_freshness.local_host_ref() != &context.host_ref
+            || current.execution_freshness.expires_at() <= current.now
         {
             return invalid(
                 "Resource attachment context, Host, session, run, or lifecycle is mismatched.",
@@ -1967,10 +1967,10 @@ impl EffectAuthorityStateV1 {
             || current.burned
             || current.disconnected
             || current.restarted
-            || current.session_binding.binding_ref != context.session_binding_ref
-            || current.session_binding.bridge_id != context.bridge_id
-            || current.session_binding.local_host_ref != context.host_ref
-            || current.session_binding.expires_at <= current.now
+            || current.execution_freshness.authority_ref() != context.session_binding_ref
+            || current.execution_freshness.bridge_id() != context.bridge_id
+            || current.execution_freshness.local_host_ref() != &context.host_ref
+            || current.execution_freshness.expires_at() <= current.now
         {
             return invalid(
                 "Execution world context, Host, session, network, run, or lifecycle is mismatched.",
@@ -2042,10 +2042,10 @@ impl EffectAuthorityStateV1 {
             || current.burned
             || current.disconnected
             || current.restarted
-            || current.session_binding.binding_ref != context.session_binding_ref
-            || current.session_binding.bridge_id != context.bridge_id
-            || current.session_binding.local_host_ref != context.host_ref
-            || current.session_binding.expires_at <= current.now
+            || current.execution_freshness.authority_ref() != context.session_binding_ref
+            || current.execution_freshness.bridge_id() != context.bridge_id
+            || current.execution_freshness.local_host_ref() != &context.host_ref
+            || current.execution_freshness.expires_at() <= current.now
         {
             return invalid(
                 "Network attachment context, Host, session, run, destination, or lifecycle is mismatched.",
@@ -2363,9 +2363,9 @@ impl EffectAuthorityStateV1 {
             || current.disconnected
             || current.restarted
             || !current.bridge_active
-            || current.session_binding.expires_at <= current.now
-            || current.session_binding.binding_ref != envelope.context.session_binding_ref
-            || current.session_binding.local_host_ref != envelope.context.host_ref
+            || current.execution_freshness.expires_at() <= current.now
+            || current.execution_freshness.authority_ref() != envelope.context.session_binding_ref
+            || current.execution_freshness.local_host_ref() != &envelope.context.host_ref
         {
             return invalid("Managed run is not currently eligible for Core completion.");
         }
@@ -2525,6 +2525,7 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_identity::HostSessionBinding;
     use crate::host_runtime::{DeveloperHostRef, DeveloperTerminalBinding};
 
     #[derive(Default)]
@@ -2855,7 +2856,7 @@ mod tests {
             envelope,
             context,
             current: CurrentHostAuthorityV1 {
-                session_binding: binding,
+                execution_freshness: binding.into(),
                 bridge_active: true,
                 burned: false,
                 disconnected: false,
@@ -3064,7 +3065,7 @@ mod tests {
         }
 
         let mut wrong_session = fixture.current.clone();
-        wrong_session.session_binding = HostSessionBinding::new(
+        wrong_session.execution_freshness = HostSessionBinding::new(
             "bridge-phase5",
             fixture.context.host_ref.clone(),
             HostRef::from_device_id("phase5-peer").unwrap(),
@@ -3073,7 +3074,8 @@ mod tests {
             "peer-route-new",
             1_000,
         )
-        .unwrap();
+        .unwrap()
+        .into();
         assert!(fixture
             .state
             .enforce(

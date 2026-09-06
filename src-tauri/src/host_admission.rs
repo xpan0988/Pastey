@@ -19,7 +19,7 @@ use crate::{
         self, participant_for_ref, requester_host, PlanApprovalV2, PlanRevisionV2, PlanStepV2,
     },
     error::AppResult,
-    host_identity::{HostRef, HostSessionBinding, PlanParticipantRef},
+    host_identity::{HostExecutionFreshness, HostRef, HostSessionBinding, PlanParticipantRef},
     storage::AppPaths,
 };
 
@@ -34,7 +34,7 @@ pub struct HostAdmissionRequestV2 {
     pub host_ref: HostRef,
     pub participant_ref: PlanParticipantRef,
     pub protocol_correlation_id: String,
-    pub session_binding: HostSessionBinding,
+    pub execution_freshness: HostExecutionFreshness,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -357,21 +357,21 @@ impl HostAdmissionService {
 
     /// Native v2 admission. The immutable revision and requester approval are
     /// supplied by the receiver-owned protocol store after exact review/start
-    /// correlation. Layer 4 contributes only the captured and current session
-    /// bindings; it cannot select work or imply admission.
+    /// correlation. Runtime freshness is proven separately from the common
+    /// Plan/approval/participant/work checks and cannot select or expand work.
     pub(crate) fn evaluate_v2(
         &self,
         revision: &PlanRevisionV2,
         approval: &PlanApprovalV2,
         request: &HostAdmissionRequestV2,
-        current_binding: &HostSessionBinding,
+        current_freshness: impl Into<HostExecutionFreshness>,
         now: i64,
     ) -> AppResult<HostAdmissionDecision> {
         self.evaluate_v2_with_availability(
             revision,
             approval,
             request,
-            current_binding,
+            current_freshness,
             ManagedPrimitiveAvailabilityV1::unavailable(),
             now,
         )
@@ -384,13 +384,14 @@ impl HostAdmissionService {
         revision: &PlanRevisionV2,
         approval: &PlanApprovalV2,
         request: &HostAdmissionRequestV2,
-        current_binding: &HostSessionBinding,
+        current_freshness: impl Into<HostExecutionFreshness>,
         availability: ManagedPrimitiveAvailabilityV1,
         now: i64,
     ) -> AppResult<HostAdmissionDecision> {
+        let current_freshness = current_freshness.into();
         if request.host_ref != self.local_host_ref
-            || request.session_binding.local_host_ref != self.local_host_ref
-            || current_binding.local_host_ref != self.local_host_ref
+            || request.execution_freshness.local_host_ref() != &self.local_host_ref
+            || current_freshness.local_host_ref() != &self.local_host_ref
         {
             return Ok(deny(
                 HostAdmissionDenialCode::HostMismatch,
@@ -398,8 +399,8 @@ impl HostAdmissionService {
             ));
         }
         if request
-            .session_binding
-            .validate_current(current_binding, now)
+            .execution_freshness
+            .validate_current(&current_freshness, now)
             .is_err()
         {
             return Ok(deny(
@@ -411,7 +412,7 @@ impl HostAdmissionService {
             || revision.plan_id != request.plan_id
             || revision.revision_id != request.revision_id
             || revision.revision_hash != request.revision_hash
-            || revision.bridge_id != request.session_binding.bridge_id
+            || revision.bridge_id != request.execution_freshness.bridge_id()
         {
             return Ok(deny(
                 HostAdmissionDenialCode::PlanMismatch,
@@ -445,22 +446,27 @@ impl HostAdmissionService {
             ));
         }
         let requester_host = requester_host(revision)?;
-        if request.session_binding.is_requester_local() {
-            if &request.participant_ref != &revision.requester
-                || requester_host != &self.local_host_ref
-            {
-                return Ok(deny(
-                    HostAdmissionDenialCode::SessionMismatch,
-                    "Requester-local admission is not bound to the exact requester participant.",
-                ));
+        match &request.execution_freshness {
+            HostExecutionFreshness::Local(_) => {
+                if &request.participant_ref != &revision.requester
+                    || requester_host != &self.local_host_ref
+                {
+                    return Ok(deny(
+                        HostAdmissionDenialCode::SessionMismatch,
+                        "Local admission is not bound to the exact requester participant.",
+                    ));
+                }
             }
-        } else if requester_host != &request.session_binding.peer_host_ref
-            || request.participant_ref == revision.requester
-        {
-            return Ok(deny(
-                HostAdmissionDenialCode::SessionMismatch,
-                "The current Layer 4 peer is not the approved v2 requester Host.",
-            ));
+            HostExecutionFreshness::Remote(binding) => {
+                if requester_host != &binding.peer_host_ref
+                    || request.participant_ref == revision.requester
+                {
+                    return Ok(deny(
+                        HostAdmissionDenialCode::SessionMismatch,
+                        "The current Layer 4 peer is not the approved v2 requester Host.",
+                    ));
+                }
+            }
         }
         if request.attempt_id.trim().is_empty() || request.protocol_correlation_id.trim().is_empty()
         {
@@ -496,7 +502,9 @@ impl HostAdmissionService {
             .into_iter()
             .map(admitted_work_v2)
             .collect::<AppResult<Vec<_>>>()?;
-        let expires_at = approval.expires_at.min(request.session_binding.expires_at);
+        let expires_at = approval
+            .expires_at
+            .min(request.execution_freshness.expires_at());
         if expires_at <= now {
             return Ok(deny(
                 HostAdmissionDenialCode::Expired,
@@ -521,7 +529,10 @@ impl HostAdmissionService {
             revision_hash: request.revision_hash.clone(),
             host_ref: self.local_host_ref.clone(),
             participant_ref: request.participant_ref.clone(),
-            session_binding_ref: request.session_binding.binding_ref.clone(),
+            // Compatibility field in the frozen admission/effect contract. For
+            // local work it contains the opaque LocalRuntime freshness authority
+            // ref; remote work continues to contain HostSessionBinding.binding_ref.
+            session_binding_ref: request.execution_freshness.authority_ref().to_string(),
             work,
             constraints,
         })))
@@ -585,7 +596,7 @@ fn admission_ref_v2(
         request.host_ref.as_str(),
         request.participant_ref.as_str(),
         request.protocol_correlation_id.as_str(),
-        request.session_binding.binding_ref.as_str(),
+        request.execution_freshness.authority_ref(),
     ] {
         hasher.update(value.as_bytes());
         hasher.update(b"\0");
@@ -891,7 +902,7 @@ mod tests {
             host_ref: transform_host.clone(),
             participant_ref: transform_participant.clone(),
             protocol_correlation_id: "correlation-transform".into(),
-            session_binding: transform_binding.clone(),
+            execution_freshness: transform_binding.clone().into(),
         };
         let execute_request = HostAdmissionRequestV2 {
             attempt_id: "attempt-execute".into(),
@@ -902,7 +913,7 @@ mod tests {
             host_ref: execute_host.clone(),
             participant_ref: execute_participant.clone(),
             protocol_correlation_id: "correlation-execute".into(),
-            session_binding: execute_binding.clone(),
+            execution_freshness: execute_binding.clone().into(),
         };
         V2AdmissionFixture {
             revision,

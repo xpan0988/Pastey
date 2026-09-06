@@ -139,6 +139,168 @@ impl PlanParticipants {
     }
 }
 
+/// Fresh process generation for the durable local Host.
+///
+/// This is deliberately not a Bridge session, peer route, or transport
+/// binding. Restarting the HostRuntime creates a different reference while
+/// retaining the same durable HostRef.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalRuntimeRef {
+    host_ref: HostRef,
+    generation_ref: String,
+}
+
+impl LocalRuntimeRef {
+    pub(crate) fn fresh(host_ref: HostRef) -> Self {
+        Self {
+            host_ref,
+            generation_ref: format!("local-runtime:v1:{}", uuid::Uuid::new_v4()),
+        }
+    }
+
+    pub fn host_ref(&self) -> &HostRef {
+        &self.host_ref
+    }
+
+    pub fn generation_ref(&self) -> &str {
+        &self.generation_ref
+    }
+
+    pub fn validate_current(&self, current: &Self) -> AppResult<()> {
+        if self != current {
+            return Err(AppError::InvalidInput(
+                "Local runtime reference is stale or mismatched.".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Bridge-scoped validity for direct execution on the current HostRuntime.
+/// It carries no peer, route, or session identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalExecutionFreshness {
+    pub bridge_id: String,
+    pub local_runtime_ref: LocalRuntimeRef,
+    pub expires_at: i64,
+}
+
+impl LocalExecutionFreshness {
+    pub fn new(
+        bridge_id: &str,
+        local_runtime_ref: LocalRuntimeRef,
+        expires_at: i64,
+    ) -> AppResult<Self> {
+        if bridge_id.trim().is_empty() || expires_at <= 0 {
+            return Err(AppError::InvalidInput(
+                "Local execution freshness is incomplete.".into(),
+            ));
+        }
+        Ok(Self {
+            bridge_id: bridge_id.to_string(),
+            local_runtime_ref,
+            expires_at,
+        })
+    }
+
+    pub fn validate_current(&self, current: &Self, now: i64) -> AppResult<()> {
+        if self.expires_at <= now || current.expires_at <= now {
+            return Err(AppError::InvalidInput(
+                "Local execution freshness has expired.".into(),
+            ));
+        }
+        self.local_runtime_ref
+            .validate_current(&current.local_runtime_ref)?;
+        if self != current {
+            return Err(AppError::InvalidInput(
+                "Local execution freshness is stale or mismatched.".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Runtime freshness used by shared managed admission and execution code.
+/// Remote serialization remains the exact HostSessionBinding representation;
+/// the local representation contains no synthetic peer/session fields.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum HostExecutionFreshness {
+    Local(LocalExecutionFreshness),
+    Remote(HostSessionBinding),
+}
+
+impl HostExecutionFreshness {
+    pub fn bridge_id(&self) -> &str {
+        match self {
+            Self::Local(freshness) => &freshness.bridge_id,
+            Self::Remote(binding) => &binding.bridge_id,
+        }
+    }
+
+    pub fn local_host_ref(&self) -> &HostRef {
+        match self {
+            Self::Local(freshness) => freshness.local_runtime_ref.host_ref(),
+            Self::Remote(binding) => &binding.local_host_ref,
+        }
+    }
+
+    pub fn expires_at(&self) -> i64 {
+        match self {
+            Self::Local(freshness) => freshness.expires_at,
+            Self::Remote(binding) => binding.expires_at,
+        }
+    }
+
+    pub fn authority_ref(&self) -> &str {
+        match self {
+            Self::Local(freshness) => freshness.local_runtime_ref.generation_ref(),
+            Self::Remote(binding) => &binding.binding_ref,
+        }
+    }
+
+    pub fn as_remote(&self) -> Option<&HostSessionBinding> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote(binding) => Some(binding),
+        }
+    }
+
+    pub fn validate_current(&self, current: &Self, now: i64) -> AppResult<()> {
+        match (self, current) {
+            (Self::Local(captured), Self::Local(current)) => {
+                captured.validate_current(current, now)
+            }
+            (Self::Remote(captured), Self::Remote(current)) => {
+                captured.validate_current(current, now)
+            }
+            _ => Err(AppError::InvalidInput(
+                "Host execution freshness kind is stale or mismatched.".into(),
+            )),
+        }
+    }
+}
+
+impl From<HostSessionBinding> for HostExecutionFreshness {
+    fn from(binding: HostSessionBinding) -> Self {
+        Self::Remote(binding)
+    }
+}
+
+impl From<&HostSessionBinding> for HostExecutionFreshness {
+    fn from(binding: &HostSessionBinding) -> Self {
+        Self::Remote(binding.clone())
+    }
+}
+
+impl From<&HostExecutionFreshness> for HostExecutionFreshness {
+    fn from(freshness: &HostExecutionFreshness) -> Self {
+        freshness.clone()
+    }
+}
+
 /// Exact, expiring association between logical Hosts and one current Layer 4
 /// Bridge/session route. It is evidence for later admission checks, never
 /// consent, capability, or Layer 5 authority by itself.
@@ -161,8 +323,6 @@ pub struct HostSessionBinding {
 }
 
 impl HostSessionBinding {
-    pub const REQUESTER_LOCAL_ROUTE_PREFIX: &'static str = "requester-local:v1:";
-
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         bridge_id: &str,
@@ -222,58 +382,6 @@ impl HostSessionBinding {
             binding_ref: format!("host-session-binding:v1:{}", hasher.finalize().to_hex()),
             session_pair_ref,
         })
-    }
-
-    /// Constructs the process-local requester self-admission binding. It is
-    /// intentionally not a transport route and cannot be constructed by the
-    /// peer-binding constructor above.
-    pub fn new_requester_local(
-        bridge_id: &str,
-        host_ref: HostRef,
-        runtime_session_ref: &str,
-        expires_at: i64,
-    ) -> AppResult<Self> {
-        if bridge_id.trim().is_empty() || runtime_session_ref.trim().is_empty() || expires_at <= 0 {
-            return Err(AppError::InvalidInput(
-                "Requester-local Host session binding is incomplete.".into(),
-            ));
-        }
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"pastey-requester-local-host-session-binding-v1\0");
-        for value in [bridge_id, host_ref.as_str(), runtime_session_ref] {
-            hasher.update(value.as_bytes());
-            hasher.update(b"\0");
-        }
-        hasher.update(&expires_at.to_le_bytes());
-        let digest = hasher.finalize().to_hex().to_string();
-        Ok(Self {
-            bridge_id: bridge_id.to_string(),
-            local_host_ref: host_ref.clone(),
-            peer_host_ref: host_ref.clone(),
-            local_session_ref: runtime_session_ref.to_string(),
-            peer_session_ref: runtime_session_ref.to_string(),
-            peer_route_ref: format!("{}{}", Self::REQUESTER_LOCAL_ROUTE_PREFIX, digest),
-            expires_at,
-            binding_ref: format!("requester-local-host-session-binding:v1:{digest}"),
-            session_pair_ref: session_pair_ref(
-                bridge_id,
-                &host_ref,
-                runtime_session_ref,
-                &host_ref,
-                runtime_session_ref,
-            ),
-        })
-    }
-
-    pub fn is_requester_local(&self) -> bool {
-        self.local_host_ref == self.peer_host_ref
-            && self.local_session_ref == self.peer_session_ref
-            && self
-                .peer_route_ref
-                .starts_with(Self::REQUESTER_LOCAL_ROUTE_PREFIX)
-            && self
-                .binding_ref
-                .starts_with("requester-local-host-session-binding:v1:")
     }
 
     /// Validates a previously captured binding against a freshly resolved
@@ -507,26 +615,29 @@ mod tests {
     }
 
     #[test]
-    fn requester_local_binding_is_process_session_exact_and_non_routable() {
+    fn local_runtime_freshness_is_host_and_process_exact_without_peer_fields() {
         let local = host("local");
-        let captured = HostSessionBinding::new_requester_local(
-            "bridge",
-            local.clone(),
-            "runtime-session-a",
-            100,
-        )
-        .unwrap();
-        let restarted =
-            HostSessionBinding::new_requester_local("bridge", local, "runtime-session-b", 100)
-                .unwrap();
+        let captured = LocalRuntimeRef::fresh(local.clone());
+        let restarted = LocalRuntimeRef::fresh(local);
+        let captured = LocalExecutionFreshness::new("bridge", captured, 100).unwrap();
+        let restarted = LocalExecutionFreshness::new("bridge", restarted, 100).unwrap();
 
-        assert!(captured.is_requester_local());
-        assert!(captured
-            .peer_route_ref
-            .starts_with(HostSessionBinding::REQUESTER_LOCAL_ROUTE_PREFIX));
-        assert_ne!(captured.binding_ref, restarted.binding_ref);
-        assert_ne!(captured.session_pair_ref, restarted.session_pair_ref);
+        assert_ne!(
+            captured.local_runtime_ref.generation_ref(),
+            restarted.local_runtime_ref.generation_ref()
+        );
         assert!(captured.validate_current(&restarted, 1).is_err());
+        let encoded = serde_json::to_value(&captured).unwrap();
+        let object = encoded.as_object().unwrap();
+        for forbidden in [
+            "peerHostRef",
+            "localSessionRef",
+            "peerSessionRef",
+            "peerRouteRef",
+            "sessionPairRef",
+        ] {
+            assert!(!object.contains_key(forbidden));
+        }
     }
 
     #[test]

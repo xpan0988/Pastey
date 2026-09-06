@@ -30,7 +30,7 @@ use crate::{
     execution_world::{
         CompletedProcessObservationV1, HostManagedProcessBackendV1, ManagedProcessInvocationV1,
     },
-    host_identity::HostSessionBinding,
+    host_identity::HostExecutionFreshness,
     host_runtime::HostRuntime,
     managed_execution::{
         AuthoritativeExecuteResultV1, ExecuteResultProposalV1, ManagedObjectRevisionResultV1,
@@ -276,7 +276,7 @@ pub(crate) struct WorkerProviderRequestV1 {
 
 struct WorkerRunInputV1 {
     grant: ManagedStepGrantV1,
-    current_binding: HostSessionBinding,
+    current_binding: HostExecutionFreshness,
     now: i64,
     live_revalidation: bool,
 }
@@ -1374,10 +1374,8 @@ fn ensure_worker_active(
     ensure_active(cancellation)?;
     if input.live_revalidation {
         let now = crate::storage::now_ts();
-        let current = crate::host_runtime::current_managed_host_session_binding(
-            runtime,
-            &input.current_binding,
-        )?;
+        let current =
+            crate::host_runtime::current_host_execution_freshness(runtime, &input.current_binding)?;
         input.current_binding.validate_current(&current, now)?;
     }
     Ok(())
@@ -1387,14 +1385,14 @@ fn completion_binding(
     runtime: &HostRuntime,
     input: &WorkerRunInputV1,
     cancellation: &WorkerHarnessRunV1,
-) -> AppResult<(HostSessionBinding, i64)> {
+) -> AppResult<(HostExecutionFreshness, i64)> {
     ensure_worker_active(runtime, input, cancellation)?;
     if !input.live_revalidation {
         return Ok((input.current_binding.clone(), input.now));
     }
     let now = crate::storage::now_ts();
     let current =
-        crate::host_runtime::current_managed_host_session_binding(runtime, &input.current_binding)?;
+        crate::host_runtime::current_host_execution_freshness(runtime, &input.current_binding)?;
     input.current_binding.validate_current(&current, now)?;
     Ok((current, now))
 }
