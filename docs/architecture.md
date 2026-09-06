@@ -32,21 +32,21 @@ Core evidence/result acceptance → requester step commit → next authored depe
 
 Renderer state, model/provider output, logs, routes, tool schemas, and capability projections never mint authority.
 
-Execution locality does not change this chain. Requester-local execution replaces Room Control self-messaging with typed direct coordinator actions, but it satisfies the same Layer 5 Review, readiness, attempt-bound admission, prepared/commit, result, continuation, and cancellation contract as remote execution.
+Execution locality does not change this chain. Core resolves each authored participant's `HostRef` once. Work for the current Host uses direct coordinator dispatch with a fresh local-runtime reference; work for another Host uses its current Bridge/session binding and Room Control. Both paths satisfy the same Layer 5 Review, readiness, attempt-bound admission, prepared/commit, result, continuation, and cancellation contract.
 
 ## HostRuntime and the multi-Host model
 
 `HostRuntime` is the UI-independent Host service owner. It owns Host identity, current session resolution, managed-object bindings, Plan stores, admission, effect authority, resource/process/network backends, Worker/provider services, native-v2 coordination, lifecycle revocation, and Developer Terminal state. Tauri is the desktop invoke/event/task adapter; extracting `HostRuntime` did not create a Headless Host.
 
-`HostRef` is Pastey's durable logical Host identity. `PlanParticipantRef` names a role within one immutable Plan, and `HostSessionBinding` correlates that participant and Host to one exact current Bridge session. A remote binding includes the current directional peer route; a requester-local binding instead includes a fresh process-session reference and a reserved non-routable route marker. These identities are not interchangeable:
+`HostRef` is Pastey's durable logical Host identity, and `PlanParticipantRef` names a role within one immutable Plan. Local execution freshness is a `LocalRuntimeRef` bound only to the current durable Host and process generation; it has no peer, route, session, or session-pair fields. `HostSessionBinding` is reserved for a remote Host's exact current Layer 4 Bridge/session route. These identities are not interchangeable:
 
 - a participant must resolve to the authored `HostRef`;
-- admission and later results must carry the same immutable Plan/revision/approval/attempt and current session binding;
-- a reconnect or replacement remote session, or a requester process restart, invalidates the previous binding;
+- admission and later results must carry the same immutable Plan/revision/approval/attempt and the appropriate current freshness proof;
+- a reconnect or replacement remote session invalidates its `HostSessionBinding`, while a local runtime restart invalidates its `LocalRuntimeRef`;
 - temporary disconnect retains Bridge membership but revokes active managed authority;
 - explicit departure removes only the authenticated departing peer; Burn performs local destructive cleanup and revocation.
 
-The full directional binding and its `binding_ref` remain Host-private authority. Cross-side lifecycle messages correlate the two views through a symmetric `session_pair_ref` derived from the exact Bridge and sorted Host/session endpoints. That correlation excludes routes, is non-authoritative, and is accepted only after the receiving Host revalidates its own complete current binding.
+For remote execution, the full directional binding and its `binding_ref` remain Host-private authority. Cross-side lifecycle messages correlate the two remote views through a symmetric `session_pair_ref` derived from the exact Bridge and sorted Host/session endpoints. That correlation excludes routes, is non-authoritative, and is accepted only after the receiving Host revalidates its own complete current binding. Local execution fabricates neither value.
 
 In a multi-Host Plan the requester coordinates global dependency state, while each Host executes only steps authored for itself. A receiver, requester-local executor, or Worker cannot select another Host, insert a Transfer, or continue the global Plan independently.
 
@@ -127,7 +127,7 @@ The Host-owned network broker exists as an independent Phase 5 authority domain,
 
 ## Current product boundary
 
-The 1.9.3 development backend implements the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, bounded Worker Harness, configured streaming provider adapter, durable generation-bound provider configuration, live managed Host coordination including requester-local self-admission, deterministic multi-Host product orchestration, and proposal-only Natural-v2 lowering.
+The 1.9.3 development backend implements the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, bounded Worker Harness, configured streaming provider adapter, durable generation-bound provider configuration, live managed Host coordination including direct local-Host admission, deterministic multi-Host product orchestration, and proposal-only Natural-v2 lowering.
 
 V1 remains isolated and unchanged: its product executes Search/Transfer and rejects Transform/Execute. The 2.0 renderer can open an existing native-v2 revision and drive Review approval, readiness start, authoritative status, and cancellation through the registered Tauri commands. Draft discovery/origination, renderer-safe PM context and detailed topology, and result content projection are not yet exposed. Provider configuration, provider health presentation, and exact managed process binding are still Host-private backend seams.
 

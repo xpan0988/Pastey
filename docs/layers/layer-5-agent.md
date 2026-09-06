@@ -12,9 +12,9 @@ Layer 5 owns semantic Plan composition, optional proposal interpretation, immuta
 
 PM and Worker may propose or request. Only Core authorizes and finalizes authoritative state; DONE and authoritative completion belong to Core, not PM.
 
-Local execution is a transport/dispatch optimization, not an authority exception. The requester-local path uses direct in-process coordinator actions instead of sending Room Control messages to itself, but it still performs exact Review, readiness, attempt-bound Host admission, prepared/commit, one-step claim, effect enforcement, evidence, result acceptance, step commit, continuation, and cancellation. Locality never bypasses Core authority.
+Local execution is a transport/dispatch optimization, not an authority exception. Core resolves the authored participant's `HostRef`; the local path then uses direct in-process coordinator actions instead of sending Room Control messages to itself. It still performs exact Review, readiness, attempt-bound Host admission, prepared/commit, one-step claim, effect enforcement, evidence, result acceptance, step commit, continuation, and cancellation. Locality never bypasses Core authority.
 
-Requester-local admission is bound to the active Bridge, requester `HostRef`, one fresh `HostRuntime` process-session reference, and expiry. Its reserved local route marker is not routable and is rejected by Room Control delivery. Restart creates a different process session and invalidates the old binding even though the durable requester `HostRef` is unchanged.
+Local admission is bound to the active Bridge, exact requester participant and `HostRef`, one opaque `LocalRuntimeRef`, and expiry. `LocalRuntimeRef` identifies only the current HostRuntime generation: it has no peer, route, Bridge-session, or `session_pair_ref` fields. Restart creates a different value and invalidates the old local authority even though the durable `HostRef` is unchanged. Remote admission continues to require the existing exact `HostSessionBinding`.
 
 ## Semantic model
 
@@ -50,15 +50,15 @@ The deterministic native-v2 Composer accepts only explicit HostRefs, roots, and 
 
 One requester approval binds the complete immutable revision. Attempt start then follows a fail-closed distributed barrier:
 
-1. The requester resolves every participant to one current, unambiguous `HostSessionBinding`: a process-session-bound local binding for itself, or the existing current peer-session binding for a remote Host.
-2. Each Host validates the complete immutable Plan and its exact participant/session correlation, then evaluates roots, transfer counterparts, provider generation/model, process binding, and verified platform world only where required by its own authored fragment.
+1. The requester resolves locality from the exact authored `HostRef`. Its own participant captures the current `LocalRuntimeRef`; every remote participant resolves the existing current, unambiguous `HostSessionBinding`.
+2. Each Host validates the complete immutable Plan and its exact participant/freshness correlation, then evaluates roots, transfer counterparts, provider generation/model, process binding, and verified platform world only where required by its own authored fragment.
 3. Any Host-local requirement reported unavailable fails the whole Plan before an earlier Search, Transfer, or managed step can execute; availability on another Host cannot satisfy it.
-4. Each bound Host validates the exact review correlation and creates Host admission in prepared state. Remote Hosts receive authenticated protocol messages; the requester runs the same receiver logic through typed local coordinator actions.
+4. Each bound Host validates the exact review correlation and creates Host admission in prepared state. Remote Hosts receive authenticated protocol messages and claim their replay identities; the requester invokes the shared semantic lifecycle through direct typed coordinator actions and creates no local protocol replay claim.
 5. Only after every Host is prepared does the requester send commit; receivers execute nothing before it.
 
 Search/Transfer-only Plans do not require a Worker provider. A resource-only Transform requires a provider but not a process world. A process-backed Transform and every current Execute require a Host-private exact revision/step process binding and a verified execution world.
 
-Review, readiness, prepared, commit, result, failure, step-commit, and cancellation transitions carry the exact Plan, revision/hash, approval, attempt, participant, Host/session binding, TTL, and correlation appropriate to the transition. The full directional `binding_ref` remains Host-private authority. Cross-side readiness/prepared/result/failure messages use the symmetric, non-authoritative `session_pair_ref`, derived from the exact Bridge and both Host/session endpoints independent of direction; it contains no route and cannot replace local full-binding validation. Replays and substitutions fail closed.
+Review, readiness, prepared, commit, result, failure, step-commit, and cancellation transitions carry the exact Plan, revision/hash, approval, attempt, participant, Host freshness, TTL, and correlation appropriate to the transition. For remote Hosts, the full directional `binding_ref` remains Host-private authority and cross-side readiness/prepared/result/failure messages use the symmetric, non-authoritative `session_pair_ref`, derived from the exact Bridge and both Host/session endpoints independent of direction. Local transitions instead carry the exact local-runtime freshness internally and never fabricate a remote binding or session pair. Replays and substitutions fail closed.
 
 ## Step and effect authority
 
@@ -173,8 +173,8 @@ Distributed delivery failure remains a product-recovery limitation: the sender c
 | --- | --- |
 | Deterministic native-v2 Draft/Review/approval/readiness/status/cancel backend and 2.0 lifecycle UI for an opened revision | Renderer-safe Draft discovery/origination, PM context, reviewed topology, and result projection |
 | Proposal-only local/provider Natural-v2 to an unapproved Draft | PM/provider selection and settings presentation |
-| Whole-Plan remote and requester-local readiness, prepare, attempt-bound admission, commit, and exact continuation | Headless Host execution |
-| Remote or requester-local Search and authored encrypted Transfer with exact receipt | Automatic/inferred movement or topology repair |
+| Whole-Plan remote and local-Host readiness, prepare, attempt-bound admission, commit, and exact continuation | Headless Host execution |
+| Remote or local-Host Search and authored encrypted Transfer with exact receipt | Automatic/inferred movement or topology repair |
 | Same-Host Resource Worker Transform; contained Process on verified macOS; native Windows Managed Execute acceptance through the Codex-backed production path | Product-configured executable binding; Linux process world |
 | Execute through Core with no lineage when an exact process binding exists | Raw shell/terminal/process authority |
 | Durable generation-bound provider state and streaming adapter | Product provider configuration/health UI |

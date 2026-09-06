@@ -27,7 +27,7 @@ use crate::{
     host_admission::{
         HostAdmissionRequestV2, HostAdmissionService, ManagedPrimitiveAvailabilityV1,
     },
-    host_identity::{HostRef, HostSessionBinding},
+    host_identity::{HostExecutionFreshness, HostRef},
     host_runtime::HostRuntime,
     managed_objects::{ManagedLogicalObjectRevision, ManagedObjectAcquisition},
     managed_resources::{
@@ -50,8 +50,8 @@ pub(crate) struct ManagedStepClaimRequestV1 {
     pub(crate) attempt_id: String,
     pub(crate) step_id: String,
     pub(crate) input: ManagedObjectAcquisition,
-    pub(crate) captured_binding: HostSessionBinding,
-    pub(crate) current_binding: HostSessionBinding,
+    pub(crate) captured_binding: HostExecutionFreshness,
+    pub(crate) current_binding: HostExecutionFreshness,
     pub(crate) now: i64,
     /// Host-private, preselected execution-world entry point. It is supplied
     /// by the future coordinator, never by a Worker/provider, and is bound
@@ -193,7 +193,7 @@ impl HostRuntime {
             participant_ref: source.participant_ref.clone(),
             host_ref: self.local_host_ref.clone(),
             admission_ref: source.admission_ref.clone(),
-            session_binding_ref: request.captured_binding.binding_ref.clone(),
+            session_binding_ref: request.captured_binding.authority_ref().to_string(),
             input_revisions: vec![ManagedInputRevisionV1 {
                 logical_object_id: input.logical_object_id.clone(),
                 revision: input.revision,
@@ -546,9 +546,10 @@ impl HostRuntime {
     pub(crate) fn finalize_v2_transform(
         &self,
         proposal: TransformResultProposalV1,
-        current_binding: HostSessionBinding,
+        current_binding: impl Into<HostExecutionFreshness>,
         now: i64,
     ) -> AppResult<ManagedObjectAcquisition> {
+        let current_binding = current_binding.into();
         let _completion_guard = self.managed_completion_lock.lock();
         let source = load_completion_source(
             &self.paths,
@@ -666,9 +667,10 @@ impl HostRuntime {
     pub(crate) fn finalize_v2_execute(
         &self,
         proposal: ExecuteResultProposalV1,
-        current_binding: HostSessionBinding,
+        current_binding: impl Into<HostExecutionFreshness>,
         now: i64,
     ) -> AppResult<AuthoritativeExecuteResultV1> {
+        let current_binding = current_binding.into();
         let _completion_guard = self.managed_completion_lock.lock();
         let source = load_completion_source(
             &self.paths,
@@ -817,10 +819,10 @@ fn load_claim_source(
     let revision: PlanRevisionV2 = serde_json::from_str(&row.13)?;
     if row.10 != "accepted"
         || row.11 != "valid"
-        || row.7 != request.captured_binding.binding_ref
-        || row.0 != request.captured_binding.bridge_id
+        || row.7 != request.captured_binding.authority_ref()
+        || row.0 != request.captured_binding.bridge_id()
         || row.9 <= request.now
-        || request.current_binding.local_host_ref != *local_host
+        || request.current_binding.local_host_ref() != local_host
         || revision.plan_id != row.2
         || revision.revision_id != row.3
         || revision.revision_hash != row.4
@@ -847,7 +849,7 @@ fn load_claim_source(
         host_ref: local_host.clone(),
         participant_ref: participant_ref.clone(),
         protocol_correlation_id: row.6,
-        session_binding: request.captured_binding.clone(),
+        execution_freshness: request.captured_binding.clone(),
     };
     let admission = admission_service.evaluate_v2_with_availability(
         &revision,
@@ -903,7 +905,7 @@ fn load_claim_source(
         step,
         admission_ref: row.8,
         participant_ref,
-        expires_at: row.9.min(request.captured_binding.expires_at),
+        expires_at: row.9.min(request.captured_binding.expires_at()),
     })
 }
 
@@ -915,7 +917,7 @@ fn load_completion_source(
     context_ref: &AuthorityContextRefV1,
     envelope_ref: &EffectEnvelopeRefV1,
     run_ref: &ManagedRunRefV1,
-    current_binding: &HostSessionBinding,
+    current_binding: &HostExecutionFreshness,
     local_host: &HostRef,
     now: i64,
 ) -> AppResult<ClaimSourceV1> {
@@ -949,9 +951,9 @@ fn load_completion_source(
         || row.5 != "valid"
         || row.8 != "claimed"
         || row.3 <= now
-        || current_binding.expires_at <= now
-        || current_binding.local_host_ref != *local_host
-        || current_binding.bridge_id != revision.bridge_id
+        || current_binding.expires_at() <= now
+        || current_binding.local_host_ref() != local_host
+        || current_binding.bridge_id() != revision.bridge_id
         || participant_for_ref(&revision, &participant_ref).map(|p| &p.host_ref) != Some(local_host)
     {
         return invalid("Managed v2 completion authority is stale, expired, or substituted.");
@@ -970,7 +972,7 @@ fn load_completion_source(
         step,
         admission_ref: row.2,
         participant_ref,
-        expires_at: row.3.min(current_binding.expires_at),
+        expires_at: row.3.min(current_binding.expires_at()),
     })
 }
 
@@ -1139,9 +1141,9 @@ fn execute_schema_ref(step: &PlanStepV2) -> AppResult<String> {
     domain_hash("pastey-execute-result-schema-v1", execution_intent)
 }
 
-fn current_authority(binding: &HostSessionBinding, now: i64) -> CurrentHostAuthorityV1 {
+fn current_authority(binding: &HostExecutionFreshness, now: i64) -> CurrentHostAuthorityV1 {
     CurrentHostAuthorityV1 {
-        session_binding: binding.clone(),
+        execution_freshness: binding.clone(),
         bridge_active: true,
         burned: false,
         disconnected: false,
@@ -1259,7 +1261,7 @@ mod tests {
             HostEffectBackendV1, ResourceEffectV1, StepWorkDescriptorV1, ToolEffectIntentV1,
             ToolRequestV1,
         },
-        host_identity::{PlanParticipantRef, PlanParticipants},
+        host_identity::{HostSessionBinding, PlanParticipantRef, PlanParticipants},
         host_runtime::{HostEvent, HostEventSink, RuntimeTask, RuntimeTaskSpawner},
         managed_objects::{HostArtifactAcquisition, ManagedObjectAcquisitionKind},
         managed_resources::{ExecutableBindingSpecV1, HostManagedResourceBackendV1},
@@ -1559,8 +1561,8 @@ mod tests {
                 attempt_id: fixture.start.attempt_id.clone(),
                 step_id: step_id.into(),
                 input,
-                captured_binding: fixture.binding.clone(),
-                current_binding: fixture.binding.clone(),
+                captured_binding: fixture.binding.clone().into(),
+                current_binding: fixture.binding.clone().into(),
                 now: NOW + 2,
                 process_world: None,
             })
@@ -1948,8 +1950,8 @@ mod tests {
             attempt_id: fixture.start.attempt_id.clone(),
             step_id: "transform".into(),
             input: fixture.input.clone(),
-            captured_binding: fixture.binding.clone(),
-            current_binding: fixture.binding.clone(),
+            captured_binding: fixture.binding.clone().into(),
+            current_binding: fixture.binding.clone().into(),
             now: NOW + 2,
             process_world: None,
         }
@@ -1965,8 +1967,8 @@ mod tests {
             attempt_id: fixture.start.attempt_id.clone(),
             step_id: step_id.into(),
             input,
-            captured_binding: fixture.binding.clone(),
-            current_binding: fixture.binding.clone(),
+            captured_binding: fixture.binding.clone().into(),
+            current_binding: fixture.binding.clone().into(),
             now: NOW + 2,
             process_world: Some(ManagedProcessWorldSpecV1 {
                 executable: ExecutableBindingSpecV1 {
@@ -2289,8 +2291,8 @@ mod tests {
                 attempt_id: fixture.start.attempt_id.clone(),
                 step_id: "transform".into(),
                 input: fixture.input.clone(),
-                captured_binding: fixture.binding.clone(),
-                current_binding: fixture.binding.clone(),
+                captured_binding: fixture.binding.clone().into(),
+                current_binding: fixture.binding.clone().into(),
                 now: NOW + 3,
                 process_world: None,
             })
@@ -2303,8 +2305,8 @@ mod tests {
                 attempt_id: fixture.start.attempt_id.clone(),
                 step_id: "execute".into(),
                 input: wrong_revision,
-                captured_binding: fixture.binding.clone(),
-                current_binding: fixture.binding.clone(),
+                captured_binding: fixture.binding.clone().into(),
+                current_binding: fixture.binding.clone().into(),
                 now: NOW + 3,
                 process_world: None,
             })
@@ -2325,8 +2327,8 @@ mod tests {
                 attempt_id: fixture.start.attempt_id.clone(),
                 step_id: "execute".into(),
                 input: fixture.input.clone(),
-                captured_binding: fixture.binding.clone(),
-                current_binding: wrong_session,
+                captured_binding: fixture.binding.clone().into(),
+                current_binding: wrong_session.into(),
                 now: NOW + 3,
                 process_world: None,
             })
@@ -2342,8 +2344,8 @@ mod tests {
                 attempt_id: fixture.start.attempt_id.clone(),
                 step_id: "execute".into(),
                 input: fixture.input.clone(),
-                captured_binding: fixture.binding.clone(),
-                current_binding: fixture.binding.clone(),
+                captured_binding: fixture.binding.clone().into(),
+                current_binding: fixture.binding.clone().into(),
                 now: NOW + 2,
                 process_world: None,
             })

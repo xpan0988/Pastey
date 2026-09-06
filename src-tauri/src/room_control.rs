@@ -1716,7 +1716,9 @@ pub async fn receive_room_control_event_handler(
                         crate::native_v2_orchestration::accept_receiver_commit(
                             &ctx.state,
                             &commit,
-                            &captured_binding,
+                            &crate::host_identity::HostExecutionFreshness::Remote(
+                                captured_binding.clone(),
+                            ),
                             now,
                         )?;
                         committed_attempt = Some(commit.attempt_id);
@@ -1752,7 +1754,9 @@ pub async fn receive_room_control_event_handler(
                         crate::native_v2_orchestration::accept_receiver_step_commit(
                             &ctx.state,
                             &commit,
-                            &captured_binding,
+                            &crate::host_identity::HostExecutionFreshness::Remote(
+                                captured_binding.clone(),
+                            ),
                             now,
                         )?;
                         committed_attempt = Some(commit.attempt_id);
@@ -1767,7 +1771,9 @@ pub async fn receive_room_control_event_handler(
                             crate::native_v2_orchestration::accept_receiver_cancel(
                                 &ctx.state,
                                 &cancel,
-                                &captured_binding,
+                                &crate::host_identity::HostExecutionFreshness::Remote(
+                                    captured_binding.clone(),
+                                ),
                                 now,
                             )?;
                         let _ = ctx
@@ -1845,7 +1851,7 @@ pub async fn receive_room_control_event_handler(
             crate::native_v2_orchestration::start_receiver_attempt(
                 ctx.state.clone(),
                 attempt_id,
-                captured_binding.clone(),
+                crate::host_identity::HostExecutionFreshness::Remote(captured_binding.clone()),
             );
         }
         if let Some(transfer_id) = cancelled_transfer {

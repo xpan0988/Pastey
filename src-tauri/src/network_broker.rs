@@ -1626,7 +1626,7 @@ mod tests {
         state.install_envelope(draft, envelope.clone()).unwrap();
         state.activate_run(&envelope.run_control_ref, 110).unwrap();
         let current = CurrentHostAuthorityV1 {
-            session_binding: binding,
+            execution_freshness: binding.into(),
             bridge_active: true,
             burned: false,
             disconnected: false,
@@ -2353,7 +2353,7 @@ mod tests {
                 }
                 "expiry" => fixture.current.now = fixture.context.expires_at,
                 "session" => {
-                    fixture.current.session_binding = HostSessionBinding::new(
+                    fixture.current.execution_freshness = HostSessionBinding::new(
                         "bridge-phase5-network",
                         fixture.context.host_ref.clone(),
                         HostRef::from_device_id("phase5-network-peer").unwrap(),
@@ -2362,7 +2362,8 @@ mod tests {
                         "substituted-route",
                         10_000,
                     )
-                    .unwrap();
+                    .unwrap()
+                    .into();
                 }
                 _ => unreachable!(),
             }

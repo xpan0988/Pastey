@@ -21,7 +21,8 @@ use crate::{
         ManagedPrimitiveAvailabilityV1,
     },
     host_identity::{
-        HostRef, HostSessionBinding, PlanParticipant, PlanParticipantRef, PlanParticipants,
+        HostExecutionFreshness, HostRef, HostSessionBinding, LocalExecutionFreshness,
+        PlanParticipant, PlanParticipantRef, PlanParticipants,
     },
     storage::AppPaths,
 };
@@ -509,28 +510,25 @@ impl<'a> BridgePlanV2Store<'a> {
         current_binding: &HostSessionBinding,
         now: i64,
     ) -> AppResult<()> {
-        self.record_review_with_mode(review, current_binding, now, false)
-    }
-
-    pub(crate) fn record_local_review(
-        &self,
-        review: &ReviewRequestV2,
-        current_binding: &HostSessionBinding,
-        now: i64,
-    ) -> AppResult<()> {
-        self.record_review_with_mode(review, current_binding, now, true)
-    }
-
-    fn record_review_with_mode(
-        &self,
-        review: &ReviewRequestV2,
-        current_binding: &HostSessionBinding,
-        now: i64,
-        allow_requester_local: bool,
-    ) -> AppResult<()> {
-        validate_review(review, now, allow_requester_local)?;
+        validate_remote_review(review, now)?;
         ensure_active_bridge(self.paths, &review.revision.bridge_id)?;
-        validate_review_binding(review, current_binding, now, allow_requester_local)?;
+        validate_review_binding(review, current_binding, now)?;
+        self.persist_review(review, now)
+    }
+
+    pub(crate) fn record_local_authority_snapshot(
+        &self,
+        review: &ReviewRequestV2,
+        current_freshness: &LocalExecutionFreshness,
+        now: i64,
+    ) -> AppResult<()> {
+        validate_local_authority_snapshot(review, now)?;
+        ensure_active_bridge(self.paths, &review.revision.bridge_id)?;
+        validate_local_review_freshness(review, current_freshness, now)?;
+        self.persist_review(review, now)
+    }
+
+    fn persist_review(&self, review: &ReviewRequestV2, now: i64) -> AppResult<()> {
         let mut conn = connection(self.paths)?;
         let tx = conn.transaction()?;
         let revision_json = serde_json::to_string(&review.revision)?;
@@ -597,10 +595,10 @@ impl<'a> BridgePlanV2Store<'a> {
         admission_service: &HostAdmissionService,
         now: i64,
     ) -> AppResult<AttemptStartDecisionV2> {
-        self.accept_attempt_start_with_availability(
+        self.accept_attempt_start_with_freshness(
             start,
-            captured_binding,
-            current_binding,
+            &HostExecutionFreshness::Remote(captured_binding.clone()),
+            &HostExecutionFreshness::Remote(current_binding.clone()),
             admission_service,
             ManagedPrimitiveAvailabilityV1::unavailable(),
             now,
@@ -617,6 +615,26 @@ impl<'a> BridgePlanV2Store<'a> {
         start: &AttemptStartV2,
         captured_binding: &HostSessionBinding,
         current_binding: &HostSessionBinding,
+        admission_service: &HostAdmissionService,
+        availability: ManagedPrimitiveAvailabilityV1,
+        now: i64,
+    ) -> AppResult<AttemptStartDecisionV2> {
+        self.accept_attempt_start_with_freshness(
+            start,
+            &HostExecutionFreshness::Remote(captured_binding.clone()),
+            &HostExecutionFreshness::Remote(current_binding.clone()),
+            admission_service,
+            availability,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn accept_attempt_start_with_freshness(
+        &self,
+        start: &AttemptStartV2,
+        captured_freshness: &HostExecutionFreshness,
+        current_freshness: &HostExecutionFreshness,
         admission_service: &HostAdmissionService,
         availability: ManagedPrimitiveAvailabilityV1,
         now: i64,
@@ -662,13 +680,15 @@ impl<'a> BridgePlanV2Store<'a> {
             return invalid("Bridge Plan v2 attempt does not match the exact reviewed Plan.");
         }
 
-        // Claim the authenticated v2 event before admission. A stale-binding
-        // denial requires a fresh event/nonce and cannot be replayed after a
-        // reconnect. V1 replay keys live in separate tables and namespaces.
-        conn.execute(
-            "INSERT INTO bridge_plan_v2_protocol_messages (bridge_id, message_id, request_nonce, correlation_id, received_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![start.bridge_id, start.message_id, start.request_nonce, start.correlation_id, now],
-        )?;
+        // Only an actual Room Control event needs the protocol replay claim.
+        // Direct local dispatch is already process-confined and is claimed by
+        // the exact receiver-attempt transition below.
+        if matches!(captured_freshness, HostExecutionFreshness::Remote(_)) {
+            conn.execute(
+                "INSERT INTO bridge_plan_v2_protocol_messages (bridge_id, message_id, request_nonce, correlation_id, received_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![start.bridge_id, start.message_id, start.request_nonce, start.correlation_id, now],
+            )?;
+        }
 
         let request = HostAdmissionRequestV2 {
             attempt_id: start.attempt_id.clone(),
@@ -676,16 +696,16 @@ impl<'a> BridgePlanV2Store<'a> {
             plan_id: start.plan_id.clone(),
             revision_id: start.revision_id.clone(),
             revision_hash: start.revision_hash.clone(),
-            host_ref: captured_binding.local_host_ref.clone(),
+            host_ref: captured_freshness.local_host_ref().clone(),
             participant_ref: start.target.clone(),
             protocol_correlation_id: start.correlation_id.clone(),
-            session_binding: captured_binding.clone(),
+            execution_freshness: captured_freshness.clone(),
         };
         let decision = admission_service.evaluate_v2_with_availability(
             &review.revision,
             &review.approval,
             &request,
-            current_binding,
+            current_freshness,
             availability,
             now,
         )?;
@@ -694,7 +714,7 @@ impl<'a> BridgePlanV2Store<'a> {
         };
         conn.execute(
             "INSERT INTO bridge_plan_v2_attempts (attempt_id, bridge_id, approval_id, plan_id, revision_id, revision_hash, target_participant_ref, correlation_id, session_binding_ref, admission_ref, expires_at, state, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'accepted', ?12)",
-            params![start.attempt_id, start.bridge_id, start.approval_id, start.plan_id, start.revision_id, start.revision_hash, start.target.as_str(), start.correlation_id, captured_binding.binding_ref, admission.admission_ref, start.expires_at, now],
+            params![start.attempt_id, start.bridge_id, start.approval_id, start.plan_id, start.revision_id, start.revision_hash, start.target.as_str(), start.correlation_id, captured_freshness.authority_ref(), admission.admission_ref, start.expires_at, now],
         )?;
         Ok(AttemptStartDecisionV2::Accepted(AcceptedAttemptV2 {
             attempt_id: start.attempt_id.clone(),
@@ -729,7 +749,7 @@ pub(crate) fn protocol_metadata(
     match kind {
         "bridge_plan.v2.review_request" => {
             let review: ReviewRequestV2 = serde_json::from_value(payload)?;
-            validate_review(&review, now, false)?;
+            validate_remote_review(&review, now)?;
             if review.revision.bridge_id != expected_bridge {
                 return invalid("Bridge Plan v2 review crossed Bridge scope.");
             }
@@ -976,11 +996,7 @@ pub(crate) fn delete_bridge_records(tx: &Transaction<'_>, bridge_id: &str) -> Ap
     Ok(())
 }
 
-fn validate_review(
-    review: &ReviewRequestV2,
-    now: i64,
-    allow_requester_local: bool,
-) -> AppResult<()> {
+fn validate_review_common(review: &ReviewRequestV2, now: i64) -> AppResult<()> {
     if review.protocol_version != PROTOCOL_VERSION {
         return invalid("Bridge Plan protocol v2 requires its exact protocol version.");
     }
@@ -994,11 +1010,25 @@ fn validate_review(
     verify_sealed_revision(&review.revision)?;
     validate_approval(&review.approval, &review.revision, now)?;
     if review.sender != review.revision.requester
-        || (review.target == review.sender && !allow_requester_local)
-        || (allow_requester_local && review.target != review.sender)
         || participant_for_ref(&review.revision, &review.target).is_none()
     {
         return invalid("Bridge Plan protocol v2 review participants are invalid.");
+    }
+    Ok(())
+}
+
+fn validate_remote_review(review: &ReviewRequestV2, now: i64) -> AppResult<()> {
+    validate_review_common(review, now)?;
+    if review.target == review.sender {
+        return invalid("Bridge Plan protocol v2 remote review target is invalid.");
+    }
+    Ok(())
+}
+
+fn validate_local_authority_snapshot(review: &ReviewRequestV2, now: i64) -> AppResult<()> {
+    validate_review_common(review, now)?;
+    if review.target != review.sender {
+        return invalid("Bridge Plan v2 local authority target is invalid.");
     }
     Ok(())
 }
@@ -1007,7 +1037,6 @@ fn validate_review_binding(
     review: &ReviewRequestV2,
     binding: &HostSessionBinding,
     now: i64,
-    allow_requester_local: bool,
 ) -> AppResult<()> {
     if binding.expires_at <= now || binding.bridge_id != review.revision.bridge_id {
         return invalid("Bridge Plan v2 review session binding is unavailable.");
@@ -1016,17 +1045,28 @@ fn validate_review_binding(
         .ok_or_else(|| AppError::InvalidInput("Bridge Plan v2 sender is unavailable.".into()))?;
     let target = participant_for_ref(&review.revision, &review.target)
         .ok_or_else(|| AppError::InvalidInput("Bridge Plan v2 target is unavailable.".into()))?;
-    let participants_match = if allow_requester_local {
-        binding.is_requester_local()
-            && sender.host_ref == binding.local_host_ref
-            && target.host_ref == binding.local_host_ref
-    } else {
-        !binding.is_requester_local()
-            && sender.host_ref == binding.peer_host_ref
-            && target.host_ref == binding.local_host_ref
-    };
-    if !participants_match {
+    if sender.host_ref != binding.peer_host_ref || target.host_ref != binding.local_host_ref {
         return invalid("Bridge Plan v2 participants do not match the current Host session.");
+    }
+    Ok(())
+}
+
+fn validate_local_review_freshness(
+    review: &ReviewRequestV2,
+    freshness: &LocalExecutionFreshness,
+    now: i64,
+) -> AppResult<()> {
+    if freshness.expires_at <= now || freshness.bridge_id != review.revision.bridge_id {
+        return invalid("Bridge Plan v2 local runtime freshness is unavailable.");
+    }
+    let sender = participant_for_ref(&review.revision, &review.sender)
+        .ok_or_else(|| AppError::InvalidInput("Bridge Plan v2 sender is unavailable.".into()))?;
+    let target = participant_for_ref(&review.revision, &review.target)
+        .ok_or_else(|| AppError::InvalidInput("Bridge Plan v2 target is unavailable.".into()))?;
+    if sender.host_ref != *freshness.local_runtime_ref.host_ref()
+        || target.host_ref != *freshness.local_runtime_ref.host_ref()
+    {
+        return invalid("Bridge Plan v2 local participant does not match this HostRuntime.");
     }
     Ok(())
 }

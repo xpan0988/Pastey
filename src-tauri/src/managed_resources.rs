@@ -1995,7 +1995,7 @@ mod tests {
             run_control_ref: envelope.run_control_ref,
             context,
             current: CurrentHostAuthorityV1 {
-                session_binding: binding,
+                execution_freshness: binding.into(),
                 bridge_active: true,
                 burned: false,
                 disconnected: false,
@@ -2480,7 +2480,12 @@ mod tests {
     fn cross_run_envelope_and_session_substitution_fail_closed() {
         let mut primary = fixture();
         let mut substituted = primary.access.clone();
-        substituted.current.session_binding.binding_ref = "wrong-binding".into();
+        let crate::host_identity::HostExecutionFreshness::Remote(binding) =
+            &mut substituted.current.execution_freshness
+        else {
+            unreachable!("fixture uses a remote session binding")
+        };
+        binding.binding_ref = "wrong-binding".into();
         assert!(primary
             .resolver
             .provision_scratch(&primary.authority, &substituted, &primary.scratch, 4096,)
