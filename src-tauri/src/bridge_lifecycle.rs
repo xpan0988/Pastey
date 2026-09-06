@@ -107,7 +107,11 @@ async fn invalidate_unreachable_sessions(state: Arc<AppState>) -> AppResult<()> 
     Ok(())
 }
 
-async fn probe_exact_peer(room: &StoredRoom, peer: &StoredBridgePeerEndpoint) -> bool {
+/// Performs the production Bridge liveness proof for one exact stored route.
+/// This is intentionally non-authorizing: callers may use it only to decide
+/// whether a `Connected` endpoint is current enough to attempt normal Bridge
+/// transport.
+pub(crate) async fn probe_exact_peer(room: &StoredRoom, peer: &StoredBridgePeerEndpoint) -> bool {
     let (Some(host), Some(port), Some(expected_key)) = (
         peer.endpoint_host.as_deref(),
         peer.endpoint_port,

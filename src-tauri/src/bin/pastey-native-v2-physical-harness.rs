@@ -230,24 +230,41 @@ async fn wait_for_exact_connected_peer(
     bridge_id: &str,
     remote_host_ref: &str,
 ) -> AppResult<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    wait_for_exact_connected_peer_with_timeout(
+        runtime,
+        bridge_id,
+        remote_host_ref,
+        Duration::from_secs(30),
+        Duration::from_millis(250),
+    )
+    .await
+}
+
+async fn wait_for_exact_connected_peer_with_timeout(
+    runtime: &HostRuntime,
+    bridge_id: &str,
+    remote_host_ref: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> AppResult<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let matches = storage::list_bridge_peer_endpoints(&runtime.paths, bridge_id)?
             .into_iter()
-            .filter(|peer| {
-                peer.logical_host_ref.as_deref() == Some(remote_host_ref)
-                    && peer.liveness == models::BridgePeerLiveness::Connected
-            })
-            .count();
-        if matches == 1 {
-            return Ok(());
+            .filter(|peer| peer.logical_host_ref.as_deref() == Some(remote_host_ref))
+            .collect::<Vec<_>>();
+        if matches.len() == 1 && matches[0].liveness == models::BridgePeerLiveness::Connected {
+            let room = storage::get_room_by_id(&runtime.paths, bridge_id)?;
+            if bridge_lifecycle::probe_exact_peer(&room, &matches[0]).await {
+                return Ok(());
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(invalid(
                 "the exact remote HostRef did not establish one current connected Bridge session",
             ));
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -737,6 +754,192 @@ fn verify(profile: Profile, args: &BTreeMap<String, String>) -> AppResult<()> {
         Err(invalid(
             "physical evidence does not satisfy the authoritative acceptance gate",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{
+        BridgePeerJoinMethod, BridgePeerLiveness, LocalRole, StoredBridgePeerEndpoint,
+    };
+
+    const BRIDGE_ID: &str = "physical-readiness-test-bridge";
+
+    fn runtime_with_device(label: &str, device_id: &str) -> Arc<HostRuntime> {
+        let root = std::env::temp_dir().join(format!("{label}-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths::new(root.clone(), root.join("logs"));
+        paths.ensure_directories().unwrap();
+        let config = crate::config::StoredConfig {
+            version: 5,
+            default_expiry_minutes: 15,
+            inbox_dir: None,
+            auto_burn_after_download: false,
+            save_received_files_to_inbox: true,
+            save_received_images_to_inbox: true,
+            transfer_window_override: None,
+            dev_tools_enabled: false,
+            micro_flow_group_mode: "off".into(),
+            shortcut: "test".into(),
+            app_secret: crate::crypto::encode_key(&[19u8; 32]),
+            device_id: device_id.into(),
+        };
+        storage::init_database(&paths).unwrap();
+        let master_key = crate::config::master_key(&config).unwrap();
+        storage::create_room(
+            &paths,
+            &master_key,
+            "123456",
+            5,
+            LocalRole::Creator,
+            Some(BRIDGE_ID.into()),
+            Some(storage::now_ts() + 3_600),
+        )
+        .unwrap();
+        Arc::new(
+            HostRuntime::new(
+                paths,
+                config,
+                Arc::new(SilentEvents),
+                Arc::new(TokioSpawner),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn peer(
+        host_ref: &str,
+        route: &str,
+        port: u16,
+        transport_public_key: String,
+    ) -> StoredBridgePeerEndpoint {
+        StoredBridgePeerEndpoint {
+            room_id: BRIDGE_ID.into(),
+            peer_session_id: route.into(),
+            display_name: Some("physical-readiness-test-peer".into()),
+            endpoint_host: Some("127.0.0.1".into()),
+            endpoint_port: Some(port),
+            transport_public_key: Some(transport_public_key),
+            liveness: BridgePeerLiveness::Connected,
+            join_method: BridgePeerJoinMethod::ManualCode,
+            logical_host_ref: Some(host_ref.into()),
+            durable_identity_id: None,
+            updated_at: storage::now_ts(),
+        }
+    }
+
+    #[tokio::test]
+    async fn physical_readiness_rejects_stale_connected_key_then_accepts_reconciled_peer() {
+        let requester = runtime_with_device("physical-readiness-requester", "readiness-requester");
+        let remote = runtime_with_device("physical-readiness-remote", "readiness-remote");
+        let port = crate::transfer::start_room_server(remote.clone(), BRIDGE_ID)
+            .await
+            .unwrap();
+        let current_key = remote
+            .active_servers
+            .lock()
+            .get(BRIDGE_ID)
+            .unwrap()
+            .transport_public_key();
+        let stale_key = crate::crypto::encode_key(&crate::crypto::transport_public_key(
+            &crate::crypto::random_key(),
+        ));
+        storage::upsert_bridge_peer_endpoint(
+            &requester.paths,
+            &peer(
+                remote.local_host_ref.as_str(),
+                "remote-current-route",
+                port,
+                stale_key,
+            ),
+        )
+        .unwrap();
+
+        assert!(wait_for_exact_connected_peer_with_timeout(
+            &requester,
+            BRIDGE_ID,
+            remote.local_host_ref.as_str(),
+            Duration::from_millis(80),
+            Duration::from_millis(5),
+        )
+        .await
+        .is_err());
+
+        storage::upsert_bridge_peer_endpoint(
+            &requester.paths,
+            &peer(
+                remote.local_host_ref.as_str(),
+                "remote-current-route",
+                port,
+                current_key,
+            ),
+        )
+        .unwrap();
+        assert!(wait_for_exact_connected_peer_with_timeout(
+            &requester,
+            BRIDGE_ID,
+            remote.local_host_ref.as_str(),
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .await
+        .is_ok());
+
+        let requester_dir = requester.paths.app_data_dir.clone();
+        let remote_dir = remote.paths.app_data_dir.clone();
+        crate::transfer::stop_room_server(remote.clone(), BRIDGE_ID)
+            .await
+            .unwrap();
+        requester.shutdown_all();
+        remote.shutdown_all();
+        let _ = fs::remove_dir_all(requester_dir);
+        let _ = fs::remove_dir_all(remote_dir);
+    }
+
+    #[tokio::test]
+    async fn physical_readiness_rejects_wrong_or_ambiguous_host_matches() {
+        let requester =
+            runtime_with_device("physical-readiness-match", "readiness-match-requester");
+        let expected = crate::host_identity::HostRef::from_device_id("readiness-expected").unwrap();
+        let wrong = crate::host_identity::HostRef::from_device_id("readiness-wrong").unwrap();
+        storage::upsert_bridge_peer_endpoint(
+            &requester.paths,
+            &peer(wrong.as_str(), "wrong-route", 9, "wrong-key".into()),
+        )
+        .unwrap();
+        assert!(wait_for_exact_connected_peer_with_timeout(
+            &requester,
+            BRIDGE_ID,
+            expected.as_str(),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        )
+        .await
+        .is_err());
+
+        storage::upsert_bridge_peer_endpoint(
+            &requester.paths,
+            &peer(expected.as_str(), "ambiguous-route-a", 9, "key-a".into()),
+        )
+        .unwrap();
+        storage::upsert_bridge_peer_endpoint(
+            &requester.paths,
+            &peer(expected.as_str(), "ambiguous-route-b", 9, "key-b".into()),
+        )
+        .unwrap();
+        assert!(wait_for_exact_connected_peer_with_timeout(
+            &requester,
+            BRIDGE_ID,
+            expected.as_str(),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        )
+        .await
+        .is_err());
+
+        let requester_dir = requester.paths.app_data_dir.clone();
+        requester.shutdown_all();
+        let _ = fs::remove_dir_all(requester_dir);
     }
 }
 
