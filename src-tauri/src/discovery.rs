@@ -58,10 +58,7 @@ pub struct PendingJoinRequest {
 }
 
 #[derive(Clone, Debug)]
-pub struct OutgoingJoinRequest {
-    pub request_id: String,
-    pub created_at: i64,
-}
+pub struct OutgoingJoinRequest;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NearbyBeacon {
@@ -397,13 +394,10 @@ pub async fn request_nearby_join(
         app_version: env!("CARGO_PKG_VERSION").into(),
         response_port: Some(response_port),
     };
-    state.outgoing_join_requests.lock().insert(
-        request.request_id.clone(),
-        OutgoingJoinRequest {
-            request_id: request.request_id.clone(),
-            created_at: storage::now_ts(),
-        },
-    );
+    state
+        .outgoing_join_requests
+        .lock()
+        .insert(request.request_id.clone(), OutgoingJoinRequest);
     let join_url = join_request_url(record.source, record.join_request_port);
     logging::write_transfer_line(&format!(
         "[pastey antenna] event=join_request_url url={join_url}"

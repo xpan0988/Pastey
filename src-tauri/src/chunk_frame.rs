@@ -16,7 +16,6 @@ pub struct BinaryChunkFrame {
     pub is_final: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BinaryChunkFrameError {
     InvalidMagic,
@@ -24,7 +23,6 @@ pub enum BinaryChunkFrameError {
     InvalidFlags,
     InvalidHeader,
     InvalidCiphertextLength,
-    InvalidNonceLength,
     FrameTooLarge,
 }
 
@@ -36,7 +34,6 @@ impl BinaryChunkFrameError {
             Self::InvalidFlags => "invalid_flags",
             Self::InvalidHeader => "invalid_header",
             Self::InvalidCiphertextLength => "invalid_ciphertext_length",
-            Self::InvalidNonceLength => "invalid_nonce_length",
             Self::FrameTooLarge => "frame_too_large",
         }
     }

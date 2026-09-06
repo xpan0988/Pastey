@@ -74,13 +74,6 @@ impl BenchmarkMode {
             _ => Self::RawMemory,
         }
     }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::RawMemory => "raw_memory",
-            Self::PasteyPipeline => "pastey_pipeline",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

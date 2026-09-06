@@ -36,7 +36,7 @@ Execution locality does not change this chain. Core resolves each authored parti
 
 ## HostRuntime and the multi-Host model
 
-`HostRuntime` is the UI-independent Host service owner. It owns Host identity, current session resolution, managed-object bindings, Plan stores, admission, effect authority, resource/process/network backends, Worker/provider services, native-v2 coordination, lifecycle revocation, and Developer Terminal state. Tauri is the desktop invoke/event/task adapter; extracting `HostRuntime` did not create a Headless Host.
+`HostRuntime` is the UI-independent Host service owner. It owns Host identity, current session resolution, managed-object bindings, Plan stores, admission, effect authority, resource/process/network backends, Worker/provider services, native-v2 coordination, lifecycle revocation, and Developer Terminal state. Tauri is the desktop invoke/event/task adapter; extracting `HostRuntime` did not create a Headless Host. Layer 4 alone resolves a durable remote `HostRef` to exactly one live current Bridge session: it filters historical lifecycle rows, proves the exact transport key, validates current Room Control/server state, and returns an opaque session carrying the resulting `HostSessionBinding`. Orchestration and acceptance harnesses do not inspect Bridge persistence or probe routes themselves.
 
 `HostRef` is Pastey's durable logical Host identity, and `PlanParticipantRef` names a role within one immutable Plan. Local execution freshness is a `LocalRuntimeRef` bound only to the current durable Host and process generation; it has no peer, route, session, or session-pair fields. `HostSessionBinding` is reserved for a remote Host's exact current Layer 4 Bridge/session route. These identities are not interchangeable:
 

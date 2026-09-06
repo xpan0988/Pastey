@@ -13,7 +13,6 @@ use serde_json::Value;
 
 use crate::{
     error::{AppError, AppResult},
-    host_identity::{project_legacy_plan_participants, HostRef, LegacyPlanParticipantProjection},
     models::PipelineHandoffMetadata,
     storage::AppPaths,
 };
@@ -1669,24 +1668,6 @@ pub(crate) fn canonical_revision_hash(revision: &BridgePlanRevision) -> AppResul
         "{HASH_VERSION}:{}",
         blake3::hash(format!("{HASH_VERSION}\0{canonical}").as_bytes()).to_hex()
     ))
-}
-
-/// Additive Phase 2 view of current v1 device tokens. This never enters the
-/// revision payload, persistence, protocol, or semantic hash. Phase 4 will
-/// replace it with native participants rather than reinterpreting v1.
-#[allow(dead_code)]
-pub(crate) fn legacy_participant_projection(
-    revision: &BridgePlanRevision,
-    resolved_hosts: &BTreeMap<String, HostRef>,
-) -> AppResult<Vec<LegacyPlanParticipantProjection>> {
-    project_legacy_plan_participants(
-        &revision.plan_id,
-        [
-            revision.requesting_device_ref.clone(),
-            revision.selected_device_ref.clone(),
-        ],
-        resolved_hosts,
-    )
 }
 
 /// Deterministically lowers one immutable revision into a platform-neutral
@@ -3924,30 +3905,6 @@ mod tests {
         ])
         .unwrap();
         assert_ne!(first.revision_hash, second.revision_hash);
-    }
-
-    #[test]
-    fn phase_two_participant_projection_does_not_reinterpret_v1_hashes() {
-        let revision = build(vec![search("B")]).unwrap();
-        let original_hash = canonical_revision_hash(&revision).unwrap();
-        let resolved = BTreeMap::from([
-            (
-                revision.requesting_device_ref.clone(),
-                HostRef::from_device_id("requesting-host").unwrap(),
-            ),
-            (
-                revision.selected_device_ref.clone(),
-                HostRef::from_device_id("selected-host").unwrap(),
-            ),
-        ]);
-
-        let participants = legacy_participant_projection(&revision, &resolved).unwrap();
-        assert_eq!(participants.len(), 2);
-        assert!(participants
-            .iter()
-            .all(|participant| participant.host_ref.is_some()));
-        assert_eq!(canonical_revision_hash(&revision).unwrap(), original_hash);
-        assert_eq!(revision.revision_hash, original_hash);
     }
 
     #[test]

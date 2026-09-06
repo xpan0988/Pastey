@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -427,57 +427,6 @@ fn session_pair_ref(
     format!("host-session-pair:v1:{}", hasher.finalize().to_hex())
 }
 
-/// Role-neutral projection for a legacy Plan device token. It is deliberately
-/// outside BridgePlanRevision v1 and therefore cannot affect its hash or wire.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LegacyPlanParticipantProjection {
-    pub participant_ref: PlanParticipantRef,
-    pub legacy_device_ref: String,
-    pub host_ref: Option<HostRef>,
-}
-
-pub fn project_legacy_plan_participants(
-    plan_id: &str,
-    device_refs: impl IntoIterator<Item = String>,
-    resolved_hosts: &BTreeMap<String, HostRef>,
-) -> AppResult<Vec<LegacyPlanParticipantProjection>> {
-    let mut seen = HashSet::new();
-    let mut claimed_hosts = HashSet::new();
-    let mut projections = Vec::new();
-    for legacy_device_ref in device_refs {
-        if !seen.insert(legacy_device_ref.clone()) {
-            continue;
-        }
-        let host_ref = resolved_hosts.get(&legacy_device_ref).cloned();
-        if let Some(host_ref) = &host_ref {
-            if !claimed_hosts.insert(host_ref.clone()) {
-                return Err(AppError::InvalidInput(
-                    "A HostRef cannot be claimed by multiple Plan participants.".into(),
-                ));
-            }
-        }
-        let participant_ref = if let Some(host_ref) = &host_ref {
-            PlanParticipantRef::for_host(plan_id, host_ref)?
-        } else {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"pastey-legacy-plan-participant-ref-v1\0");
-            hasher.update(plan_id.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(legacy_device_ref.as_bytes());
-            PlanParticipantRef(format!(
-                "{PARTICIPANT_REF_PREFIX}{}",
-                hasher.finalize().to_hex()
-            ))
-        };
-        projections.push(LegacyPlanParticipantProjection {
-            participant_ref,
-            legacy_device_ref,
-            host_ref,
-        });
-    }
-    Ok(projections)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,20 +462,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_host_ref_claims_are_rejected() {
+    fn plan_participants_reject_duplicate_host_refs() {
         let duplicate = host("same-host");
-        assert!(PlanParticipants::new("plan", [duplicate.clone(), duplicate.clone()]).is_err());
-
-        let resolved = BTreeMap::from([
-            ("legacy-a".to_string(), duplicate.clone()),
-            ("legacy-b".to_string(), duplicate),
-        ]);
-        assert!(project_legacy_plan_participants(
-            "plan",
-            ["legacy-a".to_string(), "legacy-b".to_string()],
-            &resolved,
-        )
-        .is_err());
+        assert!(PlanParticipants::new("plan", [duplicate.clone(), duplicate]).is_err());
     }
 
     #[test]

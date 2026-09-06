@@ -360,7 +360,6 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
             room_id: room_id.to_string(),
             room_code_hash: room.room_code_hash,
             port,
-            started_at: storage::now_ts(),
             expires_at: room.expires_at,
             transport_secret,
             shutdown: Some(shutdown_tx),
@@ -635,16 +634,17 @@ pub async fn send_room_file_to_bridge_peer_endpoint_with_landing(
 /// Sends one exact managed logical revision through the existing encrypted
 /// Layer 3/4/1 file path. The metadata can only validate the authored v2
 /// Transfer and destination binding; it grants no path or transfer authority.
-pub(crate) async fn send_native_v2_managed_revision_to_bridge_peer_endpoint(
+pub(crate) async fn send_native_v2_managed_revision_to_current_remote_session(
     state: Arc<AppState>,
     room_id: &str,
     item_id: &str,
     file_path: &Path,
     queue_item_id: Option<String>,
     requested_window: Option<usize>,
-    endpoint: BridgePeerTransferEndpoint,
+    session: crate::bridge_lifecycle::CurrentRemoteHostSession,
     metadata: crate::native_v2_orchestration::NativeV2TransferMetadataV1,
 ) -> AppResult<()> {
+    let endpoint = session.revalidate_for_transfer(&state).await?;
     send_room_file_to_bridge_peer_endpoint_with_orchestration(
         state,
         room_id,

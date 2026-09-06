@@ -15,7 +15,7 @@ use crate::{
     diagnostics, discovery, effect_authority,
     error::AppResult,
     execution_world, file_candidates,
-    host_admission::{HostAdmissionDecision, HostAdmissionRequest, HostAdmissionService},
+    host_admission::HostAdmissionService,
     host_identity::{
         HostExecutionFreshness, HostRef, HostSessionBinding, LocalExecutionFreshness,
         LocalRuntimeRef,
@@ -26,11 +26,7 @@ use crate::{
     storage::AppPaths,
     transfer, transfer_orchestration,
     worker_harness::WorkerHarnessRunV1,
-    worker_provider::OpenAICompatibleStreamingWorkerProviderV1,
-    worker_provider_config::{
-        WorkerProviderConfigServiceV1, WorkerProviderHealthStateV1, WorkerProviderMetadataV1,
-        WorkerProviderSelectionV1,
-    },
+    worker_provider_config::WorkerProviderConfigServiceV1,
 };
 
 /// A UI-independent notification emitted by Host/Core services.
@@ -411,39 +407,12 @@ impl HostRuntime {
             record.cancel();
         }
     }
-
-    /// Non-secret Host control-plane projection for later settings UI work.
-    /// This is deliberately crate-private and does not make Worker execution
-    /// or provider mutation reachable from a product command.
-    #[allow(dead_code)] // Later settings adapter; intentionally not a Tauri command yet.
-    pub(crate) fn worker_provider_metadata(&self) -> AppResult<Vec<WorkerProviderMetadataV1>> {
-        self.worker_provider_configs.list_metadata()
-    }
-
-    /// Explicit no-effect provider probe. Provider HTTPS is Host Harness
-    /// infrastructure and cannot be reused as a Worker NetworkGrant.
-    #[allow(dead_code)] // Later settings adapter; intentionally not a Tauri command yet.
-    pub(crate) fn probe_worker_provider(
-        &self,
-        selection: &WorkerProviderSelectionV1,
-    ) -> AppResult<WorkerProviderMetadataV1> {
-        let binding = self.worker_provider_configs.resolve(selection)?;
-        let provider = OpenAICompatibleStreamingWorkerProviderV1::from_binding(binding)?;
-        let health = if provider.health_probe().is_ok() {
-            WorkerProviderHealthStateV1::Healthy
-        } else {
-            WorkerProviderHealthStateV1::Unhealthy
-        };
-        self.worker_provider_configs
-            .record_health(&selection.config_ref, health)
-    }
 }
 
 pub struct ActiveRoomServer {
     pub room_id: String,
     pub room_code_hash: String,
     pub port: u16,
-    pub started_at: i64,
     pub expires_at: i64,
     pub transport_secret: [u8; 32],
     pub shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -630,36 +599,6 @@ pub(crate) fn current_host_execution_freshness(
     }
 }
 
-#[allow(dead_code)]
-pub fn validate_current_host_session_binding(
-    state: &HostRuntime,
-    captured: &HostSessionBinding,
-    now: i64,
-) -> AppResult<()> {
-    let current =
-        current_host_session_binding(state, &captured.bridge_id, &captured.peer_route_ref)?;
-    captured.validate_current(&current, now)
-}
-
-/// Revalidates the captured Layer 4 association, then delegates the exact
-/// stored approval/revision decision to the Host-local admission service.
-/// The result is not an attempt or step grant.
-#[allow(dead_code)] // Native protocol attachment begins with Phase 4 protocol v2.
-pub fn evaluate_current_host_admission(
-    state: &Arc<HostRuntime>,
-    request: &HostAdmissionRequest,
-    now: i64,
-) -> AppResult<HostAdmissionDecision> {
-    let current = current_host_session_binding(
-        state,
-        &request.session_binding.bridge_id,
-        &request.session_binding.peer_route_ref,
-    )?;
-    state
-        .host_admission
-        .evaluate(&state.paths, request, &current, now)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,7 +730,6 @@ mod tests {
                 room_id: room.id.clone(),
                 room_code_hash: room.room_code_hash.clone(),
                 port: 8000,
-                started_at: storage::now_ts(),
                 expires_at: room.expires_at,
                 transport_secret: crate::crypto::random_key(),
                 shutdown: None,
@@ -804,11 +742,16 @@ mod tests {
         )
         .unwrap();
         let durable_local_host_ref = runtime.local_host_ref.clone();
-        validate_current_host_session_binding(&runtime, &first, storage::now_ts()).unwrap();
+        let current =
+            current_host_session_binding(&runtime, &first.bridge_id, &first.peer_route_ref)
+                .unwrap();
+        first.validate_current(&current, storage::now_ts()).unwrap();
 
         storage::mark_rooms_left_on_startup(&paths).unwrap();
         assert!(
-            validate_current_host_session_binding(&runtime, &first, storage::now_ts()).is_err()
+            current_host_session_binding(&runtime, &first.bridge_id, &first.peer_route_ref)
+                .and_then(|current| first.validate_current(&current, storage::now_ts()))
+                .is_err()
         );
 
         storage::update_room_peer(
@@ -842,10 +785,13 @@ mod tests {
             .is_err());
 
         storage::burn_room(&paths, &room.id, &paths.inbox_dir).unwrap();
-        assert!(
-            validate_current_host_session_binding(&runtime, &reconnected, storage::now_ts())
-                .is_err()
-        );
+        assert!(current_host_session_binding(
+            &runtime,
+            &reconnected.bridge_id,
+            &reconnected.peer_route_ref,
+        )
+        .and_then(|current| reconnected.validate_current(&current, storage::now_ts()))
+        .is_err());
         assert!(storage::list_bridge_peer_endpoints(&paths, &room.id)
             .unwrap()
             .is_empty());
