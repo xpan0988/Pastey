@@ -54,6 +54,7 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 | --- | --- |
 | `HostRuntime` and lifecycle | `src-tauri/src/host_runtime.rs` |
 | `HostRef`, `PlanParticipantRef`, `HostSessionBinding` | `src-tauri/src/host_identity.rs` |
+| Canonical current remote-Host session resolution and liveness proof | `src-tauri/src/bridge_lifecycle.rs`; opaque transfer consumption in `src-tauri/src/transfer.rs` |
 | Host admission | `src-tauri/src/host_admission.rs` |
 | Plan schema/protocol v2 | `src-tauri/src/bridge_plan_v2.rs` |
 | Native-v2 product orchestration | `src-tauri/src/native_v2_orchestration.rs` |

@@ -188,14 +188,12 @@ pub(crate) fn peer_capability_event(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BridgeDepartureKind {
-    Leave,
     Burn,
 }
 
 impl BridgeDepartureKind {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Leave => "leave",
             Self::Burn => "burn",
         }
     }
@@ -1671,21 +1669,33 @@ pub async fn receive_room_control_event_handler(
                     })
             }
             crate::native_v2_orchestration::READINESS_REQUEST_KIND => {
-                serde_json::from_value(payload)
-                    .map_err(AppError::from)
-                    .and_then(|request| {
-                        let result = crate::native_v2_orchestration::accept_readiness_request(
+                match serde_json::from_value(payload).map_err(AppError::from) {
+                    Ok(request) => {
+                        match crate::native_v2_orchestration::accept_readiness_request(
                             &ctx.state,
                             request,
                             &captured_binding,
                             now,
-                        )?;
-                        native_response = Some((
-                            crate::native_v2_orchestration::READINESS_KIND,
-                            serde_json::to_value(result)?,
-                        ));
-                        Ok(())
-                    })
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                match serde_json::to_value(result).map_err(AppError::from) {
+                                    Ok(value) => {
+                                        native_response = Some((
+                                            crate::native_v2_orchestration::READINESS_KIND,
+                                            value,
+                                        ));
+                                        Ok(())
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
             }
             crate::native_v2_orchestration::READINESS_KIND => serde_json::from_value(payload)
                 .map_err(AppError::from)
@@ -2540,8 +2550,10 @@ mod tests {
             peer_observation_ref: "observation".into(),
             peer_connected: true,
         };
-        for kind in [BridgeDepartureKind::Leave, BridgeDepartureKind::Burn] {
-            let event = bridge_departure_event(kind, &context).unwrap();
+        let burn = bridge_departure_event(BridgeDepartureKind::Burn, &context).unwrap();
+        let mut leave = burn.clone();
+        leave["payload"]["departureKind"] = Value::String("leave".into());
+        for event in [leave, burn] {
             let validated = validate_control_event(event, "room", "source", "target", now).unwrap();
             assert_eq!(validated.kind, "bridge_membership.departure");
             let mut room = RoomControlRoomState::default();
@@ -2555,7 +2567,7 @@ mod tests {
             assert!(room.inbox.is_empty());
         }
 
-        let wrong_session = bridge_departure_event(BridgeDepartureKind::Leave, &context).unwrap();
+        let wrong_session = bridge_departure_event(BridgeDepartureKind::Burn, &context).unwrap();
         assert!(validate_control_event(wrong_session, "room", "other", "target", now).is_err());
     }
 
@@ -2570,7 +2582,7 @@ mod tests {
             peer_observation_ref: "observation".into(),
             peer_connected: true,
         };
-        let mut unknown = bridge_departure_event(BridgeDepartureKind::Leave, &context).unwrap();
+        let mut unknown = bridge_departure_event(BridgeDepartureKind::Burn, &context).unwrap();
         unknown["payload"]["departureKind"] = Value::String("disconnect".into());
         assert!(validate_control_event(unknown, "room", "source", "target", now).is_err());
 

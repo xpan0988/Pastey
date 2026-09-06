@@ -927,7 +927,8 @@ impl HostRuntime {
         expires_at: i64,
         now: i64,
     ) -> AppResult<NativeV2PlanStatusV1> {
-        let events = prepare_requester_attempt(self, approval_id, attempt_id, expires_at, now)?;
+        let events =
+            prepare_requester_attempt(self, approval_id, attempt_id, expires_at, now).await?;
         let revision_id = NativeV2ProductStore::new(&self.paths)
             .approval(approval_id, now)?
             .revision_id;
@@ -975,7 +976,7 @@ impl HostRuntime {
         Ok(status)
     }
 
-    fn native_v2_local_readiness(
+    async fn native_v2_local_readiness(
         &self,
         revision: &PlanRevisionV2,
         target: &PlanParticipantRef,
@@ -1023,7 +1024,12 @@ impl HostRuntime {
                                 "Native v2 Transfer participant is unavailable.".into(),
                             )
                         })?;
-                    if peer_binding_for_host(self, &revision.bridge_id, &counterpart.host_ref, now)
+                    if self
+                        .resolve_current_remote_host_session(
+                            &revision.bridge_id,
+                            &counterpart.host_ref,
+                        )
+                        .await
                         .is_err()
                     {
                         return Ok(LocalReadinessV1 {
@@ -1405,7 +1411,7 @@ pub(crate) fn receiver_attempt_binding(
         .transpose()
 }
 
-fn prepare_requester_attempt(
+async fn prepare_requester_attempt(
     runtime: &Arc<HostRuntime>,
     approval_id: &str,
     attempt_id: &str,
@@ -1439,12 +1445,13 @@ fn prepare_requester_attempt(
                 &revision.bridge_id,
             )?)
         } else {
-            HostExecutionFreshness::Remote(peer_binding_for_host(
-                runtime,
-                &revision.bridge_id,
-                &participant.host_ref,
-                now,
-            )?)
+            HostExecutionFreshness::Remote(
+                runtime
+                    .resolve_current_remote_host_session(&revision.bridge_id, &participant.host_ref)
+                    .await?
+                    .binding()
+                    .clone(),
+            )
         };
         let correlation_id = format!("native-v2-review-{}", uuid::Uuid::new_v4());
         let request_nonce = format!("native-v2-nonce-{}", uuid::Uuid::new_v4());
@@ -1610,34 +1617,6 @@ async fn send_native_v2_intent(
     let route =
         crate::room_control::selected_peer_route(&intent.room_id, &intent.binding.peer_route_ref);
     crate::room_control::send_room_control_event(runtime, &intent.room_id, event, Some(route)).await
-}
-
-fn peer_binding_for_host(
-    runtime: &HostRuntime,
-    bridge_id: &str,
-    host_ref: &HostRef,
-    now: i64,
-) -> AppResult<crate::host_identity::HostSessionBinding> {
-    let peers = crate::storage::list_bridge_peer_endpoints(&runtime.paths, bridge_id)?;
-    let mut matches = peers.into_iter().filter(|peer| {
-        peer.logical_host_ref.as_deref() == Some(host_ref.as_str())
-            && peer.liveness == crate::models::BridgePeerLiveness::Connected
-    });
-    let peer = matches
-        .next()
-        .ok_or_else(|| AppError::InvalidInput("Plan Host route is unavailable.".into()))?;
-    if matches.next().is_some() {
-        return invalid("Plan Host route is ambiguous.");
-    }
-    let binding = crate::host_runtime::current_host_session_binding(
-        runtime,
-        bridge_id,
-        &peer.peer_session_id,
-    )?;
-    if binding.expires_at <= now || binding.peer_host_ref != *host_ref {
-        return invalid("Plan Host session binding is unavailable.");
-    }
-    Ok(binding)
 }
 
 fn native_v2_control_event(
@@ -1899,23 +1878,9 @@ async fn execute_authored_transfer(
         .ok_or_else(|| AppError::InvalidInput("Native v2 Transfer destination vanished.".into()))?
         .host_ref
         .clone();
-    let binding = peer_binding_for_host(&runtime, &revision.bridge_id, &destination_host, now)?;
-    let peer = crate::storage::list_bridge_peer_endpoints(&runtime.paths, &revision.bridge_id)?
-        .into_iter()
-        .find(|peer| peer.peer_session_id == binding.peer_route_ref)
-        .ok_or_else(|| AppError::InvalidInput("Native v2 Transfer route vanished.".into()))?;
-    let endpoint = crate::transfer::BridgePeerTransferEndpoint {
-        peer_session_id: peer.peer_session_id,
-        host: peer.endpoint_host.ok_or_else(|| {
-            AppError::InvalidInput("Native v2 Transfer endpoint is unavailable.".into())
-        })?,
-        port: peer.endpoint_port.ok_or_else(|| {
-            AppError::InvalidInput("Native v2 Transfer endpoint is unavailable.".into())
-        })?,
-        transport_public_key: peer.transport_public_key.ok_or_else(|| {
-            AppError::InvalidInput("Native v2 Transfer transport identity is unavailable.".into())
-        })?,
-    };
+    let session = runtime
+        .resolve_current_remote_host_session(&revision.bridge_id, &destination_host)
+        .await?;
     let acquisition = runtime.managed_objects.lock().acquisition_for_revision(
         &revision.bridge_id,
         &input.logical_object_id,
@@ -1957,17 +1922,18 @@ async fn execute_authored_transfer(
         content_digest: artifact.identity.digest.clone(),
         expires_at: approval.expires_at,
     };
-    let transfer_result = crate::transfer::send_native_v2_managed_revision_to_bridge_peer_endpoint(
-        runtime.clone(),
-        &revision.bridge_id,
-        &item.id,
-        &artifact.path,
-        Some(format!("native-v2:{attempt_id}:{}", step.id())),
-        None,
-        endpoint,
-        metadata,
-    )
-    .await;
+    let transfer_result =
+        crate::transfer::send_native_v2_managed_revision_to_current_remote_session(
+            runtime.clone(),
+            &revision.bridge_id,
+            &item.id,
+            &artifact.path,
+            Some(format!("native-v2:{attempt_id}:{}", step.id())),
+            None,
+            session,
+            metadata,
+        )
+        .await;
     let _ = crate::storage::delete_room_item(&runtime.paths, &item.id);
     transfer_result?;
     build_host_step_result(
@@ -2534,7 +2500,7 @@ fn fail_requester_attempt(
     Ok(())
 }
 
-pub(crate) fn accept_readiness_request(
+pub(crate) async fn accept_readiness_request(
     runtime: &HostRuntime,
     request: NativeV2ReadinessRequestV1,
     captured: &crate::host_identity::HostSessionBinding,
@@ -2585,7 +2551,8 @@ pub(crate) fn accept_readiness_request(
         request,
         HostExecutionFreshness::Remote(captured.clone()),
         now,
-    )?;
+    )
+    .await?;
     Ok(NativeV2ReadinessV1 {
         protocol_version: PROTOCOL_VERSION.into(),
         message_id: format!("native-v2-readiness-result-{}", uuid::Uuid::new_v4()),
@@ -2605,7 +2572,7 @@ pub(crate) fn accept_readiness_request(
     })
 }
 
-fn accept_local_readiness_request(
+async fn accept_local_readiness_request(
     runtime: &HostRuntime,
     review: &ReviewRequestV2,
     request: NativeV2ReadinessRequestV1,
@@ -2634,16 +2601,19 @@ fn accept_local_readiness_request(
         HostExecutionFreshness::Local(freshness.clone()),
         now,
     )
+    .await
 }
 
-fn record_receiver_readiness(
+async fn record_receiver_readiness(
     runtime: &HostRuntime,
     revision: &PlanRevisionV2,
     request: NativeV2ReadinessRequestV1,
     freshness: HostExecutionFreshness,
     now: i64,
 ) -> AppResult<HostReadinessV1> {
-    let readiness = runtime.native_v2_local_readiness(revision, &request.target, now)?;
+    let readiness = runtime
+        .native_v2_local_readiness(revision, &request.target, now)
+        .await?;
     connection(&runtime.paths)?.execute(
         "INSERT INTO native_v2_receiver_reviews
          (correlation_id, attempt_id, revision_id, revision_hash, approval_id,
@@ -3931,7 +3901,8 @@ async fn dispatch_native_v2_actions(
                 crate::bridge_plan_v2::BridgePlanV2Store::new(&runtime.paths)
                     .record_local_authority_snapshot(&review, &freshness, now)?;
                 let result =
-                    accept_local_readiness_request(&runtime, &review, request, &freshness, now)?;
+                    accept_local_readiness_request(&runtime, &review, request, &freshness, now)
+                        .await?;
                 pending.extend(accept_requester_readiness_core(
                     &runtime,
                     result,
@@ -4332,12 +4303,15 @@ pub(crate) fn validate_transfer_landing(
     {
         return invalid("Native v2 Transfer metadata does not match the authored movement.");
     }
-    let peer = crate::storage::list_bridge_peer_endpoints(&runtime.paths, &metadata.bridge_id)?
-        .into_iter()
-        .filter(|peer| peer.peer_session_id == context.peer_route_ref)
-        .collect::<Vec<_>>();
-    if peer.len() != 1
-        || peer[0].logical_host_ref.as_deref() != Some(metadata.source_host_ref.as_str())
+    let source_binding = crate::host_runtime::current_host_session_binding(
+        runtime,
+        &metadata.bridge_id,
+        &context.peer_route_ref,
+    )?;
+    if source_binding.peer_host_ref != metadata.source_host_ref
+        || source_binding.local_session_ref != context.local_session_ref
+        || source_binding.peer_session_ref != context.peer_session_ref
+        || source_binding.peer_route_ref != context.peer_route_ref
     {
         return invalid("Native v2 Transfer source Host/session binding is unavailable.");
     }
@@ -4989,12 +4963,12 @@ mod tests {
         )
     }
 
-    fn install_remote_room_control_peer(
+    async fn install_remote_room_control_peer(
         runtime: &HostRuntime,
         remote_host: &HostRef,
         peer_route_ref: &str,
         now: i64,
-    ) -> HostSessionBinding {
+    ) -> (HostSessionBinding, tokio::sync::oneshot::Sender<()>) {
         let local_secret = crate::crypto::random_key();
         runtime.active_servers.lock().insert(
             "bridge-native-v2".into(),
@@ -5002,7 +4976,6 @@ mod tests {
                 room_id: "bridge-native-v2".into(),
                 room_code_hash: "test-room-code".into(),
                 port: 9,
-                started_at: now,
                 expires_at: now + 3_600,
                 transport_secret: local_secret,
                 shutdown: None,
@@ -5011,6 +4984,30 @@ mod tests {
         let remote_secret = crate::crypto::random_key();
         let remote_public_key =
             crate::crypto::encode_key(&crate::crypto::transport_public_key(&remote_secret));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let remote_port = listener.local_addr().unwrap().port();
+        let response_key = remote_public_key.clone();
+        let router = axum::Router::new().route(
+            "/rooms/:room_id/diagnostics/ping",
+            axum::routing::post(move || {
+                let transport_public_key = response_key.clone();
+                async move {
+                    axum::Json(serde_json::json!({
+                        "transportPublicKey": transport_public_key,
+                    }))
+                }
+            }),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
         storage::upsert_bridge_peer_endpoint(
             &runtime.paths,
             &StoredBridgePeerEndpoint {
@@ -5018,7 +5015,7 @@ mod tests {
                 peer_session_id: peer_route_ref.into(),
                 display_name: Some("remote-test-host".into()),
                 endpoint_host: Some("127.0.0.1".into()),
-                endpoint_port: Some(9),
+                endpoint_port: Some(remote_port),
                 transport_public_key: Some(remote_public_key.clone()),
                 liveness: BridgePeerLiveness::Connected,
                 join_method: BridgePeerJoinMethod::ManualCode,
@@ -5035,10 +5032,21 @@ mod tests {
             .execute(
                 "UPDATE rooms SET peer_host = ?2, peer_port = ?3,
                  peer_transport_public_key = ?4 WHERE id = ?1",
-                params!["bridge-native-v2", "127.0.0.1", 9, remote_public_key],
+                params![
+                    "bridge-native-v2",
+                    "127.0.0.1",
+                    remote_port,
+                    remote_public_key
+                ],
             )
             .unwrap();
-        peer_binding_for_host(runtime, "bridge-native-v2", remote_host, now).unwrap()
+        let binding = runtime
+            .resolve_current_remote_host_session("bridge-native-v2", remote_host)
+            .await
+            .unwrap()
+            .binding()
+            .clone();
+        (binding, shutdown_tx)
     }
 
     fn remote_search_revision(runtime: &HostRuntime, remote_host: &HostRef) -> PlanRevisionV2 {
@@ -5173,8 +5181,8 @@ mod tests {
         (revision, approval)
     }
 
-    #[test]
-    fn file_backed_remote_attempt_preparation_commits_before_context_materialization() {
+    #[tokio::test]
+    async fn file_backed_remote_attempt_preparation_commits_before_context_materialization() {
         let paths = paths("native-v2-sqlite-prepare");
         let now = storage::now_ts();
         connection(&paths)
@@ -5186,8 +5194,9 @@ mod tests {
             .unwrap();
         let runtime = requester_runtime(paths.clone(), "sqlite-requester");
         let remote_host = host("sqlite-remote");
-        let _binding =
-            install_remote_room_control_peer(&runtime, &remote_host, "sqlite-remote-route", now);
+        let (_binding, _probe_shutdown) =
+            install_remote_room_control_peer(&runtime, &remote_host, "sqlite-remote-route", now)
+                .await;
         let revision = remote_search_revision(&runtime, &remote_host);
         let store = NativeV2ProductStore::new(&paths);
         store
@@ -5209,6 +5218,7 @@ mod tests {
             now + 600,
             now,
         )
+        .await
         .unwrap();
         let intent = remote_intent(&actions, "bridge_plan.v2.review_request");
         let event = materialize_native_v2_remote_event(&runtime, &intent).unwrap();
@@ -5227,8 +5237,8 @@ mod tests {
         assert_eq!(state, "checking_readiness");
     }
 
-    #[test]
-    fn file_backed_remote_step_commit_materializes_after_authoritative_commit() {
+    #[tokio::test]
+    async fn file_backed_remote_step_commit_materializes_after_authoritative_commit() {
         let paths = paths("native-v2-sqlite-step-commit");
         let now = storage::now_ts();
         connection(&paths)
@@ -5240,8 +5250,9 @@ mod tests {
             .unwrap();
         let runtime = requester_runtime(paths.clone(), "sqlite-step-requester");
         let remote_host = host("sqlite-step-remote");
-        let binding =
-            install_remote_room_control_peer(&runtime, &remote_host, "sqlite-step-route", now);
+        let (binding, _probe_shutdown) =
+            install_remote_room_control_peer(&runtime, &remote_host, "sqlite-step-route", now)
+                .await;
         let (revision, approval) =
             seed_remote_search_running(&runtime, &remote_host, &binding, now);
         let remote_participant =
@@ -5284,8 +5295,8 @@ mod tests {
         assert_eq!(commits, 1);
     }
 
-    #[test]
-    fn file_backed_terminal_propagation_commits_before_remote_context_materialization() {
+    #[tokio::test]
+    async fn file_backed_terminal_propagation_commits_before_remote_context_materialization() {
         let paths = paths("native-v2-sqlite-cancel");
         let now = storage::now_ts();
         connection(&paths)
@@ -5297,8 +5308,9 @@ mod tests {
             .unwrap();
         let runtime = requester_runtime(paths.clone(), "sqlite-cancel-requester");
         let remote_host = host("sqlite-cancel-remote");
-        let _binding =
-            install_remote_room_control_peer(&runtime, &remote_host, "sqlite-cancel-route", now);
+        let (_binding, _probe_shutdown) =
+            install_remote_room_control_peer(&runtime, &remote_host, "sqlite-cancel-route", now)
+                .await;
         let revision = remote_search_revision(&runtime, &remote_host);
         let store = NativeV2ProductStore::new(&paths);
         store
@@ -5319,6 +5331,7 @@ mod tests {
             now + 600,
             now,
         )
+        .await
         .unwrap();
 
         let actions = terminate_requester_attempt(
@@ -5342,8 +5355,8 @@ mod tests {
         assert_eq!(state, "cancelled");
     }
 
-    #[test]
-    fn remote_intent_fails_closed_when_exact_route_session_is_substituted() {
+    #[tokio::test]
+    async fn remote_intent_fails_closed_when_exact_route_session_is_substituted() {
         let paths = paths("native-v2-sqlite-substitution");
         let now = storage::now_ts();
         connection(&paths)
@@ -5355,12 +5368,13 @@ mod tests {
             .unwrap();
         let runtime = requester_runtime(paths.clone(), "sqlite-substitution-requester");
         let remote_host = host("sqlite-substitution-remote");
-        let binding = install_remote_room_control_peer(
+        let (binding, _probe_shutdown) = install_remote_room_control_peer(
             &runtime,
             &remote_host,
             "sqlite-substitution-route",
             now,
-        );
+        )
+        .await;
         let intent = NativeV2RemoteIntentV1 {
             room_id: binding.bridge_id.clone(),
             binding: binding.clone(),

@@ -50,7 +50,7 @@ The deterministic native-v2 Composer accepts only explicit HostRefs, roots, and 
 
 One requester approval binds the complete immutable revision. Attempt start then follows a fail-closed distributed barrier:
 
-1. The requester resolves locality from the exact authored `HostRef`. Its own participant captures the current `LocalRuntimeRef`; every remote participant resolves the existing current, unambiguous `HostSessionBinding`.
+1. The requester resolves locality from the exact authored `HostRef`. Its own participant captures the current `LocalRuntimeRef`; every remote participant asks the canonical Layer 4 resolver for exactly one transport-proven current session and consumes its `HostSessionBinding`. Layer 5 does not interpret Bridge peer rows, reconnect markers, endpoints, or transport keys.
 2. Each Host validates the complete immutable Plan and its exact participant/freshness correlation, then evaluates roots, transfer counterparts, provider generation/model, process binding, and verified platform world only where required by its own authored fragment.
 3. Any Host-local requirement reported unavailable fails the whole Plan before an earlier Search, Transfer, or managed step can execute; availability on another Host cannot satisfy it.
 4. Each bound Host validates the exact review correlation and creates Host admission in prepared state. Remote Hosts receive authenticated protocol messages and claim their replay identities; the requester invokes the shared semantic lifecycle through direct typed coordinator actions and creates no local protocol replay claim.

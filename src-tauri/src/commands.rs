@@ -3597,28 +3597,6 @@ pub(crate) async fn burn_bridge_scope(
     Ok(true)
 }
 
-// Kept as an internal compatibility path for older protocol departure
-// messages. Burn is the only normal product lifecycle action; this command is
-// deliberately not registered with Tauri and has no renderer binding.
-#[allow(dead_code)]
-pub async fn leave_room(room_id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
-    run_async(async move {
-        let state = state.inner().clone();
-        let departure = crate::room_control::prepare_bridge_departure_delivery(
-            &state,
-            &room_id,
-            crate::room_control::BridgeDepartureKind::Leave,
-        )
-        .ok();
-        let result = burn_bridge_scope(state, &room_id, true).await;
-        if let Some(delivery) = departure {
-            let _ = crate::room_control::deliver_prepared_room_control_event(delivery).await;
-        }
-        result
-    })
-    .await
-}
-
 #[tauri::command]
 pub async fn cancel_transfer(
     transfer_id: String,
