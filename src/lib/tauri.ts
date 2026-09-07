@@ -551,6 +551,13 @@ export async function runBridgeDeviceDiagnostics(
   return invoke("run_bridge_device_diagnostics", { bridgeId, hostRef });
 }
 
+export async function runBridgeDeviceSelfCheck(
+  bridgeId: string,
+  hostRef: string
+): Promise<BridgeDeviceDiagnostics> {
+  return invoke("run_bridge_device_self_check", { bridgeId, hostRef });
+}
+
 export async function getLastBenchmarkResults(): Promise<LinkBenchmarkResult[]> {
   return invoke("get_last_benchmark_results");
 }

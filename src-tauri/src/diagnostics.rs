@@ -93,7 +93,46 @@ pub struct BridgeDeviceDiagnostics {
     pub connection: BridgeConnectionDiagnostics,
     pub managed_readiness: ManagedHostReadiness,
     pub link_benchmark: Option<LinkBenchmarkResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_e2e: Option<ManagedE2ESelfCheckReport>,
     pub checked_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ManagedE2ESelfCheckOutcome {
+    Pass,
+    Blocked,
+    Fail,
+}
+
+/// One explicit user-requested managed diagnostic. This is a bounded report of
+/// ordinary native-v2/Core facts, never an authority or a replayable command.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedE2ESelfCheckReport {
+    pub schema_version: String,
+    pub outcome: ManagedE2ESelfCheckOutcome,
+    pub checked_at: i64,
+    pub build_version: String,
+    pub build_commit: String,
+    pub bridge_id: String,
+    pub requester_host_ref: String,
+    pub remote_host_ref: String,
+    pub connection: BridgeConnectionDiagnostics,
+    pub managed_readiness: ManagedHostReadiness,
+    pub revision_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub search_committed: bool,
+    pub transfer_committed: bool,
+    pub transfer_content_digest: Option<String>,
+    pub transfer_destination_host_ref: Option<String>,
+    pub execute_committed: bool,
+    pub execute_result_digest: Option<String>,
+    pub execute_successor_lineage_count: u32,
+    pub core_terminal_state: Option<String>,
+    pub duration_millis: u64,
+    pub failure_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -233,6 +272,7 @@ mod tests {
                 managed_execution: DiagnosticState::NotConfigured,
             },
             link_benchmark: None,
+            managed_e2e: None,
             checked_at: 1,
         };
 

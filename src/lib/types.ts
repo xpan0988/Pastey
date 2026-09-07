@@ -72,7 +72,33 @@ export interface BridgeDeviceDiagnostics {
     managedExecution: DiagnosticState;
   };
   linkBenchmark?: LinkBenchmarkResult | null;
+  managedE2e?: ManagedE2ESelfCheckReport | null;
   checkedAt: number;
+}
+
+export interface ManagedE2ESelfCheckReport {
+  schemaVersion: "pastey-managed-e2e-self-check-v1";
+  outcome: "PASS" | "BLOCKED" | "FAIL";
+  checkedAt: number;
+  buildVersion: string;
+  buildCommit: string;
+  bridgeId: string;
+  requesterHostRef: string;
+  remoteHostRef: string;
+  connection: BridgeDeviceDiagnostics["connection"];
+  managedReadiness: BridgeDeviceDiagnostics["managedReadiness"];
+  revisionId?: string | null;
+  attemptId?: string | null;
+  searchCommitted: boolean;
+  transferCommitted: boolean;
+  transferContentDigest?: string | null;
+  transferDestinationHostRef?: string | null;
+  executeCommitted: boolean;
+  executeResultDigest?: string | null;
+  executeSuccessorLineageCount: number;
+  coreTerminalState?: string | null;
+  durationMillis: number;
+  failureCode?: string | null;
 }
 
 export interface RoomControlSessionContext {

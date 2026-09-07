@@ -1,5 +1,12 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, State};
@@ -15,7 +22,9 @@ use crate::{
     capability_probe::{self, CapabilityProbeMode},
     config, crypto,
     device_profile::{self, ProfileProbeMode},
-    diagnostics, discovery,
+    diagnostics,
+    diagnostics::BridgeDeviceDiagnostics,
+    discovery,
     error::{AppError, AppResult},
     file_candidates::{self, BridgePlanSearchRequest},
     host_runtime::HostRuntime as AppState,
@@ -45,6 +54,8 @@ const FILE_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-file-route-v1";
 
 const BRIDGE_PLAN_APPROVAL_TTL_SECONDS: i64 = 24 * 60 * 60;
 const BRIDGE_PLAN_CONTROL_LIFETIME_SECONDS: i64 = 120;
+const MANAGED_SELF_CHECK_SCHEMA: &str = "pastey-managed-e2e-self-check-v1";
+const MANAGED_SELF_CHECK_TIMEOUT_SECONDS: u64 = 90;
 
 /// Produces one ephemeral, non-authorizing diagnostics projection for an exact
 /// durable remote Host. All current-session and route interpretation remains
@@ -101,6 +112,7 @@ fn compose_bridge_device_diagnostics(
             .map(managed_readiness_from_projection)
             .unwrap_or_else(unknown_managed_readiness),
         link_benchmark,
+        managed_e2e: None,
         checked_at,
     }
 }
@@ -126,6 +138,374 @@ fn unknown_managed_readiness() -> diagnostics::ManagedHostReadiness {
         execution_world: diagnostics::DiagnosticState::Unknown,
         managed_execution: diagnostics::DiagnosticState::Unknown,
     }
+}
+
+fn unavailable_bridge_device_diagnostics(checked_at: i64) -> diagnostics::BridgeDeviceDiagnostics {
+    diagnostics::BridgeDeviceDiagnostics {
+        connection: diagnostics::BridgeConnectionDiagnostics {
+            identity: diagnostics::DiagnosticState::Unavailable,
+            secure_session: diagnostics::DiagnosticState::Unavailable,
+            control_channel: diagnostics::DiagnosticState::Unavailable,
+            data_path: diagnostics::DiagnosticState::Unavailable,
+        },
+        managed_readiness: unknown_managed_readiness(),
+        link_benchmark: None,
+        managed_e2e: None,
+        checked_at,
+    }
+}
+
+fn managed_self_check_preflight_ready(diagnostics: &diagnostics::BridgeDeviceDiagnostics) -> bool {
+    use diagnostics::DiagnosticState::{Available, Healthy};
+    diagnostics.connection.identity == Healthy
+        && diagnostics.connection.secure_session == Healthy
+        && diagnostics.connection.control_channel == Healthy
+        && diagnostics.connection.data_path == Healthy
+        && diagnostics.managed_readiness.provider == Available
+        && diagnostics.managed_readiness.runtime == Available
+        && diagnostics.managed_readiness.execution_world == Available
+}
+
+fn managed_self_check_report(
+    outcome: diagnostics::ManagedE2ESelfCheckOutcome,
+    bridge_id: &str,
+    requester_host_ref: &str,
+    remote_host_ref: &str,
+    checked_at: i64,
+    duration_millis: u64,
+    failure_code: Option<&str>,
+) -> diagnostics::ManagedE2ESelfCheckReport {
+    diagnostics::ManagedE2ESelfCheckReport {
+        schema_version: MANAGED_SELF_CHECK_SCHEMA.into(),
+        outcome,
+        checked_at,
+        build_version: env!("CARGO_PKG_VERSION").into(),
+        build_commit: option_env!("PASTEY_GIT_COMMIT")
+            .unwrap_or("unavailable")
+            .into(),
+        bridge_id: bridge_id.into(),
+        requester_host_ref: requester_host_ref.into(),
+        remote_host_ref: remote_host_ref.into(),
+        connection: diagnostics::BridgeConnectionDiagnostics {
+            identity: diagnostics::DiagnosticState::Unknown,
+            secure_session: diagnostics::DiagnosticState::Unknown,
+            control_channel: diagnostics::DiagnosticState::Unknown,
+            data_path: diagnostics::DiagnosticState::Unknown,
+        },
+        managed_readiness: unknown_managed_readiness(),
+        revision_id: None,
+        attempt_id: None,
+        search_committed: false,
+        transfer_committed: false,
+        transfer_content_digest: None,
+        transfer_destination_host_ref: None,
+        execute_committed: false,
+        execute_result_digest: None,
+        execute_successor_lineage_count: 0,
+        core_terminal_state: None,
+        duration_millis,
+        failure_code: failure_code.map(str::to_string),
+    }
+}
+
+fn log_managed_self_check(report: &diagnostics::ManagedE2ESelfCheckReport) {
+    if let Ok(report) = serde_json::to_string(report) {
+        logging::write_transfer_line(&format!("[pastey managed-self-check] {report}"));
+    }
+}
+
+fn prepare_managed_self_check_fixture(
+    paths: &storage::AppPaths,
+    run_id: &str,
+) -> AppResult<PathBuf> {
+    let shared = paths.app_data_dir.join("shared");
+    fs::create_dir_all(&shared)?;
+    let fixture = shared.join(format!("pastey-managed-self-check-{run_id}.txt"));
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&fixture)?
+        .write_all(b"Pastey managed self-check fixture.\n")?;
+    Ok(fixture)
+}
+
+fn managed_self_check_request(
+    state: &AppState,
+    bridge_id: &str,
+    remote_host_ref: &crate::host_identity::HostRef,
+    run_id: &str,
+) -> crate::native_v2_orchestration::NativeV2ComposeRequestV1 {
+    use crate::native_v2_orchestration::{
+        NativeV2ComposeRequestV1, NativeV2ObjectRevisionDtoV1, NativeV2StepDraftV1,
+    };
+    let requester = state.local_host_ref.as_str().to_string();
+    let remote = remote_host_ref.as_str().to_string();
+    let object = NativeV2ObjectRevisionDtoV1 {
+        logical_object_id: format!("managed-self-check-{run_id}"),
+        revision: 1,
+    };
+    NativeV2ComposeRequestV1 {
+        plan_id: format!("managed-self-check-plan-{run_id}"),
+        revision_id: format!("managed-self-check-revision-{run_id}"),
+        revision_number: 1,
+        bridge_id: bridge_id.into(),
+        requester_host_ref: requester.clone(),
+        participant_host_refs: vec![requester.clone(), remote.clone()],
+        roots: Vec::new(),
+        original_user_goal: "Pastey bounded Bridge Device managed self-check.".into(),
+        expected_outcome: "Search, authored Transfer, and remote Execute complete through Core."
+            .into(),
+        steps: vec![
+            NativeV2StepDraftV1::Search {
+                step_id: "self-check-search".into(),
+                depends_on: Vec::new(),
+                host_ref: requester.clone(),
+                output: object.clone(),
+                query: format!("pastey-managed-self-check-{run_id}.txt"),
+                safe_scope_labels: vec!["pastey_shared".into()],
+            },
+            NativeV2StepDraftV1::Transfer {
+                step_id: "self-check-transfer".into(),
+                depends_on: vec!["self-check-search".into()],
+                source_host_ref: requester,
+                destination_host_ref: remote.clone(),
+                input: object.clone(),
+                output: object.clone(),
+            },
+            NativeV2StepDraftV1::Execute {
+                step_id: "self-check-execute".into(),
+                depends_on: vec!["self-check-transfer".into()],
+                host_ref: remote,
+                target: object,
+                execution_intent: "Return the bounded managed self-check result.".into(),
+            },
+        ],
+    }
+}
+
+fn managed_self_check_state(
+    state: crate::native_v2_orchestration::NativeV2ProductStateV1,
+) -> &'static str {
+    use crate::native_v2_orchestration::NativeV2ProductStateV1::*;
+    match state {
+        Draft => "draft",
+        Approved => "approved",
+        CheckingReadiness => "checking_readiness",
+        Preparing => "preparing",
+        Running => "running",
+        Completed => "completed",
+        Failed => "failed",
+        Interrupted => "interrupted",
+        Cancelled => "cancelled",
+    }
+}
+
+fn populate_managed_self_check_evidence(
+    report: &mut diagnostics::ManagedE2ESelfCheckReport,
+    paths: &storage::AppPaths,
+) -> AppResult<()> {
+    let Some(attempt_id) = report.attempt_id.as_deref() else {
+        return Ok(());
+    };
+    let connection = Connection::open(&paths.db_path)?;
+    let mut statement = connection.prepare(
+        "SELECT step_id, operation, host_ref, result_json, state
+         FROM native_v2_step_commits WHERE attempt_id = ?1 ORDER BY step_id",
+    )?;
+    let commits = statement.query_map([attempt_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    for commit in commits {
+        let (step_id, operation, host_ref, result_json, state) = commit?;
+        let result: Value = serde_json::from_str(&result_json)?;
+        if state != "committed" {
+            continue;
+        }
+        match step_id.as_str() {
+            "self-check-search"
+                if operation == "search" && host_ref == report.requester_host_ref =>
+            {
+                report.search_committed = true;
+            }
+            "self-check-transfer"
+                if operation == "transfer" && host_ref == report.requester_host_ref =>
+            {
+                let digest = result["contentDigest"]
+                    .as_str()
+                    .filter(|value| !value.is_empty());
+                report.transfer_committed = digest.is_some();
+                report.transfer_content_digest = digest.map(str::to_string);
+                report.transfer_destination_host_ref = Some(report.remote_host_ref.clone());
+            }
+            "self-check-execute"
+                if operation == "execute" && host_ref == report.remote_host_ref =>
+            {
+                let digest = result["resultDigest"]
+                    .as_str()
+                    .filter(|value| !value.is_empty());
+                report.execute_committed = digest.is_some() && result["object"].is_null();
+                report.execute_result_digest = digest.map(str::to_string);
+            }
+            _ => {}
+        }
+    }
+    report.execute_successor_lineage_count = connection.query_row(
+        "SELECT COUNT(*) FROM bridge_plan_v2_transform_results WHERE attempt_id = ?1",
+        [attempt_id],
+        |row| row.get(0),
+    )?;
+    Ok(())
+}
+
+/// Explicitly runs one bounded, ordinary native-v2 Profile-B-shaped diagnostic
+/// after the existing Bridge diagnostics prove the local preflight. It creates
+/// no special authority and always reports a renderer-safe terminal outcome.
+pub(crate) async fn run_bridge_device_managed_self_check(
+    state: Arc<AppState>,
+    bridge_id: &str,
+    remote_host_ref: &crate::host_identity::HostRef,
+) -> diagnostics::BridgeDeviceDiagnostics {
+    let started = Instant::now();
+    let checked_at = storage::now_ts();
+    let requester = state.local_host_ref.as_str().to_string();
+    let remote = remote_host_ref.as_str().to_string();
+    let mut diagnostics =
+        match bridge_device_diagnostics_for_host(state.clone(), bridge_id, remote_host_ref).await {
+            Ok(diagnostics) => diagnostics,
+            Err(_) => unavailable_bridge_device_diagnostics(checked_at),
+        };
+    if !managed_self_check_preflight_ready(&diagnostics) {
+        let mut report = managed_self_check_report(
+            diagnostics::ManagedE2ESelfCheckOutcome::Blocked,
+            bridge_id,
+            &requester,
+            &remote,
+            checked_at,
+            started.elapsed().as_millis() as u64,
+            Some("preflight_unavailable"),
+        );
+        report.connection = diagnostics.connection.clone();
+        report.managed_readiness = diagnostics.managed_readiness.clone();
+        log_managed_self_check(&report);
+        diagnostics.managed_e2e = Some(report);
+        return diagnostics;
+    }
+
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let request = managed_self_check_request(&state, bridge_id, remote_host_ref, &run_id);
+    let revision_id = request.revision_id.clone();
+    let approval_id = format!("managed-self-check-approval-{run_id}");
+    let attempt_id = format!("managed-self-check-attempt-{run_id}");
+    let fixture = match prepare_managed_self_check_fixture(&state.paths, &run_id) {
+        Ok(fixture) => fixture,
+        Err(_) => {
+            let mut report = managed_self_check_report(
+                diagnostics::ManagedE2ESelfCheckOutcome::Fail,
+                bridge_id,
+                &requester,
+                &remote,
+                checked_at,
+                started.elapsed().as_millis() as u64,
+                Some("fixture_prepare_failed"),
+            );
+            report.connection = diagnostics.connection.clone();
+            report.managed_readiness = diagnostics.managed_readiness.clone();
+            log_managed_self_check(&report);
+            diagnostics.managed_e2e = Some(report);
+            return diagnostics;
+        }
+    };
+    let mut report = managed_self_check_report(
+        diagnostics::ManagedE2ESelfCheckOutcome::Fail,
+        bridge_id,
+        &requester,
+        &remote,
+        checked_at,
+        0,
+        Some("start_failed"),
+    );
+    report.connection = diagnostics.connection.clone();
+    report.managed_readiness = diagnostics.managed_readiness.clone();
+    report.revision_id = Some(revision_id.clone());
+    report.attempt_id = Some(attempt_id.clone());
+    let execution = async {
+        state.compose_native_v2_product_plan(request, storage::now_ts())?;
+        state.approve_native_v2_product_plan(
+            &revision_id,
+            &approval_id,
+            storage::now_ts() + 900,
+            storage::now_ts(),
+        )?;
+        state
+            .start_native_v2_product_attempt(
+                &approval_id,
+                &attempt_id,
+                storage::now_ts() + 900,
+                storage::now_ts(),
+            )
+            .await?;
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(MANAGED_SELF_CHECK_TIMEOUT_SECONDS);
+        loop {
+            let status = state.native_v2_product_status(&revision_id)?;
+            if matches!(
+                status.state,
+                crate::native_v2_orchestration::NativeV2ProductStateV1::Completed
+                    | crate::native_v2_orchestration::NativeV2ProductStateV1::Failed
+                    | crate::native_v2_orchestration::NativeV2ProductStateV1::Interrupted
+                    | crate::native_v2_orchestration::NativeV2ProductStateV1::Cancelled
+            ) {
+                return Ok(status);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let _ = state
+                    .cancel_native_v2_product_attempt(&attempt_id, storage::now_ts())
+                    .await;
+                return Err(AppError::Timeout("managed self-check timed out".into()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+    .await;
+    let _ = fs::remove_file(fixture);
+    match execution {
+        Ok(status) => {
+            report.core_terminal_state = Some(managed_self_check_state(status.state).into());
+            let evidence = populate_managed_self_check_evidence(&mut report, &state.paths);
+            let passed = evidence.is_ok()
+                && report.core_terminal_state.as_deref() == Some("completed")
+                && report.search_committed
+                && report.transfer_committed
+                && report.transfer_content_digest.is_some()
+                && report.transfer_destination_host_ref.as_deref() == Some(remote.as_str())
+                && report.execute_committed
+                && report.execute_result_digest.is_some()
+                && report.execute_successor_lineage_count == 0;
+            report.outcome = if passed {
+                diagnostics::ManagedE2ESelfCheckOutcome::Pass
+            } else {
+                diagnostics::ManagedE2ESelfCheckOutcome::Fail
+            };
+            report.failure_code = (!passed).then(|| "authoritative_evidence_missing".into());
+        }
+        Err(_) => {
+            report.failure_code = Some("managed_execution_failed".into());
+            report.core_terminal_state = state
+                .native_v2_product_status(&revision_id)
+                .ok()
+                .map(|status| managed_self_check_state(status.state).into());
+        }
+    }
+    report.duration_millis = started.elapsed().as_millis() as u64;
+    log_managed_self_check(&report);
+    diagnostics.managed_e2e = Some(report);
+    diagnostics
 }
 
 /// Requests a fresh, selected-peer capability observation over the existing
@@ -3961,6 +4341,24 @@ pub async fn run_bridge_device_diagnostics(
         .map_err(|error| error.message())
 }
 
+/// An explicit Bridge Device Check may exercise the ordinary managed path after
+/// the read-only diagnostics preflight has established that every required
+/// production capability is currently healthy.
+#[tauri::command]
+pub async fn run_bridge_device_self_check(
+    bridge_id: String,
+    host_ref: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<BridgeDeviceDiagnostics, String> {
+    let remote_host_ref =
+        crate::host_identity::HostRef::parse_peer(host_ref, &state.local_host_ref)
+            .map_err(|error| error.message())?;
+    Ok(
+        run_bridge_device_managed_self_check(state.inner().clone(), &bridge_id, &remote_host_ref)
+            .await,
+    )
+}
+
 #[tauri::command]
 pub async fn run_loopback_benchmark(
     mode: Option<String>,
@@ -4351,6 +4749,128 @@ mod tests {
             result.managed_readiness.execution_world,
             diagnostics::DiagnosticState::Unavailable
         );
+    }
+
+    #[test]
+    fn managed_self_check_preflight_blocks_before_plan_authority_exists() {
+        let blocked = unavailable_bridge_device_diagnostics(1);
+        assert!(!managed_self_check_preflight_ready(&blocked));
+
+        let ready = diagnostics::BridgeDeviceDiagnostics {
+            connection: diagnostics::BridgeConnectionDiagnostics {
+                identity: diagnostics::DiagnosticState::Healthy,
+                secure_session: diagnostics::DiagnosticState::Healthy,
+                control_channel: diagnostics::DiagnosticState::Healthy,
+                data_path: diagnostics::DiagnosticState::Healthy,
+            },
+            managed_readiness: diagnostics::ManagedHostReadiness {
+                provider: diagnostics::DiagnosticState::Available,
+                runtime: diagnostics::DiagnosticState::Available,
+                execution_world: diagnostics::DiagnosticState::Available,
+                managed_execution: diagnostics::DiagnosticState::Unavailable,
+            },
+            link_benchmark: None,
+            managed_e2e: None,
+            checked_at: 1,
+        };
+        assert!(managed_self_check_preflight_ready(&ready));
+        let missing_world = diagnostics::BridgeDeviceDiagnostics {
+            managed_readiness: diagnostics::ManagedHostReadiness {
+                execution_world: diagnostics::DiagnosticState::Unavailable,
+                ..ready.managed_readiness.clone()
+            },
+            ..ready
+        };
+        assert!(!managed_self_check_preflight_ready(&missing_world));
+    }
+
+    #[test]
+    fn managed_self_check_report_is_bounded_and_renderer_safe() {
+        let report = managed_self_check_report(
+            diagnostics::ManagedE2ESelfCheckOutcome::Blocked,
+            "bridge-1",
+            "host:requester",
+            "host:remote",
+            1,
+            2,
+            Some("preflight_unavailable"),
+        );
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("pastey-managed-e2e-self-check-v1"));
+        for forbidden in [
+            "credential",
+            "executablePath",
+            "sessionKey",
+            "stdout",
+            "stderr",
+            "evidenceHead",
+            "/Users/",
+            "C:\\\\Users\\\\",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "unsafe report field: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_self_check_uses_only_the_ordinary_native_v2_authority_path() {
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("pub(crate) async fn run_bridge_device_managed_self_check")
+            .unwrap();
+        let end = source[start..]
+            .find("/// Requests a fresh, selected-peer capability observation")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &source[start..end];
+        for required in [
+            "bridge_device_diagnostics_for_host",
+            "managed_self_check_preflight_ready",
+            "compose_native_v2_product_plan",
+            "approve_native_v2_product_plan",
+            "start_native_v2_product_attempt",
+            "native_v2_product_status",
+            "populate_managed_self_check_evidence",
+        ] {
+            assert!(
+                body.contains(required),
+                "missing canonical seam: {required}"
+            );
+        }
+        for forbidden in [
+            "DiagnosticAuthority",
+            "SelfCheckWorker",
+            "Command::new",
+            "spawn_process",
+            "direct_provider",
+            "fake_completion",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "forbidden diagnostic bypass: {forbidden}"
+            );
+        }
+
+        let plan_start = source.find("fn managed_self_check_request").unwrap();
+        let plan_end = source[plan_start..]
+            .find("fn managed_self_check_state")
+            .map(|offset| plan_start + offset)
+            .unwrap();
+        let plan = &source[plan_start..plan_end];
+        for required in [
+            "NativeV2StepDraftV1::Search",
+            "NativeV2StepDraftV1::Transfer",
+            "NativeV2StepDraftV1::Execute",
+            "destination_host_ref: remote.clone()",
+            "depends_on: vec![\"self-check-transfer\".into()]",
+        ] {
+            assert!(
+                plan.contains(required),
+                "missing self-check Plan proof: {required}"
+            );
+        }
     }
 
     fn bridge_route_room() -> StoredRoom {
