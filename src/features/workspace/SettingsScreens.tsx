@@ -1,7 +1,17 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { listManagedRuntimeOptions, selectManagedExecuteRuntime, updateConfig } from "../../lib/tauri";
-import type { ManagedRuntimeOption } from "../../lib/tauri";
+import {
+  checkManagedWorkerProviderHealth,
+  createManagedWorkerProvider,
+  deleteManagedWorkerProvider,
+  getManagedWorkerProviderSettings,
+  listManagedRuntimeOptions,
+  selectManagedExecuteRuntime,
+  selectManagedWorkerProvider,
+  updateConfig,
+  updateManagedWorkerProvider,
+} from "../../lib/tauri";
+import type { ManagedRuntimeOption, ManagedWorkerProviderSettings, ManagedWorkerProviderSettingsSnapshot } from "../../lib/tauri";
 import type { AppConfig } from "../../lib/types";
 import type { NavigateWorkspace, WorkspaceRoute } from "./workspaceTypes";
 
@@ -83,12 +93,19 @@ export function ProviderSettings({ onNavigate }: Pick<SettingsProps, "onNavigate
   const [runtimes, setRuntimes] = useState<ManagedRuntimeOption[] | null>(null);
   const [pendingRuntime, setPendingRuntime] = useState<ManagedRuntimeOption["runtimeId"] | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const [providerSettings, setProviderSettings] = useState<ManagedWorkerProviderSettingsSnapshot | null>(null);
+  const [pendingProviderAction, setPendingProviderAction] = useState<string | null>(null);
+  const [providerError, setProviderError] = useState<string | null>(null);
+  const [editingProvider, setEditingProvider] = useState<ManagedWorkerProviderSettings | "new" | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     void listManagedRuntimeOptions()
       .then((options) => { if (!cancelled) setRuntimes(options); })
       .catch((error) => { if (!cancelled) setRuntimeError(error instanceof Error ? error.message : String(error)); });
+    void getManagedWorkerProviderSettings()
+      .then((settings) => { if (!cancelled) setProviderSettings(settings); })
+      .catch((error) => { if (!cancelled) setProviderError(error instanceof Error ? error.message : String(error)); });
     return () => { cancelled = true; };
   }, []);
 
@@ -105,7 +122,47 @@ export function ProviderSettings({ onNavigate }: Pick<SettingsProps, "onNavigate
     }
   }
 
-  return <SettingsFrame title="Task Provider" description="Host-owned provider and runtime configuration for reviewed Bridge tasks." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="Managed Execute runtime">{runtimes ? runtimes.map((runtime) => <button type="button" className="v2-settings-link" key={runtime.runtimeId} disabled={!runtime.available || pendingRuntime !== null} onClick={() => void selectRuntime(runtime.runtimeId)}><SettingsRow title={runtime.runtimeId === "python" ? "Python" : "Node.js"} description="Known runtime identity discovered at a fixed Host-local location; no PATH fallback." value={runtime.selected ? (runtime.selectionReady ? "Selected" : "Re-select required") : (runtime.available ? "Select →" : "Unavailable")} status={runtime.selectionReady ? "ready" : undefined} /></button>) : <SettingsRow title="Runtime discovery" value="Checking…" />}</SettingsGroup>{runtimeError ? <p className="v2-error" role="alert">{runtimeError}</p> : null}<SettingsGroup title="Provider"><section className="v2-provider-unavailable"><strong>Provider configuration is unavailable to this renderer.</strong><p>The current backend does not expose safe selected provider, model, health, or revocation state. Credentials remain hidden, and Pastey does not use a production fallback provider.</p><span>Not configured / unavailable</span></section></SettingsGroup><SettingsGroup title="Authority"><SettingsRow title="Runtime selection" description="This Host pins one known executable identity for future Execute bindings; it grants no step authority." value="Host-local" /><SettingsRow title="Provider selection" description="A ready provider proposes a Plan; it never grants Agent authority." value="No authority" /><SettingsRow title="Agent Plan approval" description="Requester approval remains independently required." value="Always required" /></SettingsGroup></div></SettingsFrame>;
+  async function runProviderAction(action: string, operation: () => Promise<ManagedWorkerProviderSettingsSnapshot>): Promise<boolean> {
+    if (pendingProviderAction) return false;
+    setPendingProviderAction(action);
+    setProviderError(null);
+    try {
+      setProviderSettings(await operation());
+      return true;
+    } catch (error) {
+      setProviderError(error instanceof Error ? error.message : String(error));
+      return false;
+    } finally {
+      setPendingProviderAction(null);
+    }
+  }
+
+  return <SettingsFrame title="Task Provider" description="Host-owned provider and runtime configuration for reviewed Bridge tasks." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="Managed Execute runtime">{runtimes ? runtimes.map((runtime) => <button type="button" className="v2-settings-link" key={runtime.runtimeId} disabled={!runtime.available || pendingRuntime !== null} onClick={() => void selectRuntime(runtime.runtimeId)}><SettingsRow title={runtime.runtimeId === "python" ? "Python" : "Node.js"} description="Known runtime identity discovered at a fixed Host-local location; no PATH fallback." value={runtime.selected ? (runtime.selectionReady ? "Selected" : "Re-select required") : (runtime.available ? "Select →" : "Unavailable")} status={runtime.selectionReady ? "ready" : undefined} /></button>) : <SettingsRow title="Runtime discovery" value="Checking…" />}</SettingsGroup>{runtimeError ? <p className="v2-error" role="alert">{runtimeError}</p> : null}<SettingsGroup title="Provider">{providerSettings ? <><p className="v2-settings-note">Managed selection: {providerSettings.managedSelection === "selected" ? "Selected" : providerSettings.managedSelection === "stale" ? "Re-select required" : "Not configured"}.</p>{providerSettings.providers.map((provider) => <section className="v2-provider-card" key={provider.configRef.configDigest}><SettingsRow title={`${provider.providerKind === "openai_compatible" ? "OpenAI-compatible" : provider.providerKind} · ${provider.model}`} description={provider.baseUrl} value={provider.selected ? "Selected" : "Not selected"} status={provider.selected ? "ready" : undefined} /><div className="v2-provider-details"><span>Health: {provider.health}</span><span>Timeout: {provider.timeoutMillis} ms</span><span>Output: {provider.maxOutputTokens} tokens</span>{provider.lastHealthCheckAt ? <span>Last check: {new Date(provider.lastHealthCheckAt * 1000).toLocaleString()}</span> : null}</div><div className="v2-provider-actions"><button type="button" className="v2-button" disabled={pendingProviderAction !== null} onClick={() => void runProviderAction(`health:${provider.configRef.configDigest}`, () => checkManagedWorkerProviderHealth(provider.configRef))}>Check connection</button><button type="button" className="v2-button" disabled={provider.selected || pendingProviderAction !== null} onClick={() => void runProviderAction(`select:${provider.configRef.configDigest}`, () => selectManagedWorkerProvider({ configRef: provider.configRef, model: provider.model }))}>Select for tasks</button><button type="button" className="v2-button" disabled={pendingProviderAction !== null} onClick={() => setEditingProvider(provider)}>Edit</button><button type="button" className="v2-button danger" disabled={pendingProviderAction !== null} onClick={() => void runProviderAction(`delete:${provider.configRef.configDigest}`, () => deleteManagedWorkerProvider(provider.configRef))}>Remove</button></div></section>)}<button type="button" className="v2-button" disabled={pendingProviderAction !== null} onClick={() => setEditingProvider("new")}>Add provider</button></> : <SettingsRow title="Provider settings" value="Checking…" />}{editingProvider ? <ProviderForm provider={editingProvider} pending={pendingProviderAction !== null} onCancel={() => setEditingProvider(null)} onSubmit={(operation) => void runProviderAction("save", operation).then((saved) => { if (saved) setEditingProvider(null); })} /> : null}</SettingsGroup>{providerError ? <p className="v2-error" role="alert">{providerError}</p> : null}<SettingsGroup title="Authority"><SettingsRow title="Runtime selection" description="This Host pins one known executable identity for future Execute bindings; it grants no step authority." value="Host-local" /><SettingsRow title="Provider selection" description="A selected provider is only a Host-local prerequisite; it grants no Agent authority." value="No authority" /><SettingsRow title="Agent Plan approval" description="Requester approval remains independently required." value="Always required" /></SettingsGroup></div></SettingsFrame>;
+}
+
+function ProviderForm({ provider, pending, onCancel, onSubmit }: { provider: ManagedWorkerProviderSettings | "new"; pending: boolean; onCancel: () => void; onSubmit: (operation: () => Promise<ManagedWorkerProviderSettingsSnapshot>) => void }) {
+  const editing = provider !== "new";
+  const [providerId, setProviderId] = useState(editing ? provider.configRef.providerId : "primary");
+  const [baseUrl, setBaseUrl] = useState(editing ? provider.baseUrl : "https://api.openai.com/v1");
+  const [model, setModel] = useState(editing ? provider.model : "");
+  const [apiKey, setApiKey] = useState("");
+  const [timeoutMillis, setTimeoutMillis] = useState(String(editing ? provider.timeoutMillis : 30_000));
+  const [maxOutputTokens, setMaxOutputTokens] = useState(String(editing ? provider.maxOutputTokens : 1_024));
+
+  function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const timeout = Number(timeoutMillis);
+    const maxTokens = Number(maxOutputTokens);
+    if (editing) {
+      const expectedRef = provider.configRef;
+      onSubmit(() => updateManagedWorkerProvider({ expectedRef, baseUrl, model, replacementApiKey: apiKey || null, timeoutMillis: timeout, maxOutputTokens: maxTokens }));
+    } else {
+      onSubmit(() => createManagedWorkerProvider({ providerId, baseUrl, model, apiKey, timeoutMillis: timeout, maxOutputTokens: maxTokens }));
+    }
+    setApiKey("");
+  }
+
+  return <form className="v2-provider-form" onSubmit={submit}><strong>{editing ? "Edit provider" : "Add OpenAI-compatible provider"}</strong><label>Provider ID<input value={providerId} disabled={editing || pending} onChange={(event) => setProviderId(event.target.value)} /></label><label>Endpoint<input type="url" value={baseUrl} disabled={pending} onChange={(event) => setBaseUrl(event.target.value)} /></label><label>Model<input value={model} disabled={pending} onChange={(event) => setModel(event.target.value)} /></label><label>{editing ? "Replacement API key (optional)" : "API key"}<input type="password" autoComplete="new-password" required={!editing} value={apiKey} disabled={pending} onChange={(event) => setApiKey(event.target.value)} /></label><div className="v2-provider-form-grid"><label>Timeout (ms)<input type="number" min="1000" max="300000" value={timeoutMillis} disabled={pending} onChange={(event) => setTimeoutMillis(event.target.value)} /></label><label>Max output tokens<input type="number" min="1" max="32768" value={maxOutputTokens} disabled={pending} onChange={(event) => setMaxOutputTokens(event.target.value)} /></label></div><p>Credentials are sent only to this Host when you save and cannot be viewed again.</p><div className="v2-provider-actions"><button type="submit" className="v2-button primary" disabled={pending}>Save</button><button type="button" className="v2-button" disabled={pending} onClick={() => { setApiKey(""); onCancel(); }}>Cancel</button></div></form>;
 }
 
 export function TransferSettings({ config, onNavigate }: Pick<SettingsProps, "config" | "onNavigate">) {

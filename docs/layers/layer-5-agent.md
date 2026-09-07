@@ -129,7 +129,7 @@ One managed attempt stores an exact provider id, generation, config digest, and 
 
 Credentials never enter prompts, Worker history, observations, effect requests/evidence, status events, or normal DTOs. The model cannot select endpoint/model/configuration, and switching provider cannot change the `StepWorkDescriptor` or effect envelope. Environment-variable configuration exists only in an ignored development smoke path.
 
-The runtime settings surface exposes only the known logical identities and their availability/selection/readiness state; selection asks the local Host service to discover and pin the executable privately. Provider service/health operations remain a Host-private backend configuration seam whose product settings surface is not built. Once a selected runtime exists, production readiness creates the exact Execute process binding rather than requiring a test/acceptance caller to inject it.
+The Task Provider screen is a local Host configuration client, not a provider or Worker authority surface. It can create, edit, delete, explicitly select, and run the bounded no-effect health probe for the existing OpenAI-compatible configuration. Its snapshot contains only provider id/generation/config digest, endpoint, model, timeout/token bounds, health/timestamps, and selected/stale state; it never returns a credential, encrypted row, resolved binding, revocation token, Worker handle, or provider response. Saving a new key sends it directly to the local Host command and clears the password input; editing without one preserves the encrypted key. The runtime section still exposes only known logical identities and availability/selection/readiness; selection asks the local Host service to discover and pin the executable privately. Once a selected runtime exists, production readiness creates the exact Execute process binding rather than requiring a test/acceptance caller to inject it.
 
 ## Natural-v2 and PM
 
@@ -177,9 +177,9 @@ Distributed delivery failure remains a product-recovery limitation: the sender c
 | Proposal-only local/provider Natural-v2 to an unapproved Draft | PM/provider selection and settings presentation |
 | Whole-Plan remote and local-Host readiness, prepare, attempt-bound admission, commit, and exact continuation | Headless Host execution |
 | Remote or local-Host Search and authored encrypted Transfer with exact receipt | Automatic/inferred movement or topology repair |
-| Same-Host Resource Worker Transform; Host-selected runtime settings/resolution and exact Execute binding; contained Process on verified macOS; native Windows Managed Execute acceptance through the Codex-backed production path | Provider settings UI; Linux process world |
+| Same-Host Resource Worker Transform; Host-selected runtime settings/resolution and exact Execute binding; local provider configuration/selection/health UI; contained Process on verified macOS; native Windows Managed Execute acceptance through the Codex-backed production path | Linux process world |
 | Execute through Core with no lineage when an exact process binding exists | Raw shell/terminal/process authority |
-| Durable generation-bound provider state and streaming adapter | Product provider configuration/health UI |
+| Durable generation-bound provider state, streaming adapter, and safe local configuration/health product surface | Provider marketplace, routing, fallback, or additional provider backends |
 | Phase 5 Host network broker | Worker network tools or automatic task egress |
 | Cancellation/revocation/restart/Burn fail closed in state and Core authority | Guaranteed cross-partition cancellation delivery and richer recovery |
 | Bounded non-secret product/Worker status events and authoritative lifecycle presentation | Result content projection and richer interrupted/recovery detail |

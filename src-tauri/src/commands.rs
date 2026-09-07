@@ -31,6 +31,11 @@ use crate::{
         ReceivedRoomControlEvent, RoomControlDeliveryReceipt, RoomControlSessionContext,
     },
     storage, transfer,
+    worker_provider::OpenAICompatibleStreamingWorkerProviderV1,
+    worker_provider_config::{
+        WorkerProviderConfigRefV1, WorkerProviderConfigUpdateV1, WorkerProviderConfigWriteV1,
+        WorkerProviderHealthStateV1, WorkerProviderSelectionV1, WorkerProviderSettingsSnapshotV1,
+    },
 };
 
 const RELEASES_URL: &str = "https://github.com/xpan0988/Pastey/releases";
@@ -3750,6 +3755,118 @@ pub fn select_managed_execute_runtime(
         .managed_runtime_configs
         .list_managed_execute_options()
         .map_err(|error| error.message())
+}
+
+/// Returns the sole local product projection for managed Worker providers.
+/// It contains no credential, encrypted material, binding, or authority data.
+#[tauri::command]
+pub fn get_managed_worker_provider_settings(
+    state: State<'_, Arc<AppState>>,
+) -> Result<WorkerProviderSettingsSnapshotV1, String> {
+    state
+        .worker_provider_configs
+        .settings_snapshot()
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn create_managed_worker_provider(
+    request: WorkerProviderConfigWriteV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<WorkerProviderSettingsSnapshotV1, String> {
+    state
+        .worker_provider_configs
+        .create(request)
+        .map_err(|error| error.message())?;
+    state
+        .worker_provider_configs
+        .settings_snapshot()
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn update_managed_worker_provider(
+    request: WorkerProviderConfigUpdateV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<WorkerProviderSettingsSnapshotV1, String> {
+    state
+        .worker_provider_configs
+        .update(request)
+        .map_err(|error| error.message())?;
+    state
+        .worker_provider_configs
+        .settings_snapshot()
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn delete_managed_worker_provider(
+    expected_ref: WorkerProviderConfigRefV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<WorkerProviderSettingsSnapshotV1, String> {
+    state
+        .worker_provider_configs
+        .delete(&expected_ref)
+        .map_err(|error| error.message())?;
+    state
+        .worker_provider_configs
+        .settings_snapshot()
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn select_managed_worker_provider(
+    selection: WorkerProviderSelectionV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<WorkerProviderSettingsSnapshotV1, String> {
+    state
+        .worker_provider_configs
+        .select_for_managed_workers(&selection)
+        .map_err(|error| error.message())?;
+    state
+        .worker_provider_configs
+        .settings_snapshot()
+        .map_err(|error| error.message())
+}
+
+/// Performs the existing bounded, no-effect Host control-plane probe against
+/// exactly the requested immutable configuration generation. Provider replies
+/// and transport details remain Host-private; the renderer gets only updated
+/// health metadata.
+#[tauri::command]
+pub async fn check_managed_worker_provider_health(
+    config_ref: WorkerProviderConfigRefV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<WorkerProviderSettingsSnapshotV1, String> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let snapshot = state.worker_provider_configs.settings_snapshot()?;
+        let metadata = snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.config_ref == config_ref)
+            .ok_or_else(|| {
+                AppError::NotFound("Worker provider configuration is unavailable or stale.".into())
+            })?;
+        let selection = WorkerProviderSelectionV1 {
+            config_ref: config_ref.clone(),
+            model: metadata.model.clone(),
+        };
+        let provider = OpenAICompatibleStreamingWorkerProviderV1::from_binding(
+            state.worker_provider_configs.resolve(&selection)?,
+        )?;
+        let health = match provider.health_probe() {
+            Ok(_) => WorkerProviderHealthStateV1::Healthy,
+            Err(_) => WorkerProviderHealthStateV1::Unhealthy,
+        };
+        state
+            .worker_provider_configs
+            .record_health(&config_ref, health)?;
+        state.worker_provider_configs.settings_snapshot()
+    })
+    .await
+    .map_err(|_| "Provider health check could not complete.".to_string())
+    .and_then(|result| result.map_err(|error| error.message()))
 }
 
 #[tauri::command]
