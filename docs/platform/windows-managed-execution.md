@@ -22,7 +22,7 @@ The derived runner may perform one bounded credential refresh and retry for reco
 - `AuthorityNeutralEnvironment` is not a literally empty environment. Pastey supplies only the authorized invocation map; the retained platform path may add operational normalization, network-confinement values, default `PATH`/`PATHEXT` when absent, and Git safe-directory configuration. Those values carry no Pastey authority and do not change the executable binding.
 - `CancellableProcessSession` means Pastey can request termination and observe the session becoming terminal. It does not claim the former strict non-breakaway/NoDaemonSurvival policy, and evidence records `termination_requested` rather than asserting destruction of every descendant.
 - The adopted session API does not expose live descendant CPU or RSS accounting. Windows therefore does not claim those observations or synthesize them from unrelated Job behavior.
-- Native Windows v1 Stage 1–5 acceptance demonstrates the packaged verifier, native conformance, and production Managed Execute path. It is not physical multi-Host Agent proof.
+- Completed native Windows v1 Stage 1–5 acceptance demonstrates the packaged verifier, native conformance, and production Managed Execute path. It is not external-provider validation or physical multi-Host Agent proof.
 
 ## Provenance and validation ownership
 
