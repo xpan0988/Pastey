@@ -44,6 +44,8 @@ pub(crate) struct WorkerProviderSelectionV1 {
     pub(crate) model: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct WorkerProviderConfigWriteV1 {
     pub(crate) provider_id: String,
     pub(crate) base_url: String,
@@ -67,6 +69,8 @@ impl fmt::Debug for WorkerProviderConfigWriteV1 {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct WorkerProviderConfigUpdateV1 {
     pub(crate) expected_ref: WorkerProviderConfigRefV1,
     pub(crate) base_url: String,
@@ -110,6 +114,38 @@ pub(crate) struct WorkerProviderMetadataV1 {
     pub(crate) health: WorkerProviderHealthStateV1,
     pub(crate) last_health_check_at: Option<i64>,
     pub(crate) updated_at: i64,
+}
+
+/// Renderer-safe Host settings projection. It contains editable non-secret
+/// fields only; credentials and resolved bindings never cross this boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkerProviderSettingsMetadataV1 {
+    pub(crate) config_ref: WorkerProviderConfigRefV1,
+    pub(crate) provider_kind: &'static str,
+    pub(crate) base_url: String,
+    pub(crate) model: String,
+    pub(crate) timeout_millis: u64,
+    pub(crate) max_output_tokens: u32,
+    pub(crate) selected: bool,
+    pub(crate) health: WorkerProviderHealthStateV1,
+    pub(crate) last_health_check_at: Option<i64>,
+    pub(crate) updated_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ManagedWorkerProviderSelectionStateV1 {
+    NotConfigured,
+    Selected,
+    Stale,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkerProviderSettingsSnapshotV1 {
+    pub(crate) providers: Vec<WorkerProviderSettingsMetadataV1>,
+    pub(crate) managed_selection: ManagedWorkerProviderSelectionStateV1,
 }
 
 /// Immutable for one run. Updates create a new generation and cannot mutate
@@ -421,6 +457,56 @@ impl WorkerProviderConfigServiceV1 {
         metadata
     }
 
+    /// Local-renderer projection. This never reads the credential table and
+    /// reports a stale durable selection instead of repairing or substituting
+    /// it.
+    pub(crate) fn settings_snapshot(&self) -> AppResult<WorkerProviderSettingsSnapshotV1> {
+        let selection = self.raw_managed_worker_selection()?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT provider_id, generation, config_digest, base_url, model, timeout_millis,
+             max_output_tokens, health, last_health_check_at, updated_at
+             FROM worker_provider_configs ORDER BY provider_id",
+        )?;
+        let providers = statement
+            .query_map([], |row| {
+                let config_ref = WorkerProviderConfigRefV1 {
+                    provider_id: row.get(0)?,
+                    generation: row.get(1)?,
+                    config_digest: row.get(2)?,
+                };
+                let model: String = row.get(4)?;
+                let health: String = row.get(7)?;
+                Ok(WorkerProviderSettingsMetadataV1 {
+                    selected: selection.as_ref().is_some_and(|value| {
+                        value.config_ref == config_ref && value.model == model
+                    }),
+                    config_ref,
+                    provider_kind: "openai_compatible",
+                    base_url: row.get(3)?,
+                    model,
+                    timeout_millis: row.get(5)?,
+                    max_output_tokens: row.get(6)?,
+                    health: health_from_storage(&health)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    last_health_check_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let managed_selection = match selection {
+            None => ManagedWorkerProviderSelectionStateV1::NotConfigured,
+            Some(_) if providers.iter().any(|provider| provider.selected) => {
+                ManagedWorkerProviderSelectionStateV1::Selected
+            }
+            Some(_) => ManagedWorkerProviderSelectionStateV1::Stale,
+        };
+        Ok(WorkerProviderSettingsSnapshotV1 {
+            providers,
+            managed_selection,
+        })
+    }
+
     pub(crate) fn record_health(
         &self,
         expected: &WorkerProviderConfigRefV1,
@@ -555,6 +641,27 @@ impl WorkerProviderConfigServiceV1 {
         connection.execute("PRAGMA foreign_keys = ON", [])?;
         Ok(connection)
     }
+
+    fn raw_managed_worker_selection(&self) -> AppResult<Option<WorkerProviderSelectionV1>> {
+        self.connection()?
+            .query_row(
+                "SELECT provider_id, generation, config_digest, model
+                 FROM worker_provider_selection WHERE selection_key = 'managed_worker'",
+                [],
+                |row| {
+                    Ok(WorkerProviderSelectionV1 {
+                        config_ref: WorkerProviderConfigRefV1 {
+                            provider_id: row.get(0)?,
+                            generation: row.get(1)?,
+                            config_digest: row.get(2)?,
+                        },
+                        model: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
 }
 
 struct StoredProviderRowV1 {
@@ -634,6 +741,15 @@ fn metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerProvider
         last_health_check_at: row.get(5)?,
         updated_at: row.get(6)?,
     })
+}
+
+fn health_from_storage(health: &str) -> AppResult<WorkerProviderHealthStateV1> {
+    match health {
+        "unknown" => Ok(WorkerProviderHealthStateV1::Unknown),
+        "healthy" => Ok(WorkerProviderHealthStateV1::Healthy),
+        "unhealthy" => Ok(WorkerProviderHealthStateV1::Unhealthy),
+        _ => invalid("Worker provider health state is invalid."),
+    }
 }
 
 fn invalid<T>(message: &str) -> AppResult<T> {
@@ -856,19 +972,86 @@ mod tests {
     }
 
     #[test]
-    fn provider_control_plane_has_no_direct_product_registration() {
+    fn settings_snapshot_exposes_only_editable_non_secret_metadata_and_stale_selection() {
+        let (_root, service, _) = service();
+        let secret = "renderer-must-not-receive-this";
+        let created = service.create(write("model-a", secret)).unwrap();
+        let initial = service.settings_snapshot().unwrap();
+        assert_eq!(
+            initial.managed_selection,
+            ManagedWorkerProviderSelectionStateV1::NotConfigured
+        );
+        assert_eq!(initial.providers.len(), 1);
+        assert!(!initial.providers[0].selected);
+        assert_eq!(initial.providers[0].provider_kind, "openai_compatible");
+        let serialized = serde_json::to_string(&initial).unwrap();
+        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains("credential"));
+        assert!(!serialized.contains("api_key"));
+        assert!(!serialized.contains("wrapped"));
+
+        service
+            .select_for_managed_workers(&WorkerProviderSelectionV1 {
+                config_ref: created.config_ref.clone(),
+                model: created.model.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            service.settings_snapshot().unwrap().managed_selection,
+            ManagedWorkerProviderSelectionStateV1::Selected
+        );
+        service
+            .update(WorkerProviderConfigUpdateV1 {
+                expected_ref: created.config_ref,
+                base_url: "https://api.example.test/v1".into(),
+                model: "model-b".into(),
+                replacement_api_key: None,
+                timeout_millis: 10_000,
+                max_output_tokens: 512,
+            })
+            .unwrap();
+        let stale = service.settings_snapshot().unwrap();
+        assert_eq!(
+            stale.managed_selection,
+            ManagedWorkerProviderSelectionStateV1::Stale
+        );
+        assert!(!stale.providers[0].selected);
+    }
+
+    #[test]
+    fn provider_product_commands_are_limited_to_configuration_and_health() {
         let main_source = include_str!("main.rs");
         let invoke_registration = main_source
             .split(".invoke_handler(tauri::generate_handler![")
             .nth(1)
             .and_then(|source| source.split("])").next())
             .expect("Tauri invoke registration remains source-visible");
-        assert!(!invoke_registration.contains("worker"));
-        assert!(!invoke_registration.contains("provider"));
+        for command in [
+            "get_managed_worker_provider_settings",
+            "create_managed_worker_provider",
+            "update_managed_worker_provider",
+            "delete_managed_worker_provider",
+            "select_managed_worker_provider",
+            "check_managed_worker_provider_health",
+        ] {
+            assert!(invoke_registration.contains(command));
+        }
         assert!(!include_str!("commands.rs").contains("run_v2_worker_with_provider_selection"));
         let room_control = include_str!("room_control.rs");
         assert!(room_control.contains("accept_live_v2_managed_attempt"));
         assert!(!room_control.contains("select_for_managed_workers"));
         assert!(!room_control.contains("delete_worker_provider_config"));
+    }
+
+    #[test]
+    fn renderer_adapter_cannot_construct_bindings_or_select_by_endpoint() {
+        let adapter = include_str!("../../src/lib/tauri.ts");
+        let settings = include_str!("../../src/features/workspace/SettingsScreens.tsx");
+        assert!(!adapter.contains("ResolvedWorkerProviderBindingV1"));
+        assert!(!settings.contains("ResolvedWorkerProviderBindingV1"));
+        assert!(settings.contains(
+            "selectManagedWorkerProvider({ configRef: provider.configRef, model: provider.model })"
+        ));
+        assert!(!settings.contains("selectManagedWorkerProvider({ baseUrl"));
     }
 }

@@ -182,6 +182,77 @@ export function selectManagedExecuteRuntime(runtimeId: ManagedRuntimeOption["run
   return invoke("select_managed_execute_runtime", { runtimeId });
 }
 
+export interface WorkerProviderConfigRef {
+  providerId: string;
+  generation: number;
+  configDigest: string;
+}
+
+export type WorkerProviderHealth = "unknown" | "healthy" | "unhealthy";
+export type ManagedWorkerProviderSelectionState = "not_configured" | "selected" | "stale";
+
+/** Safe local settings data. Credentials, encrypted rows, bindings, and
+ * revocation handles are intentionally absent. */
+export interface ManagedWorkerProviderSettings {
+  configRef: WorkerProviderConfigRef;
+  providerKind: "openai_compatible";
+  baseUrl: string;
+  model: string;
+  timeoutMillis: number;
+  maxOutputTokens: number;
+  selected: boolean;
+  health: WorkerProviderHealth;
+  lastHealthCheckAt?: number | null;
+  updatedAt: number;
+}
+
+export interface ManagedWorkerProviderSettingsSnapshot {
+  providers: ManagedWorkerProviderSettings[];
+  managedSelection: ManagedWorkerProviderSelectionState;
+}
+
+export interface CreateManagedWorkerProviderRequest {
+  providerId: string;
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+  timeoutMillis: number;
+  maxOutputTokens: number;
+}
+
+export interface UpdateManagedWorkerProviderRequest {
+  expectedRef: WorkerProviderConfigRef;
+  baseUrl: string;
+  model: string;
+  replacementApiKey?: string | null;
+  timeoutMillis: number;
+  maxOutputTokens: number;
+}
+
+export function getManagedWorkerProviderSettings(): Promise<ManagedWorkerProviderSettingsSnapshot> {
+  return invoke("get_managed_worker_provider_settings");
+}
+
+export function createManagedWorkerProvider(request: CreateManagedWorkerProviderRequest): Promise<ManagedWorkerProviderSettingsSnapshot> {
+  return invoke("create_managed_worker_provider", { request });
+}
+
+export function updateManagedWorkerProvider(request: UpdateManagedWorkerProviderRequest): Promise<ManagedWorkerProviderSettingsSnapshot> {
+  return invoke("update_managed_worker_provider", { request });
+}
+
+export function deleteManagedWorkerProvider(expectedRef: WorkerProviderConfigRef): Promise<ManagedWorkerProviderSettingsSnapshot> {
+  return invoke("delete_managed_worker_provider", { expectedRef });
+}
+
+export function selectManagedWorkerProvider(selection: { configRef: WorkerProviderConfigRef; model: string }): Promise<ManagedWorkerProviderSettingsSnapshot> {
+  return invoke("select_managed_worker_provider", { selection });
+}
+
+export function checkManagedWorkerProviderHealth(configRef: WorkerProviderConfigRef): Promise<ManagedWorkerProviderSettingsSnapshot> {
+  return invoke("check_managed_worker_provider_health", { configRef });
+}
+
 export interface ComposedFileBridgePlanRequest {
   roomId: string;
   originalUserGoal: string;

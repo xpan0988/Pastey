@@ -76,7 +76,7 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 
 The Host service stores non-secret provider id, generation, config digest, HTTPS base URL, model, timeout, output-token limit, health, and timestamps in SQLite. The API key is stored separately as authenticated ciphertext under the existing Host master key. Exact generations are immutable run bindings; update increments generation, delete revokes active bindings, and stale references fail closed.
 
-Accepted production endpoints must use HTTPS and valid bounded model/config values. Provider health has `unknown`, `healthy`, and `unhealthy` states. The health probe performs no Worker task effect. There is no product configuration command/UI yet, and environment-variable provider loading is limited to an ignored opt-in development smoke test.
+Accepted production endpoints must use HTTPS and valid bounded model/config values. Provider health has `unknown`, `healthy`, and `unhealthy` states. The health probe performs no Worker task effect. Local Tauri commands `get_managed_worker_provider_settings`, `create_managed_worker_provider`, `update_managed_worker_provider`, `delete_managed_worker_provider`, `select_managed_worker_provider`, and `check_managed_worker_provider_health` return only the renderer-safe settings snapshot. Create/update receive a credential only for that command; no list/status/read operation or command returns it. Environment-variable provider loading remains limited to an ignored opt-in development smoke test.
 
 ## Developer Terminal protocol and bounds
 
