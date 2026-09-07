@@ -42,6 +42,8 @@ const matrixAreas = [
       "reconnect invalidates old peer_session_id",
       "durable pairing/revocation display metadata only",
       "startup/leave/burn invalidate endpoint rows",
+      "durable HostRef resolves through one transport-proven current session",
+      "Bridge device diagnostics consume only current-session semantic APIs",
     ],
   },
 ];
@@ -124,6 +126,18 @@ try {
     "--manifest-path",
     "src-tauri/Cargo.toml",
     "storage::tests::",
+  ], { timeout: 300_000 });
+  run("Rust current remote Host session tests", "cargo", [
+    "test",
+    "--manifest-path",
+    "src-tauri/Cargo.toml",
+    "bridge_lifecycle::tests::",
+  ], { timeout: 300_000 });
+  run("Rust Bridge device diagnostics boundary tests", "cargo", [
+    "test",
+    "--manifest-path",
+    "src-tauri/Cargo.toml",
+    "bridge_device_diagnostics",
   ], { timeout: 300_000 });
   console.log("[layer4-matrix] PASS automated Layer 4 validation matrix");
 } finally {

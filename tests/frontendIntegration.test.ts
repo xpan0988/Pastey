@@ -141,6 +141,23 @@ test("Devices is inspection-only and navigation cannot create or join a Bridge",
   assert.match(workspace, /route === "devices" \? <DevicesScreen room=\{activeRoom\}/);
 });
 
+test("Bridge device diagnostics use exact HostRef and remain user initiated", () => {
+  const screens = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  const devicesBody = screens.slice(screens.indexOf("export function DevicesScreen"), screens.indexOf("export function NewBridgeScreen"));
+  assert.match(devicesBody, /runBridgeDeviceDiagnostics\(bridgeId, hostRef\)/);
+  assert.match(devicesBody, /deviceCheckKey\(bridgeId, hostRef\)/);
+  assert.match(devicesBody, /inFlight\.current\.has\(checkKey\)/);
+  assert.match(devicesBody, /disabled=\{loading\}/);
+  assert.match(devicesBody, /Checking…/);
+  assert.match(devicesBody, /Retry/);
+  assert.match(devicesBody, /Not configured/);
+  assert.match(devicesBody, /Managed readiness/);
+  assert.doesNotMatch(devicesBody, /useEffect[\s\S]{0,500}runBridgeDeviceDiagnostics/);
+  assert.doesNotMatch(devicesBody, /bridge_peers|transport key|session_pair_ref|SQLite|reconnect:/);
+  assert.match(bindings, /invoke\("run_bridge_device_diagnostics", \{ bridgeId, hostRef \}\)/);
+});
+
 test("opening New Bridge is a choice view; creation is wired only to explicit Create", () => {
   const screens = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
   const workspace = readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8");

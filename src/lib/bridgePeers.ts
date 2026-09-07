@@ -25,6 +25,7 @@ export interface BridgePeerSession {
   readonly accepted: true;
   readonly sessionVerified: true;
   readonly currentSessionOnly: true;
+  readonly hostRef?: string;
   readonly isLocalSelf?: boolean;
 }
 
@@ -89,7 +90,7 @@ const PEER_REQUIRED_FIELDS = [
   "sessionVerified",
   "currentSessionOnly",
 ];
-const PEER_OPTIONAL_FIELDS = ["isLocalSelf"];
+const PEER_OPTIONAL_FIELDS = ["hostRef", "isLocalSelf"];
 const COLLECTION_REQUIRED_FIELDS = ["bridgeSessionId", "peers"];
 const UNSUPPORTED_AUTHORITY_FIELDS = [
   "authority",
@@ -151,6 +152,10 @@ export function normalizeBridgePeerSession(value: unknown): BridgePeerSessionNor
     errors.push("Bridge peer session isLocalSelf must be boolean when present.");
   }
   const isLocalSelf = typeof value.isLocalSelf === "boolean" ? value.isLocalSelf : undefined;
+  const hostRef = "hostRef" in value ? normalizeIdentifier(value.hostRef) : undefined;
+  if ("hostRef" in value && hostRef === null) {
+    errors.push("Bridge peer session hostRef must be a non-empty string when present.");
+  }
 
   return errors.length === 0 &&
     bridgeSessionId !== null &&
@@ -169,6 +174,7 @@ export function normalizeBridgePeerSession(value: unknown): BridgePeerSessionNor
           accepted: true,
           sessionVerified: true,
           currentSessionOnly: true,
+          ...(hostRef == null ? {} : { hostRef }),
           ...(isLocalSelf === undefined ? {} : { isLocalSelf }),
         },
         errors: [],

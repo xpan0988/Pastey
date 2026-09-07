@@ -305,6 +305,9 @@ pub struct RoomInfo {
 #[serde(rename_all = "camelCase")]
 pub struct BridgeRoomPeerInfo {
     pub peer_session_id: String,
+    /// Durable logical Host identity used by semantic Host operations. This is
+    /// not a route, session, pairing identity, or authority grant.
+    pub host_ref: Option<String>,
     pub display_name: Option<String>,
     pub join_method: BridgePeerJoinMethod,
     pub liveness: BridgePeerLiveness,

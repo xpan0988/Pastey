@@ -7,12 +7,28 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{AppError, AppResult};
+use crate::{
+    diagnostics::DiagnosticState,
+    error::{AppError, AppResult},
+    host_runtime::HostRuntime,
+    worker_provider_config::WorkerProviderHealthStateV1,
+};
 
 pub(crate) const PEER_CAPABILITY_SCHEMA: &str = "pastey-peer-capabilities-v2";
 const MAX_CAPABILITIES: usize = 16;
 const MAX_MEDIA_TYPES: usize = 16;
 const MAX_PAYLOAD_BYTES: usize = 4096;
+
+pub(crate) const MANAGED_PROVIDER_CAPABILITY: &str = "pastey.managed.provider";
+pub(crate) const MANAGED_RUNTIME_CAPABILITY: &str = "pastey.managed.runtime";
+pub(crate) const EXECUTION_WORLD_CAPABILITY: &str = "pastey.managed.execution_world";
+pub(crate) const MANAGED_EXECUTION_CAPABILITY: &str = "pastey.managed.execution";
+
+const REASON_NOT_CONFIGURED: &str = "not_configured";
+const REASON_UNKNOWN: &str = "unknown";
+const REASON_PLAN_BINDING_REQUIRED: &str = "plan_process_binding_required";
+const REASON_PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
+const REASON_EXECUTION_WORLD_UNAVAILABLE: &str = "execution_world_unavailable";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -39,6 +55,7 @@ pub(crate) struct PeerCapabilityStore {
     projections: HashMap<(String, String, String), PeerCapabilityProjection>,
 }
 
+#[cfg(test)]
 pub(crate) fn local_projection(
     peer_session_id: String,
     observed_at: i64,
@@ -52,6 +69,126 @@ pub(crate) fn local_projection(
         // later Agent-owned registry without treating framework support as an
         // available capability.
         capabilities: Vec::new(),
+    }
+}
+
+/// Projects current Host-owned managed readiness through the existing bounded
+/// capability channel. These are observations only: an exact Plan still owns
+/// Host selection, approval, admission, process binding, and effect authority.
+pub(crate) fn local_diagnostic_projection(
+    state: &HostRuntime,
+    peer_session_id: String,
+    observed_at: i64,
+) -> PeerCapabilityProjection {
+    let provider = match state
+        .worker_provider_configs
+        .selected_managed_worker_metadata()
+    {
+        Ok(None) => capability(
+            MANAGED_PROVIDER_CAPABILITY,
+            false,
+            Some(REASON_NOT_CONFIGURED),
+        ),
+        Ok(Some(metadata)) => match metadata.health {
+            WorkerProviderHealthStateV1::Healthy => {
+                capability(MANAGED_PROVIDER_CAPABILITY, true, None)
+            }
+            WorkerProviderHealthStateV1::Unknown => {
+                capability(MANAGED_PROVIDER_CAPABILITY, false, Some(REASON_UNKNOWN))
+            }
+            WorkerProviderHealthStateV1::Unhealthy => capability(
+                MANAGED_PROVIDER_CAPABILITY,
+                false,
+                Some(REASON_PROVIDER_UNAVAILABLE),
+            ),
+        },
+        Err(_) => capability(
+            MANAGED_PROVIDER_CAPABILITY,
+            false,
+            Some(REASON_PROVIDER_UNAVAILABLE),
+        ),
+    };
+
+    let execution_world_available = state.execution_worlds.platform_availability().available;
+    let execution_world = capability(
+        EXECUTION_WORLD_CAPABILITY,
+        execution_world_available,
+        (!execution_world_available).then_some(REASON_EXECUTION_WORLD_UNAVAILABLE),
+    );
+    let runtime = capability(
+        MANAGED_RUNTIME_CAPABILITY,
+        false,
+        Some(REASON_PLAN_BINDING_REQUIRED),
+    );
+    let managed_execution = if provider.unavailable_reason.as_deref() == Some(REASON_NOT_CONFIGURED)
+    {
+        capability(
+            MANAGED_EXECUTION_CAPABILITY,
+            false,
+            Some(REASON_NOT_CONFIGURED),
+        )
+    } else if provider.unavailable_reason.as_deref() == Some(REASON_PROVIDER_UNAVAILABLE) {
+        capability(
+            MANAGED_EXECUTION_CAPABILITY,
+            false,
+            Some(REASON_PROVIDER_UNAVAILABLE),
+        )
+    } else if !execution_world_available {
+        capability(
+            MANAGED_EXECUTION_CAPABILITY,
+            false,
+            Some(REASON_EXECUTION_WORLD_UNAVAILABLE),
+        )
+    } else {
+        capability(
+            MANAGED_EXECUTION_CAPABILITY,
+            false,
+            Some(REASON_PLAN_BINDING_REQUIRED),
+        )
+    };
+
+    PeerCapabilityProjection {
+        schema_version: PEER_CAPABILITY_SCHEMA.into(),
+        peer_session_id,
+        observed_at,
+        capabilities: vec![provider, runtime, execution_world, managed_execution],
+    }
+}
+
+fn capability(
+    capability_id: &str,
+    available: bool,
+    unavailable_reason: Option<&str>,
+) -> HostCapabilityFact {
+    HostCapabilityFact {
+        capability_id: capability_id.into(),
+        available,
+        accepted_input_media_types: Vec::new(),
+        effect: "readiness_observation".into(),
+        unavailable_reason: unavailable_reason.map(str::to_string),
+    }
+}
+
+impl PeerCapabilityProjection {
+    /// Converts one known capability fact to renderer-safe diagnostics without
+    /// making callers interpret protocol reason codes.
+    pub(crate) fn diagnostic_state(&self, capability_id: &str) -> DiagnosticState {
+        let Some(fact) = self
+            .capabilities
+            .iter()
+            .find(|fact| fact.capability_id == capability_id)
+        else {
+            return DiagnosticState::Unknown;
+        };
+        if fact.available {
+            return DiagnosticState::Available;
+        }
+        match fact.unavailable_reason.as_deref() {
+            Some(REASON_NOT_CONFIGURED) => DiagnosticState::NotConfigured,
+            Some(REASON_UNKNOWN | REASON_PLAN_BINDING_REQUIRED) => DiagnosticState::Unknown,
+            Some(_) => DiagnosticState::Unavailable,
+            None => DiagnosticState::Unknown,
+        }
     }
 }
 
@@ -86,18 +223,32 @@ impl PeerCapabilityStore {
             .retain(|(stored_room, _, _), _| stored_room != room_id);
     }
 
-    #[cfg(test)]
     pub(crate) fn projection(
         &self,
         room_id: &str,
         peer_session_id: &str,
         peer_observation_ref: &str,
-    ) -> Option<&PeerCapabilityProjection> {
-        self.projections.get(&(
+    ) -> Option<PeerCapabilityProjection> {
+        self.projections
+            .get(&(
+                room_id.into(),
+                peer_session_id.into(),
+                peer_observation_ref.into(),
+            ))
+            .cloned()
+    }
+
+    pub(crate) fn remove_projection(
+        &mut self,
+        room_id: &str,
+        peer_session_id: &str,
+        peer_observation_ref: &str,
+    ) {
+        self.projections.remove(&(
             room_id.into(),
             peer_session_id.into(),
             peer_observation_ref.into(),
-        ))
+        ));
     }
 }
 
@@ -192,5 +343,44 @@ mod tests {
             .observe("room", "peer", "observation", projection, 10)
             .unwrap();
         store.purge_room("room");
+    }
+
+    #[test]
+    fn diagnostic_states_keep_not_configured_unavailable_and_unknown_distinct() {
+        let mut projection = local_projection("peer".into(), 10);
+        projection.capabilities = vec![
+            capability(
+                MANAGED_PROVIDER_CAPABILITY,
+                false,
+                Some(REASON_NOT_CONFIGURED),
+            ),
+            capability(
+                MANAGED_RUNTIME_CAPABILITY,
+                false,
+                Some(REASON_PLAN_BINDING_REQUIRED),
+            ),
+            capability(
+                EXECUTION_WORLD_CAPABILITY,
+                false,
+                Some(REASON_EXECUTION_WORLD_UNAVAILABLE),
+            ),
+        ];
+
+        assert_eq!(
+            projection.diagnostic_state(MANAGED_PROVIDER_CAPABILITY),
+            DiagnosticState::NotConfigured
+        );
+        assert_eq!(
+            projection.diagnostic_state(MANAGED_RUNTIME_CAPABILITY),
+            DiagnosticState::Unknown
+        );
+        assert_eq!(
+            projection.diagnostic_state(EXECUTION_WORLD_CAPABILITY),
+            DiagnosticState::Unavailable
+        );
+        assert_eq!(
+            projection.diagnostic_state(MANAGED_EXECUTION_CAPABILITY),
+            DiagnosticState::Unknown
+        );
     }
 }

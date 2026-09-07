@@ -4,12 +4,14 @@ use serde::Deserialize;
 use tokio::{sync::oneshot, time::sleep};
 
 use crate::{
+    diagnostics::{BenchmarkMode, LinkBenchmarkResult},
     discovery,
     error::{AppError, AppResult},
     host_identity::{HostRef, HostSessionBinding},
     host_runtime::{DiscoveryHandle, HostRuntime as AppState},
     logging,
     models::{BridgePeerLiveness, RoomStatus, StoredBridgePeerEndpoint, StoredRoom},
+    peer_capabilities::PeerCapabilityProjection,
     room_control, storage, transfer,
 };
 
@@ -40,9 +42,21 @@ impl CurrentRemoteHostSession {
     /// the live resolution immediately before transport and requires both the
     /// public binding and private endpoint/key facts to remain exact.
     pub(crate) async fn revalidate_for_transfer(
-        self,
+        &self,
         state: &AppState,
     ) -> AppResult<transfer::BridgePeerTransferEndpoint> {
+        self.revalidate_transport_endpoint(state).await
+    }
+
+    async fn revalidate_transport_endpoint(
+        &self,
+        state: &AppState,
+    ) -> AppResult<transfer::BridgePeerTransferEndpoint> {
+        let current = self.revalidate(state).await?;
+        Ok(current.transfer_endpoint)
+    }
+
+    async fn revalidate(&self, state: &AppState) -> AppResult<CurrentRemoteHostSession> {
         let current = state
             .resolve_current_remote_host_session(
                 &self.binding.bridge_id,
@@ -53,10 +67,95 @@ impl CurrentRemoteHostSession {
             .validate_current(&current.binding, storage::now_ts())?;
         if self.transfer_endpoint != current.transfer_endpoint {
             return Err(AppError::InvalidInput(
-                "Current remote Host transport route changed before Transfer.".into(),
+                "Current remote Host transport route changed before use.".into(),
             ));
         }
-        Ok(current.transfer_endpoint)
+        Ok(current)
+    }
+
+    /// Runs the existing authenticated Room Control capability query against
+    /// this exact current remote Host and waits for its bounded observation.
+    /// Route and session identifiers never leave Layer 4.
+    pub(crate) async fn request_capability_projection(
+        &self,
+        state: Arc<AppState>,
+    ) -> AppResult<PeerCapabilityProjection> {
+        let current = self.revalidate(&state).await?;
+        let context = room_control::room_control_session_context_for_peer(
+            &state,
+            &current.binding.bridge_id,
+            &current.binding.peer_route_ref,
+        )?;
+        if context.local_session_ref != current.binding.local_session_ref
+            || context.peer_session_ref != current.binding.peer_session_ref
+            || context.peer_route_ref != current.binding.peer_route_ref
+        {
+            return Err(AppError::InvalidInput(
+                "Current remote Host control session changed during diagnostics.".into(),
+            ));
+        }
+
+        state.peer_capabilities.lock().remove_projection(
+            &current.binding.bridge_id,
+            &context.peer_route_ref,
+            &context.peer_observation_ref,
+        );
+        let event = room_control::peer_capability_event(
+            "peer_capability.query",
+            serde_json::json!({
+                "schemaVersion": crate::peer_capabilities::PEER_CAPABILITY_SCHEMA,
+                "peerSessionId": context.peer_route_ref,
+            }),
+            &context,
+        )?;
+        room_control::send_room_control_event(
+            state.clone(),
+            &current.binding.bridge_id,
+            event,
+            Some(room_control::selected_peer_route(
+                &current.binding.bridge_id,
+                &current.binding.peer_route_ref,
+            )),
+        )
+        .await?;
+
+        for _ in 0..80 {
+            let projection = {
+                state.peer_capabilities.lock().projection(
+                    &current.binding.bridge_id,
+                    &current.binding.peer_route_ref,
+                    &context.peer_observation_ref,
+                )
+            };
+            if let Some(projection) = projection {
+                self.revalidate(&state).await?;
+                return Ok(projection);
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        Err(AppError::Timeout(
+            "Current remote Host capability response is unavailable.".into(),
+        ))
+    }
+
+    /// Reuses the existing in-memory Pastey pipeline benchmark while keeping
+    /// endpoint and transport-key freshness inside the current-session owner.
+    pub(crate) async fn run_pipeline_benchmark(
+        &self,
+        state: Arc<AppState>,
+    ) -> AppResult<LinkBenchmarkResult> {
+        let endpoint = self.revalidate_transport_endpoint(&state).await?;
+        let result = crate::link_benchmark::run_peer_link_benchmark_for_endpoint(
+            endpoint,
+            self.binding.bridge_id.clone(),
+            BenchmarkMode::PasteyPipeline,
+            Some(1),
+            None,
+            crate::link_benchmark::cpu_hint(),
+        )
+        .await?;
+        self.revalidate(&state).await?;
+        Ok(result)
     }
 }
 

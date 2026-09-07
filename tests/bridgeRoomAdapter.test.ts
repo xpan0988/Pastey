@@ -96,6 +96,21 @@ test("manual-code and nearby-accept join methods remain current-session only", (
   assert.equal(manual.peers[0]?.currentSessionOnly, true);
 });
 
+test("durable HostRef is preserved as semantic device identity, not route authority", () => {
+  const collection = legacyRoomToBridgePeerCollection({
+    ...ROOM,
+    peers: [{
+      peerSessionId: "peer:a",
+      hostRef: `host:v1:${"a".repeat(64)}`,
+      displayName: "A",
+      connected: true,
+    }],
+  });
+
+  assert.equal(collection.peers[0]?.hostRef, `host:v1:${"a".repeat(64)}`);
+  assert.equal("authority" in collection.peers[0]!, false);
+});
+
 test("adapter output does not include durable identity, history, trust, or consent fields", () => {
   const collection = legacyRoomToBridgePeerCollection(ROOM);
   const route = deriveLegacyRoomDefaultBridgeRoute(ROOM);

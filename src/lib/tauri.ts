@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppConfig,
   BenchmarkMode,
+  BridgeDeviceDiagnostics,
   CapabilityProbeMode,
   DeviceCapabilities,
   DeviceProfile,
@@ -452,6 +453,13 @@ export async function runLoopbackBenchmark(options?: {
     durationSeconds: options?.durationSeconds ?? null,
     windowSize: options?.windowSize ?? null
   });
+}
+
+export async function runBridgeDeviceDiagnostics(
+  bridgeId: string,
+  hostRef: string
+): Promise<BridgeDeviceDiagnostics> {
+  return invoke("run_bridge_device_diagnostics", { bridgeId, hostRef });
 }
 
 export async function getLastBenchmarkResults(): Promise<LinkBenchmarkResult[]> {
