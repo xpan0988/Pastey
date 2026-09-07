@@ -159,6 +159,8 @@ The requester stores the Draft, approval, attempt, per-Host readiness/admission,
 
 A Host returns a bounded correlated result only after local authoritative completion. The requester verifies the exact participant/Host/session/revision/dependencies and commits it once. Remote participants receive the commit through Room Control; the requester participant receives the same transition directly. Only then can a participant consider that predecessor complete. When the requester is the Transfer destination, the exact attempt/step/revision/hash/object revision/content digest/destination receipt is validated inside the authoritative requester transaction before the shared step commit becomes visible; remote destinations enforce the same receipt gate when accepting the commit.
 
+Bridge Device Check reuses this path for its fixed production Managed E2E self-check: explicit user intent creates one ordinary `Search @ requester → authored Transfer → Execute @ exact remote Host` revision and approval, then uses the same readiness, admission, Worker, EffectEnvelope, ExecutionWorld, and Core finalization. It does not require renderer Draft origination or topology/product-result projections. Missing selected provider, runtime, or ExecutionWorld facts are a preflight `BLOCKED`, before this lifecycle starts; a real external-provider physical Mac ↔ Windows `PASS` remains pending validation. The renderer-safe report mechanics are owned by [Layer 2](layer-2-device-intelligence.md).
+
 Transform finalization seals one OutputSlot generation and registers N+1 at the same Host. Execute records only its result digest. Provider/model/Worker output is always non-authoritative.
 
 ## Lifecycle and recovery
@@ -180,6 +182,7 @@ Distributed delivery failure remains a product-recovery limitation: the sender c
 | Same-Host Resource Worker Transform; Host-selected runtime settings/resolution and exact Execute binding; local provider configuration/selection/health UI; contained Process on verified macOS; native Windows Managed Execute acceptance through the Codex-backed production path | Linux process world |
 | Execute through Core with no lineage when an exact process binding exists | Raw shell/terminal/process authority |
 | Durable generation-bound provider state, streaming adapter, and safe local configuration/health product surface | Provider marketplace, routing, fallback, or additional provider backends |
+| Bridge Device Check fixed Managed E2E self-check through the ordinary native-v2 lifecycle | External provider/API and packaged Mac ↔ Windows `PASS` evidence pending |
 | Phase 5 Host network broker | Worker network tools or automatic task egress |
 | Cancellation/revocation/restart/Burn fail closed in state and Core authority | Guaranteed cross-partition cancellation delivery and richer recovery |
 | Bounded non-secret product/Worker status events and authoritative lifecycle presentation | Result content projection and richer interrupted/recovery detail |

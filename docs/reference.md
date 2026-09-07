@@ -71,12 +71,15 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 | Core claim/result finalizer | `src-tauri/src/managed_execution.rs` |
 | Worker Harness/provider | `src-tauri/src/worker_harness.rs`, `worker_provider.rs` |
 | Provider configuration | `src-tauri/src/worker_provider_config.rs` |
+| Bridge Device Check / Managed E2E self-check | `src-tauri/src/commands.rs`, `src-tauri/src/diagnostics.rs`, `src/lib/tauri.ts`, `src/lib/types.ts` |
 
 ## Provider configuration facts
 
 The Host service stores non-secret provider id, generation, config digest, HTTPS base URL, model, timeout, output-token limit, health, and timestamps in SQLite. The API key is stored separately as authenticated ciphertext under the existing Host master key. Exact generations are immutable run bindings; update increments generation, delete revokes active bindings, and stale references fail closed.
 
 Accepted production endpoints must use HTTPS and valid bounded model/config values. Provider health has `unknown`, `healthy`, and `unhealthy` states. The health probe performs no Worker task effect. Local Tauri commands `get_managed_worker_provider_settings`, `create_managed_worker_provider`, `update_managed_worker_provider`, `delete_managed_worker_provider`, `select_managed_worker_provider`, and `check_managed_worker_provider_health` return only the renderer-safe settings snapshot. Create/update receive a credential only for that command; no list/status/read operation or command returns it. Environment-variable provider loading remains limited to an ignored opt-in development smoke test.
+
+The corresponding product configuration/selection/health closure is implemented. A real external provider/API call remains pending validation; neither configuration nor a bounded health observation alone claims a Managed E2E `PASS`.
 
 ## Developer Terminal protocol and bounds
 
