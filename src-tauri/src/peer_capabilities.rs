@@ -28,6 +28,7 @@ const REASON_NOT_CONFIGURED: &str = "not_configured";
 const REASON_UNKNOWN: &str = "unknown";
 const REASON_PLAN_BINDING_REQUIRED: &str = "plan_process_binding_required";
 const REASON_PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
+const REASON_RUNTIME_UNAVAILABLE: &str = "runtime_unavailable";
 const REASON_EXECUTION_WORLD_UNAVAILABLE: &str = "execution_world_unavailable";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -109,29 +110,44 @@ pub(crate) fn local_diagnostic_projection(
         ),
     };
 
+    let runtime = match state.managed_runtime_configs.selected_for_managed_execute() {
+        Ok(None) => capability(
+            MANAGED_RUNTIME_CAPABILITY,
+            false,
+            Some(REASON_NOT_CONFIGURED),
+        ),
+        Ok(Some(_)) => capability(MANAGED_RUNTIME_CAPABILITY, true, None),
+        Err(_) => capability(
+            MANAGED_RUNTIME_CAPABILITY,
+            false,
+            Some(REASON_RUNTIME_UNAVAILABLE),
+        ),
+    };
     let execution_world_available = state.execution_worlds.platform_availability().available;
     let execution_world = capability(
         EXECUTION_WORLD_CAPABILITY,
         execution_world_available,
         (!execution_world_available).then_some(REASON_EXECUTION_WORLD_UNAVAILABLE),
     );
-    let runtime = capability(
-        MANAGED_RUNTIME_CAPABILITY,
-        false,
-        Some(REASON_PLAN_BINDING_REQUIRED),
-    );
     let managed_execution = if provider.unavailable_reason.as_deref() == Some(REASON_NOT_CONFIGURED)
+        || runtime.unavailable_reason.as_deref() == Some(REASON_NOT_CONFIGURED)
     {
         capability(
             MANAGED_EXECUTION_CAPABILITY,
             false,
             Some(REASON_NOT_CONFIGURED),
         )
-    } else if provider.unavailable_reason.as_deref() == Some(REASON_PROVIDER_UNAVAILABLE) {
+    } else if provider.unavailable_reason.as_deref() == Some(REASON_PROVIDER_UNAVAILABLE)
+        || runtime.unavailable_reason.as_deref() == Some(REASON_RUNTIME_UNAVAILABLE)
+    {
         capability(
             MANAGED_EXECUTION_CAPABILITY,
             false,
-            Some(REASON_PROVIDER_UNAVAILABLE),
+            if provider.unavailable_reason.as_deref() == Some(REASON_PROVIDER_UNAVAILABLE) {
+                Some(REASON_PROVIDER_UNAVAILABLE)
+            } else {
+                Some(REASON_RUNTIME_UNAVAILABLE)
+            },
         )
     } else if !execution_world_available {
         capability(

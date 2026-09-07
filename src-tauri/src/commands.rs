@@ -3728,6 +3728,31 @@ pub fn get_config(state: State<'_, Arc<AppState>>) -> Result<AppConfig, String> 
 }
 
 #[tauri::command]
+pub fn list_managed_runtime_options(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::managed_runtime_config::ManagedRuntimeOptionV1>, String> {
+    state
+        .managed_runtime_configs
+        .list_managed_execute_options()
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn select_managed_execute_runtime(
+    runtime_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::managed_runtime_config::ManagedRuntimeOptionV1>, String> {
+    state
+        .managed_runtime_configs
+        .configure_discovered_for_managed_execute(&runtime_id)
+        .map_err(|error| error.message())?;
+    state
+        .managed_runtime_configs
+        .list_managed_execute_options()
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
 pub async fn get_device_profile(
     force_refresh: Option<bool>,
     state: State<'_, Arc<AppState>>,

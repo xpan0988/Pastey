@@ -63,6 +63,8 @@ mod managed_execution;
 mod managed_objects;
 #[path = "../managed_resources.rs"]
 mod managed_resources;
+#[path = "../managed_runtime_config.rs"]
+mod managed_runtime_config;
 #[path = "../managed_worker_coordinator.rs"]
 mod managed_worker_coordinator;
 #[path = "../managed_workspace.rs"]

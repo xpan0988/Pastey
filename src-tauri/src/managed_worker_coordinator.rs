@@ -91,13 +91,76 @@ impl HostRuntime {
         {
             return invalid("Managed process step binding is invalid.");
         }
-        crate::managed_resources::ManagedResourceResolverV1::executable_identity_ref(
-            &spec.executable,
-        )?;
-        self.managed_worker_process_specs
-            .lock()
-            .insert((revision_id.into(), step_id.into()), spec);
+        spec.validate_executable_identity()?;
+        let mut specs = self.managed_worker_process_specs.lock();
+        let key = (revision_id.into(), step_id.into());
+        if let Some(existing) = specs.get(&key) {
+            if existing.is_same_exact_binding(&spec) {
+                return Ok(());
+            }
+            return invalid("Managed process step already has a different exact binding.");
+        }
+        specs.insert(key, spec);
         Ok(())
+    }
+
+    /// Resolves the Host-selected logical Execute runtime locally and creates
+    /// exact revision/step bindings through the canonical binder. Existing
+    /// exact bindings are immutable and reused. A missing, replaced, or
+    /// unsupported runtime leaves an unbound revision unavailable; there is no
+    /// PATH or alternative-runtime fallback.
+    pub(crate) fn resolve_and_bind_v2_managed_process_steps(
+        &self,
+        revision: &PlanRevisionV2,
+    ) -> AppResult<bool> {
+        let execute_step_ids = revision
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(step, PlanStepV2::Execute { .. })
+                    && crate::native_v2_orchestration::step_runs_on_host(
+                        revision,
+                        step,
+                        &self.local_host_ref,
+                    )
+            })
+            .map(|step| step.id().to_string())
+            .collect::<Vec<_>>();
+        if execute_step_ids.is_empty() {
+            return Ok(true);
+        }
+        let existing_count = {
+            let specs = self.managed_worker_process_specs.lock();
+            execute_step_ids
+                .iter()
+                .filter(|step_id| {
+                    specs.contains_key(&(revision.revision_id.clone(), (*step_id).clone()))
+                })
+                .count()
+        };
+        if existing_count == execute_step_ids.len() {
+            let specs = self.managed_worker_process_specs.lock();
+            for step_id in &execute_step_ids {
+                specs
+                    .get(&(revision.revision_id.clone(), step_id.clone()))
+                    .expect("counted exact process binding")
+                    .validate_executable_identity()?;
+            }
+            return Ok(true);
+        }
+        if existing_count != 0 {
+            return invalid("Managed revision has a partial process binding set.");
+        }
+        let Some(spec) = self
+            .managed_runtime_configs
+            .selected_for_managed_execute()?
+        else {
+            return Ok(false);
+        };
+        for step_id in execute_step_ids {
+            self.bind_v2_managed_process_step(&revision.revision_id, &step_id, spec.clone())?;
+        }
+        Ok(true)
     }
 
     /// Accepts the real inbound v2 attempt only after every managed primitive
@@ -190,7 +253,14 @@ impl HostRuntime {
         // Resolution, including credential decryption, happens before attempt
         // admission. The temporary binding is dropped without a model call.
         drop(self.worker_provider_configs.resolve(&selection)?);
-        let availability = self.managed_worker_plan_availability(&revision, &selection)?;
+        let runtime_ready = self
+            .resolve_and_bind_v2_managed_process_steps(&revision)
+            .unwrap_or(false);
+        let availability = if runtime_ready {
+            self.managed_worker_plan_availability(&revision, &selection)?
+        } else {
+            ManagedPrimitiveAvailabilityV1::unavailable()
+        };
         let decision = store.accept_attempt_start_with_freshness(
             &start,
             &captured_binding,
@@ -1356,7 +1426,6 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::*;
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
     use crate::managed_resources::ExecutableBindingSpecV1;
     #[cfg(all(target_os = "windows", feature = "native-windows-acceptance"))]
     use crate::worker_harness::WorkerObservationV1;
@@ -2241,6 +2310,88 @@ mod tests {
     }
 
     #[test]
+    fn host_selected_runtime_populates_only_exact_local_execute_bindings() {
+        let execute_fixture = fixture(execute_steps);
+        let executable_path = execute_fixture._root.0.join("configured-runtime");
+        std::fs::write(&executable_path, b"configured-runtime-v1").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&executable_path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&executable_path, permissions).unwrap();
+        }
+        execute_fixture
+            .runtime
+            .managed_runtime_configs
+            .configure_for_managed_execute_for_tests(
+                crate::capability_probe::MANAGED_PYTHON_RUNTIME_ID,
+                ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+                    executable_path: executable_path.clone(),
+                    scope_root: execute_fixture._root.0.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert!(execute_fixture
+            .runtime
+            .resolve_and_bind_v2_managed_process_steps(&execute_fixture.revision)
+            .unwrap());
+        let specs = execute_fixture.runtime.managed_worker_process_specs.lock();
+        let bound = specs
+            .get(&(
+                execute_fixture.revision.revision_id.clone(),
+                "execute".into(),
+            ))
+            .expect("exact Execute process binding");
+        assert_eq!(bound.executable.executable_path, executable_path);
+        assert_eq!(specs.len(), 1);
+        drop(specs);
+        let substituted_path = execute_fixture._root.0.join("substituted-runtime");
+        std::fs::write(&substituted_path, b"configured-runtime-v1").unwrap();
+        assert!(execute_fixture
+            .runtime
+            .bind_v2_managed_process_step(
+                &execute_fixture.revision.revision_id,
+                "execute",
+                ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+                    executable_path: substituted_path,
+                    scope_root: execute_fixture._root.0.clone(),
+                })
+                .unwrap(),
+            )
+            .is_err());
+        std::fs::write(&executable_path, b"configured-runtime-v2").unwrap();
+        assert!(execute_fixture
+            .runtime
+            .resolve_and_bind_v2_managed_process_steps(&execute_fixture.revision)
+            .is_err());
+
+        let transform = fixture(transform_steps);
+        assert!(transform
+            .runtime
+            .resolve_and_bind_v2_managed_process_steps(&transform.revision)
+            .unwrap());
+        assert!(transform
+            .runtime
+            .managed_worker_process_specs
+            .lock()
+            .is_empty());
+
+        let remote_execute = fixture(local_transfer_remote_execute_steps);
+        assert!(remote_execute
+            .runtime
+            .resolve_and_bind_v2_managed_process_steps(&remote_execute.revision)
+            .unwrap());
+        assert!(remote_execute
+            .runtime
+            .managed_worker_process_specs
+            .lock()
+            .is_empty());
+    }
+
+    #[test]
     fn transform_dispatch_is_one_use_and_only_unlocks_its_authored_transfer() {
         let fixture = fixture(transform_transfer_steps);
         assert!(matches!(
@@ -2655,12 +2806,11 @@ mod tests {
             .bind_v2_managed_process_step(
                 &fixture.revision.revision_id,
                 "execute",
-                ManagedProcessWorldSpecV1 {
-                    executable: ExecutableBindingSpecV1 {
-                        executable_path: PathBuf::from("/bin/sleep"),
-                        scope_root: PathBuf::from("/bin"),
-                    },
-                },
+                ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+                    executable_path: PathBuf::from("/bin/sleep"),
+                    scope_root: PathBuf::from("/bin"),
+                })
+                .unwrap(),
             )
             .unwrap();
         if !fixture
@@ -2763,12 +2913,11 @@ mod tests {
             .bind_v2_managed_process_step(
                 &fixture.revision.revision_id,
                 "execute",
-                ManagedProcessWorldSpecV1 {
-                    executable: ExecutableBindingSpecV1 {
-                        executable_path: PathBuf::from("/usr/bin/true"),
-                        scope_root: PathBuf::from("/usr/bin"),
-                    },
-                },
+                ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+                    executable_path: PathBuf::from("/usr/bin/true"),
+                    scope_root: PathBuf::from("/usr/bin"),
+                })
+                .unwrap(),
             )
             .unwrap();
         if !fixture
@@ -2926,7 +3075,8 @@ mod tests {
             .bind_v2_managed_process_step(
                 &fixture.revision.revision_id,
                 "execute",
-                ManagedProcessWorldSpecV1 { executable },
+                ManagedProcessWorldSpecV1::new(executable)
+                    .expect("capture the exact probe executable identity"),
             )
             .expect("bind the exact Cargo-built probe to the exact approved Execute step");
 

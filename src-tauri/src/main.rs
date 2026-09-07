@@ -25,6 +25,7 @@ mod logging;
 mod managed_execution;
 mod managed_objects;
 mod managed_resources;
+mod managed_runtime_config;
 mod managed_worker_coordinator;
 mod managed_workspace;
 mod models;
@@ -67,13 +68,14 @@ use crate::{
         get_developer_terminal_workspace, get_device_capabilities, get_device_profile,
         get_file_transfer_metadata, get_last_benchmark_results, get_native_v2_plan_status,
         get_room, get_room_control_session_context, join_room, list_bridge_plan_workspace,
-        list_nearby_devices, list_received_room_control_events, list_room_items, list_rooms,
-        log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
-        mark_join_prompt_rendered, open_logs_folder, pair_bridge_peer, pending_join_requests,
-        refresh_selected_peer_capabilities, reject_nearby_join, request_developer_terminal,
-        request_nearby_join, resize_developer_terminal, reveal_in_folder,
-        revoke_bridge_peer_pairing, run_bridge_device_diagnostics, run_loopback_benchmark,
-        run_peer_link_benchmark, select_bridge_plan_search_candidate,
+        list_managed_runtime_options, list_nearby_devices, list_received_room_control_events,
+        list_room_items, list_rooms, log_frontend_diagnostic,
+        mark_bridge_peer_pairing_rotation_required, mark_join_prompt_rendered, open_logs_folder,
+        pair_bridge_peer, pending_join_requests, refresh_selected_peer_capabilities,
+        reject_nearby_join, request_developer_terminal, request_nearby_join,
+        resize_developer_terminal, reveal_in_folder, revoke_bridge_peer_pairing,
+        run_bridge_device_diagnostics, run_loopback_benchmark, run_peer_link_benchmark,
+        select_bridge_plan_search_candidate, select_managed_execute_runtime,
         send_developer_terminal_input, send_file_to_room, send_text_to_room,
         start_bridge_plan_attempt, start_native_v2_plan_attempt, update_config,
         update_transfer_window, withdraw_bridge_plan_revision, write_temp_file,
@@ -212,6 +214,8 @@ fn main() {
             delete_temp_file,
             burn_room,
             get_config,
+            list_managed_runtime_options,
+            select_managed_execute_runtime,
             get_device_profile,
             get_device_capabilities,
             run_bridge_device_diagnostics,

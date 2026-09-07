@@ -1048,6 +1048,19 @@ impl HostRuntime {
             ) && step_runs_on_host(revision, step, &self.local_host_ref)
         });
         if managed_here {
+            let runtime_ready = self
+                .resolve_and_bind_v2_managed_process_steps(revision)
+                .unwrap_or(false);
+            if revision.steps.iter().any(|step| {
+                matches!(step, PlanStepV2::Execute { .. })
+                    && step_runs_on_host(revision, step, &self.local_host_ref)
+            }) && !runtime_ready
+            {
+                return Ok(LocalReadinessV1 {
+                    ready: false,
+                    code: Some("managed_runtime_unavailable"),
+                });
+            }
             let selection = match self.worker_provider_configs.selected_for_managed_workers() {
                 Ok(selection) => selection,
                 Err(_) => {

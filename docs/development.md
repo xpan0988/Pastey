@@ -196,7 +196,7 @@ scripts/native-v2-physical/run-mac.sh verify --profile b \
   --output-dir /absolute/path/to/reports
 ```
 
-It prepares `Search @ Mac → Transfer → Execute @ Windows`, but it remains fail-closed until the existing Windows Host has a real selected provider generation, health, exact process binding, verified production execution-world availability, and the native Windows Stage 1–5 baseline. The harness does not read credentials or create those Host-private bindings. The current product has no configuration/origination surface for those provider/process bindings, so Profile B is a prepared physical path rather than a runnable PASS case. A `provider_unavailable` or `managed_platform_unavailable` state is a correct BLOCKED/FAIL-precondition outcome, not a reason to weaken the gate. Do not claim Profile B PASS until that setup and a two-machine run have actually occurred.
+It prepares `Search @ Mac → Transfer → Execute @ Windows`, but it remains fail-closed until the existing Windows Host has a real selected provider generation, health, selected Host-local managed runtime, verified production execution-world availability, and the native Windows Stage 1–5 baseline. Production readiness now turns a valid selected runtime into the exact Execute process binding; the harness still does not read credentials or configure those Host-private selections. The runtime selection is available in local Task Provider settings, but provider configuration and normal Draft origination are not product-exposed, so Profile B is a prepared physical path rather than a runnable PASS case. A `provider_unavailable`, `managed_runtime_unavailable`, or `managed_platform_unavailable` state is a correct BLOCKED/FAIL-precondition outcome, not a reason to weaken the gate. Do not claim Profile B PASS until that setup and a two-machine run have actually occurred.
 
 ## Phase 6 physical multi-Host smoke
 
@@ -211,13 +211,13 @@ A requester → Transform N→N+1 @ B → authored Transfer B→C → Execute N+
 Do not start or claim this smoke as reproducible until all of these are true:
 
 - the product can create/select a durable provider configuration on B and C and run the no-effect health probe;
-- the product can bind the exact reviewed Transform/Execute steps to Host-owned process specifications where Process is required;
+- the target Host has an explicitly selected allowed runtime identity, and production readiness resolves its pinned local executable identity into exact reviewed Execute process bindings;
 - B and C report a verified execution world for those specifications (macOS after its local probe; Windows only after its native product-binary probe; Linux fails closed);
 - the frontend or an approved test driver exposes compose/review/approve/start/status/cancel without bypassing the registered Tauri commands;
 - authored work on the requester's local Host, if included in an additional smoke case, uses direct local admission against the same lifecycle and does not send a Room Control message to itself; the canonical A→B→C case below still keeps all authored steps on remote B/C so it exercises real cross-device delivery;
 - three packaged instances have distinct HostRefs, one active Bridge, current unambiguous routes, and the exact managed root already bound at B.
 
-The repository does not currently satisfy the first three product-surface requirements end to end: provider configuration/health and process binding remain Host-private seams. The 2.0 UI can operate the authoritative lifecycle for an existing revision, but Draft origination and the detailed topology/result projections required for this smoke are not renderer-exposed. The backend contracts can be tested, but the A→B→C physical managed smoke is therefore **not yet runnable as a normal product flow**.
+The repository does not currently satisfy the complete product-surface gate: runtime selection and production exact Execute binding are implemented, but provider configuration/health remains Host-private. The 2.0 UI can operate the authoritative lifecycle for an existing revision, but Draft origination and the detailed topology/result projections required for this smoke are not renderer-exposed. The backend contracts can be tested, but the A→B→C physical managed smoke is therefore **not yet runnable as a normal product flow**.
 
 ### Procedure once the gate is implemented
 
