@@ -282,8 +282,7 @@ fn run_token(value: &str) -> AppResult<String> {
     Ok(value.into())
 }
 
-fn request(
-    profile: Profile,
+fn profile_a_request(
     runtime: &HostRuntime,
     bridge_id: &str,
     remote: &str,
@@ -299,7 +298,7 @@ fn request(
         logical_object_id: format!("physical-native-v2-{run_id}"),
         revision: 1,
     };
-    let mut steps = vec![
+    let steps = vec![
         NativeV2StepDraftV1::Search {
             step_id: "search-mac".into(),
             depends_on: vec![],
@@ -317,15 +316,6 @@ fn request(
             output: object.clone(),
         },
     ];
-    if profile == Profile::B {
-        steps.push(NativeV2StepDraftV1::Execute {
-            step_id: "execute-windows".into(),
-            depends_on: vec!["transfer-mac-windows".into()],
-            host_ref: remote.into(),
-            target: object.clone(),
-            execution_intent: "Return the deterministic physical-acceptance result digest.".into(),
-        });
-    }
     Ok(NativeV2ComposeRequestV1 {
         plan_id: format!("physical-native-v2-plan-{run_id}"),
         revision_id: format!("physical-native-v2-revision-{run_id}"),
@@ -336,11 +326,8 @@ fn request(
         roots: vec![],
         original_user_goal:
             "Physical native-v2 acceptance: exact Search then explicit Transfer to Windows.".into(),
-        expected_outcome: if profile == Profile::A {
-            "One exact Search result is received by Windows and Core completes.".into()
-        } else {
-            "Windows Execute records one result digest without a successor managed object.".into()
-        },
+        expected_outcome: "One exact Search result is received by Windows and Core completes."
+            .into(),
         steps,
     })
 }
@@ -375,8 +362,44 @@ async fn run_requester(profile: Profile, args: &BTreeMap<String, String>) -> App
     let report_dir = PathBuf::from(required(args, "report-dir")?);
     let runtime = start_host(paths.clone()).await?;
     wait_for_exact_connected_peer(&runtime, bridge_id, remote).await?;
+    if profile == Profile::B {
+        // Profile B launches the production Devices Check path.  The harness
+        // stays a thin physical launcher and read-only verifier; it must not
+        // retain a second composed-plan/approval/attempt orchestration.
+        let remote_host_ref = host_identity::HostRef::parse(remote.to_string())?;
+        let diagnostics = commands::run_bridge_device_managed_self_check(
+            runtime.clone(),
+            bridge_id,
+            &remote_host_ref,
+        )
+        .await;
+        let report = diagnostics
+            .managed_e2e
+            .as_ref()
+            .ok_or_else(|| invalid("production Bridge Device Check omitted its managed report"))?;
+        let attempt_id = report.attempt_id.as_deref().ok_or_else(|| {
+            invalid("production Bridge Device Check was BLOCKED before an attempt")
+        })?;
+        write_report(
+            profile,
+            "requester",
+            &paths,
+            attempt_id,
+            &report_dir,
+            args.get("product-executable").map(String::as_str),
+            &launch_identity,
+        )?;
+        runtime.shutdown_all();
+        return if report.outcome == diagnostics::ManagedE2ESelfCheckOutcome::Pass {
+            Ok(())
+        } else {
+            Err(invalid(
+                "production Bridge Device Check did not reach PASS; evidence was emitted when an attempt was started",
+            ))
+        };
+    }
     prepare_search_fixture(&paths, &run_id)?;
-    let request = request(profile, &runtime, bridge_id, remote, &run_id)?;
+    let request = profile_a_request(&runtime, bridge_id, remote, &run_id)?;
     let revision_id = request.revision_id.clone();
     let approval_id = format!("physical-native-v2-approval-{run_id}");
     let attempt_id = format!("physical-native-v2-attempt-{run_id}");
@@ -696,14 +719,19 @@ fn verify(profile: Profile, args: &BTreeMap<String, String>) -> AppResult<()> {
         .as_array()
         .is_none_or(|receipts| {
             receipts.len() != 1
-                || receipts[0]["stepId"] != "transfer-mac-windows"
+                || receipts[0]["stepId"]
+                    != if profile == Profile::B {
+                        "self-check-transfer"
+                    } else {
+                        "transfer-mac-windows"
+                    }
                 || receipts[0]["revisionId"] != requester["attempt"]["revisionId"]
                 || receipts[0]["revisionHash"] != requester["attempt"]["revisionHash"]
                 || receipts[0]["destinationHostRef"] != windows["identity"]["localHostRef"]
                 || !nonempty_string(&receipts[0]["contentDigest"])
         })
     {
-        failures.push("Windows receipt does not prove transfer-mac-windows with a digest for this exact revision and destination HostRef");
+        failures.push("Windows receipt does not prove the exact authored Transfer with a digest for this revision and destination HostRef");
     }
     if profile == Profile::B {
         if windows["managed"]["executeResults"]

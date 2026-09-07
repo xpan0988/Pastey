@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { runBridgeDeviceDiagnostics } from "../../lib/tauri";
+import { runBridgeDeviceSelfCheck } from "../../lib/tauri";
 import type { TransferQueueItem } from "../../lib/transferScheduler";
 import type { BridgeDeviceDiagnostics, DiagnosticState, FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../../lib/types";
 import { MessageCard, TransferMessage } from "./BridgeWorkspace";
@@ -50,7 +50,7 @@ export function DevicesScreen({ room }: { room: RoomInfo | null }) {
     inFlight.current.add(checkKey);
     setChecks((current) => ({ ...current, [checkKey]: {} }));
     try {
-      const result = await runBridgeDeviceDiagnostics(bridgeId, hostRef);
+      const result = await runBridgeDeviceSelfCheck(bridgeId, hostRef);
       setChecks((current) => ({ ...current, [checkKey]: { result } }));
     } catch {
       setChecks((current) => ({ ...current, [checkKey]: { unavailable: true } }));
@@ -105,7 +105,7 @@ function DeviceDiagnosticsResult({ check }: { check: { result?: BridgeDeviceDiag
   if (!check.result) {
     return <div className="v2-device-diagnostics" role="status">Checking the exact current Host session…</div>;
   }
-  const { connection, managedReadiness, linkBenchmark } = check.result;
+  const { connection, managedReadiness, linkBenchmark, managedE2e } = check.result;
   return <div className="v2-device-diagnostics" role="status">
     <DiagnosticGroup title="Connection" facts={[
       ["Identity", connection.identity],
@@ -120,6 +120,7 @@ function DeviceDiagnosticsResult({ check }: { check: { result?: BridgeDeviceDiag
       ["Managed execution", managedReadiness.managedExecution],
     ]} />
     {linkBenchmark ? <small>Pipeline baseline · {linkBenchmark.average_MBps.toFixed(1)} MB/s</small> : null}
+    {managedE2e ? <section><strong>Managed E2E self-check</strong><span><span>Result</span><b className={`v2-diagnostic-state ${managedE2e.outcome === "PASS" ? "healthy" : managedE2e.outcome === "BLOCKED" ? "unknown" : "unavailable"}`}>{managedE2e.outcome}</b></span>{managedE2e.coreTerminalState ? <span><span>Core terminal state</span><b>{managedE2e.coreTerminalState}</b></span> : null}{managedE2e.failureCode ? <span><span>Reason</span><b>{managedE2e.failureCode}</b></span> : null}</section> : null}
   </div>;
 }
 
