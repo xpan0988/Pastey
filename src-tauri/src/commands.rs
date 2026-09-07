@@ -208,9 +208,54 @@ fn managed_self_check_report(
     }
 }
 
-fn log_managed_self_check(report: &diagnostics::ManagedE2ESelfCheckReport) {
-    if let Ok(report) = serde_json::to_string(report) {
-        logging::write_transfer_line(&format!("[pastey managed-self-check] {report}"));
+fn write_managed_self_check_report(
+    paths: &storage::AppPaths,
+    report: &diagnostics::ManagedE2ESelfCheckReport,
+    run_id: &str,
+) -> AppResult<String> {
+    if run_id.len() > 64
+        || !run_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+    {
+        return Err(AppError::InvalidInput(
+            "managed self-check report identifier is invalid".into(),
+        ));
+    }
+    let file_name = format!("managed-self-check-{run_id}.json");
+    fs::create_dir_all(&paths.logs_dir)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(paths.logs_dir.join(&file_name))?;
+    file.write_all(&serde_json::to_vec(report)?)?;
+    Ok(file_name)
+}
+
+fn managed_self_check_outcome_label(
+    outcome: diagnostics::ManagedE2ESelfCheckOutcome,
+) -> &'static str {
+    match outcome {
+        diagnostics::ManagedE2ESelfCheckOutcome::Pass => "PASS",
+        diagnostics::ManagedE2ESelfCheckOutcome::Blocked => "BLOCKED",
+        diagnostics::ManagedE2ESelfCheckOutcome::Fail => "FAIL",
+    }
+}
+
+fn log_managed_self_check(
+    paths: &storage::AppPaths,
+    report: &diagnostics::ManagedE2ESelfCheckReport,
+    run_id: &str,
+) {
+    match write_managed_self_check_report(paths, report, run_id) {
+        Ok(file_name) => logging::write_transfer_line(&format!(
+            "[pastey managed-self-check] outcome={} report={file_name}",
+            managed_self_check_outcome_label(report.outcome)
+        )),
+        Err(_) => logging::write_transfer_line(&format!(
+            "[pastey managed-self-check] outcome={} report=write_failed",
+            managed_self_check_outcome_label(report.outcome)
+        )),
     }
 }
 
@@ -307,7 +352,23 @@ fn populate_managed_self_check_evidence(
     let Some(attempt_id) = report.attempt_id.as_deref() else {
         return Ok(());
     };
+    let Some(revision_id) = report.revision_id.as_deref() else {
+        return Err(AppError::InvalidInput(
+            "managed self-check report has no revision".into(),
+        ));
+    };
     let connection = Connection::open(&paths.db_path)?;
+    let exact_attempt_revision = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM native_v2_product_attempts
+         WHERE attempt_id = ?1 AND revision_id = ?2)",
+        [attempt_id, revision_id],
+        |row| row.get::<_, i64>(0),
+    )? == 1;
+    if !exact_attempt_revision {
+        return Err(AppError::InvalidInput(
+            "managed self-check attempt does not match its revision".into(),
+        ));
+    }
     let mut statement = connection.prepare(
         "SELECT step_id, operation, host_ref, result_json, state
          FROM native_v2_step_commits WHERE attempt_id = ?1 ORDER BY step_id",
@@ -341,7 +402,13 @@ fn populate_managed_self_check_evidence(
                     .filter(|value| !value.is_empty());
                 report.transfer_committed = digest.is_some();
                 report.transfer_content_digest = digest.map(str::to_string);
-                report.transfer_destination_host_ref = Some(report.remote_host_ref.clone());
+                // This is the Core-committed result for the exact attempt and
+                // revision above. Its object location is the Transfer's
+                // authoritative destination; never copy the requested HostRef.
+                report.transfer_destination_host_ref = result["object"]["hostRef"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
             }
             "self-check-execute"
                 if operation == "execute" && host_ref == report.remote_host_ref =>
@@ -363,6 +430,17 @@ fn populate_managed_self_check_evidence(
     Ok(())
 }
 
+fn managed_self_check_pass(report: &diagnostics::ManagedE2ESelfCheckReport) -> bool {
+    report.core_terminal_state.as_deref() == Some("completed")
+        && report.search_committed
+        && report.transfer_committed
+        && report.transfer_content_digest.is_some()
+        && report.transfer_destination_host_ref.as_deref() == Some(&report.remote_host_ref)
+        && report.execute_committed
+        && report.execute_result_digest.is_some()
+        && report.execute_successor_lineage_count == 0
+}
+
 /// Explicitly runs one bounded, ordinary native-v2 Profile-B-shaped diagnostic
 /// after the existing Bridge diagnostics prove the local preflight. It creates
 /// no special authority and always reports a renderer-safe terminal outcome.
@@ -373,6 +451,7 @@ pub(crate) async fn run_bridge_device_managed_self_check(
 ) -> diagnostics::BridgeDeviceDiagnostics {
     let started = Instant::now();
     let checked_at = storage::now_ts();
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
     let requester = state.local_host_ref.as_str().to_string();
     let remote = remote_host_ref.as_str().to_string();
     let mut diagnostics =
@@ -392,12 +471,11 @@ pub(crate) async fn run_bridge_device_managed_self_check(
         );
         report.connection = diagnostics.connection.clone();
         report.managed_readiness = diagnostics.managed_readiness.clone();
-        log_managed_self_check(&report);
+        log_managed_self_check(&state.paths, &report, &run_id);
         diagnostics.managed_e2e = Some(report);
         return diagnostics;
     }
 
-    let run_id = uuid::Uuid::new_v4().simple().to_string();
     let request = managed_self_check_request(&state, bridge_id, remote_host_ref, &run_id);
     let revision_id = request.revision_id.clone();
     let approval_id = format!("managed-self-check-approval-{run_id}");
@@ -416,7 +494,7 @@ pub(crate) async fn run_bridge_device_managed_self_check(
             );
             report.connection = diagnostics.connection.clone();
             report.managed_readiness = diagnostics.managed_readiness.clone();
-            log_managed_self_check(&report);
+            log_managed_self_check(&state.paths, &report, &run_id);
             diagnostics.managed_e2e = Some(report);
             return diagnostics;
         }
@@ -478,15 +556,7 @@ pub(crate) async fn run_bridge_device_managed_self_check(
         Ok(status) => {
             report.core_terminal_state = Some(managed_self_check_state(status.state).into());
             let evidence = populate_managed_self_check_evidence(&mut report, &state.paths);
-            let passed = evidence.is_ok()
-                && report.core_terminal_state.as_deref() == Some("completed")
-                && report.search_committed
-                && report.transfer_committed
-                && report.transfer_content_digest.is_some()
-                && report.transfer_destination_host_ref.as_deref() == Some(remote.as_str())
-                && report.execute_committed
-                && report.execute_result_digest.is_some()
-                && report.execute_successor_lineage_count == 0;
+            let passed = evidence.is_ok() && managed_self_check_pass(&report);
             report.outcome = if passed {
                 diagnostics::ManagedE2ESelfCheckOutcome::Pass
             } else {
@@ -503,7 +573,7 @@ pub(crate) async fn run_bridge_device_managed_self_check(
         }
     }
     report.duration_millis = started.elapsed().as_millis() as u64;
-    log_managed_self_check(&report);
+    log_managed_self_check(&state.paths, &report, &run_id);
     diagnostics.managed_e2e = Some(report);
     diagnostics
 }
@@ -4812,6 +4882,147 @@ mod tests {
                 "unsafe report field: {forbidden}"
             );
         }
+    }
+
+    fn managed_self_check_test_paths(label: &str) -> storage::AppPaths {
+        let root = std::env::temp_dir().join(format!("{label}-{}", uuid::Uuid::new_v4()));
+        let paths = storage::AppPaths::new(root.clone(), root.join("logs"));
+        paths.ensure_directories().unwrap();
+        paths
+    }
+
+    fn managed_self_check_evidence_report() -> diagnostics::ManagedE2ESelfCheckReport {
+        let mut report = managed_self_check_report(
+            diagnostics::ManagedE2ESelfCheckOutcome::Fail,
+            "bridge-1",
+            "host:requester",
+            "host:remote",
+            1,
+            2,
+            None,
+        );
+        report.revision_id = Some("revision-1".into());
+        report.attempt_id = Some("attempt-1".into());
+        report.core_terminal_state = Some("completed".into());
+        report
+    }
+
+    fn insert_managed_self_check_evidence(paths: &storage::AppPaths, transfer_result: Value) {
+        let connection = Connection::open(&paths.db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE native_v2_product_attempts (attempt_id TEXT PRIMARY KEY, revision_id TEXT NOT NULL);
+                 CREATE TABLE native_v2_step_commits (
+                    attempt_id TEXT NOT NULL, step_id TEXT NOT NULL, operation TEXT NOT NULL,
+                    host_ref TEXT NOT NULL, result_json TEXT NOT NULL, state TEXT NOT NULL
+                 );
+                 CREATE TABLE bridge_plan_v2_transform_results (attempt_id TEXT NOT NULL);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO native_v2_product_attempts (attempt_id, revision_id) VALUES (?1, ?2)",
+                ["attempt-1", "revision-1"],
+            )
+            .unwrap();
+        for (step_id, operation, host_ref, result) in [
+            (
+                "self-check-search",
+                "search",
+                "host:requester",
+                json!({"contentDigest": "search-digest"}),
+            ),
+            (
+                "self-check-transfer",
+                "transfer",
+                "host:requester",
+                transfer_result,
+            ),
+            (
+                "self-check-execute",
+                "execute",
+                "host:remote",
+                json!({"resultDigest": "execute-digest", "object": null}),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO native_v2_step_commits
+                     (attempt_id, step_id, operation, host_ref, result_json, state)
+                     VALUES ('attempt-1', ?1, ?2, ?3, ?4, 'committed')",
+                    (step_id, operation, host_ref, result.to_string()),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn managed_self_check_writes_one_safe_json_report_per_check() {
+        let paths = managed_self_check_test_paths("managed-self-check-reports");
+        let report = managed_self_check_report(
+            diagnostics::ManagedE2ESelfCheckOutcome::Blocked,
+            "bridge-1",
+            "host:requester",
+            "host:remote",
+            1,
+            2,
+            Some("preflight_unavailable"),
+        );
+        let first = write_managed_self_check_report(&paths, &report, "run-one").unwrap();
+        let second = write_managed_self_check_report(&paths, &report, "run-two").unwrap();
+        assert_ne!(first, second);
+        for file_name in [&first, &second] {
+            let json = fs::read_to_string(paths.logs_dir.join(file_name)).unwrap();
+            assert_eq!(
+                serde_json::from_str::<diagnostics::ManagedE2ESelfCheckReport>(&json).unwrap(),
+                report
+            );
+            for forbidden in [
+                "credential",
+                "/Users/",
+                "C:\\\\Users\\\\",
+                "stdout",
+                "stderr",
+            ] {
+                assert!(
+                    !json.contains(forbidden),
+                    "unsafe report value: {forbidden}"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn managed_self_check_requires_exact_authoritative_transfer_destination() {
+        for transfer_result in [
+            json!({"contentDigest": "transfer-digest"}),
+            json!({"contentDigest": "transfer-digest", "object": {"hostRef": "host:wrong"}}),
+        ] {
+            let paths = managed_self_check_test_paths("managed-self-check-wrong-destination");
+            insert_managed_self_check_evidence(&paths, transfer_result);
+            let mut report = managed_self_check_evidence_report();
+            populate_managed_self_check_evidence(&mut report, &paths).unwrap();
+            assert!(!managed_self_check_pass(&report));
+            let _ = fs::remove_dir_all(paths.app_data_dir);
+        }
+    }
+
+    #[test]
+    fn managed_self_check_accepts_exact_committed_transfer_destination() {
+        let paths = managed_self_check_test_paths("managed-self-check-exact-destination");
+        insert_managed_self_check_evidence(
+            &paths,
+            json!({"contentDigest": "transfer-digest", "object": {"hostRef": "host:remote"}}),
+        );
+        let mut report = managed_self_check_evidence_report();
+        populate_managed_self_check_evidence(&mut report, &paths).unwrap();
+        assert_eq!(
+            report.transfer_destination_host_ref.as_deref(),
+            Some("host:remote")
+        );
+        assert!(managed_self_check_pass(&report));
+        let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 
     #[test]
