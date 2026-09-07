@@ -51,7 +51,7 @@ The deterministic native-v2 Composer accepts only explicit HostRefs, roots, and 
 One requester approval binds the complete immutable revision. Attempt start then follows a fail-closed distributed barrier:
 
 1. The requester resolves locality from the exact authored `HostRef`. Its own participant captures the current `LocalRuntimeRef`; every remote participant asks the canonical Layer 4 resolver for exactly one transport-proven current session and consumes its `HostSessionBinding`. Layer 5 does not interpret Bridge peer rows, reconnect markers, endpoints, or transport keys.
-2. Each Host validates the complete immutable Plan and its exact participant/freshness correlation, then evaluates roots, transfer counterparts, provider generation/model, process binding, and verified platform world only where required by its own authored fragment.
+2. Each Host validates the complete immutable Plan and its exact participant/freshness correlation, then evaluates roots, transfer counterparts, provider generation/model, Host-selected runtime resolution, process binding, and verified platform world only where required by its own authored fragment.
 3. Any Host-local requirement reported unavailable fails the whole Plan before an earlier Search, Transfer, or managed step can execute; availability on another Host cannot satisfy it.
 4. Each bound Host validates the exact review correlation and creates Host admission in prepared state. Remote Hosts receive authenticated protocol messages and claim their replay identities; the requester invokes the shared semantic lifecycle through direct typed coordinator actions and creates no local protocol replay claim.
 5. Only after every Host is prepared does the requester send commit; receivers execute nothing before it.
@@ -81,6 +81,8 @@ Managed input revision N remains immutable. Mutations stay in existing private o
 ### Process
 
 The current model-visible process catalog exposes one `process_spawn` request only when Core has prebound an exact executable identity and execution-world specification to the exact revision/step. The model cannot choose an executable, raw shell, Host path, ambient environment, cwd, network policy, or terminal. Pure lowering produces the existing `ProcessEffect::Spawn`; signal/termination remains Host lifecycle authority and is not a general model tool.
+
+For current Execute steps, the Host configuration service accepts only the logical `python` or `node` runtime identity, discovers it from a bounded platform-specific set of absolute locations, and pins the resulting safe executable identity in Host-local SQLite. It stores the physical path only in that Host-private configuration. When an immutable revision reaches readiness, the target Host revalidates the pinned identity and calls the existing `bind_v2_managed_process_step()` for each Execute authored to itself. The process-world spec carries that private identity so both readiness and claim reject replacement in place. A missing selection, missing/replaced binary, unsupported identity, or wrong-Host step leaves readiness unavailable. Capability probes, the requester, PM, Worker, and provider cannot populate this binding; there is no PATH fallback, automatic installation, alternate executable substitution, new execution engine, or new authority domain. Resource-only Transform remains process-free unless a separate exact binding already exists.
 
 `ExecutionWorldServiceV1` owns the generic execution semantics: it validates exact authority and resource leases, uses mutable overlays, applies Pastey wall/output/write budgets and available platform observations, records evidence, owns cancellation, and waits for an observed terminal state before run revocation. It delegates only platform world preparation, process launch, standard-I/O transport, termination requests, and platform observations through `PlatformExecutionBackendV1`. The backend receives already-authorized mounts and launch data, mints or widens no authority, and has no unsandboxed fallback; unavailable preparation or launch fails closed.
 
@@ -119,7 +121,7 @@ Observations are bounded/redacted feedback. Resource observations carry operatio
 
 Provider sampling and context overflow have separate bounded retry policies. Compaction keeps tool-call/result pairs together and changes only model-visible context. A failed deterministic tool strategy may be observed and corrected while the same run remains active. Cancellation, malformed output, terminal provider failure, ambiguous/interrupted effect state, or an indeterminate effect is not retried as a fresh effect.
 
-## Provider configuration boundary
+## Provider and runtime configuration boundaries
 
 Provider configuration is Host-owned. Non-secret endpoint/model/timeout/token-limit metadata and a generation/config digest live in SQLite. The credential is stored in a separate authenticated-encrypted row using the existing Host master key and is materialized only into an immutable process-local binding.
 
@@ -127,7 +129,7 @@ One managed attempt stores an exact provider id, generation, config digest, and 
 
 Credentials never enter prompts, Worker history, observations, effect requests/evidence, status events, or normal DTOs. The model cannot select endpoint/model/configuration, and switching provider cannot change the `StepWorkDescriptor` or effect envelope. Environment-variable configuration exists only in an ignored development smoke path.
 
-The provider service, health probe, and process-binding methods are currently Host-private; the product settings/configuration surface remains to be built.
+The runtime settings surface exposes only the known logical identities and their availability/selection/readiness state; selection asks the local Host service to discover and pin the executable privately. Provider service/health operations remain a Host-private backend configuration seam whose product settings surface is not built. Once a selected runtime exists, production readiness creates the exact Execute process binding rather than requiring a test/acceptance caller to inject it.
 
 ## Natural-v2 and PM
 
@@ -175,7 +177,7 @@ Distributed delivery failure remains a product-recovery limitation: the sender c
 | Proposal-only local/provider Natural-v2 to an unapproved Draft | PM/provider selection and settings presentation |
 | Whole-Plan remote and local-Host readiness, prepare, attempt-bound admission, commit, and exact continuation | Headless Host execution |
 | Remote or local-Host Search and authored encrypted Transfer with exact receipt | Automatic/inferred movement or topology repair |
-| Same-Host Resource Worker Transform; contained Process on verified macOS; native Windows Managed Execute acceptance through the Codex-backed production path | Product-configured executable binding; Linux process world |
+| Same-Host Resource Worker Transform; Host-selected runtime settings/resolution and exact Execute binding; contained Process on verified macOS; native Windows Managed Execute acceptance through the Codex-backed production path | Provider settings UI; Linux process world |
 | Execute through Core with no lineage when an exact process binding exists | Raw shell/terminal/process authority |
 | Durable generation-bound provider state and streaming adapter | Product provider configuration/health UI |
 | Phase 5 Host network broker | Worker network tools or automatic task egress |

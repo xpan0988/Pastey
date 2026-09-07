@@ -1,11 +1,17 @@
-use std::process::Command;
+use std::{path::PathBuf, process::Command};
 
 use crate::{
     diagnostics::{
         CapabilitySource, DeviceCapabilities, DeviceProfile, GpuAcceleration, RuntimeCapability,
     },
+    error::{AppError, AppResult},
+    managed_execution::ManagedProcessWorldSpecV1,
+    managed_resources::ExecutableBindingSpecV1,
     storage,
 };
+
+pub(crate) const MANAGED_PYTHON_RUNTIME_ID: &str = "python";
+pub(crate) const MANAGED_NODE_RUNTIME_ID: &str = "node";
 
 #[derive(Clone, Copy)]
 struct RuntimeProbe {
@@ -145,6 +151,134 @@ fn run_fixed_probe(command: &str, args: &[&str]) -> Option<String> {
     Some(first_line.to_string())
 }
 
+pub(crate) struct DiscoveredManagedRuntimeV1 {
+    pub(crate) process_world: ManagedProcessWorldSpecV1,
+}
+
+/// Resolves a configured logical runtime identity through a bounded set of
+/// platform-specific absolute locations. This is deliberately separate from
+/// the diagnostic PATH probes above: detection is not execution authority,
+/// and a missing configured candidate has no ambient PATH fallback.
+pub(crate) fn discover_managed_runtime(
+    runtime_id: &str,
+) -> AppResult<Option<DiscoveredManagedRuntimeV1>> {
+    validate_managed_runtime_id(runtime_id)?;
+    for candidate in managed_runtime_candidates(runtime_id) {
+        let Ok(executable_path) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        if !executable_path.is_file() {
+            continue;
+        }
+        let Some(scope_root) = executable_path.parent().map(ToOwned::to_owned) else {
+            continue;
+        };
+        let executable = ExecutableBindingSpecV1 {
+            executable_path,
+            scope_root,
+        };
+        if validate_managed_runtime_executable(&executable).is_ok() {
+            if let Ok(process_world) = ManagedProcessWorldSpecV1::new(executable) {
+                return Ok(Some(DiscoveredManagedRuntimeV1 { process_world }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn validate_managed_runtime_executable(
+    executable: &ExecutableBindingSpecV1,
+) -> AppResult<()> {
+    if !executable.executable_path.is_file()
+        || !executable
+            .executable_path
+            .starts_with(&executable.scope_root)
+    {
+        return Err(AppError::InvalidInput(
+            "Managed runtime executable is outside its Host scope.".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(&executable.executable_path)?
+            .permissions()
+            .mode()
+            & 0o111
+            == 0
+        {
+            return Err(AppError::InvalidInput(
+                "Managed runtime executable is not executable on this Host.".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_managed_runtime_id(runtime_id: &str) -> AppResult<()> {
+    match runtime_id {
+        MANAGED_PYTHON_RUNTIME_ID | MANAGED_NODE_RUNTIME_ID => Ok(()),
+        _ => Err(AppError::InvalidInput(
+            "Managed runtime identity is not supported.".into(),
+        )),
+    }
+}
+
+fn managed_runtime_candidates(runtime_id: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    #[cfg(target_os = "macos")]
+    match runtime_id {
+        MANAGED_PYTHON_RUNTIME_ID => candidates.extend([
+            PathBuf::from("/usr/bin/python3"),
+            PathBuf::from("/opt/homebrew/bin/python3"),
+            PathBuf::from("/usr/local/bin/python3"),
+        ]),
+        MANAGED_NODE_RUNTIME_ID => candidates.extend([
+            PathBuf::from("/opt/homebrew/bin/node"),
+            PathBuf::from("/usr/local/bin/node"),
+            PathBuf::from("/usr/bin/node"),
+        ]),
+        _ => {}
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    match runtime_id {
+        MANAGED_PYTHON_RUNTIME_ID => candidates.extend([
+            PathBuf::from("/usr/bin/python3"),
+            PathBuf::from("/usr/local/bin/python3"),
+        ]),
+        MANAGED_NODE_RUNTIME_ID => candidates.extend([
+            PathBuf::from("/usr/bin/node"),
+            PathBuf::from("/usr/local/bin/node"),
+        ]),
+        _ => {}
+    }
+    #[cfg(target_os = "windows")]
+    match runtime_id {
+        MANAGED_PYTHON_RUNTIME_ID => {
+            for version in ["314", "313", "312", "311", "310"] {
+                candidates.push(PathBuf::from(format!(
+                    r"C:\Program Files\Python{version}\python.exe"
+                )));
+                candidates.push(PathBuf::from(format!(r"C:\Python{version}\python.exe")));
+                if let Some(local_app_data) = dirs::data_local_dir() {
+                    candidates.push(
+                        local_app_data
+                            .join("Programs")
+                            .join("Python")
+                            .join(format!("Python{version}"))
+                            .join("python.exe"),
+                    );
+                }
+            }
+        }
+        MANAGED_NODE_RUNTIME_ID => {
+            candidates.push(PathBuf::from(r"C:\Program Files\nodejs\node.exe"));
+        }
+        _ => {}
+    }
+    candidates
+}
+
 fn parse_version_string(output: &str) -> Option<String> {
     let first_line = output.lines().find(|line| !line.trim().is_empty())?.trim();
     if first_line.is_empty() {
@@ -266,5 +400,16 @@ mod tests {
             cfg!(target_os = "macos")
         );
         assert!(capabilities.updated_at > 0);
+    }
+
+    #[test]
+    fn managed_runtime_candidates_are_known_absolute_locations_only() {
+        for runtime_id in [MANAGED_PYTHON_RUNTIME_ID, MANAGED_NODE_RUNTIME_ID] {
+            let candidates = managed_runtime_candidates(runtime_id);
+            assert!(!candidates.is_empty());
+            assert!(candidates.iter().all(|candidate| candidate.is_absolute()));
+        }
+        assert!(validate_managed_runtime_id("bash").is_err());
+        assert!(validate_managed_runtime_id("C:\\attacker\\runtime.exe").is_err());
     }
 }

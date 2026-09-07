@@ -22,7 +22,9 @@ use crate::{
     },
     logging,
     managed_execution::ManagedProcessWorldSpecV1,
-    managed_objects, managed_resources, network_broker, peer_capabilities, room_control, storage,
+    managed_objects, managed_resources,
+    managed_runtime_config::ManagedRuntimeConfigServiceV1,
+    network_broker, peer_capabilities, room_control, storage,
     storage::AppPaths,
     transfer, transfer_orchestration,
     worker_harness::WorkerHarnessRunV1,
@@ -118,6 +120,10 @@ pub struct HostRuntime {
     /// Paths never enter Plan/provider/event state and restart clears them.
     pub(crate) managed_worker_process_specs:
         Mutex<HashMap<(String, String), ManagedProcessWorldSpecV1>>,
+    /// Durable Host-local allowlist/selection of logical managed runtime
+    /// identities. Exact executable paths and identities remain inside the
+    /// Host process and never enter Plan, protocol, or provider state.
+    pub(crate) managed_runtime_configs: ManagedRuntimeConfigServiceV1,
     /// Durable Host control-plane configuration and process-local immutable
     /// provider bindings. It is not Plan/effect/network authority.
     pub(crate) worker_provider_configs: WorkerProviderConfigServiceV1,
@@ -166,6 +172,7 @@ impl HostRuntime {
         let managed_resource_root = paths.temp_dir.join("managed-execution-resources");
         let worker_provider_configs =
             WorkerProviderConfigServiceV1::new(paths.clone(), config::master_key(&config)?)?;
+        let managed_runtime_configs = ManagedRuntimeConfigServiceV1::new(paths.clone())?;
         Ok(Self {
             paths,
             local_host_ref: local_host_ref.clone(),
@@ -213,6 +220,7 @@ impl HostRuntime {
             worker_harness_runs: Mutex::new(HashMap::new()),
             managed_completion_lock: Mutex::new(()),
             managed_worker_process_specs: Mutex::new(HashMap::new()),
+            managed_runtime_configs,
             worker_provider_configs,
             developer_terminal: crate::developer_terminal::DeveloperTerminalService::default(),
             event_sink,

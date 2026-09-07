@@ -59,6 +59,7 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 | Plan schema/protocol v2 | `src-tauri/src/bridge_plan_v2.rs` |
 | Native-v2 product orchestration | `src-tauri/src/native_v2_orchestration.rs` |
 | Managed Worker coordination | `src-tauri/src/managed_worker_coordinator.rs` |
+| Host-local managed runtime configuration | `src-tauri/src/managed_runtime_config.rs`, `src-tauri/src/capability_probe.rs` |
 | Managed objects | `src-tauri/src/managed_objects.rs` |
 | Safe physical identity | `src-tauri/src/safe_file_identity.rs` |
 | Effect contracts and state | `src-tauri/src/effect_authority.rs` |
@@ -111,7 +112,7 @@ The frontend uses `@xterm/xterm` and `@xterm/addon-fit`. Host shell selection is
 | --- | --- |
 | Natural proposals | `scripts/run-natural-v1-tests.mjs`, `scripts/run-natural-v2-tests.mjs`, Rust `natural_v2` tests |
 | Plan lifecycle and native-v2 orchestration | Rust `host_identity`, `host_runtime`, `host_admission`, `bridge_plan`, `bridge_plan_v2`, `native_v2_orchestration`, and `managed_worker_coordinator` tests |
-| Worker/provider/configuration | Rust `worker_harness`, `worker_provider`, and `worker_provider_config` tests |
+| Worker/provider/runtime configuration | Rust `worker_harness`, `worker_provider`, `worker_provider_config`, `managed_runtime_config`, and `managed_worker_coordinator` tests |
 | Effects/results | Rust `effect_authority`, `managed_resources`, `execution_world`, `network_broker`, and `managed_execution` tests; opt-in native Windows `windows_execution_world` integration test |
 | Layer 4 and transfer | `scripts/run-layer4-validation-matrix.mjs`, `scripts/run-transfer-planner-tests.mjs`, Rust transport/protocol tests |
 | Developer Terminal | Rust terminal/HostRuntime tests plus native physical platform checks |

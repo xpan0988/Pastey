@@ -54,7 +54,7 @@ pub(crate) struct ManagedStepClaimRequestV1 {
     pub(crate) current_binding: HostExecutionFreshness,
     pub(crate) now: i64,
     /// Host-private, preselected execution-world entry point. It is supplied
-    /// by the future coordinator, never by a Worker/provider, and is bound
+    /// by the Host runtime coordinator, never by a Worker/provider, and is bound
     /// into the immutable envelope before the run becomes active.
     pub(crate) process_world: Option<ManagedProcessWorldSpecV1>,
 }
@@ -62,6 +62,36 @@ pub(crate) struct ManagedStepClaimRequestV1 {
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedProcessWorldSpecV1 {
     pub(crate) executable: ExecutableBindingSpecV1,
+    /// Exact content identity observed when the Host selected this executable.
+    /// It remains crate-private and is revalidated at both step binding and
+    /// claim time so replacement in place cannot silently change the world.
+    executable_identity_ref: String,
+}
+
+impl ManagedProcessWorldSpecV1 {
+    pub(crate) fn new(executable: ExecutableBindingSpecV1) -> AppResult<Self> {
+        let executable_identity_ref =
+            ManagedResourceResolverV1::executable_identity_ref(&executable)?;
+        Ok(Self {
+            executable,
+            executable_identity_ref,
+        })
+    }
+
+    pub(crate) fn validate_executable_identity(&self) -> AppResult<&str> {
+        let current_identity_ref =
+            ManagedResourceResolverV1::executable_identity_ref(&self.executable)?;
+        if current_identity_ref != self.executable_identity_ref {
+            return invalid("Managed process executable identity changed.");
+        }
+        Ok(&self.executable_identity_ref)
+    }
+
+    pub(crate) fn is_same_exact_binding(&self, other: &Self) -> bool {
+        self.executable.executable_path == other.executable.executable_path
+            && self.executable.scope_root == other.executable.scope_root
+            && self.executable_identity_ref == other.executable_identity_ref
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +201,11 @@ impl HostRuntime {
             &request,
         )?;
         let (operation, input, output_revision) = managed_step_contract(&source.step)?;
+        let process_identity_ref = request
+            .process_world
+            .as_ref()
+            .map(ManagedProcessWorldSpecV1::validate_executable_identity)
+            .transpose()?;
         if request.input.object.logical_object_id != input.logical_object_id
             || request.input.object.revision != input.revision
             || request.input.object.host_ref != self.local_host_ref
@@ -291,16 +326,16 @@ impl HostRuntime {
         } else {
             None
         };
-        let executable_grant = if let Some(spec) = process_spec {
+        let executable_grant = if process_spec.is_some() {
             Some(
                 authority.mint_resource_grant(
                     &draft,
                     ResourceGrantSpecV1 {
                         host_ref: self.local_host_ref.clone(),
                         kind: ResourceKindV1::Executable,
-                        safe_identity_ref: ManagedResourceResolverV1::executable_identity_ref(
-                            &spec.executable,
-                        )?,
+                        safe_identity_ref: process_identity_ref
+                            .expect("validated process identity")
+                            .into(),
                         selector_prefix: ".".into(),
                         allowed_verbs: [ResourceVerbV1::Inspect, ResourceVerbV1::Read]
                             .into_iter()
@@ -1970,12 +2005,13 @@ mod tests {
             captured_binding: fixture.binding.clone().into(),
             current_binding: fixture.binding.clone().into(),
             now: NOW + 2,
-            process_world: Some(ManagedProcessWorldSpecV1 {
-                executable: ExecutableBindingSpecV1 {
+            process_world: Some(
+                ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
                     executable_path: PathBuf::from(executable),
                     scope_root: PathBuf::from("/usr/bin"),
-                },
-            }),
+                })
+                .unwrap(),
+            ),
         }
     }
 

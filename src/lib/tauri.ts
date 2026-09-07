@@ -164,6 +164,24 @@ export function cancelNativeV2PlanAttempt(attemptId: string): Promise<NativeV2Pl
   return invoke("cancel_native_v2_plan_attempt", { attemptId });
 }
 
+export interface ManagedRuntimeOption {
+  runtimeId: "python" | "node";
+  available: boolean;
+  selected: boolean;
+  selectionReady: boolean;
+}
+
+/** Host-local settings projection. Physical executable paths and identities
+ * remain inside Rust and are never returned to the renderer. */
+export function listManagedRuntimeOptions(): Promise<ManagedRuntimeOption[]> {
+  return invoke("list_managed_runtime_options");
+}
+
+/** Selects one discovered logical runtime identity on this Host. */
+export function selectManagedExecuteRuntime(runtimeId: ManagedRuntimeOption["runtimeId"]): Promise<ManagedRuntimeOption[]> {
+  return invoke("select_managed_execute_runtime", { runtimeId });
+}
+
 export interface ComposedFileBridgePlanRequest {
   roomId: string;
   originalUserGoal: string;

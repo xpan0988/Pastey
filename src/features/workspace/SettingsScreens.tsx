@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { updateConfig } from "../../lib/tauri";
+import { listManagedRuntimeOptions, selectManagedExecuteRuntime, updateConfig } from "../../lib/tauri";
+import type { ManagedRuntimeOption } from "../../lib/tauri";
 import type { AppConfig } from "../../lib/types";
 import type { NavigateWorkspace, WorkspaceRoute } from "./workspaceTypes";
 
@@ -79,7 +80,32 @@ export function DiagnosticsSettings({ onNavigate }: Pick<SettingsProps, "onNavig
 }
 
 export function ProviderSettings({ onNavigate }: Pick<SettingsProps, "onNavigate">) {
-  return <SettingsFrame title="Task Provider" description="Global runtime configuration for reviewed Bridge tasks." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="Agent runtime"><SettingsRow title="Enabled" description="Managed Plan support is controlled by the Host." value="State unavailable" /></SettingsGroup><SettingsGroup title="Provider"><section className="v2-provider-unavailable"><strong>Provider configuration is unavailable to this renderer.</strong><p>The current backend does not expose safe selected provider, model, health, or revocation state. Credentials remain hidden, and Pastey does not use a production fallback provider.</p><span>Not configured / unavailable</span></section></SettingsGroup><SettingsGroup title="Authority"><SettingsRow title="Provider selection" description="A ready provider proposes a Plan; it never grants Agent authority." value="No authority" /><SettingsRow title="Agent Plan approval" description="Requester approval remains independently required." value="Always required" /></SettingsGroup></div></SettingsFrame>;
+  const [runtimes, setRuntimes] = useState<ManagedRuntimeOption[] | null>(null);
+  const [pendingRuntime, setPendingRuntime] = useState<ManagedRuntimeOption["runtimeId"] | null>(null);
+  const [runtimeError, setRuntimeError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void listManagedRuntimeOptions()
+      .then((options) => { if (!cancelled) setRuntimes(options); })
+      .catch((error) => { if (!cancelled) setRuntimeError(error instanceof Error ? error.message : String(error)); });
+    return () => { cancelled = true; };
+  }, []);
+
+  async function selectRuntime(runtimeId: ManagedRuntimeOption["runtimeId"]) {
+    if (pendingRuntime) return;
+    setPendingRuntime(runtimeId);
+    setRuntimeError(null);
+    try {
+      setRuntimes(await selectManagedExecuteRuntime(runtimeId));
+    } catch (error) {
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPendingRuntime(null);
+    }
+  }
+
+  return <SettingsFrame title="Task Provider" description="Host-owned provider and runtime configuration for reviewed Bridge tasks." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="Managed Execute runtime">{runtimes ? runtimes.map((runtime) => <button type="button" className="v2-settings-link" key={runtime.runtimeId} disabled={!runtime.available || pendingRuntime !== null} onClick={() => void selectRuntime(runtime.runtimeId)}><SettingsRow title={runtime.runtimeId === "python" ? "Python" : "Node.js"} description="Known runtime identity discovered at a fixed Host-local location; no PATH fallback." value={runtime.selected ? (runtime.selectionReady ? "Selected" : "Re-select required") : (runtime.available ? "Select →" : "Unavailable")} status={runtime.selectionReady ? "ready" : undefined} /></button>) : <SettingsRow title="Runtime discovery" value="Checking…" />}</SettingsGroup>{runtimeError ? <p className="v2-error" role="alert">{runtimeError}</p> : null}<SettingsGroup title="Provider"><section className="v2-provider-unavailable"><strong>Provider configuration is unavailable to this renderer.</strong><p>The current backend does not expose safe selected provider, model, health, or revocation state. Credentials remain hidden, and Pastey does not use a production fallback provider.</p><span>Not configured / unavailable</span></section></SettingsGroup><SettingsGroup title="Authority"><SettingsRow title="Runtime selection" description="This Host pins one known executable identity for future Execute bindings; it grants no step authority." value="Host-local" /><SettingsRow title="Provider selection" description="A ready provider proposes a Plan; it never grants Agent authority." value="No authority" /><SettingsRow title="Agent Plan approval" description="Requester approval remains independently required." value="Always required" /></SettingsGroup></div></SettingsFrame>;
 }
 
 export function TransferSettings({ config, onNavigate }: Pick<SettingsProps, "config" | "onNavigate">) {
