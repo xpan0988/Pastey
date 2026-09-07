@@ -356,6 +356,18 @@ impl WorkerProviderConfigServiceV1 {
     }
 
     pub(crate) fn selected_for_managed_workers(&self) -> AppResult<WorkerProviderSelectionV1> {
+        self.selected_for_managed_workers_optional()?
+            .ok_or_else(|| {
+                AppError::NotFound("Managed Worker provider selection is unavailable.".into())
+            })
+    }
+
+    /// Returns the exact selected provider generation when configured, while
+    /// keeping absence distinct from a stale or otherwise invalid selection.
+    /// This is a Host-owned readiness fact, not provider or execution authority.
+    pub(crate) fn selected_for_managed_workers_optional(
+        &self,
+    ) -> AppResult<Option<WorkerProviderSelectionV1>> {
         let selection = self
             .connection()?
             .query_row(
@@ -373,12 +385,26 @@ impl WorkerProviderConfigServiceV1 {
                     })
                 },
             )
-            .optional()?
-            .ok_or_else(|| {
-                AppError::NotFound("Managed Worker provider selection is unavailable.".into())
-            })?;
-        self.load_row(&selection.config_ref)?;
+            .optional()?;
+        if let Some(selection) = selection.as_ref() {
+            // `resolve` also proves that the selected model still belongs to
+            // this immutable generation and that its credential can be bound.
+            drop(self.resolve(selection)?);
+        }
         Ok(selection)
+    }
+
+    pub(crate) fn selected_managed_worker_metadata(
+        &self,
+    ) -> AppResult<Option<WorkerProviderMetadataV1>> {
+        let Some(selection) = self.selected_for_managed_workers_optional()? else {
+            return Ok(None);
+        };
+        let metadata = self.metadata(&selection.config_ref)?;
+        if metadata.model != selection.model || !metadata.available {
+            return invalid("Worker provider selection is unavailable.");
+        }
+        Ok(Some(metadata))
     }
 
     pub(crate) fn list_metadata(&self) -> AppResult<Vec<WorkerProviderMetadataV1>> {
@@ -652,6 +678,16 @@ mod tests {
             timeout_millis: 10_000,
             max_output_tokens: 512,
         }
+    }
+
+    #[test]
+    fn absent_managed_provider_selection_is_not_configuration_failure() {
+        let (_root, service, _) = service();
+        assert_eq!(
+            service.selected_for_managed_workers_optional().unwrap(),
+            None
+        );
+        assert_eq!(service.selected_managed_worker_metadata().unwrap(), None);
     }
 
     #[test]

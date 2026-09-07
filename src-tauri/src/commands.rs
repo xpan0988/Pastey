@@ -41,6 +41,88 @@ const FILE_BRIDGE_ROUTE_SCHEMA_VERSION: &str = "pastey-bridge-file-route-v1";
 const BRIDGE_PLAN_APPROVAL_TTL_SECONDS: i64 = 24 * 60 * 60;
 const BRIDGE_PLAN_CONTROL_LIFETIME_SECONDS: i64 = 120;
 
+/// Produces one ephemeral, non-authorizing diagnostics projection for an exact
+/// durable remote Host. All current-session and route interpretation remains
+/// behind the canonical Layer 4 resolver and its semantic operations.
+pub(crate) async fn bridge_device_diagnostics_for_host(
+    state: Arc<AppState>,
+    bridge_id: &str,
+    remote_host_ref: &crate::host_identity::HostRef,
+) -> AppResult<diagnostics::BridgeDeviceDiagnostics> {
+    let session = state
+        .resolve_current_remote_host_session(bridge_id, remote_host_ref)
+        .await?;
+
+    let capability_projection = session
+        .request_capability_projection(state.clone())
+        .await
+        .ok();
+    let link_benchmark = session.run_pipeline_benchmark(state.clone()).await.ok();
+    if let Some(result) = link_benchmark.as_ref() {
+        state
+            .latest_benchmark_results
+            .lock()
+            .insert(bridge_id.to_string(), result.clone());
+    }
+
+    Ok(compose_bridge_device_diagnostics(
+        capability_projection.as_ref(),
+        link_benchmark,
+        storage::now_ts(),
+    ))
+}
+
+fn compose_bridge_device_diagnostics(
+    capability_projection: Option<&crate::peer_capabilities::PeerCapabilityProjection>,
+    link_benchmark: Option<diagnostics::LinkBenchmarkResult>,
+    checked_at: i64,
+) -> diagnostics::BridgeDeviceDiagnostics {
+    let control_channel = capability_projection
+        .map(|_| diagnostics::DiagnosticState::Healthy)
+        .unwrap_or(diagnostics::DiagnosticState::Unavailable);
+    let data_path = link_benchmark
+        .as_ref()
+        .filter(|result| result.total_bytes > 0 && result.failed_chunks == 0)
+        .map(|_| diagnostics::DiagnosticState::Healthy)
+        .unwrap_or(diagnostics::DiagnosticState::Unavailable);
+    diagnostics::BridgeDeviceDiagnostics {
+        connection: diagnostics::BridgeConnectionDiagnostics {
+            identity: diagnostics::DiagnosticState::Healthy,
+            secure_session: diagnostics::DiagnosticState::Healthy,
+            control_channel,
+            data_path,
+        },
+        managed_readiness: capability_projection
+            .map(managed_readiness_from_projection)
+            .unwrap_or_else(unknown_managed_readiness),
+        link_benchmark,
+        checked_at,
+    }
+}
+
+fn managed_readiness_from_projection(
+    projection: &crate::peer_capabilities::PeerCapabilityProjection,
+) -> diagnostics::ManagedHostReadiness {
+    diagnostics::ManagedHostReadiness {
+        provider: projection
+            .diagnostic_state(crate::peer_capabilities::MANAGED_PROVIDER_CAPABILITY),
+        runtime: projection.diagnostic_state(crate::peer_capabilities::MANAGED_RUNTIME_CAPABILITY),
+        execution_world: projection
+            .diagnostic_state(crate::peer_capabilities::EXECUTION_WORLD_CAPABILITY),
+        managed_execution: projection
+            .diagnostic_state(crate::peer_capabilities::MANAGED_EXECUTION_CAPABILITY),
+    }
+}
+
+fn unknown_managed_readiness() -> diagnostics::ManagedHostReadiness {
+    diagnostics::ManagedHostReadiness {
+        provider: diagnostics::DiagnosticState::Unknown,
+        runtime: diagnostics::DiagnosticState::Unknown,
+        execution_world: diagnostics::DiagnosticState::Unknown,
+        managed_execution: diagnostics::DiagnosticState::Unknown,
+    }
+}
+
 /// Requests a fresh, selected-peer capability observation over the existing
 /// current-session Room Control channel. Delivery is not availability: the
 /// response remains a separate non-authorizing fact.
@@ -3724,6 +3806,20 @@ pub async fn get_device_capabilities(
 }
 
 #[tauri::command]
+pub async fn run_bridge_device_diagnostics(
+    bridge_id: String,
+    host_ref: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<diagnostics::BridgeDeviceDiagnostics, String> {
+    let remote_host_ref =
+        crate::host_identity::HostRef::parse_peer(host_ref, &state.local_host_ref)
+            .map_err(|error| error.message())?;
+    bridge_device_diagnostics_for_host(state.inner().clone(), &bridge_id, &remote_host_ref)
+        .await
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
 pub async fn run_loopback_benchmark(
     mode: Option<String>,
     duration_seconds: Option<u64>,
@@ -4036,6 +4132,84 @@ fn resolve_user_path(input: &str) -> AppResult<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn bridge_device_diagnostics_consumes_layer4_semantics_only() {
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("pub(crate) async fn bridge_device_diagnostics_for_host")
+            .unwrap();
+        let end = source[start..]
+            .find("fn managed_readiness_from_projection")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &source[start..end];
+        assert!(body.contains("resolve_current_remote_host_session"));
+        assert!(body.contains("request_capability_projection"));
+        assert!(body.contains("run_pipeline_benchmark"));
+        for forbidden in [
+            "list_bridge_peer_endpoints",
+            "bridge_peers",
+            "peer_session_id",
+            "endpoint_host",
+            "transport_public_key",
+            "approval",
+            "admission",
+            "effect_authority",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "unexpected self-check dependency: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_device_diagnostics_keeps_bridge_health_independent_from_managed_readiness() {
+        let projection = crate::peer_capabilities::PeerCapabilityProjection {
+            schema_version: crate::peer_capabilities::PEER_CAPABILITY_SCHEMA.into(),
+            peer_session_id: "opaque-current-session".into(),
+            observed_at: 1,
+            capabilities: vec![
+                crate::peer_capabilities::HostCapabilityFact {
+                    capability_id: crate::peer_capabilities::MANAGED_PROVIDER_CAPABILITY.into(),
+                    available: false,
+                    accepted_input_media_types: Vec::new(),
+                    effect: "readiness_observation".into(),
+                    unavailable_reason: Some("not_configured".into()),
+                },
+                crate::peer_capabilities::HostCapabilityFact {
+                    capability_id: crate::peer_capabilities::EXECUTION_WORLD_CAPABILITY.into(),
+                    available: false,
+                    accepted_input_media_types: Vec::new(),
+                    effect: "readiness_observation".into(),
+                    unavailable_reason: Some("execution_world_unavailable".into()),
+                },
+            ],
+        };
+        let result = compose_bridge_device_diagnostics(Some(&projection), None, 1);
+
+        assert_eq!(
+            result.connection.identity,
+            diagnostics::DiagnosticState::Healthy
+        );
+        assert_eq!(
+            result.connection.secure_session,
+            diagnostics::DiagnosticState::Healthy
+        );
+        assert_eq!(
+            result.connection.control_channel,
+            diagnostics::DiagnosticState::Healthy
+        );
+        assert_eq!(
+            result.managed_readiness.provider,
+            diagnostics::DiagnosticState::NotConfigured
+        );
+        assert_eq!(
+            result.managed_readiness.execution_world,
+            diagnostics::DiagnosticState::Unavailable
+        );
+    }
 
     fn bridge_route_room() -> StoredRoom {
         StoredRoom {

@@ -186,13 +186,24 @@ button { color: inherit; }
 
 .v2-devices-body { padding: 38px 36px; }
 .v2-device-list { display: grid; gap: 18px; margin-bottom: 19px; }
-.v2-device-row { min-height: 94px; padding: 14px 15px; display: grid; grid-template-columns: 48px 1fr 12px; gap: 15px; align-items: center; border: 1px solid #3b3b41; border-radius: 11px; background: #222225; }
+.v2-device-row { min-height: 94px; padding: 14px 15px; display: grid; grid-template-columns: 48px minmax(0, 1fr) auto; gap: 15px; align-items: center; border: 1px solid #3b3b41; border-radius: 11px; background: #222225; }
 .v2-device-icon { width: 48px; height: 56px; border-radius: 10px; background: #29292c; }
 .v2-device-row strong, .v2-device-row small { display: block; }
 .v2-device-row strong { font-size: 14px; }
 .v2-device-row small, .v2-device-row p { color: #8f8d96; font-size: 11px; }
 .v2-device-row small { margin-top: 4px; }
 .v2-device-row p { margin: 7px 0 0; }
+.v2-device-actions { display: flex; gap: 10px; align-items: center; }
+.v2-device-diagnostic-button { min-width: 58px; min-height: 30px; }
+.v2-device-diagnostics { grid-column: 2 / -1; padding-top: 12px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; border-top: 1px solid #37373c; color: #aaa8b0; font-size: 10px; }
+.v2-device-diagnostics.unavailable { display: block; color: #d9a56c; }
+.v2-device-diagnostics > section > strong { margin-bottom: 6px; color: #d8d6dc; font-size: 11px; }
+.v2-device-diagnostics > section > span { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
+.v2-device-diagnostics > small { grid-column: 1 / -1; color: #777680; }
+.v2-diagnostic-state { color: #aaa8b0; font-weight: 650; }
+.v2-diagnostic-state.healthy, .v2-diagnostic-state.available { color: #79c99b; }
+.v2-diagnostic-state.unavailable { color: #e5a46d; }
+.v2-diagnostic-state.not_configured, .v2-diagnostic-state.unknown { color: #96949d; }
 .v2-nearby-card, .v2-nearby-empty, .v2-join-card { padding: 14px; border-radius: 11px; background: #222225; }
 .v2-nearby-card strong, .v2-join-card strong { font-size: 13px; }
 .v2-nearby-card p { color: #929099; font-size: 11px; }

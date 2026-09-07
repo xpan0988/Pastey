@@ -42,6 +42,7 @@ export interface RoomInfo {
 
 export interface RoomBridgePeerInfo {
   peerSessionId: string;
+  hostRef?: string | null;
   displayName?: string | null;
   joinMethod: BridgePeerJoinMethod;
   liveness: BridgePeerLiveness;
@@ -53,6 +54,25 @@ export interface RoomBridgePeerInfo {
   pairingMethod?: BridgePairingMethod | null;
   pairingRotationState?: BridgePairingRotationState | null;
   pairedRevokedAt?: number | null;
+}
+
+export type DiagnosticState = "healthy" | "available" | "unavailable" | "not_configured" | "unknown";
+
+export interface BridgeDeviceDiagnostics {
+  connection: {
+    identity: DiagnosticState;
+    secureSession: DiagnosticState;
+    controlChannel: DiagnosticState;
+    dataPath: DiagnosticState;
+  };
+  managedReadiness: {
+    provider: DiagnosticState;
+    runtime: DiagnosticState;
+    executionWorld: DiagnosticState;
+    managedExecution: DiagnosticState;
+  };
+  linkBenchmark?: LinkBenchmarkResult | null;
+  checkedAt: number;
 }
 
 export interface RoomControlSessionContext {

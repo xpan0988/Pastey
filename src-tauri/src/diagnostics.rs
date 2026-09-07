@@ -52,6 +52,50 @@ pub struct DeviceCapabilities {
     pub updated_at: i64,
 }
 
+/// Renderer-safe state for one on-demand Host diagnostic fact. These states
+/// deliberately preserve the distinction between missing configuration,
+/// observed unavailability, and a fact that the current native seams cannot
+/// determine without a concrete Plan.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticState {
+    Healthy,
+    Available,
+    Unavailable,
+    NotConfigured,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeConnectionDiagnostics {
+    pub identity: DiagnosticState,
+    pub secure_session: DiagnosticState,
+    pub control_channel: DiagnosticState,
+    pub data_path: DiagnosticState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedHostReadiness {
+    pub provider: DiagnosticState,
+    pub runtime: DiagnosticState,
+    pub execution_world: DiagnosticState,
+    pub managed_execution: DiagnosticState,
+}
+
+/// Thin, ephemeral composition of existing native diagnostics for one exact
+/// remote Host. It contains observations only and carries no route, key,
+/// session binding, approval, admission, or effect authority.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeDeviceDiagnostics {
+    pub connection: BridgeConnectionDiagnostics,
+    pub managed_readiness: ManagedHostReadiness,
+    pub link_benchmark: Option<LinkBenchmarkResult>,
+    pub checked_at: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct GpuAcceleration {
     pub cuda_available: bool,
@@ -171,6 +215,37 @@ mod tests {
         let restored: LinkBenchmarkResult = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored, result);
+    }
+
+    #[test]
+    fn bridge_device_diagnostics_preserve_distinct_readiness_states() {
+        let result = BridgeDeviceDiagnostics {
+            connection: BridgeConnectionDiagnostics {
+                identity: DiagnosticState::Healthy,
+                secure_session: DiagnosticState::Healthy,
+                control_channel: DiagnosticState::Healthy,
+                data_path: DiagnosticState::Unavailable,
+            },
+            managed_readiness: ManagedHostReadiness {
+                provider: DiagnosticState::NotConfigured,
+                runtime: DiagnosticState::Unknown,
+                execution_world: DiagnosticState::Available,
+                managed_execution: DiagnosticState::NotConfigured,
+            },
+            link_benchmark: None,
+            checked_at: 1,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"provider\":\"not_configured\""));
+        assert!(json.contains("\"runtime\":\"unknown\""));
+        assert!(json.contains("\"dataPath\":\"unavailable\""));
+        assert!(!json.contains("peerSession"));
+        assert!(!json.contains("transport"));
+        assert_eq!(
+            serde_json::from_str::<BridgeDeviceDiagnostics>(&json).unwrap(),
+            result
+        );
     }
 
     #[test]

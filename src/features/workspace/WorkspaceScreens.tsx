@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { runBridgeDeviceDiagnostics } from "../../lib/tauri";
 import type { TransferQueueItem } from "../../lib/transferScheduler";
-import type { FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../../lib/types";
+import type { BridgeDeviceDiagnostics, DiagnosticState, FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../../lib/types";
 import { MessageCard, TransferMessage } from "./BridgeWorkspace";
 import { formatBytes, formatClock, roomMembers, uniqueNearbyDevices } from "./workspaceViewModel";
 
@@ -38,6 +39,27 @@ function EmptyRow({ text }: { text: string }) {
 
 export function DevicesScreen({ room }: { room: RoomInfo | null }) {
   const peers = useMemo(() => roomMembers(room), [room]);
+  const [checks, setChecks] = useState<Record<string, { result?: BridgeDeviceDiagnostics; unavailable?: boolean }>>({});
+  const inFlight = useRef(new Set<string>());
+
+  async function runDiagnostics(hostRef: string) {
+    if (!room) return;
+    const bridgeId = room.id;
+    const checkKey = deviceCheckKey(bridgeId, hostRef);
+    if (inFlight.current.has(checkKey)) return;
+    inFlight.current.add(checkKey);
+    setChecks((current) => ({ ...current, [checkKey]: {} }));
+    try {
+      const result = await runBridgeDeviceDiagnostics(bridgeId, hostRef);
+      setChecks((current) => ({ ...current, [checkKey]: { result } }));
+    } catch {
+      setChecks((current) => ({ ...current, [checkKey]: { unavailable: true } }));
+    } finally {
+      inFlight.current.delete(checkKey);
+      setChecks((current) => ({ ...current }));
+    }
+  }
+
   return (
     <section className="v2-screen">
       <header className="v2-screen-header"><div><h1>Bridge devices</h1><p>Known members and their current connection state. Device admission is not supported from this view.</p></div></header>
@@ -45,7 +67,20 @@ export function DevicesScreen({ room }: { room: RoomInfo | null }) {
         <h2>Current Bridge</h2>
         <div className="v2-device-list">
           {room ? <DeviceRow name="This device" meta="Local Host" detail="This logical Bridge remains local until Burn." state="connected" /> : null}
-          {peers.map((peer) => <DeviceRow key={peer.peerSessionId} name={peer.displayName} meta="Current Bridge member" detail={peer.liveness === "connected" ? "Exact current session is routeable." : "Logical membership is retained; the old session is not routeable."} state={peer.liveness} />)}
+          {peers.map((peer) => {
+            const checkKey = room && peer.hostRef ? deviceCheckKey(room.id, peer.hostRef) : null;
+            const check = checkKey ? checks[checkKey] : undefined;
+            const loading = checkKey ? inFlight.current.has(checkKey) : false;
+            return <DeviceRow
+              key={peer.peerSessionId}
+              name={peer.displayName}
+              meta="Current Bridge member"
+              detail={peer.liveness === "connected" ? "Exact current session is routeable." : "Logical membership is retained; the old session is not routeable."}
+              state={peer.liveness}
+              action={peer.hostRef ? <button type="button" className="v2-button v2-device-diagnostic-button" aria-label={`Run diagnostics for ${peer.displayName}`} disabled={loading} onClick={() => void runDiagnostics(peer.hostRef!)}>{loading ? "Checking…" : check ? "Retry" : "Check"}</button> : null}
+              diagnostics={check ? <DeviceDiagnosticsResult check={check} /> : null}
+            />;
+          })}
           {!room ? <EmptyRow text="Select a Bridge to inspect its devices." /> : null}
           {room && peers.length === 0 ? <EmptyRow text="No remote device has joined this Bridge yet." /> : null}
         </div>
@@ -55,8 +90,46 @@ export function DevicesScreen({ room }: { room: RoomInfo | null }) {
   );
 }
 
-function DeviceRow({ name, meta, detail, state }: { name: string; meta: string; detail: string; state: string }) {
-  return <article className="v2-device-row"><div className="v2-device-icon" /><div><strong>{name}</strong><small>{meta} · {state}</small><p>{detail}</p></div><i className={`v2-dot ${state === "connected" ? "connected" : state === "reconnecting" ? "pending" : ""}`} /></article>;
+function deviceCheckKey(bridgeId: string, hostRef: string): string {
+  return JSON.stringify([bridgeId, hostRef]);
+}
+
+function DeviceRow({ name, meta, detail, state, action, diagnostics }: { name: string; meta: string; detail: string; state: string; action?: React.ReactNode; diagnostics?: React.ReactNode }) {
+  return <article className="v2-device-row"><div className="v2-device-icon" /><div><strong>{name}</strong><small>{meta} · {state}</small><p>{detail}</p></div><div className="v2-device-actions"><i className={`v2-dot ${state === "connected" ? "connected" : state === "reconnecting" ? "pending" : ""}`} />{action}</div>{diagnostics}</article>;
+}
+
+function DeviceDiagnosticsResult({ check }: { check: { result?: BridgeDeviceDiagnostics; unavailable?: boolean } }) {
+  if (check.unavailable) {
+    return <div className="v2-device-diagnostics unavailable" role="status">Current Host diagnostics are temporarily unavailable.</div>;
+  }
+  if (!check.result) {
+    return <div className="v2-device-diagnostics" role="status">Checking the exact current Host session…</div>;
+  }
+  const { connection, managedReadiness, linkBenchmark } = check.result;
+  return <div className="v2-device-diagnostics" role="status">
+    <DiagnosticGroup title="Connection" facts={[
+      ["Identity", connection.identity],
+      ["Secure session", connection.secureSession],
+      ["Control channel", connection.controlChannel],
+      ["Data path", connection.dataPath],
+    ]} />
+    <DiagnosticGroup title="Managed readiness" facts={[
+      ["Provider", managedReadiness.provider],
+      ["Runtime", managedReadiness.runtime],
+      ["Execution world", managedReadiness.executionWorld],
+      ["Managed execution", managedReadiness.managedExecution],
+    ]} />
+    {linkBenchmark ? <small>Pipeline baseline · {linkBenchmark.average_MBps.toFixed(1)} MB/s</small> : null}
+  </div>;
+}
+
+function DiagnosticGroup({ title, facts }: { title: string; facts: Array<[string, DiagnosticState]> }) {
+  return <section><strong>{title}</strong>{facts.map(([label, state]) => <span key={label}><span>{label}</span><b className={`v2-diagnostic-state ${state}`}>{diagnosticStateLabel(state)}</b></span>)}</section>;
+}
+
+function diagnosticStateLabel(state: DiagnosticState): string {
+  if (state === "not_configured") return "Not configured";
+  return state.charAt(0).toUpperCase() + state.slice(1);
 }
 
 export function NewBridgeScreen({

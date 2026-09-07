@@ -134,6 +134,11 @@ fn peer_capability_fact_code(fact: &crate::peer_capabilities::HostCapabilityFact
         (false, Some("backend_unavailable")) => "backend_unavailable",
         (false, Some("capability_unavailable")) => "capability_unavailable",
         (false, Some("runtime_unavailable")) => "runtime_unavailable",
+        (false, Some("not_configured")) => "not_configured",
+        (false, Some("unknown")) => "unknown",
+        (false, Some("plan_process_binding_required")) => "plan_process_binding_required",
+        (false, Some("provider_unavailable")) => "provider_unavailable",
+        (false, Some("execution_world_unavailable")) => "execution_world_unavailable",
         _ => "invalid_capability",
     }
 }
@@ -156,11 +161,15 @@ fn log_peer_capability_projection(
 }
 
 fn local_peer_capability_response_projection(
+    state: &AppState,
     peer_session_id: &str,
     observed_at: i64,
 ) -> AppResult<crate::peer_capabilities::PeerCapabilityProjection> {
-    let projection =
-        crate::peer_capabilities::local_projection(peer_session_id.into(), observed_at);
+    let projection = crate::peer_capabilities::local_diagnostic_projection(
+        state,
+        peer_session_id.into(),
+        observed_at,
+    );
     crate::peer_capabilities::validate_projection(&projection)?;
     Ok(projection)
 }
@@ -1530,18 +1539,21 @@ pub async fn receive_room_control_event_handler(
         // receiver must echo it, rather than substituting the requester's
         // inbound session id, so the requester can bind the fact to its
         // current selected remote peer after authenticated delivery.
-        let projection =
-            match local_peer_capability_response_projection(peer_session_id, storage::now_ts()) {
-                Ok(projection) => projection,
-                Err(_) => {
-                    log_peer_capability("response_rejected", None, Some("construction_failed"));
-                    return control_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_capability",
-                        "Invalid peer capability response.",
-                    );
-                }
-            };
+        let projection = match local_peer_capability_response_projection(
+            &ctx.state,
+            peer_session_id,
+            storage::now_ts(),
+        ) {
+            Ok(projection) => projection,
+            Err(_) => {
+                log_peer_capability("response_rejected", None, Some("construction_failed"));
+                return control_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_capability",
+                    "Invalid peer capability response.",
+                );
+            }
+        };
         log_peer_capability_projection("local_projection_created", &projection);
         let payload =
             serde_json::to_value(&projection).expect("peer capability projection serializes");
@@ -3051,7 +3063,7 @@ mod tests {
     #[test]
     fn room_control_query_builds_a_valid_empty_projection_without_fallback_fact() {
         let projection =
-            local_peer_capability_response_projection("selected-peer-session", 1).unwrap();
+            crate::peer_capabilities::local_projection("selected-peer-session".into(), 1);
         assert_eq!(projection.peer_session_id, "selected-peer-session");
         assert!(projection.capabilities.is_empty());
         let encoded = serde_json::to_string(&projection).unwrap();

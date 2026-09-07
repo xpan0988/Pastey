@@ -2404,6 +2404,7 @@ fn bridge_peer_endpoint_to_info(
         .map(|identity| identity.durable_identity_id.clone());
     BridgeRoomPeerInfo {
         peer_session_id: peer.peer_session_id,
+        host_ref: peer.logical_host_ref,
         display_name: peer.display_name,
         join_method: peer.join_method,
         liveness: peer.liveness,
@@ -3259,6 +3260,7 @@ mod tests {
         assert_eq!(info.peers.len(), 1);
         assert_eq!(info.peers[0].liveness, BridgePeerLiveness::Disconnected);
         assert!(!info.peers[0].connected);
+        assert_eq!(info.peers[0].host_ref.as_deref(), Some(host_ref.as_str()));
         let peer = list_bridge_peer_endpoints(&paths, "room")
             .unwrap()
             .remove(0);

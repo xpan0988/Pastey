@@ -19,6 +19,7 @@ import {
 
 export interface LegacyRoomBridgePeerInput {
   readonly peerSessionId?: string;
+  readonly hostRef?: string | null;
   readonly displayName?: string | null;
   readonly joinMethod?: BridgePeerJoinMethod;
   readonly liveness?: BridgePeerLiveness;
@@ -120,6 +121,7 @@ function legacyPeerToBridgePeer(
     accepted: true,
     sessionVerified: true,
     currentSessionOnly: true,
+    ...(peer.hostRef == null ? {} : { hostRef: peer.hostRef }),
     ...(peer.isLocalSelf === undefined ? {} : { isLocalSelf: peer.isLocalSelf }),
   };
 }
@@ -160,6 +162,7 @@ function livenessForLegacyPeer(peer: LegacyRoomBridgePeerInput): BridgePeerLiven
 
 function hasLegacyPeerSignal(peer: LegacyRoomBridgePeerInput): boolean {
   return peer.peerSessionId !== undefined ||
+    peer.hostRef !== undefined ||
     peer.displayName !== undefined ||
     peer.joinMethod !== undefined ||
     peer.liveness !== undefined ||

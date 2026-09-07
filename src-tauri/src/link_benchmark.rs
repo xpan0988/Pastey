@@ -14,7 +14,9 @@ use crate::{
     diagnostics::{quality_label, BenchmarkMode, LinkBenchmarkResult},
     error::{AppError, AppResult},
     host_runtime::HostRuntime as AppState,
-    storage, transfer_tuning,
+    storage,
+    transfer::BridgePeerTransferEndpoint,
+    transfer_tuning,
 };
 
 const DEFAULT_DURATION_SECS: u64 = 5;
@@ -118,7 +120,50 @@ pub async fn run_peer_link_benchmark(
         .peer_host
         .zip(room.peer_port)
         .ok_or_else(|| AppError::NotFound("Peer is not connected.".into()))?;
-    let base_url = format!("http://{peer_host}:{peer_port}/rooms/{room_id}/diagnostics");
+    run_peer_link_benchmark_at(
+        format!("http://{peer_host}:{peer_port}/rooms/{room_id}/diagnostics"),
+        Some(room_id),
+        room.peer_device_name,
+        mode,
+        duration_seconds,
+        window_size,
+        sender_cpu_hint,
+    )
+    .await
+}
+
+pub(crate) async fn run_peer_link_benchmark_for_endpoint(
+    endpoint: BridgePeerTransferEndpoint,
+    bridge_id: String,
+    mode: BenchmarkMode,
+    duration_seconds: Option<u64>,
+    window_size: Option<usize>,
+    sender_cpu_hint: Option<String>,
+) -> AppResult<LinkBenchmarkResult> {
+    run_peer_link_benchmark_at(
+        format!(
+            "http://{}:{}/rooms/{bridge_id}/diagnostics",
+            endpoint.host, endpoint.port
+        ),
+        Some(bridge_id),
+        None,
+        mode,
+        duration_seconds,
+        window_size,
+        sender_cpu_hint,
+    )
+    .await
+}
+
+async fn run_peer_link_benchmark_at(
+    base_url: String,
+    peer_id: Option<String>,
+    peer_name: Option<String>,
+    mode: BenchmarkMode,
+    duration_seconds: Option<u64>,
+    window_size: Option<usize>,
+    sender_cpu_hint: Option<String>,
+) -> AppResult<LinkBenchmarkResult> {
     let client = reqwest::Client::new();
     let latency_ms = estimate_peer_latency(&client, &base_url).await.ok();
     let duration = benchmark_duration(duration_seconds);
@@ -197,8 +242,8 @@ pub async fn run_peer_link_benchmark(
     let average_mbps = mbps(total_bytes, Duration::from_millis(duration_ms));
 
     Ok(LinkBenchmarkResult {
-        peer_id: Some(room_id),
-        peer_name: room.peer_device_name,
+        peer_id,
+        peer_name,
         average_MBps: round_metric(average_mbps),
         peak_MBps: round_metric(peak_mbps),
         latency_ms: latency_ms.map(round_metric),
