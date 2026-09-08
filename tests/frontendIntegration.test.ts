@@ -160,6 +160,17 @@ test("Bridge Device Check uses exact HostRef and remains explicitly user initiat
   assert.match(bindings, /invoke\("run_bridge_device_self_check", \{ bridgeId, hostRef \}\)/);
 });
 
+test("Bridge Devices consumes the read-only NodeList without turning it into a Check or admission flow", () => {
+  const screens = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  const devicesBody = screens.slice(screens.indexOf("export function DevicesScreen"), screens.indexOf("export function NewBridgeScreen"));
+  assert.match(devicesBody, /getBridgeNodeListProjection\(room\.id\)/);
+  assert.match(devicesBody, /nodeList\.nodes\.map/);
+  assert.match(bindings, /invoke\("get_bridge_node_list_projection", \{ bridgeId \}\)/);
+  assert.doesNotMatch(devicesBody, /useEffect[\s\S]{0,600}runBridgeDeviceSelfCheck/);
+  assert.doesNotMatch(devicesBody, /selectHost|composeNative|approveNative|startNative/);
+});
+
 test("opening New Bridge is a choice view; creation is wired only to explicit Create", () => {
   const screens = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
   const workspace = readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8");

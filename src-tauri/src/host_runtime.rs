@@ -85,6 +85,10 @@ pub struct HostRuntime {
     pub latest_device_profile: Mutex<Option<diagnostics::DeviceProfile>>,
     pub latest_device_capabilities: Mutex<Option<diagnostics::DeviceCapabilities>>,
     pub latest_benchmark_results: Mutex<HashMap<String, diagnostics::LinkBenchmarkResult>>,
+    /// Ephemeral Layer 2 benchmark observations, keyed by the exact current
+    /// Bridge/Host/session association. This is a cache, never session truth.
+    pub(crate) latest_bridge_link_benchmarks:
+        Mutex<HashMap<(String, String, String), diagnostics::LinkBenchmarkResult>>,
     pub room_control: Mutex<room_control::RoomControlRuntimeState>,
     pub bridge_plan_candidate_store: Mutex<file_candidates::BridgePlanCandidateStore>,
     /// Requester-local direct-Transfer sources keyed by immutable revision.
@@ -198,6 +202,7 @@ impl HostRuntime {
             latest_device_profile: Mutex::new(None),
             latest_device_capabilities: Mutex::new(None),
             latest_benchmark_results: Mutex::new(HashMap::new()),
+            latest_bridge_link_benchmarks: Mutex::new(HashMap::new()),
             room_control: Mutex::new(room_control::RoomControlRuntimeState::default()),
             bridge_plan_candidate_store: Mutex::new(
                 file_candidates::BridgePlanCandidateStore::default(),
@@ -268,6 +273,9 @@ impl HostRuntime {
         self.managed_objects.lock().purge_bridge(room_id);
         self.developer_terminal.purge_room(room_id);
         self.terminal_transfer_reasons.lock().clear();
+        self.latest_bridge_link_benchmarks
+            .lock()
+            .retain(|(bridge_id, _, _), _| bridge_id != room_id);
     }
 
     pub(crate) fn clear_terminal_transfer_reasons(&self) {

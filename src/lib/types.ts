@@ -76,6 +76,49 @@ export interface BridgeDeviceDiagnostics {
   checkedAt: number;
 }
 
+/** Read-only Layer 2 Bridge topology. It is never a route, Host selection,
+ * Plan, approval, or execution authority. */
+export interface BridgeNodeListProjectionV1 {
+  schemaVersion: "pastey-bridge-node-list-v1";
+  bridgeId: string;
+  nodes: BridgeNodeProjectionV1[];
+  links: BridgeLinkProjectionV1[];
+  observedAt: number;
+}
+
+export interface HostCapabilityFact {
+  capabilityId: string;
+  available: boolean;
+  acceptedInputMediaTypes: string[];
+  effect: string;
+  unavailableReason?: string | null;
+}
+
+export interface BridgeNodeProjectionV1 {
+  hostRef: string;
+  displayName?: string | null;
+  deviceProfile?: DeviceProfile | null;
+  deviceCapabilities?: DeviceCapabilities | null;
+  capabilities: HostCapabilityFact[];
+  currentSession?: {
+    liveness: BridgePeerLiveness;
+    observedAt: number;
+  } | null;
+}
+
+export interface BridgeLinkProjectionV1 {
+  sourceHostRef: string;
+  targetHostRef: string;
+  connection: {
+    liveness: BridgePeerLiveness;
+    controlChannel: DiagnosticState;
+    dataPath: DiagnosticState;
+    observedAt: number;
+  };
+  benchmark?: LinkBenchmarkResult | null;
+  observedAt: number;
+}
+
 export interface ManagedE2ESelfCheckReport {
   schemaVersion: "pastey-managed-e2e-self-check-v1";
   outcome: "PASS" | "BLOCKED" | "FAIL";

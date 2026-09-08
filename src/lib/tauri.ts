@@ -6,6 +6,7 @@ import type {
   CapabilityProbeMode,
   DeviceCapabilities,
   DeviceProfile,
+  BridgeNodeListProjectionV1,
   DeveloperModeUiSession,
   DeveloperTerminalWorkspace,
   JoinRequestPrompt,
@@ -530,6 +531,10 @@ export async function getDeviceCapabilities(options?: { forceRefresh?: boolean; 
     forceRefresh: options?.forceRefresh ?? false,
     probeMode: options?.probeMode ?? null
   });
+}
+
+export async function getBridgeNodeListProjection(bridgeId: string): Promise<BridgeNodeListProjectionV1> {
+  return invoke("get_bridge_node_list_projection", { bridgeId });
 }
 
 export async function runLoopbackBenchmark(options?: {
