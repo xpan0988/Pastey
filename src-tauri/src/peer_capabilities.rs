@@ -32,6 +32,7 @@ const REASON_PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
 const REASON_RUNTIME_UNAVAILABLE: &str = "runtime_unavailable";
 const REASON_EXECUTION_WORLD_UNAVAILABLE: &str = "execution_world_unavailable";
 const REASON_SYSTEM_PROBE_UNAVAILABLE: &str = "system_probe_unavailable";
+const REASON_SYSTEM_PROBE_UNSUPPORTED: &str = "system_probe_unsupported";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -208,13 +209,11 @@ fn append_system_probe_facts(
     for capability_id in capability_ids {
         let fact = match probe(capability_id) {
             KnownCapabilityProbeResult::Available => system_probe_fact(capability_id, true, None),
-            KnownCapabilityProbeResult::Missing => {
+            KnownCapabilityProbeResult::Unavailable => {
                 system_probe_fact(capability_id, false, Some(REASON_SYSTEM_PROBE_UNAVAILABLE))
             }
             KnownCapabilityProbeResult::Unsupported => {
-                return Err(AppError::InvalidInput(
-                    "Unsupported capability ID was requested.".into(),
-                ))
+                system_probe_fact(capability_id, false, Some(REASON_SYSTEM_PROBE_UNSUPPORTED))
             }
         };
         projection.capabilities.push(fact);
@@ -482,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn known_system_probe_observations_preserve_readiness_and_distinguish_missing() {
+    fn known_system_probe_observations_preserve_readiness_and_distinguish_unavailable() {
         let mut projection = local_projection("peer".into(), 10);
         projection.capabilities.push(capability(
             MANAGED_RUNTIME_CAPABILITY,
@@ -494,7 +493,7 @@ mod tests {
             &["runtime.python".into(), "runtime.node".into()],
             |capability_id| match capability_id {
                 "runtime.python" => KnownCapabilityProbeResult::Available,
-                "runtime.node" => KnownCapabilityProbeResult::Missing,
+                "runtime.node" => KnownCapabilityProbeResult::Unavailable,
                 _ => KnownCapabilityProbeResult::Unsupported,
             },
         )
@@ -527,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_system_probe_observation_remains_unknown_not_missing() {
+    fn absent_system_probe_observation_remains_unknown_not_unavailable() {
         let projection = local_projection("peer".into(), 10);
         assert_eq!(
             projection.diagnostic_state("runtime.python"),
@@ -536,14 +535,18 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_system_probe_cannot_be_projected_as_missing() {
+    fn locally_unsupported_system_probe_is_a_distinct_bounded_observation() {
         let mut projection = local_projection("peer".into(), 10);
-        assert!(append_system_probe_facts(
+        append_system_probe_facts(
             &mut projection,
-            &["runtime.nope".into()],
+            &["runtime.powershell".into()],
             |_capability_id| KnownCapabilityProbeResult::Unsupported,
         )
-        .is_err());
-        assert!(projection.capabilities.is_empty());
+        .unwrap();
+        assert_eq!(projection.capabilities.len(), 1);
+        assert_eq!(
+            projection.capabilities[0].unavailable_reason.as_deref(),
+            Some(REASON_SYSTEM_PROBE_UNSUPPORTED)
+        );
     }
 }
