@@ -3092,7 +3092,7 @@ mod tests {
             serde_json::json!({
                 "schemaVersion": crate::peer_capabilities::PEER_CAPABILITY_SCHEMA,
                 "peerSessionId": "selected-peer-session",
-                "capabilityIds": ["runtime.python", "runtime.python", "runtime.node"],
+                "capabilityIds": ["runtime.powershell", "runtime.powershell", "runtime.zsh"],
             }),
             &context,
         )
@@ -3100,13 +3100,13 @@ mod tests {
         assert!(validate_control_event(valid, "room", "source", "target", now).is_ok());
         let normalized = requested_peer_capability_ids(
             &serde_json::json!({
-                "capabilityIds": ["runtime.python", "runtime.python", "runtime.node"],
+                "capabilityIds": ["runtime.powershell", "runtime.powershell", "runtime.zsh"],
             })
             .as_object()
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(normalized, vec!["runtime.python", "runtime.node"]);
+        assert_eq!(normalized, vec!["runtime.powershell", "runtime.zsh"]);
 
         for payload in [
             serde_json::json!({

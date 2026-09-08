@@ -17,7 +17,7 @@ This document owns concrete identifiers, bounds, configuration facts, and source
 | Worker status event | `pastey-managed-worker-status-v1`; `pastey://managed-worker-status` |
 | Provider config | `pastey-worker-provider-config-v1` |
 | Peer capability facts | `pastey-peer-capabilities-v2` |
-| Fixed Host system-probe request | `capabilityIds`: at most 12 deduplicated fixed semantic IDs; no path, command, args, shell, or acquisition fields |
+| Fixed Host system-probe request | `capabilityIds`: at most 12 deduplicated IDs from the global semantic vocabulary; the receiving Host alone maps an ID to a fixed local probe. No path, command, args, shell, or acquisition fields. |
 | Bridge NodeList projection | `pastey-bridge-node-list-v1` |
 | Room Control route | `pastey-bridge-control-route-v1` |
 

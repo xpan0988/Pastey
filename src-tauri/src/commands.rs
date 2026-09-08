@@ -5023,13 +5023,29 @@ mod tests {
             schema_version: crate::peer_capabilities::PEER_CAPABILITY_SCHEMA.into(),
             peer_session_id: peer_session_id.into(),
             observed_at: 20,
-            capabilities: vec![crate::peer_capabilities::HostCapabilityFact {
-                capability_id: "runtime.python".into(),
-                available: true,
-                accepted_input_media_types: Vec::new(),
-                effect: "readiness_observation".into(),
-                unavailable_reason: None,
-            }],
+            capabilities: vec![
+                crate::peer_capabilities::HostCapabilityFact {
+                    capability_id: "runtime.python".into(),
+                    available: true,
+                    accepted_input_media_types: Vec::new(),
+                    effect: "system_probe_observation".into(),
+                    unavailable_reason: None,
+                },
+                crate::peer_capabilities::HostCapabilityFact {
+                    capability_id: "runtime.docker".into(),
+                    available: false,
+                    accepted_input_media_types: Vec::new(),
+                    effect: "system_probe_observation".into(),
+                    unavailable_reason: Some("system_probe_unavailable".into()),
+                },
+                crate::peer_capabilities::HostCapabilityFact {
+                    capability_id: "runtime.powershell".into(),
+                    available: false,
+                    accepted_input_media_types: Vec::new(),
+                    effect: "system_probe_observation".into(),
+                    unavailable_reason: Some("system_probe_unsupported".into()),
+                },
+            ],
         }
     }
 
@@ -5166,9 +5182,8 @@ mod tests {
                 .iter()
                 .find(|node| node.host_ref == remote_a.as_str())
                 .unwrap()
-                .capabilities[0]
-                .capability_id,
-            "runtime.python"
+                .capabilities,
+            node_list_projection("session-a").capabilities
         );
         assert!(projection
             .nodes

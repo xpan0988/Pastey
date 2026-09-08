@@ -13,6 +13,32 @@ use crate::{
 pub(crate) const MANAGED_PYTHON_RUNTIME_ID: &str = "python";
 pub(crate) const MANAGED_NODE_RUNTIME_ID: &str = "node";
 
+const RUNTIME_PYTHON_CAPABILITY_ID: &str = "runtime.python";
+const RUNTIME_NODE_CAPABILITY_ID: &str = "runtime.node";
+const RUNTIME_GIT_CAPABILITY_ID: &str = "runtime.git";
+const RUNTIME_RUST_CARGO_CAPABILITY_ID: &str = "runtime.rust_cargo";
+const RUNTIME_DOCKER_CAPABILITY_ID: &str = "runtime.docker";
+const RUNTIME_FFMPEG_CAPABILITY_ID: &str = "runtime.ffmpeg";
+const RUNTIME_CUDA_CAPABILITY_ID: &str = "runtime.cuda";
+const RUNTIME_POWERSHELL_CAPABILITY_ID: &str = "runtime.powershell";
+const RUNTIME_ZSH_CAPABILITY_ID: &str = "runtime.zsh";
+const RUNTIME_BASH_CAPABILITY_ID: &str = "runtime.bash";
+
+/// Stable semantic capability vocabulary shared by every Host platform.
+/// `RUNTIME_PROBES` below is deliberately a separate, Host-local subset.
+const KNOWN_CAPABILITY_IDS: &[&str] = &[
+    RUNTIME_PYTHON_CAPABILITY_ID,
+    RUNTIME_NODE_CAPABILITY_ID,
+    RUNTIME_GIT_CAPABILITY_ID,
+    RUNTIME_RUST_CARGO_CAPABILITY_ID,
+    RUNTIME_DOCKER_CAPABILITY_ID,
+    RUNTIME_FFMPEG_CAPABILITY_ID,
+    RUNTIME_CUDA_CAPABILITY_ID,
+    RUNTIME_POWERSHELL_CAPABILITY_ID,
+    RUNTIME_ZSH_CAPABILITY_ID,
+    RUNTIME_BASH_CAPABILITY_ID,
+];
+
 #[derive(Clone, Copy)]
 struct RuntimeProbe {
     name: &'static str,
@@ -24,50 +50,50 @@ struct RuntimeProbe {
 const RUNTIME_PROBES: &[RuntimeProbe] = &[
     RuntimeProbe {
         name: "python",
-        capability_id: "runtime.python",
+        capability_id: RUNTIME_PYTHON_CAPABILITY_ID,
         command: "python3",
         args: &["--version"],
     },
     RuntimeProbe {
         name: "node",
-        capability_id: "runtime.node",
+        capability_id: RUNTIME_NODE_CAPABILITY_ID,
         command: "node",
         args: &["--version"],
     },
     RuntimeProbe {
         name: "git",
-        capability_id: "runtime.git",
+        capability_id: RUNTIME_GIT_CAPABILITY_ID,
         command: "git",
         args: &["--version"],
     },
     RuntimeProbe {
         name: "rust/cargo",
-        capability_id: "runtime.rust_cargo",
+        capability_id: RUNTIME_RUST_CARGO_CAPABILITY_ID,
         command: "cargo",
         args: &["--version"],
     },
     RuntimeProbe {
         name: "docker",
-        capability_id: "runtime.docker",
+        capability_id: RUNTIME_DOCKER_CAPABILITY_ID,
         command: "docker",
         args: &["--version"],
     },
     RuntimeProbe {
         name: "ffmpeg",
-        capability_id: "runtime.ffmpeg",
+        capability_id: RUNTIME_FFMPEG_CAPABILITY_ID,
         command: "ffmpeg",
         args: &["-version"],
     },
     RuntimeProbe {
         name: "cuda",
-        capability_id: "runtime.cuda",
+        capability_id: RUNTIME_CUDA_CAPABILITY_ID,
         command: "nvidia-smi",
         args: &["--version"],
     },
     #[cfg(target_os = "windows")]
     RuntimeProbe {
         name: "powershell",
-        capability_id: "runtime.powershell",
+        capability_id: RUNTIME_POWERSHELL_CAPABILITY_ID,
         command: "powershell",
         args: &[
             "-NoProfile",
@@ -78,14 +104,14 @@ const RUNTIME_PROBES: &[RuntimeProbe] = &[
     #[cfg(target_os = "macos")]
     RuntimeProbe {
         name: "zsh",
-        capability_id: "runtime.zsh",
+        capability_id: RUNTIME_ZSH_CAPABILITY_ID,
         command: "zsh",
         args: &["--version"],
     },
     #[cfg(target_os = "macos")]
     RuntimeProbe {
         name: "bash",
-        capability_id: "runtime.bash",
+        capability_id: RUNTIME_BASH_CAPABILITY_ID,
         command: "bash",
         args: &["--version"],
     },
@@ -99,14 +125,15 @@ const MAX_KNOWN_CAPABILITY_ID_BYTES: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KnownCapabilityProbeResult {
     Available,
-    Missing,
+    Unavailable,
     Unsupported,
 }
 
-/// Returns the stable semantic vocabulary owned by `RUNTIME_PROBES` for this
-/// Host platform. Callers never receive the fixed command or arguments.
+/// Returns the stable global semantic vocabulary. Callers never receive a
+/// fixed command or arguments, and a remote Host alone decides whether it has
+/// a local implementation for one of these IDs.
 pub(crate) fn known_capability_ids() -> impl Iterator<Item = &'static str> {
-    RUNTIME_PROBES.iter().map(|probe| probe.capability_id)
+    KNOWN_CAPABILITY_IDS.iter().copied()
 }
 
 /// Reuses the fixed probe table's mapping for an existing runtime observation.
@@ -147,8 +174,8 @@ pub(crate) fn normalize_known_capability_request(
 }
 
 /// Probes exactly one known semantic capability with the Host-owned command
-/// and arguments from `RUNTIME_PROBES`. Unknown IDs are unsupported, rather
-/// than observations that the capability is missing.
+/// and arguments from `RUNTIME_PROBES`. Unsupported IDs are not converted to
+/// an unavailable fixed-probe observation.
 pub(crate) fn probe_known_capability(capability_id: &str) -> KnownCapabilityProbeResult {
     probe_known_capability_with_runner(capability_id, run_fixed_probe)
 }
@@ -166,7 +193,7 @@ fn probe_known_capability_with_runner(
     if runner(probe.command, probe.args).is_some() {
         KnownCapabilityProbeResult::Available
     } else {
-        KnownCapabilityProbeResult::Missing
+        KnownCapabilityProbeResult::Unavailable
     }
 }
 
@@ -419,12 +446,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_command_maps_to_unavailable() {
+    fn failed_fixed_command_maps_to_unavailable_device_observation() {
         let runtime = probe_runtime(
             RuntimeProbe {
-                name: "missing",
-                capability_id: "runtime.missing",
-                command: "missing",
+                name: "unavailable",
+                capability_id: "runtime.unavailable",
+                command: "unavailable",
                 args: &["--version"],
             },
             |_command, _args| None,
@@ -506,10 +533,24 @@ mod tests {
     }
 
     #[test]
-    fn every_fixed_probe_has_one_stable_semantic_capability_id() {
+    fn global_vocabulary_contains_all_canonical_ids_independent_of_local_probes() {
         let ids = known_capability_ids().collect::<Vec<_>>();
-        assert_eq!(ids.len(), RUNTIME_PROBES.len());
         assert_eq!(ids.iter().collect::<HashSet<_>>().len(), ids.len());
+        assert_eq!(
+            ids,
+            vec![
+                RUNTIME_PYTHON_CAPABILITY_ID,
+                RUNTIME_NODE_CAPABILITY_ID,
+                RUNTIME_GIT_CAPABILITY_ID,
+                RUNTIME_RUST_CARGO_CAPABILITY_ID,
+                RUNTIME_DOCKER_CAPABILITY_ID,
+                RUNTIME_FFMPEG_CAPABILITY_ID,
+                RUNTIME_CUDA_CAPABILITY_ID,
+                RUNTIME_POWERSHELL_CAPABILITY_ID,
+                RUNTIME_ZSH_CAPABILITY_ID,
+                RUNTIME_BASH_CAPABILITY_ID,
+            ]
+        );
         for probe in RUNTIME_PROBES {
             assert_eq!(
                 semantic_capability_id_for_runtime_name(probe.name),
@@ -520,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn known_capability_uses_only_its_fixed_probe_and_maps_success_and_failure() {
+    fn known_capability_uses_only_its_fixed_probe_and_maps_success_and_unavailable() {
         let mut seen = Vec::new();
         assert_eq!(
             probe_known_capability_with_runner("runtime.python", |command, args| {
@@ -537,7 +578,7 @@ mod tests {
         assert_eq!(seen, vec![("python3".into(), vec!["--version".into()])]);
         assert_eq!(
             probe_known_capability_with_runner("runtime.python", |_command, _args| None),
-            KnownCapabilityProbeResult::Missing
+            KnownCapabilityProbeResult::Unavailable
         );
         assert_eq!(
             probe_known_capability_with_runner("runtime.not_a_probe", |_command, _args| {
@@ -548,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_requests_are_bounded_known_ids_and_deduplicated() {
+    fn requester_side_normalization_accepts_cross_platform_ids_and_rejects_unknowns() {
         assert_eq!(
             normalize_known_capability_request(&[
                 "runtime.python".into(),
@@ -559,11 +600,32 @@ mod tests {
             vec!["runtime.python", "runtime.node"]
         );
         assert!(normalize_known_capability_request(&["runtime.nope".into()]).is_err());
+        assert!(
+            normalize_known_capability_request(&[RUNTIME_POWERSHELL_CAPABILITY_ID.into()]).is_ok()
+        );
+        assert!(normalize_known_capability_request(&[RUNTIME_ZSH_CAPABILITY_ID.into()]).is_ok());
         assert!(normalize_known_capability_request(
             &(0..=MAX_KNOWN_CAPABILITY_REQUESTS)
                 .map(|_| "runtime.python".into())
                 .collect::<Vec<_>>(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn globally_known_capability_without_a_local_probe_is_unsupported() {
+        let unsupported = known_capability_ids()
+            .find(|capability_id| {
+                !RUNTIME_PROBES
+                    .iter()
+                    .any(|probe| probe.capability_id == *capability_id)
+            })
+            .expect("each supported target omits at least one platform-specific probe");
+        assert_eq!(
+            probe_known_capability_with_runner(unsupported, |_command, _args| {
+                panic!("unsupported local IDs must not run a probe")
+            }),
+            KnownCapabilityProbeResult::Unsupported
+        );
     }
 }
