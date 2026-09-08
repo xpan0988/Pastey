@@ -155,16 +155,36 @@ impl CurrentRemoteHostSession {
         )
         .await?;
         self.revalidate(&state).await?;
-        state.latest_bridge_link_benchmarks.lock().insert(
-            (
-                self.binding.bridge_id.clone(),
-                self.binding.peer_host_ref.as_str().to_string(),
-                self.binding.peer_route_ref.clone(),
-            ),
+        store_current_link_benchmark(
+            &mut state.latest_bridge_link_benchmarks.lock(),
+            &self.binding,
             result.clone(),
         );
         Ok(result)
     }
+}
+
+/// Records one revalidated link benchmark under its exact current route. A
+/// replacement route for the same Bridge and Host invalidates every older
+/// route cache entry without touching another Host or Bridge.
+fn store_current_link_benchmark(
+    benchmarks: &mut std::collections::HashMap<(String, String, String), LinkBenchmarkResult>,
+    binding: &HostSessionBinding,
+    result: LinkBenchmarkResult,
+) {
+    benchmarks.retain(|(bridge_id, host_ref, route_ref), _| {
+        bridge_id != &binding.bridge_id
+            || host_ref != binding.peer_host_ref.as_str()
+            || route_ref == &binding.peer_route_ref
+    });
+    benchmarks.insert(
+        (
+            binding.bridge_id.clone(),
+            binding.peer_host_ref.as_str().to_string(),
+            binding.peer_route_ref.clone(),
+        ),
+        result,
+    );
 }
 
 pub async fn start(state: Arc<AppState>) {
@@ -637,6 +657,94 @@ mod tests {
                 .await;
         });
         (port, shutdown_tx)
+    }
+
+    fn benchmark_result(timestamp: i64) -> LinkBenchmarkResult {
+        LinkBenchmarkResult {
+            peer_id: None,
+            peer_name: None,
+            average_MBps: 12.0,
+            peak_MBps: 15.0,
+            latency_ms: Some(4.0),
+            duration_ms: 1_000,
+            total_bytes: 12_000,
+            effective_window_size: Some(1),
+            sender_cpu_hint: None,
+            receiver_cpu_hint: None,
+            failed_chunks: 0,
+            duplicate_chunks: 0,
+            benchmark_mode: BenchmarkMode::PasteyPipeline,
+            link_quality: crate::diagnostics::LinkQuality::Fair,
+            timestamp,
+        }
+    }
+
+    fn benchmark_binding(
+        bridge_id: &str,
+        local_host: HostRef,
+        remote_host: HostRef,
+        route: &str,
+    ) -> HostSessionBinding {
+        HostSessionBinding::new(
+            bridge_id,
+            local_host,
+            remote_host,
+            "local-session",
+            "remote-session",
+            route,
+            storage::now_ts() + 60,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn current_link_benchmark_replaces_only_superseded_route_for_its_bridge_and_host() {
+        let local = HostRef::from_device_id("local-cache").unwrap();
+        let remote = HostRef::from_device_id("remote-cache").unwrap();
+        let another_remote = HostRef::from_device_id("another-remote-cache").unwrap();
+        let old = benchmark_binding("bridge-a", local.clone(), remote.clone(), "route-old");
+        let current = benchmark_binding("bridge-a", local.clone(), remote.clone(), "route-new");
+        let other_host = benchmark_binding(
+            "bridge-a",
+            local.clone(),
+            another_remote.clone(),
+            "route-other-host",
+        );
+        let other_bridge =
+            benchmark_binding("bridge-b", local, remote.clone(), "route-other-bridge");
+        let mut cache = std::collections::HashMap::new();
+        store_current_link_benchmark(&mut cache, &old, benchmark_result(1));
+        store_current_link_benchmark(&mut cache, &other_host, benchmark_result(2));
+        store_current_link_benchmark(&mut cache, &other_bridge, benchmark_result(3));
+        store_current_link_benchmark(&mut cache, &current, benchmark_result(4));
+
+        assert_eq!(cache.len(), 3);
+        assert!(!cache.contains_key(&(
+            "bridge-a".into(),
+            remote.as_str().into(),
+            "route-old".into(),
+        )));
+        assert_eq!(
+            cache
+                .get(&(
+                    "bridge-a".into(),
+                    remote.as_str().into(),
+                    "route-new".into(),
+                ))
+                .unwrap()
+                .timestamp,
+            4
+        );
+        assert!(cache.contains_key(&(
+            "bridge-a".into(),
+            another_remote.as_str().into(),
+            "route-other-host".into(),
+        )));
+        assert!(cache.contains_key(&(
+            "bridge-b".into(),
+            remote.as_str().into(),
+            "route-other-bridge".into(),
+        )));
     }
 
     #[tokio::test]

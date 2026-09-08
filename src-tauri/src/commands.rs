@@ -112,10 +112,9 @@ fn compose_bridge_node_list_projection(
             .iter()
             .map(local_runtime_capability_fact)
             .collect(),
-        current_session: Some(diagnostics::BridgeNodeCurrentSessionObservationV1 {
-            liveness: crate::models::BridgePeerLiveness::Connected,
-            observed_at,
-        }),
+        // The local Host has LocalRuntimeRef freshness, not a Bridge peer
+        // session. NodeList must not synthesize a local current session.
+        current_session: None,
     }];
     let mut links = Vec::new();
     let mut peers_by_host =
@@ -5084,7 +5083,7 @@ mod tests {
     }
 
     #[test]
-    fn node_list_projects_each_durable_host_once_and_keeps_empty_capabilities_valid() {
+    fn node_list_omits_local_session_and_preserves_remote_current_session_serialization() {
         let remote = crate::host_identity::HostRef::from_device_id("remote").unwrap();
         let projection = compose_node_list(
             vec![
@@ -5105,6 +5104,13 @@ mod tests {
             HashMap::new(),
         );
         assert_eq!(projection.nodes.len(), 2);
+        let local = crate::host_identity::HostRef::from_device_id("local").unwrap();
+        let local_node = projection
+            .nodes
+            .iter()
+            .find(|node| node.host_ref == local.as_str())
+            .unwrap();
+        assert!(local_node.current_session.is_none());
         let remote_node = projection
             .nodes
             .iter()
@@ -5115,6 +5121,21 @@ mod tests {
             remote_node.current_session.as_ref().unwrap().observed_at,
             20
         );
+        let json = serde_json::to_value(&projection).unwrap();
+        let serialized_local = json["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["hostRef"] == local.as_str())
+            .unwrap();
+        assert!(serialized_local.get("currentSession").is_none());
+        let serialized_remote = json["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["hostRef"] == remote.as_str())
+            .unwrap();
+        assert_eq!(serialized_remote["currentSession"]["liveness"], "connected");
         assert_eq!(
             serde_json::from_str::<diagnostics::BridgeNodeListProjectionV1>(
                 &serde_json::to_string(&projection).unwrap()
@@ -5190,7 +5211,7 @@ mod tests {
     }
 
     #[test]
-    fn node_list_drops_stale_disconnected_and_replaced_session_observations() {
+    fn node_list_prevents_stale_route_cache_data_from_reappearing_after_reconnect() {
         let remote = crate::host_identity::HostRef::from_device_id("remote").unwrap();
         let mut capabilities = HashMap::new();
         capabilities.insert("old-session".into(), node_list_projection("old-session"));
@@ -5221,6 +5242,8 @@ mod tests {
             .unwrap();
         assert!(node.capabilities.is_empty());
         assert_eq!(reconnected.links.len(), 1);
+        // The supplied cache has only the superseded route's benchmark; it
+        // cannot be attached to the new exact current-session link.
         assert!(reconnected.links[0].benchmark.is_none());
 
         let disconnected = compose_node_list(
