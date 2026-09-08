@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    capability_probe::{self, KnownCapabilityProbeResult},
     diagnostics::DiagnosticState,
     error::{AppError, AppResult},
     host_runtime::HostRuntime,
@@ -30,6 +31,7 @@ const REASON_PLAN_BINDING_REQUIRED: &str = "plan_process_binding_required";
 const REASON_PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
 const REASON_RUNTIME_UNAVAILABLE: &str = "runtime_unavailable";
 const REASON_EXECUTION_WORLD_UNAVAILABLE: &str = "execution_world_unavailable";
+const REASON_SYSTEM_PROBE_UNAVAILABLE: &str = "system_probe_unavailable";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -168,6 +170,69 @@ pub(crate) fn local_diagnostic_projection(
         peer_session_id,
         observed_at,
         capabilities: vec![provider, runtime, execution_world, managed_execution],
+    }
+}
+
+/// Adds exact requested system-probe observations to the existing managed
+/// readiness projection. The request has already been reduced to canonical
+/// semantic IDs; the Host alone chooses the fixed probe implementation.
+pub(crate) fn local_diagnostic_projection_with_system_probes(
+    state: &HostRuntime,
+    peer_session_id: String,
+    observed_at: i64,
+    capability_ids: &[String],
+) -> AppResult<PeerCapabilityProjection> {
+    let capability_ids = capability_probe::normalize_known_capability_request(capability_ids)?;
+    let mut projection = local_diagnostic_projection(state, peer_session_id, observed_at);
+    append_system_probe_facts(
+        &mut projection,
+        &capability_ids,
+        capability_probe::probe_known_capability,
+    )?;
+    validate_projection(&projection)?;
+    Ok(projection)
+}
+
+/// Validates and deduplicates the capability-only part of a Room Control
+/// query. It intentionally has no command, executable, argument, or shell
+/// field to deserialize.
+pub(crate) fn normalize_system_probe_request(capability_ids: &[String]) -> AppResult<Vec<String>> {
+    capability_probe::normalize_known_capability_request(capability_ids)
+}
+
+fn append_system_probe_facts(
+    projection: &mut PeerCapabilityProjection,
+    capability_ids: &[String],
+    probe: impl Fn(&str) -> KnownCapabilityProbeResult,
+) -> AppResult<()> {
+    for capability_id in capability_ids {
+        let fact = match probe(capability_id) {
+            KnownCapabilityProbeResult::Available => system_probe_fact(capability_id, true, None),
+            KnownCapabilityProbeResult::Missing => {
+                system_probe_fact(capability_id, false, Some(REASON_SYSTEM_PROBE_UNAVAILABLE))
+            }
+            KnownCapabilityProbeResult::Unsupported => {
+                return Err(AppError::InvalidInput(
+                    "Unsupported capability ID was requested.".into(),
+                ))
+            }
+        };
+        projection.capabilities.push(fact);
+    }
+    Ok(())
+}
+
+fn system_probe_fact(
+    capability_id: &str,
+    available: bool,
+    unavailable_reason: Option<&str>,
+) -> HostCapabilityFact {
+    HostCapabilityFact {
+        capability_id: capability_id.into(),
+        available,
+        accepted_input_media_types: Vec::new(),
+        effect: "system_probe_observation".into(),
+        unavailable_reason: unavailable_reason.map(str::to_string),
     }
 }
 
@@ -344,6 +409,22 @@ mod tests {
     }
 
     #[test]
+    fn replaced_session_cannot_reuse_an_old_capability_observation() {
+        let projection = local_projection("old-session".into(), 10);
+        let mut store = PeerCapabilityStore::default();
+        store
+            .observe("room", "old-session", "old-route", projection.clone(), 10)
+            .unwrap();
+
+        assert!(store
+            .projection("room", "new-session", "new-route")
+            .is_none());
+        assert!(store
+            .observe("room", "new-session", "new-route", projection, 11)
+            .is_err());
+    }
+
+    #[test]
     fn generic_transport_accepts_bounded_facts_without_granting_authority() {
         let mut projection = local_projection("peer".into(), 10);
         projection.capabilities.push(HostCapabilityFact {
@@ -398,5 +479,71 @@ mod tests {
             projection.diagnostic_state(MANAGED_EXECUTION_CAPABILITY),
             DiagnosticState::Unknown
         );
+    }
+
+    #[test]
+    fn known_system_probe_observations_preserve_readiness_and_distinguish_missing() {
+        let mut projection = local_projection("peer".into(), 10);
+        projection.capabilities.push(capability(
+            MANAGED_RUNTIME_CAPABILITY,
+            false,
+            Some(REASON_NOT_CONFIGURED),
+        ));
+        append_system_probe_facts(
+            &mut projection,
+            &["runtime.python".into(), "runtime.node".into()],
+            |capability_id| match capability_id {
+                "runtime.python" => KnownCapabilityProbeResult::Available,
+                "runtime.node" => KnownCapabilityProbeResult::Missing,
+                _ => KnownCapabilityProbeResult::Unsupported,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(projection.capabilities.len(), 3);
+        assert_eq!(
+            projection
+                .capabilities
+                .iter()
+                .find(|fact| fact.capability_id == "runtime.python")
+                .unwrap()
+                .available,
+            true
+        );
+        assert_eq!(
+            projection
+                .capabilities
+                .iter()
+                .find(|fact| fact.capability_id == "runtime.node")
+                .unwrap()
+                .unavailable_reason
+                .as_deref(),
+            Some(REASON_SYSTEM_PROBE_UNAVAILABLE)
+        );
+        assert_eq!(
+            projection.diagnostic_state(MANAGED_RUNTIME_CAPABILITY),
+            DiagnosticState::NotConfigured
+        );
+    }
+
+    #[test]
+    fn absent_system_probe_observation_remains_unknown_not_missing() {
+        let projection = local_projection("peer".into(), 10);
+        assert_eq!(
+            projection.diagnostic_state("runtime.python"),
+            DiagnosticState::Unknown
+        );
+    }
+
+    #[test]
+    fn unsupported_system_probe_cannot_be_projected_as_missing() {
+        let mut projection = local_projection("peer".into(), 10);
+        assert!(append_system_probe_facts(
+            &mut projection,
+            &["runtime.nope".into()],
+            |_capability_id| KnownCapabilityProbeResult::Unsupported,
+        )
+        .is_err());
+        assert!(projection.capabilities.is_empty());
     }
 }

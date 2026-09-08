@@ -80,6 +80,20 @@ impl CurrentRemoteHostSession {
         &self,
         state: Arc<AppState>,
     ) -> AppResult<PeerCapabilityProjection> {
+        self.request_capability_projection_for_known_capabilities(state, &[])
+            .await
+    }
+
+    /// Queries only canonical, fixed-probe capability IDs for this exact
+    /// current remote Host. The request carries no executable, command,
+    /// arguments, shell text, or acquisition instruction.
+    pub(crate) async fn request_capability_projection_for_known_capabilities(
+        &self,
+        state: Arc<AppState>,
+        capability_ids: &[String],
+    ) -> AppResult<PeerCapabilityProjection> {
+        let capability_ids =
+            crate::peer_capabilities::normalize_system_probe_request(capability_ids)?;
         let current = self.revalidate(&state).await?;
         let context = room_control::room_control_session_context_for_peer(
             &state,
@@ -105,6 +119,7 @@ impl CurrentRemoteHostSession {
             serde_json::json!({
                 "schemaVersion": crate::peer_capabilities::PEER_CAPABILITY_SCHEMA,
                 "peerSessionId": context.peer_route_ref,
+                "capabilityIds": capability_ids,
             }),
             &context,
         )?;

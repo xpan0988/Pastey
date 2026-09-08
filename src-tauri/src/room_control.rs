@@ -164,14 +164,25 @@ fn local_peer_capability_response_projection(
     state: &AppState,
     peer_session_id: &str,
     observed_at: i64,
+    capability_ids: &[String],
 ) -> AppResult<crate::peer_capabilities::PeerCapabilityProjection> {
-    let projection = crate::peer_capabilities::local_diagnostic_projection(
+    let projection = crate::peer_capabilities::local_diagnostic_projection_with_system_probes(
         state,
         peer_session_id.into(),
         observed_at,
+        capability_ids,
     );
-    crate::peer_capabilities::validate_projection(&projection)?;
-    Ok(projection)
+    projection
+}
+
+fn requested_peer_capability_ids(
+    payload: &serde_json::Map<String, Value>,
+) -> AppResult<Vec<String>> {
+    let capability_ids = serde_json::from_value::<Vec<String>>(
+        payload.get("capabilityIds").cloned().unwrap_or(Value::Null),
+    )
+    .map_err(|_| AppError::InvalidInput("Invalid peer capability query.".into()))?;
+    crate::peer_capabilities::normalize_system_probe_request(&capability_ids)
 }
 
 pub(crate) fn peer_capability_event(
@@ -1513,13 +1524,13 @@ pub async fn receive_room_control_event_handler(
         log_peer_capability_projection("projection_stored", &projection);
     } else if validated.kind == "peer_capability.query" {
         log_peer_capability("query_received", None, None);
-        let peer_session_id = validated
-            .event
-            .get("payload")
-            .and_then(Value::as_object)
+        let payload = validated.event.get("payload").and_then(Value::as_object);
+        let peer_session_id = payload
             .and_then(|payload| payload.get("peerSessionId"))
             .and_then(Value::as_str);
-        let Some(peer_session_id) = peer_session_id else {
+        let Some((peer_session_id, capability_ids)) = peer_session_id
+            .zip(payload.and_then(|payload| requested_peer_capability_ids(payload).ok()))
+        else {
             log_peer_capability("query_rejected", None, Some("invalid_schema"));
             return control_error(
                 StatusCode::BAD_REQUEST,
@@ -1543,6 +1554,7 @@ pub async fn receive_room_control_event_handler(
             &ctx.state,
             peer_session_id,
             storage::now_ts(),
+            &capability_ids,
         ) {
             Ok(projection) => projection,
             Err(_) => {
@@ -2148,7 +2160,10 @@ fn validate_control_event(
         }
         match kind.as_str() {
             "peer_capability.query" => {
-                require_exact_fields(payload, &["schemaVersion", "peerSessionId"])?;
+                require_exact_fields(
+                    payload,
+                    &["schemaVersion", "peerSessionId", "capabilityIds"],
+                )?;
                 if string_field(payload, "schemaVersion")?
                     != crate::peer_capabilities::PEER_CAPABILITY_SCHEMA
                     || bounded_string_field(payload, "peerSessionId", 256)?.is_empty()
@@ -2157,6 +2172,7 @@ fn validate_control_event(
                         "Invalid peer capability query.".into(),
                     ));
                 }
+                requested_peer_capability_ids(payload)?;
             }
             "peer_capability.response" => {
                 let projection: crate::peer_capabilities::PeerCapabilityProjection =
@@ -3058,6 +3074,56 @@ mod tests {
         )
         .unwrap();
         assert!(validate_control_event(malformed, "room", "source", "target", now).is_err());
+    }
+
+    #[test]
+    fn peer_capability_query_accepts_only_bounded_known_semantic_ids() {
+        let now = OffsetDateTime::now_utc();
+        let context = RoomControlSessionContext {
+            room_id: "room".into(),
+            local_session_ref: "source".into(),
+            peer_session_ref: "target".into(),
+            peer_route_ref: "selected-peer-session".into(),
+            peer_observation_ref: "route-binding".into(),
+            peer_connected: true,
+        };
+        let valid = peer_capability_event(
+            "peer_capability.query",
+            serde_json::json!({
+                "schemaVersion": crate::peer_capabilities::PEER_CAPABILITY_SCHEMA,
+                "peerSessionId": "selected-peer-session",
+                "capabilityIds": ["runtime.python", "runtime.python", "runtime.node"],
+            }),
+            &context,
+        )
+        .unwrap();
+        assert!(validate_control_event(valid, "room", "source", "target", now).is_ok());
+        let normalized = requested_peer_capability_ids(
+            &serde_json::json!({
+                "capabilityIds": ["runtime.python", "runtime.python", "runtime.node"],
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(normalized, vec!["runtime.python", "runtime.node"]);
+
+        for payload in [
+            serde_json::json!({
+                "schemaVersion": crate::peer_capabilities::PEER_CAPABILITY_SCHEMA,
+                "peerSessionId": "selected-peer-session",
+                "capabilityIds": ["runtime.not_a_probe"],
+            }),
+            serde_json::json!({
+                "schemaVersion": crate::peer_capabilities::PEER_CAPABILITY_SCHEMA,
+                "peerSessionId": "selected-peer-session",
+                "capabilityIds": ["runtime.python"],
+                "command": "curl",
+            }),
+        ] {
+            let event = peer_capability_event("peer_capability.query", payload, &context).unwrap();
+            assert!(validate_control_event(event, "room", "source", "target", now).is_err());
+        }
     }
 
     #[test]

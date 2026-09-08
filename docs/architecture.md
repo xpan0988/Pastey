@@ -34,6 +34,8 @@ Renderer state, model/provider output, logs, routes, tool schemas, and capabilit
 
 Layer 2's `BridgeNodeListProjectionV1` displays durable Host membership once per `HostRef` and only matching current-session capability/link observations. It is environment fact display, not a route resolver or source of readiness/authorization: all execution paths still revalidate through the existing Layer 4 Host resolver and Core-owned admission/completion chain.
 
+A current-session Room Control capability query may ask an exact remote Host for a bounded, deduplicated list of fixed semantic system-probe IDs: `runtime.python`, `runtime.node`, `runtime.git`, `runtime.rust_cargo`, `runtime.docker`, `runtime.ffmpeg`, `runtime.cuda`, and the platform-applicable `runtime.powershell`, `runtime.zsh`, or `runtime.bash`. The Host validates each ID and runs only its own fixed probe; a caller cannot send an executable path, command, arguments, shell text, or installation instruction. A known failed probe is an observed unavailable fact, while an absent observation is not missing. Unknown IDs are unsupported and rejected rather than treated as unavailable. These are current-session NodeList observations only; they do not select a Host, repair topology, bind a process, or grant execution authority.
+
 Execution locality does not change this chain. Core resolves each authored participant's `HostRef` once. Work for the current Host uses direct coordinator dispatch with a fresh local-runtime reference; work for another Host uses its current Bridge/session binding and Room Control. Both paths satisfy the same Layer 5 Review, readiness, attempt-bound admission, prepared/commit, result, continuation, and cancellation contract.
 
 ## HostRuntime and the multi-Host model

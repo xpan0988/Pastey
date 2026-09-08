@@ -110,7 +110,7 @@ fn compose_bridge_node_list_projection(
         capabilities: local_capabilities
             .runtimes
             .iter()
-            .map(local_runtime_capability_fact)
+            .filter_map(local_runtime_capability_fact)
             .collect(),
         // The local Host has LocalRuntimeRef freshness, not a Bridge peer
         // session. NodeList must not synthesize a local current session.
@@ -207,33 +207,16 @@ fn compose_bridge_node_list_projection(
 
 fn local_runtime_capability_fact(
     capability: &diagnostics::RuntimeCapability,
-) -> crate::peer_capabilities::HostCapabilityFact {
-    let normalized = capability
-        .name
-        .chars()
-        .flat_map(char::to_lowercase)
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    crate::peer_capabilities::HostCapabilityFact {
-        capability_id: format!(
-            "runtime.{}",
-            if normalized.is_empty() {
-                "unknown"
-            } else {
-                &normalized
-            }
-        ),
+) -> Option<crate::peer_capabilities::HostCapabilityFact> {
+    let capability_id =
+        capability_probe::semantic_capability_id_for_runtime_name(&capability.name)?;
+    Some(crate::peer_capabilities::HostCapabilityFact {
+        capability_id: capability_id.into(),
         available: capability.available,
         accepted_input_media_types: Vec::new(),
         effect: "device_observation".into(),
         unavailable_reason: (!capability.available).then_some("unavailable".into()),
-    }
+    })
 }
 
 fn compose_bridge_device_diagnostics(
@@ -733,9 +716,14 @@ pub(crate) async fn run_bridge_device_managed_self_check(
 pub async fn refresh_selected_peer_capabilities(
     room_id: String,
     bridge_route: Option<Value>,
+    capability_ids: Option<Vec<String>>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<RoomControlDeliveryReceipt, String> {
     let state = state.inner().clone();
+    let capability_ids = crate::peer_capabilities::normalize_system_probe_request(
+        &capability_ids.unwrap_or_default(),
+    )
+    .map_err(|error| error.message())?;
     let context = crate::room_control::room_control_session_context(&state, &room_id)
         .map_err(|error| error.message())?;
     let event = crate::room_control::peer_capability_event(
@@ -743,6 +731,7 @@ pub async fn refresh_selected_peer_capabilities(
         serde_json::json!({
             "schemaVersion": crate::peer_capabilities::PEER_CAPABILITY_SCHEMA,
             "peerSessionId": context.peer_route_ref,
+            "capabilityIds": capability_ids,
         }),
         &context,
     )
