@@ -1,5 +1,71 @@
 use serde::{Deserialize, Serialize};
 
+use crate::{models::BridgePeerLiveness, peer_capabilities::HostCapabilityFact};
+
+pub const BRIDGE_NODE_LIST_SCHEMA: &str = "pastey-bridge-node-list-v1";
+
+/// Renderer-safe, read-only Layer 2 projection of one Bridge's durable Hosts
+/// and their current observations. It does not resolve a Host, select a Host,
+/// or carry any Plan, route, session, or authority material.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeNodeListProjectionV1 {
+    pub schema_version: String,
+    pub bridge_id: String,
+    pub nodes: Vec<BridgeNodeProjectionV1>,
+    pub links: Vec<BridgeLinkProjectionV1>,
+    pub observed_at: i64,
+}
+
+/// One durable Host exactly once. Remote profile/capability probe data remains
+/// absent until it is observed through an existing bounded channel; absence is
+/// not an inference about availability.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeNodeProjectionV1 {
+    pub host_ref: String,
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_profile: Option<DeviceProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_capabilities: Option<DeviceCapabilities>,
+    pub capabilities: Vec<HostCapabilityFact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_session: Option<BridgeNodeCurrentSessionObservationV1>,
+}
+
+/// Current-session state is an observation only. Its omission for a retained
+/// durable Host means no current session observation is available.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeNodeCurrentSessionObservationV1 {
+    pub liveness: BridgePeerLiveness,
+    pub observed_at: i64,
+}
+
+/// A directional link observed by this HostRuntime. Direction is retained so
+/// the projection never fabricates a symmetric edge from directional transport
+/// evidence. Benchmark and connection facts belong here, never to a node.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeLinkProjectionV1 {
+    pub source_host_ref: String,
+    pub target_host_ref: String,
+    pub connection: BridgeLinkConnectionObservationV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub benchmark: Option<LinkBenchmarkResult>,
+    pub observed_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeLinkConnectionObservationV1 {
+    pub liveness: BridgePeerLiveness,
+    pub control_channel: DiagnosticState,
+    pub data_path: DiagnosticState,
+    pub observed_at: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DeviceProfile {
     pub device_id: String,

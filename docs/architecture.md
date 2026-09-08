@@ -7,7 +7,7 @@ Pastey is a local-first desktop transfer and managed-workspace system. Source co
 | Layer | Responsibility |
 | --- | --- |
 | 1 — Secure LAN transport | Encrypted byte transfer, framing, integrity, acknowledgement, and finalization. |
-| 2 — Device intelligence | Factual device, link, liveness, and bounded capability observations. |
+| 2 — Device intelligence | Factual device, link, liveness, bounded capability observations, and the read-only Bridge NodeList projection. |
 | 3 — Smart orchestration | Ordinary queues and shared Rust transfer-capacity admission. |
 | 4 — Bridge | Current-session membership, routes, encrypted control delivery, replay, reconnect, departure, and Burn boundaries. |
 | 5 — Managed semantic workspace | Immutable object flow, Review/approval, Host admission, attempt/step authority, managed execution, and continuation. |
@@ -31,6 +31,8 @@ Core evidence/result acceptance → requester step commit → next authored depe
 ```
 
 Renderer state, model/provider output, logs, routes, tool schemas, and capability projections never mint authority.
+
+Layer 2's `BridgeNodeListProjectionV1` displays durable Host membership once per `HostRef` and only matching current-session capability/link observations. It is environment fact display, not a route resolver or source of readiness/authorization: all execution paths still revalidate through the existing Layer 4 Host resolver and Core-owned admission/completion chain.
 
 Execution locality does not change this chain. Core resolves each authored participant's `HostRef` once. Work for the current Host uses direct coordinator dispatch with a fresh local-runtime reference; work for another Host uses its current Bridge/session binding and Room Control. Both paths satisfy the same Layer 5 Review, readiness, attempt-bound admission, prepared/commit, result, continuation, and cancellation contract.
 

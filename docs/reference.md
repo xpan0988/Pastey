@@ -17,6 +17,7 @@ This document owns concrete identifiers, bounds, configuration facts, and source
 | Worker status event | `pastey-managed-worker-status-v1`; `pastey://managed-worker-status` |
 | Provider config | `pastey-worker-provider-config-v1` |
 | Peer capability facts | `pastey-peer-capabilities-v2` |
+| Bridge NodeList projection | `pastey-bridge-node-list-v1` |
 | Room Control route | `pastey-bridge-control-route-v1` |
 
 ## Native-v2 commands
@@ -72,6 +73,7 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 | Worker Harness/provider | `src-tauri/src/worker_harness.rs`, `worker_provider.rs` |
 | Provider configuration | `src-tauri/src/worker_provider_config.rs` |
 | Bridge Device Check / Managed E2E self-check | `src-tauri/src/commands.rs`, `src-tauri/src/diagnostics.rs`, `src/lib/tauri.ts`, `src/lib/types.ts` |
+| Bridge NodeList projection | `src-tauri/src/diagnostics.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/host_runtime.rs`, `src/lib/tauri.ts`, `src/lib/types.ts` |
 
 ## Provider configuration facts
 

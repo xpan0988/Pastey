@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, HashMap},
     fs::{self, OpenOptions},
     io::Write,
     path::PathBuf,
@@ -86,6 +87,154 @@ pub(crate) async fn bridge_device_diagnostics_for_host(
         link_benchmark,
         storage::now_ts(),
     ))
+}
+
+/// Composes a Layer 2-only Bridge topology view from durable Host membership
+/// and exact current-session observations already held by their owners. It
+/// intentionally has no resolver, planner, admission, or execution input.
+fn compose_bridge_node_list_projection(
+    bridge_id: &str,
+    local_host_ref: &crate::host_identity::HostRef,
+    local_profile: diagnostics::DeviceProfile,
+    local_capabilities: diagnostics::DeviceCapabilities,
+    peers: &[crate::models::StoredBridgePeerEndpoint],
+    capability_projections: &HashMap<String, crate::peer_capabilities::PeerCapabilityProjection>,
+    benchmarks: &HashMap<String, diagnostics::LinkBenchmarkResult>,
+    observed_at: i64,
+) -> diagnostics::BridgeNodeListProjectionV1 {
+    let mut nodes = vec![diagnostics::BridgeNodeProjectionV1 {
+        host_ref: local_host_ref.as_str().to_string(),
+        display_name: Some(local_profile.device_name.clone()),
+        device_profile: Some(local_profile),
+        device_capabilities: Some(local_capabilities.clone()),
+        capabilities: local_capabilities
+            .runtimes
+            .iter()
+            .map(local_runtime_capability_fact)
+            .collect(),
+        current_session: Some(diagnostics::BridgeNodeCurrentSessionObservationV1 {
+            liveness: crate::models::BridgePeerLiveness::Connected,
+            observed_at,
+        }),
+    }];
+    let mut links = Vec::new();
+    let mut peers_by_host =
+        BTreeMap::<String, Vec<&crate::models::StoredBridgePeerEndpoint>>::new();
+    for peer in peers {
+        let Some(host_ref) = peer.logical_host_ref.as_deref() else {
+            continue;
+        };
+        if crate::host_identity::HostRef::parse(host_ref.to_string()).is_err()
+            || host_ref == local_host_ref.as_str()
+        {
+            continue;
+        }
+        peers_by_host
+            .entry(host_ref.to_string())
+            .or_default()
+            .push(peer);
+    }
+
+    for (host_ref, host_peers) in peers_by_host {
+        let current = host_peers
+            .iter()
+            .copied()
+            .filter(|peer| peer.liveness == crate::models::BridgePeerLiveness::Connected)
+            .collect::<Vec<_>>();
+        // Multiple connected rows are ambiguous. Keep the durable node but
+        // deliberately expose no current capability or link observation.
+        let current = (current.len() == 1).then(|| current[0]);
+        let newest = host_peers
+            .iter()
+            .copied()
+            .max_by_key(|peer| peer.updated_at)
+            .expect("a grouped Host has one peer row");
+        let capability_projection =
+            current.and_then(|peer| capability_projections.get(&peer.peer_session_id));
+        nodes.push(diagnostics::BridgeNodeProjectionV1 {
+            host_ref: host_ref.clone(),
+            display_name: newest.display_name.clone(),
+            device_profile: None,
+            device_capabilities: None,
+            capabilities: capability_projection
+                .map(|projection| projection.capabilities.clone())
+                .unwrap_or_default(),
+            current_session: current.map(|peer| {
+                diagnostics::BridgeNodeCurrentSessionObservationV1 {
+                    liveness: peer.liveness.clone(),
+                    observed_at: peer.updated_at,
+                }
+            }),
+        });
+        let Some(peer) = current else {
+            continue;
+        };
+        let benchmark = benchmarks.get(&peer.peer_session_id).cloned();
+        let connection_observed_at = capability_projection
+            .map(|projection| projection.observed_at)
+            .unwrap_or(peer.updated_at);
+        let link_observed_at = benchmark
+            .as_ref()
+            .map(|benchmark| connection_observed_at.max(benchmark.timestamp))
+            .unwrap_or(connection_observed_at);
+        links.push(diagnostics::BridgeLinkProjectionV1 {
+            source_host_ref: local_host_ref.as_str().to_string(),
+            target_host_ref: host_ref,
+            connection: diagnostics::BridgeLinkConnectionObservationV1 {
+                liveness: peer.liveness.clone(),
+                control_channel: capability_projection
+                    .map(|_| diagnostics::DiagnosticState::Healthy)
+                    .unwrap_or(diagnostics::DiagnosticState::Unknown),
+                data_path: benchmark
+                    .as_ref()
+                    .filter(|benchmark| benchmark.total_bytes > 0 && benchmark.failed_chunks == 0)
+                    .map(|_| diagnostics::DiagnosticState::Healthy)
+                    .unwrap_or(diagnostics::DiagnosticState::Unknown),
+                observed_at: connection_observed_at,
+            },
+            benchmark,
+            observed_at: link_observed_at,
+        });
+    }
+
+    diagnostics::BridgeNodeListProjectionV1 {
+        schema_version: diagnostics::BRIDGE_NODE_LIST_SCHEMA.into(),
+        bridge_id: bridge_id.into(),
+        nodes,
+        links,
+        observed_at,
+    }
+}
+
+fn local_runtime_capability_fact(
+    capability: &diagnostics::RuntimeCapability,
+) -> crate::peer_capabilities::HostCapabilityFact {
+    let normalized = capability
+        .name
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    crate::peer_capabilities::HostCapabilityFact {
+        capability_id: format!(
+            "runtime.{}",
+            if normalized.is_empty() {
+                "unknown"
+            } else {
+                &normalized
+            }
+        ),
+        available: capability.available,
+        accepted_input_media_types: Vec::new(),
+        effect: "device_observation".into(),
+        unavailable_reason: (!capability.available).then_some("unavailable".into()),
+    }
 }
 
 fn compose_bridge_device_diagnostics(
@@ -4324,27 +4473,10 @@ pub async fn get_device_profile(
     force_refresh: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<diagnostics::DeviceProfile, String> {
-    run_async(async move {
-        let force_refresh = force_refresh.unwrap_or(false);
-        if let Some(profile) = cached_device_profile(&state, force_refresh) {
-            return Ok(profile);
-        }
-
-        let _guard = state.diagnostics_refresh.lock().await;
-        if let Some(profile) = cached_device_profile(&state, force_refresh) {
-            return Ok(profile);
-        }
-
-        let config = state.config.read().clone();
-        let mode = diagnostics_profile_mode(force_refresh);
-        let profile = tokio::task::spawn_blocking(move || {
-            device_profile::local_device_profile_with_mode(&config, mode)
-        })
-        .await
-        .map_err(|error| AppError::InvalidInput(format!("device profile probe failed: {error}")))?;
-        state.latest_device_profile.lock().replace(profile.clone());
-        Ok(profile)
-    })
+    run_async(current_device_profile(
+        state.inner().clone(),
+        force_refresh.unwrap_or(false),
+    ))
     .await
 }
 
@@ -4354,47 +4486,147 @@ pub async fn get_device_capabilities(
     probe_mode: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<diagnostics::DeviceCapabilities, String> {
-    run_async(async move {
-        let force_refresh = force_refresh.unwrap_or(false);
-        let capability_mode = diagnostics_capability_mode(force_refresh, probe_mode.as_deref())?;
-        if let Some(capabilities) =
-            cached_device_capabilities_for_mode(&state, force_refresh, capability_mode)
-        {
-            return Ok(capabilities);
-        }
+    run_async(current_device_capabilities(
+        state.inner().clone(),
+        force_refresh.unwrap_or(false),
+        probe_mode.as_deref(),
+    ))
+    .await
+}
 
-        let _guard = state.diagnostics_refresh.lock().await;
-        if let Some(capabilities) =
-            cached_device_capabilities_for_mode(&state, force_refresh, capability_mode)
-        {
-            return Ok(capabilities);
-        }
+async fn current_device_profile(
+    state: Arc<AppState>,
+    force_refresh: bool,
+) -> AppResult<diagnostics::DeviceProfile> {
+    if let Some(profile) = cached_device_profile(&state, force_refresh) {
+        return Ok(profile);
+    }
 
-        let config = state.config.read().clone();
-        let profile_mode =
-            diagnostics_profile_mode(force_refresh || capability_mode == CapabilityProbeMode::Full);
-        let cached_profile =
-            cached_profile_for_capability_probe(&state, force_refresh, capability_mode);
-        let (profile, capabilities) = tokio::task::spawn_blocking(move || {
-            let profile = cached_profile.unwrap_or_else(|| {
-                device_profile::local_device_profile_with_mode(&config, profile_mode)
-            });
-            let capabilities =
-                capability_probe::probe_device_capabilities_with_mode(&profile, capability_mode);
-            (profile, capabilities)
-        })
-        .await
-        .map_err(|error| {
-            AppError::InvalidInput(format!("device capability probe failed: {error}"))
-        })?;
-        state.latest_device_profile.lock().replace(profile);
-        state
-            .latest_device_capabilities
-            .lock()
-            .replace(capabilities.clone());
-        Ok(capabilities)
+    let _guard = state.diagnostics_refresh.lock().await;
+    if let Some(profile) = cached_device_profile(&state, force_refresh) {
+        return Ok(profile);
+    }
+
+    let config = state.config.read().clone();
+    let mode = diagnostics_profile_mode(force_refresh);
+    let profile = tokio::task::spawn_blocking(move || {
+        device_profile::local_device_profile_with_mode(&config, mode)
     })
     .await
+    .map_err(|error| AppError::InvalidInput(format!("device profile probe failed: {error}")))?;
+    state.latest_device_profile.lock().replace(profile.clone());
+    Ok(profile)
+}
+
+async fn current_device_capabilities(
+    state: Arc<AppState>,
+    force_refresh: bool,
+    probe_mode: Option<&str>,
+) -> AppResult<diagnostics::DeviceCapabilities> {
+    let capability_mode = diagnostics_capability_mode(force_refresh, probe_mode)?;
+    if let Some(capabilities) =
+        cached_device_capabilities_for_mode(&state, force_refresh, capability_mode)
+    {
+        return Ok(capabilities);
+    }
+
+    let _guard = state.diagnostics_refresh.lock().await;
+    if let Some(capabilities) =
+        cached_device_capabilities_for_mode(&state, force_refresh, capability_mode)
+    {
+        return Ok(capabilities);
+    }
+
+    let config = state.config.read().clone();
+    let profile_mode =
+        diagnostics_profile_mode(force_refresh || capability_mode == CapabilityProbeMode::Full);
+    let cached_profile =
+        cached_profile_for_capability_probe(&state, force_refresh, capability_mode);
+    let (profile, capabilities) = tokio::task::spawn_blocking(move || {
+        let profile = cached_profile.unwrap_or_else(|| {
+            device_profile::local_device_profile_with_mode(&config, profile_mode)
+        });
+        let capabilities =
+            capability_probe::probe_device_capabilities_with_mode(&profile, capability_mode);
+        (profile, capabilities)
+    })
+    .await
+    .map_err(|error| AppError::InvalidInput(format!("device capability probe failed: {error}")))?;
+    state.latest_device_profile.lock().replace(profile);
+    state
+        .latest_device_capabilities
+        .lock()
+        .replace(capabilities.clone());
+    Ok(capabilities)
+}
+
+/// Returns a read-only, renderer-safe Layer 2 topology projection. Durable
+/// membership determines nodes; only exact current-session observations may
+/// populate remote facts or links. Callers must still use Layer 4/Core to
+/// resolve and authorize any real operation.
+#[tauri::command]
+pub async fn get_bridge_node_list_projection(
+    bridge_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<diagnostics::BridgeNodeListProjectionV1, String> {
+    let state = state.inner().clone();
+    let profile = current_device_profile(state.clone(), false)
+        .await
+        .map_err(|error| error.message())?;
+    let capabilities = current_device_capabilities(state.clone(), false, Some("quick"))
+        .await
+        .map_err(|error| error.message())?;
+    storage::get_room_by_id(&state.paths, &bridge_id).map_err(|error| error.message())?;
+    let peers = storage::list_bridge_peer_endpoints(&state.paths, &bridge_id)
+        .map_err(|error| error.message())?;
+    let mut capability_projections = HashMap::new();
+    let mut benchmarks = HashMap::new();
+    for peer in peers.iter().filter(|peer| {
+        peer.liveness == crate::models::BridgePeerLiveness::Connected
+            && peer.logical_host_ref.is_some()
+    }) {
+        let Ok(context) = crate::room_control::room_control_session_context_for_peer(
+            &state,
+            &bridge_id,
+            &peer.peer_session_id,
+        ) else {
+            continue;
+        };
+        if context.peer_route_ref != peer.peer_session_id {
+            continue;
+        }
+        if let Some(projection) = state.peer_capabilities.lock().projection(
+            &bridge_id,
+            &peer.peer_session_id,
+            &context.peer_observation_ref,
+        ) {
+            capability_projections.insert(peer.peer_session_id.clone(), projection);
+        }
+        if let Some(benchmark) = state
+            .latest_bridge_link_benchmarks
+            .lock()
+            .get(&(
+                bridge_id.clone(),
+                peer.logical_host_ref
+                    .clone()
+                    .expect("filtered logical HostRef"),
+                peer.peer_session_id.clone(),
+            ))
+            .cloned()
+        {
+            benchmarks.insert(peer.peer_session_id.clone(), benchmark);
+        }
+    }
+    Ok(compose_bridge_node_list_projection(
+        &bridge_id,
+        &state.local_host_ref,
+        profile,
+        capabilities,
+        &peers,
+        &capability_projections,
+        &benchmarks,
+        storage::now_ts(),
+    ))
 }
 
 #[tauri::command]
@@ -4743,6 +4975,342 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn node_list_profile() -> diagnostics::DeviceProfile {
+        diagnostics::DeviceProfile {
+            device_id: "local-device".into(),
+            device_name: "Local Mac".into(),
+            platform: "macos".into(),
+            os_version: Some("15".into()),
+            arch: "aarch64".into(),
+            cpu_name: None,
+            cpu_physical_core_count: None,
+            cpu_logical_processor_count: None,
+            cpu_core_count: None,
+            memory_total_gb: None,
+            gpu_names: Vec::new(),
+            power_state: diagnostics::PowerState::Unknown,
+            battery_percent: None,
+            updated_at: 10,
+        }
+    }
+
+    fn node_list_capabilities() -> diagnostics::DeviceCapabilities {
+        diagnostics::DeviceCapabilities {
+            runtimes: Vec::new(),
+            gpu_acceleration: diagnostics::GpuAcceleration {
+                cuda_available: false,
+                metal_available: false,
+                gpu_names: Vec::new(),
+                vram_gb: None,
+            },
+            updated_at: 10,
+        }
+    }
+
+    fn node_list_peer(
+        host_ref: &crate::host_identity::HostRef,
+        peer_session_id: &str,
+        liveness: crate::models::BridgePeerLiveness,
+        updated_at: i64,
+    ) -> crate::models::StoredBridgePeerEndpoint {
+        crate::models::StoredBridgePeerEndpoint {
+            room_id: "bridge".into(),
+            peer_session_id: peer_session_id.into(),
+            display_name: Some(peer_session_id.into()),
+            endpoint_host: None,
+            endpoint_port: None,
+            transport_public_key: None,
+            liveness,
+            join_method: crate::models::BridgePeerJoinMethod::ManualCode,
+            logical_host_ref: Some(host_ref.as_str().into()),
+            durable_identity_id: None,
+            updated_at,
+        }
+    }
+
+    fn node_list_projection(
+        peer_session_id: &str,
+    ) -> crate::peer_capabilities::PeerCapabilityProjection {
+        crate::peer_capabilities::PeerCapabilityProjection {
+            schema_version: crate::peer_capabilities::PEER_CAPABILITY_SCHEMA.into(),
+            peer_session_id: peer_session_id.into(),
+            observed_at: 20,
+            capabilities: vec![crate::peer_capabilities::HostCapabilityFact {
+                capability_id: "runtime.python".into(),
+                available: true,
+                accepted_input_media_types: Vec::new(),
+                effect: "readiness_observation".into(),
+                unavailable_reason: None,
+            }],
+        }
+    }
+
+    fn node_list_benchmark() -> diagnostics::LinkBenchmarkResult {
+        diagnostics::LinkBenchmarkResult {
+            peer_id: None,
+            peer_name: None,
+            average_MBps: 12.0,
+            peak_MBps: 15.0,
+            latency_ms: Some(4.0),
+            duration_ms: 1_000,
+            total_bytes: 12_000,
+            effective_window_size: Some(1),
+            sender_cpu_hint: None,
+            receiver_cpu_hint: None,
+            failed_chunks: 0,
+            duplicate_chunks: 0,
+            benchmark_mode: diagnostics::BenchmarkMode::PasteyPipeline,
+            link_quality: diagnostics::LinkQuality::Fair,
+            timestamp: 30,
+        }
+    }
+
+    fn compose_node_list(
+        peers: Vec<crate::models::StoredBridgePeerEndpoint>,
+        capabilities: HashMap<String, crate::peer_capabilities::PeerCapabilityProjection>,
+        benchmarks: HashMap<String, diagnostics::LinkBenchmarkResult>,
+    ) -> diagnostics::BridgeNodeListProjectionV1 {
+        let local = crate::host_identity::HostRef::from_device_id("local").unwrap();
+        compose_bridge_node_list_projection(
+            "bridge",
+            &local,
+            node_list_profile(),
+            node_list_capabilities(),
+            &peers,
+            &capabilities,
+            &benchmarks,
+            40,
+        )
+    }
+
+    #[test]
+    fn node_list_projects_each_durable_host_once_and_keeps_empty_capabilities_valid() {
+        let remote = crate::host_identity::HostRef::from_device_id("remote").unwrap();
+        let projection = compose_node_list(
+            vec![
+                node_list_peer(
+                    &remote,
+                    "old-session",
+                    crate::models::BridgePeerLiveness::Stale,
+                    10,
+                ),
+                node_list_peer(
+                    &remote,
+                    "current-session",
+                    crate::models::BridgePeerLiveness::Connected,
+                    20,
+                ),
+            ],
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert_eq!(projection.nodes.len(), 2);
+        let remote_node = projection
+            .nodes
+            .iter()
+            .find(|node| node.host_ref == remote.as_str())
+            .unwrap();
+        assert!(remote_node.capabilities.is_empty());
+        assert_eq!(
+            remote_node.current_session.as_ref().unwrap().observed_at,
+            20
+        );
+        assert_eq!(
+            serde_json::from_str::<diagnostics::BridgeNodeListProjectionV1>(
+                &serde_json::to_string(&projection).unwrap()
+            )
+            .unwrap(),
+            projection
+        );
+    }
+
+    #[test]
+    fn node_list_attaches_capabilities_and_link_benchmarks_to_exact_host_relationships() {
+        let remote_a = crate::host_identity::HostRef::from_device_id("remote-a").unwrap();
+        let remote_b = crate::host_identity::HostRef::from_device_id("remote-b").unwrap();
+        let mut capabilities = HashMap::new();
+        capabilities.insert("session-a".into(), node_list_projection("session-a"));
+        let mut benchmarks = HashMap::new();
+        benchmarks.insert("session-b".into(), node_list_benchmark());
+        let projection = compose_node_list(
+            vec![
+                node_list_peer(
+                    &remote_a,
+                    "session-a",
+                    crate::models::BridgePeerLiveness::Connected,
+                    10,
+                ),
+                node_list_peer(
+                    &remote_b,
+                    "session-b",
+                    crate::models::BridgePeerLiveness::Connected,
+                    11,
+                ),
+            ],
+            capabilities,
+            benchmarks,
+        );
+        assert_eq!(
+            projection
+                .nodes
+                .iter()
+                .find(|node| node.host_ref == remote_a.as_str())
+                .unwrap()
+                .capabilities[0]
+                .capability_id,
+            "runtime.python"
+        );
+        assert!(projection
+            .nodes
+            .iter()
+            .find(|node| node.host_ref == remote_b.as_str())
+            .unwrap()
+            .capabilities
+            .is_empty());
+        assert_eq!(projection.links.len(), 2);
+        let benchmark_link = projection
+            .links
+            .iter()
+            .find(|link| link.target_host_ref == remote_b.as_str())
+            .unwrap();
+        assert!(benchmark_link.benchmark.is_some());
+        assert_eq!(
+            benchmark_link.source_host_ref,
+            crate::host_identity::HostRef::from_device_id("local")
+                .unwrap()
+                .as_str()
+        );
+        assert!(projection
+            .links
+            .iter()
+            .find(|link| link.target_host_ref == remote_a.as_str())
+            .unwrap()
+            .benchmark
+            .is_none());
+    }
+
+    #[test]
+    fn node_list_drops_stale_disconnected_and_replaced_session_observations() {
+        let remote = crate::host_identity::HostRef::from_device_id("remote").unwrap();
+        let mut capabilities = HashMap::new();
+        capabilities.insert("old-session".into(), node_list_projection("old-session"));
+        let mut benchmarks = HashMap::new();
+        benchmarks.insert("old-session".into(), node_list_benchmark());
+        let reconnected = compose_node_list(
+            vec![
+                node_list_peer(
+                    &remote,
+                    "old-session",
+                    crate::models::BridgePeerLiveness::Stale,
+                    10,
+                ),
+                node_list_peer(
+                    &remote,
+                    "new-session",
+                    crate::models::BridgePeerLiveness::Connected,
+                    20,
+                ),
+            ],
+            capabilities.clone(),
+            benchmarks.clone(),
+        );
+        let node = reconnected
+            .nodes
+            .iter()
+            .find(|node| node.host_ref == remote.as_str())
+            .unwrap();
+        assert!(node.capabilities.is_empty());
+        assert_eq!(reconnected.links.len(), 1);
+        assert!(reconnected.links[0].benchmark.is_none());
+
+        let disconnected = compose_node_list(
+            vec![node_list_peer(
+                &remote,
+                "old-session",
+                crate::models::BridgePeerLiveness::Disconnected,
+                30,
+            )],
+            capabilities,
+            benchmarks,
+        );
+        assert_eq!(disconnected.nodes.len(), 2);
+        assert!(disconnected.nodes[1].current_session.is_none());
+        assert!(disconnected.links.is_empty());
+    }
+
+    #[test]
+    fn node_list_is_renderer_safe_and_non_authorizing() {
+        let projection = compose_node_list(Vec::new(), HashMap::new(), HashMap::new());
+        let value = serde_json::to_value(&projection).unwrap();
+        fn assert_safe(value: &Value) {
+            match value {
+                Value::Object(object) => {
+                    for (key, value) in object {
+                        let key = key.to_ascii_lowercase();
+                        assert!(
+                            ![
+                                "path",
+                                "peersessionid",
+                                "localsessionref",
+                                "peersessionref",
+                                "sessionkey",
+                                "transportkey",
+                                "credential",
+                                "authority",
+                                "route",
+                                "binding"
+                            ]
+                            .iter()
+                            .any(|forbidden| key.contains(forbidden)),
+                            "unsafe NodeList field: {key}"
+                        );
+                        assert_safe(value);
+                    }
+                }
+                Value::Array(values) => values.iter().for_each(assert_safe),
+                _ => {}
+            }
+        }
+        assert_safe(&value);
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("fn compose_bridge_node_list_projection")
+            .unwrap();
+        let end = source[start..]
+            .find("fn local_runtime_capability_fact")
+            .unwrap()
+            + start;
+        let composer = &source[start..end];
+        for forbidden in [
+            "resolve_current_remote_host_session",
+            "compose_native_v2_plan",
+            "select_",
+            "approve_",
+            "start_native",
+        ] {
+            assert!(
+                !composer.contains(forbidden),
+                "NodeList must not introduce {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_device_check_keeps_its_existing_layer4_diagnostic_path() {
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("pub(crate) async fn bridge_device_diagnostics_for_host")
+            .unwrap();
+        let end = source[start..]
+            .find("\n}\n\n/// Composes a Layer 2-only Bridge topology view")
+            .unwrap()
+            + start;
+        let diagnostic = &source[start..end];
+        assert!(diagnostic.contains("resolve_current_remote_host_session"));
+        assert!(diagnostic.contains("request_capability_projection"));
+        assert!(diagnostic.contains("run_pipeline_benchmark"));
+    }
+
     #[test]
     fn bridge_device_diagnostics_consumes_layer4_semantics_only() {
         let source = include_str!("commands.rs");
@@ -4750,7 +5318,7 @@ mod tests {
             .find("pub(crate) async fn bridge_device_diagnostics_for_host")
             .unwrap();
         let end = source[start..]
-            .find("fn managed_readiness_from_projection")
+            .find("\n/// Composes a Layer 2-only Bridge topology view")
             .map(|offset| start + offset)
             .unwrap();
         let body = &source[start..end];

@@ -155,6 +155,14 @@ impl CurrentRemoteHostSession {
         )
         .await?;
         self.revalidate(&state).await?;
+        state.latest_bridge_link_benchmarks.lock().insert(
+            (
+                self.binding.bridge_id.clone(),
+                self.binding.peer_host_ref.as_str().to_string(),
+                self.binding.peer_route_ref.clone(),
+            ),
+            result.clone(),
+        );
         Ok(result)
     }
 }

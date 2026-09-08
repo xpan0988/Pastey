@@ -33,13 +33,13 @@ const REASON_EXECUTION_WORLD_UNAVAILABLE: &str = "execution_world_unavailable";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct HostCapabilityFact {
-    pub(crate) capability_id: String,
-    pub(crate) available: bool,
-    pub(crate) accepted_input_media_types: Vec<String>,
-    pub(crate) effect: String,
+pub struct HostCapabilityFact {
+    pub capability_id: String,
+    pub available: bool,
+    pub accepted_input_media_types: Vec<String>,
+    pub effect: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) unavailable_reason: Option<String>,
+    pub unavailable_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

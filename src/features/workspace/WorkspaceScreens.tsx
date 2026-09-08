@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { runBridgeDeviceSelfCheck } from "../../lib/tauri";
+import { getBridgeNodeListProjection, runBridgeDeviceSelfCheck } from "../../lib/tauri";
 import type { TransferQueueItem } from "../../lib/transferScheduler";
-import type { BridgeDeviceDiagnostics, DiagnosticState, FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../../lib/types";
+import type { BridgeDeviceDiagnostics, BridgeNodeListProjectionV1, DiagnosticState, FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../../lib/types";
 import { MessageCard, TransferMessage } from "./BridgeWorkspace";
 import { formatBytes, formatClock, roomMembers, uniqueNearbyDevices } from "./workspaceViewModel";
 
@@ -39,8 +39,21 @@ function EmptyRow({ text }: { text: string }) {
 
 export function DevicesScreen({ room }: { room: RoomInfo | null }) {
   const peers = useMemo(() => roomMembers(room), [room]);
+  const [nodeList, setNodeList] = useState<BridgeNodeListProjectionV1 | null>(null);
   const [checks, setChecks] = useState<Record<string, { result?: BridgeDeviceDiagnostics; unavailable?: boolean }>>({});
   const inFlight = useRef(new Set<string>());
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!room) {
+      setNodeList(null);
+      return;
+    }
+    void getBridgeNodeListProjection(room.id)
+      .then((projection) => { if (!cancelled) setNodeList(projection); })
+      .catch(() => { if (!cancelled) setNodeList(null); });
+    return () => { cancelled = true; };
+  }, [room?.id]);
 
   async function runDiagnostics(hostRef: string) {
     if (!room) return;
@@ -66,8 +79,25 @@ export function DevicesScreen({ room }: { room: RoomInfo | null }) {
       <div className="v2-screen-body v2-devices-body">
         <h2>Current Bridge</h2>
         <div className="v2-device-list">
-          {room ? <DeviceRow name="This device" meta="Local Host" detail="This logical Bridge remains local until Burn." state="connected" /> : null}
-          {peers.map((peer) => {
+          {nodeList ? nodeList.nodes.map((node) => {
+            const isLocal = node.hostRef === nodeList.links[0]?.sourceHostRef || node.deviceProfile !== undefined;
+            const peer = peers.find((candidate) => candidate.hostRef === node.hostRef);
+            const state = node.currentSession?.liveness ?? "disconnected";
+            const checkKey = room && !isLocal ? deviceCheckKey(room.id, node.hostRef) : null;
+            const check = checkKey ? checks[checkKey] : undefined;
+            const loading = checkKey ? inFlight.current.has(checkKey) : false;
+            return <DeviceRow
+              key={node.hostRef}
+              name={isLocal ? "This device" : node.displayName ?? "Bridge Host"}
+              meta={isLocal ? "Local Host" : "Current Bridge member"}
+              detail={isLocal ? "This logical Bridge remains local until Burn." : state === "connected" ? "Exact current-session observations are shown when available." : "Logical membership is retained; no old session observation is current."}
+              state={state}
+              action={!isLocal ? <button type="button" className="v2-button v2-device-diagnostic-button" aria-label={`Run diagnostics for ${node.displayName ?? "Bridge Host"}`} disabled={loading} onClick={() => void runDiagnostics(node.hostRef)}>{loading ? "Checking…" : check ? "Retry" : "Check"}</button> : null}
+              diagnostics={check ? <DeviceDiagnosticsResult check={check} /> : null}
+            />;
+          }) : room ? <>
+            <DeviceRow name="This device" meta="Local Host" detail="This logical Bridge remains local until Burn." state="connected" />
+            {peers.map((peer) => {
             const checkKey = room && peer.hostRef ? deviceCheckKey(room.id, peer.hostRef) : null;
             const check = checkKey ? checks[checkKey] : undefined;
             const loading = checkKey ? inFlight.current.has(checkKey) : false;
@@ -80,7 +110,8 @@ export function DevicesScreen({ room }: { room: RoomInfo | null }) {
               action={peer.hostRef ? <button type="button" className="v2-button v2-device-diagnostic-button" aria-label={`Run diagnostics for ${peer.displayName}`} disabled={loading} onClick={() => void runDiagnostics(peer.hostRef!)}>{loading ? "Checking…" : check ? "Retry" : "Check"}</button> : null}
               diagnostics={check ? <DeviceDiagnosticsResult check={check} /> : null}
             />;
-          })}
+            })}
+          </> : null}
           {!room ? <EmptyRow text="Select a Bridge to inspect its devices." /> : null}
           {room && peers.length === 0 ? <EmptyRow text="No remote device has joined this Bridge yet." /> : null}
         </div>
