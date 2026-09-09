@@ -18,11 +18,13 @@ Each Check writes one independent `managed-self-check-<run-id>.json` `pastey-man
 
 The generic peer capability projection carries `0..N` bounded capability facts. An empty projection remains a valid compatibility observation meaning that the Host currently advertises no concrete bounded capabilities. Current Hosts project provider configuration/health, the selected Host-local managed runtime state, ExecutionWorld availability, and the absence of a Plan-specific process binding as separate managed-readiness facts. `Not configured`, `Unavailable`, and `Unknown` remain distinct: a configured runtime means only that one allowed logical identity still resolves to its pinned executable identity on that Host; managed execution remains `Unknown` without a concrete reviewed Plan and exact per-step binding. Room Control transports and stores these facts without exposing a physical path or turning detection into Host selection, approval, admission, provider authority, process authority, or effect authority.
 
+The bounded system-probe request vocabulary is global, but its fixed probe implementations are Host-local. For one requested vocabulary ID, a successful local probe yields `Available`, a failed local probe yields `Unavailable`, and a Host without a fixed implementation yields `Unsupported`; no matching current-session fact means no observation and remains unknown. These states are observations only. They are separate from generic semantic capability IDs accepted by the capability-acquisition confirmation contract.
+
 ## Scope
 
 Observations are local or current-session scoped unless a different feature explicitly defines persistence. PATH-based runtime/version probes are capability detection only and never feed executable authority. A reported provider or runtime configuration is not execution approval. The pipeline benchmark proves a bounded encrypted in-memory diagnostic path for the exact revalidated session; it is a network/pipeline baseline, not a production file Transfer or receipt guarantee.
 
-NodeList is therefore a display/inspection seam, not current-session truth: any execution or readiness path must revalidate through its existing Host and Core path. The next capability seam is Host-local Capability Resolution for an already authored, reviewed exact Plan step; it may consume no NodeList fact as authority.
+NodeList is therefore a display/inspection seam, not current-session truth: any execution or readiness path must revalidate through its existing Host and Core path. Execution-side exact Host binding remains the existing Host-local runtime selection, readiness, admission, ExecutionWorld, and Core completion chain; no Layer 2 fact or separate capability-decision subsystem replaces it.
 
 ## Boundary
 

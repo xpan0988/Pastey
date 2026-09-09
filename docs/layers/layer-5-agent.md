@@ -27,6 +27,8 @@ Local admission is bound to the active Bridge, exact requester participant and `
 
 Only Transfer changes location. A Transform cannot select a new Host or produce an unrelated logical object. An Execute cannot create a revision. Every movement, dependency, mutation intent, execution intent, and Host is part of the sealed Plan.
 
+Transform is generic across representations. A Python→Java conversion may be used as an acceptance example, but it is not a Python/Java subsystem, alternate execution path, or additional primitive.
+
 ## Plan v1 and v2
 
 V1 remains the compatibility product path. It uses a Search-first `selected_file` flow, executes Search and Transfer, and rejects Transform/Execute as unsupported. V1 schemas, hashes, protocol, approval, and continuation are not reinterpreted by v2.
@@ -84,7 +86,7 @@ The current model-visible process catalog exposes one `process_spawn` request on
 
 For current Execute steps, the Host configuration service accepts only the logical `python` or `node` runtime identity, discovers it from a bounded platform-specific set of absolute locations, and pins the resulting safe executable identity in Host-local SQLite. It stores the physical path only in that Host-private configuration. When an immutable revision reaches readiness, the target Host revalidates the pinned identity and calls the existing `bind_v2_managed_process_step()` for each Execute authored to itself. The process-world spec carries that private identity so both readiness and claim reject replacement in place. A missing selection, missing/replaced binary, unsupported identity, or wrong-Host step leaves readiness unavailable. Capability probes, the requester, PM, Worker, and provider cannot populate this binding; there is no PATH fallback, automatic installation, alternate executable substitution, new execution engine, or new authority domain. Resource-only Transform remains process-free unless a separate exact binding already exists.
 
-The separate bounded Host capability probe is diagnostic-only. Its semantic vocabulary is global, while the fixed `RUNTIME_PROBES` table is the receiving Host's platform-local implementation map. A globally valid ID with no local probe is a `system_probe_unsupported` observation; a failed local fixed probe is `system_probe_unavailable`. Neither outcome proves absence or permits acquisition. The probe never supplies, discovers for execution, pins, or binds an executable identity. Managed execution continues exclusively through `ManagedRuntimeConfigServiceV1` selection, exact identity validation, existing readiness/admission, `ExecutionWorld`, and Core completion.
+The separate bounded Host capability probe is diagnostic-only. Its fixed-probe request vocabulary is global, while `RUNTIME_PROBES` is the receiving Host's platform-local implementation map. A recognized request with no local probe is a `system_probe_unsupported` observation; a failed local fixed probe is `system_probe_unavailable`. Neither outcome proves absence or supplies, discovers for execution, pins, or binds an executable identity. Managed execution continues exclusively through `ManagedRuntimeConfigServiceV1` selection, exact identity validation, existing readiness/admission, `ExecutionWorld`, and Core completion.
 
 `ExecutionWorldServiceV1` owns the generic execution semantics: it validates exact authority and resource leases, uses mutable overlays, applies Pastey wall/output/write budgets and available platform observations, records evidence, owns cancellation, and waits for an observed terminal state before run revocation. It delegates only platform world preparation, process launch, standard-I/O transport, termination requests, and platform observations through `PlatformExecutionBackendV1`. The backend receives already-authorized mounts and launch data, mints or widens no authority, and has no unsandboxed fallback; unavailable preparation or launch fails closed.
 
@@ -97,6 +99,18 @@ Windows uses `WindowsCodexBackendV1` to implement this platform seam over a Code
 `NetworkBrokerServiceV1` is an independent Host-owned TCP/DNS authority domain outside the execution world. It requires its own scopes, budgets, revalidation, closure, and evidence. The Worker catalog does not expose it. Provider HTTPS is control-plane transport, not a `NetworkGrant`, task effect, or reusable egress channel.
 
 Developer Terminal uses a separate grant/type/store/lifecycle and can never satisfy an EffectEnvelope or process binding.
+
+## Capability observation and acquisition confirmation
+
+The Bridge-native NodeList and bounded Host probes are complete observation foundations. `Available`, `Unavailable`, `Unsupported`, and no observation remain facts only: capability is not authority, probe availability is not executable binding, and execution-side exact Host binding remains separate.
+
+Low-friction Capability Acquisition foundation — DONE
+
+Actual acquisition behavior — intentionally deferred until AI integration
+
+Acquisition intents use the generic bounded semantic-ID syntax rather than the fixed-probe vocabulary. For example, `runtime.java`, `tool.cmake`, `sdk.android`, and `model.whisper` are valid acquisition intents, while `runtime.java` is rejected by the fixed Host probe path until that vocabulary and a fixed implementation support it. The renderer-safe request carries the exact durable `HostRef`, semantic ID, and bounded display facts only. Confirmation returns only `Confirmed` or `Cancelled` and creates no installer behavior, probe, process binding, execution authority, Plan/topology mutation, Host selection, or Developer Mode change.
+
+When AI integration later supplies a real Host-side action, successful setup must flow back through the existing probe → capability projection → NodeList/Settings refresh path. Confirmation itself performs none of those stages.
 
 ## Worker Harness
 
@@ -122,6 +136,10 @@ The provider-neutral adapter normalizes text deltas, fragmented tool-call identi
 Observations are bounded/redacted feedback. Resource observations carry operation/status, safe metadata, bounded content or digest, and truncation. Process observations carry exit status, stdout/stderr excerpts and digests, truncation, duration, and bounded facts such as network denial. They never replace `EffectEvidenceV1`, which remains the authoritative ordered Core record.
 
 Provider sampling and context overflow have separate bounded retry policies. Compaction keeps tool-call/result pairs together and changes only model-visible context. A failed deterministic tool strategy may be observed and corrected while the same run remains active. Cancellation, malformed output, terminal provider failure, ambiguous/interrupted effect state, or an indeterminate effect is not retried as a fresh effect.
+
+### Planned Worker Context Contract
+
+The roadmap's Worker Context Contract is planned work, not a completed new subsystem. It must reuse the current `StepWorkDescriptorV1`, `AuthorityContextV1`, `EffectEnvelopeV1`, and existing resource aliases, roles, and operation vocabulary. The Worker will receive only its exact step/revision, semantic intent, bounded resources, and allowed operations; it will not receive raw filesystem paths, whole-Plan topology, sessions/routes, credentials, Host-selection authority, or raw authority handles.
 
 ## Provider and runtime configuration boundaries
 
@@ -177,6 +195,7 @@ Distributed delivery failure remains a product-recovery limitation: the sender c
 
 | Can today | Intentionally unavailable or incomplete |
 | --- | --- |
+| Bridge-native NodeList/capability projection, bounded fixed Host probes, and generic semantic-ID capability-acquisition confirmation | Actual acquisition behavior is intentionally deferred until AI integration; confirmation performs no installation or execution |
 | Deterministic native-v2 Draft/Review/approval/readiness/status/cancel backend and 2.0 lifecycle UI for an opened revision | Renderer-safe Draft discovery/origination, PM context, reviewed topology, and result projection |
 | Proposal-only local/provider Natural-v2 to an unapproved Draft | PM/provider selection and settings presentation |
 | Whole-Plan remote and local-Host readiness, prepare, attempt-bound admission, commit, and exact continuation | Headless Host execution |

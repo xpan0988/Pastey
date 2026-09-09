@@ -17,8 +17,8 @@ This document owns concrete identifiers, bounds, configuration facts, and source
 | Worker status event | `pastey-managed-worker-status-v1`; `pastey://managed-worker-status` |
 | Provider config | `pastey-worker-provider-config-v1` |
 | Peer capability facts | `pastey-peer-capabilities-v2` |
-| Fixed Host system-probe request | `capabilityIds`: at most 12 deduplicated IDs from the current known fixed-probe vocabulary; the receiving Host alone maps an ID to a fixed local probe. No path, command, args, shell, or acquisition fields. |
-| Capability-acquisition confirmation | `CapabilityAcquisitionRequestV1` / `confirm_capability_acquisition`: validated durable `HostRef`, one bounded semantic `capabilityId` (`[A-Za-z0-9._:-]`, 1–128 bytes), bounded display text, and only `confirmed` or `cancelled`. Semantic-ID validity does not require membership in the fixed-probe vocabulary. Confirmed means consent to a future AI-side continuation only; it does not acquire, probe, bind, authorize, or mutate capability/Plan/topology/Developer Mode state. Source: `src-tauri/src/capability_acquisition_confirmation.rs`. |
+| Fixed Host system-probe request | `capabilityIds`: at most 12 deduplicated IDs from `runtime.python`, `runtime.node`, `runtime.git`, `runtime.rust_cargo`, `runtime.docker`, `runtime.ffmpeg`, `runtime.cuda`, `runtime.powershell`, `runtime.zsh`, and `runtime.bash`. The receiving Host alone maps an ID to a fixed local probe. Results are `Available`, `Unavailable` (`system_probe_unavailable`), or `Unsupported` (`system_probe_unsupported`); absence is no observation/unknown. No path, command, args, shell, or acquisition fields. |
+| Capability-acquisition confirmation | `CapabilityAcquisitionRequestV1` / `confirm_capability_acquisition`: validated durable `HostRef`, one bounded semantic `capabilityId` (`[A-Za-z0-9._:-]`, 1–128 bytes), bounded renderer-safe display text, and only `confirmed` or `cancelled`. Valid semantic acquisition IDs include `runtime.java`, `tool.cmake`, `sdk.android`, and `model.whisper`; membership in the fixed-probe vocabulary is not required. Confirmed means consent to a future AI-side continuation only; it does not install, acquire, probe, bind, authorize, or mutate capability/Plan/topology/Host selection/Developer Mode state. Actual acquisition behavior is intentionally deferred until AI integration. Source: `src-tauri/src/capability_acquisition_confirmation.rs`. |
 | Bridge NodeList projection | `pastey-bridge-node-list-v1` |
 | Room Control route | `pastey-bridge-control-route-v1` |
 
@@ -33,7 +33,7 @@ Registered Tauri commands:
 - `get_native_v2_plan_status`
 - `cancel_native_v2_plan_attempt`
 
-Only the Natural-v2 candidate command currently has a TypeScript wrapper in `src/lib/tauri.ts`. The remaining commands are backend seams for the later product UI.
+The Natural-v2 candidate plus approve/start/status/cancel commands have TypeScript wrappers in `src/lib/tauri.ts`; the lifecycle wrappers are used by the current opened-revision UI. `compose_native_v2_plan` remains a backend seam without a TypeScript wrapper.
 
 `NativeV2PlanStatusV1` exposes only: schema/Plan/revision/hash, optional approval and attempt ids, state, optional current step, completed/total step counts, ready/total Host counts, bounded code, and update time. It contains no credential, path, ObjectRef, grant, EffectEnvelope, or evidence.
 
@@ -62,6 +62,9 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 | Plan schema/protocol v2 | `src-tauri/src/bridge_plan_v2.rs` |
 | Native-v2 product orchestration | `src-tauri/src/native_v2_orchestration.rs` |
 | Managed Worker coordination | `src-tauri/src/managed_worker_coordinator.rs` |
+| Capability projection and generic semantic-ID syntax | `src-tauri/src/peer_capabilities.rs` |
+| Fixed Host capability probes | `src-tauri/src/capability_probe.rs` |
+| Capability-acquisition confirmation | `src-tauri/src/capability_acquisition_confirmation.rs`, `src-tauri/src/commands.rs`, `src/lib/tauri.ts`, `src/lib/types.ts` |
 | Host-local managed runtime configuration | `src-tauri/src/managed_runtime_config.rs`, `src-tauri/src/capability_probe.rs` |
 | Managed objects | `src-tauri/src/managed_objects.rs` |
 | Safe physical identity | `src-tauri/src/safe_file_identity.rs` |
@@ -76,6 +79,18 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 | Provider configuration | `src-tauri/src/worker_provider_config.rs` |
 | Bridge Device Check / Managed E2E self-check | `src-tauri/src/commands.rs`, `src-tauri/src/diagnostics.rs`, `src/lib/tauri.ts`, `src/lib/types.ts` |
 | Bridge NodeList projection | `src-tauri/src/diagnostics.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/host_runtime.rs`, `src/lib/tauri.ts`, `src/lib/types.ts` |
+
+The fixed-probe and acquisition-ID domains are intentionally distinct:
+
+```text
+acquisition intent:
+  runtime.java → valid semantic ID
+
+fixed Host probe:
+  runtime.java → rejected until a fixed-probe vocabulary entry and implementation exist
+```
+
+Capability is not authority, probe availability is not executable binding, and acquisition confirmation is neither installation nor execution authority.
 
 ## Provider configuration facts
 
@@ -120,6 +135,7 @@ The frontend uses `@xterm/xterm` and `@xterm/addon-fit`. Host shell selection is
 | Natural proposals | `scripts/run-natural-v1-tests.mjs`, `scripts/run-natural-v2-tests.mjs`, Rust `natural_v2` tests |
 | Plan lifecycle and native-v2 orchestration | Rust `host_identity`, `host_runtime`, `host_admission`, `bridge_plan`, `bridge_plan_v2`, `native_v2_orchestration`, and `managed_worker_coordinator` tests |
 | Worker/provider/runtime configuration | Rust `worker_harness`, `worker_provider`, `worker_provider_config`, `managed_runtime_config`, and `managed_worker_coordinator` tests |
+| NodeList/capability/confirmation boundaries | Rust `diagnostics`, `commands`, `peer_capabilities`, `capability_probe`, and `capability_acquisition_confirmation` tests; frontend integration tests |
 | Effects/results | Rust `effect_authority`, `managed_resources`, `execution_world`, `network_broker`, and `managed_execution` tests; opt-in native Windows `windows_execution_world` integration test |
 | Layer 4 and transfer | `scripts/run-layer4-validation-matrix.mjs`, `scripts/run-transfer-planner-tests.mjs`, Rust transport/protocol tests |
 | Developer Terminal | Rust terminal/HostRuntime tests plus native physical platform checks |

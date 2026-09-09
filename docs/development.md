@@ -196,9 +196,9 @@ scripts/native-v2-physical/run-mac.sh verify --profile b \
   --output-dir /absolute/path/to/reports
 ```
 
-Bridge Device Check prepares `Search @ requester → authored Transfer → Execute @ exact remote Host` through the ordinary native-v2 approval, readiness, admission, Worker, EffectEnvelope, ExecutionWorld, and Core-completion path. Windows native Managed Execute Stage 1–5 is already proven, and Host-owned runtime configuration plus provider configuration/health product closure are implemented. A missing selected provider, runtime, or ExecutionWorld correctly returns `BLOCKED` with `preflight_unavailable` before managed work starts; the present development run has that status while those inputs are not configured. This is not an architecture blocker or missing Managed E2E implementation. The remaining status is **external provider validation pending**: do not claim a real LLM/provider or physical Mac ↔ Windows Managed E2E `PASS` until an actual external provider call and packaged two-Host Check succeed.
+Bridge Device Check prepares `Search @ requester → authored Transfer → Execute @ exact remote Host` through the ordinary native-v2 approval, readiness, admission, Worker, EffectEnvelope, ExecutionWorld, and Core-completion path. Windows native Managed Execute Stage 1–5 is physically accepted, the production Bridge Device Managed E2E path exists, and Host-owned runtime configuration plus provider configuration/health product closure are implemented. Physical fail-closed preflight is verified: a missing selected provider, runtime, or ExecutionWorld returns `BLOCKED` with `preflight_unavailable` before managed work starts. This is not an architecture blocker or missing Managed E2E implementation. The remaining status is **external provider validation pending**: do not claim a real LLM/provider or packaged physical Mac ↔ Windows Managed E2E `PASS` until an actual external provider call and two-Host Check succeed.
 
-## Phase 6 physical multi-Host smoke
+## General Semantic Transform / cross-representation physical smoke
 
 The target scenario is:
 
@@ -206,7 +206,9 @@ The target scenario is:
 A requester → Transform N→N+1 @ B → authored Transfer B→C → Execute N+1 @ C
 ```
 
-### Current readiness gate
+This remains a generic semantic Transform scenario. Python→Java may be used as one acceptance payload, but it is not a product-specific subsystem. The broader cross-representation E2E follows the planned Worker Context Contract in the canonical [roadmap](architecture.md#roadmap).
+
+### Acceptance prerequisites
 
 Do not start or claim this smoke as reproducible until all of these are true:
 
@@ -217,7 +219,7 @@ Do not start or claim this smoke as reproducible until all of these are true:
 - authored work on the requester's local Host, if included in an additional smoke case, uses direct local admission against the same lifecycle and does not send a Room Control message to itself; the canonical A→B→C case below still keeps all authored steps on remote B/C so it exercises real cross-device delivery;
 - three packaged instances have distinct HostRefs, one active Bridge, current unambiguous routes, and the exact managed root already bound at B.
 
-The provider portion of the product-surface gate is implemented: each local Host can configure, explicitly select, inspect, update, delete, and health-check its existing provider generation without exposing its credential. The 2.0 UI can operate the authoritative lifecycle for an existing revision. Draft origination and detailed topology/result projections are still separate renderer product work for this broader A→B→C smoke; they do not block the implemented Bridge Device Check self-check path. No physical PASS follows from local/provider tests, and external provider validation remains pending.
+The provider portion of the product-surface gate is implemented: each local Host can configure, explicitly select, inspect, update, delete, and health-check its existing provider generation without exposing its credential. The 2.0 UI can operate the authoritative lifecycle for an existing revision. The Worker Context Contract, general cross-representation Transform coverage, Draft origination, and detailed topology/result projections remain separate work for this broader A→B→C smoke; they do not block the implemented Bridge Device Check self-check path. No physical PASS follows from local/provider tests, and external provider validation remains pending.
 
 ### Procedure once the gate is implemented
 
