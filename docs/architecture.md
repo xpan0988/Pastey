@@ -32,9 +32,20 @@ Core evidence/result acceptance → requester step commit → next authored depe
 
 Renderer state, model/provider output, logs, routes, tool schemas, and capability projections never mint authority.
 
+```text
+NodeList = environment facts
+Plan     = decision
+Host     = exact local binding
+Core     = authority
+```
+
+Capability is not authority. Probe availability is not executable binding. Acquisition confirmation is neither installation nor execution authority.
+
 Layer 2's `BridgeNodeListProjectionV1` displays durable Host membership once per `HostRef` and only matching current-session capability/link observations. It is environment fact display, not a route resolver or source of readiness/authorization: all execution paths still revalidate through the existing Layer 4 Host resolver and Core-owned admission/completion chain.
 
-A current-session Room Control capability query may ask an exact remote Host for a bounded, deduplicated list from the global semantic system-probe vocabulary: `runtime.python`, `runtime.node`, `runtime.git`, `runtime.rust_cargo`, `runtime.docker`, `runtime.ffmpeg`, `runtime.cuda`, `runtime.powershell`, `runtime.zsh`, and `runtime.bash`. The requester platform does not narrow that vocabulary. The receiving Host validates each ID, runs its own fixed probe when it has one, and reports a globally valid but locally unimplemented probe as `system_probe_unsupported`; a failed fixed probe is `system_probe_unavailable`. A caller cannot send an executable path, command, arguments, shell text, or installation instruction. An absent observation remains unknown, and globally unknown IDs are rejected. These are current-session NodeList observations only; they do not select a Host, repair topology, bind a process, or grant execution authority.
+A current-session Room Control capability query may ask an exact remote Host for a bounded, deduplicated list from the global fixed-probe request vocabulary: `runtime.python`, `runtime.node`, `runtime.git`, `runtime.rust_cargo`, `runtime.docker`, `runtime.ffmpeg`, `runtime.cuda`, `runtime.powershell`, `runtime.zsh`, and `runtime.bash`. The requester platform does not narrow that vocabulary. The receiving Host validates each ID and alone maps it to a platform-local fixed probe. A successful fixed probe is `Available`; a failed fixed probe is `Unavailable` (`system_probe_unavailable`); a globally recognized request with no local fixed implementation is `Unsupported` (`system_probe_unsupported`); and no current observation remains unknown. A caller cannot send an executable path, command, arguments, shell text, or installation instruction. These are current-session NodeList facts only; they do not select a Host, repair topology, bind a process, or grant execution authority.
+
+The low-friction Capability Acquisition foundation is also implemented, but actual acquisition behavior is intentionally deferred until AI integration. An acquisition request binds one generic bounded semantic ID to an exact durable `HostRef` and renderer-safe display facts; valid intents include `runtime.java`, `tool.cmake`, `sdk.android`, and `model.whisper` even though they are outside the fixed-probe request vocabulary. The confirmation result is only `Confirmed` or `Cancelled`. It creates no installer behavior, probe, process binding, execution authority, Plan/topology mutation, Host selection, or Developer Mode change. A future confirmed flow must reuse the existing Host probe → capability projection → NodeList/Settings refresh path after its Host-side action; confirmation itself changes none of those facts.
 
 Execution locality does not change this chain. Core resolves each authored participant's `HostRef` once. Work for the current Host uses direct coordinator dispatch with a fresh local-runtime reference; work for another Host uses its current Bridge/session binding and Room Control. Both paths satisfy the same Layer 5 Review, readiness, attempt-bound admission, prepared/commit, result, continuation, and cancellation contract.
 
@@ -64,6 +75,8 @@ Execute    = run the exact current revision at an explicit Host
 ```
 
 Only Transfer changes location. Transform consumes N and may create N+1 for the same logical object only after Core validates exact Host evidence and seals the result. Execute creates a result record but no managed lineage. Capability availability never repairs topology.
+
+Transform remains a general semantic operation over an exact object revision. Python→Java is permitted only as a cross-representation acceptance example, not as a product-specific subsystem or alternate primitive.
 
 The canonical cross-Host example is:
 
@@ -131,14 +144,33 @@ The Host-owned network broker exists as an independent Phase 5 authority domain,
 
 ## Current product boundary
 
-The 1.9.3 development backend implements the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, bounded Worker Harness, configured streaming provider adapter, durable generation-bound provider configuration, Host-local managed runtime discovery/identity pinning with production exact Execute binding, live managed Host coordination including direct local-Host admission, deterministic multi-Host product orchestration, and proposal-only Natural-v2 lowering.
+The 1.9.3 development backend implements the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, bounded Worker Harness, configured streaming provider adapter, durable generation-bound provider configuration, Host-local managed runtime discovery/identity pinning with production exact Execute binding, live managed Host coordination including direct local-Host admission, deterministic multi-Host product orchestration, proposal-only Natural-v2 lowering, Bridge-native NodeList/capability projection, bounded fixed Host probe semantics, and the low-friction Capability Acquisition confirmation foundation.
 
 V1 remains isolated and unchanged: its product executes Search/Transfer and rejects Transform/Execute. The 2.0 renderer can open an existing native-v2 revision and drive Review approval, readiness start, authoritative status, and cancellation through the registered Tauri commands. The local Task Provider screen can create, edit, remove, explicitly select, inspect, and health-check the existing OpenAI-compatible managed Worker configuration through Host-owned commands. It receives only non-secret endpoint/model/bounds/health metadata and immutable references; the credential, resolved binding, and physical runtime identity remain Host-private.
 
 Bridge Device Check is the implemented production Profile-B entry point for one bounded Managed E2E self-check. An explicit Check performs `Search @ requester → authored Transfer → Execute @ exact remote Host` through the ordinary immutable revision, approval, distributed readiness, Host admission, Worker, EffectEnvelope, ExecutionWorld, and Core completion path. Missing provider, runtime, or ExecutionWorld facts return `BLOCKED` before managed work begins. Its `PASS | BLOCKED | FAIL` report and evidence requirements are owned by [Layer 2](layers/layer-2-device-intelligence.md). Host-owned provider/runtime configuration and health closure are implemented; real provider/external API validation remains pending.
 
-Draft discovery/origination, renderer-safe PM context and detailed topology, and result content projection are not yet exposed. They are separate product work and do not block the fixed Bridge Device Check acceptance path. A real packaged Mac ↔ Windows Managed E2E PASS is also still unclaimed until an external provider call and physical Check succeed.
+Draft discovery/origination, the planned Worker Context Contract, renderer-safe PM context and detailed topology, and result content projection are not yet complete. They are separate product work and do not block the fixed Bridge Device Check acceptance path. A real packaged Mac ↔ Windows Managed E2E PASS is also still unclaimed until an external provider call and physical Check succeed.
 
-Remaining 2.0 product work includes renderer-safe Draft/PM/topology/result projections and product recovery for coordination delivery failures. External provider validation and a physical multi-Host Managed E2E Check remain pending evidence, not missing Managed E2E architecture. Independently future capabilities include a verified Linux managed execution world, Worker network tools, subagent policy, and Headless Host. None is implied by the current backend.
+## Roadmap
+
+```text
+DONE  Bridge-native NodeList / Capability Projection
+DONE  Bounded Host Capability Probe / Resolution semantics
+DONE  Low-friction Capability Acquisition foundation
+      actual acquisition behavior deferred
+
+NEXT  Worker Context Contract
+THEN  General Semantic Transform / cross-representation E2E
+THEN  Real Provider Conformance
+THEN  Contract-specific Validation Hardening
+THEN  Product Wiring / Figma integration
+THEN  Coordination Recovery Closure
+THEN  Physical Failure Matrix + Security Freeze
+```
+
+The planned Worker Context Contract must reuse `StepWorkDescriptorV1`, `AuthorityContextV1`, `EffectEnvelopeV1`, and the existing resource aliases, roles, and operations. It will give a Worker only the exact step/revision, semantic intent, bounded resources, and allowed operations. It will expose no raw filesystem paths, topology, sessions/routes, credentials, Host-selection authority, or raw authority handles.
+
+The production Bridge Device Managed E2E architecture already exists, Windows local managed execution physical acceptance is complete, and the physical fail-closed preflight is verified. Real external-provider conformance and a packaged physical Mac ↔ Windows E2E PASS remain evidence gates. Independently future capabilities include a verified Linux managed execution world, Worker network tools, subagent policy, and Headless Host; none is implied by the current backend.
 
 See [Layer 5](layers/layer-5-agent.md) for the managed contracts, [development](development.md) for validation and physical smoke procedures, and [reference](reference.md) for concrete identifiers and bounds.
