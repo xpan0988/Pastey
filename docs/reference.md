@@ -17,8 +17,8 @@ This document owns concrete identifiers, bounds, configuration facts, and source
 | Worker status event | `pastey-managed-worker-status-v1`; `pastey://managed-worker-status` |
 | Provider config | `pastey-worker-provider-config-v1` |
 | Peer capability facts | `pastey-peer-capabilities-v2` |
-| Fixed Host system-probe request | `capabilityIds`: at most 12 deduplicated IDs from the global semantic vocabulary; the receiving Host alone maps an ID to a fixed local probe. No path, command, args, shell, or acquisition fields. |
-| Capability-acquisition confirmation | `CapabilityAcquisitionRequestV1` / `confirm_capability_acquisition`: validated durable `HostRef`, one global semantic `capabilityId`, bounded display text, and only `confirmed` or `cancelled`. Confirmed means consent to a future AI-side continuation only; it does not acquire, probe, bind, authorize, or mutate capability/Plan/topology/Developer Mode state. Source: `src-tauri/src/capability_acquisition_confirmation.rs`. |
+| Fixed Host system-probe request | `capabilityIds`: at most 12 deduplicated IDs from the current known fixed-probe vocabulary; the receiving Host alone maps an ID to a fixed local probe. No path, command, args, shell, or acquisition fields. |
+| Capability-acquisition confirmation | `CapabilityAcquisitionRequestV1` / `confirm_capability_acquisition`: validated durable `HostRef`, one bounded semantic `capabilityId` (`[A-Za-z0-9._:-]`, 1–128 bytes), bounded display text, and only `confirmed` or `cancelled`. Semantic-ID validity does not require membership in the fixed-probe vocabulary. Confirmed means consent to a future AI-side continuation only; it does not acquire, probe, bind, authorize, or mutate capability/Plan/topology/Developer Mode state. Source: `src-tauri/src/capability_acquisition_confirmation.rs`. |
 | Bridge NodeList projection | `pastey-bridge-node-list-v1` |
 | Room Control route | `pastey-bridge-control-route-v1` |
 

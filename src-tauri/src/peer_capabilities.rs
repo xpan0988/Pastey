@@ -19,6 +19,7 @@ pub(crate) const PEER_CAPABILITY_SCHEMA: &str = "pastey-peer-capabilities-v2";
 const MAX_CAPABILITIES: usize = 16;
 const MAX_MEDIA_TYPES: usize = 16;
 const MAX_PAYLOAD_BYTES: usize = 4096;
+const MAX_SEMANTIC_CAPABILITY_ID_BYTES: usize = 128;
 
 pub(crate) const MANAGED_PROVIDER_CAPABILITY: &str = "pastey.managed.provider";
 pub(crate) const MANAGED_RUNTIME_CAPABILITY: &str = "pastey.managed.runtime";
@@ -43,6 +44,23 @@ pub struct HostCapabilityFact {
     pub effect: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
+}
+
+/// Validates one capability semantic identifier without asserting that a Host
+/// currently implements or probes it. This remains separate from the fixed
+/// Host probe vocabulary in `capability_probe`.
+pub(crate) fn validate_semantic_capability_id(value: &str) -> AppResult<()> {
+    if value.is_empty()
+        || value.len() > MAX_SEMANTIC_CAPABILITY_ID_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
+    {
+        return Err(AppError::InvalidInput(
+            "Semantic capability ID is invalid.".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -373,6 +391,30 @@ pub(crate) fn validate_projection(projection: &PeerCapabilityProjection) -> AppR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_capability_ids_use_the_bounded_ascii_namespace_grammar() {
+        for capability_id in [
+            "runtime.python",
+            "runtime.java",
+            "tool.cmake",
+            "sdk.android",
+            "model.whisper",
+        ] {
+            assert!(validate_semantic_capability_id(capability_id).is_ok());
+        }
+        for capability_id in [
+            "",
+            "runtime java",
+            "runtime/java",
+            "runtime\\java",
+            "runtime\njava",
+            "runtime.café",
+        ] {
+            assert!(validate_semantic_capability_id(capability_id).is_err());
+        }
+        assert!(validate_semantic_capability_id(&"a".repeat(129)).is_err());
+    }
 
     #[test]
     fn core_projection_is_empty_non_authorizing_and_valid() {
