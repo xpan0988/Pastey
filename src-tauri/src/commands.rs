@@ -58,6 +58,17 @@ const BRIDGE_PLAN_CONTROL_LIFETIME_SECONDS: i64 = 120;
 const MANAGED_SELF_CHECK_SCHEMA: &str = "pastey-managed-e2e-self-check-v1";
 const MANAGED_SELF_CHECK_TIMEOUT_SECONDS: u64 = 90;
 
+/// Returns one inert, typed user decision for a future AI-side acquisition
+/// continuation. It changes no capability projection, Host binding, Plan,
+/// Worker/Core authority, topology, or Developer Mode state.
+#[tauri::command]
+pub fn confirm_capability_acquisition(
+    input: crate::capability_acquisition_confirmation::CapabilityAcquisitionConfirmationInputV1,
+) -> Result<crate::capability_acquisition_confirmation::CapabilityAcquisitionConfirmationV1, String>
+{
+    Ok(crate::capability_acquisition_confirmation::confirm_capability_acquisition(input))
+}
+
 /// Produces one ephemeral, non-authorizing diagnostics projection for an exact
 /// durable remote Host. All current-session and route interpretation remains
 /// behind the canonical Layer 4 resolver and its semantic operations.

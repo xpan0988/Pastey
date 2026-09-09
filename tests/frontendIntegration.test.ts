@@ -160,6 +160,20 @@ test("Bridge Device Check uses exact HostRef and remains explicitly user initiat
   assert.match(bindings, /invoke\("run_bridge_device_self_check", \{ bridgeId, hostRef \}\)/);
 });
 
+test("capability acquisition confirmation binding remains display-only", () => {
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  const types = readFileSync("src/lib/types.ts", "utf8");
+  assert.match(bindings, /invoke\("confirm_capability_acquisition", \{ input \}\)/);
+  assert.match(types, /CapabilityAcquisitionConfirmationOutcomeV1 = "confirmed" \| "cancelled"/);
+  const contract = types.slice(
+    types.indexOf("export interface CapabilityAcquisitionRequestV1"),
+    types.indexOf("export type BenchmarkMode")
+  );
+  for (const forbidden of ["path", "command", "args", "shell", "installer", "credentials", "authority"]) {
+    assert.doesNotMatch(contract.toLowerCase(), new RegExp(`\\b${forbidden}\\??\\s*:`));
+  }
+});
+
 test("Bridge Devices consumes the read-only NodeList without turning it into a Check or admission flow", () => {
   const screens = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");

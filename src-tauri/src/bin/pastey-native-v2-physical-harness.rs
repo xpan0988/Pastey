@@ -15,6 +15,8 @@ mod bridge_lifecycle;
 mod bridge_plan;
 #[path = "../bridge_plan_v2.rs"]
 mod bridge_plan_v2;
+#[path = "../capability_acquisition_confirmation.rs"]
+mod capability_acquisition_confirmation;
 #[path = "../capability_probe.rs"]
 mod capability_probe;
 #[path = "../chunk_frame.rs"]
