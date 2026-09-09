@@ -7,9 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    capability_probe,
     error::{AppError, AppResult},
     host_identity::HostRef,
+    peer_capabilities,
 };
 
 const MAX_DISPLAY_NAME_BYTES: usize = 128;
@@ -56,14 +56,10 @@ impl TryFrom<CapabilityAcquisitionRequestWireV1> for CapabilityAcquisitionReques
 
     fn try_from(value: CapabilityAcquisitionRequestWireV1) -> AppResult<Self> {
         let host_ref = HostRef::parse(value.host_ref)?;
-        let capability_id =
-            capability_probe::normalize_known_capability_request(&[value.capability_id])?
-                .into_iter()
-                .next()
-                .expect("one validated capability ID");
+        peer_capabilities::validate_semantic_capability_id(&value.capability_id)?;
         Self::new(
             host_ref,
-            capability_id,
+            value.capability_id,
             value.display_name,
             value.reason,
             value.source_summary,
@@ -219,10 +215,47 @@ mod tests {
     }
 
     #[test]
-    fn unknown_capability_id_is_rejected() {
+    fn acquisition_confirmation_accepts_unknown_but_valid_semantic_capability_ids() {
+        for capability_id in ["runtime.java", "tool.cmake", "sdk.android", "model.whisper"] {
+            let mut input = valid_input();
+            input["request"]["capabilityId"] = json!(capability_id);
+            let parsed =
+                serde_json::from_value::<CapabilityAcquisitionConfirmationInputV1>(input).unwrap();
+            assert_eq!(parsed.request.capability_id, capability_id);
+        }
+    }
+
+    #[test]
+    fn acquisition_confirmation_rejects_malformed_semantic_capability_ids() {
+        for capability_id in [
+            "",
+            "runtime java",
+            "runtime/java",
+            "runtime\\java",
+            "runtime\njava",
+            "runtime.café",
+        ] {
+            let mut input = valid_input();
+            input["request"]["capabilityId"] = json!(capability_id);
+            assert!(
+                serde_json::from_value::<CapabilityAcquisitionConfirmationInputV1>(input).is_err(),
+                "{capability_id:?} must be rejected"
+            );
+        }
         let mut input = valid_input();
-        input["request"]["capabilityId"] = json!("runtime.not-real");
+        input["request"]["capabilityId"] = json!("a".repeat(129));
         assert!(serde_json::from_value::<CapabilityAcquisitionConfirmationInputV1>(input).is_err());
+    }
+
+    #[test]
+    fn unknown_semantic_acquisition_id_remains_rejected_by_the_fixed_probe_path() {
+        let mut input = valid_input();
+        input["request"]["capabilityId"] = json!("runtime.java");
+        assert!(serde_json::from_value::<CapabilityAcquisitionConfirmationInputV1>(input).is_ok());
+        assert!(
+            crate::capability_probe::normalize_known_capability_request(&["runtime.java".into()])
+                .is_err()
+        );
     }
 
     #[test]
