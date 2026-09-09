@@ -1,6 +1,7 @@
 mod bridge_lifecycle;
 mod bridge_plan;
 mod bridge_plan_v2;
+mod capability_acquisition_confirmation;
 mod capability_probe;
 mod chunk_frame;
 mod cleanup;
@@ -62,8 +63,8 @@ use crate::{
         accept_developer_terminal, accept_nearby_join, approve_bridge_plan, approve_native_v2_plan,
         bind_bridge_plan_to_session, burn_room, cancel_native_v2_plan_attempt, cancel_transfer,
         check_for_updates, check_managed_worker_provider_health, close_developer_terminal,
-        compose_native_v2_plan, compose_natural_v2_candidate, copy_last_error,
-        copy_text_to_clipboard, create_composed_file_bridge_plan,
+        compose_native_v2_plan, compose_natural_v2_candidate, confirm_capability_acquisition,
+        copy_last_error, copy_text_to_clipboard, create_composed_file_bridge_plan,
         create_direct_file_transfer_bridge_plan, create_managed_worker_provider, create_room,
         delete_managed_worker_provider, delete_temp_file, deny_developer_terminal,
         enter_developer_mode, get_bridge_node_list_projection, get_config,
@@ -229,6 +230,7 @@ fn main() {
             check_managed_worker_provider_health,
             get_device_profile,
             get_device_capabilities,
+            confirm_capability_acquisition,
             get_bridge_node_list_projection,
             run_bridge_device_diagnostics,
             run_bridge_device_self_check,

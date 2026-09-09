@@ -301,6 +301,28 @@ export interface DeviceCapabilities {
 }
 
 export type CapabilityProbeMode = "quick" | "full";
+
+// Display-only confirmation contract. It contains no install instructions,
+// capability state, executable binding, or execution authority.
+export interface CapabilityAcquisitionRequestV1 {
+  hostRef: string;
+  capabilityId: string;
+  displayName: string;
+  reason: string;
+  sourceSummary?: string;
+  estimatedSize?: string;
+  privilegeWarning?: string;
+}
+
+export type CapabilityAcquisitionConfirmationOutcomeV1 = "confirmed" | "cancelled";
+
+export interface CapabilityAcquisitionConfirmationInputV1 {
+  request: CapabilityAcquisitionRequestV1;
+  outcome: CapabilityAcquisitionConfirmationOutcomeV1;
+}
+
+export interface CapabilityAcquisitionConfirmationV1 extends CapabilityAcquisitionConfirmationInputV1 {}
+
 export type BenchmarkMode = "raw_memory" | "pastey_pipeline";
 export type LinkQuality = "Poor" | "Fair" | "Good" | "Excellent";
 

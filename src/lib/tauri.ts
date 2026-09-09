@@ -4,6 +4,8 @@ import type {
   BenchmarkMode,
   BridgeDeviceDiagnostics,
   CapabilityProbeMode,
+  CapabilityAcquisitionConfirmationInputV1,
+  CapabilityAcquisitionConfirmationV1,
   DeviceCapabilities,
   DeviceProfile,
   BridgeNodeListProjectionV1,
@@ -531,6 +533,13 @@ export async function getDeviceCapabilities(options?: { forceRefresh?: boolean; 
     forceRefresh: options?.forceRefresh ?? false,
     probeMode: options?.probeMode ?? null
   });
+}
+
+/** Records only a user's decision for a future AI-side acquisition action. */
+export async function confirmCapabilityAcquisition(
+  input: CapabilityAcquisitionConfirmationInputV1
+): Promise<CapabilityAcquisitionConfirmationV1> {
+  return invoke("confirm_capability_acquisition", { input });
 }
 
 export async function getBridgeNodeListProjection(bridgeId: string): Promise<BridgeNodeListProjectionV1> {
