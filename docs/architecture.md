@@ -107,7 +107,7 @@ Cancellation, expiry, provider revocation, session replacement, disconnect, Burn
 
 ## Managed Workspace and Developer Mode
 
-A managed Worker workspace is a Host-local, run-local ABI, not a distributed filesystem. Core derives one Host-private `ManagedRunWorkspaceV1` only from the exact active `EffectEnvelope`, current run/Host/session authority, and already attached managed resources and execution world. Its model-visible projection contains bounded logical aliases, resource roles, permitted operation vocabulary, and relative-selector facts; it contains no Host path, resource handle, physical identity, grant, credential, topology, or cross-Host reference. Alias resolution revalidates the current attachment and then enters the existing EffectRequest enforcement path, so the projection cannot authorize or widen an effect.
+A managed Worker workspace is a Host-local, run-local ABI, not a distributed filesystem. Core derives one Host-private `ManagedRunWorkspaceV1` only from the exact active `EffectEnvelope`, current run/Host/session authority, and already attached managed resources and execution world. The model-visible Worker Context Contract contains only the semantic step operation and intent, the bounded workspace projection, model-visible tool schemas, bounded history, and an operation-specific final-response template derived from the existing Worker response type. The workspace projection contains logical aliases, resource roles, permitted operation vocabulary, and relative-selector facts; neither it nor the rest of the Worker context contains a Host path, resource handle, physical identity, grant, credential, topology, session/route correlation, or cross-Host reference. Alias resolution revalidates the current attachment and then enters the existing EffectRequest enforcement path, so model-visible context and tools cannot authorize or widen an effect.
 
 Cancellation, session invalidation, disconnect, Burn, shutdown, restart, and authoritative completion revoke the underlying run/resources and make an old workspace projection unusable. Moving an authored step to another Host creates a different local run and projection. Only the managed object revision may move, and only through authored Transfer; overlays, output slots, scratch state, and workspace aliases never move or become shared state.
 
@@ -144,13 +144,13 @@ The Host-owned network broker exists as an independent Phase 5 authority domain,
 
 ## Current product boundary
 
-The 1.9.3 development backend implements the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, bounded Worker Harness, configured streaming provider adapter, durable generation-bound provider configuration, Host-local managed runtime discovery/identity pinning with production exact Execute binding, live managed Host coordination including direct local-Host admission, deterministic multi-Host product orchestration, proposal-only Natural-v2 lowering, Bridge-native NodeList/capability projection, bounded fixed Host probe semantics, and the low-friction Capability Acquisition confirmation foundation.
+The 1.9.3 development backend implements the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, bounded Worker Harness, the minimal model-visible Worker Context Contract, configured streaming provider adapter, durable generation-bound provider configuration, Host-local managed runtime discovery/identity pinning with production exact Execute binding, live managed Host coordination including direct local-Host admission, deterministic multi-Host product orchestration, proposal-only Natural-v2 lowering, Bridge-native NodeList/capability projection, bounded fixed Host probe semantics, and the low-friction Capability Acquisition confirmation foundation.
 
 V1 remains isolated and unchanged: its product executes Search/Transfer and rejects Transform/Execute. The 2.0 renderer can open an existing native-v2 revision and drive Review approval, readiness start, authoritative status, and cancellation through the registered Tauri commands. The local Task Provider screen can create, edit, remove, explicitly select, inspect, and health-check the existing OpenAI-compatible managed Worker configuration through Host-owned commands. It receives only non-secret endpoint/model/bounds/health metadata and immutable references; the credential, resolved binding, and physical runtime identity remain Host-private.
 
 Bridge Device Check is the implemented production entry point for one bounded Managed E2E self-check. An explicit Check performs `Search @ requester → authored Transfer → Execute @ exact remote Host` through the ordinary immutable revision, approval, distributed readiness, Host admission, Worker, EffectEnvelope, ExecutionWorld, and Core completion path. Missing provider, runtime, or ExecutionWorld facts return `BLOCKED` before managed work begins. Its `PASS | BLOCKED | FAIL` report and evidence requirements are owned by [Layer 2](layers/layer-2-device-intelligence.md). Host-owned provider/runtime configuration and health closure are implemented; real provider/external API validation remains pending.
 
-Draft discovery/origination, the planned Worker Context Contract, renderer-safe PM context and detailed topology, and result content projection are not yet complete. They are separate product work and do not block the fixed Bridge Device Check acceptance path. A real packaged Mac ↔ Windows Managed E2E PASS is also still unclaimed until an external provider call and physical Check succeed.
+Draft discovery/origination, General Semantic Transform context and cross-representation behavior, renderer-safe PM context and detailed topology, and result content projection are not yet complete. They are separate product work and do not block the fixed Bridge Device Check acceptance path. A real packaged Mac ↔ Windows Managed E2E PASS is also still unclaimed until an external provider call and physical Check succeed.
 
 ## Roadmap
 
@@ -160,8 +160,8 @@ DONE  Bounded Host Capability Probe / Resolution semantics
 DONE  Low-friction Capability Acquisition foundation
       actual acquisition behavior deferred
 
-NEXT  Worker Context Contract
-THEN  General Semantic Transform / cross-representation E2E
+DONE  Worker Context Contract / minimal semantic closure
+NEXT  General Semantic Transform / cross-representation E2E
 THEN  Real Provider Conformance
 THEN  Contract-specific Validation Hardening
 THEN  Product Wiring / Figma integration
@@ -169,7 +169,7 @@ THEN  Coordination Recovery Closure
 THEN  Physical Failure Matrix + Security Freeze
 ```
 
-The planned Worker Context Contract must reuse `StepWorkDescriptorV1`, `AuthorityContextV1`, `EffectEnvelopeV1`, and the existing resource aliases, roles, and operations. It will give a Worker only the exact step/revision, semantic intent, bounded resources, and allowed operations. It will expose no raw filesystem paths, topology, sessions/routes, credentials, Host-selection authority, or raw authority handles.
+The Worker Context Contract reuses the existing Host/Core authority path and workspace aliases rather than introducing another authority object. The provider receives only the semantic step operation and intent, bounded workspace roles/operations/relative-selector facts, semantic tools, bounded history, and an operation-specific completion template. Exact revision correlation, raw filesystem paths, topology, sessions/routes, credentials, Host-selection data, physical bindings, and authority handles remain Host/Core-private. General Semantic Transform context remains the next separate slice.
 
 The production Bridge Device Managed E2E architecture already exists, Windows local managed execution physical acceptance is complete, and the physical fail-closed preflight is verified. Real external-provider conformance and a packaged physical Mac ↔ Windows E2E PASS remain evidence gates. Independently future capabilities include a verified Linux managed execution world, Worker network tools, subagent policy, and Headless Host; none is implied by the current backend.
 
