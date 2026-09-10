@@ -1443,8 +1443,9 @@ mod tests {
         managed_objects::{HostArtifactAcquisition, ManagedObjectAcquisitionKind},
         models::{LocalRole, RoomStatus},
         worker_harness::{
-            WorkerProviderErrorKindV1, WorkerProviderErrorV1, WorkerProviderResponseV1,
-            WorkerProviderTurnV1, WorkerResourceAliasV1, WorkerToolCallV1,
+            WorkerProviderCancellationV1, WorkerProviderErrorKindV1, WorkerProviderErrorV1,
+            WorkerProviderResponseV1, WorkerProviderTurnV1, WorkerResourceAliasV1,
+            WorkerToolCallV1,
         },
         worker_provider_config::{
             WorkerProviderConfigUpdateV1, WorkerProviderConfigWriteV1, WorkerProviderSelectionV1,
@@ -1817,7 +1818,7 @@ mod tests {
         fn next_turn(
             &mut self,
             request: crate::worker_harness::WorkerProviderRequestV1,
-            _cancellation: &crate::worker_harness::WorkerHarnessRunV1,
+            _cancellation: &WorkerProviderCancellationV1,
         ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
             self.requests.push(request);
             self.responses
@@ -1835,7 +1836,7 @@ mod tests {
         fn next_turn(
             &mut self,
             _request: crate::worker_harness::WorkerProviderRequestV1,
-            cancellation: &crate::worker_harness::WorkerHarnessRunV1,
+            cancellation: &WorkerProviderCancellationV1,
         ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
             self.entered.send(()).unwrap();
             while !cancellation.is_cancelled() {
@@ -1855,7 +1856,7 @@ mod tests {
         fn next_turn(
             &mut self,
             _request: crate::worker_harness::WorkerProviderRequestV1,
-            _cancellation: &crate::worker_harness::WorkerHarnessRunV1,
+            _cancellation: &WorkerProviderCancellationV1,
         ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
             if let Some(dispatched) = self.dispatched.take() {
                 dispatched.send(()).unwrap();
@@ -1894,7 +1895,7 @@ mod tests {
         fn next_turn(
             &mut self,
             _request: crate::worker_harness::WorkerProviderRequestV1,
-            _cancellation: &crate::worker_harness::WorkerHarnessRunV1,
+            _cancellation: &WorkerProviderCancellationV1,
         ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
             self.turn += 1;
             let response = if self.turn == 1 {

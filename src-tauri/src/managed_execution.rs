@@ -1303,9 +1303,9 @@ mod tests {
         models::LocalRole,
         storage,
         worker_harness::{
-            WorkerProviderErrorKindV1, WorkerProviderErrorV1, WorkerProviderResponseV1,
-            WorkerProviderTurnV1, WorkerProviderV1, WorkerResourceAliasV1, WorkerRunLimitsV1,
-            WorkerToolCallV1,
+            WorkerProviderCancellationV1, WorkerProviderErrorKindV1, WorkerProviderErrorV1,
+            WorkerProviderResponseV1, WorkerProviderTurnV1, WorkerProviderV1,
+            WorkerResourceAliasV1, WorkerRunLimitsV1, WorkerToolCallV1,
         },
     };
 
@@ -1349,7 +1349,7 @@ mod tests {
         fn next_turn(
             &mut self,
             request: crate::worker_harness::WorkerProviderRequestV1,
-            _cancellation: &crate::worker_harness::WorkerHarnessRunV1,
+            _cancellation: &WorkerProviderCancellationV1,
         ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
             self.requests.push(request);
             self.responses
@@ -1365,16 +1365,11 @@ mod tests {
         fn next_turn(
             &mut self,
             _request: crate::worker_harness::WorkerProviderRequestV1,
-            cancellation: &crate::worker_harness::WorkerHarnessRunV1,
+            _cancellation: &WorkerProviderCancellationV1,
         ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
-            cancellation.cancel();
-            Ok(WorkerProviderTurnV1::scripted(
-                WorkerProviderResponseV1::ToolCall {
-                    call: WorkerToolCallV1::Read {
-                        resource: WorkerResourceAliasV1::Input,
-                    },
-                },
-            ))
+            Err(WorkerProviderErrorV1 {
+                kind: WorkerProviderErrorKindV1::Cancelled,
+            })
         }
     }
 
@@ -2069,7 +2064,25 @@ mod tests {
         assert_eq!(provider.requests.len(), 4);
         assert!(provider.requests[0]
             .system_instructions
-            .contains("cannot claim work"));
+            .contains("one authorized Transform or Execute step"));
+        assert!(!provider.requests[0]
+            .system_instructions
+            .contains("already-approved"));
+        assert!(!provider.requests[0]
+            .system_instructions
+            .contains("same-Host"));
+        let step = serde_json::to_value(&provider.requests[0].step).unwrap();
+        assert_eq!(step["operation"], "transform");
+        assert!(step.get("inputRevision").is_none());
+        assert_eq!(
+            provider.requests[0].completion_contract,
+            serde_json::json!({
+                "kind": "final",
+                "output_selector": "<output-relative-selector>",
+                "display_name": "<display-name>",
+                "media_type": "<media-type>",
+            })
+        );
         assert!(provider.requests[1].history.iter().any(|turn| matches!(
             turn.observation,
             Some(crate::worker_harness::WorkerObservationV1::ProviderRetry { .. })

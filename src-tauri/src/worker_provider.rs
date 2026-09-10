@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use crate::{
     error::{AppError, AppResult},
     worker_harness::{
-        WorkerHarnessRunV1, WorkerProviderErrorKindV1, WorkerProviderErrorV1,
+        WorkerProviderCancellationV1, WorkerProviderErrorKindV1, WorkerProviderErrorV1,
         WorkerProviderRequestV1, WorkerProviderResponseV1, WorkerProviderTurnMetadataV1,
         WorkerProviderTurnV1, WorkerProviderV1, WorkerToolCallV1,
     },
@@ -165,7 +165,7 @@ impl OpenAICompatibleStreamingWorkerProviderV1 {
     fn stream_turn(
         &self,
         request: WorkerProviderRequestV1,
-        cancellation: &WorkerHarnessRunV1,
+        cancellation: &WorkerProviderCancellationV1,
     ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
         if cancellation.is_cancelled() {
             return Err(cancelled());
@@ -202,14 +202,14 @@ impl WorkerProviderV1 for OpenAICompatibleStreamingWorkerProviderV1 {
     fn next_turn(
         &mut self,
         request: WorkerProviderRequestV1,
-        cancellation: &WorkerHarnessRunV1,
+        cancellation: &WorkerProviderCancellationV1,
     ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
         self.stream_turn(request, cancellation)
     }
 }
 
 /// Provider switching is transport-only: both providers receive the identical
-/// already-projected turn and cancellation object. No fallback can alter a
+/// already-projected turn and read-only cancellation token. No fallback can alter a
 /// descriptor, catalog, grant, or effect authority.
 pub(crate) struct WorkerProviderFailoverV1<P, S> {
     primary: P,
@@ -227,7 +227,7 @@ impl<P: WorkerProviderV1, S: WorkerProviderV1> WorkerProviderV1 for WorkerProvid
     fn next_turn(
         &mut self,
         request: WorkerProviderRequestV1,
-        cancellation: &WorkerHarnessRunV1,
+        cancellation: &WorkerProviderCancellationV1,
     ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
         match self.primary.next_turn(request.clone(), cancellation) {
             Err(error) if error.kind == WorkerProviderErrorKindV1::Retryable => {
@@ -379,7 +379,7 @@ fn normalized_tool_call(
 
 fn normalize_sse_lines<I>(
     lines: I,
-    cancellation: &WorkerHarnessRunV1,
+    cancellation: &WorkerProviderCancellationV1,
     revocation: Option<&AtomicBool>,
 ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1>
 where
@@ -428,8 +428,13 @@ fn openai_stream_request(
         "temperature": 0,
         "max_tokens": config.max_output_tokens,
         "messages": [
-            {"role": "system", "content": format!("{} Return a JSON Worker final response only when no tool is required.", request.system_instructions)},
-            {"role": "user", "content": serde_json::to_string(&json!({"step": request.step, "history": request.history})).expect("Worker projection serializes")}
+            {"role": "system", "content": format!("{} When no tool is required, return exactly one JSON object with the shape shown by completionContract in the user context, replacing angle-bracket placeholders with concrete values.", request.system_instructions)},
+            {"role": "user", "content": serde_json::to_string(&json!({
+                "step": request.step,
+                "workspace": request.workspace,
+                "history": request.history,
+                "completionContract": request.completion_contract,
+            })).expect("Worker context serializes")}
         ],
         "tools": request.tools.iter().map(|tool| json!({
             "type": "function",
@@ -560,7 +565,10 @@ mod tests {
     use std::{sync::Arc, vec};
 
     use super::*;
-    use crate::worker_harness::{WorkerResourceAliasV1, WorkerToolSchemaV1};
+    use crate::worker_harness::{
+        WorkerHarnessRunV1, WorkerObservationV1, WorkerResourceAliasV1, WorkerToolSchemaV1,
+        WorkerTurnRecordV1,
+    };
 
     fn event(value: Value) -> Value {
         value
@@ -667,29 +675,217 @@ mod tests {
         fn next_turn(
             &mut self,
             request: WorkerProviderRequestV1,
-            _cancellation: &WorkerHarnessRunV1,
+            _cancellation: &WorkerProviderCancellationV1,
         ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
             self.requests.lock().push(request);
             self.result.clone()
         }
     }
 
-    fn sample_request() -> WorkerProviderRequestV1 {
+    fn sample_request(operation: &str) -> WorkerProviderRequestV1 {
+        let completion_contract = if operation == "transform" {
+            serde_json::to_value(WorkerProviderResponseV1::Final {
+                output_selector: "<output-relative-selector>".into(),
+                display_name: "<display-name>".into(),
+                media_type: "<media-type>".into(),
+            })
+            .unwrap()
+        } else {
+            serde_json::to_value(WorkerProviderResponseV1::FinalExecute).unwrap()
+        };
         WorkerProviderRequestV1 {
-            system_instructions: "private instructions".into(),
+            system_instructions: "Use only the displayed semantic context.".into(),
             step: crate::worker_harness::WorkerStepProjectionV1 {
-                operation: "execute".into(),
-                semantic_intent: "test".into(),
-                input_revision: 1,
+                operation: operation.into(),
+                semantic_intent: "produce the requested result".into(),
             },
-            workspace: crate::managed_workspace::WorkerWorkspaceProjectionV1::empty_for_test(),
-            tools: vec![WorkerToolSchemaV1 {
-                name: "resource_read".into(),
-                description: "read".into(),
-                input_schema: json!({}),
+            workspace: crate::managed_workspace::WorkerWorkspaceProjectionV1::input_output_for_test(
+                operation == "transform",
+            ),
+            tools: vec![
+                WorkerToolSchemaV1 {
+                    name: "resource_read".into(),
+                    description: "Read bounded text from a semantic resource alias.".into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {"resource": {"enum": ["input", "output"]}},
+                        "required": ["resource"],
+                    }),
+                },
+                WorkerToolSchemaV1 {
+                    name: "resource_create".into(),
+                    description: "Create an output-relative resource.".into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "relative_selector": {"type": "string"},
+                            "content_base64": {"type": "string"},
+                        },
+                        "required": ["relative_selector", "content_base64"],
+                    }),
+                },
+            ],
+            history: vec![WorkerTurnRecordV1 {
+                response: Some(WorkerProviderResponseV1::ToolCall {
+                    call: WorkerToolCallV1::Read {
+                        resource: WorkerResourceAliasV1::Input,
+                    },
+                }),
+                observation: Some(WorkerObservationV1::Resource {
+                    operation: "read".into(),
+                    decision: "allowed".into(),
+                    generation: Some(1),
+                    content_digest: Some("digest".into()),
+                    bytes: Some(4),
+                    text: Some("text".into()),
+                    truncated: false,
+                }),
             }],
-            history: Vec::new(),
+            completion_contract,
         }
+    }
+
+    fn sample_config() -> ConfiguredWorkerProviderConfigV1 {
+        ConfiguredWorkerProviderConfigV1::new(
+            "host-provider".into(),
+            "https://api.example.test/v1".into(),
+            "model".into(),
+            "provider-api-key-sentinel".into(),
+            10_000,
+            512,
+        )
+        .unwrap()
+    }
+
+    fn user_context(payload: &Value) -> Value {
+        let content = payload["messages"][1]["content"]
+            .as_str()
+            .expect("user context is text JSON");
+        serde_json::from_str(content).expect("user context parses")
+    }
+
+    #[test]
+    fn final_openai_transform_payload_closes_the_model_visible_context() {
+        let payload = openai_stream_request(&sample_config(), &sample_request("transform"));
+        let context = user_context(&payload);
+
+        assert!(payload["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("replacing angle-bracket placeholders with concrete values"));
+        assert_eq!(context["step"]["operation"], "transform");
+        assert_eq!(
+            context["step"]["semanticIntent"],
+            "produce the requested result"
+        );
+        assert!(context["step"].get("inputRevision").is_none());
+        assert_eq!(
+            context["workspace"]["schemaVersion"],
+            "pastey-managed-workspace-v1"
+        );
+        let resources = context["workspace"]["resources"]
+            .as_array()
+            .expect("workspace resources");
+        let input = resources
+            .iter()
+            .find(|resource| resource["alias"] == "input")
+            .expect("input alias");
+        assert_eq!(input["kind"], "managed_revision");
+        assert_eq!(input["relativeSelectors"], false);
+        assert_eq!(input["operations"], json!(["inspect", "read"]));
+        let output = resources
+            .iter()
+            .find(|resource| resource["alias"] == "output")
+            .expect("output alias");
+        assert_eq!(output["kind"], "output");
+        assert_eq!(output["relativeSelectors"], true);
+        assert_eq!(
+            output["operations"],
+            json!(["inspect", "read", "create", "replace"])
+        );
+        assert_eq!(context["history"].as_array().unwrap().len(), 1);
+        assert_eq!(context["history"][0]["observation"]["text"], "text");
+        assert_eq!(
+            context["completionContract"],
+            json!({
+                "kind": "final",
+                "output_selector": "<output-relative-selector>",
+                "display_name": "<display-name>",
+                "media_type": "<media-type>",
+            })
+        );
+
+        let tools = payload["tools"].as_array().expect("provider tools");
+        assert_eq!(tools[0]["function"]["name"], "resource_read");
+        assert_eq!(
+            tools[0]["function"]["parameters"]["properties"]["resource"]["enum"],
+            json!(["input", "output"])
+        );
+        assert_eq!(tools[1]["function"]["name"], "resource_create");
+        assert!(tools[1]["function"]["parameters"]["properties"]
+            .get("relative_selector")
+            .is_some());
+
+        let model_visible = serde_json::to_string(&json!({
+            "messages": payload["messages"],
+            "tools": payload["tools"],
+        }))
+        .unwrap()
+        .to_ascii_lowercase();
+        let normalized = model_visible
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        for forbidden in [
+            "inputrevision",
+            "hostref",
+            "bridgeid",
+            "sessionbindingref",
+            "peersessionid",
+            "route",
+            "physicalroot",
+            "executablepath",
+            "executableidentity",
+            "resourcehandleref",
+            "projectionref",
+            "enveloperef",
+            "runcontrolref",
+            "contextref",
+            "processbindingref",
+            "executionworldref",
+            "approvalid",
+            "approvalref",
+            "topology",
+            "filesystempath",
+        ] {
+            assert!(
+                !normalized.contains(forbidden),
+                "model-visible payload disclosed {forbidden}"
+            );
+        }
+        for forbidden_value in [
+            "provider-api-key-sentinel",
+            "/users/private/workspace",
+            r"c:\\private\\workspace",
+        ] {
+            assert!(!model_visible.contains(forbidden_value));
+        }
+    }
+
+    #[test]
+    fn final_openai_execute_payload_has_the_execute_completion_contract() {
+        let payload = openai_stream_request(&sample_config(), &sample_request("execute"));
+        let context = user_context(&payload);
+        assert_eq!(context["step"]["operation"], "execute");
+        assert_eq!(
+            context["completionContract"],
+            json!({"kind": "final_execute"})
+        );
+        assert!(context["workspace"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|resource| resource["alias"] != "output"));
     }
 
     #[test]
@@ -707,8 +903,11 @@ mod tests {
             requests: secondary_requests.clone(),
         };
         let mut provider = WorkerProviderFailoverV1::new(primary, secondary);
-        let cancellation = WorkerHarnessRunV1::new("bridge".into(), "binding".into());
-        provider.next_turn(sample_request(), &cancellation).unwrap();
+        let run = WorkerHarnessRunV1::new("bridge".into(), "binding".into());
+        let cancellation = run.provider_cancellation();
+        provider
+            .next_turn(sample_request("execute"), &cancellation)
+            .unwrap();
         assert_eq!(
             primary_requests.lock().as_slice(),
             secondary_requests.lock().as_slice()
@@ -723,6 +922,7 @@ mod tests {
         let run = WorkerHarnessRunV1::new("bridge".into(), "binding".into());
         run.cancel();
         assert!(run.is_cancelled());
+        assert!(run.provider_cancellation().is_cancelled());
         assert_eq!(cancelled().kind, WorkerProviderErrorKindV1::Cancelled);
     }
 
@@ -744,6 +944,7 @@ mod tests {
             }
         }
         let run = WorkerHarnessRunV1::new("bridge".into(), "binding".into());
+        let cancellation = run.provider_cancellation();
         let lines = CancellingLines {
             lines: vec![
                 Ok("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"resource_read\",\"arguments\":\"{\\\"res\"}}]}}]}".into()),
@@ -754,7 +955,9 @@ mod tests {
             seen: false,
         };
         assert_eq!(
-            normalize_sse_lines(lines, &run, None).unwrap_err().kind,
+            normalize_sse_lines(lines, &cancellation, None)
+                .unwrap_err()
+                .kind,
             WorkerProviderErrorKindV1::Cancelled
         );
     }

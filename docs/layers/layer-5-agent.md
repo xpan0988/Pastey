@@ -129,7 +129,7 @@ StepWorkDescriptor + bounded resource/semantic projection
   → Core-only finalizer
 ```
 
-`TurnAssembler` builds stable Worker instructions, the exact step projection, the bounded `WorkerWorkspaceProjectionV1`, schemas derived from that projection, and ordered observations. `WorkerToolCatalogV1` resolves the existing inspect/read/create/replace/process calls only through the Host-private workspace aggregation before lowering them to the existing effect boundary. It never discovers an ambient repository or injects full topology, paths, handles, grants, credentials, or terminal data. `WorkerSessionLog` is process-local model-visible history, not an authority record.
+`TurnAssembler` builds stable Worker instructions, the semantic step operation and intent, the bounded `WorkerWorkspaceProjectionV1`, schemas derived from that projection, ordered observations, and the operation-specific completion template accepted by `WorkerProviderResponseV1`. `WorkerProviderRequestV1` is the model-visible Worker Context Contract, and the OpenAI-compatible adapter transmits its step, workspace, bounded history, completion template, and tool schemas. The provider receives only a read-only cooperative cancellation token, not the run's Bridge/session correlation. `WorkerToolCatalogV1` resolves the existing inspect/read/create/replace/process calls only through the Host-private workspace aggregation before lowering them to the existing effect boundary. It never discovers an ambient repository or injects full topology, paths, handles, grants, credentials, or terminal data. `WorkerSessionLog` is process-local model-visible history, not an authority record.
 
 The provider-neutral adapter normalizes text deltas, fragmented tool-call identifiers/names/arguments, finish reason, bounded usage, errors, and cancellation. Only a completely assembled, syntactically valid, schema-valid tool call can dispatch. Partial, malformed, interrupted, or cancelled calls produce no effect.
 
@@ -137,9 +137,11 @@ Observations are bounded/redacted feedback. Resource observations carry operatio
 
 Provider sampling and context overflow have separate bounded retry policies. Compaction keeps tool-call/result pairs together and changes only model-visible context. A failed deterministic tool strategy may be observed and corrected while the same run remains active. Cancellation, malformed output, terminal provider failure, ambiguous/interrupted effect state, or an indeterminate effect is not retried as a fresh effect.
 
-### Planned Worker Context Contract
+### Worker Context Contract
 
-The roadmap's Worker Context Contract is planned work, not a completed new subsystem. It must reuse the current `StepWorkDescriptorV1`, `AuthorityContextV1`, `EffectEnvelopeV1`, and existing resource aliases, roles, and operation vocabulary. The Worker will receive only its exact step/revision, semantic intent, bounded resources, and allowed operations; it will not receive raw filesystem paths, whole-Plan topology, sessions/routes, credentials, Host-selection authority, or raw authority handles.
+The minimal Worker Context Contract is implemented at the existing `WorkerProviderRequestV1` seam rather than as a new subsystem. For one claimed Transform or Execute, the model receives only the semantic operation and intent, bounded workspace aliases/roles/operations/relative-selector facts, the corresponding semantic tool schemas, bounded history, and the exact operation-specific final-response template. Numeric input revision, approval lifecycle wording, physical bindings, raw filesystem paths, whole-Plan topology, sessions/routes, credentials, Host-selection data, and authority handles remain outside the provider payload. Internal revision correlation remains unchanged in Core/Host authority and finalization.
+
+This closure does not complete General Semantic Transform. Input display name, media type, byte size, binary or multimodal/chunked resource access, semantic runtime labels, richer approved output specifications, cross-representation Transform behavior, and generic process capability discovery remain deferred.
 
 ## Provider and runtime configuration boundaries
 

@@ -80,12 +80,31 @@ impl WorkerHarnessRunV1 {
         self.cancellation.load(Ordering::Acquire)
     }
 
+    pub(crate) fn provider_cancellation(&self) -> WorkerProviderCancellationV1 {
+        WorkerProviderCancellationV1 {
+            cancellation: self.cancellation.clone(),
+        }
+    }
+
     pub(crate) fn bridge_id(&self) -> &str {
         &self.bridge_id
     }
 
     pub(crate) fn session_binding_ref(&self) -> &str {
         &self.session_binding_ref
+    }
+}
+
+/// Read-only cooperative cancellation view for provider transports. It carries
+/// no run, Bridge, session, Host, or authority correlation.
+#[derive(Clone, Debug)]
+pub(crate) struct WorkerProviderCancellationV1 {
+    cancellation: Arc<AtomicBool>,
+}
+
+impl WorkerProviderCancellationV1 {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Acquire)
     }
 }
 
@@ -207,7 +226,7 @@ pub(crate) trait WorkerProviderV1 {
     fn next_turn(
         &mut self,
         request: WorkerProviderRequestV1,
-        cancellation: &WorkerHarnessRunV1,
+        cancellation: &WorkerProviderCancellationV1,
     ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1>;
 }
 
@@ -216,7 +235,6 @@ pub(crate) trait WorkerProviderV1 {
 pub(crate) struct WorkerStepProjectionV1 {
     pub(crate) operation: String,
     pub(crate) semantic_intent: String,
-    pub(crate) input_revision: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -272,6 +290,7 @@ pub(crate) struct WorkerProviderRequestV1 {
     pub(crate) workspace: WorkerWorkspaceProjectionV1,
     pub(crate) tools: Vec<WorkerToolSchemaV1>,
     pub(crate) history: Vec<WorkerTurnRecordV1>,
+    pub(crate) completion_contract: serde_json::Value,
 }
 
 struct WorkerRunInputV1 {
@@ -289,33 +308,49 @@ impl WorkerTurnAssemblerV1 {
         catalog: &WorkerToolCatalogV1,
         session: &WorkerSessionLogV1,
     ) -> WorkerProviderRequestV1 {
+        let operation = input.grant.operation;
         WorkerProviderRequestV1 {
             system_instructions: format!(
                 "{WORKER_HARNESS_VERSION}: {}",
                 concat!(
-                    "You are a Pastey Worker for one already-approved same-Host Transform or Execute step. ",
-                    "Choose HOW only through the displayed resource tools. You receive bounded ",
-                    "observations, not filesystem paths or Host handles. You cannot claim work, ",
-                    "choose Hosts, create Transfer, change topology, grant authority, register ",
-                    "lineage, use a terminal, select an executable, spawn outside the displayed ",
-                    "contained process entrypoint, or use a network. Tool availability ",
-                    "does not guarantee that Host enforcement will allow the requested effect."
+                    "You are a Pastey Worker for one authorized Transform or Execute step. ",
+                    "Choose HOW only through the displayed semantic tools and resource aliases. ",
+                    "You receive bounded observations and cannot expand the displayed tools. ",
+                    "Tool availability does not guarantee that a requested effect will succeed."
                 )
             ),
             step: WorkerStepProjectionV1 {
-                operation: match input.grant.operation {
+                operation: match operation {
                     crate::effect_authority::ManagedSemanticOperationV1::Transform => "transform",
                     crate::effect_authority::ManagedSemanticOperationV1::Execute => "execute",
                 }
                 .into(),
                 semantic_intent: input.grant.operation_intent.clone(),
-                input_revision: input.grant.access.context.input_revisions[0].revision,
             },
             workspace: catalog.workspace_projection(),
             tools: catalog.schemas(),
             history: session.visible_turns(),
+            completion_contract: worker_completion_contract(operation),
         }
     }
+}
+
+fn worker_completion_contract(
+    operation: crate::effect_authority::ManagedSemanticOperationV1,
+) -> serde_json::Value {
+    let response = match operation {
+        crate::effect_authority::ManagedSemanticOperationV1::Transform => {
+            WorkerProviderResponseV1::Final {
+                output_selector: "<output-relative-selector>".into(),
+                display_name: "<display-name>".into(),
+                media_type: "<media-type>".into(),
+            }
+        }
+        crate::effect_authority::ManagedSemanticOperationV1::Execute => {
+            WorkerProviderResponseV1::FinalExecute
+        }
+    };
+    serde_json::to_value(response).expect("Worker completion contract serializes")
 }
 
 struct WorkerSessionLogV1 {
@@ -782,10 +817,11 @@ impl WorkerRunControllerV1 {
         let mut sequence = 0;
         let mut output_writes = BTreeMap::<String, EffectEvidenceV1>::new();
         let mut last_successful_process: Option<EffectEvidenceV1> = None;
+        let provider_cancellation = cancellation.provider_cancellation();
         for _ in 0..self.limits.max_turns {
             ensure_worker_active(runtime, &input, cancellation)?;
             let request = WorkerTurnAssemblerV1::assemble(&input, &catalog, &session);
-            match provider.next_turn(request, cancellation) {
+            match provider.next_turn(request, &provider_cancellation) {
                 Err(error)
                     if error.kind == WorkerProviderErrorKindV1::Retryable
                         && retries < self.limits.max_provider_retries =>

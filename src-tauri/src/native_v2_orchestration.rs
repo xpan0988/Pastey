@@ -4845,7 +4845,7 @@ mod tests {
         models::{BridgePeerJoinMethod, BridgePeerLiveness, LocalRole, StoredBridgePeerEndpoint},
         storage,
         worker_harness::{
-            WorkerHarnessRunV1, WorkerProviderErrorV1, WorkerProviderResponseV1,
+            WorkerProviderCancellationV1, WorkerProviderErrorV1, WorkerProviderResponseV1,
             WorkerProviderTurnV1, WorkerProviderV1, WorkerResourceAliasV1, WorkerToolCallV1,
         },
         worker_provider_config::{WorkerProviderConfigWriteV1, WorkerProviderSelectionV1},
@@ -5459,7 +5459,7 @@ mod tests {
         fn next_turn(
             &mut self,
             _request: crate::worker_harness::WorkerProviderRequestV1,
-            _cancellation: &WorkerHarnessRunV1,
+            _cancellation: &WorkerProviderCancellationV1,
         ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
             Ok(WorkerProviderTurnV1::scripted(
                 self.responses

@@ -134,7 +134,7 @@ impl WorkerWorkspaceProjectionV1 {
         Self {
             schema_version: MANAGED_WORKSPACE_VERSION.into(),
             resources,
-            projection_ref: format!("test-input-output-workspace-projection:{has_output}"),
+            projection_ref: format!("/Users/private/workspace/projection:{has_output}"),
         }
     }
 }
