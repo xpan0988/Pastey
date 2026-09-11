@@ -15,6 +15,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
@@ -27,7 +28,8 @@ use crate::{
     },
     error::{AppError, AppResult},
     managed_objects::{
-        ManagedObjectAcquisition, ManagedObjectBindingService, ResolvedManagedArtifact,
+        ManagedArtifactIdentityV1, ManagedObjectAcquisition, ManagedObjectBindingService,
+        ResolvedManagedArtifact,
     },
     safe_file_identity::{self, SourceIdentity},
 };
@@ -85,6 +87,8 @@ pub(crate) struct SealedOutputEvidenceV1 {
     pub(crate) generation: u64,
     pub(crate) content_digest: String,
     pub(crate) bytes: u64,
+    pub(crate) representation: crate::managed_objects::ManagedArtifactRepresentationV1,
+    pub(crate) entry_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +136,7 @@ enum HostResourceBackingV1 {
         root: PathBuf,
         files: HashMap<String, PrivateFileV1>,
         quota_bytes: u64,
+        root_sealed: bool,
     },
     Scratch {
         owner: ExactOwnerV1,
@@ -223,6 +228,33 @@ impl ManagedResourceResolverV1 {
             acquisition,
             artifact,
         )
+    }
+
+    /// Derives the existing generation precondition from Host-private tracked
+    /// output state. The Worker never receives or supplies this token.
+    pub(crate) fn output_replace_precondition(
+        &self,
+        access: &ManagedResourceAccessV1,
+        handle_ref: &ResourceHandleRefV1,
+        selector: &str,
+    ) -> AppResult<EffectPreconditionV1> {
+        validate_managed_resource_selector(selector)?;
+        let backing = self
+            .backings
+            .get(handle_ref)
+            .ok_or_else(|| AppError::InvalidInput("Output slot backing is unavailable.".into()))?;
+        validate_owner(backing.owner(), access)?;
+        let HostResourceBackingV1::OutputSlot { files, .. } = backing else {
+            return invalid("Replace preconditions require an OutputSlot.");
+        };
+        let file = files.get(selector).ok_or_else(|| {
+            AppError::InvalidInput("Output slot replace target is unavailable.".into())
+        })?;
+        Ok(EffectPreconditionV1::ResourceGeneration {
+            handle_ref: handle_ref.clone(),
+            generation: file.generation,
+            digest: file.identity.digest.clone(),
+        })
     }
 
     pub(crate) fn workspace_identity_ref(
@@ -335,7 +367,7 @@ impl ManagedResourceResolverV1 {
         let bytes = safe_file_identity::read_source_if_identity_matches(
             &artifact.path,
             &artifact.scope_root,
-            &artifact.identity,
+            artifact.identity.regular_file()?,
             spec.quota_bytes,
         )?;
         let file = write_private_file(&root, &spec.initial_selector, None, &bytes, 1)?;
@@ -402,6 +434,7 @@ impl ManagedResourceResolverV1 {
                 root,
                 files: HashMap::new(),
                 quota_bytes,
+                root_sealed: false,
             },
             ResourceKindV1::Scratch => HostResourceBackingV1::Scratch {
                 owner: owner(access)?,
@@ -502,10 +535,107 @@ impl ManagedResourceResolverV1 {
         access: &ManagedResourceAccessV1,
         handle_ref: &ResourceHandleRefV1,
         relative_selector: &str,
-        evidence: &EffectEvidenceV1,
+        evidence: &[EffectEvidenceV1],
     ) -> AppResult<SealedOutputEvidenceV1> {
         validate_attachment(authority, access, handle_ref, ResourceKindV1::OutputSlot)?;
         validate_managed_resource_selector(relative_selector)?;
+        let backing = self
+            .backings
+            .get_mut(handle_ref)
+            .ok_or_else(|| AppError::InvalidInput("Output slot backing is unavailable.".into()))?;
+        validate_owner(backing.owner(), access)?;
+        let HostResourceBackingV1::OutputSlot {
+            root,
+            files,
+            root_sealed,
+            ..
+        } = backing
+        else {
+            return invalid("Only OutputSlot resources may be sealed.");
+        };
+        if relative_selector == "." {
+            if *root_sealed {
+                return invalid("Output slot root is already sealed.");
+            }
+            let observed = scan_regular_tree(
+                root,
+                files.values().map(|file| file.identity.byte_count).sum(),
+            )?;
+            if observed.is_empty() || observed.len() != files.len() {
+                return invalid(
+                    "Output slot root is empty, changed, or contains an untracked file.",
+                );
+            }
+            let mut evidence_ids = Vec::new();
+            for (selector, identity) in &observed {
+                let file = files.get_mut(selector).ok_or_else(|| {
+                    AppError::InvalidInput("Output slot root contains an untracked file.".into())
+                })?;
+                let matching = evidence
+                    .iter()
+                    .find(|candidate| file.last_request_id.as_ref() == Some(&candidate.request_id))
+                    .ok_or_else(|| {
+                        AppError::InvalidInput(
+                            "Output slot root lacks terminal evidence for a file.".into(),
+                        )
+                    })?;
+                authority.validate_terminal_resource_evidence(
+                    matching,
+                    handle_ref,
+                    &access.envelope_ref,
+                    &access.run_control_ref,
+                    &access.context.context_ref()?,
+                )?;
+                let facts_match = matches!(&matching.facts, EffectFactsV1::Resource { generation, content_digest, bytes, .. } if *generation == file.generation && content_digest == &identity.digest && *bytes == identity.byte_count);
+                if file.sealed || file.identity != *identity || !facts_match {
+                    return invalid(
+                        "Output slot root generation or evidence is stale or mismatched.",
+                    );
+                }
+                file.sealed = true;
+                evidence_ids.push(matching.evidence_id.as_str().to_owned());
+            }
+            let digest = crate::safe_file_identity::regular_file_set_digest(&observed)?;
+            let bytes = observed.values().map(|identity| identity.byte_count).sum();
+            let seal_ref = domain_hash(
+                "pastey-output-slot-regular-file-set-seal-v1",
+                &(
+                    handle_ref.as_str(),
+                    &evidence_ids,
+                    &digest,
+                    bytes,
+                    observed.len(),
+                ),
+            )?;
+            *root_sealed = true;
+            return Ok(SealedOutputEvidenceV1 {
+                contract_version: RESOURCE_RESOLUTION_VERSION.into(),
+                seal_ref,
+                evidence_id: evidence_ids.join(","),
+                envelope_ref: access.envelope_ref.clone(),
+                run_control_ref: access.run_control_ref.clone(),
+                context_ref: access.context.context_ref()?,
+                handle_ref: handle_ref.clone(),
+                relative_selector: ".".into(),
+                generation: 0,
+                content_digest: digest,
+                bytes,
+                representation:
+                    crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet,
+                entry_count: observed.len() as u64,
+            });
+        }
+        let evidence = evidence
+            .iter()
+            .find(|candidate| {
+                files
+                    .get(relative_selector)
+                    .and_then(|file| file.last_request_id.as_ref())
+                    == Some(&candidate.request_id)
+            })
+            .ok_or_else(|| {
+                AppError::InvalidInput("Output slot generation lacks terminal evidence.".into())
+            })?;
         authority.validate_terminal_resource_evidence(
             evidence,
             handle_ref,
@@ -513,14 +643,6 @@ impl ManagedResourceResolverV1 {
             &access.run_control_ref,
             &access.context.context_ref()?,
         )?;
-        let backing = self
-            .backings
-            .get_mut(handle_ref)
-            .ok_or_else(|| AppError::InvalidInput("Output slot backing is unavailable.".into()))?;
-        validate_owner(backing.owner(), access)?;
-        let HostResourceBackingV1::OutputSlot { root, files, .. } = backing else {
-            return invalid("Only OutputSlot resources may be sealed.");
-        };
         let file = files.get_mut(relative_selector).ok_or_else(|| {
             AppError::InvalidInput("Output slot generation is unavailable.".into())
         })?;
@@ -568,6 +690,8 @@ impl ManagedResourceResolverV1 {
             generation: file.generation,
             content_digest: observed.digest,
             bytes: observed.byte_count,
+            representation: crate::managed_objects::ManagedArtifactRepresentationV1::RegularFile,
+            entry_count: 1,
         })
     }
 
@@ -597,6 +721,55 @@ impl ManagedResourceResolverV1 {
         let HostResourceBackingV1::OutputSlot { root, files, .. } = backing else {
             return invalid("Transform lineage requires an OutputSlot.");
         };
+        if seal.representation
+            == crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet
+        {
+            if seal.relative_selector != "." {
+                return invalid("Regular-file-set seal must name the OutputSlot root.");
+            }
+            let observed = scan_regular_tree(
+                root,
+                files.values().map(|file| file.identity.byte_count).sum(),
+            )?;
+            let digest = crate::safe_file_identity::regular_file_set_digest(&observed)?;
+            let bytes = observed
+                .values()
+                .map(|identity| identity.byte_count)
+                .sum::<u64>();
+            if observed.len() as u64 != seal.entry_count
+                || digest != seal.content_digest
+                || bytes != seal.bytes
+                || observed.len() != files.len()
+                || files
+                    .values()
+                    .any(|file| !file.sealed || file.lineage_registered)
+            {
+                return invalid(
+                    "Sealed regular-file-set identity is stale, reused, or mismatched.",
+                );
+            }
+            let acquisition = objects.register_core_transform_revision(
+                crate::managed_objects::HostArtifactAcquisition {
+                    kind: crate::managed_objects::ManagedObjectAcquisitionKind::GeneratedArtifact,
+                    source_ref: seal.seal_ref.clone(),
+                    bridge_id: Some(access.context.bridge_id.clone()),
+                    path: root.clone(),
+                    scope_root: root.clone(),
+                    display_name,
+                    media_type,
+                    expires_at,
+                    app_owned_temporary: true,
+                },
+                logical_object_id,
+                output_revision,
+                seal.content_digest.clone(),
+                access.current.now,
+            )?;
+            for file in files.values_mut() {
+                file.lineage_registered = true;
+            }
+            return Ok(acquisition);
+        }
         let file = files.get_mut(&seal.relative_selector).ok_or_else(|| {
             AppError::InvalidInput("Sealed output generation is unavailable.".into())
         })?;
@@ -673,7 +846,7 @@ impl ManagedResourceResolverV1 {
                     safe_file_identity::read_source_if_identity_matches(
                         &artifact.path,
                         &artifact.scope_root,
-                        &artifact.identity,
+                        artifact.identity.regular_file()?,
                         *maximum_bytes,
                     )?;
                     (artifact.path, *maximum_bytes)
@@ -824,7 +997,7 @@ impl ManagedResourceResolverV1 {
                 safe_file_identity::read_source_if_identity_matches(
                     &artifact.path,
                     &artifact.scope_root,
-                    &artifact.identity,
+                    artifact.identity.regular_file()?,
                     *maximum_bytes,
                 )?;
                 Ok(BTreeMap::new())
@@ -1009,18 +1182,58 @@ impl ManagedResourceResolverV1 {
                 maximum_bytes,
                 ..
             } => {
-                if effect.relative_selector != "." {
-                    return invalid("ManagedRevisionHandle resolves only its exact revision root.");
-                }
                 let artifact = objects.resolve(acquisition, now)?;
-                let bytes = safe_file_identity::read_source_if_identity_matches(
-                    &artifact.path,
-                    &artifact.scope_root,
-                    &artifact.identity,
-                    *maximum_bytes,
-                )?;
-                let digest = artifact.identity.digest;
-                (bytes, 1, digest)
+                match &artifact.identity {
+                    ManagedArtifactIdentityV1::RegularFile(identity) => {
+                        if effect.relative_selector != "." {
+                            return invalid("Scalar ManagedRevisionHandle resolves only its exact revision root.");
+                        }
+                        let bytes = safe_file_identity::read_source_if_identity_matches(
+                            &artifact.path,
+                            &artifact.scope_root,
+                            identity,
+                            *maximum_bytes,
+                        )?;
+                        (bytes, 1, identity.digest.clone())
+                    }
+                    ManagedArtifactIdentityV1::RegularFileSet(file_set) => {
+                        if effect.relative_selector == "." {
+                            if effect.verb != ResourceVerbV1::Inspect {
+                                return invalid("A regular-file-set root is inspectable but not readable as a file.");
+                            }
+                            let mut entries = file_set.files.iter().map(|(selector, identity)| {
+                                json!({"selector": selector, "bytes": identity.byte_count, "contentDigest": identity.digest})
+                            }).collect::<Vec<_>>();
+                            let mut truncated = false;
+                            let bytes = loop {
+                                let value = json!({"representation":"regular_file_set","entries":entries,"truncated":truncated});
+                                let bytes = serde_json::to_vec(&value)?;
+                                if bytes.len() as u64 <= *maximum_bytes || entries.is_empty() {
+                                    break bytes;
+                                }
+                                entries.pop();
+                                truncated = true;
+                            };
+                            (bytes, 1, file_set.digest.clone())
+                        } else {
+                            let identity = file_set
+                                .files
+                                .get(&effect.relative_selector)
+                                .ok_or_else(|| {
+                                    AppError::InvalidInput(
+                                        "Managed regular-file-set selector is unavailable.".into(),
+                                    )
+                                })?;
+                            let bytes = safe_file_identity::read_source_if_identity_matches(
+                                &artifact.path.join(&effect.relative_selector),
+                                &artifact.path,
+                                identity,
+                                *maximum_bytes,
+                            )?;
+                            (bytes, 1, identity.digest.clone())
+                        }
+                    }
+                }
             }
             HostResourceBackingV1::Workspace {
                 acquisition,
@@ -1089,6 +1302,15 @@ impl ManagedResourceResolverV1 {
             .expect("validated backing");
         if let HostResourceBackingV1::Workspace { acquisition, .. } = backing {
             objects.resolve(acquisition, now)?;
+        }
+        if matches!(
+            backing,
+            HostResourceBackingV1::OutputSlot {
+                root_sealed: true,
+                ..
+            }
+        ) {
+            return invalid("A root-sealed OutputSlot cannot be mutated.");
         }
         let (root, files, quota_bytes) = match backing {
             HostResourceBackingV1::ManagedRevision { .. } => {
@@ -1314,8 +1536,8 @@ fn identity_ref(
             acquisition.object.revision,
             &acquisition.object.host_ref,
             &acquisition.binding.binding_ref,
-            &artifact.identity.digest,
-            artifact.identity.byte_count,
+            artifact.identity.digest(),
+            artifact.identity.byte_count(),
         ),
     )
 }
@@ -2536,7 +2758,7 @@ mod tests {
                 &fixture.access,
                 &fixture.output,
                 "result.bin",
-                &evidence,
+                std::slice::from_ref(&evidence),
             )
             .unwrap();
         assert_eq!(sealed.generation, 1);
@@ -2545,6 +2767,99 @@ mod tests {
         assert!(!encoded.contains("logicalObjectId"));
         assert!(!encoded.contains("outputRevision"));
         assert!(!encoded.contains(fixture.root.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn output_slot_root_seals_the_complete_regular_file_set() {
+        let mut fixture = fixture();
+        fixture
+            .resolver
+            .provision_output_slot(&fixture.authority, &fixture.access, &fixture.output, 4096)
+            .unwrap();
+        let mut evidence = Vec::new();
+        for (sequence, (selector, bytes)) in [
+            ("Cargo.toml", b"[package]".as_slice()),
+            ("src/main.rs", b"fn main() {}".as_slice()),
+            ("src/lib.rs", b"pub fn x() {}".as_slice()),
+            ("tests/integration.rs", b"#[test] fn x() {}".as_slice()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let digest = digest_bytes(bytes);
+            fixture
+                .resolver
+                .stage_write_payload(
+                    &fixture.authority,
+                    &fixture.access,
+                    &fixture.output,
+                    &digest,
+                    bytes.to_vec(),
+                )
+                .unwrap();
+            let request = request(
+                &fixture,
+                sequence as u64,
+                ResourceVerbV1::Create,
+                fixture.output.clone(),
+                selector,
+                Some(digest),
+                vec![],
+                request_budget(0, 256),
+            );
+            evidence.push(enforce(&mut fixture, &request));
+        }
+        let sealed = fixture
+            .resolver
+            .seal_output_slot(
+                &fixture.authority,
+                &fixture.access,
+                &fixture.output,
+                ".",
+                &evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            sealed.representation,
+            crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet
+        );
+        assert_eq!(sealed.entry_count, 4);
+        assert!(fixture
+            .resolver
+            .seal_output_slot(
+                &fixture.authority,
+                &fixture.access,
+                &fixture.output,
+                ".",
+                &evidence
+            )
+            .is_err());
+        let bytes = b"later".to_vec();
+        let digest = digest_bytes(&bytes);
+        fixture
+            .resolver
+            .stage_write_payload(
+                &fixture.authority,
+                &fixture.access,
+                &fixture.output,
+                &digest,
+                bytes,
+            )
+            .unwrap();
+        let request = request(
+            &fixture,
+            4,
+            ResourceVerbV1::Create,
+            fixture.output.clone(),
+            "later.txt",
+            Some(digest),
+            vec![],
+            request_budget(0, 256),
+        );
+        assert_eq!(
+            enforce(&mut fixture, &request).decision,
+            EffectDecisionV1::Denied
+        );
     }
 
     #[test]
@@ -2607,7 +2922,7 @@ mod tests {
                 &fixture.access,
                 &fixture.scratch,
                 "scratch.txt",
-                &evidence,
+                std::slice::from_ref(&evidence),
             )
             .is_err());
     }

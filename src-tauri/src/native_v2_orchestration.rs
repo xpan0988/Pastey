@@ -1867,7 +1867,7 @@ fn execute_authored_search(
         host.clone(),
         runtime.local_host_ref.clone(),
         Some(output.clone()),
-        Some(artifact.identity.digest),
+        Some(artifact.identity.digest().to_owned()),
         None,
         now,
     )
@@ -1901,6 +1901,9 @@ async fn execute_authored_transfer(
         now,
     )?;
     let artifact = runtime.managed_objects.lock().resolve(&acquisition, now)?;
+    if artifact.identity.regular_file_set().is_some() {
+        return invalid("Regular-file-set Transfer is unsupported by the current transport.");
+    }
     let master_key = {
         let config = runtime.config.read();
         crate::config::master_key(&config)?
@@ -1932,7 +1935,7 @@ async fn execute_authored_transfer(
         source_host_ref: source_host,
         destination_host_ref: destination_host,
         object: input.clone(),
-        content_digest: artifact.identity.digest.clone(),
+        content_digest: artifact.identity.digest().to_owned(),
         expires_at: approval.expires_at,
     };
     let transfer_result =
@@ -1957,7 +1960,7 @@ async fn execute_authored_transfer(
         source.clone(),
         runtime.local_host_ref.clone(),
         Some(input.clone()),
-        Some(artifact.identity.digest),
+        Some(artifact.identity.digest().to_owned()),
         None,
         crate::storage::now_ts(),
     )
@@ -5436,6 +5439,7 @@ mod tests {
                     WorkerProviderResponseV1::ToolCall {
                         call: WorkerToolCallV1::Read {
                             resource: WorkerResourceAliasV1::Input,
+                            relative_selector: ".".into(),
                         },
                     },
                     WorkerProviderResponseV1::ToolCall {

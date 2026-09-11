@@ -1931,6 +1931,7 @@ mod tests {
                 Ok(WorkerProviderResponseV1::ToolCall {
                     call: WorkerToolCallV1::Read {
                         resource: WorkerResourceAliasV1::Input,
+                        relative_selector: ".".into(),
                     },
                 }),
                 Ok(WorkerProviderResponseV1::ToolCall {

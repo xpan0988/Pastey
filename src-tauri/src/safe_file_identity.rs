@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::{Component, Path},
@@ -43,6 +44,148 @@ pub(crate) struct SourceIdentity {
     pub(crate) digest: String,
     pub(crate) byte_count: u64,
     pub(crate) fingerprint: SourceFingerprint,
+}
+
+/// Host-private identity for a bounded tree of regular files.  This is a
+/// representation helper, not a managed-object or authority primitive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RegularFileSetIdentity {
+    pub(crate) files: BTreeMap<String, SourceIdentity>,
+    pub(crate) digest: String,
+    pub(crate) byte_count: u64,
+}
+
+/// The one selector contract shared by managed resources and managed-object
+/// file-set acquisition.  It deliberately admits only portable relative file
+/// selectors (and the resource-root selector `.`).
+pub(crate) fn validate_managed_selector(selector: &str) -> AppResult<()> {
+    if selector.is_empty()
+        || selector.len() > 512
+        || selector.contains('\0')
+        || selector.contains('\\')
+        || selector.to_ascii_lowercase().starts_with("file:")
+    {
+        return Err(AppError::InvalidInput(
+            "Managed resource selector is invalid.".into(),
+        ));
+    }
+    if selector == "." {
+        return Ok(());
+    }
+    let path = Path::new(selector);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(AppError::InvalidInput(
+            "Managed resource selector must be normalized and relative.".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn capture_regular_file_set_identity(
+    root: &Path,
+    maximum_bytes: u64,
+) -> AppResult<RegularFileSetIdentity> {
+    let root_metadata = fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(AppError::InvalidInput(
+            "Managed regular-file-set root must be a safe directory.".into(),
+        ));
+    }
+    let canonical_root = root.canonicalize()?;
+    let mut pending = vec![canonical_root.clone()];
+    let mut files = BTreeMap::new();
+    let mut total = 0_u64;
+    while let Some(directory) = pending.pop() {
+        let metadata = fs::symlink_metadata(&directory)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || !directory.starts_with(&canonical_root)
+        {
+            return Err(AppError::InvalidInput(
+                "Managed regular-file-set directory is unsafe.".into(),
+            ));
+        }
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(AppError::InvalidInput(
+                    "Managed regular-file-set contains a symlink or reparse point.".into(),
+                ));
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !metadata.is_file() {
+                return Err(AppError::InvalidInput(
+                    "Managed regular-file-set contains a special file.".into(),
+                ));
+            }
+            let relative = path.strip_prefix(&canonical_root).map_err(|_| {
+                AppError::InvalidInput("Managed regular-file-set escaped its root.".into())
+            })?;
+            let selector = relative
+                .components()
+                .map(|component| {
+                    component.as_os_str().to_str().ok_or_else(|| {
+                        AppError::InvalidInput(
+                            "Managed regular-file-set selector is not portable UTF-8.".into(),
+                        )
+                    })
+                })
+                .collect::<AppResult<Vec<_>>>()?
+                .join("/");
+            validate_managed_selector(&selector)?;
+            let remaining = maximum_bytes.saturating_sub(total);
+            let identity = capture_source_identity(&path, &canonical_root, remaining)?;
+            total = total.checked_add(identity.byte_count).ok_or_else(|| {
+                AppError::InvalidInput("Managed regular-file-set quota overflowed.".into())
+            })?;
+            if total > maximum_bytes || files.insert(selector, identity).is_some() {
+                return Err(AppError::InvalidInput(
+                    "Managed regular-file-set exceeds its quota or aliases a selector.".into(),
+                ));
+            }
+        }
+    }
+    if files.is_empty() {
+        return Err(AppError::InvalidInput(
+            "Managed regular-file-set must contain a regular file.".into(),
+        ));
+    }
+    let digest = regular_file_set_digest(&files)?;
+    Ok(RegularFileSetIdentity {
+        files,
+        digest,
+        byte_count: total,
+    })
+}
+
+pub(crate) fn regular_file_set_digest(
+    files: &BTreeMap<String, SourceIdentity>,
+) -> AppResult<String> {
+    if files.is_empty() {
+        return Err(AppError::InvalidInput(
+            "Managed regular-file-set must contain a regular file.".into(),
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"pastey-managed-regular-file-set-v1\0");
+    for (selector, identity) in files {
+        validate_managed_selector(selector)?;
+        hasher.update(&(selector.len() as u64).to_be_bytes());
+        hasher.update(selector.as_bytes());
+        hasher.update(&(identity.digest.len() as u64).to_be_bytes());
+        hasher.update(identity.digest.as_bytes());
+        hasher.update(&identity.byte_count.to_be_bytes());
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

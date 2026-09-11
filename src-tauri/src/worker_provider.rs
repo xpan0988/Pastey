@@ -591,7 +591,8 @@ mod tests {
             turn.response,
             WorkerProviderResponseV1::ToolCall {
                 call: WorkerToolCallV1::Read {
-                    resource: WorkerResourceAliasV1::Input
+                    resource: WorkerResourceAliasV1::Input,
+                    ..
                 }
             }
         ));
@@ -729,6 +730,7 @@ mod tests {
                 response: Some(WorkerProviderResponseV1::ToolCall {
                     call: WorkerToolCallV1::Read {
                         resource: WorkerResourceAliasV1::Input,
+                        relative_selector: ".".into(),
                     },
                 }),
                 observation: Some(WorkerObservationV1::Resource {

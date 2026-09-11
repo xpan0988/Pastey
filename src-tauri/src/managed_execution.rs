@@ -1693,6 +1693,9 @@ mod tests {
                 ".",
             )
             .is_err());
+        // Selector shape is revalidated by the managed-resource backing: the
+        // projection admits it for a possible regular-file-set input, while a
+        // scalar ManagedRevision rejects it at read enforcement.
         assert!(grant
             .workspace
             .resolve(
@@ -1702,7 +1705,7 @@ mod tests {
                 crate::managed_workspace::WorkerWorkspaceOperationV1::Read,
                 "child.txt",
             )
-            .is_err());
+            .is_ok());
         let mut widened = projection.clone();
         widened.resources[0]
             .operations
@@ -1940,7 +1943,7 @@ mod tests {
                 &grant.access,
                 grant.output_slot.as_ref().unwrap(),
                 "result.txt",
-                evidence.last().unwrap(),
+                std::slice::from_ref(evidence.last().unwrap()),
             )
             .unwrap();
         drop(objects);
@@ -2019,6 +2022,7 @@ mod tests {
                 Ok(WorkerProviderResponseV1::ToolCall {
                     call: WorkerToolCallV1::Read {
                         resource: WorkerResourceAliasV1::Input,
+                        relative_selector: ".".into(),
                     },
                 }),
                 Ok(WorkerProviderResponseV1::ToolCall {
@@ -2143,6 +2147,7 @@ mod tests {
                 Ok(WorkerProviderResponseV1::ToolCall {
                     call: WorkerToolCallV1::Read {
                         resource: WorkerResourceAliasV1::Input,
+                        relative_selector: ".".into(),
                     },
                 }),
                 Err(WorkerProviderErrorV1 {

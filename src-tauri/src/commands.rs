@@ -2437,7 +2437,7 @@ fn bind_legacy_v1_managed_object(
         size_bytes: artifact.size_bytes,
         logical_object_id: "selected_file".into(),
         revision: 1,
-        identity: artifact.identity,
+        identity: artifact.identity.regular_file()?.clone(),
         app_owned_temporary: artifact.app_owned_temporary,
     })
 }
