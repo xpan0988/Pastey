@@ -141,7 +141,9 @@ Provider sampling and context overflow have separate bounded retry policies. Com
 
 The minimal Worker Context Contract is implemented at the existing `WorkerProviderRequestV1` seam rather than as a new subsystem. For one claimed Transform or Execute, the model receives only the semantic operation and intent, bounded workspace aliases/roles/operations/relative-selector facts, the corresponding semantic tool schemas, bounded history, and the exact operation-specific final-response template. Numeric input revision, approval lifecycle wording, physical bindings, raw filesystem paths, whole-Plan topology, sessions/routes, credentials, Host-selection data, and authority handles remain outside the provider payload. Internal revision correlation remains unchanged in Core/Host authority and finalization.
 
-This closure does not complete General Semantic Transform. Input display name, media type, byte size, binary or multimodal/chunked resource access, semantic runtime labels, richer approved output specifications, cross-representation Transform behavior, and generic process capability discovery remain deferred.
+GST-1 extends the Host-private managed revision binding without changing `ManagedObjectRevisionV2`: an authoritative same-Host revision may be either one regular file or one bounded regular-file-set rooted at a private directory. A file set is a canonical ordered set of normalized relative selectors with per-file digest/byte facts and a Host-derived aggregate digest; symlinks/reparse points, special files, empty directories, executable modes, arbitrary metadata, and ambient filesystem state are not represented. Worker inspect/read remains alias- and selector-based, and `final { output_selector: "." }` seals the complete tracked OutputSlot file set before Core registers N+1.
+
+This does not complete General Semantic Transform across Hosts or process worlds. Regular-file-set Transfer encoding, full tree Execute acceptance, specialist-agent delegation, multimodal/binary generalized access, semantic runtime labels, and richer approved output specifications remain deferred. Scalar Transfer remains unchanged and rejects a file-set revision until GST-2 supplies an exact transport representation.
 
 ## Provider and runtime configuration boundaries
 
@@ -183,7 +185,7 @@ A Host returns a bounded correlated result only after local authoritative comple
 
 Bridge Device Check reuses this path for its fixed production Managed E2E self-check: explicit user intent creates one ordinary `Search @ requester → authored Transfer → Execute @ exact remote Host` revision and approval, then uses the same readiness, admission, Worker, EffectEnvelope, ExecutionWorld, and Core finalization. It does not require renderer Draft origination or topology/product-result projections. Missing selected provider, runtime, or ExecutionWorld facts are a preflight `BLOCKED`, before this lifecycle starts; a real external-provider physical Mac ↔ Windows `PASS` remains pending validation. The renderer-safe report mechanics are owned by [Layer 2](layer-2-device-intelligence.md).
 
-Transform finalization seals one OutputSlot generation and registers N+1 at the same Host. Execute records only its result digest. Provider/model/Worker output is always non-authoritative.
+Transform finalization seals either one OutputSlot file generation or, for `output_selector: "."`, the complete tracked regular-file-set, then registers N+1 at the same Host. Execute records only its result digest. Provider/model/Worker output is always non-authoritative.
 
 ## Lifecycle and recovery
 

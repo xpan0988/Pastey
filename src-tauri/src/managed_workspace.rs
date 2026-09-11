@@ -356,7 +356,9 @@ fn project_resource(
         alias,
         kind,
         operations,
-        relative_selectors: grant.kind != ResourceKindV1::ManagedRevision,
+        // The resource resolver remains authoritative: scalar revisions still
+        // reject nested selectors, while regular-file-sets expose them.
+        relative_selectors: true,
     }
 }
 

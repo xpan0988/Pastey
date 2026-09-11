@@ -140,9 +140,13 @@ pub(crate) struct WorkerToolSchemaV1 {
 pub(crate) enum WorkerToolCallV1 {
     Inspect {
         resource: WorkerResourceAliasV1,
+        #[serde(default = "root_selector")]
+        relative_selector: String,
     },
     Read {
         resource: WorkerResourceAliasV1,
+        #[serde(default = "root_selector")]
+        relative_selector: String,
     },
     Create {
         relative_selector: String,
@@ -464,25 +468,36 @@ impl WorkerToolCatalogV1 {
             return self.prepare_process(authority, call);
         }
         let (tool_name, verb, handle_ref, selector, content, expects_read, operation) = match call {
-            WorkerToolCallV1::Inspect { resource } => (
+            WorkerToolCallV1::Inspect {
+                resource,
+                relative_selector,
+            } => (
                 "resource_inspect",
                 ResourceVerbV1::Inspect,
                 self.handle_for(
                     authority,
                     resource,
                     WorkerWorkspaceOperationV1::Inspect,
-                    ".",
+                    &relative_selector,
                 )?,
-                ".".into(),
+                relative_selector,
                 None,
                 true,
                 "inspect",
             ),
-            WorkerToolCallV1::Read { resource } => (
+            WorkerToolCallV1::Read {
+                resource,
+                relative_selector,
+            } => (
                 "resource_read",
                 ResourceVerbV1::Read,
-                self.handle_for(authority, resource, WorkerWorkspaceOperationV1::Read, ".")?,
-                ".".into(),
+                self.handle_for(
+                    authority,
+                    resource,
+                    WorkerWorkspaceOperationV1::Read,
+                    &relative_selector,
+                )?,
+                relative_selector,
                 None,
                 true,
                 "read",
@@ -673,17 +688,30 @@ impl EffectDispatchBridgeV1 {
                 AppError::InvalidInput("Worker process lowering returned no request.".into())
             })?
         } else {
-            lower_tool_request(
-                &descriptor,
-                prepared.tool_request.as_ref().ok_or_else(|| {
-                    AppError::InvalidInput("Worker resource tool request is unavailable.".into())
-                })?,
-            )?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                AppError::InvalidInput("Worker tool lowering returned no request.".into())
-            })?
+            let mut tool_request = prepared.tool_request.clone().ok_or_else(|| {
+                AppError::InvalidInput("Worker resource tool request is unavailable.".into())
+            })?;
+            for intent in &mut tool_request.intents {
+                if let EffectRequestKindV1::Resource(ResourceEffectV1 {
+                    verb: ResourceVerbV1::Replace,
+                    handle_ref,
+                    relative_selector,
+                    ..
+                }) = &intent.effect
+                {
+                    intent.preconditions = vec![resolver.output_replace_precondition(
+                        &grant.access,
+                        handle_ref,
+                        relative_selector,
+                    )?];
+                }
+            }
+            lower_tool_request(&descriptor, &tool_request)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    AppError::InvalidInput("Worker tool lowering returned no request.".into())
+                })?
         };
         if let Some(write) = &prepared.staged_write {
             resolver.stage_write_payload(
@@ -954,12 +982,20 @@ impl WorkerRunControllerV1 {
                             {
                                 return invalid("Execute Worker cannot submit a Transform result.");
                             }
-                            let evidence =
-                                output_writes.remove(&output_selector).ok_or_else(|| {
+                            let evidence = if output_selector == "." {
+                                if output_writes.is_empty() {
+                                    return invalid(
+                                        "Worker final proposal has no allowed output write.",
+                                    );
+                                }
+                                output_writes.values().cloned().collect::<Vec<_>>()
+                            } else {
+                                vec![output_writes.remove(&output_selector).ok_or_else(|| {
                                     AppError::InvalidInput(
                                         "Worker final proposal has no allowed output write.".into(),
                                     )
-                                })?;
+                                })?]
+                            };
                             let seal = {
                                 let authority = runtime.effect_authority.lock();
                                 runtime.managed_resources.lock().seal_output_slot(
@@ -1234,12 +1270,12 @@ fn worker_resource_schemas(projection: &WorkerWorkspaceProjectionV1) -> Vec<Work
         schema(
             "resource_inspect",
             "Inspect the bounded input or output resource.",
-            json!({"resource":{"enum":inspect_resources}}),
+            json!({"resource":{"enum":inspect_resources},"relative_selector":{"type":"string","default":"."}}),
         ),
         schema(
             "resource_read",
             "Read bounded text from the input or output resource.",
-            json!({"resource":{"enum":read_resources}}),
+            json!({"resource":{"enum":read_resources},"relative_selector":{"type":"string","default":"."}}),
         ),
     ];
     let create_resources = projection.resources_for(WorkerWorkspaceOperationV1::Create);
@@ -1317,6 +1353,10 @@ fn decode_content(value: &str) -> AppResult<Vec<u8>> {
     BASE64
         .decode(value)
         .map_err(|_| AppError::InvalidInput("Worker write content is not valid base64.".into()))
+}
+
+fn root_selector() -> String {
+    ".".into()
 }
 
 fn project_text(bytes: Vec<u8>) -> (Option<String>, bool) {
@@ -1511,6 +1551,7 @@ mod tests {
                     response: Some(WorkerProviderResponseV1::ToolCall {
                         call: WorkerToolCallV1::Read {
                             resource: WorkerResourceAliasV1::Input,
+                            relative_selector: ".".into(),
                         },
                     }),
                     observation: Some(WorkerObservationV1::Rejected {

@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     host_identity::HostRef,
-    safe_file_identity::{self, SourceIdentity},
+    safe_file_identity::{self, RegularFileSetIdentity, SourceIdentity},
     storage::MAX_FILE_SIZE_BYTES,
 };
 
@@ -31,6 +31,58 @@ pub(crate) enum ManagedObjectAcquisitionKind {
     LocalSelection,
     GeneratedArtifact,
     TransferReceipt,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ManagedArtifactRepresentationV1 {
+    RegularFile,
+    RegularFileSet,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedArtifactIdentityV1 {
+    RegularFile(SourceIdentity),
+    RegularFileSet(RegularFileSetIdentity),
+}
+
+impl ManagedArtifactIdentityV1 {
+    pub(crate) fn representation(&self) -> ManagedArtifactRepresentationV1 {
+        match self {
+            Self::RegularFile(_) => ManagedArtifactRepresentationV1::RegularFile,
+            Self::RegularFileSet(_) => ManagedArtifactRepresentationV1::RegularFileSet,
+        }
+    }
+
+    pub(crate) fn digest(&self) -> &str {
+        match self {
+            Self::RegularFile(value) => &value.digest,
+            Self::RegularFileSet(value) => &value.digest,
+        }
+    }
+
+    pub(crate) fn byte_count(&self) -> u64 {
+        match self {
+            Self::RegularFile(value) => value.byte_count,
+            Self::RegularFileSet(value) => value.byte_count,
+        }
+    }
+
+    pub(crate) fn regular_file(&self) -> AppResult<&SourceIdentity> {
+        match self {
+            Self::RegularFile(value) => Ok(value),
+            Self::RegularFileSet(_) => Err(AppError::InvalidInput(
+                "This operation does not support a regular-file-set managed revision.".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn regular_file_set(&self) -> Option<&RegularFileSetIdentity> {
+        match self {
+            Self::RegularFile(_) => None,
+            Self::RegularFileSet(value) => Some(value),
+        }
+    }
 }
 
 /// Rust-private physical input. The owning adapter/Core service supplies the
@@ -58,6 +110,7 @@ pub(crate) struct ManagedLogicalObjectRevision {
     pub(crate) size_bytes: u64,
     pub(crate) display_name: String,
     pub(crate) acquired_from: ManagedObjectAcquisitionKind,
+    pub(crate) representation: ManagedArtifactRepresentationV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -84,7 +137,7 @@ pub(crate) struct ResolvedManagedArtifact {
     pub(crate) display_name: String,
     pub(crate) media_type: String,
     pub(crate) size_bytes: u64,
-    pub(crate) identity: SourceIdentity,
+    pub(crate) identity: ManagedArtifactIdentityV1,
     pub(crate) app_owned_temporary: bool,
 }
 
@@ -93,6 +146,7 @@ struct RevisionClaim {
     host_ref: HostRef,
     content_digest: String,
     size_bytes: u64,
+    representation: ManagedArtifactRepresentationV1,
 }
 
 #[derive(Clone, Debug)]
@@ -271,12 +325,10 @@ impl ManagedObjectBindingService {
                 "Managed object binding is stale or mismatched.".into(),
             ));
         }
-        let observed = safe_file_identity::capture_source_identity(
-            &stored.artifact.path,
-            &stored.artifact.scope_root,
-            MAX_FILE_SIZE_BYTES,
-        )?;
-        if observed != stored.artifact.identity || observed.byte_count != stored.artifact.size_bytes
+        let observed =
+            capture_artifact_identity(&stored.artifact.path, &stored.artifact.scope_root)?;
+        if observed != stored.artifact.identity
+            || observed.byte_count() != stored.artifact.size_bytes
         {
             return Err(AppError::InvalidInput(
                 "Managed object artifact changed after binding.".into(),
@@ -360,16 +412,9 @@ impl ManagedObjectBindingService {
                 "Managed object artifact escaped its Host-local scope.".into(),
             ));
         }
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(AppError::InvalidInput(
-                "Managed object artifact must be a regular file.".into(),
-            ));
-        }
-        let identity =
-            safe_file_identity::capture_source_identity(&path, &scope_root, MAX_FILE_SIZE_BYTES)?;
+        let identity = capture_artifact_identity(&path, &scope_root)?;
         if let Some(expected) = expected_content_digest {
-            if identity.digest != expected {
+            if identity.digest() != expected {
                 return Err(AppError::InvalidInput(
                     "Transferred artifact does not match the logical revision.".into(),
                 ));
@@ -377,8 +422,9 @@ impl ManagedObjectBindingService {
         }
         let claim = RevisionClaim {
             host_ref: self.local_host_ref.clone(),
-            content_digest: identity.digest.clone(),
-            size_bytes: identity.byte_count,
+            content_digest: identity.digest().to_owned(),
+            size_bytes: identity.byte_count(),
+            representation: identity.representation(),
         };
         let key = (logical_object_id.clone(), revision);
         if self
@@ -396,9 +442,10 @@ impl ManagedObjectBindingService {
             revision,
             host_ref: self.local_host_ref.clone(),
             media_type: input.media_type.clone(),
-            size_bytes: identity.byte_count,
+            size_bytes: identity.byte_count(),
             display_name: input.display_name.clone(),
             acquired_from: input.kind,
+            representation: identity.representation(),
         };
         let binding = ManagedObjectSessionBinding {
             binding_ref: format!("{MANAGED_BINDING_PREFIX}{}", Uuid::new_v4()),
@@ -413,7 +460,7 @@ impl ManagedObjectBindingService {
             scope_root,
             display_name: input.display_name,
             media_type: input.media_type,
-            size_bytes: identity.byte_count,
+            size_bytes: identity.byte_count(),
             identity,
             app_owned_temporary: input.app_owned_temporary,
         };
@@ -513,6 +560,29 @@ fn validate_binding_ref(value: &str) -> AppResult<()> {
         ));
     }
     Ok(())
+}
+
+fn capture_artifact_identity(
+    path: &std::path::Path,
+    scope_root: &std::path::Path,
+) -> AppResult<ManagedArtifactIdentityV1> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(AppError::InvalidInput(
+            "Managed object artifact may not be a symlink or reparse point.".into(),
+        ));
+    }
+    if metadata.is_file() {
+        return safe_file_identity::capture_source_identity(path, scope_root, MAX_FILE_SIZE_BYTES)
+            .map(ManagedArtifactIdentityV1::RegularFile);
+    }
+    if metadata.is_dir() {
+        return safe_file_identity::capture_regular_file_set_identity(path, MAX_FILE_SIZE_BYTES)
+            .map(ManagedArtifactIdentityV1::RegularFileSet);
+    }
+    Err(AppError::InvalidInput(
+        "Managed object artifact must be a regular file or regular-file-set root.".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -695,6 +765,48 @@ mod tests {
         assert!(ManagedObjectBindingService::new(host("local"))
             .acquire_new(input, now)
             .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regular_file_set_identity_is_deterministic_and_revalidated() {
+        let now = crate::storage::now_ts();
+        let root = std::env::temp_dir().join(format!("pastey-managed-set-{}", Uuid::new_v4()));
+        let scope = root.join("scope");
+        let project = scope.join("project");
+        fs::create_dir_all(project.join("tests")).unwrap();
+        fs::write(project.join("main.py"), b"main").unwrap();
+        fs::write(project.join("utils.py"), b"utils").unwrap();
+        fs::write(project.join("tests/test_main.py"), b"test").unwrap();
+        let input = HostArtifactAcquisition {
+            kind: ManagedObjectAcquisitionKind::LocalSelection,
+            source_ref: "tree-test".into(),
+            bridge_id: Some("bridge".into()),
+            path: project.clone(),
+            scope_root: scope,
+            display_name: "project".into(),
+            media_type: "application/vnd.pastey.regular-file-set".into(),
+            expires_at: now + 600,
+            app_owned_temporary: false,
+        };
+        let mut binder = ManagedObjectBindingService::new(host("local"));
+        let acquired = binder.acquire_new(input, now).unwrap();
+        assert_eq!(
+            acquired.object.representation,
+            ManagedArtifactRepresentationV1::RegularFileSet
+        );
+        let resolved = binder.resolve(&acquired, now).unwrap();
+        let Some(set) = resolved.identity.regular_file_set() else {
+            panic!("expected set")
+        };
+        assert_eq!(set.files.len(), 3);
+        let first = set.digest.clone();
+        let reordered =
+            safe_file_identity::capture_regular_file_set_identity(&project, MAX_FILE_SIZE_BYTES)
+                .unwrap();
+        assert_eq!(first, reordered.digest);
+        fs::write(project.join("utils.py"), b"changed").unwrap();
+        assert!(binder.resolve(&acquired, now).is_err());
         let _ = fs::remove_dir_all(root);
     }
 }
