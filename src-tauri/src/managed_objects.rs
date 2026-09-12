@@ -40,6 +40,12 @@ pub(crate) enum ManagedArtifactRepresentationV1 {
     RegularFileSet,
 }
 
+impl Default for ManagedArtifactRepresentationV1 {
+    fn default() -> Self {
+        Self::RegularFile
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ManagedArtifactIdentityV1 {
     RegularFile(SourceIdentity),
@@ -382,6 +388,13 @@ impl ManagedObjectBindingService {
         self.bindings.clear();
         self.revisions.clear();
         count
+    }
+
+    /// Host-private rollback used when a receiver cannot durably record the
+    /// receipt that would make an otherwise valid temporary artifact usable.
+    pub(crate) fn discard_binding(&mut self, acquisition: &ManagedObjectAcquisition) {
+        self.bindings.remove(&acquisition.binding.binding_ref);
+        self.retain_claimed_revisions();
     }
 
     fn acquire(

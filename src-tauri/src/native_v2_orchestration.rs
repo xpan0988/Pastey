@@ -372,6 +372,10 @@ pub(crate) struct NativeV2TransferMetadataV1 {
     pub(crate) destination_host_ref: HostRef,
     pub(crate) object: ManagedObjectRevisionV2,
     pub(crate) content_digest: String,
+    #[serde(default)]
+    pub(crate) representation: crate::managed_objects::ManagedArtifactRepresentationV1,
+    #[serde(default)]
+    pub(crate) logical_byte_count: u64,
     pub(crate) expires_at: i64,
 }
 
@@ -1901,22 +1905,50 @@ async fn execute_authored_transfer(
         now,
     )?;
     let artifact = runtime.managed_objects.lock().resolve(&acquisition, now)?;
-    if artifact.identity.regular_file_set().is_some() {
-        return invalid("Regular-file-set Transfer is unsupported by the current transport.");
-    }
     let master_key = {
         let config = runtime.config.read();
         crate::config::master_key(&config)?
     };
-    let item = crate::storage::create_outgoing_file_item_with_metadata(
+    let representation = artifact.identity.representation();
+    let package_path = match artifact.identity.regular_file_set() {
+        Some(identity) => Some(crate::regular_file_set_transfer::prepare_package(
+            &artifact.path,
+            &artifact.scope_root,
+            identity,
+            &runtime.paths.temp_dir,
+        )?),
+        None => None,
+    };
+    let transport_path = package_path.as_deref().unwrap_or(&artifact.path);
+    let item_result = crate::storage::create_outgoing_file_item_with_metadata(
         &runtime.paths,
         &master_key,
         &revision.bridge_id,
-        &artifact.path,
-        Some(artifact.display_name.clone()),
-        Some(artifact.media_type.clone()),
-    )?;
-    set_external_transfer_id(&runtime.paths, attempt_id, step.id(), &item.id, now)?;
+        transport_path,
+        package_path
+            .as_ref()
+            .map(|_| "managed-transfer".to_string())
+            .or_else(|| Some(artifact.display_name.clone())),
+        package_path
+            .as_ref()
+            .map(|_| "application/octet-stream".to_string())
+            .or_else(|| Some(artifact.media_type.clone())),
+    );
+    if item_result.is_err() {
+        if let Some(package_path) = &package_path {
+            crate::regular_file_set_transfer::cleanup_package(package_path);
+        }
+    }
+    let item = item_result?;
+    if let Err(error) =
+        set_external_transfer_id(&runtime.paths, attempt_id, step.id(), &item.id, now)
+    {
+        let _ = crate::storage::delete_room_item(&runtime.paths, &item.id);
+        if let Some(package_path) = &package_path {
+            crate::regular_file_set_transfer::cleanup_package(package_path);
+        }
+        return Err(error);
+    }
     let source_host = participant_for_ref(&revision, source)
         .ok_or_else(|| AppError::InvalidInput("Native v2 Transfer source vanished.".into()))?
         .host_ref
@@ -1936,6 +1968,8 @@ async fn execute_authored_transfer(
         destination_host_ref: destination_host,
         object: input.clone(),
         content_digest: artifact.identity.digest().to_owned(),
+        representation,
+        logical_byte_count: artifact.identity.byte_count(),
         expires_at: approval.expires_at,
     };
     let transfer_result =
@@ -1943,7 +1977,7 @@ async fn execute_authored_transfer(
             runtime.clone(),
             &revision.bridge_id,
             &item.id,
-            &artifact.path,
+            transport_path,
             Some(format!("native-v2:{attempt_id}:{}", step.id())),
             None,
             session,
@@ -1951,6 +1985,9 @@ async fn execute_authored_transfer(
         )
         .await;
     let _ = crate::storage::delete_room_item(&runtime.paths, &item.id);
+    if let Some(package_path) = &package_path {
+        crate::regular_file_set_transfer::cleanup_package(package_path);
+    }
     transfer_result?;
     build_host_step_result(
         &revision,
@@ -4280,6 +4317,12 @@ pub(crate) fn validate_transfer_landing(
     {
         return invalid("Native v2 Transfer metadata is unavailable.");
     }
+    if metadata.representation
+        == crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet
+        && metadata.logical_byte_count == 0
+    {
+        return invalid("Native v2 regular-file-set Transfer metadata is incomplete.");
+    }
     let (revision, approval) = load_receiver_attempt(&runtime.paths, &metadata.attempt_id)?;
     if metadata.approval_id != approval.approval_id
         || metadata.plan_id != revision.plan_id
@@ -4351,6 +4394,66 @@ pub(crate) fn register_transfer_landing(
     size_bytes: u64,
     now: i64,
 ) -> AppResult<()> {
+    if metadata.representation
+        == crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet
+    {
+        let tree = crate::regular_file_set_transfer::materialize_package(
+            &path,
+            &runtime.paths.temp_dir,
+            &metadata.content_digest,
+            metadata.logical_byte_count,
+        )?;
+        crate::regular_file_set_transfer::cleanup_received_package(&path);
+        let scope_root = tree
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| {
+                AppError::InvalidInput(
+                    "Native v2 regular-file-set transfer root is unavailable.".into(),
+                )
+            })?;
+        let result = runtime.managed_objects.lock().bind_transferred_revision(
+            crate::managed_objects::HostArtifactAcquisition {
+                kind: crate::managed_objects::ManagedObjectAcquisitionKind::TransferReceipt,
+                source_ref: format!(
+                    "native-v2-transfer:{}:{}",
+                    metadata.attempt_id, metadata.step_id
+                ),
+                bridge_id: Some(metadata.bridge_id.clone()),
+                path: tree.clone(),
+                scope_root,
+                display_name: "managed-input".into(),
+                media_type: "application/octet-stream".into(),
+                expires_at: metadata.expires_at,
+                app_owned_temporary: true,
+            },
+            metadata.object.logical_object_id.clone(),
+            metadata.object.revision,
+            metadata.content_digest.clone(),
+            now,
+        );
+        let acquisition = match result {
+            Ok(acquisition) => acquisition,
+            Err(error) => {
+                crate::regular_file_set_transfer::cleanup_materialized_tree(&tree);
+                return Err(error);
+            }
+        };
+        if acquisition.object.size_bytes != metadata.logical_byte_count
+            || acquisition.object.host_ref != metadata.destination_host_ref
+            || acquisition.object.representation
+                != crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet
+        {
+            crate::regular_file_set_transfer::cleanup_materialized_tree(&tree);
+            return invalid("Native v2 regular-file-set Transfer receipt content is invalid.");
+        }
+        if let Err(error) = insert_transfer_receipt(runtime, metadata, &acquisition, now) {
+            runtime.managed_objects.lock().discard_binding(&acquisition);
+            crate::regular_file_set_transfer::cleanup_materialized_tree(&tree);
+            return Err(error);
+        }
+        return Ok(());
+    }
     let scope_root = path
         .parent()
         .map(std::path::Path::to_path_buf)
@@ -4385,6 +4488,15 @@ pub(crate) fn register_transfer_landing(
     {
         return invalid("Native v2 Transfer receipt content is invalid.");
     }
+    insert_transfer_receipt(runtime, metadata, &acquisition, now)
+}
+
+fn insert_transfer_receipt(
+    runtime: &HostRuntime,
+    metadata: &NativeV2TransferMetadataV1,
+    acquisition: &crate::managed_objects::ManagedObjectAcquisition,
+    now: i64,
+) -> AppResult<()> {
     connection(&runtime.paths)?.execute(
         "INSERT INTO native_v2_transfer_receipts
          (attempt_id, step_id, revision_id, revision_hash, logical_object_id,
@@ -6734,6 +6846,164 @@ mod tests {
         assert_eq!(commits, 0);
         assert_eq!(step_state, "eligible");
         let _ = std::fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn regular_file_set_transfer_receipt_relocates_the_exact_revision_without_lineage() {
+        let paths = paths("native-v2-regular-file-set-transfer");
+        let runtime = requester_runtime(paths.clone(), "destination-host");
+        let source_root = paths.temp_dir.join("source-tree");
+        std::fs::create_dir_all(source_root.join("src")).unwrap();
+        std::fs::create_dir_all(source_root.join("tests")).unwrap();
+        std::fs::write(
+            source_root.join("Cargo.toml"),
+            b"[package]\nname = 'project'\n",
+        )
+        .unwrap();
+        std::fs::write(source_root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        std::fs::write(
+            source_root.join("src/lib.rs"),
+            b"pub fn value() -> u8 { 7 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source_root.join("tests/integration.rs"),
+            b"#[test] fn it_works() {}\n",
+        )
+        .unwrap();
+        let identity = crate::safe_file_identity::capture_regular_file_set_identity(
+            &source_root,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )
+        .unwrap();
+        let package = crate::regular_file_set_transfer::prepare_package(
+            &source_root,
+            &paths.temp_dir,
+            &identity,
+            &paths.temp_dir,
+        )
+        .unwrap();
+        let plan_id = "file-set-transfer-plan";
+        let source_host = host("source-host");
+        let source = PlanParticipantRef::for_host(plan_id, &source_host).unwrap();
+        let destination = PlanParticipantRef::for_host(plan_id, &runtime.local_host_ref).unwrap();
+        let object = ManagedObjectRevisionV2 {
+            logical_object_id: format!("managed-object:v1:{}", "d".repeat(64)),
+            revision: 7,
+        };
+        let metadata = NativeV2TransferMetadataV1 {
+            protocol_version: PROTOCOL_VERSION.into(),
+            attempt_id: "attempt-file-set-transfer".into(),
+            approval_id: "approval-file-set-transfer".into(),
+            plan_id: plan_id.into(),
+            revision_id: "revision-file-set-transfer".into(),
+            revision_hash: "hash-file-set-transfer".into(),
+            bridge_id: "bridge-native-v2".into(),
+            step_id: "transfer-file-set".into(),
+            source,
+            destination,
+            source_host_ref: source_host,
+            destination_host_ref: runtime.local_host_ref.clone(),
+            object: object.clone(),
+            content_digest: identity.digest.clone(),
+            representation: crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet,
+            logical_byte_count: identity.byte_count,
+            expires_at: NOW + 600,
+        };
+        let package_size = std::fs::metadata(&package).unwrap().len();
+        register_transfer_landing(
+            &runtime,
+            &metadata,
+            package,
+            "application/octet-stream".into(),
+            package_size,
+            NOW,
+        )
+        .unwrap();
+        let acquired = runtime
+            .managed_objects
+            .lock()
+            .acquisition_for_revision(
+                "bridge-native-v2",
+                &object.logical_object_id,
+                object.revision,
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(acquired.object.revision, 7);
+        assert_eq!(acquired.object.host_ref, runtime.local_host_ref);
+        assert_eq!(
+            acquired.object.representation,
+            crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet
+        );
+        let artifact = runtime
+            .managed_objects
+            .lock()
+            .resolve(&acquired, NOW)
+            .unwrap();
+        let received = artifact.identity.regular_file_set().unwrap();
+        assert_eq!(received.digest, identity.digest);
+        assert_eq!(
+            received.files.keys().collect::<Vec<_>>(),
+            identity.files.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::fs::read(artifact.path.join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 7 }\n"
+        );
+        let receipts: i64 = connection(&paths)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM native_v2_transfer_receipts
+                 WHERE attempt_id = 'attempt-file-set-transfer' AND step_id = 'transfer-file-set'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipts, 1);
+        assert!(!artifact
+            .path
+            .starts_with(paths.temp_dir.join("native-v2-transfers")));
+        let _ = std::fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn transfer_metadata_without_file_set_fields_remains_a_scalar_transfer() {
+        let source_host = host("scalar-source");
+        let destination_host = host("scalar-destination");
+        let plan_id = "scalar-transfer-plan";
+        let metadata = NativeV2TransferMetadataV1 {
+            protocol_version: PROTOCOL_VERSION.into(),
+            attempt_id: "attempt-scalar-transfer".into(),
+            approval_id: "approval-scalar-transfer".into(),
+            plan_id: plan_id.into(),
+            revision_id: "revision-scalar-transfer".into(),
+            revision_hash: "hash-scalar-transfer".into(),
+            bridge_id: "bridge-native-v2".into(),
+            step_id: "transfer-scalar".into(),
+            source: PlanParticipantRef::for_host(plan_id, &source_host).unwrap(),
+            destination: PlanParticipantRef::for_host(plan_id, &destination_host).unwrap(),
+            source_host_ref: source_host,
+            destination_host_ref: destination_host,
+            object: ManagedObjectRevisionV2 {
+                logical_object_id: format!("managed-object:v1:{}", "e".repeat(64)),
+                revision: 1,
+            },
+            content_digest: "a".repeat(64),
+            representation: crate::managed_objects::ManagedArtifactRepresentationV1::RegularFile,
+            logical_byte_count: 123,
+            expires_at: NOW + 600,
+        };
+        let mut wire = serde_json::to_value(metadata).unwrap();
+        let object = wire.as_object_mut().unwrap();
+        object.remove("representation");
+        object.remove("logicalByteCount");
+        let restored: NativeV2TransferMetadataV1 = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            restored.representation,
+            crate::managed_objects::ManagedArtifactRepresentationV1::RegularFile
+        );
+        assert_eq!(restored.logical_byte_count, 0);
     }
 
     #[test]

@@ -204,20 +204,47 @@ fn windows_reparse_point(metadata: &fs::Metadata) -> bool {
 pub(crate) fn regular_file_set_digest(
     files: &BTreeMap<String, SourceIdentity>,
 ) -> AppResult<String> {
-    if files.is_empty() {
+    let entries = files
+        .iter()
+        .map(|(selector, identity)| {
+            (
+                selector.as_str(),
+                identity.digest.as_str(),
+                identity.byte_count,
+            )
+        })
+        .collect::<Vec<_>>();
+    regular_file_set_digest_from_entries(entries)
+}
+
+/// Computes the stable logical digest used by regular-file-set identities
+/// without exposing physical file fingerprints. Transport framing uses this to
+/// validate its claimed logical manifest before it is materialized.
+pub(crate) fn regular_file_set_digest_from_entries<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str, u64)>,
+) -> AppResult<String> {
+    let entries = entries.into_iter().collect::<Vec<_>>();
+    if entries.is_empty() {
         return Err(AppError::InvalidInput(
             "Managed regular-file-set must contain a regular file.".into(),
         ));
     }
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"pastey-managed-regular-file-set-v1\0");
-    for (selector, identity) in files {
+    let mut previous = None;
+    for (selector, digest, byte_count) in entries {
         validate_managed_selector(selector)?;
+        if previous.is_some_and(|value: &str| value >= selector) {
+            return Err(AppError::InvalidInput(
+                "Managed regular-file-set selectors must be canonical and unique.".into(),
+            ));
+        }
+        previous = Some(selector);
         hasher.update(&(selector.len() as u64).to_be_bytes());
         hasher.update(selector.as_bytes());
-        hasher.update(&(identity.digest.len() as u64).to_be_bytes());
-        hasher.update(identity.digest.as_bytes());
-        hasher.update(&identity.byte_count.to_be_bytes());
+        hasher.update(&(digest.len() as u64).to_be_bytes());
+        hasher.update(digest.as_bytes());
+        hasher.update(&byte_count.to_be_bytes());
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
