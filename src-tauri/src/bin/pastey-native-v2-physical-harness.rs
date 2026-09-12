@@ -83,6 +83,8 @@ mod network_broker;
 mod object_refs;
 #[path = "../peer_capabilities.rs"]
 mod peer_capabilities;
+#[path = "../regular_file_set_transfer.rs"]
+mod regular_file_set_transfer;
 #[path = "../room_control.rs"]
 mod room_control;
 #[path = "../safe_file_identity.rs"]

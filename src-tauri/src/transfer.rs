@@ -4066,7 +4066,7 @@ async fn finish_file_transfer_handler(
         )
         .is_err()
         {
-            let _ = cleanup_pipeline_handoff_root(&final_path).await;
+            let _ = cleanup_native_v2_transfer_root(&final_path).await;
             return transfer_error(
                 StatusCode::BAD_REQUEST,
                 "native_v2_transfer_registration_failed",
