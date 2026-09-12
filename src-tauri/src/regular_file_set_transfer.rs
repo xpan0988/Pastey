@@ -1,12 +1,10 @@
-//! Host-private framing for moving one managed regular-file-set through the
-//! existing single-file encrypted Room transfer. This is deliberately not a
-//! managed artifact, Plan primitive, or archive abstraction.
+//! Host-private framing for a bounded regular-file-set over the existing
+//! single-file encrypted Room transfer. It is not a managed artifact or Plan primitive.
 
 use std::{
-    collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    path::{Component, Path, PathBuf},
+    io::{BufReader, Read, Write},
+    path::{Path, PathBuf},
 };
 
 use uuid::Uuid;
@@ -22,17 +20,23 @@ const VERSION: u16 = 1;
 const REPRESENTATION_REGULAR_FILE_SET: u8 = 1;
 const MAX_SELECTOR_BYTES: usize = 512;
 const MAX_DIGEST_BYTES: usize = 128;
+const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
-struct PackageEntry {
+struct PackageHeader {
+    entry_count: usize,
+    aggregate_digest: String,
+    logical_byte_count: u64,
+}
+
+#[derive(Debug)]
+struct EntryHeader {
     selector: String,
     byte_count: u64,
     content_digest: String,
-    bytes: Vec<u8>,
 }
 
-/// Writes a bounded, deterministic transport-private package. The returned
-/// path is under Pastey's temporary root and must be removed by the caller.
+/// Streams identity-matched source files into a deterministic package.
 pub(crate) fn prepare_package(
     root: &Path,
     scope_root: &Path,
@@ -44,7 +48,6 @@ pub(crate) fn prepare_package(
     if &observed != expected {
         return invalid("Managed regular-file-set changed before Transfer packaging.");
     }
-
     let package_root = temp_dir
         .join("native-v2-transfer-packages")
         .join(Uuid::new_v4().to_string());
@@ -58,23 +61,22 @@ pub(crate) fn prepare_package(
         write_header(&mut package, expected)?;
         for (selector, identity) in &expected.files {
             safe_file_identity::validate_managed_selector(selector)?;
-            let bytes = safe_file_identity::read_source_if_identity_matches(
-                &root.join(selector),
-                scope_root,
-                identity,
-                MAX_FILE_SIZE_BYTES,
-            )?;
-            write_entry(
+            write_entry_header(
                 &mut package,
                 selector,
                 identity.byte_count,
                 &identity.digest,
-                &bytes,
+            )?;
+            safe_file_identity::stream_source_if_identity_matches(
+                &root.join(selector),
+                scope_root,
+                identity,
+                MAX_FILE_SIZE_BYTES,
+                &mut package,
             )?;
         }
         package.sync_all()?;
-        let package_bytes = package.metadata()?.len();
-        if package_bytes > MAX_FILE_SIZE_BYTES {
+        if package.metadata()?.len() > MAX_FILE_SIZE_BYTES {
             return invalid("Regular-file-set transport package exceeds the transfer file limit.");
         }
         Ok(())
@@ -95,59 +97,87 @@ pub(crate) fn cleanup_package(package_path: &Path) {
     }
 }
 
-/// Parses a received package into a fresh app-owned tree. It validates every
-/// framing claim and then relies on the canonical scanner for final physical
-/// identity before a caller can register any Transfer receipt.
+/// Streams package payload bytes into a fresh no-follow private tree. Memory
+/// use is one fixed buffer plus at most one bounded metadata record per entry.
 pub(crate) fn materialize_package(
     package_path: &Path,
     temp_dir: &Path,
     expected_digest: &str,
     expected_bytes: u64,
 ) -> AppResult<PathBuf> {
-    let entries = parse_package(package_path)?;
-    let parsed_total = entries.iter().try_fold(0_u64, |total, entry| {
-        total.checked_add(entry.byte_count).ok_or_else(|| {
-            AppError::InvalidInput("Regular-file-set package byte quota overflowed.".into())
-        })
-    })?;
-    let declared_digest =
-        safe_file_identity::regular_file_set_digest_from_entries(entries.iter().map(|entry| {
-            (
-                entry.selector.as_str(),
-                entry.content_digest.as_str(),
-                entry.byte_count,
-            )
-        }))?;
-    if declared_digest != expected_digest || parsed_total != expected_bytes {
+    let package_metadata = fs::metadata(package_path)?;
+    if !package_metadata.is_file() || package_metadata.len() > MAX_FILE_SIZE_BYTES {
+        return invalid("Regular-file-set package is unavailable or exceeds its limit.");
+    }
+    let mut reader = BufReader::with_capacity(STREAM_BUFFER_BYTES, File::open(package_path)?);
+    let header = read_header(&mut reader)?;
+    if header.aggregate_digest != expected_digest || header.logical_byte_count != expected_bytes {
         return invalid("Regular-file-set package does not match the authored logical identity.");
     }
-
-    let root = temp_dir
-        .join("native-v2-file-sets")
-        .join(Uuid::new_v4().to_string())
-        .join("tree");
+    let root = safe_file_identity::create_private_tree_root(
+        temp_dir,
+        "native-v2-file-sets",
+        &Uuid::new_v4().to_string(),
+    )?;
     let result = (|| {
-        fs::create_dir_all(&root)?;
-        for entry in &entries {
-            materialize_entry(&root, entry)?;
+        let mut entries = Vec::with_capacity(header.entry_count);
+        let mut total = 0_u64;
+        let mut previous: Option<String> = None;
+        for _ in 0..header.entry_count {
+            let entry = read_entry_header(&mut reader)?;
+            safe_file_identity::validate_managed_selector(&entry.selector)?;
+            if entry.selector == "."
+                || previous
+                    .as_ref()
+                    .is_some_and(|value| value.as_str() >= entry.selector.as_str())
+            {
+                return invalid("Regular-file-set package selectors are duplicated or unordered.");
+            }
+            total = total.checked_add(entry.byte_count).ok_or_else(|| {
+                AppError::InvalidInput("Regular-file-set package byte quota overflowed.".into())
+            })?;
+            if total > MAX_FILE_SIZE_BYTES || total > header.logical_byte_count {
+                return invalid("Regular-file-set package logical bytes exceed their limit.");
+            }
+            let mut output =
+                safe_file_identity::create_private_regular_file(&root, &entry.selector)?;
+            stream_entry_payload(&mut reader, &mut output, &entry)?;
+            output.sync_all()?;
+            previous = Some(entry.selector.clone());
+            entries.push(entry);
+        }
+        if total != header.logical_byte_count || reader.read(&mut [0_u8; 1])? != 0 {
+            return invalid("Regular-file-set package contains trailing or inconsistent data.");
+        }
+        let digest = safe_file_identity::regular_file_set_digest_from_entries(entries.iter().map(
+            |entry| {
+                (
+                    entry.selector.as_str(),
+                    entry.content_digest.as_str(),
+                    entry.byte_count,
+                )
+            },
+        ))?;
+        if digest != header.aggregate_digest {
+            return invalid("Regular-file-set package aggregate digest is invalid.");
         }
         let observed =
             safe_file_identity::capture_regular_file_set_identity(&root, MAX_FILE_SIZE_BYTES)?;
         if observed.digest != expected_digest
             || observed.byte_count != expected_bytes
             || observed.files.len() != entries.len()
-            || observed.files.keys().collect::<BTreeSet<_>>()
-                != entries
-                    .iter()
-                    .map(|entry| &entry.selector)
-                    .collect::<BTreeSet<_>>()
+            || !observed
+                .files
+                .keys()
+                .zip(entries.iter().map(|entry| &entry.selector))
+                .all(|(a, b)| a == b)
         {
             return invalid("Materialized regular-file-set does not match its package identity.");
         }
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_dir_all(root.parent().expect("tree has a parent"));
+        cleanup_materialized_tree(&root);
     }
     result.map(|()| root)
 }
@@ -186,204 +216,130 @@ fn write_header(package: &mut File, identity: &RegularFileSetIdentity) -> AppRes
     Ok(())
 }
 
-fn write_entry(
+fn write_entry_header(
     package: &mut File,
     selector: &str,
     byte_count: u64,
     digest: &str,
-    bytes: &[u8],
 ) -> AppResult<()> {
-    if bytes.len() as u64 != byte_count || blake3::hash(bytes).to_hex().as_str() != digest {
-        return invalid("Regular-file-set source changed while Transfer packaging.");
-    }
     write_string(package, selector, MAX_SELECTOR_BYTES)?;
     package.write_all(&byte_count.to_be_bytes())?;
-    write_string(package, digest, MAX_DIGEST_BYTES)?;
-    package.write_all(bytes)?;
-    Ok(())
+    write_string(package, digest, MAX_DIGEST_BYTES)
 }
 
-fn write_string(package: &mut File, value: &str, maximum: usize) -> AppResult<()> {
+fn write_string(writer: &mut impl Write, value: &str, maximum: usize) -> AppResult<()> {
     if value.len() > maximum {
         return invalid("Regular-file-set package text field exceeds its limit.");
     }
-    package.write_all(
+    writer.write_all(
         &u16::try_from(value.len())
             .map_err(|_| {
                 AppError::InvalidInput("Regular-file-set package text field overflowed.".into())
             })?
             .to_be_bytes(),
     )?;
-    package.write_all(value.as_bytes())?;
+    writer.write_all(value.as_bytes())?;
     Ok(())
 }
 
-fn parse_package(path: &Path) -> AppResult<Vec<PackageEntry>> {
-    let metadata = fs::metadata(path)?;
-    if !metadata.is_file() || metadata.len() > MAX_FILE_SIZE_BYTES {
-        return invalid("Regular-file-set package is unavailable or exceeds its limit.");
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).map_err(|_| {
-        AppError::InvalidInput("Regular-file-set package is too large for this platform.".into())
-    })?);
-    File::open(path)?.read_to_end(&mut bytes)?;
-    let mut reader = Reader::new(&bytes);
-    if reader.take_exact(MAGIC.len())? != MAGIC {
+fn read_header(reader: &mut impl Read) -> AppResult<PackageHeader> {
+    let mut magic = vec![0_u8; MAGIC.len()];
+    reader.read_exact(&mut magic)?;
+    if magic != MAGIC {
         return invalid("Regular-file-set package schema is unknown.");
     }
-    if reader.u16()? != VERSION || reader.u8()? != REPRESENTATION_REGULAR_FILE_SET {
+    if read_u16(reader)? != VERSION || read_u8(reader)? != REPRESENTATION_REGULAR_FILE_SET {
         return invalid("Regular-file-set package version or representation is unknown.");
     }
-    let count = usize::try_from(reader.u32()?).map_err(|_| {
+    let entry_count = usize::try_from(read_u32(reader)?).map_err(|_| {
         AppError::InvalidInput("Regular-file-set package entry count is invalid.".into())
     })?;
-    if count == 0 || count > MAX_REGULAR_FILE_SET_ENTRIES {
+    if entry_count == 0 || entry_count > MAX_REGULAR_FILE_SET_ENTRIES {
         return invalid("Regular-file-set package entry count is invalid.");
     }
-    let aggregate_digest = reader.string(MAX_DIGEST_BYTES)?;
-    let total_bytes = reader.u64()?;
-    let mut entries = Vec::with_capacity(count);
-    let mut seen = BTreeSet::new();
-    let mut observed_total = 0_u64;
-    for _ in 0..count {
-        let selector = reader.string(MAX_SELECTOR_BYTES)?;
-        safe_file_identity::validate_managed_selector(&selector)?;
-        if selector == "." || !seen.insert(selector.clone()) {
-            return invalid("Regular-file-set package selectors are duplicated or invalid.");
-        }
-        let byte_count = reader.u64()?;
-        let digest = reader.string(MAX_DIGEST_BYTES)?;
-        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return invalid("Regular-file-set package entry digest is invalid.");
-        }
-        observed_total = observed_total.checked_add(byte_count).ok_or_else(|| {
-            AppError::InvalidInput("Regular-file-set package byte quota overflowed.".into())
-        })?;
-        if observed_total > MAX_FILE_SIZE_BYTES {
-            return invalid("Regular-file-set package logical bytes exceed their limit.");
-        }
-        let payload = reader
-            .take_exact(usize::try_from(byte_count).map_err(|_| {
-                AppError::InvalidInput(
-                    "Regular-file-set package entry is too large for this platform.".into(),
-                )
-            })?)?
-            .to_vec();
-        if blake3::hash(&payload).to_hex().as_str() != digest {
-            return invalid("Regular-file-set package entry payload digest is invalid.");
-        }
-        entries.push(PackageEntry {
-            selector,
-            byte_count,
-            content_digest: digest,
-            bytes: payload,
-        });
-    }
-    if !reader.is_empty() || observed_total != total_bytes {
-        return invalid("Regular-file-set package contains trailing or inconsistent data.");
-    }
-    let observed_digest =
-        safe_file_identity::regular_file_set_digest_from_entries(entries.iter().map(|entry| {
-            (
-                entry.selector.as_str(),
-                entry.content_digest.as_str(),
-                entry.byte_count,
-            )
-        }))?;
-    if aggregate_digest != observed_digest {
+    let aggregate_digest = read_string(reader, MAX_DIGEST_BYTES)?;
+    if aggregate_digest.len() != 64
+        || !aggregate_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
         return invalid("Regular-file-set package aggregate digest is invalid.");
     }
-    Ok(entries)
+    Ok(PackageHeader {
+        entry_count,
+        aggregate_digest,
+        logical_byte_count: read_u64(reader)?,
+    })
 }
 
-fn materialize_entry(root: &Path, entry: &PackageEntry) -> AppResult<()> {
-    safe_file_identity::validate_managed_selector(&entry.selector)?;
-    let mut destination = root.to_path_buf();
-    for component in Path::new(&entry.selector).components() {
-        let Component::Normal(component) = component else {
-            return invalid("Regular-file-set package selector is invalid.");
-        };
-        destination.push(component);
+fn read_entry_header(reader: &mut impl Read) -> AppResult<EntryHeader> {
+    let selector = read_string(reader, MAX_SELECTOR_BYTES)?;
+    let byte_count = read_u64(reader)?;
+    let content_digest = read_string(reader, MAX_DIGEST_BYTES)?;
+    if content_digest.len() != 64 || !content_digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return invalid("Regular-file-set package entry digest is invalid.");
     }
-    let parent = destination.parent().ok_or_else(|| {
-        AppError::InvalidInput("Regular-file-set materialization parent is unavailable.".into())
-    })?;
-    fs::create_dir_all(parent)?;
-    let components = Path::new(&entry.selector).components().collect::<Vec<_>>();
-    let mut current = root.to_path_buf();
-    for component in &components[..components.len().saturating_sub(1)] {
-        if let Component::Normal(name) = component {
-            current.push(name);
-            let metadata = fs::symlink_metadata(&current)?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return invalid(
-                    "Regular-file-set materialization encountered an unsafe directory.",
-                );
-            }
+    Ok(EntryHeader {
+        selector,
+        byte_count,
+        content_digest,
+    })
+}
+
+fn stream_entry_payload(
+    reader: &mut impl Read,
+    output: &mut File,
+    entry: &EntryHeader,
+) -> AppResult<()> {
+    let mut remaining = entry.byte_count;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; STREAM_BUFFER_BYTES];
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64)).expect("bounded buffer");
+        let read = reader.read(&mut buffer[..wanted])?;
+        if read == 0 {
+            return invalid("Regular-file-set package payload is truncated.");
         }
+        output.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&destination)?;
-    file.write_all(&entry.bytes)?;
-    file.sync_all()?;
+    if hasher.finalize().to_hex().as_str() != entry.content_digest {
+        return invalid("Regular-file-set package entry payload digest is invalid.");
+    }
     Ok(())
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
-    position: usize,
+fn read_u8(reader: &mut impl Read) -> AppResult<u8> {
+    let mut value = [0; 1];
+    reader.read_exact(&mut value)?;
+    Ok(value[0])
+}
+fn read_u16(reader: &mut impl Read) -> AppResult<u16> {
+    let mut value = [0; 2];
+    reader.read_exact(&mut value)?;
+    Ok(u16::from_be_bytes(value))
+}
+fn read_u32(reader: &mut impl Read) -> AppResult<u32> {
+    let mut value = [0; 4];
+    reader.read_exact(&mut value)?;
+    Ok(u32::from_be_bytes(value))
+}
+fn read_u64(reader: &mut impl Read) -> AppResult<u64> {
+    let mut value = [0; 8];
+    reader.read_exact(&mut value)?;
+    Ok(u64::from_be_bytes(value))
 }
 
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
+fn read_string(reader: &mut impl Read, maximum: usize) -> AppResult<String> {
+    let length = usize::from(read_u16(reader)?);
+    if length > maximum {
+        return invalid("Regular-file-set package text field exceeds its limit.");
     }
-
-    fn take_exact(&mut self, count: usize) -> AppResult<&'a [u8]> {
-        let end = self.position.checked_add(count).ok_or_else(|| {
-            AppError::InvalidInput("Regular-file-set package framing overflowed.".into())
-        })?;
-        let result = self.bytes.get(self.position..end).ok_or_else(|| {
-            AppError::InvalidInput("Regular-file-set package is truncated.".into())
-        })?;
-        self.position = end;
-        Ok(result)
-    }
-
-    fn u8(&mut self) -> AppResult<u8> {
-        Ok(self.take_exact(1)?[0])
-    }
-
-    fn u16(&mut self) -> AppResult<u16> {
-        let bytes: [u8; 2] = self.take_exact(2)?.try_into().expect("exact length");
-        Ok(u16::from_be_bytes(bytes))
-    }
-
-    fn u32(&mut self) -> AppResult<u32> {
-        let bytes: [u8; 4] = self.take_exact(4)?.try_into().expect("exact length");
-        Ok(u32::from_be_bytes(bytes))
-    }
-
-    fn u64(&mut self) -> AppResult<u64> {
-        let bytes: [u8; 8] = self.take_exact(8)?.try_into().expect("exact length");
-        Ok(u64::from_be_bytes(bytes))
-    }
-
-    fn string(&mut self, maximum: usize) -> AppResult<String> {
-        let length = usize::from(self.u16()?);
-        if length > maximum {
-            return invalid("Regular-file-set package text field exceeds its limit.");
-        }
-        String::from_utf8(self.take_exact(length)?.to_vec()).map_err(|_| {
-            AppError::InvalidInput("Regular-file-set package text is not UTF-8.".into())
-        })
-    }
-
-    fn is_empty(&self) -> bool {
-        self.position == self.bytes.len()
-    }
+    let mut bytes = vec![0_u8; length];
+    reader.read_exact(&mut bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|_| AppError::InvalidInput("Regular-file-set package text is not UTF-8.".into()))
 }
 
 fn invalid<T>(message: &str) -> AppResult<T> {
@@ -393,6 +349,7 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom};
 
     fn fixture(label: &str) -> (PathBuf, PathBuf, RegularFileSetIdentity) {
         let base = std::env::temp_dir().join(format!("{label}-{}", Uuid::new_v4()));
@@ -407,114 +364,134 @@ mod tests {
     }
 
     #[test]
-    fn package_is_deterministic_and_materializes_the_same_logical_tree() {
+    fn package_is_deterministic_and_streams_the_same_logical_tree() {
         let (base, tree, identity) = fixture("pastey-rfs-package");
         let first = prepare_package(&tree, &base, &identity, &base.join("temp-a")).unwrap();
         let second = prepare_package(&tree, &base, &identity, &base.join("temp-b")).unwrap();
         assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
-        let materialized = materialize_package(
-            &first,
-            &base.join("received"),
-            &identity.digest,
-            identity.byte_count,
-        )
-        .unwrap();
-        let received = safe_file_identity::capture_regular_file_set_identity(
-            &materialized,
-            MAX_FILE_SIZE_BYTES,
-        )
-        .unwrap();
-        assert_eq!(received.digest, identity.digest);
-        assert_eq!(received.byte_count, identity.byte_count);
-        assert_eq!(
-            received.files.keys().collect::<Vec<_>>(),
-            identity.files.keys().collect::<Vec<_>>()
-        );
+        let receive_root = base.join("received");
+        fs::create_dir(&receive_root).unwrap();
+        let received =
+            materialize_package(&first, &receive_root, &identity.digest, identity.byte_count)
+                .unwrap();
+        let observed =
+            safe_file_identity::capture_regular_file_set_identity(&received, MAX_FILE_SIZE_BYTES)
+                .unwrap();
+        assert_eq!(observed.digest, identity.digest);
+        assert_eq!(observed.byte_count, identity.byte_count);
         let _ = fs::remove_dir_all(base);
     }
 
     #[test]
-    fn package_rejects_digest_mutation_duplicate_selector_and_trailing_data() {
+    fn zero_byte_file_sets_are_streamed_and_materialized() {
+        let base = std::env::temp_dir().join(format!("pastey-rfs-zero-{}", Uuid::new_v4()));
+        let single = base.join("single");
+        let multiple = base.join("multiple");
+        fs::create_dir_all(&single).unwrap();
+        fs::create_dir_all(multiple.join("nested")).unwrap();
+        fs::write(single.join("empty"), b"").unwrap();
+        fs::write(multiple.join("a"), b"").unwrap();
+        fs::write(multiple.join("nested/b"), b"").unwrap();
+        for (tree, label) in [(&single, "single"), (&multiple, "multiple")] {
+            let identity = safe_file_identity::capture_regular_file_set_identity(tree, 0).unwrap();
+            let package =
+                prepare_package(tree, &base, &identity, &base.join(format!("send-{label}")))
+                    .unwrap();
+            let receive_root = base.join(format!("receive-{label}"));
+            fs::create_dir(&receive_root).unwrap();
+            let received =
+                materialize_package(&package, &receive_root, &identity.digest, 0).unwrap();
+            assert_eq!(
+                safe_file_identity::capture_regular_file_set_identity(&received, 0)
+                    .unwrap()
+                    .digest,
+                identity.digest
+            );
+        }
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn streamed_parser_rejects_truncation_digest_and_trailing_data() {
         let (base, tree, identity) = fixture("pastey-rfs-corrupt");
         let package = prepare_package(&tree, &base, &identity, &base.join("temp")).unwrap();
         let mut bytes = fs::read(&package).unwrap();
-        let digest_offset = MAGIC.len() + 2 + 1 + 4 + 2;
-        bytes[digest_offset] ^= 1;
+        bytes.pop();
         fs::write(&package, &bytes).unwrap();
         assert!(materialize_package(
             &package,
-            &base.join("received"),
+            &base.join("truncated"),
             &identity.digest,
             identity.byte_count
         )
         .is_err());
         let package = prepare_package(&tree, &base, &identity, &base.join("temp2")).unwrap();
         let mut bytes = fs::read(&package).unwrap();
-        bytes.extend_from_slice(b"unexpected");
+        *bytes.last_mut().unwrap() ^= 1;
         fs::write(&package, &bytes).unwrap();
+        let digest_root = base.join("digest");
+        fs::create_dir(&digest_root).unwrap();
         assert!(materialize_package(
             &package,
-            &base.join("received2"),
+            &digest_root,
             &identity.digest,
             identity.byte_count
         )
         .is_err());
+        let digest_namespace = digest_root.join("native-v2-file-sets");
+        assert!(
+            !digest_namespace.exists() || fs::read_dir(digest_namespace).unwrap().next().is_none()
+        );
+        let package = prepare_package(&tree, &base, &identity, &base.join("temp3")).unwrap();
+        let mut bytes = fs::read(&package).unwrap();
+        bytes.extend_from_slice(b"unexpected");
+        fs::write(&package, &bytes).unwrap();
+        let trailing_root = base.join("trailing");
+        fs::create_dir(&trailing_root).unwrap();
+        assert!(materialize_package(
+            &package,
+            &trailing_root,
+            &identity.digest,
+            identity.byte_count
+        )
+        .is_err());
+        let trailing_namespace = trailing_root.join("native-v2-file-sets");
+        assert!(
+            !trailing_namespace.exists()
+                || fs::read_dir(trailing_namespace).unwrap().next().is_none()
+        );
         let _ = fs::remove_dir_all(base);
     }
 
     #[test]
-    fn package_rejects_duplicate_or_unsafe_selectors_truncation_and_excess_entries() {
-        let (base, tree, identity) = fixture("pastey-rfs-framing");
-        let cargo = fs::read(tree.join("Cargo.toml")).unwrap();
-        let cargo_digest = blake3::hash(&cargo).to_hex().to_string();
-        let duplicate = base.join("duplicate");
-        let mut file = File::create(&duplicate).unwrap();
-        write_header(&mut file, &identity).unwrap();
-        write_entry(
-            &mut file,
-            "Cargo.toml",
-            cargo.len() as u64,
-            &cargo_digest,
-            &cargo,
-        )
-        .unwrap();
-        write_entry(
-            &mut file,
-            "Cargo.toml",
-            cargo.len() as u64,
-            &cargo_digest,
-            &cargo,
-        )
-        .unwrap();
-        assert!(parse_package(&duplicate).is_err());
-
-        let unsafe_selector = base.join("unsafe-selector");
-        let mut file = File::create(&unsafe_selector).unwrap();
-        write_header(&mut file, &identity).unwrap();
-        write_entry(
-            &mut file,
-            "../escape",
-            cargo.len() as u64,
-            &cargo_digest,
-            &cargo,
-        )
-        .unwrap();
-        assert!(parse_package(&unsafe_selector).is_err());
-
-        let truncated = prepare_package(&tree, &base, &identity, &base.join("temp3")).unwrap();
-        let mut bytes = fs::read(&truncated).unwrap();
-        bytes.pop();
-        fs::write(&truncated, bytes).unwrap();
-        assert!(parse_package(&truncated).is_err());
-
-        let excessive = base.join("excessive");
-        let mut file = File::create(&excessive).unwrap();
-        file.write_all(MAGIC).unwrap();
-        file.write_all(&VERSION.to_be_bytes()).unwrap();
-        file.write_all(&[REPRESENTATION_REGULAR_FILE_SET]).unwrap();
-        file.write_all(&((MAX_REGULAR_FILE_SET_ENTRIES as u32) + 1).to_be_bytes())
+    fn streamed_parser_rejects_a_declared_payload_larger_than_remaining_bytes() {
+        let (base, tree, identity) = fixture("pastey-rfs-declared-size");
+        let package = prepare_package(&tree, &base, &identity, &base.join("temp")).unwrap();
+        let mut package_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&package)
             .unwrap();
-        assert!(parse_package(&excessive).is_err());
+        let _header = read_header(&mut package_file).unwrap();
+        let selector_length = u64::from(read_u16(&mut package_file).unwrap());
+        package_file
+            .seek(SeekFrom::Current(selector_length as i64))
+            .unwrap();
+        package_file.write_all(&u64::MAX.to_be_bytes()).unwrap();
+        package_file.sync_all().unwrap();
+        drop(package_file);
+        assert!(materialize_package(
+            &package,
+            &base.join("received"),
+            &identity.digest,
+            identity.byte_count
+        )
+        .is_err());
+        let namespace = base.join("received/native-v2-file-sets");
+        assert!(
+            !namespace.exists() || fs::read_dir(namespace).unwrap().next().is_none(),
+            "failed materialization must not retain a private tree"
+        );
         let _ = fs::remove_dir_all(base);
     }
 }

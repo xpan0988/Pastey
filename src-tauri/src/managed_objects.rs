@@ -40,12 +40,6 @@ pub(crate) enum ManagedArtifactRepresentationV1 {
     RegularFileSet,
 }
 
-impl Default for ManagedArtifactRepresentationV1 {
-    fn default() -> Self {
-        Self::RegularFile
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ManagedArtifactIdentityV1 {
     RegularFile(SourceIdentity),

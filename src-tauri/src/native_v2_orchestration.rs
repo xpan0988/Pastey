@@ -372,10 +372,10 @@ pub(crate) struct NativeV2TransferMetadataV1 {
     pub(crate) destination_host_ref: HostRef,
     pub(crate) object: ManagedObjectRevisionV2,
     pub(crate) content_digest: String,
-    #[serde(default)]
-    pub(crate) representation: crate::managed_objects::ManagedArtifactRepresentationV1,
-    #[serde(default)]
-    pub(crate) logical_byte_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) representation: Option<crate::managed_objects::ManagedArtifactRepresentationV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) logical_byte_count: Option<u64>,
     pub(crate) expires_at: i64,
 }
 
@@ -1968,8 +1968,13 @@ async fn execute_authored_transfer(
         destination_host_ref: destination_host,
         object: input.clone(),
         content_digest: artifact.identity.digest().to_owned(),
-        representation,
-        logical_byte_count: artifact.identity.byte_count(),
+        representation: (representation
+            == crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet)
+            .then_some(representation),
+        logical_byte_count: artifact
+            .identity
+            .regular_file_set()
+            .map(|identity| identity.byte_count),
         expires_at: approval.expires_at,
     };
     let transfer_result =
@@ -4317,12 +4322,7 @@ pub(crate) fn validate_transfer_landing(
     {
         return invalid("Native v2 Transfer metadata is unavailable.");
     }
-    if metadata.representation
-        == crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet
-        && metadata.logical_byte_count == 0
-    {
-        return invalid("Native v2 regular-file-set Transfer metadata is incomplete.");
-    }
+    transfer_metadata_representation(metadata)?;
     let (revision, approval) = load_receiver_attempt(&runtime.paths, &metadata.attempt_id)?;
     if metadata.approval_id != approval.approval_id
         || metadata.plan_id != revision.plan_id
@@ -4394,14 +4394,17 @@ pub(crate) fn register_transfer_landing(
     size_bytes: u64,
     now: i64,
 ) -> AppResult<()> {
-    if metadata.representation
+    if transfer_metadata_representation(metadata)?
         == crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet
     {
+        let logical_byte_count = metadata
+            .logical_byte_count
+            .expect("validated file-set metadata");
         let tree = crate::regular_file_set_transfer::materialize_package(
             &path,
             &runtime.paths.temp_dir,
             &metadata.content_digest,
-            metadata.logical_byte_count,
+            logical_byte_count,
         )?;
         crate::regular_file_set_transfer::cleanup_received_package(&path);
         let scope_root = tree
@@ -4439,7 +4442,7 @@ pub(crate) fn register_transfer_landing(
                 return Err(error);
             }
         };
-        if acquisition.object.size_bytes != metadata.logical_byte_count
+        if acquisition.object.size_bytes != logical_byte_count
             || acquisition.object.host_ref != metadata.destination_host_ref
             || acquisition.object.representation
                 != crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet
@@ -4489,6 +4492,19 @@ pub(crate) fn register_transfer_landing(
         return invalid("Native v2 Transfer receipt content is invalid.");
     }
     insert_transfer_receipt(runtime, metadata, &acquisition, now)
+}
+
+fn transfer_metadata_representation(
+    metadata: &NativeV2TransferMetadataV1,
+) -> AppResult<crate::managed_objects::ManagedArtifactRepresentationV1> {
+    match (&metadata.representation, metadata.logical_byte_count) {
+        (None, None) => Ok(crate::managed_objects::ManagedArtifactRepresentationV1::RegularFile),
+        (
+            Some(crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet),
+            Some(_),
+        ) => Ok(crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet),
+        _ => invalid("Native v2 Transfer representation metadata is invalid."),
+    }
 }
 
 fn insert_transfer_receipt(
@@ -6906,8 +6922,10 @@ mod tests {
             destination_host_ref: runtime.local_host_ref.clone(),
             object: object.clone(),
             content_digest: identity.digest.clone(),
-            representation: crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet,
-            logical_byte_count: identity.byte_count,
+            representation: Some(
+                crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet,
+            ),
+            logical_byte_count: Some(identity.byte_count),
             expires_at: NOW + 600,
         };
         let package_size = std::fs::metadata(&package).unwrap().len();
@@ -6990,20 +7008,134 @@ mod tests {
                 revision: 1,
             },
             content_digest: "a".repeat(64),
-            representation: crate::managed_objects::ManagedArtifactRepresentationV1::RegularFile,
-            logical_byte_count: 123,
+            representation: None,
+            logical_byte_count: None,
             expires_at: NOW + 600,
         };
-        let mut wire = serde_json::to_value(metadata).unwrap();
-        let object = wire.as_object_mut().unwrap();
-        object.remove("representation");
-        object.remove("logicalByteCount");
-        let restored: NativeV2TransferMetadataV1 = serde_json::from_value(wire).unwrap();
+        let wire = serde_json::to_value(metadata).unwrap();
+        let object = wire.as_object().unwrap();
+        let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
+        fields.sort_unstable();
         assert_eq!(
-            restored.representation,
+            fields,
+            vec![
+                "approvalId",
+                "attemptId",
+                "bridgeId",
+                "contentDigest",
+                "destination",
+                "destinationHostRef",
+                "expiresAt",
+                "object",
+                "planId",
+                "protocolVersion",
+                "revisionHash",
+                "revisionId",
+                "source",
+                "sourceHostRef",
+                "stepId",
+            ]
+        );
+        assert!(!object.contains_key("representation"));
+        assert!(!object.contains_key("logicalByteCount"));
+        let restored: NativeV2TransferMetadataV1 = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored.representation, None);
+        assert_eq!(restored.logical_byte_count, None);
+        assert_eq!(
+            transfer_metadata_representation(&restored).unwrap(),
             crate::managed_objects::ManagedArtifactRepresentationV1::RegularFile
         );
-        assert_eq!(restored.logical_byte_count, 0);
+        let mut incomplete_file_set = serde_json::to_value(&restored).unwrap();
+        incomplete_file_set.as_object_mut().unwrap().insert(
+            "representation".into(),
+            serde_json::json!("regular_file_set"),
+        );
+        let incomplete_file_set: NativeV2TransferMetadataV1 =
+            serde_json::from_value(incomplete_file_set).unwrap();
+        assert!(transfer_metadata_representation(&incomplete_file_set).is_err());
+    }
+
+    #[test]
+    fn zero_byte_regular_file_set_transfer_preserves_revision_and_digest() {
+        let paths = paths("native-v2-zero-byte-file-set-transfer");
+        let runtime = requester_runtime(paths.clone(), "destination-zero-host");
+        let source_root = paths.temp_dir.join("zero-source-tree");
+        std::fs::create_dir_all(source_root.join("nested")).unwrap();
+        std::fs::write(source_root.join("empty"), b"").unwrap();
+        std::fs::write(source_root.join("nested/also-empty"), b"").unwrap();
+        let identity =
+            crate::safe_file_identity::capture_regular_file_set_identity(&source_root, 0).unwrap();
+        assert_eq!(identity.byte_count, 0);
+        let package = crate::regular_file_set_transfer::prepare_package(
+            &source_root,
+            &paths.temp_dir,
+            &identity,
+            &paths.temp_dir,
+        )
+        .unwrap();
+        let plan_id = "zero-file-set-transfer-plan";
+        let source_host = host("source-zero-host");
+        let object = ManagedObjectRevisionV2 {
+            logical_object_id: format!("managed-object:v1:{}", "f".repeat(64)),
+            revision: 9,
+        };
+        let metadata = NativeV2TransferMetadataV1 {
+            protocol_version: PROTOCOL_VERSION.into(),
+            attempt_id: "attempt-zero-file-set-transfer".into(),
+            approval_id: "approval-zero-file-set-transfer".into(),
+            plan_id: plan_id.into(),
+            revision_id: "revision-zero-file-set-transfer".into(),
+            revision_hash: "hash-zero-file-set-transfer".into(),
+            bridge_id: "bridge-native-v2".into(),
+            step_id: "transfer-zero-file-set".into(),
+            source: PlanParticipantRef::for_host(plan_id, &source_host).unwrap(),
+            destination: PlanParticipantRef::for_host(plan_id, &runtime.local_host_ref).unwrap(),
+            source_host_ref: source_host,
+            destination_host_ref: runtime.local_host_ref.clone(),
+            object: object.clone(),
+            content_digest: identity.digest.clone(),
+            representation: Some(
+                crate::managed_objects::ManagedArtifactRepresentationV1::RegularFileSet,
+            ),
+            logical_byte_count: Some(0),
+            expires_at: NOW + 600,
+        };
+        let wire = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(wire["representation"], "regular_file_set");
+        assert_eq!(wire["logicalByteCount"], 0);
+        let package_size = std::fs::metadata(&package).unwrap().len();
+        register_transfer_landing(
+            &runtime,
+            &metadata,
+            package,
+            "application/octet-stream".into(),
+            package_size,
+            NOW,
+        )
+        .unwrap();
+        let acquired = runtime
+            .managed_objects
+            .lock()
+            .acquisition_for_revision(
+                "bridge-native-v2",
+                &object.logical_object_id,
+                object.revision,
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(acquired.object.revision, object.revision);
+        assert_eq!(acquired.object.size_bytes, 0);
+        let artifact = runtime
+            .managed_objects
+            .lock()
+            .resolve(&acquired, NOW)
+            .unwrap();
+        assert_eq!(
+            artifact.identity.regular_file_set().unwrap().digest,
+            identity.digest
+        );
+        assert_eq!(artifact.identity.regular_file_set().unwrap().byte_count, 0);
+        let _ = std::fs::remove_dir_all(paths.app_data_dir);
     }
 
     #[test]
