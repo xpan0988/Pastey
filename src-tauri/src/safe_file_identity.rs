@@ -1,12 +1,9 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
-    path::{Component, Path},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Component, Path, PathBuf},
 };
-
-#[cfg(any(test, windows))]
-use std::path::PathBuf;
 
 #[cfg(unix)]
 use std::ffi::CString;
@@ -334,6 +331,270 @@ pub(crate) fn read_source_if_identity_matches(
     Ok(bytes)
 }
 
+/// Streams one exact, already-captured source through a caller-owned writer.
+/// It uses the same no-follow descriptor opening and validates the identity
+/// before and after the complete read, without retaining source contents.
+pub(crate) fn stream_source_if_identity_matches(
+    source_path: &Path,
+    scope_root: &Path,
+    expected: &SourceIdentity,
+    maximum_bytes: u64,
+    destination: &mut impl Write,
+) -> AppResult<u64> {
+    let mut source = open_regular_source(source_path, scope_root)?;
+    let before = source_fingerprint(&source)?;
+    if before != expected.fingerprint || expected.byte_count > maximum_bytes {
+        return Err(AppError::InvalidInput(
+            "Safe file source identity is stale or mismatched.".into(),
+        ));
+    }
+    source.seek(SeekFrom::Start(0))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| AppError::InvalidInput("Safe file source is too large.".into()))?;
+        if bytes > maximum_bytes {
+            return Err(AppError::InvalidInput(
+                "Safe file source exceeds the identity limit.".into(),
+            ));
+        }
+        destination.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+    }
+    let after = source_fingerprint(&source)?;
+    if before != after
+        || after != expected.fingerprint
+        || bytes != expected.byte_count
+        || hasher.finalize().to_hex().as_str() != expected.digest
+    {
+        return Err(AppError::InvalidInput(
+            "Safe file source changed while it was streamed.".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Creates a fresh app-private tree through descriptor-relative/no-follow
+/// traversal. The returned path is still rescanned before it can become a
+/// managed binding.
+pub(crate) fn create_private_tree_root(
+    temp_dir: &Path,
+    namespace: &str,
+    unique: &str,
+) -> AppResult<PathBuf> {
+    validate_private_component(namespace)?;
+    validate_private_component(unique)?;
+    #[cfg(unix)]
+    {
+        let root = open_private_directory(temp_dir)?;
+        let namespace_dir = open_or_create_private_directory(&root, namespace)?;
+        let unique_dir = open_or_create_private_directory(&namespace_dir, unique)?;
+        let _tree = open_or_create_private_directory(&unique_dir, "tree")?;
+        return Ok(temp_dir.join(namespace).join(unique).join("tree"));
+    }
+    #[cfg(windows)]
+    {
+        reject_windows_reparse_or_wrong_type(temp_dir, true)?;
+        let canonical_temp = fs::canonicalize(temp_dir)
+            .map_err(|_| AppError::InvalidInput("Private tree root is unavailable.".into()))?;
+        reject_windows_reparse_or_wrong_type(&canonical_temp, true)?;
+        let mut current = canonical_temp;
+        for component in [namespace, unique, "tree"] {
+            current.push(component);
+            if !current.exists() {
+                fs::create_dir(&current)?;
+            }
+            reject_windows_reparse_or_wrong_type(&current, true)?;
+        }
+        return Ok(current);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (temp_dir, namespace, unique);
+        Err(AppError::InvalidInput(
+            "Safe private tree creation is not supported on this platform.".into(),
+        ))
+    }
+}
+
+/// Creates exactly one regular file below a freshly created private tree. No
+/// parent directory or leaf is followed while it is opened.
+pub(crate) fn create_private_regular_file(root: &Path, selector: &str) -> AppResult<File> {
+    validate_managed_selector(selector)?;
+    if selector == "." {
+        return Err(AppError::InvalidInput(
+            "Private tree file selector must name a file.".into(),
+        ));
+    }
+    let components = Path::new(selector).components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(AppError::InvalidInput(
+            "Private tree file selector is invalid.".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let mut directory = open_private_directory(root)?;
+        for component in &components[..components.len() - 1] {
+            let Component::Normal(component) = component else {
+                unreachable!("validated normal selector component")
+            };
+            let component_text = component.to_str().ok_or_else(|| {
+                AppError::InvalidInput("Private tree file selector is invalid.".into())
+            })?;
+            directory = open_or_create_private_directory(&directory, component_text)?;
+        }
+        let Component::Normal(component) = components.last().expect("nonempty selector") else {
+            unreachable!("validated normal selector component")
+        };
+        let name = CString::new(component.as_bytes())
+            .map_err(|_| AppError::InvalidInput("Private tree file selector is invalid.".into()))?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(AppError::InvalidInput(
+                "Private tree output is unavailable or unsafe.".into(),
+            ));
+        }
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+    #[cfg(windows)]
+    {
+        reject_windows_reparse_or_wrong_type(root, true)?;
+        let canonical_root = fs::canonicalize(root)
+            .map_err(|_| AppError::InvalidInput("Private tree root is unavailable.".into()))?;
+        reject_windows_reparse_or_wrong_type(&canonical_root, true)?;
+        let mut destination = canonical_root.clone();
+        for component in &components {
+            let Component::Normal(component) = component else {
+                unreachable!("validated normal selector component")
+            };
+            destination.push(component);
+        }
+        let mut current = canonical_root.clone();
+        for component in &components[..components.len() - 1] {
+            let Component::Normal(component) = component else {
+                unreachable!("validated normal selector component")
+            };
+            current.push(component);
+            if !current.exists() {
+                fs::create_dir(&current)?;
+            }
+            reject_windows_reparse_or_wrong_type(&current, true)?;
+        }
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+        let file = options.open(&destination).map_err(|_| {
+            AppError::InvalidInput("Private tree output is unavailable or unsafe.".into())
+        })?;
+        let opened = normalized_windows_path(&final_windows_handle_path(&file)?);
+        let root = normalized_windows_path(&canonical_root);
+        if !windows_path_is_within(&opened, &root) {
+            return Err(AppError::InvalidInput(
+                "Private tree output escaped its root.".into(),
+            ));
+        }
+        return Ok(file);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = root;
+        Err(AppError::InvalidInput(
+            "Safe private file creation is not supported on this platform.".into(),
+        ))
+    }
+}
+
+fn validate_private_component(value: &str) -> AppResult<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.contains('/')
+        || value.contains('\\')
+        || value == "."
+        || value == ".."
+    {
+        return Err(AppError::InvalidInput(
+            "Private tree component is invalid.".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_private_directory(path: &Path) -> AppResult<File> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| AppError::InvalidInput("Private tree directory is unavailable.".into()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppError::InvalidInput(
+            "Private tree directory is unsafe.".into(),
+        ));
+    }
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| {
+            AppError::InvalidInput("Private tree directory is unavailable or unsafe.".into())
+        })
+}
+
+#[cfg(unix)]
+fn open_or_create_private_directory(parent: &File, name: &str) -> AppResult<File> {
+    validate_private_component(name)?;
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| AppError::InvalidInput("Private tree component is invalid.".into()))?;
+    let mut fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        )
+    };
+    if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0
+            && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
+        {
+            return Err(AppError::InvalidInput(
+                "Private tree directory could not be created.".into(),
+            ));
+        }
+        fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+            )
+        };
+    }
+    if fd < 0 {
+        return Err(AppError::InvalidInput(
+            "Private tree directory is unavailable or unsafe.".into(),
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 /// Creates an immutable, normalized receiver-local copy. The source is opened
 /// once by descriptor and is never reopened by path while bytes are copied.
 fn open_regular_source(source_path: &Path, scope_root: &Path) -> AppResult<File> {
@@ -636,6 +897,7 @@ fn digest_open_source(source: &mut File, maximum_bytes: u64) -> AppResult<(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, Write};
 
     fn fixture() -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!("pastey-safe-file-{}", uuid::Uuid::new_v4()));
@@ -710,6 +972,68 @@ mod tests {
         assert!(validate_managed_selector("nested/file.txt").is_ok());
     }
 
+    #[test]
+    fn source_streaming_uses_fixed_size_writes_without_payload_buffering() {
+        struct BoundedWriter {
+            bytes: usize,
+            writes: usize,
+        }
+
+        impl Write for BoundedWriter {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                assert!(buffer.len() <= COPY_BUFFER_BYTES);
+                self.bytes += buffer.len();
+                self.writes += 1;
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (scope, path) = fixture();
+        let contents = vec![0x5a; COPY_BUFFER_BYTES * 3 + 17];
+        fs::write(&path, &contents).unwrap();
+        let identity = capture_source_identity(&path, &scope, contents.len() as u64).unwrap();
+        let mut writer = BoundedWriter {
+            bytes: 0,
+            writes: 0,
+        };
+        assert_eq!(
+            stream_source_if_identity_matches(
+                &path,
+                &scope,
+                &identity,
+                contents.len() as u64,
+                &mut writer,
+            )
+            .unwrap(),
+            contents.len() as u64
+        );
+        assert_eq!(writer.bytes, contents.len());
+        assert!(writer.writes >= 4);
+        let root = scope.parent().unwrap().to_path_buf();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_private_materialization_rejects_symlink_parent_without_escape() {
+        use std::os::unix::fs::symlink;
+
+        let base =
+            std::env::temp_dir().join(format!("pastey-private-tree-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&base).unwrap();
+        let tree = create_private_tree_root(&base, "private", "tree-id").unwrap();
+        let outside = base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, tree.join("link")).unwrap();
+        assert!(create_private_regular_file(&tree, "link/escaped.txt").is_err());
+        assert!(!outside.join("escaped.txt").exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_descriptor_open_rejects_symlinks_and_non_regular_files() {
@@ -742,5 +1066,22 @@ mod tests {
         assert_ne!(identity.fingerprint, changed.fingerprint);
         let root = scope.parent().unwrap().to_path_buf();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_materialization_rejects_reparse_parent() {
+        let base =
+            std::env::temp_dir().join(format!("pastey-private-tree-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&base).unwrap();
+        let tree = create_private_tree_root(&base, "private", "tree-id").unwrap();
+        let outside = base.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let link = tree.join("link");
+        if std::os::windows::fs::symlink_dir(&outside, &link).is_ok() {
+            assert!(create_private_regular_file(&tree, "link/escaped.txt").is_err());
+            assert!(!outside.join("escaped.txt").exists());
+        }
+        let _ = fs::remove_dir_all(base);
     }
 }
