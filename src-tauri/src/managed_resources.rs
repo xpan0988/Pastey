@@ -35,7 +35,6 @@ use crate::{
 };
 
 const RESOURCE_RESOLUTION_VERSION: &str = "pastey-managed-resource-resolution-v1";
-const MAX_SELECTOR_BYTES: usize = 512;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedResourceAccessV1 {
@@ -566,9 +565,12 @@ impl ManagedResourceResolverV1 {
                     "Output slot root is empty, changed, or contains an untracked file.",
                 );
             }
-            let mut evidence_ids = Vec::new();
+            // Phase 1: validate every tracked entry and all terminal evidence
+            // without changing the seal state. A failed complete-root seal
+            // must leave every output generation retryable.
+            let mut evidence_ids = Vec::with_capacity(observed.len());
             for (selector, identity) in &observed {
-                let file = files.get_mut(selector).ok_or_else(|| {
+                let file = files.get(selector).ok_or_else(|| {
                     AppError::InvalidInput("Output slot root contains an untracked file.".into())
                 })?;
                 let matching = evidence
@@ -592,11 +594,16 @@ impl ManagedResourceResolverV1 {
                         "Output slot root generation or evidence is stale or mismatched.",
                     );
                 }
-                file.sealed = true;
                 evidence_ids.push(matching.evidence_id.as_str().to_owned());
             }
             let digest = crate::safe_file_identity::regular_file_set_digest(&observed)?;
-            let bytes = observed.values().map(|identity| identity.byte_count).sum();
+            let bytes = observed
+                .values()
+                .map(|identity| identity.byte_count)
+                .try_fold(0_u64, u64::checked_add)
+                .ok_or_else(|| {
+                    AppError::InvalidInput("Output slot root quota overflowed.".into())
+                })?;
             let seal_ref = domain_hash(
                 "pastey-output-slot-regular-file-set-seal-v1",
                 &(
@@ -607,6 +614,10 @@ impl ManagedResourceResolverV1 {
                     observed.len(),
                 ),
             )?;
+            // Phase 2: commit only after the complete file-set validates.
+            for file in files.values_mut() {
+                file.sealed = true;
+            }
             *root_sealed = true;
             return Ok(SealedOutputEvidenceV1 {
                 contract_version: RESOURCE_RESOLUTION_VERSION.into(),
@@ -1201,19 +1212,10 @@ impl ManagedResourceResolverV1 {
                             if effect.verb != ResourceVerbV1::Inspect {
                                 return invalid("A regular-file-set root is inspectable but not readable as a file.");
                             }
-                            let mut entries = file_set.files.iter().map(|(selector, identity)| {
-                                json!({"selector": selector, "bytes": identity.byte_count, "contentDigest": identity.digest})
-                            }).collect::<Vec<_>>();
-                            let mut truncated = false;
-                            let bytes = loop {
-                                let value = json!({"representation":"regular_file_set","entries":entries,"truncated":truncated});
-                                let bytes = serde_json::to_vec(&value)?;
-                                if bytes.len() as u64 <= *maximum_bytes || entries.is_empty() {
-                                    break bytes;
-                                }
-                                entries.pop();
-                                truncated = true;
-                            };
+                            let effective_ceiling =
+                                (*maximum_bytes).min(request.requested_budget_slice.read_bytes);
+                            let bytes =
+                                bounded_regular_file_set_manifest(file_set, effective_ceiling)?;
                             (bytes, 1, file_set.digest.clone())
                         } else {
                             let identity = file_set
@@ -1502,26 +1504,7 @@ fn validate_quota(quota: u64, ceiling: u64) -> AppResult<()> {
 }
 
 pub(crate) fn validate_managed_resource_selector(selector: &str) -> AppResult<()> {
-    if selector.is_empty()
-        || selector.len() > MAX_SELECTOR_BYTES
-        || selector.contains('\0')
-        || selector.contains('\\')
-        || selector.to_ascii_lowercase().starts_with("file:")
-    {
-        return invalid("Managed resource selector is invalid.");
-    }
-    if selector == "." {
-        return Ok(());
-    }
-    let path = Path::new(selector);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return invalid("Managed resource selector must be normalized and relative.");
-    }
-    Ok(())
+    safe_file_identity::validate_managed_selector(selector)
 }
 
 fn identity_ref(
@@ -1603,56 +1586,38 @@ fn unsafe_directory_metadata(metadata: &fs::Metadata) -> bool {
 }
 
 fn scan_regular_tree(root: &Path, quota_bytes: u64) -> AppResult<BTreeMap<String, SourceIdentity>> {
-    let canonical_root = root.canonicalize().map_err(|_| {
-        AppError::InvalidInput("Private managed resource root is unavailable.".into())
-    })?;
-    let mut pending = vec![canonical_root.clone()];
-    let mut observed = BTreeMap::new();
-    let mut total = 0_u64;
-    while let Some(directory) = pending.pop() {
-        let metadata = fs::symlink_metadata(&directory)?;
-        if unsafe_directory_metadata(&metadata) || !directory.starts_with(&canonical_root) {
-            return invalid("Execution world resource tree contains an unsafe directory.");
-        }
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() {
-                return invalid(
-                    "Execution world resource tree contains a symlink or reparse point.",
-                );
-            }
-            if metadata.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if !metadata.is_file() {
-                return invalid("Execution world resource tree contains a special file.");
-            }
-            let relative = path.strip_prefix(&canonical_root).map_err(|_| {
-                AppError::InvalidInput("Execution world resource escaped its private root.".into())
-            })?;
-            let selector = relative
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            validate_managed_resource_selector(&selector)?;
-            let remaining = quota_bytes.saturating_sub(total);
-            let identity =
-                safe_file_identity::capture_source_identity(&path, &canonical_root, remaining)?;
-            total = total.checked_add(identity.byte_count).ok_or_else(|| {
-                AppError::InvalidInput("Execution world resource quota overflowed.".into())
-            })?;
-            if total > quota_bytes || observed.insert(selector, identity).is_some() {
-                return invalid(
-                    "Execution world resource tree exceeds quota or aliases a selector.",
-                );
-            }
+    safe_file_identity::scan_regular_file_set(root, quota_bytes).map(|(files, _)| files)
+}
+
+fn bounded_regular_file_set_manifest(
+    file_set: &crate::safe_file_identity::RegularFileSetIdentity,
+    maximum_bytes: u64,
+) -> AppResult<Vec<u8>> {
+    let entries = file_set
+        .files
+        .iter()
+        .map(|(selector, identity)| {
+            json!({"selector": selector, "bytes": identity.byte_count, "contentDigest": identity.digest})
+        })
+        .collect::<Vec<_>>();
+    let minimum = serde_json::to_vec(
+        &json!({"representation":"regular_file_set","entries":[],"truncated":true}),
+    )?;
+    if minimum.len() as u64 > maximum_bytes {
+        return invalid("Managed resource read budget cannot encode a file-set manifest.");
+    }
+    for included in (0..=entries.len()).rev() {
+        let truncated = included != entries.len();
+        let bytes = serde_json::to_vec(&json!({
+            "representation":"regular_file_set",
+            "entries": &entries[..included],
+            "truncated": truncated,
+        }))?;
+        if bytes.len() as u64 <= maximum_bytes {
+            return Ok(bytes);
         }
     }
-    Ok(observed)
+    unreachable!("the validated minimum manifest must fit")
 }
 
 fn validate_private_tree(
@@ -1989,16 +1954,36 @@ mod tests {
         let identity = ExecutionWorldServiceV1::default()
             .platform_availability()
             .identity_digest;
-        fixture_with_world_identity(&identity)
+        fixture_with_artifact(&identity, false)
     }
 
     fn fixture_with_world_identity(world_identity: &str) -> Fixture {
+        fixture_with_artifact(world_identity, false)
+    }
+
+    fn regular_file_set_fixture() -> Fixture {
+        let identity = ExecutionWorldServiceV1::default()
+            .platform_availability()
+            .identity_digest;
+        fixture_with_artifact(&identity, true)
+    }
+
+    fn fixture_with_artifact(world_identity: &str, regular_file_set: bool) -> Fixture {
         let now = crate::storage::now_ts();
         let root = std::env::temp_dir().join(format!("pastey-step5-{}", Uuid::new_v4()));
         let source_root = root.join("source");
         fs::create_dir_all(&source_root).unwrap();
-        let source_path = source_root.join("input.txt");
-        fs::write(&source_path, b"authoritative revision N").unwrap();
+        let source_path = if regular_file_set {
+            let source_path = source_root.join("input-set");
+            fs::create_dir_all(source_path.join("nested")).unwrap();
+            fs::write(source_path.join("nested/first.txt"), b"first").unwrap();
+            fs::write(source_path.join("second.txt"), b"second").unwrap();
+            source_path
+        } else {
+            let source_path = source_root.join("input.txt");
+            fs::write(&source_path, b"authoritative revision N").unwrap();
+            source_path
+        };
 
         let local = HostRef::from_device_id("phase5-step5-local").unwrap();
         let peer = HostRef::from_device_id("phase5-step5-peer").unwrap();
@@ -2021,7 +2006,11 @@ mod tests {
                     bridge_id: Some("bridge-step5".into()),
                     path: source_path.clone(),
                     scope_root: source_root,
-                    display_name: "input.txt".into(),
+                    display_name: if regular_file_set {
+                        "input-set".into()
+                    } else {
+                        "input.txt".into()
+                    },
                     media_type: "text/plain".into(),
                     expires_at: now + 800,
                     app_owned_temporary: false,
@@ -2770,6 +2759,87 @@ mod tests {
     }
 
     #[test]
+    fn host_derived_replace_precondition_succeeds_once_and_then_fails_stale() {
+        let mut fixture = fixture();
+        fixture
+            .resolver
+            .provision_output_slot(&fixture.authority, &fixture.access, &fixture.output, 4096)
+            .unwrap();
+        let original = b"original".to_vec();
+        let original_digest = digest_bytes(&original);
+        fixture
+            .resolver
+            .stage_write_payload(
+                &fixture.authority,
+                &fixture.access,
+                &fixture.output,
+                &original_digest,
+                original,
+            )
+            .unwrap();
+        let create = request(
+            &fixture,
+            0,
+            ResourceVerbV1::Create,
+            fixture.output.clone(),
+            "result.txt",
+            Some(original_digest),
+            vec![],
+            request_budget(0, 256),
+        );
+        assert_eq!(
+            enforce(&mut fixture, &create).decision,
+            EffectDecisionV1::Allowed
+        );
+
+        let host_precondition = fixture
+            .resolver
+            .output_replace_precondition(&fixture.access, &fixture.output, "result.txt")
+            .unwrap();
+        let replacement = b"replacement".to_vec();
+        let replacement_digest = digest_bytes(&replacement);
+        fixture
+            .resolver
+            .stage_write_payload(
+                &fixture.authority,
+                &fixture.access,
+                &fixture.output,
+                &replacement_digest,
+                replacement,
+            )
+            .unwrap();
+        let replace = request(
+            &fixture,
+            1,
+            ResourceVerbV1::Replace,
+            fixture.output.clone(),
+            "result.txt",
+            Some(replacement_digest),
+            vec![host_precondition.clone()],
+            request_budget(0, 256),
+        );
+        assert_eq!(
+            enforce(&mut fixture, &replace).decision,
+            EffectDecisionV1::Allowed
+        );
+
+        let stale = request(
+            &fixture,
+            2,
+            ResourceVerbV1::Replace,
+            fixture.output.clone(),
+            "result.txt",
+            Some(digest_bytes(b"stale")),
+            vec![host_precondition],
+            request_budget(0, 256),
+        );
+        assert_eq!(
+            enforce(&mut fixture, &stale).decision,
+            EffectDecisionV1::Denied
+        );
+    }
+
+    #[test]
     fn output_slot_root_seals_the_complete_regular_file_set() {
         let mut fixture = fixture();
         fixture
@@ -2860,6 +2930,147 @@ mod tests {
             enforce(&mut fixture, &request).decision,
             EffectDecisionV1::Denied
         );
+    }
+
+    #[test]
+    fn failed_root_seal_leaves_every_output_unsealed_for_a_valid_retry() {
+        let mut fixture = fixture();
+        fixture
+            .resolver
+            .provision_output_slot(&fixture.authority, &fixture.access, &fixture.output, 4096)
+            .unwrap();
+        let mut evidence = Vec::new();
+        for (sequence, (selector, bytes)) in [
+            ("a.txt", b"first".as_slice()),
+            ("b.txt", b"second".as_slice()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let digest = digest_bytes(bytes);
+            fixture
+                .resolver
+                .stage_write_payload(
+                    &fixture.authority,
+                    &fixture.access,
+                    &fixture.output,
+                    &digest,
+                    bytes.to_vec(),
+                )
+                .unwrap();
+            let request = request(
+                &fixture,
+                sequence as u64,
+                ResourceVerbV1::Create,
+                fixture.output.clone(),
+                selector,
+                Some(digest),
+                vec![],
+                request_budget(0, 256),
+            );
+            evidence.push(enforce(&mut fixture, &request));
+        }
+
+        let mut mismatched_evidence = evidence.clone();
+        let EffectFactsV1::Resource { content_digest, .. } = &mut mismatched_evidence[1].facts
+        else {
+            unreachable!();
+        };
+        *content_digest = "mismatched-digest".into();
+        assert!(fixture
+            .resolver
+            .seal_output_slot(
+                &fixture.authority,
+                &fixture.access,
+                &fixture.output,
+                ".",
+                &mismatched_evidence,
+            )
+            .is_err());
+        let HostResourceBackingV1::OutputSlot {
+            files, root_sealed, ..
+        } = fixture.resolver.backings.get(&fixture.output).unwrap()
+        else {
+            unreachable!();
+        };
+        assert!(!*root_sealed);
+        assert!(files.values().all(|file| !file.sealed));
+
+        assert!(fixture
+            .resolver
+            .seal_output_slot(
+                &fixture.authority,
+                &fixture.access,
+                &fixture.output,
+                ".",
+                &evidence,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn regular_file_set_manifest_is_deterministic_valid_json_and_budget_bounded() {
+        let root = std::env::temp_dir().join(format!("pastey-manifest-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/first.txt"), b"first").unwrap();
+        fs::write(root.join("second.txt"), b"second").unwrap();
+        let identity = safe_file_identity::capture_regular_file_set_identity(&root, 4096).unwrap();
+        let full = bounded_regular_file_set_manifest(&identity, 4096).unwrap();
+        let minimum = bounded_regular_file_set_manifest(&identity, 100).unwrap();
+        assert!(minimum.len() <= 100);
+        assert!(serde_json::from_slice::<serde_json::Value>(&minimum).is_ok());
+        assert_eq!(
+            minimum,
+            bounded_regular_file_set_manifest(&identity, 100).unwrap()
+        );
+        let full_value = serde_json::from_slice::<serde_json::Value>(&full).unwrap();
+        let minimum_value = serde_json::from_slice::<serde_json::Value>(&minimum).unwrap();
+        assert!(
+            full_value["entries"].as_array().unwrap().len()
+                >= minimum_value["entries"].as_array().unwrap().len()
+        );
+        assert!(!String::from_utf8(minimum)
+            .unwrap()
+            .contains(root.to_string_lossy().as_ref()));
+        assert!(bounded_regular_file_set_manifest(&identity, 1).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regular_file_set_root_inspect_obeys_the_requested_read_budget() {
+        let mut fixture = regular_file_set_fixture();
+        fixture
+            .resolver
+            .bind_managed_revision(
+                &fixture.authority,
+                &mut fixture.objects,
+                &fixture.access,
+                &fixture.managed,
+                fixture.acquisition.clone(),
+            )
+            .unwrap();
+        let request = request(
+            &fixture,
+            0,
+            ResourceVerbV1::Inspect,
+            fixture.managed.clone(),
+            ".",
+            None,
+            vec![],
+            request_budget(100, 0),
+        );
+        assert_eq!(
+            enforce(&mut fixture, &request).decision,
+            EffectDecisionV1::Allowed
+        );
+        let read = fixture.resolver.take_read(&request.request_id).unwrap();
+        assert!(read.bytes.len() <= 100);
+        let manifest: serde_json::Value = serde_json::from_slice(&read.bytes).unwrap();
+        assert_eq!(manifest["representation"], "regular_file_set");
+        assert_eq!(manifest["truncated"], true);
+        assert!(!String::from_utf8(read.bytes)
+            .unwrap()
+            .contains(fixture.root.to_string_lossy().as_ref()));
     }
 
     #[test]

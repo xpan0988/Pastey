@@ -38,6 +38,10 @@ use windows_sys::Win32::{
 use crate::error::{AppError, AppResult};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+/// Bounds traversal, identity state, manifests, and seal evidence for one
+/// managed regular-file-set. This is intentionally a fixed representation
+/// limit rather than a product policy surface.
+pub(crate) const MAX_REGULAR_FILE_SET_ENTRIES: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SourceIdentity {
@@ -89,8 +93,30 @@ pub(crate) fn capture_regular_file_set_identity(
     root: &Path,
     maximum_bytes: u64,
 ) -> AppResult<RegularFileSetIdentity> {
+    let (files, total) = scan_regular_file_set(root, maximum_bytes)?;
+    if files.is_empty() {
+        return Err(AppError::InvalidInput(
+            "Managed regular-file-set must contain a regular file.".into(),
+        ));
+    }
+    let digest = regular_file_set_digest(&files)?;
+    Ok(RegularFileSetIdentity {
+        files,
+        digest,
+        byte_count: total,
+    })
+}
+
+/// Canonically enumerate a Host-local tree of regular files. Callers that
+/// model a managed artifact must reject the empty result; private execution
+/// overlays may use an empty result while retaining exactly the same physical
+/// safety, selector, byte, and entry-count rules.
+pub(crate) fn scan_regular_file_set(
+    root: &Path,
+    maximum_bytes: u64,
+) -> AppResult<(BTreeMap<String, SourceIdentity>, u64)> {
     let root_metadata = fs::symlink_metadata(root)?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+    if unsafe_regular_file_set_directory(&root_metadata) {
         return Err(AppError::InvalidInput(
             "Managed regular-file-set root must be a safe directory.".into(),
         ));
@@ -101,10 +127,7 @@ pub(crate) fn capture_regular_file_set_identity(
     let mut total = 0_u64;
     while let Some(directory) = pending.pop() {
         let metadata = fs::symlink_metadata(&directory)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_dir()
-            || !directory.starts_with(&canonical_root)
-        {
+        if unsafe_regular_file_set_directory(&metadata) || !directory.starts_with(&canonical_root) {
             return Err(AppError::InvalidInput(
                 "Managed regular-file-set directory is unsafe.".into(),
             ));
@@ -113,7 +136,7 @@ pub(crate) fn capture_regular_file_set_identity(
             let entry = entry?;
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() {
+            if metadata.file_type().is_symlink() || windows_reparse_point(&metadata) {
                 return Err(AppError::InvalidInput(
                     "Managed regular-file-set contains a symlink or reparse point.".into(),
                 ));
@@ -125,6 +148,11 @@ pub(crate) fn capture_regular_file_set_identity(
             if !metadata.is_file() {
                 return Err(AppError::InvalidInput(
                     "Managed regular-file-set contains a special file.".into(),
+                ));
+            }
+            if files.len() >= MAX_REGULAR_FILE_SET_ENTRIES {
+                return Err(AppError::InvalidInput(
+                    "Managed regular-file-set exceeds its entry-count limit.".into(),
                 ));
             }
             let relative = path.strip_prefix(&canonical_root).map_err(|_| {
@@ -154,17 +182,23 @@ pub(crate) fn capture_regular_file_set_identity(
             }
         }
     }
-    if files.is_empty() {
-        return Err(AppError::InvalidInput(
-            "Managed regular-file-set must contain a regular file.".into(),
-        ));
+    Ok((files, total))
+}
+
+fn unsafe_regular_file_set_directory(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink() || !metadata.is_dir() || windows_reparse_point(metadata)
+}
+
+fn windows_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
-    let digest = regular_file_set_digest(&files)?;
-    Ok(RegularFileSetIdentity {
-        files,
-        digest,
-        byte_count: total,
-    })
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
 }
 
 pub(crate) fn regular_file_set_digest(
@@ -602,6 +636,53 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn regular_file_set_scan_is_deterministic_and_entry_bounded() {
+        let (scope, _) = fixture();
+        fs::create_dir_all(scope.join("nested")).unwrap();
+        fs::write(scope.join("zeta.txt"), b"z").unwrap();
+        fs::write(scope.join("nested/alpha.txt"), b"a").unwrap();
+        let first = capture_regular_file_set_identity(&scope, 1024).unwrap();
+        let second = capture_regular_file_set_identity(&scope, 1024).unwrap();
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(
+            first.files.keys().cloned().collect::<Vec<_>>(),
+            vec!["candidate.txt", "nested/alpha.txt", "zeta.txt"]
+        );
+
+        let bounded = scope.join("bounded");
+        fs::create_dir(&bounded).unwrap();
+        for index in 0..MAX_REGULAR_FILE_SET_ENTRIES {
+            fs::write(bounded.join(format!("{index:04}.txt")), b"").unwrap();
+        }
+        assert_eq!(
+            capture_regular_file_set_identity(&bounded, 0)
+                .unwrap()
+                .files
+                .len(),
+            MAX_REGULAR_FILE_SET_ENTRIES
+        );
+        fs::write(bounded.join("overflow.txt"), b"").unwrap();
+        assert!(capture_regular_file_set_identity(&bounded, 0).is_err());
+
+        let root = scope.parent().unwrap().to_path_buf();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_selectors_are_portable_and_confined() {
+        for selector in [
+            "",
+            "/absolute",
+            "../escape",
+            "nested\\escape",
+            "file:escape",
+        ] {
+            assert!(validate_managed_selector(selector).is_err(), "{selector}");
+        }
+        assert!(validate_managed_selector("nested/file.txt").is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_descriptor_open_rejects_symlinks_and_non_regular_files() {
@@ -610,6 +691,7 @@ mod tests {
         let link = scope.join("link.txt");
         symlink(&path, &link).unwrap();
         assert!(capture_source_identity(&link, &scope, 1024).is_err());
+        assert!(capture_regular_file_set_identity(&scope, 1024).is_err());
         assert!(capture_source_identity(&scope, scope.parent().unwrap(), 1024).is_err());
         let root = scope.parent().unwrap().to_path_buf();
         let _ = fs::remove_dir_all(root);
@@ -623,6 +705,7 @@ mod tests {
         let link = scope.join("link.txt");
         if std::os::windows::fs::symlink_file(&path, &link).is_ok() {
             assert!(capture_source_identity(&link, &scope, 1024).is_err());
+            assert!(capture_regular_file_set_identity(&scope, 1024).is_err());
         }
         let replacement = scope.join("replacement.txt");
         fs::write(&replacement, b"approved bytes").unwrap();
