@@ -1298,7 +1298,9 @@ mod tests {
         },
         host_identity::{HostSessionBinding, PlanParticipantRef, PlanParticipants},
         host_runtime::{HostEvent, HostEventSink, RuntimeTask, RuntimeTaskSpawner},
-        managed_objects::{HostArtifactAcquisition, ManagedObjectAcquisitionKind},
+        managed_objects::{
+            HostArtifactAcquisition, ManagedArtifactIdentityV1, ManagedObjectAcquisitionKind,
+        },
         managed_resources::{ExecutableBindingSpecV1, HostManagedResourceBackendV1},
         models::LocalRole,
         storage,
@@ -1306,6 +1308,9 @@ mod tests {
             WorkerProviderCancellationV1, WorkerProviderErrorKindV1, WorkerProviderErrorV1,
             WorkerProviderResponseV1, WorkerProviderTurnV1, WorkerProviderV1,
             WorkerResourceAliasV1, WorkerRunLimitsV1, WorkerToolCallV1,
+        },
+        worker_provider::{
+            ConfiguredWorkerProviderConfigV1, OpenAICompatibleStreamingWorkerProviderV1,
         },
     };
 
@@ -1367,9 +1372,9 @@ mod tests {
             _request: crate::worker_harness::WorkerProviderRequestV1,
             _cancellation: &WorkerProviderCancellationV1,
         ) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
-            Err(WorkerProviderErrorV1 {
-                kind: WorkerProviderErrorKindV1::Cancelled,
-            })
+            Err(WorkerProviderErrorV1::new(
+                WorkerProviderErrorKindV1::Cancelled,
+            ))
         }
     }
 
@@ -2047,9 +2052,9 @@ mod tests {
     fn worker_script(output: &[u8]) -> ScriptedWorkerProvider {
         ScriptedWorkerProvider {
             responses: VecDeque::from([
-                Err(WorkerProviderErrorV1 {
-                    kind: WorkerProviderErrorKindV1::Retryable,
-                }),
+                Err(WorkerProviderErrorV1::new(
+                    WorkerProviderErrorKindV1::Retryable,
+                )),
                 Ok(WorkerProviderResponseV1::ToolCall {
                     call: WorkerToolCallV1::Read {
                         resource: WorkerResourceAliasV1::Input,
@@ -2138,6 +2143,92 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opt-in only: set PASTEY_REAL_PROVIDER_TEST=1 and PASTEY_WORKER_PROVIDER_URL, _MODEL, _API_KEY"]
+    fn real_provider_regular_file_set_transform_smoke_uses_ordinary_worker_effects_and_core() {
+        if std::env::var("PASTEY_REAL_PROVIDER_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        let (Ok(base_url), Ok(model), Ok(api_key)) = (
+            std::env::var("PASTEY_WORKER_PROVIDER_URL"),
+            std::env::var("PASTEY_WORKER_PROVIDER_MODEL"),
+            std::env::var("PASTEY_WORKER_PROVIDER_API_KEY"),
+        ) else {
+            return;
+        };
+        let fixture = fixture_with_input(
+            |input, host| {
+                let one = ManagedObjectRevisionV2 {
+                    logical_object_id: input.object.logical_object_id.clone(),
+                    revision: 1,
+                };
+                let two = ManagedObjectRevisionV2 {
+                    logical_object_id: input.object.logical_object_id.clone(),
+                    revision: 2,
+                };
+                vec![PlanStepV2::Transform {
+                    step_id: "transform".into(),
+                    depends_on: vec![],
+                    host: host.clone(),
+                    input: one,
+                    output: two,
+                    modification_intent: "Create two deterministic output files named transformed.txt and manifest.txt, then finish with output selector '.'.".into(),
+                }]
+            },
+            true,
+            |artifact_root| {
+                std::fs::write(artifact_root.join("source.txt"), b"source\n").unwrap();
+                std::fs::write(artifact_root.join("metadata.txt"), b"metadata\n").unwrap();
+                (
+                    artifact_root.to_path_buf(),
+                    "input".into(),
+                    "application/x-pastey-file-set".into(),
+                    ManagedObjectAcquisitionKind::LocalSelection,
+                )
+            },
+        );
+        let config = ConfiguredWorkerProviderConfigV1::new(
+            "real-provider-smoke".into(),
+            base_url,
+            model,
+            api_key,
+            60_000,
+            1_024,
+        )
+        .unwrap();
+        let mut provider = OpenAICompatibleStreamingWorkerProviderV1::new(config).unwrap();
+        let result = fixture
+            .runtime
+            .run_v2_transform_worker(
+                worker_claim_request(&fixture),
+                WorkerRunLimitsV1::default(),
+                &mut provider,
+            )
+            .unwrap();
+        assert_eq!(result.object.revision, 2);
+        let artifact = fixture
+            .runtime
+            .managed_objects
+            .lock()
+            .resolve(&result, NOW + 3)
+            .unwrap();
+        assert!(matches!(
+            artifact.identity,
+            ManagedArtifactIdentityV1::RegularFileSet(_)
+        ));
+        assert!(artifact.path.join("transformed.txt").is_file());
+        assert!(artifact.path.join("manifest.txt").is_file());
+        let transform_results: i64 = connection(&fixture.runtime.paths)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_transform_results",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transform_results, 1);
+    }
+
+    #[test]
     fn worker_cancellation_prevents_dispatch_and_interrupts_the_claim() {
         let fixture = fixture(transform_then_execute_steps);
         let mut provider = CancellingWorkerProvider;
@@ -2181,9 +2272,9 @@ mod tests {
                         relative_selector: ".".into(),
                     },
                 }),
-                Err(WorkerProviderErrorV1 {
-                    kind: WorkerProviderErrorKindV1::ContextOverflow,
-                }),
+                Err(WorkerProviderErrorV1::new(
+                    WorkerProviderErrorKindV1::ContextOverflow,
+                )),
                 Ok(WorkerProviderResponseV1::ToolCall {
                     call: WorkerToolCallV1::Create {
                         relative_selector: "result.txt".into(),

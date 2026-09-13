@@ -14,6 +14,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -195,6 +196,29 @@ pub(crate) enum WorkerProviderErrorKindV1 {
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerProviderErrorV1 {
     pub(crate) kind: WorkerProviderErrorKindV1,
+    /// A bounded, Host-private retry hint derived from Retry-After. It is
+    /// deliberately not provider output and never enters Worker context.
+    pub(crate) retry_after_millis: Option<u64>,
+    /// A stable, non-secret classification for Host diagnostics only.
+    pub(crate) diagnostic: &'static str,
+}
+
+impl WorkerProviderErrorV1 {
+    pub(crate) fn new(kind: WorkerProviderErrorKindV1) -> Self {
+        Self {
+            kind,
+            retry_after_millis: None,
+            diagnostic: "provider_error",
+        }
+    }
+
+    pub(crate) fn retryable(retry_after_millis: Option<u64>, diagnostic: &'static str) -> Self {
+        Self {
+            kind: WorkerProviderErrorKindV1::Retryable,
+            retry_after_millis,
+            diagnostic,
+        }
+    }
 }
 
 /// Bounded metadata normalized from a provider stream. It is diagnostic-only:
@@ -205,6 +229,9 @@ pub(crate) struct WorkerProviderTurnMetadataV1 {
     pub(crate) finish_reason: Option<String>,
     pub(crate) input_tokens: Option<u32>,
     pub(crate) output_tokens: Option<u32>,
+    /// The accepted concrete response model. This is diagnostic-only and is
+    /// never an authority binding or part of an EffectRequest.
+    pub(crate) response_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -864,6 +891,11 @@ impl WorkerRunControllerV1 {
                         },
                         &self.limits,
                     );
+                    wait_for_provider_retry(
+                        &provider_cancellation,
+                        error.retry_after_millis,
+                        retries,
+                    )?;
                 }
                 Err(error)
                     if error.kind == WorkerProviderErrorKindV1::ContextOverflow
@@ -1089,6 +1121,41 @@ impl WorkerRunControllerV1 {
         }
         invalid("Worker run exceeded its turn budget.")
     }
+}
+
+/// The generic Worker retries only the same immutable provider/model binding.
+/// The wait is sliced so cancellation is observed without retaining a stalled
+/// retry delay. Tests exercise the policy function without sleeping.
+fn wait_for_provider_retry(
+    cancellation: &WorkerProviderCancellationV1,
+    retry_after_millis: Option<u64>,
+    attempt: u32,
+) -> AppResult<()> {
+    let delay = if cfg!(test) {
+        0
+    } else {
+        provider_retry_delay_millis(retry_after_millis, attempt)
+    };
+    let mut remaining = delay;
+    while remaining > 0 {
+        if cancellation.is_cancelled() {
+            return invalid("Worker provider retry was cancelled.");
+        }
+        let slice = remaining.min(20);
+        std::thread::sleep(Duration::from_millis(slice));
+        remaining -= slice;
+    }
+    if cancellation.is_cancelled() {
+        return invalid("Worker provider retry was cancelled.");
+    }
+    Ok(())
+}
+
+fn provider_retry_delay_millis(retry_after_millis: Option<u64>, attempt: u32) -> u64 {
+    const MAX_RETRY_DELAY_MILLIS: u64 = 5_000;
+    retry_after_millis
+        .unwrap_or_else(|| 50u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(6)))
+        .min(MAX_RETRY_DELAY_MILLIS)
 }
 
 impl HostRuntime {
@@ -1531,6 +1598,14 @@ mod tests {
         assert!(process_state_allows_next_turn("failed"));
         assert!(!process_state_allows_next_turn("cancelled"));
         assert!(!process_state_allows_next_turn("indeterminate"));
+    }
+
+    #[test]
+    fn provider_retry_delay_is_bounded_and_retry_after_wins() {
+        assert_eq!(provider_retry_delay_millis(None, 1), 50);
+        assert_eq!(provider_retry_delay_millis(None, 2), 100);
+        assert_eq!(provider_retry_delay_millis(Some(2_000), 2), 2_000);
+        assert_eq!(provider_retry_delay_millis(Some(99_000), 2), 5_000);
     }
 
     #[test]

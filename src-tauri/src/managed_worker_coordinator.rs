@@ -1842,9 +1842,9 @@ mod tests {
             while !cancellation.is_cancelled() {
                 thread::sleep(Duration::from_millis(1));
             }
-            Err(WorkerProviderErrorV1 {
-                kind: WorkerProviderErrorKindV1::Cancelled,
-            })
+            Err(WorkerProviderErrorV1::new(
+                WorkerProviderErrorKindV1::Cancelled,
+            ))
         }
     }
 
@@ -2647,9 +2647,9 @@ mod tests {
             AttemptStartDecisionV2::Accepted(_)
         ));
         let mut provider = ScriptedProvider {
-            responses: VecDeque::from([Err(WorkerProviderErrorV1 {
-                kind: WorkerProviderErrorKindV1::Fatal,
-            })]),
+            responses: VecDeque::from([Err(WorkerProviderErrorV1::new(
+                WorkerProviderErrorKindV1::Fatal,
+            ))]),
             requests: Vec::new(),
         };
         assert!(fixture

@@ -9,15 +9,16 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    io::{BufRead, BufReader},
+    sync::mpsc,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    thread,
+    time::{Duration, SystemTime},
 };
 
-use reqwest::{blocking::Client, StatusCode, Url};
+use reqwest::{Client, Response, StatusCode, Url};
 use serde_json::{json, Value};
 
 use crate::{
@@ -34,6 +35,10 @@ const MAX_PROVIDER_DELTA_BYTES: usize = 32 * 1024;
 const MAX_PROVIDER_TOOL_ARGUMENT_BYTES: usize = 32 * 1024;
 const MAX_PROVIDER_STREAM_LINES: usize = 512;
 const MAX_PROVIDER_TOKEN_COUNT: u64 = 10_000_000;
+const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 8 * 1024;
+const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 32 * 1024;
+const PROVIDER_CANCELLATION_POLL_MILLIS: u64 = 20;
+const MAX_RETRY_AFTER_MILLIS: u64 = 5_000;
 
 /// Host-private configuration for one OpenAI-compatible Chat Completions
 /// provider. It intentionally mirrors the existing Cloud OpenAI-compatible
@@ -137,29 +142,25 @@ impl OpenAICompatibleStreamingWorkerProviderV1 {
         if self.is_revoked() {
             return Err(revoked());
         }
-        let endpoint = self.config.endpoint().map_err(|_| fatal())?;
-        let response = self
-            .client
-            .post(endpoint)
-            .bearer_auth(&self.config.api_key)
-            .json(&json!({
-                "model": self.config.model,
-                "messages": [{"role": "user", "content": "Reply with READY."}],
-                "max_tokens": 1,
-                "stream": false,
-            }))
-            .send()
-            .map_err(classify_transport_error)?;
+        let config = self.config.clone();
+        let client = self.client.clone();
+        let revocation = self.revocation.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .map_err(|_| fatal())
+                .and_then(|runtime| {
+                    runtime.block_on(health_probe_async(client, config, revocation))
+                });
+            let _ = sender.send(result);
+        });
+        let response = receiver.recv().map_err(|_| interrupted())??;
         if self.is_revoked() {
             return Err(revoked());
         }
-        if !response.status().is_success() {
-            return Err(classify_status(response.status()));
-        }
-        Ok(WorkerProviderHealthV1 {
-            provider_id: self.config.provider_id.clone(),
-            model: self.config.model.clone(),
-        })
+        Ok(response)
     }
 
     fn stream_turn(
@@ -173,22 +174,39 @@ impl OpenAICompatibleStreamingWorkerProviderV1 {
         if self.is_revoked() {
             return Err(revoked());
         }
-        let endpoint = self.config.endpoint().map_err(|_| fatal())?;
-        let response = self
-            .client
-            .post(endpoint)
-            .bearer_auth(&self.config.api_key)
-            .json(&openai_stream_request(&self.config, &request))
-            .send()
-            .map_err(classify_transport_error)?;
-        if !response.status().is_success() {
-            return Err(classify_status(response.status()));
+        let config = self.config.clone();
+        let client = self.client.clone();
+        let revocation = self.revocation.clone();
+        let cancellation = cancellation.clone();
+        let child_cancellation = cancellation.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .map_err(|_| fatal())
+                .and_then(|runtime| {
+                    runtime.block_on(stream_turn_async(
+                        client,
+                        config,
+                        request,
+                        child_cancellation,
+                        revocation,
+                    ))
+                });
+            let _ = sender.send(result);
+        });
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MILLIS)) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(interrupted()),
+                Err(mpsc::RecvTimeoutError::Timeout) if cancellation.is_cancelled() => {
+                    return Err(cancelled());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) if self.is_revoked() => return Err(revoked()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
         }
-        normalize_sse_lines(
-            BufReader::new(response).lines(),
-            cancellation,
-            self.revocation.as_deref(),
-        )
     }
 
     fn is_revoked(&self) -> bool {
@@ -196,6 +214,197 @@ impl OpenAICompatibleStreamingWorkerProviderV1 {
             .as_ref()
             .is_some_and(|token| token.load(Ordering::Acquire))
     }
+}
+
+async fn health_probe_async(
+    client: Client,
+    config: ConfiguredWorkerProviderConfigV1,
+    revocation: Option<Arc<AtomicBool>>,
+) -> Result<WorkerProviderHealthV1, WorkerProviderErrorV1> {
+    let endpoint = config
+        .endpoint()
+        .map_err(|_| fatal_with("invalid_endpoint"))?;
+    let response = client
+        .post(endpoint)
+        .bearer_auth(&config.api_key)
+        .json(&json!({
+            "model": config.model,
+            "messages": [{"role": "user", "content": "Reply with READY."}],
+            "max_tokens": 1,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .map_err(classify_transport_error)?;
+    if revocation
+        .as_ref()
+        .is_some_and(|token| token.load(Ordering::Acquire))
+    {
+        return Err(revoked());
+    }
+    if !response.status().is_success() {
+        return Err(classify_http_error(response, None, revocation.as_deref()).await?);
+    }
+    let body = read_bounded_response_body(
+        response,
+        None,
+        revocation.as_deref(),
+        MAX_PROVIDER_RESPONSE_BODY_BYTES,
+    )
+    .await?;
+    let value: Value =
+        serde_json::from_slice(&body).map_err(|_| malformed_with("unsupported_response_shape"))?;
+    let returned_model =
+        response_model(&value).ok_or_else(|| fatal_with("missing_response_model"))?;
+    require_configured_response_model(&config.model, &returned_model)?;
+    if value.get("choices").and_then(Value::as_array).is_none() {
+        return Err(malformed_with("unsupported_response_shape"));
+    }
+    Ok(WorkerProviderHealthV1 {
+        provider_id: config.provider_id,
+        model: config.model,
+        returned_model,
+    })
+}
+
+async fn stream_turn_async(
+    client: Client,
+    config: ConfiguredWorkerProviderConfigV1,
+    request: WorkerProviderRequestV1,
+    cancellation: WorkerProviderCancellationV1,
+    revocation: Option<Arc<AtomicBool>>,
+) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
+    let endpoint = config
+        .endpoint()
+        .map_err(|_| fatal_with("invalid_endpoint"))?;
+    let send = client
+        .post(endpoint)
+        .bearer_auth(&config.api_key)
+        .json(&openai_stream_request(&config, &request))
+        .send();
+    let response = await_cancellable(send, &cancellation, revocation.as_deref()).await?;
+    if !response.status().is_success() {
+        return Err(
+            classify_http_error(response, Some(&cancellation), revocation.as_deref()).await?,
+        );
+    }
+    normalize_sse_response(
+        response,
+        &config.model,
+        &cancellation,
+        revocation.as_deref(),
+    )
+    .await
+}
+
+async fn await_cancellable<T, F>(
+    future: F,
+    cancellation: &WorkerProviderCancellationV1,
+    revocation: Option<&AtomicBool>,
+) -> Result<T, WorkerProviderErrorV1>
+where
+    F: std::future::Future<Output = Result<T, reqwest::Error>>,
+{
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result.map_err(classify_transport_error),
+            _ = tokio::time::sleep(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MILLIS)) => {
+                if cancellation.is_cancelled() { return Err(cancelled()); }
+                if revocation.is_some_and(|token| token.load(Ordering::Acquire)) { return Err(revoked()); }
+            }
+        }
+    }
+}
+
+async fn read_bounded_response_body(
+    mut response: Response,
+    cancellation: Option<&WorkerProviderCancellationV1>,
+    revocation: Option<&AtomicBool>,
+    max: usize,
+) -> Result<Vec<u8>, WorkerProviderErrorV1> {
+    let mut body = Vec::new();
+    loop {
+        if cancellation.is_some_and(WorkerProviderCancellationV1::is_cancelled) {
+            return Err(cancelled());
+        }
+        if revocation.is_some_and(|token| token.load(Ordering::Acquire)) {
+            return Err(revoked());
+        }
+        let chunk = match cancellation {
+            Some(cancellation) => {
+                await_cancellable(response.chunk(), cancellation, revocation).await?
+            }
+            None => response.chunk().await.map_err(classify_transport_error)?,
+        };
+        let Some(chunk) = chunk else { break };
+        if body.len().saturating_add(chunk.len()) > max {
+            return Err(malformed_with("response_body_too_large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn classify_http_error(
+    response: Response,
+    cancellation: Option<&WorkerProviderCancellationV1>,
+    revocation: Option<&AtomicBool>,
+) -> Result<WorkerProviderErrorV1, WorkerProviderErrorV1> {
+    let status = response.status();
+    let retry_after = retry_after_millis(response.headers());
+    let body = read_bounded_response_body(
+        response,
+        cancellation,
+        revocation,
+        MAX_PROVIDER_ERROR_BODY_BYTES,
+    )
+    .await?;
+    Ok(classify_status_and_body(status, &body, retry_after))
+}
+
+async fn normalize_sse_response(
+    mut response: Response,
+    configured_model: &str,
+    cancellation: &WorkerProviderCancellationV1,
+    revocation: Option<&AtomicBool>,
+) -> Result<WorkerProviderTurnV1, WorkerProviderErrorV1> {
+    let mut assembler = OpenAICompatibleStreamAssemblerV1::default();
+    let mut buffered = Vec::new();
+    let mut lines = 0usize;
+    loop {
+        let chunk = await_cancellable(response.chunk(), cancellation, revocation).await?;
+        let Some(chunk) = chunk else { break };
+        if buffered.len().saturating_add(chunk.len()) > MAX_PROVIDER_DELTA_BYTES {
+            return Err(malformed_with("stream_line_too_large"));
+        }
+        buffered.extend_from_slice(&chunk);
+        while let Some(newline) = buffered.iter().position(|byte| *byte == b'\n') {
+            let mut line = buffered.drain(..=newline).collect::<Vec<_>>();
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            lines += 1;
+            if lines > MAX_PROVIDER_STREAM_LINES {
+                return Err(malformed_with("too_many_stream_lines"));
+            }
+            let line =
+                std::str::from_utf8(&line).map_err(|_| malformed_with("invalid_stream_utf8"))?;
+            if process_sse_line(&mut assembler, line, configured_model)? {
+                return assembler.finish();
+            }
+        }
+    }
+    if cancellation.is_cancelled() {
+        return Err(cancelled());
+    }
+    if revocation.is_some_and(|token| token.load(Ordering::Acquire)) {
+        return Err(revoked());
+    }
+    assembler.finish()
 }
 
 impl WorkerProviderV1 for OpenAICompatibleStreamingWorkerProviderV1 {
@@ -246,6 +455,7 @@ impl<P: WorkerProviderV1, S: WorkerProviderV1> WorkerProviderV1 for WorkerProvid
 pub(crate) struct WorkerProviderHealthV1 {
     pub(crate) provider_id: String,
     pub(crate) model: String,
+    pub(crate) returned_model: String,
 }
 
 #[derive(Default)]
@@ -254,17 +464,23 @@ struct OpenAICompatibleStreamAssemblerV1 {
     tool_calls: BTreeMap<u32, PartialToolCallV1>,
     finish_reason: Option<String>,
     usage: WorkerProviderTurnMetadataV1,
+    response_model: Option<String>,
     done: bool,
 }
 
 #[derive(Default)]
 struct PartialToolCallV1 {
-    name: Option<String>,
+    id: Option<String>,
+    call_type: Option<String>,
+    name: String,
     arguments: String,
 }
 
 impl OpenAICompatibleStreamAssemblerV1 {
     fn push_openai_event(&mut self, event: &Value) -> Result<(), WorkerProviderErrorV1> {
+        if let Some(model) = response_model(event) {
+            set_or_validate(&mut self.response_model, &model)?;
+        }
         let Some(choice) = event
             .get("choices")
             .and_then(Value::as_array)
@@ -292,12 +508,21 @@ impl OpenAICompatibleStreamAssemblerV1 {
                     .ok_or_else(malformed)?;
                 let index = u32::try_from(index).map_err(|_| malformed())?;
                 let partial = self.tool_calls.entry(index).or_default();
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    set_or_validate(&mut partial.id, id)?;
+                }
+                if let Some(call_type) = call.get("type").and_then(Value::as_str) {
+                    if call_type != "function" {
+                        return Err(malformed_with("unsupported_tool_type"));
+                    }
+                    set_or_validate(&mut partial.call_type, call_type)?;
+                }
                 if let Some(name) = call
                     .get("function")
                     .and_then(|function| function.get("name"))
                     .and_then(Value::as_str)
                 {
-                    partial.name = Some(name.into());
+                    push_bounded(&mut partial.name, name, 256)?;
                 }
                 if let Some(arguments) = call
                     .get("function")
@@ -332,16 +557,22 @@ impl OpenAICompatibleStreamAssemblerV1 {
             return Err(interrupted());
         }
         self.usage.finish_reason = self.finish_reason.clone();
+        self.usage.response_model = self.response_model.clone();
         let response = match self.finish_reason.as_deref() {
             Some("tool_calls") => {
                 if self.tool_calls.len() != 1 {
                     return Err(malformed());
                 }
                 let (_, call) = self.tool_calls.pop_first().expect("checked one tool call");
-                let name = call.name.ok_or_else(malformed)?;
+                if call.id.is_none()
+                    || call.call_type.as_deref() != Some("function")
+                    || call.name.is_empty()
+                {
+                    return Err(malformed_with("missing_tool_identity"));
+                }
                 let arguments: Value =
                     serde_json::from_str(&call.arguments).map_err(|_| malformed())?;
-                let call = normalized_tool_call(&name, arguments)?;
+                let call = normalized_tool_call(&call.name, arguments)?;
                 WorkerProviderResponseV1::ToolCall { call }
             }
             Some("stop") => {
@@ -397,16 +628,9 @@ where
             return Err(malformed());
         }
         let line = line.map_err(|_| interrupted())?;
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data == "[DONE]" {
-            assembler.done = true;
+        if process_sse_line(&mut assembler, &line, "")? {
             break;
         }
-        let event: Value = serde_json::from_str(data).map_err(|_| malformed())?;
-        assembler.push_openai_event(&event)?;
     }
     if cancellation.is_cancelled() {
         return Err(cancelled());
@@ -417,6 +641,36 @@ where
     assembler.finish()
 }
 
+fn process_sse_line(
+    assembler: &mut OpenAICompatibleStreamAssemblerV1,
+    line: &str,
+    configured_model: &str,
+) -> Result<bool, WorkerProviderErrorV1> {
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(false);
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        assembler.done = true;
+        if !configured_model.is_empty() {
+            let response_model = assembler
+                .response_model
+                .as_deref()
+                .ok_or_else(|| fatal_with("missing_response_model"))?;
+            require_configured_response_model(configured_model, response_model)?;
+        }
+        return Ok(true);
+    }
+    let event: Value = serde_json::from_str(data).map_err(|_| malformed())?;
+    assembler.push_openai_event(&event)?;
+    if !configured_model.is_empty() {
+        if let Some(response_model) = assembler.response_model.as_deref() {
+            require_configured_response_model(configured_model, response_model)?;
+        }
+    }
+    Ok(false)
+}
+
 fn openai_stream_request(
     config: &ConfiguredWorkerProviderConfigV1,
     request: &WorkerProviderRequestV1,
@@ -425,6 +679,7 @@ fn openai_stream_request(
         "model": config.model,
         "stream": true,
         "stream_options": {"include_usage": true},
+        "parallel_tool_calls": false,
         "temperature": 0,
         "max_tokens": config.max_output_tokens,
         "messages": [
@@ -466,7 +721,10 @@ fn validate_config(
     }
     let url = Url::parse(base_url.trim())
         .map_err(|_| AppError::InvalidInput("Worker provider endpoint is invalid.".into()))?;
-    if url.scheme() != "https"
+    let test_loopback_http = cfg!(test)
+        && url.scheme() == "http"
+        && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+    if (url.scheme() != "https" && !test_loopback_http)
         || url.host_str().is_none()
         || url.username() != ""
         || url.password().is_some()
@@ -493,66 +751,189 @@ fn bounded_tokens(value: Option<&Value>) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
-fn classify_status(status: StatusCode) -> WorkerProviderErrorV1 {
-    if status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::TOO_MANY_REQUESTS
-        || status.is_server_error()
-    {
-        retryable()
-    } else if status == StatusCode::PAYLOAD_TOO_LARGE {
-        context_overflow()
+fn response_model(event: &Value) -> Option<String> {
+    event
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| {
+            !model.is_empty() && model.len() <= 256 && !model.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
+}
+
+fn require_configured_response_model(
+    configured_model: &str,
+    returned_model: &str,
+) -> Result<(), WorkerProviderErrorV1> {
+    // There is no alias qualification store in the current Host binding. Exact
+    // equality is therefore the only safe accepted relation; aliases must be
+    // explicitly qualified by a future Host-owned mechanism before use.
+    if configured_model == returned_model {
+        Ok(())
     } else {
-        fatal()
+        Err(fatal_with("provider_model_mismatch"))
     }
+}
+
+fn set_or_validate(target: &mut Option<String>, value: &str) -> Result<(), WorkerProviderErrorV1> {
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(malformed());
+    }
+    match target {
+        Some(existing) if existing != value => Err(malformed_with("conflicting_tool_identity")),
+        Some(_) => Ok(()),
+        None => {
+            *target = Some(value.into());
+            Ok(())
+        }
+    }
+}
+
+fn retry_after_millis(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds.saturating_mul(1_000).min(MAX_RETRY_AFTER_MILLIS));
+    }
+    httpdate::parse_http_date(value)
+        .ok()
+        .and_then(|deadline| deadline.duration_since(SystemTime::now()).ok())
+        .map(|delay| {
+            u64::try_from(delay.as_millis())
+                .unwrap_or(u64::MAX)
+                .min(MAX_RETRY_AFTER_MILLIS)
+        })
+}
+
+fn classify_status_and_body(
+    status: StatusCode,
+    body: &[u8],
+    retry_after_millis: Option<u64>,
+) -> WorkerProviderErrorV1 {
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    if status == StatusCode::PAYLOAD_TOO_LARGE || looks_like_context_overflow(&text) {
+        return context_overflow();
+    }
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return fatal_with("authentication_rejected");
+    }
+    if looks_like_model_unavailable(&text) {
+        return fatal_with("model_unavailable");
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return retryable_with(retry_after_millis, "rate_limited");
+    }
+    if status == StatusCode::REQUEST_TIMEOUT || status.is_server_error() {
+        return retryable_with(retry_after_millis, "provider_capacity");
+    }
+    fatal_with("fatal_client_request")
+}
+
+fn looks_like_context_overflow(text: &str) -> bool {
+    [
+        "context length",
+        "context window",
+        "maximum context",
+        "too many tokens",
+        "token limit",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn looks_like_model_unavailable(text: &str) -> bool {
+    [
+        "model not found",
+        "model_not_found",
+        "model unavailable",
+        "unknown model",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn classify_transport_error(error: reqwest::Error) -> WorkerProviderErrorV1 {
     if error.is_timeout() || error.is_connect() {
-        retryable()
+        retryable_with(
+            None,
+            if error.is_timeout() {
+                "timeout"
+            } else {
+                "connection_failure"
+            },
+        )
     } else {
         interrupted()
     }
 }
 
 fn retryable() -> WorkerProviderErrorV1 {
-    WorkerProviderErrorV1 {
-        kind: WorkerProviderErrorKindV1::Retryable,
-    }
+    retryable_with(None, "transient_provider_failure")
+}
+
+fn retryable_with(
+    retry_after_millis: Option<u64>,
+    diagnostic: &'static str,
+) -> WorkerProviderErrorV1 {
+    WorkerProviderErrorV1::retryable(retry_after_millis, diagnostic)
 }
 
 fn context_overflow() -> WorkerProviderErrorV1 {
     WorkerProviderErrorV1 {
         kind: WorkerProviderErrorKindV1::ContextOverflow,
+        retry_after_millis: None,
+        diagnostic: "context_overflow",
     }
 }
 
 fn cancelled() -> WorkerProviderErrorV1 {
     WorkerProviderErrorV1 {
         kind: WorkerProviderErrorKindV1::Cancelled,
+        retry_after_millis: None,
+        diagnostic: "cancelled",
     }
 }
 
 fn interrupted() -> WorkerProviderErrorV1 {
     WorkerProviderErrorV1 {
         kind: WorkerProviderErrorKindV1::Interrupted,
+        retry_after_millis: None,
+        diagnostic: "interrupted_stream",
     }
 }
 
 fn malformed() -> WorkerProviderErrorV1 {
+    malformed_with("malformed_provider_output")
+}
+
+fn malformed_with(diagnostic: &'static str) -> WorkerProviderErrorV1 {
     WorkerProviderErrorV1 {
         kind: WorkerProviderErrorKindV1::MalformedOutput,
+        retry_after_millis: None,
+        diagnostic,
     }
 }
 
 fn fatal() -> WorkerProviderErrorV1 {
+    fatal_with("fatal_provider_error")
+}
+
+fn fatal_with(diagnostic: &'static str) -> WorkerProviderErrorV1 {
     WorkerProviderErrorV1 {
         kind: WorkerProviderErrorKindV1::Fatal,
+        retry_after_millis: None,
+        diagnostic,
     }
 }
 
 fn revoked() -> WorkerProviderErrorV1 {
     WorkerProviderErrorV1 {
         kind: WorkerProviderErrorKindV1::ProviderRevoked,
+        retry_after_millis: None,
+        diagnostic: "provider_revoked",
     }
 }
 
@@ -562,7 +943,14 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, vec};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{mpsc, Arc},
+        thread,
+        time::Duration,
+        vec,
+    };
 
     use super::*;
     use crate::worker_harness::{
@@ -578,15 +966,16 @@ mod tests {
     fn reconstructs_fragmented_tool_call_and_bounded_usage() {
         let mut assembler = OpenAICompatibleStreamAssemblerV1::default();
         assembler
-            .push_openai_event(&event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"resource_read","arguments":r#"{"res"#}}]}}]})))
+            .push_openai_event(&event(json!({"model":"model","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"resource_","arguments":r#"{"res"#}}]}}]})))
             .unwrap();
         assembler
-            .push_openai_event(&event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":r#"ource":"input"}"#}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":3}})))
+            .push_openai_event(&event(json!({"model":"model","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":r#"ource":"input"}"#}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":3}})))
             .unwrap();
         assembler.done = true;
         let turn = assembler.finish().unwrap();
         assert_eq!(turn.metadata.input_tokens, Some(12));
         assert_eq!(turn.metadata.output_tokens, Some(3));
+        assert_eq!(turn.metadata.response_model.as_deref(), Some("model"));
         assert!(matches!(
             turn.response,
             WorkerProviderResponseV1::ToolCall {
@@ -602,7 +991,7 @@ mod tests {
     fn malformed_or_partial_tool_call_never_normalizes() {
         let mut assembler = OpenAICompatibleStreamAssemblerV1::default();
         assembler
-            .push_openai_event(&event(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"resource_read","arguments":r#"{"resource":"#}}]},"finish_reason":"tool_calls"}]})))
+            .push_openai_event(&event(json!({"model":"model","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"resource_read","arguments":r#"{"resource":"#}}]},"finish_reason":"tool_calls"}]})))
             .unwrap();
         assembler.done = true;
         assert_eq!(
@@ -628,6 +1017,200 @@ mod tests {
             incomplete.finish().unwrap_err().kind,
             WorkerProviderErrorKindV1::Interrupted
         );
+    }
+
+    #[test]
+    fn conflicting_tool_identity_or_response_model_never_normalizes() {
+        let mut assembler = OpenAICompatibleStreamAssemblerV1::default();
+        assembler
+            .push_openai_event(&json!({"model":"model-a","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","type":"function","function":{"name":"resource_read","arguments":""}}]}}]}))
+            .unwrap();
+        assert_eq!(
+            assembler
+                .push_openai_event(&json!({"model":"model-a","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-b","type":"function","function":{"arguments":"{}"}}]}}]}))
+                .unwrap_err()
+                .kind,
+            WorkerProviderErrorKindV1::MalformedOutput
+        );
+        let mut models = OpenAICompatibleStreamAssemblerV1::default();
+        models
+            .push_openai_event(&json!({"model":"model-a","choices":[]}))
+            .unwrap();
+        assert_eq!(
+            models
+                .push_openai_event(&json!({"model":"model-b","choices":[]}))
+                .unwrap_err()
+                .kind,
+            WorkerProviderErrorKindV1::MalformedOutput
+        );
+
+        let mut unsupported_type = OpenAICompatibleStreamAssemblerV1::default();
+        assert_eq!(
+            unsupported_type
+                .push_openai_event(&json!({"model":"model","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","type":"computer","function":{"name":"resource_read","arguments":"{}"}}]}}]}))
+                .unwrap_err()
+                .kind,
+            WorkerProviderErrorKindV1::MalformedOutput
+        );
+
+        let mut conflicting_name = OpenAICompatibleStreamAssemblerV1::default();
+        conflicting_name
+            .push_openai_event(&json!({"model":"model","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","type":"function","function":{"name":"resource_","arguments":""}}]}}]}))
+            .unwrap();
+        conflicting_name
+            .push_openai_event(&json!({"model":"model","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"write","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}))
+            .unwrap();
+        conflicting_name.done = true;
+        assert_eq!(
+            conflicting_name.finish().unwrap_err().kind,
+            WorkerProviderErrorKindV1::MalformedOutput
+        );
+    }
+
+    #[test]
+    fn missing_terminal_identity_and_multiple_calls_fail_closed() {
+        let mut missing = OpenAICompatibleStreamAssemblerV1::default();
+        missing.push_openai_event(&json!({"model":"model","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"resource_read","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})).unwrap();
+        missing.done = true;
+        assert_eq!(
+            missing.finish().unwrap_err().kind,
+            WorkerProviderErrorKindV1::MalformedOutput
+        );
+
+        let mut multiple = OpenAICompatibleStreamAssemblerV1::default();
+        multiple.push_openai_event(&json!({"model":"model","choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"call-a","type":"function","function":{"name":"resource_read","arguments":"{}"}},
+            {"index":1,"id":"call-b","type":"function","function":{"name":"resource_read","arguments":"{}"}}
+        ]},"finish_reason":"tool_calls"}]})).unwrap();
+        multiple.done = true;
+        assert_eq!(
+            multiple.finish().unwrap_err().kind,
+            WorkerProviderErrorKindV1::MalformedOutput
+        );
+    }
+
+    #[test]
+    fn response_model_and_bounded_error_classification_are_fail_closed() {
+        assert!(require_configured_response_model("model", "model").is_ok());
+        assert_eq!(
+            require_configured_response_model("model", "other")
+                .unwrap_err()
+                .diagnostic,
+            "provider_model_mismatch"
+        );
+        let rate_limited =
+            classify_status_and_body(StatusCode::TOO_MANY_REQUESTS, b"", Some(5_000));
+        assert_eq!(rate_limited.kind, WorkerProviderErrorKindV1::Retryable);
+        assert_eq!(rate_limited.retry_after_millis, Some(5_000));
+        assert_eq!(
+            classify_status_and_body(StatusCode::UNAUTHORIZED, b"", None).diagnostic,
+            "authentication_rejected"
+        );
+        assert_eq!(
+            classify_status_and_body(StatusCode::BAD_REQUEST, b"context window exceeded", None)
+                .kind,
+            WorkerProviderErrorKindV1::ContextOverflow
+        );
+    }
+
+    #[test]
+    fn deterministic_http_sse_exercises_real_adapter_identity_and_retry_after() {
+        let run = WorkerHarnessRunV1::new("bridge".into(), "binding".into());
+        let parsed = normalize_sse_lines(
+            valid_tool_sse("model")
+                .lines()
+                .map(|line| Ok::<_, std::io::Error>(line.to_owned())),
+            &run.provider_cancellation(),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.response,
+            WorkerProviderResponseV1::ToolCall { .. }
+        ));
+        let Some(url) = local_response_server("200 OK", &[], valid_tool_sse("model")) else {
+            return;
+        };
+        let mut provider =
+            OpenAICompatibleStreamingWorkerProviderV1::new(local_config(url)).unwrap();
+        let turn = provider
+            .next_turn(sample_request("transform"), &run.provider_cancellation())
+            .unwrap();
+        assert_eq!(turn.metadata.response_model.as_deref(), Some("model"));
+        assert!(matches!(
+            turn.response,
+            WorkerProviderResponseV1::ToolCall { .. }
+        ));
+
+        let Some(url) = local_response_server(
+            "429 Too Many Requests",
+            &[("Retry-After", "2")],
+            r#"{"error":{"message":"slow down"}}"#.into(),
+        ) else {
+            return;
+        };
+        let mut provider =
+            OpenAICompatibleStreamingWorkerProviderV1::new(local_config(url)).unwrap();
+        let error = provider
+            .next_turn(sample_request("transform"), &run.provider_cancellation())
+            .unwrap_err();
+        assert_eq!(error.kind, WorkerProviderErrorKindV1::Retryable);
+        assert_eq!(error.retry_after_millis, Some(2_000));
+        assert_eq!(error.diagnostic, "rate_limited");
+    }
+
+    #[test]
+    fn returned_model_mismatch_and_stalled_sse_cancel_before_normalization() {
+        let Some(url) = local_response_server("200 OK", &[], valid_tool_sse("other-model")) else {
+            return;
+        };
+        let mut provider =
+            OpenAICompatibleStreamingWorkerProviderV1::new(local_config(url)).unwrap();
+        let run = WorkerHarnessRunV1::new("bridge".into(), "binding".into());
+        let error = provider
+            .next_turn(sample_request("transform"), &run.provider_cancellation())
+            .unwrap_err();
+        assert_eq!(error.diagnostic, "provider_model_mismatch");
+
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("fault-injection listener failed: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let (entered_sender, entered) = mpsc::sync_channel(1);
+        let (release_sender, release) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            entered_sender.send(()).unwrap();
+            let _ = release.recv_timeout(Duration::from_secs(1));
+        });
+        let run = WorkerHarnessRunV1::new("bridge".into(), "binding".into());
+        let cancellation = run.provider_cancellation();
+        let config = local_config(format!("http://{address}/v1"));
+        let (result_sender, result) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let mut provider = OpenAICompatibleStreamingWorkerProviderV1::new(config).unwrap();
+            let _ =
+                result_sender.send(provider.next_turn(sample_request("transform"), &cancellation));
+        });
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        run.cancel();
+        assert_eq!(
+            result
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap()
+                .unwrap_err()
+                .kind,
+            WorkerProviderErrorKindV1::Cancelled
+        );
+        let _ = release_sender.send(());
     }
 
     #[test]
@@ -759,6 +1342,78 @@ mod tests {
         .unwrap()
     }
 
+    fn local_config(base_url: String) -> ConfiguredWorkerProviderConfigV1 {
+        ConfiguredWorkerProviderConfigV1::new(
+            "fault-injection-provider".into(),
+            base_url,
+            "model".into(),
+            "test-key".into(),
+            5_000,
+            512,
+        )
+        .unwrap()
+    }
+
+    fn local_response_server(
+        status: &str,
+        headers: &[(&str, &str)],
+        body: String,
+    ) -> Option<String> {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            // This managed sandbox denies listeners. CI and ordinary local
+            // runs exercise the real adapter; parser/authority tests remain
+            // deterministic in the restricted environment.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("fault-injection listener failed: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let status = status.to_owned();
+        let headers = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect::<Vec<_>>();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let mut response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
+            for (name, value) in headers {
+                response.push_str(&format!("{name}: {value}\r\n"));
+            }
+            response.push_str("\r\n");
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        });
+        Some(format!("http://{address}/v1"))
+    }
+
+    fn valid_tool_sse(model: &str) -> String {
+        let first = json!({
+            "model": model,
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "resource_", "arguments": "{\"res"}
+            }]}}]
+        });
+        let second = json!({
+            "model": model,
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "function": {"name": "read", "arguments": "ource\":\"input\"}"}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        });
+        format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n")
+    }
+
     fn user_context(payload: &Value) -> Value {
         let content = payload["messages"][1]["content"]
             .as_str()
@@ -770,6 +1425,7 @@ mod tests {
     fn final_openai_transform_payload_closes_the_model_visible_context() {
         let payload = openai_stream_request(&sample_config(), &sample_request("transform"));
         let context = user_context(&payload);
+        assert_eq!(payload["parallel_tool_calls"], false);
 
         assert!(payload["messages"][0]["content"]
             .as_str()
