@@ -1265,6 +1265,44 @@ mod tests {
         assert!(validate_invocation(&invocation).is_err());
     }
 
+    #[test]
+    fn managed_revision_directory_mount_resolves_input_root_as_working_directory() {
+        let root = std::env::temp_dir().join(format!("pastey-tree-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("package")).unwrap();
+        std::fs::write(root.join("main.py"), b"from package import helper\n").unwrap();
+        std::fs::write(root.join("package/helper.py"), b"VALUE = 1\n").unwrap();
+        let source_path = root.canonicalize().unwrap();
+        let input_handle: ResourceHandleRefV1 =
+            serde_json::from_value(serde_json::json!("tree-input-handle")).unwrap();
+        let executable_handle: ResourceHandleRefV1 =
+            serde_json::from_value(serde_json::json!("tree-executable-handle")).unwrap();
+        let mount = ExecutionWorldMountV1 {
+            handle_ref: input_handle.clone(),
+            kind: ResourceKindV1::ManagedRevision,
+            source_path: source_path.clone(),
+            mount_name: "tree-input".into(),
+            writable: false,
+            quota_bytes: 4096,
+            allowed_verbs: BTreeSet::new(),
+            private_overlay: false,
+            initial_bytes: 0,
+        };
+        let invocation = ManagedProcessInvocationV1 {
+            executable_handle,
+            argv: vec!["main.py".into()],
+            environment: BTreeMap::new(),
+            stdin: None,
+            working_directory_handle: Some(input_handle),
+            working_directory_selector: Some(".".into()),
+        };
+
+        assert_eq!(
+            resolve_working_directory(&[mount], &invocation).unwrap(),
+            Some(source_path)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     struct CancellationProcess {
         terminations: Arc<AtomicUsize>,
     }

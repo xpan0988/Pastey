@@ -1383,6 +1383,23 @@ mod tests {
         steps: impl FnOnce(&ManagedObjectAcquisition, &PlanParticipantRef) -> Vec<PlanStepV2>,
         managed_available: bool,
     ) -> Fixture {
+        fixture_with_input(steps, managed_available, |artifact_root| {
+            let artifact_path = artifact_root.join("input.txt");
+            std::fs::write(&artifact_path, b"revision one").unwrap();
+            (
+                artifact_path,
+                "input.txt".into(),
+                "text/plain".into(),
+                ManagedObjectAcquisitionKind::LocalSelection,
+            )
+        })
+    }
+
+    fn fixture_with_input(
+        steps: impl FnOnce(&ManagedObjectAcquisition, &PlanParticipantRef) -> Vec<PlanStepV2>,
+        managed_available: bool,
+        input: impl FnOnce(&std::path::Path) -> (PathBuf, String, String, ManagedObjectAcquisitionKind),
+    ) -> Fixture {
         let root = std::env::temp_dir().join(format!("pastey-step8-{}", uuid::Uuid::new_v4()));
         let paths = AppPaths::new(root.clone(), root.join("logs"));
         paths.ensure_directories().unwrap();
@@ -1419,26 +1436,40 @@ mod tests {
         .unwrap();
         let artifact_root = root.join("artifact");
         std::fs::create_dir_all(&artifact_root).unwrap();
-        let artifact_path = artifact_root.join("input.txt");
-        std::fs::write(&artifact_path, b"revision one").unwrap();
-        let input = runtime
-            .managed_objects
-            .lock()
-            .acquire_new(
-                HostArtifactAcquisition {
-                    kind: ManagedObjectAcquisitionKind::LocalSelection,
-                    source_ref: "step8-test-input".into(),
-                    bridge_id: Some(BRIDGE.into()),
-                    path: artifact_path,
-                    scope_root: artifact_root,
-                    display_name: "input.txt".into(),
-                    media_type: "text/plain".into(),
-                    expires_at: NOW + 600,
-                    app_owned_temporary: false,
-                },
-                NOW,
-            )
-            .unwrap();
+        let (artifact_path, display_name, media_type, acquisition_kind) = input(&artifact_root);
+        let artifact_input = HostArtifactAcquisition {
+            kind: acquisition_kind,
+            source_ref: "step8-test-input".into(),
+            bridge_id: Some(BRIDGE.into()),
+            path: artifact_path.clone(),
+            scope_root: artifact_root,
+            display_name,
+            media_type,
+            expires_at: NOW + 600,
+            app_owned_temporary: false,
+        };
+        let mut managed_objects = runtime.managed_objects.lock();
+        let input = if acquisition_kind == ManagedObjectAcquisitionKind::TransferReceipt {
+            let expected_content_digest =
+                crate::safe_file_identity::capture_regular_file_set_identity(
+                    &artifact_path,
+                    u64::MAX,
+                )
+                .unwrap()
+                .digest;
+            managed_objects
+                .bind_transferred_revision(
+                    artifact_input,
+                    format!("managed-object:v1:{}", uuid::Uuid::new_v4()),
+                    1,
+                    expected_content_digest,
+                    NOW,
+                )
+                .unwrap()
+        } else {
+            managed_objects.acquire_new(artifact_input, NOW).unwrap()
+        };
+        drop(managed_objects);
         let requester_host = HostRef::from_device_id("step8-requester").unwrap();
         let plan_id = format!("plan-step8-{}", uuid::Uuid::new_v4());
         let participants = PlanParticipants::new(
@@ -2332,6 +2363,109 @@ mod tests {
             )
             .unwrap();
         assert_eq!(revisions, 1);
+    }
+
+    #[test]
+    fn execute_worker_consumes_a_regular_file_set_from_input_root_without_lineage() {
+        let fixture = fixture_with_input(
+            |input, host| {
+                vec![PlanStepV2::Execute {
+                    step_id: "execute".into(),
+                    depends_on: vec![],
+                    host: host.clone(),
+                    target: ManagedObjectRevisionV2 {
+                        logical_object_id: input.object.logical_object_id.clone(),
+                        revision: input.object.revision,
+                    },
+                    execution_intent: "Run the exact multi-file project.".into(),
+                }]
+            },
+            true,
+            |artifact_root| {
+                let project = artifact_root.join("input");
+                std::fs::create_dir_all(project.join("package")).unwrap();
+                std::fs::write(
+                    project.join("main.py"),
+                    b"import utils\nprint(utils.value())\n",
+                )
+                .unwrap();
+                std::fs::write(
+                    project.join("utils.py"),
+                    b"from package.helper import VALUE\ndef value(): return VALUE\n",
+                )
+                .unwrap();
+                std::fs::write(project.join("package/__init__.py"), b"").unwrap();
+                std::fs::write(project.join("package/helper.py"), b"VALUE = 'tree-ok'\n").unwrap();
+                (
+                    project,
+                    "input".into(),
+                    "text/x-python".into(),
+                    ManagedObjectAcquisitionKind::TransferReceipt,
+                )
+            },
+        );
+        if !fixture
+            .runtime
+            .execution_worlds
+            .platform_availability()
+            .available
+            || !PathBuf::from("/usr/bin/python3").is_file()
+        {
+            return;
+        }
+        let mut provider = ScriptedWorkerProvider {
+            responses: VecDeque::from([
+                Ok(WorkerProviderResponseV1::ToolCall {
+                    call: WorkerToolCallV1::ProcessSpawn {
+                        arguments: vec!["main.py".into()],
+                        environment: Default::default(),
+                        stdin_base64: None,
+                        working_directory: Some(WorkerResourceAliasV1::Input),
+                    },
+                }),
+                Ok(WorkerProviderResponseV1::FinalExecute),
+            ]),
+            requests: Vec::new(),
+        };
+        let result = fixture
+            .runtime
+            .run_v2_execute_worker(
+                worker_process_claim_request(
+                    &fixture,
+                    "execute",
+                    fixture.input.clone(),
+                    "/usr/bin/python3",
+                ),
+                WorkerRunLimitsV1::default(),
+                &mut provider,
+            )
+            .unwrap();
+        assert_eq!(
+            result.input.logical_object_id,
+            fixture.input.object.logical_object_id
+        );
+        assert_eq!(result.input.revision, fixture.input.object.revision);
+        assert!(!result.result_digest.is_empty());
+        let connection = connection(&fixture.runtime.paths).unwrap();
+        let transforms: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_transform_results",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let executes: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_execute_results",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transforms, 0);
+        assert_eq!(executes, 1);
+        let serialized_provider_request = serde_json::to_string(&provider.requests[0]).unwrap();
+        assert!(serialized_provider_request.contains("\"alias\":\"input\""));
+        assert!(!serialized_provider_request.contains("/pastey-step8-"));
     }
 
     #[test]

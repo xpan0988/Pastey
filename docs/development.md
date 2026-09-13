@@ -208,6 +208,8 @@ A requester → Transform N→N+1 @ B → authored Transfer B→C → Execute N+
 
 This remains a generic semantic Transform scenario. Python→Java may be used as one acceptance payload, but it is not a product-specific subsystem. The broader cross-representation E2E follows the planned Worker Context Contract in the canonical [roadmap](architecture.md#roadmap).
 
+GST-1 through GST-3 automated coverage is complete for bounded regular-file representations, exact file-set Transfer, and read-only contained file-set Execute. This does not constitute physical Mac ↔ Windows tree Execute evidence; record that separately when a packaged two-Host scenario is run.
+
 ### Acceptance prerequisites
 
 Do not start or claim this smoke as reproducible until all of these are true:
