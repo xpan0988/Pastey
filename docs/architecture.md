@@ -150,7 +150,7 @@ V1 remains isolated and unchanged: its product executes Search/Transfer and reje
 
 Bridge Device Check is the implemented production entry point for one bounded Managed E2E self-check. An explicit Check performs `Search @ requester → authored Transfer → Execute @ exact remote Host` through the ordinary immutable revision, approval, distributed readiness, Host admission, Worker, EffectEnvelope, ExecutionWorld, and Core completion path. Missing provider, runtime, or ExecutionWorld facts return `BLOCKED` before managed work begins. Its `PASS | BLOCKED | FAIL` report and evidence requirements are owned by [Layer 2](layers/layer-2-device-intelligence.md). Host-owned provider/runtime configuration and health closure are implemented; real provider/external API validation remains pending.
 
-Draft discovery/origination, full tree Execute acceptance, renderer-safe PM context and detailed topology, and result content projection are not yet complete. GST-1 implements same-Host General Semantic Transform revision lifecycle for a scalar regular file or bounded regular-file-set, with Core-owned canonical file-set sealing. GST-2 implements exact authored cross-Host relocation of that bounded file-set: Transfer preserves the same logical object and revision while a Host-private deterministic single-file transport package moves through the existing encrypted Room transfer. The package is not a managed object and canonical regular-file-set digest remains the logical identity; scalar Transfer remains direct. GST-3 tree Execute acceptance is pending. A real packaged Mac ↔ Windows Managed E2E PASS is also still unclaimed until an external provider call and physical Check succeed.
+Draft discovery/origination, renderer-safe PM context and detailed topology, and result content projection are not yet complete. The General Semantic Transform foundation is complete for bounded regular-file representations: GST-1 implements same-Host lifecycle and Core-owned canonical file-set sealing; GST-2 preserves the same logical object and revision through exact authored cross-Host file-set Transfer; and GST-3 consumes an exact RegularFileSet through the existing read-only ExecutionWorld mount and exact process binding, yielding only the existing Execute result digest. The Host canonically revalidates the entire tree both before leasing and after releasing the world; Execute never registers N+1. The transport package remains Host-private and is not a managed object; scalar Transfer and scalar Execute remain unchanged. A real packaged Mac ↔ Windows tree Execute PASS is still unclaimed until it is physically run, as are external-provider and packaged two-Host Managed E2E PASS claims.
 
 ## Roadmap
 
@@ -161,15 +161,15 @@ DONE  Low-friction Capability Acquisition foundation
       actual acquisition behavior deferred
 
 DONE  Worker Context Contract / minimal semantic closure
-NEXT  General Semantic Transform / cross-representation E2E
-THEN  Real Provider Conformance
+DONE  General Semantic Transform foundation / bounded representations, exact Transfer, contained Execute
+NEXT  Real Provider Conformance
 THEN  Contract-specific Validation Hardening
 THEN  Product Wiring / Figma integration
 THEN  Coordination Recovery Closure
 THEN  Physical Failure Matrix + Security Freeze
 ```
 
-The Worker Context Contract reuses the existing Host/Core authority path and workspace aliases rather than introducing another authority object. The provider receives only the semantic step operation and intent, bounded workspace roles/operations/relative-selector facts, semantic tools, bounded history, and an operation-specific completion template. Exact revision correlation, raw filesystem paths, topology, sessions/routes, credentials, Host-selection data, physical bindings, and authority handles remain Host/Core-private. General Semantic Transform context remains the next separate slice.
+The Worker Context Contract reuses the existing Host/Core authority path and workspace aliases rather than introducing another authority object. The provider receives only the semantic step operation and intent, bounded workspace roles/operations/relative-selector facts, semantic tools, bounded history, and an operation-specific completion template. Exact revision correlation, raw filesystem paths, topology, sessions/routes, credentials, Host-selection data, physical bindings, and authority handles remain Host/Core-private.
 
 The production Bridge Device Managed E2E architecture already exists, Windows local managed execution physical acceptance is complete, and the physical fail-closed preflight is verified. Real external-provider conformance and a packaged physical Mac ↔ Windows E2E PASS remain evidence gates. Independently future capabilities include a verified Linux managed execution world, Worker network tools, subagent policy, and Headless Host; none is implied by the current backend.
 

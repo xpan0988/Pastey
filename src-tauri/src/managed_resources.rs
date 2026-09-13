@@ -854,12 +854,32 @@ impl ManagedResourceResolverV1 {
                     ..
                 } => {
                     let artifact = objects.resolve(acquisition, access.current.now)?;
-                    safe_file_identity::read_source_if_identity_matches(
-                        &artifact.path,
-                        &artifact.scope_root,
-                        artifact.identity.regular_file()?,
-                        *maximum_bytes,
-                    )?;
+                    match &artifact.identity {
+                        ManagedArtifactIdentityV1::RegularFile(identity) => {
+                            // Preserve the scalar mount revalidation path.
+                            safe_file_identity::read_source_if_identity_matches(
+                                &artifact.path,
+                                &artifact.scope_root,
+                                identity,
+                                *maximum_bytes,
+                            )?;
+                        }
+                        ManagedArtifactIdentityV1::RegularFileSet(identity) => {
+                            // A managed tree is mounted from its exact private root.  Re-scan
+                            // immediately before the platform adapter receives that root so
+                            // every selector, file identity, byte count, and aggregate digest
+                            // remains bound to the exact managed revision.
+                            let observed = safe_file_identity::capture_regular_file_set_identity(
+                                &artifact.path,
+                                *maximum_bytes,
+                            )?;
+                            if &observed != identity {
+                                return invalid(
+                                    "Managed regular-file-set changed before execution world lease.",
+                                );
+                            }
+                        }
+                    }
                     (artifact.path, *maximum_bytes)
                 }
                 HostResourceBackingV1::Workspace {
@@ -1005,12 +1025,30 @@ impl ManagedResourceResolverV1 {
                 ..
             } => {
                 let artifact = objects.resolve(acquisition, access.current.now)?;
-                safe_file_identity::read_source_if_identity_matches(
-                    &artifact.path,
-                    &artifact.scope_root,
-                    artifact.identity.regular_file()?,
-                    *maximum_bytes,
-                )?;
+                match &artifact.identity {
+                    ManagedArtifactIdentityV1::RegularFile(identity) => {
+                        // Preserve the scalar release revalidation path.
+                        safe_file_identity::read_source_if_identity_matches(
+                            &artifact.path,
+                            &artifact.scope_root,
+                            identity,
+                            *maximum_bytes,
+                        )?;
+                    }
+                    ManagedArtifactIdentityV1::RegularFileSet(identity) => {
+                        // Execute cannot accept a changed tree as a successor.  The canonical
+                        // scanner must still reproduce the exact bound tree at completion.
+                        let observed = safe_file_identity::capture_regular_file_set_identity(
+                            &artifact.path,
+                            *maximum_bytes,
+                        )?;
+                        if &observed != identity {
+                            return invalid(
+                                "Managed regular-file-set changed during execution world lease.",
+                            );
+                        }
+                    }
+                }
                 Ok(BTreeMap::new())
             }
             HostResourceBackingV1::Executable {
@@ -2480,6 +2518,135 @@ mod tests {
             .resolver
             .exclusive_world_leases
             .contains(&fixture.managed));
+    }
+
+    #[test]
+    fn regular_file_set_managed_revision_world_mount_leases_the_complete_read_only_tree() {
+        let mut fixture = regular_file_set_fixture();
+        fixture
+            .resolver
+            .bind_managed_revision(
+                &fixture.authority,
+                &mut fixture.objects,
+                &fixture.access,
+                &fixture.managed,
+                fixture.acquisition.clone(),
+            )
+            .unwrap();
+        let grant = world_grant(&fixture, &fixture.managed, ResourceKindV1::ManagedRevision);
+        let mounts = fixture
+            .resolver
+            .lease_execution_world_mounts(
+                &fixture.authority,
+                &mut fixture.objects,
+                &fixture.access,
+                &[grant],
+            )
+            .unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(
+            mounts[0].source_path,
+            fixture.source_path.canonicalize().unwrap()
+        );
+        assert!(mounts[0].source_path.is_dir());
+        assert!(!mounts[0].writable);
+        let identity = safe_file_identity::capture_regular_file_set_identity(
+            &mounts[0].source_path,
+            mounts[0].quota_bytes,
+        )
+        .unwrap();
+        let artifact = fixture
+            .objects
+            .resolve(&fixture.acquisition, fixture.access.current.now)
+            .unwrap();
+        assert_eq!(artifact.identity.regular_file_set(), Some(&identity));
+
+        let request_id: EffectRequestIdV1 =
+            serde_json::from_value(serde_json::json!("regular-file-set-world-release")).unwrap();
+        fixture
+            .resolver
+            .release_execution_world_mounts(
+                &mut fixture.objects,
+                &fixture.access,
+                &request_id,
+                &mounts,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn regular_file_set_world_lease_rejects_a_tree_changed_after_binding() {
+        let mut fixture = regular_file_set_fixture();
+        fixture
+            .resolver
+            .bind_managed_revision(
+                &fixture.authority,
+                &mut fixture.objects,
+                &fixture.access,
+                &fixture.managed,
+                fixture.acquisition.clone(),
+            )
+            .unwrap();
+        fs::write(fixture.source_path.join("second.txt"), b"changed").unwrap();
+        let grant = world_grant(&fixture, &fixture.managed, ResourceKindV1::ManagedRevision);
+        assert!(fixture
+            .resolver
+            .lease_execution_world_mounts(
+                &fixture.authority,
+                &mut fixture.objects,
+                &fixture.access,
+                &[grant],
+            )
+            .is_err());
+        assert!(!fixture.resolver.world_leases.contains(&fixture.managed));
+    }
+
+    #[test]
+    fn regular_file_set_world_release_rejects_changed_added_or_removed_entries() {
+        for mutation in ["changed", "added", "removed"] {
+            let mut fixture = regular_file_set_fixture();
+            fixture
+                .resolver
+                .bind_managed_revision(
+                    &fixture.authority,
+                    &mut fixture.objects,
+                    &fixture.access,
+                    &fixture.managed,
+                    fixture.acquisition.clone(),
+                )
+                .unwrap();
+            let grant = world_grant(&fixture, &fixture.managed, ResourceKindV1::ManagedRevision);
+            let mounts = fixture
+                .resolver
+                .lease_execution_world_mounts(
+                    &fixture.authority,
+                    &mut fixture.objects,
+                    &fixture.access,
+                    &[grant],
+                )
+                .unwrap();
+            match mutation {
+                "changed" => fs::write(fixture.source_path.join("second.txt"), b"changed").unwrap(),
+                "added" => fs::write(fixture.source_path.join("added.txt"), b"added").unwrap(),
+                "removed" => fs::remove_file(fixture.source_path.join("second.txt")).unwrap(),
+                _ => unreachable!(),
+            }
+            let request_id: EffectRequestIdV1 = serde_json::from_value(serde_json::json!(format!(
+                "regular-file-set-world-release-{mutation}"
+            )))
+            .unwrap();
+            assert!(fixture
+                .resolver
+                .release_execution_world_mounts(
+                    &mut fixture.objects,
+                    &fixture.access,
+                    &request_id,
+                    &mounts,
+                )
+                .is_err());
+            assert!(!fixture.resolver.world_leases.contains(&fixture.managed));
+        }
     }
 
     #[test]
