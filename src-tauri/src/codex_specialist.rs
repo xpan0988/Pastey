@@ -2,8 +2,8 @@
 //!
 //! This module intentionally has no Plan dispatch, no OutputSlot import, and
 //! no successor-revision path. Its production state remains unqualified until
-//! a Host can physically prove that a controller's provider traffic is split
-//! from every model-generated child process.
+//! a Host can obtain physical execution-boundary proof that a controller's
+//! provider traffic is split from every model-generated child process.
 
 #![allow(dead_code)] // B0 is intentionally unselected by production dispatch.
 
@@ -86,8 +86,9 @@ impl CodexAttemptBindingV0 {
     }
 }
 
-/// Host-owned invocation posture. The command is materialized only after a
-/// real qualification proves every flag and the controller/child boundary.
+/// Host-owned invocation posture. This deterministic policy model is not an
+/// OS-enforced controller/child network boundary; production materialization
+/// remains unavailable until physical qualification proves one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CodexInvocationV0 {
     argv: Vec<String>,
@@ -127,6 +128,8 @@ impl CodexInvocationV0 {
     }
 }
 
+/// Deterministic policy-model representation of one Host-owned provider
+/// proxy. B0 does not open a listener or establish OS process containment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProviderControlPlaneProxyV0 {
     controller_ref: String,
@@ -148,8 +151,9 @@ impl ProviderControlPlaneProxyV0 {
     }
 }
 
-/// Host-private configuration for the controller only. There is deliberately
-/// no conversion to a task-child environment.
+/// Controller side of the deterministic boundary model. There is deliberately
+/// no conversion to a task-child environment, but B0 does not claim that an
+/// OS-enforced Codex child projection exists yet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ControllerEnvironmentV0 {
     values: BTreeMap<String, String>,
@@ -172,10 +176,10 @@ impl ControllerEnvironmentV0 {
     }
 }
 
-/// The policy handed to model-generated children. It has no token, proxy,
-/// credential, Codex config path, or ambient HOME. The actual production
-/// bridge stays unavailable until qualification proves Codex enforces this
-/// projection for every child it creates.
+/// Task-child side of the deterministic boundary model. It has no token,
+/// proxy, credential, Codex config path, or ambient HOME. Production stays
+/// unavailable until physical qualification proves Codex enforces this for
+/// every child it creates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TaskChildEnvironmentV0 {
     values: BTreeMap<String, String>,
@@ -203,7 +207,7 @@ fn parse_codex_jsonl(input: &[u8]) -> AppResult<Vec<CodexJsonlEventV0>> {
         return invalid("Codex JSONL output is empty.");
     }
     let mut events = Vec::new();
-    let mut completed = false;
+    let mut state = CodexJsonlStateV0::ExpectThreadStarted;
     for line in input.split(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
@@ -221,29 +225,45 @@ fn parse_codex_jsonl(input: &[u8]) -> AppResult<Vec<CodexJsonlEventV0>> {
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty() && value.len() <= 128)
             .ok_or_else(|| AppError::InvalidInput("Codex JSONL event type is invalid.".into()))?;
-        let lowered = serde_json::to_string(&value)?.to_ascii_lowercase();
-        if [
-            "error", "approval", "mcp", "subagent", "plugin", "hook", "app",
-        ]
-        .iter()
-        .any(|forbidden| lowered.contains(forbidden))
-        {
-            return invalid("Codex JSONL contains a forbidden or failed event.");
+        if object.contains_key("error") {
+            return invalid("Codex JSONL contains a top-level error event.");
         }
-        match event_type {
-            "thread.started" | "turn.started" | "item.started" | "item.updated"
-            | "item.completed" => {}
-            "turn.completed" => completed = true,
-            _ => return invalid("Codex JSONL event type is not in the B0 allowlist."),
-        }
+        state = state.transition(event_type)?;
         events.push(CodexJsonlEventV0 {
             event_type: event_type.into(),
         });
     }
-    if events.is_empty() || !completed {
-        return invalid("Codex JSONL did not reach an allowed terminal event.");
+    if events.is_empty() || state != CodexJsonlStateV0::Completed {
+        return invalid("Codex JSONL did not reach exactly one terminal completion.");
     }
     Ok(events)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexJsonlStateV0 {
+    ExpectThreadStarted,
+    ExpectTurnStarted,
+    InTurn,
+    Completed,
+}
+
+impl CodexJsonlStateV0 {
+    fn transition(self, event_type: &str) -> AppResult<Self> {
+        match (self, event_type) {
+            (Self::ExpectThreadStarted, "thread.started") => Ok(Self::ExpectTurnStarted),
+            (Self::ExpectTurnStarted, "turn.started") => Ok(Self::InTurn),
+            (Self::InTurn, "item.started" | "item.updated" | "item.completed") => Ok(Self::InTurn),
+            (Self::InTurn, "turn.completed") => Ok(Self::Completed),
+            (Self::Completed, _) => invalid("Codex JSONL contains an event after completion."),
+            (_, "turn.failed" | "error") => invalid("Codex JSONL contains a failed event."),
+            (
+                _,
+                "approval.requested" | "mcp.call" | "plugin.loaded" | "hook.called" | "app.started"
+                | "subagent.started",
+            ) => invalid("Codex JSONL contains a forbidden event."),
+            _ => invalid("Codex JSONL event type or ordering is not allowed in B0."),
+        }
+    }
 }
 
 struct CodexControllerSessionV0 {
@@ -304,7 +324,8 @@ impl CodexSpecialistServiceV0 {
     }
 
     /// Deliberately fail closed in production. B0 has no real authentication
-    /// or process-tree network proof, so detection never upgrades to ready.
+    /// or physical controller/child network containment proof, so detection
+    /// never upgrades to ready.
     pub(crate) fn bind_claimed_transform(
         &mut self,
         grant: &ManagedStepGrantV1,
@@ -325,7 +346,9 @@ impl CodexSpecialistServiceV0 {
             )
         })?;
         if !qualification.synthetic {
-            return invalid("Codex real qualification is deferred pending boundary proof.");
+            return invalid(
+                "Codex real qualification is deferred pending physical execution-boundary proof.",
+            );
         }
         let executable_identity_ref = qualification
             .process_world
@@ -493,20 +516,32 @@ mod tests {
     }
 
     #[test]
-    fn strict_jsonl_accepts_only_terminal_safe_events() {
+    fn jsonl_state_machine_requires_one_ordered_terminal_turn() {
         let parsed = parse_codex_jsonl(
             br#"{"type":"thread.started"}
+{"type":"turn.started"}
 {"type":"item.completed"}
+{"type":"item.updated","message":"app error hook plugin mcp approval subagent"}
 {"type":"turn.completed"}
 "#,
         )
         .unwrap();
-        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed.len(), 5);
         for input in [
             br#"not json\n"#.as_slice(),
+            br#"{"type":"turn.started"}\n"#.as_slice(),
+            br#"{"type":"thread.started"}\n{"type":"turn.completed"}\n"#.as_slice(),
+            br#"{"type":"thread.started"}\n{"type":"turn.started"}\n{"type":"turn.completed"}\n{"type":"turn.completed"}\n"#.as_slice(),
+            br#"{"type":"thread.started"}\n{"type":"turn.started"}\n{"type":"turn.completed"}\n{"type":"item.completed"}\n"#.as_slice(),
+            br#"{"type":"thread.started"}\n{"type":"turn.started"}\n{"type":"turn.failed"}\n"#.as_slice(),
+            br#"{"type":"thread.started","error":"bad"}\n"#.as_slice(),
             br#"{"type":"approval.requested"}\n"#.as_slice(),
             br#"{"type":"mcp.call"}\n"#.as_slice(),
-            br#"{"type":"turn.failed"}\n"#.as_slice(),
+            br#"{"type":"plugin.loaded"}\n"#.as_slice(),
+            br#"{"type":"hook.called"}\n"#.as_slice(),
+            br#"{"type":"app.started"}\n"#.as_slice(),
+            br#"{"type":"subagent.started"}\n"#.as_slice(),
+            br#"{"type":"unknown.event"}\n"#.as_slice(),
         ] {
             assert!(parse_codex_jsonl(input).is_err());
         }
@@ -546,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn controller_proxy_and_task_child_policy_are_not_interchangeable() {
+    fn deterministic_boundary_model_keeps_controller_and_task_child_policy_separate() {
         let proxy = ProviderControlPlaneProxyV0::new();
         let controller = ControllerEnvironmentV0::new(PathBuf::from("/private/codex"), &proxy);
         let child = TaskChildEnvironmentV0::new();
