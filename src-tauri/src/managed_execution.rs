@@ -304,31 +304,21 @@ impl HostRuntime {
             None
         };
         let scratch_grant = if process_spec.is_some() || request.private_scratch {
-            Some(
-                authority.mint_resource_grant(
-                    &draft,
-                    ResourceGrantSpecV1 {
-                        host_ref: self.local_host_ref.clone(),
-                        kind: ResourceKindV1::Scratch,
-                        safe_identity_ref: domain_hash(
-                            "pastey-phase5-v2-process-scratch-v1",
-                            &(draft.context_ref.as_str(), draft.run_control_ref.as_str()),
-                        )?,
-                        selector_prefix: ".".into(),
-                        allowed_verbs: [
-                            ResourceVerbV1::Inspect,
-                            ResourceVerbV1::Read,
-                            ResourceVerbV1::Create,
-                            ResourceVerbV1::Replace,
-                            ResourceVerbV1::Delete,
-                        ]
-                        .into_iter()
-                        .collect(),
-                        budgets,
-                        expires_at: source.expires_at,
-                    },
-                )?,
-            )
+            Some(authority.mint_resource_grant(
+                &draft,
+                ResourceGrantSpecV1 {
+                    host_ref: self.local_host_ref.clone(),
+                    kind: ResourceKindV1::Scratch,
+                    safe_identity_ref: domain_hash(
+                        "pastey-phase5-v2-process-scratch-v1",
+                        &(draft.context_ref.as_str(), draft.run_control_ref.as_str()),
+                    )?,
+                    selector_prefix: ".".into(),
+                    allowed_verbs: scratch_allowed_verbs(request.private_scratch),
+                    budgets,
+                    expires_at: source.expires_at,
+                },
+            )?)
         } else {
             None
         };
@@ -1229,6 +1219,21 @@ fn resource_bounds() -> Vec<EffectBoundV1> {
         },
     })
     .collect()
+}
+
+fn scratch_allowed_verbs(private_scratch: bool) -> BTreeSet<ResourceVerbV1> {
+    let mut verbs: BTreeSet<_> = [
+        ResourceVerbV1::Inspect,
+        ResourceVerbV1::Read,
+        ResourceVerbV1::Create,
+        ResourceVerbV1::Replace,
+    ]
+    .into_iter()
+    .collect();
+    if private_scratch {
+        verbs.insert(ResourceVerbV1::Delete);
+    }
+    verbs
 }
 
 fn process_bounds() -> Vec<EffectBoundV1> {
@@ -2153,6 +2158,18 @@ mod tests {
             process_world: None,
             private_scratch: false,
         }
+    }
+
+    #[test]
+    fn generic_worker_scratch_does_not_mint_delete_authority() {
+        let generic = scratch_allowed_verbs(false);
+        assert!(generic.contains(&ResourceVerbV1::Inspect));
+        assert!(generic.contains(&ResourceVerbV1::Read));
+        assert!(generic.contains(&ResourceVerbV1::Create));
+        assert!(generic.contains(&ResourceVerbV1::Replace));
+        assert!(!generic.contains(&ResourceVerbV1::Delete));
+
+        assert!(scratch_allowed_verbs(true).contains(&ResourceVerbV1::Delete));
     }
 
     fn worker_process_claim_request(
