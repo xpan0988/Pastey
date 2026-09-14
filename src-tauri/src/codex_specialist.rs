@@ -1,9 +1,12 @@
-//! B0 Host-local foundation for the OpenAI Codex specialist Worker.
+//! Host-local foundation and authoritative Transform import for the OpenAI
+//! Codex specialist Worker.
 //!
-//! This module intentionally has no Plan dispatch, no OutputSlot import, and
-//! no successor-revision path. Its production state remains unqualified until
-//! a Host can obtain physical execution-boundary proof that a controller's
-//! provider traffic is split from every model-generated child process.
+//! This module intentionally has no Plan dispatch or production selection.
+//! B0 binding/scan remains non-authoritative by itself. B1 imports a complete
+//! Host-scanned Scratch tree only through existing Resource effects, OutputSlot
+//! sealing, and Core finalization. Production remains unqualified until a Host
+//! can obtain physical execution-boundary proof that controller provider
+//! traffic is split from every model-generated child process.
 
 #![allow(dead_code)] // B0 is intentionally unselected by production dispatch.
 
@@ -24,10 +27,18 @@ use crate::{
         discover_codex_specialist_executable, probe_known_capability, KnownCapabilityProbeResult,
         CODEX_SPECIALIST_CAPABILITY_ID,
     },
-    effect_authority::{EffectAuthorityStateV1, ManagedRunRefV1, ManagedSemanticOperationV1},
+    effect_authority::{
+        lower_tool_request, EffectAuthorityStateV1, EffectBudgetsV1, EffectDecisionV1,
+        EffectRequestKindV1, ManagedRunRefV1, ManagedSemanticOperationV1, ResourceEffectV1,
+        ResourceVerbV1, StepWorkDescriptorV1, ToolEffectIntentV1, ToolRequestV1,
+        EFFECT_AUTHORITY_VERSION,
+    },
     error::{AppError, AppResult},
     managed_execution::{ManagedProcessWorldSpecV1, ManagedStepGrantV1},
-    managed_resources::{ManagedResourceResolverV1, ManagedScratchLeaseV1, ManagedScratchScanV1},
+    managed_resources::{
+        HostManagedResourceBackendV1, ManagedResourceResolverV1, ManagedScratchLeaseV1,
+        ManagedScratchScanV1, SealedOutputEvidenceV1,
+    },
     managed_workspace::{WorkerWorkspaceAliasV1, WorkerWorkspaceOperationV1},
 };
 
@@ -200,6 +211,15 @@ impl TaskChildEnvironmentV0 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CodexJsonlEventV0 {
     pub(crate) event_type: String,
+}
+
+/// Host-authenticated B1 import facts. Codex never constructs this value: its
+/// only source is a complete scratch scan followed by ordinary Resource
+/// evidence and the existing OutputSlot root seal.
+pub(crate) struct CodexScratchImportV1 {
+    pub(crate) output_seal: SealedOutputEvidenceV1,
+    pub(crate) evidence_ids: Vec<String>,
+    pub(crate) evidence_head: String,
 }
 
 fn parse_codex_jsonl(input: &[u8]) -> AppResult<Vec<CodexJsonlEventV0>> {
@@ -407,6 +427,113 @@ impl CodexSpecialistServiceV0 {
             return invalid("Codex scratch output exceeds the B0 file limit.");
         }
         Ok(scan)
+    }
+
+    /// Imports one complete, already-bound Scratch tree through the ordinary
+    /// Resource-effect path. Scratch paths and Codex claims never cross this
+    /// boundary; every imported byte is re-read no-follow against the Host
+    /// scan identity before it is staged for an OutputSlot Create effect.
+    pub(crate) fn import_bound_scratch(
+        &self,
+        binding: &CodexAttemptBindingV0,
+        authority: &mut EffectAuthorityStateV1,
+        resolver: &mut ManagedResourceResolverV1,
+        objects: &mut crate::managed_objects::ManagedObjectBindingService,
+        grant: &ManagedStepGrantV1,
+        access: &crate::managed_resources::ManagedResourceAccessV1,
+        scratch: &ManagedScratchLeaseV1,
+        now: i64,
+    ) -> AppResult<CodexScratchImportV1> {
+        if grant.operation != ManagedSemanticOperationV1::Transform
+            || grant.process_world.is_some()
+            || binding.run_ref != access.run_control_ref
+            || grant.access.run_control_ref != access.run_control_ref
+        {
+            return invalid("Codex B1 import requires its exact claimed Transform binding.");
+        }
+        let output_slot = grant.output_slot.as_ref().ok_or_else(|| {
+            AppError::InvalidInput("Codex B1 Transform has no OutputSlot.".into())
+        })?;
+        let scan = self.scan_bound_scratch(binding, authority, resolver, access, scratch)?;
+        let first_sequence = authority.next_request_sequence(&access.run_control_ref)?;
+        let mut intents = Vec::with_capacity(scan.identity.files.len());
+        for (selector, identity) in &scan.identity.files {
+            intents.push(ToolEffectIntentV1 {
+                effect: EffectRequestKindV1::Resource(ResourceEffectV1 {
+                    verb: ResourceVerbV1::Create,
+                    handle_ref: output_slot.clone(),
+                    relative_selector: selector.clone(),
+                    value_digest: Some(identity.digest.clone()),
+                }),
+                requested_budget_slice: EffectBudgetsV1 {
+                    requests: 1,
+                    write_bytes: identity.byte_count,
+                    ..Default::default()
+                },
+                preconditions: vec![],
+            });
+        }
+        let requests = lower_tool_request(
+            &StepWorkDescriptorV1 {
+                contract_version: EFFECT_AUTHORITY_VERSION.into(),
+                context: access.context.clone(),
+                envelope_ref: access.envelope_ref.clone(),
+                run_control_ref: access.run_control_ref.clone(),
+                first_sequence,
+            },
+            &ToolRequestV1 {
+                tool_name: "codex-specialist-host-import-v1".into(),
+                adapter_version_ref: "codex-specialist-host-import-v1".into(),
+                intents,
+            },
+        )?;
+        let mut evidence = Vec::with_capacity(requests.len());
+        for (request, (selector, identity)) in requests.iter().zip(&scan.identity.files) {
+            let bytes = crate::safe_file_identity::read_source_if_identity_matches(
+                &scratch.root.join(selector),
+                &scratch.root,
+                identity,
+                identity.byte_count,
+            )?;
+            resolver.stage_write_payload(
+                authority,
+                access,
+                output_slot,
+                &identity.digest,
+                bytes,
+            )?;
+            let mut backend = HostManagedResourceBackendV1::new(resolver, objects, now);
+            let item = authority.enforce(request, &access.current, &mut backend)?;
+            if item.decision != EffectDecisionV1::Allowed {
+                return invalid("Codex B1 OutputSlot import effect was denied or unavailable.");
+            }
+            evidence.push(item);
+        }
+        // Re-scan after the per-file no-follow reads. A changed, added, or
+        // removed Scratch entry makes the whole incomplete import fail closed.
+        if self
+            .scan_bound_scratch(binding, authority, resolver, access, scratch)?
+            .identity
+            != scan.identity
+        {
+            return invalid("Codex scratch changed while the Host imported it.");
+        }
+        let output_seal =
+            resolver.seal_output_slot(authority, access, output_slot, ".", &evidence)?;
+        let evidence_ids = evidence
+            .iter()
+            .map(|item| item.evidence_id.as_str().to_owned())
+            .collect();
+        let evidence_head = evidence
+            .last()
+            .expect("non-empty specialist scratch scan")
+            .evidence_digest
+            .clone();
+        Ok(CodexScratchImportV1 {
+            output_seal,
+            evidence_ids,
+            evidence_head,
+        })
     }
 
     pub(crate) fn terminate_run(&mut self, run_ref: &ManagedRunRefV1) {

@@ -1793,6 +1793,25 @@ impl EffectAuthorityStateV1 {
         self.append_evidence(&envelope, request, decision, summary, facts, debit)
     }
 
+    /// Returns the next exact effect sequence for a still-active run. This is
+    /// observation only: callers must still lower and enforce an immutable
+    /// request through this authority before any Host backend can act.
+    pub(crate) fn next_request_sequence(&self, run_ref: &ManagedRunRefV1) -> AppResult<u64> {
+        let run = self
+            .runs
+            .get(run_ref)
+            .ok_or_else(|| AppError::InvalidInput("Managed run is unavailable.".into()))?;
+        if run.state != ManagedRunStateV1::Active {
+            return invalid("Managed run is not active for the next effect.");
+        }
+        Ok(run.next_request_sequence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evidence_for_test(&self, run_ref: &ManagedRunRefV1) -> Vec<EffectEvidenceV1> {
+        self.evidence.get(run_ref).cloned().unwrap_or_default()
+    }
+
     fn validate_exact_request_context(
         &self,
         request: &EffectRequestV1,
