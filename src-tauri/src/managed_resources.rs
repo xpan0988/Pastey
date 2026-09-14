@@ -72,6 +72,23 @@ pub(crate) struct ExecutionWorldMountV1 {
     pub(crate) initial_bytes: u64,
 }
 
+/// Host-private direct lease of the existing Scratch resource for a backend
+/// that is not an ExecutionWorld. The path never leaves Host code and is
+/// deliberately not an Effect, OutputSlot, or managed-object primitive.
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedScratchLeaseV1 {
+    pub(crate) handle_ref: ResourceHandleRefV1,
+    pub(crate) root: PathBuf,
+    pub(crate) input_identity_ref: String,
+}
+
+/// A bounded, no-follow observation of a specialist Scratch tree. It is
+/// advisory until a later Host-owned import uses ordinary EffectAuthority.
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedScratchScanV1 {
+    pub(crate) identity: crate::safe_file_identity::RegularFileSetIdentity,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SealedOutputEvidenceV1 {
@@ -414,6 +431,169 @@ impl ManagedResourceResolverV1 {
             ResourceKindV1::Scratch,
             quota_bytes,
         )
+    }
+
+    /// Clones the already-bound exact input revision into the existing
+    /// attempt-private Scratch resource. This is intentionally Host-owned:
+    /// no Worker request is created and no OutputSlot is touched.
+    pub(crate) fn clone_exact_input_to_scratch(
+        &mut self,
+        authority: &EffectAuthorityStateV1,
+        objects: &mut ManagedObjectBindingService,
+        access: &ManagedResourceAccessV1,
+        input_handle: &ResourceHandleRefV1,
+        scratch_handle: &ResourceHandleRefV1,
+    ) -> AppResult<ManagedScratchLeaseV1> {
+        let input_grant = validate_attachment(
+            authority,
+            access,
+            input_handle,
+            ResourceKindV1::ManagedRevision,
+        )?;
+        let scratch_grant =
+            validate_attachment(authority, access, scratch_handle, ResourceKindV1::Scratch)?;
+        let (acquisition, maximum_bytes) = match self.backings.get(input_handle) {
+            Some(HostResourceBackingV1::ManagedRevision {
+                owner,
+                acquisition,
+                maximum_bytes,
+            }) => {
+                validate_owner(owner, access)?;
+                (acquisition.clone(), *maximum_bytes)
+            }
+            _ => return invalid("Codex scratch input backing is unavailable."),
+        };
+        let artifact = objects.resolve(&acquisition, access.current.now)?;
+        if input_grant.safe_identity_ref
+            != Self::managed_revision_identity_ref(&acquisition, &artifact)?
+        {
+            return invalid("Codex scratch input identity changed before cloning.");
+        }
+
+        let (root, files, quota_bytes) = match self.backings.get_mut(scratch_handle) {
+            Some(HostResourceBackingV1::Scratch {
+                owner,
+                root,
+                files,
+                quota_bytes,
+            }) => {
+                validate_owner(owner, access)?;
+                (root.clone(), files, *quota_bytes)
+            }
+            _ => return invalid("Codex scratch backing is unavailable."),
+        };
+        if scratch_grant.budgets.write_bytes < quota_bytes || !files.is_empty() {
+            return invalid("Codex scratch is not an empty exact attempt-private resource.");
+        }
+        let observed_before = scan_regular_tree(&root, quota_bytes)?;
+        if !observed_before.is_empty() {
+            return invalid("Codex scratch root was populated before input cloning.");
+        }
+
+        let clone_result: AppResult<()> = match &artifact.identity {
+            ManagedArtifactIdentityV1::RegularFile(identity) => {
+                let bytes = safe_file_identity::read_source_if_identity_matches(
+                    &artifact.path,
+                    &artifact.scope_root,
+                    identity,
+                    quota_bytes.min(maximum_bytes),
+                )?;
+                let file = write_private_file(&root, "input", None, &bytes, 1)?;
+                files.insert("input".into(), file);
+                Ok(())
+            }
+            ManagedArtifactIdentityV1::RegularFileSet(expected) => {
+                let observed = safe_file_identity::capture_regular_file_set_identity(
+                    &artifact.path,
+                    quota_bytes.min(maximum_bytes),
+                )?;
+                if &observed != expected {
+                    return invalid("Codex scratch input tree changed before cloning.");
+                }
+                copy_private_tree(&artifact.path, &root, quota_bytes.min(maximum_bytes))?;
+                let copied = scan_regular_tree(&root, quota_bytes)?;
+                if copied != expected.files {
+                    return invalid("Codex scratch clone does not match the exact input tree.");
+                }
+                for (selector, identity) in copied {
+                    files.insert(
+                        selector.clone(),
+                        PrivateFileV1 {
+                            path: root.join(selector),
+                            identity,
+                            generation: 1,
+                            sealed: false,
+                            lineage_registered: false,
+                            last_request_id: None,
+                        },
+                    );
+                }
+                Ok(())
+            }
+        };
+        if clone_result.is_err() {
+            files.clear();
+            let _ = fs::remove_dir_all(&root);
+            let _ = fs::create_dir_all(&root);
+        }
+        clone_result?;
+        Ok(ManagedScratchLeaseV1 {
+            handle_ref: scratch_handle.clone(),
+            root,
+            input_identity_ref: input_grant.safe_identity_ref,
+        })
+    }
+
+    /// Performs the B0 post-run safety scan. It does not reconcile effects,
+    /// write an OutputSlot, seal anything, or create a successor revision.
+    pub(crate) fn scan_specialist_scratch(
+        &self,
+        authority: &EffectAuthorityStateV1,
+        access: &ManagedResourceAccessV1,
+        lease: &ManagedScratchLeaseV1,
+    ) -> AppResult<ManagedScratchScanV1> {
+        let grant = validate_attachment(
+            authority,
+            access,
+            &lease.handle_ref,
+            ResourceKindV1::Scratch,
+        )?;
+        let (root, quota_bytes) = match self.backings.get(&lease.handle_ref) {
+            Some(HostResourceBackingV1::Scratch {
+                owner,
+                root,
+                quota_bytes,
+                ..
+            }) => {
+                validate_owner(owner, access)?;
+                (root, *quota_bytes)
+            }
+            _ => return invalid("Codex scratch lease is unavailable."),
+        };
+        if root != &lease.root
+            || lease.input_identity_ref.is_empty()
+            || quota_bytes > grant.budgets.write_bytes
+        {
+            return invalid("Codex scratch lease was substituted.");
+        }
+        let identity = safe_file_identity::capture_regular_file_set_identity(root, quota_bytes)?;
+        if identity.files.len() > 64 {
+            return invalid("Codex scratch output exceeds the 64-file B0 limit.");
+        }
+        Ok(ManagedScratchScanV1 { identity })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn private_file_count_for_test(
+        &self,
+        handle_ref: &ResourceHandleRefV1,
+    ) -> Option<usize> {
+        match self.backings.get(handle_ref) {
+            Some(HostResourceBackingV1::Workspace { files, .. })
+            | Some(HostResourceBackingV1::OutputSlot { files, .. })
+            | Some(HostResourceBackingV1::Scratch { files, .. }) => Some(files.len()),
+            _ => None,
+        }
     }
 
     fn provision_empty(

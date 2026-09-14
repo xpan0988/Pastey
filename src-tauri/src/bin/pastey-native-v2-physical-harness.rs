@@ -23,6 +23,8 @@ mod capability_probe;
 mod chunk_frame;
 #[path = "../cleanup.rs"]
 mod cleanup;
+#[path = "../codex_specialist.rs"]
+mod codex_specialist;
 #[path = "../commands.rs"]
 mod commands;
 #[path = "../config.rs"]
