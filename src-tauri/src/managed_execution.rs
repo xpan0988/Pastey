@@ -1691,6 +1691,7 @@ mod tests {
                 input: one,
                 output: two.clone(),
                 modification_intent: "Rewrite safely.".into(),
+                worker_capability_requirement: None,
             },
             PlanStepV2::Execute {
                 step_id: "execute".into(),
@@ -2659,6 +2660,7 @@ mod tests {
                     input: one,
                     output: two,
                     modification_intent: "Create two deterministic output files named transformed.txt and manifest.txt, then finish with output selector '.'.".into(),
+                    worker_capability_requirement: None,
                 }]
             },
             true,
@@ -3231,6 +3233,7 @@ mod tests {
                         revision: 2,
                     },
                     modification_intent: "No backend fallback.".into(),
+                    worker_capability_requirement: None,
                 }]
             },
             false,

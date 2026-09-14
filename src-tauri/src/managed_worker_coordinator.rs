@@ -247,17 +247,31 @@ impl HostRuntime {
                 now,
             );
         }
-        let selection = self
-            .worker_provider_configs
-            .selected_for_managed_workers()?;
-        // Resolution, including credential decryption, happens before attempt
-        // admission. The temporary binding is dropped without a model call.
-        drop(self.worker_provider_configs.resolve(&selection)?);
+        let native_required = self.local_plan_requires_native_provider(&revision);
+        let codex_generation = self
+            .local_plan_requires_codex(&revision)
+            .then(|| {
+                self.codex_specialists
+                    .lock()
+                    .required_transform_qualification_generation()
+            })
+            .flatten();
+        let selection = if native_required {
+            let selection = self
+                .worker_provider_configs
+                .selected_for_managed_workers()?;
+            // Resolution, including credential decryption, happens before
+            // admission only for a generic Native Worker path.
+            drop(self.worker_provider_configs.resolve(&selection)?);
+            Some(selection)
+        } else {
+            None
+        };
         let runtime_ready = self
             .resolve_and_bind_v2_managed_process_steps(&revision)
             .unwrap_or(false);
         let availability = if runtime_ready {
-            self.managed_worker_plan_availability(&revision, &selection)?
+            self.managed_worker_plan_availability(&revision, selection.as_ref(), codex_generation)?
         } else {
             ManagedPrimitiveAvailabilityV1::unavailable()
         };
@@ -272,7 +286,13 @@ impl HostRuntime {
         if !matches!(decision, AttemptStartDecisionV2::Accepted(_)) {
             return Ok(decision);
         }
-        if let Err(error) = insert_worker_attempt(&self.paths, &start.attempt_id, &selection, now) {
+        if let Err(error) = insert_worker_attempt(
+            &self.paths,
+            &start.attempt_id,
+            selection.as_ref(),
+            codex_generation,
+            now,
+        ) {
             interrupt_base_attempt(&self.paths, &start.attempt_id);
             return Err(error);
         }
@@ -297,27 +317,35 @@ impl HostRuntime {
     pub(crate) fn managed_worker_plan_availability(
         &self,
         revision: &PlanRevisionV2,
-        selection: &WorkerProviderSelectionV1,
+        selection: Option<&WorkerProviderSelectionV1>,
+        codex_generation: Option<u64>,
     ) -> AppResult<ManagedPrimitiveAvailabilityV1> {
-        drop(self.worker_provider_configs.resolve(selection)?);
-        let provider_available = self
-            .worker_provider_configs
-            .list_metadata()?
-            .into_iter()
-            .any(|metadata| {
-                metadata.config_ref == selection.config_ref
-                    && metadata.model == selection.model
-                    && metadata.available
-                    && metadata.health
-                        != crate::worker_provider_config::WorkerProviderHealthStateV1::Unhealthy
-            });
-        if !provider_available {
+        let native_required = self.local_plan_requires_native_provider(revision);
+        let provider_available = match selection {
+            Some(selection) => {
+                drop(self.worker_provider_configs.resolve(selection)?);
+                self.worker_provider_configs
+                    .list_metadata()?
+                    .into_iter()
+                    .any(|metadata| {
+                        metadata.config_ref == selection.config_ref
+                        && metadata.model == selection.model
+                        && metadata.available
+                        && metadata.health
+                            != crate::worker_provider_config::WorkerProviderHealthStateV1::Unhealthy
+                    })
+            }
+            None => !native_required,
+        };
+        if !provider_available
+            || (self.local_plan_requires_codex(revision) && codex_generation.is_none())
+        {
             return Ok(ManagedPrimitiveAvailabilityV1::unavailable());
         }
         let platform = self.execution_worlds.platform_availability();
         let specs = self.managed_worker_process_specs.lock();
         let transform = revision.steps.iter().all(|step| match step {
-            PlanStepV2::Transform { step_id, .. } => {
+            PlanStepV2::Transform { step_id, .. } if !step.requires_codex_specialist() => {
                 !crate::native_v2_orchestration::step_runs_on_host(
                     revision,
                     step,
@@ -338,11 +366,34 @@ impl HostRuntime {
             }
             _ => true,
         });
-        Ok(ManagedPrimitiveAvailabilityV1::verified_attachment(
-            self.local_host_ref.clone(),
-            transform,
-            execute,
-        ))
+        Ok(
+            ManagedPrimitiveAvailabilityV1::verified_attachment_with_codex(
+                self.local_host_ref.clone(),
+                transform,
+                codex_generation.is_some(),
+                execute,
+            ),
+        )
+    }
+
+    pub(crate) fn local_plan_requires_native_provider(&self, revision: &PlanRevisionV2) -> bool {
+        revision.steps.iter().any(|step| {
+            crate::native_v2_orchestration::step_runs_on_host(revision, step, &self.local_host_ref)
+                && (matches!(step, PlanStepV2::Execute { .. })
+                    || (matches!(step, PlanStepV2::Transform { .. })
+                        && !step.requires_codex_specialist()))
+        })
+    }
+
+    pub(crate) fn local_plan_requires_codex(&self, revision: &PlanRevisionV2) -> bool {
+        revision.steps.iter().any(|step| {
+            step.requires_codex_specialist()
+                && crate::native_v2_orchestration::step_runs_on_host(
+                    revision,
+                    step,
+                    &self.local_host_ref,
+                )
+        })
     }
 
     pub(crate) fn drive_live_v2_attempt(
@@ -352,39 +403,11 @@ impl HostRuntime {
     ) {
         loop {
             let now = storage::now_ts();
-            let selection = match worker_attempt_selection(&self.paths, &attempt_id) {
-                Ok(selection) => selection,
-                Err(_) => return,
-            };
-            let binding = match self.worker_provider_configs.resolve(&selection) {
-                Ok(binding) => binding,
-                Err(_) => {
-                    self.finish_worker_failure(
-                        &attempt_id,
-                        None,
-                        ManagedWorkerCoordinatorStateV1::Interrupted,
-                        "provider_unavailable",
-                        now,
-                    );
-                    self.notify_coordinated_failure(
-                        &attempt_id,
-                        None,
-                        &captured,
-                        "provider_unavailable",
-                    );
-                    return;
-                }
-            };
-            let next = match reserve_next_dispatch(
-                &self.paths,
-                &attempt_id,
-                &selection,
-                &self.local_host_ref,
-                now,
-            ) {
-                Ok(next) => next,
-                Err(_) => return,
-            };
+            let next =
+                match reserve_next_dispatch(&self.paths, &attempt_id, &self.local_host_ref, now) {
+                    Ok(next) => next,
+                    Err(_) => return,
+                };
             let step = match next {
                 NextDispatchV1::Managed(step) => step,
                 NextDispatchV1::External(step) => {
@@ -435,6 +458,73 @@ impl HostRuntime {
                 None,
                 now,
             ));
+            if step.requires_codex_specialist() {
+                let qualified = codex_attempt_qualification_generation(&self.paths, &attempt_id)
+                    .ok()
+                    .flatten()
+                    .zip(
+                        self.codex_specialists
+                            .lock()
+                            .required_transform_qualification_generation(),
+                    )
+                    .is_some_and(|(bound, current)| bound == current);
+                if !qualified {
+                    self.finish_worker_failure(
+                        &attempt_id,
+                        Some(&step_id),
+                        ManagedWorkerCoordinatorStateV1::Interrupted,
+                        "codex_unqualified",
+                        now,
+                    );
+                    self.notify_coordinated_failure(
+                        &attempt_id,
+                        Some(&step_id),
+                        &captured,
+                        "codex_unqualified",
+                    );
+                    return;
+                }
+                // B0/B1 retain the only Codex execution path. There is no
+                // physical controller launch proof yet, so even a synthetic
+                // test qualification must never fall through to Native.
+                self.finish_worker_failure(
+                    &attempt_id,
+                    Some(&step_id),
+                    ManagedWorkerCoordinatorStateV1::Interrupted,
+                    "codex_controller_unavailable",
+                    now,
+                );
+                self.notify_coordinated_failure(
+                    &attempt_id,
+                    Some(&step_id),
+                    &captured,
+                    "codex_controller_unavailable",
+                );
+                return;
+            }
+            let selection = match worker_attempt_selection(&self.paths, &attempt_id) {
+                Ok(selection) => selection,
+                Err(_) => return,
+            };
+            let binding = match self.worker_provider_configs.resolve(&selection) {
+                Ok(binding) => binding,
+                Err(_) => {
+                    self.finish_worker_failure(
+                        &attempt_id,
+                        Some(&step_id),
+                        ManagedWorkerCoordinatorStateV1::Interrupted,
+                        "provider_unavailable",
+                        now,
+                    );
+                    self.notify_coordinated_failure(
+                        &attempt_id,
+                        Some(&step_id),
+                        &captured,
+                        "provider_unavailable",
+                    );
+                    return;
+                }
+            };
             let revoked = binding.revocation_token();
             let result = self.invoke_reserved_worker(&attempt_id, &step, &captured, binding, now);
             match result {
@@ -642,18 +732,16 @@ impl HostRuntime {
         now: i64,
     ) -> AppResult<StepOperation> {
         let captured = captured.into();
-        let selection = worker_attempt_selection(&self.paths, attempt_id)?;
-        drop(self.worker_provider_configs.resolve(&selection)?);
-        let NextDispatchV1::Managed(step) = reserve_next_dispatch(
-            &self.paths,
-            attempt_id,
-            &selection,
-            &self.local_host_ref,
-            now,
-        )?
+        let NextDispatchV1::Managed(step) =
+            reserve_next_dispatch(&self.paths, attempt_id, &self.local_host_ref, now)?
         else {
             return invalid("No managed v2 step is eligible for dispatch.");
         };
+        if step.requires_codex_specialist() {
+            return invalid("Codex-required Transform cannot dispatch through a Native provider.");
+        }
+        let selection = worker_attempt_selection(&self.paths, attempt_id)?;
+        drop(self.worker_provider_configs.resolve(&selection)?);
         let operation = step.operation();
         let current = current_host_execution_freshness(self, &captured)?;
         captured.validate_current(&current, now)?;
@@ -810,9 +898,23 @@ impl HostRuntime {
 fn insert_worker_attempt(
     paths: &crate::storage::AppPaths,
     attempt_id: &str,
-    selection: &WorkerProviderSelectionV1,
+    selection: Option<&WorkerProviderSelectionV1>,
+    codex_generation: Option<u64>,
     now: i64,
 ) -> AppResult<()> {
+    let (provider_id, provider_generation, provider_config_digest, provider_model) = match selection
+    {
+        Some(selection) => (
+            selection.config_ref.provider_id.as_str(),
+            selection.config_ref.generation,
+            selection.config_ref.config_digest.as_str(),
+            selection.model.as_str(),
+        ),
+        // This fixed sentinel exists solely because the pre-existing Worker
+        // lifecycle row owns attempt state. It is never resolved as a
+        // provider, never contains credentials, and never selects Native.
+        None => ("codex-specialist-v0", 0, "", ""),
+    };
     connection(paths)?.execute(
         "INSERT INTO bridge_plan_v2_worker_attempts
          (attempt_id, provider_id, provider_generation, provider_config_digest,
@@ -820,14 +922,36 @@ fn insert_worker_attempt(
          VALUES (?1, ?2, ?3, ?4, ?5, 'accepted', NULL, ?6, ?6)",
         params![
             attempt_id,
-            selection.config_ref.provider_id,
-            selection.config_ref.generation,
-            selection.config_ref.config_digest,
-            selection.model,
+            provider_id,
+            provider_generation,
+            provider_config_digest,
+            provider_model,
             now,
         ],
     )?;
+    if let Some(qualification_generation) = codex_generation {
+        connection(paths)?.execute(
+            "INSERT INTO bridge_plan_v2_codex_attempt_bindings
+             (attempt_id, qualification_generation, created_at) VALUES (?1, ?2, ?3)",
+            params![attempt_id, qualification_generation, now],
+        )?;
+    }
     Ok(())
+}
+
+fn codex_attempt_qualification_generation(
+    paths: &crate::storage::AppPaths,
+    attempt_id: &str,
+) -> AppResult<Option<u64>> {
+    connection(paths)?
+        .query_row(
+            "SELECT qualification_generation FROM bridge_plan_v2_codex_attempt_bindings
+             WHERE attempt_id = ?1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn worker_attempt_selection(
@@ -857,7 +981,6 @@ fn worker_attempt_selection(
 fn reserve_next_dispatch(
     paths: &crate::storage::AppPaths,
     attempt_id: &str,
-    selection: &WorkerProviderSelectionV1,
     local_host_ref: &crate::host_identity::HostRef,
     now: i64,
 ) -> AppResult<NextDispatchV1> {
@@ -868,16 +991,8 @@ fn reserve_next_dispatch(
         "SELECT EXISTS(SELECT 1 FROM bridge_plan_v2_worker_attempts w
          JOIN bridge_plan_v2_attempts a ON a.attempt_id = w.attempt_id
          WHERE w.attempt_id = ?1 AND w.state IN ('accepted','running','waiting')
-         AND a.state = 'accepted' AND w.provider_id = ?2
-         AND w.provider_generation = ?3 AND w.provider_config_digest = ?4
-         AND w.provider_model = ?5)",
-        params![
-            attempt_id,
-            selection.config_ref.provider_id,
-            selection.config_ref.generation,
-            selection.config_ref.config_digest,
-            selection.model
-        ],
+         AND a.state = 'accepted')",
+        [attempt_id],
         |row| row.get(0),
     )?;
     if active == 0 {
@@ -1434,7 +1549,7 @@ mod tests {
     use crate::{
         bridge_plan_v2::{
             seal_revision, ManagedObjectRevisionV2, PlanApprovalV2, PlanRootV2, ReviewRequestV2,
-            PLAN_SCHEMA_VERSION, PROTOCOL_VERSION,
+            TransformWorkerCapabilityRequirementV1, PLAN_SCHEMA_VERSION, PROTOCOL_VERSION,
         },
         config::StoredConfig,
         host_identity::{HostRef, PlanParticipantRef, PlanParticipants},
@@ -2168,6 +2283,7 @@ mod tests {
                 revision: input.revision + 1,
             },
             modification_intent: "Rewrite safely.".into(),
+            worker_capability_requirement: None,
         }]
     }
 
@@ -2188,6 +2304,7 @@ mod tests {
                 input: input.clone(),
                 output: output.clone(),
                 modification_intent: "Rewrite safely.".into(),
+                worker_capability_requirement: None,
             },
             PlanStepV2::Transfer {
                 step_id: "transfer".into(),
@@ -2314,6 +2431,165 @@ mod tests {
     }
 
     #[test]
+    fn codex_requirement_blocks_before_native_selection_or_claim() {
+        let fixture = fixture(|input, local, _| {
+            vec![PlanStepV2::Transform {
+                step_id: "codex-transform".into(),
+                depends_on: vec![],
+                host: local.clone(),
+                input: input.clone(),
+                output: ManagedObjectRevisionV2 {
+                    logical_object_id: input.logical_object_id.clone(),
+                    revision: input.revision + 1,
+                },
+                modification_intent: "Apply the approved change with Codex.".into(),
+                worker_capability_requirement: Some(TransformWorkerCapabilityRequirementV1::Codex),
+            }]
+        });
+        assert!(matches!(
+            accept(&fixture),
+            AttemptStartDecisionV2::Denied(_)
+        ));
+        let conn = connection(&fixture.runtime.paths).unwrap();
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_worker_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let claims: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_managed_step_claims",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0);
+        assert_eq!(claims, 0);
+    }
+
+    #[test]
+    fn codex_readiness_rechecks_the_exact_qualification_binding() {
+        let fixture = fixture(|input, local, _| {
+            vec![PlanStepV2::Transform {
+                step_id: "codex-transform".into(),
+                depends_on: vec![],
+                host: local.clone(),
+                input: input.clone(),
+                output: ManagedObjectRevisionV2 {
+                    logical_object_id: input.logical_object_id.clone(),
+                    revision: input.revision + 1,
+                },
+                modification_intent: "Apply the approved change with Codex.".into(),
+                worker_capability_requirement: Some(TransformWorkerCapabilityRequirementV1::Codex),
+            }]
+        });
+        let executable = fixture._root.0.join("synthetic-codex");
+        std::fs::write(&executable, b"synthetic-codex-v1").unwrap();
+        let world = ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+            executable_path: executable.clone(),
+            scope_root: fixture._root.0.clone(),
+        })
+        .unwrap();
+        fixture
+            .runtime
+            .codex_specialists
+            .lock()
+            .install_synthetic_qualification(world, 7)
+            .unwrap();
+        let generation = fixture
+            .runtime
+            .codex_specialists
+            .lock()
+            .required_transform_qualification_generation();
+        let available = fixture
+            .runtime
+            .managed_worker_plan_availability(&fixture.revision, None, generation)
+            .unwrap();
+        assert!(available.supports(&fixture.revision, &fixture.revision.steps[0]));
+
+        std::fs::write(&executable, b"synthetic-codex-v2").unwrap();
+        let stale_generation = fixture
+            .runtime
+            .codex_specialists
+            .lock()
+            .required_transform_qualification_generation();
+        assert!(stale_generation.is_none());
+        let unavailable = fixture
+            .runtime
+            .managed_worker_plan_availability(&fixture.revision, None, stale_generation)
+            .unwrap();
+        assert!(!unavailable.supports(&fixture.revision, &fixture.revision.steps[0]));
+    }
+
+    #[test]
+    fn qualified_codex_transform_binds_only_codex_and_never_native_dispatch() {
+        let fixture = fixture(|input, local, _| {
+            vec![PlanStepV2::Transform {
+                step_id: "codex-transform".into(),
+                depends_on: vec![],
+                host: local.clone(),
+                input: input.clone(),
+                output: ManagedObjectRevisionV2 {
+                    logical_object_id: input.logical_object_id.clone(),
+                    revision: input.revision + 1,
+                },
+                modification_intent: "Apply the approved change with Codex.".into(),
+                worker_capability_requirement: Some(TransformWorkerCapabilityRequirementV1::Codex),
+            }]
+        });
+        let executable = fixture._root.0.join("synthetic-codex");
+        std::fs::write(&executable, b"synthetic-codex-v1").unwrap();
+        fixture
+            .runtime
+            .codex_specialists
+            .lock()
+            .install_synthetic_qualification(
+                ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+                    executable_path: executable,
+                    scope_root: fixture._root.0.clone(),
+                })
+                .unwrap(),
+                11,
+            )
+            .unwrap();
+        assert!(matches!(
+            accept(&fixture),
+            AttemptStartDecisionV2::Accepted(_)
+        ));
+        let conn = connection(&fixture.runtime.paths).unwrap();
+        let binding: u64 = conn
+            .query_row(
+                "SELECT qualification_generation FROM bridge_plan_v2_codex_attempt_bindings
+                 WHERE attempt_id = ?1",
+                [&fixture.start.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(binding, 11);
+        let provider_id: String = conn
+            .query_row(
+                "SELECT provider_id FROM bridge_plan_v2_worker_attempts WHERE attempt_id = ?1",
+                [&fixture.start.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider_id, "codex-specialist-v0");
+        assert!(fixture
+            .runtime
+            .dispatch_next_v2_managed_with_provider(
+                &fixture.start.attempt_id,
+                fixture.binding.clone(),
+                &mut transform_script(),
+                storage::now_ts(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("Codex-required Transform cannot dispatch through a Native provider"));
+    }
+
+    #[test]
     fn host_selected_runtime_populates_only_exact_local_execute_bindings() {
         let execute_fixture = fixture(execute_steps);
         let executable_path = execute_fixture._root.0.join("configured-runtime");
@@ -2418,7 +2694,6 @@ mod tests {
         let next = reserve_next_dispatch(
             &fixture.runtime.paths,
             &fixture.start.attempt_id,
-            &fixture.selection,
             &fixture.runtime.local_host_ref,
             storage::now_ts(),
         )
@@ -2674,7 +2949,6 @@ mod tests {
         assert!(reserve_next_dispatch(
             &fixture.runtime.paths,
             &fixture.start.attempt_id,
-            &fixture.selection,
             &fixture.runtime.local_host_ref,
             storage::now_ts(),
         )

@@ -116,6 +116,7 @@ pub struct HostAdmissionService {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ManagedPrimitiveAvailabilityV1 {
     transform_hosts: BTreeSet<HostRef>,
+    codex_transform_hosts: BTreeSet<HostRef>,
     execute_hosts: BTreeSet<HostRef>,
 }
 
@@ -125,8 +126,23 @@ impl ManagedPrimitiveAvailabilityV1 {
     }
 
     pub(crate) fn verified_attachment(host_ref: HostRef, transform: bool, execute: bool) -> Self {
+        Self::verified_attachment_with_codex(host_ref, transform, false, execute)
+    }
+
+    /// Host-private readiness result for the one supported specialist. This
+    /// is deliberately a fixed field, not a backend registry.
+    pub(crate) fn verified_attachment_with_codex(
+        host_ref: HostRef,
+        transform: bool,
+        codex_transform: bool,
+        execute: bool,
+    ) -> Self {
         Self {
             transform_hosts: transform.then_some(host_ref.clone()).into_iter().collect(),
+            codex_transform_hosts: codex_transform
+                .then_some(host_ref.clone())
+                .into_iter()
+                .collect(),
             execute_hosts: execute.then_some(host_ref).into_iter().collect(),
         }
     }
@@ -143,7 +159,13 @@ impl ManagedPrimitiveAvailabilityV1 {
         };
         match step.operation() {
             StepOperation::Search | StepOperation::Transfer => true,
-            StepOperation::Transform => self.transform_hosts.contains(host_ref),
+            StepOperation::Transform => {
+                if step.requires_codex_specialist() {
+                    self.codex_transform_hosts.contains(host_ref)
+                } else {
+                    self.transform_hosts.contains(host_ref)
+                }
+            }
             StepOperation::Execute => self.execute_hosts.contains(host_ref),
         }
     }
@@ -460,6 +482,7 @@ mod tests {
                         input: input.clone(),
                         output: output.clone(),
                         modification_intent: "Apply the reviewed change.".into(),
+                        worker_capability_requirement: None,
                     },
                     PlanStepV2::Transfer {
                         step_id: "transfer-b-c".into(),

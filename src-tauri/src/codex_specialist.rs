@@ -326,6 +326,21 @@ pub(crate) struct CodexSpecialistServiceV0 {
 }
 
 impl CodexSpecialistServiceV0 {
+    /// Readiness is Host-private and rechecks the exact executable identity.
+    /// Production qualification remains deliberately unavailable until the
+    /// physical controller/child containment proof exists. Synthetic
+    /// qualification is test-only evidence for the B0/B1 path.
+    pub(crate) fn required_transform_qualification_generation(&self) -> Option<u64> {
+        self.qualification.as_ref().and_then(|qualification| {
+            (qualification.synthetic
+                && qualification
+                    .process_world
+                    .validate_executable_identity()
+                    .is_ok())
+            .then_some(qualification.generation)
+        })
+    }
+
     pub(crate) fn observe(&mut self) -> AppResult<CodexObservationV0> {
         let detected = match probe_known_capability(CODEX_SPECIALIST_CAPABILITY_ID) {
             KnownCapabilityProbeResult::Available => CodexDetectionV0::Available,
