@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    bridge_plan, config,
+    bridge_plan, codex_specialist, config,
     config::StoredConfig,
     diagnostics, discovery, effect_authority,
     error::AppResult,
@@ -113,6 +113,9 @@ pub struct HostRuntime {
     /// and copy-on-write overlays only in this process. Declaration after the
     /// world controller preserves kill-before-root-removal drop ordering.
     pub(crate) managed_resources: Mutex<managed_resources::ManagedResourceResolverV1>,
+    /// B0's Codex-only Host-local state. It has no Plan attachment and stays
+    /// unqualified until the Host can prove controller/child separation.
+    pub(crate) codex_specialists: Mutex<codex_specialist::CodexSpecialistServiceV0>,
     /// Process-local model cancellation state for the one-step Worker Harness.
     /// It is not a Core grant or a durable authority record.
     pub(crate) worker_harness_runs:
@@ -222,6 +225,7 @@ impl HostRuntime {
             managed_resources: Mutex::new(managed_resources::ManagedResourceResolverV1::new(
                 managed_resource_root,
             )),
+            codex_specialists: Mutex::new(codex_specialist::CodexSpecialistServiceV0::default()),
             worker_harness_runs: Mutex::new(HashMap::new()),
             managed_completion_lock: Mutex::new(()),
             managed_worker_process_specs: Mutex::new(HashMap::new()),
@@ -267,6 +271,7 @@ impl HostRuntime {
         worker_runs.retain(|_, record| record.bridge_id() != room_id);
         drop(worker_runs);
         self.execution_worlds.terminate_bridge(room_id);
+        self.codex_specialists.lock().terminate_bridge(room_id);
         self.network_broker.terminate_bridge(room_id);
         self.effect_authority.lock().revoke_bridge(room_id);
         self.managed_resources.lock().purge_bridge(room_id);
@@ -292,6 +297,7 @@ impl HostRuntime {
     ) -> AppResult<()> {
         self.cancel_worker_run(run_ref);
         self.execution_worlds.terminate_run(run_ref);
+        self.codex_specialists.lock().terminate_run(run_ref);
         self.network_broker.terminate_run(run_ref);
         self.managed_resources.lock().purge_run(run_ref);
         crate::managed_execution::interrupt_claim_for_run(&self.paths, run_ref);
@@ -328,6 +334,9 @@ impl HostRuntime {
                 .run_refs_for_session(session_binding_ref),
         );
         self.execution_worlds.terminate_session(session_binding_ref);
+        self.codex_specialists
+            .lock()
+            .terminate_session(session_binding_ref);
         self.network_broker.terminate_session(session_binding_ref);
         let mut resources = self.managed_resources.lock();
         for run_ref in run_refs {
@@ -362,6 +371,7 @@ impl HostRuntime {
             .object_store
             .purge_all();
         self.execution_worlds.terminate_all();
+        self.codex_specialists.lock().terminate_all();
         self.network_broker.terminate_all();
         self.managed_objects.lock().purge_all();
         self.effect_authority.lock().revoke_all();

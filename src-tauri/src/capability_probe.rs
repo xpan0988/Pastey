@@ -12,6 +12,9 @@ use crate::{
 
 pub(crate) const MANAGED_PYTHON_RUNTIME_ID: &str = "python";
 pub(crate) const MANAGED_NODE_RUNTIME_ID: &str = "node";
+/// Semantic observation only. A positive PATH probe is never a Codex
+/// executable binding, qualification, or execution authorization.
+pub(crate) const CODEX_SPECIALIST_CAPABILITY_ID: &str = "agent.coding.codex";
 
 const RUNTIME_PYTHON_CAPABILITY_ID: &str = "runtime.python";
 const RUNTIME_NODE_CAPABILITY_ID: &str = "runtime.node";
@@ -37,6 +40,7 @@ const KNOWN_CAPABILITY_IDS: &[&str] = &[
     RUNTIME_POWERSHELL_CAPABILITY_ID,
     RUNTIME_ZSH_CAPABILITY_ID,
     RUNTIME_BASH_CAPABILITY_ID,
+    CODEX_SPECIALIST_CAPABILITY_ID,
 ];
 
 #[derive(Clone, Copy)]
@@ -79,6 +83,12 @@ const RUNTIME_PROBES: &[RuntimeProbe] = &[
         args: &["--version"],
     },
     RuntimeProbe {
+        name: "codex",
+        capability_id: CODEX_SPECIALIST_CAPABILITY_ID,
+        command: "codex",
+        args: &["--version"],
+    },
+    RuntimeProbe {
         name: "ffmpeg",
         capability_id: RUNTIME_FFMPEG_CAPABILITY_ID,
         command: "ffmpeg",
@@ -117,7 +127,7 @@ const RUNTIME_PROBES: &[RuntimeProbe] = &[
     },
 ];
 
-pub(crate) const MAX_KNOWN_CAPABILITY_REQUESTS: usize = 12;
+pub(crate) const MAX_KNOWN_CAPABILITY_REQUESTS: usize = 13;
 const MAX_KNOWN_CAPABILITY_ID_BYTES: usize = 128;
 
 /// The only outcomes of a Host-local request against the fixed probe table.
@@ -330,6 +340,42 @@ pub(crate) fn validate_managed_runtime_executable(
         }
     }
     Ok(())
+}
+
+/// Resolves only Host-owned absolute candidates for the Codex specialist.
+/// This deliberately does not consult PATH: PATH remains diagnostics-only.
+/// Windows stays unavailable in B0 until its process-tree boundary can be
+/// physically qualified.
+#[allow(dead_code)] // B0 observes/qualifies only through this Host-private seam.
+pub(crate) fn discover_codex_specialist_executable() -> AppResult<Option<ManagedProcessWorldSpecV1>>
+{
+    #[cfg(target_os = "macos")]
+    let candidates = [
+        PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
+        PathBuf::from("/opt/homebrew/bin/codex"),
+        PathBuf::from("/usr/local/bin/codex"),
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let candidates: [PathBuf; 0] = [];
+
+    for candidate in candidates {
+        let Ok(executable_path) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        let Some(scope_root) = executable_path.parent().map(ToOwned::to_owned) else {
+            continue;
+        };
+        let executable = ExecutableBindingSpecV1 {
+            executable_path,
+            scope_root,
+        };
+        if validate_managed_runtime_executable(&executable).is_ok() {
+            if let Ok(process_world) = ManagedProcessWorldSpecV1::new(executable) {
+                return Ok(Some(process_world));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn validate_managed_runtime_id(runtime_id: &str) -> AppResult<()> {
@@ -549,6 +595,7 @@ mod tests {
                 RUNTIME_POWERSHELL_CAPABILITY_ID,
                 RUNTIME_ZSH_CAPABILITY_ID,
                 RUNTIME_BASH_CAPABILITY_ID,
+                CODEX_SPECIALIST_CAPABILITY_ID,
             ]
         );
         for probe in RUNTIME_PROBES {
@@ -556,8 +603,26 @@ mod tests {
                 semantic_capability_id_for_runtime_name(probe.name),
                 Some(probe.capability_id)
             );
-            assert!(probe.capability_id.starts_with("runtime."));
+            assert!(
+                probe.capability_id.starts_with("runtime.")
+                    || probe.capability_id == CODEX_SPECIALIST_CAPABILITY_ID
+            );
         }
+    }
+
+    #[test]
+    fn codex_capability_is_a_fixed_path_observation_only() {
+        let result =
+            probe_known_capability_with_runner(CODEX_SPECIALIST_CAPABILITY_ID, |command, args| {
+                assert_eq!(command, "codex");
+                assert_eq!(args, ["--version"]);
+                Some("codex-cli test".into())
+            });
+        assert_eq!(result, KnownCapabilityProbeResult::Available);
+        assert_eq!(
+            semantic_capability_id_for_runtime_name("codex"),
+            Some(CODEX_SPECIALIST_CAPABILITY_ID)
+        );
     }
 
     #[test]

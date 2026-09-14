@@ -57,6 +57,11 @@ pub(crate) struct ManagedStepClaimRequestV1 {
     /// by the Host runtime coordinator, never by a Worker/provider, and is bound
     /// into the immutable envelope before the run becomes active.
     pub(crate) process_world: Option<ManagedProcessWorldSpecV1>,
+    /// A Host-private backend may require the existing per-run Scratch
+    /// resource while deliberately declining the generic execution world.
+    /// This does not authorize a process or expose an OutputSlot; it only
+    /// permits Host-owned preparation of an already claimed attempt.
+    pub(crate) private_scratch: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -298,7 +303,7 @@ impl HostRuntime {
         } else {
             None
         };
-        let scratch_grant = if process_spec.is_some() {
+        let scratch_grant = if process_spec.is_some() || request.private_scratch {
             Some(
                 authority.mint_resource_grant(
                     &draft,
@@ -315,6 +320,7 @@ impl HostRuntime {
                             ResourceVerbV1::Read,
                             ResourceVerbV1::Create,
                             ResourceVerbV1::Replace,
+                            ResourceVerbV1::Delete,
                         ]
                         .into_iter()
                         .collect(),
@@ -1212,6 +1218,7 @@ fn resource_bounds() -> Vec<EffectBoundV1> {
         ResourceVerbV1::Read,
         ResourceVerbV1::Create,
         ResourceVerbV1::Replace,
+        ResourceVerbV1::Delete,
     ]
     .into_iter()
     .map(|verb| EffectBoundV1 {
@@ -1631,6 +1638,7 @@ mod tests {
                 current_binding: fixture.binding.clone().into(),
                 now: NOW + 2,
                 process_world: None,
+                private_scratch: false,
             })
             .unwrap()
     }
@@ -1684,6 +1692,126 @@ mod tests {
                 "leaked {forbidden}: {encoded}"
             );
         }
+    }
+
+    #[test]
+    fn codex_b0_claim_clones_private_scratch_and_cannot_write_output_or_n_plus_one() {
+        let fixture = fixture(transform_then_execute_steps);
+        let grant = fixture
+            .runtime
+            .claim_v2_managed_step(ManagedStepClaimRequestV1 {
+                attempt_id: fixture.start.attempt_id.clone(),
+                step_id: "transform".into(),
+                input: fixture.input.clone(),
+                captured_binding: fixture.binding.clone().into(),
+                current_binding: fixture.binding.clone().into(),
+                now: NOW + 2,
+                process_world: None,
+                private_scratch: true,
+            })
+            .unwrap();
+        assert!(grant.process_world.is_none());
+        let executable_root =
+            std::env::temp_dir().join(format!("pastey-codex-b0-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&executable_root).unwrap();
+        let executable = executable_root.join("codex");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let world = ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+            executable_path: executable,
+            scope_root: executable_root.clone(),
+        })
+        .unwrap();
+        let mut specialist = fixture.runtime.codex_specialists.lock();
+        specialist
+            .install_synthetic_qualification(world, 1)
+            .unwrap();
+        let authority = fixture.runtime.effect_authority.lock();
+        let mut resources = fixture.runtime.managed_resources.lock();
+        let mut objects = fixture.runtime.managed_objects.lock();
+        let (binding, scratch) = specialist
+            .bind_claimed_transform(
+                &grant,
+                &authority,
+                &mut resources,
+                &mut objects,
+                Some("test"),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(scratch.root.join("input")).unwrap(),
+            b"revision one"
+        );
+        std::fs::write(scratch.root.join("input"), b"specialist result").unwrap();
+        let scan = specialist
+            .scan_bound_scratch(&binding, &authority, &resources, &grant.access, &scratch)
+            .unwrap();
+        assert_eq!(scan.identity.files.len(), 1);
+        for index in 0..64 {
+            std::fs::write(scratch.root.join(format!("extra-{index}")), b"x").unwrap();
+        }
+        assert!(specialist
+            .scan_bound_scratch(&binding, &authority, &resources, &grant.access, &scratch)
+            .is_err());
+        for index in 0..64 {
+            std::fs::remove_file(scratch.root.join(format!("extra-{index}"))).unwrap();
+        }
+        std::fs::remove_file(scratch.root.join("input")).unwrap();
+        assert!(specialist
+            .scan_bound_scratch(&binding, &authority, &resources, &grant.access, &scratch)
+            .is_err());
+        std::fs::write(scratch.root.join("input"), b"specialist result").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", scratch.root.join("escape")).unwrap();
+            assert!(specialist
+                .scan_bound_scratch(&binding, &authority, &resources, &grant.access, &scratch)
+                .is_err());
+            std::fs::remove_file(scratch.root.join("escape")).unwrap();
+            let fifo = scratch.root.join("special");
+            assert_eq!(
+                unsafe {
+                    libc::mkfifo(
+                        std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+                            .unwrap()
+                            .as_ptr(),
+                        0o600,
+                    )
+                },
+                0
+            );
+            assert!(specialist
+                .scan_bound_scratch(&binding, &authority, &resources, &grant.access, &scratch)
+                .is_err());
+            std::fs::remove_file(fifo).unwrap();
+        }
+        let oversized = std::fs::File::create(scratch.root.join("input")).unwrap();
+        oversized.set_len(16 * 1024 * 1024 + 1).unwrap();
+        assert!(specialist
+            .scan_bound_scratch(&binding, &authority, &resources, &grant.access, &scratch)
+            .is_err());
+        assert_eq!(
+            resources.private_file_count_for_test(grant.output_slot.as_ref().unwrap()),
+            Some(0)
+        );
+        drop(objects);
+        drop(resources);
+        drop(authority);
+        drop(specialist);
+        let connection = Connection::open(&fixture.runtime.paths.db_path).unwrap();
+        let transforms: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_transform_results",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transforms, 0);
+        let _ = std::fs::remove_dir_all(executable_root);
     }
 
     #[test]
@@ -2023,6 +2151,7 @@ mod tests {
             current_binding: fixture.binding.clone().into(),
             now: NOW + 2,
             process_world: None,
+            private_scratch: false,
         }
     }
 
@@ -2046,6 +2175,7 @@ mod tests {
                 })
                 .unwrap(),
             ),
+            private_scratch: false,
         }
     }
 
@@ -2574,6 +2704,7 @@ mod tests {
                 current_binding: fixture.binding.clone().into(),
                 now: NOW + 3,
                 process_world: None,
+                private_scratch: false,
             })
             .is_err());
         let mut wrong_revision = fixture.input.clone();
@@ -2588,6 +2719,7 @@ mod tests {
                 current_binding: fixture.binding.clone().into(),
                 now: NOW + 3,
                 process_world: None,
+                private_scratch: false,
             })
             .is_err());
         let wrong_session = HostSessionBinding::new(
@@ -2610,6 +2742,7 @@ mod tests {
                 current_binding: wrong_session.into(),
                 now: NOW + 3,
                 process_world: None,
+                private_scratch: false,
             })
             .is_err());
     }
@@ -2627,6 +2760,7 @@ mod tests {
                 current_binding: fixture.binding.clone().into(),
                 now: NOW + 2,
                 process_world: None,
+                private_scratch: false,
             })
             .is_err());
         let grant = claim(&fixture, "transform", fixture.input.clone());

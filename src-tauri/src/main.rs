@@ -5,6 +5,7 @@ mod capability_acquisition_confirmation;
 mod capability_probe;
 mod chunk_frame;
 mod cleanup;
+mod codex_specialist;
 mod commands;
 mod config;
 mod crypto;
