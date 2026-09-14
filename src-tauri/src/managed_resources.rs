@@ -511,11 +511,17 @@ impl ManagedResourceResolverV1 {
                     return invalid("Codex scratch input tree changed before cloning.");
                 }
                 copy_private_tree(&artifact.path, &root, quota_bytes.min(maximum_bytes))?;
-                let copied = scan_regular_tree(&root, quota_bytes)?;
-                if copied != expected.files {
-                    return invalid("Codex scratch clone does not match the exact input tree.");
+                let copied =
+                    safe_file_identity::capture_regular_file_set_identity(&root, quota_bytes)?;
+                if copied.digest != expected.digest
+                    || copied.byte_count != expected.byte_count
+                    || copied.files.len() != expected.files.len()
+                {
+                    return invalid(
+                        "Codex scratch clone does not match the exact logical input tree.",
+                    );
                 }
-                for (selector, identity) in copied {
+                for (selector, identity) in copied.files {
                     files.insert(
                         selector.clone(),
                         PrivateFileV1 {
@@ -592,6 +598,19 @@ impl ManagedResourceResolverV1 {
             Some(HostResourceBackingV1::Workspace { files, .. })
             | Some(HostResourceBackingV1::OutputSlot { files, .. })
             | Some(HostResourceBackingV1::Scratch { files, .. }) => Some(files.len()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn private_root_for_test(
+        &self,
+        handle_ref: &ResourceHandleRefV1,
+    ) -> Option<PathBuf> {
+        match self.backings.get(handle_ref) {
+            Some(HostResourceBackingV1::Workspace { root, .. })
+            | Some(HostResourceBackingV1::OutputSlot { root, .. })
+            | Some(HostResourceBackingV1::Scratch { root, .. }) => Some(root.clone()),
             _ => None,
         }
     }

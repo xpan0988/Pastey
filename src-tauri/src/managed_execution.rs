@@ -695,6 +695,80 @@ impl HostRuntime {
         Ok(acquisition)
     }
 
+    /// Explicit Host-only B1 closure for an already prepared Codex attempt.
+    /// It is not Plan selection and cannot qualify or launch Codex. B0 callers
+    /// that bind and scan Scratch alone still have no OutputSlot or N+1 path.
+    pub(crate) fn finalize_codex_specialist_transform(
+        &self,
+        grant: &ManagedStepGrantV1,
+        codex_binding: &crate::codex_specialist::CodexAttemptBindingV0,
+        scratch: &crate::managed_resources::ManagedScratchLeaseV1,
+        current_binding: impl Into<HostExecutionFreshness>,
+        now: i64,
+    ) -> AppResult<ManagedObjectAcquisition> {
+        let current_binding = current_binding.into();
+        let mut access = grant.access.clone();
+        access.current = current_authority(&current_binding, now);
+        let imported = {
+            let specialists = self.codex_specialists.lock();
+            let mut authority = self.effect_authority.lock();
+            let mut resolver = self.managed_resources.lock();
+            let mut objects = self.managed_objects.lock();
+            specialists.import_bound_scratch(
+                codex_binding,
+                &mut authority,
+                &mut resolver,
+                &mut objects,
+                grant,
+                &access,
+                scratch,
+                now,
+            )
+        };
+        let imported = match imported {
+            Ok(imported) => imported,
+            Err(error) => {
+                let _ = self.cancel_managed_run(&grant.access.run_control_ref);
+                return Err(error);
+            }
+        };
+        let input = grant
+            .access
+            .context
+            .input_revisions
+            .first()
+            .cloned()
+            .ok_or_else(|| {
+                AppError::InvalidInput("Codex Transform input is unavailable.".into())
+            })?;
+        let proposal = TransformResultProposalV1 {
+            attempt_id: grant.access.context.attempt_id.clone(),
+            step_id: grant.access.context.step_id.clone(),
+            context_ref: grant.access.context.context_ref()?,
+            envelope_ref: grant.access.envelope_ref.clone(),
+            run_control_ref: grant.access.run_control_ref.clone(),
+            input: input.clone(),
+            output: ManagedObjectRevisionResultV1 {
+                logical_object_id: input.logical_object_id,
+                revision: grant.output_revision.ok_or_else(|| {
+                    AppError::InvalidInput("Codex Transform output is unavailable.".into())
+                })?,
+                host_ref: self.local_host_ref.clone(),
+                content_digest: imported.output_seal.content_digest.clone(),
+            },
+            output_seal: imported.output_seal,
+            evidence_ids: imported.evidence_ids,
+            evidence_head: imported.evidence_head,
+            display_name: "codex-transform-output".into(),
+            media_type: "application/x-pastey-file-set".into(),
+        };
+        let result = self.finalize_v2_transform(proposal, current_binding, now);
+        if result.is_err() {
+            let _ = self.cancel_managed_run(&grant.access.run_control_ref);
+        }
+        result
+    }
+
     pub(crate) fn finalize_v2_execute(
         &self,
         proposal: ExecuteResultProposalV1,
@@ -1648,6 +1722,75 @@ mod tests {
             .unwrap()
     }
 
+    fn claim_codex_transform(fixture: &Fixture) -> ManagedStepGrantV1 {
+        fixture
+            .runtime
+            .claim_v2_managed_step(ManagedStepClaimRequestV1 {
+                attempt_id: fixture.start.attempt_id.clone(),
+                step_id: "transform".into(),
+                input: fixture.input.clone(),
+                captured_binding: fixture.binding.clone().into(),
+                current_binding: fixture.binding.clone().into(),
+                now: NOW + 2,
+                process_world: None,
+                private_scratch: true,
+            })
+            .unwrap()
+    }
+
+    fn bind_synthetic_codex(
+        fixture: &Fixture,
+        grant: &ManagedStepGrantV1,
+    ) -> (
+        crate::codex_specialist::CodexAttemptBindingV0,
+        crate::managed_resources::ManagedScratchLeaseV1,
+        PathBuf,
+    ) {
+        let executable_root =
+            std::env::temp_dir().join(format!("pastey-codex-b1-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&executable_root).unwrap();
+        let executable = executable_root.join("codex");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let world = ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+            executable_path: executable,
+            scope_root: executable_root.clone(),
+        })
+        .unwrap();
+        let mut specialist = fixture.runtime.codex_specialists.lock();
+        specialist
+            .install_synthetic_qualification(world, 1)
+            .unwrap();
+        let authority = fixture.runtime.effect_authority.lock();
+        let mut resources = fixture.runtime.managed_resources.lock();
+        let mut objects = fixture.runtime.managed_objects.lock();
+        let result = specialist
+            .bind_claimed_transform(
+                grant,
+                &authority,
+                &mut resources,
+                &mut objects,
+                Some("test"),
+            )
+            .unwrap();
+        (result.0, result.1, executable_root)
+    }
+
+    fn transform_result_count(fixture: &Fixture) -> i64 {
+        Connection::open(&fixture.runtime.paths.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_transform_results",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn managed_workspace_projection_resolves_only_exact_envelope_resources() {
         let fixture = fixture(transform_then_execute_steps);
@@ -1816,6 +1959,203 @@ mod tests {
             )
             .unwrap();
         assert_eq!(transforms, 0);
+        let _ = std::fs::remove_dir_all(executable_root);
+    }
+
+    #[test]
+    fn codex_b1_imports_the_complete_scanned_tree_through_effects_and_one_core_n_plus_one() {
+        let fixture = fixture_with_input(transform_then_execute_steps, true, |artifact_root| {
+            std::fs::write(artifact_root.join("keep.txt"), b"keep").unwrap();
+            std::fs::write(artifact_root.join("replace.txt"), b"old").unwrap();
+            std::fs::write(artifact_root.join("delete.txt"), b"delete").unwrap();
+            (
+                artifact_root.to_path_buf(),
+                "input-tree".into(),
+                "application/x-pastey-file-set".into(),
+                ManagedObjectAcquisitionKind::LocalSelection,
+            )
+        });
+        let grant = claim_codex_transform(&fixture);
+        let (binding, scratch, executable_root) = bind_synthetic_codex(&fixture, &grant);
+        std::fs::write(scratch.root.join("replace.txt"), b"new").unwrap();
+        std::fs::remove_file(scratch.root.join("delete.txt")).unwrap();
+        std::fs::write(scratch.root.join("added.txt"), b"added").unwrap();
+        std::fs::write(scratch.root.join("empty.txt"), b"").unwrap();
+        let expected = crate::safe_file_identity::capture_regular_file_set_identity(
+            &scratch.root,
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let output = fixture
+            .runtime
+            .finalize_codex_specialist_transform(
+                &grant,
+                &binding,
+                &scratch,
+                fixture.binding.clone(),
+                NOW + 3,
+            )
+            .unwrap();
+        assert_eq!(output.object.revision, 2);
+        let resolved = fixture
+            .runtime
+            .managed_objects
+            .lock()
+            .resolve(&output, NOW + 3)
+            .unwrap();
+        let actual = crate::safe_file_identity::capture_regular_file_set_identity(
+            &resolved.path,
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(actual.digest, expected.digest);
+        assert_eq!(actual.byte_count, expected.byte_count);
+        assert_eq!(
+            actual
+                .files
+                .iter()
+                .map(|(selector, identity)| (selector, &identity.digest, identity.byte_count))
+                .collect::<Vec<_>>(),
+            expected
+                .files
+                .iter()
+                .map(|(selector, identity)| (selector, &identity.digest, identity.byte_count))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::fs::read(resolved.path.join("replace.txt")).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            std::fs::read(resolved.path.join("added.txt")).unwrap(),
+            b"added"
+        );
+        assert_eq!(std::fs::read(resolved.path.join("empty.txt")).unwrap(), b"");
+        assert!(!resolved.path.join("delete.txt").exists());
+
+        let evidence = fixture
+            .runtime
+            .effect_authority
+            .lock()
+            .evidence_for_test(&grant.access.run_control_ref);
+        assert_eq!(evidence.len(), expected.files.len());
+        assert!(evidence.iter().all(|item| {
+            item.decision == crate::effect_authority::EffectDecisionV1::Allowed
+                && matches!(
+                    item.facts,
+                    crate::effect_authority::EffectFactsV1::Resource { ref handle_ref, .. }
+                        if handle_ref == grant.output_slot.as_ref().unwrap()
+                )
+        }));
+        let (digest, seal_ref, evidence_head): (String, String, String) = Connection::open(
+            &fixture.runtime.paths.db_path,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT content_digest, seal_ref, evidence_head FROM bridge_plan_v2_transform_results",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+        assert_eq!(digest, expected.digest);
+        assert!(seal_ref.starts_with("pastey-output-slot-regular-file-set-seal-v1:"));
+        assert_eq!(evidence_head, evidence.last().unwrap().evidence_digest);
+        assert_eq!(transform_result_count(&fixture), 1);
+        let _ = std::fs::remove_dir_all(executable_root);
+    }
+
+    #[test]
+    fn codex_b1_partial_import_cancels_without_a_successor_revision() {
+        let fixture = fixture(transform_then_execute_steps);
+        let grant = claim_codex_transform(&fixture);
+        let (binding, scratch, executable_root) = bind_synthetic_codex(&fixture, &grant);
+        std::fs::remove_file(scratch.root.join("input")).unwrap();
+        std::fs::write(scratch.root.join("a.txt"), b"a").unwrap();
+        std::fs::write(scratch.root.join("b.txt"), b"b").unwrap();
+        let output_root = fixture
+            .runtime
+            .managed_resources
+            .lock()
+            .private_root_for_test(grant.output_slot.as_ref().unwrap())
+            .unwrap();
+        // Fault injection: an untracked destination makes the second ordered
+        // Create fail after the first import effect has terminal evidence.
+        std::fs::write(output_root.join("b.txt"), b"untracked").unwrap();
+        assert!(fixture
+            .runtime
+            .finalize_codex_specialist_transform(
+                &grant,
+                &binding,
+                &scratch,
+                fixture.binding.clone(),
+                NOW + 3,
+            )
+            .is_err());
+        assert_eq!(transform_result_count(&fixture), 0);
+        let _ = std::fs::remove_dir_all(executable_root);
+    }
+
+    #[test]
+    fn codex_b1_cancellation_stale_binding_and_seal_failure_create_no_successor() {
+        let cancelled = fixture(transform_then_execute_steps);
+        let grant = claim_codex_transform(&cancelled);
+        let (binding, scratch, executable_root) = bind_synthetic_codex(&cancelled, &grant);
+        cancelled
+            .runtime
+            .cancel_managed_run(&grant.access.run_control_ref)
+            .unwrap();
+        assert!(cancelled
+            .runtime
+            .finalize_codex_specialist_transform(
+                &grant,
+                &binding,
+                &scratch,
+                cancelled.binding.clone(),
+                NOW + 3,
+            )
+            .is_err());
+        assert_eq!(transform_result_count(&cancelled), 0);
+        let _ = std::fs::remove_dir_all(executable_root);
+
+        let stale = fixture(transform_then_execute_steps);
+        let grant = claim_codex_transform(&stale);
+        let (binding, scratch, executable_root) = bind_synthetic_codex(&stale, &grant);
+        std::fs::write(executable_root.join("codex"), b"#!/bin/sh\necho replaced\n").unwrap();
+        assert!(stale
+            .runtime
+            .finalize_codex_specialist_transform(
+                &grant,
+                &binding,
+                &scratch,
+                stale.binding.clone(),
+                NOW + 3,
+            )
+            .is_err());
+        assert_eq!(transform_result_count(&stale), 0);
+        let _ = std::fs::remove_dir_all(executable_root);
+
+        let seal_failure = fixture(transform_then_execute_steps);
+        let grant = claim_codex_transform(&seal_failure);
+        let (binding, scratch, executable_root) = bind_synthetic_codex(&seal_failure, &grant);
+        let output_root = seal_failure
+            .runtime
+            .managed_resources
+            .lock()
+            .private_root_for_test(grant.output_slot.as_ref().unwrap())
+            .unwrap();
+        std::fs::write(output_root.join("untracked.txt"), b"fault").unwrap();
+        assert!(seal_failure
+            .runtime
+            .finalize_codex_specialist_transform(
+                &grant,
+                &binding,
+                &scratch,
+                seal_failure.binding.clone(),
+                NOW + 3,
+            )
+            .is_err());
+        assert_eq!(transform_result_count(&seal_failure), 0);
         let _ = std::fs::remove_dir_all(executable_root);
     }
 
