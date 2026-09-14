@@ -148,6 +148,7 @@ impl OpenAICompatibleStreamingWorkerProviderV1 {
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let result = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
                 .enable_time()
                 .build()
                 .map_err(|_| fatal())
@@ -182,6 +183,7 @@ impl OpenAICompatibleStreamingWorkerProviderV1 {
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let result = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
                 .enable_time()
                 .build()
                 .map_err(|_| fatal())
