@@ -487,6 +487,7 @@ pub(crate) fn lower_candidate(
                     input: input.object,
                     output,
                     modification_intent: modification_intent.clone(),
+                    worker_capability_requirement: None,
                 });
                 topology.push(topology_step(
                     &step_alias,

@@ -53,6 +53,15 @@ pub(crate) struct PlanRootV2 {
     pub(crate) host: PlanParticipantRef,
 }
 
+/// An explicitly approved Transform Worker capability. This is semantic Plan
+/// authority only: executable identity, qualification generation, credentials,
+/// and other Host implementation facts never enter the Plan.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) enum TransformWorkerCapabilityRequirementV1 {
+    #[serde(rename = "agent.coding.codex")]
+    Codex,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     tag = "operation",
@@ -76,6 +85,8 @@ pub(crate) enum PlanStepV2 {
         input: ManagedObjectRevisionV2,
         output: ManagedObjectRevisionV2,
         modification_intent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_capability_requirement: Option<TransformWorkerCapabilityRequirementV1>,
     },
     Transfer {
         step_id: String,
@@ -120,6 +131,16 @@ impl PlanStepV2 {
             Self::Transfer { .. } => StepOperation::Transfer,
             Self::Execute { .. } => StepOperation::Execute,
         }
+    }
+
+    pub(crate) fn requires_codex_specialist(&self) -> bool {
+        matches!(
+            self,
+            Self::Transform {
+                worker_capability_requirement: Some(TransformWorkerCapabilityRequirementV1::Codex),
+                ..
+            }
+        )
     }
 
     pub(crate) fn binds_participant(&self, participant: &PlanParticipantRef) -> bool {
@@ -862,6 +883,11 @@ pub(crate) fn init_schema(conn: &Connection) -> AppResult<()> {
             failure_code TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
             FOREIGN KEY(attempt_id) REFERENCES bridge_plan_v2_attempts(attempt_id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS bridge_plan_v2_codex_attempt_bindings (
+            attempt_id TEXT PRIMARY KEY, qualification_generation INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(attempt_id) REFERENCES bridge_plan_v2_attempts(attempt_id) ON DELETE CASCADE
+        );
         CREATE TABLE IF NOT EXISTS bridge_plan_v2_worker_dispatches (
             attempt_id TEXT NOT NULL, step_id TEXT NOT NULL,
             operation TEXT NOT NULL CHECK(operation IN ('transform','execute')),
@@ -918,6 +944,9 @@ pub(crate) fn init_schema(conn: &Connection) -> AppResult<()> {
                 ('running','completed','failed','interrupted','cancelled'))
         )
         BEGIN SELECT RAISE(ABORT, 'Illegal Bridge Plan v2 Worker attempt transition'); END;
+        CREATE TRIGGER IF NOT EXISTS bridge_plan_v2_codex_attempt_binding_immutable
+        BEFORE UPDATE ON bridge_plan_v2_codex_attempt_bindings
+        BEGIN SELECT RAISE(ABORT, 'Bridge Plan v2 Codex binding is immutable'); END;
         CREATE TRIGGER IF NOT EXISTS bridge_plan_v2_worker_attempt_terminal_guard
         BEFORE UPDATE ON bridge_plan_v2_worker_attempts
         WHEN OLD.state IN ('completed','failed','interrupted','cancelled')
@@ -1368,6 +1397,7 @@ mod tests {
                 input: revision_one,
                 output: revision_two.clone(),
                 modification_intent: "Apply the reviewed modification.".into(),
+                worker_capability_requirement: None,
             },
             PlanStepV2::Transfer {
                 step_id: "transfer".into(),
@@ -2023,6 +2053,44 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, 0);
         assert_eq!(local_host, host("source"));
+        std::fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
+
+    #[test]
+    fn codex_transform_requirement_is_canonical_and_survives_review_storage() {
+        let native = all_four_revision();
+        let native_json = serde_json::to_value(&native).unwrap();
+        assert!(native_json["steps"][1]
+            .get("workerCapabilityRequirement")
+            .is_none());
+
+        let mut codex = native.clone();
+        let PlanStepV2::Transform {
+            worker_capability_requirement,
+            ..
+        } = &mut codex.steps[1]
+        else {
+            unreachable!();
+        };
+        *worker_capability_requirement = Some(TransformWorkerCapabilityRequirementV1::Codex);
+        codex.revision_hash.clear();
+        let codex = seal_revision(codex).unwrap();
+        assert_ne!(native.revision_hash, codex.revision_hash);
+        assert_eq!(
+            serde_json::to_value(&codex).unwrap()["steps"][1]["workerCapabilityRequirement"],
+            "agent.coding.codex"
+        );
+        verify_sealed_revision(&codex).unwrap();
+
+        let paths = paths("pastey-v2-codex-plan-storage");
+        let local = host("source");
+        let review = review_for(&codex, participant(&codex, &local));
+        let store = BridgePlanV2Store::new(&paths);
+        record_review(&store, &review, &local);
+        let reloaded = store
+            .reviewed_revision_for_start(&start_for(&review), NOW)
+            .unwrap();
+        assert_eq!(reloaded, codex);
         std::fs::remove_dir_all(paths.app_data_dir).unwrap();
     }
 }
