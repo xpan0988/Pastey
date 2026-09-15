@@ -10,6 +10,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    io::Write,
     path::PathBuf,
     process::{Output, Stdio},
     sync::{
@@ -38,12 +39,15 @@ use crate::{
     managed_execution::{ManagedProcessWorldSpecV1, ManagedStepGrantV1},
     managed_resources::{ManagedResourceResolverV1, ManagedScratchLeaseV1, ManagedScratchScanV1},
     managed_workspace::{WorkerWorkspaceAliasV1, WorkerWorkspaceOperationV1},
+    safe_file_identity::{self, SourceIdentity},
 };
 
 const MAX_PI_JSONL_LINE_BYTES: usize = 64 * 1024;
 const MAX_PI_JSONL_EVENTS: usize = 1_024;
 const MAX_PI_STDOUT_BYTES: usize = MAX_PI_JSONL_LINE_BYTES * MAX_PI_JSONL_EVENTS;
 const MAX_PI_STDERR_BYTES: usize = 64 * 1024;
+const MAX_PI_SUPPORT_FILES_PER_KIND: usize = 8;
+const MAX_PI_SUPPORT_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PiDetectionV0 {
@@ -64,7 +68,163 @@ struct PiQualificationV0 {
     generation: u64,
     process_world: ManagedProcessWorldSpecV1,
     executable_identity_ref: String,
+    support_content: PiHostSupportContentV0,
     synthetic: bool,
+}
+
+/// Host-owned Pi support content. Its bytes are neither ambient Pi state nor
+/// project resources: each claimed attempt copies them into a fresh private
+/// root and binds the resulting no-follow identities.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PiHostSupportContentV0 {
+    skills: Vec<Vec<u8>>,
+    prompt_templates: Vec<Vec<u8>>,
+}
+
+impl PiHostSupportContentV0 {
+    #[cfg(test)]
+    pub(crate) fn for_test(skills: Vec<Vec<u8>>, prompt_templates: Vec<Vec<u8>>) -> Self {
+        Self {
+            skills,
+            prompt_templates,
+        }
+    }
+
+    fn materialize(&self) -> AppResult<PiBoundSupportContentV0> {
+        if self.skills.is_empty() && self.prompt_templates.is_empty() {
+            return Ok(PiBoundSupportContentV0::default());
+        }
+        if self.skills.len() > MAX_PI_SUPPORT_FILES_PER_KIND
+            || self.prompt_templates.len() > MAX_PI_SUPPORT_FILES_PER_KIND
+        {
+            return invalid("Pi Host-bound support content exceeds its file limit.");
+        }
+        let total_bytes = self.skills.iter().chain(&self.prompt_templates).try_fold(
+            0_u64,
+            |total, content| {
+                total.checked_add(content.len() as u64).ok_or_else(|| {
+                    AppError::InvalidInput("Pi support content is too large.".into())
+                })
+            },
+        )?;
+        if total_bytes > MAX_PI_SUPPORT_BYTES {
+            return invalid("Pi Host-bound support content exceeds its byte limit.");
+        }
+
+        let root = std::env::temp_dir().join(format!("pastey-pi-support-{}", Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        }
+        let result = (|| {
+            let skills = self
+                .skills
+                .iter()
+                .enumerate()
+                .map(|(index, content)| {
+                    materialize_support_file(&root, "skills", index, "skill.md", content)
+                })
+                .collect::<AppResult<Vec<_>>>()?;
+            let prompt_templates = self
+                .prompt_templates
+                .iter()
+                .enumerate()
+                .map(|(index, content)| {
+                    materialize_support_file(
+                        &root,
+                        "prompt-templates",
+                        index,
+                        "prompt-template.md",
+                        content,
+                    )
+                })
+                .collect::<AppResult<Vec<_>>>()?;
+            Ok(PiBoundSupportContentV0 {
+                root: Some(Arc::new(PiPrivateSupportRootV0 { path: root.clone() })),
+                skills,
+                prompt_templates,
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&root);
+        }
+        result
+    }
+}
+
+#[derive(Debug)]
+struct PiPrivateSupportRootV0 {
+    path: PathBuf,
+}
+
+impl Drop for PiPrivateSupportRootV0 {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PiBoundSupportFileV0 {
+    path: PathBuf,
+    identity: SourceIdentity,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PiBoundSupportContentV0 {
+    /// The root's lifetime is the attempt binding's lifetime. It is never
+    /// visible through Pi's ambient discovery roots or the Worker context.
+    root: Option<Arc<PiPrivateSupportRootV0>>,
+    skills: Vec<PiBoundSupportFileV0>,
+    prompt_templates: Vec<PiBoundSupportFileV0>,
+}
+
+impl PiBoundSupportContentV0 {
+    fn validate(&self) -> AppResult<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        for support_file in self.skills.iter().chain(&self.prompt_templates) {
+            safe_file_identity::read_source_if_identity_matches(
+                &support_file.path,
+                &root.path,
+                &support_file.identity,
+                MAX_PI_SUPPORT_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn materialize_support_file(
+    root: &std::path::Path,
+    kind: &str,
+    index: usize,
+    suffix: &str,
+    content: &[u8],
+) -> AppResult<PiBoundSupportFileV0> {
+    let directory = root.join(kind);
+    fs::create_dir_all(&directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    }
+    let path = directory.join(format!("{index:02}-{suffix}"));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
+    }
+    let identity = safe_file_identity::capture_source_identity(&path, root, MAX_PI_SUPPORT_BYTES)?;
+    Ok(PiBoundSupportFileV0 { path, identity })
 }
 
 #[derive(Clone, Debug)]
@@ -74,29 +234,36 @@ struct PiInvocationV0 {
 }
 
 impl PiInvocationV0 {
-    fn new(scratch_root: PathBuf) -> Self {
-        Self {
+    fn new(scratch_root: PathBuf, support_content: &PiBoundSupportContentV0) -> Self {
+        let mut argv = [
             // Pi JSON mode has a different protocol from `codex exec --json`.
             // `--no-session` prevents its otherwise persistent JSONL session.
-            argv: [
-                "--mode",
-                "json",
-                "--no-session",
-                "--no-approve",
-                "--no-extensions",
-                "--no-skills",
-                "--no-prompt-templates",
-                "--no-themes",
-                "--no-context-files",
-                "--tools",
-                "read,bash,edit,write,grep,find,ls",
-                "--",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-            scratch_root,
+            "--mode",
+            "json",
+            "--no-session",
+            "--no-approve",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-context-files",
+            "--tools",
+            "read,bash,edit,write,grep,find,ls",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        for skill in &support_content.skills {
+            argv.extend(["--skill".into(), skill.path.to_string_lossy().into_owned()]);
         }
+        for prompt_template in &support_content.prompt_templates {
+            argv.extend([
+                "--prompt-template".into(),
+                prompt_template.path.to_string_lossy().into_owned(),
+            ]);
+        }
+        argv.push("--".into());
+        Self { argv, scratch_root }
     }
 }
 
@@ -106,6 +273,7 @@ pub(crate) struct PiAttemptBindingV0 {
     pub(crate) qualification_generation: u64,
     pub(crate) executable_identity_ref: String,
     invocation: PiInvocationV0,
+    support_content: PiBoundSupportContentV0,
     revoked: Arc<AtomicBool>,
 }
 
@@ -121,6 +289,7 @@ impl PiAttemptBindingV0 {
         if current != self.executable_identity_ref {
             return invalid("Pi executable identity changed after qualification.");
         }
+        self.support_content.validate()?;
         Ok(())
     }
 }
@@ -297,12 +466,14 @@ impl PiSpecialistServiceV0 {
             &grant.input_handle,
             &scratch_handle,
         )?;
+        let support_content = qualification.support_content.materialize()?;
         let revoked = Arc::new(AtomicBool::new(false));
         let binding = PiAttemptBindingV0 {
             run_ref: grant.access.run_control_ref.clone(),
             qualification_generation: qualification.generation,
             executable_identity_ref,
-            invocation: PiInvocationV0::new(scratch.root.clone()),
+            invocation: PiInvocationV0::new(scratch.root.clone(), &support_content),
+            support_content,
             revoked: revoked.clone(),
         };
         binding.validate(qualification)?;
@@ -505,6 +676,25 @@ impl PiSpecialistServiceV0 {
             generation,
             process_world,
             executable_identity_ref,
+            support_content: PiHostSupportContentV0::default(),
+            synthetic: true,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_synthetic_qualification_with_support(
+        &mut self,
+        process_world: ManagedProcessWorldSpecV1,
+        generation: u64,
+        support_content: PiHostSupportContentV0,
+    ) -> AppResult<()> {
+        let executable_identity_ref = process_world.validate_executable_identity()?.to_owned();
+        self.qualification = Some(PiQualificationV0 {
+            generation,
+            process_world,
+            executable_identity_ref,
+            support_content,
             synthetic: true,
         });
         Ok(())
@@ -517,7 +707,19 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use super::*;
+    use crate::managed_resources::ExecutableBindingSpecV1;
+
+    fn synthetic_world(path: PathBuf) -> ManagedProcessWorldSpecV1 {
+        let scope_root = path.parent().unwrap().to_path_buf();
+        ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+            executable_path: path,
+            scope_root,
+        })
+        .unwrap()
+    }
 
     #[test]
     fn pi_json_protocol_requires_its_own_ordered_terminal_events() {
@@ -533,7 +735,10 @@ mod tests {
 
     #[test]
     fn pi_invocation_is_ephemeral_and_ambient_config_free() {
-        let invocation = PiInvocationV0::new(PathBuf::from("/private/scratch"));
+        let invocation = PiInvocationV0::new(
+            PathBuf::from("/private/scratch"),
+            &PiBoundSupportContentV0::default(),
+        );
         assert!(invocation.argv.iter().any(|argument| argument == "--mode"));
         assert!(invocation.argv.iter().any(|argument| argument == "json"));
         assert!(invocation
@@ -544,5 +749,122 @@ mod tests {
             .argv
             .iter()
             .any(|argument| argument == "--no-context-files"));
+        assert!(invocation
+            .argv
+            .iter()
+            .any(|argument| argument == "--no-skills"));
+        assert!(invocation
+            .argv
+            .iter()
+            .any(|argument| argument == "--no-prompt-templates"));
+        assert!(!invocation.argv.iter().any(|argument| argument == "--skill"));
+        assert!(!invocation
+            .argv
+            .iter()
+            .any(|argument| argument == "--prompt-template"));
+    }
+
+    #[test]
+    fn explicit_host_bound_support_is_visible_without_ambient_discovery() {
+        let ambient_root =
+            std::env::temp_dir().join(format!("pastey-pi-ambient-{}", Uuid::new_v4()));
+        fs::create_dir_all(&ambient_root).unwrap();
+        let ambient_skill = ambient_root.join("ambient-skill.md");
+        fs::write(&ambient_skill, b"ambient skill").unwrap();
+
+        let support = PiHostSupportContentV0::for_test(
+            vec![b"exact skill".to_vec()],
+            vec![b"exact template".to_vec()],
+        )
+        .materialize()
+        .unwrap();
+        let invocation = PiInvocationV0::new(PathBuf::from("/private/scratch"), &support);
+        let skill = support
+            .skills
+            .first()
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+        let prompt_template = support
+            .prompt_templates
+            .first()
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(invocation
+            .argv
+            .windows(2)
+            .any(|pair| { pair[0] == "--skill" && pair[1] == skill }));
+        assert!(invocation
+            .argv
+            .windows(2)
+            .any(|pair| { pair[0] == "--prompt-template" && pair[1] == prompt_template }));
+        assert!(invocation
+            .argv
+            .iter()
+            .any(|argument| argument == "--no-skills"));
+        assert!(invocation
+            .argv
+            .iter()
+            .any(|argument| argument == "--no-prompt-templates"));
+        assert!(invocation
+            .argv
+            .iter()
+            .any(|argument| argument == "--no-context-files"));
+        assert!(!invocation
+            .argv
+            .iter()
+            .any(|argument| argument == &ambient_skill.to_string_lossy()));
+        assert!(support.validate().is_ok());
+
+        drop(support);
+        let _ = fs::remove_dir_all(ambient_root);
+    }
+
+    #[test]
+    fn bound_support_replacement_stales_the_attempt_before_controller_start() {
+        let directory =
+            std::env::temp_dir().join(format!("pastey-pi-support-stale-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("pi");
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let world = synthetic_world(executable);
+        let mut service = PiSpecialistServiceV0::default();
+        service
+            .install_synthetic_qualification_with_support(
+                world,
+                7,
+                PiHostSupportContentV0::for_test(
+                    vec![b"exact skill".to_vec()],
+                    vec![b"exact template".to_vec()],
+                ),
+            )
+            .unwrap();
+        let qualification = service.qualification.as_ref().unwrap();
+        let support_content = qualification.support_content.materialize().unwrap();
+        let replacement_path = support_content.skills.first().unwrap().path.clone();
+        let binding = PiAttemptBindingV0 {
+            run_ref: ManagedRunRefV1::from_stored("pi-support-test-run".into()).unwrap(),
+            qualification_generation: 7,
+            executable_identity_ref: qualification.executable_identity_ref.clone(),
+            invocation: PiInvocationV0::new(PathBuf::from("/private/scratch"), &support_content),
+            support_content,
+            revoked: Arc::new(AtomicBool::new(false)),
+        };
+        binding.validate(&qualification).unwrap();
+        fs::remove_file(&replacement_path).unwrap();
+        fs::write(&replacement_path, b"replacement skill").unwrap();
+        assert!(binding.validate(&qualification).is_err());
+
+        drop(binding);
+        let _ = fs::remove_dir_all(directory);
     }
 }
