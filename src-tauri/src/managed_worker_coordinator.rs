@@ -458,7 +458,7 @@ impl HostRuntime {
                 None,
                 now,
             ));
-            if step.requires_codex_specialist() {
+            let (result, provider_revoked) = if step.requires_codex_specialist() {
                 let qualified = codex_attempt_qualification_generation(&self.paths, &attempt_id)
                     .ok()
                     .flatten()
@@ -469,64 +469,48 @@ impl HostRuntime {
                     )
                     .is_some_and(|(bound, current)| bound == current);
                 if !qualified {
-                    self.finish_worker_failure(
-                        &attempt_id,
-                        Some(&step_id),
-                        ManagedWorkerCoordinatorStateV1::Interrupted,
-                        "codex_unqualified",
-                        now,
-                    );
-                    self.notify_coordinated_failure(
-                        &attempt_id,
-                        Some(&step_id),
-                        &captured,
-                        "codex_unqualified",
-                    );
-                    return;
+                    (
+                        Err(AppError::InvalidInput(
+                            "Codex qualification is stale.".into(),
+                        )),
+                        None,
+                    )
+                } else {
+                    (
+                        self.invoke_reserved_codex_specialist(&attempt_id, &step, &captured, now),
+                        None,
+                    )
                 }
-                // B0/B1 retain the only Codex execution path. There is no
-                // physical controller launch proof yet, so even a synthetic
-                // test qualification must never fall through to Native.
-                self.finish_worker_failure(
-                    &attempt_id,
-                    Some(&step_id),
-                    ManagedWorkerCoordinatorStateV1::Interrupted,
-                    "codex_controller_unavailable",
-                    now,
-                );
-                self.notify_coordinated_failure(
-                    &attempt_id,
-                    Some(&step_id),
-                    &captured,
-                    "codex_controller_unavailable",
-                );
-                return;
-            }
-            let selection = match worker_attempt_selection(&self.paths, &attempt_id) {
-                Ok(selection) => selection,
-                Err(_) => return,
+            } else {
+                let selection = match worker_attempt_selection(&self.paths, &attempt_id) {
+                    Ok(selection) => selection,
+                    Err(_) => return,
+                };
+                let binding = match self.worker_provider_configs.resolve(&selection) {
+                    Ok(binding) => binding,
+                    Err(_) => {
+                        self.finish_worker_failure(
+                            &attempt_id,
+                            Some(&step_id),
+                            ManagedWorkerCoordinatorStateV1::Interrupted,
+                            "provider_unavailable",
+                            now,
+                        );
+                        self.notify_coordinated_failure(
+                            &attempt_id,
+                            Some(&step_id),
+                            &captured,
+                            "provider_unavailable",
+                        );
+                        return;
+                    }
+                };
+                let revoked = binding.revocation_token();
+                (
+                    self.invoke_reserved_worker(&attempt_id, &step, &captured, binding, now),
+                    Some(revoked),
+                )
             };
-            let binding = match self.worker_provider_configs.resolve(&selection) {
-                Ok(binding) => binding,
-                Err(_) => {
-                    self.finish_worker_failure(
-                        &attempt_id,
-                        Some(&step_id),
-                        ManagedWorkerCoordinatorStateV1::Interrupted,
-                        "provider_unavailable",
-                        now,
-                    );
-                    self.notify_coordinated_failure(
-                        &attempt_id,
-                        Some(&step_id),
-                        &captured,
-                        "provider_unavailable",
-                    );
-                    return;
-                }
-            };
-            let revoked = binding.revocation_token();
-            let result = self.invoke_reserved_worker(&attempt_id, &step, &captured, binding, now);
             match result {
                 Ok(()) => {
                     let completed = {
@@ -613,7 +597,10 @@ impl HostRuntime {
                 Err(_) => {
                     let (state, code) = if worker_attempt_is_cancelled(&self.paths, &attempt_id) {
                         (ManagedWorkerCoordinatorStateV1::Cancelled, "user_cancelled")
-                    } else if revoked.load(std::sync::atomic::Ordering::Acquire) {
+                    } else if provider_revoked
+                        .as_ref()
+                        .is_some_and(|revoked| revoked.load(std::sync::atomic::Ordering::Acquire))
+                    {
                         (
                             ManagedWorkerCoordinatorStateV1::Interrupted,
                             "provider_revoked",
@@ -719,6 +706,39 @@ impl HostRuntime {
             WorkerRunLimitsV1::default(),
             binding,
         )?;
+        Ok(())
+    }
+
+    fn invoke_reserved_codex_specialist(
+        &self,
+        attempt_id: &str,
+        step: &PlanStepV2,
+        captured: &HostExecutionFreshness,
+        now: i64,
+    ) -> AppResult<()> {
+        if !step.requires_codex_specialist() {
+            return invalid("Codex dispatch requires an explicitly Codex-bound Transform.");
+        }
+        ensure_worker_attempt_active(&self.paths, attempt_id)?;
+        let current = current_host_execution_freshness(self, captured)?;
+        captured.validate_current(&current, now)?;
+        let input = step_input(step)?;
+        let acquisition = self.managed_objects.lock().acquisition_for_revision(
+            captured.bridge_id(),
+            &input.logical_object_id,
+            input.revision,
+            now,
+        )?;
+        self.run_codex_specialist_transform(ManagedStepClaimRequestV1 {
+            attempt_id: attempt_id.into(),
+            step_id: step.id().into(),
+            input: acquisition,
+            captured_binding: captured.clone(),
+            current_binding: current,
+            now,
+            process_world: None,
+            private_scratch: true,
+        })?;
         Ok(())
     }
 
@@ -2587,6 +2607,138 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Codex-required Transform cannot dispatch through a Native provider"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_controller_runs_private_scratch_then_b1_finalizes_one_successor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = fixture(|input, local, _| {
+            vec![PlanStepV2::Transform {
+                step_id: "codex-transform".into(),
+                depends_on: vec![],
+                host: local.clone(),
+                input: input.clone(),
+                output: ManagedObjectRevisionV2 {
+                    logical_object_id: input.logical_object_id.clone(),
+                    revision: input.revision + 1,
+                },
+                modification_intent: "Apply the approved change with Codex.".into(),
+                worker_capability_requirement: Some(TransformWorkerCapabilityRequirementV1::Codex),
+            }]
+        });
+        let executable = fixture._root.0.join("synthetic-codex");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --cd ]; then scratch=$2; shift 2; else shift; fi\ndone\nprintf 'controller output\\n' > \"$scratch/result.txt\"\nprintf '%s\\n' '{\"type\":\"thread.started\"}' '{\"type\":\"turn.started\"}' '{\"type\":\"item.completed\"}' '{\"type\":\"turn.completed\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        fixture
+            .runtime
+            .codex_specialists
+            .lock()
+            .install_synthetic_qualification(
+                ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+                    executable_path: executable,
+                    scope_root: fixture._root.0.clone(),
+                })
+                .unwrap(),
+                12,
+            )
+            .unwrap();
+        assert!(matches!(
+            accept(&fixture),
+            AttemptStartDecisionV2::Accepted(_)
+        ));
+        fixture.runtime.clone().drive_live_v2_attempt(
+            fixture.start.attempt_id.clone(),
+            HostExecutionFreshness::Remote(fixture.binding.clone()),
+        );
+        let conn = connection(&fixture.runtime.paths).unwrap();
+        let successors: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_transform_results WHERE attempt_id = ?1",
+                [&fixture.start.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let status = fixture
+            .runtime
+            .managed_worker_status(&fixture.start.attempt_id)
+            .unwrap();
+        assert_eq!(successors, 1, "controller status: {status:?}");
+        assert_eq!(status.state, ManagedWorkerCoordinatorStateV1::Completed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_controller_malformed_or_nonzero_output_has_no_successor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (index, script) in [
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"thread.started\"}' '{\"type\":\"turn.completed\"}'\n",
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"thread.started\"}' '{\"type\":\"turn.started\"}'\nexit 9\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = fixture(|input, local, _| {
+                vec![PlanStepV2::Transform {
+                    step_id: "codex-transform".into(),
+                    depends_on: vec![],
+                    host: local.clone(),
+                    input: input.clone(),
+                    output: ManagedObjectRevisionV2 {
+                        logical_object_id: input.logical_object_id.clone(),
+                        revision: input.revision + 1,
+                    },
+                    modification_intent: "Apply the approved change with Codex.".into(),
+                    worker_capability_requirement: Some(
+                        TransformWorkerCapabilityRequirementV1::Codex,
+                    ),
+                }]
+            });
+            let executable = fixture._root.0.join("synthetic-codex");
+            std::fs::write(&executable, script).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            fixture
+                .runtime
+                .codex_specialists
+                .lock()
+                .install_synthetic_qualification(
+                    ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+                        executable_path: executable,
+                        scope_root: fixture._root.0.clone(),
+                    })
+                    .unwrap(),
+                    index as u64 + 20,
+                )
+                .unwrap();
+            assert!(matches!(accept(&fixture), AttemptStartDecisionV2::Accepted(_)));
+            fixture.runtime.clone().drive_live_v2_attempt(
+                fixture.start.attempt_id.clone(),
+                HostExecutionFreshness::Remote(fixture.binding.clone()),
+            );
+            let successors: i64 = connection(&fixture.runtime.paths)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM bridge_plan_v2_transform_results WHERE attempt_id = ?1",
+                    [&fixture.start.attempt_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(successors, 0);
+            assert_eq!(
+                fixture
+                    .runtime
+                    .managed_worker_status(&fixture.start.attempt_id)
+                    .unwrap()
+                    .state,
+                ManagedWorkerCoordinatorStateV1::Failed
+            );
+        }
     }
 
     #[test]

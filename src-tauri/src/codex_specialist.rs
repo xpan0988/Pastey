@@ -1,18 +1,20 @@
 //! Host-local foundation and authoritative Transform import for the OpenAI
 //! Codex specialist Worker.
 //!
-//! This module intentionally has no Plan dispatch or production selection.
 //! B0 binding/scan remains non-authoritative by itself. B1 imports a complete
 //! Host-scanned Scratch tree only through existing Resource effects, OutputSlot
-//! sealing, and Core finalization. Production remains unqualified until a Host
-//! can obtain physical execution-boundary proof that controller provider
-//! traffic is split from every model-generated child process.
+//! sealing, and Core finalization. B3 supplies the selected controller runner.
+//! Production remains unqualified until a Host can obtain physical
+//! execution-boundary proof that controller provider traffic is split from
+//! every model-generated child process.
 
 #![allow(dead_code)] // B0 is intentionally unselected by production dispatch.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fs,
     path::PathBuf,
+    process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -45,6 +47,8 @@ use crate::{
 const MAX_JSONL_LINE_BYTES: usize = 64 * 1024;
 const MAX_JSONL_EVENTS: usize = 1_024;
 const MAX_SPECIALIST_SCRATCH_FILES: usize = 64;
+const MAX_CONTROLLER_STDOUT_BYTES: usize = MAX_JSONL_LINE_BYTES * MAX_JSONL_EVENTS;
+const MAX_CONTROLLER_STDERR_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexDetectionV0 {
@@ -294,6 +298,24 @@ struct CodexControllerSessionV0 {
     process_group: Option<i32>,
 }
 
+/// One started controller. It owns no authority: Host retains the exact
+/// binding, and cancellation uses the service's recorded process group.
+pub(crate) struct RunningCodexControllerV0 {
+    run_ref: ManagedRunRefV1,
+    child: Child,
+    private_home: PathBuf,
+}
+
+impl RunningCodexControllerV0 {
+    /// Wait outside the specialist mutex so Host cancellation can remove the
+    /// recorded session and terminate the complete controller process group.
+    pub(crate) fn wait(self) -> AppResult<Output> {
+        let output = self.child.wait_with_output()?;
+        let _ = fs::remove_dir_all(&self.private_home);
+        Ok(output)
+    }
+}
+
 struct CodexBindingRecordV0 {
     bridge_id: String,
     session_binding_ref: String,
@@ -422,6 +444,122 @@ impl CodexSpecialistServiceV0 {
             },
         );
         Ok((binding, scratch))
+    }
+
+    /// Starts exactly one bounded, non-interactive controller process for an
+    /// existing binding. The real Host qualification path remains unavailable;
+    /// synthetic qualification is used only by deterministic tests.
+    pub(crate) fn start_bound_controller(
+        &mut self,
+        binding: &CodexAttemptBindingV0,
+        operation_intent: &str,
+    ) -> AppResult<RunningCodexControllerV0> {
+        let qualification = self
+            .qualification
+            .as_ref()
+            .ok_or_else(|| AppError::InvalidInput("Codex qualification is unavailable.".into()))?;
+        binding.validate(qualification)?;
+        if operation_intent.is_empty() || operation_intent.len() > 1_024 {
+            return invalid("Codex Transform intent is invalid.");
+        }
+        let private_home = std::env::temp_dir().join(format!("pastey-codex-{}", Uuid::new_v4()));
+        let codex_home = private_home.join("codex-home");
+        fs::create_dir_all(&codex_home)?;
+        let proxy = ProviderControlPlaneProxyV0::new();
+        let controller = ControllerEnvironmentV0::new(private_home.clone(), &proxy);
+        let task_child = TaskChildEnvironmentV0::new();
+        if controller.values.contains_key("PASTEY_CODEX_PROXY_TOKEN")
+            && (task_child.values.contains_key("PASTEY_CODEX_PROXY_TOKEN")
+                || task_child.values.contains_key("HOME")
+                || !task_child.no_raw_network)
+        {
+            return invalid("Codex task-child authority projection is invalid.");
+        }
+        let executable = &qualification.process_world.executable.executable_path;
+        let mut command = Command::new(executable);
+        command
+            .args(&binding.invocation.argv)
+            .arg(operation_intent)
+            .env_clear()
+            .envs(&controller.values)
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let child = command.spawn()?;
+        let process_group = {
+            #[cfg(unix)]
+            {
+                Some(child.id() as i32)
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        };
+        self.sessions.insert(
+            binding.run_ref.clone(),
+            CodexControllerSessionV0 {
+                bridge_id: self
+                    .bindings
+                    .get(&binding.run_ref)
+                    .ok_or_else(|| AppError::InvalidInput("Codex binding is unavailable.".into()))?
+                    .bridge_id
+                    .clone(),
+                session_binding_ref: self
+                    .bindings
+                    .get(&binding.run_ref)
+                    .expect("checked Codex binding")
+                    .session_binding_ref
+                    .clone(),
+                revoked: binding.revoked.clone(),
+                #[cfg(unix)]
+                process_group,
+            },
+        );
+        Ok(RunningCodexControllerV0 {
+            run_ref: binding.run_ref.clone(),
+            child,
+            private_home,
+        })
+    }
+
+    pub(crate) fn finish_bound_controller(
+        &mut self,
+        binding: &CodexAttemptBindingV0,
+        output: Output,
+    ) -> AppResult<Vec<CodexJsonlEventV0>> {
+        self.sessions.remove(&binding.run_ref);
+        let qualification = self
+            .qualification
+            .as_ref()
+            .ok_or_else(|| AppError::InvalidInput("Codex qualification is unavailable.".into()))?;
+        binding.validate(qualification)?;
+        if !output.status.success() {
+            return invalid("Codex controller exited unsuccessfully.");
+        }
+        if output.stdout.len() > MAX_CONTROLLER_STDOUT_BYTES
+            || output.stderr.len() > MAX_CONTROLLER_STDERR_BYTES
+        {
+            return invalid("Codex controller output exceeded its B3 limit.");
+        }
+        parse_codex_jsonl(&output.stdout)
+    }
+
+    pub(crate) fn run_is_quiescent(&self, run_ref: &ManagedRunRefV1) -> bool {
+        !self.sessions.contains_key(run_ref)
     }
 
     pub(crate) fn scan_bound_scratch(
