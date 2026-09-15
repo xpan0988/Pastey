@@ -2678,8 +2678,20 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         for (index, script) in [
+            // Strict JSONL failures and non-zero root exits remain ordinary
+            // failed attempts with no B1 import or successor.
             "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"thread.started\"}' '{\"type\":\"turn.completed\"}'\n",
             "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"thread.started\"}' '{\"type\":\"turn.started\"}'\nexit 9\n",
+            // The concurrent bounded collector must terminate the complete
+            // controller process group before an unbounded stdout stream can
+            // reach JSONL parsing or B1.
+            "#!/bin/sh\nyes x\n",
+            // stderr is independently bounded even though it is never parsed
+            // as Codex JSONL.
+            "#!/bin/sh\nyes x >&2\n",
+            // A successful root exit is insufficient: this inherited process
+            // group descendant must be detected, terminated, and fail closed.
+            "#!/bin/sh\n(while :; do sleep 1; done) &\nprintf '%s\\n' '{\"type\":\"thread.started\"}' '{\"type\":\"turn.started\"}' '{\"type\":\"item.completed\"}' '{\"type\":\"turn.completed\"}'\n",
         ]
         .into_iter()
         .enumerate()
