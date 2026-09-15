@@ -13,14 +13,12 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{self, Read},
     path::PathBuf,
-    process::{Child, Command, Output, Stdio},
+    process::{Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread::{self, JoinHandle},
 };
 
 use serde_json::Value;
@@ -31,28 +29,24 @@ use crate::{
         discover_codex_specialist_executable, probe_known_capability, KnownCapabilityProbeResult,
         CODEX_SPECIALIST_CAPABILITY_ID,
     },
-    effect_authority::{
-        lower_tool_request, EffectAuthorityStateV1, EffectBudgetsV1, EffectDecisionV1,
-        EffectRequestKindV1, ManagedRunRefV1, ManagedSemanticOperationV1, ResourceEffectV1,
-        ResourceVerbV1, StepWorkDescriptorV1, ToolEffectIntentV1, ToolRequestV1,
-        EFFECT_AUTHORITY_VERSION,
-    },
+    effect_authority::{EffectAuthorityStateV1, ManagedRunRefV1, ManagedSemanticOperationV1},
     error::{AppError, AppResult},
-    managed_execution::{ManagedProcessWorldSpecV1, ManagedStepGrantV1},
-    managed_resources::{
-        HostManagedResourceBackendV1, ManagedResourceResolverV1, ManagedScratchLeaseV1,
-        ManagedScratchScanV1, SealedOutputEvidenceV1,
+    host_process::{
+        spawn_bounded_host_process, HostBoundedProcessSpecV1, HostProcessControlV1,
+        RunningHostProcessV1,
     },
+    host_scratch_import::{
+        import_complete_scratch_to_output_slot, HostScratchImportV1, MAX_HOST_SCRATCH_IMPORT_FILES,
+    },
+    managed_execution::{ManagedProcessWorldSpecV1, ManagedStepGrantV1},
+    managed_resources::{ManagedResourceResolverV1, ManagedScratchLeaseV1, ManagedScratchScanV1},
     managed_workspace::{WorkerWorkspaceAliasV1, WorkerWorkspaceOperationV1},
 };
 
 const MAX_JSONL_LINE_BYTES: usize = 64 * 1024;
 const MAX_JSONL_EVENTS: usize = 1_024;
-const MAX_SPECIALIST_SCRATCH_FILES: usize = 64;
 const MAX_CONTROLLER_STDOUT_BYTES: usize = MAX_JSONL_LINE_BYTES * MAX_JSONL_EVENTS;
 const MAX_CONTROLLER_STDERR_BYTES: usize = 64 * 1024;
-const CONTROLLER_QUIESCENCE_POLLS: usize = 100;
-const CONTROLLER_QUIESCENCE_POLL_MILLIS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexDetectionV0 {
@@ -221,15 +215,6 @@ pub(crate) struct CodexJsonlEventV0 {
     pub(crate) event_type: String,
 }
 
-/// Host-authenticated B1 import facts. Codex never constructs this value: its
-/// only source is a complete scratch scan followed by ordinary Resource
-/// evidence and the existing OutputSlot root seal.
-pub(crate) struct CodexScratchImportV1 {
-    pub(crate) output_seal: SealedOutputEvidenceV1,
-    pub(crate) evidence_ids: Vec<String>,
-    pub(crate) evidence_head: String,
-}
-
 fn parse_codex_jsonl(input: &[u8]) -> AppResult<Vec<CodexJsonlEventV0>> {
     if input.is_empty() {
         return invalid("Codex JSONL output is empty.");
@@ -298,207 +283,7 @@ struct CodexControllerSessionV0 {
     bridge_id: String,
     session_binding_ref: String,
     revoked: Arc<AtomicBool>,
-    #[cfg(unix)]
-    process_group: Option<i32>,
-}
-
-/// One started controller. It owns no authority: Host retains the exact
-/// binding, and cancellation uses the service's recorded process group.
-pub(crate) struct RunningCodexControllerV0 {
-    run_ref: ManagedRunRefV1,
-    child: Child,
-    private_home: PathBuf,
-    #[cfg(unix)]
-    process_group: i32,
-}
-
-impl RunningCodexControllerV0 {
-    /// Wait outside the specialist mutex so Host cancellation can remove the
-    /// recorded session and terminate the complete controller process group.
-    /// Both pipes are drained concurrently and bounded while the controller
-    /// runs; a root-process exit is accepted only after its process group is
-    /// proven empty.
-    pub(crate) fn wait(mut self) -> AppResult<Output> {
-        let result = self.wait_bounded();
-        let _ = fs::remove_dir_all(&self.private_home);
-        result
-    }
-
-    fn wait_bounded(&mut self) -> AppResult<Output> {
-        let stdout = self.child.stdout.take().ok_or_else(|| {
-            AppError::InvalidInput("Codex controller stdout pipe is unavailable.".into())
-        })?;
-        let stderr = self.child.stderr.take().ok_or_else(|| {
-            AppError::InvalidInput("Codex controller stderr pipe is unavailable.".into())
-        })?;
-        let stdout_overflow = Arc::new(AtomicBool::new(false));
-        let stderr_overflow = Arc::new(AtomicBool::new(false));
-        let stdout_reader = spawn_bounded_controller_reader(
-            stdout,
-            MAX_CONTROLLER_STDOUT_BYTES,
-            stdout_overflow.clone(),
-            #[cfg(unix)]
-            self.process_group,
-        );
-        let stderr_reader = spawn_bounded_controller_reader(
-            stderr,
-            MAX_CONTROLLER_STDERR_BYTES,
-            stderr_overflow.clone(),
-            #[cfg(unix)]
-            self.process_group,
-        );
-        let status = match self.child.wait() {
-            Ok(status) => status,
-            Err(error) => {
-                self.terminate_and_wait_for_quiescence();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(error.into());
-            }
-        };
-        // Do this before joining the pipe readers: a surviving descendant can
-        // retain either pipe after the root exits, so waiting for EOF first
-        // would mistake a live process tree for an output-drain delay.
-        if !self.is_process_group_quiescent() {
-            self.terminate_and_wait_for_quiescence();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return invalid("Codex controller descendants survived root-process exit.");
-        }
-        let stdout = join_bounded_controller_reader(stdout_reader);
-        let stderr = join_bounded_controller_reader(stderr_reader);
-        if stdout_overflow.load(Ordering::SeqCst) || stderr_overflow.load(Ordering::SeqCst) {
-            self.terminate_and_wait_for_quiescence();
-            return invalid("Codex controller output exceeded its B3 limit.");
-        }
-        let stdout = match stdout {
-            Ok(stdout) => stdout,
-            Err(error) => {
-                self.terminate_and_wait_for_quiescence();
-                return Err(error);
-            }
-        };
-        let stderr = match stderr {
-            Ok(stderr) => stderr,
-            Err(error) => {
-                self.terminate_and_wait_for_quiescence();
-                return Err(error);
-            }
-        };
-        Ok(Output {
-            status,
-            stdout,
-            stderr,
-        })
-    }
-
-    fn terminate_and_wait_for_quiescence(&self) {
-        #[cfg(unix)]
-        {
-            terminate_process_group(self.process_group);
-            let _ = wait_for_process_group_quiescence(self.process_group);
-        }
-    }
-
-    fn is_process_group_quiescent(&self) -> bool {
-        #[cfg(unix)]
-        {
-            !process_group_is_alive(self.process_group)
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
-    }
-}
-
-fn spawn_bounded_controller_reader<R: Read + Send + 'static>(
-    stream: R,
-    limit: usize,
-    overflow: Arc<AtomicBool>,
-    #[cfg(unix)] process_group: i32,
-) -> JoinHandle<io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        read_bounded_controller_stream(
-            stream,
-            limit,
-            overflow,
-            #[cfg(unix)]
-            process_group,
-        )
-    })
-}
-
-fn read_bounded_controller_stream<R: Read>(
-    mut stream: R,
-    limit: usize,
-    overflow: Arc<AtomicBool>,
-    #[cfg(unix)] process_group: i32,
-) -> io::Result<Vec<u8>> {
-    let mut collected = Vec::new();
-    let mut buffer = [0_u8; 8 * 1024];
-    loop {
-        let count = match stream.read(&mut buffer) {
-            Ok(count) => count,
-            Err(error) => {
-                #[cfg(unix)]
-                terminate_process_group(process_group);
-                return Err(error);
-            }
-        };
-        if count == 0 {
-            return Ok(collected);
-        }
-        if collected.len().saturating_add(count) > limit {
-            overflow.store(true, Ordering::SeqCst);
-            #[cfg(unix)]
-            terminate_process_group(process_group);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Codex controller output exceeded its B3 limit.",
-            ));
-        }
-        collected.extend_from_slice(&buffer[..count]);
-    }
-}
-
-fn join_bounded_controller_reader(reader: JoinHandle<io::Result<Vec<u8>>>) -> AppResult<Vec<u8>> {
-    match reader.join() {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(_)) => invalid("Codex controller output stream failed."),
-        Err(_) => invalid("Codex controller output reader panicked."),
-    }
-}
-
-#[cfg(unix)]
-fn terminate_process_group(process_group: i32) {
-    // The negative PGID is the complete controller tree. This uses no Codex
-    // cancellation protocol and never waits for its cooperation.
-    unsafe {
-        libc::kill(-process_group, libc::SIGTERM);
-        libc::kill(-process_group, libc::SIGKILL);
-    }
-}
-
-#[cfg(unix)]
-fn process_group_is_alive(process_group: i32) -> bool {
-    if unsafe { libc::kill(-process_group, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(unix)]
-fn wait_for_process_group_quiescence(process_group: i32) -> bool {
-    for _ in 0..CONTROLLER_QUIESCENCE_POLLS {
-        if !process_group_is_alive(process_group) {
-            return true;
-        }
-        thread::sleep(std::time::Duration::from_millis(
-            CONTROLLER_QUIESCENCE_POLL_MILLIS,
-        ));
-    }
-    !process_group_is_alive(process_group)
+    control: HostProcessControlV1,
 }
 
 struct CodexBindingRecordV0 {
@@ -510,10 +295,8 @@ struct CodexBindingRecordV0 {
 impl CodexControllerSessionV0 {
     fn terminate(&self) {
         self.revoked.store(true, Ordering::SeqCst);
-        #[cfg(unix)]
-        if let Some(process_group) = self.process_group {
-            terminate_process_group(process_group);
-        }
+        self.control.terminate();
+        let _ = self.control.wait_for_quiescence();
     }
 }
 
@@ -633,11 +416,7 @@ impl CodexSpecialistServiceV0 {
         &mut self,
         binding: &CodexAttemptBindingV0,
         operation_intent: &str,
-    ) -> AppResult<RunningCodexControllerV0> {
-        #[cfg(not(unix))]
-        {
-            return invalid("Codex B3 requires Host process-group containment.");
-        }
+    ) -> AppResult<RunningHostProcessV1> {
         let qualification = self
             .qualification
             .as_ref()
@@ -659,32 +438,26 @@ impl CodexSpecialistServiceV0 {
         {
             return invalid("Codex task-child authority projection is invalid.");
         }
-        let executable = &qualification.process_world.executable.executable_path;
-        let mut command = Command::new(executable);
-        command
-            .args(&binding.invocation.argv)
-            .arg(operation_intent)
-            .env_clear()
-            .envs(&controller.values)
-            .env("PATH", "/usr/bin:/bin")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                command.pre_exec(|| {
-                    if libc::setpgid(0, 0) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-        let child = command.spawn()?;
-        #[cfg(unix)]
-        let process_group = child.id() as i32;
+        let mut argv = binding.invocation.argv.clone();
+        argv.push(operation_intent.into());
+        let mut environment = controller.values;
+        environment.insert("PATH".into(), "/usr/bin:/bin".into());
+        let process = spawn_bounded_host_process(HostBoundedProcessSpecV1 {
+            executable: qualification
+                .process_world
+                .executable
+                .executable_path
+                .clone(),
+            argv,
+            current_dir: None,
+            environment,
+            stdin: Stdio::null(),
+            stdout: Stdio::piped(),
+            stderr: Stdio::piped(),
+            stdout_limit: MAX_CONTROLLER_STDOUT_BYTES,
+            stderr_limit: MAX_CONTROLLER_STDERR_BYTES,
+            cleanup_roots: vec![private_home],
+        })?;
         self.sessions.insert(
             binding.run_ref.clone(),
             CodexControllerSessionV0 {
@@ -701,17 +474,10 @@ impl CodexSpecialistServiceV0 {
                     .session_binding_ref
                     .clone(),
                 revoked: binding.revoked.clone(),
-                #[cfg(unix)]
-                process_group: Some(process_group),
+                control: process.control(),
             },
         );
-        Ok(RunningCodexControllerV0 {
-            run_ref: binding.run_ref.clone(),
-            child,
-            private_home,
-            #[cfg(unix)]
-            process_group,
-        })
+        Ok(process)
     }
 
     pub(crate) fn finish_bound_controller(
@@ -754,16 +520,14 @@ impl CodexSpecialistServiceV0 {
             .ok_or_else(|| AppError::InvalidInput("Codex qualification is unavailable.".into()))?;
         binding.validate(qualification)?;
         let scan = resolver.scan_specialist_scratch(authority, access, scratch)?;
-        if scan.identity.files.len() > MAX_SPECIALIST_SCRATCH_FILES {
+        if scan.identity.files.len() > MAX_HOST_SCRATCH_IMPORT_FILES {
             return invalid("Codex scratch output exceeds the B0 file limit.");
         }
         Ok(scan)
     }
 
-    /// Imports one complete, already-bound Scratch tree through the ordinary
-    /// Resource-effect path. Scratch paths and Codex claims never cross this
-    /// boundary; every imported byte is re-read no-follow against the Host
-    /// scan identity before it is staged for an OutputSlot Create effect.
+    /// Validates the concrete Codex binding, then delegates all Scratch scan,
+    /// no-follow import, evidence, and sealing mechanics to the Host.
     pub(crate) fn import_bound_scratch(
         &self,
         binding: &CodexAttemptBindingV0,
@@ -774,97 +538,18 @@ impl CodexSpecialistServiceV0 {
         access: &crate::managed_resources::ManagedResourceAccessV1,
         scratch: &ManagedScratchLeaseV1,
         now: i64,
-    ) -> AppResult<CodexScratchImportV1> {
-        if grant.operation != ManagedSemanticOperationV1::Transform
-            || grant.process_world.is_some()
-            || binding.run_ref != access.run_control_ref
-            || grant.access.run_control_ref != access.run_control_ref
-        {
+    ) -> AppResult<HostScratchImportV1> {
+        if binding.run_ref != access.run_control_ref {
             return invalid("Codex B1 import requires its exact claimed Transform binding.");
         }
-        let output_slot = grant.output_slot.as_ref().ok_or_else(|| {
-            AppError::InvalidInput("Codex B1 Transform has no OutputSlot.".into())
-        })?;
-        let scan = self.scan_bound_scratch(binding, authority, resolver, access, scratch)?;
-        let first_sequence = authority.next_request_sequence(&access.run_control_ref)?;
-        let mut intents = Vec::with_capacity(scan.identity.files.len());
-        for (selector, identity) in &scan.identity.files {
-            intents.push(ToolEffectIntentV1 {
-                effect: EffectRequestKindV1::Resource(ResourceEffectV1 {
-                    verb: ResourceVerbV1::Create,
-                    handle_ref: output_slot.clone(),
-                    relative_selector: selector.clone(),
-                    value_digest: Some(identity.digest.clone()),
-                }),
-                requested_budget_slice: EffectBudgetsV1 {
-                    requests: 1,
-                    write_bytes: identity.byte_count,
-                    ..Default::default()
-                },
-                preconditions: vec![],
-            });
-        }
-        let requests = lower_tool_request(
-            &StepWorkDescriptorV1 {
-                contract_version: EFFECT_AUTHORITY_VERSION.into(),
-                context: access.context.clone(),
-                envelope_ref: access.envelope_ref.clone(),
-                run_control_ref: access.run_control_ref.clone(),
-                first_sequence,
-            },
-            &ToolRequestV1 {
-                tool_name: "codex-specialist-host-import-v1".into(),
-                adapter_version_ref: "codex-specialist-host-import-v1".into(),
-                intents,
-            },
-        )?;
-        let mut evidence = Vec::with_capacity(requests.len());
-        for (request, (selector, identity)) in requests.iter().zip(&scan.identity.files) {
-            let bytes = crate::safe_file_identity::read_source_if_identity_matches(
-                &scratch.root.join(selector),
-                &scratch.root,
-                identity,
-                identity.byte_count,
-            )?;
-            resolver.stage_write_payload(
-                authority,
-                access,
-                output_slot,
-                &identity.digest,
-                bytes,
-            )?;
-            let mut backend = HostManagedResourceBackendV1::new(resolver, objects, now);
-            let item = authority.enforce(request, &access.current, &mut backend)?;
-            if item.decision != EffectDecisionV1::Allowed {
-                return invalid("Codex B1 OutputSlot import effect was denied or unavailable.");
-            }
-            evidence.push(item);
-        }
-        // Re-scan after the per-file no-follow reads. A changed, added, or
-        // removed Scratch entry makes the whole incomplete import fail closed.
-        if self
-            .scan_bound_scratch(binding, authority, resolver, access, scratch)?
-            .identity
-            != scan.identity
-        {
-            return invalid("Codex scratch changed while the Host imported it.");
-        }
-        let output_seal =
-            resolver.seal_output_slot(authority, access, output_slot, ".", &evidence)?;
-        let evidence_ids = evidence
-            .iter()
-            .map(|item| item.evidence_id.as_str().to_owned())
-            .collect();
-        let evidence_head = evidence
-            .last()
-            .expect("non-empty specialist scratch scan")
-            .evidence_digest
-            .clone();
-        Ok(CodexScratchImportV1 {
-            output_seal,
-            evidence_ids,
-            evidence_head,
-        })
+        let qualification = self
+            .qualification
+            .as_ref()
+            .ok_or_else(|| AppError::InvalidInput("Codex qualification is unavailable.".into()))?;
+        binding.validate(qualification)?;
+        import_complete_scratch_to_output_slot(
+            authority, resolver, objects, grant, access, scratch, now,
+        )
     }
 
     pub(crate) fn terminate_run(&mut self, run_ref: &ManagedRunRefV1) {
@@ -936,7 +621,7 @@ impl CodexSpecialistServiceV0 {
         run_ref: ManagedRunRefV1,
         bridge_id: &str,
         session_binding_ref: &str,
-        #[cfg(unix)] process_group: Option<i32>,
+        control: HostProcessControlV1,
     ) -> Arc<AtomicBool> {
         let revoked = Arc::new(AtomicBool::new(false));
         self.sessions.insert(
@@ -945,8 +630,7 @@ impl CodexSpecialistServiceV0 {
                 bridge_id: bridge_id.into(),
                 session_binding_ref: session_binding_ref.into(),
                 revoked: revoked.clone(),
-                #[cfg(unix)]
-                process_group,
+                control,
             },
         );
         revoked
@@ -959,7 +643,7 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process::Command, thread, time::Duration};
+    use std::{collections::BTreeMap, fs, process::Stdio};
 
     use super::*;
     use crate::managed_resources::ExecutableBindingSpecV1;
@@ -1081,36 +765,29 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cancellation_revokes_and_kills_the_controller_process_group() {
-        use std::os::unix::process::CommandExt;
-
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 30 & wait"]);
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn().unwrap();
+        let process = spawn_bounded_host_process(HostBoundedProcessSpecV1 {
+            executable: PathBuf::from("/bin/sh"),
+            argv: vec!["-c".into(), "sleep 30 & wait".into()],
+            current_dir: None,
+            environment: BTreeMap::new(),
+            stdin: Stdio::null(),
+            stdout: Stdio::piped(),
+            stderr: Stdio::piped(),
+            stdout_limit: 1024,
+            stderr_limit: 1024,
+            cleanup_roots: vec![],
+        })
+        .unwrap();
         let run_ref = ManagedRunRefV1::from_stored("codex-test-run".into()).unwrap();
         let mut service = CodexSpecialistServiceV0::default();
         let revoked = service.register_test_controller(
             run_ref.clone(),
             "bridge",
             "session",
-            Some(child.id() as i32),
+            process.control(),
         );
         service.terminate_run(&run_ref);
         assert!(revoked.load(Ordering::SeqCst));
-        for _ in 0..20 {
-            if child.try_wait().unwrap().is_some() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
-        let _ = child.kill();
-        panic!("Codex controller process group survived cancellation");
+        assert!(!process.wait().unwrap().status.success());
     }
 }

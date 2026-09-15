@@ -8,16 +8,14 @@
 #![allow(dead_code)] // Real Pi qualification remains deliberately unavailable.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{self, Read},
     path::PathBuf,
-    process::{Child, Command, Output, Stdio},
+    process::{Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread::{self, JoinHandle},
 };
 
 use serde_json::Value;
@@ -28,28 +26,24 @@ use crate::{
         discover_pi_specialist_executable, probe_known_capability, KnownCapabilityProbeResult,
         PI_SPECIALIST_CAPABILITY_ID,
     },
-    effect_authority::{
-        lower_tool_request, EffectAuthorityStateV1, EffectBudgetsV1, EffectDecisionV1,
-        EffectRequestKindV1, ManagedRunRefV1, ManagedSemanticOperationV1, ResourceEffectV1,
-        ResourceVerbV1, StepWorkDescriptorV1, ToolEffectIntentV1, ToolRequestV1,
-        EFFECT_AUTHORITY_VERSION,
-    },
+    effect_authority::{EffectAuthorityStateV1, ManagedRunRefV1, ManagedSemanticOperationV1},
     error::{AppError, AppResult},
-    managed_execution::{ManagedProcessWorldSpecV1, ManagedStepGrantV1},
-    managed_resources::{
-        HostManagedResourceBackendV1, ManagedResourceResolverV1, ManagedScratchLeaseV1,
-        ManagedScratchScanV1, SealedOutputEvidenceV1,
+    host_process::{
+        spawn_bounded_host_process, HostBoundedProcessSpecV1, HostProcessControlV1,
+        RunningHostProcessV1,
     },
+    host_scratch_import::{
+        import_complete_scratch_to_output_slot, HostScratchImportV1, MAX_HOST_SCRATCH_IMPORT_FILES,
+    },
+    managed_execution::{ManagedProcessWorldSpecV1, ManagedStepGrantV1},
+    managed_resources::{ManagedResourceResolverV1, ManagedScratchLeaseV1, ManagedScratchScanV1},
     managed_workspace::{WorkerWorkspaceAliasV1, WorkerWorkspaceOperationV1},
 };
 
 const MAX_PI_JSONL_LINE_BYTES: usize = 64 * 1024;
 const MAX_PI_JSONL_EVENTS: usize = 1_024;
-const MAX_PI_SCRATCH_FILES: usize = 64;
 const MAX_PI_STDOUT_BYTES: usize = MAX_PI_JSONL_LINE_BYTES * MAX_PI_JSONL_EVENTS;
 const MAX_PI_STDERR_BYTES: usize = 64 * 1024;
-const PI_QUIESCENCE_POLLS: usize = 100;
-const PI_QUIESCENCE_POLL_MILLIS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PiDetectionV0 {
@@ -216,186 +210,15 @@ struct PiControllerSessionV0 {
     bridge_id: String,
     session_binding_ref: String,
     revoked: Arc<AtomicBool>,
-    #[cfg(unix)]
-    process_group: i32,
+    control: HostProcessControlV1,
 }
 
 impl PiControllerSessionV0 {
     fn terminate(&self) {
         self.revoked.store(true, Ordering::SeqCst);
-        #[cfg(unix)]
-        terminate_process_group(self.process_group);
+        self.control.terminate();
+        let _ = self.control.wait_for_quiescence();
     }
-}
-
-pub(crate) struct RunningPiControllerV0 {
-    child: Child,
-    private_root: PathBuf,
-    #[cfg(unix)]
-    process_group: i32,
-}
-
-impl RunningPiControllerV0 {
-    pub(crate) fn wait(mut self) -> AppResult<Output> {
-        let result = self.wait_bounded();
-        let _ = fs::remove_dir_all(&self.private_root);
-        result
-    }
-
-    fn wait_bounded(&mut self) -> AppResult<Output> {
-        let stdout = self.child.stdout.take().ok_or_else(|| {
-            AppError::InvalidInput("Pi controller stdout pipe is unavailable.".into())
-        })?;
-        let stderr = self.child.stderr.take().ok_or_else(|| {
-            AppError::InvalidInput("Pi controller stderr pipe is unavailable.".into())
-        })?;
-        let stdout_overflow = Arc::new(AtomicBool::new(false));
-        let stderr_overflow = Arc::new(AtomicBool::new(false));
-        let stdout_reader = spawn_reader(
-            stdout,
-            MAX_PI_STDOUT_BYTES,
-            stdout_overflow.clone(),
-            #[cfg(unix)]
-            self.process_group,
-        );
-        let stderr_reader = spawn_reader(
-            stderr,
-            MAX_PI_STDERR_BYTES,
-            stderr_overflow.clone(),
-            #[cfg(unix)]
-            self.process_group,
-        );
-        let status = match self.child.wait() {
-            Ok(status) => status,
-            Err(error) => {
-                self.terminate_and_wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(error.into());
-            }
-        };
-        // A live descendant can retain either pipe. Verify the process group
-        // before joining readers, then terminate and fail rather than hang.
-        if !self.is_quiescent() {
-            self.terminate_and_wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return invalid("Pi controller descendants survived root-process exit.");
-        }
-        let stdout = join_reader(stdout_reader);
-        let stderr = join_reader(stderr_reader);
-        if stdout_overflow.load(Ordering::SeqCst) || stderr_overflow.load(Ordering::SeqCst) {
-            self.terminate_and_wait();
-            return invalid("Pi controller output exceeded its limit.");
-        }
-        Ok(Output {
-            status,
-            stdout: stdout.map_err(|error| {
-                self.terminate_and_wait();
-                error
-            })?,
-            stderr: stderr.map_err(|error| {
-                self.terminate_and_wait();
-                error
-            })?,
-        })
-    }
-
-    fn terminate_and_wait(&self) {
-        #[cfg(unix)]
-        {
-            terminate_process_group(self.process_group);
-            let _ = wait_for_quiescence(self.process_group);
-        }
-    }
-
-    fn is_quiescent(&self) -> bool {
-        #[cfg(unix)]
-        {
-            !process_group_alive(self.process_group)
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
-    }
-}
-
-fn spawn_reader<R: Read + Send + 'static>(
-    stream: R,
-    limit: usize,
-    overflow: Arc<AtomicBool>,
-    #[cfg(unix)] process_group: i32,
-) -> JoinHandle<io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut stream = stream;
-        let mut collected = Vec::new();
-        let mut buffer = [0_u8; 8 * 1024];
-        loop {
-            let count = match stream.read(&mut buffer) {
-                Ok(count) => count,
-                Err(error) => {
-                    #[cfg(unix)]
-                    terminate_process_group(process_group);
-                    return Err(error);
-                }
-            };
-            if count == 0 {
-                return Ok(collected);
-            }
-            if collected.len().saturating_add(count) > limit {
-                overflow.store(true, Ordering::SeqCst);
-                #[cfg(unix)]
-                terminate_process_group(process_group);
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Pi output exceeded its limit.",
-                ));
-            }
-            collected.extend_from_slice(&buffer[..count]);
-        }
-    })
-}
-
-fn join_reader(reader: JoinHandle<io::Result<Vec<u8>>>) -> AppResult<Vec<u8>> {
-    match reader.join() {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(_)) => invalid("Pi controller output stream failed."),
-        Err(_) => invalid("Pi controller output reader panicked."),
-    }
-}
-
-#[cfg(unix)]
-fn terminate_process_group(process_group: i32) {
-    unsafe {
-        libc::kill(-process_group, libc::SIGTERM);
-        libc::kill(-process_group, libc::SIGKILL);
-    }
-}
-
-#[cfg(unix)]
-fn process_group_alive(process_group: i32) -> bool {
-    if unsafe { libc::kill(-process_group, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(unix)]
-fn wait_for_quiescence(process_group: i32) -> bool {
-    for _ in 0..PI_QUIESCENCE_POLLS {
-        if !process_group_alive(process_group) {
-            return true;
-        }
-        thread::sleep(std::time::Duration::from_millis(PI_QUIESCENCE_POLL_MILLIS));
-    }
-    !process_group_alive(process_group)
-}
-
-pub(crate) struct PiScratchImportV1 {
-    pub(crate) output_seal: SealedOutputEvidenceV1,
-    pub(crate) evidence_ids: Vec<String>,
-    pub(crate) evidence_head: String,
 }
 
 #[derive(Default)]
@@ -498,11 +321,7 @@ impl PiSpecialistServiceV0 {
         &mut self,
         binding: &PiAttemptBindingV0,
         operation_intent: &str,
-    ) -> AppResult<RunningPiControllerV0> {
-        #[cfg(not(unix))]
-        {
-            return invalid("Pi requires Host process-group containment.");
-        }
+    ) -> AppResult<RunningHostProcessV1> {
         let qualification = self
             .qualification
             .as_ref()
@@ -516,37 +335,38 @@ impl PiSpecialistServiceV0 {
         let pi_sessions = private_root.join("pi-sessions");
         fs::create_dir_all(&pi_home)?;
         fs::create_dir_all(&pi_sessions)?;
-        let mut command = Command::new(&qualification.process_world.executable.executable_path);
-        command
-            .args(&binding.invocation.argv)
-            .arg(operation_intent)
-            .current_dir(&binding.invocation.scratch_root)
-            .env_clear()
-            .env("HOME", &private_root)
-            .env("PI_CODING_AGENT_DIR", &pi_home)
-            .env("PI_CODING_AGENT_SESSION_DIR", &pi_sessions)
-            .env("PI_OFFLINE", "1")
-            .env("PI_SKIP_VERSION_CHECK", "1")
-            .env("PI_TELEMETRY", "0")
-            .env("PATH", "/usr/bin:/bin")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                command.pre_exec(|| {
-                    if libc::setpgid(0, 0) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-        let child = command.spawn()?;
-        #[cfg(unix)]
-        let process_group = child.id() as i32;
+        let mut environment = BTreeMap::new();
+        environment.insert("HOME".into(), private_root.to_string_lossy().into_owned());
+        environment.insert(
+            "PI_CODING_AGENT_DIR".into(),
+            pi_home.to_string_lossy().into_owned(),
+        );
+        environment.insert(
+            "PI_CODING_AGENT_SESSION_DIR".into(),
+            pi_sessions.to_string_lossy().into_owned(),
+        );
+        environment.insert("PI_OFFLINE".into(), "1".into());
+        environment.insert("PI_SKIP_VERSION_CHECK".into(), "1".into());
+        environment.insert("PI_TELEMETRY".into(), "0".into());
+        environment.insert("PATH".into(), "/usr/bin:/bin".into());
+        let mut argv = binding.invocation.argv.clone();
+        argv.push(operation_intent.into());
+        let process = spawn_bounded_host_process(HostBoundedProcessSpecV1 {
+            executable: qualification
+                .process_world
+                .executable
+                .executable_path
+                .clone(),
+            argv,
+            current_dir: Some(binding.invocation.scratch_root.clone()),
+            environment,
+            stdin: Stdio::null(),
+            stdout: Stdio::piped(),
+            stderr: Stdio::piped(),
+            stdout_limit: MAX_PI_STDOUT_BYTES,
+            stderr_limit: MAX_PI_STDERR_BYTES,
+            cleanup_roots: vec![private_root],
+        })?;
         let record = self
             .bindings
             .get(&binding.run_ref)
@@ -557,16 +377,10 @@ impl PiSpecialistServiceV0 {
                 bridge_id: record.bridge_id.clone(),
                 session_binding_ref: record.session_binding_ref.clone(),
                 revoked: binding.revoked.clone(),
-                #[cfg(unix)]
-                process_group,
+                control: process.control(),
             },
         );
-        Ok(RunningPiControllerV0 {
-            child,
-            private_root,
-            #[cfg(unix)]
-            process_group,
-        })
+        Ok(process)
     }
 
     pub(crate) fn finish_bound_controller(
@@ -603,7 +417,7 @@ impl PiSpecialistServiceV0 {
             .ok_or_else(|| AppError::InvalidInput("Pi qualification is unavailable.".into()))?;
         binding.validate(qualification)?;
         let scan = resolver.scan_specialist_scratch(authority, access, scratch)?;
-        if scan.identity.files.len() > MAX_PI_SCRATCH_FILES {
+        if scan.identity.files.len() > MAX_HOST_SCRATCH_IMPORT_FILES {
             return invalid("Pi scratch output exceeds the file limit.");
         }
         Ok(scan)
@@ -619,96 +433,18 @@ impl PiSpecialistServiceV0 {
         access: &crate::managed_resources::ManagedResourceAccessV1,
         scratch: &ManagedScratchLeaseV1,
         now: i64,
-    ) -> AppResult<PiScratchImportV1> {
-        if grant.operation != ManagedSemanticOperationV1::Transform
-            || grant.process_world.is_some()
-            || binding.run_ref != access.run_control_ref
-            || grant.access.run_control_ref != access.run_control_ref
-        {
+    ) -> AppResult<HostScratchImportV1> {
+        if binding.run_ref != access.run_control_ref {
             return invalid("Pi import requires its exact claimed Transform binding.");
         }
-        let output_slot = grant
-            .output_slot
+        let qualification = self
+            .qualification
             .as_ref()
-            .ok_or_else(|| AppError::InvalidInput("Pi Transform has no OutputSlot.".into()))?;
-        let scan = self.scan_bound_scratch(binding, authority, resolver, access, scratch)?;
-        let first_sequence = authority.next_request_sequence(&access.run_control_ref)?;
-        let intents = scan
-            .identity
-            .files
-            .iter()
-            .map(|(selector, identity)| ToolEffectIntentV1 {
-                effect: EffectRequestKindV1::Resource(ResourceEffectV1 {
-                    verb: ResourceVerbV1::Create,
-                    handle_ref: output_slot.clone(),
-                    relative_selector: selector.clone(),
-                    value_digest: Some(identity.digest.clone()),
-                }),
-                requested_budget_slice: EffectBudgetsV1 {
-                    requests: 1,
-                    write_bytes: identity.byte_count,
-                    ..Default::default()
-                },
-                preconditions: vec![],
-            })
-            .collect();
-        let requests = lower_tool_request(
-            &StepWorkDescriptorV1 {
-                contract_version: EFFECT_AUTHORITY_VERSION.into(),
-                context: access.context.clone(),
-                envelope_ref: access.envelope_ref.clone(),
-                run_control_ref: access.run_control_ref.clone(),
-                first_sequence,
-            },
-            &ToolRequestV1 {
-                tool_name: "pi-specialist-host-import-v1".into(),
-                adapter_version_ref: "pi-specialist-host-import-v1".into(),
-                intents,
-            },
-        )?;
-        let mut evidence = Vec::with_capacity(requests.len());
-        for (request, (selector, identity)) in requests.iter().zip(&scan.identity.files) {
-            let bytes = crate::safe_file_identity::read_source_if_identity_matches(
-                &scratch.root.join(selector),
-                &scratch.root,
-                identity,
-                identity.byte_count,
-            )?;
-            resolver.stage_write_payload(
-                authority,
-                access,
-                output_slot,
-                &identity.digest,
-                bytes,
-            )?;
-            let mut backend = HostManagedResourceBackendV1::new(resolver, objects, now);
-            let item = authority.enforce(request, &access.current, &mut backend)?;
-            if item.decision != EffectDecisionV1::Allowed {
-                return invalid("Pi OutputSlot import effect was denied or unavailable.");
-            }
-            evidence.push(item);
-        }
-        if self
-            .scan_bound_scratch(binding, authority, resolver, access, scratch)?
-            .identity
-            != scan.identity
-        {
-            return invalid("Pi scratch changed while the Host imported it.");
-        }
-        let output_seal =
-            resolver.seal_output_slot(authority, access, output_slot, ".", &evidence)?;
-        Ok(PiScratchImportV1 {
-            output_seal,
-            evidence_ids: evidence
-                .iter()
-                .map(|item| item.evidence_id.as_str().to_owned())
-                .collect(),
-            evidence_head: evidence
-                .last()
-                .expect("non-empty specialist scratch scan")
-                .evidence_digest
-                .clone(),
-        })
+            .ok_or_else(|| AppError::InvalidInput("Pi qualification is unavailable.".into()))?;
+        binding.validate(qualification)?;
+        import_complete_scratch_to_output_slot(
+            authority, resolver, objects, grant, access, scratch, now,
+        )
     }
 
     pub(crate) fn terminate_run(&mut self, run_ref: &ManagedRunRefV1) {
