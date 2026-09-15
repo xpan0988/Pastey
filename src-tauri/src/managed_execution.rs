@@ -769,6 +769,69 @@ impl HostRuntime {
         result
     }
 
+    /// B3 Host-owned controller closure. The Plan/coordinator selects the
+    /// specialist before this method; this method only claims one exact
+    /// Transform, runs its bound controller in private Scratch, and delegates
+    /// authoritative import/sealing/N+1 to the existing B1 finalizer.
+    pub(crate) fn run_codex_specialist_transform(
+        &self,
+        request: ManagedStepClaimRequestV1,
+    ) -> AppResult<ManagedObjectAcquisition> {
+        if !request.private_scratch || request.process_world.is_some() {
+            return invalid("Codex B3 requires an exact private-scratch Transform claim.");
+        }
+        let current_binding = request.current_binding.clone();
+        let grant = self.claim_v2_managed_step(request)?;
+        let (binding, scratch) = {
+            let mut specialists = self.codex_specialists.lock();
+            let authority = self.effect_authority.lock();
+            let mut resolver = self.managed_resources.lock();
+            let mut objects = self.managed_objects.lock();
+            specialists.bind_claimed_transform(
+                &grant,
+                &authority,
+                &mut resolver,
+                &mut objects,
+                None,
+            )?
+        };
+        let controller_result = {
+            self.codex_specialists
+                .lock()
+                .start_bound_controller(&binding, &grant.operation_intent)
+        };
+        let controller = match controller_result {
+            Ok(controller) => controller,
+            Err(error) => {
+                let _ = self.cancel_managed_run(&grant.access.run_control_ref);
+                return Err(error);
+            }
+        };
+        let output = match controller.wait() {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = self.cancel_managed_run(&grant.access.run_control_ref);
+                return Err(error);
+            }
+        };
+        let controller_result = {
+            self.codex_specialists
+                .lock()
+                .finish_bound_controller(&binding, output)
+        };
+        if let Err(error) = controller_result {
+            let _ = self.cancel_managed_run(&grant.access.run_control_ref);
+            return Err(error);
+        }
+        self.finalize_codex_specialist_transform(
+            &grant,
+            &binding,
+            &scratch,
+            current_binding,
+            crate::storage::now_ts(),
+        )
+    }
+
     pub(crate) fn finalize_v2_execute(
         &self,
         proposal: ExecuteResultProposalV1,
@@ -961,7 +1024,12 @@ fn load_claim_source(
         &approval,
         &admission_request,
         &request.current_binding,
-        ManagedPrimitiveAvailabilityV1::verified_attachment(local_host.clone(), true, true),
+        ManagedPrimitiveAvailabilityV1::verified_attachment_with_codex(
+            local_host.clone(),
+            true,
+            true,
+            true,
+        ),
         request.now,
     )?;
     if admission
