@@ -24,7 +24,7 @@ use crate::{
     managed_execution::ManagedProcessWorldSpecV1,
     managed_objects, managed_resources,
     managed_runtime_config::ManagedRuntimeConfigServiceV1,
-    network_broker, peer_capabilities, room_control, storage,
+    network_broker, peer_capabilities, pi_specialist, room_control, storage,
     storage::AppPaths,
     transfer, transfer_orchestration,
     worker_harness::WorkerHarnessRunV1,
@@ -116,6 +116,9 @@ pub struct HostRuntime {
     /// B0's Codex-only Host-local state. It has no Plan attachment and stays
     /// unqualified until the Host can prove controller/child separation.
     pub(crate) codex_specialists: Mutex<codex_specialist::CodexSpecialistServiceV0>,
+    /// Concrete Pi proof state; it intentionally does not share a specialist
+    /// registry or adapter with Codex.
+    pub(crate) pi_specialists: Mutex<pi_specialist::PiSpecialistServiceV0>,
     /// Process-local model cancellation state for the one-step Worker Harness.
     /// It is not a Core grant or a durable authority record.
     pub(crate) worker_harness_runs:
@@ -226,6 +229,7 @@ impl HostRuntime {
                 managed_resource_root,
             )),
             codex_specialists: Mutex::new(codex_specialist::CodexSpecialistServiceV0::default()),
+            pi_specialists: Mutex::new(pi_specialist::PiSpecialistServiceV0::default()),
             worker_harness_runs: Mutex::new(HashMap::new()),
             managed_completion_lock: Mutex::new(()),
             managed_worker_process_specs: Mutex::new(HashMap::new()),
@@ -272,6 +276,7 @@ impl HostRuntime {
         drop(worker_runs);
         self.execution_worlds.terminate_bridge(room_id);
         self.codex_specialists.lock().terminate_bridge(room_id);
+        self.pi_specialists.lock().terminate_bridge(room_id);
         self.network_broker.terminate_bridge(room_id);
         self.effect_authority.lock().revoke_bridge(room_id);
         self.managed_resources.lock().purge_bridge(room_id);
@@ -298,6 +303,7 @@ impl HostRuntime {
         self.cancel_worker_run(run_ref);
         self.execution_worlds.terminate_run(run_ref);
         self.codex_specialists.lock().terminate_run(run_ref);
+        self.pi_specialists.lock().terminate_run(run_ref);
         self.network_broker.terminate_run(run_ref);
         self.managed_resources.lock().purge_run(run_ref);
         crate::managed_execution::interrupt_claim_for_run(&self.paths, run_ref);
@@ -337,6 +343,9 @@ impl HostRuntime {
         self.codex_specialists
             .lock()
             .terminate_session(session_binding_ref);
+        self.pi_specialists
+            .lock()
+            .terminate_session(session_binding_ref);
         self.network_broker.terminate_session(session_binding_ref);
         let mut resources = self.managed_resources.lock();
         for run_ref in run_refs {
@@ -372,6 +381,7 @@ impl HostRuntime {
             .purge_all();
         self.execution_worlds.terminate_all();
         self.codex_specialists.lock().terminate_all();
+        self.pi_specialists.lock().terminate_all();
         self.network_broker.terminate_all();
         self.managed_objects.lock().purge_all();
         self.effect_authority.lock().revoke_all();

@@ -1091,10 +1091,19 @@ impl HostRuntime {
                         .required_transform_qualification_generation()
                 })
                 .flatten();
+            let pi_generation = self
+                .local_plan_requires_pi(revision)
+                .then(|| {
+                    self.pi_specialists
+                        .lock()
+                        .required_transform_qualification_generation()
+                })
+                .flatten();
             let availability = self.managed_worker_plan_availability(
                 revision,
                 selection.as_ref(),
                 codex_generation,
+                pi_generation,
             )?;
             if revision.steps.iter().any(|step| {
                 matches!(
