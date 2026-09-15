@@ -68,7 +68,6 @@ struct PiQualificationV0 {
     generation: u64,
     process_world: ManagedProcessWorldSpecV1,
     executable_identity_ref: String,
-    support_content: PiHostSupportContentV0,
     synthetic: bool,
 }
 
@@ -394,6 +393,7 @@ impl PiControllerSessionV0 {
 pub(crate) struct PiSpecialistServiceV0 {
     observation: Option<PiObservationV0>,
     qualification: Option<PiQualificationV0>,
+    support_content: PiHostSupportContentV0,
     bindings: HashMap<ManagedRunRefV1, PiBindingRecordV0>,
     sessions: HashMap<ManagedRunRefV1, PiControllerSessionV0>,
 }
@@ -466,7 +466,7 @@ impl PiSpecialistServiceV0 {
             &grant.input_handle,
             &scratch_handle,
         )?;
-        let support_content = qualification.support_content.materialize()?;
+        let support_content = self.support_content.materialize()?;
         let revoked = Arc::new(AtomicBool::new(false));
         let binding = PiAttemptBindingV0 {
             run_ref: grant.access.run_control_ref.clone(),
@@ -676,28 +676,14 @@ impl PiSpecialistServiceV0 {
             generation,
             process_world,
             executable_identity_ref,
-            support_content: PiHostSupportContentV0::default(),
             synthetic: true,
         });
         Ok(())
     }
 
     #[cfg(test)]
-    pub(crate) fn install_synthetic_qualification_with_support(
-        &mut self,
-        process_world: ManagedProcessWorldSpecV1,
-        generation: u64,
-        support_content: PiHostSupportContentV0,
-    ) -> AppResult<()> {
-        let executable_identity_ref = process_world.validate_executable_identity()?.to_owned();
-        self.qualification = Some(PiQualificationV0 {
-            generation,
-            process_world,
-            executable_identity_ref,
-            support_content,
-            synthetic: true,
-        });
-        Ok(())
+    fn set_host_support_content_for_test(&mut self, support_content: PiHostSupportContentV0) {
+        self.support_content = support_content;
     }
 }
 
@@ -825,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn bound_support_replacement_stales_the_attempt_before_controller_start() {
+    fn host_support_changes_preserve_qualification_and_bound_support_staleness() {
         let directory =
             std::env::temp_dir().join(format!("pastey-pi-support-stale-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
@@ -838,27 +824,41 @@ mod tests {
         }
         let world = synthetic_world(executable);
         let mut service = PiSpecialistServiceV0::default();
-        service
-            .install_synthetic_qualification_with_support(
-                world,
-                7,
-                PiHostSupportContentV0::for_test(
-                    vec![b"exact skill".to_vec()],
-                    vec![b"exact template".to_vec()],
-                ),
-            )
-            .unwrap();
+        service.install_synthetic_qualification(world, 7).unwrap();
+        service.set_host_support_content_for_test(PiHostSupportContentV0::for_test(
+            vec![b"exact skill".to_vec()],
+            vec![b"exact template".to_vec()],
+        ));
         let qualification = service.qualification.as_ref().unwrap();
-        let support_content = qualification.support_content.materialize().unwrap();
+        let qualification_generation = qualification.generation;
+        let executable_identity_ref = qualification.executable_identity_ref.clone();
+        let support_content = service.support_content.materialize().unwrap();
         let replacement_path = support_content.skills.first().unwrap().path.clone();
         let binding = PiAttemptBindingV0 {
             run_ref: ManagedRunRefV1::from_stored("pi-support-test-run".into()).unwrap(),
-            qualification_generation: 7,
-            executable_identity_ref: qualification.executable_identity_ref.clone(),
+            qualification_generation,
+            executable_identity_ref: executable_identity_ref.clone(),
             invocation: PiInvocationV0::new(PathBuf::from("/private/scratch"), &support_content),
             support_content,
             revoked: Arc::new(AtomicBool::new(false)),
         };
+        service.set_host_support_content_for_test(PiHostSupportContentV0::for_test(
+            vec![b"replacement host skill".to_vec()],
+            vec![b"replacement host template".to_vec()],
+        ));
+        let current_support = service.support_content.materialize().unwrap();
+        assert_ne!(
+            replacement_path,
+            current_support.skills.first().unwrap().path,
+            "a later Host-support snapshot must not rebind an existing attempt"
+        );
+        drop(current_support);
+        let qualification = service.qualification.as_ref().unwrap();
+        assert_eq!(qualification.generation, qualification_generation);
+        assert_eq!(
+            qualification.executable_identity_ref,
+            executable_identity_ref
+        );
         binding.validate(&qualification).unwrap();
         fs::remove_file(&replacement_path).unwrap();
         fs::write(&replacement_path, b"replacement skill").unwrap();
