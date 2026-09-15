@@ -55,8 +55,12 @@ mod file_candidates;
 mod host_admission;
 #[path = "../host_identity.rs"]
 mod host_identity;
+#[path = "../host_process.rs"]
+mod host_process;
 #[path = "../host_runtime.rs"]
 mod host_runtime;
+#[path = "../host_scratch_import.rs"]
+mod host_scratch_import;
 #[path = "../link_benchmark.rs"]
 mod link_benchmark;
 #[path = "../logging.rs"]
