@@ -13,12 +13,14 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    io::{self, Read},
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    thread::{self, JoinHandle},
 };
 
 use serde_json::Value;
@@ -49,6 +51,8 @@ const MAX_JSONL_EVENTS: usize = 1_024;
 const MAX_SPECIALIST_SCRATCH_FILES: usize = 64;
 const MAX_CONTROLLER_STDOUT_BYTES: usize = MAX_JSONL_LINE_BYTES * MAX_JSONL_EVENTS;
 const MAX_CONTROLLER_STDERR_BYTES: usize = 64 * 1024;
+const CONTROLLER_QUIESCENCE_POLLS: usize = 100;
+const CONTROLLER_QUIESCENCE_POLL_MILLIS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexDetectionV0 {
@@ -304,16 +308,197 @@ pub(crate) struct RunningCodexControllerV0 {
     run_ref: ManagedRunRefV1,
     child: Child,
     private_home: PathBuf,
+    #[cfg(unix)]
+    process_group: i32,
 }
 
 impl RunningCodexControllerV0 {
     /// Wait outside the specialist mutex so Host cancellation can remove the
     /// recorded session and terminate the complete controller process group.
-    pub(crate) fn wait(self) -> AppResult<Output> {
-        let output = self.child.wait_with_output()?;
+    /// Both pipes are drained concurrently and bounded while the controller
+    /// runs; a root-process exit is accepted only after its process group is
+    /// proven empty.
+    pub(crate) fn wait(mut self) -> AppResult<Output> {
+        let result = self.wait_bounded();
         let _ = fs::remove_dir_all(&self.private_home);
-        Ok(output)
+        result
     }
+
+    fn wait_bounded(&mut self) -> AppResult<Output> {
+        let stdout = self.child.stdout.take().ok_or_else(|| {
+            AppError::InvalidInput("Codex controller stdout pipe is unavailable.".into())
+        })?;
+        let stderr = self.child.stderr.take().ok_or_else(|| {
+            AppError::InvalidInput("Codex controller stderr pipe is unavailable.".into())
+        })?;
+        let stdout_overflow = Arc::new(AtomicBool::new(false));
+        let stderr_overflow = Arc::new(AtomicBool::new(false));
+        let stdout_reader = spawn_bounded_controller_reader(
+            stdout,
+            MAX_CONTROLLER_STDOUT_BYTES,
+            stdout_overflow.clone(),
+            #[cfg(unix)]
+            self.process_group,
+        );
+        let stderr_reader = spawn_bounded_controller_reader(
+            stderr,
+            MAX_CONTROLLER_STDERR_BYTES,
+            stderr_overflow.clone(),
+            #[cfg(unix)]
+            self.process_group,
+        );
+        let status = match self.child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                self.terminate_and_wait_for_quiescence();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error.into());
+            }
+        };
+        // Do this before joining the pipe readers: a surviving descendant can
+        // retain either pipe after the root exits, so waiting for EOF first
+        // would mistake a live process tree for an output-drain delay.
+        if !self.is_process_group_quiescent() {
+            self.terminate_and_wait_for_quiescence();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return invalid("Codex controller descendants survived root-process exit.");
+        }
+        let stdout = join_bounded_controller_reader(stdout_reader);
+        let stderr = join_bounded_controller_reader(stderr_reader);
+        if stdout_overflow.load(Ordering::SeqCst) || stderr_overflow.load(Ordering::SeqCst) {
+            self.terminate_and_wait_for_quiescence();
+            return invalid("Codex controller output exceeded its B3 limit.");
+        }
+        let stdout = match stdout {
+            Ok(stdout) => stdout,
+            Err(error) => {
+                self.terminate_and_wait_for_quiescence();
+                return Err(error);
+            }
+        };
+        let stderr = match stderr {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                self.terminate_and_wait_for_quiescence();
+                return Err(error);
+            }
+        };
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn terminate_and_wait_for_quiescence(&self) {
+        #[cfg(unix)]
+        {
+            terminate_process_group(self.process_group);
+            let _ = wait_for_process_group_quiescence(self.process_group);
+        }
+    }
+
+    fn is_process_group_quiescent(&self) -> bool {
+        #[cfg(unix)]
+        {
+            !process_group_is_alive(self.process_group)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+fn spawn_bounded_controller_reader<R: Read + Send + 'static>(
+    stream: R,
+    limit: usize,
+    overflow: Arc<AtomicBool>,
+    #[cfg(unix)] process_group: i32,
+) -> JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        read_bounded_controller_stream(
+            stream,
+            limit,
+            overflow,
+            #[cfg(unix)]
+            process_group,
+        )
+    })
+}
+
+fn read_bounded_controller_stream<R: Read>(
+    mut stream: R,
+    limit: usize,
+    overflow: Arc<AtomicBool>,
+    #[cfg(unix)] process_group: i32,
+) -> io::Result<Vec<u8>> {
+    let mut collected = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let count = match stream.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) => {
+                #[cfg(unix)]
+                terminate_process_group(process_group);
+                return Err(error);
+            }
+        };
+        if count == 0 {
+            return Ok(collected);
+        }
+        if collected.len().saturating_add(count) > limit {
+            overflow.store(true, Ordering::SeqCst);
+            #[cfg(unix)]
+            terminate_process_group(process_group);
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Codex controller output exceeded its B3 limit.",
+            ));
+        }
+        collected.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn join_bounded_controller_reader(reader: JoinHandle<io::Result<Vec<u8>>>) -> AppResult<Vec<u8>> {
+    match reader.join() {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(_)) => invalid("Codex controller output stream failed."),
+        Err(_) => invalid("Codex controller output reader panicked."),
+    }
+}
+
+#[cfg(unix)]
+fn terminate_process_group(process_group: i32) {
+    // The negative PGID is the complete controller tree. This uses no Codex
+    // cancellation protocol and never waits for its cooperation.
+    unsafe {
+        libc::kill(-process_group, libc::SIGTERM);
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+fn process_group_is_alive(process_group: i32) -> bool {
+    if unsafe { libc::kill(-process_group, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
+fn wait_for_process_group_quiescence(process_group: i32) -> bool {
+    for _ in 0..CONTROLLER_QUIESCENCE_POLLS {
+        if !process_group_is_alive(process_group) {
+            return true;
+        }
+        thread::sleep(std::time::Duration::from_millis(
+            CONTROLLER_QUIESCENCE_POLL_MILLIS,
+        ));
+    }
+    !process_group_is_alive(process_group)
 }
 
 struct CodexBindingRecordV0 {
@@ -327,12 +512,7 @@ impl CodexControllerSessionV0 {
         self.revoked.store(true, Ordering::SeqCst);
         #[cfg(unix)]
         if let Some(process_group) = self.process_group {
-            // The negative PGID is the complete controller tree. This uses no
-            // Codex cancellation protocol and never waits for its cooperation.
-            unsafe {
-                libc::kill(-process_group, libc::SIGTERM);
-                libc::kill(-process_group, libc::SIGKILL);
-            }
+            terminate_process_group(process_group);
         }
     }
 }
@@ -454,6 +634,10 @@ impl CodexSpecialistServiceV0 {
         binding: &CodexAttemptBindingV0,
         operation_intent: &str,
     ) -> AppResult<RunningCodexControllerV0> {
+        #[cfg(not(unix))]
+        {
+            return invalid("Codex B3 requires Host process-group containment.");
+        }
         let qualification = self
             .qualification
             .as_ref()
@@ -499,16 +683,8 @@ impl CodexSpecialistServiceV0 {
             }
         }
         let child = command.spawn()?;
-        let process_group = {
-            #[cfg(unix)]
-            {
-                Some(child.id() as i32)
-            }
-            #[cfg(not(unix))]
-            {
-                None
-            }
-        };
+        #[cfg(unix)]
+        let process_group = child.id() as i32;
         self.sessions.insert(
             binding.run_ref.clone(),
             CodexControllerSessionV0 {
@@ -526,13 +702,15 @@ impl CodexSpecialistServiceV0 {
                     .clone(),
                 revoked: binding.revoked.clone(),
                 #[cfg(unix)]
-                process_group,
+                process_group: Some(process_group),
             },
         );
         Ok(RunningCodexControllerV0 {
             run_ref: binding.run_ref.clone(),
             child,
             private_home,
+            #[cfg(unix)]
+            process_group,
         })
     }
 
