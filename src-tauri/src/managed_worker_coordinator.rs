@@ -256,6 +256,14 @@ impl HostRuntime {
                     .required_transform_qualification_generation()
             })
             .flatten();
+        let pi_generation = self
+            .local_plan_requires_pi(&revision)
+            .then(|| {
+                self.pi_specialists
+                    .lock()
+                    .required_transform_qualification_generation()
+            })
+            .flatten();
         let selection = if native_required {
             let selection = self
                 .worker_provider_configs
@@ -271,7 +279,12 @@ impl HostRuntime {
             .resolve_and_bind_v2_managed_process_steps(&revision)
             .unwrap_or(false);
         let availability = if runtime_ready {
-            self.managed_worker_plan_availability(&revision, selection.as_ref(), codex_generation)?
+            self.managed_worker_plan_availability(
+                &revision,
+                selection.as_ref(),
+                codex_generation,
+                pi_generation,
+            )?
         } else {
             ManagedPrimitiveAvailabilityV1::unavailable()
         };
@@ -291,6 +304,7 @@ impl HostRuntime {
             &start.attempt_id,
             selection.as_ref(),
             codex_generation,
+            pi_generation,
             now,
         ) {
             interrupt_base_attempt(&self.paths, &start.attempt_id);
@@ -319,6 +333,7 @@ impl HostRuntime {
         revision: &PlanRevisionV2,
         selection: Option<&WorkerProviderSelectionV1>,
         codex_generation: Option<u64>,
+        pi_generation: Option<u64>,
     ) -> AppResult<ManagedPrimitiveAvailabilityV1> {
         let native_required = self.local_plan_requires_native_provider(revision);
         let provider_available = match selection {
@@ -339,13 +354,16 @@ impl HostRuntime {
         };
         if !provider_available
             || (self.local_plan_requires_codex(revision) && codex_generation.is_none())
+            || (self.local_plan_requires_pi(revision) && pi_generation.is_none())
         {
             return Ok(ManagedPrimitiveAvailabilityV1::unavailable());
         }
         let platform = self.execution_worlds.platform_availability();
         let specs = self.managed_worker_process_specs.lock();
         let transform = revision.steps.iter().all(|step| match step {
-            PlanStepV2::Transform { step_id, .. } if !step.requires_codex_specialist() => {
+            PlanStepV2::Transform { step_id, .. }
+                if !step.requires_codex_specialist() && !step.requires_pi_specialist() =>
+            {
                 !crate::native_v2_orchestration::step_runs_on_host(
                     revision,
                     step,
@@ -367,10 +385,11 @@ impl HostRuntime {
             _ => true,
         });
         Ok(
-            ManagedPrimitiveAvailabilityV1::verified_attachment_with_codex(
+            ManagedPrimitiveAvailabilityV1::verified_attachment_with_specialists(
                 self.local_host_ref.clone(),
                 transform,
                 codex_generation.is_some(),
+                pi_generation.is_some(),
                 execute,
             ),
         )
@@ -381,13 +400,25 @@ impl HostRuntime {
             crate::native_v2_orchestration::step_runs_on_host(revision, step, &self.local_host_ref)
                 && (matches!(step, PlanStepV2::Execute { .. })
                     || (matches!(step, PlanStepV2::Transform { .. })
-                        && !step.requires_codex_specialist()))
+                        && !step.requires_codex_specialist()
+                        && !step.requires_pi_specialist()))
         })
     }
 
     pub(crate) fn local_plan_requires_codex(&self, revision: &PlanRevisionV2) -> bool {
         revision.steps.iter().any(|step| {
             step.requires_codex_specialist()
+                && crate::native_v2_orchestration::step_runs_on_host(
+                    revision,
+                    step,
+                    &self.local_host_ref,
+                )
+        })
+    }
+
+    pub(crate) fn local_plan_requires_pi(&self, revision: &PlanRevisionV2) -> bool {
+        revision.steps.iter().any(|step| {
+            step.requires_pi_specialist()
                 && crate::native_v2_orchestration::step_runs_on_host(
                     revision,
                     step,
@@ -478,6 +509,27 @@ impl HostRuntime {
                 } else {
                     (
                         self.invoke_reserved_codex_specialist(&attempt_id, &step, &captured, now),
+                        None,
+                    )
+                }
+            } else if step.requires_pi_specialist() {
+                let qualified = pi_attempt_qualification_generation(&self.paths, &attempt_id)
+                    .ok()
+                    .flatten()
+                    .zip(
+                        self.pi_specialists
+                            .lock()
+                            .required_transform_qualification_generation(),
+                    )
+                    .is_some_and(|(bound, current)| bound == current);
+                if !qualified {
+                    (
+                        Err(AppError::InvalidInput("Pi qualification is stale.".into())),
+                        None,
+                    )
+                } else {
+                    (
+                        self.invoke_reserved_pi_specialist(&attempt_id, &step, &captured, now),
                         None,
                     )
                 }
@@ -742,6 +794,39 @@ impl HostRuntime {
         Ok(())
     }
 
+    fn invoke_reserved_pi_specialist(
+        &self,
+        attempt_id: &str,
+        step: &PlanStepV2,
+        captured: &HostExecutionFreshness,
+        now: i64,
+    ) -> AppResult<()> {
+        if !step.requires_pi_specialist() {
+            return invalid("Pi dispatch requires an explicitly Pi-bound Transform.");
+        }
+        ensure_worker_attempt_active(&self.paths, attempt_id)?;
+        let current = current_host_execution_freshness(self, captured)?;
+        captured.validate_current(&current, now)?;
+        let input = step_input(step)?;
+        let acquisition = self.managed_objects.lock().acquisition_for_revision(
+            captured.bridge_id(),
+            &input.logical_object_id,
+            input.revision,
+            now,
+        )?;
+        self.run_pi_specialist_transform(ManagedStepClaimRequestV1 {
+            attempt_id: attempt_id.into(),
+            step_id: step.id().into(),
+            input: acquisition,
+            captured_binding: captured.clone(),
+            current_binding: current,
+            now,
+            process_world: None,
+            private_scratch: true,
+        })?;
+        Ok(())
+    }
+
     /// Testable coordinator dispatch retaining the same reservation and live
     /// Host/session checks while injecting a provider-neutral adapter.
     pub(crate) fn dispatch_next_v2_managed_with_provider<P: WorkerProviderV1>(
@@ -759,6 +844,9 @@ impl HostRuntime {
         };
         if step.requires_codex_specialist() {
             return invalid("Codex-required Transform cannot dispatch through a Native provider.");
+        }
+        if step.requires_pi_specialist() {
+            return invalid("Pi-required Transform cannot dispatch through a Native provider.");
         }
         let selection = worker_attempt_selection(&self.paths, attempt_id)?;
         drop(self.worker_provider_configs.resolve(&selection)?);
@@ -920,6 +1008,7 @@ fn insert_worker_attempt(
     attempt_id: &str,
     selection: Option<&WorkerProviderSelectionV1>,
     codex_generation: Option<u64>,
+    pi_generation: Option<u64>,
     now: i64,
 ) -> AppResult<()> {
     let (provider_id, provider_generation, provider_config_digest, provider_model) = match selection
@@ -933,6 +1022,7 @@ fn insert_worker_attempt(
         // This fixed sentinel exists solely because the pre-existing Worker
         // lifecycle row owns attempt state. It is never resolved as a
         // provider, never contains credentials, and never selects Native.
+        None if pi_generation.is_some() => ("pi-specialist-v0", 0, "", ""),
         None => ("codex-specialist-v0", 0, "", ""),
     };
     connection(paths)?.execute(
@@ -956,6 +1046,13 @@ fn insert_worker_attempt(
             params![attempt_id, qualification_generation, now],
         )?;
     }
+    if let Some(qualification_generation) = pi_generation {
+        connection(paths)?.execute(
+            "INSERT INTO bridge_plan_v2_pi_attempt_bindings
+             (attempt_id, qualification_generation, created_at) VALUES (?1, ?2, ?3)",
+            params![attempt_id, qualification_generation, now],
+        )?;
+    }
     Ok(())
 }
 
@@ -966,6 +1063,21 @@ fn codex_attempt_qualification_generation(
     connection(paths)?
         .query_row(
             "SELECT qualification_generation FROM bridge_plan_v2_codex_attempt_bindings
+             WHERE attempt_id = ?1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn pi_attempt_qualification_generation(
+    paths: &crate::storage::AppPaths,
+    attempt_id: &str,
+) -> AppResult<Option<u64>> {
+    connection(paths)?
+        .query_row(
+            "SELECT qualification_generation FROM bridge_plan_v2_pi_attempt_bindings
              WHERE attempt_id = ?1",
             [attempt_id],
             |row| row.get(0),
@@ -2525,7 +2637,7 @@ mod tests {
             .required_transform_qualification_generation();
         let available = fixture
             .runtime
-            .managed_worker_plan_availability(&fixture.revision, None, generation)
+            .managed_worker_plan_availability(&fixture.revision, None, generation, None)
             .unwrap();
         assert!(available.supports(&fixture.revision, &fixture.revision.steps[0]));
 
@@ -2538,7 +2650,7 @@ mod tests {
         assert!(stale_generation.is_none());
         let unavailable = fixture
             .runtime
-            .managed_worker_plan_availability(&fixture.revision, None, stale_generation)
+            .managed_worker_plan_availability(&fixture.revision, None, stale_generation, None)
             .unwrap();
         assert!(!unavailable.supports(&fixture.revision, &fixture.revision.steps[0]));
     }
@@ -2751,6 +2863,226 @@ mod tests {
                 ManagedWorkerCoordinatorStateV1::Failed
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_controller_runs_its_json_protocol_then_creates_one_ordinary_successor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = fixture(|input, local, _| {
+            vec![PlanStepV2::Transform {
+                step_id: "pi-transform".into(),
+                depends_on: vec![],
+                host: local.clone(),
+                input: input.clone(),
+                output: ManagedObjectRevisionV2 {
+                    logical_object_id: input.logical_object_id.clone(),
+                    revision: input.revision + 1,
+                },
+                modification_intent: "Apply the approved change with Pi.".into(),
+                worker_capability_requirement: Some(TransformWorkerCapabilityRequirementV1::Pi),
+            }]
+        });
+        let executable = fixture._root.0.join("synthetic-pi");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf 'pi output\\n' > result.txt\nprintf '%s\\n' '{\"type\":\"session\"}' '{\"type\":\"agent_start\"}' '{\"type\":\"turn_start\"}' '{\"type\":\"message_end\"}' '{\"type\":\"turn_end\"}' '{\"type\":\"agent_end\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        fixture
+            .runtime
+            .pi_specialists
+            .lock()
+            .install_synthetic_qualification(
+                ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+                    executable_path: executable,
+                    scope_root: fixture._root.0.clone(),
+                })
+                .unwrap(),
+                31,
+            )
+            .unwrap();
+        assert!(matches!(
+            accept(&fixture),
+            AttemptStartDecisionV2::Accepted(_)
+        ));
+        fixture.runtime.clone().drive_live_v2_attempt(
+            fixture.start.attempt_id.clone(),
+            HostExecutionFreshness::Remote(fixture.binding.clone()),
+        );
+        let conn = connection(&fixture.runtime.paths).unwrap();
+        let successors: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_plan_v2_transform_results WHERE attempt_id = ?1",
+                [&fixture.start.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let provider_id: String = conn
+            .query_row(
+                "SELECT provider_id FROM bridge_plan_v2_worker_attempts WHERE attempt_id = ?1",
+                [&fixture.start.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(successors, 1);
+        assert_eq!(provider_id, "pi-specialist-v0");
+        assert_eq!(
+            fixture
+                .runtime
+                .managed_worker_status(&fixture.start.attempt_id)
+                .unwrap()
+                .state,
+            ManagedWorkerCoordinatorStateV1::Completed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_failures_stale_binding_and_cancellation_have_no_successor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (index, (script, stale, cancelled)) in [
+            (
+                "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"thread.started\"}'\n",
+                false,
+                false,
+            ),
+            ("#!/bin/sh\nexit 9\n", false, false),
+            (
+                "#!/bin/sh\nln -s /tmp unsafe\nprintf '%s\\n' '{\"type\":\"session\"}' '{\"type\":\"agent_start\"}' '{\"type\":\"turn_start\"}' '{\"type\":\"turn_end\"}' '{\"type\":\"agent_end\"}'\n",
+                false,
+                false,
+            ),
+            (
+                "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"session\"}' '{\"type\":\"agent_start\"}' '{\"type\":\"turn_start\"}' '{\"type\":\"turn_end\"}' '{\"type\":\"agent_end\"}'\n",
+                true,
+                false,
+            ),
+            (
+                "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"session\"}' '{\"type\":\"agent_start\"}' '{\"type\":\"turn_start\"}' '{\"type\":\"turn_end\"}' '{\"type\":\"agent_end\"}'\n",
+                false,
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = fixture(|input, local, _| {
+                vec![PlanStepV2::Transform {
+                    step_id: "pi-transform".into(),
+                    depends_on: vec![],
+                    host: local.clone(),
+                    input: input.clone(),
+                    output: ManagedObjectRevisionV2 {
+                        logical_object_id: input.logical_object_id.clone(),
+                        revision: input.revision + 1,
+                    },
+                    modification_intent: "Apply the approved change with Pi.".into(),
+                    worker_capability_requirement: Some(
+                        TransformWorkerCapabilityRequirementV1::Pi,
+                    ),
+                }]
+            });
+            let executable = fixture._root.0.join("synthetic-pi");
+            std::fs::write(&executable, script).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            fixture
+                .runtime
+                .pi_specialists
+                .lock()
+                .install_synthetic_qualification(
+                    ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+                        executable_path: executable.clone(),
+                        scope_root: fixture._root.0.clone(),
+                    })
+                    .unwrap(),
+                    index as u64 + 40,
+                )
+                .unwrap();
+            assert!(matches!(accept(&fixture), AttemptStartDecisionV2::Accepted(_)));
+            if stale {
+                std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            if cancelled {
+                fixture
+                    .runtime
+                    .cancel_live_v2_managed_attempt(&fixture.start.attempt_id, storage::now_ts())
+                    .unwrap();
+            }
+            fixture.runtime.clone().drive_live_v2_attempt(
+                fixture.start.attempt_id.clone(),
+                HostExecutionFreshness::Remote(fixture.binding.clone()),
+            );
+            let successors: i64 = connection(&fixture.runtime.paths)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM bridge_plan_v2_transform_results WHERE attempt_id = ?1",
+                    [&fixture.start.attempt_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(successors, 0);
+        }
+    }
+
+    #[test]
+    fn pi_required_transform_never_dispatches_through_native_or_codex() {
+        let fixture = fixture(|input, local, _| {
+            vec![PlanStepV2::Transform {
+                step_id: "pi-transform".into(),
+                depends_on: vec![],
+                host: local.clone(),
+                input: input.clone(),
+                output: ManagedObjectRevisionV2 {
+                    logical_object_id: input.logical_object_id.clone(),
+                    revision: input.revision + 1,
+                },
+                modification_intent: "Apply the approved change with Pi.".into(),
+                worker_capability_requirement: Some(TransformWorkerCapabilityRequirementV1::Pi),
+            }]
+        });
+        let executable = fixture._root.0.join("synthetic-pi");
+        std::fs::write(&executable, b"synthetic-pi-v1").unwrap();
+        fixture
+            .runtime
+            .pi_specialists
+            .lock()
+            .install_synthetic_qualification(
+                ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+                    executable_path: executable,
+                    scope_root: fixture._root.0.clone(),
+                })
+                .unwrap(),
+                56,
+            )
+            .unwrap();
+        assert!(fixture
+            .runtime
+            .codex_specialists
+            .lock()
+            .required_transform_qualification_generation()
+            .is_none());
+        assert!(matches!(
+            accept(&fixture),
+            AttemptStartDecisionV2::Accepted(_)
+        ));
+        assert!(fixture
+            .runtime
+            .dispatch_next_v2_managed_with_provider(
+                &fixture.start.attempt_id,
+                fixture.binding.clone(),
+                &mut transform_script(),
+                storage::now_ts(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("Pi-required Transform cannot dispatch through a Native provider"));
     }
 
     #[test]

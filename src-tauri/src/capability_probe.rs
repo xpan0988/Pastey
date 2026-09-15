@@ -12,9 +12,10 @@ use crate::{
 
 pub(crate) const MANAGED_PYTHON_RUNTIME_ID: &str = "python";
 pub(crate) const MANAGED_NODE_RUNTIME_ID: &str = "node";
-/// Semantic observation only. A positive PATH probe is never a Codex
+/// Semantic observation only. A positive PATH probe is never a specialist
 /// executable binding, qualification, or execution authorization.
 pub(crate) const CODEX_SPECIALIST_CAPABILITY_ID: &str = "agent.coding.codex";
+pub(crate) const PI_SPECIALIST_CAPABILITY_ID: &str = "agent.coding.pi";
 
 const RUNTIME_PYTHON_CAPABILITY_ID: &str = "runtime.python";
 const RUNTIME_NODE_CAPABILITY_ID: &str = "runtime.node";
@@ -41,6 +42,7 @@ const KNOWN_CAPABILITY_IDS: &[&str] = &[
     RUNTIME_ZSH_CAPABILITY_ID,
     RUNTIME_BASH_CAPABILITY_ID,
     CODEX_SPECIALIST_CAPABILITY_ID,
+    PI_SPECIALIST_CAPABILITY_ID,
 ];
 
 #[derive(Clone, Copy)]
@@ -89,6 +91,12 @@ const RUNTIME_PROBES: &[RuntimeProbe] = &[
         args: &["--version"],
     },
     RuntimeProbe {
+        name: "pi",
+        capability_id: PI_SPECIALIST_CAPABILITY_ID,
+        command: "pi",
+        args: &["--version"],
+    },
+    RuntimeProbe {
         name: "ffmpeg",
         capability_id: RUNTIME_FFMPEG_CAPABILITY_ID,
         command: "ffmpeg",
@@ -127,7 +135,7 @@ const RUNTIME_PROBES: &[RuntimeProbe] = &[
     },
 ];
 
-pub(crate) const MAX_KNOWN_CAPABILITY_REQUESTS: usize = 13;
+pub(crate) const MAX_KNOWN_CAPABILITY_REQUESTS: usize = 14;
 const MAX_KNOWN_CAPABILITY_ID_BYTES: usize = 128;
 
 /// The only outcomes of a Host-local request against the fixed probe table.
@@ -378,6 +386,38 @@ pub(crate) fn discover_codex_specialist_executable() -> AppResult<Option<Managed
     Ok(None)
 }
 
+/// Resolves only Host-owned absolute candidates for the Pi specialist. PATH
+/// remains diagnostics-only and never becomes a qualification input.
+#[allow(dead_code)] // Pi proof observes/qualifies only through this Host-private seam.
+pub(crate) fn discover_pi_specialist_executable() -> AppResult<Option<ManagedProcessWorldSpecV1>> {
+    #[cfg(target_os = "macos")]
+    let candidates = [
+        PathBuf::from("/opt/homebrew/bin/pi"),
+        PathBuf::from("/usr/local/bin/pi"),
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let candidates: [PathBuf; 0] = [];
+
+    for candidate in candidates {
+        let Ok(executable_path) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        let Some(scope_root) = executable_path.parent().map(ToOwned::to_owned) else {
+            continue;
+        };
+        let executable = ExecutableBindingSpecV1 {
+            executable_path,
+            scope_root,
+        };
+        if validate_managed_runtime_executable(&executable).is_ok() {
+            if let Ok(process_world) = ManagedProcessWorldSpecV1::new(executable) {
+                return Ok(Some(process_world));
+            }
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn validate_managed_runtime_id(runtime_id: &str) -> AppResult<()> {
     match runtime_id {
         MANAGED_PYTHON_RUNTIME_ID | MANAGED_NODE_RUNTIME_ID => Ok(()),
@@ -596,6 +636,7 @@ mod tests {
                 RUNTIME_ZSH_CAPABILITY_ID,
                 RUNTIME_BASH_CAPABILITY_ID,
                 CODEX_SPECIALIST_CAPABILITY_ID,
+                PI_SPECIALIST_CAPABILITY_ID,
             ]
         );
         for probe in RUNTIME_PROBES {
@@ -606,12 +647,13 @@ mod tests {
             assert!(
                 probe.capability_id.starts_with("runtime.")
                     || probe.capability_id == CODEX_SPECIALIST_CAPABILITY_ID
+                    || probe.capability_id == PI_SPECIALIST_CAPABILITY_ID
             );
         }
     }
 
     #[test]
-    fn codex_capability_is_a_fixed_path_observation_only() {
+    fn specialist_capabilities_are_fixed_path_observations_only() {
         let result =
             probe_known_capability_with_runner(CODEX_SPECIALIST_CAPABILITY_ID, |command, args| {
                 assert_eq!(command, "codex");

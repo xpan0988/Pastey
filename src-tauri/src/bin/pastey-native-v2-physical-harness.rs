@@ -85,6 +85,8 @@ mod network_broker;
 mod object_refs;
 #[path = "../peer_capabilities.rs"]
 mod peer_capabilities;
+#[path = "../pi_specialist.rs"]
+mod pi_specialist;
 #[path = "../regular_file_set_transfer.rs"]
 mod regular_file_set_transfer;
 #[path = "../room_control.rs"]

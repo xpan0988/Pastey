@@ -832,6 +832,130 @@ impl HostRuntime {
         )
     }
 
+    /// Concrete Pi closure. It shares only the existing Host/Core primitives
+    /// with Codex; Pi binding, invocation, JSON protocol, and lifecycle remain
+    /// in its own backend.
+    pub(crate) fn finalize_pi_specialist_transform(
+        &self,
+        grant: &ManagedStepGrantV1,
+        pi_binding: &crate::pi_specialist::PiAttemptBindingV0,
+        scratch: &crate::managed_resources::ManagedScratchLeaseV1,
+        current_binding: impl Into<HostExecutionFreshness>,
+        now: i64,
+    ) -> AppResult<ManagedObjectAcquisition> {
+        let current_binding = current_binding.into();
+        let mut access = grant.access.clone();
+        access.current = current_authority(&current_binding, now);
+        let imported = {
+            let specialists = self.pi_specialists.lock();
+            let mut authority = self.effect_authority.lock();
+            let mut resolver = self.managed_resources.lock();
+            let mut objects = self.managed_objects.lock();
+            specialists.import_bound_scratch(
+                pi_binding,
+                &mut authority,
+                &mut resolver,
+                &mut objects,
+                grant,
+                &access,
+                scratch,
+                now,
+            )
+        };
+        let imported = match imported {
+            Ok(imported) => imported,
+            Err(error) => {
+                let _ = self.cancel_managed_run(&grant.access.run_control_ref);
+                return Err(error);
+            }
+        };
+        let input = grant
+            .access
+            .context
+            .input_revisions
+            .first()
+            .cloned()
+            .ok_or_else(|| AppError::InvalidInput("Pi Transform input is unavailable.".into()))?;
+        let proposal = TransformResultProposalV1 {
+            attempt_id: grant.access.context.attempt_id.clone(),
+            step_id: grant.access.context.step_id.clone(),
+            context_ref: grant.access.context.context_ref()?,
+            envelope_ref: grant.access.envelope_ref.clone(),
+            run_control_ref: grant.access.run_control_ref.clone(),
+            input: input.clone(),
+            output: ManagedObjectRevisionResultV1 {
+                logical_object_id: input.logical_object_id,
+                revision: grant.output_revision.ok_or_else(|| {
+                    AppError::InvalidInput("Pi Transform output is unavailable.".into())
+                })?,
+                host_ref: self.local_host_ref.clone(),
+                content_digest: imported.output_seal.content_digest.clone(),
+            },
+            output_seal: imported.output_seal,
+            evidence_ids: imported.evidence_ids,
+            evidence_head: imported.evidence_head,
+            display_name: "pi-transform-output".into(),
+            media_type: "application/x-pastey-file-set".into(),
+        };
+        let result = self.finalize_v2_transform(proposal, current_binding, now);
+        if result.is_err() {
+            let _ = self.cancel_managed_run(&grant.access.run_control_ref);
+        }
+        result
+    }
+
+    pub(crate) fn run_pi_specialist_transform(
+        &self,
+        request: ManagedStepClaimRequestV1,
+    ) -> AppResult<ManagedObjectAcquisition> {
+        if !request.private_scratch || request.process_world.is_some() {
+            return invalid("Pi requires an exact private-scratch Transform claim.");
+        }
+        let current_binding = request.current_binding.clone();
+        let grant = self.claim_v2_managed_step(request)?;
+        let (binding, scratch) = {
+            let mut specialists = self.pi_specialists.lock();
+            let authority = self.effect_authority.lock();
+            let mut resolver = self.managed_resources.lock();
+            let mut objects = self.managed_objects.lock();
+            specialists.bind_claimed_transform(&grant, &authority, &mut resolver, &mut objects)?
+        };
+        let controller = match self
+            .pi_specialists
+            .lock()
+            .start_bound_controller(&binding, &grant.operation_intent)
+        {
+            Ok(controller) => controller,
+            Err(error) => {
+                let _ = self.cancel_managed_run(&grant.access.run_control_ref);
+                return Err(error);
+            }
+        };
+        let output = match controller.wait() {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = self.cancel_managed_run(&grant.access.run_control_ref);
+                return Err(error);
+            }
+        };
+        let controller_result = {
+            self.pi_specialists
+                .lock()
+                .finish_bound_controller(&binding, output)
+        };
+        if let Err(error) = controller_result {
+            let _ = self.cancel_managed_run(&grant.access.run_control_ref);
+            return Err(error);
+        }
+        self.finalize_pi_specialist_transform(
+            &grant,
+            &binding,
+            &scratch,
+            current_binding,
+            crate::storage::now_ts(),
+        )
+    }
+
     pub(crate) fn finalize_v2_execute(
         &self,
         proposal: ExecuteResultProposalV1,
@@ -1024,8 +1148,9 @@ fn load_claim_source(
         &approval,
         &admission_request,
         &request.current_binding,
-        ManagedPrimitiveAvailabilityV1::verified_attachment_with_codex(
+        ManagedPrimitiveAvailabilityV1::verified_attachment_with_specialists(
             local_host.clone(),
+            true,
             true,
             true,
             true,
@@ -1849,6 +1974,42 @@ mod tests {
         (result.0, result.1, executable_root)
     }
 
+    fn bind_synthetic_pi(
+        fixture: &Fixture,
+        grant: &ManagedStepGrantV1,
+    ) -> (
+        crate::pi_specialist::PiAttemptBindingV0,
+        crate::managed_resources::ManagedScratchLeaseV1,
+        PathBuf,
+    ) {
+        let executable_root =
+            std::env::temp_dir().join(format!("pastey-pi-b1-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&executable_root).unwrap();
+        let executable = executable_root.join("pi");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let world = ManagedProcessWorldSpecV1::new(ExecutableBindingSpecV1 {
+            executable_path: executable,
+            scope_root: executable_root.clone(),
+        })
+        .unwrap();
+        let mut specialist = fixture.runtime.pi_specialists.lock();
+        specialist
+            .install_synthetic_qualification(world, 1)
+            .unwrap();
+        let authority = fixture.runtime.effect_authority.lock();
+        let mut resources = fixture.runtime.managed_resources.lock();
+        let mut objects = fixture.runtime.managed_objects.lock();
+        let result = specialist
+            .bind_claimed_transform(grant, &authority, &mut resources, &mut objects)
+            .unwrap();
+        (result.0, result.1, executable_root)
+    }
+
     fn transform_result_count(fixture: &Fixture) -> i64 {
         Connection::open(&fixture.runtime.paths.db_path)
             .unwrap()
@@ -2154,6 +2315,35 @@ mod tests {
         assert!(fixture
             .runtime
             .finalize_codex_specialist_transform(
+                &grant,
+                &binding,
+                &scratch,
+                fixture.binding.clone(),
+                NOW + 3,
+            )
+            .is_err());
+        assert_eq!(transform_result_count(&fixture), 0);
+        let _ = std::fs::remove_dir_all(executable_root);
+    }
+
+    #[test]
+    fn pi_import_failure_cancels_without_a_successor_revision() {
+        let fixture = fixture(transform_then_execute_steps);
+        let grant = claim_codex_transform(&fixture);
+        let (binding, scratch, executable_root) = bind_synthetic_pi(&fixture, &grant);
+        std::fs::remove_file(scratch.root.join("input")).unwrap();
+        std::fs::write(scratch.root.join("a.txt"), b"a").unwrap();
+        std::fs::write(scratch.root.join("b.txt"), b"b").unwrap();
+        let output_root = fixture
+            .runtime
+            .managed_resources
+            .lock()
+            .private_root_for_test(grant.output_slot.as_ref().unwrap())
+            .unwrap();
+        std::fs::write(output_root.join("b.txt"), b"untracked").unwrap();
+        assert!(fixture
+            .runtime
+            .finalize_pi_specialist_transform(
                 &grant,
                 &binding,
                 &scratch,

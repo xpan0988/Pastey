@@ -60,6 +60,8 @@ pub(crate) struct PlanRootV2 {
 pub(crate) enum TransformWorkerCapabilityRequirementV1 {
     #[serde(rename = "agent.coding.codex")]
     Codex,
+    #[serde(rename = "agent.coding.pi")]
+    Pi,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -138,6 +140,16 @@ impl PlanStepV2 {
             self,
             Self::Transform {
                 worker_capability_requirement: Some(TransformWorkerCapabilityRequirementV1::Codex),
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn requires_pi_specialist(&self) -> bool {
+        matches!(
+            self,
+            Self::Transform {
+                worker_capability_requirement: Some(TransformWorkerCapabilityRequirementV1::Pi),
                 ..
             }
         )
@@ -888,6 +900,11 @@ pub(crate) fn init_schema(conn: &Connection) -> AppResult<()> {
             created_at INTEGER NOT NULL,
             FOREIGN KEY(attempt_id) REFERENCES bridge_plan_v2_attempts(attempt_id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS bridge_plan_v2_pi_attempt_bindings (
+            attempt_id TEXT PRIMARY KEY, qualification_generation INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(attempt_id) REFERENCES bridge_plan_v2_attempts(attempt_id) ON DELETE CASCADE
+        );
         CREATE TABLE IF NOT EXISTS bridge_plan_v2_worker_dispatches (
             attempt_id TEXT NOT NULL, step_id TEXT NOT NULL,
             operation TEXT NOT NULL CHECK(operation IN ('transform','execute')),
@@ -947,6 +964,9 @@ pub(crate) fn init_schema(conn: &Connection) -> AppResult<()> {
         CREATE TRIGGER IF NOT EXISTS bridge_plan_v2_codex_attempt_binding_immutable
         BEFORE UPDATE ON bridge_plan_v2_codex_attempt_bindings
         BEGIN SELECT RAISE(ABORT, 'Bridge Plan v2 Codex binding is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS bridge_plan_v2_pi_attempt_binding_immutable
+        BEFORE UPDATE ON bridge_plan_v2_pi_attempt_bindings
+        BEGIN SELECT RAISE(ABORT, 'Bridge Plan v2 Pi binding is immutable'); END;
         CREATE TRIGGER IF NOT EXISTS bridge_plan_v2_worker_attempt_terminal_guard
         BEFORE UPDATE ON bridge_plan_v2_worker_attempts
         WHEN OLD.state IN ('completed','failed','interrupted','cancelled')
@@ -2057,7 +2077,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_transform_requirement_is_canonical_and_survives_review_storage() {
+    fn coding_specialist_requirements_are_canonical_and_survive_review_storage() {
         let native = all_four_revision();
         let native_json = serde_json::to_value(&native).unwrap();
         assert!(native_json["steps"][1]
@@ -2082,15 +2102,45 @@ mod tests {
         );
         verify_sealed_revision(&codex).unwrap();
 
-        let paths = paths("pastey-v2-codex-plan-storage");
+        let mut pi = native.clone();
+        let PlanStepV2::Transform {
+            worker_capability_requirement,
+            ..
+        } = &mut pi.steps[1]
+        else {
+            unreachable!();
+        };
+        *worker_capability_requirement = Some(TransformWorkerCapabilityRequirementV1::Pi);
+        pi.revision_hash.clear();
+        let pi = seal_revision(pi).unwrap();
+        assert_ne!(native.revision_hash, pi.revision_hash);
+        assert_ne!(codex.revision_hash, pi.revision_hash);
+        assert_eq!(
+            serde_json::to_value(&pi).unwrap()["steps"][1]["workerCapabilityRequirement"],
+            "agent.coding.pi"
+        );
+        verify_sealed_revision(&pi).unwrap();
+
+        let codex_paths = paths("pastey-v2-codex-plan-storage");
         let local = host("source");
         let review = review_for(&codex, participant(&codex, &local));
-        let store = BridgePlanV2Store::new(&paths);
+        let store = BridgePlanV2Store::new(&codex_paths);
         record_review(&store, &review, &local);
         let reloaded = store
             .reviewed_revision_for_start(&start_for(&review), NOW)
             .unwrap();
         assert_eq!(reloaded, codex);
-        std::fs::remove_dir_all(paths.app_data_dir).unwrap();
+        let pi_paths = paths("pastey-v2-pi-plan-storage");
+        let pi_store = BridgePlanV2Store::new(&pi_paths);
+        let pi_review = review_for(&pi, participant(&pi, &local));
+        record_review(&pi_store, &pi_review, &local);
+        assert_eq!(
+            pi_store
+                .reviewed_revision_for_start(&start_for(&pi_review), NOW)
+                .unwrap(),
+            pi
+        );
+        std::fs::remove_dir_all(codex_paths.app_data_dir).unwrap();
+        std::fs::remove_dir_all(pi_paths.app_data_dir).unwrap();
     }
 }
