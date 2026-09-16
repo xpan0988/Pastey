@@ -13,8 +13,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(target_os = "macos")]
-use std::fs;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 
@@ -26,6 +24,9 @@ use crate::{
     },
     managed_resources::ExecutionWorldMountV1,
 };
+
+#[cfg(target_os = "macos")]
+use crate::host_process::{macos_sandbox_exec_command, macos_sandbox_exec_identity};
 
 #[cfg(target_os = "macos")]
 use crate::execution_world::{domain_hash, EXECUTION_WORLD_VERSION};
@@ -226,19 +227,9 @@ pub(crate) fn exit_budget_state(status: &ExitStatus) -> Option<&'static str> {
 
 #[cfg(target_os = "macos")]
 fn macos_availability(required: &BTreeSet<ConfinementPropertyV1>) -> ExecutionWorldAvailabilityV1 {
-    let path = Path::new("/usr/bin/sandbox-exec");
     let result = (|| -> AppResult<String> {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let metadata = fs::symlink_metadata(path)?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != 0
-            || metadata.permissions().mode() & 0o022 != 0
-        {
-            return invalid("macOS sandbox-exec identity is unsafe.");
-        }
-        let bytes = fs::read(path)?;
-        let probe = Command::new(path)
+        let sandbox_exec_identity = macos_sandbox_exec_identity()?;
+        let probe = Command::new("/usr/bin/sandbox-exec")
             .args([
                 "-p",
                 "(version 1)(deny default)(deny network*)(allow process-exec)(allow file-read* (literal \"/usr/bin/true\") (subpath \"/System\") (subpath \"/usr/lib\") (subpath \"/private/var/db/dyld\"))",
@@ -254,11 +245,7 @@ fn macos_availability(required: &BTreeSet<ConfinementPropertyV1>) -> ExecutionWo
         }
         domain_hash(
             "pastey-macos-sandbox-exec-world-v1",
-            &(
-                blake3::hash(&bytes).to_hex().to_string(),
-                EXECUTION_WORLD_VERSION,
-                required,
-            ),
+            &(sandbox_exec_identity, EXECUTION_WORLD_VERSION, required),
         )
     })();
     match result {
@@ -301,12 +288,11 @@ fn build_unix_command(
     #[cfg(target_os = "macos")]
     if kind == PlatformWorldKindV1::MacOsSandboxExec {
         let profile = macos_profile(launch.mounts, launch.executable)?;
-        let mut command = Command::new("/usr/bin/sandbox-exec");
-        command
-            .arg("-p")
-            .arg(profile)
-            .arg(&launch.executable.source_path)
-            .args(&launch.invocation.argv);
+        let mut command = macos_sandbox_exec_command(
+            profile,
+            &launch.executable.source_path,
+            &launch.invocation.argv,
+        )?;
         if let Some(cwd) = launch.cwd {
             command.current_dir(cwd);
         }

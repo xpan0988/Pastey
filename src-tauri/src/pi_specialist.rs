@@ -17,6 +17,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use serde_json::Value;
@@ -31,7 +32,7 @@ use crate::{
     error::{AppError, AppResult},
     host_process::{
         spawn_bounded_host_process, HostBoundedProcessSpecV1, HostProcessControlV1,
-        RunningHostProcessV1,
+        HostProcessSandboxV1, HostProcessTreeRequirementV1, RunningHostProcessV1,
     },
     host_scratch_import::{
         import_complete_scratch_to_output_slot, HostScratchImportV1, MAX_HOST_SCRATCH_IMPORT_FILES,
@@ -50,6 +51,14 @@ const MAX_PI_SUPPORT_FILES_PER_KIND: usize = 8;
 const MAX_PI_SUPPORT_BYTES: u64 = 256 * 1024;
 const MAX_PI_INPUT_CONTEXT_BYTES: u64 = 32 * 1024;
 const PI_APPEND_SYSTEM_PROMPT_FLAG: &str = "--append-system-prompt";
+const MAX_PI_WALL_TIME: Duration = Duration::from_secs(5 * 60);
+
+fn controller_tree_requirement() -> HostProcessTreeRequirementV1 {
+    #[cfg(test)]
+    return HostProcessTreeRequirementV1::AllowProcessGroupForTest;
+    #[cfg(not(test))]
+    HostProcessTreeRequirementV1::RequireVerifiedTree
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PiDetectionV0 {
@@ -65,16 +74,55 @@ pub(crate) struct PiObservationV0 {
     candidate_present: bool,
 }
 
+/// Pi's build closure is deliberately distinct from Codex. The current
+/// executable identity is the S1 floor; Node/package closure expansion is a
+/// later physical qualification fact, not provider state.
+#[derive(Clone, Debug)]
+struct PiBuildClosureV1 {
+    process_world: ManagedProcessWorldSpecV1,
+    executable_identity_ref: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PiFeatureProfileV1 {
+    append_system_prompt: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PiProtocolProfileV1 {
+    jsonl_profile: &'static str,
+    invocation_profile: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PiHostContainmentProfileV1 {
+    sandbox_profile: &'static str,
+    process_tree_profile: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PiOsPasteyBuildIdentityV1 {
+    os: &'static str,
+    architecture: &'static str,
+    pastey_version: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PiPhysicalAcceptanceV1 {
+    NotRun,
+    Failed { reason: &'static str },
+}
+
 #[derive(Clone, Debug)]
 struct PiQualificationV0 {
     generation: u64,
-    process_world: ManagedProcessWorldSpecV1,
-    executable_identity_ref: String,
-    /// Whether this exact Pi CLI has qualified its explicit
-    /// `--append-system-prompt` contract. This is a feature fact, not support
-    /// content and not an authority grant.
-    append_system_prompt: bool,
-    synthetic: bool,
+    build_closure: PiBuildClosureV1,
+    feature_profile: PiFeatureProfileV1,
+    protocol_profile: PiProtocolProfileV1,
+    host_containment_profile: PiHostContainmentProfileV1,
+    os_pastey_build_identity: PiOsPasteyBuildIdentityV1,
+    physical_acceptance: PiPhysicalAcceptanceV1,
+    test_only: bool,
 }
 
 /// Host-owned Pi support content. Its bytes are neither ambient Pi state nor
@@ -366,11 +414,14 @@ impl PiAttemptBindingV0 {
     fn validate(&self, qualification: &PiQualificationV0) -> AppResult<()> {
         if self.revoked.load(Ordering::SeqCst)
             || self.qualification_generation != qualification.generation
-            || self.executable_identity_ref != qualification.executable_identity_ref
+            || self.executable_identity_ref != qualification.build_closure.executable_identity_ref
         {
             return invalid("Pi attempt binding is revoked or stale.");
         }
-        let current = qualification.process_world.validate_executable_identity()?;
+        let current = qualification
+            .build_closure
+            .process_world
+            .validate_executable_identity()?;
         if current != self.executable_identity_ref {
             return invalid("Pi executable identity changed after qualification.");
         }
@@ -487,8 +538,10 @@ pub(crate) struct PiSpecialistServiceV0 {
 impl PiSpecialistServiceV0 {
     pub(crate) fn required_transform_qualification_generation(&self) -> Option<u64> {
         self.qualification.as_ref().and_then(|qualification| {
-            (qualification.synthetic
+            (cfg!(test)
+                && qualification.test_only
                 && qualification
+                    .build_closure
                     .process_world
                     .validate_executable_identity()
                     .is_ok())
@@ -528,12 +581,13 @@ impl PiSpecialistServiceV0 {
                 "Pi is detected at most; Host qualification is unavailable.".into(),
             )
         })?;
-        if !qualification.synthetic {
+        if !cfg!(test) || !qualification.test_only {
             return invalid(
                 "Pi real qualification is deferred pending physical containment proof.",
             );
         }
         let executable_identity_ref = qualification
+            .build_closure
             .process_world
             .validate_executable_identity()?
             .to_owned();
@@ -554,7 +608,7 @@ impl PiSpecialistServiceV0 {
         )?;
         let support_content = self
             .support_content
-            .materialize(qualification.append_system_prompt)?;
+            .materialize(qualification.feature_profile.append_system_prompt)?;
         let revoked = Arc::new(AtomicBool::new(false));
         let binding = PiAttemptBindingV0 {
             run_ref: grant.access.run_control_ref.clone(),
@@ -612,6 +666,7 @@ impl PiSpecialistServiceV0 {
         argv.push(operation_intent.into());
         let process = spawn_bounded_host_process(HostBoundedProcessSpecV1 {
             executable: qualification
+                .build_closure
                 .process_world
                 .executable
                 .executable_path
@@ -624,6 +679,9 @@ impl PiSpecialistServiceV0 {
             stderr: Stdio::piped(),
             stdout_limit: MAX_PI_STDOUT_BYTES,
             stderr_limit: MAX_PI_STDERR_BYTES,
+            wall_timeout: MAX_PI_WALL_TIME,
+            tree_requirement: controller_tree_requirement(),
+            sandbox: HostProcessSandboxV1::None,
             cleanup_roots: vec![private_root],
         })?;
         let record = self
@@ -762,12 +820,30 @@ impl PiSpecialistServiceV0 {
         let executable_identity_ref = process_world.validate_executable_identity()?.to_owned();
         self.qualification = Some(PiQualificationV0 {
             generation,
-            process_world,
-            executable_identity_ref,
-            append_system_prompt: pi_append_system_prompt_is_qualified(
-                "--append-system-prompt <text>\n",
-            ),
-            synthetic: true,
+            build_closure: PiBuildClosureV1 {
+                process_world,
+                executable_identity_ref,
+            },
+            feature_profile: PiFeatureProfileV1 {
+                append_system_prompt: pi_append_system_prompt_is_qualified(
+                    "--append-system-prompt <text>\n",
+                ),
+            },
+            protocol_profile: PiProtocolProfileV1 {
+                jsonl_profile: "pi-json-one-shot-v0",
+                invocation_profile: "pi-no-session-no-ambient-discovery-v0",
+            },
+            host_containment_profile: PiHostContainmentProfileV1 {
+                sandbox_profile: "macos-seatbelt-controller-network-denied-deferred-v1",
+                process_tree_profile: "unix-process-group-unproven-v1",
+            },
+            os_pastey_build_identity: PiOsPasteyBuildIdentityV1 {
+                os: std::env::consts::OS,
+                architecture: std::env::consts::ARCH,
+                pastey_version: env!("CARGO_PKG_VERSION"),
+            },
+            physical_acceptance: PiPhysicalAcceptanceV1::NotRun,
+            test_only: true,
         });
         Ok(())
     }
@@ -945,6 +1021,20 @@ mod tests {
         let world = synthetic_world(executable);
         let mut service = PiSpecialistServiceV0::default();
         service.install_synthetic_qualification(world, 7).unwrap();
+        let qualification = service.qualification.as_ref().unwrap();
+        assert_eq!(
+            qualification.physical_acceptance,
+            PiPhysicalAcceptanceV1::NotRun
+        );
+        assert_eq!(
+            qualification.protocol_profile.jsonl_profile,
+            "pi-json-one-shot-v0"
+        );
+        assert_eq!(
+            qualification.host_containment_profile.process_tree_profile,
+            "unix-process-group-unproven-v1"
+        );
+        assert!(qualification.test_only);
         service.set_host_support_content_for_test(
             PiHostSupportContentV0::for_test_with_input_context(
                 vec![b"exact skill".to_vec()],
@@ -954,7 +1044,7 @@ mod tests {
         );
         let qualification = service.qualification.as_ref().unwrap();
         let qualification_generation = qualification.generation;
-        let executable_identity_ref = qualification.executable_identity_ref.clone();
+        let executable_identity_ref = qualification.build_closure.executable_identity_ref.clone();
         let support_content = service.support_content.materialize(true).unwrap();
         let replacement_path = support_content.input_context.as_ref().unwrap().path.clone();
         let binding = PiAttemptBindingV0 {
@@ -983,7 +1073,7 @@ mod tests {
         let qualification = service.qualification.as_ref().unwrap();
         assert_eq!(qualification.generation, qualification_generation);
         assert_eq!(
-            qualification.executable_identity_ref,
+            qualification.build_closure.executable_identity_ref,
             executable_identity_ref
         );
         binding.validate(&qualification).unwrap();
