@@ -19,6 +19,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use serde_json::Value;
@@ -33,7 +34,7 @@ use crate::{
     error::{AppError, AppResult},
     host_process::{
         spawn_bounded_host_process, HostBoundedProcessSpecV1, HostProcessControlV1,
-        RunningHostProcessV1,
+        HostProcessSandboxV1, HostProcessTreeRequirementV1, RunningHostProcessV1,
     },
     host_scratch_import::{
         import_complete_scratch_to_output_slot, HostScratchImportV1, MAX_HOST_SCRATCH_IMPORT_FILES,
@@ -48,6 +49,14 @@ const MAX_JSONL_EVENTS: usize = 1_024;
 const MAX_CONTROLLER_STDOUT_BYTES: usize = MAX_JSONL_LINE_BYTES * MAX_JSONL_EVENTS;
 const MAX_CONTROLLER_STDERR_BYTES: usize = 64 * 1024;
 const CODEX_MULTI_AGENT_FEATURE: &str = "multi_agent";
+const MAX_CONTROLLER_WALL_TIME: Duration = Duration::from_secs(5 * 60);
+
+fn controller_tree_requirement() -> HostProcessTreeRequirementV1 {
+    #[cfg(test)]
+    return HostProcessTreeRequirementV1::AllowProcessGroupForTest;
+    #[cfg(not(test))]
+    HostProcessTreeRequirementV1::RequireVerifiedTree
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexDetectionV0 {
@@ -65,18 +74,60 @@ pub(crate) struct CodexObservationV0 {
     candidate_present: bool,
 }
 
+/// Exact controller bytes currently known to the Host. S1 keeps this narrow:
+/// future closure expansion must remain a build fact, never provider state.
+#[derive(Clone, Debug)]
+struct CodexBuildClosureV1 {
+    process_world: ManagedProcessWorldSpecV1,
+    executable_identity_ref: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CodexFeatureProfileV1 {
+    multi_agent: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CodexProtocolProfileV1 {
+    jsonl_profile: &'static str,
+    invocation_profile: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CodexHostContainmentProfileV1 {
+    sandbox_profile: &'static str,
+    process_tree_profile: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CodexOsPasteyBuildIdentityV1 {
+    os: &'static str,
+    architecture: &'static str,
+    pastey_version: &'static str,
+}
+
+/// S1 creates only an explicit, non-promoting physical result. There is no
+/// production constructor for a pass because the actual controller/provider
+/// boundary is deliberately outside this slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CodexPhysicalAcceptanceV1 {
+    NotRun,
+    Failed { reason: &'static str },
+}
+
 #[derive(Clone, Debug)]
 struct CodexQualificationV0 {
     generation: u64,
-    process_world: ManagedProcessWorldSpecV1,
-    executable_identity_ref: String,
-    /// The exact `codex features list` contract is Host-qualified. This
-    /// enables only Codex's in-attempt multi-agent harness; it does not add a
-    /// Pastey planner, authority, or cross-attempt session.
-    multi_agent: bool,
-    /// Production B0 never sets this. Test-only qualification exists solely
-    /// to exercise replacement and binding rejection deterministically.
-    synthetic: bool,
+    build_closure: CodexBuildClosureV1,
+    feature_profile: CodexFeatureProfileV1,
+    protocol_profile: CodexProtocolProfileV1,
+    host_containment_profile: CodexHostContainmentProfileV1,
+    os_pastey_build_identity: CodexOsPasteyBuildIdentityV1,
+    physical_acceptance: CodexPhysicalAcceptanceV1,
+    /// Test-only binding evidence exercises stale/revoked behavior without
+    /// representing physical qualification. This field is never constructible
+    /// in production because its only installer is `#[cfg(test)]`.
+    test_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -92,11 +143,14 @@ impl CodexAttemptBindingV0 {
     fn validate(&self, qualification: &CodexQualificationV0) -> AppResult<()> {
         if self.revoked.load(Ordering::SeqCst)
             || self.qualification_generation != qualification.generation
-            || self.executable_identity_ref != qualification.executable_identity_ref
+            || self.executable_identity_ref != qualification.build_closure.executable_identity_ref
         {
             return invalid("Codex attempt binding is revoked or stale.");
         }
-        let current = qualification.process_world.validate_executable_identity()?;
+        let current = qualification
+            .build_closure
+            .process_world
+            .validate_executable_identity()?;
         if current != self.executable_identity_ref {
             return invalid("Codex executable changed after attempt binding.");
         }
@@ -335,14 +389,15 @@ pub(crate) struct CodexSpecialistServiceV0 {
 }
 
 impl CodexSpecialistServiceV0 {
-    /// Readiness is Host-private and rechecks the exact executable identity.
-    /// Production qualification remains deliberately unavailable until the
-    /// physical controller/child containment proof exists. Synthetic
-    /// qualification is test-only evidence for the B0/B1 path.
+    /// Readiness is Host-private and rechecks the exact build closure.
+    /// S1 never promotes production readiness: test-only binding evidence is
+    /// compiled out of production and physical acceptance remains NotRun.
     pub(crate) fn required_transform_qualification_generation(&self) -> Option<u64> {
         self.qualification.as_ref().and_then(|qualification| {
-            (qualification.synthetic
+            (cfg!(test)
+                && qualification.test_only
                 && qualification
+                    .build_closure
                     .process_world
                     .validate_executable_identity()
                     .is_ok())
@@ -389,12 +444,13 @@ impl CodexSpecialistServiceV0 {
                 "Codex is detected at most; Host qualification is unavailable in B0.".into(),
             )
         })?;
-        if !qualification.synthetic {
+        if !cfg!(test) || !qualification.test_only {
             return invalid(
                 "Codex real qualification is deferred pending physical execution-boundary proof.",
             );
         }
         let executable_identity_ref = qualification
+            .build_closure
             .process_world
             .validate_executable_identity()?
             .to_owned();
@@ -418,7 +474,11 @@ impl CodexSpecialistServiceV0 {
             run_ref: grant.access.run_control_ref.clone(),
             qualification_generation: qualification.generation,
             executable_identity_ref,
-            invocation: CodexInvocationV0::new(&scratch.root, model, qualification.multi_agent)?,
+            invocation: CodexInvocationV0::new(
+                &scratch.root,
+                model,
+                qualification.feature_profile.multi_agent,
+            )?,
             revoked: revoked.clone(),
         };
         binding.validate(qualification)?;
@@ -468,6 +528,7 @@ impl CodexSpecialistServiceV0 {
         environment.insert("PATH".into(), "/usr/bin:/bin".into());
         let process = spawn_bounded_host_process(HostBoundedProcessSpecV1 {
             executable: qualification
+                .build_closure
                 .process_world
                 .executable
                 .executable_path
@@ -480,6 +541,9 @@ impl CodexSpecialistServiceV0 {
             stderr: Stdio::piped(),
             stdout_limit: MAX_CONTROLLER_STDOUT_BYTES,
             stderr_limit: MAX_CONTROLLER_STDERR_BYTES,
+            wall_timeout: MAX_CONTROLLER_WALL_TIME,
+            tree_requirement: controller_tree_requirement(),
+            sandbox: HostProcessSandboxV1::None,
             cleanup_roots: vec![private_home],
         })?;
         self.sessions.insert(
@@ -632,10 +696,28 @@ impl CodexSpecialistServiceV0 {
         let executable_identity_ref = process_world.validate_executable_identity()?.to_owned();
         self.qualification = Some(CodexQualificationV0 {
             generation,
-            process_world,
-            executable_identity_ref,
-            multi_agent: codex_multi_agent_feature_is_qualified("multi_agent stable true\n"),
-            synthetic: true,
+            build_closure: CodexBuildClosureV1 {
+                process_world,
+                executable_identity_ref,
+            },
+            feature_profile: CodexFeatureProfileV1 {
+                multi_agent: codex_multi_agent_feature_is_qualified("multi_agent stable true\n"),
+            },
+            protocol_profile: CodexProtocolProfileV1 {
+                jsonl_profile: "codex-exec-jsonl-v0",
+                invocation_profile: "codex-exec-ephemeral-strict-v0",
+            },
+            host_containment_profile: CodexHostContainmentProfileV1 {
+                sandbox_profile: "macos-seatbelt-controller-network-denied-deferred-v1",
+                process_tree_profile: "unix-process-group-unproven-v1",
+            },
+            os_pastey_build_identity: CodexOsPasteyBuildIdentityV1 {
+                os: std::env::consts::OS,
+                architecture: std::env::consts::ARCH,
+                pastey_version: env!("CARGO_PKG_VERSION"),
+            },
+            physical_acceptance: CodexPhysicalAcceptanceV1::NotRun,
+            test_only: true,
         });
         Ok(())
     }
@@ -668,7 +750,7 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, process::Stdio};
+    use std::{collections::BTreeMap, fs, process::Stdio, time::Duration};
 
     use super::*;
     use crate::managed_resources::ExecutableBindingSpecV1;
@@ -730,6 +812,20 @@ mod tests {
         service
             .install_synthetic_qualification(world.clone(), 7)
             .unwrap();
+        let qualification = service.qualification.as_ref().unwrap();
+        assert_eq!(
+            qualification.physical_acceptance,
+            CodexPhysicalAcceptanceV1::NotRun
+        );
+        assert_eq!(
+            qualification.protocol_profile.jsonl_profile,
+            "codex-exec-jsonl-v0"
+        );
+        assert_eq!(
+            qualification.host_containment_profile.process_tree_profile,
+            "unix-process-group-unproven-v1"
+        );
+        assert!(qualification.test_only);
         let binding = CodexAttemptBindingV0 {
             run_ref: ManagedRunRefV1::from_stored("run".into()).unwrap(),
             qualification_generation: 7,
@@ -820,6 +916,9 @@ mod tests {
             stderr: Stdio::piped(),
             stdout_limit: 1024,
             stderr_limit: 1024,
+            wall_timeout: Duration::from_secs(2),
+            tree_requirement: HostProcessTreeRequirementV1::AllowProcessGroupForTest,
+            sandbox: HostProcessSandboxV1::None,
             cleanup_roots: vec![],
         })
         .unwrap();
