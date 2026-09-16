@@ -48,6 +48,8 @@ const MAX_PI_STDOUT_BYTES: usize = MAX_PI_JSONL_LINE_BYTES * MAX_PI_JSONL_EVENTS
 const MAX_PI_STDERR_BYTES: usize = 64 * 1024;
 const MAX_PI_SUPPORT_FILES_PER_KIND: usize = 8;
 const MAX_PI_SUPPORT_BYTES: u64 = 256 * 1024;
+const MAX_PI_INPUT_CONTEXT_BYTES: u64 = 32 * 1024;
+const PI_APPEND_SYSTEM_PROMPT_FLAG: &str = "--append-system-prompt";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PiDetectionV0 {
@@ -68,6 +70,10 @@ struct PiQualificationV0 {
     generation: u64,
     process_world: ManagedProcessWorldSpecV1,
     executable_identity_ref: String,
+    /// Whether this exact Pi CLI has qualified its explicit
+    /// `--append-system-prompt` contract. This is a feature fact, not support
+    /// content and not an authority grant.
+    append_system_prompt: bool,
     synthetic: bool,
 }
 
@@ -78,6 +84,7 @@ struct PiQualificationV0 {
 pub(crate) struct PiHostSupportContentV0 {
     skills: Vec<Vec<u8>>,
     prompt_templates: Vec<Vec<u8>>,
+    input_context: Option<Vec<u8>>,
 }
 
 impl PiHostSupportContentV0 {
@@ -86,11 +93,28 @@ impl PiHostSupportContentV0 {
         Self {
             skills,
             prompt_templates,
+            input_context: None,
         }
     }
 
-    fn materialize(&self) -> AppResult<PiBoundSupportContentV0> {
-        if self.skills.is_empty() && self.prompt_templates.is_empty() {
+    #[cfg(test)]
+    pub(crate) fn for_test_with_input_context(
+        skills: Vec<Vec<u8>>,
+        prompt_templates: Vec<Vec<u8>>,
+        input_context: Vec<u8>,
+    ) -> Self {
+        Self {
+            skills,
+            prompt_templates,
+            input_context: Some(input_context),
+        }
+    }
+
+    fn materialize(&self, append_system_prompt: bool) -> AppResult<PiBoundSupportContentV0> {
+        if self.skills.is_empty()
+            && self.prompt_templates.is_empty()
+            && self.input_context.is_none()
+        {
             return Ok(PiBoundSupportContentV0::default());
         }
         if self.skills.len() > MAX_PI_SUPPORT_FILES_PER_KIND
@@ -98,14 +122,27 @@ impl PiHostSupportContentV0 {
         {
             return invalid("Pi Host-bound support content exceeds its file limit.");
         }
-        let total_bytes = self.skills.iter().chain(&self.prompt_templates).try_fold(
-            0_u64,
-            |total, content| {
+        if let Some(input_context) = &self.input_context {
+            if !append_system_prompt {
+                return invalid("Pi does not qualify explicit input context support.");
+            }
+            if input_context.is_empty()
+                || input_context.len() as u64 > MAX_PI_INPUT_CONTEXT_BYTES
+                || std::str::from_utf8(input_context).is_err()
+            {
+                return invalid("Pi explicit input context is invalid or too large.");
+            }
+        }
+        let total_bytes = self
+            .skills
+            .iter()
+            .chain(&self.prompt_templates)
+            .chain(self.input_context.iter())
+            .try_fold(0_u64, |total, content| {
                 total.checked_add(content.len() as u64).ok_or_else(|| {
                     AppError::InvalidInput("Pi support content is too large.".into())
                 })
-            },
-        )?;
+            })?;
         if total_bytes > MAX_PI_SUPPORT_BYTES {
             return invalid("Pi Host-bound support content exceeds its byte limit.");
         }
@@ -140,10 +177,24 @@ impl PiHostSupportContentV0 {
                     )
                 })
                 .collect::<AppResult<Vec<_>>>()?;
+            let input_context = self
+                .input_context
+                .as_deref()
+                .map(|content| {
+                    materialize_support_file(
+                        &root,
+                        "input-context",
+                        0,
+                        "append-system-prompt.txt",
+                        content,
+                    )
+                })
+                .transpose()?;
             Ok(PiBoundSupportContentV0 {
                 root: Some(Arc::new(PiPrivateSupportRootV0 { path: root.clone() })),
                 skills,
                 prompt_templates,
+                input_context,
             })
         })();
         if result.is_err() {
@@ -151,6 +202,17 @@ impl PiHostSupportContentV0 {
         }
         result
     }
+}
+
+/// A Host qualification accepts this capability only when the exact Pi help
+/// surface presents the documented explicit text argument. Ambient context
+/// discovery is never an alternative capability path.
+fn pi_append_system_prompt_is_qualified(cli_help: &str) -> bool {
+    cli_help.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        matches!(fields.next(), Some(PI_APPEND_SYSTEM_PROMPT_FLAG))
+            && matches!(fields.next(), Some("<text>"))
+    })
 }
 
 #[derive(Debug)]
@@ -177,6 +239,7 @@ struct PiBoundSupportContentV0 {
     root: Option<Arc<PiPrivateSupportRootV0>>,
     skills: Vec<PiBoundSupportFileV0>,
     prompt_templates: Vec<PiBoundSupportFileV0>,
+    input_context: Option<PiBoundSupportFileV0>,
 }
 
 impl PiBoundSupportContentV0 {
@@ -184,7 +247,12 @@ impl PiBoundSupportContentV0 {
         let Some(root) = &self.root else {
             return Ok(());
         };
-        for support_file in self.skills.iter().chain(&self.prompt_templates) {
+        for support_file in self
+            .skills
+            .iter()
+            .chain(&self.prompt_templates)
+            .chain(self.input_context.iter())
+        {
             safe_file_identity::read_source_if_identity_matches(
                 &support_file.path,
                 &root.path,
@@ -193,6 +261,21 @@ impl PiBoundSupportContentV0 {
             )?;
         }
         Ok(())
+    }
+
+    fn input_context_text(&self) -> AppResult<Option<String>> {
+        let (Some(root), Some(input_context)) = (&self.root, &self.input_context) else {
+            return Ok(None);
+        };
+        let content = safe_file_identity::read_source_if_identity_matches(
+            &input_context.path,
+            &root.path,
+            &input_context.identity,
+            MAX_PI_INPUT_CONTEXT_BYTES,
+        )?;
+        String::from_utf8(content)
+            .map(Some)
+            .map_err(|_| AppError::InvalidInput("Pi explicit input context is not UTF-8.".into()))
     }
 }
 
@@ -233,7 +316,7 @@ struct PiInvocationV0 {
 }
 
 impl PiInvocationV0 {
-    fn new(scratch_root: PathBuf, support_content: &PiBoundSupportContentV0) -> Self {
+    fn new(scratch_root: PathBuf, support_content: &PiBoundSupportContentV0) -> AppResult<Self> {
         let mut argv = [
             // Pi JSON mode has a different protocol from `codex exec --json`.
             // `--no-session` prevents its otherwise persistent JSONL session.
@@ -261,8 +344,11 @@ impl PiInvocationV0 {
                 prompt_template.path.to_string_lossy().into_owned(),
             ]);
         }
+        if let Some(input_context) = support_content.input_context_text()? {
+            argv.extend([PI_APPEND_SYSTEM_PROMPT_FLAG.into(), input_context]);
+        }
         argv.push("--".into());
-        Self { argv, scratch_root }
+        Ok(Self { argv, scratch_root })
     }
 }
 
@@ -466,13 +552,15 @@ impl PiSpecialistServiceV0 {
             &grant.input_handle,
             &scratch_handle,
         )?;
-        let support_content = self.support_content.materialize()?;
+        let support_content = self
+            .support_content
+            .materialize(qualification.append_system_prompt)?;
         let revoked = Arc::new(AtomicBool::new(false));
         let binding = PiAttemptBindingV0 {
             run_ref: grant.access.run_control_ref.clone(),
             qualification_generation: qualification.generation,
             executable_identity_ref,
-            invocation: PiInvocationV0::new(scratch.root.clone(), &support_content),
+            invocation: PiInvocationV0::new(scratch.root.clone(), &support_content)?,
             support_content,
             revoked: revoked.clone(),
         };
@@ -676,6 +764,9 @@ impl PiSpecialistServiceV0 {
             generation,
             process_world,
             executable_identity_ref,
+            append_system_prompt: pi_append_system_prompt_is_qualified(
+                "--append-system-prompt <text>\n",
+            ),
             synthetic: true,
         });
         Ok(())
@@ -724,7 +815,8 @@ mod tests {
         let invocation = PiInvocationV0::new(
             PathBuf::from("/private/scratch"),
             &PiBoundSupportContentV0::default(),
-        );
+        )
+        .unwrap();
         assert!(invocation.argv.iter().any(|argument| argument == "--mode"));
         assert!(invocation.argv.iter().any(|argument| argument == "json"));
         assert!(invocation
@@ -762,9 +854,9 @@ mod tests {
             vec![b"exact skill".to_vec()],
             vec![b"exact template".to_vec()],
         )
-        .materialize()
+        .materialize(true)
         .unwrap();
-        let invocation = PiInvocationV0::new(PathBuf::from("/private/scratch"), &support);
+        let invocation = PiInvocationV0::new(PathBuf::from("/private/scratch"), &support).unwrap();
         let skill = support
             .skills
             .first()
@@ -811,6 +903,34 @@ mod tests {
     }
 
     #[test]
+    fn exact_host_bound_input_context_is_explicit_and_stays_out_of_discovery() {
+        let support = PiHostSupportContentV0::for_test_with_input_context(
+            vec![],
+            vec![],
+            b"Use only this exact approved input context.".to_vec(),
+        );
+        assert!(support.materialize(false).is_err());
+
+        let support = support.materialize(true).unwrap();
+        let invocation = PiInvocationV0::new(PathBuf::from("/private/scratch"), &support).unwrap();
+        assert!(invocation.argv.windows(2).any(|pair| {
+            pair[0] == PI_APPEND_SYSTEM_PROMPT_FLAG
+                && pair[1] == "Use only this exact approved input context."
+        }));
+        assert!(invocation
+            .argv
+            .iter()
+            .any(|argument| argument == "--no-context-files"));
+        assert!(support.validate().is_ok());
+        assert!(pi_append_system_prompt_is_qualified(
+            "--append-system-prompt <text>\n"
+        ));
+        assert!(!pi_append_system_prompt_is_qualified(
+            "--append-system-prompt <file>\n"
+        ));
+    }
+
+    #[test]
     fn host_support_changes_preserve_qualification_and_bound_support_staleness() {
         let directory =
             std::env::temp_dir().join(format!("pastey-pi-support-stale-{}", Uuid::new_v4()));
@@ -825,28 +945,35 @@ mod tests {
         let world = synthetic_world(executable);
         let mut service = PiSpecialistServiceV0::default();
         service.install_synthetic_qualification(world, 7).unwrap();
-        service.set_host_support_content_for_test(PiHostSupportContentV0::for_test(
-            vec![b"exact skill".to_vec()],
-            vec![b"exact template".to_vec()],
-        ));
+        service.set_host_support_content_for_test(
+            PiHostSupportContentV0::for_test_with_input_context(
+                vec![b"exact skill".to_vec()],
+                vec![b"exact template".to_vec()],
+                b"exact approved input context".to_vec(),
+            ),
+        );
         let qualification = service.qualification.as_ref().unwrap();
         let qualification_generation = qualification.generation;
         let executable_identity_ref = qualification.executable_identity_ref.clone();
-        let support_content = service.support_content.materialize().unwrap();
-        let replacement_path = support_content.skills.first().unwrap().path.clone();
+        let support_content = service.support_content.materialize(true).unwrap();
+        let replacement_path = support_content.input_context.as_ref().unwrap().path.clone();
         let binding = PiAttemptBindingV0 {
             run_ref: ManagedRunRefV1::from_stored("pi-support-test-run".into()).unwrap(),
             qualification_generation,
             executable_identity_ref: executable_identity_ref.clone(),
-            invocation: PiInvocationV0::new(PathBuf::from("/private/scratch"), &support_content),
+            invocation: PiInvocationV0::new(PathBuf::from("/private/scratch"), &support_content)
+                .unwrap(),
             support_content,
             revoked: Arc::new(AtomicBool::new(false)),
         };
+        assert!(binding.invocation.argv.windows(2).any(|pair| {
+            pair[0] == PI_APPEND_SYSTEM_PROMPT_FLAG && pair[1] == "exact approved input context"
+        }));
         service.set_host_support_content_for_test(PiHostSupportContentV0::for_test(
             vec![b"replacement host skill".to_vec()],
             vec![b"replacement host template".to_vec()],
         ));
-        let current_support = service.support_content.materialize().unwrap();
+        let current_support = service.support_content.materialize(true).unwrap();
         assert_ne!(
             replacement_path,
             current_support.skills.first().unwrap().path,

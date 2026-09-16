@@ -47,6 +47,7 @@ const MAX_JSONL_LINE_BYTES: usize = 64 * 1024;
 const MAX_JSONL_EVENTS: usize = 1_024;
 const MAX_CONTROLLER_STDOUT_BYTES: usize = MAX_JSONL_LINE_BYTES * MAX_JSONL_EVENTS;
 const MAX_CONTROLLER_STDERR_BYTES: usize = 64 * 1024;
+const CODEX_MULTI_AGENT_FEATURE: &str = "multi_agent";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexDetectionV0 {
@@ -69,6 +70,10 @@ struct CodexQualificationV0 {
     generation: u64,
     process_world: ManagedProcessWorldSpecV1,
     executable_identity_ref: String,
+    /// The exact `codex features list` contract is Host-qualified. This
+    /// enables only Codex's in-attempt multi-agent harness; it does not add a
+    /// Pastey planner, authority, or cross-attempt session.
+    multi_agent: bool,
     /// Production B0 never sets this. Test-only qualification exists solely
     /// to exercise replacement and binding rejection deterministically.
     synthetic: bool,
@@ -108,7 +113,7 @@ struct CodexInvocationV0 {
 }
 
 impl CodexInvocationV0 {
-    fn new(scratch: &PathBuf, model: Option<&str>) -> AppResult<Self> {
+    fn new(scratch: &PathBuf, model: Option<&str>, multi_agent: bool) -> AppResult<Self> {
         if scratch.as_os_str().is_empty() {
             return invalid("Codex scratch root is unavailable.");
         }
@@ -137,8 +142,27 @@ impl CodexInvocationV0 {
             }
             argv.extend(["--model".into(), model.into()]);
         }
+        if multi_agent {
+            // `multi_agent stable true` in `codex features list` is
+            // qualification evidence for this explicit CLI enablement. Any
+            // extra top-level JSONL event remains unknown and fail-closed.
+            argv.extend(["--enable".into(), CODEX_MULTI_AGENT_FEATURE.into()]);
+        }
         Ok(Self { argv })
     }
+}
+
+/// The qualification probe must recognize the current CLI's bounded feature
+/// listing exactly. A missing, disabled, or non-stable feature does not widen
+/// an attempt; Codex continues without its multi-agent harness.
+fn codex_multi_agent_feature_is_qualified(feature_list: &str) -> bool {
+    feature_list.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        matches!(fields.next(), Some(CODEX_MULTI_AGENT_FEATURE))
+            && matches!(fields.next(), Some("stable"))
+            && matches!(fields.next(), Some("true"))
+            && fields.next().is_none()
+    })
 }
 
 /// Deterministic policy-model representation of one Host-owned provider
@@ -394,7 +418,7 @@ impl CodexSpecialistServiceV0 {
             run_ref: grant.access.run_control_ref.clone(),
             qualification_generation: qualification.generation,
             executable_identity_ref,
-            invocation: CodexInvocationV0::new(&scratch.root, model)?,
+            invocation: CodexInvocationV0::new(&scratch.root, model, qualification.multi_agent)?,
             revoked: revoked.clone(),
         };
         binding.validate(qualification)?;
@@ -610,6 +634,7 @@ impl CodexSpecialistServiceV0 {
             generation,
             process_world,
             executable_identity_ref,
+            multi_agent: codex_multi_agent_feature_is_qualified("multi_agent stable true\n"),
             synthetic: true,
         });
         Ok(())
@@ -709,7 +734,7 @@ mod tests {
             run_ref: ManagedRunRefV1::from_stored("run".into()).unwrap(),
             qualification_generation: 7,
             executable_identity_ref: world.validate_executable_identity().unwrap().into(),
-            invocation: CodexInvocationV0::new(&directory, None).unwrap(),
+            invocation: CodexInvocationV0::new(&directory, None, true).unwrap(),
             revoked: Arc::new(AtomicBool::new(false)),
         };
         binding
@@ -744,7 +769,8 @@ mod tests {
     #[test]
     fn invocation_is_ephemeral_noninteractive_and_ambient_config_free() {
         let invocation =
-            CodexInvocationV0::new(&PathBuf::from("/private/scratch"), Some("gpt-5")).unwrap();
+            CodexInvocationV0::new(&PathBuf::from("/private/scratch"), Some("gpt-5"), true)
+                .unwrap();
         for required in [
             "--json",
             "--ephemeral",
@@ -760,6 +786,25 @@ mod tests {
             .argv
             .iter()
             .any(|argument| argument == "--worktree"));
+        assert!(invocation
+            .argv
+            .windows(2)
+            .any(|pair| { pair[0] == "--enable" && pair[1] == CODEX_MULTI_AGENT_FEATURE }));
+        assert!(codex_multi_agent_feature_is_qualified(
+            "multi_agent stable true\n"
+        ));
+        assert!(!codex_multi_agent_feature_is_qualified(
+            "multi_agent experimental true\n"
+        ));
+        assert!(!codex_multi_agent_feature_is_qualified(
+            "multi_agent stable false\n"
+        ));
+        let unqualified =
+            CodexInvocationV0::new(&PathBuf::from("/private/scratch"), None, false).unwrap();
+        assert!(!unqualified
+            .argv
+            .iter()
+            .any(|argument| argument == CODEX_MULTI_AGENT_FEATURE));
     }
 
     #[cfg(unix)]
