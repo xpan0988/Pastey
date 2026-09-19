@@ -300,6 +300,10 @@ impl WorkerProviderConfigServiceV1 {
             params![generation, wrapped, nonce, next_ref.provider_id],
         )?;
         transaction.commit()?;
+        // A generation replacement revokes every already materialized
+        // binding.  In-flight Native and Codex-broker turns therefore cannot
+        // continue with a stale endpoint, model, digest, or credential.
+        self.revoke_active_bindings(&next_ref.provider_id);
         self.metadata(&next_ref)
     }
 
@@ -329,11 +333,7 @@ impl WorkerProviderConfigServiceV1 {
             return invalid("Worker provider configuration changed during deletion.");
         }
         transaction.commit()?;
-        if let Some(tokens) = self.active_bindings.lock().remove(&expected.provider_id) {
-            for token in tokens.into_iter().filter_map(|token| token.upgrade()) {
-                token.store(true, Ordering::Release);
-            }
-        }
+        self.revoke_active_bindings(&expected.provider_id);
         Ok(())
     }
 
@@ -364,6 +364,14 @@ impl WorkerProviderConfigServiceV1 {
             provider_config,
             revoked,
         })
+    }
+
+    fn revoke_active_bindings(&self, provider_id: &str) {
+        if let Some(tokens) = self.active_bindings.lock().remove(provider_id) {
+            for token in tokens.into_iter().filter_map(|token| token.upgrade()) {
+                token.store(true, Ordering::Release);
+            }
+        }
     }
 
     /// Host control-plane choice for managed Worker runs. Resolving first
@@ -888,7 +896,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(binding.provider_config.model, "model-a");
-        assert!(!binding.is_revoked());
+        assert!(binding.is_revoked());
         let provider = OpenAICompatibleStreamingWorkerProviderV1::from_binding(binding).unwrap();
         service.delete(&updated.config_ref).unwrap();
         assert_eq!(

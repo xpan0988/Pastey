@@ -776,6 +776,7 @@ impl HostRuntime {
     pub(crate) fn run_codex_specialist_transform(
         &self,
         request: ManagedStepClaimRequestV1,
+        provider: crate::worker_provider_config::ResolvedWorkerProviderBindingV1,
     ) -> AppResult<ManagedObjectAcquisition> {
         if !request.private_scratch || request.process_world.is_some() {
             return invalid("Codex B3 requires an exact private-scratch Transform claim.");
@@ -792,13 +793,14 @@ impl HostRuntime {
                 &authority,
                 &mut resolver,
                 &mut objects,
-                None,
+                provider.config_ref.clone(),
+                provider.revocation_token(),
             )?
         };
         let controller_result = {
             self.codex_specialists
                 .lock()
-                .start_bound_controller(&binding, &grant.operation_intent)
+                .start_bound_controller(&binding, &provider)
         };
         let controller = match controller_result {
             Ok(controller) => controller,
@@ -807,17 +809,13 @@ impl HostRuntime {
                 return Err(error);
             }
         };
-        let output = match controller.wait() {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = self.cancel_managed_run(&grant.access.run_control_ref);
-                return Err(error);
-            }
-        };
         let controller_result = {
-            self.codex_specialists
-                .lock()
-                .finish_bound_controller(&binding, output)
+            self.codex_specialists.lock().finish_bound_controller(
+                &binding,
+                controller,
+                &grant.operation_intent,
+                &provider.provider_config.model,
+            )
         };
         if let Err(error) = controller_result {
             let _ = self.cancel_managed_run(&grant.access.run_control_ref);
@@ -1558,7 +1556,11 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+    use std::{
+        collections::VecDeque,
+        path::PathBuf,
+        sync::{atomic::AtomicBool, Arc},
+    };
 
     use base64::Engine as _;
 
@@ -1591,10 +1593,19 @@ mod tests {
         worker_provider::{
             ConfiguredWorkerProviderConfigV1, OpenAICompatibleStreamingWorkerProviderV1,
         },
+        worker_provider_config::WorkerProviderConfigRefV1,
     };
 
     const NOW: i64 = 20_000;
     const BRIDGE: &str = "bridge-step8";
+
+    fn synthetic_codex_provider_ref() -> WorkerProviderConfigRefV1 {
+        WorkerProviderConfigRefV1 {
+            provider_id: "test-codex-provider".into(),
+            generation: 1,
+            config_digest: "test-digest".into(),
+        }
+    }
 
     #[derive(Default)]
     struct Sink;
@@ -1968,7 +1979,8 @@ mod tests {
                 &authority,
                 &mut resources,
                 &mut objects,
-                Some("test"),
+                synthetic_codex_provider_ref(),
+                Arc::new(AtomicBool::new(false)),
             )
             .unwrap();
         (result.0, result.1, executable_root)
@@ -2117,7 +2129,8 @@ mod tests {
                 &authority,
                 &mut resources,
                 &mut objects,
-                Some("test"),
+                synthetic_codex_provider_ref(),
+                Arc::new(AtomicBool::new(false)),
             )
             .unwrap();
         assert_eq!(

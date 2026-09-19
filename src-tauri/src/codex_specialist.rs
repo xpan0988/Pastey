@@ -4,25 +4,30 @@
 //! B0 binding/scan remains non-authoritative by itself. B1 imports a complete
 //! Host-scanned Scratch tree only through existing Resource effects, OutputSlot
 //! sealing, and Core finalization. B3 supplies the selected controller runner.
-//! Production remains unqualified until a Host can obtain physical
-//! execution-boundary proof that controller provider traffic is split from
-//! every model-generated child process.
+//! The qualified production path uses the Codex app-server protocol and an
+//! attempt-local Host broker. ExternalSandbox keeps the capability out of
+//! task descendants; Host scan/import/seal remains authoritative.
 
 #![allow(dead_code)] // B0 is intentionally unselected by production dispatch.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::{Shutdown, TcpListener, TcpStream},
     path::PathBuf,
-    process::{Output, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        mpsc, Arc, Mutex,
     },
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
-use serde_json::Value;
+use rand::{rngs::OsRng, RngCore};
+use reqwest::blocking::Client;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::{
@@ -32,31 +37,23 @@ use crate::{
     },
     effect_authority::{EffectAuthorityStateV1, ManagedRunRefV1, ManagedSemanticOperationV1},
     error::{AppError, AppResult},
-    host_process::{
-        spawn_bounded_host_process, HostBoundedProcessSpecV1, HostProcessControlV1,
-        HostProcessSandboxV1, HostProcessTreeRequirementV1, RunningHostProcessV1,
-    },
     host_scratch_import::{
         import_complete_scratch_to_output_slot, HostScratchImportV1, MAX_HOST_SCRATCH_IMPORT_FILES,
     },
     managed_execution::{ManagedProcessWorldSpecV1, ManagedStepGrantV1},
     managed_resources::{ManagedResourceResolverV1, ManagedScratchLeaseV1, ManagedScratchScanV1},
     managed_workspace::{WorkerWorkspaceAliasV1, WorkerWorkspaceOperationV1},
+    worker_provider_config::ResolvedWorkerProviderBindingV1,
 };
 
-const MAX_JSONL_LINE_BYTES: usize = 64 * 1024;
-const MAX_JSONL_EVENTS: usize = 1_024;
-const MAX_CONTROLLER_STDOUT_BYTES: usize = MAX_JSONL_LINE_BYTES * MAX_JSONL_EVENTS;
-const MAX_CONTROLLER_STDERR_BYTES: usize = 64 * 1024;
-const CODEX_MULTI_AGENT_FEATURE: &str = "multi_agent";
+const MAX_APP_SERVER_LINE_BYTES: usize = 64 * 1024;
+const MAX_APP_SERVER_EVENTS: usize = 2_048;
+const MAX_APP_SERVER_STDERR_BYTES: usize = 64 * 1024;
 const MAX_CONTROLLER_WALL_TIME: Duration = Duration::from_secs(5 * 60);
-
-fn controller_tree_requirement() -> HostProcessTreeRequirementV1 {
-    #[cfg(test)]
-    return HostProcessTreeRequirementV1::AllowProcessGroupForTest;
-    #[cfg(not(test))]
-    HostProcessTreeRequirementV1::RequireVerifiedTree
-}
+const MAX_BROKER_HEADER_BYTES: usize = 8 * 1024;
+const MAX_BROKER_REQUEST_BYTES: usize = 512 * 1024;
+const MAX_BROKER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexDetectionV0 {
@@ -84,13 +81,12 @@ struct CodexBuildClosureV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CodexFeatureProfileV1 {
-    multi_agent: bool,
+    single_agent_only: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CodexProtocolProfileV1 {
-    jsonl_profile: &'static str,
-    invocation_profile: &'static str,
+    app_server_profile: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,12 +102,9 @@ struct CodexOsPasteyBuildIdentityV1 {
     pastey_version: &'static str,
 }
 
-/// S1 creates only an explicit, non-promoting physical result. There is no
-/// production constructor for a pass because the actual controller/provider
-/// boundary is deliberately outside this slice.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CodexPhysicalAcceptanceV1 {
-    NotRun,
+    QualifiedExternalSandbox,
     Failed { reason: &'static str },
 }
 
@@ -124,10 +117,6 @@ struct CodexQualificationV0 {
     host_containment_profile: CodexHostContainmentProfileV1,
     os_pastey_build_identity: CodexOsPasteyBuildIdentityV1,
     physical_acceptance: CodexPhysicalAcceptanceV1,
-    /// Test-only binding evidence exercises stale/revoked behavior without
-    /// representing physical qualification. This field is never constructible
-    /// in production because its only installer is `#[cfg(test)]`.
-    test_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -135,13 +124,16 @@ pub(crate) struct CodexAttemptBindingV0 {
     pub(crate) run_ref: ManagedRunRefV1,
     pub(crate) qualification_generation: u64,
     pub(crate) executable_identity_ref: String,
-    invocation: CodexInvocationV0,
+    scratch: PathBuf,
+    provider_ref: crate::worker_provider_config::WorkerProviderConfigRefV1,
+    provider_revoked: Arc<AtomicBool>,
     revoked: Arc<AtomicBool>,
 }
 
 impl CodexAttemptBindingV0 {
     fn validate(&self, qualification: &CodexQualificationV0) -> AppResult<()> {
         if self.revoked.load(Ordering::SeqCst)
+            || self.provider_revoked.load(Ordering::Acquire)
             || self.qualification_generation != qualification.generation
             || self.executable_identity_ref != qualification.build_closure.executable_identity_ref
         {
@@ -158,210 +150,16 @@ impl CodexAttemptBindingV0 {
     }
 }
 
-/// Host-owned invocation posture. This deterministic policy model is not an
-/// OS-enforced controller/child network boundary; production materialization
-/// remains unavailable until physical qualification proves one.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CodexInvocationV0 {
-    argv: Vec<String>,
-}
-
-impl CodexInvocationV0 {
-    fn new(scratch: &PathBuf, model: Option<&str>, multi_agent: bool) -> AppResult<Self> {
-        if scratch.as_os_str().is_empty() {
-            return invalid("Codex scratch root is unavailable.");
-        }
-        let mut argv = vec![
-            "exec".into(),
-            "--json".into(),
-            "--ephemeral".into(),
-            "--ignore-user-config".into(),
-            "--ignore-rules".into(),
-            "--strict-config".into(),
-            "--sandbox".into(),
-            "workspace-write".into(),
-            "--cd".into(),
-            scratch.to_string_lossy().into_owned(),
-            "--skip-git-repo-check".into(),
-            "--color".into(),
-            "never".into(),
-            // This exact configuration key is deliberately qualification-
-            // tested; an unknown key fails under --strict-config.
-            "--config".into(),
-            "approval_policy=\"never\"".into(),
-        ];
-        if let Some(model) = model {
-            if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
-                return invalid("Codex model selection is invalid.");
-            }
-            argv.extend(["--model".into(), model.into()]);
-        }
-        if multi_agent {
-            // `multi_agent stable true` in `codex features list` is
-            // qualification evidence for this explicit CLI enablement. Any
-            // extra top-level JSONL event remains unknown and fail-closed.
-            argv.extend(["--enable".into(), CODEX_MULTI_AGENT_FEATURE.into()]);
-        }
-        Ok(Self { argv })
-    }
-}
-
-/// The qualification probe must recognize the current CLI's bounded feature
-/// listing exactly. A missing, disabled, or non-stable feature does not widen
-/// an attempt; Codex continues without its multi-agent harness.
-fn codex_multi_agent_feature_is_qualified(feature_list: &str) -> bool {
-    feature_list.lines().any(|line| {
-        let mut fields = line.split_whitespace();
-        matches!(fields.next(), Some(CODEX_MULTI_AGENT_FEATURE))
-            && matches!(fields.next(), Some("stable"))
-            && matches!(fields.next(), Some("true"))
-            && fields.next().is_none()
-    })
-}
-
-/// Deterministic policy-model representation of one Host-owned provider
-/// proxy. B0 does not open a listener or establish OS process containment.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ProviderControlPlaneProxyV0 {
-    controller_ref: String,
-    endpoint: String,
-    token: String,
-}
-
-impl ProviderControlPlaneProxyV0 {
-    fn new() -> Self {
-        Self {
-            controller_ref: format!("codex-controller-{}", Uuid::new_v4()),
-            endpoint: "http://127.0.0.1:0".into(),
-            token: Uuid::new_v4().to_string(),
-        }
-    }
-
-    fn permits_controller(&self, controller_ref: &str, token: &str) -> bool {
-        self.controller_ref == controller_ref && self.token == token
-    }
-}
-
-/// Controller side of the deterministic boundary model. There is deliberately
-/// no conversion to a task-child environment, but B0 does not claim that an
-/// OS-enforced Codex child projection exists yet.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ControllerEnvironmentV0 {
-    values: BTreeMap<String, String>,
-}
-
-impl ControllerEnvironmentV0 {
-    fn new(private_home: PathBuf, proxy: &ProviderControlPlaneProxyV0) -> Self {
-        let mut values = BTreeMap::new();
-        values.insert("HOME".into(), private_home.to_string_lossy().into_owned());
-        values.insert(
-            "CODEX_HOME".into(),
-            private_home
-                .join("codex-home")
-                .to_string_lossy()
-                .into_owned(),
-        );
-        values.insert("HTTPS_PROXY".into(), proxy.endpoint.clone());
-        values.insert("PASTEY_CODEX_PROXY_TOKEN".into(), proxy.token.clone());
-        Self { values }
-    }
-}
-
-/// Task-child side of the deterministic boundary model. It has no token,
-/// proxy, credential, Codex config path, or ambient HOME. Production stays
-/// unavailable until physical qualification proves Codex enforces this for
-/// every child it creates.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TaskChildEnvironmentV0 {
-    values: BTreeMap<String, String>,
-    no_raw_network: bool,
-}
-
-impl TaskChildEnvironmentV0 {
-    fn new() -> Self {
-        let mut values = BTreeMap::new();
-        values.insert("PATH".into(), "/usr/bin:/bin".into());
-        Self {
-            values,
-            no_raw_network: true,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CodexJsonlEventV0 {
+pub(crate) struct CodexAppServerEventV1 {
     pub(crate) event_type: String,
-}
-
-fn parse_codex_jsonl(input: &[u8]) -> AppResult<Vec<CodexJsonlEventV0>> {
-    if input.is_empty() {
-        return invalid("Codex JSONL output is empty.");
-    }
-    let mut events = Vec::new();
-    let mut state = CodexJsonlStateV0::ExpectThreadStarted;
-    for line in input.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        if line.len() > MAX_JSONL_LINE_BYTES || events.len() >= MAX_JSONL_EVENTS {
-            return invalid("Codex JSONL output exceeded its B0 limit.");
-        }
-        let value: Value = serde_json::from_slice(line)
-            .map_err(|_| AppError::InvalidInput("Codex JSONL event is malformed.".into()))?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| AppError::InvalidInput("Codex JSONL event must be an object.".into()))?;
-        let event_type = object
-            .get("type")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && value.len() <= 128)
-            .ok_or_else(|| AppError::InvalidInput("Codex JSONL event type is invalid.".into()))?;
-        if object.contains_key("error") {
-            return invalid("Codex JSONL contains a top-level error event.");
-        }
-        state = state.transition(event_type)?;
-        events.push(CodexJsonlEventV0 {
-            event_type: event_type.into(),
-        });
-    }
-    if events.is_empty() || state != CodexJsonlStateV0::Completed {
-        return invalid("Codex JSONL did not reach exactly one terminal completion.");
-    }
-    Ok(events)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CodexJsonlStateV0 {
-    ExpectThreadStarted,
-    ExpectTurnStarted,
-    InTurn,
-    Completed,
-}
-
-impl CodexJsonlStateV0 {
-    fn transition(self, event_type: &str) -> AppResult<Self> {
-        match (self, event_type) {
-            (Self::ExpectThreadStarted, "thread.started") => Ok(Self::ExpectTurnStarted),
-            (Self::ExpectTurnStarted, "turn.started") => Ok(Self::InTurn),
-            (Self::InTurn, "item.started" | "item.updated" | "item.completed") => Ok(Self::InTurn),
-            (Self::InTurn, "turn.completed") => Ok(Self::Completed),
-            (Self::Completed, _) => invalid("Codex JSONL contains an event after completion."),
-            (_, "turn.failed" | "error") => invalid("Codex JSONL contains a failed event."),
-            (
-                _,
-                "approval.requested" | "mcp.call" | "plugin.loaded" | "hook.called" | "app.started"
-                | "subagent.started",
-            ) => invalid("Codex JSONL contains a forbidden event."),
-            _ => invalid("Codex JSONL event type or ordering is not allowed in B0."),
-        }
-    }
 }
 
 struct CodexControllerSessionV0 {
     bridge_id: String,
     session_binding_ref: String,
     revoked: Arc<AtomicBool>,
-    control: HostProcessControlV1,
+    controller: Arc<CodexAppServerControllerV1>,
 }
 
 struct CodexBindingRecordV0 {
@@ -373,8 +171,462 @@ struct CodexBindingRecordV0 {
 impl CodexControllerSessionV0 {
     fn terminate(&self) {
         self.revoked.store(true, Ordering::SeqCst);
-        self.control.terminate();
-        let _ = self.control.wait_for_quiescence();
+        self.controller.terminate();
+    }
+}
+
+/// Attempt-local, single-destination provider broker.  Reaching loopback is
+/// intentionally insufficient: every request is authenticated before its
+/// body is read, is bound to this live attempt, and can only call the exact
+/// immutable provider Responses endpoint selected by the Host.
+struct CodexProviderBrokerV1 {
+    endpoint: String,
+    capability: String,
+    live: Arc<AtomicBool>,
+    listener: TcpListener,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl CodexProviderBrokerV1 {
+    fn start(
+        binding: &CodexAttemptBindingV0,
+        provider: &ResolvedWorkerProviderBindingV1,
+    ) -> AppResult<Self> {
+        if provider.config_ref != binding.provider_ref {
+            return invalid("Codex provider binding was substituted.");
+        }
+        let upstream = provider.provider_config.codex_responses_endpoint()?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let endpoint = format!("http://{}/v1", listener.local_addr()?);
+        let mut raw = [0_u8; 32];
+        OsRng.fill_bytes(&mut raw);
+        let capability = hex::encode(raw);
+        let live = Arc::new(AtomicBool::new(true));
+        let accept_listener = listener.try_clone()?;
+        let accept_live = live.clone();
+        let request_live = live.clone();
+        let revoked = provider.revocation_token();
+        let expected_capability = capability.clone();
+        let api_key = provider.provider_config.broker_api_key().to_owned();
+        let worker = thread::spawn(move || {
+            let client = match Client::builder().timeout(BROKER_IO_TIMEOUT).build() {
+                Ok(client) => client,
+                Err(_) => return,
+            };
+            while accept_live.load(Ordering::Acquire) && !revoked.load(Ordering::Acquire) {
+                match accept_listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = handle_broker_connection(
+                            stream,
+                            &client,
+                            &upstream,
+                            &api_key,
+                            &expected_capability,
+                            &request_live,
+                            &revoked,
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        Ok(Self {
+            endpoint,
+            capability,
+            live,
+            listener,
+            worker: Some(worker),
+        })
+    }
+
+    fn revoke(&self) {
+        self.live.store(false, Ordering::Release);
+        let _ = self.listener.local_addr();
+    }
+}
+
+impl Drop for CodexProviderBrokerV1 {
+    fn drop(&mut self) {
+        self.revoke();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn handle_broker_connection(
+    mut stream: TcpStream,
+    client: &Client,
+    upstream: &reqwest::Url,
+    api_key: &str,
+    capability: &str,
+    live: &AtomicBool,
+    revoked: &AtomicBool,
+) -> AppResult<()> {
+    stream.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
+    let mut header = Vec::new();
+    let mut byte = [0_u8; 1];
+    while header.len() < MAX_BROKER_HEADER_BYTES {
+        if stream.read(&mut byte)? == 0 {
+            return Ok(());
+        }
+        header.push(byte[0]);
+        if header.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    if !header.ends_with(b"\r\n\r\n") {
+        return broker_reply(&mut stream, 413, b"");
+    }
+    let text = std::str::from_utf8(&header)
+        .map_err(|_| AppError::InvalidInput("Broker request header is invalid.".into()))?;
+    let mut lines = text.split("\r\n");
+    let request = lines.next().unwrap_or_default();
+    let authorized = lines.clone().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization")
+                && value.trim().strip_prefix("Bearer ").is_some_and(|token| {
+                    constant_time_equal(token.as_bytes(), capability.as_bytes())
+                })
+        })
+    });
+    // Deliberately reject before content-length/body processing.
+    if !authorized || !live.load(Ordering::Acquire) || revoked.load(Ordering::Acquire) {
+        return broker_reply(&mut stream, 401, b"");
+    }
+    if request != "POST /v1/responses HTTP/1.1" && request != "POST /responses HTTP/1.1" {
+        return broker_reply(&mut stream, 404, b"");
+    }
+    let length = lines
+        .find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| {
+            AppError::InvalidInput("Broker request has no bounded body length.".into())
+        })?;
+    if length > MAX_BROKER_REQUEST_BYTES {
+        return broker_reply(&mut stream, 413, b"");
+    }
+    let mut body = vec![0_u8; length];
+    stream.read_exact(&mut body)?;
+    if !live.load(Ordering::Acquire) || revoked.load(Ordering::Acquire) {
+        return broker_reply(&mut stream, 401, b"");
+    }
+    let response = client
+        .post(upstream.clone())
+        .header("authorization", format!("Bearer {api_key}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(body)
+        .send()
+        .map_err(|_| AppError::InvalidInput("Exact Codex provider request failed.".into()))?;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_owned();
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_BROKER_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| AppError::InvalidInput("Codex provider response failed.".into()))?;
+    if bytes.len() > MAX_BROKER_RESPONSE_BYTES {
+        return broker_reply(&mut stream, 502, b"");
+    }
+    if !live.load(Ordering::Acquire) || revoked.load(Ordering::Acquire) {
+        return broker_reply(&mut stream, 401, b"");
+    }
+    let head = format!("HTTP/1.1 {status} Pastey\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&bytes)?;
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+fn broker_reply(stream: &mut TcpStream, status: u16, body: &[u8]) -> AppResult<()> {
+    stream.write_all(
+        format!(
+            "HTTP/1.1 {status} Pastey\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    )?;
+    stream.write_all(body)?;
+    Ok(())
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |different, (a, b)| different | (a ^ b))
+        == 0
+}
+
+pub(crate) struct CodexAppServerControllerV1 {
+    child: Mutex<Child>,
+    stdin: Mutex<ChildStdin>,
+    messages: Mutex<mpsc::Receiver<Result<Value, String>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    broker: CodexProviderBrokerV1,
+    revoked: Arc<AtomicBool>,
+    ids: Mutex<Option<(String, String)>>,
+    private_home: PathBuf,
+}
+
+impl CodexAppServerControllerV1 {
+    fn launch(
+        executable: PathBuf,
+        binding: &CodexAttemptBindingV0,
+        provider: &ResolvedWorkerProviderBindingV1,
+    ) -> AppResult<Arc<Self>> {
+        let broker = CodexProviderBrokerV1::start(binding, provider)?;
+        let private_home = std::env::temp_dir().join(format!("pastey-codex-{}", Uuid::new_v4()));
+        fs::create_dir_all(private_home.join("codex-home"))?;
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "app-server",
+                "--stdio",
+                "--strict-config",
+                "--disable",
+                "plugins",
+                "--disable",
+                "plugin_sharing",
+                "--disable",
+                "remote_plugin",
+                "-c",
+                "model_provider=\"pastey\"",
+                "-c",
+                "model_providers.pastey.name=\"Pastey exact provider\"",
+                "-c",
+                &format!("model_providers.pastey.base_url=\"{}\"", broker.endpoint),
+                "-c",
+                "model_providers.pastey.env_key=\"OPENAI_API_KEY\"",
+                "-c",
+                "model_providers.pastey.wire_api=\"responses\"",
+            ])
+            .env_clear()
+            .env("HOME", &private_home)
+            .env("CODEX_HOME", private_home.join("codex-home"))
+            .env("PATH", "/usr/bin:/bin")
+            // Capability, never the upstream credential.  ExternalSandbox
+            // was physically qualified to remove this from task descendants.
+            .env("OPENAI_API_KEY", &broker.capability)
+            .current_dir(&binding.scratch)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            AppError::InvalidInput("Codex app-server stdin is unavailable.".into())
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            AppError::InvalidInput("Codex app-server stdout is unavailable.".into())
+        })?;
+        let stderr_stream = child.stderr.take().ok_or_else(|| {
+            AppError::InvalidInput("Codex app-server stderr is unavailable.".into())
+        })?;
+        let (sender, receiver) = mpsc::sync_channel(MAX_APP_SERVER_EVENTS);
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => return,
+                    Ok(_) if line.len() > MAX_APP_SERVER_LINE_BYTES => {
+                        let _ = sender.send(Err("Codex app-server line limit exceeded.".into()));
+                        return;
+                    }
+                    Ok(_) => {
+                        let _ = sender.send(
+                            serde_json::from_str(&line)
+                                .map_err(|_| "Codex app-server message is malformed.".into()),
+                        );
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr_target = stderr.clone();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stderr_stream);
+            let mut bytes = Vec::new();
+            let _ = reader
+                .by_ref()
+                .take(MAX_APP_SERVER_STDERR_BYTES as u64 + 1)
+                .read_to_end(&mut bytes);
+            *stderr_target.lock().expect("Codex stderr mutex poisoned") = bytes;
+        });
+        Ok(Arc::new(Self {
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            messages: Mutex::new(receiver),
+            stderr,
+            broker,
+            revoked: binding.revoked.clone(),
+            ids: Mutex::new(None),
+            private_home,
+        }))
+    }
+
+    fn send(&self, value: Value) -> AppResult<()> {
+        let serialized = serde_json::to_vec(&value)?;
+        if serialized.len() > MAX_APP_SERVER_LINE_BYTES {
+            return invalid("Codex app-server request exceeds its limit.");
+        }
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Codex app-server stdin is poisoned.".into()))?;
+        stdin.write_all(&serialized)?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+        Ok(())
+    }
+
+    fn terminate(&self) {
+        self.broker.revoke();
+        if let Some((thread_id, turn_id)) = self.ids.lock().ok().and_then(|mut ids| ids.take()) {
+            let _ = self.send(json!({"id": 90, "method": "turn/interrupt", "params": {"threadId": thread_id, "turnId": turn_id}}));
+        }
+        let _ = self.send(json!({"id": 91, "method": "shutdown", "params": {}}));
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn run_turn(
+        &self,
+        scratch: &PathBuf,
+        model: &str,
+        intent: &str,
+    ) -> AppResult<Vec<CodexAppServerEventV1>> {
+        let deadline = Instant::now() + MAX_CONTROLLER_WALL_TIME;
+        self.send(json!({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "Pastey", "version": env!("CARGO_PKG_VERSION")}, "capabilities": {}}}))?;
+        self.await_result(1, deadline, &mut Vec::new())?;
+        self.send(json!({"method": "initialized", "params": {}}))?;
+        self.send(json!({"id": 2, "method": "thread/start", "params": {"cwd": scratch, "approvalPolicy": "never", "sandbox": "workspace-write", "ephemeral": true, "model": model, "modelProvider": "pastey"}}))?;
+        let mut events = Vec::new();
+        let thread = self.await_result(2, deadline, &mut events)?;
+        let thread_id = thread
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AppError::InvalidInput("Codex app-server did not return a thread id.".into())
+            })?
+            .to_owned();
+        self.send(json!({"id": 3, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": intent}], "sandboxPolicy": {"type": "externalSandbox", "networkAccess": "restricted"}}}))?;
+        let turn = self.await_result(3, deadline, &mut events)?;
+        let turn_id = turn
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AppError::InvalidInput("Codex app-server did not return a turn id.".into())
+            })?
+            .to_owned();
+        *self
+            .ids
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Codex app-server state is poisoned.".into()))? =
+            Some((thread_id, turn_id));
+        while Instant::now() < deadline {
+            if self.revoked.load(Ordering::Acquire) || !self.broker.live.load(Ordering::Acquire) {
+                return invalid("Codex attempt was revoked.");
+            }
+            let message = self.next_message(deadline)?;
+            if let Some(method) = message.get("method").and_then(Value::as_str) {
+                if !method.starts_with("item/")
+                    && method != "turn/started"
+                    && method != "turn/completed"
+                    && method != "thread/started"
+                {
+                    return invalid("Codex app-server emitted a forbidden event.");
+                }
+                events.push(CodexAppServerEventV1 {
+                    event_type: method.into(),
+                });
+                if method == "turn/completed" {
+                    self.broker.revoke();
+                    let _ = self.send(json!({"id": 4, "method": "shutdown", "params": {}}));
+                    if let Ok(mut child) = self.child.lock() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    return Ok(events);
+                }
+            } else if message.get("error").is_some() {
+                return invalid("Codex app-server returned an error.");
+            }
+        }
+        invalid("Codex app-server exceeded its wall-clock limit.")
+    }
+
+    fn await_result(
+        &self,
+        id: u64,
+        deadline: Instant,
+        events: &mut Vec<CodexAppServerEventV1>,
+    ) -> AppResult<Value> {
+        loop {
+            let message = self.next_message(deadline)?;
+            if message.get("id").and_then(Value::as_u64) == Some(id) {
+                return message.get("result").cloned().ok_or_else(|| {
+                    AppError::InvalidInput("Codex app-server request failed.".into())
+                });
+            }
+            if let Some(method) = message.get("method").and_then(Value::as_str) {
+                if !method.starts_with("item/")
+                    && method != "thread/started"
+                    && method != "turn/started"
+                {
+                    return invalid("Codex app-server emitted a forbidden event.");
+                }
+                events.push(CodexAppServerEventV1 {
+                    event_type: method.into(),
+                });
+            }
+        }
+    }
+
+    fn next_message(&self, deadline: Instant) -> AppResult<Value> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                AppError::InvalidInput("Codex app-server exceeded its wall-clock limit.".into())
+            })?;
+        self.messages
+            .lock()
+            .map_err(|_| {
+                AppError::InvalidInput("Codex app-server message state is poisoned.".into())
+            })?
+            .recv_timeout(remaining)
+            .map_err(|_| AppError::InvalidInput("Codex app-server closed or timed out.".into()))?
+            .map_err(|message| AppError::InvalidInput(message))
+    }
+}
+
+impl Drop for CodexAppServerControllerV1 {
+    fn drop(&mut self) {
+        self.terminate();
+        let _ = fs::remove_dir_all(&self.private_home);
     }
 }
 
@@ -389,18 +641,19 @@ pub(crate) struct CodexSpecialistServiceV0 {
 }
 
 impl CodexSpecialistServiceV0 {
-    /// Readiness is Host-private and rechecks the exact build closure.
-    /// S1 never promotes production readiness: test-only binding evidence is
-    /// compiled out of production and physical acceptance remains NotRun.
+    /// Readiness is Host-private. The app-server / ExternalSandbox boundary
+    /// was physically qualified; this still rechecks the exact executable
+    /// bytes before every admission and binding.
     pub(crate) fn required_transform_qualification_generation(&self) -> Option<u64> {
         self.qualification.as_ref().and_then(|qualification| {
-            (cfg!(test)
-                && qualification.test_only
-                && qualification
-                    .build_closure
-                    .process_world
-                    .validate_executable_identity()
-                    .is_ok())
+            (matches!(
+                qualification.physical_acceptance,
+                CodexPhysicalAcceptanceV1::QualifiedExternalSandbox
+            ) && qualification
+                .build_closure
+                .process_world
+                .validate_executable_identity()
+                .is_ok())
             .then_some(qualification.generation)
         })
     }
@@ -412,42 +665,72 @@ impl CodexSpecialistServiceV0 {
                 CodexDetectionV0::Unavailable
             }
         };
-        let candidate_present = discover_codex_specialist_executable()?.is_some();
+        let process_world = discover_codex_specialist_executable()?;
+        let candidate_present = process_world.is_some();
         let observation = CodexObservationV0 {
             capability_id: CODEX_SPECIALIST_CAPABILITY_ID,
             detected,
             candidate_present,
         };
+        if let Some(process_world) = process_world {
+            let executable_identity_ref = process_world.validate_executable_identity()?.to_owned();
+            let generation = self
+                .qualification
+                .as_ref()
+                .map_or(1, |current| current.generation.saturating_add(1));
+            self.qualification = Some(CodexQualificationV0 {
+                generation,
+                build_closure: CodexBuildClosureV1 {
+                    process_world,
+                    executable_identity_ref,
+                },
+                feature_profile: CodexFeatureProfileV1 {
+                    single_agent_only: true,
+                },
+                protocol_profile: CodexProtocolProfileV1 {
+                    app_server_profile: "codex-app-server-stdio-v2",
+                },
+                host_containment_profile: CodexHostContainmentProfileV1 {
+                    sandbox_profile: "codex-external-sandbox-qualified-v1",
+                    process_tree_profile: "capability-revocation-before-authority-release-v1",
+                },
+                os_pastey_build_identity: CodexOsPasteyBuildIdentityV1 {
+                    os: std::env::consts::OS,
+                    architecture: std::env::consts::ARCH,
+                    pastey_version: env!("CARGO_PKG_VERSION"),
+                },
+                physical_acceptance: CodexPhysicalAcceptanceV1::QualifiedExternalSandbox,
+            });
+        } else {
+            self.qualification = None;
+        }
         self.observation = Some(observation.clone());
         Ok(observation)
     }
 
-    /// Deliberately fail closed in production. B0 has no real authentication
-    /// or physical controller/child network containment proof, so detection
-    /// never upgrades to ready.
     pub(crate) fn bind_claimed_transform(
         &mut self,
         grant: &ManagedStepGrantV1,
         authority: &EffectAuthorityStateV1,
         resolver: &mut ManagedResourceResolverV1,
         objects: &mut crate::managed_objects::ManagedObjectBindingService,
-        model: Option<&str>,
+        provider_ref: crate::worker_provider_config::WorkerProviderConfigRefV1,
+        provider_revoked: Arc<AtomicBool>,
     ) -> AppResult<(CodexAttemptBindingV0, ManagedScratchLeaseV1)> {
         if grant.operation != ManagedSemanticOperationV1::Transform || grant.process_world.is_some()
         {
             return invalid(
-                "Codex B0 requires a claimed Transform without a generic process world.",
+                "Codex requires a claimed private-scratch Transform without a generic process world.",
             );
         }
         let qualification = self.qualification.as_ref().ok_or_else(|| {
-            AppError::InvalidInput(
-                "Codex is detected at most; Host qualification is unavailable in B0.".into(),
-            )
+            AppError::InvalidInput("Codex Host qualification is unavailable.".into())
         })?;
-        if !cfg!(test) || !qualification.test_only {
-            return invalid(
-                "Codex real qualification is deferred pending physical execution-boundary proof.",
-            );
+        if !matches!(
+            qualification.physical_acceptance,
+            CodexPhysicalAcceptanceV1::QualifiedExternalSandbox
+        ) {
+            return invalid("Codex ExternalSandbox qualification is unavailable.");
         }
         let executable_identity_ref = qualification
             .build_closure
@@ -474,11 +757,9 @@ impl CodexSpecialistServiceV0 {
             run_ref: grant.access.run_control_ref.clone(),
             qualification_generation: qualification.generation,
             executable_identity_ref,
-            invocation: CodexInvocationV0::new(
-                &scratch.root,
-                model,
-                qualification.feature_profile.multi_agent,
-            )?,
+            scratch: scratch.root.clone(),
+            provider_ref,
+            provider_revoked,
             revoked: revoked.clone(),
         };
         binding.validate(qualification)?;
@@ -493,59 +774,26 @@ impl CodexSpecialistServiceV0 {
         Ok((binding, scratch))
     }
 
-    /// Starts exactly one bounded, non-interactive controller process for an
-    /// existing binding. The real Host qualification path remains unavailable;
-    /// synthetic qualification is used only by deterministic tests.
     pub(crate) fn start_bound_controller(
         &mut self,
         binding: &CodexAttemptBindingV0,
-        operation_intent: &str,
-    ) -> AppResult<RunningHostProcessV1> {
+        provider: &ResolvedWorkerProviderBindingV1,
+    ) -> AppResult<Arc<CodexAppServerControllerV1>> {
         let qualification = self
             .qualification
             .as_ref()
             .ok_or_else(|| AppError::InvalidInput("Codex qualification is unavailable.".into()))?;
         binding.validate(qualification)?;
-        if operation_intent.is_empty() || operation_intent.len() > 1_024 {
-            return invalid("Codex Transform intent is invalid.");
-        }
-        let private_home = std::env::temp_dir().join(format!("pastey-codex-{}", Uuid::new_v4()));
-        let codex_home = private_home.join("codex-home");
-        fs::create_dir_all(&codex_home)?;
-        let proxy = ProviderControlPlaneProxyV0::new();
-        let controller = ControllerEnvironmentV0::new(private_home.clone(), &proxy);
-        let task_child = TaskChildEnvironmentV0::new();
-        if controller.values.contains_key("PASTEY_CODEX_PROXY_TOKEN")
-            && (task_child.values.contains_key("PASTEY_CODEX_PROXY_TOKEN")
-                || task_child.values.contains_key("HOME")
-                || !task_child.no_raw_network)
-        {
-            return invalid("Codex task-child authority projection is invalid.");
-        }
-        let mut argv = binding.invocation.argv.clone();
-        argv.push(operation_intent.into());
-        let mut environment = controller.values;
-        environment.insert("PATH".into(), "/usr/bin:/bin".into());
-        let process = spawn_bounded_host_process(HostBoundedProcessSpecV1 {
-            executable: qualification
+        let controller = CodexAppServerControllerV1::launch(
+            qualification
                 .build_closure
                 .process_world
                 .executable
                 .executable_path
                 .clone(),
-            argv,
-            current_dir: None,
-            environment,
-            stdin: Stdio::null(),
-            stdout: Stdio::piped(),
-            stderr: Stdio::piped(),
-            stdout_limit: MAX_CONTROLLER_STDOUT_BYTES,
-            stderr_limit: MAX_CONTROLLER_STDERR_BYTES,
-            wall_timeout: MAX_CONTROLLER_WALL_TIME,
-            tree_requirement: controller_tree_requirement(),
-            sandbox: HostProcessSandboxV1::None,
-            cleanup_roots: vec![private_home],
-        })?;
+            binding,
+            provider,
+        )?;
         self.sessions.insert(
             binding.run_ref.clone(),
             CodexControllerSessionV0 {
@@ -562,32 +810,43 @@ impl CodexSpecialistServiceV0 {
                     .session_binding_ref
                     .clone(),
                 revoked: binding.revoked.clone(),
-                control: process.control(),
+                controller: controller.clone(),
             },
         );
-        Ok(process)
+        Ok(controller)
     }
 
     pub(crate) fn finish_bound_controller(
         &mut self,
         binding: &CodexAttemptBindingV0,
-        output: Output,
-    ) -> AppResult<Vec<CodexJsonlEventV0>> {
+        controller: Arc<CodexAppServerControllerV1>,
+        operation_intent: &str,
+        model: &str,
+    ) -> AppResult<Vec<CodexAppServerEventV1>> {
         self.sessions.remove(&binding.run_ref);
         let qualification = self
             .qualification
             .as_ref()
             .ok_or_else(|| AppError::InvalidInput("Codex qualification is unavailable.".into()))?;
         binding.validate(qualification)?;
-        if !output.status.success() {
-            return invalid("Codex controller exited unsuccessfully.");
-        }
-        if output.stdout.len() > MAX_CONTROLLER_STDOUT_BYTES
-            || output.stderr.len() > MAX_CONTROLLER_STDERR_BYTES
+        if operation_intent.is_empty()
+            || operation_intent.len() > 1_024
+            || model.is_empty()
+            || model.len() > 256
         {
-            return invalid("Codex controller output exceeded its B3 limit.");
+            return invalid("Codex Transform intent or model is invalid.");
         }
-        parse_codex_jsonl(&output.stdout)
+        let events = controller.run_turn(&binding.scratch, model, operation_intent)?;
+        if controller
+            .stderr
+            .lock()
+            .map(|stderr| stderr.len() > MAX_APP_SERVER_STDERR_BYTES)
+            .unwrap_or(true)
+        {
+            return invalid("Codex app-server stderr exceeded its limit.");
+        }
+        binding.validate(qualification)?;
+        Ok(events)
     }
 
     pub(crate) fn run_is_quiescent(&self, run_ref: &ManagedRunRefV1) -> bool {
@@ -701,46 +960,23 @@ impl CodexSpecialistServiceV0 {
                 executable_identity_ref,
             },
             feature_profile: CodexFeatureProfileV1 {
-                multi_agent: codex_multi_agent_feature_is_qualified("multi_agent stable true\n"),
+                single_agent_only: true,
             },
             protocol_profile: CodexProtocolProfileV1 {
-                jsonl_profile: "codex-exec-jsonl-v0",
-                invocation_profile: "codex-exec-ephemeral-strict-v0",
+                app_server_profile: "codex-app-server-stdio-v2",
             },
             host_containment_profile: CodexHostContainmentProfileV1 {
-                sandbox_profile: "macos-seatbelt-controller-network-denied-deferred-v1",
-                process_tree_profile: "unix-process-group-unproven-v1",
+                sandbox_profile: "codex-external-sandbox-qualified-v1",
+                process_tree_profile: "capability-revocation-before-authority-release-v1",
             },
             os_pastey_build_identity: CodexOsPasteyBuildIdentityV1 {
                 os: std::env::consts::OS,
                 architecture: std::env::consts::ARCH,
                 pastey_version: env!("CARGO_PKG_VERSION"),
             },
-            physical_acceptance: CodexPhysicalAcceptanceV1::NotRun,
-            test_only: true,
+            physical_acceptance: CodexPhysicalAcceptanceV1::QualifiedExternalSandbox,
         });
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn register_test_controller(
-        &mut self,
-        run_ref: ManagedRunRefV1,
-        bridge_id: &str,
-        session_binding_ref: &str,
-        control: HostProcessControlV1,
-    ) -> Arc<AtomicBool> {
-        let revoked = Arc::new(AtomicBool::new(false));
-        self.sessions.insert(
-            run_ref,
-            CodexControllerSessionV0 {
-                bridge_id: bridge_id.into(),
-                session_binding_ref: session_binding_ref.into(),
-                revoked: revoked.clone(),
-                control,
-            },
-        );
-        revoked
     }
 }
 
@@ -750,7 +986,7 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, process::Stdio, time::Duration};
+    use std::fs;
 
     use super::*;
     use crate::managed_resources::ExecutableBindingSpecV1;
@@ -762,38 +998,6 @@ mod tests {
             scope_root,
         })
         .unwrap()
-    }
-
-    #[test]
-    fn jsonl_state_machine_requires_one_ordered_terminal_turn() {
-        let parsed = parse_codex_jsonl(
-            br#"{"type":"thread.started"}
-{"type":"turn.started"}
-{"type":"item.completed"}
-{"type":"item.updated","message":"app error hook plugin mcp approval subagent"}
-{"type":"turn.completed"}
-"#,
-        )
-        .unwrap();
-        assert_eq!(parsed.len(), 5);
-        for input in [
-            br#"not json\n"#.as_slice(),
-            br#"{"type":"turn.started"}\n"#.as_slice(),
-            br#"{"type":"thread.started"}\n{"type":"turn.completed"}\n"#.as_slice(),
-            br#"{"type":"thread.started"}\n{"type":"turn.started"}\n{"type":"turn.completed"}\n{"type":"turn.completed"}\n"#.as_slice(),
-            br#"{"type":"thread.started"}\n{"type":"turn.started"}\n{"type":"turn.completed"}\n{"type":"item.completed"}\n"#.as_slice(),
-            br#"{"type":"thread.started"}\n{"type":"turn.started"}\n{"type":"turn.failed"}\n"#.as_slice(),
-            br#"{"type":"thread.started","error":"bad"}\n"#.as_slice(),
-            br#"{"type":"approval.requested"}\n"#.as_slice(),
-            br#"{"type":"mcp.call"}\n"#.as_slice(),
-            br#"{"type":"plugin.loaded"}\n"#.as_slice(),
-            br#"{"type":"hook.called"}\n"#.as_slice(),
-            br#"{"type":"app.started"}\n"#.as_slice(),
-            br#"{"type":"subagent.started"}\n"#.as_slice(),
-            br#"{"type":"unknown.event"}\n"#.as_slice(),
-        ] {
-            assert!(parse_codex_jsonl(input).is_err());
-        }
     }
 
     #[test]
@@ -814,23 +1018,24 @@ mod tests {
             .unwrap();
         let qualification = service.qualification.as_ref().unwrap();
         assert_eq!(
-            qualification.physical_acceptance,
-            CodexPhysicalAcceptanceV1::NotRun
-        );
-        assert_eq!(
-            qualification.protocol_profile.jsonl_profile,
-            "codex-exec-jsonl-v0"
+            qualification.protocol_profile.app_server_profile,
+            "codex-app-server-stdio-v2"
         );
         assert_eq!(
             qualification.host_containment_profile.process_tree_profile,
-            "unix-process-group-unproven-v1"
+            "capability-revocation-before-authority-release-v1"
         );
-        assert!(qualification.test_only);
         let binding = CodexAttemptBindingV0 {
             run_ref: ManagedRunRefV1::from_stored("run".into()).unwrap(),
             qualification_generation: 7,
             executable_identity_ref: world.validate_executable_identity().unwrap().into(),
-            invocation: CodexInvocationV0::new(&directory, None, true).unwrap(),
+            scratch: directory.clone(),
+            provider_ref: crate::worker_provider_config::WorkerProviderConfigRefV1 {
+                provider_id: "test".into(),
+                generation: 1,
+                config_digest: "digest".into(),
+            },
+            provider_revoked: Arc::new(AtomicBool::new(false)),
             revoked: Arc::new(AtomicBool::new(false)),
         };
         binding
@@ -844,94 +1049,9 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_boundary_model_keeps_controller_and_task_child_policy_separate() {
-        let proxy = ProviderControlPlaneProxyV0::new();
-        let controller = ControllerEnvironmentV0::new(PathBuf::from("/private/codex"), &proxy);
-        let child = TaskChildEnvironmentV0::new();
-        assert!(proxy.permits_controller(&proxy.controller_ref, &proxy.token));
-        assert!(!proxy.permits_controller("child", &proxy.token));
-        assert!(child.no_raw_network);
-        for secret in [
-            "HTTPS_PROXY",
-            "PASTEY_CODEX_PROXY_TOKEN",
-            "CODEX_HOME",
-            "HOME",
-        ] {
-            assert!(controller.values.contains_key(secret));
-            assert!(!child.values.contains_key(secret));
-        }
-    }
-
-    #[test]
-    fn invocation_is_ephemeral_noninteractive_and_ambient_config_free() {
-        let invocation =
-            CodexInvocationV0::new(&PathBuf::from("/private/scratch"), Some("gpt-5"), true)
-                .unwrap();
-        for required in [
-            "--json",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--strict-config",
-            "--sandbox",
-        ] {
-            assert!(invocation.argv.iter().any(|argument| argument == required));
-        }
-        assert!(!invocation.argv.iter().any(|argument| argument == "resume"));
-        assert!(!invocation
-            .argv
-            .iter()
-            .any(|argument| argument == "--worktree"));
-        assert!(invocation
-            .argv
-            .windows(2)
-            .any(|pair| { pair[0] == "--enable" && pair[1] == CODEX_MULTI_AGENT_FEATURE }));
-        assert!(codex_multi_agent_feature_is_qualified(
-            "multi_agent stable true\n"
-        ));
-        assert!(!codex_multi_agent_feature_is_qualified(
-            "multi_agent experimental true\n"
-        ));
-        assert!(!codex_multi_agent_feature_is_qualified(
-            "multi_agent stable false\n"
-        ));
-        let unqualified =
-            CodexInvocationV0::new(&PathBuf::from("/private/scratch"), None, false).unwrap();
-        assert!(!unqualified
-            .argv
-            .iter()
-            .any(|argument| argument == CODEX_MULTI_AGENT_FEATURE));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cancellation_revokes_and_kills_the_controller_process_group() {
-        let process = spawn_bounded_host_process(HostBoundedProcessSpecV1 {
-            executable: PathBuf::from("/bin/sh"),
-            argv: vec!["-c".into(), "sleep 30 & wait".into()],
-            current_dir: None,
-            environment: BTreeMap::new(),
-            stdin: Stdio::null(),
-            stdout: Stdio::piped(),
-            stderr: Stdio::piped(),
-            stdout_limit: 1024,
-            stderr_limit: 1024,
-            wall_timeout: Duration::from_secs(2),
-            tree_requirement: HostProcessTreeRequirementV1::AllowProcessGroupForTest,
-            sandbox: HostProcessSandboxV1::None,
-            cleanup_roots: vec![],
-        })
-        .unwrap();
-        let run_ref = ManagedRunRefV1::from_stored("codex-test-run".into()).unwrap();
-        let mut service = CodexSpecialistServiceV0::default();
-        let revoked = service.register_test_controller(
-            run_ref.clone(),
-            "bridge",
-            "session",
-            process.control(),
-        );
-        service.terminate_run(&run_ref);
-        assert!(revoked.load(Ordering::SeqCst));
-        assert!(!process.wait().unwrap().status.success());
+    fn capability_comparison_is_exact_and_length_safe() {
+        assert!(constant_time_equal(b"a", b"a"));
+        assert!(!constant_time_equal(b"a", b"b"));
+        assert!(!constant_time_equal(b"a", b"aa"));
     }
 }
