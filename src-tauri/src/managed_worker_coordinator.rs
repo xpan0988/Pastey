@@ -264,7 +264,7 @@ impl HostRuntime {
                     .required_transform_qualification_generation()
             })
             .flatten();
-        let selection = if native_required {
+        let selection = if native_required || self.local_plan_requires_codex(&revision) {
             let selection = self
                 .worker_provider_configs
                 .selected_for_managed_workers()?;
@@ -336,6 +336,7 @@ impl HostRuntime {
         pi_generation: Option<u64>,
     ) -> AppResult<ManagedPrimitiveAvailabilityV1> {
         let native_required = self.local_plan_requires_native_provider(revision);
+        let codex_required = self.local_plan_requires_codex(revision);
         let provider_available = match selection {
             Some(selection) => {
                 drop(self.worker_provider_configs.resolve(selection)?);
@@ -350,7 +351,7 @@ impl HostRuntime {
                             != crate::worker_provider_config::WorkerProviderHealthStateV1::Unhealthy
                     })
             }
-            None => !native_required,
+            None => !native_required && !codex_required,
         };
         if !provider_available
             || (self.local_plan_requires_codex(revision) && codex_generation.is_none())
@@ -781,16 +782,21 @@ impl HostRuntime {
             input.revision,
             now,
         )?;
-        self.run_codex_specialist_transform(ManagedStepClaimRequestV1 {
-            attempt_id: attempt_id.into(),
-            step_id: step.id().into(),
-            input: acquisition,
-            captured_binding: captured.clone(),
-            current_binding: current,
-            now,
-            process_world: None,
-            private_scratch: true,
-        })?;
+        let selection = worker_attempt_selection(&self.paths, attempt_id)?;
+        let provider = self.worker_provider_configs.resolve(&selection)?;
+        self.run_codex_specialist_transform(
+            ManagedStepClaimRequestV1 {
+                attempt_id: attempt_id.into(),
+                step_id: step.id().into(),
+                input: acquisition,
+                captured_binding: captured.clone(),
+                current_binding: current,
+                now,
+                process_world: None,
+                private_scratch: true,
+            },
+            provider,
+        )?;
         Ok(())
     }
 
@@ -2635,9 +2641,14 @@ mod tests {
             .codex_specialists
             .lock()
             .required_transform_qualification_generation();
+        let selection = fixture
+            .runtime
+            .worker_provider_configs
+            .selected_for_managed_workers()
+            .unwrap();
         let available = fixture
             .runtime
-            .managed_worker_plan_availability(&fixture.revision, None, generation, None)
+            .managed_worker_plan_availability(&fixture.revision, Some(&selection), generation, None)
             .unwrap();
         assert!(available.supports(&fixture.revision, &fixture.revision.steps[0]));
 
@@ -2650,7 +2661,12 @@ mod tests {
         assert!(stale_generation.is_none());
         let unavailable = fixture
             .runtime
-            .managed_worker_plan_availability(&fixture.revision, None, stale_generation, None)
+            .managed_worker_plan_availability(
+                &fixture.revision,
+                Some(&selection),
+                stale_generation,
+                None,
+            )
             .unwrap();
         assert!(!unavailable.supports(&fixture.revision, &fixture.revision.steps[0]));
     }
@@ -2707,7 +2723,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(provider_id, "codex-specialist-v0");
+        assert_eq!(provider_id, "primary");
         assert!(fixture
             .runtime
             .dispatch_next_v2_managed_with_provider(
@@ -2743,7 +2759,7 @@ mod tests {
         let executable = fixture._root.0.join("synthetic-codex");
         std::fs::write(
             &executable,
-            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --cd ]; then scratch=$2; shift 2; else shift; fi\ndone\nprintf 'controller output\\n' > \"$scratch/result.txt\"\nprintf '%s\\n' '{\"type\":\"thread.started\"}' '{\"type\":\"turn.started\"}' '{\"type\":\"item.completed\"}' '{\"type\":\"turn.completed\"}'\n",
+            "#!/bin/sh\nprintf 'controller output\\n' > result.txt\nprintf '%s\\n' '{\"id\":1,\"result\":{}}' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread\"}}}' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn\"}}}' '{\"method\":\"turn/completed\",\"params\":{}}'\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();

@@ -105,6 +105,26 @@ impl ConfiguredWorkerProviderConfigV1 {
         Url::parse(&endpoint)
             .map_err(|_| AppError::InvalidInput("Worker provider endpoint is invalid.".into()))
     }
+
+    /// The Codex broker is the only other Host-private transport which may
+    /// use this exact immutable provider binding.  It is deliberately a
+    /// Responses endpoint, not a caller-selected URL or a general proxy.
+    pub(crate) fn codex_responses_endpoint(&self) -> AppResult<Url> {
+        let mut endpoint = Url::parse(&self.base_url)
+            .map_err(|_| AppError::InvalidInput("Worker provider endpoint is invalid.".into()))?;
+        let base_path = endpoint.path().trim_end_matches('/');
+        endpoint.set_path(&format!("{base_path}/responses"));
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        Ok(endpoint)
+    }
+
+    /// Kept crate-private so only Host-owned transports can attach the
+    /// credential.  No Worker, Scratch, support payload, or controller
+    /// command line receives this value.
+    pub(crate) fn broker_api_key(&self) -> &str {
+        &self.api_key
+    }
 }
 
 /// One concrete, streaming production adapter. The Worker only sees the
