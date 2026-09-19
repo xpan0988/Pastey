@@ -37,14 +37,21 @@ and bounded lifecycle/status are correlated end-to-end. Replay is rejected
 before invocation and cancellation wins over a late status. This direct remote
 case creates no ManagedObject, Scratch, Worker, GST scan, or Transfer.
 
-When a workspace or result actually must move across Hosts, the later extension
-uses the existing managed object/Transfer flow only for movement: it must
-propose outbound and return transfers, present the consequence in Review,
-materialize the remote task workspace, and scan the result only for the
-authored return. If the originating workspace has changed, Pastey must enter an
-explicit conflict/recovery state; it must not overwrite, guess, or report
-`DONE`. That workspace-movement continuation is not part of the direct remote
-native-Agent capability.
+When a workspace or result actually must move across Hosts, Pastey uses the
+existing managed object/RegularFileSet and encrypted Transfer flow only for
+that movement. The normal product presents one Review in device terms—send the
+workspace to the Agent Host, let Codex work, then return it—and one approval
+covers all three consequences. The outbound receipt materializes as a
+Host-private Pastey task workspace; Codex operates on that normal workspace
+without seeing GST, receipts, source Host identity, or other movement internals.
+
+After native success, Pastey scans the final task workspace solely because it
+must return. The initiating Host rechecks the exact approved source baseline
+before a bounded staged replacement. An unchanged source applies automatically
+without another confirmation. A changed source retains the returned result and
+enters `conflict_recovery_required`; it does not overwrite, merge, guess, or
+report `DONE`. Agent failure, cancellation, interruption, transfer failure, or
+an unknown outcome similarly has no result apply and is non-DONE.
 
 ## Responsibility and locality
 

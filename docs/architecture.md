@@ -72,13 +72,20 @@ workspace, task correlation, bounded status propagation, replay rejection, and
 cancellation. It reuses the Host's native session service and creates no
 ManagedObject, Scratch, Worker, GST scan, or Transfer.
 
-Managed resources and Transfer remain the cross-device object/lineage mechanism
-only when a workspace or resulting workspace must cross a Host boundary. Its
-derived outbound and return movement must be visible in Review before it
-executes. A changed source must enter an explicit conflict/recovery state and
-remain non-DONE; unknown, lost, failed, or cancelled Agent outcomes are likewise
-never global completion. That workspace-movement continuation remains a later
-slice.
+Managed resources and Transfer are introduced only when a workspace or result
+must cross a Host boundary. For a local workspace selected with a remote native
+Agent, Pastey creates one product Review that says it will send the workspace,
+let the Agent work, and return the result. One approval covers that outbound
+Transfer, native task, return Transfer, and unchanged-source apply. The source
+is captured as an exact `RegularFileSet` baseline at approval; package framing,
+encrypted transport, and landing reuse the ordinary managed-object Transfer
+seams. The Agent sees only the Host-private task workspace on its Host.
+
+The return is scanned because it must cross Hosts. Pastey revalidates the
+approved source immediately before its bounded staged apply. If it changed,
+Pastey preserves the returned result and enters conflict/recovery without an
+overwrite or `DONE`. Failed, cancelled, interrupted, lost, or otherwise
+ambiguous Agent/return outcomes are likewise never global completion.
 
 Layer 2's `BridgeNodeListProjectionV1` displays durable Host membership once per `HostRef` and only matching current-session capability/link observations. It is environment fact display, not a route resolver or source of readiness/authorization: all execution paths still revalidate through the existing Layer 4 Host resolver and Core-owned admission/completion chain.
 

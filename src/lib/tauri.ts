@@ -188,6 +188,23 @@ export interface NativeAgentTaskStatus {
   code?: string | null;
 }
 
+export type NativeAgentWorkspaceMovementState =
+  | "review" | "awaiting_approval" | "transferring_to_agent" | "agent_running"
+  | "returning_result" | "applying_result" | "completed"
+  | "conflict_recovery_required" | "failed" | "cancelled" | "interrupted";
+
+export interface NativeAgentWorkspaceMovement {
+  schemaVersion: "pastey-native-agent-workspace-movement-v1";
+  movementId: string;
+  taskId: string;
+  agentId: string;
+  sourceWorkspaceName: string;
+  targetHostRef: string;
+  reviewSummary: string;
+  state: NativeAgentWorkspaceMovementState;
+  code?: string | null;
+}
+
 export function listNativeAgentCapabilities(): Promise<NativeAgentCapability[]> {
   return invoke("list_native_agent_capabilities");
 }
@@ -208,6 +225,24 @@ export function startRemoteNativeCodexTask(
   roomId: string, peerSessionId: string, targetHostRef: string, workspace: string, task: string, resume: boolean,
 ): Promise<NativeAgentTaskStatus> {
   return invoke("start_remote_native_codex_task", { roomId, peerSessionId, targetHostRef, workspace, task, resume });
+}
+
+export function proposeRemoteNativeCodexWorkspaceMovement(
+  targetHostRef: string, sourceWorkspace: string, task: string, roomId: string,
+): Promise<NativeAgentWorkspaceMovement> {
+  return invoke("propose_remote_native_codex_workspace_movement", { targetHostRef, sourceWorkspace, task, roomId });
+}
+
+export function approveRemoteNativeCodexWorkspaceMovement(
+  movementId: string, roomId: string, peerSessionId: string,
+): Promise<NativeAgentWorkspaceMovement> {
+  return invoke("approve_remote_native_codex_workspace_movement", { movementId, roomId, peerSessionId });
+}
+
+export function getNativeAgentWorkspaceMovementStatus(
+  movementId: string,
+): Promise<NativeAgentWorkspaceMovement> {
+  return invoke("get_native_agent_workspace_movement_status", { movementId });
 }
 
 export function cancelRemoteNativeAgentTask(
