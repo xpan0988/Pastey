@@ -814,6 +814,163 @@ pub async fn start_native_v2_plan_attempt(
         .map_err(|error| error.message())
 }
 
+/// Lists native mature-Agent capabilities that this Host can invoke. These are
+/// not managed Worker providers and reveal no native configuration details.
+#[tauri::command]
+pub fn list_native_agent_capabilities(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::native_agent::NativeAgentCapabilityV1>, String> {
+    Ok(state.native_agents.lock().capabilities())
+}
+
+/// Starts one task in the Host-private native Codex session for this exact
+/// original workspace. No ManagedObject, Scratch lease, provider broker, or
+/// Worker effect is created by this local path.
+#[tauri::command]
+pub fn start_native_codex_task(
+    workspace: String,
+    task: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    state
+        .native_agents
+        .lock()
+        .start_codex_task(std::path::Path::new(&workspace), &task)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn get_native_agent_task_status(
+    task_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    state
+        .native_agents
+        .lock()
+        .task_status(&task_id)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn cancel_native_agent_task(
+    task_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    state
+        .native_agents
+        .lock()
+        .cancel_task(&task_id)
+        .map_err(|error| error.message())
+}
+
+/// Dispatches a native Codex task to one exact current Bridge Host. The
+/// workspace path is encrypted control input for that Host only; no managed
+/// resource, Scratch, Worker, or Transfer is introduced when it already exists
+/// there.
+#[tauri::command]
+pub async fn start_remote_native_codex_task(
+    room_id: String,
+    peer_session_id: String,
+    target_host_ref: String,
+    workspace: String,
+    task: String,
+    resume: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    let target =
+        crate::host_identity::HostRef::parse_peer(target_host_ref.clone(), &state.local_host_ref)
+            .map_err(|error| error.message())?;
+    let task_id = format!("native-agent:{}", uuid::Uuid::new_v4());
+    let request = crate::native_agent::NativeAgentInvokeV1 {
+        schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+        task_id: task_id.clone(),
+        target_host_ref: target.as_str().into(),
+        agent_capability: crate::native_agent::CODEX_CAPABILITY_ID.into(),
+        workspace: workspace.clone(),
+        task,
+        resume,
+    };
+    crate::native_agent::validate_invoke(&request).map_err(|error| error.message())?;
+    let queued = state
+        .native_agents
+        .lock()
+        .queue_remote_task(&task_id, target.as_str(), &workspace)
+        .map_err(|error| error.message())?;
+    let context = crate::room_control::room_control_session_context_for_peer(
+        &state,
+        &room_id,
+        &peer_session_id,
+    )
+    .map_err(|error| error.message())?;
+    let event = crate::room_control::native_agent_event(
+        "native_agent.invoke",
+        serde_json::to_value(request).map_err(|error| error.to_string())?,
+        &context,
+    )
+    .map_err(|error| error.message())?;
+    if let Err(error) = crate::room_control::send_room_control_event(
+        state.inner().clone(),
+        &room_id,
+        event,
+        Some(crate::room_control::selected_peer_route(
+            &room_id,
+            &peer_session_id,
+        )),
+    )
+    .await
+    {
+        state.native_agents.lock().fail_remote_delivery(&task_id);
+        return Err(error.message());
+    }
+    Ok(queued)
+}
+
+#[tauri::command]
+pub async fn cancel_remote_native_agent_task(
+    room_id: String,
+    peer_session_id: String,
+    target_host_ref: String,
+    task_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    let target =
+        crate::host_identity::HostRef::parse_peer(target_host_ref.clone(), &state.local_host_ref)
+            .map_err(|error| error.message())?;
+    let local = state
+        .native_agents
+        .lock()
+        .cancel_remote_task(&task_id, target.as_str())
+        .map_err(|error| error.message())?;
+    let context = crate::room_control::room_control_session_context_for_peer(
+        &state,
+        &room_id,
+        &peer_session_id,
+    )
+    .map_err(|error| error.message())?;
+    let cancel = crate::native_agent::NativeAgentCancelV1 {
+        schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+        task_id,
+        target_host_ref: target.as_str().into(),
+    };
+    let event = crate::room_control::native_agent_event(
+        "native_agent.cancel",
+        serde_json::to_value(cancel).map_err(|error| error.to_string())?,
+        &context,
+    )
+    .map_err(|error| error.message())?;
+    let _ = crate::room_control::send_room_control_event(
+        state.inner().clone(),
+        &room_id,
+        event,
+        Some(crate::room_control::selected_peer_route(
+            &room_id,
+            &peer_session_id,
+        )),
+    )
+    .await;
+    Ok(local)
+}
+
 #[tauri::command]
 pub fn get_native_v2_plan_status(
     revision_id: String,

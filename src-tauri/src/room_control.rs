@@ -73,11 +73,15 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "developer_terminal.exit",
     "developer_terminal.close",
     "bridge_membership.departure",
+    "native_agent.invoke",
+    "native_agent.status",
+    "native_agent.cancel",
 ];
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
 const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
 const DEVELOPER_TERMINAL_PROTOCOL_FAMILY: &str = "developer_terminal";
 const BRIDGE_MEMBERSHIP_PROTOCOL_FAMILY: &str = "bridge_membership";
+const NATIVE_AGENT_PROTOCOL_FAMILY: &str = "native_agent";
 const BRIDGE_MEMBERSHIP_SCHEMA: &str = "pastey-bridge-membership-v1";
 const MAX_TERMINAL_EVENTS_PER_MINUTE: usize = 3_000;
 const MAX_TERMINAL_BURST_EVENTS: usize = 256;
@@ -201,6 +205,30 @@ pub(crate) fn peer_capability_event(
         "targetPeerRef": context.peer_session_ref,
         "createdAt": now.format(&Rfc3339).map_err(|_| AppError::InvalidInput("Invalid capability event time.".into()))?,
         "expiresAt": (now + time::Duration::seconds(MAX_EVENT_LIFETIME_SECONDS)).format(&Rfc3339).map_err(|_| AppError::InvalidInput("Invalid capability event time.".into()))?,
+        "previewOnly": false,
+        "payload": payload,
+    }))
+}
+
+/// Native Agent messages use the authenticated Room Control transport. The
+/// payload is lifecycle-only: it never carries native credentials, executable
+/// paths, model choice, session IDs, tool calls, or sandbox configuration.
+pub(crate) fn native_agent_event(
+    kind: &str,
+    payload: Value,
+    context: &RoomControlSessionContext,
+) -> AppResult<Value> {
+    let now = OffsetDateTime::now_utc();
+    Ok(serde_json::json!({
+        "schemaVersion": ROOM_CONTROL_SCHEMA,
+        "eventId": format!("native-agent-event-{}", uuid::Uuid::new_v4()),
+        "kind": kind,
+        "protocolFamily": NATIVE_AGENT_PROTOCOL_FAMILY,
+        "roomRef": context.room_id,
+        "sourceDeviceRef": context.local_session_ref,
+        "targetPeerRef": context.peer_session_ref,
+        "createdAt": now.format(&Rfc3339).map_err(|_| AppError::InvalidInput("Invalid native Agent event time.".into()))?,
+        "expiresAt": (now + time::Duration::seconds(MAX_EVENT_LIFETIME_SECONDS)).format(&Rfc3339).map_err(|_| AppError::InvalidInput("Invalid native Agent event time.".into()))?,
         "previewOnly": false,
         "payload": payload,
     }))
@@ -1479,6 +1507,220 @@ pub async fn receive_room_control_event_handler(
         // the bounded Room Control inbox.
         return encrypted_receipt_response(&event_key, &validated.event_id, &now_iso());
     }
+    if validated.kind.starts_with("native_agent.") {
+        // Native Agent invocation is a bounded product protocol over the
+        // existing authenticated current-session channel. Record replay before
+        // starting anything: receipt replay must never start a second task.
+        {
+            let mut runtime = ctx.state.room_control.lock();
+            let room_state = runtime.rooms.entry(room_id.clone()).or_default();
+            if is_replayed(room_state, &validated) {
+                return control_error(
+                    StatusCode::CONFLICT,
+                    "event_replayed",
+                    "Native Agent event was already received.",
+                );
+            }
+            if !accept_rate_limited_event(room_state, OffsetDateTime::now_utc().unix_timestamp()) {
+                return control_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limited",
+                    "Native Agent event rate exceeded.",
+                );
+            }
+            record_replay_id(
+                &mut room_state.seen_event_ids,
+                &mut room_state.seen_event_id_set,
+                validated.event_id.clone(),
+            );
+            if let Some(request_id) = validated.request_id.clone() {
+                record_replay_id(
+                    &mut room_state.seen_request_ids,
+                    &mut room_state.seen_request_id_set,
+                    request_id,
+                );
+            }
+        }
+        let payload = validated
+            .event
+            .get("payload")
+            .cloned()
+            .unwrap_or(Value::Null);
+        match validated.kind.as_str() {
+            "native_agent.invoke" => {
+                let request: crate::native_agent::NativeAgentInvokeV1 =
+                    match serde_json::from_value(payload) {
+                        Ok(request) if crate::native_agent::validate_invoke(&request).is_ok() => {
+                            request
+                        }
+                        _ => {
+                            return control_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_native_agent",
+                                "Invalid native Agent invocation.",
+                            )
+                        }
+                    };
+                if request.target_host_ref != ctx.state.local_host_ref.as_str() {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native Agent target Host does not match this Host.",
+                    );
+                }
+                let _started = match ctx
+                    .state
+                    .native_agents
+                    .lock()
+                    .start_codex_task_with_id_resume(
+                        &request.task_id,
+                        std::path::Path::new(&request.workspace),
+                        &request.task,
+                        request.resume,
+                    ) {
+                    Ok(status) => status,
+                    Err(_) => {
+                        return control_error(
+                            StatusCode::BAD_REQUEST,
+                            "native_agent_unavailable",
+                            "Native Agent invocation was rejected by this Host.",
+                        )
+                    }
+                };
+                let response_context = match room_control_session_context_for_peer(
+                    &ctx.state,
+                    &room_id,
+                    &inbound_peer.peer_session_id,
+                ) {
+                    Ok(context) => context,
+                    Err(_) => {
+                        return control_error(
+                            StatusCode::GONE,
+                            "host_binding_unavailable",
+                            "Native Agent response route is unavailable.",
+                        )
+                    }
+                };
+                let response_state = ctx.state.clone();
+                let response_room = room_id.clone();
+                let response_route =
+                    selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
+                let task_id = request.task_id;
+                let host_ref = ctx.state.local_host_ref.as_str().to_owned();
+                ctx.state.spawn(async move {
+                    let mut last = None;
+                    loop {
+                        let status = response_state.native_agents.lock().task_status(&task_id);
+                        let Ok(status) = status else {
+                            return;
+                        };
+                        if last.as_ref() != Some(&status) {
+                            let payload =
+                                serde_json::to_value(crate::native_agent::NativeAgentStatusV1 {
+                                    schema_version:
+                                        crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                                    task_id: task_id.clone(),
+                                    executing_host_ref: host_ref.clone(),
+                                    status: status.clone(),
+                                });
+                            if let Ok(payload) = payload {
+                                let payload = native_agent_event(
+                                    "native_agent.status",
+                                    payload,
+                                    &response_context,
+                                );
+                                if let Ok(payload) = payload {
+                                    let _ = send_room_control_event(
+                                        response_state.clone(),
+                                        &response_room,
+                                        payload,
+                                        Some(response_route.clone()),
+                                    )
+                                    .await;
+                                }
+                            }
+                            last = Some(status.clone());
+                        }
+                        if status.state != crate::native_agent::NativeAgentTaskStateV1::Running {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                });
+            }
+            "native_agent.status" => {
+                let remote: crate::native_agent::NativeAgentStatusV1 =
+                    match serde_json::from_value(payload) {
+                        Ok(status) if crate::native_agent::validate_status(&status).is_ok() => {
+                            status
+                        }
+                        _ => {
+                            return control_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_native_agent",
+                                "Invalid native Agent status.",
+                            )
+                        }
+                    };
+                if ctx
+                    .state
+                    .native_agents
+                    .lock()
+                    .record_remote_status(remote)
+                    .is_err()
+                {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native Agent status does not match its selected Host.",
+                    );
+                }
+            }
+            "native_agent.cancel" => {
+                let cancel: crate::native_agent::NativeAgentCancelV1 =
+                    match serde_json::from_value(payload) {
+                        Ok(cancel) if crate::native_agent::validate_cancel(&cancel).is_ok() => {
+                            cancel
+                        }
+                        _ => {
+                            return control_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_native_agent",
+                                "Invalid native Agent cancellation.",
+                            )
+                        }
+                    };
+                if cancel.target_host_ref != ctx.state.local_host_ref.as_str() {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native Agent cancellation targets another Host.",
+                    );
+                }
+                if ctx
+                    .state
+                    .native_agents
+                    .lock()
+                    .cancel_task(&cancel.task_id)
+                    .is_err()
+                {
+                    return control_error(
+                        StatusCode::BAD_REQUEST,
+                        "native_agent_unavailable",
+                        "Native Agent task is unavailable.",
+                    );
+                }
+            }
+            _ => {
+                return control_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_native_agent",
+                    "Unsupported native Agent event.",
+                )
+            }
+        }
+        return encrypted_receipt_response(&event_key, &validated.event_id, &now_iso());
+    }
     let mut protocol_action = crate::bridge_plan::InboundProtocolAction::None;
     if validated.kind == "peer_capability.response" {
         log_peer_capability("response_received", None, None);
@@ -2048,6 +2290,7 @@ fn validate_control_event(
             || raw_kind.starts_with("peer_capability.")
             || raw_kind.starts_with("developer_terminal.")
             || raw_kind.starts_with("bridge_membership.")
+            || raw_kind.starts_with("native_agent.")
         {
             &[
                 "schemaVersion",
@@ -2198,6 +2441,49 @@ fn validate_control_event(
         }
         let _ = crate::developer_terminal::validate_wire_message(&kind, payload)?;
         (None, None)
+    } else if kind.starts_with("native_agent.") {
+        if string_field(object, "protocolFamily")? != NATIVE_AGENT_PROTOCOL_FAMILY
+            || object.get("previewOnly") != Some(&Value::Bool(false))
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid native Agent protocol event.".into(),
+            ));
+        }
+        let replay_id = match kind.as_str() {
+            "native_agent.invoke" => {
+                let request = serde_json::from_value::<crate::native_agent::NativeAgentInvokeV1>(
+                    Value::Object(payload.clone()),
+                )
+                .map_err(AppError::from)?;
+                crate::native_agent::validate_invoke(&request)?;
+                format!("native-agent-invoke:{}", request.task_id)
+            }
+            "native_agent.status" => {
+                let status = serde_json::from_value::<crate::native_agent::NativeAgentStatusV1>(
+                    Value::Object(payload.clone()),
+                )
+                .map_err(AppError::from)?;
+                crate::native_agent::validate_status(&status)?;
+                format!(
+                    "native-agent-status:{}:{:?}",
+                    status.task_id, status.status.state
+                )
+            }
+            "native_agent.cancel" => {
+                let cancel = serde_json::from_value::<crate::native_agent::NativeAgentCancelV1>(
+                    Value::Object(payload.clone()),
+                )
+                .map_err(AppError::from)?;
+                crate::native_agent::validate_cancel(&cancel)?;
+                format!("native-agent-cancel:{}", cancel.task_id)
+            }
+            _ => {
+                return Err(AppError::InvalidInput(
+                    "Unsupported native Agent event kind.".into(),
+                ))
+            }
+        };
+        (None, Some(replay_id))
     } else if kind == "bridge_membership.departure" {
         if string_field(object, "protocolFamily")? != BRIDGE_MEMBERSHIP_PROTOCOL_FAMILY
             || object.get("previewOnly") != Some(&Value::Bool(false))
@@ -3150,6 +3436,32 @@ mod tests {
             resolve_room_control_route(Some(&response_route), "room", &room, &[inbound_peer])
                 .unwrap();
         assert_eq!(resolved.peer_session_id, "requester-current-session");
+    }
+
+    #[test]
+    fn native_agent_event_binds_the_exact_current_peer_session() {
+        let context = RoomControlSessionContext {
+            room_id: "room".into(),
+            local_session_ref: "source".into(),
+            peer_session_ref: "target".into(),
+            peer_route_ref: "peer".into(),
+            peer_observation_ref: "observation".into(),
+            peer_connected: true,
+        };
+        let payload = serde_json::to_value(crate::native_agent::NativeAgentInvokeV1 {
+            schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: "task".into(),
+            target_host_ref: "host:remote".into(),
+            agent_capability: crate::native_agent::CODEX_CAPABILITY_ID.into(),
+            workspace: "/existing/workspace".into(),
+            task: "work".into(),
+            resume: true,
+        })
+        .unwrap();
+        let event = native_agent_event("native_agent.invoke", payload, &context).unwrap();
+        let now = OffsetDateTime::now_utc();
+        assert!(validate_control_event(event.clone(), "room", "source", "target", now).is_ok());
+        assert!(validate_control_event(event, "room", "source", "stale-target", now).is_err());
     }
 
     #[test]

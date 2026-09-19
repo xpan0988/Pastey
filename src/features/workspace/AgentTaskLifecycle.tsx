@@ -3,7 +3,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   approveNativeV2Plan,
   cancelNativeV2PlanAttempt,
+  cancelNativeAgentTask,
+  cancelRemoteNativeAgentTask,
+  getNativeAgentTaskStatus,
   getNativeV2PlanStatus,
+  listNativeAgentCapabilities,
+  startNativeCodexTask,
+  startRemoteNativeCodexTask,
+  type NativeAgentCapability,
+  type NativeAgentTaskStatus,
   startNativeV2PlanAttempt,
   type NativeV2PlanStatus,
   type NativeV2ProductState,
@@ -134,6 +142,69 @@ export function useAgentTaskLifecycle() {
 }
 
 export type AgentTaskController = ReturnType<typeof useAgentTaskLifecycle>;
+
+/** Product-facing lifecycle for a Host-native mature Agent. It does not use
+ * the managed Worker/Plan controller above. */
+export function useNativeAgentTask() {
+  const [capabilities, setCapabilities] = useState<NativeAgentCapability[]>([]);
+  const [workspace, setWorkspace] = useState("");
+  const [taskText, setTaskText] = useState("");
+  const [status, setStatus] = useState<NativeAgentTaskStatus | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const refreshCapabilities = useCallback(async () => {
+    try { setCapabilities(await listNativeAgentCapabilities()); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not inspect native Agents."); }
+  }, []);
+
+  useEffect(() => { void refreshCapabilities(); }, [refreshCapabilities]);
+  useEffect(() => {
+    if (!status || !["queued", "running"].includes(status.state)) return;
+    let cancelled = false;
+    const poll = async () => {
+      try { setStatus(await getNativeAgentTaskStatus(status.taskId)); }
+      catch (error) { setMessage(error instanceof Error ? error.message : "Pastey lost the native Agent task outcome."); }
+      if (!cancelled) window.setTimeout(() => void poll(), 1_000);
+    };
+    const timer = window.setTimeout(() => void poll(), 1_000);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [status]);
+
+  const start = useCallback(async () => {
+    if (!workspace.trim() || !taskText.trim() || busy) return;
+    setBusy(true); setMessage(null);
+    try { setStatus(await startNativeCodexTask(workspace.trim(), taskText.trim())); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start Codex."); }
+    finally { setBusy(false); }
+  }, [busy, taskText, workspace]);
+
+  const startRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string) => {
+    if (!roomId || !peerSessionId || !hostRef || !workspace.trim() || !taskText.trim() || busy) return;
+    setBusy(true); setMessage(null);
+    try { setStatus(await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, workspace.trim(), taskText.trim(), true)); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start remote Codex."); }
+    finally { setBusy(false); }
+  }, [busy, taskText, workspace]);
+
+  const cancel = useCallback(async () => {
+    if (!status || !["queued", "running"].includes(status.state)) return;
+    setBusy(true);
+    try { setStatus(await cancelNativeAgentTask(status.taskId)); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not cancel Codex."); }
+    finally { setBusy(false); }
+  }, [status]);
+
+  const cancelRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string) => {
+    if (!status || !["queued", "running"].includes(status.state)) return;
+    setBusy(true);
+    try { setStatus(await cancelRemoteNativeAgentTask(roomId, peerSessionId, hostRef, status.taskId)); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not cancel remote Codex."); }
+    finally { setBusy(false); }
+  }, [status]);
+
+  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, message, busy, start, startRemote, cancel, cancelRemote, refreshCapabilities };
+}
 
 export function StatusBadge({ tone, children }: { tone: LifecycleTone; children: React.ReactNode }) {
   return <span className={`v2-status ${tone}`}>{children}</span>;

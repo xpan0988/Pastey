@@ -2,6 +2,50 @@
 
 Layer 5 owns semantic Plan composition, optional proposal interpretation, immutable object-flow revisions, one complete requester approval, Host admission, exact attempt/step authority, managed execution, authoritative completion, and dependency continuation. It does not own transport routes, raw Host resources, or Developer Terminal authority.
 
+## Native mature Agents
+
+A mature Agent is a Host capability, not a Pastey-managed Worker. Pastey
+controls the task envelope, visible cross-device movement, continuation, and
+global completion; the Agent controls execution. Its native provider/auth,
+model selection, workspace behavior, tools, sandbox, reasoning, subagents,
+and persistent conversation remain Host-private and opaque to Pastey.
+
+The default local path is intentionally direct:
+
+```text
+Pastey → selected Host → native Agent session → original workspace → native result
+```
+
+Pastey neither scans the workspace merely to observe edits nor creates a
+ManagedObject, Scratch lease, provider broker, managed Worker run, or effect
+translation. A Host-private native session is keyed by Host + Agent + canonical
+workspace. Related tasks resume that session; an unrelated workspace receives a
+different session. The native session identifier is never a Plan semantic.
+
+The first concrete implementation is Codex via its native app-server session
+protocol. Pastey inherits Codex's normal configuration and authentication and
+uses `initialize`, `thread/start`, `turn/start`, bounded lifecycle observation,
+`turn/interrupt` when available, and shutdown. It does not set a Pastey model
+provider, inject credentials, select a model, impose `externalSandbox`, or use
+an ephemeral session. A failed, cancelled, disconnected, or otherwise ambiguous
+native turn is `failed`, `cancelled`, or `interrupted`—never global `DONE`.
+
+For an existing workspace already present on a connected remote Host, Pastey
+uses the same native session service through authenticated current-session Room
+Control: exact selected Host, Codex capability, workspace input, task identity,
+and bounded lifecycle/status are correlated end-to-end. Replay is rejected
+before invocation and cancellation wins over a late status. This direct remote
+case creates no ManagedObject, Scratch, Worker, GST scan, or Transfer.
+
+When a workspace or result actually must move across Hosts, the later extension
+uses the existing managed object/Transfer flow only for movement: it must
+propose outbound and return transfers, present the consequence in Review,
+materialize the remote task workspace, and scan the result only for the
+authored return. If the originating workspace has changed, Pastey must enter an
+explicit conflict/recovery state; it must not overwrite, guess, or report
+`DONE`. That workspace-movement continuation is not part of the direct remote
+native-Agent capability.
+
 ## Responsibility and locality
 
 | Role | Canonical responsibility |
@@ -145,9 +189,7 @@ GST-1 extends the Host-private managed revision binding without changing `Manage
 
 GST-2 completes exact authored regular-file-set Transfer without adding a Plan or Layer-5 primitive. The sender revalidates the complete bound tree and frames its canonical selectors, per-file logical digest/bytes, aggregate digest, and bytes into one bounded Host-private package that uses the existing encrypted single-file Room transfer. The receiver validates and materializes that package into a fresh private tree, canonical-rescans it, and only then binds the same logical object/revision as the Transfer receipt. Package bytes and path are transport-private and never become a managed object; the existing canonical regular-file-set digest, not a package digest, remains authoritative. Scalar Transfer still sends the original regular file directly.
 
-GST-3 completes RegularFileSet Execute without a new primitive or execution subsystem. The existing `ManagedRevision` ExecutionWorld mount resolves the exact acquisition and canonically rescans a file set before lease and after release; it mounts the Host-private tree root read-only, while the existing semantic `input` alias with selector `"."` resolves the contained process cwd to that root. The existing exact Host-private executable binding, one `process_spawn`, raw-network denial, bounded evidence, and Core finalizer remain unchanged. Execute yields only its result digest: it accepts neither a changed tree nor an N+1/successor lineage. The representation and physical path remain outside Worker context and provider payloads. Codex uses the same Host-only Scratch scan/import, ordinary Resource effects, GST seal, and Core N+1 finalizer. A changed tree, failed import, failed seal, cancellation, provider revocation, or stale executable/provider binding cancels before successor registration. The optional Transform-only `workerCapabilityRequirement: "agent.coding.codex"` enters Plan validation, approval, hashing, storage, readiness, and an immutable Host-local qualification-generation binding; when absent, Transform continues through the Native Worker path unchanged. A Codex attempt additionally binds the selected provider ref, generation, digest, model, origin, and Responses API exactly. B3 runs the qualified `codex app-server --stdio` lifecycle (`initialize`, `initialized`, `thread/start`, `turn/start`, streamed item/turn events, `turn/interrupt`, and shutdown) with a single-agent `ExternalSandbox` turn. The Host starts a fresh loopback broker for each attempt; broker authority is the intersection of reachable transport, a high-entropy memory-only capability, a live attempt, and the exact provider binding. The upstream credential remains Host-only; task environments begin empty and do not receive the capability. The broker rejects unauthenticated requests before bounded-body processing, permits only the exact Responses route, applies strict body, response, timeout, and event limits, and is revoked and closed before attempt authority is released. The qualified physical Codex path proves that task descendants may reach loopback transport but receive no capability, have no raw or auxiliary Codex egress, and cannot inspect the controller environment. Pi and Codex multi-agent remain deferred.
-
-Pi is a second concrete Transform specialist proof: `agent.coding.pi` receives an exact Host-private executable qualification and one private Scratch clone, then runs an ephemeral `pi --mode json` controller with no session, ambient config, extensions, themes, context files, telemetry, or update check. Qualification contains only executable and feature facts; the concrete Pi Host service separately owns its current skill, prompt-template, and optional explicit input-context content. Skill and prompt-template discovery remain disabled, but each claim snapshots exact Host-owned bytes beneath a fresh attempt-private support root. A Pi CLI qualified for `--append-system-prompt` may receive that bounded UTF-8 input context as an explicit argument while `--no-context-files` remains present; there is no parent or project context discovery. The binding captures no-follow identities for every explicit support resource and fails stale before controller or import continuation, so later Host-support changes neither requalify the executable nor alter an existing attempt. Pi's `session → agent_start → turn_start → … → turn_end → agent_end` JSON protocol is validated separately from Codex JSONL, and Pi uses its scratch cwd rather than Codex's `exec --cd` invocation. The genuinely common parts are ordinary claimed Transform admission, exact executable identity revalidation, private Scratch, bounded process-group lifecycle, canonical no-follow scan, Resource `Create` effects, OutputSlot seal, and Core N+1 finalization. The Host now owns only those shared process-tree and complete-Scratch-import mechanics; concrete bindings, invocation/environment, JSON lifecycle, capability, qualification store, and dispatch branch remain deliberately duplicated. Two proofs do not justify a shared specialist adapter, registry, manager, or universal protocol.
+GST-3 completes RegularFileSet Execute without a new primitive or execution subsystem. The existing `ManagedRevision` ExecutionWorld mount resolves the exact acquisition and canonically rescans a file set before lease and after release; it mounts the Host-private tree root read-only, while the existing semantic `input` alias with selector `"."` resolves the contained process cwd to that root. The existing exact Host-private executable binding, one `process_spawn`, raw-network denial, bounded evidence, and Core finalizer remain unchanged. Execute yields only its result digest: it accepts neither a changed tree nor an N+1/successor lineage. The representation and physical path remain outside Worker context and provider payloads. Native mature Agents are not GST/Worker participants: they use their selected original workspace directly unless an explicit cross-Host Transfer requires a Pastey task workspace.
 
 ## Provider and runtime configuration boundaries
 

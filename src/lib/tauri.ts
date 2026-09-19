@@ -167,6 +167,55 @@ export function cancelNativeV2PlanAttempt(attemptId: string): Promise<NativeV2Pl
   return invoke("cancel_native_v2_plan_attempt", { attemptId });
 }
 
+/** A mature Agent is a Host capability, not a managed Worker/provider. */
+export interface NativeAgentCapability {
+  agentId: string;
+  displayName: string;
+  detected: boolean;
+  usable: boolean;
+}
+
+export type NativeAgentTaskState = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
+
+export interface NativeAgentTaskStatus {
+  schemaVersion: "pastey-native-agent-task-v1";
+  taskId: string;
+  agentId: string;
+  workspaceName: string;
+  sessionReused: boolean;
+  state: NativeAgentTaskState;
+  result?: string | null;
+  code?: string | null;
+}
+
+export function listNativeAgentCapabilities(): Promise<NativeAgentCapability[]> {
+  return invoke("list_native_agent_capabilities");
+}
+
+export function startNativeCodexTask(workspace: string, task: string): Promise<NativeAgentTaskStatus> {
+  return invoke("start_native_codex_task", { workspace, task });
+}
+
+export function getNativeAgentTaskStatus(taskId: string): Promise<NativeAgentTaskStatus> {
+  return invoke("get_native_agent_task_status", { taskId });
+}
+
+export function cancelNativeAgentTask(taskId: string): Promise<NativeAgentTaskStatus> {
+  return invoke("cancel_native_agent_task", { taskId });
+}
+
+export function startRemoteNativeCodexTask(
+  roomId: string, peerSessionId: string, targetHostRef: string, workspace: string, task: string, resume: boolean,
+): Promise<NativeAgentTaskStatus> {
+  return invoke("start_remote_native_codex_task", { roomId, peerSessionId, targetHostRef, workspace, task, resume });
+}
+
+export function cancelRemoteNativeAgentTask(
+  roomId: string, peerSessionId: string, targetHostRef: string, taskId: string,
+): Promise<NativeAgentTaskStatus> {
+  return invoke("cancel_remote_native_agent_task", { roomId, peerSessionId, targetHostRef, taskId });
+}
+
 export interface ManagedRuntimeOption {
   runtimeId: "python" | "node";
   available: boolean;
