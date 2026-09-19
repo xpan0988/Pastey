@@ -12,10 +12,10 @@ use crate::{
 
 pub(crate) const MANAGED_PYTHON_RUNTIME_ID: &str = "python";
 pub(crate) const MANAGED_NODE_RUNTIME_ID: &str = "node";
-/// Semantic observation only. A positive PATH probe is never a specialist
-/// executable binding, qualification, or execution authorization.
-pub(crate) const CODEX_SPECIALIST_CAPABILITY_ID: &str = "agent.coding.codex";
-pub(crate) const PI_SPECIALIST_CAPABILITY_ID: &str = "agent.coding.pi";
+/// Detection only: neither identifier is a managed Worker binding,
+/// qualification result, provider selection, or execution authorization.
+pub(crate) const CODEX_AGENT_CAPABILITY_ID: &str = "agent.coding.codex";
+pub(crate) const PI_AGENT_CAPABILITY_ID: &str = "agent.coding.pi";
 
 const RUNTIME_PYTHON_CAPABILITY_ID: &str = "runtime.python";
 const RUNTIME_NODE_CAPABILITY_ID: &str = "runtime.node";
@@ -41,8 +41,8 @@ const KNOWN_CAPABILITY_IDS: &[&str] = &[
     RUNTIME_POWERSHELL_CAPABILITY_ID,
     RUNTIME_ZSH_CAPABILITY_ID,
     RUNTIME_BASH_CAPABILITY_ID,
-    CODEX_SPECIALIST_CAPABILITY_ID,
-    PI_SPECIALIST_CAPABILITY_ID,
+    CODEX_AGENT_CAPABILITY_ID,
+    PI_AGENT_CAPABILITY_ID,
 ];
 
 #[derive(Clone, Copy)]
@@ -86,13 +86,13 @@ const RUNTIME_PROBES: &[RuntimeProbe] = &[
     },
     RuntimeProbe {
         name: "codex",
-        capability_id: CODEX_SPECIALIST_CAPABILITY_ID,
+        capability_id: CODEX_AGENT_CAPABILITY_ID,
         command: "codex",
         args: &["--version"],
     },
     RuntimeProbe {
         name: "pi",
-        capability_id: PI_SPECIALIST_CAPABILITY_ID,
+        capability_id: PI_AGENT_CAPABILITY_ID,
         command: "pi",
         args: &["--version"],
     },
@@ -350,74 +350,6 @@ pub(crate) fn validate_managed_runtime_executable(
     Ok(())
 }
 
-/// Resolves only Host-owned absolute candidates for the Codex specialist.
-/// This deliberately does not consult PATH: PATH remains diagnostics-only.
-/// Windows stays unavailable in B0 until its process-tree boundary can be
-/// physically qualified.
-#[allow(dead_code)] // B0 observes/qualifies only through this Host-private seam.
-pub(crate) fn discover_codex_specialist_executable() -> AppResult<Option<ManagedProcessWorldSpecV1>>
-{
-    #[cfg(target_os = "macos")]
-    let candidates = [
-        PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
-        PathBuf::from("/opt/homebrew/bin/codex"),
-        PathBuf::from("/usr/local/bin/codex"),
-    ];
-    #[cfg(not(target_os = "macos"))]
-    let candidates: [PathBuf; 0] = [];
-
-    for candidate in candidates {
-        let Ok(executable_path) = std::fs::canonicalize(candidate) else {
-            continue;
-        };
-        let Some(scope_root) = executable_path.parent().map(ToOwned::to_owned) else {
-            continue;
-        };
-        let executable = ExecutableBindingSpecV1 {
-            executable_path,
-            scope_root,
-        };
-        if validate_managed_runtime_executable(&executable).is_ok() {
-            if let Ok(process_world) = ManagedProcessWorldSpecV1::new(executable) {
-                return Ok(Some(process_world));
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Resolves only Host-owned absolute candidates for the Pi specialist. PATH
-/// remains diagnostics-only and never becomes a qualification input.
-#[allow(dead_code)] // Pi proof observes/qualifies only through this Host-private seam.
-pub(crate) fn discover_pi_specialist_executable() -> AppResult<Option<ManagedProcessWorldSpecV1>> {
-    #[cfg(target_os = "macos")]
-    let candidates = [
-        PathBuf::from("/opt/homebrew/bin/pi"),
-        PathBuf::from("/usr/local/bin/pi"),
-    ];
-    #[cfg(not(target_os = "macos"))]
-    let candidates: [PathBuf; 0] = [];
-
-    for candidate in candidates {
-        let Ok(executable_path) = std::fs::canonicalize(candidate) else {
-            continue;
-        };
-        let Some(scope_root) = executable_path.parent().map(ToOwned::to_owned) else {
-            continue;
-        };
-        let executable = ExecutableBindingSpecV1 {
-            executable_path,
-            scope_root,
-        };
-        if validate_managed_runtime_executable(&executable).is_ok() {
-            if let Ok(process_world) = ManagedProcessWorldSpecV1::new(executable) {
-                return Ok(Some(process_world));
-            }
-        }
-    }
-    Ok(None)
-}
-
 pub(crate) fn validate_managed_runtime_id(runtime_id: &str) -> AppResult<()> {
     match runtime_id {
         MANAGED_PYTHON_RUNTIME_ID | MANAGED_NODE_RUNTIME_ID => Ok(()),
@@ -635,8 +567,8 @@ mod tests {
                 RUNTIME_POWERSHELL_CAPABILITY_ID,
                 RUNTIME_ZSH_CAPABILITY_ID,
                 RUNTIME_BASH_CAPABILITY_ID,
-                CODEX_SPECIALIST_CAPABILITY_ID,
-                PI_SPECIALIST_CAPABILITY_ID,
+                CODEX_AGENT_CAPABILITY_ID,
+                PI_AGENT_CAPABILITY_ID,
             ]
         );
         for probe in RUNTIME_PROBES {
@@ -646,16 +578,16 @@ mod tests {
             );
             assert!(
                 probe.capability_id.starts_with("runtime.")
-                    || probe.capability_id == CODEX_SPECIALIST_CAPABILITY_ID
-                    || probe.capability_id == PI_SPECIALIST_CAPABILITY_ID
+                    || probe.capability_id == CODEX_AGENT_CAPABILITY_ID
+                    || probe.capability_id == PI_AGENT_CAPABILITY_ID
             );
         }
     }
 
     #[test]
-    fn specialist_capabilities_are_fixed_path_observations_only() {
+    fn agent_capabilities_are_fixed_path_observations_only() {
         let result =
-            probe_known_capability_with_runner(CODEX_SPECIALIST_CAPABILITY_ID, |command, args| {
+            probe_known_capability_with_runner(CODEX_AGENT_CAPABILITY_ID, |command, args| {
                 assert_eq!(command, "codex");
                 assert_eq!(args, ["--version"]);
                 Some("codex-cli test".into())
@@ -663,7 +595,7 @@ mod tests {
         assert_eq!(result, KnownCapabilityProbeResult::Available);
         assert_eq!(
             semantic_capability_id_for_runtime_name("codex"),
-            Some(CODEX_SPECIALIST_CAPABILITY_ID)
+            Some(CODEX_AGENT_CAPABILITY_ID)
         );
     }
 

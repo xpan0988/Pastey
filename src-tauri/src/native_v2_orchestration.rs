@@ -22,7 +22,7 @@ use crate::{
     bridge_plan_v2::{
         participant_for_ref, seal_revision, verify_sealed_revision, AttemptStartV2,
         ManagedObjectRevisionV2, PlanApprovalV2, PlanRevisionV2, PlanRootV2, PlanStepV2,
-        ReviewRequestV2, TransformWorkerCapabilityRequirementV1, PROTOCOL_VERSION,
+        ReviewRequestV2, PROTOCOL_VERSION,
     },
     error::{AppError, AppResult},
     host_identity::{
@@ -104,8 +104,6 @@ pub enum NativeV2StepDraftV1 {
         input: NativeV2ObjectRevisionDtoV1,
         output: NativeV2ObjectRevisionDtoV1,
         modification_intent: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        worker_capability_requirement: Option<TransformWorkerCapabilityRequirementV1>,
     },
     Transfer {
         step_id: String,
@@ -528,7 +526,6 @@ fn lower_step(
             input,
             output,
             modification_intent,
-            worker_capability_requirement,
         } => {
             let host = HostRef::parse(host_ref)?;
             PlanStepV2::Transform {
@@ -538,7 +535,6 @@ fn lower_step(
                 input: input.into(),
                 output: output.into(),
                 modification_intent,
-                worker_capability_requirement,
             }
         }
         NativeV2StepDraftV1::Transfer {
@@ -1083,28 +1079,8 @@ impl HostRuntime {
             } else {
                 None
             };
-            let codex_generation = self
-                .local_plan_requires_codex(revision)
-                .then(|| {
-                    self.codex_specialists
-                        .lock()
-                        .required_transform_qualification_generation()
-                })
-                .flatten();
-            let pi_generation = self
-                .local_plan_requires_pi(revision)
-                .then(|| {
-                    self.pi_specialists
-                        .lock()
-                        .required_transform_qualification_generation()
-                })
-                .flatten();
-            let availability = self.managed_worker_plan_availability(
-                revision,
-                selection.as_ref(),
-                codex_generation,
-                pi_generation,
-            )?;
+            let availability =
+                self.managed_worker_plan_availability(revision, selection.as_ref())?;
             if revision.steps.iter().any(|step| {
                 matches!(
                     step,
@@ -5065,7 +5041,6 @@ mod tests {
                         revision: 2,
                     },
                     modification_intent: "Apply the approved semantic change.".into(),
-                    worker_capability_requirement: None,
                 },
                 NativeV2StepDraftV1::Transfer {
                     step_id: "transfer-b-c".into(),
@@ -5684,7 +5659,6 @@ mod tests {
             input: input.clone(),
             output: output.clone(),
             modification_intent: "Produce the exact approved next revision.".into(),
-            worker_capability_requirement: None,
         }];
         if include_successor {
             steps.push(NativeV2StepDraftV1::Transform {
@@ -5697,7 +5671,6 @@ mod tests {
                     revision: output.revision + 1,
                 },
                 modification_intent: "Produce the second approved revision.".into(),
-                worker_capability_requirement: None,
             });
         }
         let revision = compose_revision(NativeV2ComposeRequestV1 {

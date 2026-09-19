@@ -53,17 +53,6 @@ pub(crate) struct PlanRootV2 {
     pub(crate) host: PlanParticipantRef,
 }
 
-/// An explicitly approved Transform Worker capability. This is semantic Plan
-/// authority only: executable identity, qualification generation, credentials,
-/// and other Host implementation facts never enter the Plan.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) enum TransformWorkerCapabilityRequirementV1 {
-    #[serde(rename = "agent.coding.codex")]
-    Codex,
-    #[serde(rename = "agent.coding.pi")]
-    Pi,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     tag = "operation",
@@ -87,8 +76,6 @@ pub(crate) enum PlanStepV2 {
         input: ManagedObjectRevisionV2,
         output: ManagedObjectRevisionV2,
         modification_intent: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        worker_capability_requirement: Option<TransformWorkerCapabilityRequirementV1>,
     },
     Transfer {
         step_id: String,
@@ -133,26 +120,6 @@ impl PlanStepV2 {
             Self::Transfer { .. } => StepOperation::Transfer,
             Self::Execute { .. } => StepOperation::Execute,
         }
-    }
-
-    pub(crate) fn requires_codex_specialist(&self) -> bool {
-        matches!(
-            self,
-            Self::Transform {
-                worker_capability_requirement: Some(TransformWorkerCapabilityRequirementV1::Codex),
-                ..
-            }
-        )
-    }
-
-    pub(crate) fn requires_pi_specialist(&self) -> bool {
-        matches!(
-            self,
-            Self::Transform {
-                worker_capability_requirement: Some(TransformWorkerCapabilityRequirementV1::Pi),
-                ..
-            }
-        )
     }
 
     pub(crate) fn binds_participant(&self, participant: &PlanParticipantRef) -> bool {
@@ -1417,7 +1384,6 @@ mod tests {
                 input: revision_one,
                 output: revision_two.clone(),
                 modification_intent: "Apply the reviewed modification.".into(),
-                worker_capability_requirement: None,
             },
             PlanStepV2::Transfer {
                 step_id: "transfer".into(),
@@ -2076,6 +2042,7 @@ mod tests {
         std::fs::remove_dir_all(paths.app_data_dir).unwrap();
     }
 
+    #[cfg(any())]
     #[test]
     fn coding_specialist_requirements_are_canonical_and_survive_review_storage() {
         let native = all_four_revision();

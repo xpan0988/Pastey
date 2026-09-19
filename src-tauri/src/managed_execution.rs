@@ -695,265 +695,6 @@ impl HostRuntime {
         Ok(acquisition)
     }
 
-    /// Explicit Host-only B1 closure for an already prepared Codex attempt.
-    /// It is not Plan selection and cannot qualify or launch Codex. B0 callers
-    /// that bind and scan Scratch alone still have no OutputSlot or N+1 path.
-    pub(crate) fn finalize_codex_specialist_transform(
-        &self,
-        grant: &ManagedStepGrantV1,
-        codex_binding: &crate::codex_specialist::CodexAttemptBindingV0,
-        scratch: &crate::managed_resources::ManagedScratchLeaseV1,
-        current_binding: impl Into<HostExecutionFreshness>,
-        now: i64,
-    ) -> AppResult<ManagedObjectAcquisition> {
-        let current_binding = current_binding.into();
-        let mut access = grant.access.clone();
-        access.current = current_authority(&current_binding, now);
-        let imported = {
-            let specialists = self.codex_specialists.lock();
-            let mut authority = self.effect_authority.lock();
-            let mut resolver = self.managed_resources.lock();
-            let mut objects = self.managed_objects.lock();
-            specialists.import_bound_scratch(
-                codex_binding,
-                &mut authority,
-                &mut resolver,
-                &mut objects,
-                grant,
-                &access,
-                scratch,
-                now,
-            )
-        };
-        let imported = match imported {
-            Ok(imported) => imported,
-            Err(error) => {
-                let _ = self.cancel_managed_run(&grant.access.run_control_ref);
-                return Err(error);
-            }
-        };
-        let input = grant
-            .access
-            .context
-            .input_revisions
-            .first()
-            .cloned()
-            .ok_or_else(|| {
-                AppError::InvalidInput("Codex Transform input is unavailable.".into())
-            })?;
-        let proposal = TransformResultProposalV1 {
-            attempt_id: grant.access.context.attempt_id.clone(),
-            step_id: grant.access.context.step_id.clone(),
-            context_ref: grant.access.context.context_ref()?,
-            envelope_ref: grant.access.envelope_ref.clone(),
-            run_control_ref: grant.access.run_control_ref.clone(),
-            input: input.clone(),
-            output: ManagedObjectRevisionResultV1 {
-                logical_object_id: input.logical_object_id,
-                revision: grant.output_revision.ok_or_else(|| {
-                    AppError::InvalidInput("Codex Transform output is unavailable.".into())
-                })?,
-                host_ref: self.local_host_ref.clone(),
-                content_digest: imported.output_seal.content_digest.clone(),
-            },
-            output_seal: imported.output_seal,
-            evidence_ids: imported.evidence_ids,
-            evidence_head: imported.evidence_head,
-            display_name: "codex-transform-output".into(),
-            media_type: "application/x-pastey-file-set".into(),
-        };
-        let result = self.finalize_v2_transform(proposal, current_binding, now);
-        if result.is_err() {
-            let _ = self.cancel_managed_run(&grant.access.run_control_ref);
-        }
-        result
-    }
-
-    /// B3 Host-owned controller closure. The Plan/coordinator selects the
-    /// specialist before this method; this method only claims one exact
-    /// Transform, runs its bound controller in private Scratch, and delegates
-    /// authoritative import/sealing/N+1 to the existing B1 finalizer.
-    pub(crate) fn run_codex_specialist_transform(
-        &self,
-        request: ManagedStepClaimRequestV1,
-        provider: crate::worker_provider_config::ResolvedWorkerProviderBindingV1,
-    ) -> AppResult<ManagedObjectAcquisition> {
-        if !request.private_scratch || request.process_world.is_some() {
-            return invalid("Codex B3 requires an exact private-scratch Transform claim.");
-        }
-        let current_binding = request.current_binding.clone();
-        let grant = self.claim_v2_managed_step(request)?;
-        let (binding, scratch) = {
-            let mut specialists = self.codex_specialists.lock();
-            let authority = self.effect_authority.lock();
-            let mut resolver = self.managed_resources.lock();
-            let mut objects = self.managed_objects.lock();
-            specialists.bind_claimed_transform(
-                &grant,
-                &authority,
-                &mut resolver,
-                &mut objects,
-                provider.config_ref.clone(),
-                provider.revocation_token(),
-            )?
-        };
-        let controller_result = {
-            self.codex_specialists
-                .lock()
-                .start_bound_controller(&binding, &provider)
-        };
-        let controller = match controller_result {
-            Ok(controller) => controller,
-            Err(error) => {
-                let _ = self.cancel_managed_run(&grant.access.run_control_ref);
-                return Err(error);
-            }
-        };
-        let controller_result = {
-            self.codex_specialists.lock().finish_bound_controller(
-                &binding,
-                controller,
-                &grant.operation_intent,
-                &provider.provider_config.model,
-            )
-        };
-        if let Err(error) = controller_result {
-            let _ = self.cancel_managed_run(&grant.access.run_control_ref);
-            return Err(error);
-        }
-        self.finalize_codex_specialist_transform(
-            &grant,
-            &binding,
-            &scratch,
-            current_binding,
-            crate::storage::now_ts(),
-        )
-    }
-
-    /// Concrete Pi closure. It shares only the existing Host/Core primitives
-    /// with Codex; Pi binding, invocation, JSON protocol, and lifecycle remain
-    /// in its own backend.
-    pub(crate) fn finalize_pi_specialist_transform(
-        &self,
-        grant: &ManagedStepGrantV1,
-        pi_binding: &crate::pi_specialist::PiAttemptBindingV0,
-        scratch: &crate::managed_resources::ManagedScratchLeaseV1,
-        current_binding: impl Into<HostExecutionFreshness>,
-        now: i64,
-    ) -> AppResult<ManagedObjectAcquisition> {
-        let current_binding = current_binding.into();
-        let mut access = grant.access.clone();
-        access.current = current_authority(&current_binding, now);
-        let imported = {
-            let specialists = self.pi_specialists.lock();
-            let mut authority = self.effect_authority.lock();
-            let mut resolver = self.managed_resources.lock();
-            let mut objects = self.managed_objects.lock();
-            specialists.import_bound_scratch(
-                pi_binding,
-                &mut authority,
-                &mut resolver,
-                &mut objects,
-                grant,
-                &access,
-                scratch,
-                now,
-            )
-        };
-        let imported = match imported {
-            Ok(imported) => imported,
-            Err(error) => {
-                let _ = self.cancel_managed_run(&grant.access.run_control_ref);
-                return Err(error);
-            }
-        };
-        let input = grant
-            .access
-            .context
-            .input_revisions
-            .first()
-            .cloned()
-            .ok_or_else(|| AppError::InvalidInput("Pi Transform input is unavailable.".into()))?;
-        let proposal = TransformResultProposalV1 {
-            attempt_id: grant.access.context.attempt_id.clone(),
-            step_id: grant.access.context.step_id.clone(),
-            context_ref: grant.access.context.context_ref()?,
-            envelope_ref: grant.access.envelope_ref.clone(),
-            run_control_ref: grant.access.run_control_ref.clone(),
-            input: input.clone(),
-            output: ManagedObjectRevisionResultV1 {
-                logical_object_id: input.logical_object_id,
-                revision: grant.output_revision.ok_or_else(|| {
-                    AppError::InvalidInput("Pi Transform output is unavailable.".into())
-                })?,
-                host_ref: self.local_host_ref.clone(),
-                content_digest: imported.output_seal.content_digest.clone(),
-            },
-            output_seal: imported.output_seal,
-            evidence_ids: imported.evidence_ids,
-            evidence_head: imported.evidence_head,
-            display_name: "pi-transform-output".into(),
-            media_type: "application/x-pastey-file-set".into(),
-        };
-        let result = self.finalize_v2_transform(proposal, current_binding, now);
-        if result.is_err() {
-            let _ = self.cancel_managed_run(&grant.access.run_control_ref);
-        }
-        result
-    }
-
-    pub(crate) fn run_pi_specialist_transform(
-        &self,
-        request: ManagedStepClaimRequestV1,
-    ) -> AppResult<ManagedObjectAcquisition> {
-        if !request.private_scratch || request.process_world.is_some() {
-            return invalid("Pi requires an exact private-scratch Transform claim.");
-        }
-        let current_binding = request.current_binding.clone();
-        let grant = self.claim_v2_managed_step(request)?;
-        let (binding, scratch) = {
-            let mut specialists = self.pi_specialists.lock();
-            let authority = self.effect_authority.lock();
-            let mut resolver = self.managed_resources.lock();
-            let mut objects = self.managed_objects.lock();
-            specialists.bind_claimed_transform(&grant, &authority, &mut resolver, &mut objects)?
-        };
-        let controller = match self
-            .pi_specialists
-            .lock()
-            .start_bound_controller(&binding, &grant.operation_intent)
-        {
-            Ok(controller) => controller,
-            Err(error) => {
-                let _ = self.cancel_managed_run(&grant.access.run_control_ref);
-                return Err(error);
-            }
-        };
-        let output = match controller.wait() {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = self.cancel_managed_run(&grant.access.run_control_ref);
-                return Err(error);
-            }
-        };
-        let controller_result = {
-            self.pi_specialists
-                .lock()
-                .finish_bound_controller(&binding, output)
-        };
-        if let Err(error) = controller_result {
-            let _ = self.cancel_managed_run(&grant.access.run_control_ref);
-            return Err(error);
-        }
-        self.finalize_pi_specialist_transform(
-            &grant,
-            &binding,
-            &scratch,
-            current_binding,
-            crate::storage::now_ts(),
-        )
-    }
-
     pub(crate) fn finalize_v2_execute(
         &self,
         proposal: ExecuteResultProposalV1,
@@ -1146,13 +887,7 @@ fn load_claim_source(
         &approval,
         &admission_request,
         &request.current_binding,
-        ManagedPrimitiveAvailabilityV1::verified_attachment_with_specialists(
-            local_host.clone(),
-            true,
-            true,
-            true,
-            true,
-        ),
+        ManagedPrimitiveAvailabilityV1::verified_attachment(local_host.clone(), true, true),
         request.now,
     )?;
     if admission
@@ -1556,11 +1291,7 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::VecDeque,
-        path::PathBuf,
-        sync::{atomic::AtomicBool, Arc},
-    };
+    use std::{collections::VecDeque, path::PathBuf, sync::Arc};
 
     use base64::Engine as _;
 
@@ -1895,7 +1626,6 @@ mod tests {
                 input: one,
                 output: two.clone(),
                 modification_intent: "Rewrite safely.".into(),
-                worker_capability_requirement: None,
             },
             PlanStepV2::Execute {
                 step_id: "execute".into(),
@@ -1927,6 +1657,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(any())]
     fn claim_codex_transform(fixture: &Fixture) -> ManagedStepGrantV1 {
         fixture
             .runtime
@@ -1943,6 +1674,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(any())]
     fn bind_synthetic_codex(
         fixture: &Fixture,
         grant: &ManagedStepGrantV1,
@@ -1986,6 +1718,7 @@ mod tests {
         (result.0, result.1, executable_root)
     }
 
+    #[cfg(any())]
     fn bind_synthetic_pi(
         fixture: &Fixture,
         grant: &ManagedStepGrantV1,
@@ -2022,6 +1755,7 @@ mod tests {
         (result.0, result.1, executable_root)
     }
 
+    #[cfg(any())]
     fn transform_result_count(fixture: &Fixture) -> i64 {
         Connection::open(&fixture.runtime.paths.db_path)
             .unwrap()
@@ -2084,6 +1818,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     #[test]
     fn codex_b0_claim_clones_private_scratch_and_cannot_write_output_or_n_plus_one() {
         let fixture = fixture(transform_then_execute_steps);
@@ -2205,6 +1940,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(executable_root);
     }
 
+    #[cfg(any())]
     #[test]
     fn codex_b1_imports_the_complete_scanned_tree_through_effects_and_one_core_n_plus_one() {
         let fixture = fixture_with_input(transform_then_execute_steps, true, |artifact_root| {
@@ -2308,6 +2044,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(executable_root);
     }
 
+    #[cfg(any())]
     #[test]
     fn codex_b1_partial_import_cancels_without_a_successor_revision() {
         let fixture = fixture(transform_then_execute_steps);
@@ -2339,6 +2076,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(executable_root);
     }
 
+    #[cfg(any())]
     #[test]
     fn pi_import_failure_cancels_without_a_successor_revision() {
         let fixture = fixture(transform_then_execute_steps);
@@ -2368,6 +2106,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(executable_root);
     }
 
+    #[cfg(any())]
     #[test]
     fn codex_b1_cancellation_stale_binding_and_seal_failure_create_no_successor() {
         let cancelled = fixture(transform_then_execute_steps);
@@ -2931,7 +2670,6 @@ mod tests {
                     input: one,
                     output: two,
                     modification_intent: "Create two deterministic output files named transformed.txt and manifest.txt, then finish with output selector '.'.".into(),
-                    worker_capability_requirement: None,
                 }]
             },
             true,
@@ -3504,7 +3242,6 @@ mod tests {
                         revision: 2,
                     },
                     modification_intent: "No backend fallback.".into(),
-                    worker_capability_requirement: None,
                 }]
             },
             false,

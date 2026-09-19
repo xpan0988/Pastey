@@ -248,23 +248,9 @@ impl HostRuntime {
             );
         }
         let native_required = self.local_plan_requires_native_provider(&revision);
-        let codex_generation = self
-            .local_plan_requires_codex(&revision)
-            .then(|| {
-                self.codex_specialists
-                    .lock()
-                    .required_transform_qualification_generation()
-            })
-            .flatten();
-        let pi_generation = self
-            .local_plan_requires_pi(&revision)
-            .then(|| {
-                self.pi_specialists
-                    .lock()
-                    .required_transform_qualification_generation()
-            })
-            .flatten();
-        let selection = if native_required || self.local_plan_requires_codex(&revision) {
+        // Mature Agents are native Host capabilities and never enter this
+        // managed-Worker provider path.
+        let selection = if native_required {
             let selection = self
                 .worker_provider_configs
                 .selected_for_managed_workers()?;
@@ -279,12 +265,7 @@ impl HostRuntime {
             .resolve_and_bind_v2_managed_process_steps(&revision)
             .unwrap_or(false);
         let availability = if runtime_ready {
-            self.managed_worker_plan_availability(
-                &revision,
-                selection.as_ref(),
-                codex_generation,
-                pi_generation,
-            )?
+            self.managed_worker_plan_availability(&revision, selection.as_ref())?
         } else {
             ManagedPrimitiveAvailabilityV1::unavailable()
         };
@@ -303,8 +284,8 @@ impl HostRuntime {
             &self.paths,
             &start.attempt_id,
             selection.as_ref(),
-            codex_generation,
-            pi_generation,
+            None,
+            None,
             now,
         ) {
             interrupt_base_attempt(&self.paths, &start.attempt_id);
@@ -332,11 +313,8 @@ impl HostRuntime {
         &self,
         revision: &PlanRevisionV2,
         selection: Option<&WorkerProviderSelectionV1>,
-        codex_generation: Option<u64>,
-        pi_generation: Option<u64>,
     ) -> AppResult<ManagedPrimitiveAvailabilityV1> {
         let native_required = self.local_plan_requires_native_provider(revision);
-        let codex_required = self.local_plan_requires_codex(revision);
         let provider_available = match selection {
             Some(selection) => {
                 drop(self.worker_provider_configs.resolve(selection)?);
@@ -351,20 +329,15 @@ impl HostRuntime {
                             != crate::worker_provider_config::WorkerProviderHealthStateV1::Unhealthy
                     })
             }
-            None => !native_required && !codex_required,
+            None => !native_required,
         };
-        if !provider_available
-            || (self.local_plan_requires_codex(revision) && codex_generation.is_none())
-            || (self.local_plan_requires_pi(revision) && pi_generation.is_none())
-        {
+        if !provider_available {
             return Ok(ManagedPrimitiveAvailabilityV1::unavailable());
         }
         let platform = self.execution_worlds.platform_availability();
         let specs = self.managed_worker_process_specs.lock();
         let transform = revision.steps.iter().all(|step| match step {
-            PlanStepV2::Transform { step_id, .. }
-                if !step.requires_codex_specialist() && !step.requires_pi_specialist() =>
-            {
+            PlanStepV2::Transform { step_id, .. } => {
                 !crate::native_v2_orchestration::step_runs_on_host(
                     revision,
                     step,
@@ -385,45 +358,19 @@ impl HostRuntime {
             }
             _ => true,
         });
-        Ok(
-            ManagedPrimitiveAvailabilityV1::verified_attachment_with_specialists(
-                self.local_host_ref.clone(),
-                transform,
-                codex_generation.is_some(),
-                pi_generation.is_some(),
-                execute,
-            ),
-        )
+        Ok(ManagedPrimitiveAvailabilityV1::verified_attachment(
+            self.local_host_ref.clone(),
+            transform,
+            execute,
+        ))
     }
 
     pub(crate) fn local_plan_requires_native_provider(&self, revision: &PlanRevisionV2) -> bool {
         revision.steps.iter().any(|step| {
             crate::native_v2_orchestration::step_runs_on_host(revision, step, &self.local_host_ref)
-                && (matches!(step, PlanStepV2::Execute { .. })
-                    || (matches!(step, PlanStepV2::Transform { .. })
-                        && !step.requires_codex_specialist()
-                        && !step.requires_pi_specialist()))
-        })
-    }
-
-    pub(crate) fn local_plan_requires_codex(&self, revision: &PlanRevisionV2) -> bool {
-        revision.steps.iter().any(|step| {
-            step.requires_codex_specialist()
-                && crate::native_v2_orchestration::step_runs_on_host(
-                    revision,
+                && matches!(
                     step,
-                    &self.local_host_ref,
-                )
-        })
-    }
-
-    pub(crate) fn local_plan_requires_pi(&self, revision: &PlanRevisionV2) -> bool {
-        revision.steps.iter().any(|step| {
-            step.requires_pi_specialist()
-                && crate::native_v2_orchestration::step_runs_on_host(
-                    revision,
-                    step,
-                    &self.local_host_ref,
+                    PlanStepV2::Execute { .. } | PlanStepV2::Transform { .. }
                 )
         })
     }
@@ -490,80 +437,31 @@ impl HostRuntime {
                 None,
                 now,
             ));
-            let (result, provider_revoked) = if step.requires_codex_specialist() {
-                let qualified = codex_attempt_qualification_generation(&self.paths, &attempt_id)
-                    .ok()
-                    .flatten()
-                    .zip(
-                        self.codex_specialists
-                            .lock()
-                            .required_transform_qualification_generation(),
-                    )
-                    .is_some_and(|(bound, current)| bound == current);
-                if !qualified {
-                    (
-                        Err(AppError::InvalidInput(
-                            "Codex qualification is stale.".into(),
-                        )),
-                        None,
-                    )
-                } else {
-                    (
-                        self.invoke_reserved_codex_specialist(&attempt_id, &step, &captured, now),
-                        None,
-                    )
-                }
-            } else if step.requires_pi_specialist() {
-                let qualified = pi_attempt_qualification_generation(&self.paths, &attempt_id)
-                    .ok()
-                    .flatten()
-                    .zip(
-                        self.pi_specialists
-                            .lock()
-                            .required_transform_qualification_generation(),
-                    )
-                    .is_some_and(|(bound, current)| bound == current);
-                if !qualified {
-                    (
-                        Err(AppError::InvalidInput("Pi qualification is stale.".into())),
-                        None,
-                    )
-                } else {
-                    (
-                        self.invoke_reserved_pi_specialist(&attempt_id, &step, &captured, now),
-                        None,
-                    )
-                }
-            } else {
-                let selection = match worker_attempt_selection(&self.paths, &attempt_id) {
-                    Ok(selection) => selection,
-                    Err(_) => return,
-                };
-                let binding = match self.worker_provider_configs.resolve(&selection) {
-                    Ok(binding) => binding,
-                    Err(_) => {
-                        self.finish_worker_failure(
-                            &attempt_id,
-                            Some(&step_id),
-                            ManagedWorkerCoordinatorStateV1::Interrupted,
-                            "provider_unavailable",
-                            now,
-                        );
-                        self.notify_coordinated_failure(
-                            &attempt_id,
-                            Some(&step_id),
-                            &captured,
-                            "provider_unavailable",
-                        );
-                        return;
-                    }
-                };
-                let revoked = binding.revocation_token();
-                (
-                    self.invoke_reserved_worker(&attempt_id, &step, &captured, binding, now),
-                    Some(revoked),
-                )
+            let selection = match worker_attempt_selection(&self.paths, &attempt_id) {
+                Ok(selection) => selection,
+                Err(_) => return,
             };
+            let binding = match self.worker_provider_configs.resolve(&selection) {
+                Ok(binding) => binding,
+                Err(_) => {
+                    self.finish_worker_failure(
+                        &attempt_id,
+                        Some(&step_id),
+                        ManagedWorkerCoordinatorStateV1::Interrupted,
+                        "provider_unavailable",
+                        now,
+                    );
+                    self.notify_coordinated_failure(
+                        &attempt_id,
+                        Some(&step_id),
+                        &captured,
+                        "provider_unavailable",
+                    );
+                    return;
+                }
+            };
+            let provider_revoked = Some(binding.revocation_token());
+            let result = self.invoke_reserved_worker(&attempt_id, &step, &captured, binding, now);
             match result {
                 Ok(()) => {
                     let completed = {
@@ -762,77 +660,6 @@ impl HostRuntime {
         Ok(())
     }
 
-    fn invoke_reserved_codex_specialist(
-        &self,
-        attempt_id: &str,
-        step: &PlanStepV2,
-        captured: &HostExecutionFreshness,
-        now: i64,
-    ) -> AppResult<()> {
-        if !step.requires_codex_specialist() {
-            return invalid("Codex dispatch requires an explicitly Codex-bound Transform.");
-        }
-        ensure_worker_attempt_active(&self.paths, attempt_id)?;
-        let current = current_host_execution_freshness(self, captured)?;
-        captured.validate_current(&current, now)?;
-        let input = step_input(step)?;
-        let acquisition = self.managed_objects.lock().acquisition_for_revision(
-            captured.bridge_id(),
-            &input.logical_object_id,
-            input.revision,
-            now,
-        )?;
-        let selection = worker_attempt_selection(&self.paths, attempt_id)?;
-        let provider = self.worker_provider_configs.resolve(&selection)?;
-        self.run_codex_specialist_transform(
-            ManagedStepClaimRequestV1 {
-                attempt_id: attempt_id.into(),
-                step_id: step.id().into(),
-                input: acquisition,
-                captured_binding: captured.clone(),
-                current_binding: current,
-                now,
-                process_world: None,
-                private_scratch: true,
-            },
-            provider,
-        )?;
-        Ok(())
-    }
-
-    fn invoke_reserved_pi_specialist(
-        &self,
-        attempt_id: &str,
-        step: &PlanStepV2,
-        captured: &HostExecutionFreshness,
-        now: i64,
-    ) -> AppResult<()> {
-        if !step.requires_pi_specialist() {
-            return invalid("Pi dispatch requires an explicitly Pi-bound Transform.");
-        }
-        ensure_worker_attempt_active(&self.paths, attempt_id)?;
-        let current = current_host_execution_freshness(self, captured)?;
-        captured.validate_current(&current, now)?;
-        let input = step_input(step)?;
-        let acquisition = self.managed_objects.lock().acquisition_for_revision(
-            captured.bridge_id(),
-            &input.logical_object_id,
-            input.revision,
-            now,
-        )?;
-        self.run_pi_specialist_transform(ManagedStepClaimRequestV1 {
-            attempt_id: attempt_id.into(),
-            step_id: step.id().into(),
-            input: acquisition,
-            captured_binding: captured.clone(),
-            current_binding: current,
-            now,
-            process_world: None,
-            private_scratch: true,
-        })?;
-        Ok(())
-    }
-
     /// Testable coordinator dispatch retaining the same reservation and live
     /// Host/session checks while injecting a provider-neutral adapter.
     pub(crate) fn dispatch_next_v2_managed_with_provider<P: WorkerProviderV1>(
@@ -848,12 +675,6 @@ impl HostRuntime {
         else {
             return invalid("No managed v2 step is eligible for dispatch.");
         };
-        if step.requires_codex_specialist() {
-            return invalid("Codex-required Transform cannot dispatch through a Native provider.");
-        }
-        if step.requires_pi_specialist() {
-            return invalid("Pi-required Transform cannot dispatch through a Native provider.");
-        }
         let selection = worker_attempt_selection(&self.paths, attempt_id)?;
         drop(self.worker_provider_configs.resolve(&selection)?);
         let operation = step.operation();
@@ -1687,7 +1508,7 @@ mod tests {
     use crate::{
         bridge_plan_v2::{
             seal_revision, ManagedObjectRevisionV2, PlanApprovalV2, PlanRootV2, ReviewRequestV2,
-            TransformWorkerCapabilityRequirementV1, PLAN_SCHEMA_VERSION, PROTOCOL_VERSION,
+            PLAN_SCHEMA_VERSION, PROTOCOL_VERSION,
         },
         config::StoredConfig,
         host_identity::{HostRef, PlanParticipantRef, PlanParticipants},
@@ -2421,7 +2242,6 @@ mod tests {
                 revision: input.revision + 1,
             },
             modification_intent: "Rewrite safely.".into(),
-            worker_capability_requirement: None,
         }]
     }
 
@@ -2442,7 +2262,6 @@ mod tests {
                 input: input.clone(),
                 output: output.clone(),
                 modification_intent: "Rewrite safely.".into(),
-                worker_capability_requirement: None,
             },
             PlanStepV2::Transfer {
                 step_id: "transfer".into(),
@@ -2568,6 +2387,7 @@ mod tests {
         assert_eq!(attempts, 0);
     }
 
+    #[cfg(any())]
     #[test]
     fn codex_requirement_blocks_before_native_selection_or_claim() {
         let fixture = fixture(|input, local, _| {
@@ -2607,6 +2427,7 @@ mod tests {
         assert_eq!(claims, 0);
     }
 
+    #[cfg(any())]
     #[test]
     fn codex_readiness_rechecks_the_exact_qualification_binding() {
         let fixture = fixture(|input, local, _| {
@@ -2648,7 +2469,7 @@ mod tests {
             .unwrap();
         let available = fixture
             .runtime
-            .managed_worker_plan_availability(&fixture.revision, Some(&selection), generation, None)
+            .managed_worker_plan_availability(&fixture.revision, Some(&selection))
             .unwrap();
         assert!(available.supports(&fixture.revision, &fixture.revision.steps[0]));
 
@@ -2661,16 +2482,12 @@ mod tests {
         assert!(stale_generation.is_none());
         let unavailable = fixture
             .runtime
-            .managed_worker_plan_availability(
-                &fixture.revision,
-                Some(&selection),
-                stale_generation,
-                None,
-            )
+            .managed_worker_plan_availability(&fixture.revision, Some(&selection))
             .unwrap();
         assert!(!unavailable.supports(&fixture.revision, &fixture.revision.steps[0]));
     }
 
+    #[cfg(any())]
     #[test]
     fn qualified_codex_transform_binds_only_codex_and_never_native_dispatch() {
         let fixture = fixture(|input, local, _| {
@@ -2737,6 +2554,7 @@ mod tests {
             .contains("Codex-required Transform cannot dispatch through a Native provider"));
     }
 
+    #[cfg(any())]
     #[cfg(unix)]
     #[test]
     fn codex_controller_runs_private_scratch_then_b1_finalizes_one_successor() {
@@ -2800,6 +2618,7 @@ mod tests {
         assert_eq!(status.state, ManagedWorkerCoordinatorStateV1::Completed);
     }
 
+    #[cfg(any())]
     #[cfg(unix)]
     #[test]
     fn codex_controller_malformed_or_nonzero_output_has_no_successor() {
@@ -2881,6 +2700,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     #[cfg(unix)]
     #[test]
     fn pi_controller_runs_its_json_protocol_then_creates_one_ordinary_successor() {
@@ -2955,6 +2775,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[cfg(unix)]
     #[test]
     fn pi_failures_stale_binding_and_cancellation_have_no_successor() {
@@ -3047,6 +2868,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     #[test]
     fn pi_required_transform_never_dispatches_through_native_or_codex() {
         let fixture = fixture(|input, local, _| {

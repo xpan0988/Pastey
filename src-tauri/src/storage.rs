@@ -36,6 +36,20 @@ pub struct AppPaths {
     pub config_path: PathBuf,
 }
 
+/// Host-private recovery pointer for a native-Agent result that Pastey refused
+/// to apply because the original workspace changed.  It is deliberately not a
+/// Room item or a new object-flow primitive: it only makes a non-DONE recovery
+/// state survive transient-transfer cleanup and process restart.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredNativeAgentConflict {
+    pub(crate) movement_id: String,
+    pub(crate) task_id: String,
+    pub(crate) retained_tree: PathBuf,
+    pub(crate) result_digest: String,
+    pub(crate) result_byte_count: u64,
+    pub(crate) created_at: i64,
+}
+
 impl AppPaths {
     /// Builds the complete Host path set from adapter-supplied roots.
     pub fn new(app_data_dir: PathBuf, logs_dir: PathBuf) -> Self {
@@ -136,6 +150,15 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             burned_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS native_agent_conflicts (
+            movement_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            retained_tree TEXT NOT NULL,
+            result_digest TEXT NOT NULL,
+            result_byte_count INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_rooms_code_hash ON rooms(room_code_hash);
         CREATE INDEX IF NOT EXISTS idx_rooms_expires_at ON rooms(expires_at);
         CREATE INDEX IF NOT EXISTS idx_room_items_room_id ON room_items(room_id, created_at);
@@ -150,6 +173,79 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
     migrate_room_statuses(&conn)?;
     backfill_legacy_bridge_peers(&conn)?;
     Ok(())
+}
+
+pub(crate) fn save_native_agent_conflict(
+    paths: &AppPaths,
+    record: &StoredNativeAgentConflict,
+) -> AppResult<()> {
+    if record.movement_id.trim().is_empty()
+        || record.movement_id.len() > 256
+        || record.task_id.trim().is_empty()
+        || record.task_id.len() > 256
+        || record.result_digest.len() != 64
+        || !record
+            .result_digest
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit())
+        || !record
+            .retained_tree
+            .starts_with(paths.app_data_dir.join("native-agent-conflicts"))
+    {
+        return Err(AppError::InvalidInput(
+            "Native Agent conflict recovery record is invalid.".into(),
+        ));
+    }
+    let conn = connection(paths)?;
+    conn.execute(
+        r#"
+        INSERT INTO native_agent_conflicts (
+            movement_id, task_id, retained_tree, result_digest, result_byte_count, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(movement_id) DO UPDATE SET
+            task_id = excluded.task_id,
+            retained_tree = excluded.retained_tree,
+            result_digest = excluded.result_digest,
+            result_byte_count = excluded.result_byte_count,
+            created_at = excluded.created_at
+        "#,
+        params![
+            &record.movement_id,
+            &record.task_id,
+            record.retained_tree.to_string_lossy(),
+            &record.result_digest,
+            record.result_byte_count as i64,
+            record.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn get_native_agent_conflict(
+    paths: &AppPaths,
+    movement_id: &str,
+) -> AppResult<Option<StoredNativeAgentConflict>> {
+    let conn = connection(paths)?;
+    conn.query_row(
+        r#"
+        SELECT movement_id, task_id, retained_tree, result_digest, result_byte_count, created_at
+        FROM native_agent_conflicts
+        WHERE movement_id = ?1
+        "#,
+        [movement_id],
+        |row| {
+            Ok(StoredNativeAgentConflict {
+                movement_id: row.get(0)?,
+                task_id: row.get(1)?,
+                retained_tree: PathBuf::from(row.get::<_, String>(2)?),
+                result_digest: row.get(3)?,
+                result_byte_count: row.get::<_, i64>(4)? as u64,
+                created_at: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(AppError::from)
 }
 
 pub fn create_room(
