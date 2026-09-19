@@ -41,6 +41,45 @@ Core     = authority
 
 Capability is not authority. Probe availability is not executable binding. Acquisition confirmation is neither installation nor execution authority.
 
+## Native mature-Agent boundary
+
+Pastey 2.0 treats a mature Agent (Codex, Claude Code, Pi, OpenCode, and similar
+native products) as a Host capability—not as a Pastey Worker harness. The
+boundary is deliberately small:
+
+```text
+Pastey controls the envelope.
+Agent controls the execution.
+```
+
+Pastey can detect/observe a native Agent, qualify only enough to use its native
+interface, open or resume its Host-private session, send a task, observe its
+bounded lifecycle/result, and cancel where that interface supports it. It does
+not broker the Agent provider or authentication, translate native tools into
+effects, control its tool or shell strategy, recreate its sandbox, inspect its
+reasoning/process topology, or require ordinary Host-local tasks to pass through
+Scratch, GST, or ManagedObject.
+
+By default a selected Agent works directly in the explicitly selected original
+workspace on its Host. A Host-private native session is associated with Host +
+Agent + workspace so related tasks preserve the Agent's native context while an
+unrelated workspace is never silently reused. Native session identifiers and
+internal conversation mechanics are not Plan semantics.
+
+For an existing workspace already on the selected connected Host, the direct
+remote Codex path is an authenticated Room Control invocation with exact Host,
+workspace, task correlation, bounded status propagation, replay rejection, and
+cancellation. It reuses the Host's native session service and creates no
+ManagedObject, Scratch, Worker, GST scan, or Transfer.
+
+Managed resources and Transfer remain the cross-device object/lineage mechanism
+only when a workspace or resulting workspace must cross a Host boundary. Its
+derived outbound and return movement must be visible in Review before it
+executes. A changed source must enter an explicit conflict/recovery state and
+remain non-DONE; unknown, lost, failed, or cancelled Agent outcomes are likewise
+never global completion. That workspace-movement continuation remains a later
+slice.
+
 Layer 2's `BridgeNodeListProjectionV1` displays durable Host membership once per `HostRef` and only matching current-session capability/link observations. It is environment fact display, not a route resolver or source of readiness/authorization: all execution paths still revalidate through the existing Layer 4 Host resolver and Core-owned admission/completion chain.
 
 A current-session Room Control capability query may ask an exact remote Host for a bounded, deduplicated list from the global fixed-probe request vocabulary: `runtime.python`, `runtime.node`, `runtime.git`, `runtime.rust_cargo`, `runtime.docker`, `runtime.ffmpeg`, `runtime.cuda`, `runtime.powershell`, `runtime.zsh`, and `runtime.bash`. The requester platform does not narrow that vocabulary. The receiving Host validates each ID and alone maps it to a platform-local fixed probe. A successful fixed probe is `Available`; a failed fixed probe is `Unavailable` (`system_probe_unavailable`); a globally recognized request with no local fixed implementation is `Unsupported` (`system_probe_unsupported`); and no current observation remains unknown. A caller cannot send an executable path, command, arguments, shell text, or installation instruction. These are current-session NodeList facts only; they do not select a Host, repair topology, bind a process, or grant execution authority.

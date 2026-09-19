@@ -8,7 +8,7 @@ import type { TransferQueueInput, TransferQueueItem } from "../../lib/transferSc
 import type { RoomInfo, RoomItem } from "../../lib/types";
 import type { DeveloperModeUiSession, DeveloperTerminalWorkspace } from "../../lib/types";
 import type { AgentTaskController } from "./AgentTaskLifecycle";
-import { StatusBadge } from "./AgentTaskLifecycle";
+import { StatusBadge, useNativeAgentTask } from "./AgentTaskLifecycle";
 import { DeveloperModeScreen } from "./DeveloperModeScreen";
 import { bridgeCode, bridgeDeviceCount, fileName, formatBytes, formatClock, roomPeers } from "./workspaceViewModel";
 
@@ -127,6 +127,7 @@ export function BridgeWorkspace({ room, items, queueItems, task, developerMode, 
         </div>
         <TaskComposer
           mode={composerMode}
+          roomId={room.id}
           onMode={setComposerMode}
           text={text}
           onText={setText}
@@ -196,8 +197,9 @@ function ResultCard({ task }: { task: AgentTaskController }) {
   );
 }
 
-function TaskComposer({ mode, onMode, text, onText, peers, selectedPeerId, onPeer, disabled, task, onFiles, onSend, onDeveloper }: {
+function TaskComposer({ mode, roomId, onMode, text, onText, peers, selectedPeerId, onPeer, disabled, task, onFiles, onSend, onDeveloper }: {
   mode: "send" | "task";
+  roomId: string;
   onMode: (mode: "send" | "task") => void;
   text: string;
   onText: (text: string) => void;
@@ -215,18 +217,36 @@ function TaskComposer({ mode, onMode, text, onText, peers, selectedPeerId, onPee
       {mode === "send" ? (
         <textarea value={text} onChange={(event) => onText(event.target.value)} placeholder="Paste text or image, or drop files here…" aria-label="Send message" />
       ) : (
-        <div className="v2-task-open">{task.status ? <><strong>Revision {task.status.revisionId}</strong><small>Authoritative lifecycle open · goal and richer topology are not renderer-exposed.</small></> : <><input value={task.revisionInput} onChange={(event) => task.setRevisionInput(event.target.value)} placeholder="Open an existing native-v2 revision ID…" aria-label="Native-v2 revision ID" /><small>Draft origination and PM context projection are not renderer-exposed.</small></>}</div>
+        <NativeAgentTaskCard roomId={roomId} peers={peers} />
       )}
       <div className="v2-composer-controls">
         <button type="button" className="v2-square-button" disabled={mode === "send" && disabled} onClick={mode === "send" ? onFiles : undefined}>＋</button>
         <label className="v2-mode-select"><select value={mode} onChange={(event) => onMode(event.target.value as "send" | "task")}><option value="send">Send</option><option value="task">Task</option></select></label>
         {mode === "send" ? (
           <><label className="v2-target-select"><select value={selectedPeerId} onChange={(event) => onPeer(event.target.value)} disabled={!peers.length}>{peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></label><button type="button" className="v2-developer-button" disabled={!peers.length} onClick={onDeveloper}>Developer Mode</button><button type="button" className="v2-send-button" disabled={disabled || !text.trim()} onClick={onSend}>↑</button></>
-        ) : <><span className="v2-plan-scope">Whole Plan · PM selects Hosts</span><button type="button" className="v2-send-button" disabled={task.busy !== null || (!task.status && !task.revisionInput.trim())} onClick={() => void (task.status ? task.refresh() : task.openRevision())}>{task.status ? "↻" : "↑"}</button></>}
+        ) : <><span className="v2-plan-scope">Device → Agent → Task</span></>}
       </div>
-      <small className="v2-composer-help">{mode === "send" ? "Send mode targets one selected device. Developer Mode is human-only current-session terminal access; it does not grant Agent, Plan, or Execute authority." : "Agent Tasks use the whole Plan scope. Task mode opens an authoritative immutable Draft; it is not permanently bound to the Send destination."}</small>
+      <small className="v2-composer-help">{mode === "send" ? "Send mode targets one selected device. Developer Mode is human-only current-session terminal access; it does not grant Agent, Plan, or Execute authority." : "Agent Tasks use the whole Plan scope when opening an existing Plan. Native Agents own their workspace, authentication, tools, sandbox, and context; Pastey only observes their lifecycle."}</small>
     </section>
   );
+}
+
+function NativeAgentTaskCard({ roomId, peers }: { roomId: string; peers: ReturnType<typeof roomPeers> }) {
+  const agent = useNativeAgentTask();
+  const codex = agent.capabilities.find((capability) => capability.agentId === "agent.coding.codex");
+  const [target, setTarget] = useState("local");
+  const remote = peers.find((peer) => peer.peerSessionId === target) ?? null;
+  const running = agent.status?.state === "running" || agent.status?.state === "queued";
+  return <div className="v2-task-open">
+    <strong>Run with Codex</strong>
+    <label className="v2-target-select"><select value={target} onChange={(event) => setTarget(event.target.value)} disabled={running}><option value="local">This device</option>{peers.filter((peer) => peer.hostRef).map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></label>
+    <small>{remote ? "Pastey will invoke native Codex directly in this device’s existing workspace. No files will move." : codex?.usable ? "Codex is ready to use its native session." : "Codex is not currently usable on this device."}</small>
+    <input value={agent.workspace} onChange={(event) => agent.setWorkspace(event.target.value)} placeholder="Original workspace path…" aria-label="Codex workspace" disabled={running} />
+    <textarea value={agent.taskText} onChange={(event) => agent.setTaskText(event.target.value)} placeholder="What should Codex do?" aria-label="Codex task" disabled={running} />
+    {agent.status ? <small>{agent.status.state.replace(/_/g, " ")} · {agent.status.sessionReused ? "resumed native session" : "new native session"}{agent.status.result ? ` · ${agent.status.result}` : ""}</small> : null}
+    {agent.message ? <small className="v2-error">{agent.message}</small> : null}
+    <footer>{running ? <button type="button" className="v2-button" disabled={agent.busy} onClick={() => void (remote ? agent.cancelRemote(roomId, remote.peerSessionId, remote.hostRef!) : agent.cancel())}>Stop Codex</button> : <button type="button" className="v2-button primary" disabled={agent.busy || (!remote && !codex?.usable) || (remote && !remote.hostRef) || !agent.workspace.trim() || !agent.taskText.trim()} onClick={() => void (remote ? agent.startRemote(roomId, remote.peerSessionId, remote.hostRef!) : agent.start())}>{agent.busy ? "Starting…" : "Run with Codex"}</button>}</footer>
+  </div>;
 }
 
 export function MessageCard({ item }: { item: RoomItem }) {

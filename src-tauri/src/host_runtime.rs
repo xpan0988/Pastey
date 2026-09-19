@@ -119,6 +119,9 @@ pub struct HostRuntime {
     /// Concrete Pi proof state; it intentionally does not share a specialist
     /// registry or adapter with Codex.
     pub(crate) pi_specialists: Mutex<pi_specialist::PiSpecialistServiceV0>,
+    /// Native mature Agents are Host capabilities, outside managed Worker
+    /// execution and managed-object lifecycle.
+    pub(crate) native_agents: Mutex<crate::native_agent::NativeAgentServiceV1>,
     /// Process-local model cancellation state for the one-step Worker Harness.
     /// It is not a Core grant or a durable authority record.
     pub(crate) worker_harness_runs:
@@ -230,6 +233,7 @@ impl HostRuntime {
             )),
             codex_specialists: Mutex::new(codex_specialist::CodexSpecialistServiceV0::default()),
             pi_specialists: Mutex::new(pi_specialist::PiSpecialistServiceV0::default()),
+            native_agents: Mutex::new(crate::native_agent::NativeAgentServiceV1::default()),
             worker_harness_runs: Mutex::new(HashMap::new()),
             managed_completion_lock: Mutex::new(()),
             managed_worker_process_specs: Mutex::new(HashMap::new()),
@@ -382,6 +386,7 @@ impl HostRuntime {
         self.execution_worlds.terminate_all();
         self.codex_specialists.lock().terminate_all();
         self.pi_specialists.lock().terminate_all();
+        self.native_agents.lock().shutdown();
         self.network_broker.terminate_all();
         self.managed_objects.lock().purge_all();
         self.effect_authority.lock().revoke_all();

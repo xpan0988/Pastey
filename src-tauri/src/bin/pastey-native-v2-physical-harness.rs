@@ -79,6 +79,8 @@ mod managed_worker_coordinator;
 mod managed_workspace;
 #[path = "../models.rs"]
 mod models;
+#[path = "../native_agent.rs"]
+mod native_agent;
 #[path = "../native_v2_orchestration.rs"]
 mod native_v2_orchestration;
 #[path = "../natural_v2.rs"]
