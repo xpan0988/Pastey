@@ -6,7 +6,7 @@
 //! bounded task envelope and the lifecycle it needs for orchestration.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -249,6 +249,7 @@ impl NativeAgentServiceV1 {
         let source_workspace = source_workspace.canonicalize().map_err(|_| {
             AppError::InvalidInput("Native Agent source workspace is unavailable.".into())
         })?;
+        validate_workspace_transfer_fidelity(&source_workspace)?;
         let baseline = crate::safe_file_identity::capture_regular_file_set_identity(
             &source_workspace,
             crate::storage::MAX_FILE_SIZE_BYTES,
@@ -325,6 +326,7 @@ impl NativeAgentServiceV1 {
                 "Native Agent movement source is unavailable on this Host.".into(),
             )
         })?;
+        validate_workspace_transfer_fidelity(&source.workspace)?;
         let package = crate::regular_file_set_transfer::prepare_package(
             &source.workspace,
             &source.workspace,
@@ -566,6 +568,7 @@ impl NativeAgentServiceV1 {
         let source = record.source.as_ref().ok_or_else(|| {
             AppError::InvalidInput("Native Agent result return arrived at the wrong Host.".into())
         })?;
+        validate_workspace_transfer_fidelity(returned_workspace)?;
         let current = crate::safe_file_identity::capture_regular_file_set_identity(
             &source.workspace,
             crate::storage::MAX_FILE_SIZE_BYTES,
@@ -805,6 +808,16 @@ impl NativeAgentServiceV1 {
                         status.state = NativeAgentTaskStateV1::Cancelled;
                         status.code = Some("native_agent_cancelled".into());
                     }
+                    Err(error) if error.message().contains("failed") => {
+                        status.state = NativeAgentTaskStateV1::Failed;
+                        status.code = Some("native_agent_failed".into());
+                        status.result = Some(error.message().into());
+                    }
+                    Err(error) if error.message().contains("interrupted") => {
+                        status.state = NativeAgentTaskStateV1::Interrupted;
+                        status.code = Some("native_agent_interrupted".into());
+                        status.result = Some(error.message().into());
+                    }
                     Err(error) => {
                         status.state = NativeAgentTaskStateV1::Interrupted;
                         status.code = Some("native_agent_outcome_unknown".into());
@@ -993,6 +1006,130 @@ impl NativeAgentServiceV1 {
     }
 }
 
+/// RegularFileSet deliberately represents only regular file bytes.  Native
+/// Agent workspace movement must therefore reject, before Review or Return,
+/// every workspace feature that that representation would silently discard.
+/// Local native tasks never pass through this gate: Codex sees their original
+/// workspace and keeps its own native workspace semantics.
+fn validate_workspace_transfer_fidelity(root: &Path) -> AppResult<()> {
+    let root_metadata = fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return invalid("Native Agent workspace Transfer requires a real directory.");
+    }
+    let canonical_root = root.canonicalize()?;
+    let mut pending = vec![canonical_root.clone()];
+    let mut case_folded_selectors = BTreeSet::new();
+    while let Some(directory) = pending.pop() {
+        let metadata = fs::symlink_metadata(&directory)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || !directory.starts_with(&canonical_root)
+        {
+            return invalid("Native Agent workspace Transfer contains an unsafe directory.");
+        }
+        let entries = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
+        if entries.is_empty() {
+            return invalid(
+                "Native Agent workspace Transfer is blocked because empty directories are not portable.",
+            );
+        }
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return invalid(
+                    "Native Agent workspace Transfer is blocked because symlinks are not portable.",
+                );
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !metadata.is_file() {
+                return invalid(
+                    "Native Agent workspace Transfer is blocked because special files are not portable.",
+                );
+            }
+            #[cfg(unix)]
+            if std::os::unix::fs::MetadataExt::mode(&metadata) & 0o111 != 0 {
+                return invalid(
+                    "Native Agent workspace Transfer is blocked because executable file modes are not portable.",
+                );
+            }
+            let relative = path.strip_prefix(&canonical_root).map_err(|_| {
+                AppError::InvalidInput("Native Agent workspace Transfer escaped its root.".into())
+            })?;
+            let selector = relative
+                .components()
+                .map(|component| {
+                    component.as_os_str().to_str().ok_or_else(|| {
+                        AppError::InvalidInput(
+                            "Native Agent workspace Transfer has a non-portable selector.".into(),
+                        )
+                    })
+                })
+                .collect::<AppResult<Vec<_>>>()?
+                .join("/");
+            crate::safe_file_identity::validate_managed_selector(&selector)?;
+            validate_windows_portable_selector(&selector)?;
+            if !case_folded_selectors.insert(selector.to_lowercase()) {
+                return invalid(
+                    "Native Agent workspace Transfer is blocked by case-colliding selectors.",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_windows_portable_selector(selector: &str) -> AppResult<()> {
+    for component in selector.split('/') {
+        if component.is_empty()
+            || component.ends_with('.')
+            || component.ends_with(' ')
+            || component.chars().any(|character| {
+                character.is_control()
+                    || matches!(character, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*')
+            })
+        {
+            return invalid("Native Agent workspace Transfer has a non-portable selector.");
+        }
+        let stem = component
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if matches!(
+            stem.as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        ) {
+            return invalid("Native Agent workspace Transfer has a Windows-reserved selector.");
+        }
+    }
+    Ok(())
+}
+
 /// The only filesystem mutation in this slice. It stages an already-scanned
 /// result beside the original workspace, rechecks the approved baseline, then
 /// swaps the exact directory. If either recheck or swap fails it returns a
@@ -1083,6 +1220,66 @@ fn same_logical_file_set(
                 .map(|(selector, identity)| (selector, &identity.digest, identity.byte_count)))
 }
 
+fn retain_conflicted_workspace(
+    paths: &crate::storage::AppPaths,
+    movement_id: &str,
+    task_id: &str,
+    returned_workspace: &Path,
+) -> AppResult<PathBuf> {
+    validate_movement_id(movement_id)?;
+    validate_task_id(task_id)?;
+    validate_workspace_transfer_fidelity(returned_workspace)?;
+    let identity = crate::safe_file_identity::capture_regular_file_set_identity(
+        returned_workspace,
+        crate::storage::MAX_FILE_SIZE_BYTES,
+    )?;
+    let unique = Uuid::new_v4().to_string();
+    let retained = crate::safe_file_identity::create_private_tree_root(
+        &paths.app_data_dir,
+        "native-agent-conflicts",
+        &unique,
+    )?;
+    let result = (|| {
+        for (selector, source_identity) in &identity.files {
+            let bytes = crate::safe_file_identity::read_source_if_identity_matches(
+                &returned_workspace.join(selector),
+                returned_workspace,
+                source_identity,
+                crate::storage::MAX_FILE_SIZE_BYTES,
+            )?;
+            let mut output =
+                crate::safe_file_identity::create_private_regular_file(&retained, selector)?;
+            output.write_all(&bytes)?;
+            output.sync_all()?;
+        }
+        let observed = crate::safe_file_identity::capture_regular_file_set_identity(
+            &retained,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )?;
+        if !same_logical_file_set(&observed, &identity) {
+            return invalid("Native Agent conflict result did not survive durable retention.");
+        }
+        crate::storage::save_native_agent_conflict(
+            paths,
+            &crate::storage::StoredNativeAgentConflict {
+                movement_id: movement_id.into(),
+                task_id: task_id.into(),
+                retained_tree: retained.clone(),
+                result_digest: identity.digest.clone(),
+                result_byte_count: identity.byte_count,
+                created_at: crate::storage::now_ts(),
+            },
+        )?;
+        Ok(())
+    })();
+    if result.is_err() {
+        if let Some(root) = retained.parent() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+    result.map(|()| retained)
+}
+
 /// Finalizes an encrypted workspace Transfer into a Host-private task tree or
 /// a retained returned-result tree. ManagedObject binding is retained for the
 /// real cross-Host object movement; the Agent is only started after the
@@ -1136,33 +1333,42 @@ pub(crate) fn register_workspace_transfer_landing(
             .native_agents
             .lock()
             .start_received_workspace_task(&metadata.movement_id, &tree)
-            .map(|_| ()),
+            .map(|_| None),
         NativeAgentWorkspaceTransferPhaseV1::Return => runtime
             .native_agents
             .lock()
             .apply_received_workspace_return(&metadata.movement_id, &tree)
-            .map(|_| ()),
+            .map(Some),
     };
-    if let Err(error) = outcome {
-        // The exact receipt remains retained on a source-change conflict; all
-        // other landing errors can safely discard its private material.
-        let preserve = runtime
+    match outcome {
+        Ok(Some(status))
+            if status.state == NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired =>
+        {
+            if let Err(error) = retain_conflicted_workspace(
+                &runtime.paths,
+                &metadata.movement_id,
+                &metadata.task_id,
+                &tree,
+            ) {
+                runtime.native_agents.lock().interrupt_workspace_movement(
+                    &metadata.movement_id,
+                    "conflict_result_retention_failed",
+                );
+                crate::regular_file_set_transfer::cleanup_materialized_tree(&tree);
+                return Err(error);
+            }
+            crate::regular_file_set_transfer::cleanup_materialized_tree(&tree);
+            Ok(status)
+        }
+        Ok(_) => runtime
             .native_agents
             .lock()
-            .movement_status(&metadata.movement_id)
-            .map(|status| {
-                status.state == NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
-            })
-            .unwrap_or(false);
-        if !preserve {
+            .movement_status(&metadata.movement_id),
+        Err(error) => {
             crate::regular_file_set_transfer::cleanup_materialized_tree(&tree);
+            Err(error)
         }
-        return Err(error);
     }
-    runtime
-        .native_agents
-        .lock()
-        .movement_status(&metadata.movement_id)
 }
 
 /// Watches the bounded native lifecycle after an outbound workspace has
@@ -1256,6 +1462,7 @@ async fn send_workspace_result(
         .native_agents
         .lock()
         .completed_task_workspace_for_return(movement_id)?;
+    validate_workspace_transfer_fidelity(&workspace)?;
     let identity = crate::safe_file_identity::capture_regular_file_set_identity(
         &workspace,
         crate::storage::MAX_FILE_SIZE_BYTES,
@@ -1553,19 +1760,28 @@ impl CodexAppServerV1 {
             .active_turn
             .lock()
             .map_err(|_| AppError::InvalidInput("Codex session state is unavailable.".into()))? =
-            Some((thread_id.into(), turn_id));
+            Some((thread_id.into(), turn_id.clone()));
         loop {
             let message = self.next_message(deadline)?;
             if message.get("method").and_then(Value::as_str) == Some("turn/completed") {
-                *self.active_turn.lock().map_err(|_| {
-                    AppError::InvalidInput("Codex session state is unavailable.".into())
-                })? = None;
-                return Ok(());
+                let outcome = codex_completed_turn_outcome(&message, thread_id, &turn_id);
+                self.clear_active_turn()?;
+                return outcome;
             }
             if message.get("error").is_some() {
+                self.clear_active_turn()?;
                 return invalid("Codex native task failed.");
             }
         }
+    }
+
+    fn clear_active_turn(&self) -> AppResult<()> {
+        *self
+            .active_turn
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Codex session state is unavailable.".into()))? =
+            None;
+        Ok(())
     }
 
     fn interrupt(&self) {
@@ -1631,27 +1847,78 @@ fn invalid<T>(message: &str) -> AppResult<T> {
     Err(AppError::InvalidInput(message.into()))
 }
 
+/// The native app-server can emit terminal notifications for other threads on
+/// the same connection.  A Pastey task reaches success only when the terminal
+/// notification names the exact `thread/start` thread and `turn/start` turn,
+/// and Codex reports that turn as completed without an error.  Every other
+/// terminal shape is intentionally non-success so it cannot trigger a result
+/// scan, Return Transfer, apply, or global DONE.
+fn codex_completed_turn_outcome(message: &Value, thread_id: &str, turn_id: &str) -> AppResult<()> {
+    let params = message
+        .get("params")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            AppError::InvalidInput("Codex terminal task outcome is malformed.".into())
+        })?;
+    if params.get("threadId").and_then(Value::as_str) != Some(thread_id) {
+        return invalid("Codex terminal task outcome crossed its native session.");
+    }
+    let turn = params
+        .get("turn")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            AppError::InvalidInput("Codex terminal task outcome is malformed.".into())
+        })?;
+    if turn.get("id").and_then(Value::as_str) != Some(turn_id) {
+        return invalid("Codex terminal task outcome crossed its native turn.");
+    }
+    match turn.get("status").and_then(Value::as_str) {
+        Some("completed") if turn.get("error").is_none_or(Value::is_null) => Ok(()),
+        Some("completed") => invalid("Codex native task completed with an error."),
+        Some("failed") => invalid("Codex native task failed."),
+        Some("interrupted") => invalid("Codex native task interrupted."),
+        // `cancelled` is not currently emitted by Codex's schema, but treating
+        // it as an explicit non-success protects this boundary across native
+        // protocol versions and lets the task envelope surface cancellation.
+        Some("cancelled") => invalid("Codex native task cancelled."),
+        Some("inProgress") => invalid("Codex native task terminal outcome is incomplete."),
+        _ => invalid("Codex terminal task outcome is malformed."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{fs, os::unix::fs::PermissionsExt};
 
     fn fixture() -> (PathBuf, PathBuf, PathBuf) {
+        fixture_with_terminal(
+            r#"{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"completed","error":null}}}"#,
+        )
+    }
+
+    fn fixture_with_terminal(terminal: &str) -> (PathBuf, PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!("pastey-native-agent-{}", Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         let workspace = root.join("workspace");
         fs::create_dir(&workspace).unwrap();
         let agent = root.join("codex-fixture");
-        fs::write(&agent, r#"#!/bin/sh
+        fs::write(
+            &agent,
+            format!(
+                r#"#!/bin/sh
 if [ "$2" = "--help" ]; then exit 0; fi
 while IFS= read -r line; do
   case "$line" in
-    *'"id":1'*) echo '{"id":1,"result":{}}' ;;
-    *'"id":2'*) echo '{"id":2,"result":{"thread":{"id":"native-thread"}}}' ;;
-    *'"id":3'*) echo '{"id":3,"result":{"turn":{"id":"native-turn"}}}'; echo '{"method":"turn/completed","params":{}}' ;;
+    *'"id":1'*) echo '{{"id":1,"result":{{}}}}' ;;
+    *'"id":2'*) echo '{{"id":2,"result":{{"thread":{{"id":"native-thread"}}}}}}' ;;
+    *'"id":3'*) echo '{{"id":3,"result":{{"turn":{{"id":"native-turn"}}}}}}'; echo '{terminal}' ;;
   esac
 done
-"#).unwrap();
+"#
+            ),
+        )
+        .unwrap();
         let mut permissions = fs::metadata(&agent).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&agent, permissions).unwrap();
@@ -1667,6 +1934,20 @@ done
             thread::sleep(Duration::from_millis(10));
         }
         panic!("fixture native Agent did not complete")
+    }
+
+    fn wait_for_live_terminal(
+        service: &NativeAgentServiceV1,
+        task_id: &str,
+    ) -> NativeAgentTaskStatusV1 {
+        for _ in 0..720 {
+            let status = service.task_status(task_id).unwrap();
+            if status.state != NativeAgentTaskStateV1::Running {
+                return status;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        panic!("installed Codex did not return a bounded terminal outcome")
     }
 
     #[test]
@@ -1700,6 +1981,97 @@ done
             NativeAgentTaskStateV1::Completed
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires an installed, authenticated native Codex app-server"]
+    fn installed_codex_modifies_a_disposable_original_workspace_and_reuses_its_session() {
+        if !codex_usable() {
+            panic!("installed Codex app-server is unavailable");
+        }
+        let root =
+            std::env::temp_dir().join(format!("pastey-native-agent-live-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("pastey-native-agent-acceptance.txt");
+        let mut service = NativeAgentServiceV1::default();
+        let first = service
+            .start_codex_task(
+                &workspace,
+                "Create pastey-native-agent-acceptance.txt in this workspace containing exactly `first native turn`. Do not only describe the change; make it.",
+            )
+            .unwrap();
+        assert!(!first.session_reused);
+        assert_eq!(
+            wait_for_live_terminal(&service, &first.task_id).state,
+            NativeAgentTaskStateV1::Completed
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap().trim(),
+            "first native turn"
+        );
+        let second = service
+            .start_codex_task(
+                &workspace,
+                "In the file you created in the preceding turn, append exactly one new line: `second native turn`. Make the edit now.",
+            )
+            .unwrap();
+        assert!(second.session_reused);
+        assert_eq!(
+            wait_for_live_terminal(&service, &second.task_id).state,
+            NativeAgentTaskStateV1::Completed
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "first native turn\nsecond native turn\n"
+        );
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_success_requires_the_exact_native_thread_turn_and_clean_completion() {
+        let cases = [
+            (
+                r#"{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"failed","error":{"message":"no"}}}}"#,
+                NativeAgentTaskStateV1::Failed,
+            ),
+            (
+                r#"{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"interrupted","error":null}}}"#,
+                NativeAgentTaskStateV1::Interrupted,
+            ),
+            (
+                r#"{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"cancelled","error":null}}}"#,
+                NativeAgentTaskStateV1::Cancelled,
+            ),
+            (
+                r#"{"method":"turn/completed","params":{"threadId":"other-thread","turn":{"id":"native-turn","items":[],"status":"completed","error":null}}}"#,
+                NativeAgentTaskStateV1::Interrupted,
+            ),
+            (
+                r#"{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"other-turn","items":[],"status":"completed","error":null}}}"#,
+                NativeAgentTaskStateV1::Interrupted,
+            ),
+            (
+                r#"{"method":"turn/completed","params":{}}"#,
+                NativeAgentTaskStateV1::Interrupted,
+            ),
+            (
+                r#"{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"completed","error":{"message":"no"}}}}"#,
+                NativeAgentTaskStateV1::Interrupted,
+            ),
+        ];
+        for (index, (terminal, expected)) in cases.into_iter().enumerate() {
+            let (root, workspace, agent) = fixture_with_terminal(terminal);
+            let mut service = NativeAgentServiceV1::default();
+            let started = service
+                .start_codex_task_with_executable(&agent, &workspace, "run")
+                .unwrap();
+            let terminal = wait_for_terminal(&service, &started.task_id);
+            assert_eq!(terminal.state, expected, "case {index}");
+            assert_ne!(terminal.state, NativeAgentTaskStateV1::Completed);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -1874,6 +2246,53 @@ done
     }
 
     #[test]
+    fn workspace_movement_blocks_unrepresentable_features_before_review() {
+        let (root, source, _) = fixture();
+        fs::write(source.join("file.txt"), b"content").unwrap();
+        fs::create_dir(source.join("empty")).unwrap();
+        let mut service = NativeAgentServiceV1::default();
+        assert!(service
+            .propose_workspace_movement(
+                "movement-empty-dir",
+                "task-empty-dir",
+                &source,
+                "host:remote",
+                movement_object(),
+                "update the project",
+                true,
+            )
+            .is_err());
+        assert!(service
+            .workspace_movements
+            .get("movement-empty-dir")
+            .is_none());
+
+        fs::remove_dir(source.join("empty")).unwrap();
+        fs::write(source.join("NUL.txt"), b"not portable to Windows").unwrap();
+        assert!(validate_workspace_transfer_fidelity(&source).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_movement_blocks_executable_modes_and_symlinks_before_review() {
+        let (root, source, _) = fixture();
+        let executable = source.join("run.sh");
+        fs::write(&executable, b"echo native").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        assert!(validate_workspace_transfer_fidelity(&source).is_err());
+
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&executable, permissions).unwrap();
+        std::os::unix::fs::symlink("run.sh", source.join("link.sh")).unwrap();
+        assert!(validate_workspace_transfer_fidelity(&source).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn returned_workspace_applies_once_or_enters_conflict_recovery() {
         let (root, source, _) = fixture();
         fs::write(source.join("before.txt"), b"approved baseline").unwrap();
@@ -1937,6 +2356,31 @@ done
         assert_eq!(
             fs::read(conflicted.join("local.txt")).unwrap(),
             b"local edit"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn conflict_result_is_retained_outside_transient_transfer_storage() {
+        let (root, _, _) = fixture();
+        let returned = root.join("returned");
+        fs::create_dir(&returned).unwrap();
+        fs::write(returned.join("result.txt"), b"native result").unwrap();
+        let paths = crate::storage::AppPaths::new(root.join("app-data"), root.join("logs"));
+        paths.ensure_directories().unwrap();
+        crate::storage::init_database(&paths).unwrap();
+        let retained =
+            retain_conflicted_workspace(&paths, "movement-retain", "task-retain", &returned)
+                .unwrap();
+        let stored = crate::storage::get_native_agent_conflict(&paths, "movement-retain")
+            .unwrap()
+            .expect("durable conflict receipt");
+        assert_eq!(stored.retained_tree, retained);
+        assert!(retained.starts_with(paths.app_data_dir.join("native-agent-conflicts")));
+        fs::remove_dir_all(&returned).unwrap();
+        assert_eq!(
+            fs::read(retained.join("result.txt")).unwrap(),
+            b"native result"
         );
         let _ = fs::remove_dir_all(root);
     }

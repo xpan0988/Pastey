@@ -83,9 +83,18 @@ seams. The Agent sees only the Host-private task workspace on its Host.
 
 The return is scanned because it must cross Hosts. Pastey revalidates the
 approved source immediately before its bounded staged apply. If it changed,
-Pastey preserves the returned result and enters conflict/recovery without an
-overwrite or `DONE`. Failed, cancelled, interrupted, lost, or otherwise
+Pastey retains the returned workspace under Host-private conflict storage and
+enters conflict/recovery without an overwrite or `DONE`. Cross-Host movement
+is rejected before Review when the selected workspace cannot be represented
+faithfully (including symlink/reparse or special entries, empty directories,
+executable modes, invalid portable selectors, or bounded-manifest violations).
+Failed, cancelled, interrupted, lost, malformed, mismatched, or otherwise
 ambiguous Agent/return outcomes are likewise never global completion.
+
+Codex terminal success is intentionally narrow: the exact native
+`thread/completed` notification must name the requested thread and turn, carry
+`status: completed`, and have no error. `failed`, `interrupted`, cancellation,
+and any malformed or mismatched terminal notification stay non-DONE.
 
 Layer 2's `BridgeNodeListProjectionV1` displays durable Host membership once per `HostRef` and only matching current-session capability/link observations. It is environment fact display, not a route resolver or source of readiness/authorization: all execution paths still revalidate through the existing Layer 4 Host resolver and Core-owned admission/completion chain.
 

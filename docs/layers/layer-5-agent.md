@@ -27,8 +27,10 @@ protocol. Pastey inherits Codex's normal configuration and authentication and
 uses `initialize`, `thread/start`, `turn/start`, bounded lifecycle observation,
 `turn/interrupt` when available, and shutdown. It does not set a Pastey model
 provider, inject credentials, select a model, impose `externalSandbox`, or use
-an ephemeral session. A failed, cancelled, disconnected, or otherwise ambiguous
-native turn is `failed`, `cancelled`, or `interrupted`—never global `DONE`.
+an ephemeral session. Completion is accepted only from the exact requested
+thread and turn with native `status: completed` and no error. A failed,
+interrupted, cancelled, disconnected, malformed, or otherwise ambiguous native
+turn is non-DONE.
 
 For an existing workspace already present on a connected remote Host, Pastey
 uses the same native session service through authenticated current-session Room
@@ -49,9 +51,13 @@ After native success, Pastey scans the final task workspace solely because it
 must return. The initiating Host rechecks the exact approved source baseline
 before a bounded staged replacement. An unchanged source applies automatically
 without another confirmation. A changed source retains the returned result and
-enters `conflict_recovery_required`; it does not overwrite, merge, guess, or
-report `DONE`. Agent failure, cancellation, interruption, transfer failure, or
-an unknown outcome similarly has no result apply and is non-DONE.
+enters `conflict_recovery_required` with a durable Host-private recovery copy;
+it does not overwrite, merge, guess, or report `DONE`. Before Review, a
+cross-Host workspace must be representable faithfully: Pastey rejects
+symlink/reparse and special entries, empty directories, executable modes,
+invalid portable selectors, case-folding collisions, and bounded-manifest
+violations. Agent failure, cancellation, interruption, transfer failure, or an
+unknown outcome similarly has no result apply and is non-DONE.
 
 ## Responsibility and locality
 

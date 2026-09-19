@@ -61,6 +61,7 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 | Host admission | `src-tauri/src/host_admission.rs` |
 | Plan schema/protocol v2 | `src-tauri/src/bridge_plan_v2.rs` |
 | Native-v2 product orchestration | `src-tauri/src/native_v2_orchestration.rs` |
+| Native mature-Agent sessions and cross-device task envelope | `src-tauri/src/native_agent.rs` |
 | Managed Worker coordination | `src-tauri/src/managed_worker_coordinator.rs` |
 | Capability projection and generic semantic-ID syntax | `src-tauri/src/peer_capabilities.rs` |
 | Fixed Host capability probes | `src-tauri/src/capability_probe.rs` |

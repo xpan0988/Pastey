@@ -1001,18 +1001,9 @@ mod tests {
     fn authorized_upper_layers_do_not_reimplement_remote_resolution() {
         let native_v2 = include_str!("native_v2_orchestration.rs");
         assert!(!native_v2.contains("fn peer_binding_for_host"));
-        let harness = include_str!("bin/pastey-native-v2-physical-harness.rs");
-        let wait_body = harness
-            .split("async fn wait_for_exact_connected_peer_with_timeout")
-            .nth(1)
-            .unwrap()
-            .split("fn run_token")
-            .next()
-            .unwrap();
-        assert!(wait_body.contains("resolve_current_remote_host_session"));
-        assert!(!wait_body.contains("list_bridge_peer_endpoints"));
-        assert!(!wait_body.contains("probe_exact_peer"));
-        assert!(!wait_body.contains("BridgePeerLiveness"));
+        assert!(native_v2.contains("resolve_current_remote_host_session"));
+        assert!(!native_v2.contains("list_bridge_peer_endpoints"));
+        assert!(!native_v2.contains("probe_exact_peer"));
     }
 
     #[test]
