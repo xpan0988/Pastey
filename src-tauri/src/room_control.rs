@@ -76,6 +76,7 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "native_agent.invoke",
     "native_agent.status",
     "native_agent.cancel",
+    "native_agent.workspace_prepare",
 ];
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
 const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
@@ -1711,6 +1712,57 @@ pub async fn receive_room_control_event_handler(
                     );
                 }
             }
+            "native_agent.workspace_prepare" => {
+                let request: crate::native_agent::NativeAgentWorkspacePrepareV1 =
+                    match serde_json::from_value(payload) {
+                        Ok(request)
+                            if crate::native_agent::validate_workspace_prepare(&request)
+                                .is_ok() =>
+                        {
+                            request
+                        }
+                        _ => {
+                            return control_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_native_agent_workspace",
+                                "Invalid native Agent workspace preparation.",
+                            )
+                        }
+                    };
+                if request.target_host_ref != ctx.state.local_host_ref.as_str() {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native Agent workspace targets another Host.",
+                    );
+                }
+                let movement_id = request.movement_id.clone();
+                if ctx
+                    .state
+                    .native_agents
+                    .lock()
+                    .accept_workspace_prepare(request)
+                    .is_err()
+                {
+                    return control_error(
+                        StatusCode::BAD_REQUEST,
+                        "native_agent_workspace_rejected",
+                        "Native Agent workspace preparation was rejected by this Host.",
+                    );
+                }
+                let runtime = ctx.state.clone();
+                let watcher_room = room_id.clone();
+                let watcher_peer = inbound_peer.peer_session_id.clone();
+                ctx.state.spawn(async move {
+                    crate::native_agent::monitor_received_workspace_task(
+                        runtime,
+                        watcher_room,
+                        watcher_peer,
+                        movement_id,
+                    )
+                    .await;
+                });
+            }
             _ => {
                 return control_error(
                     StatusCode::BAD_REQUEST,
@@ -2476,6 +2528,14 @@ fn validate_control_event(
                 .map_err(AppError::from)?;
                 crate::native_agent::validate_cancel(&cancel)?;
                 format!("native-agent-cancel:{}", cancel.task_id)
+            }
+            "native_agent.workspace_prepare" => {
+                let request = serde_json::from_value::<
+                    crate::native_agent::NativeAgentWorkspacePrepareV1,
+                >(Value::Object(payload.clone()))
+                .map_err(AppError::from)?;
+                crate::native_agent::validate_workspace_prepare(&request)?;
+                format!("native-agent-workspace-prepare:{}", request.movement_id)
             }
             _ => {
                 return Err(AppError::InvalidInput(

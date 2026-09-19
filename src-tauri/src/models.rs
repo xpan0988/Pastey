@@ -601,6 +601,12 @@ pub struct FileTransferStartRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) native_v2_transfer:
         Option<crate::native_v2_orchestration::NativeV2TransferMetadataV1>,
+    /// Native mature-Agent workspace movement over the ordinary encrypted
+    /// transfer transport. It is immutable correlation only; no path, session,
+    /// provider, or Agent internals cross the Host boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) native_agent_workspace_transfer:
+        Option<crate::native_agent::NativeAgentWorkspaceTransferV1>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

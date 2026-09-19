@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
@@ -27,8 +28,11 @@ const MAX_TASK_BYTES: usize = 16 * 1024;
 const MAX_TASK_WALL_TIME: Duration = Duration::from_secs(15 * 60);
 pub(crate) const NATIVE_AGENT_PROTOCOL_SCHEMA: &str = "pastey-native-agent-control-v1";
 pub(crate) const CODEX_CAPABILITY_ID: &str = "agent.coding.codex";
+pub(crate) const NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA: &str =
+    "pastey-native-agent-workspace-movement-v1";
 const MAX_TASK_ID_BYTES: usize = 256;
 const MAX_WORKSPACE_BYTES: usize = 4 * 1024;
+const MAX_MOVEMENT_ID_BYTES: usize = 256;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -57,6 +61,107 @@ pub(crate) struct NativeAgentCancelV1 {
     pub(crate) schema_version: String,
     pub(crate) task_id: String,
     pub(crate) target_host_ref: String,
+}
+
+/// Immutable control input sent before an existing encrypted Transfer carries
+/// an approved workspace to the Agent Host.  It contains no source path,
+/// credential, provider, session identifier, or managed-object binding.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeAgentWorkspacePrepareV1 {
+    pub(crate) schema_version: String,
+    pub(crate) movement_id: String,
+    pub(crate) task_id: String,
+    pub(crate) source_host_ref: String,
+    pub(crate) target_host_ref: String,
+    pub(crate) agent_capability: String,
+    pub(crate) task: String,
+    pub(crate) resume: bool,
+    pub(crate) source_object: crate::bridge_plan_v2::ManagedObjectRevisionV2,
+    pub(crate) source_digest: String,
+    pub(crate) source_bytes: u64,
+}
+
+/// Transfer metadata for the existing encrypted file transport.  The two
+/// phases are authored as one approved envelope: source-to-Agent and result
+/// back to source.  This is correlation data, not a new Transfer primitive.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeAgentWorkspaceTransferPhaseV1 {
+    Outbound,
+    Return,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeAgentWorkspaceTransferV1 {
+    pub(crate) schema_version: String,
+    pub(crate) movement_id: String,
+    pub(crate) task_id: String,
+    pub(crate) phase: NativeAgentWorkspaceTransferPhaseV1,
+    pub(crate) bridge_id: String,
+    pub(crate) source_host_ref: String,
+    pub(crate) destination_host_ref: String,
+    pub(crate) object: crate::bridge_plan_v2::ManagedObjectRevisionV2,
+    pub(crate) content_digest: String,
+    pub(crate) logical_byte_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeAgentWorkspaceMovementStateV1 {
+    Review,
+    AwaitingApproval,
+    TransferringToAgent,
+    AgentRunning,
+    ReturningResult,
+    ApplyingResult,
+    Completed,
+    ConflictRecoveryRequired,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeAgentWorkspaceMovementV1 {
+    pub(crate) schema_version: String,
+    pub(crate) movement_id: String,
+    pub(crate) task_id: String,
+    pub(crate) agent_id: String,
+    pub(crate) source_workspace_name: String,
+    pub(crate) target_host_ref: String,
+    pub(crate) review_summary: String,
+    pub(crate) state: NativeAgentWorkspaceMovementStateV1,
+    pub(crate) code: Option<String>,
+}
+
+#[derive(Clone)]
+struct LocalMovementSourceV1 {
+    workspace: PathBuf,
+    baseline: crate::safe_file_identity::RegularFileSetIdentity,
+    object: crate::bridge_plan_v2::ManagedObjectRevisionV2,
+    task: String,
+    resume: bool,
+}
+
+#[derive(Clone)]
+struct PreparedRemoteWorkspaceV1 {
+    source_host_ref: String,
+    task: String,
+    resume: bool,
+    source_object: crate::bridge_plan_v2::ManagedObjectRevisionV2,
+    source_digest: String,
+    source_bytes: u64,
+}
+
+#[derive(Clone)]
+struct WorkspaceMovementRecordV1 {
+    status: NativeAgentWorkspaceMovementV1,
+    source: Option<LocalMovementSourceV1>,
+    prepared_remote: Option<PreparedRemoteWorkspaceV1>,
+    task_workspace: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -105,6 +210,7 @@ pub(crate) struct NativeAgentServiceV1 {
     active_workspaces: Arc<Mutex<HashMap<PathBuf, String>>>,
     remote_targets: HashMap<String, String>,
     task_workspaces: HashMap<String, PathBuf>,
+    workspace_movements: HashMap<String, WorkspaceMovementRecordV1>,
 }
 
 impl NativeAgentServiceV1 {
@@ -117,6 +223,376 @@ impl NativeAgentServiceV1 {
             detected,
             usable,
         }]
+    }
+
+    /// Creates the user-visible Review envelope on the initiating Host.  This
+    /// only captures an exact safe baseline; no package, transfer, or Agent
+    /// invocation exists until the one approval below.
+    pub(crate) fn propose_workspace_movement(
+        &mut self,
+        movement_id: &str,
+        task_id: &str,
+        source_workspace: &Path,
+        target_host_ref: &str,
+        source_object: crate::bridge_plan_v2::ManagedObjectRevisionV2,
+        task: &str,
+        resume: bool,
+    ) -> AppResult<NativeAgentWorkspaceMovementV1> {
+        validate_movement_id(movement_id)?;
+        validate_task_id(task_id)?;
+        if task.trim().is_empty() || task.len() > MAX_TASK_BYTES {
+            return invalid("Native Agent workspace movement task is invalid.");
+        }
+        if target_host_ref.trim().is_empty() || target_host_ref.len() > 256 {
+            return invalid("Native Agent movement target Host is invalid.");
+        }
+        let source_workspace = source_workspace.canonicalize().map_err(|_| {
+            AppError::InvalidInput("Native Agent source workspace is unavailable.".into())
+        })?;
+        let baseline = crate::safe_file_identity::capture_regular_file_set_identity(
+            &source_workspace,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )?;
+        if let Some(existing) = self.workspace_movements.get(movement_id) {
+            if existing.source.as_ref().map(|source| &source.workspace) == Some(&source_workspace)
+                && existing.status.task_id == task_id
+            {
+                return Ok(existing.status.clone());
+            }
+            return invalid("Native Agent movement identity was replayed for another workspace.");
+        }
+        let source_workspace_name = source_workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace")
+            .to_owned();
+        let status = NativeAgentWorkspaceMovementV1 {
+            schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+            movement_id: movement_id.into(),
+            task_id: task_id.into(),
+            agent_id: CODEX_CAPABILITY_ID.into(),
+            source_workspace_name: source_workspace_name.clone(),
+            target_host_ref: target_host_ref.into(),
+            review_summary: format!(
+                "Pastey will send \"{source_workspace_name}\" to the selected device, let Codex work on it, then return the result here."
+            ),
+            state: NativeAgentWorkspaceMovementStateV1::AwaitingApproval,
+            code: None,
+        };
+        self.workspace_movements.insert(
+            movement_id.into(),
+            WorkspaceMovementRecordV1 {
+                status: status.clone(),
+                source: Some(LocalMovementSourceV1 {
+                    workspace: source_workspace,
+                    baseline,
+                    object: source_object,
+                    task: task.into(),
+                    resume,
+                }),
+                prepared_remote: None,
+                task_workspace: None,
+            },
+        );
+        Ok(status)
+    }
+
+    /// Revalidates the approved source and frames it with the established
+    /// RegularFileSet Transfer package.  The caller sends that package through
+    /// the existing encrypted Room transfer; this service never transports it.
+    pub(crate) fn approve_workspace_movement(
+        &mut self,
+        movement_id: &str,
+        bridge_id: &str,
+        local_host_ref: &str,
+        temp_dir: &Path,
+    ) -> AppResult<(
+        NativeAgentWorkspacePrepareV1,
+        NativeAgentWorkspaceTransferV1,
+        PathBuf,
+    )> {
+        let record = self
+            .workspace_movements
+            .get_mut(movement_id)
+            .ok_or_else(|| {
+                AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+            })?;
+        if record.status.state != NativeAgentWorkspaceMovementStateV1::AwaitingApproval {
+            return invalid("Native Agent workspace movement is not awaiting Review approval.");
+        }
+        let source = record.source.as_ref().ok_or_else(|| {
+            AppError::InvalidInput(
+                "Native Agent movement source is unavailable on this Host.".into(),
+            )
+        })?;
+        let package = crate::regular_file_set_transfer::prepare_package(
+            &source.workspace,
+            &source.workspace,
+            &source.baseline,
+            temp_dir,
+        )?;
+        record.status.state = NativeAgentWorkspaceMovementStateV1::TransferringToAgent;
+        let prepare = NativeAgentWorkspacePrepareV1 {
+            schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+            movement_id: movement_id.into(),
+            task_id: record.status.task_id.clone(),
+            source_host_ref: local_host_ref.into(),
+            target_host_ref: record.status.target_host_ref.clone(),
+            agent_capability: CODEX_CAPABILITY_ID.into(),
+            task: source.task.clone(),
+            resume: source.resume,
+            source_object: source.object.clone(),
+            source_digest: source.baseline.digest.clone(),
+            source_bytes: source.baseline.byte_count,
+        };
+        let metadata = NativeAgentWorkspaceTransferV1 {
+            schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+            movement_id: movement_id.into(),
+            task_id: record.status.task_id.clone(),
+            phase: NativeAgentWorkspaceTransferPhaseV1::Outbound,
+            bridge_id: bridge_id.into(),
+            source_host_ref: local_host_ref.into(),
+            destination_host_ref: record.status.target_host_ref.clone(),
+            object: source.object.clone(),
+            content_digest: source.baseline.digest.clone(),
+            logical_byte_count: source.baseline.byte_count,
+        };
+        Ok((prepare, metadata, package))
+    }
+
+    pub(crate) fn accept_workspace_prepare(
+        &mut self,
+        request: NativeAgentWorkspacePrepareV1,
+    ) -> AppResult<()> {
+        validate_workspace_prepare(&request)?;
+        if let Some(existing) = self.workspace_movements.get(&request.movement_id) {
+            let prepared = existing.prepared_remote.as_ref();
+            if existing.status.task_id == request.task_id
+                && prepared.map(|value| value.source_digest.as_str())
+                    == Some(request.source_digest.as_str())
+            {
+                return Ok(());
+            }
+            return invalid("Native Agent workspace movement replay does not match its task.");
+        }
+        let status = NativeAgentWorkspaceMovementV1 {
+            schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+            movement_id: request.movement_id.clone(),
+            task_id: request.task_id.clone(),
+            agent_id: CODEX_CAPABILITY_ID.into(),
+            source_workspace_name: "transferred workspace".into(),
+            target_host_ref: request.target_host_ref.clone(),
+            review_summary: "Approved workspace transfer is awaiting arrival.".into(),
+            state: NativeAgentWorkspaceMovementStateV1::TransferringToAgent,
+            code: None,
+        };
+        self.workspace_movements.insert(
+            request.movement_id,
+            WorkspaceMovementRecordV1 {
+                status,
+                source: None,
+                prepared_remote: Some(PreparedRemoteWorkspaceV1 {
+                    source_host_ref: request.source_host_ref,
+                    task: request.task,
+                    resume: request.resume,
+                    source_object: request.source_object,
+                    source_digest: request.source_digest,
+                    source_bytes: request.source_bytes,
+                }),
+                task_workspace: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn validate_workspace_transfer(
+        &self,
+        metadata: &NativeAgentWorkspaceTransferV1,
+        local_host_ref: &str,
+    ) -> AppResult<()> {
+        validate_workspace_transfer(metadata)?;
+        if metadata.destination_host_ref != local_host_ref {
+            return invalid("Native Agent workspace Transfer targets another Host.");
+        }
+        let record = self
+            .workspace_movements
+            .get(&metadata.movement_id)
+            .ok_or_else(|| {
+                AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+            })?;
+        if record.status.task_id != metadata.task_id {
+            return invalid("Native Agent workspace Transfer crossed its task binding.");
+        }
+        match metadata.phase {
+            NativeAgentWorkspaceTransferPhaseV1::Outbound => {
+                let prepared = record.prepared_remote.as_ref().ok_or_else(|| {
+                    AppError::InvalidInput(
+                        "Native Agent workspace was not prepared on this Host.".into(),
+                    )
+                })?;
+                if prepared.source_host_ref != metadata.source_host_ref
+                    || prepared.source_object != metadata.object
+                    || prepared.source_digest != metadata.content_digest
+                    || prepared.source_bytes != metadata.logical_byte_count
+                    || record.status.state
+                        != NativeAgentWorkspaceMovementStateV1::TransferringToAgent
+                {
+                    return invalid(
+                        "Native Agent outbound workspace Transfer does not match Review.",
+                    );
+                }
+            }
+            NativeAgentWorkspaceTransferPhaseV1::Return => {
+                let source = record.source.as_ref().ok_or_else(|| {
+                    AppError::InvalidInput(
+                        "Native Agent result return arrived at the wrong Host.".into(),
+                    )
+                })?;
+                if metadata.destination_host_ref != local_host_ref
+                    || metadata.source_host_ref != record.status.target_host_ref
+                    || record.status.state != NativeAgentWorkspaceMovementStateV1::ReturningResult
+                    || source.workspace.as_os_str().is_empty()
+                {
+                    return invalid(
+                        "Native Agent result Transfer does not match its approved movement.",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Binds the received file-set to the pre-authorized task workspace.  The
+    /// native Agent sees only that ordinary local directory.
+    pub(crate) fn start_received_workspace_task(
+        &mut self,
+        movement_id: &str,
+        task_workspace: &Path,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        let (task_id, task, resume) = {
+            let record = self.workspace_movements.get(movement_id).ok_or_else(|| {
+                AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+            })?;
+            let prepared = record.prepared_remote.as_ref().ok_or_else(|| {
+                AppError::InvalidInput(
+                    "Native Agent workspace was not prepared on this Host.".into(),
+                )
+            })?;
+            (
+                record.status.task_id.clone(),
+                prepared.task.clone(),
+                prepared.resume,
+            )
+        };
+        let status =
+            self.start_codex_task_with_id_resume(&task_id, task_workspace, &task, resume)?;
+        let record = self
+            .workspace_movements
+            .get_mut(movement_id)
+            .ok_or_else(|| {
+                AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+            })?;
+        record.status.state = NativeAgentWorkspaceMovementStateV1::AgentRunning;
+        record.task_workspace = Some(task_workspace.to_path_buf());
+        Ok(status)
+    }
+
+    pub(crate) fn movement_status(
+        &self,
+        movement_id: &str,
+    ) -> AppResult<NativeAgentWorkspaceMovementV1> {
+        self.workspace_movements
+            .get(movement_id)
+            .map(|record| record.status.clone())
+            .ok_or_else(|| {
+                AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+            })
+    }
+
+    pub(crate) fn completed_task_workspace_for_return(
+        &mut self,
+        movement_id: &str,
+    ) -> AppResult<(String, PathBuf, String)> {
+        let (task_id, source_host_ref, workspace) = {
+            let record = self.workspace_movements.get(movement_id).ok_or_else(|| {
+                AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+            })?;
+            let prepared = record.prepared_remote.as_ref().ok_or_else(|| {
+                AppError::InvalidInput("Native Agent workspace is not owned by this Host.".into())
+            })?;
+            (
+                record.status.task_id.clone(),
+                prepared.source_host_ref.clone(),
+                record.task_workspace.clone().ok_or_else(|| {
+                    AppError::InvalidInput("Native Agent task workspace is unavailable.".into())
+                })?,
+            )
+        };
+        if self.task_status(&task_id)?.state != NativeAgentTaskStateV1::Completed {
+            return invalid("Native Agent result is not available for return.");
+        }
+        let record = self
+            .workspace_movements
+            .get_mut(movement_id)
+            .expect("checked above");
+        record.status.state = NativeAgentWorkspaceMovementStateV1::ReturningResult;
+        Ok((task_id, workspace, source_host_ref))
+    }
+
+    pub(crate) fn interrupt_workspace_movement(&mut self, movement_id: &str, code: &str) {
+        if let Some(record) = self.workspace_movements.get_mut(movement_id) {
+            if !matches!(
+                record.status.state,
+                NativeAgentWorkspaceMovementStateV1::Completed
+                    | NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+            ) {
+                record.status.state = NativeAgentWorkspaceMovementStateV1::Interrupted;
+                record.status.code = Some(code.into());
+            }
+        }
+    }
+
+    pub(crate) fn apply_received_workspace_return(
+        &mut self,
+        movement_id: &str,
+        returned_workspace: &Path,
+    ) -> AppResult<NativeAgentWorkspaceMovementV1> {
+        let record = self
+            .workspace_movements
+            .get_mut(movement_id)
+            .ok_or_else(|| {
+                AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+            })?;
+        let source = record.source.as_ref().ok_or_else(|| {
+            AppError::InvalidInput("Native Agent result return arrived at the wrong Host.".into())
+        })?;
+        let current = crate::safe_file_identity::capture_regular_file_set_identity(
+            &source.workspace,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )?;
+        if current != source.baseline {
+            record.status.state = NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired;
+            record.status.code = Some("source_changed_since_approval".into());
+            return Ok(record.status.clone());
+        }
+        let returned = crate::safe_file_identity::capture_regular_file_set_identity(
+            returned_workspace,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )?;
+        record.status.state = NativeAgentWorkspaceMovementStateV1::ApplyingResult;
+        if let Err(error) = replace_workspace_from_exact_tree(
+            &source.workspace,
+            &source.baseline,
+            returned_workspace,
+            &returned,
+        ) {
+            record.status.state = NativeAgentWorkspaceMovementStateV1::Interrupted;
+            record.status.code = Some("result_apply_interrupted".into());
+            return Err(error);
+        }
+        record.status.state = NativeAgentWorkspaceMovementStateV1::Completed;
+        record.status.code = None;
+        Ok(record.status.clone())
     }
 
     pub(crate) fn start_codex_task(
@@ -417,6 +893,26 @@ impl NativeAgentServiceV1 {
             return Ok(current.clone());
         }
         tasks.insert(remote.task_id.clone(), remote.status.clone());
+        if let Some(record) = self
+            .workspace_movements
+            .values_mut()
+            .find(|record| record.status.task_id == remote.task_id)
+        {
+            record.status.state = match remote.status.state {
+                NativeAgentTaskStateV1::Queued | NativeAgentTaskStateV1::Running => {
+                    NativeAgentWorkspaceMovementStateV1::AgentRunning
+                }
+                NativeAgentTaskStateV1::Completed => {
+                    NativeAgentWorkspaceMovementStateV1::ReturningResult
+                }
+                NativeAgentTaskStateV1::Failed => NativeAgentWorkspaceMovementStateV1::Failed,
+                NativeAgentTaskStateV1::Cancelled => NativeAgentWorkspaceMovementStateV1::Cancelled,
+                NativeAgentTaskStateV1::Interrupted => {
+                    NativeAgentWorkspaceMovementStateV1::Interrupted
+                }
+            };
+            record.status.code = remote.status.code.clone();
+        }
         Ok(remote.status)
     }
 
@@ -497,6 +993,340 @@ impl NativeAgentServiceV1 {
     }
 }
 
+/// The only filesystem mutation in this slice. It stages an already-scanned
+/// result beside the original workspace, rechecks the approved baseline, then
+/// swaps the exact directory. If either recheck or swap fails it returns a
+/// non-DONE state; it never attempts a merge.
+fn replace_workspace_from_exact_tree(
+    source_workspace: &Path,
+    approved_baseline: &crate::safe_file_identity::RegularFileSetIdentity,
+    returned_workspace: &Path,
+    returned_identity: &crate::safe_file_identity::RegularFileSetIdentity,
+) -> AppResult<()> {
+    let observed = crate::safe_file_identity::capture_regular_file_set_identity(
+        source_workspace,
+        crate::storage::MAX_FILE_SIZE_BYTES,
+    )?;
+    if &observed != approved_baseline {
+        return invalid("Native Agent source changed before result apply.");
+    }
+    let parent = source_workspace.parent().ok_or_else(|| {
+        AppError::InvalidInput("Native Agent source workspace has no safe parent.".into())
+    })?;
+    let token = Uuid::new_v4().to_string();
+    let stage = parent.join(format!(".pastey-agent-apply-{token}"));
+    let backup = parent.join(format!(".pastey-agent-backup-{token}"));
+    fs::create_dir(&stage)?;
+    let staged = (|| {
+        for (selector, identity) in &returned_identity.files {
+            let bytes = crate::safe_file_identity::read_source_if_identity_matches(
+                &returned_workspace.join(selector),
+                returned_workspace,
+                identity,
+                crate::storage::MAX_FILE_SIZE_BYTES,
+            )?;
+            let destination = stage.join(selector);
+            let directory = destination.parent().ok_or_else(|| {
+                AppError::InvalidInput("Native Agent result selector is unavailable.".into())
+            })?;
+            fs::create_dir_all(directory)?;
+            fs::write(destination, bytes)?;
+        }
+        let staged_identity = crate::safe_file_identity::capture_regular_file_set_identity(
+            &stage,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )?;
+        if !same_logical_file_set(&staged_identity, returned_identity) {
+            return invalid("Native Agent staged result changed before apply.");
+        }
+        let final_source = crate::safe_file_identity::capture_regular_file_set_identity(
+            source_workspace,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )?;
+        if &final_source != approved_baseline {
+            return invalid("Native Agent source changed before result apply.");
+        }
+        fs::rename(source_workspace, &backup)?;
+        if let Err(error) = fs::rename(&stage, source_workspace) {
+            let _ = fs::rename(&backup, source_workspace);
+            return Err(error.into());
+        }
+        let applied = crate::safe_file_identity::capture_regular_file_set_identity(
+            source_workspace,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )?;
+        if !same_logical_file_set(&applied, returned_identity) {
+            return invalid("Native Agent result did not survive bounded apply.");
+        }
+        fs::remove_dir_all(&backup)?;
+        Ok(())
+    })();
+    if staged.is_err() {
+        let _ = fs::remove_dir_all(&stage);
+    }
+    staged
+}
+
+fn same_logical_file_set(
+    left: &crate::safe_file_identity::RegularFileSetIdentity,
+    right: &crate::safe_file_identity::RegularFileSetIdentity,
+) -> bool {
+    left.digest == right.digest
+        && left.byte_count == right.byte_count
+        && left
+            .files
+            .iter()
+            .map(|(selector, identity)| (selector, &identity.digest, identity.byte_count))
+            .eq(right
+                .files
+                .iter()
+                .map(|(selector, identity)| (selector, &identity.digest, identity.byte_count)))
+}
+
+/// Finalizes an encrypted workspace Transfer into a Host-private task tree or
+/// a retained returned-result tree. ManagedObject binding is retained for the
+/// real cross-Host object movement; the Agent is only started after the
+/// outbound receipt is exact.
+pub(crate) fn register_workspace_transfer_landing(
+    runtime: &crate::host_runtime::HostRuntime,
+    metadata: &NativeAgentWorkspaceTransferV1,
+    package_path: PathBuf,
+    now: i64,
+) -> AppResult<NativeAgentWorkspaceMovementV1> {
+    runtime
+        .native_agents
+        .lock()
+        .validate_workspace_transfer(metadata, runtime.local_host_ref.as_str())?;
+    let tree = crate::regular_file_set_transfer::materialize_package(
+        &package_path,
+        &runtime.paths.temp_dir,
+        &metadata.content_digest,
+        metadata.logical_byte_count,
+    )?;
+    crate::regular_file_set_transfer::cleanup_received_package(&package_path);
+    let scope_root = tree.parent().map(Path::to_path_buf).ok_or_else(|| {
+        AppError::InvalidInput("Native Agent workspace receipt root is unavailable.".into())
+    })?;
+    let acquisition = runtime.managed_objects.lock().bind_transferred_revision(
+        crate::managed_objects::HostArtifactAcquisition {
+            kind: crate::managed_objects::ManagedObjectAcquisitionKind::TransferReceipt,
+            source_ref: format!(
+                "native-agent-workspace:{}:{:?}",
+                metadata.movement_id, metadata.phase
+            ),
+            bridge_id: Some(metadata.bridge_id.clone()),
+            path: tree.clone(),
+            scope_root,
+            display_name: "native-agent-workspace".into(),
+            media_type: "application/octet-stream".into(),
+            expires_at: now + 60 * 60,
+            app_owned_temporary: true,
+        },
+        metadata.object.logical_object_id.clone(),
+        metadata.object.revision,
+        metadata.content_digest.clone(),
+        now,
+    );
+    if let Err(error) = acquisition {
+        crate::regular_file_set_transfer::cleanup_materialized_tree(&tree);
+        return Err(error);
+    }
+    let outcome = match metadata.phase {
+        NativeAgentWorkspaceTransferPhaseV1::Outbound => runtime
+            .native_agents
+            .lock()
+            .start_received_workspace_task(&metadata.movement_id, &tree)
+            .map(|_| ()),
+        NativeAgentWorkspaceTransferPhaseV1::Return => runtime
+            .native_agents
+            .lock()
+            .apply_received_workspace_return(&metadata.movement_id, &tree)
+            .map(|_| ()),
+    };
+    if let Err(error) = outcome {
+        // The exact receipt remains retained on a source-change conflict; all
+        // other landing errors can safely discard its private material.
+        let preserve = runtime
+            .native_agents
+            .lock()
+            .movement_status(&metadata.movement_id)
+            .map(|status| {
+                status.state == NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+            })
+            .unwrap_or(false);
+        if !preserve {
+            crate::regular_file_set_transfer::cleanup_materialized_tree(&tree);
+        }
+        return Err(error);
+    }
+    runtime
+        .native_agents
+        .lock()
+        .movement_status(&metadata.movement_id)
+}
+
+/// Watches the bounded native lifecycle after an outbound workspace has
+/// landed. Native completion is reported first; only then does Pastey scan the
+/// task tree and use the existing encrypted Transfer path for the result.
+pub(crate) async fn monitor_received_workspace_task(
+    runtime: Arc<crate::host_runtime::HostRuntime>,
+    room_id: String,
+    peer_session_id: String,
+    movement_id: String,
+) {
+    let mut last: Option<NativeAgentTaskStatusV1> = None;
+    for _ in 0..(15 * 60 * 4) {
+        let task = {
+            let service = runtime.native_agents.lock();
+            let movement = match service.movement_status(&movement_id) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            service.task_status(&movement.task_id).ok()
+        };
+        let Some(task) = task else {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        };
+        if last.as_ref() != Some(&task) {
+            if let Ok(context) = crate::room_control::room_control_session_context_for_peer(
+                &runtime,
+                &room_id,
+                &peer_session_id,
+            ) {
+                if let Ok(payload) = serde_json::to_value(NativeAgentStatusV1 {
+                    schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                    task_id: task.task_id.clone(),
+                    executing_host_ref: runtime.local_host_ref.as_str().into(),
+                    status: task.clone(),
+                }) {
+                    if let Ok(event) = crate::room_control::native_agent_event(
+                        "native_agent.status",
+                        payload,
+                        &context,
+                    ) {
+                        let _ = crate::room_control::send_room_control_event(
+                            runtime.clone(),
+                            &room_id,
+                            event,
+                            Some(crate::room_control::selected_peer_route(
+                                &room_id,
+                                &peer_session_id,
+                            )),
+                        )
+                        .await;
+                    }
+                }
+            }
+            last = Some(task.clone());
+        }
+        match task.state {
+            NativeAgentTaskStateV1::Running | NativeAgentTaskStateV1::Queued => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            NativeAgentTaskStateV1::Completed => {
+                if send_workspace_result(runtime.clone(), &room_id, &movement_id)
+                    .await
+                    .is_err()
+                {
+                    runtime
+                        .native_agents
+                        .lock()
+                        .interrupt_workspace_movement(&movement_id, "result_return_failed");
+                }
+                return;
+            }
+            NativeAgentTaskStateV1::Failed
+            | NativeAgentTaskStateV1::Cancelled
+            | NativeAgentTaskStateV1::Interrupted => return,
+        }
+    }
+    runtime
+        .native_agents
+        .lock()
+        .interrupt_workspace_movement(&movement_id, "native_agent_status_timeout");
+}
+
+async fn send_workspace_result(
+    runtime: Arc<crate::host_runtime::HostRuntime>,
+    room_id: &str,
+    movement_id: &str,
+) -> AppResult<()> {
+    let (task_id, workspace, source_host_ref) = runtime
+        .native_agents
+        .lock()
+        .completed_task_workspace_for_return(movement_id)?;
+    let identity = crate::safe_file_identity::capture_regular_file_set_identity(
+        &workspace,
+        crate::storage::MAX_FILE_SIZE_BYTES,
+    )?;
+    let now = crate::storage::now_ts();
+    let result = runtime.managed_objects.lock().acquire_new(
+        crate::managed_objects::HostArtifactAcquisition {
+            kind: crate::managed_objects::ManagedObjectAcquisitionKind::GeneratedArtifact,
+            source_ref: format!("native-agent-result:{movement_id}"),
+            bridge_id: Some(room_id.into()),
+            path: workspace.clone(),
+            scope_root: workspace.clone(),
+            display_name: "native-agent-result".into(),
+            media_type: "application/octet-stream".into(),
+            expires_at: now + 60 * 60,
+            app_owned_temporary: true,
+        },
+        now,
+    )?;
+    let package = crate::regular_file_set_transfer::prepare_package(
+        &workspace,
+        &workspace,
+        &identity,
+        &runtime.paths.temp_dir,
+    )?;
+    let source_host =
+        crate::host_identity::HostRef::parse_peer(source_host_ref, &runtime.local_host_ref)?;
+    let session = runtime
+        .resolve_current_remote_host_session(room_id, &source_host)
+        .await?;
+    let master_key = {
+        let config = runtime.config.read();
+        crate::config::master_key(&config)?
+    };
+    let item = crate::storage::create_outgoing_file_item_with_metadata(
+        &runtime.paths,
+        &master_key,
+        room_id,
+        &package,
+        Some("Codex result".into()),
+        Some("application/octet-stream".into()),
+    )?;
+    let metadata = NativeAgentWorkspaceTransferV1 {
+        schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+        movement_id: movement_id.into(),
+        task_id,
+        phase: NativeAgentWorkspaceTransferPhaseV1::Return,
+        bridge_id: room_id.into(),
+        source_host_ref: runtime.local_host_ref.as_str().into(),
+        destination_host_ref: source_host.as_str().into(),
+        object: crate::bridge_plan_v2::ManagedObjectRevisionV2 {
+            logical_object_id: result.object.logical_object_id,
+            revision: result.object.revision,
+        },
+        content_digest: identity.digest,
+        logical_byte_count: identity.byte_count,
+    };
+    let sent = crate::transfer::send_native_agent_workspace_to_current_remote_session(
+        runtime.clone(),
+        room_id,
+        &item.id,
+        &package,
+        session,
+        metadata,
+    )
+    .await;
+    let _ = crate::storage::delete_room_item(&runtime.paths, &item.id);
+    crate::regular_file_set_transfer::cleanup_package(&package);
+    sent
+}
+
 pub(crate) fn validate_invoke(request: &NativeAgentInvokeV1) -> AppResult<()> {
     if request.schema_version != NATIVE_AGENT_PROTOCOL_SCHEMA
         || request.task_id.trim().is_empty()
@@ -539,6 +1369,76 @@ pub(crate) fn validate_cancel(cancel: &NativeAgentCancelV1) -> AppResult<()> {
         return invalid("Native Agent cancellation is invalid.");
     }
     Ok(())
+}
+
+pub(crate) fn validate_workspace_prepare(request: &NativeAgentWorkspacePrepareV1) -> AppResult<()> {
+    if request.schema_version != NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA
+        || !valid_movement_id(&request.movement_id)
+        || !valid_task_id(&request.task_id)
+        || request.source_host_ref.trim().is_empty()
+        || request.source_host_ref.len() > 256
+        || request.target_host_ref.trim().is_empty()
+        || request.target_host_ref.len() > 256
+        || request.agent_capability != CODEX_CAPABILITY_ID
+        || request.task.trim().is_empty()
+        || request.task.len() > MAX_TASK_BYTES
+        || request.source_object.logical_object_id.trim().is_empty()
+        || request.source_object.revision == 0
+        || request.source_digest.trim().is_empty()
+        || request.source_digest.len() > 128
+        || request.source_bytes > crate::storage::MAX_FILE_SIZE_BYTES
+    {
+        return invalid("Native Agent workspace movement preparation is invalid.");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_workspace_transfer(
+    metadata: &NativeAgentWorkspaceTransferV1,
+) -> AppResult<()> {
+    if metadata.schema_version != NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA
+        || !valid_movement_id(&metadata.movement_id)
+        || !valid_task_id(&metadata.task_id)
+        || metadata.bridge_id.trim().is_empty()
+        || metadata.bridge_id.len() > 256
+        || metadata.source_host_ref.trim().is_empty()
+        || metadata.source_host_ref.len() > 256
+        || metadata.destination_host_ref.trim().is_empty()
+        || metadata.destination_host_ref.len() > 256
+        || metadata.source_host_ref == metadata.destination_host_ref
+        || metadata.object.logical_object_id.trim().is_empty()
+        || metadata.object.revision == 0
+        || metadata.content_digest.trim().is_empty()
+        || metadata.content_digest.len() > 128
+        || metadata.logical_byte_count > crate::storage::MAX_FILE_SIZE_BYTES
+    {
+        return invalid("Native Agent workspace Transfer metadata is invalid.");
+    }
+    Ok(())
+}
+
+fn validate_movement_id(value: &str) -> AppResult<()> {
+    if valid_movement_id(value) {
+        Ok(())
+    } else {
+        invalid("Native Agent workspace movement identity is invalid.")
+    }
+}
+
+fn validate_task_id(value: &str) -> AppResult<()> {
+    if valid_task_id(value) {
+        Ok(())
+    } else {
+        invalid("Native Agent task identity is invalid.")
+    }
+}
+
+fn valid_movement_id(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= MAX_MOVEMENT_ID_BYTES
+}
+
+fn valid_task_id(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= MAX_TASK_ID_BYTES
 }
 
 fn codex_usable() -> bool {
@@ -890,6 +1790,154 @@ done
         assert!(service
             .start_codex_task_with_executable_and_id(&agent, "same-request", &other, "replay")
             .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn movement_object() -> crate::bridge_plan_v2::ManagedObjectRevisionV2 {
+        crate::bridge_plan_v2::ManagedObjectRevisionV2 {
+            logical_object_id: "managed-object:v1:movement-test".into(),
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn approved_workspace_movement_has_visible_review_and_exact_outbound_package() {
+        let (root, source, _) = fixture();
+        fs::write(source.join("before.txt"), b"approved baseline").unwrap();
+        let mut source_host = NativeAgentServiceV1::default();
+        let review = source_host
+            .propose_workspace_movement(
+                "movement-1",
+                "task-1",
+                &source,
+                "host:remote",
+                movement_object(),
+                "update the project",
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            review.state,
+            NativeAgentWorkspaceMovementStateV1::AwaitingApproval
+        );
+        assert!(review.review_summary.contains("send"));
+        assert!(review.review_summary.contains("return"));
+        let (prepare, metadata, package) = source_host
+            .approve_workspace_movement("movement-1", "room-1", "host:source", &root)
+            .unwrap();
+        assert_eq!(
+            metadata.phase,
+            NativeAgentWorkspaceTransferPhaseV1::Outbound
+        );
+        assert_eq!(prepare.source_digest, metadata.content_digest);
+        let tree = crate::regular_file_set_transfer::materialize_package(
+            &package,
+            &root,
+            &metadata.content_digest,
+            metadata.logical_byte_count,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(tree.join("before.txt")).unwrap(),
+            b"approved baseline"
+        );
+        crate::regular_file_set_transfer::cleanup_package(&package);
+        crate::regular_file_set_transfer::cleanup_materialized_tree(&tree);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_change_after_review_blocks_outbound_packaging() {
+        let (root, source, _) = fixture();
+        fs::write(source.join("before.txt"), b"approved baseline").unwrap();
+        let mut service = NativeAgentServiceV1::default();
+        service
+            .propose_workspace_movement(
+                "movement-2",
+                "task-2",
+                &source,
+                "host:remote",
+                movement_object(),
+                "update the project",
+                true,
+            )
+            .unwrap();
+        fs::write(source.join("before.txt"), b"changed before approval").unwrap();
+        assert!(service
+            .approve_workspace_movement("movement-2", "room-1", "host:source", &root)
+            .is_err());
+        assert_eq!(
+            service.movement_status("movement-2").unwrap().state,
+            NativeAgentWorkspaceMovementStateV1::AwaitingApproval
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn returned_workspace_applies_once_or_enters_conflict_recovery() {
+        let (root, source, _) = fixture();
+        fs::write(source.join("before.txt"), b"approved baseline").unwrap();
+        let returned = root.join("returned");
+        fs::create_dir(&returned).unwrap();
+        fs::write(returned.join("after.txt"), b"native result").unwrap();
+        let mut service = NativeAgentServiceV1::default();
+        service
+            .propose_workspace_movement(
+                "movement-3",
+                "task-3",
+                &source,
+                "host:remote",
+                movement_object(),
+                "update the project",
+                true,
+            )
+            .unwrap();
+        service
+            .workspace_movements
+            .get_mut("movement-3")
+            .unwrap()
+            .status
+            .state = NativeAgentWorkspaceMovementStateV1::ReturningResult;
+        let applied = service
+            .apply_received_workspace_return("movement-3", &returned)
+            .unwrap();
+        assert_eq!(
+            applied.state,
+            NativeAgentWorkspaceMovementStateV1::Completed
+        );
+        assert_eq!(
+            fs::read(source.join("after.txt")).unwrap(),
+            b"native result"
+        );
+        assert!(!source.join("before.txt").exists());
+
+        let conflicted = root.join("conflicted");
+        fs::create_dir(&conflicted).unwrap();
+        fs::write(conflicted.join("before.txt"), b"approved baseline").unwrap();
+        let mut conflict_service = NativeAgentServiceV1::default();
+        conflict_service
+            .propose_workspace_movement(
+                "movement-4",
+                "task-4",
+                &conflicted,
+                "host:remote",
+                movement_object(),
+                "update the project",
+                true,
+            )
+            .unwrap();
+        fs::write(conflicted.join("local.txt"), b"local edit").unwrap();
+        let conflict = conflict_service
+            .apply_received_workspace_return("movement-4", &returned)
+            .unwrap();
+        assert_eq!(
+            conflict.state,
+            NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+        );
+        assert_eq!(
+            fs::read(conflicted.join("local.txt")).unwrap(),
+            b"local edit"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -109,6 +109,8 @@ enum ActiveFileTransferKind {
         mime_type: Option<String>,
         pipeline_handoff: Option<PipelineHandoffMetadata>,
         native_v2_transfer: Option<crate::native_v2_orchestration::NativeV2TransferMetadataV1>,
+        native_agent_workspace_transfer:
+            Option<crate::native_agent::NativeAgentWorkspaceTransferV1>,
         created_at: i64,
         transferred_bytes: u64,
         expected_chunk_index: u64,
@@ -577,6 +579,7 @@ pub async fn send_room_file_to_bridge_peer_endpoint(
         endpoint,
         None,
         None,
+        None,
         crate::transfer_orchestration::TransferCapacityOrigin::Ordinary,
     )
     .await
@@ -599,6 +602,7 @@ pub(crate) async fn send_managed_room_file_to_bridge_peer_endpoint(
         queue_item_id,
         requested_window,
         endpoint,
+        None,
         None,
         None,
         crate::transfer_orchestration::TransferCapacityOrigin::Managed,
@@ -625,6 +629,7 @@ pub async fn send_room_file_to_bridge_peer_endpoint_with_landing(
         requested_window,
         endpoint,
         pipeline_handoff,
+        None,
         None,
         crate::transfer_orchestration::TransferCapacityOrigin::Managed,
     )
@@ -655,6 +660,35 @@ pub(crate) async fn send_native_v2_managed_revision_to_current_remote_session(
         endpoint,
         None,
         Some(metadata),
+        None,
+        crate::transfer_orchestration::TransferCapacityOrigin::Managed,
+    )
+    .await
+}
+
+/// Carries one approved native-Agent task workspace through the same encrypted
+/// managed Transfer path. The movement metadata is validated by the receiving
+/// Host before any private materialization occurs.
+pub(crate) async fn send_native_agent_workspace_to_current_remote_session(
+    state: Arc<AppState>,
+    room_id: &str,
+    item_id: &str,
+    file_path: &Path,
+    session: crate::bridge_lifecycle::CurrentRemoteHostSession,
+    metadata: crate::native_agent::NativeAgentWorkspaceTransferV1,
+) -> AppResult<()> {
+    let endpoint = session.revalidate_for_transfer(&state).await?;
+    send_room_file_to_bridge_peer_endpoint_with_orchestration(
+        state,
+        room_id,
+        item_id,
+        file_path,
+        Some(format!("native-agent-workspace:{}", metadata.movement_id)),
+        None,
+        endpoint,
+        None,
+        None,
+        Some(metadata),
         crate::transfer_orchestration::TransferCapacityOrigin::Managed,
     )
     .await
@@ -670,6 +704,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
     endpoint: BridgePeerTransferEndpoint,
     pipeline_handoff: Option<PipelineHandoffMetadata>,
     native_v2_transfer: Option<crate::native_v2_orchestration::NativeV2TransferMetadataV1>,
+    native_agent_workspace_transfer: Option<crate::native_agent::NativeAgentWorkspaceTransferV1>,
     capacity_origin: crate::transfer_orchestration::TransferCapacityOrigin,
 ) -> AppResult<()> {
     let room = storage::get_room_by_id(&state.paths, room_id)?;
@@ -791,6 +826,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
         preferred_chunk_protocol: Some(CHUNK_PROTOCOL_BINARY_V1.to_string()),
         pipeline_handoff,
         native_v2_transfer,
+        native_agent_workspace_transfer,
     };
 
     let start_response = client.post(&start_url).json(&start).send().await;
@@ -3021,7 +3057,12 @@ async fn start_file_transfer_handler(
     }
     let pipeline_handoff = start.pipeline_handoff.clone();
     let native_v2_transfer = start.native_v2_transfer.clone();
-    if pipeline_handoff.is_some() && native_v2_transfer.is_some() {
+    let native_agent_workspace_transfer = start.native_agent_workspace_transfer.clone();
+    if usize::from(pipeline_handoff.is_some())
+        + usize::from(native_v2_transfer.is_some())
+        + usize::from(native_agent_workspace_transfer.is_some())
+        > 1
+    {
         return transfer_error(
             StatusCode::BAD_REQUEST,
             "managed_landing_ambiguous",
@@ -3095,6 +3136,45 @@ async fn start_file_transfer_handler(
                 "Native v2 Transfer does not match the authored Plan.".into(),
             );
         }
+    } else if let Some(metadata) = &native_agent_workspace_transfer {
+        let context =
+            match crate::room_control::room_control_session_context_for_transport_key(
+                &ctx.state,
+                &room_id,
+                &start.sender_public_key,
+            ) {
+                Ok(context) => context,
+                Err(_) => return transfer_error(
+                    StatusCode::GONE,
+                    "native_agent_workspace_route_unavailable",
+                    "Native Agent workspace transfer is no longer in the current Bridge session."
+                        .into(),
+                ),
+            };
+        let binding = crate::host_runtime::current_host_session_binding(
+            &ctx.state,
+            &room_id,
+            &context.peer_route_ref,
+        );
+        let binding_matches = matches!(
+            binding.as_ref(),
+            Ok(binding) if binding.peer_host_ref.as_str() == metadata.source_host_ref
+        );
+        if metadata.bridge_id != room_id
+            || !binding_matches
+            || ctx
+                .state
+                .native_agents
+                .lock()
+                .validate_workspace_transfer(metadata, ctx.state.local_host_ref.as_str())
+                .is_err()
+        {
+            return transfer_error(
+                StatusCode::BAD_REQUEST,
+                "native_agent_workspace_binding_invalid",
+                "Native Agent workspace transfer does not match the approved task.".into(),
+            );
+        }
     } else {
         match storage::room_item_exists(&ctx.state.paths, &start.item_id) {
             Ok(true) => return Json(file_transfer_start_response()).into_response(),
@@ -3128,7 +3208,9 @@ async fn start_file_transfer_handler(
             );
         }
     };
-    let managed_private_landing = pipeline_handoff.is_some() || native_v2_transfer.is_some();
+    let managed_private_landing = pipeline_handoff.is_some()
+        || native_v2_transfer.is_some()
+        || native_agent_workspace_transfer.is_some();
     let destination_dir = if pipeline_handoff.is_some() {
         ctx.state
             .paths
@@ -3140,6 +3222,12 @@ async fn start_file_transfer_handler(
             .paths
             .temp_dir
             .join("native-v2-transfers")
+            .join(&start.transfer_id)
+    } else if native_agent_workspace_transfer.is_some() {
+        ctx.state
+            .paths
+            .temp_dir
+            .join("native-agent-workspace-transfers")
             .join(&start.transfer_id)
     } else {
         let config = ctx.state.config.read();
@@ -3225,6 +3313,7 @@ async fn start_file_transfer_handler(
             mime_type: start.mime_type,
             pipeline_handoff,
             native_v2_transfer,
+            native_agent_workspace_transfer,
             created_at: start.created_at,
             transferred_bytes: 0,
             expected_chunk_index: 0,
@@ -3817,6 +3906,7 @@ async fn finish_file_transfer_handler(
         mime_type,
         pipeline_handoff,
         native_v2_transfer,
+        native_agent_workspace_transfer,
         created_at,
         transferred_bytes,
         expected_chunk_index,
@@ -3931,6 +4021,8 @@ async fn finish_file_transfer_handler(
             "landing=pipeline_private"
         } else if native_v2_transfer.is_some() {
             "landing=native_v2_private"
+        } else if native_agent_workspace_transfer.is_some() {
+            "landing=native_agent_workspace_private"
         } else {
             "part_location=inbox_part_root final_location=inbox_root"
         },
@@ -4039,6 +4131,35 @@ async fn finish_file_transfer_handler(
             &metadata.step_id,
             "registered",
         );
+        emit_event(
+            &ctx.state,
+            &transfer,
+            "completed",
+            transfer.file_size,
+            0.0,
+            average_speed(&transfer, transfer.file_size),
+            Some(0.0),
+            None,
+        );
+        return Json(TransferOkResponse { ok: true }).into_response();
+    }
+
+    if let Some(metadata) = native_agent_workspace_transfer {
+        if crate::native_agent::register_workspace_transfer_landing(
+            &ctx.state,
+            &metadata,
+            final_path.clone(),
+            storage::now_ts(),
+        )
+        .is_err()
+        {
+            let _ = cleanup_native_agent_workspace_transfer_root(&final_path).await;
+            return transfer_error(
+                StatusCode::BAD_REQUEST,
+                "native_agent_workspace_registration_failed",
+                "Native Agent workspace could not be registered.".into(),
+            );
+        }
         emit_event(
             &ctx.state,
             &transfer,
@@ -4747,6 +4868,22 @@ async fn cleanup_native_v2_transfer_root(file_path: &Path) -> std::io::Result<()
     }
 }
 
+fn native_agent_workspace_transfer_root(part_path: &Path) -> Option<&Path> {
+    let transfer_root = part_path.parent()?;
+    (transfer_root
+        .parent()?
+        .file_name()
+        .is_some_and(|name| name == "native-agent-workspace-transfers"))
+    .then_some(transfer_root)
+}
+
+async fn cleanup_native_agent_workspace_transfer_root(file_path: &Path) -> std::io::Result<()> {
+    match native_agent_workspace_transfer_root(file_path) {
+        Some(root) => tokio::fs::remove_dir_all(root).await,
+        None => Ok(()),
+    }
+}
+
 fn emit_progress(
     state: &Arc<AppState>,
     transfer_id: &str,
@@ -5342,6 +5479,7 @@ mod tests {
                 mime_type: None,
                 pipeline_handoff: None,
                 native_v2_transfer: None,
+                native_agent_workspace_transfer: None,
                 created_at: 0,
                 transferred_bytes: 0,
                 expected_chunk_index: 0,

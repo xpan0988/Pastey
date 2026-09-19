@@ -971,6 +971,177 @@ pub async fn cancel_remote_native_agent_task(
     Ok(local)
 }
 
+/// Builds the one-review cross-device envelope when the selected workspace is
+/// local to this Host and Codex is selected on another current Bridge Host.
+/// This is deliberately not used for ordinary remote-existing-workspace tasks.
+#[tauri::command]
+pub fn propose_remote_native_codex_workspace_movement(
+    target_host_ref: String,
+    source_workspace: String,
+    task: String,
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentWorkspaceMovementV1, String> {
+    let target = crate::host_identity::HostRef::parse_peer(target_host_ref, &state.local_host_ref)
+        .map_err(|error| error.message())?;
+    let workspace = std::path::Path::new(&source_workspace)
+        .canonicalize()
+        .map_err(|_| "Pastey could not open the selected workspace.".to_string())?;
+    let scope_root = workspace
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| "Pastey could not bind the selected workspace.".to_string())?;
+    let movement_id = format!("native-agent-movement:{}", uuid::Uuid::new_v4());
+    let task_id = format!("native-agent:{}", uuid::Uuid::new_v4());
+    let now = storage::now_ts();
+    let acquisition = state
+        .managed_objects
+        .lock()
+        .acquire_new(
+            HostArtifactAcquisition {
+                kind: ManagedObjectAcquisitionKind::LocalSelection,
+                source_ref: movement_id.clone(),
+                bridge_id: Some(room_id),
+                path: workspace.clone(),
+                scope_root,
+                display_name: workspace
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("workspace")
+                    .into(),
+                media_type: "application/octet-stream".into(),
+                expires_at: now + 60 * 60,
+                app_owned_temporary: false,
+            },
+            now,
+        )
+        .map_err(|error| error.message())?;
+    let object = crate::bridge_plan_v2::ManagedObjectRevisionV2 {
+        logical_object_id: acquisition.object.logical_object_id,
+        revision: acquisition.object.revision,
+    };
+    state
+        .native_agents
+        .lock()
+        .propose_workspace_movement(
+            &movement_id,
+            &task_id,
+            &workspace,
+            target.as_str(),
+            object,
+            &task,
+            true,
+        )
+        .map_err(|error| error.message())
+}
+
+/// Executes one already reviewed workspace movement. A single call covers the
+/// outbound source transfer, native task, return transfer, and unchanged-source
+/// apply; no second user confirmation is introduced.
+#[tauri::command]
+pub async fn approve_remote_native_codex_workspace_movement(
+    movement_id: String,
+    room_id: String,
+    peer_session_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentWorkspaceMovementV1, String> {
+    let (prepare, metadata, package) = state
+        .native_agents
+        .lock()
+        .approve_workspace_movement(
+            &movement_id,
+            &room_id,
+            state.local_host_ref.as_str(),
+            &state.paths.temp_dir,
+        )
+        .map_err(|error| error.message())?;
+    let target = crate::host_identity::HostRef::parse_peer(
+        metadata.destination_host_ref.clone(),
+        &state.local_host_ref,
+    )
+    .map_err(|error| error.message())?;
+    state
+        .native_agents
+        .lock()
+        .queue_remote_task(&prepare.task_id, target.as_str(), "approved workspace")
+        .map_err(|error| error.message())?;
+    let context = crate::room_control::room_control_session_context_for_peer(
+        &state,
+        &room_id,
+        &peer_session_id,
+    )
+    .map_err(|error| error.message())?;
+    let event = crate::room_control::native_agent_event(
+        "native_agent.workspace_prepare",
+        serde_json::to_value(prepare).map_err(|error| error.to_string())?,
+        &context,
+    )
+    .map_err(|error| error.message())?;
+    crate::room_control::send_room_control_event(
+        state.inner().clone(),
+        &room_id,
+        event,
+        Some(crate::room_control::selected_peer_route(
+            &room_id,
+            &peer_session_id,
+        )),
+    )
+    .await
+    .map_err(|error| error.message())?;
+    let session = state
+        .resolve_current_remote_host_session(&room_id, &target)
+        .await
+        .map_err(|error| error.message())?;
+    let master_key = {
+        let config = state.config.read();
+        crate::config::master_key(&config).map_err(|error| error.message())?
+    };
+    let item = storage::create_outgoing_file_item_with_metadata(
+        &state.paths,
+        &master_key,
+        &room_id,
+        &package,
+        Some("approved workspace".into()),
+        Some("application/octet-stream".into()),
+    )
+    .map_err(|error| error.message())?;
+    let send = transfer::send_native_agent_workspace_to_current_remote_session(
+        state.inner().clone(),
+        &room_id,
+        &item.id,
+        &package,
+        session,
+        metadata,
+    )
+    .await;
+    let _ = storage::delete_room_item(&state.paths, &item.id);
+    crate::regular_file_set_transfer::cleanup_package(&package);
+    if let Err(error) = send {
+        state
+            .native_agents
+            .lock()
+            .interrupt_workspace_movement(&movement_id, "outbound_transfer_failed");
+        return Err(error.message());
+    }
+    state
+        .native_agents
+        .lock()
+        .movement_status(&movement_id)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn get_native_agent_workspace_movement_status(
+    movement_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentWorkspaceMovementV1, String> {
+    state
+        .native_agents
+        .lock()
+        .movement_status(&movement_id)
+        .map_err(|error| error.message())
+}
+
 #[tauri::command]
 pub fn get_native_v2_plan_status(
     revision_id: String,

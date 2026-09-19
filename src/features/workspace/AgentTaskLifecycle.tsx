@@ -2,16 +2,20 @@ import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   approveNativeV2Plan,
+  approveRemoteNativeCodexWorkspaceMovement,
   cancelNativeV2PlanAttempt,
   cancelNativeAgentTask,
   cancelRemoteNativeAgentTask,
   getNativeAgentTaskStatus,
+  getNativeAgentWorkspaceMovementStatus,
   getNativeV2PlanStatus,
   listNativeAgentCapabilities,
+  proposeRemoteNativeCodexWorkspaceMovement,
   startNativeCodexTask,
   startRemoteNativeCodexTask,
   type NativeAgentCapability,
   type NativeAgentTaskStatus,
+  type NativeAgentWorkspaceMovement,
   startNativeV2PlanAttempt,
   type NativeV2PlanStatus,
   type NativeV2ProductState,
@@ -150,6 +154,7 @@ export function useNativeAgentTask() {
   const [workspace, setWorkspace] = useState("");
   const [taskText, setTaskText] = useState("");
   const [status, setStatus] = useState<NativeAgentTaskStatus | null>(null);
+  const [movement, setMovement] = useState<NativeAgentWorkspaceMovement | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -170,6 +175,15 @@ export function useNativeAgentTask() {
     const timer = window.setTimeout(() => void poll(), 1_000);
     return () => { cancelled = true; window.clearTimeout(timer); };
   }, [status]);
+  useEffect(() => {
+    if (!movement || ["completed", "conflict_recovery_required", "failed", "cancelled", "interrupted"].includes(movement.state)) return;
+    const timer = window.setTimeout(() => {
+      void getNativeAgentWorkspaceMovementStatus(movement.movementId).then(setMovement).catch((error) => {
+        setMessage(error instanceof Error ? error.message : "Pastey lost the workspace movement outcome.");
+      });
+    }, 1_000);
+    return () => window.clearTimeout(timer);
+  }, [movement]);
 
   const start = useCallback(async () => {
     if (!workspace.trim() || !taskText.trim() || busy) return;
@@ -187,6 +201,22 @@ export function useNativeAgentTask() {
     finally { setBusy(false); }
   }, [busy, taskText, workspace]);
 
+  const proposeRemoteMovement = useCallback(async (roomId: string, hostRef: string) => {
+    if (!roomId || !hostRef || !workspace.trim() || !taskText.trim() || busy) return;
+    setBusy(true); setMessage(null);
+    try { setMovement(await proposeRemoteNativeCodexWorkspaceMovement(hostRef, workspace.trim(), taskText.trim(), roomId)); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not prepare the workspace review."); }
+    finally { setBusy(false); }
+  }, [busy, taskText, workspace]);
+
+  const approveRemoteMovement = useCallback(async (roomId: string, peerSessionId: string) => {
+    if (!movement || movement.state !== "awaiting_approval" || busy) return;
+    setBusy(true); setMessage(null);
+    try { setMovement(await approveRemoteNativeCodexWorkspaceMovement(movement.movementId, roomId, peerSessionId)); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start the approved workspace movement."); }
+    finally { setBusy(false); }
+  }, [busy, movement]);
+
   const cancel = useCallback(async () => {
     if (!status || !["queued", "running"].includes(status.state)) return;
     setBusy(true);
@@ -203,7 +233,7 @@ export function useNativeAgentTask() {
     finally { setBusy(false); }
   }, [status]);
 
-  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, message, busy, start, startRemote, cancel, cancelRemote, refreshCapabilities };
+  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, message, busy, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, refreshCapabilities };
 }
 
 export function StatusBadge({ tone, children }: { tone: LifecycleTone; children: React.ReactNode }) {
