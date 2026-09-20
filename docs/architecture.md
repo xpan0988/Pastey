@@ -1,6 +1,6 @@
 # Pastey architecture
 
-Pastey is a local-first desktop transfer and managed-workspace system. Source code, validators, and tests are authoritative. Version 1.9.2 is the last packaged baseline; the current 1.9.3 development line preserves its Layer 1–5 semantics while adding the Host, authority, Worker, native-v2 orchestration, and proposal foundations intended for 2.0. The complete 2.0 Agent product and UI are not finished.
+Pastey is a local-first desktop transfer and workspace-orchestration system. Source code, validators, and tests are authoritative. Version 1.9.2 is the last packaged baseline. The current development line preserves the Layer 1–5 foundations while its mature-Agent product direction treats native Agents as Host capabilities rather than Pastey-managed Workers.
 
 ## System and dependency direction
 
@@ -92,7 +92,7 @@ Failed, cancelled, interrupted, lost, malformed, mismatched, or otherwise
 ambiguous Agent/return outcomes are likewise never global completion.
 
 Codex terminal success is intentionally narrow: the exact native
-`thread/completed` notification must name the requested thread and turn, carry
+`turn/completed` notification must name the requested thread and turn, carry
 `status: completed`, and have no error. `failed`, `interrupted`, cancellation,
 and any malformed or mismatched terminal notification stay non-DONE.
 
@@ -100,7 +100,7 @@ Layer 2's `BridgeNodeListProjectionV1` displays durable Host membership once per
 
 A current-session Room Control capability query may ask an exact remote Host for a bounded, deduplicated list from the global fixed-probe request vocabulary: `runtime.python`, `runtime.node`, `runtime.git`, `runtime.rust_cargo`, `runtime.docker`, `runtime.ffmpeg`, `runtime.cuda`, `runtime.powershell`, `runtime.zsh`, and `runtime.bash`. The requester platform does not narrow that vocabulary. The receiving Host validates each ID and alone maps it to a platform-local fixed probe. A successful fixed probe is `Available`; a failed fixed probe is `Unavailable` (`system_probe_unavailable`); a globally recognized request with no local fixed implementation is `Unsupported` (`system_probe_unsupported`); and no current observation remains unknown. A caller cannot send an executable path, command, arguments, shell text, or installation instruction. These are current-session NodeList facts only; they do not select a Host, repair topology, bind a process, or grant execution authority.
 
-The low-friction Capability Acquisition foundation is also implemented, but actual acquisition behavior is intentionally deferred until AI integration. An acquisition request binds one generic bounded semantic ID to an exact durable `HostRef` and renderer-safe display facts; valid intents include `runtime.java`, `tool.cmake`, `sdk.android`, and `model.whisper` even though they are outside the fixed-probe request vocabulary. The confirmation result is only `Confirmed` or `Cancelled`. It creates no installer behavior, probe, process binding, execution authority, Plan/topology mutation, Host selection, or Developer Mode change. A future confirmed flow must reuse the existing Host probe → capability projection → NodeList/Settings refresh path after its Host-side action; confirmation itself changes none of those facts.
+The low-friction Capability Acquisition confirmation foundation is also implemented, but generic capability acquisition/install behavior is not. An acquisition request binds one generic bounded semantic ID to an exact durable `HostRef` and renderer-safe display facts; valid intents include `runtime.java`, `tool.cmake`, `sdk.android`, and `model.whisper` even though they are outside the fixed-probe request vocabulary. The confirmation result is only `Confirmed` or `Cancelled`. It creates no installer behavior, probe, process binding, execution authority, Plan/topology mutation, Host selection, or Developer Mode change. Any future Host-side acquisition flow must reuse the existing Host probe → capability projection → NodeList/Settings refresh path; confirmation itself changes none of those facts.
 
 Execution locality does not change this chain. Core resolves each authored participant's `HostRef` once. Work for the current Host uses direct coordinator dispatch with a fresh local-runtime reference; work for another Host uses its current Bridge/session binding and Room Control. Both paths satisfy the same Layer 5 Review, readiness, attempt-bound admission, prepared/commit, result, continuation, and cancellation contract.
 
@@ -199,33 +199,26 @@ The Host-owned network broker exists as an independent Phase 5 authority domain,
 
 ## Current product boundary
 
-The 1.9.3 development backend implements the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, bounded Worker Harness, the minimal model-visible Worker Context Contract, configured streaming provider adapter, durable generation-bound provider configuration, Host-local managed runtime discovery/identity pinning with production exact Execute binding, live managed Host coordination including direct local-Host admission, deterministic multi-Host product orchestration, proposal-only Natural-v2 lowering, Bridge-native NodeList/capability projection, bounded fixed Host probe semantics, and the low-friction Capability Acquisition confirmation foundation.
+The primary product path is Native mature Agents. Pastey implements Host-native Codex capability discovery and invocation, Host-private persistent native sessions, local original-workspace operation, authenticated direct remote invocation when that workspace already exists on the target Host, and explicit one-review workspace movement when it does not. The movement path uses encrypted outbound and return Transfer, captures and revalidates the source baseline, preserves a returned result for durable conflict recovery instead of overwriting a changed source, and treats cancellation, stale or replaced sessions, malformed messages, and ambiguous outcomes as non-completion.
 
-V1 remains isolated and unchanged: its product executes Search/Transfer and rejects Transform/Execute. The 2.0 renderer can open an existing native-v2 revision and drive Review approval, readiness start, authoritative status, and cancellation through the registered Tauri commands. The local Task Provider screen can create, edit, remove, explicitly select, inspect, and health-check the existing OpenAI-compatible managed Worker configuration through Host-owned commands. It receives only non-secret endpoint/model/bounds/health metadata and immutable references; the credential, resolved binding, and physical runtime identity remain Host-private.
+The associated product presentation exposes native-Agent capability state, task lifecycle, remote invocation, movement review, one approval, and bounded movement status. Phase 1 is complete; Phase 2 is reliability closure around this implemented architecture rather than a proposal for a new execution model.
 
-Bridge Device Check is the implemented production entry point for one bounded Managed E2E self-check. An explicit Check performs `Search @ requester → authored Transfer → Execute @ exact remote Host` through the ordinary immutable revision, approval, distributed readiness, Host admission, Worker, EffectEnvelope, ExecutionWorld, and Core completion path. Missing provider, runtime, or ExecutionWorld facts return `BLOCKED` before managed work begins. Its `PASS | BLOCKED | FAIL` report and evidence requirements are owned by [Layer 2](layers/layer-2-device-intelligence.md). Host-owned provider/runtime configuration and health closure are implemented; real provider/external API validation remains pending.
+The Generic Managed Worker / Transform / Execute path remains implemented and distinct. It includes the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, the bounded Worker Harness and model-visible Worker Context Contract, provider configuration, exact managed runtime binding, managed Host coordination, native-v2 orchestration, Natural-v2 lowering, and capability observation/confirmation. V1 remains isolated and unchanged: it executes Search/Transfer and rejects Transform/Execute. The Generic Managed path retains its own evidence limits: Bridge Device Check is a bounded Managed E2E self-check, and Windows Managed Execute acceptance does not establish an external-provider or physical multi-Host PASS.
 
-Draft discovery/origination, renderer-safe PM context and detailed topology, and result content projection are not yet complete. The General Semantic Transform foundation is complete for bounded regular-file representations: GST-1 implements same-Host lifecycle and Core-owned canonical file-set sealing; GST-2 preserves the same logical object and revision through exact authored cross-Host file-set Transfer; and GST-3 consumes an exact RegularFileSet through the existing read-only ExecutionWorld mount and exact process binding, yielding only the existing Execute result digest. The Host canonically revalidates the entire tree both before leasing and after releasing the world; Execute never registers N+1. The transport package remains Host-private and is not a managed object; scalar Transfer and scalar Execute remain unchanged. A real packaged Mac ↔ Windows tree Execute PASS is still unclaimed until it is physically run, as are external-provider and packaged two-Host Managed E2E PASS claims.
+The General Semantic Transform foundation is complete for bounded regular-file representations: GST-1 implements same-Host lifecycle and Core-owned canonical file-set sealing; GST-2 preserves the same logical object and revision through exact authored cross-Host file-set Transfer; and GST-3 consumes an exact RegularFileSet through the existing read-only ExecutionWorld mount and exact process binding, yielding only the existing Execute result digest. The Host canonically revalidates the entire tree both before leasing and after releasing the world; Execute never registers N+1. The transport package remains Host-private and is not a managed object; scalar Transfer and scalar Execute remain unchanged.
 
 ## Roadmap
 
 ```text
-DONE  Bridge-native NodeList / Capability Projection
-DONE  Bounded Host Capability Probe / Resolution semantics
-DONE  Low-friction Capability Acquisition foundation
-      actual acquisition behavior deferred
+Phase 1 — Native Agent Core
+CLOSED
 
-DONE  Worker Context Contract / minimal semantic closure
-DONE  General Semantic Transform foundation / bounded representations, exact Transfer, contained Execute
-NEXT  Real Provider Conformance
-THEN  Contract-specific Validation Hardening
-THEN  Product Wiring / Figma integration
-THEN  Coordination Recovery Closure
-THEN  Physical Failure Matrix + Security Freeze
+Phase 2 — Multi-Device Reliability Closure
+CURRENT
 ```
 
-The Worker Context Contract reuses the existing Host/Core authority path and workspace aliases rather than introducing another authority object. The provider receives only the semantic step operation and intent, bounded workspace roles/operations/relative-selector facts, semantic tools, bounded history, and an operation-specific completion template. Exact revision correlation, raw filesystem paths, topology, sessions/routes, credentials, Host-selection data, physical bindings, and authority handles remain Host/Core-private.
+Phase 2 closes reliability and product-state gaps in the architecture already present: cross-device workspace movement reliability; disconnect/reconnect behavior; rejection of stale or replaced Bridge sessions; interrupted-movement recovery; durable conflict recovery; cancellation races; replay protection; restart behavior; a physical multi-device validation and failure matrix; and the product/state presentation and security hardening needed to support those flows. A future physical workflow must be designed around this Native Agent path; the deleted native-v2 physical harness is not a substitute.
 
-The production Bridge Device Managed E2E architecture already exists, Windows local managed execution physical acceptance is complete, and the physical fail-closed preflight is verified. Real external-provider conformance and a packaged physical Mac ↔ Windows E2E PASS remain evidence gates. Independently future capabilities include a verified Linux managed execution world, Worker network tools, subagent policy, and Headless Host; none is implied by the current backend.
+The Generic Managed Worker / Transform / Execute subsystem remains a separate maintained architecture. Its Worker Context Contract, provider configuration, Managed E2E self-check, and Windows Managed Execute backend are factual implementation material, not the primary mature-Agent roadmap.
 
-See [Layer 5](layers/layer-5-agent.md) for the managed contracts, [development](development.md) for validation and physical smoke procedures, and [reference](reference.md) for concrete identifiers and bounds.
+See [Layer 5](layers/layer-5-agent.md) for the managed and native-Agent contracts, [development](development.md) for runnable validation, and [reference](reference.md) for concrete identifiers and bounds.

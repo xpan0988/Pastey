@@ -96,172 +96,29 @@ node scripts/replay-transfer-planner-scenarios.mjs
 
 The generated transfer fixture corpus is documented in [tests/fixtures/transfer-corpus/README.md](../tests/fixtures/transfer-corpus/README.md). Generated payloads are local-only and must not be committed.
 
-For a single-machine dual-instance smoke, create/join a Bridge and exercise selected-peer ordinary data, Room Control, Search/Transfer Review & Run, disconnect/reconnect, and Burn. For a two-device smoke, repeat with packaged builds on independent LAN Hosts and record the evidence as described below.
+For a single-machine dual-instance smoke, create/join a Bridge and exercise selected-peer ordinary data, Room Control, Search/Transfer Review & Run, disconnect/reconnect, and Burn.
 
 ## Automated, local, and physical evidence
 
 - Rust and TypeScript tests cover deterministic composition, alias resolution, immutable correlation, whole-Plan readiness, replay, Worker/provider streaming, effect enforcement, Core results, exact Transfer receipt, cancellation/revocation races, restart, and Burn.
 - A local dual-instance run covers desktop wiring, current-session Room Control, ordinary Transfer, and protocol interaction on one machine. It does not prove independent physical Hosts, LAN failure behavior, native Windows, or a verified managed process world on another platform.
-- Physical multi-device proof requires packaged builds on the named devices and a recorded run of the procedure below. Do not report PASS from unit tests, Darwin-only integration, cross-compilation, or source inspection.
+- Physical multi-device proof requires packaged builds on the named devices and a recorded Native Agent procedure. No such procedure is currently implemented in this repository: the deleted legacy physical harness has no runnable replacement. Do not recreate it.
 
-## Mac requester ↔ Windows native-v2 physical acceptance harness
+## Native Agent focused validation
 
-`pastey-native-v2-physical-harness` is a source-built, headless acceptance adapter. It initializes the same production `HostRuntime`, Bridge lifecycle, native-v2 orchestration, Search adapter, encrypted Transfer path, and Core SQLite stores as the desktop app. It does not mock a peer, create an authority bypass, alter admission, or configure a provider. Use one clean, dedicated `PASTEY_APP_DATA_DIR` on each physical machine; do not point it at normal user data.
-
-The current Bridge still has to be created and joined by the normal product flow before starting the headless Hosts. For a same-commit source run, launch each desktop app with its dedicated data directory, create/join one Bridge, record its id, then close both desktop apps. Bridge creation/join is intentionally not automated. Profile A's primary workflow is one wrapper command on Windows, one on macOS, then one verifier command; the wrappers require clean source worktrees before launch. Their defaults are `C:\pastey-physical\windows-app-data` / `C:\pastey-physical\reports` on Windows and `~/pastey-physical/mac-app-data` / `~/pastey-physical/reports` on macOS.
-
-### Profile A primary workflow
-
-1. On each physical machine, use the normal desktop product with the matching dedicated app-data directory to create/join one Bridge, record `BRIDGE_ID`, then close both apps. For example:
+The Native Agent path has focused Rust coverage in `native_agent`, `commands`, `room_control`, `transfer`, `storage`, and `host_runtime`. Run the available module tests with:
 
 ```bash
-# macOS UI setup only; close the app after creating/joining the Bridge.
-PASTEY_APP_DATA_DIR="$HOME/pastey-physical/mac-app-data" npm run tauri:dev
+cargo test --manifest-path src-tauri/Cargo.toml native_agent -- --nocapture
 ```
 
-```powershell
-# Windows UI setup only; close the app after joining the same Bridge.
-$env:PASTEY_APP_DATA_DIR = 'C:\pastey-physical\windows-app-data'
-npm run tauri:dev
-```
+These tests cover Host-native session reuse and terminal-success handling, authenticated remote task correlation and cancellation, one-review workspace movement, transfer metadata validation, source revalidation, durable conflict retention, and exact current-session Room Control handling. They are local automated evidence, not physical multi-device proof.
 
-2. On Windows, run the one wrapper command below and leave it running. It prints `WINDOWS_HOST_REF=...`.
+Phase 2 must define a Native Agent physical multi-device procedure before claiming movement reliability across actual devices. It must exercise a connected remote Host, explicit movement review, encrypted outbound and return transfer, stale/replaced-session rejection, interruption and restart behavior, cancellation races, replay rejection, source-change conflict retention, and recovery presentation. Keep recorded evidence non-secret: never include provider credentials, native session identifiers, Host paths, grants, ObjectRefs, or raw Agent/terminal content.
 
-```powershell
-# Windows: leave this one command running. It prints WINDOWS_HOST_REF=... .
-.\scripts\native-v2-physical\profile-a-windows.ps1 -BridgeId BRIDGE_ID -RunId RUN_ID
-```
+## Manual two-device smoke
 
-3. Copy the printed `WINDOWS_HOST_REF` into the following Mac command. The Mac wrapper starts the sole requester `HostRuntime` through `run`; do not start a separate Mac `host`.
-
-```bash
-# macOS
-scripts/native-v2-physical/profile-a-mac.sh \
-  --bridge-id BRIDGE_ID --windows-host-ref WINDOWS_HOST_REF --run-id RUN_ID
-```
-
-The Windows wrapper derives `physical-native-v2-attempt-RUN_ID`, waits until the real Host reports its exact HostRef, then waits through the existing Rust `collect` command for the exact receiver attempt, one digest-bearing `transfer-mac-windows` receipt, and one committed `transfer-mac-windows` authoritative step-commit row. It prints `WINDOWS_EVIDENCE_JSON=...` and stops its child Host only after that final evidence collection or on abort. The Mac wrapper derives the requester evidence path and prints the exact Windows evidence filename required below.
-
-4. Copy that Windows JSON file to the Mac report directory with an operator-approved channel outside Pastey. Then invoke the authoritative verifier; the wrapper only derives filenames and forwards the result.
-
-```bash
-# macOS
-scripts/native-v2-physical/profile-a-verify.sh --run-id RUN_ID
-```
-
-Use `--app-data-dir DIR` and `--report-dir DIR` on the Mac wrapper, `-AppDataDir DIR` and `-ReportDir DIR` on the Windows wrapper, or `--report-dir DIR` on the verifier to override defaults. Keep these dedicated directories separate from normal user app data.
-
-### Profile A manual/troubleshooting fallback
-
-The wrappers do not replace the Rust harness. If an operator needs to investigate an interrupted run, the equivalent lower-level commands remain available. Start the Windows Host first and keep it open; on macOS use only `run` (it owns the requester `HostRuntime`).
-
-```powershell
-.\scripts\native-v2-physical\run-windows.ps1 host `
-  --app-data-dir C:\pastey-physical\windows-app-data --bridge-id BRIDGE_ID
-
-# After the Mac run, collect Windows evidence in another PowerShell.
-.\scripts\native-v2-physical\run-windows.ps1 collect --profile a --role windows-host `
-  --app-data-dir C:\pastey-physical\windows-app-data `
-  --attempt-id physical-native-v2-attempt-RUN_ID --report-dir C:\pastey-physical\reports
-```
-
-```bash
-scripts/native-v2-physical/run-mac.sh run --profile a \
-  --app-data-dir "$HOME/pastey-physical/mac-app-data" --bridge-id BRIDGE_ID \
-  --remote-host-ref WINDOWS_HOST_REF --run-id RUN_ID \
-  --report-dir "$HOME/pastey-physical/reports"
-
-scripts/native-v2-physical/run-mac.sh verify --profile a \
-  --requester-report "$HOME/pastey-physical/reports/native-v2-physical-requester-physical-native-v2-attempt-RUN_ID.json" \
-  --windows-report "$HOME/pastey-physical/reports/native-v2-physical-windows-host-physical-native-v2-attempt-RUN_ID.json" \
-  --output-dir "$HOME/pastey-physical/reports"
-```
-
-The requester `run` command creates one deterministic real file in its dedicated `shared/` fixture scope, seals a two-step Profile A (`Search @ Mac → explicit Transfer Mac → Windows`) Plan, makes the ordinary approval/start calls, and waits for a terminal Core state. It never supplies a direct receiver result.
-
-The reports are `pastey-native-v2-physical-evidence-v1` JSON plus a concise text summary. They contain launch-time git commit and clean/dirty worktree state, harness/product identity, local HostRef and bridge session data, Plan/revision/approval/attempt ids, readiness/admission state, step/dispatch/commit counts, Transfer digest and exact destination receipt, and final Core state. The Profile B verifier remains read-only around the production Check and additionally verifies its Execute result digest and authoritative count of successor managed-object lineage. These physical evidence reports deliberately exclude credentials, private paths, ObjectRefs, grants, raw terminal content, and raw evidence internals.
-
-`verify` produces `PASS` only if both reports have the exact evidence schema and requested profile; the requester is macOS and role `requester`; the remote report is Windows and role `windows-host`; both source-built launches recorded one equal, present git commit and a clean worktree; and the two local HostRefs are distinct. It additionally requires requester Core to name exactly those two ready, committed participant Hosts and one completed exact revision; the expected number of unique authoritative step commits; exactly one Windows authored Transfer receipt with a non-empty content digest and the exact destination HostRef; and `ok` SQLite integrity. For Profile B it also requires exactly one Windows Execute result with a non-empty result digest and zero successor-lineage rows. Individual machine reports never say PASS.
-
-Profile B uses the production Bridge Device Check with `--profile b`. The harness is only a thin physical launcher plus read-only verifier: it obtains the generated attempt id from the production Managed E2E self-check report and does not compose a second Profile-B Plan or approval. Each explicit Check also writes its own `managed-self-check-<run-id>.json` report in the existing app logs directory; the shared log records only the brief outcome/report-filename reference.
-
-```bash
-scripts/native-v2-physical/run-mac.sh run --profile b \
-  --app-data-dir /absolute/path/to/mac-app-data --bridge-id BRIDGE_ID \
-  --remote-host-ref HOSTREF_WINDOWS --run-id RUN_ID \
-  --report-dir /absolute/path/to/reports
-scripts/native-v2-physical/run-mac.sh verify --profile b \
-  --requester-report /absolute/path/to/reports/native-v2-physical-requester-ATTEMPT_ID.json \
-  --windows-report /absolute/path/to/reports/native-v2-physical-windows-host-ATTEMPT_ID.json \
-  --output-dir /absolute/path/to/reports
-```
-
-Bridge Device Check prepares `Search @ requester → authored Transfer → Execute @ exact remote Host` through the ordinary native-v2 approval, readiness, admission, Worker, EffectEnvelope, ExecutionWorld, and Core-completion path. Windows native Managed Execute Stage 1–5 is physically accepted, the production Bridge Device Managed E2E path exists, and Host-owned runtime configuration plus provider configuration/health product closure are implemented. Physical fail-closed preflight is verified: a missing selected provider, runtime, or ExecutionWorld returns `BLOCKED` with `preflight_unavailable` before managed work starts. This is not an architecture blocker or missing Managed E2E implementation. The remaining status is **external provider validation pending**: do not claim a real LLM/provider or packaged physical Mac ↔ Windows Managed E2E `PASS` until an actual external provider call and two-Host Check succeed.
-
-## General Semantic Transform / cross-representation physical smoke
-
-The target scenario is:
-
-```text
-A requester → Transform N→N+1 @ B → authored Transfer B→C → Execute N+1 @ C
-```
-
-This remains a generic semantic Transform scenario. Python→Java may be used as one acceptance payload, but it is not a product-specific subsystem. The broader cross-representation E2E follows the planned Worker Context Contract in the canonical [roadmap](architecture.md#roadmap).
-
-GST-1 through GST-3 automated coverage is complete for bounded regular-file representations, exact file-set Transfer, and read-only contained file-set Execute. This does not constitute physical Mac ↔ Windows tree Execute evidence; record that separately when a packaged two-Host scenario is run.
-
-### Acceptance prerequisites
-
-Do not start or claim this smoke as reproducible until all of these are true:
-
-- the product can create/select a durable provider configuration on B and C and run the no-effect health probe;
-- the target Host has an explicitly selected allowed runtime identity, and production readiness resolves its pinned local executable identity into exact reviewed Execute process bindings;
-- B and C report a verified execution world for those specifications (macOS after its local probe; Windows only after its native product-binary probe; Linux fails closed);
-- the frontend or an approved test driver exposes compose/review/approve/start/status/cancel without bypassing the registered Tauri commands;
-- authored work on the requester's local Host, if included in an additional smoke case, uses direct local admission against the same lifecycle and does not send a Room Control message to itself; the canonical A→B→C case below still keeps all authored steps on remote B/C so it exercises real cross-device delivery;
-- three packaged instances have distinct HostRefs, one active Bridge, current unambiguous routes, and the exact managed root already bound at B.
-
-The provider portion of the product-surface gate is implemented: each local Host can configure, explicitly select, inspect, update, delete, and health-check its existing provider generation without exposing its credential. The 2.0 UI can operate the authoritative lifecycle for an existing revision. The Worker Context Contract, general cross-representation Transform coverage, Draft origination, and detailed topology/result projections remain separate work for this broader A→B→C smoke; they do not block the implemented Bridge Device Check self-check path. No physical PASS follows from local/provider tests, and external provider validation remains pending.
-
-### Procedure once the gate is implemented
-
-Record app version/build id, OS/architecture, HostRef, Bridge id, provider id/generation/model (never the credential), execution-world probe result, and wall-clock time for A/B/C.
-
-1. On B, bind a safe test object as managed revision N. Configure and health-check the provider on B and C. Verify the health operation creates no Plan, Room Control event, grant, or effect.
-2. On A, compose a native-v2 Plan with exactly three steps: Transform N→N+1 at B; Transfer N+1 B→C dependent on Transform; Execute N+1 at C dependent on Transfer. Review the displayed Hosts, topology, movement, object/revisions, intents, and hash.
-3. Approve once and start one attempt. Confirm all Hosts report ready before any Search, Worker effect, or Transfer begins. Confirm B/C prepare exact admissions before A commits.
-4. Confirm B alone runs Transform. Capture bounded product/Worker status and verify Core records N+1 at B. Before Transfer receipt, assert C cannot resolve N+1 and Execute remains pending.
-5. Confirm only the authored Transfer uses the normal encrypted transfer path. On C, verify the receipt matches attempt, step, revision id/hash, logical object/revision, content digest, destination HostRef, and current binding.
-6. Confirm A accepts the Transfer result and broadcasts the exact step commit. Only then confirm Execute becomes eligible and runs on C. Verify Execute records a result digest and creates no N+2 or other lineage.
-7. Confirm final status on A/B/C names the same attempt/revision/hash and exact completed step set. Verify no implicit Host change, hidden Transfer, Worker NetworkGrant, or Developer Terminal session exists.
-
-### Failure matrix
-
-Use a fresh approved revision/attempt for each case; terminal attempts are never resumed.
-
-- Cancel before provider call, during provider streaming, during Process, during Transfer, and after Worker proposal but before Core completion. Assert no late success or dependent step.
-- Disconnect or replace B/C session during readiness, prepared state, Worker execution, Transfer, and step-commit delivery. Assert old binding rejection and new admission on any later fresh attempt.
-- Revoke/delete the exact provider generation before start and during a run. Assert no provider substitution and no authority widening.
-- Burn B or C during readiness, Worker execution, and Transfer. Assert local cleanup, run/world termination, no late receipt/result, and no remote Burn shortcut.
-- Restart A/B/C in checking-readiness, prepared, running, and post-Transfer/pre-commit states. Assert process-local Worker/grant/world state is not restored and durable attempts become interrupted.
-- Replay review, start, commit, Worker dispatch, result, receipt, and cancellation messages. Assert duplicate/late rejection.
-- Drop coordination delivery after local Core completion. Record the resulting interrupted/stale presentation behavior; this remains a recovery/UI acceptance test, not a reason to treat an uncommitted result as global success.
-
-Retain non-secret logs/status exports, revision/hash, receipt metadata, and screenshots as manual evidence. Never record provider credentials, Host paths, ObjectRefs, grants, raw evidence internals, or terminal contents.
-
-## Ordinary two-device smoke
-
-With packaged builds on two supported desktops, record the logical Bridge id and current exact peer-session ids where diagnostics expose them, then verify:
-
-1. Connect A/B, Quit B normally, and confirm A leaves healthy Connected state. Restart B and confirm both retain the same logical Bridge, establish fresh exact sessions, converge on one member each, show no duplicate peer, and reject every old route.
-2. Open New Bridge and confirm no Bridge is created. Exercise Nearby request/remote Accept and manual 8-digit join separately; each successful action creates or joins exactly one Bridge. Confirm Devices remains inspection-only and cannot create a Bridge.
-3. From A's selected Bridge, switch the central workspace to Developer Mode and request B. Confirm B sees Accept/Deny without first opening Developer Mode. Accept once, run a harmless command, inspect output, and End session. Request again, Deny, and confirm A receives a terminal denied state and B starts no PTY.
-4. Navigate Bridge → Inbox → Devices → Settings → Bridge → Developer Mode → Bridge while transferring a few items and disconnecting/reconnecting. Confirm one selected Bridge/context, no duplicate listeners, members, items, or requests, no stale send target, and no lifecycle mutation from navigation.
-5. Burn locally and confirm immediate removal from every local renderer surface, rejection of late events, and no claim that the remote Host also burned.
-
-Also exercise Search/Transfer Review & Run, explicit departure, and ordinary text/file transfer. Verify paired-device display identity neither auto-joins nor authorizes a capability. Record failures; do not infer packaged or physical PASS from automated tests.
-
-Native packaged Windows must separately exercise normal-file Search/Transfer, reparse/path substitution rejection, identity/digest checks, explicit movement, restart, and Burn. Native packaged macOS must exercise the descriptor-oriented no-follow and identity path.
+With packaged builds on two supported desktops, a manual Bridge smoke may exercise ordinary transfer and lifecycle behavior: connect two Hosts, restart one Host and verify fresh sessions reject old routes, exercise ordinary text/file transfer and explicit departure, and Burn locally without claiming a remote Burn. This is not a replacement for Native Agent physical validation.
 
 ## Developer Terminal physical checks
 
