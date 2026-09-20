@@ -161,13 +161,13 @@ Developer Terminal uses a separate grant/type/store/lifecycle and can never sati
 
 The Bridge-native NodeList and bounded Host probes are complete observation foundations. `Available`, `Unavailable`, `Unsupported`, and no observation remain facts only: capability is not authority, probe availability is not executable binding, and execution-side exact Host binding remains separate.
 
-Low-friction Capability Acquisition foundation — DONE
+Low-friction Capability Acquisition confirmation foundation — DONE
 
-Actual acquisition behavior — intentionally deferred until AI integration
+Generic capability acquisition/install behavior — not implemented
 
 Acquisition intents use the generic bounded semantic-ID syntax rather than the fixed-probe vocabulary. For example, `runtime.java`, `tool.cmake`, `sdk.android`, and `model.whisper` are valid acquisition intents, while `runtime.java` is rejected by the fixed Host probe path until that vocabulary and a fixed implementation support it. The renderer-safe request carries the exact durable `HostRef`, semantic ID, and bounded display facts only. Confirmation returns only `Confirmed` or `Cancelled` and creates no installer behavior, probe, process binding, execution authority, Plan/topology mutation, Host selection, or Developer Mode change.
 
-When AI integration later supplies a real Host-side action, successful setup must flow back through the existing probe → capability projection → NodeList/Settings refresh path. Confirmation itself performs none of those stages.
+Native Agent integration does not provide a generic installer or capability-acquisition authority. Any future Host-side acquisition action must flow back through the existing probe → capability projection → NodeList/Settings refresh path. Confirmation itself performs none of those stages.
 
 ## Worker Harness
 
@@ -242,7 +242,7 @@ The requester stores the Draft, approval, attempt, per-Host readiness/admission,
 
 A Host returns a bounded correlated result only after local authoritative completion. The requester verifies the exact participant/Host/session/revision/dependencies and commits it once. Remote participants receive the commit through Room Control; the requester participant receives the same transition directly. Only then can a participant consider that predecessor complete. When the requester is the Transfer destination, the exact attempt/step/revision/hash/object revision/content digest/destination receipt is validated inside the authoritative requester transaction before the shared step commit becomes visible; remote destinations enforce the same receipt gate when accepting the commit.
 
-Bridge Device Check reuses this path for its fixed production Managed E2E self-check: explicit user intent creates one ordinary `Search @ requester → authored Transfer → Execute @ exact remote Host` revision and approval, then uses the same readiness, admission, Worker, EffectEnvelope, ExecutionWorld, and Core finalization. It does not require renderer Draft origination or topology/product-result projections. Missing selected provider, runtime, or ExecutionWorld facts are a preflight `BLOCKED`, before this lifecycle starts; a real external-provider physical Mac ↔ Windows `PASS` remains pending validation. The renderer-safe report mechanics are owned by [Layer 2](layer-2-device-intelligence.md).
+Bridge Device Check remains a fixed Generic Managed E2E self-check: explicit user intent creates one ordinary `Search @ requester → authored Transfer → Execute @ exact remote Host` revision and approval, then uses the same readiness, admission, Worker, EffectEnvelope, ExecutionWorld, and Core finalization. It is not the Native mature-Agent path or its roadmap gate. Missing selected provider, runtime, or ExecutionWorld facts are a preflight `BLOCKED`; its renderer-safe report mechanics are owned by [Layer 2](layer-2-device-intelligence.md).
 
 Transform finalization seals either one OutputSlot file generation or, for `output_selector: "."`, the complete tracked regular-file-set, then registers N+1 at the same Host. Execute records only its result digest. Provider/model/Worker output is always non-authoritative.
 
@@ -258,17 +258,20 @@ Distributed delivery failure remains a product-recovery limitation: the sender c
 
 | Can today | Intentionally unavailable or incomplete |
 | --- | --- |
-| Bridge-native NodeList/capability projection, bounded fixed Host probes, and generic semantic-ID capability-acquisition confirmation | Actual acquisition behavior is intentionally deferred until AI integration; confirmation performs no installation or execution |
+| Host-native Codex capability discovery/invocation and Host-private native sessions | Generic capability acquisition/install behavior; Agent integration does not authorize installation |
+| Native Agent local original-workspace execution and direct remote invocation for a workspace already on the selected Host | Automatic or invisible topology mutation; remote movement remains visible and consented |
+| Required remote workspace movement detection, one Review/approval, encrypted outbound/return movement, source revalidation, and durable conflict recovery | Physical multi-device reliability closure and failure-matrix evidence |
+| Bridge-native NodeList/capability projection, bounded fixed Host probes, and generic semantic-ID capability-acquisition confirmation | Confirmation performs no installation or execution |
 | Deterministic native-v2 Draft/Review/approval/readiness/status/cancel backend and 2.0 lifecycle UI for an opened revision | Renderer-safe Draft discovery/origination, PM context, reviewed topology, and result projection |
 | Proposal-only local/provider Natural-v2 to an unapproved Draft | PM/provider selection and settings presentation |
 | Whole-Plan remote and local-Host readiness, prepare, attempt-bound admission, commit, and exact continuation | Headless Host execution |
-| Remote or local-Host Search and authored encrypted Transfer with exact receipt | Automatic/inferred movement or topology repair |
+| Remote or local-Host Search and authored encrypted Transfer with exact receipt | Automatic topology repair for Generic Managed Plans |
 | Same-Host Resource Worker Transform; Host-selected runtime settings/resolution and exact Execute binding; local provider configuration/selection/health UI; contained Process on verified macOS; native Windows Managed Execute acceptance through the Codex-backed production path | Linux process world |
 | Execute through Core with no lineage when an exact process binding exists | Raw shell/terminal/process authority |
 | Durable generation-bound provider state, streaming adapter, and safe local configuration/health product surface | Provider marketplace, routing, fallback, or additional provider backends |
-| Bridge Device Check fixed Managed E2E self-check through the ordinary native-v2 lifecycle | External provider/API and packaged Mac ↔ Windows `PASS` evidence pending |
+| Bridge Device Check fixed Generic Managed E2E self-check through the ordinary native-v2 lifecycle | Its external-provider/API and packaged Mac ↔ Windows evidence remain Generic Managed subsystem limits |
 | Phase 5 Host network broker | Worker network tools or automatic task egress |
 | Cancellation/revocation/restart/Burn fail closed in state and Core authority | Guaranteed cross-partition cancellation delivery and richer recovery |
 | Bounded non-secret product/Worker status events and authoritative lifecycle presentation | Result content projection and richer interrupted/recovery detail |
 
-Subagents, Headless Host, Worker network, Developer Terminal conversion, task-specific patch/document engines, and task/command allowlists are absent. Automated tests validate contracts and local integration; they are not physical multi-device proof. See [development](../development.md) for the gated physical smoke procedure.
+Subagents, Headless Host, Worker network, Developer Terminal conversion, task-specific patch/document engines, and task/command allowlists are absent from the Generic Managed Worker subsystem. Automated tests validate contracts and local integration; they are not physical multi-device proof. Native Agent physical multi-device validation is Phase 2 work; no obsolete harness procedure is retained in [development](../development.md).

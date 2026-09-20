@@ -18,7 +18,7 @@ This document owns concrete identifiers, bounds, configuration facts, and source
 | Provider config | `pastey-worker-provider-config-v1` |
 | Peer capability facts | `pastey-peer-capabilities-v2` |
 | Fixed Host system-probe request | `capabilityIds`: at most 12 deduplicated IDs from `runtime.python`, `runtime.node`, `runtime.git`, `runtime.rust_cargo`, `runtime.docker`, `runtime.ffmpeg`, `runtime.cuda`, `runtime.powershell`, `runtime.zsh`, and `runtime.bash`. The receiving Host alone maps an ID to a fixed local probe. Results are `Available`, `Unavailable` (`system_probe_unavailable`), or `Unsupported` (`system_probe_unsupported`); absence is no observation/unknown. No path, command, args, shell, or acquisition fields. |
-| Capability-acquisition confirmation | `CapabilityAcquisitionRequestV1` / `confirm_capability_acquisition`: validated durable `HostRef`, one bounded semantic `capabilityId` (`[A-Za-z0-9._:-]`, 1–128 bytes), bounded renderer-safe display text, and only `confirmed` or `cancelled`. Valid semantic acquisition IDs include `runtime.java`, `tool.cmake`, `sdk.android`, and `model.whisper`; membership in the fixed-probe vocabulary is not required. Confirmed means consent to a future AI-side continuation only; it does not install, acquire, probe, bind, authorize, or mutate capability/Plan/topology/Host selection/Developer Mode state. Actual acquisition behavior is intentionally deferred until AI integration. Source: `src-tauri/src/capability_acquisition_confirmation.rs`. |
+| Capability-acquisition confirmation | `CapabilityAcquisitionRequestV1` / `confirm_capability_acquisition`: validated durable `HostRef`, one bounded semantic `capabilityId` (`[A-Za-z0-9._:-]`, 1–128 bytes), bounded renderer-safe display text, and only `confirmed` or `cancelled`. Valid semantic acquisition IDs include `runtime.java`, `tool.cmake`, `sdk.android`, and `model.whisper`; membership in the fixed-probe vocabulary is not required. Confirmed means consent to a future Host-side continuation only; it does not install, acquire, probe, bind, authorize, or mutate capability/Plan/topology/Host selection/Developer Mode state. Generic capability acquisition/install behavior is not implemented. Source: `src-tauri/src/capability_acquisition_confirmation.rs`. |
 | Bridge NodeList projection | `pastey-bridge-node-list-v1` |
 | Room Control route | `pastey-bridge-control-route-v1` |
 
@@ -50,6 +50,45 @@ Local-Host transitions use `NativeV2CoordinatorActionV1` directly and do not cre
 Native-v2 Host admission is bound to `attempt_id` as well as the exact approval, Plan revision/hash, participant, Host/session binding, TTL, and local authored fragment. Current admission references use `host-admission:v2-attempt-bound:*`; changing an attempt cannot reuse an admission.
 
 The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bounded to 128 characters and product semantic text to 1,024 characters by the native-v2 service.
+
+## Native Agent facts
+
+Native mature Agents are Host capabilities, separate from the Generic Managed Worker/provider path. The current concrete capability is Codex: `agent.coding.codex`. Its control schema is `pastey-native-agent-control-v1`; task status is `pastey-native-agent-task-v1`; and workspace-movement metadata/status uses `pastey-native-agent-workspace-movement-v1`.
+
+The Native Agent control payloads are `NativeAgentInvokeV1`, `NativeAgentStatusV1`, `NativeAgentCancelV1`, and `NativeAgentWorkspacePrepareV1`. They reject unknown fields and bind the task identity, target/executing Host, capability, workspace/task inputs, and movement correlation as appropriate. Native Agent Room Control uses protocol family `native_agent` and the following event kinds:
+
+- `native_agent.invoke`
+- `native_agent.status`
+- `native_agent.cancel`
+- `native_agent.workspace_prepare`
+
+The renderer-visible task states are `queued`, `running`, `completed`, `failed`, `cancelled`, and `interrupted`. Workspace movement states are `review`, `awaiting_approval`, `transferring_to_agent`, `agent_running`, `returning_result`, `applying_result`, `completed`, `conflict_recovery_required`, `failed`, `cancelled`, and `interrupted`.
+
+Native task and movement identifiers are bounded to 256 bytes; workspace input is bounded to 4 KiB; task text, a native stdout/stderr line, and retained stderr are each bounded at 16 KiB or 64 KiB as applicable. Native task observation is bounded to 15 minutes. Workspace transfer metadata is additionally limited by the existing 10 GiB file-size bound. Source: `src-tauri/src/native_agent.rs`, `src-tauri/src/storage.rs`.
+
+Registered Native Agent Tauri commands:
+
+- `list_native_agent_capabilities`
+- `start_native_codex_task`, `get_native_agent_task_status`, `cancel_native_agent_task`
+- `start_remote_native_codex_task`, `cancel_remote_native_agent_task`
+- `propose_remote_native_codex_workspace_movement`, `approve_remote_native_codex_workspace_movement`, `get_native_agent_workspace_movement_status`
+
+For an existing remote workspace, direct invocation uses the current authenticated Room Control session and does not create a ManagedObject, Scratch, Worker, GST scan, or Transfer. When the selected local workspace must move to a remote Agent, proposal records the movement as requiring review; one approval covers prepare, encrypted outbound transfer, native task, encrypted return transfer, and unchanged-source apply. Outbound/return metadata uses `NativeAgentWorkspaceTransferV1` with `outbound` or `return` phase and is carried by the existing transfer implementation, not a new transfer primitive. The original workspace is captured as a `RegularFileSet` baseline. Before applying the return, Pastey revalidates that baseline; a changed source writes a Host-private retained result under `native-agent-conflicts` and stores its metadata in the `native_agent_conflicts` SQLite table instead of overwriting the source.
+
+Native sessions are Host-private. `NativeAgentServiceV1` keeps Codex sessions per workspace, and only an exact requested `turn/completed` notification with `status: completed` and no error is terminal success. Cancellation wins a late completion; malformed, mismatched, failed, interrupted, or unknown outcomes are non-completion. Current-session resolution, replay checks, and rate limits remain the Room Control boundary; the Native Agent path does not expose provider credentials, native session IDs, raw workspace paths, or Agent reasoning.
+
+### Native Agent source map
+
+| Boundary | Primary source |
+| --- | --- |
+| Native capability, session, task, movement, baseline and conflict behavior | `src-tauri/src/native_agent.rs` |
+| Registered commands and remote-session/movement dispatch | `src-tauri/src/commands.rs`, `src-tauri/src/main.rs` |
+| Native Agent Room Control envelope, validation, replay/session handling | `src-tauri/src/room_control.rs` |
+| Encrypted workspace package send, private landing, and movement registration | `src-tauri/src/transfer.rs`, `src-tauri/src/models.rs` |
+| Host-owned Native Agent service lifetime | `src-tauri/src/host_runtime.rs` |
+| Durable conflict table and retained-result validation | `src-tauri/src/storage.rs` |
+| Renderer lifecycle/review controls | `src/features/workspace/AgentTaskLifecycle.tsx`, `src/features/workspace/BridgeWorkspace.tsx` |
+| TypeScript status types and Tauri invocations | `src/lib/tauri.ts` |
 
 ## Host and managed authority source map
 
@@ -140,5 +179,6 @@ The frontend uses `@xterm/xterm` and `@xterm/addon-fit`. Host shell selection is
 | Effects/results | Rust `effect_authority`, `managed_resources`, `execution_world`, `network_broker`, and `managed_execution` tests; opt-in native Windows `windows_execution_world` integration test |
 | Layer 4 and transfer | `scripts/run-layer4-validation-matrix.mjs`, `scripts/run-transfer-planner-tests.mjs`, Rust transport/protocol tests |
 | Developer Terminal | Rust terminal/HostRuntime tests plus native physical platform checks |
+| Native Agent task/session/movement and conflict recovery | Rust `native_agent`, `commands`, `room_control`, `transfer`, `storage`, and `host_runtime` tests; renderer types/lifecycle in `src/lib/tauri.ts` and `src/features/workspace/AgentTaskLifecycle.tsx` |
 
 The full contributor and physical validation procedure is in [development](development.md).
