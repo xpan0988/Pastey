@@ -27,9 +27,18 @@ const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_TASK_BYTES: usize = 16 * 1024;
 const MAX_TASK_WALL_TIME: Duration = Duration::from_secs(15 * 60);
 pub(crate) const NATIVE_AGENT_PROTOCOL_SCHEMA: &str = "pastey-native-agent-control-v1";
+pub(crate) const NATIVE_AGENT_TASK_SCHEMA: &str = "pastey-native-agent-task-v1";
 pub(crate) const CODEX_CAPABILITY_ID: &str = "agent.coding.codex";
 pub(crate) const NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA: &str =
     "pastey-native-agent-workspace-movement-v1";
+/// The intentionally small, exact control surface Pastey 2.0 understands for
+/// its one concrete native capability. This is a Host capability fact, never
+/// execution, Transfer, or session authority.
+pub(crate) const NATIVE_AGENT_COMPATIBILITY_PROTOCOLS: [&str; 3] = [
+    NATIVE_AGENT_PROTOCOL_SCHEMA,
+    NATIVE_AGENT_TASK_SCHEMA,
+    NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA,
+];
 const MAX_TASK_ID_BYTES: usize = 256;
 const MAX_WORKSPACE_BYTES: usize = 4 * 1024;
 const MAX_MOVEMENT_ID_BYTES: usize = 256;
@@ -215,12 +224,19 @@ pub(crate) enum NativeAgentTaskStateV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeAgentCapabilityStateV1 {
+    Available,
+    Incompatible,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct NativeAgentCapabilityV1 {
     pub(crate) agent_id: String,
     pub(crate) display_name: String,
-    pub(crate) detected: bool,
-    pub(crate) usable: bool,
+    pub(crate) state: NativeAgentCapabilityStateV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -249,6 +265,7 @@ pub(crate) struct NativeAgentServiceV1 {
     active_workspaces: Arc<Mutex<HashMap<PathBuf, String>>>,
     remote_targets: HashMap<String, String>,
     task_workspaces: HashMap<String, PathBuf>,
+    task_digests: HashMap<String, String>,
     workspace_movements: HashMap<String, WorkspaceMovementRecordV1>,
     durable_paths: Option<crate::storage::AppPaths>,
 }
@@ -317,6 +334,10 @@ impl NativeAgentServiceV1 {
             if let Some(target) = persisted.remote_target.clone() {
                 self.remote_targets
                     .insert(persisted.task.task_id.clone(), target);
+            }
+            if let Some(digest) = persisted.task_digest.clone() {
+                self.task_digests
+                    .insert(persisted.task.task_id.clone(), digest);
             }
             self.tasks
                 .lock()
@@ -406,14 +427,29 @@ impl NativeAgentServiceV1 {
         );
     }
     pub(crate) fn capabilities(&self) -> Vec<NativeAgentCapabilityV1> {
-        let detected = codex_detected();
-        let usable = codex_usable();
         vec![NativeAgentCapabilityV1 {
             agent_id: CODEX_CAPABILITY_ID.into(),
             display_name: "Codex".into(),
-            detected,
-            usable,
+            state: codex_compatibility_at(Path::new("codex")),
         }]
+    }
+
+    pub(crate) fn native_capability_fact(&self) -> crate::peer_capabilities::HostCapabilityFact {
+        crate::peer_capabilities::native_agent_capability_fact(codex_compatibility_at(Path::new(
+            "codex",
+        )))
+    }
+
+    pub(crate) fn require_codex_compatibility(&self) -> AppResult<()> {
+        match codex_compatibility_at(Path::new("codex")) {
+            NativeAgentCapabilityStateV1::Available => Ok(()),
+            NativeAgentCapabilityStateV1::Incompatible => {
+                invalid("Codex native app-server interface is incompatible.")
+            }
+            NativeAgentCapabilityStateV1::Unavailable => {
+                invalid("Codex native capability is unavailable.")
+            }
+        }
     }
 
     /// Creates the user-visible Review envelope on the initiating Host.  This
@@ -511,6 +547,8 @@ impl NativeAgentServiceV1 {
             );
         self.remote_targets
             .insert(task_id.into(), target_host_ref.into());
+        self.task_digests
+            .insert(task_id.into(), Self::task_digest(task));
         self.persist_envelope(task_id, Some(&Self::task_digest(task)))?;
         Ok(status)
     }
@@ -652,6 +690,8 @@ impl NativeAgentServiceV1 {
                     code: Some("workspace_transfer_pending".into()),
                 },
             );
+        self.task_digests
+            .insert(request.task_id.clone(), task_digest.clone());
         self.persist_envelope(&request.task_id, Some(&task_digest))?;
         Ok(())
     }
@@ -1119,7 +1159,9 @@ impl NativeAgentServiceV1 {
             .get(task_id)
             .cloned()
         {
-            if self.task_workspaces.get(task_id) != Some(&workspace) {
+            if self.task_workspaces.get(task_id) != Some(&workspace)
+                || self.task_digests.get(task_id) != Some(&Self::task_digest(task))
+            {
                 return invalid("Native Agent task identity was replayed for another workspace.");
             }
             return Ok(existing);
@@ -1153,7 +1195,9 @@ impl NativeAgentServiceV1 {
             .get(task_id)
             .cloned()
         {
-            if self.task_workspaces.get(task_id) != Some(&workspace) {
+            if self.task_workspaces.get(task_id) != Some(&workspace)
+                || self.task_digests.get(task_id) != Some(&Self::task_digest(task))
+            {
                 return invalid("Native Agent task identity was replayed for another workspace.");
             }
             return Ok(existing);
@@ -1196,15 +1240,23 @@ impl NativeAgentServiceV1 {
             .get(task_id)
             .cloned()
         {
-            if self.task_workspaces.get(task_id) != Some(&workspace) {
+            if self.task_workspaces.get(task_id) != Some(&workspace)
+                || self.task_digests.get(task_id) != Some(&Self::task_digest(task))
+            {
                 return invalid("Native Agent task identity was replayed for another workspace.");
             }
             return Ok(existing);
         }
-        if !codex_usable_at(executable) {
-            return invalid(
-                "Codex is detected but its native app-server interface is unavailable.",
-            );
+        match codex_compatibility_at(executable) {
+            NativeAgentCapabilityStateV1::Available => {}
+            NativeAgentCapabilityStateV1::Incompatible => {
+                return invalid(
+                    "Codex is detected but its native app-server interface is incompatible.",
+                )
+            }
+            NativeAgentCapabilityStateV1::Unavailable => {
+                return invalid("Codex native capability is unavailable.")
+            }
         }
         if self
             .active_workspaces
@@ -1253,6 +1305,8 @@ impl NativeAgentServiceV1 {
             .insert(task_id.clone(), status.clone());
         self.task_workspaces
             .insert(task_id.clone(), workspace.clone());
+        self.task_digests
+            .insert(task_id.clone(), Self::task_digest(task));
         self.persist_envelope(&task_id, Some(&Self::task_digest(task)))?;
         self.active_workspaces
             .lock()
@@ -1329,10 +1383,12 @@ impl NativeAgentServiceV1 {
         task_id: &str,
         target_host_ref: &str,
         workspace: &str,
+        task: &str,
     ) -> AppResult<NativeAgentTaskStatusV1> {
         if task_id.trim().is_empty()
             || target_host_ref.trim().is_empty()
             || workspace.trim().is_empty()
+            || task.trim().is_empty()
         {
             return invalid("Remote native Agent task is invalid.");
         }
@@ -1344,8 +1400,8 @@ impl NativeAgentServiceV1 {
             .cloned()
         {
             if self.remote_targets.get(task_id).map(String::as_str) != Some(target_host_ref)
-                || existing.workspace_name
-                    != workspace.rsplit(['/', '\\']).next().unwrap_or("workspace")
+                || self.task_workspaces.get(task_id) != Some(&PathBuf::from(workspace))
+                || self.task_digests.get(task_id) != Some(&Self::task_digest(task))
             {
                 return invalid(
                     "Remote native Agent identity was reused with conflicting correlation.",
@@ -1373,7 +1429,11 @@ impl NativeAgentServiceV1 {
             .insert(task_id.into(), status.clone());
         self.remote_targets
             .insert(task_id.into(), target_host_ref.into());
-        self.persist_envelope(task_id, None)?;
+        self.task_workspaces
+            .insert(task_id.into(), PathBuf::from(workspace));
+        self.task_digests
+            .insert(task_id.into(), Self::task_digest(task));
+        self.persist_envelope(task_id, Some(&Self::task_digest(task)))?;
         Ok(status)
     }
 
@@ -1449,22 +1509,31 @@ impl NativeAgentServiceV1 {
         Ok(status)
     }
 
-    pub(crate) fn fail_remote_delivery(&mut self, task_id: &str) {
-        if let Ok(mut tasks) = self.tasks.lock() {
-            if let Some(task) = tasks.get_mut(task_id) {
-                if matches!(
-                    task.state,
-                    NativeAgentTaskStateV1::Queued | NativeAgentTaskStateV1::Running
-                ) {
-                    // A receipt may be lost after the peer accepted invoke.
-                    // Keep the exact task for fresh-session reconciliation;
-                    // this is not evidence that the Agent did not start.
-                    task.state = NativeAgentTaskStateV1::Interrupted;
-                    task.code = Some("native_agent_reconciliation_required".into());
-                }
+    pub(crate) fn fail_remote_delivery(
+        &mut self,
+        task_id: &str,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        let status = {
+            let mut tasks = self.tasks.lock().map_err(|_| {
+                AppError::InvalidInput("Native Agent task store is unavailable.".into())
+            })?;
+            let task = tasks.get_mut(task_id).ok_or_else(|| {
+                AppError::InvalidInput("Remote native Agent task is unavailable.".into())
+            })?;
+            if matches!(
+                task.state,
+                NativeAgentTaskStateV1::Queued | NativeAgentTaskStateV1::Running
+            ) {
+                // A receipt may be lost after the peer accepted invoke. Keep
+                // this exact durable identity for fresh-session reconciliation;
+                // it is not evidence that the Agent did not start.
+                task.state = NativeAgentTaskStateV1::Interrupted;
+                task.code = Some("native_agent_reconciliation_required".into());
             }
-        }
-        let _ = self.persist_envelope(task_id, None);
+            task.clone()
+        };
+        self.persist_envelope(task_id, None)?;
+        Ok(status)
     }
 
     pub(crate) fn cancel_task(&mut self, task_id: &str) -> AppResult<NativeAgentTaskStatusV1> {
@@ -2263,24 +2332,30 @@ fn valid_task_id(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= MAX_TASK_ID_BYTES
 }
 
-fn codex_usable() -> bool {
-    codex_usable_at(Path::new("codex"))
-}
-
-fn codex_detected() -> bool {
-    Command::new("codex")
+fn codex_compatibility_at(executable: &Path) -> NativeAgentCapabilityStateV1 {
+    let detected = Command::new(executable)
         .arg("--version")
         .output()
         .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-fn codex_usable_at(executable: &Path) -> bool {
-    Command::new(executable)
+        .unwrap_or(false);
+    if !detected {
+        return NativeAgentCapabilityStateV1::Unavailable;
+    }
+    let app_server_usable = Command::new(executable)
         .args(["app-server", "--help"])
         .output()
         .map(|output| output.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if app_server_usable {
+        NativeAgentCapabilityStateV1::Available
+    } else {
+        // Detection proves only the native product exists. The app-server
+        // compatibility fact is deliberately limited to Pastey's fixed
+        // initialize/thread/start/turn/start/observation/interrupt/shutdown
+        // surface; no provider, model, credential, or native session detail
+        // is queried here.
+        NativeAgentCapabilityStateV1::Incompatible
+    }
 }
 
 struct CodexAppServerV1 {
@@ -2568,6 +2643,46 @@ done
         (root, workspace, agent)
     }
 
+    fn compatibility_fixture(root: &Path, app_server_help_exit: i32) -> PathBuf {
+        let executable = root.join("codex-compatibility-fixture");
+        fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex fixture"; exit 0; fi
+if [ "$1" = "app-server" ] && [ "$2" = "--help" ]; then exit {app_server_help_exit}; fi
+exit 1
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+        executable
+    }
+
+    #[test]
+    fn codex_capability_distinguishes_compatible_incompatible_and_absent_interfaces() {
+        let root = std::env::temp_dir().join(format!("pastey-native-compat-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let compatible = compatibility_fixture(&root, 0);
+        assert_eq!(
+            codex_compatibility_at(&compatible),
+            NativeAgentCapabilityStateV1::Available
+        );
+        let incompatible = compatibility_fixture(&root, 1);
+        assert_eq!(
+            codex_compatibility_at(&incompatible),
+            NativeAgentCapabilityStateV1::Incompatible
+        );
+        assert_eq!(
+            codex_compatibility_at(&root.join("codex-absent")),
+            NativeAgentCapabilityStateV1::Unavailable
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn wait_for_terminal(service: &NativeAgentServiceV1, task_id: &str) -> NativeAgentTaskStatusV1 {
         for _ in 0..100 {
             let status = service.task_status(task_id).unwrap();
@@ -2629,7 +2744,7 @@ done
     #[test]
     #[ignore = "requires an installed, authenticated native Codex app-server"]
     fn installed_codex_modifies_a_disposable_original_workspace_and_reuses_its_session() {
-        if !codex_usable() {
+        if codex_compatibility_at(Path::new("codex")) != NativeAgentCapabilityStateV1::Available {
             panic!("installed Codex app-server is unavailable");
         }
         let root =
@@ -2738,7 +2853,7 @@ done
     fn remote_status_requires_the_exact_selected_host_and_cancellation_wins() {
         let mut service = NativeAgentServiceV1::default();
         service
-            .queue_remote_task("request-1", "host:remote", "/remote/workspace")
+            .queue_remote_task("request-1", "host:remote", "/remote/workspace", "task")
             .unwrap();
         let status = NativeAgentTaskStatusV1 {
             schema_version: "pastey-native-agent-task-v1".into(),
@@ -3041,7 +3156,7 @@ done
         let paths = durable_paths(&root);
         let mut before = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
         before
-            .queue_remote_task("task-restart", "host:remote", "/workspace")
+            .queue_remote_task("task-restart", "host:remote", "/workspace", "task")
             .unwrap();
         let after = NativeAgentServiceV1::with_paths(paths).unwrap();
         let task = after.task_status("task-restart").unwrap();
@@ -3059,21 +3174,27 @@ done
         let paths = durable_paths(&root);
         let mut before = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
         before
-            .queue_remote_task("task-replay", "host:remote", "/workspace")
+            .queue_remote_task("task-replay", "host:remote", "/workspace", "task")
             .unwrap();
         let mut after = NativeAgentServiceV1::with_paths(paths).unwrap();
         assert_eq!(
             after
-                .queue_remote_task("task-replay", "host:remote", "/workspace")
+                .queue_remote_task("task-replay", "host:remote", "/workspace", "task")
                 .unwrap()
                 .state,
             NativeAgentTaskStateV1::Interrupted
         );
         assert!(after
-            .queue_remote_task("task-replay", "host:other", "/workspace")
+            .queue_remote_task("task-replay", "host:other", "/workspace", "task")
             .is_err());
         assert!(after
-            .queue_remote_task("task-replay", "host:remote", "/other")
+            .queue_remote_task("task-replay", "host:remote", "/other", "task")
+            .is_err());
+        assert!(after
+            .queue_remote_task("task-replay", "host:remote", "/other/workspace", "task")
+            .is_err());
+        assert!(after
+            .queue_remote_task("task-replay", "host:remote", "/workspace", "other task")
             .is_err());
         let _ = fs::remove_dir_all(root);
     }
@@ -3085,9 +3206,9 @@ done
         let paths = durable_paths(&root);
         let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
         service
-            .queue_remote_task("task-invoke-loss", "host:remote", "/workspace")
+            .queue_remote_task("task-invoke-loss", "host:remote", "/workspace", "task")
             .unwrap();
-        service.fail_remote_delivery("task-invoke-loss");
+        service.fail_remote_delivery("task-invoke-loss").unwrap();
         let task = service.task_status("task-invoke-loss").unwrap();
         assert_eq!(task.state, NativeAgentTaskStateV1::Interrupted);
         assert_eq!(
@@ -3391,7 +3512,7 @@ done
     fn reconciliation_rejects_a_replaced_or_wrong_selected_host() {
         let mut service = NativeAgentServiceV1::default();
         service
-            .queue_remote_task("task-reconcile", "host:current", "/workspace")
+            .queue_remote_task("task-reconcile", "host:current", "/workspace", "task")
             .unwrap();
         let fact = NativeAgentReconciliationV1 {
             schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),

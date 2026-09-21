@@ -226,6 +226,7 @@ fn local_runtime_capability_fact(
         available: capability.available,
         accepted_input_media_types: Vec::new(),
         effect: "device_observation".into(),
+        supported_protocols: Vec::new(),
         unavailable_reason: (!capability.available).then_some("unavailable".into()),
     })
 }
@@ -839,6 +840,40 @@ pub fn start_native_codex_task(
         .map_err(|error| error.message())
 }
 
+/// Observes the concrete native Codex capability through the existing Layer 4
+/// current-session resolver. Compatibility is only a bounded Host fact: it
+/// does not select the Host or grant invocation, Transfer, or Review authority.
+async fn require_remote_native_codex_compatibility(
+    state: Arc<AppState>,
+    room_id: &str,
+    target: &crate::host_identity::HostRef,
+) -> Result<crate::bridge_lifecycle::CurrentRemoteHostSession, String> {
+    let session = state
+        .resolve_current_remote_host_session(room_id, target)
+        .await
+        .map_err(|error| error.message())?;
+    let projection = session
+        .request_capability_projection(state.clone())
+        .await
+        .map_err(|error| error.message())?;
+    projection
+        .require_native_agent_protocols(&crate::native_agent::NATIVE_AGENT_COMPATIBILITY_PROTOCOLS)
+        .map_err(|error| error.message())?;
+    Ok(session)
+}
+
+/// Room Control delivery failures at this boundary are receipt-ambiguous. The
+/// caller must retain the exact durable task handle to reconcile; it must not
+/// infer a remote non-start or retry the native Agent.
+fn interrupted_remote_native_invoke_status(
+    service: &mut crate::native_agent::NativeAgentServiceV1,
+    task_id: &str,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    service
+        .fail_remote_delivery(task_id)
+        .map_err(|error| error.message())
+}
+
 #[tauri::command]
 pub fn get_native_agent_task_status(
     task_id: String,
@@ -880,6 +915,11 @@ pub async fn start_remote_native_codex_task(
     let target =
         crate::host_identity::HostRef::parse_peer(target_host_ref.clone(), &state.local_host_ref)
             .map_err(|error| error.message())?;
+    let session =
+        require_remote_native_codex_compatibility(state.inner().clone(), &room_id, &target).await?;
+    if session.binding().peer_route_ref != peer_session_id {
+        return Err("The selected Host session changed before native invocation.".into());
+    }
     let task_id = format!("native-agent:{}", uuid::Uuid::new_v4());
     let request = crate::native_agent::NativeAgentInvokeV1 {
         schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
@@ -887,14 +927,14 @@ pub async fn start_remote_native_codex_task(
         target_host_ref: target.as_str().into(),
         agent_capability: crate::native_agent::CODEX_CAPABILITY_ID.into(),
         workspace: workspace.clone(),
-        task,
+        task: task.clone(),
         resume,
     };
     crate::native_agent::validate_invoke(&request).map_err(|error| error.message())?;
     let queued = state
         .native_agents
         .lock()
-        .queue_remote_task(&task_id, target.as_str(), &workspace)
+        .queue_remote_task(&task_id, target.as_str(), &workspace, &task)
         .map_err(|error| error.message())?;
     let context = crate::room_control::room_control_session_context_for_peer(
         &state,
@@ -908,7 +948,7 @@ pub async fn start_remote_native_codex_task(
         &context,
     )
     .map_err(|error| error.message())?;
-    if let Err(error) = crate::room_control::send_room_control_event(
+    if crate::room_control::send_room_control_event(
         state.inner().clone(),
         &room_id,
         event,
@@ -918,9 +958,9 @@ pub async fn start_remote_native_codex_task(
         )),
     )
     .await
+    .is_err()
     {
-        state.native_agents.lock().fail_remote_delivery(&task_id);
-        return Err(error.message());
+        return interrupted_remote_native_invoke_status(&mut state.native_agents.lock(), &task_id);
     }
     Ok(queued)
 }
@@ -975,7 +1015,7 @@ pub async fn cancel_remote_native_agent_task(
 /// local to this Host and Codex is selected on another current Bridge Host.
 /// This is deliberately not used for ordinary remote-existing-workspace tasks.
 #[tauri::command]
-pub fn propose_remote_native_codex_workspace_movement(
+pub async fn propose_remote_native_codex_workspace_movement(
     target_host_ref: String,
     source_workspace: String,
     task: String,
@@ -984,6 +1024,7 @@ pub fn propose_remote_native_codex_workspace_movement(
 ) -> Result<crate::native_agent::NativeAgentWorkspaceMovementV1, String> {
     let target = crate::host_identity::HostRef::parse_peer(target_host_ref, &state.local_host_ref)
         .map_err(|error| error.message())?;
+    require_remote_native_codex_compatibility(state.inner().clone(), &room_id, &target).await?;
     let workspace = std::path::Path::new(&source_workspace)
         .canonicalize()
         .map_err(|_| "Pastey could not open the selected workspace.".to_string())?;
@@ -1045,6 +1086,19 @@ pub async fn approve_remote_native_codex_workspace_movement(
     peer_session_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentWorkspaceMovementV1, String> {
+    let movement = state
+        .native_agents
+        .lock()
+        .movement_status(&movement_id)
+        .map_err(|error| error.message())?;
+    let target =
+        crate::host_identity::HostRef::parse_peer(movement.target_host_ref, &state.local_host_ref)
+            .map_err(|error| error.message())?;
+    let session =
+        require_remote_native_codex_compatibility(state.inner().clone(), &room_id, &target).await?;
+    if session.binding().peer_route_ref != peer_session_id {
+        return Err("The selected Host session changed before workspace preparation.".into());
+    }
     let (prepare, metadata, package) = state
         .native_agents
         .lock()
@@ -1055,11 +1109,6 @@ pub async fn approve_remote_native_codex_workspace_movement(
             &state.paths.temp_dir,
         )
         .map_err(|error| error.message())?;
-    let target = crate::host_identity::HostRef::parse_peer(
-        metadata.destination_host_ref.clone(),
-        &state.local_host_ref,
-    )
-    .map_err(|error| error.message())?;
     let context = crate::room_control::room_control_session_context_for_peer(
         &state,
         &room_id,
@@ -5368,6 +5417,45 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn ambiguous_remote_native_invoke_returns_the_original_reconciliation_handle() {
+        let mut service = crate::native_agent::NativeAgentServiceV1::default();
+        let queued = service
+            .queue_remote_task(
+                "native-agent:delivery-ambiguous",
+                "host:remote",
+                "/remote/workspace",
+                "make one change",
+            )
+            .unwrap();
+
+        // This is the command's Room Control error branch. It has no native
+        // launch operation, so it cannot create a second Agent invocation.
+        let returned = interrupted_remote_native_invoke_status(&mut service, &queued.task_id)
+            .expect("the renderer must retain the durable task handle");
+        assert_eq!(returned.task_id, queued.task_id);
+        assert_eq!(
+            returned.state,
+            crate::native_agent::NativeAgentTaskStateV1::Interrupted
+        );
+        assert_eq!(
+            returned.code.as_deref(),
+            Some("native_agent_reconciliation_required")
+        );
+        assert_eq!(
+            service
+                .queue_remote_task(
+                    &queued.task_id,
+                    "host:remote",
+                    "/remote/workspace",
+                    "make one change",
+                )
+                .unwrap()
+                .task_id,
+            queued.task_id
+        );
+    }
+
     fn node_list_profile() -> diagnostics::DeviceProfile {
         diagnostics::DeviceProfile {
             device_id: "local-device".into(),
@@ -5434,6 +5522,7 @@ mod tests {
                     available: true,
                     accepted_input_media_types: Vec::new(),
                     effect: "system_probe_observation".into(),
+                    supported_protocols: Vec::new(),
                     unavailable_reason: None,
                 },
                 crate::peer_capabilities::HostCapabilityFact {
@@ -5441,6 +5530,7 @@ mod tests {
                     available: false,
                     accepted_input_media_types: Vec::new(),
                     effect: "system_probe_observation".into(),
+                    supported_protocols: Vec::new(),
                     unavailable_reason: Some("system_probe_unavailable".into()),
                 },
                 crate::peer_capabilities::HostCapabilityFact {
@@ -5448,6 +5538,7 @@ mod tests {
                     available: false,
                     accepted_input_media_types: Vec::new(),
                     effect: "system_probe_observation".into(),
+                    supported_protocols: Vec::new(),
                     unavailable_reason: Some("system_probe_unsupported".into()),
                 },
             ],
@@ -5786,6 +5877,7 @@ mod tests {
                     available: false,
                     accepted_input_media_types: Vec::new(),
                     effect: "readiness_observation".into(),
+                    supported_protocols: Vec::new(),
                     unavailable_reason: Some("not_configured".into()),
                 },
                 crate::peer_capabilities::HostCapabilityFact {
@@ -5793,6 +5885,7 @@ mod tests {
                     available: false,
                     accepted_input_media_types: Vec::new(),
                     effect: "readiness_observation".into(),
+                    supported_protocols: Vec::new(),
                     unavailable_reason: Some("execution_world_unavailable".into()),
                 },
             ],
