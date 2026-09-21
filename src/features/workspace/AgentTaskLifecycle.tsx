@@ -28,6 +28,14 @@ const ONE_DAY_SECONDS = 24 * 60 * 60;
 
 export type LifecycleTone = "neutral" | "pending" | "live" | "danger" | "complete";
 
+/** Durable movement history stays visible. Only an active or unresolved
+ * movement blocks creating another Native Agent task/review. */
+export function nativeAgentMovementBlocksNewRun(
+  movement: NativeAgentWorkspaceMovement | null,
+): boolean {
+  return !!movement && !["completed", "failed", "cancelled", "interrupted"].includes(movement.state);
+}
+
 export const STATE_COPY: Record<NativeV2ProductState, { label: string; detail: string; tone: LifecycleTone }> = {
   draft: { label: "Awaiting review", detail: "The PM proposal is an immutable Draft. Nothing can execute yet.", tone: "pending" },
   approved: { label: "Awaiting Host admission", detail: "Requester approval is recorded. Participating Hosts must still admit the Plan.", tone: "pending" },
