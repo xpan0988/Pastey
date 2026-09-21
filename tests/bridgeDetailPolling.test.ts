@@ -42,3 +42,11 @@ test("Send and Agent Task keep their routing semantics separate", () => {
   assert.match(component, /target: \{ kind: "selected_peer"/);
   assert.match(component, /bridgeTargetKind: "selected_peer"/);
 });
+
+test("an active workspace movement exposes Stop Codex through its task identity", () => {
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  const bridge = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  assert.match(lifecycle, /movement\?\.state === "agent_running"\s*\? movement\.taskId/);
+  assert.match(lifecycle, /canCancel: !!cancellableTaskId/);
+  assert.match(bridge, /agent\.canCancel[\s\S]*Stop Codex/);
+});
