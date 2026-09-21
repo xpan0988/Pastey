@@ -366,7 +366,6 @@ impl NativeAgentServiceV1 {
             "movementId": movement.as_ref().map(|value| &value.status.movement_id),
             "targetHostRef": movement.as_ref().map(|value| &value.status.target_host_ref)
                 .or_else(|| persisted.remote_target.as_ref()),
-            "workspace": persisted.task_workspace,
             "taskDigest": persisted.task_digest,
         }))?;
         crate::storage::save_native_agent_envelope(
@@ -700,9 +699,18 @@ impl NativeAgentServiceV1 {
                         "Native Agent result return arrived at the wrong Host.".into(),
                     )
                 })?;
+                let returned = record.result_identity.as_ref();
+                let duplicate_completed = record.apply_completed
+                    && record.status.state == NativeAgentWorkspaceMovementStateV1::Completed
+                    && returned.is_some_and(|identity| {
+                        identity.digest == metadata.content_digest
+                            && identity.byte_count == metadata.logical_byte_count
+                    });
                 if metadata.destination_host_ref != local_host_ref
                     || metadata.source_host_ref != record.status.target_host_ref
-                    || record.status.state != NativeAgentWorkspaceMovementStateV1::ReturningResult
+                    || (!duplicate_completed
+                        && record.status.state
+                            != NativeAgentWorkspaceMovementStateV1::ReturningResult)
                     || source.workspace.as_os_str().is_empty()
                 {
                     return invalid(
@@ -714,10 +722,37 @@ impl NativeAgentServiceV1 {
         Ok(())
     }
 
+    fn return_is_already_applied(&self, metadata: &NativeAgentWorkspaceTransferV1) -> bool {
+        self.workspace_movements
+            .get(&metadata.movement_id)
+            .filter(|record| record.status.task_id == metadata.task_id)
+            .is_some_and(|record| {
+                record.apply_completed
+                    && record.status.state == NativeAgentWorkspaceMovementStateV1::Completed
+                    && record.result_identity.as_ref().is_some_and(|identity| {
+                        identity.digest == metadata.content_digest
+                            && identity.byte_count == metadata.logical_byte_count
+                    })
+            })
+    }
+
     /// Binds the received file-set to the pre-authorized task workspace.  The
     /// native Agent sees only that ordinary local directory.
     pub(crate) fn start_received_workspace_task(
         &mut self,
+        movement_id: &str,
+        task_workspace: &Path,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.start_received_workspace_task_with_executable(
+            Path::new("codex"),
+            movement_id,
+            task_workspace,
+        )
+    }
+
+    fn start_received_workspace_task_with_executable(
+        &mut self,
+        executable: &Path,
         movement_id: &str,
         task_workspace: &Path,
     ) -> AppResult<NativeAgentTaskStatusV1> {
@@ -743,8 +778,17 @@ impl NativeAgentServiceV1 {
             .lock()
             .map_err(|_| AppError::InvalidInput("Native Agent task store is unavailable.".into()))?
             .remove(&task_id);
-        let status =
-            self.start_codex_task_with_id_resume(&task_id, task_workspace, &task, resume)?;
+        if !resume && self.codex_sessions.contains_key(task_workspace) {
+            return invalid(
+                "Native Agent workspace already has a session; resumption is required.",
+            );
+        }
+        let status = self.start_codex_task_with_executable_and_id(
+            executable,
+            &task_id,
+            task_workspace,
+            &task,
+        )?;
         let record = self
             .workspace_movements
             .get_mut(movement_id)
@@ -1004,6 +1048,7 @@ impl NativeAgentServiceV1 {
             returned_workspace,
             crate::storage::MAX_FILE_SIZE_BYTES,
         )?;
+        record.result_identity = Some(returned.clone());
         record.status.state = NativeAgentWorkspaceMovementStateV1::ApplyingResult;
         if let Err(error) = replace_workspace_from_exact_tree(
             &source.workspace,
@@ -1411,8 +1456,11 @@ impl NativeAgentServiceV1 {
                     task.state,
                     NativeAgentTaskStateV1::Queued | NativeAgentTaskStateV1::Running
                 ) {
-                    task.state = NativeAgentTaskStateV1::Failed;
-                    task.code = Some("remote_agent_delivery_failed".into());
+                    // A receipt may be lost after the peer accepted invoke.
+                    // Keep the exact task for fresh-session reconciliation;
+                    // this is not evidence that the Agent did not start.
+                    task.state = NativeAgentTaskStateV1::Interrupted;
+                    task.code = Some("native_agent_reconciliation_required".into());
                 }
             }
         }
@@ -1797,6 +1845,18 @@ pub(crate) fn register_workspace_transfer_landing(
         .native_agents
         .lock()
         .validate_workspace_transfer(metadata, runtime.local_host_ref.as_str())?;
+    if metadata.phase == NativeAgentWorkspaceTransferPhaseV1::Return
+        && runtime
+            .native_agents
+            .lock()
+            .return_is_already_applied(metadata)
+    {
+        crate::regular_file_set_transfer::cleanup_received_package(&package_path);
+        return runtime
+            .native_agents
+            .lock()
+            .movement_status(&metadata.movement_id);
+    }
     let tree = crate::regular_file_set_transfer::materialize_package(
         &package_path,
         &runtime.paths.temp_dir,
@@ -2444,7 +2504,35 @@ fn codex_completed_turn_outcome(message: &Value, thread_id: &str, turn_id: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+    struct NoopEventSink;
+    impl crate::host_runtime::HostEventSink for NoopEventSink {
+        fn emit(&self, _event: crate::host_runtime::HostEvent) -> AppResult<()> {
+            Ok(())
+        }
+    }
+    struct NoopTaskSpawner;
+    impl crate::host_runtime::RuntimeTaskSpawner for NoopTaskSpawner {
+        fn spawn(&self, _task: crate::host_runtime::RuntimeTask) {}
+    }
+
+    fn test_config() -> crate::config::StoredConfig {
+        crate::config::StoredConfig {
+            version: 5,
+            default_expiry_minutes: 15,
+            inbox_dir: None,
+            auto_burn_after_download: false,
+            save_received_files_to_inbox: true,
+            save_received_images_to_inbox: true,
+            transfer_window_override: None,
+            dev_tools_enabled: false,
+            micro_flow_group_mode: "off".into(),
+            shortcut: "test".into(),
+            app_secret: crate::crypto::encode_key(&[9u8; 32]),
+            device_id: "native-return-test".into(),
+        }
+    }
 
     fn fixture() -> (PathBuf, PathBuf, PathBuf) {
         fixture_with_terminal(
@@ -2722,7 +2810,7 @@ done
 
     fn movement_object() -> crate::bridge_plan_v2::ManagedObjectRevisionV2 {
         crate::bridge_plan_v2::ManagedObjectRevisionV2 {
-            logical_object_id: "managed-object:v1:movement-test".into(),
+            logical_object_id: format!("managed-object:v1:{}", "a".repeat(64)),
             revision: 1,
         }
     }
@@ -2991,6 +3079,30 @@ done
     }
 
     #[test]
+    fn invoke_delivery_receipt_loss_requires_reconciliation_not_failure() {
+        let root =
+            std::env::temp_dir().join(format!("pastey-native-invoke-loss-{}", Uuid::new_v4()));
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        service
+            .queue_remote_task("task-invoke-loss", "host:remote", "/workspace")
+            .unwrap();
+        service.fail_remote_delivery("task-invoke-loss");
+        let task = service.task_status("task-invoke-loss").unwrap();
+        assert_eq!(task.state, NativeAgentTaskStateV1::Interrupted);
+        assert_eq!(
+            task.code.as_deref(),
+            Some("native_agent_reconciliation_required")
+        );
+        let restarted = NativeAgentServiceV1::with_paths(paths).unwrap();
+        assert_eq!(
+            restarted.task_status("task-invoke-loss").unwrap().state,
+            NativeAgentTaskStateV1::Interrupted
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn workspace_prepare_is_durable_idempotent_and_conflicting_reuse_fails_closed() {
         let root = std::env::temp_dir().join(format!("pastey-native-prepare-{}", Uuid::new_v4()));
         let paths = durable_paths(&root);
@@ -3014,6 +3126,62 @@ done
         let mut conflicting = request;
         conflicting.task = "different".into();
         assert!(after.accept_workspace_prepare(conflicting).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_workspace_prepare_keeps_immutable_correlation_after_outbound_landing() {
+        let (root, source, agent) = fixture();
+        fs::write(source.join("input.txt"), b"outbound input").unwrap();
+        let paths = durable_paths(&root);
+        let source_identity = crate::safe_file_identity::capture_regular_file_set_identity(
+            &source,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )
+        .unwrap();
+        let request = NativeAgentWorkspacePrepareV1 {
+            schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+            movement_id: "movement-landing".into(),
+            task_id: "task-landing".into(),
+            source_host_ref: "host:source".into(),
+            target_host_ref: "host:target".into(),
+            agent_capability: CODEX_CAPABILITY_ID.into(),
+            task: "edit".into(),
+            resume: true,
+            source_object: movement_object(),
+            source_digest: source_identity.digest.clone(),
+            source_bytes: source_identity.byte_count,
+        };
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        service.accept_workspace_prepare(request.clone()).unwrap();
+        let before = crate::storage::get_native_agent_envelope(&paths, "task-landing")
+            .unwrap()
+            .unwrap()
+            .immutable_correlation;
+        let package = crate::regular_file_set_transfer::prepare_package(
+            &source,
+            &source,
+            &source_identity,
+            &paths.temp_dir,
+        )
+        .unwrap();
+        let landed = crate::regular_file_set_transfer::materialize_package(
+            &package,
+            &paths.temp_dir,
+            &source_identity.digest,
+            source_identity.byte_count,
+        )
+        .unwrap();
+        service
+            .start_received_workspace_task_with_executable(&agent, "movement-landing", &landed)
+            .unwrap();
+        let after = crate::storage::get_native_agent_envelope(&paths, "task-landing")
+            .unwrap()
+            .unwrap()
+            .immutable_correlation;
+        assert_eq!(before, after);
+        crate::regular_file_set_transfer::cleanup_package(&package);
+        service.shutdown();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3059,6 +3227,109 @@ done
                 .state,
             NativeAgentWorkspaceMovementStateV1::Completed
         );
+        assert_eq!(
+            fs::read(source.join("after.txt")).unwrap(),
+            b"native result"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn duplicate_return_transfer_landing_is_acknowledged_without_reapplying() {
+        let (root, source, _) = fixture();
+        fs::write(source.join("before.txt"), b"approved baseline").unwrap();
+        let returned = root.join("returned");
+        fs::create_dir(&returned).unwrap();
+        fs::write(returned.join("after.txt"), b"native result").unwrap();
+        let paths = durable_paths(&root);
+        let runtime = crate::host_runtime::HostRuntime::new(
+            paths.clone(),
+            test_config(),
+            Arc::new(NoopEventSink),
+            Arc::new(NoopTaskSpawner),
+        )
+        .unwrap();
+        runtime
+            .native_agents
+            .lock()
+            .propose_workspace_movement(
+                "movement-return-landing",
+                "task-return-landing",
+                &source,
+                "host:remote",
+                movement_object(),
+                "edit",
+                true,
+            )
+            .unwrap();
+        runtime
+            .native_agents
+            .lock()
+            .workspace_movements
+            .get_mut("movement-return-landing")
+            .unwrap()
+            .status
+            .state = NativeAgentWorkspaceMovementStateV1::ReturningResult;
+        let identity = crate::safe_file_identity::capture_regular_file_set_identity(
+            &returned,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )
+        .unwrap();
+        let metadata = NativeAgentWorkspaceTransferV1 {
+            schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+            movement_id: "movement-return-landing".into(),
+            task_id: "task-return-landing".into(),
+            phase: NativeAgentWorkspaceTransferPhaseV1::Return,
+            bridge_id: "room".into(),
+            source_host_ref: "host:remote".into(),
+            destination_host_ref: runtime.local_host_ref.as_str().into(),
+            object: movement_object(),
+            content_digest: identity.digest.clone(),
+            logical_byte_count: identity.byte_count,
+        };
+        let first = crate::regular_file_set_transfer::prepare_package(
+            &returned,
+            &returned,
+            &identity,
+            &paths.temp_dir,
+        )
+        .unwrap();
+        assert_eq!(
+            register_workspace_transfer_landing(
+                &runtime,
+                &metadata,
+                first,
+                crate::storage::now_ts()
+            )
+            .unwrap()
+            .state,
+            NativeAgentWorkspaceMovementStateV1::Completed
+        );
+        let duplicate = crate::regular_file_set_transfer::prepare_package(
+            &returned,
+            &returned,
+            &identity,
+            &paths.temp_dir,
+        )
+        .unwrap();
+        assert_eq!(
+            register_workspace_transfer_landing(
+                &runtime,
+                &metadata,
+                duplicate,
+                crate::storage::now_ts()
+            )
+            .unwrap()
+            .state,
+            NativeAgentWorkspaceMovementStateV1::Completed
+        );
+        let mut conflicting = metadata.clone();
+        conflicting.content_digest = "f".repeat(64);
+        assert!(runtime
+            .native_agents
+            .lock()
+            .validate_workspace_transfer(&conflicting, runtime.local_host_ref.as_str())
+            .is_err());
         assert_eq!(
             fs::read(source.join("after.txt")).unwrap(),
             b"native result"
