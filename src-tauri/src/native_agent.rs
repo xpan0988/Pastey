@@ -11,7 +11,10 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -25,7 +28,9 @@ use crate::error::{AppError, AppResult};
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_TASK_BYTES: usize = 16 * 1024;
-const MAX_TASK_WALL_TIME: Duration = Duration::from_secs(15 * 60);
+/// Bounds one native control RPC acknowledgement only. It never bounds the
+/// accepted native turn's execution or terminal observation.
+const NATIVE_AGENT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const NATIVE_AGENT_PROTOCOL_SCHEMA: &str = "pastey-native-agent-control-v1";
 pub(crate) const NATIVE_AGENT_TASK_SCHEMA: &str = "pastey-native-agent-task-v1";
 pub(crate) const CODEX_CAPABILITY_ID: &str = "agent.coding.codex";
@@ -236,6 +241,17 @@ pub(crate) enum NativeAgentTaskStateV1 {
     Failed,
     Cancelled,
     Interrupted,
+}
+
+/// Host-private terminal classification. It deliberately contains no native
+/// session, provider, or process detail and is not a generic Agent framework.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeTurnOutcomeV1 {
+    Completed,
+    Failed,
+    Interrupted,
+    Cancelled,
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1159,21 +1175,26 @@ impl NativeAgentServiceV1 {
         let task = tasks.get_mut(&fact.task_id).ok_or_else(|| {
             AppError::InvalidInput("Remote native Agent task is unavailable.".into())
         })?;
-        if task.state != NativeAgentTaskStateV1::Cancelled {
+        let cancellation_won = task.state == NativeAgentTaskStateV1::Cancelled;
+        if !cancellation_won {
             task.state = fact.task_state;
             task.code = fact.code.clone();
         }
         drop(tasks);
-        if let Some(movement_id) = fact.movement_id.as_ref() {
-            if let Some(movement) = self.workspace_movements.get_mut(movement_id) {
-                if movement.status.task_id != fact.task_id {
-                    return invalid("Native Agent reconciliation crossed movement correlation.");
-                }
-                if !movement.apply_completed {
-                    if let Some(state) = fact.movement_state {
-                        movement.status.state = state;
+        if !cancellation_won {
+            if let Some(movement_id) = fact.movement_id.as_ref() {
+                if let Some(movement) = self.workspace_movements.get_mut(movement_id) {
+                    if movement.status.task_id != fact.task_id {
+                        return invalid(
+                            "Native Agent reconciliation crossed movement correlation.",
+                        );
                     }
-                    movement.status.code = fact.code;
+                    if !movement.apply_completed {
+                        if let Some(state) = fact.movement_state {
+                            movement.status.state = state;
+                        }
+                        movement.status.code = fact.code;
+                    }
                 }
             }
         }
@@ -1671,50 +1692,62 @@ impl NativeAgentServiceV1 {
         let prompt = task.to_owned();
         thread::spawn(move || {
             let outcome = controller.run_turn(&thread_id, &prompt);
+            let mut persisted_status = None;
             if let Ok(mut tasks) = tasks.lock() {
-                let Some(status) = tasks.get_mut(&task_id) else {
-                    return;
-                };
-                // Cancellation wins a concurrent late native completion. A
-                // cancelled or indeterminate envelope must never become DONE.
-                if status.state == NativeAgentTaskStateV1::Cancelled {
-                    return;
+                if let Some(status) = tasks.get_mut(&task_id) {
+                    // Cancellation wins a concurrent late native completion.
+                    // The observer still reaches this point to release its
+                    // Host-private workspace execution occupancy.
+                    if status.state == NativeAgentTaskStateV1::Cancelled {
+                        if outcome == NativeTurnOutcomeV1::Cancelled {
+                            status.code = Some("native_agent_cancelled".into());
+                        }
+                    } else {
+                        match outcome {
+                            NativeTurnOutcomeV1::Completed => {
+                                status.state = NativeAgentTaskStateV1::Completed;
+                                status.result = Some("Codex completed its native task.".into());
+                            }
+                            NativeTurnOutcomeV1::Failed => {
+                                status.state = NativeAgentTaskStateV1::Failed;
+                                status.code = Some("native_agent_failed".into());
+                            }
+                            NativeTurnOutcomeV1::Interrupted => {
+                                status.state = NativeAgentTaskStateV1::Interrupted;
+                                status.code = Some("native_agent_interrupted".into());
+                            }
+                            NativeTurnOutcomeV1::Cancelled => {
+                                status.state = NativeAgentTaskStateV1::Cancelled;
+                                status.code = Some("native_agent_cancelled".into());
+                            }
+                            NativeTurnOutcomeV1::Unknown => {
+                                status.state = NativeAgentTaskStateV1::Interrupted;
+                                status.code = Some("native_agent_outcome_unknown".into());
+                            }
+                        }
+                    }
+                    persisted_status = Some(status.clone());
                 }
-                match outcome {
-                    Ok(()) => {
-                        status.state = NativeAgentTaskStateV1::Completed;
-                        status.result = Some("Codex completed its native task.".into());
-                    }
-                    Err(error) if error.message().contains("cancelled") => {
-                        status.state = NativeAgentTaskStateV1::Cancelled;
-                        status.code = Some("native_agent_cancelled".into());
-                    }
-                    Err(error) if error.message().contains("failed") => {
-                        status.state = NativeAgentTaskStateV1::Failed;
-                        status.code = Some("native_agent_failed".into());
-                        status.result = Some(error.message().into());
-                    }
-                    Err(error) if error.message().contains("interrupted") => {
-                        status.state = NativeAgentTaskStateV1::Interrupted;
-                        status.code = Some("native_agent_interrupted".into());
-                        status.result = Some(error.message().into());
-                    }
-                    Err(error) => {
-                        status.state = NativeAgentTaskStateV1::Interrupted;
-                        status.code = Some("native_agent_outcome_unknown".into());
-                        status.result = Some(error.message().into());
-                    }
-                }
-                if let Some(paths) = durable_paths.as_ref() {
-                    NativeAgentServiceV1::persist_task_status_after_native_turn(
-                        paths, &task_id, status,
-                    );
-                }
-                active_workspaces
-                    .lock()
-                    .ok()
-                    .map(|mut active| active.remove(&completed_workspace));
             }
+            if let (Some(paths), Some(status)) = (durable_paths.as_ref(), persisted_status.as_ref())
+            {
+                NativeAgentServiceV1::persist_task_status_after_native_turn(
+                    paths, &task_id, status,
+                );
+            }
+            if outcome == NativeTurnOutcomeV1::Unknown {
+                // A turn/start acknowledgement or terminal shape may be
+                // indeterminate while the app-server remains alive. Keep the
+                // workspace occupied until its observation channel is actually
+                // lost; a different task must not overlap possible execution.
+                controller.wait_until_observation_lost();
+            }
+            // Always release only after the native observer exits, including
+            // when cancellation had already revoked visible authority.
+            active_workspaces
+                .lock()
+                .ok()
+                .map(|mut active| active.remove(&completed_workspace));
         });
         Ok(status)
     }
@@ -1851,10 +1884,30 @@ impl NativeAgentServiceV1 {
             NativeAgentTaskStateV1::Queued | NativeAgentTaskStateV1::Running
         ) {
             task.state = NativeAgentTaskStateV1::Cancelled;
-            task.code = Some("native_agent_cancelled".into());
+            task.code = Some("native_agent_cancel_requested".into());
         }
         let status = task.clone();
         drop(tasks);
+        self.persist_envelope(task_id, None)?;
+        Ok(status)
+    }
+
+    pub(crate) fn mark_remote_cancel_delivery_uncertain(
+        &mut self,
+        task_id: &str,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        let status = {
+            let mut tasks = self.tasks.lock().map_err(|_| {
+                AppError::InvalidInput("Native Agent task store is unavailable.".into())
+            })?;
+            let task = tasks.get_mut(task_id).ok_or_else(|| {
+                AppError::InvalidInput("Remote native Agent task is unavailable.".into())
+            })?;
+            if task.state == NativeAgentTaskStateV1::Cancelled {
+                task.code = Some("native_agent_cancel_delivery_uncertain".into());
+            }
+            task.clone()
+        };
         self.persist_envelope(task_id, None)?;
         Ok(status)
     }
@@ -1891,29 +1944,45 @@ impl NativeAgentServiceV1 {
             self.task_workspaces.get(task_id).cloned().ok_or_else(|| {
                 AppError::InvalidInput("Native Agent task is unavailable.".into())
             })?;
-        let mut tasks = self.tasks.lock().map_err(|_| {
-            AppError::InvalidInput("Native Agent task store is unavailable.".into())
-        })?;
-        let task = tasks
-            .get_mut(task_id)
-            .ok_or_else(|| AppError::InvalidInput("Native Agent task is unavailable.".into()))?;
-        if task.state != NativeAgentTaskStateV1::Running {
-            return Ok(task.clone());
-        }
-        task.state = NativeAgentTaskStateV1::Cancelled;
-        task.code = Some("native_agent_cancelled".into());
-        // Set the terminal envelope before the fallible native interrupt so a
-        // racing native completion can never claim DONE.
-        if let Some(session) = self.codex_sessions.get(&workspace) {
-            session.controller.interrupt();
-        }
-        self.active_workspaces
-            .lock()
-            .ok()
-            .map(|mut active| active.retain(|_, active_task| active_task != task_id));
-        let status = task.clone();
-        drop(tasks);
+        let status = {
+            let mut tasks = self.tasks.lock().map_err(|_| {
+                AppError::InvalidInput("Native Agent task store is unavailable.".into())
+            })?;
+            let task = tasks.get_mut(task_id).ok_or_else(|| {
+                AppError::InvalidInput("Native Agent task is unavailable.".into())
+            })?;
+            if task.state != NativeAgentTaskStateV1::Running {
+                return Ok(task.clone());
+            }
+            // Revoke Pastey's execution/result authority before attempting a
+            // fallible native interrupt. This is not proof the process ended.
+            task.state = NativeAgentTaskStateV1::Cancelled;
+            task.code = Some("native_agent_cancel_requested".into());
+            task.clone()
+        };
         self.persist_envelope(task_id, None)?;
+        let interrupt = self
+            .codex_sessions
+            .get(&workspace)
+            .map(|session| session.controller.interrupt())
+            .unwrap_or_else(|| invalid("Native Agent session is unavailable."));
+        if interrupt.is_err() {
+            let status = {
+                let mut tasks = self.tasks.lock().map_err(|_| {
+                    AppError::InvalidInput("Native Agent task store is unavailable.".into())
+                })?;
+                let task = tasks.get_mut(task_id).ok_or_else(|| {
+                    AppError::InvalidInput("Native Agent task is unavailable.".into())
+                })?;
+                // The task remains cancelled even when delivery of its native
+                // interrupt is uncertain; workspace occupancy remains until
+                // the observer actually exits.
+                task.code = Some("native_agent_cancel_delivery_uncertain".into());
+                task.clone()
+            };
+            self.persist_envelope(task_id, None)?;
+            return Ok(status);
+        }
         Ok(status)
     }
 
@@ -2437,7 +2506,7 @@ pub(crate) fn register_workspace_transfer_landing(
     }
 }
 
-/// Watches the bounded native lifecycle after an outbound workspace has
+/// Watches the native lifecycle after an outbound workspace has
 /// landed. Native completion is reported first; only then does Pastey scan the
 /// task tree and use the existing encrypted Transfer path for the result.
 pub(crate) async fn monitor_received_workspace_task(
@@ -2447,7 +2516,7 @@ pub(crate) async fn monitor_received_workspace_task(
     movement_id: String,
 ) {
     let mut last: Option<NativeAgentTaskStatusV1> = None;
-    for _ in 0..(15 * 60 * 4) {
+    loop {
         let task = {
             let service = runtime.native_agents.lock();
             let movement = match service.movement_status(&movement_id) {
@@ -2513,10 +2582,6 @@ pub(crate) async fn monitor_received_workspace_task(
             | NativeAgentTaskStateV1::Interrupted => return,
         }
     }
-    runtime
-        .native_agents
-        .lock()
-        .interrupt_workspace_movement(&movement_id, "native_agent_status_timeout");
 }
 
 async fn send_workspace_result(
@@ -2766,6 +2831,20 @@ fn valid_task_id(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= MAX_TASK_ID_BYTES
 }
 
+fn turn_start_ack_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        // A controlled test-only RPC bound proves acknowledgement ambiguity
+        // without turning a unit test into a 30-second wait. It is not an
+        // execution-duration limit.
+        Duration::from_millis(50)
+    }
+    #[cfg(not(test))]
+    {
+        NATIVE_AGENT_RPC_TIMEOUT
+    }
+}
+
 fn codex_compatibility_at(executable: &Path) -> NativeAgentCapabilityStateV1 {
     let detected = Command::new(executable)
         .arg("--version")
@@ -2797,6 +2876,7 @@ struct CodexAppServerV1 {
     stdin: Mutex<ChildStdin>,
     messages: Mutex<mpsc::Receiver<AppResult<Value>>>,
     active_turn: Mutex<Option<(String, String)>>,
+    interrupt_requested: AtomicBool,
 }
 
 impl CodexAppServerV1 {
@@ -2853,16 +2933,17 @@ impl CodexAppServerV1 {
             stdin: Mutex::new(stdin),
             messages: Mutex::new(receiver),
             active_turn: Mutex::new(None),
+            interrupt_requested: AtomicBool::new(false),
         };
         controller.send(json!({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "Pastey", "version": env!("CARGO_PKG_VERSION")}, "capabilities": {}}}))?;
-        controller.await_result(1, Instant::now() + Duration::from_secs(30))?;
+        controller.await_result(1, Instant::now() + NATIVE_AGENT_RPC_TIMEOUT)?;
         controller.send(json!({"method": "initialized", "params": {}}))?;
         Ok(controller)
     }
 
     fn start_thread(&self, workspace: &Path) -> AppResult<String> {
         self.send(json!({"id": 2, "method": "thread/start", "params": {"cwd": workspace}}))?;
-        self.await_result(2, Instant::now() + Duration::from_secs(30))?
+        self.await_result(2, Instant::now() + NATIVE_AGENT_RPC_TIMEOUT)?
             .pointer("/thread/id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
@@ -2870,33 +2951,60 @@ impl CodexAppServerV1 {
             .ok_or_else(|| AppError::InvalidInput("Codex did not return a native session.".into()))
     }
 
-    fn run_turn(&self, thread_id: &str, task: &str) -> AppResult<()> {
-        let deadline = Instant::now() + MAX_TASK_WALL_TIME;
-        self.send(json!({"id": 3, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": task}]}}))?;
-        let turn = self.await_result(3, deadline)?;
-        let turn_id = turn
+    /// Obtains the exact turn identity with a bounded RPC timeout, then waits
+    /// indefinitely for that turn's native terminal fact. Silence is not a
+    /// lifecycle event; only channel/process loss is unknown.
+    fn run_turn(&self, thread_id: &str, task: &str) -> NativeTurnOutcomeV1 {
+        if self
+            .send(json!({"id": 3, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": task}]}}))
+            .is_err()
+        {
+            return NativeTurnOutcomeV1::Unknown;
+        }
+        let turn = match self.await_result(3, Instant::now() + turn_start_ack_timeout()) {
+            Ok(turn) => turn,
+            // The request may have reached Codex even though Pastey did not
+            // receive its acknowledgement. Never retry or infer failure.
+            Err(_) => return NativeTurnOutcomeV1::Unknown,
+        };
+        let Some(turn_id) = turn
             .pointer("/turn/id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
-            .ok_or_else(|| AppError::InvalidInput("Codex did not return a turn id.".into()))?
-            .to_owned();
-        *self
+            .map(str::to_owned)
+        else {
+            return NativeTurnOutcomeV1::Unknown;
+        };
+        if self
             .active_turn
             .lock()
-            .map_err(|_| AppError::InvalidInput("Codex session state is unavailable.".into()))? =
-            Some((thread_id.into(), turn_id.clone()));
-        loop {
-            let message = self.next_message(deadline)?;
-            if message.get("method").and_then(Value::as_str) == Some("turn/completed") {
-                let outcome = codex_completed_turn_outcome(&message, thread_id, &turn_id);
-                self.clear_active_turn()?;
-                return outcome;
-            }
-            if message.get("error").is_some() {
-                self.clear_active_turn()?;
-                return invalid("Codex native task failed.");
-            }
+            .map(|mut active| *active = Some((thread_id.into(), turn_id.clone())))
+            .is_err()
+        {
+            return NativeTurnOutcomeV1::Unknown;
         }
+        // Cancellation may have been requested while turn/start was awaiting
+        // its acknowledgement. Once its exact identity is known, issue the
+        // one bounded native interrupt without clearing occupancy.
+        let _ = self.send_active_interrupt_if_requested();
+        let outcome = loop {
+            match self.next_observation() {
+                Ok(message)
+                    if message.get("method").and_then(Value::as_str) == Some("turn/completed") =>
+                {
+                    break codex_completed_turn_outcome(&message, thread_id, &turn_id);
+                }
+                Ok(message) if message.get("error").is_some() => {
+                    break NativeTurnOutcomeV1::Unknown;
+                }
+                Ok(_) => {}
+                // App-server stdout/process observation disappeared before an
+                // exact terminal outcome. This is indeterminate, not failed.
+                Err(_) => break NativeTurnOutcomeV1::Unknown,
+            }
+        };
+        let _ = self.clear_active_turn();
+        outcome
     }
 
     fn clear_active_turn(&self) -> AppResult<()> {
@@ -2905,18 +3013,33 @@ impl CodexAppServerV1 {
             .lock()
             .map_err(|_| AppError::InvalidInput("Codex session state is unavailable.".into()))? =
             None;
+        self.interrupt_requested.store(false, Ordering::Release);
         Ok(())
     }
 
-    fn interrupt(&self) {
-        if let Ok(mut active) = self.active_turn.lock() {
-            if let Some((thread_id, turn_id)) = active.take() {
-                let _ = self.send(json!({"id": 4, "method": "turn/interrupt", "params": {"threadId": thread_id, "turnId": turn_id}}));
-            }
+    /// Records cancellation intent independently from native termination. The
+    /// exact active turn stays retained until the observer exits.
+    fn interrupt(&self) -> AppResult<()> {
+        self.interrupt_requested.store(true, Ordering::Release);
+        self.send_active_interrupt_if_requested()
+    }
+
+    fn send_active_interrupt_if_requested(&self) -> AppResult<()> {
+        if !self.interrupt_requested.load(Ordering::Acquire) {
+            return Ok(());
         }
+        let active = self
+            .active_turn
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Codex session state is unavailable.".into()))?
+            .clone();
+        if let Some((thread_id, turn_id)) = active {
+            self.send(json!({"id": 4, "method": "turn/interrupt", "params": {"threadId": thread_id, "turnId": turn_id}}))?;
+        }
+        Ok(())
     }
     fn shutdown(&self) {
-        self.interrupt();
+        let _ = self.interrupt();
         let _ = self.send(json!({"id": 5, "method": "shutdown", "params": {}}));
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
@@ -2960,6 +3083,20 @@ impl CodexAppServerV1 {
             .recv_timeout(remaining)
             .map_err(|_| AppError::InvalidInput("Codex native task outcome is unknown.".into()))?
     }
+
+    fn next_observation(&self) -> AppResult<Value> {
+        self.messages
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Codex messages are unavailable.".into()))?
+            .recv()
+            .map_err(|_| {
+                AppError::InvalidInput("Codex native observation is unavailable.".into())
+            })?
+    }
+
+    fn wait_until_observation_lost(&self) {
+        while self.next_observation().is_ok() {}
+    }
 }
 
 impl Drop for CodexAppServerV1 {
@@ -2977,36 +3114,36 @@ fn invalid<T>(message: &str) -> AppResult<T> {
 /// and Codex reports that turn as completed without an error.  Every other
 /// terminal shape is intentionally non-success so it cannot trigger a result
 /// scan, Return Transfer, apply, or global DONE.
-fn codex_completed_turn_outcome(message: &Value, thread_id: &str, turn_id: &str) -> AppResult<()> {
-    let params = message
-        .get("params")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            AppError::InvalidInput("Codex terminal task outcome is malformed.".into())
-        })?;
+fn codex_completed_turn_outcome(
+    message: &Value,
+    thread_id: &str,
+    turn_id: &str,
+) -> NativeTurnOutcomeV1 {
+    let Some(params) = message.get("params").and_then(Value::as_object) else {
+        return NativeTurnOutcomeV1::Unknown;
+    };
     if params.get("threadId").and_then(Value::as_str) != Some(thread_id) {
-        return invalid("Codex terminal task outcome crossed its native session.");
+        return NativeTurnOutcomeV1::Unknown;
     }
-    let turn = params
-        .get("turn")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            AppError::InvalidInput("Codex terminal task outcome is malformed.".into())
-        })?;
+    let Some(turn) = params.get("turn").and_then(Value::as_object) else {
+        return NativeTurnOutcomeV1::Unknown;
+    };
     if turn.get("id").and_then(Value::as_str) != Some(turn_id) {
-        return invalid("Codex terminal task outcome crossed its native turn.");
+        return NativeTurnOutcomeV1::Unknown;
     }
     match turn.get("status").and_then(Value::as_str) {
-        Some("completed") if turn.get("error").is_none_or(Value::is_null) => Ok(()),
-        Some("completed") => invalid("Codex native task completed with an error."),
-        Some("failed") => invalid("Codex native task failed."),
-        Some("interrupted") => invalid("Codex native task interrupted."),
+        Some("completed") if turn.get("error").is_none_or(Value::is_null) => {
+            NativeTurnOutcomeV1::Completed
+        }
+        Some("completed") => NativeTurnOutcomeV1::Unknown,
+        Some("failed") => NativeTurnOutcomeV1::Failed,
+        Some("interrupted") => NativeTurnOutcomeV1::Interrupted,
         // `cancelled` is not currently emitted by Codex's schema, but treating
         // it as an explicit non-success protects this boundary across native
         // protocol versions and lets the task envelope surface cancellation.
-        Some("cancelled") => invalid("Codex native task cancelled."),
-        Some("inProgress") => invalid("Codex native task terminal outcome is incomplete."),
-        _ => invalid("Codex terminal task outcome is malformed."),
+        Some("cancelled") => NativeTurnOutcomeV1::Cancelled,
+        Some("inProgress") => NativeTurnOutcomeV1::Unknown,
+        _ => NativeTurnOutcomeV1::Unknown,
     }
 }
 
@@ -3050,6 +3187,12 @@ mod tests {
     }
 
     fn fixture_with_terminal(terminal: &str) -> (PathBuf, PathBuf, PathBuf) {
+        fixture_with_turn_start_behavior(&format!(
+            "echo '{{\"id\":3,\"result\":{{\"turn\":{{\"id\":\"native-turn\"}}}}}}'; echo '{terminal}'"
+        ))
+    }
+
+    fn fixture_with_turn_start_behavior(turn_start: &str) -> (PathBuf, PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!("pastey-native-agent-{}", Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         let workspace = root.join("workspace");
@@ -3064,7 +3207,7 @@ while IFS= read -r line; do
   case "$line" in
     *'"id":1'*) echo '{{"id":1,"result":{{}}}}' ;;
     *'"id":2'*) echo '{{"id":2,"result":{{"thread":{{"id":"native-thread"}}}}}}' ;;
-    *'"id":3'*) echo '{{"id":3,"result":{{"turn":{{"id":"native-turn"}}}}}}'; echo '{terminal}' ;;
+    *'"id":3'*) {turn_start} ;;
   esac
 done
 "#
@@ -3118,7 +3261,7 @@ exit 1
     }
 
     fn wait_for_terminal(service: &NativeAgentServiceV1, task_id: &str) -> NativeAgentTaskStatusV1 {
-        for _ in 0..100 {
+        for _ in 0..300 {
             let status = service.task_status(task_id).unwrap();
             if status.state != NativeAgentTaskStateV1::Running {
                 return status;
@@ -3262,6 +3405,7 @@ exit 1
             let terminal = wait_for_terminal(&service, &started.task_id);
             assert_eq!(terminal.state, expected, "case {index}");
             assert_ne!(terminal.state, NativeAgentTaskStateV1::Completed);
+            service.shutdown();
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -3280,6 +3424,187 @@ exit 1
             service.task_status(&started.task_id).unwrap().state,
             NativeAgentTaskStateV1::Cancelled
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delayed_native_terminal_remains_running_without_an_execution_deadline() {
+        let terminal = r#"{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"completed","error":null}}}"#;
+        let (root, workspace, agent) = fixture_with_turn_start_behavior(&format!(
+            "echo '{{\"id\":3,\"result\":{{\"turn\":{{\"id\":\"native-turn\"}}}}}}'; sleep 1; echo '{terminal}'"
+        ));
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "long task")
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            service.task_status(&started.task_id).unwrap().state,
+            NativeAgentTaskStateV1::Running
+        );
+        assert_eq!(
+            wait_for_terminal(&service, &started.task_id).state,
+            NativeAgentTaskStateV1::Completed
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uncertain_turn_start_ack_is_interrupted_without_a_second_turn() {
+        let (root, workspace, agent) = fixture_with_turn_start_behavior("");
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "start once")
+            .unwrap();
+        let terminal = wait_for_terminal(&service, &started.task_id);
+        assert_eq!(terminal.state, NativeAgentTaskStateV1::Interrupted);
+        assert_eq!(
+            terminal.code.as_deref(),
+            Some("native_agent_outcome_unknown")
+        );
+        assert!(service
+            .start_codex_task_with_executable_and_id(
+                &agent,
+                &started.task_id,
+                &workspace,
+                "start once",
+            )
+            .is_ok());
+        assert!(service
+            .start_codex_task_with_executable(&agent, &workspace, "must not overlap")
+            .is_err());
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_observation_loss_is_interrupted_unknown() {
+        let (root, workspace, agent) = fixture_with_turn_start_behavior(
+            "echo '{\"id\":3,\"result\":{\"turn\":{\"id\":\"native-turn\"}}}'; exit 0",
+        );
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "observe")
+            .unwrap();
+        let terminal = wait_for_terminal(&service, &started.task_id);
+        assert_eq!(terminal.state, NativeAgentTaskStateV1::Interrupted);
+        assert_eq!(
+            terminal.code.as_deref(),
+            Some("native_agent_outcome_unknown")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancellation_holds_workspace_until_native_observer_exits() {
+        let terminal = r#"{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"completed","error":null}}}"#;
+        let (root, workspace, agent) = fixture_with_turn_start_behavior(&format!(
+            "echo '{{\"id\":3,\"result\":{{\"turn\":{{\"id\":\"native-turn\"}}}}}}'; sleep 1; echo '{terminal}'"
+        ));
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "wait")
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            service.cancel_task(&started.task_id).unwrap().state,
+            NativeAgentTaskStateV1::Cancelled
+        );
+        assert!(service
+            .start_codex_task_with_executable(&agent, &workspace, "must wait")
+            .is_err());
+        thread::sleep(Duration::from_millis(1100));
+        assert_eq!(
+            service.task_status(&started.task_id).unwrap().state,
+            NativeAgentTaskStateV1::Cancelled
+        );
+        assert!(service
+            .start_codex_task_with_executable(&agent, &workspace, "may start now")
+            .is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn workspace_monitor_keeps_agent_running_without_a_status_timeout() {
+        let (root, _, _) = fixture();
+        let paths = durable_paths(&root);
+        let runtime = Arc::new(
+            crate::host_runtime::HostRuntime::new(
+                paths,
+                test_config(),
+                Arc::new(NoopEventSink),
+                Arc::new(NoopTaskSpawner),
+            )
+            .unwrap(),
+        );
+        {
+            let mut service = runtime.native_agents.lock();
+            service.tasks.lock().unwrap().insert(
+                "task-long-movement".into(),
+                NativeAgentTaskStatusV1 {
+                    schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
+                    task_id: "task-long-movement".into(),
+                    agent_id: CODEX_CAPABILITY_ID.into(),
+                    workspace_name: "workspace".into(),
+                    session_reused: false,
+                    state: NativeAgentTaskStateV1::Running,
+                    result: None,
+                    code: None,
+                },
+            );
+            service.workspace_movements.insert(
+                "movement-long-running".into(),
+                WorkspaceMovementRecordV1 {
+                    status: NativeAgentWorkspaceMovementV1 {
+                        schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+                        movement_id: "movement-long-running".into(),
+                        task_id: "task-long-movement".into(),
+                        agent_id: CODEX_CAPABILITY_ID.into(),
+                        source_workspace_name: "transferred workspace".into(),
+                        target_host_ref: runtime.local_host_ref.as_str().into(),
+                        review_summary: "running".into(),
+                        state: NativeAgentWorkspaceMovementStateV1::AgentRunning,
+                        code: None,
+                    },
+                    source: None,
+                    prepared_remote: None,
+                    task_workspace: None,
+                    result_snapshot: None,
+                    result_identity: None,
+                    bridge_id: None,
+                    apply_completed: false,
+                },
+            );
+        }
+        let watcher = tokio::spawn(monitor_received_workspace_task(
+            runtime.clone(),
+            "room-unavailable".into(),
+            "peer-unavailable".into(),
+            "movement-long-running".into(),
+        ));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            runtime
+                .native_agents
+                .lock()
+                .movement_status("movement-long-running")
+                .unwrap()
+                .state,
+            NativeAgentWorkspaceMovementStateV1::AgentRunning
+        );
+        runtime
+            .native_agents
+            .lock()
+            .tasks
+            .lock()
+            .unwrap()
+            .get_mut("task-long-movement")
+            .unwrap()
+            .state = NativeAgentTaskStateV1::Cancelled;
+        tokio::time::timeout(Duration::from_secs(2), watcher)
+            .await
+            .expect("terminal task state ends the monitor")
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3310,6 +3635,18 @@ exit 1
             .cancel_remote_task("request-1", "host:remote")
             .unwrap();
         assert_eq!(cancelled.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(
+            cancelled.code.as_deref(),
+            Some("native_agent_cancel_requested")
+        );
+        assert_eq!(
+            service
+                .mark_remote_cancel_delivery_uncertain("request-1")
+                .unwrap()
+                .code
+                .as_deref(),
+            Some("native_agent_cancel_delivery_uncertain")
+        );
         let late = NativeAgentStatusV1 {
             schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
             task_id: "request-1".into(),
@@ -3318,6 +3655,23 @@ exit 1
         };
         assert_eq!(
             service.record_remote_status(late).unwrap().state,
+            NativeAgentTaskStateV1::Cancelled
+        );
+        service
+            .record_remote_reconciliation(NativeAgentReconciliationV1 {
+                schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                task_id: "request-1".into(),
+                movement_id: None,
+                executing_host_ref: "host:remote".into(),
+                task_state: NativeAgentTaskStateV1::Completed,
+                movement_state: None,
+                result_digest: None,
+                apply_completed: false,
+                code: None,
+            })
+            .unwrap();
+        assert_eq!(
+            service.task_status("request-1").unwrap().state,
             NativeAgentTaskStateV1::Cancelled
         );
     }
