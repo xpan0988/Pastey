@@ -77,6 +77,8 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "native_agent.status",
     "native_agent.cancel",
     "native_agent.workspace_prepare",
+    "native_agent.reconcile",
+    "native_agent.reconciliation",
 ];
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
 const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
@@ -1712,6 +1714,118 @@ pub async fn receive_room_control_event_handler(
                     );
                 }
             }
+            "native_agent.reconcile" => {
+                let request: crate::native_agent::NativeAgentReconcileV1 =
+                    match serde_json::from_value(payload) {
+                        Ok(request)
+                            if crate::native_agent::validate_reconcile(&request).is_ok() =>
+                        {
+                            request
+                        }
+                        _ => {
+                            return control_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_native_agent",
+                                "Invalid native Agent reconciliation query.",
+                            )
+                        }
+                    };
+                if request.target_host_ref != ctx.state.local_host_ref.as_str() {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native Agent reconciliation targets another Host.",
+                    );
+                }
+                let fact = match ctx.state.native_agents.lock().reconciliation_fact(
+                    &request.task_id,
+                    request.movement_id.as_deref(),
+                    ctx.state.local_host_ref.as_str(),
+                ) {
+                    Ok(fact) => fact,
+                    Err(_) => {
+                        return control_error(
+                            StatusCode::NOT_FOUND,
+                            "native_agent_unavailable",
+                            "Native Agent durable fact is unavailable.",
+                        )
+                    }
+                };
+                let response_context = match room_control_session_context_for_peer(
+                    &ctx.state,
+                    &room_id,
+                    &inbound_peer.peer_session_id,
+                ) {
+                    Ok(context) => context,
+                    Err(_) => {
+                        return control_error(
+                            StatusCode::GONE,
+                            "host_binding_unavailable",
+                            "Native Agent response route is unavailable.",
+                        )
+                    }
+                };
+                let response =
+                    match serde_json::to_value(fact)
+                        .map_err(AppError::from)
+                        .and_then(|payload| {
+                            native_agent_event(
+                                "native_agent.reconciliation",
+                                payload,
+                                &response_context,
+                            )
+                        }) {
+                        Ok(event) => event,
+                        Err(_) => {
+                            return control_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_native_agent",
+                                "Native Agent reconciliation response is invalid.",
+                            )
+                        }
+                    };
+                let response_state = ctx.state.clone();
+                let response_room = room_id.clone();
+                let response_route =
+                    selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
+                ctx.state.spawn(async move {
+                    let _ = send_room_control_event(
+                        response_state,
+                        &response_room,
+                        response,
+                        Some(response_route),
+                    )
+                    .await;
+                });
+            }
+            "native_agent.reconciliation" => {
+                let fact: crate::native_agent::NativeAgentReconciliationV1 =
+                    match serde_json::from_value(payload) {
+                        Ok(fact) if crate::native_agent::validate_reconciliation(&fact).is_ok() => {
+                            fact
+                        }
+                        _ => {
+                            return control_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_native_agent",
+                                "Invalid native Agent reconciliation fact.",
+                            )
+                        }
+                    };
+                if ctx
+                    .state
+                    .native_agents
+                    .lock()
+                    .record_remote_reconciliation(fact)
+                    .is_err()
+                {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native Agent reconciliation does not match its selected Host.",
+                    );
+                }
+            }
             "native_agent.workspace_prepare" => {
                 let request: crate::native_agent::NativeAgentWorkspacePrepareV1 =
                     match serde_json::from_value(payload) {
@@ -2536,6 +2650,33 @@ fn validate_control_event(
                 .map_err(AppError::from)?;
                 crate::native_agent::validate_workspace_prepare(&request)?;
                 format!("native-agent-workspace-prepare:{}", request.movement_id)
+            }
+            "native_agent.reconcile" => {
+                let request =
+                    serde_json::from_value::<crate::native_agent::NativeAgentReconcileV1>(
+                        Value::Object(payload.clone()),
+                    )
+                    .map_err(AppError::from)?;
+                crate::native_agent::validate_reconcile(&request)?;
+                format!(
+                    "native-agent-reconcile:{}:{}",
+                    request.task_id,
+                    request.movement_id.unwrap_or_default()
+                )
+            }
+            "native_agent.reconciliation" => {
+                let fact =
+                    serde_json::from_value::<crate::native_agent::NativeAgentReconciliationV1>(
+                        Value::Object(payload.clone()),
+                    )
+                    .map_err(AppError::from)?;
+                crate::native_agent::validate_reconciliation(&fact)?;
+                format!(
+                    "native-agent-reconciliation:{}:{}:{:?}",
+                    fact.task_id,
+                    fact.movement_id.unwrap_or_default(),
+                    fact.task_state
+                )
             }
             _ => {
                 return Err(AppError::InvalidInput(

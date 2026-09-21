@@ -181,7 +181,7 @@ impl HostRuntime {
             WorkerProviderConfigServiceV1::new(paths.clone(), config::master_key(&config)?)?;
         let managed_runtime_configs = ManagedRuntimeConfigServiceV1::new(paths.clone())?;
         Ok(Self {
-            paths,
+            paths: paths.clone(),
             local_host_ref: local_host_ref.clone(),
             local_runtime_ref: LocalRuntimeRef::fresh(local_host_ref.clone()),
             config: RwLock::new(config),
@@ -225,7 +225,9 @@ impl HostRuntime {
             managed_resources: Mutex::new(managed_resources::ManagedResourceResolverV1::new(
                 managed_resource_root,
             )),
-            native_agents: Mutex::new(crate::native_agent::NativeAgentServiceV1::default()),
+            native_agents: Mutex::new(crate::native_agent::NativeAgentServiceV1::with_paths(
+                paths.clone(),
+            )?),
             worker_harness_runs: Mutex::new(HashMap::new()),
             managed_completion_lock: Mutex::new(()),
             managed_worker_process_specs: Mutex::new(HashMap::new()),

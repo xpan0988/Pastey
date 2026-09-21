@@ -1060,11 +1060,6 @@ pub async fn approve_remote_native_codex_workspace_movement(
         &state.local_host_ref,
     )
     .map_err(|error| error.message())?;
-    state
-        .native_agents
-        .lock()
-        .queue_remote_task(&prepare.task_id, target.as_str(), "approved workspace")
-        .map_err(|error| error.message())?;
     let context = crate::room_control::room_control_session_context_for_peer(
         &state,
         &room_id,
@@ -1140,6 +1135,77 @@ pub fn get_native_agent_workspace_movement_status(
         .lock()
         .movement_status(&movement_id)
         .map_err(|error| error.message())
+}
+
+/// Retries only delivery of an already durable result snapshot. It does not
+/// restart, resume, or otherwise contact the native Agent session.
+#[tauri::command]
+pub async fn retry_native_agent_workspace_result_return(
+    movement_id: String,
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentWorkspaceMovementV1, String> {
+    crate::native_agent::retry_workspace_result_return(
+        state.inner().clone(),
+        &room_id,
+        &movement_id,
+    )
+    .await
+    .map_err(|error| error.message())?;
+    state
+        .native_agents
+        .lock()
+        .movement_status(&movement_id)
+        .map_err(|error| error.message())
+}
+
+/// Asks the selected durable Host for outer envelope facts using a freshly
+/// resolved Layer 4 binding. It is a query only: no Agent session is resumed.
+#[tauri::command]
+pub async fn reconcile_remote_native_agent_task(
+    room_id: String,
+    target_host_ref: String,
+    task_id: String,
+    movement_id: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomControlDeliveryReceipt, String> {
+    let target = crate::host_identity::HostRef::parse_peer(target_host_ref, &state.local_host_ref)
+        .map_err(|error| error.message())?;
+    let session = state
+        .resolve_current_remote_host_session(&room_id, &target)
+        .await
+        .map_err(|error| error.message())?;
+    let binding = session.binding().clone();
+    let request = crate::native_agent::NativeAgentReconcileV1 {
+        schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+        task_id,
+        movement_id,
+        target_host_ref: target.as_str().into(),
+    };
+    crate::native_agent::validate_reconcile(&request).map_err(|error| error.message())?;
+    let context = crate::room_control::room_control_session_context_for_peer(
+        &state,
+        &room_id,
+        &binding.peer_route_ref,
+    )
+    .map_err(|error| error.message())?;
+    let event = crate::room_control::native_agent_event(
+        "native_agent.reconcile",
+        serde_json::to_value(request).map_err(|error| error.to_string())?,
+        &context,
+    )
+    .map_err(|error| error.message())?;
+    crate::room_control::send_room_control_event(
+        state.inner().clone(),
+        &room_id,
+        event,
+        Some(crate::room_control::selected_peer_route(
+            &room_id,
+            &binding.peer_route_ref,
+        )),
+    )
+    .await
+    .map_err(|error| error.message())
 }
 
 #[tauri::command]

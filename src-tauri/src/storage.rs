@@ -50,6 +50,18 @@ pub(crate) struct StoredNativeAgentConflict {
     pub(crate) created_at: i64,
 }
 
+/// Host-private Native Agent envelope facts. These records deliberately retain
+/// only Pastey's outer correlation, phase, exact file-set evidence, and private
+/// recovery locations. They never serialize native session/provider/tool state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredNativeAgentEnvelope {
+    pub(crate) task_id: String,
+    pub(crate) movement_id: Option<String>,
+    pub(crate) immutable_correlation: String,
+    pub(crate) record_json: String,
+    pub(crate) updated_at: i64,
+}
+
 impl AppPaths {
     /// Builds the complete Host path set from adapter-supplied roots.
     pub fn new(app_data_dir: PathBuf, logs_dir: PathBuf) -> Self {
@@ -159,6 +171,14 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             created_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS native_agent_envelopes (
+            task_id TEXT PRIMARY KEY,
+            movement_id TEXT UNIQUE,
+            immutable_correlation TEXT NOT NULL,
+            record_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_rooms_code_hash ON rooms(room_code_hash);
         CREATE INDEX IF NOT EXISTS idx_rooms_expires_at ON rooms(expires_at);
         CREATE INDEX IF NOT EXISTS idx_room_items_room_id ON room_items(room_id, created_at);
@@ -173,6 +193,108 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
     migrate_room_statuses(&conn)?;
     backfill_legacy_bridge_peers(&conn)?;
     Ok(())
+}
+
+/// Inserts or updates one durable outer envelope. A reused identity is valid
+/// only when every immutable correlation field is byte-for-byte unchanged.
+pub(crate) fn save_native_agent_envelope(
+    paths: &AppPaths,
+    record: &StoredNativeAgentEnvelope,
+) -> AppResult<()> {
+    if record.task_id.trim().is_empty()
+        || record.task_id.len() > 256
+        || record
+            .movement_id
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty() || value.len() > 256)
+        || record.immutable_correlation.is_empty()
+        || record.record_json.is_empty()
+    {
+        return Err(AppError::InvalidInput(
+            "Native Agent durable envelope is invalid.".into(),
+        ));
+    }
+    let conn = connection(paths)?;
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT immutable_correlation FROM native_agent_envelopes WHERE task_id = ?1",
+            [&record.task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing
+        .as_deref()
+        .is_some_and(|value| value != record.immutable_correlation)
+    {
+        return Err(AppError::InvalidInput(
+            "Native Agent identity was reused with conflicting correlation.".into(),
+        ));
+    }
+    conn.execute(
+        r#"
+        INSERT INTO native_agent_envelopes (
+            task_id, movement_id, immutable_correlation, record_json, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(task_id) DO UPDATE SET
+            movement_id = excluded.movement_id,
+            record_json = excluded.record_json,
+            updated_at = excluded.updated_at
+        "#,
+        params![
+            &record.task_id,
+            &record.movement_id,
+            &record.immutable_correlation,
+            &record.record_json,
+            record.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn list_native_agent_envelopes(
+    paths: &AppPaths,
+) -> AppResult<Vec<StoredNativeAgentEnvelope>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare(
+        "SELECT task_id, movement_id, immutable_correlation, record_json, updated_at
+         FROM native_agent_envelopes ORDER BY updated_at, task_id",
+    )?;
+    let records = statement
+        .query_map([], |row| {
+            Ok(StoredNativeAgentEnvelope {
+                task_id: row.get(0)?,
+                movement_id: row.get(1)?,
+                immutable_correlation: row.get(2)?,
+                record_json: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::from)?;
+    Ok(records)
+}
+
+pub(crate) fn get_native_agent_envelope(
+    paths: &AppPaths,
+    task_id: &str,
+) -> AppResult<Option<StoredNativeAgentEnvelope>> {
+    let conn = connection(paths)?;
+    conn.query_row(
+        "SELECT task_id, movement_id, immutable_correlation, record_json, updated_at
+         FROM native_agent_envelopes WHERE task_id = ?1",
+        [task_id],
+        |row| {
+            Ok(StoredNativeAgentEnvelope {
+                task_id: row.get(0)?,
+                movement_id: row.get(1)?,
+                immutable_correlation: row.get(2)?,
+                record_json: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(AppError::from)
 }
 
 pub(crate) fn save_native_agent_conflict(

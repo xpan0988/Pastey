@@ -32,6 +32,8 @@ thread and turn with native `status: completed` and no error. A failed,
 interrupted, cancelled, disconnected, malformed, or otherwise ambiguous native
 turn is non-DONE.
 
+Pastey persists only the outer Native Agent envelope: immutable task/movement correlation, outer phase/status, exact returned-result snapshot/digest, and source-side apply fact. Restart converts unproved native work to interrupted/reconciliation-required; it does not recreate a native session or authorize another turn. A snapshotted return may be retried through the existing encrypted Transfer, while a durable completed apply is idempotent. Reconciliation is a bounded Room Control fact query over a freshly resolved Layer 4 Host binding, so a replaced session can carry new transport but cannot revive its old authority.
+
 For an existing workspace already present on a connected remote Host, Pastey
 uses the same native session service through authenticated current-session Room
 Control: exact selected Host, Codex capability, workspace input, task identity,
