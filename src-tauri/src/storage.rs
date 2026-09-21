@@ -370,6 +370,20 @@ pub(crate) fn get_native_agent_conflict(
     .map_err(AppError::from)
 }
 
+/// Deletes only the durable receipt for one explicitly discarded retained
+/// result. The caller must remove and validate the app-owned tree first.
+pub(crate) fn delete_native_agent_conflict(paths: &AppPaths, movement_id: &str) -> AppResult<bool> {
+    if movement_id.trim().is_empty() || movement_id.len() > 256 {
+        return Err(AppError::InvalidInput(
+            "Native Agent conflict movement identity is invalid.".into(),
+        ));
+    }
+    Ok(connection(paths)?.execute(
+        "DELETE FROM native_agent_conflicts WHERE movement_id = ?1",
+        [movement_id],
+    )? > 0)
+}
+
 pub fn create_room(
     paths: &AppPaths,
     master_key: &[u8; 32],

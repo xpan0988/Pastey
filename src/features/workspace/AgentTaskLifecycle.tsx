@@ -5,12 +5,14 @@ import {
   approveRemoteNativeCodexWorkspaceMovement,
   cancelNativeV2PlanAttempt,
   cancelNativeAgentTask,
+  discardNativeAgentConflictResult,
   cancelRemoteNativeAgentTask,
   getNativeAgentTaskStatus,
   getNativeAgentWorkspaceMovementStatus,
   getNativeV2PlanStatus,
   listNativeAgentCapabilities,
   proposeRemoteNativeCodexWorkspaceMovement,
+  revealNativeAgentConflictResult,
   startNativeCodexTask,
   startRemoteNativeCodexTask,
   type NativeAgentCapability,
@@ -233,7 +235,23 @@ export function useNativeAgentTask() {
     finally { setBusy(false); }
   }, [status]);
 
-  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, message, busy, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, refreshCapabilities };
+  const revealConflictResult = useCallback(async () => {
+    if (!movement || movement.state !== "conflict_recovery_required" || busy) return;
+    setBusy(true); setMessage(null);
+    try { await revealNativeAgentConflictResult(movement.movementId); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not reveal the retained result."); }
+    finally { setBusy(false); }
+  }, [busy, movement]);
+
+  const discardConflictResult = useCallback(async () => {
+    if (!movement || movement.state !== "conflict_recovery_required" || busy) return;
+    setBusy(true); setMessage(null);
+    try { setMovement(await discardNativeAgentConflictResult(movement.movementId)); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not discard the retained result."); }
+    finally { setBusy(false); }
+  }, [busy, movement]);
+
+  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, message, busy, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, revealConflictResult, discardConflictResult, refreshCapabilities };
 }
 
 export function StatusBadge({ tone, children }: { tone: LifecycleTone; children: React.ReactNode }) {

@@ -34,7 +34,9 @@ pub(crate) const NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA: &str =
 /// The intentionally small, exact control surface Pastey 2.0 understands for
 /// its one concrete native capability. This is a Host capability fact, never
 /// execution, Transfer, or session authority.
-pub(crate) const NATIVE_AGENT_COMPATIBILITY_PROTOCOLS: [&str; 3] = [
+pub(crate) const DIRECT_NATIVE_INVOKE_PROTOCOLS: [&str; 2] =
+    [NATIVE_AGENT_PROTOCOL_SCHEMA, NATIVE_AGENT_TASK_SCHEMA];
+pub(crate) const WORKSPACE_MOVEMENT_PROTOCOLS: [&str; 3] = [
     NATIVE_AGENT_PROTOCOL_SCHEMA,
     NATIVE_AGENT_TASK_SCHEMA,
     NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA,
@@ -155,6 +157,19 @@ pub(crate) enum NativeAgentWorkspaceMovementStateV1 {
     Failed,
     Cancelled,
     Interrupted,
+}
+
+/// Review drafts do not own their source. Exactly one post-approval movement
+/// may own a canonical source workspace until it reaches a non-authoritative
+/// terminal state.
+fn movement_holds_source_ownership(state: &NativeAgentWorkspaceMovementStateV1) -> bool {
+    matches!(
+        state,
+        NativeAgentWorkspaceMovementStateV1::TransferringToAgent
+            | NativeAgentWorkspaceMovementStateV1::AgentRunning
+            | NativeAgentWorkspaceMovementStateV1::ReturningResult
+            | NativeAgentWorkspaceMovementStateV1::ApplyingResult
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -300,7 +315,49 @@ impl NativeAgentServiceV1 {
                 changed = true;
             }
             if let Some(movement) = persisted.movement.as_mut() {
-                if !matches!(
+                let durable_conflict = movement.result_identity.as_ref().is_some_and(|identity| {
+                    crate::storage::get_native_agent_conflict(&paths, &movement.status.movement_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|conflict| {
+                            conflict.task_id == movement.status.task_id
+                                && conflict.result_digest == identity.digest
+                                && conflict.result_byte_count == identity.byte_count
+                                && validate_retained_conflict(&paths, &conflict).is_ok()
+                        })
+                });
+                if movement.status.state
+                    == NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+                    && !durable_conflict
+                {
+                    // Never advertise a recoverable conflict whose durable
+                    // retained result cannot be proved after restart.
+                    movement.status.state = NativeAgentWorkspaceMovementStateV1::Interrupted;
+                    movement.status.code = Some("conflict_result_retention_required".into());
+                    changed = true;
+                } else if movement.status.state
+                    == NativeAgentWorkspaceMovementStateV1::ApplyingResult
+                    && movement.status.code.as_deref() == Some("conflict_result_retention_pending")
+                    && durable_conflict
+                {
+                    // Retention reached durable storage before the terminal
+                    // envelope write. Finish only the outer terminal fact;
+                    // never redo Agent work or create another retained tree.
+                    movement.status.state =
+                        NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired;
+                    movement.status.code = Some("source_changed_since_approval".into());
+                    changed = true;
+                } else if movement.status.state
+                    == NativeAgentWorkspaceMovementStateV1::ApplyingResult
+                    && movement.status.code.as_deref() == Some("conflict_result_retention_pending")
+                {
+                    // The exact returned digest was durable but retention did
+                    // not complete. A matching Return may repair this outer
+                    // consequence; execution itself is never retried.
+                    movement.status.state = NativeAgentWorkspaceMovementStateV1::Interrupted;
+                    movement.status.code = Some("conflict_result_retention_required".into());
+                    changed = true;
+                } else if !matches!(
                     movement.status.state,
                     NativeAgentWorkspaceMovementStateV1::AwaitingApproval
                         | NativeAgentWorkspaceMovementStateV1::Completed
@@ -567,15 +624,42 @@ impl NativeAgentServiceV1 {
         NativeAgentWorkspaceTransferV1,
         PathBuf,
     )> {
+        let source_workspace = self.workspace_movements.get(movement_id).ok_or_else(|| {
+            AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+        })?;
+        if source_workspace.status.state != NativeAgentWorkspaceMovementStateV1::AwaitingApproval {
+            return invalid("Native Agent workspace movement is not awaiting Review approval.");
+        }
+        let source_workspace = source_workspace
+            .source
+            .as_ref()
+            .ok_or_else(|| {
+                AppError::InvalidInput(
+                    "Native Agent movement source is unavailable on this Host.".into(),
+                )
+            })?
+            .workspace
+            .clone();
+        if self
+            .workspace_movements
+            .iter()
+            .any(|(existing_id, existing)| {
+                existing_id != movement_id
+                    && existing
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| source.workspace == source_workspace)
+                    && movement_holds_source_ownership(&existing.status.state)
+            })
+        {
+            return invalid(
+                "Another approved Native Agent workspace movement already owns this source workspace.",
+            );
+        }
         let record = self
             .workspace_movements
             .get_mut(movement_id)
-            .ok_or_else(|| {
-                AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
-            })?;
-        if record.status.state != NativeAgentWorkspaceMovementStateV1::AwaitingApproval {
-            return invalid("Native Agent workspace movement is not awaiting Review approval.");
-        }
+            .expect("checked above");
         let source = record.source.as_ref().ok_or_else(|| {
             AppError::InvalidInput(
                 "Native Agent movement source is unavailable on this Host.".into(),
@@ -746,9 +830,32 @@ impl NativeAgentServiceV1 {
                         identity.digest == metadata.content_digest
                             && identity.byte_count == metadata.logical_byte_count
                     });
+                let conflict_retention_pending =
+                    record.result_identity.as_ref().is_some_and(|identity| {
+                        identity.digest == metadata.content_digest
+                            && identity.byte_count == metadata.logical_byte_count
+                            && matches!(
+                                record.status.state,
+                                NativeAgentWorkspaceMovementStateV1::ApplyingResult
+                                    | NativeAgentWorkspaceMovementStateV1::Interrupted
+                            )
+                            && record.status.code.as_deref().is_some_and(|code| {
+                                code == "conflict_result_retention_pending"
+                                    || code == "conflict_result_retention_required"
+                                    || code == "conflict_result_retention_failed"
+                            })
+                    });
+                let duplicate_conflict = record.status.state
+                    == NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+                    && record.result_identity.as_ref().is_some_and(|identity| {
+                        identity.digest == metadata.content_digest
+                            && identity.byte_count == metadata.logical_byte_count
+                    });
                 if metadata.destination_host_ref != local_host_ref
                     || metadata.source_host_ref != record.status.target_host_ref
                     || (!duplicate_completed
+                        && !duplicate_conflict
+                        && !conflict_retention_pending
                         && record.status.state
                             != NativeAgentWorkspaceMovementStateV1::ReturningResult)
                     || source.workspace.as_os_str().is_empty()
@@ -773,6 +880,32 @@ impl NativeAgentServiceV1 {
                         identity.digest == metadata.content_digest
                             && identity.byte_count == metadata.logical_byte_count
                     })
+            })
+    }
+
+    fn return_is_already_conflicted(
+        &self,
+        metadata: &NativeAgentWorkspaceTransferV1,
+        paths: &crate::storage::AppPaths,
+    ) -> bool {
+        self.workspace_movements
+            .get(&metadata.movement_id)
+            .filter(|record| record.status.task_id == metadata.task_id)
+            .is_some_and(|record| {
+                record.status.state == NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+                    && record.result_identity.as_ref().is_some_and(|identity| {
+                        identity.digest == metadata.content_digest
+                            && identity.byte_count == metadata.logical_byte_count
+                    })
+                    && crate::storage::get_native_agent_conflict(paths, &metadata.movement_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|conflict| {
+                            conflict.task_id == metadata.task_id
+                                && conflict.result_digest == metadata.content_digest
+                                && conflict.result_byte_count == metadata.logical_byte_count
+                                && validate_retained_conflict(paths, &conflict).is_ok()
+                        })
             })
     }
 
@@ -1071,23 +1204,34 @@ impl NativeAgentServiceV1 {
             AppError::InvalidInput("Native Agent result return arrived at the wrong Host.".into())
         })?;
         validate_workspace_transfer_fidelity(returned_workspace)?;
+        let returned = crate::safe_file_identity::capture_regular_file_set_identity(
+            returned_workspace,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )?;
         let current = crate::safe_file_identity::capture_regular_file_set_identity(
             &source.workspace,
             crate::storage::MAX_FILE_SIZE_BYTES,
         )?;
         if current != source.baseline {
-            record.status.state = NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired;
-            record.status.code = Some("source_changed_since_approval".into());
+            if record
+                .result_identity
+                .as_ref()
+                .is_some_and(|existing| existing != &returned)
+            {
+                return invalid("Native Agent conflict Return does not match its exact result.");
+            }
+            // Persist the exact returned identity before retention. The
+            // terminal conflict fact is written only after the app-owned copy
+            // and its durable record have both been proved.
+            record.result_identity = Some(returned);
+            record.status.state = NativeAgentWorkspaceMovementStateV1::ApplyingResult;
+            record.status.code = Some("conflict_result_retention_pending".into());
             let status = record.status.clone();
             let task_id = record.status.task_id.clone();
             let _ = record;
             self.persist_envelope(&task_id, None)?;
             return Ok(status);
         }
-        let returned = crate::safe_file_identity::capture_regular_file_set_identity(
-            returned_workspace,
-            crate::storage::MAX_FILE_SIZE_BYTES,
-        )?;
         record.result_identity = Some(returned.clone());
         record.status.state = NativeAgentWorkspaceMovementStateV1::ApplyingResult;
         if let Err(error) = replace_workspace_from_exact_tree(
@@ -1109,6 +1253,138 @@ impl NativeAgentServiceV1 {
         let status = record.status.clone();
         let task_id = record.status.task_id.clone();
         let _ = record;
+        self.persist_envelope(&task_id, None)?;
+        Ok(status)
+    }
+
+    fn finalize_conflict_recovery(
+        &mut self,
+        movement_id: &str,
+        paths: &crate::storage::AppPaths,
+    ) -> AppResult<NativeAgentWorkspaceMovementV1> {
+        let record = self
+            .workspace_movements
+            .get_mut(movement_id)
+            .ok_or_else(|| {
+                AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+            })?;
+        let result = record.result_identity.as_ref().ok_or_else(|| {
+            AppError::InvalidInput("Native Agent conflict result is unavailable.".into())
+        })?;
+        let conflict =
+            crate::storage::get_native_agent_conflict(paths, movement_id)?.ok_or_else(|| {
+                AppError::InvalidInput(
+                    "Native Agent retained conflict result is unavailable.".into(),
+                )
+            })?;
+        if conflict.task_id != record.status.task_id
+            || conflict.result_digest != result.digest
+            || conflict.result_byte_count != result.byte_count
+        {
+            return invalid("Native Agent retained conflict correlation is invalid.");
+        }
+        validate_retained_conflict(paths, &conflict)?;
+        record.status.state = NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired;
+        record.status.code = Some("source_changed_since_approval".into());
+        let status = record.status.clone();
+        let task_id = record.status.task_id.clone();
+        let _ = record;
+        self.persist_envelope(&task_id, None)?;
+        Ok(status)
+    }
+
+    pub(crate) fn retained_conflict_result_for_reveal(
+        &self,
+        movement_id: &str,
+    ) -> AppResult<PathBuf> {
+        let paths = self.durable_paths.as_ref().ok_or_else(|| {
+            AppError::InvalidInput("Native Agent conflict persistence is unavailable.".into())
+        })?;
+        let movement = self.workspace_movements.get(movement_id).ok_or_else(|| {
+            AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+        })?;
+        if movement.status.state != NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired {
+            return invalid("Native Agent conflict result is not available for reveal.");
+        }
+        let result = movement.result_identity.as_ref().ok_or_else(|| {
+            AppError::InvalidInput("Native Agent conflict result is unavailable.".into())
+        })?;
+        let conflict =
+            crate::storage::get_native_agent_conflict(paths, movement_id)?.ok_or_else(|| {
+                AppError::InvalidInput(
+                    "Native Agent retained conflict result is unavailable.".into(),
+                )
+            })?;
+        if conflict.task_id != movement.status.task_id
+            || conflict.result_digest != result.digest
+            || conflict.result_byte_count != result.byte_count
+        {
+            return invalid("Native Agent retained conflict correlation is invalid.");
+        }
+        validate_retained_conflict(paths, &conflict)
+    }
+
+    pub(crate) fn discard_retained_conflict_result(
+        &mut self,
+        movement_id: &str,
+    ) -> AppResult<NativeAgentWorkspaceMovementV1> {
+        let paths = self.durable_paths.clone().ok_or_else(|| {
+            AppError::InvalidInput("Native Agent conflict persistence is unavailable.".into())
+        })?;
+        let (task_id, already_discarded) = {
+            let movement = self.workspace_movements.get(movement_id).ok_or_else(|| {
+                AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+            })?;
+            (
+                movement.status.task_id.clone(),
+                movement.status.state == NativeAgentWorkspaceMovementStateV1::Cancelled
+                    && movement.status.code.as_deref() == Some("conflict_result_discarded"),
+            )
+        };
+        if already_discarded {
+            return self.movement_status(movement_id);
+        }
+        let conflict = crate::storage::get_native_agent_conflict(&paths, movement_id)?;
+        if let Some(conflict) = conflict {
+            if conflict.task_id != task_id {
+                return invalid("Native Agent retained conflict correlation is invalid.");
+            }
+            if conflict.retained_tree.exists() {
+                let retained = validate_retained_conflict(&paths, &conflict)?;
+                let container = retained.parent().ok_or_else(|| {
+                    AppError::InvalidInput(
+                        "Native Agent retained conflict container is unavailable.".into(),
+                    )
+                })?;
+                let root = fs::canonicalize(conflict_root(&paths)).map_err(|_| {
+                    AppError::InvalidInput("Native Agent conflict root is unavailable.".into())
+                })?;
+                let container = fs::canonicalize(container).map_err(|_| {
+                    AppError::InvalidInput(
+                        "Native Agent retained conflict container is unavailable.".into(),
+                    )
+                })?;
+                if !container.starts_with(&root) || container.parent() != Some(root.as_path()) {
+                    return invalid(
+                        "Native Agent retained conflict container is outside its private root.",
+                    );
+                }
+                fs::remove_dir_all(&container)?;
+            }
+            crate::storage::delete_native_agent_conflict(&paths, movement_id)?;
+        }
+        let movement = self
+            .workspace_movements
+            .get_mut(movement_id)
+            .expect("checked above");
+        if movement.status.state != NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired {
+            return invalid("Native Agent conflict result is not available for discard.");
+        }
+        movement.status.state = NativeAgentWorkspaceMovementStateV1::Cancelled;
+        movement.status.code = Some("conflict_result_discarded".into());
+        let status = movement.status.clone();
+        let task_id = movement.status.task_id.clone();
+        let _ = movement;
         self.persist_envelope(&task_id, None)?;
         Ok(status)
     }
@@ -1807,6 +2083,18 @@ fn retain_conflicted_workspace(
         returned_workspace,
         crate::storage::MAX_FILE_SIZE_BYTES,
     )?;
+    if let Some(existing) = crate::storage::get_native_agent_conflict(paths, movement_id)? {
+        if existing.task_id != task_id
+            || existing.result_digest != identity.digest
+            || existing.result_byte_count != identity.byte_count
+        {
+            return invalid(
+                "Native Agent conflict result correlation is already bound differently.",
+            );
+        }
+        validate_retained_conflict(paths, &existing)?;
+        return Ok(existing.retained_tree);
+    }
     let unique = Uuid::new_v4().to_string();
     let retained = crate::safe_file_identity::create_private_tree_root(
         &paths.app_data_dir,
@@ -1852,6 +2140,39 @@ fn retain_conflicted_workspace(
         }
     }
     result.map(|()| retained)
+}
+
+fn conflict_root(paths: &crate::storage::AppPaths) -> PathBuf {
+    paths.app_data_dir.join("native-agent-conflicts")
+}
+
+/// Resolves a retained result only after proving that it is still an
+/// app-owned conflict tree with the exact durable identity. The path never
+/// enters a renderer-safe DTO.
+fn validate_retained_conflict(
+    paths: &crate::storage::AppPaths,
+    conflict: &crate::storage::StoredNativeAgentConflict,
+) -> AppResult<PathBuf> {
+    let root = fs::canonicalize(conflict_root(paths))
+        .map_err(|_| AppError::InvalidInput("Native Agent conflict root is unavailable.".into()))?;
+    let retained = fs::canonicalize(&conflict.retained_tree).map_err(|_| {
+        AppError::InvalidInput("Native Agent retained conflict result is unavailable.".into())
+    })?;
+    if !retained.starts_with(&root)
+        || retained.file_name().and_then(|name| name.to_str()) != Some("tree")
+    {
+        return invalid("Native Agent retained conflict result is outside its private root.");
+    }
+    let identity = crate::safe_file_identity::capture_regular_file_set_identity(
+        &retained,
+        crate::storage::MAX_FILE_SIZE_BYTES,
+    )?;
+    if identity.digest != conflict.result_digest
+        || identity.byte_count != conflict.result_byte_count
+    {
+        return invalid("Native Agent retained conflict result no longer matches its receipt.");
+    }
+    Ok(retained)
 }
 
 fn snapshot_exact_workspace_result(
@@ -1926,6 +2247,18 @@ pub(crate) fn register_workspace_transfer_landing(
             .lock()
             .movement_status(&metadata.movement_id);
     }
+    if metadata.phase == NativeAgentWorkspaceTransferPhaseV1::Return
+        && runtime
+            .native_agents
+            .lock()
+            .return_is_already_conflicted(metadata, &runtime.paths)
+    {
+        crate::regular_file_set_transfer::cleanup_received_package(&package_path);
+        return runtime
+            .native_agents
+            .lock()
+            .movement_status(&metadata.movement_id);
+    }
     let tree = crate::regular_file_set_transfer::materialize_package(
         &package_path,
         &runtime.paths.temp_dir,
@@ -1973,9 +2306,7 @@ pub(crate) fn register_workspace_transfer_landing(
             .map(Some),
     };
     match outcome {
-        Ok(Some(status))
-            if status.state == NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired =>
-        {
+        Ok(Some(status)) if status.code.as_deref() == Some("conflict_result_retention_pending") => {
             if let Err(error) = retain_conflicted_workspace(
                 &runtime.paths,
                 &metadata.movement_id,
@@ -1990,7 +2321,10 @@ pub(crate) fn register_workspace_transfer_landing(
                 return Err(error);
             }
             crate::regular_file_set_transfer::cleanup_materialized_tree(&tree);
-            Ok(status)
+            runtime
+                .native_agents
+                .lock()
+                .finalize_conflict_recovery(&metadata.movement_id, &runtime.paths)
         }
         Ok(_) => runtime
             .native_agents
@@ -3051,7 +3385,7 @@ exit 1
     }
 
     #[test]
-    fn returned_workspace_applies_once_or_enters_conflict_recovery() {
+    fn returned_workspace_applies_once_or_stops_at_conflict_retention_pending() {
         let (root, source, _) = fixture();
         fs::write(source.join("before.txt"), b"approved baseline").unwrap();
         let returned = root.join("returned");
@@ -3109,7 +3443,11 @@ exit 1
             .unwrap();
         assert_eq!(
             conflict.state,
-            NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+            NativeAgentWorkspaceMovementStateV1::ApplyingResult
+        );
+        assert_eq!(
+            conflict.code.as_deref(),
+            Some("conflict_result_retention_pending")
         );
         assert_eq!(
             fs::read(conflicted.join("local.txt")).unwrap(),
@@ -3143,11 +3481,251 @@ exit 1
         let _ = fs::remove_dir_all(root);
     }
 
+    fn finalize_test_conflict(
+        service: &mut NativeAgentServiceV1,
+        paths: &crate::storage::AppPaths,
+        movement_id: &str,
+        returned: &Path,
+    ) -> NativeAgentWorkspaceMovementV1 {
+        let pending = service
+            .apply_received_workspace_return(movement_id, returned)
+            .unwrap();
+        assert_eq!(
+            pending.code.as_deref(),
+            Some("conflict_result_retention_pending")
+        );
+        let task_id = pending.task_id;
+        retain_conflicted_workspace(paths, movement_id, &task_id, returned).unwrap();
+        service
+            .finalize_conflict_recovery(movement_id, paths)
+            .unwrap()
+    }
+
+    #[test]
+    fn conflict_reveal_and_discard_validate_then_remain_idempotent() {
+        let (root, source, _) = fixture();
+        fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+        let returned = root.join("returned");
+        fs::create_dir(&returned).unwrap();
+        fs::write(returned.join("result.txt"), b"native result").unwrap();
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        service
+            .propose_workspace_movement(
+                "movement-reveal",
+                "task-reveal",
+                &source,
+                "host:remote",
+                movement_object(),
+                "edit",
+                true,
+            )
+            .unwrap();
+        service
+            .workspace_movements
+            .get_mut("movement-reveal")
+            .unwrap()
+            .status
+            .state = NativeAgentWorkspaceMovementStateV1::ReturningResult;
+        fs::write(source.join("local-change.txt"), b"local").unwrap();
+        assert_eq!(
+            finalize_test_conflict(&mut service, &paths, "movement-reveal", &returned).state,
+            NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+        );
+        let revealed = service
+            .retained_conflict_result_for_reveal("movement-reveal")
+            .unwrap();
+        assert!(revealed.starts_with(fs::canonicalize(conflict_root(&paths)).unwrap()));
+        assert_eq!(
+            fs::read(revealed.join("result.txt")).unwrap(),
+            b"native result"
+        );
+        assert_eq!(
+            service
+                .discard_retained_conflict_result("movement-reveal")
+                .unwrap()
+                .state,
+            NativeAgentWorkspaceMovementStateV1::Cancelled
+        );
+        assert!(
+            crate::storage::get_native_agent_conflict(&paths, "movement-reveal")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            service
+                .discard_retained_conflict_result("movement-reveal")
+                .unwrap()
+                .code
+                .as_deref(),
+            Some("conflict_result_discarded")
+        );
+        assert_ne!(
+            service.movement_status("movement-reveal").unwrap().state,
+            NativeAgentWorkspaceMovementStateV1::Completed
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn conflict_retention_crash_windows_never_advertise_missing_recovery() {
+        let (root, source, _) = fixture();
+        fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+        let returned = root.join("returned");
+        fs::create_dir(&returned).unwrap();
+        fs::write(returned.join("result.txt"), b"native result").unwrap();
+        let paths = durable_paths(&root);
+        let mut before = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        before
+            .propose_workspace_movement(
+                "movement-crash",
+                "task-crash",
+                &source,
+                "host:remote",
+                movement_object(),
+                "edit",
+                true,
+            )
+            .unwrap();
+        before
+            .workspace_movements
+            .get_mut("movement-crash")
+            .unwrap()
+            .status
+            .state = NativeAgentWorkspaceMovementStateV1::ReturningResult;
+        fs::write(source.join("local-change.txt"), b"local").unwrap();
+        before
+            .apply_received_workspace_return("movement-crash", &returned)
+            .unwrap();
+        let after_missing_retention = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        let interrupted = after_missing_retention
+            .movement_status("movement-crash")
+            .unwrap();
+        assert_eq!(
+            interrupted.state,
+            NativeAgentWorkspaceMovementStateV1::Interrupted
+        );
+        assert_eq!(
+            interrupted.code.as_deref(),
+            Some("conflict_result_retention_required")
+        );
+
+        let mut before_terminal = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        retain_conflicted_workspace(&paths, "movement-crash", "task-crash", &returned).unwrap();
+        before_terminal
+            .workspace_movements
+            .get_mut("movement-crash")
+            .unwrap()
+            .status
+            .state = NativeAgentWorkspaceMovementStateV1::ApplyingResult;
+        before_terminal
+            .workspace_movements
+            .get_mut("movement-crash")
+            .unwrap()
+            .status
+            .code = Some("conflict_result_retention_pending".into());
+        before_terminal
+            .persist_envelope("task-crash", None)
+            .unwrap();
+        let after_retention = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        assert_eq!(
+            after_retention
+                .movement_status("movement-crash")
+                .unwrap()
+                .state,
+            NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+        );
+        assert!(after_retention
+            .retained_conflict_result_for_reveal("movement-crash")
+            .is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn durable_paths(root: &Path) -> crate::storage::AppPaths {
         let paths = crate::storage::AppPaths::new(root.join("app-data"), root.join("logs"));
         paths.ensure_directories().unwrap();
         crate::storage::init_database(&paths).unwrap();
         paths
+    }
+
+    #[test]
+    fn only_one_approved_movement_can_own_a_canonical_source_workspace() {
+        let (root, source, _) = fixture();
+        fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        for (movement, task) in [
+            ("movement-owner-a", "task-owner-a"),
+            ("movement-owner-b", "task-owner-b"),
+        ] {
+            service
+                .propose_workspace_movement(
+                    movement,
+                    task,
+                    &source,
+                    "host:remote",
+                    movement_object(),
+                    "edit",
+                    true,
+                )
+                .unwrap();
+        }
+        let first = service
+            .approve_workspace_movement("movement-owner-a", "room", "host:source", &paths.temp_dir)
+            .unwrap();
+        assert!(service
+            .approve_workspace_movement("movement-owner-b", "room", "host:source", &paths.temp_dir)
+            .is_err());
+        service.interrupt_workspace_movement("movement-owner-a", "outbound_transfer_failed");
+        let second = service
+            .approve_workspace_movement("movement-owner-b", "room", "host:source", &paths.temp_dir)
+            .unwrap();
+        crate::regular_file_set_transfer::cleanup_package(&first.2);
+        crate::regular_file_set_transfer::cleanup_package(&second.2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_restart_restores_then_releases_interrupted_source_ownership() {
+        let (root, source, _) = fixture();
+        fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+        let paths = durable_paths(&root);
+        let mut before = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        for (movement, task) in [
+            ("movement-restart-a", "task-restart-a"),
+            ("movement-restart-b", "task-restart-b"),
+        ] {
+            before
+                .propose_workspace_movement(
+                    movement,
+                    task,
+                    &source,
+                    "host:remote",
+                    movement_object(),
+                    "edit",
+                    true,
+                )
+                .unwrap();
+        }
+        let approved = before
+            .approve_workspace_movement(
+                "movement-restart-a",
+                "room",
+                "host:source",
+                &paths.temp_dir,
+            )
+            .unwrap();
+        crate::regular_file_set_transfer::cleanup_package(&approved.2);
+        let mut after = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        assert!(after
+            .approve_workspace_movement(
+                "movement-restart-b",
+                "room",
+                "host:source",
+                &paths.temp_dir
+            )
+            .is_ok());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3455,6 +4033,99 @@ exit 1
             fs::read(source.join("after.txt")).unwrap(),
             b"native result"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn duplicate_conflict_return_landing_is_acknowledged_without_second_retention() {
+        let (root, source, _) = fixture();
+        fs::write(source.join("before.txt"), b"approved baseline").unwrap();
+        let returned = root.join("returned");
+        fs::create_dir(&returned).unwrap();
+        fs::write(returned.join("after.txt"), b"native result").unwrap();
+        let paths = durable_paths(&root);
+        let runtime = crate::host_runtime::HostRuntime::new(
+            paths.clone(),
+            test_config(),
+            Arc::new(NoopEventSink),
+            Arc::new(NoopTaskSpawner),
+        )
+        .unwrap();
+        runtime
+            .native_agents
+            .lock()
+            .propose_workspace_movement(
+                "movement-conflict-landing",
+                "task-conflict-landing",
+                &source,
+                "host:remote",
+                movement_object(),
+                "edit",
+                true,
+            )
+            .unwrap();
+        runtime
+            .native_agents
+            .lock()
+            .workspace_movements
+            .get_mut("movement-conflict-landing")
+            .unwrap()
+            .status
+            .state = NativeAgentWorkspaceMovementStateV1::ReturningResult;
+        fs::write(source.join("local-change.txt"), b"local").unwrap();
+        let identity = crate::safe_file_identity::capture_regular_file_set_identity(
+            &returned,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )
+        .unwrap();
+        let metadata = NativeAgentWorkspaceTransferV1 {
+            schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+            movement_id: "movement-conflict-landing".into(),
+            task_id: "task-conflict-landing".into(),
+            phase: NativeAgentWorkspaceTransferPhaseV1::Return,
+            bridge_id: "room".into(),
+            source_host_ref: "host:remote".into(),
+            destination_host_ref: runtime.local_host_ref.as_str().into(),
+            object: movement_object(),
+            content_digest: identity.digest.clone(),
+            logical_byte_count: identity.byte_count,
+        };
+        for _ in 0..2 {
+            let package = crate::regular_file_set_transfer::prepare_package(
+                &returned,
+                &returned,
+                &identity,
+                &paths.temp_dir,
+            )
+            .unwrap();
+            assert_eq!(
+                register_workspace_transfer_landing(
+                    &runtime,
+                    &metadata,
+                    package,
+                    crate::storage::now_ts()
+                )
+                .unwrap()
+                .state,
+                NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired,
+            );
+        }
+        let retained =
+            crate::storage::get_native_agent_conflict(&paths, "movement-conflict-landing")
+                .unwrap()
+                .unwrap();
+        assert_eq!(retained.result_digest, identity.digest);
+        assert_eq!(
+            fs::read(source.join("before.txt")).unwrap(),
+            b"approved baseline"
+        );
+        let mut conflicting = metadata.clone();
+        conflicting.content_digest = "f".repeat(64);
+        assert!(runtime
+            .native_agents
+            .lock()
+            .validate_workspace_transfer(&conflicting, runtime.local_host_ref.as_str())
+            .is_err());
         let _ = fs::remove_dir_all(root);
     }
 
