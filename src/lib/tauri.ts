@@ -244,6 +244,16 @@ export function getNativeAgentWorkspaceMovementStatus(
   return invoke("get_native_agent_workspace_movement_status", { movementId });
 }
 
+export function revealNativeAgentConflictResult(movementId: string): Promise<void> {
+  return invoke("reveal_native_agent_conflict_result", { movementId });
+}
+
+export function discardNativeAgentConflictResult(
+  movementId: string,
+): Promise<NativeAgentWorkspaceMovement> {
+  return invoke("discard_native_agent_conflict_result", { movementId });
+}
+
 export function cancelRemoteNativeAgentTask(
   roomId: string, peerSessionId: string, targetHostRef: string, taskId: string,
 ): Promise<NativeAgentTaskStatus> {

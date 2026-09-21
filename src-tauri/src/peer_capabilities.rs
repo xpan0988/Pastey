@@ -292,7 +292,7 @@ pub(crate) fn native_agent_capability_fact(
             available: true,
             accepted_input_media_types: Vec::new(),
             effect: NATIVE_AGENT_EFFECT.into(),
-            supported_protocols: crate::native_agent::NATIVE_AGENT_COMPATIBILITY_PROTOCOLS
+            supported_protocols: crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS
                 .iter()
                 .map(|value| (*value).into())
                 .collect(),
@@ -595,9 +595,7 @@ mod tests {
             crate::native_agent::NativeAgentCapabilityStateV1::Available,
         ));
         assert!(compatible
-            .require_native_agent_protocols(
-                &crate::native_agent::NATIVE_AGENT_COMPATIBILITY_PROTOCOLS
-            )
+            .require_native_agent_protocols(&crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS)
             .is_ok());
         assert!(compatible
             .require_native_agent_protocols(&[
@@ -606,14 +604,25 @@ mod tests {
             ])
             .is_err());
 
+        let mut direct_only = compatible.clone();
+        direct_only.capabilities[0].supported_protocols =
+            crate::native_agent::DIRECT_NATIVE_INVOKE_PROTOCOLS
+                .iter()
+                .map(|value| (*value).into())
+                .collect();
+        assert!(direct_only
+            .require_native_agent_protocols(&crate::native_agent::DIRECT_NATIVE_INVOKE_PROTOCOLS)
+            .is_ok());
+        assert!(direct_only
+            .require_native_agent_protocols(&crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS)
+            .is_err());
+
         let mut incompatible = local_projection("peer".into(), 10);
         incompatible.capabilities.push(native_agent_capability_fact(
             crate::native_agent::NativeAgentCapabilityStateV1::Incompatible,
         ));
         assert!(incompatible
-            .require_native_agent_protocols(
-                &crate::native_agent::NATIVE_AGENT_COMPATIBILITY_PROTOCOLS
-            )
+            .require_native_agent_protocols(&crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS)
             .is_err());
         // The fact remains only an observation: this module exposes no Plan,
         // Transfer, Host-selection, or execution grant API.

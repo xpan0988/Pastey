@@ -847,6 +847,7 @@ async fn require_remote_native_codex_compatibility(
     state: Arc<AppState>,
     room_id: &str,
     target: &crate::host_identity::HostRef,
+    required_protocols: &[&str],
 ) -> Result<crate::bridge_lifecycle::CurrentRemoteHostSession, String> {
     let session = state
         .resolve_current_remote_host_session(room_id, target)
@@ -857,7 +858,7 @@ async fn require_remote_native_codex_compatibility(
         .await
         .map_err(|error| error.message())?;
     projection
-        .require_native_agent_protocols(&crate::native_agent::NATIVE_AGENT_COMPATIBILITY_PROTOCOLS)
+        .require_native_agent_protocols(required_protocols)
         .map_err(|error| error.message())?;
     Ok(session)
 }
@@ -915,8 +916,13 @@ pub async fn start_remote_native_codex_task(
     let target =
         crate::host_identity::HostRef::parse_peer(target_host_ref.clone(), &state.local_host_ref)
             .map_err(|error| error.message())?;
-    let session =
-        require_remote_native_codex_compatibility(state.inner().clone(), &room_id, &target).await?;
+    let session = require_remote_native_codex_compatibility(
+        state.inner().clone(),
+        &room_id,
+        &target,
+        &crate::native_agent::DIRECT_NATIVE_INVOKE_PROTOCOLS,
+    )
+    .await?;
     if session.binding().peer_route_ref != peer_session_id {
         return Err("The selected Host session changed before native invocation.".into());
     }
@@ -1024,7 +1030,13 @@ pub async fn propose_remote_native_codex_workspace_movement(
 ) -> Result<crate::native_agent::NativeAgentWorkspaceMovementV1, String> {
     let target = crate::host_identity::HostRef::parse_peer(target_host_ref, &state.local_host_ref)
         .map_err(|error| error.message())?;
-    require_remote_native_codex_compatibility(state.inner().clone(), &room_id, &target).await?;
+    require_remote_native_codex_compatibility(
+        state.inner().clone(),
+        &room_id,
+        &target,
+        &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS,
+    )
+    .await?;
     let workspace = std::path::Path::new(&source_workspace)
         .canonicalize()
         .map_err(|_| "Pastey could not open the selected workspace.".to_string())?;
@@ -1094,8 +1106,13 @@ pub async fn approve_remote_native_codex_workspace_movement(
     let target =
         crate::host_identity::HostRef::parse_peer(movement.target_host_ref, &state.local_host_ref)
             .map_err(|error| error.message())?;
-    let session =
-        require_remote_native_codex_compatibility(state.inner().clone(), &room_id, &target).await?;
+    let session = require_remote_native_codex_compatibility(
+        state.inner().clone(),
+        &room_id,
+        &target,
+        &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS,
+    )
+    .await?;
     if session.binding().peer_route_ref != peer_session_id {
         return Err("The selected Host session changed before workspace preparation.".into());
     }
@@ -1183,6 +1200,38 @@ pub fn get_native_agent_workspace_movement_status(
         .native_agents
         .lock()
         .movement_status(&movement_id)
+        .map_err(|error| error.message())
+}
+
+/// Reveals only a backend-validated app-owned retained conflict result. The
+/// private path is never returned to the renderer.
+#[tauri::command]
+pub fn reveal_native_agent_conflict_result(
+    movement_id: String,
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let retained = state
+        .native_agents
+        .lock()
+        .retained_conflict_result_for_reveal(&movement_id)
+        .map_err(|error| error.message())?;
+    app.opener()
+        .reveal_item_in_dir(retained)
+        .map_err(|error| error.to_string())
+}
+
+/// Discards one explicitly selected retained conflict result. It is an
+/// idempotent non-success terminal transition and never retries the Agent.
+#[tauri::command]
+pub fn discard_native_agent_conflict_result(
+    movement_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentWorkspaceMovementV1, String> {
+    state
+        .native_agents
+        .lock()
+        .discard_retained_conflict_result(&movement_id)
         .map_err(|error| error.message())
 }
 
