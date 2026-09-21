@@ -1571,6 +1571,19 @@ pub async fn receive_room_control_event_handler(
                         "Native Agent target Host does not match this Host.",
                     );
                 }
+                if ctx
+                    .state
+                    .native_agents
+                    .lock()
+                    .require_codex_compatibility()
+                    .is_err()
+                {
+                    return control_error(
+                        StatusCode::BAD_REQUEST,
+                        "native_agent_incompatible",
+                        "Native Agent interface is incompatible on this Host.",
+                    );
+                }
                 let _started = match ctx
                     .state
                     .native_agents
@@ -1848,6 +1861,19 @@ pub async fn receive_room_control_event_handler(
                         StatusCode::FORBIDDEN,
                         "host_mismatch",
                         "Native Agent workspace targets another Host.",
+                    );
+                }
+                if ctx
+                    .state
+                    .native_agents
+                    .lock()
+                    .require_codex_compatibility()
+                    .is_err()
+                {
+                    return control_error(
+                        StatusCode::BAD_REQUEST,
+                        "native_agent_incompatible",
+                        "Native Agent interface is incompatible on this Host.",
                     );
                 }
                 let movement_id = request.movement_id.clone();

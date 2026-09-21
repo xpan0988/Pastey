@@ -171,8 +171,7 @@ export function cancelNativeV2PlanAttempt(attemptId: string): Promise<NativeV2Pl
 export interface NativeAgentCapability {
   agentId: string;
   displayName: string;
-  detected: boolean;
-  usable: boolean;
+  state: "available" | "incompatible" | "unavailable";
 }
 
 export type NativeAgentTaskState = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";

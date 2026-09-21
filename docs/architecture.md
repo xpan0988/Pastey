@@ -43,8 +43,8 @@ Capability is not authority. Probe availability is not executable binding. Acqui
 
 ## Native mature-Agent boundary
 
-Pastey 2.0 treats a mature Agent (Codex, Claude Code, Pi, OpenCode, and similar
-native products) as a Host capability—not as a Pastey Worker harness. The
+Pastey 2.0 treats its currently implemented native Codex Agent capability as a
+Host capability—not as a Pastey Worker harness. The
 boundary is deliberately small:
 
 ```text

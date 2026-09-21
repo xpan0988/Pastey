@@ -16,7 +16,7 @@ use crate::{
 };
 
 pub(crate) const PEER_CAPABILITY_SCHEMA: &str = "pastey-peer-capabilities-v2";
-const MAX_CAPABILITIES: usize = 16;
+const MAX_CAPABILITIES: usize = 24;
 const MAX_MEDIA_TYPES: usize = 16;
 const MAX_PAYLOAD_BYTES: usize = 4096;
 const MAX_SEMANTIC_CAPABILITY_ID_BYTES: usize = 128;
@@ -25,6 +25,10 @@ pub(crate) const MANAGED_PROVIDER_CAPABILITY: &str = "pastey.managed.provider";
 pub(crate) const MANAGED_RUNTIME_CAPABILITY: &str = "pastey.managed.runtime";
 pub(crate) const EXECUTION_WORLD_CAPABILITY: &str = "pastey.managed.execution_world";
 pub(crate) const MANAGED_EXECUTION_CAPABILITY: &str = "pastey.managed.execution";
+pub(crate) const NATIVE_AGENT_CODEX_CAPABILITY: &str = crate::native_agent::CODEX_CAPABILITY_ID;
+const NATIVE_AGENT_EFFECT: &str = "native_agent_compatibility";
+const REASON_NATIVE_AGENT_INCOMPATIBLE: &str = "native_agent_incompatible";
+const REASON_NATIVE_AGENT_UNAVAILABLE: &str = "native_agent_unavailable";
 
 const REASON_NOT_CONFIGURED: &str = "not_configured";
 const REASON_UNKNOWN: &str = "unknown";
@@ -42,6 +46,10 @@ pub struct HostCapabilityFact {
     pub available: bool,
     pub accepted_input_media_types: Vec<String>,
     pub effect: String,
+    /// Exact Pastey protocol schemas supported by this bounded Host
+    /// capability. This is an observation, not a grant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_protocols: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
 }
@@ -188,7 +196,13 @@ pub(crate) fn local_diagnostic_projection(
         schema_version: PEER_CAPABILITY_SCHEMA.into(),
         peer_session_id,
         observed_at,
-        capabilities: vec![provider, runtime, execution_world, managed_execution],
+        capabilities: vec![
+            provider,
+            runtime,
+            execution_world,
+            managed_execution,
+            state.native_agents.lock().native_capability_fact(),
+        ],
     }
 }
 
@@ -249,6 +263,7 @@ fn system_probe_fact(
         available,
         accepted_input_media_types: Vec::new(),
         effect: "system_probe_observation".into(),
+        supported_protocols: Vec::new(),
         unavailable_reason: unavailable_reason.map(str::to_string),
     }
 }
@@ -263,7 +278,51 @@ fn capability(
         available,
         accepted_input_media_types: Vec::new(),
         effect: "readiness_observation".into(),
+        supported_protocols: Vec::new(),
         unavailable_reason: unavailable_reason.map(str::to_string),
+    }
+}
+
+pub(crate) fn native_agent_capability_fact(
+    state: crate::native_agent::NativeAgentCapabilityStateV1,
+) -> HostCapabilityFact {
+    match state {
+        crate::native_agent::NativeAgentCapabilityStateV1::Available => HostCapabilityFact {
+            capability_id: NATIVE_AGENT_CODEX_CAPABILITY.into(),
+            available: true,
+            accepted_input_media_types: Vec::new(),
+            effect: NATIVE_AGENT_EFFECT.into(),
+            supported_protocols: crate::native_agent::NATIVE_AGENT_COMPATIBILITY_PROTOCOLS
+                .iter()
+                .map(|value| (*value).into())
+                .collect(),
+            unavailable_reason: None,
+        },
+        crate::native_agent::NativeAgentCapabilityStateV1::Incompatible => capability_with_reason(
+            NATIVE_AGENT_CODEX_CAPABILITY,
+            NATIVE_AGENT_EFFECT,
+            REASON_NATIVE_AGENT_INCOMPATIBLE,
+        ),
+        crate::native_agent::NativeAgentCapabilityStateV1::Unavailable => capability_with_reason(
+            NATIVE_AGENT_CODEX_CAPABILITY,
+            NATIVE_AGENT_EFFECT,
+            REASON_NATIVE_AGENT_UNAVAILABLE,
+        ),
+    }
+}
+
+fn capability_with_reason(
+    capability_id: &str,
+    effect: &str,
+    unavailable_reason: &str,
+) -> HostCapabilityFact {
+    HostCapabilityFact {
+        capability_id: capability_id.into(),
+        available: false,
+        accepted_input_media_types: Vec::new(),
+        effect: effect.into(),
+        supported_protocols: Vec::new(),
+        unavailable_reason: Some(unavailable_reason.into()),
     }
 }
 
@@ -287,6 +346,43 @@ impl PeerCapabilityProjection {
             Some(_) => DiagnosticState::Unavailable,
             None => DiagnosticState::Unknown,
         }
+    }
+
+    /// Requires this exact current-session observation to advertise the
+    /// concrete Codex capability and every exact schema an operation uses.
+    /// The result deliberately grants no execution or Transfer authority.
+    pub(crate) fn require_native_agent_protocols(&self, required: &[&str]) -> AppResult<()> {
+        let fact = self
+            .capabilities
+            .iter()
+            .find(|fact| fact.capability_id == NATIVE_AGENT_CODEX_CAPABILITY)
+            .ok_or_else(|| {
+                AppError::InvalidInput("Remote native Agent compatibility is unavailable.".into())
+            })?;
+        if !fact.available {
+            return Err(AppError::InvalidInput(
+                match fact.unavailable_reason.as_deref() {
+                    Some(REASON_NATIVE_AGENT_INCOMPATIBLE) => {
+                        "Remote native Agent capability is incompatible."
+                    }
+                    _ => "Remote native Agent compatibility is unavailable.",
+                }
+                .into(),
+            ));
+        }
+        if fact.effect != NATIVE_AGENT_EFFECT
+            || required.iter().any(|protocol| {
+                !fact
+                    .supported_protocols
+                    .iter()
+                    .any(|known| known == protocol)
+            })
+        {
+            return Err(AppError::InvalidInput(
+                "Remote native Agent protocol is incompatible.".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -374,6 +470,14 @@ pub(crate) fn validate_projection(projection: &PeerCapabilityProjection) -> AppR
                 .any(|media| !media.contains('/'))
             || capability.effect.is_empty()
             || capability.effect.len() > 128
+            || capability.supported_protocols.len() > 8
+            || capability.supported_protocols.iter().any(|protocol| {
+                protocol.is_empty()
+                    || protocol.len() > 128
+                    || !protocol.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            })
             || match (capability.available, capability.unavailable_reason.as_ref()) {
                 (true, None) => false,
                 (false, Some(reason)) if !reason.is_empty() && reason.len() <= 128 => false,
@@ -473,6 +577,7 @@ mod tests {
             available: false,
             accepted_input_media_types: vec!["text/plain".into()],
             effect: "future_agent_owned_effect".into(),
+            supported_protocols: Vec::new(),
             unavailable_reason: Some("agent_not_installed".into()),
         });
         assert!(validate_projection(&projection).is_ok());
@@ -481,6 +586,53 @@ mod tests {
             .observe("room", "peer", "observation", projection, 10)
             .unwrap();
         store.purge_room("room");
+    }
+
+    #[test]
+    fn native_agent_compatibility_requires_exact_protocols_without_granting_authority() {
+        let mut compatible = local_projection("peer".into(), 10);
+        compatible.capabilities.push(native_agent_capability_fact(
+            crate::native_agent::NativeAgentCapabilityStateV1::Available,
+        ));
+        assert!(compatible
+            .require_native_agent_protocols(
+                &crate::native_agent::NATIVE_AGENT_COMPATIBILITY_PROTOCOLS
+            )
+            .is_ok());
+        assert!(compatible
+            .require_native_agent_protocols(&[
+                crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA,
+                "other"
+            ])
+            .is_err());
+
+        let mut incompatible = local_projection("peer".into(), 10);
+        incompatible.capabilities.push(native_agent_capability_fact(
+            crate::native_agent::NativeAgentCapabilityStateV1::Incompatible,
+        ));
+        assert!(incompatible
+            .require_native_agent_protocols(
+                &crate::native_agent::NATIVE_AGENT_COMPATIBILITY_PROTOCOLS
+            )
+            .is_err());
+        // The fact remains only an observation: this module exposes no Plan,
+        // Transfer, Host-selection, or execution grant API.
+        assert!(validate_projection(&compatible).is_ok());
+    }
+
+    #[test]
+    fn native_agent_compatibility_observation_is_bound_to_the_current_session() {
+        let mut projection = local_projection("old-session".into(), 10);
+        projection.capabilities.push(native_agent_capability_fact(
+            crate::native_agent::NativeAgentCapabilityStateV1::Available,
+        ));
+        let mut store = PeerCapabilityStore::default();
+        store
+            .observe("room", "old-session", "old-route", projection, 10)
+            .unwrap();
+        assert!(store
+            .projection("room", "new-session", "new-route")
+            .is_none());
     }
 
     #[test]
