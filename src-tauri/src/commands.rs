@@ -987,33 +987,44 @@ pub async fn cancel_remote_native_agent_task(
         .lock()
         .cancel_remote_task(&task_id, target.as_str())
         .map_err(|error| error.message())?;
-    let context = crate::room_control::room_control_session_context_for_peer(
-        &state,
-        &room_id,
-        &peer_session_id,
-    )
-    .map_err(|error| error.message())?;
-    let cancel = crate::native_agent::NativeAgentCancelV1 {
-        schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
-        task_id,
-        target_host_ref: target.as_str().into(),
-    };
-    let event = crate::room_control::native_agent_event(
-        "native_agent.cancel",
-        serde_json::to_value(cancel).map_err(|error| error.to_string())?,
-        &context,
-    )
-    .map_err(|error| error.message())?;
-    let _ = crate::room_control::send_room_control_event(
-        state.inner().clone(),
-        &room_id,
-        event,
-        Some(crate::room_control::selected_peer_route(
+    let delivery = async {
+        let context = crate::room_control::room_control_session_context_for_peer(
+            &state,
             &room_id,
             &peer_session_id,
-        )),
-    )
+        )
+        .map_err(|error| error.message())?;
+        let cancel = crate::native_agent::NativeAgentCancelV1 {
+            schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: task_id.clone(),
+            target_host_ref: target.as_str().into(),
+        };
+        let event = crate::room_control::native_agent_event(
+            "native_agent.cancel",
+            serde_json::to_value(cancel).map_err(|error| error.to_string())?,
+            &context,
+        )
+        .map_err(|error| error.message())?;
+        crate::room_control::send_room_control_event(
+            state.inner().clone(),
+            &room_id,
+            event,
+            Some(crate::room_control::selected_peer_route(
+                &room_id,
+                &peer_session_id,
+            )),
+        )
+        .await
+        .map_err(|error| error.message())
+    }
     .await;
+    if delivery.is_err() {
+        return state
+            .native_agents
+            .lock()
+            .mark_remote_cancel_delivery_uncertain(&task_id)
+            .map_err(|error| error.message());
+    }
     Ok(local)
 }
 
