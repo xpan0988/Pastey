@@ -1937,7 +1937,10 @@ impl NativeAgentServiceV1 {
             task.state,
             NativeAgentTaskStateV1::Queued | NativeAgentTaskStateV1::Running
         ) || (task.state == NativeAgentTaskStateV1::Interrupted
-            && task.code.as_deref() == Some("native_agent_reconciliation_required"))
+            && matches!(
+                task.code.as_deref(),
+                Some("native_agent_reconciliation_required") | Some("native_agent_outcome_unknown")
+            ))
         {
             task.state = NativeAgentTaskStateV1::Cancelled;
             task.code = Some("native_agent_cancel_requested".into());
@@ -2052,31 +2055,40 @@ impl NativeAgentServiceV1 {
         if !native_execution_needs_cancellation {
             return Ok(status);
         }
-        let interrupt = self
+        let termination_path = self
             .codex_sessions
             .get(&workspace)
             .map(|session| session.controller.cancel_owned_turn_or_session())
             .unwrap_or_else(|| invalid("Native Agent session is unavailable."));
-        if interrupt.is_err() {
-            let status = {
-                let mut tasks = self.tasks.lock().map_err(|_| {
-                    AppError::InvalidInput("Native Agent task store is unavailable.".into())
-                })?;
-                let task = tasks.get_mut(task_id).ok_or_else(|| {
-                    AppError::InvalidInput("Native Agent task is unavailable.".into())
-                })?;
-                // The task remains cancelled even when delivery of its native
-                // interrupt is uncertain; workspace occupancy remains until
-                // the observer actually exits.
-                task.code = Some("native_agent_cancel_delivery_uncertain".into());
-                task.clone()
-            };
-            self.cancel_matching_workspace_movement(
-                task_id,
-                status.code.as_deref().unwrap_or("native_agent_cancelled"),
-            );
-            self.persist_envelope(task_id, None)?;
-            return Ok(status);
+        let terminate_session = match termination_path {
+            Ok(terminate_session) => terminate_session,
+            Err(_) => {
+                let status = {
+                    let mut tasks = self.tasks.lock().map_err(|_| {
+                        AppError::InvalidInput("Native Agent task store is unavailable.".into())
+                    })?;
+                    let task = tasks.get_mut(task_id).ok_or_else(|| {
+                        AppError::InvalidInput("Native Agent task is unavailable.".into())
+                    })?;
+                    // The task remains cancelled even when delivery of its native
+                    // interrupt is uncertain; workspace occupancy remains until
+                    // the observer actually exits.
+                    task.code = Some("native_agent_cancel_delivery_uncertain".into());
+                    task.clone()
+                };
+                self.cancel_matching_workspace_movement(
+                    task_id,
+                    status.code.as_deref().unwrap_or("native_agent_cancelled"),
+                );
+                self.persist_envelope(task_id, None)?;
+                return Ok(status);
+            }
+        };
+        if terminate_session {
+            // The observer retains its Arc long enough to see the terminated
+            // app-server channel and release occupancy, but this service must
+            // never offer that dead controller to a later task.
+            self.codex_sessions.remove(&workspace);
         }
         Ok(status)
     }
@@ -3124,7 +3136,7 @@ impl CodexAppServerV1 {
     /// `turn/interrupt` is not available, so terminate this Host-private
     /// app-server/session instead. This is never automatic: ordinary unknown
     /// outcome handling keeps observing and retains workspace occupancy.
-    fn cancel_owned_turn_or_session(&self) -> AppResult<()> {
+    fn cancel_owned_turn_or_session(&self) -> AppResult<bool> {
         self.interrupt_requested.store(true, Ordering::Release);
         let has_exact_turn = self
             .active_turn
@@ -3132,10 +3144,11 @@ impl CodexAppServerV1 {
             .map_err(|_| AppError::InvalidInput("Codex session state is unavailable.".into()))?
             .is_some();
         if has_exact_turn {
-            return self.send_active_interrupt_if_requested();
+            self.send_active_interrupt_if_requested()?;
+            return Ok(false);
         }
         self.shutdown();
-        Ok(())
+        Ok(true)
     }
 
     fn send_active_interrupt_if_requested(&self) -> AppResult<()> {
@@ -3609,6 +3622,7 @@ exit 1
     #[test]
     fn explicit_cancel_terminates_an_uncertain_turn_start_and_releases_its_workspace() {
         let (root, workspace, agent) = fixture_with_turn_start_behavior("");
+        let (fresh_root, _, fresh_agent) = fixture();
         let mut service = NativeAgentServiceV1::default();
         let started = service
             .start_codex_task_with_executable(&agent, &workspace, "start once")
@@ -3634,7 +3648,17 @@ exit 1
             service.task_status(&started.task_id).unwrap().state,
             NativeAgentTaskStateV1::Cancelled
         );
+        let fresh = service
+            .start_codex_task_with_executable(&fresh_agent, &workspace, "start fresh")
+            .unwrap();
+        assert!(!fresh.session_reused);
+        assert_eq!(
+            wait_for_terminal(&service, &fresh.task_id).state,
+            NativeAgentTaskStateV1::Completed
+        );
+        service.shutdown();
         let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(fresh_root);
     }
 
     #[test]
@@ -3897,7 +3921,7 @@ exit 1
     }
 
     #[test]
-    fn requester_cancellation_keeps_its_movement_cancelled_and_blocks_return_apply() {
+    fn requester_cancellation_of_unknown_outcome_keeps_its_movement_cancelled() {
         let (root, source, _) = fixture();
         fs::write(source.join("approved.txt"), b"approved baseline").unwrap();
         let returned = root.join("returned");
@@ -3915,12 +3939,26 @@ exit 1
                 true,
             )
             .unwrap();
+        {
+            let mut tasks = service.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-cancel-requester").unwrap();
+            task.state = NativeAgentTaskStateV1::Interrupted;
+            task.code = Some("native_agent_outcome_unknown".into());
+        }
         assert_eq!(
             service
                 .cancel_remote_task("task-cancel-requester", "host:remote")
                 .unwrap()
                 .state,
             NativeAgentTaskStateV1::Cancelled
+        );
+        assert_eq!(
+            service
+                .mark_remote_cancel_delivery_uncertain("task-cancel-requester")
+                .unwrap()
+                .code
+                .as_deref(),
+            Some("native_agent_cancel_delivery_uncertain")
         );
         assert_eq!(
             service
