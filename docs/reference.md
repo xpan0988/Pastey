@@ -55,12 +55,14 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 
 Native mature Agents are Host capabilities, separate from the Generic Managed Worker/provider path. The current concrete capability is Codex: `agent.coding.codex`. Its control schema is `pastey-native-agent-control-v1`; task status is `pastey-native-agent-task-v1`; and workspace-movement metadata/status uses `pastey-native-agent-workspace-movement-v1`.
 
-The Native Agent control payloads are `NativeAgentInvokeV1`, `NativeAgentStatusV1`, `NativeAgentCancelV1`, and `NativeAgentWorkspacePrepareV1`. They reject unknown fields and bind the task identity, target/executing Host, capability, workspace/task inputs, and movement correlation as appropriate. Native Agent Room Control uses protocol family `native_agent` and the following event kinds:
+The Native Agent control payloads are `NativeAgentInvokeV1`, `NativeAgentStatusV1`, `NativeAgentCancelV1`, `NativeAgentWorkspacePrepareV1`, `NativeAgentReconcileV1`, and `NativeAgentReconciliationV1`. They reject unknown fields and bind the task identity, target/executing Host, capability, workspace/task inputs, and movement correlation as appropriate. Native Agent Room Control uses protocol family `native_agent` and the following event kinds:
 
 - `native_agent.invoke`
 - `native_agent.status`
 - `native_agent.cancel`
 - `native_agent.workspace_prepare`
+- `native_agent.reconcile`
+- `native_agent.reconciliation`
 
 The renderer-visible task states are `queued`, `running`, `completed`, `failed`, `cancelled`, and `interrupted`. Workspace movement states are `review`, `awaiting_approval`, `transferring_to_agent`, `agent_running`, `returning_result`, `applying_result`, `completed`, `conflict_recovery_required`, `failed`, `cancelled`, and `interrupted`.
 
@@ -72,8 +74,11 @@ Registered Native Agent Tauri commands:
 - `start_native_codex_task`, `get_native_agent_task_status`, `cancel_native_agent_task`
 - `start_remote_native_codex_task`, `cancel_remote_native_agent_task`
 - `propose_remote_native_codex_workspace_movement`, `approve_remote_native_codex_workspace_movement`, `get_native_agent_workspace_movement_status`
+- `retry_native_agent_workspace_result_return`, `reconcile_remote_native_agent_task`
 
 For an existing remote workspace, direct invocation uses the current authenticated Room Control session and does not create a ManagedObject, Scratch, Worker, GST scan, or Transfer. When the selected local workspace must move to a remote Agent, proposal records the movement as requiring review; one approval covers prepare, encrypted outbound transfer, native task, encrypted return transfer, and unchanged-source apply. Outbound/return metadata uses `NativeAgentWorkspaceTransferV1` with `outbound` or `return` phase and is carried by the existing transfer implementation, not a new transfer primitive. The original workspace is captured as a `RegularFileSet` baseline. Before applying the return, Pastey revalidates that baseline; a changed source writes a Host-private retained result under `native-agent-conflicts` and stores its metadata in the `native_agent_conflicts` SQLite table instead of overwriting the source.
+
+`native_agent_envelopes` stores only Host-private outer task/movement correlation, phase, task status, exact result snapshot/digest, and apply fact. On startup, queued/running or otherwise unproved phases become `interrupted` with `native_agent_reconciliation_required`; Pastey never restores a Codex process, session, turn, or retry authority. A durable result snapshot keeps `returning_result` retryable through the existing encrypted Transfer. A durable completed apply is idempotent and duplicate returns do not apply again. Reused identities must retain their immutable correlation or fail closed. Reconciliation re-resolves the durable remote `HostRef` through the existing Layer 4 current-session binding; the old session binding is never accepted again, and facts disclose no private paths, credentials, session IDs, reasoning, or Agent process/tool state.
 
 Native sessions are Host-private. `NativeAgentServiceV1` keeps Codex sessions per workspace, and only an exact requested `turn/completed` notification with `status: completed` and no error is terminal success. Cancellation wins a late completion; malformed, mismatched, failed, interrupted, or unknown outcomes are non-completion. Current-session resolution, replay checks, and rate limits remain the Room Control boundary; the Native Agent path does not expose provider credentials, native session IDs, raw workspace paths, or Agent reasoning.
 

@@ -5,6 +5,8 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use serde::{Deserialize, Serialize};
+
 #[cfg(unix)]
 use std::ffi::CString;
 
@@ -40,7 +42,7 @@ const COPY_BUFFER_BYTES: usize = 64 * 1024;
 /// limit rather than a product policy surface.
 pub(crate) const MAX_REGULAR_FILE_SET_ENTRIES: usize = 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct SourceIdentity {
     pub(crate) digest: String,
     pub(crate) byte_count: u64,
@@ -49,7 +51,7 @@ pub(crate) struct SourceIdentity {
 
 /// Host-private identity for a bounded tree of regular files.  This is a
 /// representation helper, not a managed-object or authority primitive.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct RegularFileSetIdentity {
     pub(crate) files: BTreeMap<String, SourceIdentity>,
     pub(crate) digest: String,
@@ -246,7 +248,7 @@ pub(crate) fn regular_file_set_digest_from_entries<'a>(
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct SourceFingerprint {
     device: u64,
     inode: u64,
