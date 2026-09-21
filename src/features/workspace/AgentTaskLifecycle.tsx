@@ -167,6 +167,14 @@ export function useNativeAgentTask() {
   const [movement, setMovement] = useState<NativeAgentWorkspaceMovement | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const cancellableTaskId = status && (
+    ["queued", "running"].includes(status.state)
+    || (status.state === "interrupted" && status.code === "native_agent_outcome_unknown")
+  )
+    ? status.taskId
+    : movement?.state === "agent_running"
+      ? movement.taskId
+      : null;
 
   const refreshCapabilities = useCallback(async () => {
     try { setCapabilities(await listNativeAgentCapabilities()); }
@@ -228,20 +236,20 @@ export function useNativeAgentTask() {
   }, [busy, movement]);
 
   const cancel = useCallback(async () => {
-    if (!status || !["queued", "running"].includes(status.state)) return;
+    if (!cancellableTaskId) return;
     setBusy(true);
-    try { setStatus(await cancelNativeAgentTask(status.taskId)); }
+    try { setStatus(await cancelNativeAgentTask(cancellableTaskId)); }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not cancel Codex."); }
     finally { setBusy(false); }
-  }, [status]);
+  }, [cancellableTaskId]);
 
   const cancelRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string) => {
-    if (!status || !["queued", "running"].includes(status.state)) return;
+    if (!cancellableTaskId) return;
     setBusy(true);
-    try { setStatus(await cancelRemoteNativeAgentTask(roomId, peerSessionId, hostRef, status.taskId)); }
+    try { setStatus(await cancelRemoteNativeAgentTask(roomId, peerSessionId, hostRef, cancellableTaskId)); }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not cancel remote Codex."); }
     finally { setBusy(false); }
-  }, [status]);
+  }, [cancellableTaskId]);
 
   const revealConflictResult = useCallback(async () => {
     if (!movement || movement.state !== "conflict_recovery_required" || busy) return;
@@ -259,7 +267,7 @@ export function useNativeAgentTask() {
     finally { setBusy(false); }
   }, [busy, movement]);
 
-  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, message, busy, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, revealConflictResult, discardConflictResult, refreshCapabilities };
+  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, message, busy, canCancel: !!cancellableTaskId, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, revealConflictResult, discardConflictResult, refreshCapabilities };
 }
 
 export function StatusBadge({ tone, children }: { tone: LifecycleTone; children: React.ReactNode }) {

@@ -972,6 +972,18 @@ impl NativeAgentServiceV1 {
                 prepared.resume,
             )
         };
+        // A cancellation may have reached this Host after workspace prepare
+        // but before the authenticated outbound landing. Its terminal outer
+        // authority prevents this landing from starting a native turn.
+        if self
+            .workspace_movements
+            .get(movement_id)
+            .is_some_and(|record| {
+                record.status.state == NativeAgentWorkspaceMovementStateV1::Cancelled
+            })
+        {
+            return self.task_status(&task_id);
+        }
         // This queued entry is only the durable pre-transfer envelope; it is
         // not proof that a native turn started. Replace it exactly once when
         // the authenticated Transfer landing is materialized.
@@ -1062,6 +1074,9 @@ impl NativeAgentServiceV1 {
         crate::safe_file_identity::RegularFileSetIdentity,
     )> {
         if let Some(record) = self.workspace_movements.get(movement_id) {
+            if record.status.state == NativeAgentWorkspaceMovementStateV1::Cancelled {
+                return invalid("Native Agent workspace movement was cancelled.");
+            }
             if let (Some(snapshot), Some(identity), Some(prepared)) = (
                 record.result_snapshot.as_ref(),
                 record.result_identity.as_ref(),
@@ -1112,6 +1127,7 @@ impl NativeAgentServiceV1 {
                     record.status.state,
                     NativeAgentWorkspaceMovementStateV1::Completed
                         | NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+                        | NativeAgentWorkspaceMovementStateV1::Cancelled
                 )
             {
                 record.status.state = NativeAgentWorkspaceMovementStateV1::ReturningResult;
@@ -1181,7 +1197,13 @@ impl NativeAgentServiceV1 {
             task.code = fact.code.clone();
         }
         drop(tasks);
-        if !cancellation_won {
+        if cancellation_won {
+            let code = self
+                .task_status(&fact.task_id)?
+                .code
+                .unwrap_or_else(|| "native_agent_cancelled".into());
+            self.cancel_matching_workspace_movement(&fact.task_id, &code);
+        } else {
             if let Some(movement_id) = fact.movement_id.as_ref() {
                 if let Some(movement) = self.workspace_movements.get_mut(movement_id) {
                     if movement.status.task_id != fact.task_id {
@@ -1232,6 +1254,9 @@ impl NativeAgentServiceV1 {
             || record.status.state == NativeAgentWorkspaceMovementStateV1::Completed
         {
             return Ok(record.status.clone());
+        }
+        if record.status.state == NativeAgentWorkspaceMovementStateV1::Cancelled {
+            return invalid("Native Agent workspace movement was cancelled.");
         }
         let source = record.source.as_ref().ok_or_else(|| {
             AppError::InvalidInput("Native Agent result return arrived at the wrong Host.".into())
@@ -1761,6 +1786,28 @@ impl NativeAgentServiceV1 {
             .ok_or_else(|| AppError::InvalidInput("Native Agent task is unavailable.".into()))
     }
 
+    /// Revokes the outer movement authority for the exact task. This says
+    /// nothing about whether the Host-private native process has stopped; its
+    /// workspace occupancy remains governed by `active_workspaces`.
+    fn cancel_matching_workspace_movement(&mut self, task_id: &str, code: &str) {
+        for record in self
+            .workspace_movements
+            .values_mut()
+            .filter(|record| record.status.task_id == task_id)
+        {
+            if !record.apply_completed
+                && !matches!(
+                    record.status.state,
+                    NativeAgentWorkspaceMovementStateV1::Completed
+                        | NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+                )
+            {
+                record.status.state = NativeAgentWorkspaceMovementStateV1::Cancelled;
+                record.status.code = Some(code.into());
+            }
+        }
+    }
+
     pub(crate) fn queue_remote_task(
         &mut self,
         task_id: &str,
@@ -1837,7 +1884,14 @@ impl NativeAgentServiceV1 {
             AppError::InvalidInput("Remote native Agent task is unavailable.".into())
         })?;
         if current.state == NativeAgentTaskStateV1::Cancelled {
-            return Ok(current.clone());
+            let status = current.clone();
+            drop(tasks);
+            self.cancel_matching_workspace_movement(
+                &remote.task_id,
+                status.code.as_deref().unwrap_or("native_agent_cancelled"),
+            );
+            self.persist_envelope(&remote.task_id, None)?;
+            return Ok(status);
         }
         tasks.insert(remote.task_id.clone(), remote.status.clone());
         if let Some(record) = self
@@ -1882,12 +1936,20 @@ impl NativeAgentServiceV1 {
         if matches!(
             task.state,
             NativeAgentTaskStateV1::Queued | NativeAgentTaskStateV1::Running
-        ) {
+        ) || (task.state == NativeAgentTaskStateV1::Interrupted
+            && task.code.as_deref() == Some("native_agent_reconciliation_required"))
+        {
             task.state = NativeAgentTaskStateV1::Cancelled;
             task.code = Some("native_agent_cancel_requested".into());
         }
         let status = task.clone();
         drop(tasks);
+        if status.state == NativeAgentTaskStateV1::Cancelled {
+            self.cancel_matching_workspace_movement(
+                task_id,
+                status.code.as_deref().unwrap_or("native_agent_cancelled"),
+            );
+        }
         self.persist_envelope(task_id, None)?;
         Ok(status)
     }
@@ -1908,6 +1970,12 @@ impl NativeAgentServiceV1 {
             }
             task.clone()
         };
+        if status.state == NativeAgentTaskStateV1::Cancelled {
+            self.cancel_matching_workspace_movement(
+                task_id,
+                status.code.as_deref().unwrap_or("native_agent_cancelled"),
+            );
+        }
         self.persist_envelope(task_id, None)?;
         Ok(status)
     }
@@ -1944,27 +2012,50 @@ impl NativeAgentServiceV1 {
             self.task_workspaces.get(task_id).cloned().ok_or_else(|| {
                 AppError::InvalidInput("Native Agent task is unavailable.".into())
             })?;
-        let status = {
+        let owns_active_workspace = self
+            .active_workspaces
+            .lock()
+            .map_err(|_| {
+                AppError::InvalidInput("Native Agent session store is unavailable.".into())
+            })?
+            .get(&workspace)
+            .is_some_and(|owner| owner == task_id);
+        let (status, native_execution_needs_cancellation) = {
             let mut tasks = self.tasks.lock().map_err(|_| {
                 AppError::InvalidInput("Native Agent task store is unavailable.".into())
             })?;
             let task = tasks.get_mut(task_id).ok_or_else(|| {
                 AppError::InvalidInput("Native Agent task is unavailable.".into())
             })?;
-            if task.state != NativeAgentTaskStateV1::Running {
+            let uncertain_active_turn = task.state == NativeAgentTaskStateV1::Interrupted
+                && task.code.as_deref() == Some("native_agent_outcome_unknown")
+                && owns_active_workspace;
+            if !matches!(
+                task.state,
+                NativeAgentTaskStateV1::Queued | NativeAgentTaskStateV1::Running
+            ) && !uncertain_active_turn
+            {
                 return Ok(task.clone());
             }
             // Revoke Pastey's execution/result authority before attempting a
             // fallible native interrupt. This is not proof the process ended.
+            let native_execution_needs_cancellation = task.state != NativeAgentTaskStateV1::Queued;
             task.state = NativeAgentTaskStateV1::Cancelled;
             task.code = Some("native_agent_cancel_requested".into());
-            task.clone()
+            (task.clone(), native_execution_needs_cancellation)
         };
+        self.cancel_matching_workspace_movement(
+            task_id,
+            status.code.as_deref().unwrap_or("native_agent_cancelled"),
+        );
         self.persist_envelope(task_id, None)?;
+        if !native_execution_needs_cancellation {
+            return Ok(status);
+        }
         let interrupt = self
             .codex_sessions
             .get(&workspace)
-            .map(|session| session.controller.interrupt())
+            .map(|session| session.controller.cancel_owned_turn_or_session())
             .unwrap_or_else(|| invalid("Native Agent session is unavailable."));
         if interrupt.is_err() {
             let status = {
@@ -1980,6 +2071,10 @@ impl NativeAgentServiceV1 {
                 task.code = Some("native_agent_cancel_delivery_uncertain".into());
                 task.clone()
             };
+            self.cancel_matching_workspace_movement(
+                task_id,
+                status.code.as_deref().unwrap_or("native_agent_cancelled"),
+            );
             self.persist_envelope(task_id, None)?;
             return Ok(status);
         }
@@ -3024,6 +3119,25 @@ impl CodexAppServerV1 {
         self.send_active_interrupt_if_requested()
     }
 
+    /// Explicit user cancellation may arrive after `turn/start` was accepted
+    /// but before Pastey obtained its exact turn identity. In that one case,
+    /// `turn/interrupt` is not available, so terminate this Host-private
+    /// app-server/session instead. This is never automatic: ordinary unknown
+    /// outcome handling keeps observing and retains workspace occupancy.
+    fn cancel_owned_turn_or_session(&self) -> AppResult<()> {
+        self.interrupt_requested.store(true, Ordering::Release);
+        let has_exact_turn = self
+            .active_turn
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Codex session state is unavailable.".into()))?
+            .is_some();
+        if has_exact_turn {
+            return self.send_active_interrupt_if_requested();
+        }
+        self.shutdown();
+        Ok(())
+    }
+
     fn send_active_interrupt_if_requested(&self) -> AppResult<()> {
         if !self.interrupt_requested.load(Ordering::Acquire) {
             return Ok(());
@@ -3271,6 +3385,21 @@ exit 1
         panic!("fixture native Agent did not complete")
     }
 
+    fn wait_for_workspace_release(service: &NativeAgentServiceV1, workspace: &Path) {
+        for _ in 0..300 {
+            if !service
+                .active_workspaces
+                .lock()
+                .unwrap()
+                .contains_key(workspace)
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("fixture native Agent did not release its workspace")
+    }
+
     fn wait_for_live_terminal(
         service: &NativeAgentServiceV1,
         task_id: &str,
@@ -3478,6 +3607,37 @@ exit 1
     }
 
     #[test]
+    fn explicit_cancel_terminates_an_uncertain_turn_start_and_releases_its_workspace() {
+        let (root, workspace, agent) = fixture_with_turn_start_behavior("");
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "start once")
+            .unwrap();
+        let unknown = wait_for_terminal(&service, &started.task_id);
+        assert_eq!(unknown.state, NativeAgentTaskStateV1::Interrupted);
+        assert_eq!(
+            unknown.code.as_deref(),
+            Some("native_agent_outcome_unknown")
+        );
+        assert!(service
+            .active_workspaces
+            .lock()
+            .unwrap()
+            .contains_key(&workspace));
+
+        assert_eq!(
+            service.cancel_task(&started.task_id).unwrap().state,
+            NativeAgentTaskStateV1::Cancelled
+        );
+        wait_for_workspace_release(&service, &workspace);
+        assert_eq!(
+            service.task_status(&started.task_id).unwrap().state,
+            NativeAgentTaskStateV1::Cancelled
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn native_observation_loss_is_interrupted_unknown() {
         let (root, workspace, agent) = fixture_with_turn_start_behavior(
             "echo '{\"id\":3,\"result\":{\"turn\":{\"id\":\"native-turn\"}}}'; exit 0",
@@ -3521,6 +3681,66 @@ exit 1
         assert!(service
             .start_codex_task_with_executable(&agent, &workspace, "may start now")
             .is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancelling_workspace_task_cancels_movement_without_releasing_native_occupancy() {
+        let terminal = r#"{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"completed","error":null}}}"#;
+        let (root, workspace, agent) = fixture_with_turn_start_behavior(&format!(
+            "echo '{{\"id\":3,\"result\":{{\"turn\":{{\"id\":\"native-turn\"}}}}}}'; sleep 1; echo '{terminal}'"
+        ));
+        let mut service = NativeAgentServiceV1::default();
+        service
+            .accept_workspace_prepare(NativeAgentWorkspacePrepareV1 {
+                schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+                movement_id: "movement-cancel-host".into(),
+                task_id: "task-cancel-host".into(),
+                source_host_ref: "host:source".into(),
+                target_host_ref: "host:target".into(),
+                agent_capability: CODEX_CAPABILITY_ID.into(),
+                task: "work".into(),
+                resume: true,
+                source_object: movement_object(),
+                source_digest: "b".repeat(64),
+                source_bytes: 13,
+            })
+            .unwrap();
+        let started = service
+            .start_received_workspace_task_with_executable(
+                &agent,
+                "movement-cancel-host",
+                &workspace,
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            service.cancel_task(&started.task_id).unwrap().state,
+            NativeAgentTaskStateV1::Cancelled
+        );
+        assert_eq!(
+            service
+                .movement_status("movement-cancel-host")
+                .unwrap()
+                .state,
+            NativeAgentWorkspaceMovementStateV1::Cancelled
+        );
+        assert!(service
+            .start_codex_task_with_executable(&agent, &workspace, "must not overlap")
+            .is_err());
+        thread::sleep(Duration::from_millis(1100));
+        assert_eq!(
+            service.task_status(&started.task_id).unwrap().state,
+            NativeAgentTaskStateV1::Cancelled
+        );
+        assert_eq!(
+            service
+                .movement_status("movement-cancel-host")
+                .unwrap()
+                .state,
+            NativeAgentWorkspaceMovementStateV1::Cancelled
+        );
+        wait_for_workspace_release(&service, &workspace);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3674,6 +3894,111 @@ exit 1
             service.task_status("request-1").unwrap().state,
             NativeAgentTaskStateV1::Cancelled
         );
+    }
+
+    #[test]
+    fn requester_cancellation_keeps_its_movement_cancelled_and_blocks_return_apply() {
+        let (root, source, _) = fixture();
+        fs::write(source.join("approved.txt"), b"approved baseline").unwrap();
+        let returned = root.join("returned");
+        fs::create_dir(&returned).unwrap();
+        fs::write(returned.join("native.txt"), b"native result").unwrap();
+        let mut service = NativeAgentServiceV1::default();
+        service
+            .propose_workspace_movement(
+                "movement-cancel-requester",
+                "task-cancel-requester",
+                &source,
+                "host:remote",
+                movement_object(),
+                "work",
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            service
+                .cancel_remote_task("task-cancel-requester", "host:remote")
+                .unwrap()
+                .state,
+            NativeAgentTaskStateV1::Cancelled
+        );
+        assert_eq!(
+            service
+                .movement_status("movement-cancel-requester")
+                .unwrap()
+                .state,
+            NativeAgentWorkspaceMovementStateV1::Cancelled
+        );
+
+        let completed = NativeAgentTaskStatusV1 {
+            schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
+            task_id: "task-cancel-requester".into(),
+            agent_id: CODEX_CAPABILITY_ID.into(),
+            workspace_name: "workspace".into(),
+            session_reused: true,
+            state: NativeAgentTaskStateV1::Completed,
+            result: Some("late result".into()),
+            code: None,
+        };
+        assert_eq!(
+            service
+                .record_remote_status(NativeAgentStatusV1 {
+                    schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                    task_id: "task-cancel-requester".into(),
+                    executing_host_ref: "host:remote".into(),
+                    status: completed,
+                })
+                .unwrap()
+                .state,
+            NativeAgentTaskStateV1::Cancelled
+        );
+        service
+            .record_remote_reconciliation(NativeAgentReconciliationV1 {
+                schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                task_id: "task-cancel-requester".into(),
+                movement_id: Some("movement-cancel-requester".into()),
+                executing_host_ref: "host:remote".into(),
+                task_state: NativeAgentTaskStateV1::Completed,
+                movement_state: Some(NativeAgentWorkspaceMovementStateV1::ReturningResult),
+                result_digest: Some("c".repeat(64)),
+                apply_completed: false,
+                code: None,
+            })
+            .unwrap();
+        assert_eq!(
+            service
+                .movement_status("movement-cancel-requester")
+                .unwrap()
+                .state,
+            NativeAgentWorkspaceMovementStateV1::Cancelled
+        );
+
+        let return_metadata = NativeAgentWorkspaceTransferV1 {
+            schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+            movement_id: "movement-cancel-requester".into(),
+            task_id: "task-cancel-requester".into(),
+            phase: NativeAgentWorkspaceTransferPhaseV1::Return,
+            bridge_id: "room".into(),
+            source_host_ref: "host:remote".into(),
+            destination_host_ref: "host:source".into(),
+            object: movement_object(),
+            content_digest: "c".repeat(64),
+            logical_byte_count: 0,
+        };
+        assert!(service
+            .validate_workspace_transfer(&return_metadata, "host:source")
+            .is_err());
+        assert!(service
+            .apply_received_workspace_return("movement-cancel-requester", &returned)
+            .is_err());
+        assert_eq!(
+            service
+                .movement_status("movement-cancel-requester")
+                .unwrap()
+                .state,
+            NativeAgentWorkspaceMovementStateV1::Cancelled
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
