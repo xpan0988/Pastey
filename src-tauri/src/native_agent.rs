@@ -302,6 +302,7 @@ impl NativeAgentServiceV1 {
         let Some(paths) = self.durable_paths.clone() else {
             return Ok(());
         };
+        let mut pending_conflict_discards = Vec::new();
         for stored in crate::storage::list_native_agent_envelopes(&paths)? {
             let mut persisted: PersistedNativeAgentEnvelopeV1 =
                 serde_json::from_str(&stored.record_json).map_err(AppError::from)?;
@@ -381,6 +382,11 @@ impl NativeAgentServiceV1 {
                 }
                 self.workspace_movements
                     .insert(movement.status.movement_id.clone(), movement.clone());
+                if movement.status.state == NativeAgentWorkspaceMovementStateV1::Cancelled
+                    && movement.status.code.as_deref() == Some("conflict_result_discard_pending")
+                {
+                    pending_conflict_discards.push(movement.status.movement_id.clone());
+                }
             }
             self.task_workspaces.extend(
                 persisted
@@ -405,6 +411,12 @@ impl NativeAgentServiceV1 {
             if changed {
                 self.persist_envelope(&persisted.task.task_id, persisted.task_digest.as_deref())?;
             }
+        }
+        for movement_id in pending_conflict_discards {
+            // The cancellation marker was durable before any retained-result
+            // deletion. On restart, finish only this Host-private cleanup;
+            // never contact the Agent or source workspace.
+            let _ = self.finish_pending_conflict_discard(&movement_id);
         }
         Ok(())
     }
@@ -1331,62 +1343,124 @@ impl NativeAgentServiceV1 {
         let paths = self.durable_paths.clone().ok_or_else(|| {
             AppError::InvalidInput("Native Agent conflict persistence is unavailable.".into())
         })?;
-        let (task_id, already_discarded) = {
+        let (task_id, was_pending, prior_code) = {
             let movement = self.workspace_movements.get(movement_id).ok_or_else(|| {
                 AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
             })?;
+            if movement.status.state == NativeAgentWorkspaceMovementStateV1::Cancelled
+                && movement.status.code.as_deref() == Some("conflict_result_discarded")
+            {
+                return Ok(movement.status.clone());
+            }
             (
                 movement.status.task_id.clone(),
                 movement.status.state == NativeAgentWorkspaceMovementStateV1::Cancelled
-                    && movement.status.code.as_deref() == Some("conflict_result_discarded"),
+                    && movement.status.code.as_deref() == Some("conflict_result_discard_pending"),
+                movement.status.code.clone(),
             )
         };
-        if already_discarded {
-            return self.movement_status(movement_id);
-        }
-        let conflict = crate::storage::get_native_agent_conflict(&paths, movement_id)?;
-        if let Some(conflict) = conflict {
-            if conflict.task_id != task_id {
+        if !was_pending {
+            let movement = self
+                .workspace_movements
+                .get(movement_id)
+                .expect("checked above");
+            if movement.status.state
+                != NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+            {
+                return invalid("Native Agent conflict result is not available for discard.");
+            }
+            let result = movement.result_identity.as_ref().ok_or_else(|| {
+                AppError::InvalidInput("Native Agent conflict result is unavailable.".into())
+            })?;
+            let conflict = crate::storage::get_native_agent_conflict(&paths, movement_id)?
+                .ok_or_else(|| {
+                    AppError::InvalidInput(
+                        "Native Agent retained conflict result is unavailable.".into(),
+                    )
+                })?;
+            if conflict.task_id != task_id
+                || conflict.result_digest != result.digest
+                || conflict.result_byte_count != result.byte_count
+            {
                 return invalid("Native Agent retained conflict correlation is invalid.");
             }
-            if conflict.retained_tree.exists() {
-                let retained = validate_retained_conflict(&paths, &conflict)?;
-                let container = retained.parent().ok_or_else(|| {
-                    AppError::InvalidInput(
-                        "Native Agent retained conflict container is unavailable.".into(),
-                    )
-                })?;
-                let root = fs::canonicalize(conflict_root(&paths)).map_err(|_| {
-                    AppError::InvalidInput("Native Agent conflict root is unavailable.".into())
-                })?;
-                let container = fs::canonicalize(container).map_err(|_| {
-                    AppError::InvalidInput(
-                        "Native Agent retained conflict container is unavailable.".into(),
-                    )
-                })?;
-                if !container.starts_with(&root) || container.parent() != Some(root.as_path()) {
-                    return invalid(
-                        "Native Agent retained conflict container is outside its private root.",
-                    );
-                }
-                fs::remove_dir_all(&container)?;
+            // Eligibility is proved before the durable pending marker. Later
+            // retries accept a missing tree only because this exact marker
+            // records that deletion may already have completed.
+            validate_retained_conflict(&paths, &conflict)?;
+            {
+                let movement = self
+                    .workspace_movements
+                    .get_mut(movement_id)
+                    .expect("checked above");
+                movement.status.state = NativeAgentWorkspaceMovementStateV1::Cancelled;
+                movement.status.code = Some("conflict_result_discard_pending".into());
             }
+            if let Err(error) = self.persist_envelope(&task_id, None) {
+                let movement = self
+                    .workspace_movements
+                    .get_mut(movement_id)
+                    .expect("checked above");
+                movement.status.state =
+                    NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired;
+                movement.status.code = prior_code;
+                return Err(error);
+            }
+        }
+        self.finish_pending_conflict_discard(movement_id)
+    }
+
+    /// Completes only a cancellation whose pending marker was already durable.
+    /// This is deliberately not a movement transition framework: it is the
+    /// recoverable consequence of one explicit retained-result discard.
+    fn finish_pending_conflict_discard(
+        &mut self,
+        movement_id: &str,
+    ) -> AppResult<NativeAgentWorkspaceMovementV1> {
+        let paths = self.durable_paths.clone().ok_or_else(|| {
+            AppError::InvalidInput("Native Agent conflict persistence is unavailable.".into())
+        })?;
+        let (task_id, result) = {
+            let movement = self.workspace_movements.get(movement_id).ok_or_else(|| {
+                AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+            })?;
+            if movement.status.state != NativeAgentWorkspaceMovementStateV1::Cancelled
+                || movement.status.code.as_deref() != Some("conflict_result_discard_pending")
+            {
+                return invalid("Native Agent conflict discard is not pending.");
+            }
+            (
+                movement.status.task_id.clone(),
+                movement.result_identity.clone().ok_or_else(|| {
+                    AppError::InvalidInput("Native Agent conflict result is unavailable.".into())
+                })?,
+            )
+        };
+        if let Some(conflict) = crate::storage::get_native_agent_conflict(&paths, movement_id)? {
+            if conflict.task_id != task_id
+                || conflict.result_digest != result.digest
+                || conflict.result_byte_count != result.byte_count
+            {
+                return invalid("Native Agent retained conflict correlation is invalid.");
+            }
+            delete_exact_retained_conflict_container(&paths, &conflict)?;
             crate::storage::delete_native_agent_conflict(&paths, movement_id)?;
         }
         let movement = self
             .workspace_movements
             .get_mut(movement_id)
             .expect("checked above");
-        if movement.status.state != NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired {
-            return invalid("Native Agent conflict result is not available for discard.");
-        }
-        movement.status.state = NativeAgentWorkspaceMovementStateV1::Cancelled;
         movement.status.code = Some("conflict_result_discarded".into());
-        let status = movement.status.clone();
-        let task_id = movement.status.task_id.clone();
         let _ = movement;
-        self.persist_envelope(&task_id, None)?;
-        Ok(status)
+        if let Err(error) = self.persist_envelope(&task_id, None) {
+            self.workspace_movements
+                .get_mut(movement_id)
+                .expect("checked above")
+                .status
+                .code = Some("conflict_result_discard_pending".into());
+            return Err(error);
+        }
+        self.movement_status(movement_id)
     }
 
     pub(crate) fn start_codex_task(
@@ -2173,6 +2247,32 @@ fn validate_retained_conflict(
         return invalid("Native Agent retained conflict result no longer matches its receipt.");
     }
     Ok(retained)
+}
+
+/// Removes only the unique app-owned container that holds one exact retained
+/// conflict tree. A missing tree is an expected restart case after the
+/// filesystem deletion completed but before its SQLite receipt was removed.
+fn delete_exact_retained_conflict_container(
+    paths: &crate::storage::AppPaths,
+    conflict: &crate::storage::StoredNativeAgentConflict,
+) -> AppResult<()> {
+    if !conflict.retained_tree.exists() {
+        return Ok(());
+    }
+    let retained = validate_retained_conflict(paths, conflict)?;
+    let container = retained.parent().ok_or_else(|| {
+        AppError::InvalidInput("Native Agent retained conflict container is unavailable.".into())
+    })?;
+    let root = fs::canonicalize(conflict_root(paths))
+        .map_err(|_| AppError::InvalidInput("Native Agent conflict root is unavailable.".into()))?;
+    let container = fs::canonicalize(container).map_err(|_| {
+        AppError::InvalidInput("Native Agent retained conflict container is unavailable.".into())
+    })?;
+    if !container.starts_with(&root) || container.parent() != Some(root.as_path()) {
+        return invalid("Native Agent retained conflict container is outside its private root.");
+    }
+    fs::remove_dir_all(&container)?;
+    Ok(())
 }
 
 fn snapshot_exact_workspace_result(
@@ -3646,6 +3746,150 @@ exit 1
         paths.ensure_directories().unwrap();
         crate::storage::init_database(&paths).unwrap();
         paths
+    }
+
+    fn durable_conflict_fixture(
+        movement_id: &str,
+        task_id: &str,
+    ) -> (
+        PathBuf,
+        crate::storage::AppPaths,
+        NativeAgentServiceV1,
+        crate::storage::StoredNativeAgentConflict,
+    ) {
+        let (root, source, _) = fixture();
+        fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+        let returned = root.join("returned");
+        fs::create_dir(&returned).unwrap();
+        fs::write(returned.join("result.txt"), b"native result").unwrap();
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        service
+            .propose_workspace_movement(
+                movement_id,
+                task_id,
+                &source,
+                "host:remote",
+                movement_object(),
+                "edit",
+                true,
+            )
+            .unwrap();
+        service
+            .workspace_movements
+            .get_mut(movement_id)
+            .unwrap()
+            .status
+            .state = NativeAgentWorkspaceMovementStateV1::ReturningResult;
+        fs::write(source.join("local-change.txt"), b"local").unwrap();
+        assert_eq!(
+            finalize_test_conflict(&mut service, &paths, movement_id, &returned).state,
+            NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+        );
+        let conflict = crate::storage::get_native_agent_conflict(&paths, movement_id)
+            .unwrap()
+            .expect("durable conflict receipt");
+        (root, paths, service, conflict)
+    }
+
+    fn mark_conflict_discard_pending(service: &mut NativeAgentServiceV1, movement_id: &str) {
+        let task_id = service
+            .workspace_movements
+            .get(movement_id)
+            .unwrap()
+            .status
+            .task_id
+            .clone();
+        let movement = service.workspace_movements.get_mut(movement_id).unwrap();
+        assert_eq!(
+            movement.status.state,
+            NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+        );
+        movement.status.state = NativeAgentWorkspaceMovementStateV1::Cancelled;
+        movement.status.code = Some("conflict_result_discard_pending".into());
+        service.persist_envelope(&task_id, None).unwrap();
+    }
+
+    fn assert_discarded(
+        service: &mut NativeAgentServiceV1,
+        paths: &crate::storage::AppPaths,
+        movement_id: &str,
+    ) {
+        if service
+            .movement_status(movement_id)
+            .unwrap()
+            .code
+            .as_deref()
+            == Some("conflict_result_discard_pending")
+        {
+            service
+                .discard_retained_conflict_result(movement_id)
+                .unwrap();
+        }
+        let status = service.movement_status(movement_id).unwrap();
+        assert_eq!(status.state, NativeAgentWorkspaceMovementStateV1::Cancelled);
+        assert_eq!(status.code.as_deref(), Some("conflict_result_discarded"));
+        assert!(
+            crate::storage::get_native_agent_conflict(paths, movement_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_ne!(status.state, NativeAgentWorkspaceMovementStateV1::Completed);
+        assert_eq!(
+            service
+                .discard_retained_conflict_result(movement_id)
+                .unwrap()
+                .code
+                .as_deref(),
+            Some("conflict_result_discarded")
+        );
+    }
+
+    #[test]
+    fn discard_restart_after_pending_marker_finishes_exact_cleanup() {
+        let (root, paths, mut before, conflict) =
+            durable_conflict_fixture("movement-discard-marker", "task-discard-marker");
+        mark_conflict_discard_pending(&mut before, "movement-discard-marker");
+        assert!(conflict.retained_tree.exists());
+
+        let mut after = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        assert_discarded(&mut after, &paths, "movement-discard-marker");
+        assert!(!conflict.retained_tree.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discard_repeat_after_filesystem_delete_finishes_sqlite_then_terminal_fact() {
+        let (root, paths, mut service, conflict) =
+            durable_conflict_fixture("movement-discard-filesystem", "task-discard-filesystem");
+        mark_conflict_discard_pending(&mut service, "movement-discard-filesystem");
+        delete_exact_retained_conflict_container(&paths, &conflict).unwrap();
+        assert!(!conflict.retained_tree.exists());
+        assert!(
+            crate::storage::get_native_agent_conflict(&paths, "movement-discard-filesystem")
+                .unwrap()
+                .is_some()
+        );
+
+        assert_discarded(&mut service, &paths, "movement-discard-filesystem");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discard_restart_after_sqlite_delete_finalizes_without_touching_other_results() {
+        let (root, paths, mut before, conflict) =
+            durable_conflict_fixture("movement-discard-sqlite", "task-discard-sqlite");
+        mark_conflict_discard_pending(&mut before, "movement-discard-sqlite");
+        delete_exact_retained_conflict_container(&paths, &conflict).unwrap();
+        assert!(
+            crate::storage::delete_native_agent_conflict(&paths, "movement-discard-sqlite")
+                .unwrap()
+        );
+
+        let mut after = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        assert_discarded(&mut after, &paths, "movement-discard-sqlite");
+        assert!(!conflict.retained_tree.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
