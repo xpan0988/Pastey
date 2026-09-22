@@ -2424,6 +2424,24 @@ impl NativeAgentServiceV1 {
                 task_id,
                 status.code.as_deref().unwrap_or("native_agent_cancelled"),
             );
+        } else if matches!(
+            status.state,
+            NativeAgentTaskStateV1::Completed | NativeAgentTaskStateV1::Failed
+        ) {
+            // The Agent's terminal fact remains unchanged. The user is only
+            // abandoning Pastey's unresolved consequence-side movement.
+            if let Some(movement) = self.workspace_movements.values_mut().find(|record| {
+                record.status.task_id == task_id
+                    && record.status.state == NativeAgentWorkspaceMovementStateV1::Interrupted
+                    && matches!(
+                        record.status.code.as_deref(),
+                        Some("conflict_result_retention_required")
+                            | Some("result_apply_interrupted")
+                    )
+            }) {
+                movement.status.state = NativeAgentWorkspaceMovementStateV1::Cancelled;
+                movement.status.code = Some("native_agent_recovery_abandoned".into());
+            }
         }
         self.persist_envelope(task_id, None)?;
         if let Some(workspace) = self.task_workspaces.get(task_id) {
@@ -5852,6 +5870,196 @@ exit 1
             .unwrap();
 
         assert!(after
+            .recovery_projection_for_bridge("room-recovery")
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn consequence_recovery_abandonment_preserves_completed_task_and_drains_next_item() {
+        for (index, code) in [
+            "result_apply_interrupted",
+            "conflict_result_retention_required",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (root, source, _) = fixture();
+            fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+            let paths = durable_paths(&root);
+            let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+            let task_id = format!("task-a-{index}");
+            let movement_id = format!("movement-a-{index}");
+            service
+                .propose_bridge_workspace_movement(
+                    "room-recovery",
+                    &movement_id,
+                    &task_id,
+                    &source,
+                    "host:remote",
+                    movement_object(),
+                    "edit",
+                    true,
+                )
+                .unwrap();
+            {
+                let mut tasks = service.tasks.lock().unwrap();
+                let task = tasks.get_mut(&task_id).unwrap();
+                task.state = NativeAgentTaskStateV1::Completed;
+                task.code = Some("native_agent_completed".into());
+                drop(tasks);
+                let movement = service.workspace_movements.get_mut(&movement_id).unwrap();
+                movement.status.state = NativeAgentWorkspaceMovementStateV1::Interrupted;
+                movement.status.code = Some(code.into());
+            }
+            service.persist_envelope(&task_id, None).unwrap();
+            let next_task_id = format!("task-b-{index}");
+            service
+                .queue_bridge_remote_task(
+                    "room-recovery",
+                    &next_task_id,
+                    "host:remote",
+                    "/remote/workspace",
+                    "next task",
+                )
+                .unwrap();
+            {
+                let mut tasks = service.tasks.lock().unwrap();
+                let task = tasks.get_mut(&next_task_id).unwrap();
+                task.state = NativeAgentTaskStateV1::Interrupted;
+                task.code = Some("native_agent_reconciliation_required".into());
+            }
+            service.persist_envelope(&next_task_id, None).unwrap();
+
+            let first = service
+                .recovery_projection_for_bridge("room-recovery")
+                .unwrap()
+                .expect("consequence movement must be projected");
+            assert_eq!(first.task.task_id, task_id);
+            assert_eq!(first.task.state, NativeAgentTaskStateV1::Completed);
+            assert_eq!(first.movement.as_ref().unwrap().code.as_deref(), Some(code));
+
+            let stopped = service
+                .stop_bridge_task_authority("room-recovery", &task_id)
+                .unwrap();
+            assert_eq!(stopped.state, NativeAgentTaskStateV1::Completed);
+            assert_eq!(
+                service.movement_status(&movement_id).unwrap().state,
+                NativeAgentWorkspaceMovementStateV1::Cancelled
+            );
+            assert_eq!(
+                service
+                    .movement_status(&movement_id)
+                    .unwrap()
+                    .code
+                    .as_deref(),
+                Some("native_agent_recovery_abandoned")
+            );
+
+            // An authoritative late execution fact cannot restore an abandoned
+            // Pastey movement or apply its result.
+            service
+                .record_bridge_remote_reconciliation(
+                    "room-recovery",
+                    NativeAgentReconciliationV1 {
+                        schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                        task_id: task_id.clone(),
+                        movement_id: Some(movement_id.clone()),
+                        executing_host_ref: "host:remote".into(),
+                        task_state: NativeAgentTaskStateV1::Completed,
+                        movement_state: Some(NativeAgentWorkspaceMovementStateV1::ReturningResult),
+                        result_digest: None,
+                        apply_completed: false,
+                        code: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                service.movement_status(&movement_id).unwrap().state,
+                NativeAgentWorkspaceMovementStateV1::Cancelled
+            );
+            drop(service);
+
+            let mut recovered = NativeAgentServiceV1::with_paths(paths).unwrap();
+            let next = recovered
+                .recovery_projection_for_bridge("room-recovery")
+                .unwrap()
+                .expect("next unresolved recovery item must become reachable after restart");
+            assert_eq!(next.task.task_id, next_task_id);
+            assert!(next.task.task_id != task_id);
+            recovered
+                .stop_bridge_task_authority("room-recovery", &next_task_id)
+                .unwrap();
+            assert!(recovered
+                .recovery_projection_for_bridge("room-recovery")
+                .unwrap()
+                .is_none());
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn outcome_unknown_reconciliation_reveals_next_bridge_recovery_item() {
+        let root =
+            std::env::temp_dir().join(format!("pastey-native-reconcile-drain-{}", Uuid::new_v4()));
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths).unwrap();
+        for (task_id, code) in [
+            ("task-a", "native_agent_outcome_unknown"),
+            ("task-b", "native_agent_reconciliation_required"),
+        ] {
+            service
+                .queue_bridge_remote_task(
+                    "room-recovery",
+                    task_id,
+                    "host:remote",
+                    "/remote/workspace",
+                    "task",
+                )
+                .unwrap();
+            {
+                let mut tasks = service.tasks.lock().unwrap();
+                let task = tasks.get_mut(task_id).unwrap();
+                task.state = NativeAgentTaskStateV1::Interrupted;
+                task.code = Some(code.into());
+            }
+            service.persist_envelope(task_id, None).unwrap();
+        }
+        assert_eq!(
+            service
+                .recovery_projection_for_bridge("room-recovery")
+                .unwrap()
+                .unwrap()
+                .task
+                .task_id,
+            "task-a"
+        );
+        service
+            .record_bridge_remote_reconciliation(
+                "room-recovery",
+                NativeAgentReconciliationV1 {
+                    schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                    task_id: "task-a".into(),
+                    movement_id: None,
+                    executing_host_ref: "host:remote".into(),
+                    task_state: NativeAgentTaskStateV1::Completed,
+                    movement_state: None,
+                    result_digest: None,
+                    apply_completed: false,
+                    code: None,
+                },
+            )
+            .unwrap();
+        let next = service
+            .recovery_projection_for_bridge("room-recovery")
+            .unwrap()
+            .expect("resolved unknown outcome must drain to the next item");
+        assert_eq!(next.task.task_id, "task-b");
+        service
+            .stop_bridge_task_authority("room-recovery", "task-b")
+            .unwrap();
+        assert!(service
             .recovery_projection_for_bridge("room-recovery")
             .unwrap()
             .is_none());

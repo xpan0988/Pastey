@@ -65,6 +65,28 @@ export function nativeAgentInterruptedRecoveryRequiresAction(
     ].includes(movement.code ?? ""));
 }
 
+export function nativeAgentRemoteReconciliationRequired(
+  status: NativeAgentTaskStatus | null,
+  movement: NativeAgentWorkspaceMovement | null,
+): boolean {
+  return (status?.state === "interrupted"
+    && ["native_agent_reconciliation_required", "native_agent_outcome_unknown"].includes(status.code ?? ""))
+    || (movement?.state === "interrupted" && movement.code === "native_agent_reconciliation_required");
+}
+
+export function nativeAgentConsequenceAbandonmentRequired(
+  movement: NativeAgentWorkspaceMovement | null,
+): boolean {
+  return movement?.state === "interrupted"
+    && ["conflict_result_retention_required", "result_apply_interrupted"].includes(movement.code ?? "");
+}
+
+export function nativeAgentTaskNeedsObservation(status: NativeAgentTaskStatus | null): boolean {
+  return !!status && (["queued", "running"].includes(status.state)
+    || (status.state === "interrupted"
+      && ["native_agent_reconciliation_required", "native_agent_outcome_unknown"].includes(status.code ?? "")));
+}
+
 export const STATE_COPY: Record<NativeV2ProductState, { label: string; detail: string; tone: LifecycleTone }> = {
   draft: { label: "Awaiting review", detail: "The PM proposal is an immutable Draft. Nothing can execute yet.", tone: "pending" },
   approved: { label: "Awaiting Host admission", detail: "Requester approval is recorded. Participating Hosts must still admit the Plan.", tone: "pending" },
@@ -249,13 +271,11 @@ export function useNativeAgentTask(roomId: string) {
     });
   }, [loadRecoveryProjection, movement, recoveryTaskId, status]);
   useEffect(() => {
-    if (!status || !(
-      ["queued", "running"].includes(status.state)
-      || (status.state === "interrupted" && status.code === "native_agent_reconciliation_required")
-    )) return;
+    const observedStatus = status;
+    if (!observedStatus || !nativeAgentTaskNeedsObservation(observedStatus)) return;
     let cancelled = false;
     const poll = async () => {
-      try { setStatus(await getNativeAgentTaskStatus(status.taskId)); }
+      try { setStatus(await getNativeAgentTaskStatus(observedStatus.taskId)); }
       catch (error) { setMessage(error instanceof Error ? error.message : "Pastey lost the native Agent task outcome."); }
       if (!cancelled) window.setTimeout(() => void poll(), 1_000);
     };
@@ -354,7 +374,7 @@ export function useNativeAgentTask(roomId: string) {
       setStatus(await stopBridgeNativeAgentTask(roomId, status.taskId));
       if (movement) setMovement(await getNativeAgentWorkspaceMovementStatus(movement.movementId));
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not stop the unresolved remote task.");
+      setMessage(error instanceof Error ? error.message : "Pastey could not abandon the unresolved recovery.");
     } finally { setBusy(false); }
   }, [busy, movement, roomId, status]);
 

@@ -11,6 +11,9 @@ import {
   nativeAgentInterruptedRecoveryRequiresAction,
   nativeAgentMovementBlocksNewRun,
   nativeAgentRecoveryRequiresAction,
+  nativeAgentRemoteReconciliationRequired,
+  nativeAgentConsequenceAbandonmentRequired,
+  nativeAgentTaskNeedsObservation,
 } from "../src/features/workspace/AgentTaskLifecycle";
 import type { FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../src/lib/types";
 
@@ -281,7 +284,10 @@ test("Native Agent recovery uses the existing card with durable refresh and expl
   assert.match(card, /Pastey will not reuse this workspace until the task is reconciled or explicitly stopped/);
   assert.match(card, />Reconcile</);
   assert.match(card, />Stop</);
+  assert.match(card, />Abandon recovery</);
   assert.match(card, />Retry result Return</);
+  assert.match(lifecycle, /nativeAgentTaskNeedsObservation\(observedStatus\)/);
+  assert.match(lifecycle, /native_agent_outcome_unknown/);
   assert.match(bindings, /invoke\("get_native_agent_recovery_projection", \{ roomId \}\)/);
   const recoveryType = bindings.slice(
     bindings.indexOf("export interface NativeAgentRecoveryProjection"),
@@ -304,6 +310,9 @@ test("Native Agent recovery drains only after the current item no longer require
   assert.equal(nativeAgentRecoveryRequiresAction(task, null), true);
   assert.equal(nativeAgentInterruptedRecoveryRequiresAction(task, null), true);
   assert.equal(nativeAgentInterruptedRecoveryRequiresAction({ ...task, code: "native_agent_outcome_unknown" }, null), true);
+  assert.equal(nativeAgentRemoteReconciliationRequired({ ...task, code: "native_agent_outcome_unknown" }, null), true);
+  assert.equal(nativeAgentTaskNeedsObservation({ ...task, code: "native_agent_outcome_unknown" }), true);
+  assert.equal(nativeAgentTaskNeedsObservation({ ...task, state: "completed", code: null }), false);
   assert.equal(nativeAgentRecoveryRequiresAction({ ...task, state: "cancelled", code: "native_agent_cancel_requested" }, null), false);
   assert.equal(nativeAgentInterruptedRecoveryRequiresAction(null, {
     schemaVersion: "pastey-native-agent-workspace-movement-v1",
@@ -316,6 +325,19 @@ test("Native Agent recovery drains only after the current item no longer require
     state: "interrupted",
     code: "result_apply_interrupted",
   }), true);
+  const applyInterrupted = {
+    schemaVersion: "pastey-native-agent-workspace-movement-v1" as const,
+    movementId: "movement-apply",
+    taskId: "task-apply",
+    agentId: "agent.coding.codex",
+    sourceWorkspaceName: "workspace-apply",
+    targetHostRef: "host:remote",
+    reviewSummary: "Review",
+    state: "interrupted" as const,
+    code: "result_apply_interrupted",
+  };
+  assert.equal(nativeAgentRemoteReconciliationRequired(null, applyInterrupted), false);
+  assert.equal(nativeAgentConsequenceAbandonmentRequired(applyInterrupted), true);
   assert.equal(nativeAgentRecoveryRequiresAction(null, {
     schemaVersion: "pastey-native-agent-workspace-movement-v1",
     movementId: "movement-two",
