@@ -941,8 +941,11 @@ mod tests {
         std::fs::create_dir_all(&scope).unwrap();
         let path = scope.join("input.txt");
         std::fs::write(&path, b"managed input").unwrap();
+        let paths = AppPaths::new(root.clone(), root.join("logs"));
+        paths.ensure_directories().unwrap();
+        storage::init_database(&paths).unwrap();
         let runtime = HostRuntime::new(
-            AppPaths::new(root.clone(), root.join("logs")),
+            paths,
             test_config(),
             Arc::new(RecordingEventSink::default()),
             Arc::new(RecordingTaskSpawner::default()),

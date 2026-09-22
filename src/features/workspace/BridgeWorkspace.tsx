@@ -8,7 +8,7 @@ import type { TransferQueueInput, TransferQueueItem } from "../../lib/transferSc
 import type { RoomInfo, RoomItem } from "../../lib/types";
 import type { DeveloperModeUiSession, DeveloperTerminalWorkspace } from "../../lib/types";
 import type { AgentTaskController } from "./AgentTaskLifecycle";
-import { nativeAgentMovementBlocksNewRun, StatusBadge, useNativeAgentTask } from "./AgentTaskLifecycle";
+import { nativeAgentInterruptedRecoveryRequiresAction, nativeAgentMovementBlocksNewRun, StatusBadge, useNativeAgentTask } from "./AgentTaskLifecycle";
 import { DeveloperModeScreen } from "./DeveloperModeScreen";
 import { bridgeCode, bridgeDeviceCount, fileName, formatBytes, formatClock, roomPeers } from "./workspaceViewModel";
 
@@ -239,8 +239,7 @@ function NativeAgentTaskCard({ roomId, peers }: { roomId: string; peers: ReturnT
   const remote = peers.find((peer) => peer.peerSessionId === target) ?? null;
   const running = agent.status?.state === "running" || agent.status?.state === "queued";
   const movementBlocksNewRun = nativeAgentMovementBlocksNewRun(agent.movement);
-  const reconciliationRequired = agent.status?.code === "native_agent_reconciliation_required"
-    || agent.movement?.code === "native_agent_reconciliation_required";
+  const reconciliationRequired = nativeAgentInterruptedRecoveryRequiresAction(agent.status, agent.movement);
   const resultReturnRetryRequired = agent.movement?.code === "result_return_retry_required";
   return <div className="v2-task-open">
     <strong>Run with Codex</strong>

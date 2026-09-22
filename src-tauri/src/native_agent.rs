@@ -2509,18 +2509,18 @@ impl NativeAgentServiceV1 {
     }
 
     pub(crate) fn cancel_task(&mut self, task_id: &str) -> AppResult<NativeAgentTaskStatusV1> {
-        let workspace =
-            self.task_workspaces.get(task_id).cloned().ok_or_else(|| {
-                AppError::InvalidInput("Native Agent task is unavailable.".into())
-            })?;
-        let owns_active_workspace = self
-            .active_workspaces
-            .lock()
-            .map_err(|_| {
-                AppError::InvalidInput("Native Agent session store is unavailable.".into())
-            })?
-            .get(&workspace)
-            .is_some_and(|owner| owner == task_id);
+        let workspace = self.task_workspaces.get(task_id).cloned();
+        let owns_active_workspace = match workspace.as_ref() {
+            Some(workspace) => self
+                .active_workspaces
+                .lock()
+                .map_err(|_| {
+                    AppError::InvalidInput("Native Agent session store is unavailable.".into())
+                })?
+                .get(workspace)
+                .is_some_and(|owner| owner == task_id),
+            None => false,
+        };
         let (status, native_execution_needs_cancellation) = {
             let mut tasks = self.tasks.lock().map_err(|_| {
                 AppError::InvalidInput("Native Agent task store is unavailable.".into())
@@ -2553,6 +2553,9 @@ impl NativeAgentServiceV1 {
         if !native_execution_needs_cancellation {
             return Ok(status);
         }
+        let workspace = workspace.ok_or_else(|| {
+            AppError::InvalidInput("Native Agent task workspace is unavailable.".into())
+        })?;
         let termination_path = self
             .codex_sessions
             .get(&workspace)
@@ -5795,6 +5798,126 @@ exit 1
                 "leaked private field: {private}"
             );
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_projection_drains_every_unresolved_bridge_task() {
+        let root =
+            std::env::temp_dir().join(format!("pastey-native-recovery-drain-{}", Uuid::new_v4()));
+        let paths = durable_paths(&root);
+        let mut before = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        for task_id in ["task-a", "task-b"] {
+            before
+                .queue_bridge_remote_task(
+                    "room-recovery",
+                    task_id,
+                    "host:remote",
+                    &format!("/private/{task_id}"),
+                    "private task instructions",
+                )
+                .unwrap();
+        }
+        before
+            .queue_bridge_remote_task(
+                "room-recovery",
+                "task-terminal-history",
+                "host:remote",
+                "/private/history",
+                "already terminal",
+            )
+            .unwrap();
+        before
+            .cancel_remote_task("task-terminal-history", "host:remote")
+            .unwrap();
+
+        let mut after = NativeAgentServiceV1::with_paths(paths).unwrap();
+        let first = after
+            .recovery_projection_for_bridge("room-recovery")
+            .unwrap()
+            .expect("first unresolved task must be reachable");
+        assert_eq!(first.task.task_id, "task-a");
+        after
+            .stop_bridge_task_authority("room-recovery", &first.task.task_id)
+            .unwrap();
+
+        let second = after
+            .recovery_projection_for_bridge("room-recovery")
+            .unwrap()
+            .expect("next unresolved task must become reachable");
+        assert_eq!(second.task.task_id, "task-b");
+        assert_ne!(second.task.task_id, "task-terminal-history");
+        after
+            .stop_bridge_task_authority("room-recovery", &second.task.task_id)
+            .unwrap();
+
+        assert!(after
+            .recovery_projection_for_bridge("room-recovery")
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_workspace_cancel_is_idempotent_and_blocks_late_landing() {
+        let root =
+            std::env::temp_dir().join(format!("pastey-native-prepare-cancel-{}", Uuid::new_v4()));
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths).unwrap();
+        service
+            .accept_bridge_workspace_prepare(
+                "room",
+                NativeAgentWorkspacePrepareV1 {
+                    schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+                    movement_id: "movement-prepared".into(),
+                    task_id: "task-prepared".into(),
+                    source_host_ref: "host:source".into(),
+                    target_host_ref: "host:local".into(),
+                    agent_capability: CODEX_CAPABILITY_ID.into(),
+                    task: "edit".into(),
+                    resume: true,
+                    source_object: movement_object(),
+                    source_digest: "a".repeat(64),
+                    source_bytes: 0,
+                },
+            )
+            .unwrap();
+
+        let first = service.cancel_task("task-prepared").unwrap();
+        let duplicate = service.cancel_task("task-prepared").unwrap();
+        assert_eq!(first, duplicate);
+        assert_eq!(first.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(
+            service.movement_status("movement-prepared").unwrap().state,
+            NativeAgentWorkspaceMovementStateV1::Cancelled
+        );
+
+        let metadata = NativeAgentWorkspaceTransferV1 {
+            schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+            movement_id: "movement-prepared".into(),
+            task_id: "task-prepared".into(),
+            phase: NativeAgentWorkspaceTransferPhaseV1::Outbound,
+            bridge_id: "room".into(),
+            source_host_ref: "host:source".into(),
+            destination_host_ref: "host:local".into(),
+            object: movement_object(),
+            content_digest: "a".repeat(64),
+            logical_byte_count: 0,
+        };
+        assert!(service
+            .validate_workspace_transfer(&metadata, "host:local")
+            .is_err());
+        let landed = root.join("late-landing");
+        fs::create_dir_all(&landed).unwrap();
+        let late = service
+            .start_received_workspace_task_with_executable(
+                Path::new("/definitely/missing/codex"),
+                "movement-prepared",
+                &landed,
+            )
+            .unwrap();
+        assert_eq!(late.state, NativeAgentTaskStateV1::Cancelled);
+        assert!(service.active_workspaces.lock().unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
     }
 

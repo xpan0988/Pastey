@@ -7,7 +7,11 @@ import { chooseInitialBridgeId, reconcileSelectedBridgeId, visibleBridgeRooms } 
 import { ownAsyncDisposer } from "../src/lib/subscriptionLifecycle";
 import { mergeTransferEvent } from "../src/lib/transferState";
 import { uniqueNearbyDevices } from "../src/features/workspace/workspaceViewModel";
-import { nativeAgentMovementBlocksNewRun } from "../src/features/workspace/AgentTaskLifecycle";
+import {
+  nativeAgentInterruptedRecoveryRequiresAction,
+  nativeAgentMovementBlocksNewRun,
+  nativeAgentRecoveryRequiresAction,
+} from "../src/features/workspace/AgentTaskLifecycle";
 import type { FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../src/lib/types";
 
 function room(peerConnected: boolean): RoomInfo {
@@ -270,6 +274,7 @@ test("Native Agent recovery uses the existing card with durable refresh and expl
   const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
   assert.match(lifecycle, /getNativeAgentRecoveryProjection\(roomId\)/);
+  assert.match(lifecycle, /void loadRecoveryProjection\(\)/);
   assert.match(lifecycle, /getNativeAgentWorkspaceMovementStatus\(movement\.movementId\)/);
   assert.match(lifecycle, /reconcileRemoteNativeAgentTask\(roomId, recoveryTargetHostRef/);
   assert.match(lifecycle, /stopBridgeNativeAgentTask\(roomId, status\.taskId\)/);
@@ -285,4 +290,41 @@ test("Native Agent recovery uses the existing card with durable refresh and expl
   for (const privateField of ["path", "threadId", "turnId", "provider", "auth", "processId", "sessionReused"]) {
     assert.doesNotMatch(recoveryType, new RegExp(privateField, "i"));
   }
+});
+
+test("Native Agent recovery drains only after the current item no longer requires action", () => {
+  const task = {
+    schemaVersion: "pastey-native-agent-task-v1" as const,
+    taskId: "task-one",
+    agentId: "agent.coding.codex",
+    workspaceName: "workspace",
+    state: "interrupted" as const,
+    code: "native_agent_reconciliation_required",
+  };
+  assert.equal(nativeAgentRecoveryRequiresAction(task, null), true);
+  assert.equal(nativeAgentInterruptedRecoveryRequiresAction(task, null), true);
+  assert.equal(nativeAgentInterruptedRecoveryRequiresAction({ ...task, code: "native_agent_outcome_unknown" }, null), true);
+  assert.equal(nativeAgentRecoveryRequiresAction({ ...task, state: "cancelled", code: "native_agent_cancel_requested" }, null), false);
+  assert.equal(nativeAgentInterruptedRecoveryRequiresAction(null, {
+    schemaVersion: "pastey-native-agent-workspace-movement-v1",
+    movementId: "movement-apply",
+    taskId: "task-apply",
+    agentId: "agent.coding.codex",
+    sourceWorkspaceName: "workspace-apply",
+    targetHostRef: "host:remote",
+    reviewSummary: "Review",
+    state: "interrupted",
+    code: "result_apply_interrupted",
+  }), true);
+  assert.equal(nativeAgentRecoveryRequiresAction(null, {
+    schemaVersion: "pastey-native-agent-workspace-movement-v1",
+    movementId: "movement-two",
+    taskId: "task-two",
+    agentId: "agent.coding.codex",
+    sourceWorkspaceName: "workspace-two",
+    targetHostRef: "host:remote",
+    reviewSummary: "Review",
+    state: "returning_result",
+    code: "result_return_retry_required",
+  }), true);
 });

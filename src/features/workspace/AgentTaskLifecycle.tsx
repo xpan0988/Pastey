@@ -43,6 +43,28 @@ export function nativeAgentMovementBlocksNewRun(
   );
 }
 
+export function nativeAgentRecoveryRequiresAction(
+  status: NativeAgentTaskStatus | null,
+  movement: NativeAgentWorkspaceMovement | null,
+): boolean {
+  return nativeAgentInterruptedRecoveryRequiresAction(status, movement)
+    || movement?.state === "conflict_recovery_required"
+    || (movement?.state === "returning_result" && movement.code === "result_return_retry_required");
+}
+
+export function nativeAgentInterruptedRecoveryRequiresAction(
+  status: NativeAgentTaskStatus | null,
+  movement: NativeAgentWorkspaceMovement | null,
+): boolean {
+  return (status?.state === "interrupted"
+    && ["native_agent_reconciliation_required", "native_agent_outcome_unknown"].includes(status.code ?? ""))
+    || (movement?.state === "interrupted" && [
+      "native_agent_reconciliation_required",
+      "conflict_result_retention_required",
+      "result_apply_interrupted",
+    ].includes(movement.code ?? ""));
+}
+
 export const STATE_COPY: Record<NativeV2ProductState, { label: string; detail: string; tone: LifecycleTone }> = {
   draft: { label: "Awaiting review", detail: "The PM proposal is an immutable Draft. Nothing can execute yet.", tone: "pending" },
   approved: { label: "Awaiting Host admission", detail: "Requester approval is recorded. Participating Hosts must still admit the Plan.", tone: "pending" },
@@ -175,6 +197,7 @@ export function useNativeAgentTask(roomId: string) {
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [recoveryTargetHostRef, setRecoveryTargetHostRef] = useState<string | null>(null);
+  const [recoveryTaskId, setRecoveryTaskId] = useState<string | null>(null);
   const cancellableTaskId = status && (
     ["queued", "running"].includes(status.state)
     || (status.state === "interrupted" && ["native_agent_outcome_unknown", "native_agent_reconciliation_required"].includes(status.code ?? ""))
@@ -189,20 +212,42 @@ export function useNativeAgentTask(roomId: string) {
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not inspect native Agents."); }
   }, []);
 
+  const loadRecoveryProjection = useCallback(async (isCurrent: () => boolean = () => true) => {
+    const projection = await getNativeAgentRecoveryProjection(roomId);
+    if (!isCurrent()) return;
+    if (projection) {
+      setStatus(projection.task);
+      setMovement(projection.movement ?? null);
+      setRecoveryTargetHostRef(projection.targetHostRef ?? null);
+      setRecoveryTaskId(projection.task.taskId);
+    } else {
+      setStatus(null);
+      setMovement(null);
+      setRecoveryTargetHostRef(null);
+      setRecoveryTaskId(null);
+    }
+  }, [roomId]);
+
   useEffect(() => { void refreshCapabilities(); }, [refreshCapabilities]);
   useEffect(() => {
     if (!hasTauriRuntime() || !roomId) return;
     let cancelled = false;
-    void getNativeAgentRecoveryProjection(roomId).then((projection) => {
-      if (cancelled || !projection) return;
-      setStatus(projection.task);
-      setMovement(projection.movement ?? null);
-      setRecoveryTargetHostRef(projection.targetHostRef ?? null);
-    }).catch((error) => {
+    void loadRecoveryProjection(() => !cancelled).catch((error) => {
       if (!cancelled) setMessage(error instanceof Error ? error.message : "Pastey could not recover unresolved native Agent work.");
     });
     return () => { cancelled = true; };
-  }, [roomId]);
+  }, [loadRecoveryProjection, roomId]);
+  useEffect(() => {
+    if (!recoveryTaskId || status?.taskId !== recoveryTaskId
+      || nativeAgentRecoveryRequiresAction(status, movement)) return;
+    // The card remains single-item. Once its durable fact becomes terminal,
+    // immediately ask for the next unresolved Bridge-bound item until the
+    // backend reports that recovery is drained.
+    setRecoveryTaskId(null);
+    void loadRecoveryProjection().catch((error) => {
+      setMessage(error instanceof Error ? error.message : "Pastey could not load the next unresolved native Agent task.");
+    });
+  }, [loadRecoveryProjection, movement, recoveryTaskId, status]);
   useEffect(() => {
     if (!status || !(
       ["queued", "running"].includes(status.state)
