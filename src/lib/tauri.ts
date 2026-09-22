@@ -181,7 +181,7 @@ export interface NativeAgentTaskStatus {
   taskId: string;
   agentId: string;
   workspaceName: string;
-  sessionReused: boolean;
+  sessionReused?: boolean;
   state: NativeAgentTaskState;
   result?: string | null;
   code?: string | null;
@@ -202,6 +202,21 @@ export interface NativeAgentWorkspaceMovement {
   reviewSummary: string;
   state: NativeAgentWorkspaceMovementState;
   code?: string | null;
+}
+
+export interface NativeAgentRecoveryTaskStatus {
+  schemaVersion: "pastey-native-agent-task-v1";
+  taskId: string;
+  agentId: string;
+  workspaceName: string;
+  state: NativeAgentTaskState;
+  code?: string | null;
+}
+
+export interface NativeAgentRecoveryProjection {
+  task: NativeAgentRecoveryTaskStatus;
+  movement?: NativeAgentWorkspaceMovement | null;
+  targetHostRef?: string | null;
 }
 
 export function listNativeAgentCapabilities(): Promise<NativeAgentCapability[]> {
@@ -244,6 +259,24 @@ export function getNativeAgentWorkspaceMovementStatus(
   return invoke("get_native_agent_workspace_movement_status", { movementId });
 }
 
+export function getNativeAgentRecoveryProjection(
+  roomId: string,
+): Promise<NativeAgentRecoveryProjection | null> {
+  return invoke("get_native_agent_recovery_projection", { roomId });
+}
+
+export function reconcileRemoteNativeAgentTask(
+  roomId: string, targetHostRef: string, taskId: string, movementId?: string | null,
+): Promise<void> {
+  return invoke("reconcile_remote_native_agent_task", { roomId, targetHostRef, taskId, movementId });
+}
+
+export function retryNativeAgentWorkspaceResultReturn(
+  movementId: string, roomId: string,
+): Promise<NativeAgentWorkspaceMovement> {
+  return invoke("retry_native_agent_workspace_result_return", { movementId, roomId });
+}
+
 export function revealNativeAgentConflictResult(movementId: string): Promise<void> {
   return invoke("reveal_native_agent_conflict_result", { movementId });
 }
@@ -258,6 +291,12 @@ export function cancelRemoteNativeAgentTask(
   roomId: string, peerSessionId: string, targetHostRef: string, taskId: string,
 ): Promise<NativeAgentTaskStatus> {
   return invoke("cancel_remote_native_agent_task", { roomId, peerSessionId, targetHostRef, taskId });
+}
+
+export function stopBridgeNativeAgentTask(
+  roomId: string, taskId: string,
+): Promise<NativeAgentTaskStatus> {
+  return invoke("stop_bridge_native_agent_task", { roomId, taskId });
 }
 
 export interface ManagedRuntimeOption {

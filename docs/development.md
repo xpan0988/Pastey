@@ -112,7 +112,7 @@ The Native Agent path has focused Rust coverage in `native_agent`, `commands`, `
 cargo test --manifest-path src-tauri/Cargo.toml native_agent -- --nocapture
 ```
 
-These tests cover Host-native session reuse and terminal-success handling, authenticated remote task correlation and cancellation, one-review workspace movement, transfer metadata validation, source revalidation, durable conflict retention, and exact current-session Room Control handling. They are local automated evidence, not physical multi-device proof.
+These tests cover Host-native session reuse and terminal-success handling, authenticated remote task correlation and cancellation, one-review workspace movement, transfer metadata validation and final-acknowledgement ambiguity, source ownership and revalidation, restart-safe recovery projection, monotonic lifecycle/replay handling, Bridge Burn authority purge, durable conflict retention, and exact current-session Room Control handling. `npm run test:frontend-integration` additionally checks that unresolved movement blocks a new run while Reconcile, Stop, and result-Return repair stay reachable. They are local automated evidence, not physical multi-device proof.
 
 Phase 2 must define a Native Agent physical multi-device procedure before claiming movement reliability across actual devices. It must exercise a connected remote Host, explicit movement review, encrypted outbound and return transfer, stale/replaced-session rejection, interruption and restart behavior, cancellation races, replay rejection, source-change conflict retention, and recovery presentation. Keep recorded evidence non-secret: never include provider credentials, native session identifiers, Host paths, grants, ObjectRefs, or raw Agent/terminal content.
 

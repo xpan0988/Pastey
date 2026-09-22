@@ -7,6 +7,7 @@ import { chooseInitialBridgeId, reconcileSelectedBridgeId, visibleBridgeRooms } 
 import { ownAsyncDisposer } from "../src/lib/subscriptionLifecycle";
 import { mergeTransferEvent } from "../src/lib/transferState";
 import { uniqueNearbyDevices } from "../src/features/workspace/workspaceViewModel";
+import { nativeAgentMovementBlocksNewRun } from "../src/features/workspace/AgentTaskLifecycle";
 import type { FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../src/lib/types";
 
 function room(peerConnected: boolean): RoomInfo {
@@ -244,5 +245,44 @@ test("all workspace Tauri listeners use late-resolution-safe ownership", () => {
     const listenCalls = source.match(/\blisten</g)?.length ?? 0;
     const ownedCalls = source.match(/ownAsyncDisposer\(listen</g)?.length ?? 0;
     assert.equal(ownedCalls, listenCalls, path);
+  }
+});
+
+test("reconciliation-required Native Agent movement remains exclusive while ordinary interruption releases", () => {
+  const interrupted = {
+    schemaVersion: "pastey-native-agent-workspace-movement-v1" as const,
+    movementId: "movement",
+    taskId: "task",
+    agentId: "agent.coding.codex",
+    sourceWorkspaceName: "workspace",
+    targetHostRef: "host:remote",
+    reviewSummary: "Review",
+    state: "interrupted" as const,
+    code: "native_agent_reconciliation_required",
+  };
+  assert.equal(nativeAgentMovementBlocksNewRun(interrupted), true);
+  assert.equal(nativeAgentMovementBlocksNewRun({ ...interrupted, code: "outbound_transfer_failed" }), false);
+  assert.equal(nativeAgentMovementBlocksNewRun({ ...interrupted, state: "cancelled", code: null }), false);
+});
+
+test("Native Agent recovery uses the existing card with durable refresh and explicit repair actions", () => {
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  assert.match(lifecycle, /getNativeAgentRecoveryProjection\(roomId\)/);
+  assert.match(lifecycle, /getNativeAgentWorkspaceMovementStatus\(movement\.movementId\)/);
+  assert.match(lifecycle, /reconcileRemoteNativeAgentTask\(roomId, recoveryTargetHostRef/);
+  assert.match(lifecycle, /stopBridgeNativeAgentTask\(roomId, status\.taskId\)/);
+  assert.match(card, /Pastey will not reuse this workspace until the task is reconciled or explicitly stopped/);
+  assert.match(card, />Reconcile</);
+  assert.match(card, />Stop</);
+  assert.match(card, />Retry result Return</);
+  assert.match(bindings, /invoke\("get_native_agent_recovery_projection", \{ roomId \}\)/);
+  const recoveryType = bindings.slice(
+    bindings.indexOf("export interface NativeAgentRecoveryProjection"),
+    bindings.indexOf("export function listNativeAgentCapabilities"),
+  );
+  for (const privateField of ["path", "threadId", "turnId", "provider", "auth", "processId", "sessionReused"]) {
+    assert.doesNotMatch(recoveryType, new RegExp(privateField, "i"));
   }
 });
