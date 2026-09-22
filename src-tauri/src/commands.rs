@@ -894,6 +894,81 @@ fn fail_approved_native_workspace_dispatch(
     message
 }
 
+async fn revoke_prepared_native_workspace_authority(
+    state: &Arc<AppState>,
+    room_id: &str,
+    target: &crate::host_identity::HostRef,
+    task_id: &str,
+) {
+    let Ok(session) = state
+        .resolve_current_remote_host_session(room_id, target)
+        .await
+    else {
+        return;
+    };
+    let binding = session.binding().clone();
+    let Ok(context) = crate::room_control::room_control_session_context_for_peer(
+        state,
+        room_id,
+        &binding.peer_route_ref,
+    ) else {
+        return;
+    };
+    let cancel = crate::native_agent::NativeAgentCancelV1 {
+        schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+        task_id: task_id.into(),
+        target_host_ref: target.as_str().into(),
+    };
+    let Ok(payload) = serde_json::to_value(cancel) else {
+        return;
+    };
+    let Ok(event) =
+        crate::room_control::native_agent_event("native_agent.cancel", payload, &context)
+    else {
+        return;
+    };
+    let _ = crate::room_control::send_room_control_event(
+        state.clone(),
+        room_id,
+        event,
+        Some(crate::room_control::selected_peer_route(
+            room_id,
+            &binding.peer_route_ref,
+        )),
+    )
+    .await;
+}
+
+async fn fail_accepted_native_workspace_dispatch(
+    state: &Arc<AppState>,
+    movement_id: &str,
+    task_id: &str,
+    room_id: &str,
+    target: &crate::host_identity::HostRef,
+    package: &std::path::Path,
+    outgoing_item_id: Option<&str>,
+    message: String,
+    final_receipt_ambiguous: bool,
+) -> String {
+    let message = fail_approved_native_workspace_dispatch(
+        state,
+        movement_id,
+        package,
+        outgoing_item_id,
+        message,
+        final_receipt_ambiguous,
+    );
+    if !final_receipt_ambiguous {
+        // The prepare was accepted, but receiver finalization (and therefore
+        // native execution) is still proven not to have happened. Revoke the
+        // queued receiver authority through the existing authenticated cancel
+        // event. Delivery is best effort and cannot turn this into execution
+        // ambiguity on the source Host.
+        revoke_prepared_native_workspace_authority(state, room_id, target, task_id).await;
+    }
+    message
+}
+
 #[tauri::command]
 pub fn get_native_agent_task_status(
     task_id: String,
@@ -1287,50 +1362,71 @@ pub async fn approve_remote_native_codex_workspace_movement(
             false,
         ));
     }
-    let session = state
+    let session = match state
         .resolve_current_remote_host_session(&room_id, &target)
         .await
-        .map_err(|error| {
-            fail_approved_native_workspace_dispatch(
+    {
+        Ok(session) => session,
+        Err(error) => {
+            return Err(fail_accepted_native_workspace_dispatch(
                 &state,
                 &movement_id,
+                &movement.task_id,
+                &room_id,
+                &target,
                 &package,
                 None,
                 error.message(),
                 false,
             )
-        })?;
+            .await)
+        }
+    };
     let master_key = {
         let config = state.config.read();
-        crate::config::master_key(&config).map_err(|error| {
-            fail_approved_native_workspace_dispatch(
+        crate::config::master_key(&config)
+    };
+    let master_key = match master_key {
+        Ok(master_key) => master_key,
+        Err(error) => {
+            return Err(fail_accepted_native_workspace_dispatch(
                 &state,
                 &movement_id,
+                &movement.task_id,
+                &room_id,
+                &target,
                 &package,
                 None,
                 error.message(),
                 false,
             )
-        })?
+            .await)
+        }
     };
-    let item = storage::create_outgoing_file_item_with_metadata(
+    let item = match storage::create_outgoing_file_item_with_metadata(
         &state.paths,
         &master_key,
         &room_id,
         &package,
         Some("approved workspace".into()),
         Some("application/octet-stream".into()),
-    )
-    .map_err(|error| {
-        fail_approved_native_workspace_dispatch(
-            &state,
-            &movement_id,
-            &package,
-            None,
-            error.message(),
-            false,
-        )
-    })?;
+    ) {
+        Ok(item) => item,
+        Err(error) => {
+            return Err(fail_accepted_native_workspace_dispatch(
+                &state,
+                &movement_id,
+                &movement.task_id,
+                &room_id,
+                &target,
+                &package,
+                None,
+                error.message(),
+                false,
+            )
+            .await)
+        }
+    };
     let send = transfer::send_native_agent_workspace_to_current_remote_session(
         state.inner().clone(),
         &room_id,
@@ -1340,18 +1436,22 @@ pub async fn approve_remote_native_codex_workspace_movement(
         metadata,
     )
     .await;
-    let _ = storage::delete_room_item(&state.paths, &item.id);
-    crate::regular_file_set_transfer::cleanup_package(&package);
     if let Err(failure) = send {
-        return Err(fail_approved_native_workspace_dispatch(
+        return Err(fail_accepted_native_workspace_dispatch(
             &state,
             &movement_id,
+            &movement.task_id,
+            &room_id,
+            &target,
             &package,
             Some(&item.id),
             failure.error.message(),
             failure.final_receipt_ambiguous,
-        ));
+        )
+        .await);
     }
+    let _ = storage::delete_room_item(&state.paths, &item.id);
+    crate::regular_file_set_transfer::cleanup_package(&package);
     state
         .native_agents
         .lock()
@@ -5720,8 +5820,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn proven_pre_transfer_dispatch_failure_cleans_package_and_outgoing_item() {
+    #[tokio::test]
+    async fn accepted_prepare_pre_transfer_failure_cleans_and_stays_non_ambiguous() {
         let root = std::env::temp_dir().join(format!(
             "pastey-native-dispatch-cleanup-{}",
             uuid::Uuid::new_v4()
@@ -5789,14 +5889,19 @@ mod tests {
         )
         .unwrap();
 
-        let error = fail_approved_native_workspace_dispatch(
+        let target = crate::host_identity::HostRef::from_device_id("remote-device").unwrap();
+        let error = fail_accepted_native_workspace_dispatch(
             &state,
             "movement",
+            "task",
+            "room",
+            &target,
             &package,
             Some(&item.id),
             "pre-transfer setup failed".into(),
             false,
-        );
+        )
+        .await;
         assert_eq!(error, "pre-transfer setup failed");
         assert!(!package.exists());
         assert!(storage::get_room_item_by_id(&paths, &item.id).is_err());
