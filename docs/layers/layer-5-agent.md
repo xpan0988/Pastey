@@ -32,7 +32,7 @@ thread and turn with native `status: completed` and no error. A failed,
 interrupted, cancelled, disconnected, malformed, or otherwise ambiguous native
 turn is non-DONE.
 
-Pastey persists only the outer Native Agent envelope: immutable task/movement correlation, outer phase/status, exact returned-result snapshot/digest, and source-side apply fact. Restart converts unproved native work to interrupted/reconciliation-required; it does not recreate a native session or authorize another turn. A snapshotted return may be retried through the existing encrypted Transfer, while a durable completed apply is idempotent. Reconciliation is a bounded Room Control fact query over a freshly resolved Layer 4 Host binding, so a replaced session can carry new transport but cannot revive its old authority.
+Pastey persists only the outer Native Agent envelope: immutable task/movement correlation, Host-private Bridge correlation, outer phase/status, exact returned-result snapshot/digest, and source-side apply fact. Restart converts unproved native work to interrupted/reconciliation-required; it does not recreate a native session or authorize another turn. Reopening that Bridge projects only unresolved safe lifecycle fields into the existing Native Agent card, where the user can reconcile over a freshly resolved Layer 4 binding or explicitly stop the task. The projection excludes physical paths, native session/turn/process details, provider/auth state, result text, and reasoning/tool history. A reconciliation-required interruption continues owning its canonical source until authoritative reconciliation or explicit cancellation; ordinary interruption may release it. A snapshotted return may be retried through the existing encrypted Transfer, while a durable completed apply is idempotent.
 
 For an existing workspace already present on a connected remote Host, Pastey
 uses the same native session service through authenticated current-session Room
@@ -254,7 +254,7 @@ User cancellation marks requester and receiver attempt/dispatch state terminal, 
 
 Successful Core completion cannot be converted back into cancellation during the small completion critical section, but a terminal global interruption rejects a later product result/continuation. Failed or cancelled steps never unlock dependencies. Duplicate and late remote completion is rejected by immutable/unique commit state.
 
-Distributed delivery failure remains a product-recovery limitation: the sender can make its local state terminal, but a partition may prevent immediate propagation to another Host. Current-session revocation/expiry then prevents further authoritative success; a richer retry/reconciliation UI is still required for 2.0.
+Distributed delivery failure remains unable to prove remote native-process termination across a partition. Native Agent recovery is nevertheless product-reachable: the existing card reopens unresolved durable facts, permits repeated fresh-session reconciliation queries, provides explicit Stop, and retries an already durable result Return without rerunning the Agent or resending its workspace. A lost final outbound Transfer acknowledgement is treated as execution-ambiguous and retains source ownership.
 
 ## Current capability matrix
 
@@ -262,7 +262,7 @@ Distributed delivery failure remains a product-recovery limitation: the sender c
 | --- | --- |
 | Host-native Codex capability discovery/invocation and Host-private native sessions | Generic capability acquisition/install behavior; Agent integration does not authorize installation |
 | Native Agent local original-workspace execution and direct remote invocation for a workspace already on the selected Host | Automatic or invisible topology mutation; remote movement remains visible and consented |
-| Required remote workspace movement detection, one Review/approval, encrypted outbound/return movement, source revalidation, and durable conflict recovery | Physical multi-device reliability closure and failure-matrix evidence |
+| Required remote workspace movement detection, one Review/approval, encrypted outbound/return movement, restart recovery, source revalidation, and durable conflict recovery | Physical multi-device reliability and failure-matrix evidence |
 | Bridge-native NodeList/capability projection, bounded fixed Host probes, and generic semantic-ID capability-acquisition confirmation | Confirmation performs no installation or execution |
 | Deterministic native-v2 Draft/Review/approval/readiness/status/cancel backend and 2.0 lifecycle UI for an opened revision | Renderer-safe Draft discovery/origination, PM context, reviewed topology, and result projection |
 | Proposal-only local/provider Natural-v2 to an unapproved Draft | PM/provider selection and settings presentation |
@@ -273,7 +273,7 @@ Distributed delivery failure remains a product-recovery limitation: the sender c
 | Durable generation-bound provider state, streaming adapter, and safe local configuration/health product surface | Provider marketplace, routing, fallback, or additional provider backends |
 | Bridge Device Check fixed Generic Managed E2E self-check through the ordinary native-v2 lifecycle | Its external-provider/API and packaged Mac ↔ Windows evidence remain Generic Managed subsystem limits |
 | Phase 5 Host network broker | Worker network tools or automatic task egress |
-| Cancellation/revocation/restart/Burn fail closed in state and Core authority | Guaranteed cross-partition cancellation delivery and richer recovery |
-| Bounded non-secret product/Worker status events and authoritative lifecycle presentation | Result content projection and richer interrupted/recovery detail |
+| Cancellation/revocation/restart/Burn fail closed in state and Core authority; Bridge Burn purges only Bridge-bound Native Agent outer state and retained app-owned results | Guaranteed cross-partition native-process termination |
+| Bounded non-secret product/Worker status events and authoritative lifecycle presentation, including Native Agent reconciliation/Stop/Return repair | Result content projection or Native Agent history/task browsing |
 
 Subagents, Headless Host, Worker network, Developer Terminal conversion, task-specific patch/document engines, and task/command allowlists are absent from the Generic Managed Worker subsystem. Automated tests validate contracts and local integration; they are not physical multi-device proof. Native Agent physical multi-device validation is Phase 2 work; no obsolete harness procedure is retained in [development](../development.md).

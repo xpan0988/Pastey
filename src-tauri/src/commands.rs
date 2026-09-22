@@ -875,6 +875,25 @@ fn interrupted_remote_native_invoke_status(
         .map_err(|error| error.message())
 }
 
+fn fail_approved_native_workspace_dispatch(
+    state: &Arc<AppState>,
+    movement_id: &str,
+    package: &std::path::Path,
+    outgoing_item_id: Option<&str>,
+    message: String,
+    final_receipt_ambiguous: bool,
+) -> String {
+    if let Some(item_id) = outgoing_item_id {
+        let _ = storage::delete_room_item(&state.paths, item_id);
+    }
+    crate::regular_file_set_transfer::cleanup_package(package);
+    let _ = state
+        .native_agents
+        .lock()
+        .mark_outbound_workspace_delivery_failed(movement_id, final_receipt_ambiguous);
+    message
+}
+
 #[tauri::command]
 pub fn get_native_agent_task_status(
     task_id: String,
@@ -940,7 +959,7 @@ pub async fn start_remote_native_codex_task(
     let queued = state
         .native_agents
         .lock()
-        .queue_remote_task(&task_id, target.as_str(), &workspace, &task)
+        .queue_bridge_remote_task(&room_id, &task_id, target.as_str(), &workspace, &task)
         .map_err(|error| error.message())?;
     let context = crate::room_control::room_control_session_context_for_peer(
         &state,
@@ -1028,6 +1047,76 @@ pub async fn cancel_remote_native_agent_task(
     Ok(local)
 }
 
+/// Explicit recovery Stop revokes local Bridge-derived authority first. If a
+/// fresh current-session route exists, it then makes best-effort use of the
+/// existing authenticated cancellation event; absence of a route cannot undo
+/// the local terminal cutoff.
+#[tauri::command]
+pub async fn stop_bridge_native_agent_task(
+    room_id: String,
+    task_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    let target_host_ref = state
+        .native_agents
+        .lock()
+        .bridge_remote_target(&room_id, &task_id)
+        .map_err(|error| error.message())?;
+    let local = state
+        .native_agents
+        .lock()
+        .stop_bridge_task_authority(&room_id, &task_id)
+        .map_err(|error| error.message())?;
+    let Some(target_host_ref) = target_host_ref else {
+        return Ok(local);
+    };
+    let target = crate::host_identity::HostRef::parse_peer(target_host_ref, &state.local_host_ref)
+        .map_err(|error| error.message())?;
+    let Ok(session) = state
+        .resolve_current_remote_host_session(&room_id, &target)
+        .await
+    else {
+        return Ok(local);
+    };
+    let binding = session.binding().clone();
+    let delivery = async {
+        let context = crate::room_control::room_control_session_context_for_peer(
+            &state,
+            &room_id,
+            &binding.peer_route_ref,
+        )?;
+        let cancel = crate::native_agent::NativeAgentCancelV1 {
+            schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: task_id.clone(),
+            target_host_ref: target.as_str().into(),
+        };
+        let event = crate::room_control::native_agent_event(
+            "native_agent.cancel",
+            serde_json::to_value(cancel)?,
+            &context,
+        )?;
+        crate::room_control::send_room_control_event(
+            state.inner().clone(),
+            &room_id,
+            event,
+            Some(crate::room_control::selected_peer_route(
+                &room_id,
+                &binding.peer_route_ref,
+            )),
+        )
+        .await
+    }
+    .await;
+    if delivery.is_err() {
+        return state
+            .native_agents
+            .lock()
+            .mark_remote_cancel_delivery_uncertain(&task_id)
+            .map_err(|error| error.message());
+    }
+    Ok(local)
+}
+
 /// Builds the one-review cross-device envelope when the selected workspace is
 /// local to this Host and Codex is selected on another current Bridge Host.
 /// This is deliberately not used for ordinary remote-existing-workspace tasks.
@@ -1065,7 +1154,7 @@ pub async fn propose_remote_native_codex_workspace_movement(
             HostArtifactAcquisition {
                 kind: ManagedObjectAcquisitionKind::LocalSelection,
                 source_ref: movement_id.clone(),
-                bridge_id: Some(room_id),
+                bridge_id: Some(room_id.clone()),
                 path: workspace.clone(),
                 scope_root,
                 display_name: workspace
@@ -1087,7 +1176,8 @@ pub async fn propose_remote_native_codex_workspace_movement(
     state
         .native_agents
         .lock()
-        .propose_workspace_movement(
+        .propose_bridge_workspace_movement(
+            &room_id,
             &movement_id,
             &task_id,
             &workspace,
@@ -1142,14 +1232,42 @@ pub async fn approve_remote_native_codex_workspace_movement(
         &room_id,
         &peer_session_id,
     )
-    .map_err(|error| error.message())?;
+    .map_err(|error| {
+        fail_approved_native_workspace_dispatch(
+            &state,
+            &movement_id,
+            &package,
+            None,
+            error.message(),
+            false,
+        )
+    })?;
+    let prepare_payload = serde_json::to_value(prepare).map_err(|error| {
+        fail_approved_native_workspace_dispatch(
+            &state,
+            &movement_id,
+            &package,
+            None,
+            error.to_string(),
+            false,
+        )
+    })?;
     let event = crate::room_control::native_agent_event(
         "native_agent.workspace_prepare",
-        serde_json::to_value(prepare).map_err(|error| error.to_string())?,
+        prepare_payload,
         &context,
     )
-    .map_err(|error| error.message())?;
-    crate::room_control::send_room_control_event(
+    .map_err(|error| {
+        fail_approved_native_workspace_dispatch(
+            &state,
+            &movement_id,
+            &package,
+            None,
+            error.message(),
+            false,
+        )
+    })?;
+    if let Err(error) = crate::room_control::send_room_control_event(
         state.inner().clone(),
         &room_id,
         event,
@@ -1159,14 +1277,41 @@ pub async fn approve_remote_native_codex_workspace_movement(
         )),
     )
     .await
-    .map_err(|error| error.message())?;
+    {
+        return Err(fail_approved_native_workspace_dispatch(
+            &state,
+            &movement_id,
+            &package,
+            None,
+            error.message(),
+            false,
+        ));
+    }
     let session = state
         .resolve_current_remote_host_session(&room_id, &target)
         .await
-        .map_err(|error| error.message())?;
+        .map_err(|error| {
+            fail_approved_native_workspace_dispatch(
+                &state,
+                &movement_id,
+                &package,
+                None,
+                error.message(),
+                false,
+            )
+        })?;
     let master_key = {
         let config = state.config.read();
-        crate::config::master_key(&config).map_err(|error| error.message())?
+        crate::config::master_key(&config).map_err(|error| {
+            fail_approved_native_workspace_dispatch(
+                &state,
+                &movement_id,
+                &package,
+                None,
+                error.message(),
+                false,
+            )
+        })?
     };
     let item = storage::create_outgoing_file_item_with_metadata(
         &state.paths,
@@ -1176,7 +1321,16 @@ pub async fn approve_remote_native_codex_workspace_movement(
         Some("approved workspace".into()),
         Some("application/octet-stream".into()),
     )
-    .map_err(|error| error.message())?;
+    .map_err(|error| {
+        fail_approved_native_workspace_dispatch(
+            &state,
+            &movement_id,
+            &package,
+            None,
+            error.message(),
+            false,
+        )
+    })?;
     let send = transfer::send_native_agent_workspace_to_current_remote_session(
         state.inner().clone(),
         &room_id,
@@ -1188,12 +1342,15 @@ pub async fn approve_remote_native_codex_workspace_movement(
     .await;
     let _ = storage::delete_room_item(&state.paths, &item.id);
     crate::regular_file_set_transfer::cleanup_package(&package);
-    if let Err(error) = send {
-        state
-            .native_agents
-            .lock()
-            .interrupt_workspace_movement(&movement_id, "outbound_transfer_failed");
-        return Err(error.message());
+    if let Err(failure) = send {
+        return Err(fail_approved_native_workspace_dispatch(
+            &state,
+            &movement_id,
+            &package,
+            Some(&item.id),
+            failure.error.message(),
+            failure.final_receipt_ambiguous,
+        ));
     }
     state
         .native_agents
@@ -1211,6 +1368,18 @@ pub fn get_native_agent_workspace_movement_status(
         .native_agents
         .lock()
         .movement_status(&movement_id)
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn get_native_agent_recovery_projection(
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<crate::native_agent::NativeAgentRecoveryProjectionV1>, String> {
+    state
+        .native_agents
+        .lock()
+        .recovery_projection_for_bridge(&room_id)
         .map_err(|error| error.message())
 }
 
@@ -4724,10 +4893,14 @@ pub(crate) fn purge_bridge_runtime_authority(
     state: &Arc<AppState>,
     room_id: &str,
 ) -> AppResult<()> {
+    let mut first_error = state
+        .native_agents
+        .lock()
+        .purge_bridge_authority(room_id)
+        .err();
     state.room_control.lock().purge_room(room_id);
     state.purge_room(room_id);
 
-    let mut first_error = None;
     let mut candidates = state.bridge_plan_candidate_store.lock();
     // Direct requester sources are never durable. Clearing the small
     // process-local map on Burn is conservative across all Bridges and
@@ -5477,6 +5650,37 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    struct NoopEventSink;
+
+    impl crate::host_runtime::HostEventSink for NoopEventSink {
+        fn emit(&self, _event: crate::host_runtime::HostEvent) -> AppResult<()> {
+            Ok(())
+        }
+    }
+
+    struct NoopTaskSpawner;
+
+    impl crate::host_runtime::RuntimeTaskSpawner for NoopTaskSpawner {
+        fn spawn(&self, _task: crate::host_runtime::RuntimeTask) {}
+    }
+
+    fn native_dispatch_test_config() -> crate::config::StoredConfig {
+        crate::config::StoredConfig {
+            version: 5,
+            default_expiry_minutes: 15,
+            inbox_dir: None,
+            auto_burn_after_download: false,
+            save_received_files_to_inbox: true,
+            save_received_images_to_inbox: true,
+            transfer_window_override: None,
+            dev_tools_enabled: false,
+            micro_flow_group_mode: "off".into(),
+            shortcut: "test".into(),
+            app_secret: crate::crypto::encode_key(&[7_u8; 32]),
+            device_id: "native-dispatch-test".into(),
+        }
+    }
+
     #[test]
     fn ambiguous_remote_native_invoke_returns_the_original_reconciliation_handle() {
         let mut service = crate::native_agent::NativeAgentServiceV1::default();
@@ -5514,6 +5718,99 @@ mod tests {
                 .task_id,
             queued.task_id
         );
+    }
+
+    #[test]
+    fn proven_pre_transfer_dispatch_failure_cleans_package_and_outgoing_item() {
+        let root = std::env::temp_dir().join(format!(
+            "pastey-native-dispatch-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = storage::AppPaths::new(root.clone(), root.join("logs"));
+        paths.ensure_directories().unwrap();
+        storage::init_database(&paths).unwrap();
+        let state = Arc::new(
+            crate::host_runtime::HostRuntime::new(
+                paths.clone(),
+                native_dispatch_test_config(),
+                Arc::new(NoopEventSink),
+                Arc::new(NoopTaskSpawner),
+            )
+            .unwrap(),
+        );
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("note.txt"), b"baseline").unwrap();
+        state
+            .native_agents
+            .lock()
+            .propose_bridge_workspace_movement(
+                "room",
+                "movement",
+                "task",
+                &source,
+                "host:remote",
+                crate::bridge_plan_v2::ManagedObjectRevisionV2 {
+                    logical_object_id: format!("managed-object:v1:{}", "a".repeat(64)),
+                    revision: 1,
+                },
+                "edit",
+                true,
+            )
+            .unwrap();
+        let (_, _, package) = state
+            .native_agents
+            .lock()
+            .approve_workspace_movement(
+                "movement",
+                "room",
+                state.local_host_ref.as_str(),
+                &paths.temp_dir,
+            )
+            .unwrap();
+        let master_key = crate::config::master_key(&state.config.read()).unwrap();
+        storage::create_room(
+            &paths,
+            &master_key,
+            "12345678",
+            15,
+            LocalRole::Creator,
+            Some("room".into()),
+            Some(storage::now_ts() + 300),
+        )
+        .unwrap();
+        let item = storage::create_outgoing_file_item_with_metadata(
+            &paths,
+            &master_key,
+            "room",
+            &package,
+            Some("approved workspace".into()),
+            Some("application/octet-stream".into()),
+        )
+        .unwrap();
+
+        let error = fail_approved_native_workspace_dispatch(
+            &state,
+            "movement",
+            &package,
+            Some(&item.id),
+            "pre-transfer setup failed".into(),
+            false,
+        );
+        assert_eq!(error, "pre-transfer setup failed");
+        assert!(!package.exists());
+        assert!(storage::get_room_item_by_id(&paths, &item.id).is_err());
+        let movement = state
+            .native_agents
+            .lock()
+            .movement_status("movement")
+            .unwrap();
+        assert_eq!(
+            movement.state,
+            crate::native_agent::NativeAgentWorkspaceMovementStateV1::Interrupted
+        );
+        assert_eq!(movement.code.as_deref(), Some("outbound_transfer_failed"));
+        let _ = fs::remove_dir_all(root);
     }
 
     fn node_list_profile() -> diagnostics::DeviceProfile {

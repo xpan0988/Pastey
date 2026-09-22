@@ -1588,7 +1588,8 @@ pub async fn receive_room_control_event_handler(
                     .state
                     .native_agents
                     .lock()
-                    .start_codex_task_with_id_resume(
+                    .start_bridge_codex_task_with_id_resume(
+                        &room_id,
                         &request.task_id,
                         std::path::Path::new(&request.workspace),
                         &request.task,
@@ -1682,7 +1683,7 @@ pub async fn receive_room_control_event_handler(
                     .state
                     .native_agents
                     .lock()
-                    .record_remote_status(remote)
+                    .record_bridge_remote_status(&room_id, remote)
                     .is_err()
                 {
                     return control_error(
@@ -1829,7 +1830,7 @@ pub async fn receive_room_control_event_handler(
                     .state
                     .native_agents
                     .lock()
-                    .record_remote_reconciliation(fact)
+                    .record_bridge_remote_reconciliation(&room_id, fact)
                     .is_err()
                 {
                     return control_error(
@@ -1881,7 +1882,7 @@ pub async fn receive_room_control_event_handler(
                     .state
                     .native_agents
                     .lock()
-                    .accept_workspace_prepare(request)
+                    .accept_bridge_workspace_prepare(&room_id, request)
                     .is_err()
                 {
                     return control_error(
@@ -2552,7 +2553,11 @@ fn validate_control_event(
         .get("payload")
         .and_then(Value::as_object)
         .ok_or_else(|| AppError::InvalidInput("Invalid room control event payload.".into()))?;
-    if contains_unsafe_field(&event) {
+    let allow_validated_native_code = matches!(
+        kind.as_str(),
+        "native_agent.status" | "native_agent.reconciliation"
+    );
+    if contains_unsafe_field(&event, allow_validated_native_code) {
         return Err(AppError::InvalidInput(
             "Room control event contains unsafe fields.".into(),
         ));
@@ -2657,8 +2662,9 @@ fn validate_control_event(
                 .map_err(AppError::from)?;
                 crate::native_agent::validate_status(&status)?;
                 format!(
-                    "native-agent-status:{}:{:?}",
-                    status.task_id, status.status.state
+                    "native-agent-status:{}:{}",
+                    status.task_id,
+                    canonical_safe_fact_digest(&status)?
                 )
             }
             "native_agent.cancel" => {
@@ -2684,11 +2690,21 @@ fn validate_control_event(
                     )
                     .map_err(AppError::from)?;
                 crate::native_agent::validate_reconcile(&request)?;
-                format!(
-                    "native-agent-reconcile:{}:{}",
-                    request.task_id,
-                    request.movement_id.unwrap_or_default()
-                )
+                // Reconciliation is a read-only query. Its authenticated event
+                // id is replay-protected, but stable task/movement identity is
+                // intentionally not a once-only mutation key.
+                return Ok(ValidatedControlEvent {
+                    event_id,
+                    kind,
+                    room_ref,
+                    source_device_ref,
+                    target_peer_ref,
+                    created_at,
+                    expires_at,
+                    envelope_id: None,
+                    request_id: None,
+                    event,
+                });
             }
             "native_agent.reconciliation" => {
                 let fact =
@@ -2698,10 +2714,10 @@ fn validate_control_event(
                     .map_err(AppError::from)?;
                 crate::native_agent::validate_reconciliation(&fact)?;
                 format!(
-                    "native-agent-reconciliation:{}:{}:{:?}",
+                    "native-agent-reconciliation:{}:{}:{}",
                     fact.task_id,
-                    fact.movement_id.unwrap_or_default(),
-                    fact.task_state
+                    fact.movement_id.clone().unwrap_or_default(),
+                    canonical_safe_fact_digest(&fact)?
                 )
             }
             _ => {
@@ -2899,6 +2915,12 @@ async fn control_response_failure(response: reqwest::Response) -> AppError {
     AppError::Network(message.into())
 }
 
+fn canonical_safe_fact_digest<T: Serialize>(value: &T) -> AppResult<String> {
+    Ok(blake3::hash(&serde_json::to_vec(value)?)
+        .to_hex()
+        .to_string())
+}
+
 fn record_replay_id(queue: &mut VecDeque<String>, set: &mut HashSet<String>, id: String) {
     if set.insert(id.clone()) {
         queue.push_back(id);
@@ -2995,11 +3017,16 @@ fn bounded_string_field(object: &Map<String, Value>, field: &str, max: usize) ->
     Ok(value.to_string())
 }
 
-fn contains_unsafe_field(value: &Value) -> bool {
+fn contains_unsafe_field(value: &Value, allow_validated_native_code: bool) -> bool {
     match value {
-        Value::Array(values) => values.iter().any(contains_unsafe_field),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| contains_unsafe_field(value, allow_validated_native_code)),
         Value::Object(object) => object.iter().any(|(key, value)| {
-            UNSAFE_FIELDS.contains(&normalize_field(key).as_str()) || contains_unsafe_field(value)
+            let normalized = normalize_field(key);
+            (UNSAFE_FIELDS.contains(&normalized.as_str())
+                && !(allow_validated_native_code && normalized == "code"))
+                || contains_unsafe_field(value, allow_validated_native_code)
         }),
         _ => false,
     }
@@ -3689,6 +3716,139 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         assert!(validate_control_event(event.clone(), "room", "source", "target", now).is_ok());
         assert!(validate_control_event(event, "room", "source", "stale-target", now).is_err());
+    }
+
+    fn native_agent_test_context() -> RoomControlSessionContext {
+        RoomControlSessionContext {
+            room_id: "room".into(),
+            local_session_ref: "source".into(),
+            peer_session_ref: "target".into(),
+            peer_route_ref: "peer".into(),
+            peer_observation_ref: "observation".into(),
+            peer_connected: true,
+        }
+    }
+
+    #[test]
+    fn reconciliation_queries_replay_only_the_exact_control_event() {
+        let now = OffsetDateTime::now_utc();
+        let payload = serde_json::to_value(crate::native_agent::NativeAgentReconcileV1 {
+            schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: "task".into(),
+            movement_id: Some("movement".into()),
+            target_host_ref: "host:remote".into(),
+        })
+        .unwrap();
+        let first = validate_control_event(
+            native_agent_event(
+                "native_agent.reconcile",
+                payload.clone(),
+                &native_agent_test_context(),
+            )
+            .unwrap(),
+            "room",
+            "source",
+            "target",
+            now,
+        )
+        .unwrap();
+        let second = validate_control_event(
+            native_agent_event(
+                "native_agent.reconcile",
+                payload,
+                &native_agent_test_context(),
+            )
+            .unwrap(),
+            "room",
+            "source",
+            "target",
+            now,
+        )
+        .unwrap();
+        assert_ne!(first.event_id, second.event_id);
+        assert!(first.request_id.is_none());
+        assert!(second.request_id.is_none());
+        let mut room = RoomControlRoomState::default();
+        record_replay_id(
+            &mut room.seen_event_ids,
+            &mut room.seen_event_id_set,
+            first.event_id.clone(),
+        );
+        assert!(is_replayed(&room, &first));
+        assert!(!is_replayed(&room, &second));
+    }
+
+    #[test]
+    fn materially_different_native_agent_facts_have_distinct_semantic_replay_ids() {
+        let now = OffsetDateTime::now_utc();
+        let status_event = |code: &str| {
+            native_agent_event(
+                "native_agent.status",
+                serde_json::to_value(crate::native_agent::NativeAgentStatusV1 {
+                    schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                    task_id: "task".into(),
+                    executing_host_ref: "host:remote".into(),
+                    status: crate::native_agent::NativeAgentTaskStatusV1 {
+                        schema_version: crate::native_agent::NATIVE_AGENT_TASK_SCHEMA.into(),
+                        task_id: "task".into(),
+                        agent_id: crate::native_agent::CODEX_CAPABILITY_ID.into(),
+                        workspace_name: "workspace".into(),
+                        session_reused: false,
+                        state: crate::native_agent::NativeAgentTaskStateV1::Running,
+                        result: None,
+                        code: Some(code.into()),
+                    },
+                })
+                .unwrap(),
+                &native_agent_test_context(),
+            )
+            .unwrap()
+        };
+        let first = validate_control_event(status_event("code_a"), "room", "source", "target", now)
+            .unwrap();
+        let second =
+            validate_control_event(status_event("code_b"), "room", "source", "target", now)
+                .unwrap();
+        assert_ne!(first.request_id, second.request_id);
+
+        let reconciliation_event = |digest: &str, code: &str| {
+            native_agent_event(
+                "native_agent.reconciliation",
+                serde_json::to_value(crate::native_agent::NativeAgentReconciliationV1 {
+                    schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                    task_id: "task".into(),
+                    movement_id: Some("movement".into()),
+                    executing_host_ref: "host:remote".into(),
+                    task_state: crate::native_agent::NativeAgentTaskStateV1::Completed,
+                    movement_state: Some(
+                        crate::native_agent::NativeAgentWorkspaceMovementStateV1::ReturningResult,
+                    ),
+                    result_digest: Some(digest.into()),
+                    apply_completed: false,
+                    code: Some(code.into()),
+                })
+                .unwrap(),
+                &native_agent_test_context(),
+            )
+            .unwrap()
+        };
+        let third = validate_control_event(
+            reconciliation_event(&"a".repeat(64), "code_a"),
+            "room",
+            "source",
+            "target",
+            now,
+        )
+        .unwrap();
+        let fourth = validate_control_event(
+            reconciliation_event(&"b".repeat(64), "code_b"),
+            "room",
+            "source",
+            "target",
+            now,
+        )
+        .unwrap();
+        assert_ne!(third.request_id, fourth.request_id);
     }
 
     #[test]

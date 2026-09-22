@@ -2,7 +2,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -65,6 +65,11 @@ const CHUNK_RETRY_BACKOFFS: [Duration; 3] = [
     Duration::from_millis(800),
     Duration::from_millis(1500),
 ];
+
+pub(crate) struct NativeAgentWorkspaceTransferFailure {
+    pub(crate) error: AppError,
+    pub(crate) final_receipt_ambiguous: bool,
+}
 
 pub struct ActiveFileTransfer {
     room_id: String,
@@ -580,6 +585,7 @@ pub async fn send_room_file_to_bridge_peer_endpoint(
         None,
         None,
         None,
+        None,
         crate::transfer_orchestration::TransferCapacityOrigin::Ordinary,
     )
     .await
@@ -602,6 +608,7 @@ pub(crate) async fn send_managed_room_file_to_bridge_peer_endpoint(
         queue_item_id,
         requested_window,
         endpoint,
+        None,
         None,
         None,
         None,
@@ -629,6 +636,7 @@ pub async fn send_room_file_to_bridge_peer_endpoint_with_landing(
         requested_window,
         endpoint,
         pipeline_handoff,
+        None,
         None,
         None,
         crate::transfer_orchestration::TransferCapacityOrigin::Managed,
@@ -661,6 +669,7 @@ pub(crate) async fn send_native_v2_managed_revision_to_current_remote_session(
         None,
         Some(metadata),
         None,
+        None,
         crate::transfer_orchestration::TransferCapacityOrigin::Managed,
     )
     .await
@@ -676,9 +685,16 @@ pub(crate) async fn send_native_agent_workspace_to_current_remote_session(
     file_path: &Path,
     session: crate::bridge_lifecycle::CurrentRemoteHostSession,
     metadata: crate::native_agent::NativeAgentWorkspaceTransferV1,
-) -> AppResult<()> {
-    let endpoint = session.revalidate_for_transfer(&state).await?;
-    send_room_file_to_bridge_peer_endpoint_with_orchestration(
+) -> Result<(), NativeAgentWorkspaceTransferFailure> {
+    let endpoint = session
+        .revalidate_for_transfer(&state)
+        .await
+        .map_err(|error| NativeAgentWorkspaceTransferFailure {
+            error,
+            final_receipt_ambiguous: false,
+        })?;
+    let final_receipt_ambiguous = Arc::new(AtomicBool::new(false));
+    let result = send_room_file_to_bridge_peer_endpoint_with_orchestration(
         state,
         room_id,
         item_id,
@@ -689,9 +705,14 @@ pub(crate) async fn send_native_agent_workspace_to_current_remote_session(
         None,
         None,
         Some(metadata),
+        Some(final_receipt_ambiguous.clone()),
         crate::transfer_orchestration::TransferCapacityOrigin::Managed,
     )
-    .await
+    .await;
+    result.map_err(|error| NativeAgentWorkspaceTransferFailure {
+        error,
+        final_receipt_ambiguous: final_receipt_ambiguous.load(Ordering::SeqCst),
+    })
 }
 
 async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
@@ -705,6 +726,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
     pipeline_handoff: Option<PipelineHandoffMetadata>,
     native_v2_transfer: Option<crate::native_v2_orchestration::NativeV2TransferMetadataV1>,
     native_agent_workspace_transfer: Option<crate::native_agent::NativeAgentWorkspaceTransferV1>,
+    final_receipt_ambiguous: Option<Arc<AtomicBool>>,
     capacity_origin: crate::transfer_orchestration::TransferCapacityOrigin,
 ) -> AppResult<()> {
     let room = storage::get_room_by_id(&state.paths, room_id)?;
@@ -1201,6 +1223,14 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
         }
         Ok(response) => {
             let details = response_error_details(response).await;
+            if native_agent_finish_response_is_ambiguous(details.code.as_deref()) {
+                if let Some(ambiguous) = final_receipt_ambiguous.as_ref() {
+                    // Registration includes native task start before its final
+                    // movement persistence. This compound failure cannot prove
+                    // that remote execution did not begin.
+                    ambiguous.store(true, Ordering::SeqCst);
+                }
+            }
             let message = map_response_error_message(&details);
             if matches!(
                 details.code.as_deref(),
@@ -1219,6 +1249,9 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
             Err(AppError::Network(message))
         }
         Err(error) => {
+            if let Some(ambiguous) = final_receipt_ambiguous.as_ref() {
+                ambiguous.store(true, Ordering::SeqCst);
+            }
             dev_log_sender_final_error(
                 &transfer_id,
                 room_id,
@@ -1231,6 +1264,10 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
             Err(AppError::Http(error))
         }
     }
+}
+
+fn native_agent_finish_response_is_ambiguous(code: Option<&str>) -> bool {
+    code == Some("native_agent_workspace_registration_failed")
 }
 
 fn update_sender_transfer_report(
@@ -5383,6 +5420,17 @@ mod tests {
             .unwrap()
             .get("host_ref")
             .is_some());
+    }
+
+    #[test]
+    fn native_agent_final_registration_failure_is_receipt_ambiguous() {
+        assert!(native_agent_finish_response_is_ambiguous(Some(
+            "native_agent_workspace_registration_failed"
+        )));
+        assert!(!native_agent_finish_response_is_ambiguous(Some(
+            "metadata_mismatch"
+        )));
+        assert!(!native_agent_finish_response_is_ambiguous(None));
     }
 
     struct ShortAsyncReader {

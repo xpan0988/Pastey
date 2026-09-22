@@ -7,14 +7,18 @@ import {
   cancelNativeAgentTask,
   discardNativeAgentConflictResult,
   cancelRemoteNativeAgentTask,
+  getNativeAgentRecoveryProjection,
   getNativeAgentTaskStatus,
   getNativeAgentWorkspaceMovementStatus,
   getNativeV2PlanStatus,
   listNativeAgentCapabilities,
   proposeRemoteNativeCodexWorkspaceMovement,
   revealNativeAgentConflictResult,
+  reconcileRemoteNativeAgentTask,
+  retryNativeAgentWorkspaceResultReturn,
   startNativeCodexTask,
   startRemoteNativeCodexTask,
+  stopBridgeNativeAgentTask,
   type NativeAgentCapability,
   type NativeAgentTaskStatus,
   type NativeAgentWorkspaceMovement,
@@ -33,7 +37,10 @@ export type LifecycleTone = "neutral" | "pending" | "live" | "danger" | "complet
 export function nativeAgentMovementBlocksNewRun(
   movement: NativeAgentWorkspaceMovement | null,
 ): boolean {
-  return !!movement && !["completed", "failed", "cancelled", "interrupted"].includes(movement.state);
+  return !!movement && (
+    !["completed", "failed", "cancelled", "interrupted"].includes(movement.state)
+    || (movement.state === "interrupted" && movement.code === "native_agent_reconciliation_required")
+  );
 }
 
 export const STATE_COPY: Record<NativeV2ProductState, { label: string; detail: string; tone: LifecycleTone }> = {
@@ -159,7 +166,7 @@ export type AgentTaskController = ReturnType<typeof useAgentTaskLifecycle>;
 
 /** Product-facing lifecycle for a Host-native mature Agent. It does not use
  * the managed Worker/Plan controller above. */
-export function useNativeAgentTask() {
+export function useNativeAgentTask(roomId: string) {
   const [capabilities, setCapabilities] = useState<NativeAgentCapability[]>([]);
   const [workspace, setWorkspace] = useState("");
   const [taskText, setTaskText] = useState("");
@@ -167,9 +174,10 @@ export function useNativeAgentTask() {
   const [movement, setMovement] = useState<NativeAgentWorkspaceMovement | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [recoveryTargetHostRef, setRecoveryTargetHostRef] = useState<string | null>(null);
   const cancellableTaskId = status && (
     ["queued", "running"].includes(status.state)
-    || (status.state === "interrupted" && status.code === "native_agent_outcome_unknown")
+    || (status.state === "interrupted" && ["native_agent_outcome_unknown", "native_agent_reconciliation_required"].includes(status.code ?? ""))
   )
     ? status.taskId
     : movement?.state === "agent_running"
@@ -183,7 +191,23 @@ export function useNativeAgentTask() {
 
   useEffect(() => { void refreshCapabilities(); }, [refreshCapabilities]);
   useEffect(() => {
-    if (!status || !["queued", "running"].includes(status.state)) return;
+    if (!hasTauriRuntime() || !roomId) return;
+    let cancelled = false;
+    void getNativeAgentRecoveryProjection(roomId).then((projection) => {
+      if (cancelled || !projection) return;
+      setStatus(projection.task);
+      setMovement(projection.movement ?? null);
+      setRecoveryTargetHostRef(projection.targetHostRef ?? null);
+    }).catch((error) => {
+      if (!cancelled) setMessage(error instanceof Error ? error.message : "Pastey could not recover unresolved native Agent work.");
+    });
+    return () => { cancelled = true; };
+  }, [roomId]);
+  useEffect(() => {
+    if (!status || !(
+      ["queued", "running"].includes(status.state)
+      || (status.state === "interrupted" && status.code === "native_agent_reconciliation_required")
+    )) return;
     let cancelled = false;
     const poll = async () => {
       try { setStatus(await getNativeAgentTaskStatus(status.taskId)); }
@@ -194,7 +218,8 @@ export function useNativeAgentTask() {
     return () => { cancelled = true; window.clearTimeout(timer); };
   }, [status]);
   useEffect(() => {
-    if (!movement || ["completed", "conflict_recovery_required", "failed", "cancelled", "interrupted"].includes(movement.state)) return;
+    if (!movement || ["completed", "conflict_recovery_required", "failed", "cancelled"].includes(movement.state)
+      || (movement.state === "interrupted" && movement.code !== "native_agent_reconciliation_required")) return;
     const timer = window.setTimeout(() => {
       void getNativeAgentWorkspaceMovementStatus(movement.movementId).then(setMovement).catch((error) => {
         setMessage(error instanceof Error ? error.message : "Pastey lost the workspace movement outcome.");
@@ -231,7 +256,10 @@ export function useNativeAgentTask() {
     if (!movement || movement.state !== "awaiting_approval" || busy) return;
     setBusy(true); setMessage(null);
     try { setMovement(await approveRemoteNativeCodexWorkspaceMovement(movement.movementId, roomId, peerSessionId)); }
-    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start the approved workspace movement."); }
+    catch (error) {
+      try { setMovement(await getNativeAgentWorkspaceMovementStatus(movement.movementId)); } catch { /* retain the original actionable error */ }
+      setMessage(error instanceof Error ? error.message : "Pastey could not start the approved workspace movement.");
+    }
     finally { setBusy(false); }
   }, [busy, movement]);
 
@@ -246,10 +274,44 @@ export function useNativeAgentTask() {
   const cancelRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string) => {
     if (!cancellableTaskId) return;
     setBusy(true);
-    try { setStatus(await cancelRemoteNativeAgentTask(roomId, peerSessionId, hostRef, cancellableTaskId)); }
+    try {
+      setStatus(await cancelRemoteNativeAgentTask(roomId, peerSessionId, hostRef, cancellableTaskId));
+      if (movement) setMovement(await getNativeAgentWorkspaceMovementStatus(movement.movementId));
+    }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not cancel remote Codex."); }
     finally { setBusy(false); }
-  }, [cancellableTaskId]);
+  }, [cancellableTaskId, movement]);
+
+  const reconcileRemote = useCallback(async () => {
+    if (!status || !recoveryTargetHostRef || busy) return;
+    setBusy(true); setMessage(null);
+    try {
+      await reconcileRemoteNativeAgentTask(roomId, recoveryTargetHostRef, status.taskId, movement?.movementId);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Pastey could not reconcile the remote task.");
+    } finally { setBusy(false); }
+  }, [busy, movement, recoveryTargetHostRef, roomId, status]);
+
+  const retryResultReturn = useCallback(async () => {
+    if (!movement || movement.code !== "result_return_retry_required" || busy) return;
+    setBusy(true); setMessage(null);
+    try { setMovement(await retryNativeAgentWorkspaceResultReturn(movement.movementId, roomId)); }
+    catch (error) {
+      try { setMovement(await getNativeAgentWorkspaceMovementStatus(movement.movementId)); } catch { /* preserve delivery error */ }
+      setMessage(error instanceof Error ? error.message : "Pastey could not retry the durable result Return.");
+    } finally { setBusy(false); }
+  }, [busy, movement, roomId]);
+
+  const stopRecovery = useCallback(async () => {
+    if (!status || busy) return;
+    setBusy(true); setMessage(null);
+    try {
+      setStatus(await stopBridgeNativeAgentTask(roomId, status.taskId));
+      if (movement) setMovement(await getNativeAgentWorkspaceMovementStatus(movement.movementId));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Pastey could not stop the unresolved remote task.");
+    } finally { setBusy(false); }
+  }, [busy, movement, roomId, status]);
 
   const revealConflictResult = useCallback(async () => {
     if (!movement || movement.state !== "conflict_recovery_required" || busy) return;
@@ -267,7 +329,7 @@ export function useNativeAgentTask() {
     finally { setBusy(false); }
   }, [busy, movement]);
 
-  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, message, busy, canCancel: !!cancellableTaskId, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, revealConflictResult, discardConflictResult, refreshCapabilities };
+  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, recoveryTargetHostRef, message, busy, canCancel: !!cancellableTaskId, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities };
 }
 
 export function StatusBadge({ tone, children }: { tone: LifecycleTone; children: React.ReactNode }) {

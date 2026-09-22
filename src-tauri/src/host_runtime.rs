@@ -252,6 +252,10 @@ impl HostRuntime {
 
     pub fn purge_room(&self, room_id: &str) {
         let _completion_guard = self.managed_completion_lock.lock();
+        // Native Agent authority is Bridge-derived but not managed execution.
+        // Revoke it through the same Bridge lifecycle seam before any other
+        // cleanup can fail or a late observer can persist completion.
+        let _ = self.native_agents.lock().purge_bridge_authority(room_id);
         crate::native_v2_orchestration::interrupt_attempts_for_bridge(
             &self.paths,
             room_id,

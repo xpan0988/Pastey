@@ -297,6 +297,18 @@ pub(crate) fn get_native_agent_envelope(
     .map_err(AppError::from)
 }
 
+pub(crate) fn delete_native_agent_envelope(paths: &AppPaths, task_id: &str) -> AppResult<bool> {
+    if task_id.trim().is_empty() || task_id.len() > 256 {
+        return Err(AppError::InvalidInput(
+            "Native Agent task identity is invalid.".into(),
+        ));
+    }
+    Ok(connection(paths)?.execute(
+        "DELETE FROM native_agent_envelopes WHERE task_id = ?1",
+        [task_id],
+    )? > 0)
+}
+
 pub(crate) fn save_native_agent_conflict(
     paths: &AppPaths,
     record: &StoredNativeAgentConflict,
@@ -1511,6 +1523,7 @@ pub fn finalize_burned_room(
     // after the authority cutoff and before the room can be finalized. Any
     // deletion failure leaves the burned tombstone in place for retry.
     bridge_plan::delete_bridge_records(paths, room_id)?;
+    crate::native_agent::purge_durable_bridge_state(paths, room_id)?;
     let conn = connection(paths)?;
     delete_room_files(paths, room_id, effective_inbox_dir)?;
     conn.execute("DELETE FROM room_items WHERE room_id = ?1", [room_id])?;
