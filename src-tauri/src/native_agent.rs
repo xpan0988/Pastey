@@ -2429,13 +2429,14 @@ impl NativeAgentServiceV1 {
             NativeAgentTaskStateV1::Completed | NativeAgentTaskStateV1::Failed
         ) {
             // The Agent's terminal fact remains unchanged. The user is only
-            // abandoning Pastey's unresolved consequence-side movement.
+            // abandoning Pastey's unresolved movement authority.
             if let Some(movement) = self.workspace_movements.values_mut().find(|record| {
                 record.status.task_id == task_id
                     && record.status.state == NativeAgentWorkspaceMovementStateV1::Interrupted
                     && matches!(
                         record.status.code.as_deref(),
-                        Some("conflict_result_retention_required")
+                        Some("native_agent_reconciliation_required")
+                            | Some("conflict_result_retention_required")
                             | Some("result_apply_interrupted")
                     )
             }) {
@@ -5881,6 +5882,7 @@ exit 1
         for (index, code) in [
             "result_apply_interrupted",
             "conflict_result_retention_required",
+            "native_agent_reconciliation_required",
         ]
         .into_iter()
         .enumerate()
