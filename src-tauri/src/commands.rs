@@ -1142,6 +1142,13 @@ pub async fn stop_bridge_native_agent_task(
         .lock()
         .stop_bridge_task_authority(&room_id, &task_id)
         .map_err(|error| error.message())?;
+    if matches!(
+        &local.state,
+        crate::native_agent::NativeAgentTaskStateV1::Completed
+            | crate::native_agent::NativeAgentTaskStateV1::Failed
+    ) {
+        return Ok(local);
+    }
     let Some(target_host_ref) = target_host_ref else {
         return Ok(local);
     };
