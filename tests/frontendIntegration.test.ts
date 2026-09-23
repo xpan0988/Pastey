@@ -277,10 +277,13 @@ test("Native Agent recovery uses the existing card with durable refresh and expl
   const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
   assert.match(lifecycle, /getNativeAgentRecoveryProjection\(roomId\)/);
-  assert.match(lifecycle, /void loadRecoveryProjection\(\)/);
+  assert.match(lifecycle, /await loadRecoveryProjection\(\)/);
   assert.match(lifecycle, /getNativeAgentWorkspaceMovementStatus\(movement\.movementId\)/);
-  assert.match(lifecycle, /reconcileRemoteNativeAgentTask\(roomId, recoveryTargetHostRef/);
-  assert.match(lifecycle, /stopBridgeNativeAgentTask\(roomId, status\.taskId\)/);
+  assert.match(lifecycle, /reconcileRemoteNativeAgentTask\(\s*roomId,\s*recoveryCorrelation\.targetHostRef,\s*recoveryCorrelation\.taskId/);
+  assert.match(lifecycle, /stopBridgeNativeAgentTask\(roomId, recoveryCorrelation\.taskId\)/);
+  assert.match(card, />Load recovery details</);
+  assert.match(card, /disabled=\{agent\.busy \|\| !agent\.recoveryTaskId\} onClick=\{\(\) => void agent\.stopRecovery\(\)\}/);
+  assert.match(card, /agent\.recoveryTargetHostRef \? <button[^>]*onClick=\{\(\) => void agent\.reconcileRemote\(\)\}>Reconcile<\/button> : null/);
   assert.match(card, /Pastey will not reuse this workspace until the task is reconciled or explicitly stopped/);
   assert.match(card, />Reconcile</);
   assert.match(card, />Stop</);
@@ -337,7 +340,7 @@ test("Native Agent recovery drains only after the current item no longer require
     code: "result_apply_interrupted",
   };
   assert.equal(nativeAgentRemoteReconciliationRequired(null, applyInterrupted), false);
-  assert.equal(nativeAgentConsequenceAbandonmentRequired(applyInterrupted), true);
+  assert.equal(nativeAgentConsequenceAbandonmentRequired(applyInterrupted), false);
   assert.equal(nativeAgentRecoveryRequiresAction(null, {
     schemaVersion: "pastey-native-agent-workspace-movement-v1",
     movementId: "movement-two",

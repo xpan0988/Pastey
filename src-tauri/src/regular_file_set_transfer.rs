@@ -194,9 +194,12 @@ pub(crate) fn cleanup_materialized_tree(tree: &Path) {
 
 pub(crate) fn cleanup_received_package(package_path: &Path) {
     if let Some(root) = package_path.parent().filter(|root| {
-        root.parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == "native-v2-transfers")
+        root.parent().and_then(Path::file_name).is_some_and(|name| {
+            matches!(
+                name.to_str(),
+                Some("native-v2-transfers" | "native-agent-workspace-transfers")
+            )
+        })
     }) {
         let _ = fs::remove_dir_all(root);
     }
@@ -361,6 +364,26 @@ mod tests {
             safe_file_identity::capture_regular_file_set_identity(&tree, MAX_FILE_SIZE_BYTES)
                 .unwrap();
         (base, tree, identity)
+    }
+
+    #[test]
+    fn received_package_cleanup_removes_native_agent_and_native_v2_namespaces_only() {
+        let base = std::env::temp_dir().join(format!("pastey-rfs-cleanup-{}", Uuid::new_v4()));
+        for namespace in ["native-v2-transfers", "native-agent-workspace-transfers"] {
+            let transfer_root = base.join(namespace).join("transfer-id");
+            fs::create_dir_all(&transfer_root).unwrap();
+            let package = transfer_root.join("input");
+            fs::write(&package, b"app-owned package").unwrap();
+            cleanup_received_package(&package);
+            assert!(!transfer_root.exists(), "{namespace} should be removed");
+        }
+        let unrelated = base.join("user-transfers").join("transfer-id");
+        fs::create_dir_all(&unrelated).unwrap();
+        let unrelated_file = unrelated.join("input");
+        fs::write(&unrelated_file, b"user data").unwrap();
+        cleanup_received_package(&unrelated_file);
+        assert!(unrelated_file.exists());
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
