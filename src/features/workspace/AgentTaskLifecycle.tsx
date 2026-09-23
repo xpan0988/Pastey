@@ -93,6 +93,43 @@ export function nativeAgentTaskNeedsObservation(status: NativeAgentTaskStatus | 
       && ["native_agent_reconciliation_required", "native_agent_outcome_unknown"].includes(status.code ?? "")));
 }
 
+const RETURN_RETRY_POLL_INTERVAL_MS = 1_000;
+const RETURN_RETRY_MAX_POLLS = 20;
+
+export async function observeNativeAgentMovementAfterReturnRetry(
+  initial: NativeAgentWorkspaceMovement,
+  readMovement: (movementId: string) => Promise<NativeAgentWorkspaceMovement>,
+  onMovement: (movement: NativeAgentWorkspaceMovement) => void,
+  isCancelled: () => boolean,
+  wait: (delayMs: number) => Promise<void> = (delayMs) =>
+    new Promise((resolve) => globalThis.setTimeout(resolve, delayMs)),
+  onError: (error: unknown) => void = () => {},
+): Promise<void> {
+  for (let poll = 0; poll < RETURN_RETRY_MAX_POLLS; poll += 1) {
+    await wait(RETURN_RETRY_POLL_INTERVAL_MS);
+    if (isCancelled()) return;
+    let movement: NativeAgentWorkspaceMovement;
+    try {
+      movement = await readMovement(initial.movementId);
+    } catch (error) {
+      if (isCancelled()) return;
+      onError(error);
+      continue;
+    }
+    if (isCancelled()) return;
+    onMovement(movement);
+    if (movement.movementId !== initial.movementId) continue;
+    const changed = movement.state !== initial.state
+      || (movement.code ?? null) !== (initial.code ?? null);
+    if (!changed) continue;
+    if (["completed", "conflict_recovery_required", "failed", "cancelled"].includes(movement.state)
+      || movement.code === "result_return_retry_required"
+      || (movement.state === "interrupted" && movement.code === "result_apply_interrupted")) {
+      return;
+    }
+  }
+}
+
 export const STATE_COPY: Record<NativeV2ProductState, { label: string; detail: string; tone: LifecycleTone }> = {
   draft: { label: "Awaiting review", detail: "The PM proposal is an immutable Draft. Nothing can execute yet.", tone: "pending" },
   approved: { label: "Awaiting Host admission", detail: "Requester approval is recorded. Participating Hosts must still admit the Plan.", tone: "pending" },
@@ -223,6 +260,10 @@ export function useNativeAgentTask(roomId: string) {
   const [status, setStatus] = useState<NativeAgentTaskStatus | null>(null);
   const [movement, setMovement] = useState<NativeAgentWorkspaceMovement | null>(null);
   const [recoveryProjection, setRecoveryProjection] = useState<NativeAgentRecoveryProjection | null>(null);
+  const [returnRetryObservation, setReturnRetryObservation] = useState<{
+    roomId: string;
+    movement: NativeAgentWorkspaceMovement;
+  } | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const recoveryCorrelation = movement
@@ -305,6 +346,26 @@ export function useNativeAgentTask(roomId: string) {
     }, 1_000);
     return () => window.clearTimeout(timer);
   }, [movement]);
+  useEffect(() => {
+    const observation = returnRetryObservation;
+    if (!observation || observation.roomId !== roomId) return;
+    let cancelled = false;
+    void observeNativeAgentMovementAfterReturnRetry(
+      observation.movement,
+      getNativeAgentWorkspaceMovementStatus,
+      setMovement,
+      () => cancelled,
+      undefined,
+      (error) => setMessage(error instanceof Error ? error.message : "Pastey could not observe the retried result Return."),
+    ).finally(() => {
+      if (!cancelled) {
+        setReturnRetryObservation((current) => current?.movement.movementId === observation.movement.movementId
+          ? null
+          : current);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [returnRetryObservation, roomId]);
 
   const start = useCallback(async () => {
     if (!workspace.trim() || !taskText.trim() || busy) return;
@@ -388,14 +449,16 @@ export function useNativeAgentTask(roomId: string) {
     if (!movement || ![
       "result_return_retry_required",
       "result_apply_interrupted",
-    ].includes(movement.code ?? "") || busy) return;
+    ].includes(movement.code ?? "") || busy
+      || returnRetryObservation?.roomId === roomId) return;
+    setReturnRetryObservation({ roomId, movement });
     setBusy(true); setMessage(null);
     try { setMovement(await retryNativeAgentWorkspaceResultReturn(movement.movementId, roomId)); }
     catch (error) {
       try { setMovement(await getNativeAgentWorkspaceMovementStatus(movement.movementId)); } catch { /* preserve delivery error */ }
       setMessage(error instanceof Error ? error.message : "Pastey could not retry the durable result Return.");
     } finally { setBusy(false); }
-  }, [busy, movement, roomId]);
+  }, [busy, movement, returnRetryObservation, roomId]);
 
   const stopRecovery = useCallback(async () => {
     if (!recoveryCorrelation?.taskId || busy) return;
@@ -431,7 +494,9 @@ export function useNativeAgentTask(roomId: string) {
     finally { setBusy(false); }
   }, [busy, movement]);
 
-  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
+  const retryingResultReturn = returnRetryObservation?.roomId === roomId
+    && returnRetryObservation.movement.movementId === movement?.movementId;
+  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, retryingResultReturn, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
 }
 
 export function StatusBadge({ tone, children }: { tone: LifecycleTone; children: React.ReactNode }) {

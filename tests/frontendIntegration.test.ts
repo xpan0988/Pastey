@@ -10,6 +10,7 @@ import { uniqueNearbyDevices } from "../src/features/workspace/workspaceViewMode
 import {
   nativeAgentInterruptedRecoveryRequiresAction,
   nativeAgentMovementBlocksNewRun,
+  observeNativeAgentMovementAfterReturnRetry,
   nativeAgentRecoveryRequiresAction,
   nativeAgentRemoteReconciliationRequired,
   nativeAgentConsequenceAbandonmentRequired,
@@ -288,7 +289,10 @@ test("Native Agent recovery uses the existing card with durable refresh and expl
   assert.match(card, />Reconcile</);
   assert.match(card, />Stop</);
   assert.match(card, />Abandon recovery</);
-  assert.match(card, />Retry result Return</);
+  assert.match(card, /agent\.retryingResultReturn \? "Retrying result Return…" : "Retry result Return"/);
+  assert.match(lifecycle, /setReturnRetryObservation\(\{ roomId, movement \}\)/);
+  assert.match(lifecycle, /observeNativeAgentMovementAfterReturnRetry\(/);
+  assert.match(lifecycle, /RETURN_RETRY_MAX_POLLS = 20/);
   assert.match(lifecycle, /nativeAgentTaskNeedsObservation\(observedStatus\)/);
   assert.match(lifecycle, /native_agent_outcome_unknown/);
   assert.match(bindings, /invoke\("get_native_agent_recovery_projection", \{ roomId \}\)/);
@@ -299,6 +303,36 @@ test("Native Agent recovery uses the existing card with durable refresh and expl
   for (const privateField of ["path", "threadId", "turnId", "provider", "auth", "processId", "sessionReused"]) {
     assert.doesNotMatch(recoveryType, new RegExp(privateField, "i"));
   }
+});
+
+test("Retry result Return observes a later backend transition in the same mounted lifecycle", async () => {
+  const initial = {
+    schemaVersion: "pastey-native-agent-workspace-movement-v1" as const,
+    movementId: "movement-apply-retry",
+    taskId: "task-apply-retry",
+    agentId: "agent.coding.codex",
+    sourceWorkspaceName: "workspace",
+    targetHostRef: "host:remote",
+    reviewSummary: "Review",
+    state: "interrupted" as const,
+    code: "result_apply_interrupted",
+  };
+  const completed = { ...initial, state: "completed" as const, code: null };
+  const responses = [initial, completed];
+  const observed: string[] = [];
+  let reads = 0;
+  await observeNativeAgentMovementAfterReturnRetry(
+    initial,
+    async (movementId) => {
+      assert.equal(movementId, initial.movementId);
+      return responses[reads++];
+    },
+    (movement) => observed.push(movement.state),
+    () => false,
+    async () => {},
+  );
+  assert.equal(reads, 2, "an unchanged acknowledgement must not stop observation");
+  assert.deepEqual(observed, ["interrupted", "completed"]);
 });
 
 test("Native Agent recovery drains only after the current item no longer requires action", () => {
