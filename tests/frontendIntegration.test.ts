@@ -270,6 +270,11 @@ test("reconciliation-required Native Agent movement remains exclusive while ordi
   };
   assert.equal(nativeAgentMovementBlocksNewRun(interrupted), true);
   assert.equal(nativeAgentMovementBlocksNewRun({ ...interrupted, code: "outbound_transfer_failed" }), false);
+  const captureFailure = { ...interrupted, code: "native_agent_result_snapshot_recovery_failed" };
+  assert.equal(nativeAgentMovementBlocksNewRun(captureFailure), true);
+  assert.equal(nativeAgentConsequenceAbandonmentRequired(captureFailure), true);
+  assert.equal(nativeAgentRecoveryRequiresAction(null, captureFailure), true);
+  assert.equal(nativeAgentRecoveryRequiresAction(null, { ...interrupted, state: "returning_result", code: null }), true);
   assert.equal(nativeAgentMovementBlocksNewRun({ ...interrupted, state: "cancelled", code: null }), false);
 });
 
@@ -295,6 +300,8 @@ test("Native Agent recovery uses the existing card with durable refresh and expl
   assert.match(lifecycle, /RETURN_RETRY_MAX_POLLS = 20/);
   assert.match(lifecycle, /nativeAgentTaskNeedsObservation\(observedStatus\)/);
   assert.match(lifecycle, /native_agent_outcome_unknown/);
+  assert.match(lifecycle, /reconcileRemoteNativeAgentTask\(\s*roomId,\s*movement\.targetHostRef,\s*movement\.taskId,\s*movement\.movementId/);
+  assert.match(card, /Codex completed, but Pastey could not safely capture its result for return/);
   assert.match(bindings, /invoke\("get_native_agent_recovery_projection", \{ roomId \}\)/);
   const recoveryType = bindings.slice(
     bindings.indexOf("export interface NativeAgentRecoveryProjection"),

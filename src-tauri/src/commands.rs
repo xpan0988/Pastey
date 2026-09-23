@@ -1541,15 +1541,34 @@ pub async fn retry_native_agent_workspace_result_return(
         .lock()
         .movement_status(&movement_id)
         .map_err(|error| error.message())?;
-    if current_movement.state
-        == crate::native_agent::NativeAgentWorkspaceMovementStateV1::Interrupted
-        && current_movement.code.as_deref() == Some("result_apply_interrupted")
+    let source_pending_return = if current_movement.state
+        == crate::native_agent::NativeAgentWorkspaceMovementStateV1::ReturningResult
+        && current_movement.code.as_deref() == Some("result_return_retry_required")
     {
-        let movement = state
+        state
             .native_agents
             .lock()
-            .authorize_source_apply_retry(&room_id, &movement_id)
-            .map_err(|error| error.message())?;
+            .authorize_source_pending_return_retry(&room_id, &movement_id)
+            .ok()
+    } else {
+        None
+    };
+    if (current_movement.state
+        == crate::native_agent::NativeAgentWorkspaceMovementStateV1::Interrupted
+        && current_movement.code.as_deref() == Some("result_apply_interrupted"))
+        || source_pending_return.is_some()
+    {
+        let movement = if current_movement.state
+            == crate::native_agent::NativeAgentWorkspaceMovementStateV1::Interrupted
+        {
+            state
+                .native_agents
+                .lock()
+                .authorize_source_apply_retry(&room_id, &movement_id)
+        } else {
+            Ok(source_pending_return.expect("checked above"))
+        }
+        .map_err(|error| error.message())?;
         let target = crate::host_identity::HostRef::parse_peer(
             movement.target_host_ref.clone(),
             &state.local_host_ref,

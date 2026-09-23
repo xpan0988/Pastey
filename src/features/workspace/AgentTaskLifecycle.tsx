@@ -44,6 +44,7 @@ export function nativeAgentMovementBlocksNewRun(
       "native_agent_reconciliation_required",
       "native_agent_outcome_unknown",
       "result_apply_interrupted",
+      "native_agent_result_snapshot_recovery_failed",
     ].includes(movement.code ?? ""))
   );
 }
@@ -54,6 +55,7 @@ export function nativeAgentRecoveryRequiresAction(
 ): boolean {
   return nativeAgentInterruptedRecoveryRequiresAction(status, movement)
     || movement?.state === "conflict_recovery_required"
+    || (movement?.state === "returning_result" && !movement.code)
     || (movement?.code === "result_return_retry_required"
       && ["returning_result", "interrupted"].includes(movement.state));
 }
@@ -68,6 +70,7 @@ export function nativeAgentInterruptedRecoveryRequiresAction(
       "native_agent_reconciliation_required",
       "conflict_result_retention_required",
       "result_apply_interrupted",
+      "native_agent_result_snapshot_recovery_failed",
     ].includes(movement.code ?? ""));
 }
 
@@ -84,7 +87,7 @@ export function nativeAgentConsequenceAbandonmentRequired(
   movement: NativeAgentWorkspaceMovement | null,
 ): boolean {
   return movement?.state === "interrupted"
-    && movement.code === "conflict_result_retention_required";
+    && ["conflict_result_retention_required", "native_agent_result_snapshot_recovery_failed"].includes(movement.code ?? "");
 }
 
 export function nativeAgentTaskNeedsObservation(status: NativeAgentTaskStatus | null): boolean {
@@ -346,6 +349,24 @@ export function useNativeAgentTask(roomId: string) {
     }, 1_000);
     return () => window.clearTimeout(timer);
   }, [movement]);
+  useEffect(() => {
+    if (!roomId || status?.state !== "completed"
+      || movement?.state !== "returning_result" || movement.code
+      || !movement.targetHostRef) return;
+    // A task completion is not a Return fact. Query the selected Host for its
+    // exact consequence periodically; silence never becomes a failure fact.
+    const query = () => {
+      void reconcileRemoteNativeAgentTask(
+        roomId,
+        movement.targetHostRef,
+        movement.taskId,
+        movement.movementId,
+      ).catch(() => {});
+    };
+    query();
+    const timer = window.setInterval(query, 5_000);
+    return () => window.clearInterval(timer);
+  }, [roomId, status?.state, movement?.state, movement?.code, movement?.targetHostRef, movement?.taskId, movement?.movementId]);
   useEffect(() => {
     const observation = returnRetryObservation;
     if (!observation || observation.roomId !== roomId) return;

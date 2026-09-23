@@ -1752,10 +1752,23 @@ pub async fn receive_room_control_event_handler(
                         "Native Agent reconciliation targets another Host.",
                     );
                 }
+                let Some(source_host_ref) = peers
+                    .iter()
+                    .find(|peer| peer.peer_session_id == inbound_peer.peer_session_id)
+                    .and_then(|peer| peer.logical_host_ref.as_deref())
+                else {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native Agent reconciliation has no bound source Host.",
+                    );
+                };
                 let fact = match ctx.state.native_agents.lock().reconciliation_fact(
+                    &room_id,
                     &request.task_id,
                     request.movement_id.as_deref(),
                     ctx.state.local_host_ref.as_str(),
+                    source_host_ref,
                 ) {
                     Ok(fact) => fact,
                     Err(_) => {
