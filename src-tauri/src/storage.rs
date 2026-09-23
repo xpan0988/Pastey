@@ -297,6 +297,34 @@ pub(crate) fn get_native_agent_envelope(
     .map_err(AppError::from)
 }
 
+/// Update only an envelope that still exists. The immediate transaction keeps
+/// a concurrent Burn deletion from being undone by a late native observer.
+pub(crate) fn update_native_agent_observed_task_if_present(
+    paths: &AppPaths,
+    task_id: &str,
+    task: &serde_json::Value,
+) -> AppResult<()> {
+    let mut conn = connection(paths)?;
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current: Option<String> = transaction
+        .query_row(
+            "SELECT record_json FROM native_agent_envelopes WHERE task_id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(current) = current {
+        let mut envelope: serde_json::Value = serde_json::from_str(&current)?;
+        envelope["task"] = task.clone();
+        transaction.execute(
+            "UPDATE native_agent_envelopes SET record_json = ?2, updated_at = ?3 WHERE task_id = ?1",
+            params![task_id, serde_json::to_string(&envelope)?, now_ts()],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 pub(crate) fn delete_native_agent_envelope(paths: &AppPaths, task_id: &str) -> AppResult<bool> {
     if task_id.trim().is_empty() || task_id.len() > 256 {
         return Err(AppError::InvalidInput(
