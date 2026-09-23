@@ -79,6 +79,7 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "native_agent.workspace_prepare",
     "native_agent.reconcile",
     "native_agent.reconciliation",
+    "native_agent.retry_result_return",
 ];
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
 const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
@@ -1812,6 +1813,72 @@ pub async fn receive_room_control_event_handler(
                     .await;
                 });
             }
+            "native_agent.retry_result_return" => {
+                let request = match serde_json::from_value::<
+                    crate::native_agent::NativeAgentRetryResultReturnV1,
+                >(payload)
+                .map_err(AppError::from)
+                .and_then(|request| {
+                    crate::native_agent::validate_retry_result_return(&request)?;
+                    Ok(request)
+                }) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        return control_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_native_agent",
+                            "Invalid native Agent result Return retry.",
+                        )
+                    }
+                };
+                let Some(source_host_ref) = peers
+                    .iter()
+                    .find(|peer| peer.peer_session_id == inbound_peer.peer_session_id)
+                    .and_then(|peer| peer.logical_host_ref.as_deref())
+                else {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native Agent result Return retry has no bound source Host.",
+                    );
+                };
+                if ctx
+                    .state
+                    .native_agents
+                    .lock()
+                    .authorize_result_return_retry(
+                        &room_id,
+                        &request,
+                        source_host_ref,
+                        ctx.state.local_host_ref.as_str(),
+                    )
+                    .is_err()
+                {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native Agent result Return retry does not match this Bridge session.",
+                    );
+                }
+                let retry_state = ctx.state.clone();
+                let retry_room = room_id.clone();
+                let movement_id = request.movement_id;
+                ctx.state.spawn(async move {
+                    if crate::native_agent::retry_workspace_result_return(
+                        retry_state.clone(),
+                        &retry_room,
+                        &movement_id,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        retry_state
+                            .native_agents
+                            .lock()
+                            .mark_result_return_pending(&movement_id);
+                    }
+                });
+            }
             "native_agent.reconciliation" => {
                 let fact: crate::native_agent::NativeAgentReconciliationV1 =
                     match serde_json::from_value(payload) {
@@ -2705,6 +2772,17 @@ fn validate_control_event(
                     request_id: None,
                     event,
                 });
+            }
+            "native_agent.retry_result_return" => {
+                let request = serde_json::from_value::<
+                    crate::native_agent::NativeAgentRetryResultReturnV1,
+                >(Value::Object(payload.clone()))
+                .map_err(AppError::from)?;
+                crate::native_agent::validate_retry_result_return(&request)?;
+                format!(
+                    "native-agent-result-return-retry:{}:{}",
+                    request.movement_id, request.retry_id
+                )
             }
             "native_agent.reconciliation" => {
                 let fact =

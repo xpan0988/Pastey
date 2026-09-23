@@ -1252,10 +1252,10 @@ pub async fn propose_remote_native_codex_workspace_movement(
         )
         .map_err(|error| error.message())?;
     let object = crate::bridge_plan_v2::ManagedObjectRevisionV2 {
-        logical_object_id: acquisition.object.logical_object_id,
+        logical_object_id: acquisition.object.logical_object_id.clone(),
         revision: acquisition.object.revision,
     };
-    state
+    let proposed = state
         .native_agents
         .lock()
         .propose_bridge_workspace_movement(
@@ -1267,8 +1267,14 @@ pub async fn propose_remote_native_codex_workspace_movement(
             object,
             &task,
             true,
-        )
-        .map_err(|error| error.message())
+        );
+    match proposed {
+        Ok(movement) => Ok(movement),
+        Err(error) => {
+            state.managed_objects.lock().discard_binding(&acquisition);
+            Err(error.message())
+        }
+    }
 }
 
 /// Executes one already reviewed workspace movement. A single call covers the
@@ -1530,6 +1536,69 @@ pub async fn retry_native_agent_workspace_result_return(
     room_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentWorkspaceMovementV1, String> {
+    let current_movement = state
+        .native_agents
+        .lock()
+        .movement_status(&movement_id)
+        .map_err(|error| error.message())?;
+    if current_movement.state
+        == crate::native_agent::NativeAgentWorkspaceMovementStateV1::Interrupted
+        && current_movement.code.as_deref() == Some("result_apply_interrupted")
+    {
+        let movement = state
+            .native_agents
+            .lock()
+            .authorize_source_apply_retry(&room_id, &movement_id)
+            .map_err(|error| error.message())?;
+        let target = crate::host_identity::HostRef::parse_peer(
+            movement.target_host_ref.clone(),
+            &state.local_host_ref,
+        )
+        .map_err(|error| error.message())?;
+        let session = state
+            .resolve_current_remote_host_session(&room_id, &target)
+            .await
+            .map_err(|error| error.message())?;
+        let binding = session.binding().clone();
+        let request = crate::native_agent::NativeAgentRetryResultReturnV1 {
+            schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            retry_id: uuid::Uuid::new_v4().to_string(),
+            movement_id: movement_id.clone(),
+            task_id: movement.task_id.clone(),
+            target_host_ref: target.as_str().into(),
+        };
+        crate::native_agent::validate_retry_result_return(&request)
+            .map_err(|error| error.message())?;
+        let context = crate::room_control::room_control_session_context_for_peer(
+            &state,
+            &room_id,
+            &binding.peer_route_ref,
+        )
+        .map_err(|error| error.message())?;
+        let event = crate::room_control::native_agent_event(
+            "native_agent.retry_result_return",
+            serde_json::to_value(request).map_err(|error| error.to_string())?,
+            &context,
+        )
+        .map_err(|error| error.message())?;
+        crate::room_control::send_room_control_event(
+            state.inner().clone(),
+            &room_id,
+            event,
+            Some(crate::room_control::selected_peer_route(
+                &room_id,
+                &binding.peer_route_ref,
+            )),
+        )
+        .await
+        .map_err(|error| error.message())?;
+        return state
+            .native_agents
+            .lock()
+            .movement_status(&movement_id)
+            .map_err(|error| error.message());
+    }
+
     crate::native_agent::retry_workspace_result_return(
         state.inner().clone(),
         &room_id,
