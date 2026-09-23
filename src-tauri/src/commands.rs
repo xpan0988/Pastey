@@ -884,13 +884,24 @@ fn fail_approved_native_workspace_dispatch(
     final_receipt_ambiguous: bool,
 ) -> String {
     if let Some(item_id) = outgoing_item_id {
-        let _ = storage::delete_room_item(&state.paths, item_id);
+        if let Err(error) = storage::delete_room_item(&state.paths, item_id) {
+            crate::logging::write_error_line(&format!(
+                "Native Agent outbound room-item cleanup failed: {}",
+                error.message()
+            ));
+        }
     }
     crate::regular_file_set_transfer::cleanup_package(package);
-    let _ = state
+    if let Err(error) = state
         .native_agents
         .lock()
-        .mark_outbound_workspace_delivery_failed(movement_id, final_receipt_ambiguous);
+        .mark_outbound_workspace_delivery_failed(movement_id, final_receipt_ambiguous)
+    {
+        crate::logging::write_error_line(&format!(
+            "Native Agent outbound recovery persistence failed: {}",
+            error.message()
+        ));
+    }
     message
 }
 
@@ -1555,7 +1566,12 @@ pub async fn retry_native_agent_workspace_result_return(
     };
     if (current_movement.state
         == crate::native_agent::NativeAgentWorkspaceMovementStateV1::Interrupted
-        && current_movement.code.as_deref() == Some("result_apply_interrupted"))
+        && matches!(
+            current_movement.code.as_deref(),
+            Some("result_apply_interrupted")
+                | Some("conflict_result_retention_required")
+                | Some("conflict_result_retention_failed")
+        ))
         || source_pending_return.is_some()
     {
         let movement = if current_movement.state

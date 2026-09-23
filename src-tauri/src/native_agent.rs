@@ -192,6 +192,8 @@ fn movement_holds_source_ownership(movement: &NativeAgentWorkspaceMovementV1) ->
             Some("native_agent_reconciliation_required")
                 | Some("native_agent_outcome_unknown")
                 | Some("result_apply_interrupted")
+                | Some("conflict_result_retention_required")
+                | Some("conflict_result_retention_failed")
                 | Some("native_agent_result_snapshot_recovery_failed")
         ))
 }
@@ -562,10 +564,16 @@ impl NativeAgentServiceV1 {
                     movement.status.code = Some("conflict_result_retention_required".into());
                     changed = true;
                 } else if movement.status.state == NativeAgentWorkspaceMovementStateV1::Interrupted
-                    && movement.status.code.as_deref() == Some("result_apply_interrupted")
+                    && matches!(
+                        movement.status.code.as_deref(),
+                        Some("result_apply_interrupted")
+                            | Some("conflict_result_retention_required")
+                            | Some("conflict_result_retention_failed")
+                    )
                 {
-                    // Preserve the more precise local apply-recovery state
-                    // established by the durable transaction journal.
+                    // Preserve exact local consequence recovery across every
+                    // restart; generic execution reconciliation cannot accept
+                    // an already received Return identity.
                 } else if persisted.task.state == NativeAgentTaskStateV1::Completed
                     && movement.prepared_remote.is_some()
                     && movement.apply_transaction.is_none()
@@ -1742,7 +1750,12 @@ impl NativeAgentServiceV1 {
                 != Some(bridge_id)
             || record.source.is_none()
             || record.status.state != NativeAgentWorkspaceMovementStateV1::Interrupted
-            || record.status.code.as_deref() != Some("result_apply_interrupted")
+            || !matches!(
+                record.status.code.as_deref(),
+                Some("result_apply_interrupted")
+                    | Some("conflict_result_retention_required")
+                    | Some("conflict_result_retention_failed")
+            )
             || record.result_identity.is_none()
             || record
                 .apply_transaction
@@ -2247,7 +2260,7 @@ impl NativeAgentServiceV1 {
             if record
                 .result_identity
                 .as_ref()
-                .is_some_and(|existing| existing != &returned)
+                .is_some_and(|existing| !same_logical_file_set(existing, &returned))
             {
                 return invalid("Native Agent conflict Return does not match its exact result.");
             }
@@ -2270,7 +2283,7 @@ impl NativeAgentServiceV1 {
         if record
             .result_identity
             .as_ref()
-            .is_some_and(|existing| existing != &returned)
+            .is_some_and(|existing| !same_logical_file_set(existing, &returned))
         {
             return invalid("Native Agent result Return does not match its exact durable result.");
         }
@@ -2315,7 +2328,9 @@ impl NativeAgentServiceV1 {
                 if record
                     .apply_transaction
                     .as_ref()
-                    .is_some_and(|transaction| transaction.result_identity != returned_identity)
+                    .is_some_and(|transaction| {
+                        !same_logical_file_set(&transaction.result_identity, &returned_identity)
+                    })
                 {
                     return invalid(
                         "Native Agent result Return does not match its durable apply transaction.",
@@ -3395,6 +3410,7 @@ impl NativeAgentServiceV1 {
                                 value.code.as_deref(),
                                 Some("native_agent_reconciliation_required")
                                     | Some("conflict_result_retention_required")
+                                    | Some("conflict_result_retention_failed")
                                     | Some("result_apply_interrupted")
                                     | Some("native_agent_result_snapshot_recovery_failed")
                             ))
@@ -3473,6 +3489,7 @@ impl NativeAgentServiceV1 {
                         record.status.code.as_deref(),
                         Some("native_agent_reconciliation_required")
                             | Some("conflict_result_retention_required")
+                            | Some("conflict_result_retention_failed")
                             | Some("result_apply_interrupted")
                             | Some("native_agent_result_snapshot_recovery_failed")
                     )
@@ -3699,7 +3716,15 @@ impl NativeAgentServiceV1 {
             .collect::<Vec<_>>();
         for movement_id in &movement_ids {
             if let Some(record) = self.workspace_movements.get_mut(movement_id) {
-                recover_workspace_apply_record(movement_id, record)?;
+                if let Err(error) = recover_workspace_apply_record(movement_id, record) {
+                    // Burn has already revoked Bridge authority. Preserve an
+                    // unprovable canonical tree and its siblings, then remove
+                    // the envelope so startup cannot restore that authority.
+                    crate::logging::write_error_line(&format!(
+                        "Native Agent Burn left an unresolved workspace apply journal: {}",
+                        error.message()
+                    ));
+                }
             }
         }
         if let Some(paths) = self.durable_paths.as_ref() {
@@ -3847,7 +3872,14 @@ pub(crate) fn purge_durable_bridge_state(
         }
         if let Some(movement) = persisted.movement.as_mut() {
             let movement_id = movement.status.movement_id.clone();
-            recover_workspace_apply_record(&movement_id, movement)?;
+            if let Err(error) = recover_workspace_apply_record(&movement_id, movement) {
+                // The durable Burn tombstone is authoritative. Unknown
+                // canonical, stage, and backup trees remain untouched.
+                crate::logging::write_error_line(&format!(
+                    "Native Agent burned-room cleanup left an unresolved workspace apply journal: {}",
+                    error.message()
+                ));
+            }
             if let Some(conflict) =
                 crate::storage::get_native_agent_conflict(paths, &movement.status.movement_id)?
             {
@@ -6652,6 +6684,382 @@ exit 1
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn exact_conflict_return_survives_repeated_requester_restarts_and_repairs_once() {
+        let terminal = r#"{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"completed","error":null}}}"#;
+        let (root, source, agent) = fixture_with_turn_start_behavior(&format!(
+            "echo '{{\"id\":3,\"result\":{{\"turn\":{{\"id\":\"native-turn\"}}}}}}'; echo run >> \"$PWD/turn-runs\"; echo '{terminal}'"
+        ));
+        fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+        let received = root.join("received");
+        fs::create_dir(&received).unwrap();
+        fs::write(received.join("baseline.txt"), b"baseline").unwrap();
+        let requester_paths = durable_paths(&root.join("requester"));
+        let executor_paths = durable_paths(&root.join("executor"));
+        let mut requester = NativeAgentServiceV1::with_paths(requester_paths.clone()).unwrap();
+        requester
+            .propose_bridge_workspace_movement(
+                "room-conflict",
+                "movement-conflict",
+                "task-conflict",
+                &source,
+                "host:remote",
+                movement_object(),
+                "edit",
+                true,
+            )
+            .unwrap();
+        requester
+            .propose_bridge_workspace_movement(
+                "room-conflict",
+                "movement-later",
+                "task-later",
+                &source,
+                "host:remote",
+                movement_object(),
+                "edit later",
+                true,
+            )
+            .unwrap();
+        let (prepare, _, package) = requester
+            .approve_workspace_movement(
+                "movement-conflict",
+                "room-conflict",
+                "host:source",
+                &requester_paths.temp_dir,
+            )
+            .unwrap();
+        crate::regular_file_set_transfer::cleanup_package(&package);
+        let mut executor = NativeAgentServiceV1::with_paths(executor_paths).unwrap();
+        executor
+            .accept_bridge_workspace_prepare("room-conflict", prepare)
+            .unwrap();
+        executor
+            .start_received_workspace_task_with_executable(&agent, "movement-conflict", &received)
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal(&executor, "task-conflict").state,
+            NativeAgentTaskStateV1::Completed
+        );
+        let (_, exact_snapshot, _, identity) = executor
+            .captured_result_snapshot_for_return("movement-conflict")
+            .unwrap();
+        let first_return = root.join("first-return");
+        fs::create_dir(&first_return).unwrap();
+        for name in ["baseline.txt", "turn-runs"] {
+            fs::copy(exact_snapshot.join(name), first_return.join(name)).unwrap();
+        }
+        executor.mark_result_return_pending("movement-conflict");
+        let fact = executor
+            .reconciliation_fact(
+                "room-conflict",
+                "task-conflict",
+                Some("movement-conflict"),
+                "host:remote",
+                "host:source",
+            )
+            .unwrap();
+        requester
+            .record_bridge_remote_reconciliation("room-conflict", fact)
+            .unwrap();
+        fs::write(source.join("local-change.txt"), b"user edit").unwrap();
+        let transfer = NativeAgentWorkspaceTransferV1 {
+            schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+            movement_id: "movement-conflict".into(),
+            task_id: "task-conflict".into(),
+            phase: NativeAgentWorkspaceTransferPhaseV1::Return,
+            bridge_id: "room-conflict".into(),
+            source_host_ref: "host:remote".into(),
+            destination_host_ref: "host:source".into(),
+            object: movement_object(),
+            content_digest: identity.digest.clone(),
+            logical_byte_count: identity.byte_count,
+        };
+        requester
+            .validate_workspace_transfer(&transfer, "host:source")
+            .unwrap();
+        assert_eq!(
+            requester
+                .apply_received_workspace_return("movement-conflict", &first_return)
+                .unwrap()
+                .code
+                .as_deref(),
+            Some("conflict_result_retention_pending")
+        );
+        assert!(requester
+            .workspace_movements
+            .get("movement-conflict")
+            .unwrap()
+            .result_identity
+            .as_ref()
+            .is_some_and(|received| same_logical_file_set(received, &identity)));
+        drop(requester);
+        for _ in 0..3 {
+            requester = NativeAgentServiceV1::with_paths(requester_paths.clone()).unwrap();
+            let pending = requester.movement_status("movement-conflict").unwrap();
+            assert_eq!(
+                pending.state,
+                NativeAgentWorkspaceMovementStateV1::Interrupted
+            );
+            assert_eq!(
+                pending.code.as_deref(),
+                Some("conflict_result_retention_required")
+            );
+            assert!(movement_holds_source_ownership(&pending));
+            assert!(requester
+                .approve_workspace_movement(
+                    "movement-later",
+                    "room-conflict",
+                    "host:source",
+                    &requester_paths.temp_dir,
+                )
+                .is_err());
+            drop(requester);
+        }
+        requester = NativeAgentServiceV1::with_paths(requester_paths.clone()).unwrap();
+        let mut wrong = transfer.clone();
+        wrong.content_digest = "0".repeat(64);
+        assert!(requester
+            .validate_workspace_transfer(&wrong, "host:source")
+            .is_err());
+        wrong = transfer.clone();
+        wrong.task_id = "wrong-task".into();
+        assert!(requester
+            .validate_workspace_transfer(&wrong, "host:source")
+            .is_err());
+        wrong = transfer.clone();
+        wrong.movement_id = "movement-later".into();
+        assert!(requester
+            .validate_workspace_transfer(&wrong, "host:source")
+            .is_err());
+        wrong = transfer.clone();
+        wrong.source_host_ref = "host:wrong".into();
+        assert!(requester
+            .validate_workspace_transfer(&wrong, "host:source")
+            .is_err());
+        wrong = transfer.clone();
+        wrong.destination_host_ref = "host:wrong".into();
+        assert!(requester
+            .validate_workspace_transfer(&wrong, "host:source")
+            .is_err());
+        requester
+            .authorize_source_apply_retry("room-conflict", "movement-conflict")
+            .unwrap();
+        executor
+            .authorize_result_return_retry(
+                "room-conflict",
+                &NativeAgentRetryResultReturnV1 {
+                    schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                    retry_id: "retry-conflict".into(),
+                    movement_id: "movement-conflict".into(),
+                    task_id: "task-conflict".into(),
+                    target_host_ref: "host:remote".into(),
+                },
+                "host:source",
+                "host:remote",
+            )
+            .unwrap();
+        let retry_return = root.join("retry-return");
+        fs::create_dir(&retry_return).unwrap();
+        for name in ["baseline.txt", "turn-runs"] {
+            fs::copy(exact_snapshot.join(name), retry_return.join(name)).unwrap();
+        }
+        let retry_identity = crate::safe_file_identity::capture_regular_file_set_identity(
+            &retry_return,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )
+        .unwrap();
+        let first_identity = requester
+            .workspace_movements
+            .get("movement-conflict")
+            .unwrap()
+            .result_identity
+            .as_ref()
+            .unwrap();
+        assert_ne!(first_identity, &retry_identity);
+        assert!(same_logical_file_set(first_identity, &retry_identity));
+        requester
+            .validate_workspace_transfer(&transfer, "host:source")
+            .unwrap();
+        assert_eq!(
+            requester
+                .apply_received_workspace_return("movement-conflict", &retry_return)
+                .unwrap()
+                .code
+                .as_deref(),
+            Some("conflict_result_retention_pending")
+        );
+        retain_conflicted_workspace(
+            &requester_paths,
+            "movement-conflict",
+            "task-conflict",
+            &retry_return,
+        )
+        .unwrap();
+        assert_eq!(
+            requester
+                .finalize_conflict_recovery("movement-conflict", &requester_paths)
+                .unwrap()
+                .state,
+            NativeAgentWorkspaceMovementStateV1::ConflictRecoveryRequired
+        );
+        assert_eq!(
+            fs::read(source.join("local-change.txt")).unwrap(),
+            b"user edit"
+        );
+        assert_eq!(
+            executor.task_status("task-conflict").unwrap().state,
+            NativeAgentTaskStateV1::Completed
+        );
+        assert_eq!(
+            fs::read_to_string(received.join("turn-runs"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn conflict_retention_repair_or_abandon_keeps_one_source_owner() {
+        for failure_code in [
+            "conflict_result_retention_required",
+            "conflict_result_retention_failed",
+        ] {
+            let (root, source, _) = fixture();
+            fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+            let returned = root.join("returned");
+            fs::create_dir(&returned).unwrap();
+            fs::write(returned.join("result.txt"), b"result").unwrap();
+            let identity = crate::safe_file_identity::capture_regular_file_set_identity(
+                &returned,
+                crate::storage::MAX_FILE_SIZE_BYTES,
+            )
+            .unwrap();
+            let paths = durable_paths(&root);
+            let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+            service
+                .propose_bridge_workspace_movement(
+                    "room-retention",
+                    "movement-retention",
+                    "task-retention",
+                    &source,
+                    "host:remote",
+                    movement_object(),
+                    "edit",
+                    true,
+                )
+                .unwrap();
+            let (_, _, package) = service
+                .approve_workspace_movement(
+                    "movement-retention",
+                    "room-retention",
+                    "host:source",
+                    &paths.temp_dir,
+                )
+                .unwrap();
+            crate::regular_file_set_transfer::cleanup_package(&package);
+            service
+                .tasks
+                .lock()
+                .unwrap()
+                .get_mut("task-retention")
+                .unwrap()
+                .state = NativeAgentTaskStateV1::Completed;
+            service
+                .workspace_movements
+                .get_mut("movement-retention")
+                .unwrap()
+                .status
+                .state = NativeAgentWorkspaceMovementStateV1::ReturningResult;
+            service.persist_envelope("task-retention", None).unwrap();
+            fs::write(source.join("local-change.txt"), b"user edit").unwrap();
+            assert_eq!(
+                service
+                    .apply_received_workspace_return("movement-retention", &returned)
+                    .unwrap()
+                    .code
+                    .as_deref(),
+                Some("conflict_result_retention_pending")
+            );
+            if failure_code == "conflict_result_retention_failed" {
+                service.interrupt_workspace_movement("movement-retention", failure_code);
+            }
+            drop(service);
+            let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+            let pending = service.movement_status("movement-retention").unwrap();
+            assert_eq!(pending.code.as_deref(), Some(failure_code));
+            assert!(movement_holds_source_ownership(&pending));
+            assert!(service
+                .recovery_projection_for_bridge("room-retention")
+                .unwrap()
+                .is_some());
+            service
+                .authorize_source_apply_retry("room-retention", "movement-retention")
+                .unwrap();
+            let transfer = NativeAgentWorkspaceTransferV1 {
+                schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+                movement_id: "movement-retention".into(),
+                task_id: "task-retention".into(),
+                phase: NativeAgentWorkspaceTransferPhaseV1::Return,
+                bridge_id: "room-retention".into(),
+                source_host_ref: "host:remote".into(),
+                destination_host_ref: "host:source".into(),
+                object: movement_object(),
+                content_digest: identity.digest,
+                logical_byte_count: identity.byte_count,
+            };
+            service
+                .validate_workspace_transfer(&transfer, "host:source")
+                .unwrap();
+            service
+                .stop_bridge_task_authority("room-retention", "task-retention")
+                .unwrap();
+            assert_eq!(
+                service.task_status("task-retention").unwrap().state,
+                NativeAgentTaskStateV1::Completed
+            );
+            assert_eq!(
+                service
+                    .movement_status("movement-retention")
+                    .unwrap()
+                    .code
+                    .as_deref(),
+                Some("native_agent_recovery_abandoned")
+            );
+            assert!(service
+                .validate_workspace_transfer(&transfer, "host:source")
+                .is_err());
+            assert_eq!(
+                fs::read(source.join("local-change.txt")).unwrap(),
+                b"user edit"
+            );
+            service
+                .propose_bridge_workspace_movement(
+                    "room-retention",
+                    "movement-new",
+                    "task-new",
+                    &source,
+                    "host:remote",
+                    movement_object(),
+                    "new task",
+                    true,
+                )
+                .unwrap();
+            let (_, _, package) = service
+                .approve_workspace_movement(
+                    "movement-new",
+                    "room-retention",
+                    "host:source",
+                    &paths.temp_dir,
+                )
+                .unwrap();
+            crate::regular_file_set_transfer::cleanup_package(&package);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
     fn durable_paths(root: &Path) -> crate::storage::AppPaths {
         let paths = crate::storage::AppPaths::new(root.join("app-data"), root.join("logs"));
         paths.ensure_directories().unwrap();
@@ -7334,6 +7742,123 @@ exit 1
                 b"local edit",
                 "duplicate exact Return must not apply over later user edits"
             );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn burned_bridge_with_unprovable_apply_journal_finalizes_on_every_startup() {
+        for in_memory_purge in [false, true] {
+            let (root, source, _) = fixture();
+            fs::write(source.join("baseline.txt"), b"approved baseline").unwrap();
+            let returned = root.join("returned");
+            fs::create_dir(&returned).unwrap();
+            fs::write(returned.join("result.txt"), b"exact native result").unwrap();
+            let identity = crate::safe_file_identity::capture_regular_file_set_identity(
+                &returned,
+                crate::storage::MAX_FILE_SIZE_BYTES,
+            )
+            .unwrap();
+            let paths = durable_paths(&root);
+            crate::storage::create_room(
+                &paths,
+                &[9u8; 32],
+                "123456",
+                30,
+                crate::models::LocalRole::Creator,
+                Some("room-unsafe-apply".into()),
+                None,
+            )
+            .unwrap();
+            let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+            service
+                .propose_bridge_workspace_movement(
+                    "room-unsafe-apply",
+                    "movement-unsafe-apply",
+                    "task-unsafe-apply",
+                    &source,
+                    "host:remote",
+                    movement_object(),
+                    "edit",
+                    true,
+                )
+                .unwrap();
+            let source_record = {
+                let record = service
+                    .workspace_movements
+                    .get_mut("movement-unsafe-apply")
+                    .unwrap();
+                record.status.state = NativeAgentWorkspaceMovementStateV1::ReturningResult;
+                record.source.clone().unwrap()
+            };
+            service
+                .tasks
+                .lock()
+                .unwrap()
+                .get_mut("task-unsafe-apply")
+                .unwrap()
+                .state = NativeAgentTaskStateV1::Completed;
+            service.persist_envelope("task-unsafe-apply", None).unwrap();
+            assert!(service
+                .apply_exact_workspace_result_with_crash(
+                    "movement-unsafe-apply",
+                    &source_record,
+                    &returned,
+                    identity,
+                    Some(ApplyCrashPointV1::StageJournaled),
+                )
+                .is_err());
+            let (stage, backup) =
+                apply_transaction_paths(&source, "movement-unsafe-apply").unwrap();
+            assert!(stage.is_dir());
+            assert!(!backup.exists());
+            fs::write(source.join("user-change.txt"), b"unexpected user content").unwrap();
+            assert!(recover_workspace_apply_record(
+                "movement-unsafe-apply",
+                service
+                    .workspace_movements
+                    .get_mut("movement-unsafe-apply")
+                    .unwrap(),
+            )
+            .is_err());
+            assert_eq!(
+                fs::read(source.join("user-change.txt")).unwrap(),
+                b"unexpected user content"
+            );
+            crate::storage::cut_off_bridge_authority(&paths, "room-unsafe-apply").unwrap();
+            assert!(crate::storage::is_burned_bridge(&paths, "room-unsafe-apply").unwrap());
+            if in_memory_purge {
+                service.purge_bridge_authority("room-unsafe-apply").unwrap();
+                assert!(service
+                    .propose_bridge_workspace_movement(
+                        "room-unsafe-apply",
+                        "movement-late",
+                        "task-late",
+                        &source,
+                        "host:remote",
+                        movement_object(),
+                        "late",
+                        true,
+                    )
+                    .is_err());
+            }
+            drop(service);
+            for _ in 0..2 {
+                crate::storage::finalize_burned_room(&paths, "room-unsafe-apply", &paths.inbox_dir)
+                    .unwrap();
+                assert!(crate::storage::is_burned_bridge(&paths, "room-unsafe-apply").unwrap());
+                assert!(crate::storage::list_native_agent_envelopes(&paths)
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    fs::read(source.join("user-change.txt")).unwrap(),
+                    b"unexpected user content"
+                );
+                assert!(stage.is_dir());
+                assert!(!backup.exists());
+                let restored = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+                assert!(restored.movement_status("movement-unsafe-apply").is_err());
+            }
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -9084,6 +9609,153 @@ exit 1
         assert!(service
             .approve_workspace_movement("movement-next", "room", "host:source", &paths.temp_dir,)
             .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_remote_finish_with_failed_sender_status_write_keeps_source_owned() {
+        let terminal = r#"{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"completed","error":null}}}"#;
+        let (root, source, agent) = fixture_with_turn_start_behavior(&format!(
+            "echo '{{\"id\":3,\"result\":{{\"turn\":{{\"id\":\"native-turn\"}}}}}}'; echo run >> \"$PWD/turn-runs\"; echo '{terminal}'"
+        ));
+        fs::write(source.join("baseline.txt"), b"baseline").unwrap();
+        let received = root.join("received");
+        fs::create_dir(&received).unwrap();
+        fs::write(received.join("baseline.txt"), b"baseline").unwrap();
+        let requester_paths = durable_paths(&root.join("requester"));
+        let executor_paths = durable_paths(&root.join("executor"));
+        let mut requester = NativeAgentServiceV1::with_paths(requester_paths.clone()).unwrap();
+        requester
+            .propose_bridge_workspace_movement(
+                "room-finish",
+                "movement-finish",
+                "task-finish",
+                &source,
+                "host:remote",
+                movement_object(),
+                "edit",
+                true,
+            )
+            .unwrap();
+        requester
+            .propose_bridge_workspace_movement(
+                "room-finish",
+                "movement-next",
+                "task-next",
+                &source,
+                "host:remote",
+                movement_object(),
+                "edit again",
+                true,
+            )
+            .unwrap();
+        let (prepare, _, package) = requester
+            .approve_workspace_movement(
+                "movement-finish",
+                "room-finish",
+                "host:source",
+                &requester_paths.temp_dir,
+            )
+            .unwrap();
+        crate::regular_file_set_transfer::cleanup_package(&package);
+        let mut executor = NativeAgentServiceV1::with_paths(executor_paths).unwrap();
+        executor
+            .accept_bridge_workspace_prepare("room-finish", prepare)
+            .unwrap();
+        // Receiver /finish has completed landing and started the one Agent
+        // turn before this sender-local UI write fails.
+        executor
+            .start_received_workspace_task_with_executable(&agent, "movement-finish", &received)
+            .unwrap();
+        let receipt_ambiguous = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let write = crate::transfer::record_successful_finish_before_sender_bookkeeping(
+            Some(&receipt_ambiguous),
+            || invalid("injected sender room-item status failure"),
+        );
+        assert!(write.is_err());
+        assert!(receipt_ambiguous.load(std::sync::atomic::Ordering::SeqCst));
+        let interrupted = requester
+            .mark_outbound_workspace_delivery_failed(
+                "movement-finish",
+                receipt_ambiguous.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .unwrap();
+        assert_eq!(
+            interrupted.code.as_deref(),
+            Some("native_agent_reconciliation_required")
+        );
+        assert!(movement_holds_source_ownership(
+            &requester
+                .workspace_movements
+                .get("movement-finish")
+                .unwrap()
+                .status
+        ));
+        assert!(requester
+            .approve_workspace_movement(
+                "movement-next",
+                "room-finish",
+                "host:source",
+                &requester_paths.temp_dir
+            )
+            .is_err());
+        assert!(requester
+            .start_codex_task_with_executable(&agent, &source, "must not start")
+            .is_err());
+        assert_eq!(
+            wait_for_terminal(&executor, "task-finish").state,
+            NativeAgentTaskStateV1::Completed
+        );
+        executor
+            .captured_result_snapshot_for_return("movement-finish")
+            .unwrap();
+        executor.mark_result_return_pending("movement-finish");
+        let fact = executor
+            .reconciliation_fact(
+                "room-finish",
+                "task-finish",
+                Some("movement-finish"),
+                "host:remote",
+                "host:source",
+            )
+            .unwrap();
+        requester
+            .record_bridge_remote_reconciliation("room-finish", fact)
+            .unwrap();
+        let result = crate::safe_file_identity::capture_regular_file_set_identity(
+            &received,
+            crate::storage::MAX_FILE_SIZE_BYTES,
+        )
+        .unwrap();
+        let transfer = NativeAgentWorkspaceTransferV1 {
+            schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+            movement_id: "movement-finish".into(),
+            task_id: "task-finish".into(),
+            phase: NativeAgentWorkspaceTransferPhaseV1::Return,
+            bridge_id: "room-finish".into(),
+            source_host_ref: "host:remote".into(),
+            destination_host_ref: "host:source".into(),
+            object: movement_object(),
+            content_digest: result.digest,
+            logical_byte_count: result.byte_count,
+        };
+        requester
+            .validate_workspace_transfer(&transfer, "host:source")
+            .unwrap();
+        assert_eq!(
+            requester
+                .apply_received_workspace_return("movement-finish", &received)
+                .unwrap()
+                .state,
+            NativeAgentWorkspaceMovementStateV1::Completed
+        );
+        assert_eq!(
+            fs::read_to_string(received.join("turn-runs"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -44,6 +44,8 @@ export function nativeAgentMovementBlocksNewRun(
       "native_agent_reconciliation_required",
       "native_agent_outcome_unknown",
       "result_apply_interrupted",
+      "conflict_result_retention_required",
+      "conflict_result_retention_failed",
       "native_agent_result_snapshot_recovery_failed",
     ].includes(movement.code ?? ""))
   );
@@ -69,6 +71,7 @@ export function nativeAgentInterruptedRecoveryRequiresAction(
     || (movement?.state === "interrupted" && [
       "native_agent_reconciliation_required",
       "conflict_result_retention_required",
+      "conflict_result_retention_failed",
       "result_apply_interrupted",
       "native_agent_result_snapshot_recovery_failed",
     ].includes(movement.code ?? ""));
@@ -87,7 +90,7 @@ export function nativeAgentConsequenceAbandonmentRequired(
   movement: NativeAgentWorkspaceMovement | null,
 ): boolean {
   return movement?.state === "interrupted"
-    && ["conflict_result_retention_required", "native_agent_result_snapshot_recovery_failed"].includes(movement.code ?? "");
+    && ["conflict_result_retention_required", "conflict_result_retention_failed", "native_agent_result_snapshot_recovery_failed"].includes(movement.code ?? "");
 }
 
 export function nativeAgentTaskNeedsObservation(status: NativeAgentTaskStatus | null): boolean {
@@ -470,6 +473,8 @@ export function useNativeAgentTask(roomId: string) {
     if (!movement || ![
       "result_return_retry_required",
       "result_apply_interrupted",
+      "conflict_result_retention_required",
+      "conflict_result_retention_failed",
     ].includes(movement.code ?? "") || busy
       || returnRetryObservation?.roomId === roomId) return;
     setReturnRetryObservation({ roomId, movement });
