@@ -274,6 +274,12 @@ test("reconciliation-required Native Agent movement remains exclusive while ordi
   assert.equal(nativeAgentMovementBlocksNewRun(captureFailure), true);
   assert.equal(nativeAgentConsequenceAbandonmentRequired(captureFailure), true);
   assert.equal(nativeAgentRecoveryRequiresAction(null, captureFailure), true);
+  for (const code of ["conflict_result_retention_required", "conflict_result_retention_failed"]) {
+    const conflictRepair = { ...interrupted, code };
+    assert.equal(nativeAgentMovementBlocksNewRun(conflictRepair), true);
+    assert.equal(nativeAgentConsequenceAbandonmentRequired(conflictRepair), true);
+    assert.equal(nativeAgentRecoveryRequiresAction(null, conflictRepair), true);
+  }
   assert.equal(nativeAgentRecoveryRequiresAction(null, { ...interrupted, state: "returning_result", code: null }), true);
   assert.equal(nativeAgentMovementBlocksNewRun({ ...interrupted, state: "cancelled", code: null }), false);
 });

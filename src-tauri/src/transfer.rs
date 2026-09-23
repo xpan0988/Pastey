@@ -527,6 +527,18 @@ pub async fn send_room_item_to_bridge_peer_endpoint(
     }
 }
 
+pub(crate) fn record_successful_finish_before_sender_bookkeeping(
+    final_receipt_ambiguous: Option<&Arc<AtomicBool>>,
+    write_status: impl FnOnce() -> AppResult<()>,
+) -> AppResult<()> {
+    // /finish has already accepted the Native Agent landing. A later
+    // sender-local room item write cannot prove remote non-delivery.
+    if let Some(ambiguous) = final_receipt_ambiguous {
+        ambiguous.store(true, Ordering::SeqCst);
+    }
+    write_status()
+}
+
 pub async fn send_room_file(
     state: Arc<AppState>,
     room_id: &str,
@@ -1217,7 +1229,10 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
         .await;
     match finish_response {
         Ok(response) if response.status().is_success() => {
-            storage::set_room_item_status(&state.paths, item_id, RoomItemStatus::Sent)?;
+            record_successful_finish_before_sender_bookkeeping(
+                final_receipt_ambiguous.as_ref(),
+                || storage::set_room_item_status(&state.paths, item_id, RoomItemStatus::Sent),
+            )?;
             finish_transfer_locally(&state, &transfer_id, "completed", None);
             Ok(())
         }
