@@ -1,6 +1,6 @@
 # Pastey architecture
 
-Pastey is a local-first desktop transfer and workspace-orchestration system. Source code, validators, and tests are authoritative. Version 1.9.2 is the last packaged baseline. The current development line preserves the Layer 1–5 foundations while its mature-Agent product direction treats native Agents as Host capabilities rather than Pastey-managed Workers.
+Pastey is a local-first desktop transfer and workspace-orchestration system. Source code, validators, and tests are authoritative. Version 1.9.2 is the last packaged baseline; the implemented 2.0 architecture is being prepared for its first unstable/beta release. Native Agents are Host capabilities rather than Pastey-managed Workers.
 
 ## System and dependency direction
 
@@ -48,8 +48,9 @@ Host capability—not as a Pastey Worker harness. The
 boundary is deliberately small:
 
 ```text
-Pastey controls the envelope.
-Agent controls the execution.
+Agent owns HOW.
+Pastey owns WHERE, authority, cross-Host movement, effects and consequences,
+completion, cancellation, and recovery.
 ```
 
 Pastey can detect/observe a native Agent, qualify only enough to use its native
@@ -83,13 +84,16 @@ seams. The Agent sees only the Host-private task workspace on its Host.
 
 The return is scanned because it must cross Hosts. Pastey revalidates the
 approved source immediately before its bounded staged apply. If it changed,
-Pastey retains the returned workspace under Host-private conflict storage and
-enters conflict/recovery without an overwrite or `DONE`. Cross-Host movement
-is rejected before Review when the selected workspace cannot be represented
+Pastey retains the exact returned workspace under Host-private conflict storage
+and enters consequence recovery without overwriting the source. The native
+task remains `Completed` if its execution completed; movement completion and
+result apply remain separate facts. Cross-Host movement is rejected before
+Review when the selected workspace cannot be represented
 faithfully (including symlink/reparse or special entries, empty directories,
 executable modes, invalid portable selectors, or bounded-manifest violations).
 Failed, cancelled, interrupted, lost, malformed, mismatched, or otherwise
-ambiguous Agent/return outcomes are likewise never global completion.
+ambiguous Agent outcomes never establish Agent completion; an uncertain Return
+or apply never establishes movement completion.
 
 Codex terminal success is intentionally narrow: the exact native
 `turn/completed` notification must name the requested thread and turn, carry
@@ -201,7 +205,7 @@ The Host-owned network broker exists as an independent Phase 5 authority domain,
 
 The primary product path is Native mature Agents. Pastey implements Host-native Codex capability discovery and invocation, Host-private persistent native sessions, local original-workspace operation, authenticated direct remote invocation when that workspace already exists on the target Host, and explicit one-review workspace movement when it does not. The movement path uses encrypted outbound and return Transfer, captures and revalidates the source baseline, preserves a returned result for durable conflict recovery instead of overwriting a changed source, and treats cancellation, stale or replaced sessions, malformed messages, and ambiguous outcomes as non-completion.
 
-The associated product presentation exposes native-Agent capability state, task lifecycle, remote invocation, movement review, one approval, bounded movement status, and Bridge-scoped reopening of unresolved durable work with Reconcile, Stop, conflict, and result-Return repair actions. Receipt-ambiguous outbound movement retains source ownership and never triggers automatic workspace resend or Agent rerun. Phase 1 is complete; Phase 2 remains the physical-validation closure around this implemented architecture rather than a proposal for a new execution model.
+The associated product presentation exposes native-Agent capability state, task lifecycle, remote invocation, movement review, one approval, bounded movement status, and Bridge-scoped reopening of unresolved durable work with Reconcile, Stop, conflict, and result-Return repair actions. Receipt-ambiguous outbound movement retains source ownership and never triggers automatic workspace resend or Agent rerun. Phase 1 is complete. Phase 2 source-level reliability and deterministic two-Host state validation are complete; physical Mac ↔ Windows validation remains pending.
 
 The Generic Managed Worker / Transform / Execute path remains implemented and distinct. It includes the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, the bounded Worker Harness and model-visible Worker Context Contract, provider configuration, exact managed runtime binding, managed Host coordination, native-v2 orchestration, Natural-v2 lowering, and capability observation/confirmation. V1 remains isolated and unchanged: it executes Search/Transfer and rejects Transform/Execute. The Generic Managed path retains its own evidence limits: Bridge Device Check is a bounded Managed E2E self-check, and Windows Managed Execute acceptance does not establish an external-provider or physical multi-Host PASS.
 
@@ -214,10 +218,10 @@ Phase 1 — Native Agent Core
 CLOSED
 
 Phase 2 — Multi-Device Reliability Closure
-CURRENT
+SOURCE AND DETERMINISTIC VALIDATION COMPLETE; PHYSICAL VALIDATION PENDING
 ```
 
-Phase 2's source-level reliability closure covers disconnect/reconnect behavior, rejection of stale or replaced Bridge sessions, restart-visible interrupted-movement recovery, monotonic status/reconciliation, receipt-ambiguous outbound movement, durable conflict/Return recovery, cancellation races, replay protection, and Bridge Burn authority cutoff. Transient session loss invalidates Bridge transport authority but preserves Host-local Codex sessions and live observers; a still-observed turn continues locally. Durable task, movement, and exact result facts remain available for fresh-session reconciliation. A completed task with an exact durable result snapshot stays `ReturningResult / result_return_retry_required`; if Pastey restarts before sealing that snapshot, a safe retained received workspace can supply the exact snapshot for Return retry without rerunning the Agent. Unsafe or failed capture is a consequence-side failure, not execution uncertainty. Burn remains destructive and deletes only Bridge-bound Native Agent artifacts. The implemented recovery boundary persists only Pastey's outer envelope and exact result/apply facts: an unproved native turn is interrupted/reconciliation-required and continues owning its source, an already snapshotted result can retry the existing encrypted return Transfer, and a durable apply journal recovers the canonical workspace to its original or exact-result state before claiming completion. A completed apply is idempotent. It never reconstructs or reruns an Agent's private execution. Physical multi-device validation and its failure matrix remain Phase 2 work; the deleted native-v2 physical harness is not a substitute.
+Phase 2's source-level reliability closure covers disconnect/reconnect behavior, rejection of stale or replaced Bridge sessions, restart-visible interrupted-movement recovery, monotonic status/reconciliation, receipt-ambiguous outbound movement, durable conflict/Return recovery, cancellation races, replay protection, and Bridge Burn authority cutoff. The deterministic two-Host harness validates state and consequence paths with independent durable Hosts and an external Agent-turn ledger. Transient session loss invalidates Bridge transport authority but preserves Host-local Codex sessions and live observers; a still-observed turn continues locally. An unproved native turn remains reconciliation-required and source-owning. A completed native turn remains `Completed` through result capture, Return, conflict-retention, apply, or abandonment failures; only its consequence state changes. An exact durable snapshot may retry Return without another Agent turn. The apply journal claims completion only for a proven original or exact-result workspace and leaves unexpected state untouched. Burn removes Bridge authority even when safe filesystem repair is unprovable; uncertain trees may remain as orphan residue without blocking startup. Physical Mac ↔ Windows validation remains Phase 2 work and is not established by the deterministic harness.
 
 The Generic Managed Worker / Transform / Execute subsystem remains a separate maintained architecture. Its Worker Context Contract, provider configuration, Managed E2E self-check, and Windows Managed Execute backend are factual implementation material, not the primary mature-Agent roadmap.
 

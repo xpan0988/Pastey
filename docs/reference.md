@@ -53,9 +53,11 @@ The maximum native-v2 approval/attempt lifetime is 24 hours. Identifiers are bou
 
 ## Native Agent facts
 
+Native Agent execution, result capture, result Transfer, conflict retention, result Apply, and movement completion are distinct durable facts. A completed Agent task remains `Completed` when a later consequence fails or is explicitly abandoned; recovery can repair only the exact consequence and cannot authorize another Agent turn. `conflict_result_retention_required` and `conflict_result_retention_failed` retain source ownership while exact Return repair is admissible. Source-level reliability and deterministic two-Host state validation are complete. Physical Mac ↔ Windows validation remains pending; see [development](development.md).
+
 Native mature Agents are Host capabilities, separate from the Generic Managed Worker/provider path. The current concrete capability is Codex: `agent.coding.codex`. Its control schema is `pastey-native-agent-control-v1`; task status is `pastey-native-agent-task-v1`; and workspace-movement metadata/status uses `pastey-native-agent-workspace-movement-v1`.
 
-Native Codex capability state is exactly `available`, `incompatible`, or `unavailable`. `available` means this Host detected Codex and its bounded native app-server interface used by Pastey (initialize, thread/start, turn/start, lifecycle observation, interrupt, and shutdown) is usable. `incompatible` means Codex was detected but that interface is not usable by this build; `unavailable` means Codex cannot currently be invoked. The current-session peer capability observation carries `agent.coding.codex` plus exact supported Native Agent schemas. Direct remote invoke requires only `pastey-native-agent-control-v1` and `pastey-native-agent-task-v1`; cross-Host workspace proposal, approval, and preparation require those two schemas plus `pastey-native-agent-workspace-movement-v1`. Compatibility is not Host selection or authority: `detected != compatible`, `compatible != authorized`, and capability compatibility does not authorize execution, Transfer, Review bypass, or session creation. A replaced session requires a fresh observation and cannot reuse the former binding.
+Native Codex capability state is exactly `available`, `incompatible`, or `unavailable`. `available` means this Host detected Codex and its bounded native app-server interface used by Pastey (initialize, thread/start, turn/start, lifecycle observation, interrupt, and shutdown) is usable. `incompatible` means Codex was detected but that interface is not usable by this build; `unavailable` means Codex cannot currently be invoked. The current-session peer capability observation carries `agent.coding.codex` plus exact supported Native Agent schemas. Direct remote invoke requires only `pastey-native-agent-control-v1` and `pastey-native-agent-task-v1`; cross-Host workspace proposal, approval, and preparation require those two schemas plus `pastey-native-agent-workspace-movement-v1`. Compatibility is not Host selection or authority: installed/detected capability is not necessarily compatible, and compatible capability is not necessarily authorized. Capability compatibility does not authorize execution, Transfer, Review bypass, or session creation. A replaced session requires a fresh observation and cannot reuse the former binding.
 
 The Native Agent control payloads are `NativeAgentInvokeV1`, `NativeAgentStatusV1`, `NativeAgentCancelV1`, `NativeAgentWorkspacePrepareV1`, `NativeAgentReconcileV1`, and `NativeAgentReconciliationV1`. They reject unknown fields and bind the task identity, target/executing Host, capability, workspace/task inputs, and movement correlation as appropriate. Native Agent Room Control uses protocol family `native_agent` and the following event kinds:
 
@@ -94,6 +96,7 @@ Native sessions are Host-private. `NativeAgentServiceV1` keeps Codex sessions pe
 | Boundary | Primary source |
 | --- | --- |
 | Native capability, session, task, movement, baseline and conflict behavior | `src-tauri/src/native_agent.rs` |
+| Test-only deterministic requester/executor pair and external Agent-turn ledger | `src-tauri/src/native_agent_pair_harness.rs` |
 | Registered commands and remote-session/movement dispatch | `src-tauri/src/commands.rs`, `src-tauri/src/main.rs` |
 | Native Agent Room Control envelope, validation, replay/session handling | `src-tauri/src/room_control.rs` |
 | Encrypted workspace package send, private landing, and movement registration | `src-tauri/src/transfer.rs`, `src-tauri/src/models.rs` |
@@ -191,6 +194,6 @@ The frontend uses `@xterm/xterm` and `@xterm/addon-fit`. Host shell selection is
 | Effects/results | Rust `effect_authority`, `managed_resources`, `execution_world`, `network_broker`, and `managed_execution` tests; opt-in native Windows `windows_execution_world` integration test |
 | Layer 4 and transfer | `scripts/run-layer4-validation-matrix.mjs`, `scripts/run-transfer-planner-tests.mjs`, Rust transport/protocol tests |
 | Developer Terminal | Rust terminal/HostRuntime tests plus native physical platform checks |
-| Native Agent task/session/movement and conflict recovery | Rust `native_agent`, `commands`, `room_control`, `transfer`, `storage`, and `host_runtime` tests; renderer types/lifecycle in `src/lib/tauri.ts` and `src/features/workspace/AgentTaskLifecycle.tsx` |
+| Native Agent task/session/movement and conflict recovery | Rust `native_agent`, `commands`, `room_control`, `transfer`, `storage`, and `host_runtime` tests, including the test-only two-Host pair harness; renderer types/lifecycle in `src/lib/tauri.ts` and `src/features/workspace/AgentTaskLifecycle.tsx` |
 
 The full contributor and physical validation procedure is in [development](development.md).
