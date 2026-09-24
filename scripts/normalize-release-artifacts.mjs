@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { artifactSourceVersion, parseSemver, sourceMatchesTarget } from "./release-utils.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const bundleRoot = path.join(repoRoot, "src-tauri", "target", "release", "bundle");
@@ -8,6 +9,7 @@ const outputDir = process.env.RELEASE_ARTIFACTS_DIR
   ? path.resolve(process.env.RELEASE_ARTIFACTS_DIR)
   : path.join(repoRoot, "release-artifacts");
 const appVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8")).version;
+parseSemver(appVersion);
 const tagVersion = (process.env.GITHUB_REF_NAME ?? "").replace(/^v/, "");
 const runnerOs = process.env.RUNNER_OS ?? "";
 
@@ -31,7 +33,7 @@ for (const target of targets) {
   }
 
   const basename = path.basename(source);
-  const sourceVersion = basename.match(/\d+\.\d+\.\d+/)?.[0];
+  const sourceVersion = artifactSourceVersion(basename);
   if (sourceVersion !== appVersion) {
     fail(`${basename} does not contain expected app version ${appVersion}.`);
   }
@@ -44,6 +46,7 @@ function targetArtifactsForRunner(os, version) {
   if (os === "macOS") {
     return [
       {
+        version,
         expectedSourceSuffix: `pastey_${version}_aarch64.dmg`,
         outputName: `pastey_${version}_aarch64.dmg`
       }
@@ -53,10 +56,12 @@ function targetArtifactsForRunner(os, version) {
   if (os === "Windows") {
     return [
       {
+        version,
         expectedSourceSuffix: `pastey_${version}_x64-setup.exe`,
         outputName: `pastey_${version}_x64-setup.exe`
       },
       {
+        version,
         expectedSourceSuffix: `pastey_${version}_x64_en-US.msi`,
         outputName: `pastey_${version}_x64_en-US.msi`
       }
@@ -66,13 +71,13 @@ function targetArtifactsForRunner(os, version) {
   if (os === "Linux") {
     return [
       {
+        version,
         expectedSourceExtension: ".AppImage",
-        expectedSourceVersion: version,
         outputName: `pastey_${version}_x86_64.AppImage`
       },
       {
+        version,
         expectedSourceExtension: ".deb",
-        expectedSourceVersion: version,
         outputName: `pastey_${version}_amd64.deb`
       }
     ];
@@ -96,26 +101,6 @@ function findArtifacts(root) {
     }
   }
   return results;
-}
-
-function sourceMatchesTarget(artifact, target) {
-  if (target.expectedSourceSuffix) {
-    return artifact.endsWith(target.expectedSourceSuffix);
-  }
-
-  const extensionMatches =
-    path.extname(artifact).toLowerCase() === target.expectedSourceExtension.toLowerCase();
-  if (!extensionMatches) {
-    return false;
-  }
-
-  if (target.expectedSourceVersion) {
-    const basename = path.basename(artifact);
-    const sourceVersion = basename.match(/\d+\.\d+\.\d+/)?.[0];
-    return sourceVersion === target.expectedSourceVersion;
-  }
-
-  return true;
 }
 
 function fail(message) {

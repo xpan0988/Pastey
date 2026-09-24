@@ -2,9 +2,11 @@
 
 Detailed update and release history for Pastey.
 
-Version 1.9.2 is the previous frozen Layer 1–5 packaged baseline. The current `Unreleased` section records both the retained Generic Managed Worker / Execute foundations and the implemented Native mature-Agent architecture. Phase 1 Native Agent Core, Phase 2 source-level reliability, and deterministic two-Host state validation are complete. Physical Mac ↔ Windows validation remains pending for the first unstable/beta 2.0 release; no stable release is recorded here.
+The current development changes belong in `Unreleased`. Each release archives that section under its version while leaving a clean `Unreleased` section for later changes.
 
 ## Unreleased
+
+Version 1.9.2 is the previous frozen Layer 1–5 packaged baseline. The implemented 2.0 architecture has completed source-level reliability and deterministic two-Host state validation. An initial unstable/beta 2.0 release may ship before physical Mac ↔ Windows Native Agent acceptance. The beta period gathers that evidence; physical acceptance is required before RC or stable readiness can be claimed.
 
 ### Added
 

@@ -66,6 +66,10 @@ jobs:
       - name: Check release version
         run: npm run check:version
 
+      - name: Classify SemVer release tag
+        id: release_meta
+        run: node scripts/release-tag-metadata.mjs
+
       - name: Build frontend
         run: npm run build
 
@@ -97,3 +101,5 @@ jobs:
         with:
           files: release-artifacts/*
           fail_on_unmatched_files: true
+          prerelease: ${{ steps.release_meta.outputs.prerelease }}
+          make_latest: ${{ steps.release_meta.outputs.make_latest }}
