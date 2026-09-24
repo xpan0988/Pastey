@@ -5459,6 +5459,11 @@ mod tests {
     use super::*;
     use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
 
+    mod pair_harness {
+        use super::*;
+        include!("native_agent_pair_harness.rs");
+    }
+
     struct NoopEventSink;
     impl crate::host_runtime::HostEventSink for NoopEventSink {
         fn emit(&self, _event: crate::host_runtime::HostEvent) -> AppResult<()> {
