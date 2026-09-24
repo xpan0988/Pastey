@@ -1,6 +1,6 @@
 [package]
 name = "pastey"
-version = "1.9.2"
+version = "2.0.0-beta.1"
 description = "Local-first encrypted paste and file transfer utility"
 authors = ["xpan0988"]
 edition = "2021"
