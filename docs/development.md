@@ -132,13 +132,20 @@ On macOS and Windows in both controller/Host directions, verify prompt/VT render
 `src-tauri/Cargo.toml` is the authoritative packaged app version. Release with:
 
 ```bash
-npm run release:version -- X.Y.Z "Release Title"
+npm run release:version -- 2.0.0-beta.1 "Pastey 2.0 Beta 1" --dry-run
+npm run release:version -- 2.0.0-beta.1 "Pastey 2.0 Beta 1"
 git push origin main --tags
 ```
 
-The script requires a greater unused version, updates derived version files and release documentation, runs its checks, stages only release-file edits, creates `chore(release): vX.Y.Z`, and creates annotated tag `vX.Y.Z`. Use `--dry-run` to preview. It refuses a dirty worktree unless `--allow-dirty` is explicit and never pushes automatically.
+Stable versions use the same command, for example `npm run release:version -- 2.0.0 "Pastey 2.0" --dry-run` followed by the command without `--dry-run` and the tag push. The script requires an unused version with greater SemVer precedence than the packaged version. Prereleases sort below the corresponding stable version; build metadata does not change precedence. It rejects malformed versions before editing files and refuses a dirty worktree unless `--allow-dirty` is explicit.
 
-Its built-in checks are Cargo formatting, Cargo check, and version consistency. The implemented 2.0 architecture and source-level/deterministic validation support an initial unstable/beta validation release; physical Mac ↔ Windows Native Agent acceptance and RC/stable release claims remain pending. A release pass must additionally run the full validation stack and packaged physical smoke appropriate to its actual claim. This documentation pass does not change the packaged version or create a release tag.
+The command updates `src-tauri/Cargo.toml`, `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.lock` to the exact version. It archives the current `## Unreleased` CHANGELOG body under the new version and date, leaving a clean section for later beta fixes. When `docs/release-notes/` exists, it also writes a short note for that version. It runs Cargo formatting, Cargo check, and `npm run check:version`, stages only release files, commits `chore(release): v<version>`, and creates annotated tag `v<version>`. The dry run previews these actions without writes; the command never pushes automatically.
+
+Focused release-tool checks run with `node --test tests/releaseTooling.test.mjs`; they use temporary fixtures for prerelease version synchronization and do not change the checkout or create tags.
+
+Pushing the tag triggers GitHub Actions installer builds for macOS Apple Silicon, Windows, and Linux x86_64. A SemVer prerelease tag produces a GitHub Pre-release and is not marked latest; a stable tag produces a normal release. Artifact normalization requires the tag, packaged version, source artifact, and output filename to agree on the full version, including any prerelease suffix.
+
+The implemented 2.0 architecture and source-level/deterministic validation permit an initial unstable/beta validation release. The beta period is for physical Mac ↔ Windows Native Agent acceptance. A beta release does not establish physical acceptance or RC/stable readiness. A release pass must also run the full validation stack and packaged physical smoke appropriate to its actual claim.
 
 ## Repository hygiene
 

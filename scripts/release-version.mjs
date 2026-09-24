@@ -2,9 +2,19 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  compareSemver,
+  parseSemver,
+  releaseNotesContent,
+  updateCargoLockPackageVersion,
+  updateCargoTomlPackageVersion,
+  updateChangelog,
+  updatePackageJsonVersion,
+  updatePackageLockVersion,
+  updateTauriConfigVersion,
+} from "./release-utils.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const semverPattern = /^\d+\.\d+\.\d+$/;
 
 try {
   main();
@@ -16,11 +26,9 @@ try {
 function main() {
   const options = parseArgs(process.argv.slice(2));
   if (!options.version) {
-    throw new Error("Usage: npm run release:version -- 1.5.1 [title] [--dry-run] [--allow-dirty]");
+    throw new Error("Usage: npm run release:version -- 2.0.0[-prerelease][+build] [title] [--dry-run] [--allow-dirty]");
   }
-  if (!semverPattern.test(options.version)) {
-    throw new Error(`Invalid semantic version ${JSON.stringify(options.version)}. Expected X.Y.Z.`);
-  }
+  parseSemver(options.version);
 
   const currentVersion = parseCargoTomlPackageVersion(readText("src-tauri/Cargo.toml"));
   if (compareSemver(options.version, currentVersion) <= 0) {
@@ -40,7 +48,7 @@ function main() {
     console.log("Dry run: working tree is dirty; no files will be modified.");
   }
 
-  const planned = planVersionEdits(options.version, options.title);
+  const planned = planVersionEdits(options.version, options.title, today());
   const commitMessage = `chore(release): v${options.version}`;
   const tagMessage = `Release v${options.version}`;
 
@@ -114,7 +122,7 @@ function parseArgs(args) {
   };
 }
 
-function planVersionEdits(version, title) {
+function planVersionEdits(version, title, date) {
   const edits = [];
 
   edits.push({
@@ -123,31 +131,17 @@ function planVersionEdits(version, title) {
   });
 
   if (exists("package.json")) {
-    const packageJson = readJson("package.json");
-    packageJson.version = version;
-    edits.push({ path: "package.json", content: `${JSON.stringify(packageJson, null, 2)}\n` });
+    edits.push({ path: "package.json", content: updatePackageJsonVersion(readText("package.json"), version) });
   }
 
   if (exists("package-lock.json")) {
-    const packageLock = readJson("package-lock.json");
-    packageLock.version = version;
-    if (packageLock.packages?.[""]) {
-      packageLock.packages[""].version = version;
-    }
-    edits.push({ path: "package-lock.json", content: `${JSON.stringify(packageLock, null, 2)}\n` });
+    edits.push({ path: "package-lock.json", content: updatePackageLockVersion(readText("package-lock.json"), version) });
   }
 
   if (exists("src-tauri/tauri.conf.json")) {
-    const tauriConfig = readJson("src-tauri/tauri.conf.json");
-    if (typeof tauriConfig.version === "string") {
-      tauriConfig.version = version;
-    }
-    if (tauriConfig.package && typeof tauriConfig.package.version === "string") {
-      tauriConfig.package.version = version;
-    }
     edits.push({
       path: "src-tauri/tauri.conf.json",
-      content: `${JSON.stringify(tauriConfig, null, 2)}\n`,
+      content: updateTauriConfigVersion(readText("src-tauri/tauri.conf.json"), version),
     });
   }
 
@@ -160,74 +154,19 @@ function planVersionEdits(version, title) {
 
   edits.push({
     path: "CHANGELOG.md",
-    content: updateChangelog(exists("CHANGELOG.md") ? readText("CHANGELOG.md") : "# Changelog\n", version, title),
+    content: updateChangelog(readText("CHANGELOG.md"), version, title, date),
   });
 
   if (exists("docs/release-notes")) {
+    const notesPath = `docs/release-notes/v${version}.md`;
+    if (exists(notesPath)) throw new Error(`${notesPath} already exists.`);
     edits.push({
-      path: `docs/release-notes/v${version}.md`,
-      content: releaseNotesContent(version, title),
+      path: notesPath,
+      content: releaseNotesContent(version, title, date),
     });
   }
 
   return dedupeEdits(edits);
-}
-
-function updateCargoTomlPackageVersion(content, version) {
-  const normalized = content.replace(/\r\n/g, "\n");
-  const blocks = normalized.split(/\n(?=\[[^\]]+\])/);
-  const updated = blocks.map((block) => {
-    if (!block.trimStart().startsWith("[package]")) {
-      return block;
-    }
-    if (!/^version\s*=\s*"[^"]+"/m.test(block)) {
-      throw new Error("Missing version in [package] block of src-tauri/Cargo.toml.");
-    }
-    return block.replace(/^version\s*=\s*"[^"]+"/m, `version = "${version}"`);
-  });
-  if (updated.join("\n") === normalized) {
-    throw new Error("Missing [package] block in src-tauri/Cargo.toml.");
-  }
-  return updated.join("\n");
-}
-
-function updateCargoLockPackageVersion(content, packageName, version) {
-  let changed = false;
-  const updated = content.replace(/\[\[package\]\][\s\S]*?(?=\n\[\[package\]\]|\s*$)/g, (block) => {
-    if (!new RegExp(`^name\\s*=\\s*"${escapeRegExp(packageName)}"`, "m").test(block)) {
-      return block;
-    }
-    changed = true;
-    return block.replace(/^version\s*=\s*"[^"]+"/m, `version = "${version}"`);
-  });
-  if (!changed) {
-    throw new Error(`Missing ${packageName} package block in src-tauri/Cargo.lock.`);
-  }
-  return updated;
-}
-
-function updateChangelog(content, version, title) {
-  const date = today();
-  const heading = releaseHeading(version, title, date);
-  const body = `${heading}\n\n- Release version v${version}.\n`;
-  const normalized = content.trimEnd();
-  const existingHeading = new RegExp(`^##\\s+${escapeRegExp(version)}(?:\\s|$).*`, "m");
-
-  if (existingHeading.test(normalized)) {
-    return `${normalized.replace(existingHeading, heading)}\n`;
-  }
-  if (/^#\s+.+/m.test(normalized)) {
-    return `${normalized.replace(/^#\s+.+\n?/, (match) => `${match.trimEnd()}\n\n${body}\n`)}\n`;
-  }
-  return `# Changelog\n\n${body}\n${normalized}\n`;
-}
-
-function releaseNotesContent(version, title) {
-  return `# ${releaseHeading(version, title, today()).replace(/^##\s+/, "")}\n\n- Release version v${version}.\n`;
-}
-
-function releaseHeading(version, title, date) {
-  return title ? `## ${version} — ${title} — ${date}` : `## ${version} — ${date}`;
 }
 
 function today() {
@@ -252,17 +191,6 @@ function parseCargoTomlPackageVersion(content) {
     throw new Error("Missing Cargo.toml package.version.");
   }
   return version;
-}
-
-function compareSemver(a, b) {
-  const left = a.split(".").map(Number);
-  const right = b.split(".").map(Number);
-  for (let index = 0; index < 3; index += 1) {
-    if (left[index] !== right[index]) {
-      return left[index] - right[index];
-    }
-  }
-  return 0;
 }
 
 function gitTagExists(tagName) {
@@ -321,8 +249,4 @@ function runCapture(command, args, options) {
     throw new Error(`Command failed: ${command} ${args.join(" ")}\n${result.stderr}`);
   }
   return result.stdout;
-}
-
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
