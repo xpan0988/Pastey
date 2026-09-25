@@ -438,13 +438,31 @@ fn configure_unix_process(
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "uclibc")))]
+type UnixRlimitResource = libc::__rlimit_resource_t;
+#[cfg(all(
+    unix,
+    not(all(target_os = "linux", any(target_env = "gnu", target_env = "uclibc")))
+))]
+type UnixRlimitResource = libc::c_int;
+
 #[cfg(unix)]
-unsafe fn set_limit(resource: libc::c_int, soft: u64, hard: u64) -> std::io::Result<()> {
+unsafe fn set_limit(resource: UnixRlimitResource, soft: u64, hard: u64) -> std::io::Result<()> {
     let limit = libc::rlimit {
-        rlim_cur: soft as libc::rlim_t,
-        rlim_max: hard as libc::rlim_t,
+        rlim_cur: soft.try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "soft resource limit overflows rlim_t",
+            )
+        })?,
+        rlim_max: hard.try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "hard resource limit overflows rlim_t",
+            )
+        })?,
     };
-    if libc::setrlimit(resource as _, &limit) != 0 {
+    if libc::setrlimit(resource, &limit) != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())

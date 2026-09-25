@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { artifactSourceVersion, parseSemver, sourceMatchesTarget } from "./release-utils.mjs";
+import { artifactSourceVersion, parseSemver, sourceMatchesTarget, targetArtifactsForRunner } from "./release-utils.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const bundleRoot = path.join(repoRoot, "src-tauri", "target", "release", "bundle");
@@ -40,50 +40,6 @@ for (const target of targets) {
 
   fs.copyFileSync(source, path.join(outputDir, target.outputName));
   console.log(`Prepared ${path.relative(repoRoot, source)} as ${target.outputName}`);
-}
-
-function targetArtifactsForRunner(os, version) {
-  if (os === "macOS") {
-    return [
-      {
-        version,
-        expectedSourceSuffix: `pastey_${version}_aarch64.dmg`,
-        outputName: `pastey_${version}_aarch64.dmg`
-      }
-    ];
-  }
-
-  if (os === "Windows") {
-    return [
-      {
-        version,
-        expectedSourceSuffix: `pastey_${version}_x64-setup.exe`,
-        outputName: `pastey_${version}_x64-setup.exe`
-      },
-      {
-        version,
-        expectedSourceSuffix: `pastey_${version}_x64_en-US.msi`,
-        outputName: `pastey_${version}_x64_en-US.msi`
-      }
-    ];
-  }
-
-  if (os === "Linux") {
-    return [
-      {
-        version,
-        expectedSourceExtension: ".AppImage",
-        outputName: `pastey_${version}_x86_64.AppImage`
-      },
-      {
-        version,
-        expectedSourceExtension: ".deb",
-        outputName: `pastey_${version}_amd64.deb`
-      }
-    ];
-  }
-
-  fail(`Unsupported RUNNER_OS ${JSON.stringify(os)}.`);
 }
 
 function findArtifacts(root) {

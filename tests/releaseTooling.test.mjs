@@ -19,6 +19,8 @@ import {
   updatePackageJsonVersion,
   updatePackageLockVersion,
   updateTauriConfigVersion,
+  targetArtifactsForRunner,
+  windowsReleasePolicy,
 } from "../scripts/release-utils.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -93,31 +95,78 @@ test("version consistency check accepts the exact beta version in an isolated fi
 });
 
 test("Unreleased history moves once and later releases archive only new changes", () => {
-  const original = read("CHANGELOG.md");
+  const original = `# Changelog
+
+## Unreleased
+
+### Added
+
+- First beta history.
+
+### Fixed / Changed
+
+- Fixes.
+
+### Known limitations
+
+- Physical acceptance pending.
+
+## 1.9.2 — 2026-08-26
+`;
   const beta1 = updateChangelog(original, "2.0.0-beta.1", "Pastey 2.0 Beta 1", "2026-09-24");
   assert.match(beta1, /^## Unreleased\n\n## 2\.0\.0-beta\.1 — Pastey 2\.0 Beta 1 — 2026-09-24$/m);
   assert.match(beta1, /## 2\.0\.0-beta\.1[^]*?### Added[^]*?### Fixed \/ Changed[^]*?### Known limitations[^]*?## 1\.9\.2/);
-  assert.equal((beta1.match(/Added remote native Agent invocation/g) ?? []).length, 1);
+  assert.equal((beta1.match(/First beta history/g) ?? []).length, 1);
   assert.throws(() => updateChangelog(beta1, "2.0.0-beta.1", "Again", "2026-09-25"), /already has a release section/);
   const newChanges = beta1.replace("## Unreleased\n\n", "## Unreleased\n\n- Fixed a beta issue.\n\n");
   const beta2 = updateChangelog(newChanges, "2.0.0-beta.2", "Pastey 2.0 Beta 2", "2026-09-26");
   assert.match(beta2, /^## Unreleased\n\n## 2\.0\.0-beta\.2 — Pastey 2\.0 Beta 2 — 2026-09-26\n\n- Fixed a beta issue\./m);
   assert.equal((beta2.match(/Fixed a beta issue/g) ?? []).length, 1);
-  assert.equal((beta2.match(/Added remote native Agent invocation/g) ?? []).length, 1);
+  assert.equal((beta2.match(/First beta history/g) ?? []).length, 1);
   assert.ok(beta2.indexOf("## 2.0.0-beta.2") < beta2.indexOf("## 2.0.0-beta.1"));
   const rc1 = updateChangelog(beta2.replace("## Unreleased\n\n", "## Unreleased\n\n- Recorded physical acceptance.\n\n"), "2.0.0-rc.1", "Pastey 2.0 RC 1", "2026-09-27");
   const stable = updateChangelog(rc1.replace("## Unreleased\n\n", "## Unreleased\n\n- Completed release checks.\n\n"), "2.0.0", "Pastey 2.0", "2026-09-28");
   assert.deepEqual([...stable.matchAll(/^## (2\.0\.0[^ ]*)/gm)].map((match) => match[1]), ["2.0.0", "2.0.0-rc.1", "2.0.0-beta.2", "2.0.0-beta.1"]);
-  assert.equal((stable.match(/Added remote native Agent invocation/g) ?? []).length, 1);
+  assert.equal((stable.match(/First beta history/g) ?? []).length, 1);
   assert.throws(() => updateChangelog(beta1, "2.0.0-beta.2", "", "2026-09-26"), /no content to archive/);
 });
 
 test("tag classification and beta release notes preserve the release boundary", () => {
   assert.deepEqual(releaseTagMetadata("v2.0.0-beta.1", "2.0.0-beta.1"), { prerelease: "true", makeLatest: "false" });
+  assert.deepEqual(releaseTagMetadata("v2.0.0-rc.1", "2.0.0-rc.1"), { prerelease: "true", makeLatest: "false" });
   assert.deepEqual(releaseTagMetadata("v2.0.0", "2.0.0"), { prerelease: "false", makeLatest: "true" });
   assert.throws(() => releaseTagMetadata("v2.0.0-beta.1", "2.0.0"), /does not match/);
   assert.match(releaseNotesContent("2.0.0-beta.1", "Pastey 2.0 Beta 1", "2026-09-24"), /unstable\/beta validation release[^]*?Physical Mac ↔ Windows Native Agent acceptance remains pending/);
   assert.doesNotMatch(releaseNotesContent("2.0.0", "Pastey 2.0", "2026-09-24"), /unstable\/beta/);
+});
+
+test("Windows bundle and artifact requirements follow the SemVer release type", () => {
+  for (const version of ["2.0.0-beta.1", "2.0.0-beta.2", "2.0.0-rc.1"]) {
+    const policy = windowsReleasePolicy(version);
+    assert.deepEqual(policy.bundles, ["nsis"]);
+    assert.deepEqual(policy.artifacts.map((artifact) => artifact.outputName), [`pastey_${version}_x64-setup.exe`]);
+    assert.deepEqual(targetArtifactsForRunner("Windows", version), policy.artifacts);
+  }
+  const stable = windowsReleasePolicy("2.0.0");
+  assert.deepEqual(stable.bundles, ["nsis", "msi"]);
+  assert.deepEqual(stable.artifacts.map((artifact) => artifact.outputName), [
+    "pastey_2.0.0_x64-setup.exe",
+    "pastey_2.0.0_x64_en-US.msi",
+  ]);
+  assert.deepEqual(targetArtifactsForRunner("Windows", "2.0.0"), stable.artifacts);
+  assert.throws(() => windowsReleasePolicy("2.0.0-beta.01"), /Invalid semantic version/);
+});
+
+test("Windows prerelease targets require the exact complete source version", () => {
+  const [target] = targetArtifactsForRunner("Windows", "2.0.0-beta.2");
+  assert.equal(sourceMatchesTarget("/bundle/pastey_2.0.0-beta.2_x64-setup.exe", target), true);
+  for (const source of [
+    "/bundle/pastey_2.0.0_x64-setup.exe",
+    "/bundle/pastey_2.0.0-beta.1_x64-setup.exe",
+    "/bundle/pastey_2.0.0-beta.20_x64-setup.exe",
+  ]) {
+    assert.equal(sourceMatchesTarget(source, target), false, source);
+  }
 });
 
 test("artifact matching requires the complete source version", () => {

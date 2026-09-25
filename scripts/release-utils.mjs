@@ -157,6 +157,42 @@ export function sourceMatchesTarget(artifact, target) {
   return path.extname(artifact).toLowerCase() === target.expectedSourceExtension?.toLowerCase();
 }
 
+export function windowsReleasePolicy(version) {
+  const prerelease = isPrerelease(version);
+  const artifacts = [{
+    version,
+    expectedSourceSuffix: `pastey_${version}_x64-setup.exe`,
+    outputName: `pastey_${version}_x64-setup.exe`,
+  }];
+  if (!prerelease) {
+    artifacts.push({
+      version,
+      expectedSourceSuffix: `pastey_${version}_x64_en-US.msi`,
+      outputName: `pastey_${version}_x64_en-US.msi`,
+    });
+  }
+  return { bundles: prerelease ? ["nsis"] : ["nsis", "msi"], artifacts };
+}
+
+export function targetArtifactsForRunner(os, version) {
+  parseSemver(version);
+  if (os === "macOS") {
+    return [{
+      version,
+      expectedSourceSuffix: `pastey_${version}_aarch64.dmg`,
+      outputName: `pastey_${version}_aarch64.dmg`,
+    }];
+  }
+  if (os === "Windows") return windowsReleasePolicy(version).artifacts;
+  if (os === "Linux") {
+    return [
+      { version, expectedSourceExtension: ".AppImage", outputName: `pastey_${version}_x86_64.AppImage` },
+      { version, expectedSourceExtension: ".deb", outputName: `pastey_${version}_amd64.deb` },
+    ];
+  }
+  throw new Error(`Unsupported RUNNER_OS ${JSON.stringify(os)}.`);
+}
+
 function releaseHeading(version, title, date) {
   return title ? `## ${version} — ${title} — ${date}` : `## ${version} — ${date}`;
 }
