@@ -61,6 +61,8 @@ effects, control its tool or shell strategy, recreate its sandbox, inspect its
 reasoning/process topology, or require ordinary Host-local tasks to pass through
 Scratch, GST, or ManagedObject.
 
+The [META Embodiment Constitution](meta/embodiment/constitution.md) extends this ownership principle to future physical-device execution. It defines governance, local enforcement, and evidence obligations; Pastey's current runtime does not implement those embodied contracts.
+
 By default a selected Agent works directly in the explicitly selected original
 workspace on its Host. A Host-private native session is associated with Host +
 Agent + workspace so related tasks preserve the Agent's native context while an
