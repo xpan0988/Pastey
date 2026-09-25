@@ -9,7 +9,7 @@ npm install
 npm run tauri:dev
 ```
 
-Use `npm run tauri:dev-fast` only for local transfer-throughput work. Build the frontend with `npm run build`, a desktop package with `npm run tauri:build`, and a checked package with `npm run build:checked`. Linux release hosts use `npm run build:checked:linux`. Windows packages use `npm run tauri:build:windows`; that command first builds and stages the pinned Codex command-runner and setup sidecars, then supplies their `externalBin` bundle configuration to Tauri.
+Use `npm run tauri:dev-fast` only for local transfer-throughput work. Build the frontend with `npm run build`, a desktop package with `npm run tauri:build`, and a checked package with `npm run build:checked`. Linux release hosts use `npm run build:checked:linux`. Windows release hosts use `npm run build:checked:windows`; it checks the version, builds and stages the pinned Codex command-runner and setup sidecars through `tauri:build:windows`, applies their `externalBin` bundle configuration, builds the installers, and audits the bundle. Windows SemVer prereleases build NSIS; stable versions build NSIS and MSI.
 
 ## Validation stack
 
@@ -64,7 +64,7 @@ Native Windows acceptance is five stop-on-failure scripts run from the repositor
    powershell -ExecutionPolicy Bypass -File .\scripts\windows-acceptance\stage-5-managed-execute.ps1
    ```
 
-Stage 1 intentionally uses `npm ci` and the unchanged `npm run tauri:build:windows` production package/install path, so packaging failures are Stage 1 FAIL results rather than hidden workarounds. Stage 2 is the explicit elevated, Host-owned Codex sandbox setup; it never reads, copies, or prints `.sandbox-secrets/sandbox_users.json`. Stage 3 runs the installed packaged verifier. Stage 4 runs native conformance through the production backend. Stage 5 builds the opt-in Managed Execute probe and runs the exact ignored production-path Managed Execute test.
+Stage 1 intentionally uses `npm ci` and the `npm run tauri:build:windows` production package/install path, so packaging failures are Stage 1 FAIL results rather than hidden workarounds. Stage 2 is the explicit elevated, Host-owned Codex sandbox setup; it never reads, copies, or prints `.sandbox-secrets/sandbox_users.json`. Stage 3 runs the installed packaged verifier. Stage 4 runs native conformance through the production backend. Stage 5 builds the opt-in Managed Execute probe and runs the exact ignored production-path Managed Execute test.
 
 A failed or unavailable verifier keeps managed Process execution unavailable. Windows semantics and limitations are in [Windows managed execution](platform/windows-managed-execution.md); source provenance and the upstream update procedure are in [`UPSTREAM.md`](../src-tauri/crates/windows-codex-sandbox/UPSTREAM.md). GNU cross-compilation is never a substitute for these native stages.
 
@@ -132,8 +132,8 @@ On macOS and Windows in both controller/Host directions, verify prompt/VT render
 `src-tauri/Cargo.toml` is the authoritative packaged app version. Release with:
 
 ```bash
-npm run release:version -- 2.0.0-beta.1 "Pastey 2.0 Beta 1" --dry-run
-npm run release:version -- 2.0.0-beta.1 "Pastey 2.0 Beta 1"
+npm run release:version -- 2.0.0-beta.2 "Pastey 2.0 Beta 2" --dry-run
+npm run release:version -- 2.0.0-beta.2 "Pastey 2.0 Beta 2"
 git push origin main --tags
 ```
 
@@ -143,7 +143,7 @@ The command updates `src-tauri/Cargo.toml`, `package.json`, `package-lock.json`,
 
 Focused release-tool checks run with `node --test tests/releaseTooling.test.mjs`; they use temporary fixtures for prerelease version synchronization and do not change the checkout or create tags.
 
-Pushing the tag triggers GitHub Actions installer builds for macOS Apple Silicon, Windows, and Linux x86_64. A SemVer prerelease tag produces a GitHub Pre-release and is not marked latest; a stable tag produces a normal release. Artifact normalization requires the tag, packaged version, source artifact, and output filename to agree on the full version, including any prerelease suffix.
+Pushing the tag triggers GitHub Actions installer builds for macOS Apple Silicon, Windows, and Linux x86_64. A SemVer prerelease tag produces a GitHub Pre-release and is not marked latest; a stable tag produces a normal release. Windows prereleases require the sidecar-aware NSIS installer and do not require MSI; stable Windows releases require both NSIS and MSI. Artifact normalization requires the tag, packaged version, source artifact, and output filename to agree on the full version, including any prerelease suffix. The existing beta.1 release remains an incomplete pipeline probe: its macOS DMG uploaded, while Windows and Linux artifacts did not.
 
 The implemented 2.0 architecture and source-level/deterministic validation permit an initial unstable/beta validation release. The beta period is for physical Mac ↔ Windows Native Agent acceptance. A beta release does not establish physical acceptance or RC/stable readiness. A release pass must also run the full validation stack and packaged physical smoke appropriate to its actual claim.
 

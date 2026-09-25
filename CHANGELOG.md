@@ -6,6 +6,12 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ## Unreleased
 
+### Fixed / Changed
+
+- Made Unix resource-limit typing target-correct for Linux GNU without changing the enforced limits.
+- Switched Windows release packaging to the production path that stages the pinned Codex sandbox sidecars and audits the bundle.
+- Use NSIS for Windows SemVer prereleases because MSI cannot represent their prerelease identifiers; stable Windows releases retain NSIS and MSI.
+
 ## 2.0.0-beta.1 — Pastey 2.0 Beta 1 — 2026-09-24
 
 Version 1.9.2 is the previous frozen Layer 1–5 packaged baseline. The implemented 2.0 architecture has completed source-level reliability and deterministic two-Host state validation. An initial unstable/beta 2.0 release may ship before physical Mac ↔ Windows Native Agent acceptance. The beta period gathers that evidence; physical acceptance is required before RC or stable readiness can be claimed.
