@@ -1,6 +1,12 @@
-# Layer 5 — Managed semantic workspace
+# Layer 5 — Agent execution
 
-Layer 5 owns semantic Plan composition, optional proposal interpretation, immutable object-flow revisions, one complete requester approval, Host admission, exact attempt/step authority, managed execution, authoritative completion, and dependency continuation. It does not own transport routes, raw Host resources, or Developer Terminal authority.
+## Role in Pastey
+
+Layer 5 turns task decisions into execution on selected Host capabilities and handles completion, continuation, and consequences. Its implemented paths are a native Codex Host capability and a separate Generic Managed Worker path. For managed Plans it owns semantic composition, optional proposal interpretation, immutable object-flow revisions, one complete requester approval, Host admission, exact attempt/step authority, managed execution, authoritative completion, and dependency continuation. It does not own transport routes, raw Host resources, or Developer Terminal authority.
+
+## Agent / Host / capability model
+
+A Host is a device and execution locality represented by Pastey. A capability is an ability exposed by that Host. An Agent is an intelligence or execution participant that can make or propose decisions over capabilities and resources. The general-capability direction lets an Agent reason over heterogeneous capabilities across Hosts without constraining it to one tool, provider, model, capability family, or locality. Current capability observation does not grant selection or execution authority, and Pastey does not currently integrate arbitrary Agents or capabilities. See [architecture](../architecture.md) for the system model.
 
 ## Native mature Agents
 
@@ -22,6 +28,8 @@ translation. A Host-private native session is keyed by Host + Agent + canonical
 workspace. Related tasks resume that session; an unrelated workspace receives a
 different session. The native session identifier is never a Plan semantic.
 
+## Native Codex today
+
 The first concrete implementation is Codex via its native app-server session
 protocol. Pastey inherits Codex's normal configuration and authentication and
 uses `initialize`, `thread/start`, `turn/start`, bounded lifecycle observation,
@@ -32,6 +40,8 @@ thread and turn with native `status: completed` and no error. A failed,
 interrupted, cancelled, disconnected, malformed, or otherwise ambiguous native
 turn is non-DONE.
 
+### Native completion and consequence recovery
+
 Pastey persists only its outer task and movement facts: immutable correlation, Host-private Bridge binding, execution status, exact result snapshot/digest, and requester apply state. Agent execution, result capture, encrypted Return, conflict retention, result Apply, and movement completion are separate facts. A completed Agent task stays `Completed` if capture, Return, retention, Apply, or explicit recovery abandonment later fails. Recovery, Return retry, cancellation, and Burn never authorize a second Agent turn. Restart does not recreate a native process, session, or turn. Unproved Bridge-bound execution becomes interrupted/reconciliation-required; an unbound local task that cannot be reconciled becomes terminal `failed` with `native_agent_interrupted_on_restart` and its unreachable envelope is removed.
 
 A durably completed received task can seal its exact result from its retained app-owned workspace if capture was interrupted, then retry only Return. Failed or unsafe capture is a consequence failure. After session loss, fresh authenticated reconciliation can prove a completed task and a validated durable snapshot digest. The requester retains that expected digest separately; it creates `result_identity` only from content actually received locally. The executor resends only its matching snapshot, never reruns the Agent. Lost final outbound Transfer acknowledgement, including a sender bookkeeping failure after receiver `/finish`, remains reconciliation-required and source-owning. Proven failure before Transfer finalization can become an ordinary interruption with best-effort cancellation of queued preparation.
@@ -39,6 +49,8 @@ A durably completed received task can seal its exact result from its retained ap
 If the source changed, Pastey retains the exact returned result without overwriting the source. `conflict_result_retention_required` and `conflict_result_retention_failed` remain explicit consequence-recovery states; exact Return repair or explicit abandonment remains available, and the old movement keeps source ownership while repair is admissible, including across requester restarts. A rematerialized result is matched by exact logical file-set content rather than inode or mtime. `WorkspaceApplyTransactionV1` journals the received result identity before filesystem changes. Restart may restore the baseline, complete a provably staged result, or recognize an already committed result; unexpected canonical state stays blocked and untouched. Exact duplicate Return does not reapply over later edits. Abandonment cancels movement authority without rewriting completed Agent history.
 
 Reopening a Bridge projects one unresolved safe fact at a time into the existing card. Remote uncertainty offers Reconcile and Stop, durable Return offers Retry result Return, retained conflict offers Reveal result and Discard result, and consequence interruption can offer Abandon recovery. The projection excludes physical paths, native session/turn/process details, provider/auth state, result text, and reasoning/tool history. One canonical workspace remains owned while execution, movement, reconciliation, or apply recovery can affect it; only terminal resolution, explicit cancellation, or proven ordinary interruption releases that ownership. Session loss revokes Bridge transport authority but does not Burn the Bridge or terminate a still-observed Host-local turn. Burn removes Bridge authority and envelopes even when an apply journal cannot prove safe filesystem repair: canonical and uncertain sibling trees remain untouched, possible orphan residue does not block startup, and late observer writes cannot restore authority.
+
+### Direct remote invocation and explicit movement
 
 For an existing workspace already present on a connected remote Host, Pastey
 uses the same native session service through authenticated current-session Room
@@ -68,6 +80,10 @@ invalid portable selectors, case-folding collisions, and bounded-manifest
 violations. Agent failure, cancellation, interruption, transfer failure, or an
 unknown Agent outcome similarly has no result apply and cannot prove completion.
 
+## Managed execution path
+
+The Generic Managed Worker is a separate, currently implemented path for exact managed Plan steps. Its semantic workspace and `ManagedObject` revision flow apply to this path; they are not the definition of every Agent capability. The following roles and contracts describe managed execution unless stated otherwise.
+
 ## Responsibility and locality
 
 | Role | Canonical responsibility |
@@ -82,7 +98,9 @@ Local execution is a transport/dispatch optimization, not an authority exception
 
 Local admission is bound to the active Bridge, exact requester participant and `HostRef`, one opaque `LocalRuntimeRef`, and expiry. `LocalRuntimeRef` identifies only the current HostRuntime generation: it has no peer, route, Bridge-session, or `session_pair_ref` fields. Restart creates a different value and invalidates the old local authority even though the durable `HostRef` is unchanged. Remote admission continues to require the existing exact `HostSessionBinding`.
 
-## Semantic model
+## Current managed semantic model
+
+Search / Transform / Transfer / Execute are the current managed primitives, not universal verbs for future Host capabilities. A task may execute where its needed capability and resources already reside. In a managed Plan, explicit Transfer is needed when an authored step requires its exact object revision on another Host.
 
 | Primitive | Contract |
 | --- | --- |
@@ -91,7 +109,7 @@ Local admission is bound to the active Bridge, exact requester participant and `
 | Transfer | Move the exact current revision from one authored Host to another without changing its logical revision. |
 | Execute | Run the exact current revision on its authored Host and produce a result digest, never lineage. |
 
-Only Transfer changes location. A Transform cannot select a new Host or produce an unrelated logical object. An Execute cannot create a revision. Every movement, dependency, mutation intent, execution intent, and Host is part of the sealed Plan.
+**Transfer is the only current managed primitive that changes ManagedObject location.** A Transform cannot select a new Host or produce an unrelated logical object. An Execute cannot create a revision. Every movement, dependency, mutation intent, execution intent, and Host is part of the sealed Plan.
 
 Transform is generic across representations. A Python→Java conversion may be used as an acceptance example, but it is not a Python/Java subsystem, alternate execution path, or additional primitive.
 

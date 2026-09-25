@@ -2,6 +2,17 @@
 
 This document owns concrete identifiers, bounds, configuration facts, and source pointers. Source types and validators remain authoritative; architecture is in [architecture](architecture.md), [Layer 5](layers/layer-5-agent.md), and [Windows managed execution](platform/windows-managed-execution.md).
 
+## Terms used by current contracts
+
+| Term | Meaning in this implementation |
+| --- | --- |
+| Host | A device/execution locality with a durable `HostRef`; a remote action additionally requires its exact current Bridge session binding. |
+| Capability | A bounded ability observed or exposed by a Host. Observation and compatibility do not select a Host or grant execution authority. |
+| Agent | An intelligence/execution participant that can make or propose task decisions over capabilities and resources. Pastey does not currently integrate arbitrary Agents. |
+| Native Agent | A Host-owned mature Agent, currently Codex (`agent.coding.codex`), invoked through its native interface and Host-private sessions; it owns HOW. |
+| Generic Managed Worker | The distinct bounded Worker path for one already authorized Transform or Execute step. It is not the Native Codex service. |
+| Managed execution | The current Plan/ObjectRef/`ManagedObjectRevisionV2` path with Search, Transform, Transfer, and Execute; those are managed primitives rather than a universal capability vocabulary. |
+
 ## Versions and schemas
 
 | Boundary | Value / source |

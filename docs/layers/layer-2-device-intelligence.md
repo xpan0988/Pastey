@@ -1,6 +1,6 @@
-# Layer 2 — Device intelligence
+# Layer 2 — Host and capability observation
 
-Layer 2 describes facts about the local device and current links. It is intentionally not a recommendation or authority system.
+Layer 2 describes factual Host, capability, device, and current-link observations that can inform higher-level Agent task decisions. It neither chooses which capability an Agent should use nor grants authority. Its profiles and benchmarks do not define a universal intelligence score for a device.
 
 ## Owned observations
 
@@ -28,6 +28,6 @@ NodeList is therefore a display/inspection seam, not current-session truth: any 
 
 ## Boundary
 
-Layer 2 describes facts. It does not produce planner commands, peer rankings, recommended devices, trust, consent, Host selection, topology rewrites, or authority. In particular, device facts do not command Layer 3 scheduler policy and paired-device display metadata does not establish Layer 4 routeability.
+Layer 2 describes facts. It does not produce Agent decisions, planner commands, peer rankings, recommended devices, trust, consent, Host selection, topology rewrites, or authority. In particular, device facts do not command Layer 3 scheduler policy and paired-device display metadata does not establish Layer 4 routeability.
 
 See [Layer 3](layer-3-orchestration.md) for the scheduler that makes policy decisions and [Layer 4](layer-4-bridge.md) for current-session liveness and routeability semantics.

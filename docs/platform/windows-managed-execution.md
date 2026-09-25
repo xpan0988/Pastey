@@ -1,6 +1,6 @@
 # Windows managed execution
 
-This document owns the durable Windows platform semantics and limitations for managed Process execution. The generic Plan, authority, resource, and completion contract remains in [Layer 5](../layers/layer-5-agent.md); executable acceptance and recovery remain in [development](../development.md).
+This document owns the durable Windows platform semantics and limitations for managed Process execution. Windows Managed Execute is one backend of the current Generic Managed Worker path, not a general Native Agent integration. The managed Plan, authority, resource, and completion contract remains in [Layer 5](../layers/layer-5-agent.md); executable acceptance and recovery remain in [development](../development.md).
 
 ## Role and authority boundary
 

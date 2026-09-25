@@ -1,7 +1,7 @@
 [package]
 name = "pastey"
 version = "2.0.0-beta.2"
-description = "Local-first encrypted paste and file transfer utility"
+description = "Cross-device infrastructure for general-capability Agents"
 authors = ["xpan0988"]
 edition = "2021"
 default-run = "pastey"

@@ -1,6 +1,6 @@
-# Layer 3 — Smart orchestration
+# Layer 3 — Execution and transfer orchestration
 
-Layer 3 owns transfer planner/scheduler policy, queue lifecycle, capacity accounting, runtime-window allocation, and `MicroFlowGroup`. The ordinary UI queue remains frontend-owned, while a shared Rust capacity-admission boundary applies the same global window and active-transfer limits to both ordinary and managed Transfers before either reaches the existing Rust transfer path. It does not create a second transfer core.
+Layer 3 owns lower-level transfer planner/scheduler policy, queue lifecycle, capacity accounting, runtime-window allocation, and `MicroFlowGroup`. It coordinates transport capacity after Agent task placement and managed semantic eligibility are decided elsewhere; it does not reason over general Host capabilities or select execution placement. The ordinary UI queue remains frontend-owned, while a shared Rust capacity-admission boundary applies the same global window and active-transfer limits to both ordinary and managed Transfers before either reaches the existing Rust transfer path. It does not create a second transfer core.
 
 ## Planner and capacity
 
