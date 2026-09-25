@@ -1,7 +1,7 @@
 {
   "name": "pastey",
   "private": true,
-  "version": "2.0.0-beta.1",
+  "version": "2.0.0-beta.2",
   "author": "xpan0988",
   "type": "module",
   "scripts": {

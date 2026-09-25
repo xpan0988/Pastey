@@ -6,6 +6,8 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ## Unreleased
 
+## 2.0.0-beta.2 — Pastey 2.0 Beta 2 — 2026-09-25
+
 ### Fixed / Changed
 
 - Made Unix resource-limit typing target-correct for Linux GNU without changing the enforced limits.
