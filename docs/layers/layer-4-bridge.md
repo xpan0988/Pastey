@@ -1,6 +1,6 @@
-# Layer 4 — Multi-device Bridge sessions and peer identity
+# Layer 4 — Cross-device session and control fabric
 
-Bridge is Pastey's ephemeral, current-session device workspace. This document owns Bridge membership, peer identity boundaries, ordinary-data routing, and control transport. Legacy code and storage still use **Room** terminology; it refers to the current Bridge session, not a separate product model.
+Bridge is Pastey's authenticated current-session communication and control fabric across Hosts. It carries ordinary data and bounded control for Agent execution while keeping session delivery separate from task authority. This document owns Bridge membership, peer identity boundaries, ordinary-data routing, and control transport. Legacy code and storage still use **Room** terminology; it refers to the current Bridge session, not a separate product model.
 
 ## Current-session peer model
 

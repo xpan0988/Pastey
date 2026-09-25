@@ -1,6 +1,6 @@
-# Layer 1 — Secure LAN transport
+# Layer 1 — Secure transfer substrate
 
-Layer 1 owns the encrypted byte-oriented LAN transfer path. It is the canonical documentation for binary-v1 mechanics and transfer lifecycle. Scheduling and capacity admission belong to [Layer 3](layer-3-orchestration.md); Bridge target resolution belongs to [Layer 4](layer-4-bridge.md); managed step continuation belongs to [Layer 5](layer-5-agent.md).
+Layer 1 owns the encrypted byte-oriented LAN transfer path used when an Agent task needs resources or results to cross Hosts. Transfer supports execution placement when capability and resource locations differ; it does not define Pastey's product identity. This is the canonical documentation for binary-v1 mechanics and transfer lifecycle. Scheduling and capacity admission belong to [Layer 3](layer-3-orchestration.md); Bridge target resolution belongs to [Layer 4](layer-4-bridge.md); managed step continuation belongs to [Layer 5](layer-5-agent.md).
 
 ## Transport model
 

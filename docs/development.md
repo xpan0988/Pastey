@@ -1,6 +1,6 @@
 # Development, validation, and release
 
-Architecture belongs in [architecture](architecture.md), managed contracts in [Layer 5](layers/layer-5-agent.md), Windows platform semantics in [Windows managed execution](platform/windows-managed-execution.md), and concrete identifiers/configuration in [reference](reference.md).
+This document describes how the current cross-device Agent execution substrate is built and validated. Architecture belongs in [architecture](architecture.md), native and managed contracts in [Layer 5](layers/layer-5-agent.md), Windows managed-backend semantics in [Windows managed execution](platform/windows-managed-execution.md), and concrete identifiers/configuration in [reference](reference.md).
 
 ## Setup and builds
 
@@ -132,8 +132,8 @@ On macOS and Windows in both controller/Host directions, verify prompt/VT render
 `src-tauri/Cargo.toml` is the authoritative packaged app version. Release with:
 
 ```bash
-npm run release:version -- 2.0.0-beta.2 "Pastey 2.0 Beta 2" --dry-run
-npm run release:version -- 2.0.0-beta.2 "Pastey 2.0 Beta 2"
+npm run release:version -- 2.0.0-beta.3 "Pastey 2.0 Beta 3" --dry-run
+npm run release:version -- 2.0.0-beta.3 "Pastey 2.0 Beta 3"
 git push origin main --tags
 ```
 
@@ -145,7 +145,7 @@ Focused release-tool checks run with `node --test tests/releaseTooling.test.mjs`
 
 Pushing the tag triggers GitHub Actions installer builds for macOS Apple Silicon, Windows, and Linux x86_64. A SemVer prerelease tag produces a GitHub Pre-release and is not marked latest; a stable tag produces a normal release. Windows prereleases require the sidecar-aware NSIS installer and do not require MSI; stable Windows releases require both NSIS and MSI. Artifact normalization requires the tag, packaged version, source artifact, and output filename to agree on the full version, including any prerelease suffix. The existing beta.1 release remains an incomplete pipeline probe: its macOS DMG uploaded, while Windows and Linux artifacts did not.
 
-The implemented 2.0 architecture and source-level/deterministic validation permit an initial unstable/beta validation release. The beta period is for physical Mac ↔ Windows Native Agent acceptance. A beta release does not establish physical acceptance or RC/stable readiness. A release pass must also run the full validation stack and packaged physical smoke appropriate to its actual claim.
+The tagged 2.0 beta releases provide a validation path while physical Mac ↔ Windows Native Agent acceptance remains pending. A beta release does not establish physical acceptance or RC/stable readiness. A release pass must also run the full validation stack and packaged physical smoke appropriate to its actual claim.
 
 ## Repository hygiene
 

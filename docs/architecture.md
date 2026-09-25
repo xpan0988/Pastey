@@ -1,47 +1,26 @@
 # Pastey architecture
 
-Pastey is a local-first desktop transfer and workspace-orchestration system. Source code, validators, and tests are authoritative. Version 1.9.2 is the last packaged baseline; the implemented 2.0 architecture is being prepared for its first unstable/beta release. Native Agents are Host capabilities rather than Pastey-managed Workers.
+Pastey is cross-device infrastructure for general-capability Agents. A Host is a device and execution locality; a capability is an ability that Host exposes; and an Agent is an intelligence or execution participant that makes or proposes task decisions over capabilities and resources. A general-capability Agent is not architecturally confined to one Host, tool, provider, model, capability family, or local execution environment. Hosts expose capabilities and resources, Agents reason over them, and Pastey makes authorized decisions executable across devices.
+
+This is the product and architecture direction, not a claim of AGI or universal Agent integration. The current 2.0 implementation has a native Codex path and a distinct Generic Managed Worker path over a LAN-oriented current-session Bridge. Source code, validators, and tests are authoritative. The repository is at `2.0.0-beta.2`; its beta status does not establish physical Mac ↔ Windows Native Agent acceptance.
+
+## Agent execution across Hosts
+
+An Agent or product flow can identify the capability a task needs, select its owning Host, and place execution there. If the necessary resources are already on that Host, the capability works locally. If capability and resource placement differ, Pastey can authorize explicit movement, execute on the selected Host, then handle result continuation or consequences. Factual capability observations inform selection but never grant it. The currently implemented Native Agent and managed paths have different authority and execution contracts; neither path implies arbitrary future capabilities work today.
 
 ## System and dependency direction
 
 | Layer | Responsibility |
 | --- | --- |
-| 1 — Secure LAN transport | Encrypted byte transfer, framing, integrity, acknowledgement, and finalization. |
-| 2 — Device intelligence | Factual device, link, liveness, bounded capability observations, and the read-only Bridge NodeList projection. |
-| 3 — Smart orchestration | Ordinary queues and shared Rust transfer-capacity admission. |
-| 4 — Bridge | Current-session membership, routes, encrypted control delivery, replay, reconnect, departure, and Burn boundaries. |
-| 5 — Managed semantic workspace | Immutable object flow, Review/approval, Host admission, attempt/step authority, managed execution, and continuation. |
+| 1 — Secure transfer substrate | Encrypted byte movement when cross-Host placement requires it; framing, integrity, acknowledgement, and finalization. |
+| 2 — Host and capability observation | Factual device, link, liveness, bounded capability observations, and the read-only Bridge NodeList projection. |
+| 3 — Execution and transfer orchestration | Ordinary queues and shared Rust transfer-capacity admission; no Agent-level Host or capability reasoning. |
+| 4 — Cross-device session and control fabric | Current-session Bridge membership, routes, encrypted control delivery, replay, reconnect, departure, and Burn boundaries. |
+| 5 — Agent execution | Native Host capability invocation and the separate managed path with immutable object flow, Review/approval, Host admission, attempt/step authority, execution, and continuation. |
 
-Dependencies point downward. Layer 5 decides semantic eligibility before Layer 3 admits transfer capacity; Layer 4 supplies a current authenticated route; Layer 1 moves bytes. A lower layer never creates, approves, repairs, or advances a Plan. Layer 2 facts and Layer 4 delivery are observations, not authority.
+Dependencies point downward. Layer 5 decides semantic eligibility before Layer 3 admits transfer capacity; Layer 4 supplies a current authenticated route; Layer 1 moves bytes when required. A lower layer never creates, approves, repairs, or advances a Plan. Layer 2 facts and Layer 4 delivery are observations, not authority. Transfer is supporting infrastructure for the difference between capability placement and resource placement.
 
-```text
-user / product UI
-        |
-Natural-v2 proposal or deterministic v2 Composer
-        |
-Pastey Core: validate → seal revision/hash → Review → approval
-        |
-requester whole-Plan readiness → local/remote prepare and admission → commit
-        |
-Host coordinator claims one exact eligible step
-        |
-Search | Worker Transform/Execute | authored Transfer
-        |
-Core evidence/result acceptance → requester step commit → next authored dependency
-```
-
-Renderer state, model/provider output, logs, routes, tool schemas, and capability projections never mint authority.
-
-```text
-NodeList = environment facts
-Plan     = decision
-Host     = exact local binding
-Core     = authority
-```
-
-Capability is not authority. Probe availability is not executable binding. Acquisition confirmation is neither installation nor execution authority.
-
-## Native mature-Agent boundary
+## Native Host capabilities
 
 Pastey 2.0 treats its currently implemented native Codex Agent capability as a
 Host capability—not as a Pastey Worker harness. The
@@ -60,8 +39,6 @@ not broker the Agent provider or authentication, translate native tools into
 effects, control its tool or shell strategy, recreate its sandbox, inspect its
 reasoning/process topology, or require ordinary Host-local tasks to pass through
 Scratch, GST, or ManagedObject.
-
-The [META Embodiment Constitution](meta/embodiment/constitution.md) extends this ownership principle to future physical-device execution. It defines governance, local enforcement, and evidence obligations; Pastey's current runtime does not implement those embodied contracts.
 
 By default a selected Agent works directly in the explicitly selected original
 workspace on its Host. A Host-private native session is associated with Host +
@@ -102,11 +79,44 @@ Codex terminal success is intentionally narrow: the exact native
 `status: completed`, and have no error. `failed`, `interrupted`, cancellation,
 and any malformed or mismatched terminal notification stay non-DONE.
 
+## Host and capability observations
+
 Layer 2's `BridgeNodeListProjectionV1` displays durable Host membership once per `HostRef` and only matching current-session capability/link observations. It is environment fact display, not a route resolver or source of readiness/authorization: all execution paths still revalidate through the existing Layer 4 Host resolver and Core-owned admission/completion chain.
 
 A current-session Room Control capability query may ask an exact remote Host for a bounded, deduplicated list from the global fixed-probe request vocabulary: `runtime.python`, `runtime.node`, `runtime.git`, `runtime.rust_cargo`, `runtime.docker`, `runtime.ffmpeg`, `runtime.cuda`, `runtime.powershell`, `runtime.zsh`, and `runtime.bash`. The requester platform does not narrow that vocabulary. The receiving Host validates each ID and alone maps it to a platform-local fixed probe. A successful fixed probe is `Available`; a failed fixed probe is `Unavailable` (`system_probe_unavailable`); a globally recognized request with no local fixed implementation is `Unsupported` (`system_probe_unsupported`); and no current observation remains unknown. A caller cannot send an executable path, command, arguments, shell text, or installation instruction. These are current-session NodeList facts only; they do not select a Host, repair topology, bind a process, or grant execution authority.
 
 The low-friction Capability Acquisition confirmation foundation is also implemented, but generic capability acquisition/install behavior is not. An acquisition request binds one generic bounded semantic ID to an exact durable `HostRef` and renderer-safe display facts; valid intents include `runtime.java`, `tool.cmake`, `sdk.android`, and `model.whisper` even though they are outside the fixed-probe request vocabulary. The confirmation result is only `Confirmed` or `Cancelled`. It creates no installer behavior, probe, process binding, execution authority, Plan/topology mutation, Host selection, or Developer Mode change. Any future Host-side acquisition flow must reuse the existing Host probe → capability projection → NodeList/Settings refresh path; confirmation itself changes none of those facts.
+
+## Current managed Plan path
+
+The following sequence describes the **current managed Plan path**, not every native capability:
+
+```text
+user / product UI
+        |
+Natural-v2 proposal or deterministic v2 Composer
+        |
+Pastey Core: validate → seal revision/hash → Review → approval
+        |
+requester whole-Plan readiness → local/remote prepare and admission → commit
+        |
+Host coordinator claims one exact eligible step
+        |
+Search | Worker Transform/Execute | authored Transfer
+        |
+Core evidence/result acceptance → requester step commit → next authored dependency
+```
+
+Renderer state, model/provider output, logs, routes, tool schemas, and capability projections never mint authority.
+
+```text
+NodeList = environment facts
+Plan     = decision
+Host     = exact local binding
+Core     = authority
+```
+
+Capability is not authority. Probe availability is not executable binding. Acquisition confirmation is neither installation nor execution authority.
 
 Execution locality does not change this chain. Core resolves each authored participant's `HostRef` once. Work for the current Host uses direct coordinator dispatch with a fresh local-runtime reference; work for another Host uses its current Bridge/session binding and Room Control. Both paths satisfy the same Layer 5 Review, readiness, attempt-bound admission, prepared/commit, result, continuation, and cancellation contract.
 
@@ -126,7 +136,9 @@ For remote execution, the full directional binding and its `binding_ref` remain 
 
 In a multi-Host Plan the requester coordinates global dependency state, while each Host executes only steps authored for itself. A receiver, requester-local executor, or Worker cannot select another Host, insert a Transfer, or continue the global Plan independently.
 
-## Four primitive invariants
+## Current managed semantic primitives
+
+Search, Transform, Transfer, and Execute are the current **managed** Plan vocabulary. They are not a universal capability vocabulary or a requirement on native Agents. A managed object stays at its exact current Host unless an authored Transfer completes; **Transfer is the only current managed primitive that changes ManagedObject location**.
 
 ```text
 Search     = find an object at an explicit Host
@@ -135,7 +147,7 @@ Transfer   = move the exact revision between explicit Hosts
 Execute    = run the exact current revision at an explicit Host
 ```
 
-Only Transfer changes location. Transform consumes N and may create N+1 for the same logical object only after Core validates exact Host evidence and seals the result. Execute creates a result record but no managed lineage. Capability availability never repairs topology.
+Transform consumes N and may create N+1 for the same logical object only after Core validates exact Host evidence and seals the result. Execute creates a result record but no managed lineage. Capability availability never repairs topology.
 
 Transform remains a general semantic operation over an exact object revision. Python→Java is permitted only as a cross-representation acceptance example, not as a product-specific subsystem or alternate primitive.
 
