@@ -1,6 +1,6 @@
-//! Stage 1 physical contracts: data and pure validation, never executable authority.
+//! Physical contracts and Stage 2 durable/trusted environmental facts, never authority.
 //!
-//! No resolver, authority constructor, session, persistence, protocol or I/O lives here.
+//! No task authority, executable session, protocol, adapter or native I/O lives here.
 //! Successfully validating a claim does not authenticate its producer or qualify a body.
 #![allow(dead_code)] // Deliberately has no runtime consumers until later stages.
 
@@ -39,6 +39,7 @@ macro_rules! claim {
 
 pub(crate) mod binding;
 pub(crate) mod contracts;
+pub(crate) mod store;
 pub(crate) mod values;
 
 #[cfg(test)]

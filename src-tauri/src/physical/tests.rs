@@ -527,3 +527,878 @@ fn scope_hash_version_one_vector() {
         "a2026bfa34d35d3c33476a9baeb08444f6fef9ffd00e6fa53d3ca58a16604b89"
     );
 }
+
+mod stage2 {
+    use super::super::{binding::test_support as fake, store::PhysicalStoreV1};
+    use super::*;
+    use crate::{
+        host_identity::LocalRuntimeRef,
+        storage::{self, AppPaths},
+    };
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Barrier,
+    };
+
+    struct Clock {
+        wall: AtomicU64,
+        ticks: AtomicU64,
+    }
+    impl Clock {
+        fn new() -> Self {
+            Self {
+                wall: AtomicU64::new(1000),
+                ticks: AtomicU64::new(0),
+            }
+        }
+        fn set(&self, wall: u64, ticks: u64) {
+            self.wall.store(wall, Ordering::SeqCst);
+            self.ticks.store(ticks, Ordering::SeqCst);
+        }
+    }
+    impl BindingClockV1 for Clock {
+        fn read(&self) -> crate::error::AppResult<(UnixMillis, u64)> {
+            Ok((
+                UnixMillis::try_from(self.wall.load(Ordering::SeqCst))?,
+                self.ticks.load(Ordering::SeqCst),
+            ))
+        }
+    }
+    struct Fixture {
+        paths: AppPaths,
+        clock: Arc<Clock>,
+        resolver: PhysicalBindingResolverV1,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("pastey-physical-stage2-{}", uuid::Uuid::new_v4()));
+            let paths = AppPaths::new(root.clone(), root.join("logs"));
+            paths.ensure_directories().unwrap();
+            storage::init_database(&paths).unwrap();
+            let clock = Arc::new(Clock::new());
+            let resolver = PhysicalBindingResolverV1::new(
+                &paths,
+                LocalRuntimeRef::fresh(host("executor")),
+                clock.clone(),
+            )
+            .unwrap();
+            Self {
+                paths,
+                clock,
+                resolver,
+            }
+        }
+        fn enroll(&mut self, b: &EnvironmentBindingViewV1) {
+            self.resolver.enroll(fake::enrollment(b), None).unwrap();
+        }
+        fn resolve(&mut self, b: &EnvironmentBindingViewV1, native: bool) -> EnvironmentBindingV1 {
+            let c = self.resolver.begin_resolution(&b.environment).unwrap();
+            let facts = fake::facts(&self.resolver, c, b, native);
+            self.resolver.resolve(facts).unwrap()
+        }
+        fn qualify(
+            &mut self,
+            b: &EnvironmentBindingV1,
+            p: &PhysicalCapabilityProfileV1,
+        ) -> PhysicalQualificationV1 {
+            let q = qualification(p, b.view());
+            let evidence = fake::evidence(&q, digest_value());
+            self.resolver
+                .record_qualification(b, p, &q, evidence)
+                .unwrap();
+            q
+        }
+        fn reopen(&self) -> PhysicalBindingResolverV1 {
+            PhysicalBindingResolverV1::new(
+                &self.paths,
+                LocalRuntimeRef::fresh(host("executor")),
+                self.clock.clone(),
+            )
+            .unwrap()
+        }
+        fn sql(&self) -> rusqlite::Connection {
+            rusqlite::Connection::open(&self.paths.db_path).unwrap()
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.resolver.close();
+            std::fs::remove_dir_all(&self.paths.app_data_dir).unwrap();
+        }
+    }
+    fn second_environment() -> EnvironmentBindingViewV1 {
+        let mut b = binding();
+        b.environment = decode(json!("environment:v1:00000000-0000-4000-8000-000000000002"));
+        b
+    }
+    fn second_domain() -> DomainId {
+        decode(json!(
+            "physical-domain:v1:00000000-0000-4000-8000-000000000002"
+        ))
+    }
+
+    #[test]
+    fn duplicate_enrollment_and_revision_host_mismatch_are_denied() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        assert!(f.resolver.enroll(fake::enrollment(&b), None).is_err());
+        assert!(f.resolver.enroll(fake::enrollment(&b), Some(1)).is_err());
+        let mut changed = b.clone();
+        changed.registration_revision = 2;
+        assert!(f
+            .resolver
+            .enroll(fake::enrollment(&changed), Some(9))
+            .is_err());
+        changed.executor = host("other");
+        assert!(f
+            .resolver
+            .enroll(fake::enrollment(&changed), Some(1))
+            .is_err());
+        assert_eq!(
+            fake::store(&f.resolver)
+                .registration(&b.environment)
+                .unwrap()
+                .revision,
+            1
+        );
+    }
+    #[test]
+    fn environment_revision_change_withdraws_proof_and_qualification_and_advances_epoch() {
+        let mut f = Fixture::new();
+        let mut b = binding();
+        f.enroll(&b);
+        let live = f.resolve(&b, false);
+        let p = profile();
+        let q = f.qualify(&live, &p);
+        let epochs = fake::store(&f.resolver)
+            .epochs(b.domains().into_iter().cloned())
+            .unwrap();
+        b.registration_revision = 2;
+        b.subsystems
+            .get_mut(&label("locomotion"))
+            .unwrap()
+            .controller_incarnation =
+            decode(json!("incarnation:v1:00000000-0000-4000-8000-000000000002"));
+        f.resolver.enroll(fake::enrollment(&b), Some(1)).unwrap();
+        assert!(f.resolver.validate_current(&live).is_err());
+        assert!(fake::store(&f.resolver)
+            .qualification(&q.qualification_id, UnixMillis::try_from(1000).unwrap())
+            .is_err());
+        let new_epochs = fake::store(&f.resolver)
+            .epochs(b.domains().into_iter().cloned())
+            .unwrap();
+        assert!(new_epochs.iter().all(|(d, e)| *e == epochs[d] + 1));
+        let fresh = f.resolve(&b, false);
+        f.resolver.validate_current(&fresh).unwrap();
+    }
+    #[test]
+    fn aliases_and_overlapping_views_share_exact_canonical_namespace() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let second = second_environment();
+        let mut enrollment = fake::enrollment(&second);
+        fake::record(&mut enrollment).aliases.insert(
+            label("move"),
+            b.domains().first().unwrap().to_owned().clone(),
+        );
+        f.resolver.enroll(enrollment, None).unwrap();
+        let first = f.resolve(&b, false);
+        let second = f.resolve(&second, false);
+        let epochs = fake::store(&f.resolver)
+            .epochs(b.domains().into_iter().cloned())
+            .unwrap();
+        assert_eq!(epochs.len(), 1);
+        fake::store(&f.resolver).advance_epochs(&epochs).unwrap();
+        assert!(f.resolver.validate_current(&first).is_err());
+        assert!(f.resolver.validate_current(&second).is_err());
+        assert_eq!(
+            f.sql()
+                .query_row("SELECT count(*) FROM physical_domains", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn conflicting_alias_and_duplicate_resource_names_roll_back_entire_enrollment() {
+        for same_resource in [false, true] {
+            let mut f = Fixture::new();
+            f.enroll(&binding());
+            let mut b = second_environment();
+            b.subsystems.get_mut(&label("locomotion")).unwrap().domains = vec![second_domain()];
+            let mut enrollment = fake::enrollment(&b);
+            if !same_resource {
+                fake::record(&mut enrollment)
+                    .resources
+                    .insert(second_domain(), label("different.mechanism"));
+            } else {
+                fake::record(&mut enrollment).aliases.clear();
+                fake::record(&mut enrollment)
+                    .aliases
+                    .insert(label("other.alias"), second_domain());
+            }
+            assert!(f.resolver.enroll(enrollment, None).is_err());
+            assert_eq!(
+                f.sql()
+                    .query_row("SELECT count(*) FROM physical_environments", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                f.sql()
+                    .query_row("SELECT count(*) FROM physical_domains", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn canonical_domain_cannot_be_reassigned_to_another_mechanism() {
+        let mut f = Fixture::new();
+        f.enroll(&binding());
+        let mut e = fake::enrollment(&second_environment());
+        fake::record(&mut e).resources.insert(
+            binding().domains().first().unwrap().to_owned().clone(),
+            label("different.mechanism"),
+        );
+        assert!(f.resolver.enroll(e, None).is_err());
+    }
+    #[test]
+    fn duplicate_or_mismatched_qualification_identity_cannot_mutate_expiry_or_evidence() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let live = f.resolve(&b, false);
+        let p = profile();
+        let q = f.qualify(&live, &p);
+        assert!(f
+            .resolver
+            .record_qualification(&live, &p, &q, fake::evidence(&q, digest_value()))
+            .is_err());
+        for field in [
+            "expiry",
+            "evidence",
+            "conditions",
+            "revision",
+            "profile",
+            "binding",
+            "class",
+        ] {
+            let mut bad = q.clone();
+            match field {
+                "expiry" => bad.expires_at = UnixMillis::try_from(1900).unwrap(),
+                "evidence" => bad.evidence_digest = decode(json!("b".repeat(64))),
+                "conditions" => bad.conditions_digest = decode(json!("b".repeat(64))),
+                "revision" => bad.revision = 2,
+                "profile" => bad.profile_digest = digest_value(),
+                "binding" => bad.binding_digest = digest_value(),
+                _ => bad.evidence_class = EvidenceClassV1::Hardware,
+            }
+            assert!(
+                f.resolver
+                    .record_qualification(&live, &p, &bad, fake::evidence(&bad, digest_value()))
+                    .is_err(),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            f.resolver
+                .qualification(&live, &p, &q.qualification_id)
+                .unwrap(),
+            q
+        );
+    }
+    #[test]
+    fn withdrawal_is_monotonic_terminal_and_survives_reopen() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let live = f.resolve(&b, false);
+        let p = profile();
+        let q = f.qualify(&live, &p);
+        assert!(f.resolver.withdraw(&q.qualification_id, 1).is_err());
+        f.resolver.withdraw(&q.qualification_id, 2).unwrap();
+        assert!(f.resolver.withdraw(&q.qualification_id, 2).is_err());
+        assert!(f.resolver.withdraw(&q.qualification_id, 1).is_err());
+        f.resolver.withdraw(&q.qualification_id, 3).unwrap();
+        assert!(f
+            .resolver
+            .qualification(&live, &p, &q.qualification_id)
+            .is_err());
+        assert!(f
+            .resolver
+            .record_qualification(&live, &p, &q, fake::evidence(&q, digest_value()))
+            .is_err());
+        let reopened = PhysicalStoreV1::open(&f.paths).unwrap();
+        assert!(reopened
+            .qualification(&q.qualification_id, UnixMillis::try_from(1000).unwrap())
+            .is_err());
+        assert_eq!(
+            f.sql()
+                .query_row(
+                    "SELECT withdrawal_revision FROM physical_qualifications",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+    }
+    #[test]
+    fn qualification_expiry_is_exclusive_and_not_receipt_relative() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let live = f.resolve(&b, false);
+        let p = profile();
+        let mut q = qualification(&p, live.view());
+        q.expires_at = UnixMillis::try_from(1500).unwrap();
+        f.resolver
+            .record_qualification(&live, &p, &q, fake::evidence(&q, digest_value()))
+            .unwrap();
+        f.clock.set(1499, 499000);
+        f.resolver
+            .qualification(&live, &p, &q.qualification_id)
+            .unwrap();
+        f.clock.set(1500, 500000);
+        assert!(f
+            .resolver
+            .qualification(&live, &p, &q.qualification_id)
+            .is_err());
+        let mut past = q.clone();
+        past.qualification_id = decode(json!(
+            "qualification:v1:00000000-0000-4000-8000-000000000002"
+        ));
+        assert!(f
+            .resolver
+            .record_qualification(&live, &p, &past, fake::evidence(&past, digest_value()))
+            .is_err());
+        let store = PhysicalStoreV1::open(&f.paths).unwrap();
+        assert!(store
+            .qualification(&q.qualification_id, UnixMillis::try_from(1500).unwrap())
+            .is_err());
+    }
+    #[test]
+    fn qualification_cannot_weaken_profile_or_promote_gate_a_to_gate_b() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let live = f.resolve(&b, false);
+        let mut p = profile();
+        p.required_enforcement_class = SessionEnforcementClassV1::NativeFence;
+        let mut q = qualification(&p, live.view());
+        assert!(f
+            .resolver
+            .record_qualification(&live, &p, &q, fake::evidence(&q, digest_value()))
+            .is_err());
+        q.required_enforcement_class = SessionEnforcementClassV1::AdapterIsolationOnly;
+        assert!(f
+            .resolver
+            .record_qualification(&live, &p, &q, fake::evidence(&q, digest_value()))
+            .is_err());
+        let native = f.resolve(&b, true);
+        let q = qualification(&p, native.view());
+        f.resolver
+            .record_qualification(&native, &p, &q, fake::evidence(&q, digest_value()))
+            .unwrap();
+        f.resolver
+            .qualification(&native, &p, &q.qualification_id)
+            .unwrap();
+    }
+    #[test]
+    fn qualification_requires_the_configured_trusted_evaluator_for_exact_fingerprint() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let live = f.resolve(&b, false);
+        let p = profile();
+        let q = qualification(&p, live.view());
+        assert!(f
+            .resolver
+            .record_qualification(
+                &live,
+                &p,
+                &q,
+                fake::evidence(&q, decode(json!("b".repeat(64))))
+            )
+            .is_err());
+        let mut other = q.clone();
+        other.conditions_digest = decode(json!("b".repeat(64)));
+        assert!(f
+            .resolver
+            .record_qualification(&live, &p, &other, fake::evidence(&q, digest_value()))
+            .is_err());
+    }
+    #[test]
+    fn changed_required_identity_dimensions_deny_binding_and_close_old_proof() {
+        for pointer in [
+            "/subsystems/locomotion/controllerIncarnation",
+            "/subsystems/locomotion/bodyIncarnation",
+            "/subsystems/locomotion/worldIncarnation",
+            "/subsystems/locomotion/configurationDigest",
+            "/subsystems/locomotion/policyDigest",
+            "/configurationDigest",
+            "/subsystems/locomotion/body",
+            "/subsystems/locomotion/domains",
+        ] {
+            let mut f = Fixture::new();
+            let b = binding();
+            f.enroll(&b);
+            let old = f.resolve(&b, false);
+            let mut v = wire(&b);
+            *v.pointer_mut(pointer).unwrap() = if pointer.ends_with("Digest") {
+                json!("b".repeat(64))
+            } else if pointer.ends_with("/body") {
+                json!("body:v1:00000000-0000-4000-8000-000000000002")
+            } else if pointer.ends_with("domains") {
+                json!([second_domain()])
+            } else {
+                json!("incarnation:v1:00000000-0000-4000-8000-000000000002")
+            };
+            let wrong: EnvironmentBindingViewV1 = decode(v);
+            let c = f.resolver.begin_resolution(&b.environment).unwrap();
+            let facts = fake::facts(&f.resolver, c, &wrong, false);
+            assert!(f.resolver.resolve(facts).is_err(), "{pointer}");
+            assert!(f.resolver.validate_current(&old).is_err());
+            assert_eq!(fake::live_count(&f.resolver), 0);
+        }
+    }
+    #[test]
+    fn adapter_runtime_and_provenance_owner_are_not_sender_controlled() {
+        for which in ["adapter", "runtime", "owner"] {
+            let mut f = Fixture::new();
+            let b = binding();
+            f.enroll(&b);
+            let c = f.resolver.begin_resolution(&b.environment).unwrap();
+            let mut facts = fake::facts(&f.resolver, c, &b, false);
+            match which {
+                "adapter" => fake::change_adapter(
+                    &mut facts,
+                    decode(json!("incarnation:v1:00000000-0000-4000-8000-000000000002")),
+                ),
+                "runtime" => {
+                    fake::change_runtime(&mut facts, LocalRuntimeRef::fresh(host("executor")))
+                }
+                _ => fake::change_owner(&mut facts, decode(json!("b".repeat(64)))),
+            }
+            assert!(f.resolver.resolve(facts).is_err());
+        }
+    }
+    #[test]
+    fn hardware_requires_native_provenance_and_cannot_use_simulation_qualification() {
+        let mut f = Fixture::new();
+        let mut b = binding();
+        b.evidence_class = EvidenceClassV1::Hardware;
+        b.subsystems
+            .get_mut(&label("locomotion"))
+            .unwrap()
+            .world_incarnation = None;
+        f.enroll(&b);
+        let c = f.resolver.begin_resolution(&b.environment).unwrap();
+        let facts = fake::facts(&f.resolver, c, &b, false);
+        assert!(f.resolver.resolve(facts).is_err());
+        let native = f.resolve(&b, true);
+        let mut p = profile();
+        p.evidence_class = EvidenceClassV1::Hardware;
+        p.required_enforcement_class = SessionEnforcementClassV1::NativeFence;
+        let mut q = qualification(&p, native.view());
+        q.evidence_class = EvidenceClassV1::Simulation;
+        assert!(f
+            .resolver
+            .record_qualification(&native, &p, &q, fake::evidence(&q, digest_value()))
+            .is_err());
+        let q = qualification(&p, native.view());
+        f.resolver
+            .record_qualification(&native, &p, &q, fake::evidence(&q, digest_value()))
+            .unwrap();
+        let c = f.resolver.begin_resolution(&b.environment).unwrap();
+        let facts = fake::facts(&f.resolver, c, &binding(), true);
+        assert!(f.resolver.resolve(facts).is_err());
+    }
+    #[test]
+    fn delayed_handshake_and_late_superseded_facts_cannot_restore_old_binding() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let c = f.resolver.begin_resolution(&b.environment).unwrap();
+        let late = fake::facts(&f.resolver, c, &b, false);
+        let current = f.resolve(&b, false);
+        assert!(f.resolver.resolve(late).is_err());
+        f.resolver.validate_current(&current).unwrap();
+        let c = f.resolver.begin_resolution(&b.environment).unwrap();
+        let late = fake::facts(&f.resolver, c, &b, false);
+        f.clock.set(2000, 1_000_000);
+        assert!(f.resolver.resolve(late).is_err());
+    }
+    #[test]
+    fn removal_retains_aliases_tombstones_and_epoch_high_water_after_restart() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let live = f.resolve(&b, false);
+        let q = f.qualify(&live, &profile());
+        let c = f.resolver.begin_resolution(&b.environment).unwrap();
+        let late = fake::facts(&f.resolver, c, &b, false);
+        let epochs = fake::store(&f.resolver)
+            .epochs(b.domains().into_iter().cloned())
+            .unwrap();
+        f.resolver.retire(&b.environment, 1).unwrap();
+        assert!(f.resolver.resolve(late).is_err());
+        assert!(f.resolver.validate_current(&live).is_err());
+        let mut reopened = f.reopen();
+        assert!(reopened.begin_resolution(&b.environment).is_err());
+        assert!(reopened.enroll(fake::enrollment(&b), None).is_err());
+        let mut newer = b.clone();
+        newer.registration_revision = 2;
+        assert!(reopened.enroll(fake::enrollment(&newer), Some(1)).is_err());
+        assert!(fake::store(&reopened)
+            .qualification(&q.qualification_id, UnixMillis::try_from(1000).unwrap())
+            .is_err());
+        let after = fake::store(&reopened)
+            .epochs(b.domains().into_iter().cloned())
+            .unwrap();
+        assert!(after.iter().all(|(d, e)| *e == epochs[d] + 1));
+        assert_eq!(
+            f.sql()
+                .query_row("SELECT count(*) FROM physical_aliases", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(f
+            .sql()
+            .execute("DELETE FROM physical_environments", [])
+            .is_err());
+    }
+    #[test]
+    fn concurrent_domain_cas_has_one_winner_and_reopen_preserves_high_water() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let epochs = fake::store(&f.resolver)
+            .epochs(b.domains().into_iter().cloned())
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let paths = f.paths.clone();
+                let epochs = epochs.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let store = PhysicalStoreV1::open(&paths).unwrap();
+                    barrier.wait();
+                    store.advance_epochs(&epochs).is_ok()
+                })
+            })
+            .collect();
+        barrier.wait();
+        let winners = handles
+            .into_iter()
+            .map(|h| usize::from(h.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(winners, 1);
+        let reopened = PhysicalStoreV1::open(&f.paths).unwrap();
+        let after = reopened.epochs(b.domains().into_iter().cloned()).unwrap();
+        assert!(after.iter().all(|(d, e)| *e == epochs[d] + 1));
+        assert!(reopened.advance_epochs(&epochs).is_err());
+        assert_eq!(
+            f.sql()
+                .query_row("SELECT quarantined FROM physical_domains", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn multi_domain_cas_rolls_back_when_one_domain_conflicts() {
+        let mut f = Fixture::new();
+        let mut b = binding();
+        b.subsystems
+            .get_mut(&label("locomotion"))
+            .unwrap()
+            .domains
+            .push(second_domain());
+        let mut e = fake::enrollment(&b);
+        fake::record(&mut e)
+            .resources
+            .insert(second_domain(), label("second.mechanism"));
+        f.resolver.enroll(e, None).unwrap();
+        let epochs = fake::store(&f.resolver)
+            .epochs(b.domains().into_iter().cloned())
+            .unwrap();
+        let mut wrong = epochs.clone();
+        wrong.insert(second_domain(), 999);
+        assert!(fake::store(&f.resolver).advance_epochs(&wrong).is_err());
+        assert_eq!(
+            fake::store(&f.resolver)
+                .epochs(b.domains().into_iter().cloned())
+                .unwrap(),
+            epochs
+        );
+    }
+    #[test]
+    fn reopen_does_not_restore_live_proof_and_new_offer_needs_fresh_qualification() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let live = f.resolve(&b, false);
+        let p = profile();
+        let q = f.qualify(&live, &p);
+        let snapshot = decode::<EnvironmentBindingViewV1>(wire(live.view()));
+        let mut reopened = f.reopen();
+        assert_eq!(fake::live_count(&reopened), 0);
+        assert!(reopened.validate_current(&live).is_err());
+        let c = reopened.begin_resolution(&b.environment).unwrap();
+        let facts = fake::facts(&reopened, c, &snapshot, false);
+        let fresh = reopened.resolve(facts).unwrap();
+        assert_ne!(fresh.view().offer_id, snapshot.offer_id);
+        assert_ne!(
+            fresh.view().adapter_incarnation,
+            snapshot.adapter_incarnation
+        );
+        assert!(reopened
+            .qualification(&fresh, &p, &q.qualification_id)
+            .is_err());
+    }
+    #[test]
+    fn trusted_types_have_no_dto_deserialization_or_conversion_path() {
+        // Compile-time negative trait assertions: adding any forbidden impl
+        // makes inference ambiguous and breaks compilation of this test.
+        macro_rules! no_impl {
+            ($ty:ty, $bound:path) => {{
+                struct Implemented;
+                trait AmbiguousIfImpl<A> {
+                    fn check() {}
+                }
+                impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+                impl<T: ?Sized + $bound> AmbiguousIfImpl<Implemented> for T {}
+                let _ = <$ty as AmbiguousIfImpl<_>>::check;
+            }};
+        }
+        no_impl!(EnvironmentBindingV1, serde::de::DeserializeOwned);
+        no_impl!(EnvironmentBindingV1, serde::Serialize);
+        no_impl!(EnvironmentBindingV1, From<EnvironmentBindingViewV1>);
+        no_impl!(EnvironmentBindingV1, TryFrom<EnvironmentBindingViewV1>);
+        no_impl!(TrustedBindingFactsV1, serde::de::DeserializeOwned);
+        no_impl!(TrustedEnrollmentV1, serde::de::DeserializeOwned);
+        no_impl!(TrustedQualificationEvidenceV1, serde::de::DeserializeOwned);
+    }
+    #[test]
+    fn expiry_clock_regression_and_shutdown_close_proofs() {
+        for mode in ["wall", "ticks", "expiry", "shutdown"] {
+            let mut f = Fixture::new();
+            let b = binding();
+            f.enroll(&b);
+            let live = f.resolve(&b, false);
+            f.clock.set(1100, 100000);
+            f.resolver.validate_current(&live).unwrap();
+            match mode {
+                "wall" => f.clock.set(1000, 100001),
+                "ticks" => f.clock.set(1101, 0),
+                "expiry" => f.clock.set(1999, 1_000_000),
+                _ => f.resolver.close(),
+            }
+            assert!(f.resolver.validate_current(&live).is_err());
+            f.clock.set(1101, 100001);
+            assert!(f.resolver.validate_current(&live).is_err());
+        }
+    }
+    #[test]
+    fn missing_corrupt_incompatible_or_mismatched_persistence_fails_closed() {
+        for mode in [
+            "version",
+            "partial",
+            "malformed",
+            "columns",
+            "tombstone",
+            "epoch",
+            "qualification",
+        ] {
+            let mut f = Fixture::new();
+            let b = binding();
+            f.enroll(&b);
+            let live = f.resolve(&b, false);
+            f.qualify(&live, &profile());
+            let conn = f.sql();
+            match mode {
+                "version" => {
+                    conn.execute_batch(
+                        "PRAGMA ignore_check_constraints=ON; UPDATE physical_schema SET version=2;",
+                    )
+                    .unwrap();
+                }
+                "partial" => {
+                    conn.execute_batch("DROP TABLE physical_schema;").unwrap();
+                }
+                "malformed" => {
+                    conn.execute_batch("DROP TRIGGER physical_environment_monotonic; UPDATE physical_environments SET record_json='{}';").unwrap();
+                }
+                "columns" => {
+                    conn.execute_batch("DROP TRIGGER physical_environment_monotonic; UPDATE physical_environments SET revision=77;").unwrap();
+                }
+                "tombstone" => {
+                    conn.execute_batch("PRAGMA ignore_check_constraints=ON; DROP TRIGGER physical_environment_monotonic; UPDATE physical_environments SET retired=1,denial_revision=0;").unwrap();
+                }
+                "epoch" => {
+                    conn.execute_batch("PRAGMA ignore_check_constraints=ON; DROP TRIGGER physical_epoch_monotonic; UPDATE physical_domains SET epoch=0;").unwrap();
+                }
+                _ => {
+                    conn.execute_batch("DROP TRIGGER physical_qualification_monotonic; UPDATE physical_qualifications SET conditions_digest='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';").unwrap();
+                }
+            }
+            assert!(PhysicalStoreV1::open(&f.paths).is_err(), "{mode}");
+            assert!(storage::init_database(&f.paths).is_err(), "{mode}");
+            assert!(f.resolver.validate_current(&live).is_err(), "{mode}");
+        }
+        let f = Fixture::new();
+        std::fs::remove_file(&f.paths.db_path).unwrap();
+        assert!(PhysicalStoreV1::open(&f.paths).is_err());
+        assert!(!f.paths.db_path.exists());
+    }
+    #[test]
+    fn valid_schema_with_malformed_record_and_column_corruption_is_rejected() {
+        for qualification_record in [false, true] {
+            let mut f = Fixture::new();
+            let b = binding();
+            f.enroll(&b);
+            let live = f.resolve(&b, false);
+            f.qualify(&live, &profile());
+            let conn = f.sql();
+            // Preserve schema fingerprint, exercise actual record auditing.
+            if qualification_record {
+                conn.execute(
+                    "UPDATE physical_qualifications SET expires_at=1001,withdrawal_revision=2",
+                    [],
+                )
+                .unwrap();
+            } else {
+                conn.execute(
+                    "UPDATE physical_environments SET record_json='{}',revision=2",
+                    [],
+                )
+                .unwrap();
+            }
+            assert!(PhysicalStoreV1::open(&f.paths).is_err());
+        }
+    }
+    #[test]
+    fn epoch_overflow_and_sql_monotonicity_checks_never_reset_counters() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        f.sql()
+            .execute("UPDATE physical_domains SET epoch=?1", [i64::MAX])
+            .unwrap();
+        let epochs = fake::store(&f.resolver)
+            .epochs(b.domains().into_iter().cloned())
+            .unwrap();
+        assert!(fake::store(&f.resolver).advance_epochs(&epochs).is_err());
+        assert!(f.resolver.retire(&b.environment, 1).is_err());
+        assert!(f
+            .sql()
+            .execute("UPDATE physical_domains SET epoch=1", [])
+            .is_err());
+        assert!(f.sql().execute("DELETE FROM physical_domains", []).is_err());
+        assert_eq!(
+            fake::store(&f.resolver)
+                .epochs(b.domains().into_iter().cloned())
+                .unwrap(),
+            epochs
+        );
+    }
+    #[test]
+    fn physical_connections_verify_durability_foreign_keys_and_leave_journal_unchanged() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let before: String = f
+            .sql()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        PhysicalStoreV1::open(&f.paths).unwrap();
+        let after: String = f
+            .sql()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        // Direct verified settings on the connection used by the store.
+        let conn = super::super::store::test_connection(&f.paths).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA fullfsync", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(conn
+            .execute(
+                "INSERT INTO physical_aliases VALUES ('unknown',?1)",
+                [String::from(second_domain())]
+            )
+            .is_err());
+        for mode in ["WAL", "TRUNCATE", "PERSIST", "DELETE"] {
+            f.sql()
+                .execute_batch(&format!("PRAGMA journal_mode={mode}"))
+                .unwrap();
+            PhysicalStoreV1::open(&f.paths).unwrap();
+        }
+        for setting in [
+            "journal_mode=OFF",
+            "journal_mode=MEMORY",
+            "synchronous=OFF",
+            "foreign_keys=OFF",
+            "fullfsync=OFF",
+        ] {
+            let conn = super::super::store::test_connection(&f.paths).unwrap();
+            conn.execute_batch(&format!("PRAGMA {setting}")).unwrap();
+            assert!(
+                super::super::store::test_verify_durability(&conn).is_err(),
+                "{setting}"
+            );
+        }
+    }
+    #[test]
+    fn missing_subsystem_and_changed_ledger_during_handshake_deny_resolution() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let c = f.resolver.begin_resolution(&b.environment).unwrap();
+        let mut missing = b.clone();
+        missing.subsystems.clear();
+        let facts = fake::facts(&f.resolver, c, &missing, false);
+        assert!(f.resolver.resolve(facts).is_err());
+        let c = f.resolver.begin_resolution(&b.environment).unwrap();
+        let facts = fake::facts(&f.resolver, c, &b, false);
+        let epochs = fake::store(&f.resolver)
+            .epochs(b.domains().into_iter().cloned())
+            .unwrap();
+        fake::store(&f.resolver).advance_epochs(&epochs).unwrap();
+        assert!(f.resolver.resolve(facts).is_err());
+    }
+    #[test]
+    fn late_old_handshake_does_not_consume_a_new_pending_resolution() {
+        let mut f = Fixture::new();
+        let b = binding();
+        f.enroll(&b);
+        let c = f.resolver.begin_resolution(&b.environment).unwrap();
+        let old = fake::facts(&f.resolver, c, &b, false);
+        let c = f.resolver.begin_resolution(&b.environment).unwrap();
+        let fresh = fake::facts(&f.resolver, c, &b, false);
+        assert!(f.resolver.resolve(old).is_err());
+        let proof = f.resolver.resolve(fresh).unwrap();
+        f.resolver.validate_current(&proof).unwrap();
+    }
+}

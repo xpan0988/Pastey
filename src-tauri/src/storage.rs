@@ -192,6 +192,7 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
     bridge_plan::init_schema(&conn)?;
     migrate_room_statuses(&conn)?;
     backfill_legacy_bridge_peers(&conn)?;
+    crate::physical::store::initialize(paths)?;
     Ok(())
 }
 
