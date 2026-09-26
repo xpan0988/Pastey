@@ -37,6 +37,7 @@ mod natural_v2;
 mod network_broker;
 mod object_refs;
 mod peer_capabilities;
+mod physical;
 mod regular_file_set_transfer;
 mod room_control;
 mod safe_file_identity;

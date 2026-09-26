@@ -1,6 +1,6 @@
 # Physical-environment control: implementation architecture v1
 
-Status: proposed implementation design; no production code, schema migration or native-controller change is implemented here.
+Status: Stage 1 contracts, identity and pure validation are implemented. All authority construction, services, persistence, protocol, execution and native-controller changes below remain proposed; there is no physical execution path.
 
 Source inspection: 2026-09-26, Pastey `db5b124f94f0e348c3eef77136cb870eda9482bc`. The [accepted target architecture](physical-environment-control.md) governs this design. The [MicroDuck binding](platform/microduck-environment-design.md) retains its upstream revisions and PoC parameters. Names and Rust sketches below are proposed unless explicitly identified as existing source. They specify ownership and validation boundaries, not compilable code.
 
@@ -62,7 +62,7 @@ Proposed paths under `src-tauri/src/physical/`:
 | `protocol.rs` | `physical-control-v1` wire variants, bounds, semantic deduplication keys and verified-peer dispatch mapping; no route resolver |
 | `adapters/mod.rs`, `adapters/microduck.rs` | Typed native discovery/translation/I/O and evidence decoding; no authority minting or policy/controller logic |
 
-These files are coding destinations, not additions made by this document. The service owns binding, store and evidence components directly; only control lanes run background tasks. Do not create separate discovery, grant-manager, session-manager, reconciliation-server or world-state services.
+Stage 1 supplies `mod.rs`, `contracts.rs`, `values.rs`, pure binding views/validators in `binding.rs`, and `tests.rs`. The binding resolver and all other runtime components in this table remain proposed. The service owns binding, store and evidence components directly; only control lanes run background tasks. Do not create separate discovery, grant-manager, session-manager, reconciliation-server or world-state services.
 
 `HostRuntime` supplies paths, Host/runtime identity, event sink, task spawner, a clock abstraction and existing route-resolution/delivery calls. Use an injected clock and fake adapter in tests. The adapter is not handed mutable `HostRuntime`, the physical store, a root constructor or a grant issuer. A control lane receives narrow read-only admitted-action/native-session views plus a live execution-validity handle; adapter output returns facts for Core/evidence validation.
 
@@ -574,7 +574,7 @@ These changes stay above native locomotion; no PPO/Safety algorithm/`RobotIo` ac
 
 ## 12. First coding sequence
 
-This sequence implements the accepted target in dependency order. Tests named here are future acceptance requirements; none were written or run by this documentation task.
+This sequence implements the accepted target in dependency order. Stage 1 is implemented with focused semantic tests. Tests in stages 2–9 remain future acceptance requirements.
 
 | Stage | Likely files/modules | New invariant and required tests | Unavailable until complete |
 |---|---|---|---|
@@ -590,9 +590,13 @@ This sequence implements the accepted target in dependency order. Tests named he
 
 ### Stage 1 implementation contract
 
-The next coding task can implement stage 1 without choosing a new authority architecture. Add only the versioned serializable contract/value types and validators from §§4–6, plus opaque live-authority shells owned by the future Core module if needed for compile-time separation. Do not expose a constructor that accepts a DTO and returns live authority. Bind `EnvironmentRefV1` independently of `HostRef`, represent subsystem incarnation maps and canonical conflict domains, make exact intent/profile versions explicit, and keep all three freshness/lifetime concepts separate.
+Implemented in [`src-tauri/src/physical/`](../src-tauri/src/physical/mod.rs), with only a `mod physical` declaration in `main.rs`. `values.rs` contains versioned UUID identity newtypes, canonical digests, bounded labels, finite SI quantities, separate duration/audit-time values and enforcement/evidence classes. `binding.rs` contains transferable binding claims and pure validators, including duplicate subsystem/domain rejection. It does not create trusted enrollment, a live binding proof or current-time validity.
 
-Stage 1 has no service startup, socket access, database initialization/migration, Tauri invoke, protocol dispatch, model integration or native mutation. Tests exercise semantic validation and type boundaries, not serialization snapshots that merely mirror fields. Physical profiles/loss/completion references are typed and validated but not considered qualified by construction. A subsequent stage installs trusted binding/qualification owners before any grant can be issued.
+`contracts.rs` contains the exact MicroDuck intent/profile, qualification claim, immutable `PhysicalReviewScopeV1`, separate review/approval record, completion/loss parameters, execution ceilings and proposal claims. The scope is a private immutable wrapper over validated fields. It embeds the complete profile/qualification claims and verifies their fingerprint relationships; future authority construction must separately authenticate and qualify those claims. Scope hashing uses domain-separated BLAKE3 over the fixed typed v1 serialization, ordered subsystem keys and normalized signed zero. It excludes review IDs/revisions, lifecycle and approval metadata. The canonical vector is pinned in tests; changing this encoding requires a version change.
+
+Deserialization rejects unknown fields/versions/variants and runs the same semantic checks as constructed claims. Pure compatibility checks enforce exact targets, narrowing, evidence-class separation and qualification enforcement at least as strong as the profile. `SessionEnforcementClassV1::meets` checks claimed strength only; it does not authenticate native evidence or activate a session. Proposal age checks, observation age/gap checks and execution ceilings remain independent; no serialized value reconstructs a running deadline.
+
+No live authority shells were needed. There is no root, grant, admitted action, executable session, resolver, service, database, protocol dispatch, Tauri invoke, adapter, observation/evaluation runtime or native mutation. Successful validation returns data or `Result<()>`, never authority. Later root-bound sessions and per-action grants must be constructed in Core; none can be deserialized or obtained from Stage 1. The module deliberately allows dead code until later stages add consumers. Stage 2 has not started.
 
 ## 13. Deferred work and unresolved questions
 
@@ -619,4 +623,4 @@ These questions affect later integration details or qualification, not authority
 
 This design was derived from current source using ProGraph for navigation and direct inspection for behavior. In addition to the insertion-point sources in §2, `LocalRuntimeRef`/`HostSessionBinding`, current effect-envelope compilation, Room Control's validation/replay path, SQLite review transactions, Native Agent cancellation/reconciliation, and Host shutdown/session invalidation were checked. Source behavior is used only where explicitly labeled current.
 
-The [accepted target](physical-environment-control.md) supplies the five contract families, authority separation and consequence model. The [MicroDuck source inventory](platform/microduck-environment-design.md#source-references) supplies revision-pinned native API/control/safety/simulation evidence; this implementation design does not change those baselines or claim stronger current native guarantees. Validation for this task is documentation scope, references, state/authority consistency and whitespace; no runtime, simulator, migration or hardware test is claimed.
+The [accepted target](physical-environment-control.md) supplies the five contract families, authority separation and consequence model. The [MicroDuck source inventory](platform/microduck-environment-design.md#source-references) supplies revision-pinned native API/control/safety/simulation evidence; this implementation design does not change those baselines or claim stronger current native guarantees. The original design was validated for documentation scope, references, state/authority consistency and whitespace. Stage 1 adds automated Rust contract tests and repository compilation/test validation; these provide no simulator, migration, native-fence or hardware evidence.
