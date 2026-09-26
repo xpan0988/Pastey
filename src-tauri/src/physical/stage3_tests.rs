@@ -949,6 +949,7 @@ fn recognized_stage2_schema_migrates_transactionally_and_keeps_facts() {
     let f = Fixture::new();
     let conn = f.sql();
     // Remove the Stage 4 extension to model an actual Stage 2 database.
+    conn.execute_batch("DROP TABLE physical_handovers; DROP TABLE physical_handover_policies; DROP TABLE physical_task_acceptance; DROP TABLE physical_reconciliations; DROP TABLE physical_consequences; DROP TABLE physical_evidence; DROP TABLE physical_evidence_schema;").unwrap();
     conn.execute_batch("DROP TABLE physical_actions; DROP TABLE physical_control_budgets; DROP TABLE physical_domain_reservations; DROP TABLE physical_sessions; DROP TABLE physical_control_schema;").unwrap();
     conn.execute_batch("DROP TRIGGER physical_reviews_keep; DROP TRIGGER physical_attempts_keep; DROP TRIGGER physical_review_immutable; DROP TRIGGER physical_attempt_closed; DROP TABLE physical_attempts; DROP TABLE physical_reviews; DROP TABLE physical_core_schema;").unwrap();
     storage::init_database(&f.paths).unwrap();
@@ -1096,6 +1097,7 @@ fn rolled_back_start_rows_cannot_remint_authority_in_current_core() {
         )
         .unwrap();
     // Model a coherent pre-start disk snapshot, not a supported ledger mutation.
+    remove_stage5_terminal_rows_for_rollback(&conn);
     conn.execute_batch("DROP TRIGGER physical_attempts_keep; DROP TRIGGER physical_review_immutable; DELETE FROM physical_attempts; UPDATE physical_reviews SET state_revision=3;").unwrap();
     conn.execute_batch(&attempt_trigger).unwrap();
     conn.execute_batch(&review_trigger).unwrap();
@@ -1116,6 +1118,7 @@ fn lost_attempt_with_consumed_review_cas_fails_audit_closed() {
             |r| r.get(0),
         )
         .unwrap();
+    remove_stage5_terminal_rows_for_rollback(&conn);
     conn.execute_batch("DROP TRIGGER physical_attempts_keep; DELETE FROM physical_attempts;")
         .unwrap();
     conn.execute_batch(&trigger).unwrap();
@@ -1125,3 +1128,20 @@ fn lost_attempt_with_consumed_review_cas_fails_audit_closed() {
 
 #[path = "stage4_tests.rs"]
 mod stage4;
+
+// The old-snapshot fixtures remove the new dependent terminal row as well; all
+// original replay/CAS assertions remain unchanged and the denial trigger returns.
+fn remove_stage5_terminal_rows_for_rollback(conn: &rusqlite::Connection) {
+    let trigger: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='physical_acceptance_keep'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER physical_acceptance_keep; DELETE FROM physical_task_acceptance;",
+    )
+    .unwrap();
+    conn.execute_batch(&trigger).unwrap();
+}

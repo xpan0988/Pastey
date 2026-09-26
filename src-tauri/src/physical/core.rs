@@ -1,10 +1,13 @@
 //! Core-owned review and finite task authority. The sealed Stage 3 grant basis
-//! feeds the child Stage 4 control module; no real physical I/O or acceptance.
+//! feeds the child Stage 4 control module; no real physical I/O.
 #[path = "control.rs"]
 mod control;
+#[path = "core_evidence.rs"]
+mod evidence_core;
 #[cfg(test)]
 pub(super) use control::test_support as control_test_support;
 pub(super) use control::*;
+pub(super) use evidence_core::CoreAcceptanceDecisionV1;
 
 use super::{
     binding::{BindingClockV1, EnvironmentBindingV1, PhysicalBindingResolverV1},
@@ -108,6 +111,7 @@ struct ExecutorPolicyV1 {
 
 // Process-local review correlation for immediate revocation, never restored.
 struct RootRegistrationV1 {
+    environment: EnvironmentRefV1,
     valid: Arc<AtomicBool>,
     review: ReviewId,
     revision: u64,
@@ -444,6 +448,7 @@ impl PhysicalControlServiceV1 {
         self.roots.insert(
             audit.root_id.clone(),
             RootRegistrationV1 {
+                environment: audit.environment.clone(),
                 valid: valid.clone(),
                 review: audit.review_id.clone(),
                 revision: audit.review_revision,

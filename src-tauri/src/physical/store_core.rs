@@ -406,6 +406,7 @@ impl PhysicalStoreV1 {
         )?;
         dependencies(&tx, &r.scope, snapshot, now)?;
         tx.execute("INSERT INTO physical_attempts(root_id,role,attempt_id,approval_id,review_id,review_revision,scope_digest,principal,requester,executor,environment_id,registration_digest,binding_digest,profile_digest,qualification_id,qualification_digest,policy_digest,runtime_generation,created_at,expires_at,audit_digest,audit_json,state,revision) VALUES(?1,'requester_executor',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,'open',1)",params![text(&a.root_id),text(&a.attempt_id),text(&a.approval.approval_id),text(&a.review_id),checked_integer(a.review_revision)?,text(&a.scope_digest),text(&a.principal),a.requester.as_str(),a.executor.as_str(),text(&a.environment),text(&a.registration_digest),text(&a.binding_digest),text(&a.profile_digest),text(&a.qualification_id),text(&a.qualification_digest),text(&a.policy_digest),a.runtime_generation,a.created_at.get() as i64,a.expires_at.get() as i64,text(&a.digest()?),serde_json::to_string(a)?])?;
+        super::evidence_ledger::originate(&tx, &a.root_id)?;
         tx.execute("UPDATE physical_reviews SET state_revision=state_revision+1 WHERE review_id=?1 AND revision=?2 AND state='approved'",params![text(&a.review_id),checked_integer(a.review_revision)?])?;
         tx.commit()?;
         Ok(())
@@ -428,8 +429,30 @@ impl PhysicalStoreV1 {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::audit(&tx)?;
+        super::evidence_ledger::cancel(&tx, id)?;
         super::control_ledger::close_root(&tx, id)?;
         tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason=?2 WHERE root_id=?1 AND state='open'",params![text(id),reason])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(in crate::physical) fn close_environment_attempts(
+        &self,
+        environment: &EnvironmentRefV1,
+    ) -> AppResult<()> {
+        let mut c = self.connection()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::audit(&tx)?;
+        tx.execute("UPDATE physical_task_acceptance SET state='cancelled',revision=2 WHERE state='pending' AND root_id IN (SELECT root_id FROM physical_attempts WHERE environment_id=?1)",[text(environment)])?;
+        let roots: Vec<String> = tx
+            .prepare(
+                "SELECT root_id FROM physical_attempts WHERE environment_id=?1 AND state='open'",
+            )?
+            .query_map([text(environment)], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for root in roots {
+            super::control_ledger::close_root(&tx, &RootId::try_from(root)?)?;
+        }
+        tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason='dependency_invalidated' WHERE environment_id=?1 AND state='open'",[text(environment)])?;
         tx.commit()?;
         Ok(())
     }
@@ -438,6 +461,9 @@ impl PhysicalStoreV1 {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::audit(&tx)?;
+        if !matches!(reason, "interrupted" | "shutdown") {
+            tx.execute("UPDATE physical_task_acceptance SET state='cancelled',revision=2 WHERE state='pending'", [])?;
+        }
         super::control_ledger::recover(&tx, reason == "interrupted")?;
         tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason=?1 WHERE state='open'",[reason])?;
         tx.commit()?;
@@ -456,9 +482,12 @@ fn valid_reason(s: &str) -> bool {
     )
 }
 fn close_review(c: &Connection, id: &ReviewId, rev: u64, reason: &str) -> AppResult<()> {
+    c.execute("UPDATE physical_task_acceptance SET state='cancelled',revision=2 WHERE state='pending' AND root_id IN (SELECT root_id FROM physical_attempts WHERE review_id=?1 AND review_revision=?2)",params![text(id),checked_integer(rev)?])?;
     let roots:Vec<String> = c.prepare("SELECT root_id FROM physical_attempts WHERE review_id=?1 AND review_revision=?2 AND state='open'")?.query_map(params![text(id),checked_integer(rev)?],|r|r.get(0))?.collect::<Result<_,_>>()?;
     for root in roots {
-        super::control_ledger::close_root(c, &RootId::try_from(root)?)?;
+        let id = RootId::try_from(root)?;
+        super::evidence_ledger::cancel(c, &id)?;
+        super::control_ledger::close_root(c, &id)?;
     }
     c.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason=?3 WHERE review_id=?1 AND review_revision=?2 AND state='open'",params![text(id),checked_integer(rev)?,reason])?;
     Ok(())

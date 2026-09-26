@@ -1,7 +1,7 @@
-//! Physical facts and Core-owned bounded task authority through Stage 4.
+//! Physical facts and Core-owned bounded task authority through Stage 5.
 //!
 //! Private session/action admission uses only a deterministic test lane.
-//! No real native I/O, physical protocol, consequence evaluator or acceptance.
+//! No real native I/O, physical protocol or production evidence ingress.
 //! Successfully validating a claim does not authenticate its producer or qualify a body.
 #![allow(dead_code)] // Internal review/authority APIs await later product wiring.
 
@@ -41,6 +41,7 @@ macro_rules! claim {
 pub(crate) mod binding;
 pub(crate) mod contracts;
 pub(crate) mod core;
+pub(crate) mod evidence;
 pub(crate) mod store;
 pub(crate) mod values;
 

@@ -369,6 +369,13 @@ impl PhysicalBindingResolverV1 {
             old.valid.store(false, Ordering::Release);
         }
     }
+    pub(super) fn invalidate_evidence_continuity(
+        &mut self,
+        id: &EnvironmentRefV1,
+    ) -> AppResult<()> {
+        self.invalidate_live(id);
+        self.store.invalidate_qualifications(id)
+    }
     pub(super) fn retire(&mut self, id: &EnvironmentRefV1, expected: u64) -> AppResult<()> {
         self.invalidate_live(id); // deny locally even if persistence fails
         self.store.retire(id, expected)

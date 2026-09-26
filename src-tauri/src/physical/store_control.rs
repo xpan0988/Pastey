@@ -170,7 +170,7 @@ pub(super) fn verify_version(c: &Connection) -> AppResult<()> {
         .collect::<Result<_, _>>()?;
     require(v == [1], "Incompatible control ledger version")
 }
-fn root(c: &Connection, id: &RootId) -> AppResult<RootAuditV1> {
+pub(super) fn root(c: &Connection, id: &RootId) -> AppResult<RootAuditV1> {
     let raw: String = c.query_row(
         "SELECT audit_json FROM physical_attempts WHERE root_id=?1 AND role='requester_executor'",
         [text(id)],
@@ -178,7 +178,7 @@ fn root(c: &Connection, id: &RootId) -> AppResult<RootAuditV1> {
     )?;
     decode(&raw)
 }
-fn session(c: &Connection, id: &SessionId) -> AppResult<SessionAuditV1> {
+pub(super) fn session(c: &Connection, id: &SessionId) -> AppResult<SessionAuditV1> {
     let raw: String = c.query_row(
         "SELECT audit_json FROM physical_sessions WHERE session_id=?1",
         [text(id)],
@@ -186,7 +186,7 @@ fn session(c: &Connection, id: &SessionId) -> AppResult<SessionAuditV1> {
     )?;
     decode(&raw)
 }
-fn action(c: &Connection, id: &ActionId) -> AppResult<ActionAuditV1> {
+pub(super) fn action(c: &Connection, id: &ActionId) -> AppResult<ActionAuditV1> {
     let raw: String = c.query_row(
         "SELECT audit_json FROM physical_actions WHERE action_id=?1",
         [text(id)],
@@ -581,13 +581,12 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
                 params![text(domain), text(&s.id)], |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             require(
-                phase
-                    == if state == "quarantined" {
-                        "quarantined"
-                    } else {
-                        "held"
-                    }
-                    && high_water >= checked_integer(*reserved_epoch)?,
+                (if state == "quarantined" {
+                    phase == "quarantined"
+                        || (phase == "released" && super::evidence_ledger::released(c, &s.id)?)
+                } else {
+                    phase == "held"
+                }) && high_water >= checked_integer(*reserved_epoch)?,
                 "Domain state/high-water mismatch",
             )?;
             if state == "quarantined" {

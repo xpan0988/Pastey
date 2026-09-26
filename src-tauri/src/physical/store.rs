@@ -13,6 +13,8 @@ use crate::{error::AppResult, storage::AppPaths};
 mod control_ledger;
 #[path = "store_core.rs"]
 mod core_ledger;
+#[path = "store_evidence.rs"]
+mod evidence_ledger;
 pub(super) use control_ledger::{
     ActionAuditV1, FenceAuditV1, ReservationReceiptV1, SessionAuditV1,
 };
@@ -148,6 +150,16 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
         core_ledger::audit(&tx)?;
         tx.execute_batch(control_ledger::SCHEMA)?;
     }
+    let stage4 = Connection::open_in_memory()?;
+    stage4.execute_batch(SCHEMA)?;
+    stage4.execute_batch(core_ledger::SCHEMA)?;
+    stage4.execute_batch(control_ledger::SCHEMA)?;
+    if schema_objects(&tx)? == schema_objects(&stage4)? {
+        audit_facts(&tx)?;
+        core_ledger::audit(&tx)?;
+        control_ledger::audit(&tx)?;
+        tx.execute_batch(evidence_ledger::SCHEMA)?;
+    }
     verify_schema(&tx)?;
     audit(&tx)?;
     tx.commit()?;
@@ -184,13 +196,24 @@ fn schema_objects(conn: &Connection) -> AppResult<Vec<(String, Option<String>)>>
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?)
 }
+fn expected_schema() -> AppResult<&'static Vec<(String, Option<String>)>> {
+    // Cache only the immutable compiled DDL template, never database facts or
+    // validation results. Each connection still reads and compares its own schema.
+    static EXPECTED: std::sync::OnceLock<Vec<(String, Option<String>)>> =
+        std::sync::OnceLock::new();
+    if EXPECTED.get().is_none() {
+        let expected = Connection::open_in_memory()?;
+        expected.execute_batch(SCHEMA)?;
+        expected.execute_batch(core_ledger::SCHEMA)?;
+        expected.execute_batch(control_ledger::SCHEMA)?;
+        expected.execute_batch(evidence_ledger::SCHEMA)?;
+        let _ = EXPECTED.set(schema_objects(&expected)?);
+    }
+    Ok(EXPECTED.get().expect("compiled schema initialized"))
+}
 fn verify_schema(conn: &Connection) -> AppResult<()> {
-    let expected = Connection::open_in_memory()?;
-    expected.execute_batch(SCHEMA)?;
-    expected.execute_batch(core_ledger::SCHEMA)?;
-    expected.execute_batch(control_ledger::SCHEMA)?;
     require(
-        schema_objects(conn)? == schema_objects(&expected)?,
+        &schema_objects(conn)? == expected_schema()?,
         "Incompatible physical ledger schema",
     )?;
     control_ledger::verify_version(conn)?;
@@ -461,7 +484,8 @@ fn load_registration(
 fn audit(conn: &Connection) -> AppResult<()> {
     audit_facts(conn)?;
     core_ledger::audit(conn)?;
-    control_ledger::audit(conn)
+    control_ledger::audit(conn)?;
+    evidence_ledger::audit(conn)
 }
 fn audit_facts(conn: &Connection) -> AppResult<()> {
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
@@ -578,4 +602,17 @@ pub(super) fn test_connection(paths: &AppPaths) -> AppResult<Connection> {
 #[cfg(test)]
 pub(super) fn test_verify_durability(conn: &Connection) -> AppResult<()> {
     verify_durability(conn)
+}
+
+#[cfg(test)]
+pub(super) fn test_stage4_reservation_schema() -> AppResult<Vec<String>> {
+    let c = Connection::open_in_memory()?;
+    c.execute_batch(SCHEMA)?;
+    c.execute_batch(core_ledger::SCHEMA)?;
+    c.execute_batch(control_ledger::SCHEMA)?;
+    let mut stmt=c.prepare("SELECT sql FROM sqlite_master WHERE name IN ('physical_domain_reservations','physical_reservation_monotonic','physical_reservations_keep') ORDER BY CASE WHEN type='table' THEN 0 ELSE 1 END,name")?;
+    let rows = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
 }

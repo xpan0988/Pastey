@@ -969,6 +969,11 @@ pub(in crate::physical) mod test_support {
             requested_duration_us: PositiveMicros::try_from(duration).unwrap(),
         }
     }
+    pub(in crate::physical) fn action_session(
+        a: &AdmittedBodyActionV1,
+    ) -> Arc<BodyControlSessionV1> {
+        a.grant.session.clone()
+    }
     pub(in crate::physical) fn deadline(a: &AdmittedBodyActionV1) -> u64 {
         a.deadline
     }

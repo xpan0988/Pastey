@@ -1033,6 +1033,7 @@ async fn recognized_stage3_migration_preserves_consumed_approval_and_closes_root
     let f = ControlFixture::new();
     let (root, _) = f.root_basis();
     let sql = f.sql();
+    sql.execute_batch("DROP TABLE physical_handovers; DROP TABLE physical_handover_policies; DROP TABLE physical_task_acceptance; DROP TABLE physical_reconciliations; DROP TABLE physical_consequences; DROP TABLE physical_evidence; DROP TABLE physical_evidence_schema;").unwrap();
     sql.execute_batch("DROP TABLE physical_actions; DROP TABLE physical_control_budgets; DROP TABLE physical_domain_reservations; DROP TABLE physical_sessions; DROP TABLE physical_control_schema;").unwrap();
     storage::init_database(&f.paths).unwrap();
     let mut restarted = PhysicalControlServiceV1::new(
@@ -1146,3 +1147,6 @@ fn review_rejection_write_failure_closes_even_a_root_without_a_session() {
     drop(core);
     assert_eq!(f.scalar("SELECT count(*) FROM physical_sessions"), 0);
 }
+
+#[path = "stage5_tests.rs"]
+mod stage5;
