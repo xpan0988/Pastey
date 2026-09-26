@@ -13,8 +13,9 @@ The authority path is:
 ```text
 Core-sealed physical review → Core-approved exact scope → Core physical authority root
  → trusted current environment binding + qualification + local policy intersection
- → BodyActionGrantV1 → domain reservation + native session installation
- → fresh proposal admission + cumulative budget reservation → AdmittedBodyActionV1
+ → root-bound BodyControlSessionV1 for the selected binding/profile
+ → one BodyActionGrantV1 per exact action → fresh proposal admission + cumulative budget reservation
+ → AdmittedBodyActionV1
  → adapter → native fence → native capability
  → disposition + observations → consequence evaluation → Core acceptance/reconciliation
 ```
@@ -106,25 +107,26 @@ The following tables specify owners, durability and transfer rules for every top
 |---|---|---|---|
 | `EnvironmentRefV1`, `EnvironmentRegistrationV1` | Binding resolver; D Host-private registration, W identity view | Trusted enrollment binds Host/body/subsystems/domain aliases; explicit enrollment changes revision | No task motion; IDs never recycled after deletion |
 | `EnvironmentBindingV1` / `EnvironmentBindingViewV1` | Binding resolver; L private proof, W bounded view | Validated endpoint/boot/config plus Host/runtime/adapter/world incarnation; withdraw on any required mismatch | No grant; view/offers expire and cannot reconstruct a private binding |
-| `PhysicalCapabilityProfileV1` | Registered binding validator + Host qualification policy; D versioned descriptor, W digest/view | Capability/schema/native boundary, domain set, bounds, start/continue/cancel/loss semantics, allowed evidence class | No authority from advertisement; profile changes invalidate bound grants rather than mutate meaning |
-| `PhysicalQualificationV1` | Trusted Host/Core qualification evaluator; D evidence record, W summary/reference | Exact binding dependencies/profile, test/witness provenance, conditions, expiry and withdrawal revision | Cannot mint or widen authority; old valid record cannot override later withdrawal |
+| `PhysicalCapabilityProfileV1` | Registered binding validator + Host qualification policy; D versioned descriptor, W digest/view | Capability/schema/native boundary, domain set, bounds, `required_enforcement_class`, start/continue/cancel/loss semantics, allowed evidence class | No authority from advertisement; profile changes invalidate bound grants rather than mutate meaning |
+| `PhysicalQualificationV1` | Trusted Host/Core qualification evaluator; D evidence record, W summary/reference | Exact binding dependencies/profile, `required_enforcement_class`, test/witness provenance, conditions, expiry and withdrawal revision | Cannot mint or widen authority or lower the profile's enforcement minimum; old valid record cannot override later withdrawal |
 | `PhysicalCompletionContractV1` | Core seals with review; D embedded, W exact contract | Registered evaluator ID/version, predicate params, witness classes, frame, tolerance, uncertainty, dwell and age/gap/timeout rules | No executable user predicates, no “ack means success”; immutable digest per review |
-| `PhysicalReviewV1` | Requester Core; D immutable scope plus append-only approval transition, W review snapshot | Review/revision/digest, principal, target Host + exact binding view, capability/profile/qualification reference, exact intent/horizon, ceilings, freshness and completion/loss contracts | Draft/review is not authority; approval command consumes an existing review digest, not replacement payload |
+| `PhysicalReviewScopeV1` | Requester Core; D immutable scope, W exact scope view | Principal, target Hosts + exact binding view, capability/profile/qualification reference, exact intent/horizon, ceilings, freshness and completion/loss contracts | `scope_digest` covers exactly this scope; changing it creates a new review revision |
+| `PhysicalReviewRecordV1` | Requester Core; D review lifecycle and append-only approval correlation, W review snapshot | Review/revision, `scope_digest`, immutable scope, lifecycle state and optional approval correlation | Draft/review is not authority; approval consumes an existing exact scope digest and never mutates the scope |
 
-The review record includes `Draft → Reviewed → Approved` or `Rejected/Expired`; approval ID/principal/time/expiry are separate append-only fields bound to the scope digest. A scope change creates another review revision and invalidates pending approval for the prior revision. UI events are display hints; status is loaded from the service. An approved scope still needs an attempt/root and live executor admission.
+`scope_digest` is the canonical digest of exactly `PhysicalReviewScopeV1`; review lifecycle state and approval correlation are outside its digest input. `approve_review(review_id, exact_scope_digest)` appends approval ID/principal/time/expiry against that digest and never changes or redefines the approved scope. The review record includes `Draft → Reviewed → Approved` or `Rejected/Expired`. A scope change creates another review revision and invalidates pending approval for the prior revision. UI events are display hints; status is loaded from the service. An approved scope still needs an attempt/root and live executor admission.
 
 ### 5.2 Task authority and control
 
 | Type | Owner / location / representation | Identity, creation and narrowing/revocation | Must never authorize / replay rule |
 |---|---|---|---|
-| `PhysicalAuthorityRootV1` | Requester Core originates; executor Core installs validated lineage; L, D audit, W offer | Exact approval/review digest, requester/executor Hosts, attempt ID, requester runtime generation, selected environment/binding, mode, scope/budgets/expiry, Bridge cause correlation if remote | Not managed authority or operator rights; only Core start/import-validation creates L; restart closes it; same root/attempt cannot be restarted from D |
-| `BodyActionGrantV1` | Executor Core constructor; L plus D projection, W digest/status only | Root + exact action/decision identity + live binding/profile/qualification + intersected bounds/predicates/budgets/expiry + cancellation/completion contract | Adapter/native cannot mint/widen; no action until session and proposal admission; closed grant ID never reopens |
+| `PhysicalAuthorityRootV1` | Requester Core originates; executor Core installs validated lineage; L, D audit, W offer | Exact immutable reviewed scope + scope digest and explicit approval ID/principal/time/expiry correlation, requester/executor Hosts, attempt ID, requester runtime generation, selected environment/binding, mode, scope/budgets/expiry, Bridge cause correlation if remote | Not managed authority or operator rights; only Core start/import-validation creates L; restart closes it; same root/attempt cannot be restarted from D |
+| `BodyActionGrantV1` | Executor Core constructor; L plus D projection, W digest/status only | Root + session + exact action/decision identity + live binding/profile/qualification + intersected bounds/predicates/budgets/expiry + cancellation/completion contract | Adapter/native cannot mint/widen; no action until session and proposal admission; closed grant ID never reopens |
 | `PhysicalActionProposalV1` | User/decision capability submits a claim; W, D when admitted/rejected for relevant replay | Attempt/action ID, decision sequence, capability/schema, typed payload/digest, requested horizon, observation/challenge references | No authority from model or freshness; changed digest under same decision identity rejected; duplicate never resets budget |
-| `BodyControlSessionV1` | Executor Core/control lane; L private state, D history, W status | Grant lineage, exact binding, canonical domain, executor runtime, session UUID, monotonic fencing epoch, native boot/session receipt, finite local lease | Session ACK authorizes no new scope; old sessions never resume after restart/replacement |
+| `BodyControlSessionV1` | Executor Core/control lane; L private state, D history, W status | Root-bound authority plus exact binding/profile/qualification, canonical domain, executor runtime, session UUID, monotonic fencing epoch, native boot/session receipt, finite local lease | Binds stable environment ownership, not an exact grant/action; session ACK authorizes no new scope; old sessions never resume after restart/replacement |
 | `NativeFenceReceiptV1` | Native enforcer produces, control lane verifies; W native→Host, D evidence | Exact session/epoch/native/body generation, install request nonce, local lease/clock facts and fencing guarantee profile | Receipt is evidence of installation, not Core authority or physical stop; mismatched/stale/duplicate receipts cannot advance state |
 | `AdmittedBodyActionV1` | Executor Core only; L opaque execution permit, D admission/dispatch record, W status/projection only as needed | Exact grant/payload/decision, session/epoch, proposal-admission proof, fixed action expiry, budget reservation, continuing-observation requirements | Same-action refresh only; cannot change payload, extend budget, start another action or create protective rights |
 
-Lease and fencing values belong in `BodyControlSessionV1`, not separate manager types. A session can host future finite-stream actions under one root, but v1 enables exactly one action. Native receipt installation does not override Core revocation or turn a reserved session active if grant validation has changed.
+Lease and fencing values belong in `BodyControlSessionV1`, not separate manager types. One root-bound session can carry multiple exact grants/actions under that root; Exact v1 still has exactly one root, session, grant and action. Finite decision streams remain deferred. Native receipt installation does not override Core revocation or activate a session when root, binding, profile, qualification or enforcement checks fail.
 
 ### 5.3 Evidence, consequence and intervention
 
@@ -162,10 +164,7 @@ struct EnvironmentBindingViewV1 {
 // Each subsystem view includes its native identity, controller/body/world
 // incarnations as required by its profile, and canonical conflict-domain IDs.
 
-struct PhysicalReviewV1 {
-    review_id: ReviewId,
-    revision: u64,
-    scope_digest: Digest,
+struct PhysicalReviewScopeV1 {
     requester: HostRef,
     executor: HostRef,
     environment: EnvironmentBindingViewV1,
@@ -177,6 +176,13 @@ struct PhysicalReviewV1 {
     freshness: PhysicalFreshnessV1,
     completion: PhysicalCompletionContractV1,
     loss_profile: Digest,
+}
+struct PhysicalReviewRecordV1 {
+    review_id: ReviewId,
+    revision: u64,
+    scope: PhysicalReviewScopeV1,
+    scope_digest: Digest, // canonical digest of scope only
+    state: PhysicalReviewStateV1,
     approval: Option<ApprovalCorrelationV1>,
 }
 
@@ -185,17 +191,19 @@ struct PhysicalAuthorityRootV1 {
     root_id: RootId,
     attempt_id: AttemptId,
     review_id: ReviewId,
-    approval_id: ApprovalId,
+    review_revision: u64,
+    approval: ApprovalCorrelationV1,
     scope_digest: Digest,
     requester: HostRef,
     executor: HostRef,
     ingress: VerifiedCoreIngress, // private LocalCore or VerifiedPeer proof
-    approved_scope: PhysicalReviewV1,
+    approved_scope: PhysicalReviewScopeV1,
     validity: LiveRootValidity, // closed flag, generation, local deadline
 }
 struct BodyActionGrantV1 {
     grant_id: GrantId,
     root_id: RootId,
+    session_id: SessionId,
     action_id: ActionId,
     decision_sequence: u64,
     binding: EnvironmentBindingV1,
@@ -223,16 +231,24 @@ struct AdmittedBodyActionV1 {
     execution_deadline: LocalDeadline,
     validity: LiveActionValidity, // root/grant/session plus expiring observation validity
 }
+enum SessionEnforcementClassV1 {
+    AdapterIsolationOnly,
+    NativeFence, // stricter than AdapterIsolationOnly
+}
+// PhysicalCapabilityProfileV1 and PhysicalQualificationV1 each declare this
+// minimum; the qualification cannot weaken the selected profile's minimum.
 struct BodyControlSessionV1 {
     session_id: SessionId,
     root_id: RootId,
-    grant_id: GrantId,
     binding: EnvironmentBindingV1,
+    profile_digest: Digest,
+    qualification_digest: Digest,
+    required_enforcement_class: SessionEnforcementClassV1,
     domain_ids: Vec<DomainId>,
     epoch: u64,
     renewal_sequence: u64,
     lease_deadline: LocalDeadline,
-    installation: Option<SessionEnforcementEvidenceV1>, // required and validated for Active
+    installation: Option<SessionEnforcementEvidenceV1>, // must meet required_enforcement_class for Active
     state: SessionStateV1,
 }
 
@@ -270,6 +286,7 @@ enum SessionEnforcementEvidenceV1 {
 trait PhysicalEnvironmentAdapterV1 {
     // Return facts only. Enrollment/trust and qualification are outside this trait.
     async fn inspect(&self) -> Result<NativeBindingFactsV1>;
+    // NativeSessionInstallViewV1 carries required_enforcement_class.
     async fn install_session(&self, session: NativeSessionInstallViewV1)
         -> Result<SessionEnforcementEvidenceV1>;
     async fn apply(&self, action: AdmittedActionReadViewV1)
@@ -283,17 +300,19 @@ trait PhysicalEnvironmentAdapterV1 {
 
 Read views have crate-private unforgeable construction in Core/control and carry current validity references; they are not arbitrary external JSON. The service revalidates before every refresh; the native fence independently validates at consumption in Gate B. Native install/fence DTOs carry epoch/deadline facts and authenticated local sender binding, not the full human review or a managed envelope. Gate A returns a distinctly tagged `AdapterIsolationOnly` installation disposition, never a forged native fence receipt claiming Gate B guarantees.
 
+**Session activation admission invariant:** the selected capability profile and qualification both declare `required_enforcement_class`; the qualification may strengthen but never lower the profile minimum. The selected qualification's class is frozen into the session install view. L3 marks the session `Active` only when returned `SessionEnforcementEvidenceV1` meets that class and all root/binding/profile/qualification checks remain current. `NativeFence` evidence meets either minimum; `AdapterIsolationOnly` evidence meets only the isolation minimum and cannot satisfy a Gate B-qualified profile. Gate A may select only the explicitly qualified `AdapterIsolationOnly` profile.
+
 ## 7. Authority construction and linearization
 
 ### 7.1 Root origination and local/remote symmetry
 
-Core `prepare_review` resolves a current descriptor/binding offer and qualified profile, validates exact intent/effects, and durably seals scope. `approve_review(review_id, digest)` records explicit approval against that exact stored scope; the caller cannot replace payload/target through approval arguments. `start_exact_action(approval_id)` allocates server-side attempt/action/root IDs and records consumption of that approval for this attempt. Another attempt requires an explicit fresh approval/start decision, never an automatic retry after uncertainty.
+Core `prepare_review` resolves a current descriptor/binding offer and qualified profile, validates exact intent/effects, and durably seals immutable scope with `scope_digest = digest(scope)`. `approve_review(review_id, exact_scope_digest)` appends explicit approval correlation against that exact stored scope; the caller cannot replace payload/target through approval arguments, and approval does not mutate the scope or digest. `start_exact_action(approval_id)` allocates server-side attempt/action/root IDs and records consumption of that approval for this attempt. Another attempt requires an explicit fresh approval/start decision, never an automatic retry after uncertainty.
 
 For remote execution, requester Core sends a **root offer claim**, not a deserializable grant. Executor Core authenticates the current peer Host, verifies the complete reviewed correlation/digest, its own exact target, enrolled binding offer, local policy allowing that requester, qualification and freshness, and durably installs that lineage. It may reject or narrow; it cannot originate a broader root. V1 trusts the authenticated peer's trusted Pastey Core and its approval assertion, as a Host trust boundary; current Bridge crypto proves which Host sent it, not independent proof of human consent or Byzantine-host integrity. No transferable signing PKI is added for v1. A compromised trusted Host is outside this guarantee, not repaired by hashing a review.
 
 Local execution calls the same executor admission routine through a private `LocalCore` ingress proof tied to `LocalRuntimeRef`. Remote dispatch constructs a private `VerifiedPeer` ingress proof only after Layer 4 validation and exact Host resolution. Untrusted protocol DTOs cannot supply either proof. Do not fabricate a Bridge/session for a wholly local action.
 
-The grant constructor intersects reviewed ceilings, executor policy, qualification and native enforcement profile; validates subset relationships; and binds the exact action plus live environment. A stricter admission cannot silently rewrite a materially different reviewed intent (e.g. another direction or method); reject and re-review instead. Smaller validity/budget ceilings may deny an action if its required horizon no longer fits.
+The executor creates one `BodyControlSessionV1` for the validated root and stable live binding/profile/qualification ownership. The session does not reference an exact grant. For each admitted exact action, the grant constructor intersects reviewed ceilings, executor policy, qualification and native enforcement profile; validates subset relationships; and binds that action to the current session and live environment. A stricter admission cannot silently rewrite a materially different reviewed intent (e.g. another direction or method); reject and re-review instead. Smaller validity/budget ceilings may deny an action if its required horizon no longer fits.
 
 Protective/operator authority is independently established by the native environment's local policy and operator controls. A task grant may reference a qualified loss profile; this does not mint operator privileges. Protective authority may fence a task and perform only its bounded protective operations, never start or resume ordinary task motion. Neither domain can be converted into the other. An intervention record is evidence of that independent authority, not a task grant constructor.
 
@@ -301,10 +320,10 @@ Protective/operator authority is independently established by the native environ
 
 | Point | State change and owner | Durable / native boundary |
 |---|---|---|
-| L0 Review/approval | Requester Core seals immutable scope; later records approval against same digest | Review/approval transaction commits; no executable authority yet |
+| L0 Review/approval | Requester Core seals immutable scope; later records approval correlation against the same exact scope digest | Review/approval transaction commits; approval state is outside the scope digest; no executable authority yet |
 | L1 Root start/install | Requester records exact attempt and approval consumption; executor validates and records same root lineage | Separate Host transactions, not a distributed atomic commit; ambiguous install permits no replayed action |
-| L2 Domain/grant reservation | Executor checks qualification/binding, constructs narrowed grant and reserves canonical domain | One `BEGIN IMMEDIATE` transaction checks root open, writes grant snapshot, advances/reserves epoch and session `Installing`; no motion |
-| L3 Native session activation | Native installs exact boot/session/epoch/finite lease; Core validates receipt against still-current L2 | Native installation is enforcement point; conditional DB/session update marks `Active` only if root/grant still open. Failure/late receipt fences or quarantines |
+| L2 Domain/session reservation | Executor checks qualification/binding, creates the root-bound session and reserves the canonical domain; Exact v1 also constructs its single narrowed grant | One `BEGIN IMMEDIATE` transaction checks root open, writes session/grant snapshots as applicable, advances/reserves epoch and session `Installing`; no motion |
+| L3 Native session activation | Native installs exact boot/session/epoch/finite lease; Core validates returned evidence against the selected qualification's `required_enforcement_class` and still-current root/binding/profile/qualification | Native installation is enforcement point; conditional DB/session update marks `Active` only if evidence meets the minimum and the root/session reservation remains current. Failure, incompatible or late receipt fences or quarantines |
 | L4 Proposal admission | Core checks new proposal challenge/view, exact payload and continuing predicates; reserves cumulative budget and dedup key | Atomic transaction writes admitted action and fixed execution budget/deadline record, increments domain/action revision; proposal not renewable by duplicate |
 | L5 Dispatch / consume | Control lane rechecks current validity; records dispatch intent before native write | Dispatch-intent commit precedes I/O. Native consumption check linearizes actual command eligibility. Crash between them is `dispatch_unknown` |
 | L6 Revoke/cancel | Core closes live permission immediately; serializes terminal root/grant/action state and epoch invalidation | Durable terminal/fence transaction before acknowledgement; native fence acknowledgement is a separate enforcement fact. DB failure keeps memory closed and stops dispatch but cannot claim durable completion |
@@ -338,7 +357,7 @@ Proposed table responsibilities (schema version tracked by the physical store):
 |---|---|---|
 | `physical_environments` | `environment_id`; unique enrollment/resource alias ownership as configured | Registrations and revisions, trusted config references, removal tombstones |
 | `physical_qualifications` | qualification ID/digest + monotonic withdrawal revision | Profile snapshots, evidence references, conditions and withdrawal/expiry |
-| `physical_reviews` | review/revision digest; unique approval ID and attempt consumption | Immutable scope, approval state/principal and root-start correlation |
+| `physical_reviews` | review/revision scope digest; unique approval ID and attempt consumption | Immutable scope plus its digest, separate review state/approval correlation and root-start correlation |
 | `physical_attempts` | `(root_id, role)` with requester/executor role; immutable attempt correlation; revision CAS | Root audit, grant/session/action summaries, terminal authority and task acceptance, accumulated budgets, loss/reconcile causes |
 | `physical_domains` | canonical resource/domain ID | Exclusive holder, fencing high-water epoch, quarantine/handover state; reservation and budget changes share transaction |
 | `physical_actions` | unique `(root_id, action_id)` and `(root_id, decision_sequence)`; immutable payload digest | Admitted action snapshot, reserved budget, dispatch-intent flag, independent disposition/consequence/acceptance revisions |
@@ -366,7 +385,7 @@ Add bounded `physical-control-v1` compatibility under a Host capability such as 
 | Proposed messages | Contents and meaning |
 |---|---|
 | `physical.discover` / `physical.catalog` | Bounded environment/profile/binding-view/qualification summaries; no private endpoint or authority |
-| `physical.prepare` / `physical.prepared` | Core root offer with exact review/approval/attempt and binding offer; executor narrowed grant/session status or denial. Prepared requires correlated activation, not just receipt |
+| `physical.prepare` / `physical.prepared` | Core root offer with exact review/approval/attempt and binding offer; executor narrowed grant/session status or denial. Prepared requires correlated activation with evidence meeting the selected enforcement minimum, not just receipt |
 | `physical.challenge` / `physical.challenge_result` | Action-admission observation/challenge request/result after session activation; short local validity |
 | `physical.propose` / `physical.disposition` | Fresh exact proposal; semantic admission/refusal/native disposition with action/decision correlation |
 | `physical.renew` / `physical.renewed` | Current session/epoch, next renewal sequence and challenge-bound finite request; no widening/action budget reset |
@@ -401,11 +420,12 @@ sequenceDiagram
     participant N as Native fence / robotd
     U->>C: Prepare review, approve exact stored digest, start
     C->>S: L0/L1 approval consumption and root audit
-    C->>S: L2 narrowed grant/domain reservation
-    C->>A: Install exact session/epoch
+    C->>S: L2 root-bound session/domain reservation and Exact v1 grant
+    C->>A: Install session/epoch at selected enforcement class
     A->>N: Native installation (Gate B)
-    N-->>C: Receipt via adapter
-    C->>S: L3 conditional activation
+    N-->>C: Enforcement evidence via adapter
+    C->>C: L3 check evidence against qualification minimum
+    C->>S: Conditional activation only if compatible
     U->>C: Fresh exact proposal against local challenge
     C->>S: L4 admission, dedup key, budget reservation
     C->>S: L5 dispatch intent
@@ -430,9 +450,10 @@ sequenceDiagram
     R->>R: Seal/approve exact scope and originate attempt/root
     R->>T: physical.prepare (root offer, current route)
     T->>E: Authenticated peer claim
-    E->>E: Validate root, policy, binding, qualification; reserve
-    E->>N: Session installation
-    N-->>E: Native fence receipt
+    E->>E: Validate root, policy, binding, qualification and required enforcement class; reserve
+    E->>N: Session installation at selected enforcement class
+    N-->>E: Session enforcement evidence
+    E->>E: L3 checks evidence against qualification minimum
     E-->>R: physical.prepared (semantic status)
     R->>E: physical.challenge through Layer 4
     E-->>R: Current action challenge and observations
@@ -455,10 +476,11 @@ Every cross-Host arrow in the second diagram uses the current verified route, in
 ```text
 Root: approved scope → Started/Installed → Closed
                                       └→ Expired/Revoked/Interrupted
-Grant: Candidate → Reserved → Active → Exhausted/Released/Fenced/Revoked/Expired
+Session (root + stable binding/profile): Unbound → Installing → Active → Draining → Released
+Grant (one exact action under root/session): Candidate → Reserved → Active → Exhausted/Released/Fenced/Revoked/Expired
 ```
 
-Only Core transitions into executable `Active`; root/grant closure is monotonic and durable. A revoke closes relevant live validity before fallible I/O. Closing a root closes all grants/actions under it; fencing one action/session may close its exact grant while retaining factual history. Restart closes all prior live authority, even if durable state formerly said active. V1 has one action/grant per attempt, avoiding ambiguous partial-root continuation.
+Only Core transitions into executable `Active`; root/session/grant closure is monotonic and durable. A revoke closes relevant live validity before fallible I/O. Closing a root closes its session and all grants/actions under it; closing a session closes admission for its grants/actions; fencing one action closes its exact grant while retaining factual history. Restart closes all prior live authority, even if durable state formerly said active. Exact v1 has one root/session/grant/action per attempt; finite decision streams remain deferred.
 
 ### 10.2 Session
 
@@ -471,7 +493,7 @@ Unbound → Installing → Active → Draining → Released
                            unknown consequence → Quarantined
 ```
 
-L2 persists `Installing`; L3 conditionally records activation. Installation timeout or lost receipt is not “no session exists”: record enforcement unknown, prevent action dispatch and fence/query. Fenced-but-moving is valid; a fresh owner's task admission waits for the native handover predicate. Local protective/operator intervention is allowed independently while ordinary task control is quarantined.
+L2 persists `Installing`; L3 conditionally records activation only after checking returned enforcement evidence against the selected qualification's minimum and revalidating the root-bound binding/profile/qualification. A Gate B-qualified session cannot become `Active` from `AdapterIsolationOnly` evidence. Installation timeout or lost receipt is not “no session exists”: record enforcement unknown, prevent action dispatch and fence/query. Fenced-but-moving is valid; a fresh owner's task admission waits for the native handover predicate. Local protective/operator intervention is allowed independently while ordinary task control is quarantined.
 
 ### 10.3 Proposal, action and native disposition
 
@@ -530,7 +552,7 @@ Keep the upstream revisions and behavioral findings from the reference document.
 
 ### 11.1 Gate A: existing upstream, isolated simulation
 
-Pastey side implements the full Core/binding/journal/evidence path but qualifies the native installation as `AdapterIsolationOnly`. A trusted harness proves single writer and provides simulator/daemon incarnation plus instrumentation needed to distinguish fresh measurements from cached state. If it cannot prove those facts, admission or completion remains unavailable. Do not infer them from the socket filename or fabricate sensor validity.
+Pastey side implements the full Core/binding/journal/evidence path with a capability profile and qualification that explicitly set `required_enforcement_class = AdapterIsolationOnly`. L3 accepts only compatible installation evidence; Gate A makes no native-fence claim. A trusted harness proves single writer and provides simulator/daemon incarnation plus instrumentation needed to distinguish fresh measurements from cached state. If it cannot prove those facts, admission or completion remains unavailable. Do not infer them from the socket filename or fabricate sensor validity.
 
 Use current `robot.move`, `robot.stop`, `robot.subscribe` and `robot.state`. Keep all alternative mutating clients disabled/isolated. Native command deadman behavior can be measured, but adapter-side fencing cannot reject data already buffered at `robotd` after revoke. Gate A therefore demonstrates only its stated isolation profile, not end-to-end lease/fence enforcement or controller-crash protection.
 
@@ -540,6 +562,7 @@ Camera/depth subscriptions are optional later read capabilities through their na
 
 | Required change | Owner / existing seam | Required proof |
 |---|---|---|
+| Gate B profile/qualification and session activation | Pastey capability/profile and qualification selection; L3 Core activation | `required_enforcement_class = NativeFence`; `AdapterIsolationOnly` evidence cannot activate the selected profile |
 | Session/epoch install and mutating-client arbitration | MicroDuck `duck-ipc-proto`, `robotd` IPC/admission and `intents` | Every mutating request/notification/alternate client either carries current ownership or invokes authenticated operator preemption |
 | Tagged action and separate admission/execution deadlines | Native intent/action record and loop-side consumption check; Pastey control sends narrowed views | Old buffered command cannot refresh motion after action/lease/epoch expiry |
 | Native local expiry/revoke behavior | `robotd` ownership/loss handling calling its native zero-twist path | Adapter death needs no cleanup RPC; pending stale task intents cleared/fenced; no new controller or safety algorithm |
@@ -555,7 +578,7 @@ This sequence implements the accepted target in dependency order. Tests named he
 
 | Stage | Likely files/modules | New invariant and required tests | Unavailable until complete |
 |---|---|---|---|
-| 1. Contracts and pure identity/validation | New `physical/mod.rs`, `contracts.rs`, initial `binding.rs` value validation; `main.rs` module declaration only | Versioned DTO/live-type separation; exact environment vs Host; canonical digest/finite units; proposal vs action vs observation clocks. Tests for malformed/unknown variants, non-finite values, digest stability, altered incarnation/frame/Host, no managed-type conversion | No runtime service, commands, DB migration, native I/O or authority issuance |
+| 1. Contracts and pure identity/validation | New `physical/mod.rs`, `contracts.rs`, initial `binding.rs` value validation; `main.rs` module declaration only | Versioned DTO/live-type separation; exact environment vs Host; digest over immutable review scope only; typed enforcement minimum and session-evidence compatibility; proposal vs action vs observation clocks. Tests for malformed/unknown variants, non-finite values, digest stability, altered incarnation/frame/Host, Gate B rejection of isolation-only evidence, no managed-type conversion | No runtime service, commands, DB migration, native I/O or authority issuance |
 | 2. Durable ledger and trusted binding | `physical/store.rs`, binding resolver; startup integration in `storage.rs`/`host_runtime.rs` | Immutable correlation, domain aliases, epoch/tombstone persistence, qualification withdrawal. Transaction tests for duplicate/mismatch, concurrent domain reservation, crash/restart reconstruction denied, late facts cannot recreate root | No task action until Core construction/admission exists |
 | 3. Core review/root/grant construction | `physical/core.rs`; HostRuntime ownership and pure typed local entry points | Only Core constructors; exact approval/attempt/binding; ceiling subset/no-widening. Tests for stale approval/qualification/root, wrong Host/body, unauthorized peer claim, local/remote ingress proof separation, cumulative budget constraints | Native apply/refresh and user-facing Start disabled |
 | 4. Session/action admission and fake native lane | `physical/control.rs`, evidence validity primitives, fake adapter tests | L2–L6 order, local clock installation, action vs proposal expiry, observation certificates. Injected-clock tests for races, stale queued command, duplicate proposal, budget retention, storage/I/O failures and no await-under-lock | Real motion; streams; unsupported cancellation profiles |
