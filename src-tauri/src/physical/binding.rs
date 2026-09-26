@@ -279,12 +279,30 @@ impl EnvironmentBindingV1 {
         &self.view
     }
 }
+/// Sealed snapshot for atomic Core ledger checks; never an authority or DTO.
+#[derive(Clone)]
+pub(super) struct BindingLedgerSnapshotV1 {
+    environment: EnvironmentRefV1,
+    registration_digest: DigestV1,
+    epochs: BTreeMap<DomainId, u64>,
+}
+impl BindingLedgerSnapshotV1 {
+    pub(super) fn environment(&self) -> &EnvironmentRefV1 {
+        &self.environment
+    }
+    pub(super) fn registration_digest(&self) -> &DigestV1 {
+        &self.registration_digest
+    }
+    pub(super) fn epochs(&self) -> &BTreeMap<DomainId, u64> {
+        &self.epochs
+    }
+}
 struct LiveBindingEntryV1 {
     offer: BindingOfferId,
     valid: Arc<AtomicBool>,
 }
 
-/// Foundation owned directly by HostRuntime, later internal to its one physical
+/// Environmental foundation internal to the one HostRuntime-owned physical
 /// service. No worker, daemon, qualification manager or authority service.
 pub(crate) struct PhysicalBindingResolverV1 {
     store: PhysicalStoreV1,
@@ -314,7 +332,7 @@ impl PhysicalBindingResolverV1 {
             live: BTreeMap::new(),
         })
     }
-    fn now(&mut self) -> AppResult<(UnixMillis, u64)> {
+    pub(super) fn now(&mut self) -> AppResult<(UnixMillis, u64)> {
         require(!self.closed, "Physical binding resolver closed")?;
         let result = self.clock.read();
         if let Ok(current) = result {
@@ -503,6 +521,17 @@ impl PhysicalBindingResolverV1 {
             binding.valid.store(false, Ordering::Release);
         }
         result
+    }
+    pub(super) fn ledger_snapshot(
+        &mut self,
+        binding: &EnvironmentBindingV1,
+    ) -> AppResult<BindingLedgerSnapshotV1> {
+        self.validate_current(binding)?;
+        Ok(BindingLedgerSnapshotV1 {
+            environment: binding.view.environment.clone(),
+            registration_digest: binding.registration_digest.clone(),
+            epochs: binding.epochs.clone(),
+        })
     }
     pub(super) fn record_qualification(
         &mut self,

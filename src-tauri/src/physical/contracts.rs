@@ -65,7 +65,7 @@ impl VelocityLimitsV1 {
             && v.vy_mps.get().abs() <= self.max_abs_vy_mps.get()
             && v.vyaw_radps.get().abs() <= self.max_abs_vyaw_radps.get()
     }
-    fn is_subset_of(&self, ceiling: &Self) -> bool {
+    pub(super) fn is_subset_of(&self, ceiling: &Self) -> bool {
         self.max_abs_vx_mps <= ceiling.max_abs_vx_mps
             && self.max_abs_vy_mps <= ceiling.max_abs_vy_mps
             && self.max_abs_vyaw_radps <= ceiling.max_abs_vyaw_radps
@@ -106,7 +106,7 @@ impl PhysicalFreshnessV1 {
     pub fn validate(&self) -> AppResult<()> {
         self.observation.validate()
     }
-    fn is_subset_of(&self, ceiling: &Self) -> bool {
+    pub(super) fn is_subset_of(&self, ceiling: &Self) -> bool {
         self.proposal.0 <= ceiling.proposal.0
             && self.observation.max_age_us <= ceiling.observation.max_age_us
             && self.observation.max_gap_us <= ceiling.observation.max_gap_us
@@ -128,7 +128,7 @@ impl ExecutionBudgetV1 {
             "Action duration exceeds cumulative execution budget",
         )
     }
-    fn is_subset_of(&self, ceiling: &Self) -> bool {
+    pub(super) fn is_subset_of(&self, ceiling: &Self) -> bool {
         self.action_duration_us <= ceiling.action_duration_us
             && self.lease_duration_us <= ceiling.lease_duration_us
             && self.total_execution_us <= ceiling.total_execution_us
@@ -410,7 +410,7 @@ pub(crate) enum PhysicalReviewStateV1 {
     Expired,
 }
 
-// A review/approval record is still just a claim. No approve/start method exists.
+// A review/approval record remains data; only Core owns approval/start operations.
 claim!(PhysicalReviewRecordV1 {
     version: VersionV1,
     review_id: ReviewId,

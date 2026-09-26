@@ -1,8 +1,8 @@
-//! Physical contracts and Stage 2 durable/trusted environmental facts, never authority.
+//! Physical facts and Core-owned bounded task authority through Stage 3.
 //!
-//! No task authority, executable session, protocol, adapter or native I/O lives here.
+//! No control session, admitted action, protocol, adapter or native I/O lives here.
 //! Successfully validating a claim does not authenticate its producer or qualify a body.
-#![allow(dead_code)] // Deliberately has no runtime consumers until later stages.
+#![allow(dead_code)] // Internal review/authority APIs await later product wiring.
 
 use crate::error::{AppError, AppResult};
 
@@ -39,6 +39,7 @@ macro_rules! claim {
 
 pub(crate) mod binding;
 pub(crate) mod contracts;
+pub(crate) mod core;
 pub(crate) mod store;
 pub(crate) mod values;
 

@@ -9,6 +9,10 @@ use super::{
 };
 use crate::{error::AppResult, storage::AppPaths};
 
+#[path = "store_core.rs"]
+mod core_ledger;
+pub(super) use core_ledger::RootAuditV1;
+
 // Dedicated versioning; neither SQLite user_version nor other Pastey tables are repurposed.
 const SCHEMA: &str = r#"
 CREATE TABLE physical_schema (
@@ -121,6 +125,14 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
     if count == 0 {
         tx.execute_batch(SCHEMA)?;
     }
+    // Only a complete, exactly recognized Stage 2 schema may gain the Core extension.
+    let base = Connection::open_in_memory()?;
+    base.execute_batch(SCHEMA)?;
+    if schema_objects(&tx)? == schema_objects(&base)? {
+        verify_base_version(&tx)?;
+        audit_facts(&tx)?;
+        tx.execute_batch(core_ledger::SCHEMA)?;
+    }
     verify_schema(&tx)?;
     audit(&tx)?;
     tx.commit()?;
@@ -160,10 +172,15 @@ fn schema_objects(conn: &Connection) -> AppResult<Vec<(String, Option<String>)>>
 fn verify_schema(conn: &Connection) -> AppResult<()> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SCHEMA)?;
+    expected.execute_batch(core_ledger::SCHEMA)?;
     require(
         schema_objects(conn)? == schema_objects(&expected)?,
         "Incompatible physical ledger schema",
     )?;
+    core_ledger::verify_version(conn)?;
+    verify_base_version(conn)
+}
+fn verify_base_version(conn: &Connection) -> AppResult<()> {
     let versions: Vec<i64> = conn
         .prepare("SELECT version FROM physical_schema WHERE singleton=1")?
         .query_map([], |r| r.get(0))?
@@ -425,6 +442,10 @@ fn load_registration(
     decode(&raw)
 }
 fn audit(conn: &Connection) -> AppResult<()> {
+    audit_facts(conn)?;
+    core_ledger::audit(conn)
+}
+fn audit_facts(conn: &Connection) -> AppResult<()> {
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
     require(integrity == "ok", "Corrupt physical ledger")?;
     // Validate this module's relationships, not legacy rows owned elsewhere.

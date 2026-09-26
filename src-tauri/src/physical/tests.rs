@@ -1402,3 +1402,6 @@ mod stage2 {
         f.resolver.validate_current(&proof).unwrap();
     }
 }
+
+#[path = "stage3_tests.rs"]
+mod stage3;

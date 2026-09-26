@@ -57,6 +57,7 @@ identity!(BindingOfferId, "binding-offer:v1:");
 identity!(QualificationId, "qualification:v1:");
 identity!(ReviewId, "physical-review:v1:");
 identity!(ApprovalId, "physical-approval:v1:");
+identity!(RootId, "physical-root:v1:");
 identity!(AttemptId, "physical-attempt:v1:");
 identity!(ActionId, "physical-action:v1:");
 identity!(ChallengeId, "physical-challenge:v1:");

@@ -66,8 +66,8 @@ pub struct HostRuntime {
     /// Fresh process generation for direct execution on the durable local Host.
     /// It is not a Bridge session, peer identity, or route.
     pub(crate) local_runtime_ref: LocalRuntimeRef,
-    /// Stage 2 environmental facts only; no physical task authority or I/O.
-    pub(crate) physical_binding: Mutex<crate::physical::binding::PhysicalBindingResolverV1>,
+    /// Physical facts and Core task authority through Stage 3; no session or I/O.
+    pub(crate) physical_control: Mutex<crate::physical::core::PhysicalControlServiceV1>,
     pub config: RwLock<StoredConfig>,
     pub active_servers: Mutex<HashMap<String, ActiveRoomServer>>,
     pub active_file_transfers: Mutex<HashMap<String, transfer::ActiveFileTransfer>>,
@@ -183,7 +183,7 @@ impl HostRuntime {
             WorkerProviderConfigServiceV1::new(paths.clone(), config::master_key(&config)?)?;
         let managed_runtime_configs = ManagedRuntimeConfigServiceV1::new(paths.clone())?;
         let local_runtime_ref = LocalRuntimeRef::fresh(local_host_ref.clone());
-        let physical_binding = crate::physical::binding::PhysicalBindingResolverV1::new(
+        let physical_control = crate::physical::core::PhysicalControlServiceV1::new(
             &paths,
             local_runtime_ref.clone(),
             Arc::new(crate::physical::binding::SystemBindingClockV1::default()),
@@ -192,7 +192,7 @@ impl HostRuntime {
             paths: paths.clone(),
             local_host_ref: local_host_ref.clone(),
             local_runtime_ref,
-            physical_binding: Mutex::new(physical_binding),
+            physical_control: Mutex::new(physical_control),
             config: RwLock::new(config),
             active_servers: Mutex::new(HashMap::new()),
             active_file_transfers: Mutex::new(HashMap::new()),
@@ -363,7 +363,7 @@ impl HostRuntime {
     }
 
     pub fn shutdown_all(&self) {
-        self.physical_binding.lock().close();
+        let _ = self.physical_control.lock().close();
         let _completion_guard = self.managed_completion_lock.lock();
         crate::native_v2_orchestration::interrupt_all_attempts(
             &self.paths,
