@@ -4,6 +4,8 @@ Pastey is cross-device infrastructure for general-capability Agents. A Host is a
 
 This is the product and architecture direction, not a claim of AGI or universal Agent integration. The current 2.0 implementation has a native Codex path and a distinct Generic Managed Worker path over a LAN-oriented current-session Bridge. Source code, validators, and tests are authoritative. The repository is at `2.0.0-beta.2`; its beta status does not establish physical Mac ↔ Windows Native Agent acceptance.
 
+The proposed [physical-environment control architecture](physical-environment-control.md) extends the environment/capability model to embodied systems through Core-owned authority, native enforcement, and observed consequences. [MicroDuck](platform/microduck-environment-design.md) is its first reference binding. These documents describe future physical integration, not current runtime support.
+
 ## Agent execution across Hosts
 
 An Agent or product flow can identify the capability a task needs, select its owning Host, and place execution there. If the necessary resources are already on that Host, the capability works locally. If capability and resource placement differ, Pastey can authorize explicit movement, execute on the selected Host, then handle result continuation or consequences. Factual capability observations inform selection but never grant it. The currently implemented Native Agent and managed paths have different authority and execution contracts; neither path implies arbitrary future capabilities work today.

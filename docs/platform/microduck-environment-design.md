@@ -360,7 +360,7 @@ These are requirements to qualify capabilities, not a request to implement them 
 
 ## 16. Future extensions and what stays native
 
-The reusable semantics are environment identity distinct from route, capability discovery without authority, scoped exclusive grants, local fencing, expiring sessions, native cancellation profiles, and evidence-based consequence acceptance. Keep them as MicroDuck records until a second integration demonstrates a need for common types.
+The reusable semantics are environment identity distinct from route, capability discovery without authority, scoped exclusive grants, local fencing, expiring sessions, native cancellation profiles, and evidence-based consequence acceptance. The [physical-environment control architecture](../physical-environment-control.md) defines their target contracts across environments and derives the implementation slice from them; this document remains the concrete MicroDuck binding and isolated PoC specification. Common runtime types should be extracted only after a second integration validates the shared semantics, rather than making MicroDuck's schema universal.
 
 MicroDuck-specific details remain the `robot.*` schema, frames/ranges, mode/policy catalog, sit toggle, skill scheduling and chaining, native deadman behavior, telemetry interpretation, and sim/body identity mapping.
 
