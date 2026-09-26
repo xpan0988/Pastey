@@ -4,6 +4,8 @@ Status: target architecture and implementation plan, not implemented runtime beh
 
 Design date: 2026-09-26. Pastey source baseline: `5b7e389c86fc7b6fb61aea3e75e79ee370a6cfe1`. The [MicroDuck reference design](platform/microduck-environment-design.md) remains the concrete binding and isolated MuJoCo PoC specification. Its upstream baselines were rechecked against public HEAD: MicroDuck `a9ec4b2079ef8ee7904014089c885bb07d57d63c`, microduck_rl `cb70b792312d559a4da09064d92009079671815f`. No simulator or hardware qualification was performed for this document.
 
+The [implementation architecture v1](physical-environment-implementation.md) maps this target into proposed Rust contracts, HostRuntime ownership, transactions, protocol messages, native fencing and a dependency-ordered coding sequence. It does not implement runtime support or change this target's authority/control boundary.
+
 ## 1. Target system and architectural decision
 
 Pastey should select an environment, discover and qualify its capabilities, acquire bounded authority to use them, route intent, observe consequences, and accept completion. A laptop, VM, browser, mobile robot, arm, or other embodied system fits this model. They need not share command schemas, timing, sensors, cancellation behavior, or completion evidence.
