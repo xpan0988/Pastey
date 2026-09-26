@@ -66,7 +66,7 @@ pub struct HostRuntime {
     /// Fresh process generation for direct execution on the durable local Host.
     /// It is not a Bridge session, peer identity, or route.
     pub(crate) local_runtime_ref: LocalRuntimeRef,
-    /// Physical facts and Core task authority through Stage 3; no session or I/O.
+    /// Physical Core through Stage 4; private control authority, fake lane only.
     pub(crate) physical_control: Mutex<crate::physical::core::PhysicalControlServiceV1>,
     pub config: RwLock<StoredConfig>,
     pub active_servers: Mutex<HashMap<String, ActiveRoomServer>>,

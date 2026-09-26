@@ -1,5 +1,11 @@
-//! Core-owned review and finite task authority. Stage 3 ends at a sealed grant
-//! basis: no control session, action admission, dispatch or physical I/O.
+//! Core-owned review and finite task authority. The sealed Stage 3 grant basis
+//! feeds the child Stage 4 control module; no real physical I/O or acceptance.
+#[path = "control.rs"]
+mod control;
+#[cfg(test)]
+pub(super) use control::test_support as control_test_support;
+pub(super) use control::*;
+
 use super::{
     binding::{BindingClockV1, EnvironmentBindingV1, PhysicalBindingResolverV1},
     contracts::*,
@@ -100,6 +106,14 @@ struct ExecutorPolicyV1 {
     digest: DigestV1,
 }
 
+// Process-local review correlation for immediate revocation, never restored.
+struct RootRegistrationV1 {
+    valid: Arc<AtomicBool>,
+    review: ReviewId,
+    revision: u64,
+    scope_digest: DigestV1,
+}
+
 /// The single HostRuntime-owned physical service. Typed internal Core entry
 /// points only; production environmental producers/remote ingress remain closed.
 pub(crate) struct PhysicalControlServiceV1 {
@@ -108,8 +122,10 @@ pub(crate) struct PhysicalControlServiceV1 {
     runtime: LocalRuntimeRef,
     issuer: Arc<AtomicBool>,
     policy: Option<ExecutorPolicyV1>,
-    roots: BTreeMap<RootId, Arc<AtomicBool>>,
+    roots: BTreeMap<RootId, RootRegistrationV1>,
     start_decisions: BTreeSet<ApprovalId>,
+    control: ControlStateV1,
+    clock: Arc<dyn BindingClockV1>,
 }
 impl PhysicalControlServiceV1 {
     pub(crate) fn new(
@@ -121,7 +137,7 @@ impl PhysicalControlServiceV1 {
         // One atomic startup closure before exposing Core. No stored row is converted
         // to a Root. Old approval consumption survives this transaction.
         store.close_open_attempts("interrupted")?;
-        let binding = PhysicalBindingResolverV1::new(paths, runtime.clone(), clock)?;
+        let binding = PhysicalBindingResolverV1::new(paths, runtime.clone(), clock.clone())?;
         Ok(Self {
             binding,
             store,
@@ -130,6 +146,8 @@ impl PhysicalControlServiceV1 {
             policy: None,
             roots: BTreeMap::new(),
             start_decisions: BTreeSet::new(),
+            control: ControlStateV1::default(),
+            clock,
         })
     }
     pub(super) fn local_ingress(&self) -> AppResult<LocalCoreIngressV1> {
@@ -300,6 +318,12 @@ impl PhysicalControlServiceV1 {
             ),
             "Invalid terminal review state",
         )?;
+        self.invalidate_review(id, revision, Some(exact_digest));
+        let current = self.store.review(id, revision)?;
+        require(
+            &current.scope_digest == exact_digest,
+            "Review digest mismatch",
+        )?;
         let r = self
             .store
             .transition_review(id, revision, exact_digest, state, None)?;
@@ -318,6 +342,7 @@ impl PhysicalControlServiceV1 {
         self.current_scope(&scope, binding)?;
         let snapshot = self.binding.ledger_snapshot(binding)?;
         let (now, _) = self.binding.now()?;
+        self.invalidate_review(id, expected, None);
         self.store
             .revise_review(id, expected, scope, &snapshot, now)
     }
@@ -416,7 +441,15 @@ impl PhysicalControlServiceV1 {
         self.start_decisions.insert(approval_id.clone());
         self.store.originate_attempt(&audit, &snapshot, now)?;
         let valid = Arc::new(AtomicBool::new(true));
-        self.roots.insert(audit.root_id.clone(), valid.clone());
+        self.roots.insert(
+            audit.root_id.clone(),
+            RootRegistrationV1 {
+                valid: valid.clone(),
+                review: audit.review_id.clone(),
+                revision: audit.review_revision,
+                scope_digest: audit.scope_digest.clone(),
+            },
+        );
         let root = PhysicalAuthorityRootV1 {
             audit,
             scope: r.scope,
@@ -434,10 +467,12 @@ impl PhysicalControlServiceV1 {
             self.validate_ingress(&root.ingress)?;
             require(
                 root.valid.load(Ordering::Acquire)
-                    && self
-                        .roots
-                        .get(root.root_id())
-                        .is_some_and(|flag| Arc::ptr_eq(flag, &root.valid)),
+                    && self.roots.get(root.root_id()).is_some_and(|entry| {
+                        Arc::ptr_eq(&entry.valid, &root.valid)
+                            && entry.review == root.audit.review_id
+                            && entry.revision == root.audit.review_revision
+                            && entry.scope_digest == root.audit.scope_digest
+                    }),
                 "Unknown/closed physical Root",
             )?;
             let (now, ticks) = self.binding.now()?;
@@ -457,6 +492,7 @@ impl PhysicalControlServiceV1 {
             self.store.validate_attempt(&root.audit, &snapshot, now)
         })();
         if result.is_err() {
+            self.control.invalidate_root(root.root_id());
             root.valid.store(false, Ordering::Release);
             self.roots.remove(root.root_id());
             let _ = self
@@ -532,13 +568,30 @@ impl PhysicalControlServiceV1 {
         )
     }
     pub(super) fn close_root(&mut self, root: &PhysicalAuthorityRootV1) -> AppResult<()> {
+        self.control.invalidate_root(root.root_id());
         root.valid.store(false, Ordering::Release);
         self.roots.remove(root.root_id());
         self.store.close_attempt(root.root_id(), "revoked")
     }
+    fn invalidate_review(&mut self, id: &ReviewId, revision: u64, digest: Option<&DigestV1>) {
+        let control = &mut self.control;
+        self.roots.retain(|root, entry| {
+            if &entry.review == id
+                && entry.revision == revision
+                && digest.is_none_or(|d| d == &entry.scope_digest)
+            {
+                entry.valid.store(false, Ordering::Release);
+                control.invalidate_root(root);
+                false
+            } else {
+                true
+            }
+        });
+    }
     fn invalidate_live(&mut self) {
-        for flag in self.roots.values() {
-            flag.store(false, Ordering::Release);
+        self.control.invalidate_all();
+        for entry in self.roots.values() {
+            entry.valid.store(false, Ordering::Release);
         }
         self.roots.clear();
     }
@@ -557,7 +610,7 @@ impl Drop for PhysicalControlServiceV1 {
 
 /// All exact semantic fields (including profile/qualification fingerprints and
 /// completion/loss) remain identical. Only declared ceilings may shrink.
-fn validate_narrowing(
+pub(super) fn validate_narrowing(
     reviewed: &PhysicalReviewScopeV1,
     narrowed: &PhysicalReviewScopeV1,
 ) -> AppResult<()> {
@@ -660,6 +713,9 @@ pub(super) mod test_support {
     }
     pub(in crate::physical) fn audit(root: &PhysicalAuthorityRootV1) -> RootAuditV1 {
         root.audit.clone()
+    }
+    pub(in crate::physical) fn root_open(root: &PhysicalAuthorityRootV1) -> bool {
+        root.valid.load(Ordering::Acquire)
     }
     pub(in crate::physical) fn runtime(core: &PhysicalControlServiceV1) -> LocalRuntimeRef {
         core.runtime.clone()

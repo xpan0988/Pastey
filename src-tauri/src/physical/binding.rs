@@ -268,7 +268,7 @@ pub(super) struct EnvironmentBindingV1 {
     view: EnvironmentBindingViewV1,
     runtime: LocalRuntimeRef,
     registration_digest: DigestV1,
-    epochs: BTreeMap<DomainId, u64>,
+    epochs: parking_lot::Mutex<BTreeMap<DomainId, u64>>,
     deadline_ticks: u64,
     provenance: BindingProvenanceV1,
     provenance_evidence_digest: DigestV1,
@@ -484,7 +484,7 @@ impl PhysicalBindingResolverV1 {
             view,
             runtime: self.runtime.clone(),
             registration_digest: c.registration_digest,
-            epochs: c.epochs,
+            epochs: parking_lot::Mutex::new(c.epochs),
             deadline_ticks,
             provenance: facts.provenance,
             provenance_evidence_digest: facts.evidence_digest,
@@ -513,7 +513,7 @@ impl PhysicalBindingResolverV1 {
             let reg = self.store.registration(&binding.view.environment)?;
             require(
                 reg.digest()? == binding.registration_digest
-                    && self.store.epochs(reg.resources.keys().cloned())? == binding.epochs,
+                    && self.store.epochs(reg.resources.keys().cloned())? == *binding.epochs.lock(),
                 "Trusted binding dependencies invalidated",
             )
         })();
@@ -521,6 +521,40 @@ impl PhysicalBindingResolverV1 {
             binding.valid.store(false, Ordering::Release);
         }
         result
+    }
+    /// Only a sealed, committed L2 receipt may update the existing proof's epoch
+    /// dependency. No incarnation, enrollment or qualification fact is renewed.
+    pub(super) fn accept_reservation(
+        &mut self,
+        binding: &EnvironmentBindingV1,
+        receipt: &super::store::ReservationReceiptV1,
+    ) -> AppResult<()> {
+        let s = receipt.session();
+        let (now, ticks) = self.now()?;
+        require(
+            binding.valid.load(Ordering::Acquire)
+                && self
+                    .live
+                    .get(&binding.view.environment)
+                    .is_some_and(|entry| {
+                        entry.offer == binding.view.offer_id
+                            && Arc::ptr_eq(&entry.valid, &binding.valid)
+                    }),
+            "Reservation binding is not current",
+        )?;
+        binding.runtime.validate_current(&self.runtime)?;
+        let reg = self.store.registration(&binding.view.environment)?;
+        require(
+            now < binding.view.offer_expiry
+                && ticks < binding.deadline_ticks
+                && reg.digest()? == binding.registration_digest
+                && s.binding_digest == binding.view.digest()?
+                && *binding.epochs.lock() == s.previous
+                && self.store.epochs(reg.resources.keys().cloned())? == s.epochs,
+            "Unproven reservation epoch transition",
+        )?;
+        *binding.epochs.lock() = s.epochs.clone();
+        Ok(())
     }
     pub(super) fn ledger_snapshot(
         &mut self,
@@ -530,7 +564,7 @@ impl PhysicalBindingResolverV1 {
         Ok(BindingLedgerSnapshotV1 {
             environment: binding.view.environment.clone(),
             registration_digest: binding.registration_digest.clone(),
-            epochs: binding.epochs.clone(),
+            epochs: binding.epochs.lock().clone(),
         })
     }
     pub(super) fn record_qualification(

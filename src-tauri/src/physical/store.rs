@@ -9,8 +9,13 @@ use super::{
 };
 use crate::{error::AppResult, storage::AppPaths};
 
+#[path = "store_control.rs"]
+mod control_ledger;
 #[path = "store_core.rs"]
 mod core_ledger;
+pub(super) use control_ledger::{
+    ActionAuditV1, FenceAuditV1, ReservationReceiptV1, SessionAuditV1,
+};
 pub(super) use core_ledger::RootAuditV1;
 
 // Dedicated versioning; neither SQLite user_version nor other Pastey tables are repurposed.
@@ -133,6 +138,16 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
         audit_facts(&tx)?;
         tx.execute_batch(core_ledger::SCHEMA)?;
     }
+    let stage3 = Connection::open_in_memory()?;
+    stage3.execute_batch(SCHEMA)?;
+    stage3.execute_batch(core_ledger::SCHEMA)?;
+    if schema_objects(&tx)? == schema_objects(&stage3)? {
+        verify_base_version(&tx)?;
+        core_ledger::verify_version(&tx)?;
+        audit_facts(&tx)?;
+        core_ledger::audit(&tx)?;
+        tx.execute_batch(control_ledger::SCHEMA)?;
+    }
     verify_schema(&tx)?;
     audit(&tx)?;
     tx.commit()?;
@@ -173,10 +188,12 @@ fn verify_schema(conn: &Connection) -> AppResult<()> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SCHEMA)?;
     expected.execute_batch(core_ledger::SCHEMA)?;
+    expected.execute_batch(control_ledger::SCHEMA)?;
     require(
         schema_objects(conn)? == schema_objects(&expected)?,
         "Incompatible physical ledger schema",
     )?;
+    control_ledger::verify_version(conn)?;
     core_ledger::verify_version(conn)?;
     verify_base_version(conn)
 }
@@ -443,7 +460,8 @@ fn load_registration(
 }
 fn audit(conn: &Connection) -> AppResult<()> {
     audit_facts(conn)?;
-    core_ledger::audit(conn)
+    core_ledger::audit(conn)?;
+    control_ledger::audit(conn)
 }
 fn audit_facts(conn: &Connection) -> AppResult<()> {
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;

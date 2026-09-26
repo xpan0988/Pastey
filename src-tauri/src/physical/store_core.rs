@@ -93,7 +93,7 @@ impl RootAuditV1 {
     fn digest(&self) -> AppResult<DigestV1> {
         digest("pastey-physical-root-audit-v1", self)
     }
-    fn validate(&self, review: &PhysicalReviewRecordV1) -> AppResult<()> {
+    pub(super) fn validate(&self, review: &PhysicalReviewRecordV1) -> AppResult<()> {
         let s = review.scope.fields();
         validate_host(&self.requester)?;
         validate_host(&self.executor)?;
@@ -161,7 +161,7 @@ fn load_review(
     r.validate()?;
     Ok(r)
 }
-fn current_review(
+pub(super) fn current_review(
     conn: &Connection,
     id: &ReviewId,
     revision: u64,
@@ -192,7 +192,7 @@ fn update_review(
     let n=conn.execute("UPDATE physical_reviews SET state=?3,state_revision=state_revision+1,approval_id=?4,approval_principal=?5,approved_at=?6,approval_expiry=?7,record_json=?8 WHERE review_id=?1 AND revision=?2 AND state=?9",params![text(&r.review_id),checked_integer(r.revision)?,tag(&r.state)?,a.map(|a|text(&a.approval_id)),a.map(|a|text(&a.principal)),a.map(|a|a.approved_at.get() as i64),a.map(|a|a.expires_at.get() as i64),serde_json::to_string(r)?,tag(&expected)?])?;
     require(n == 1, "Concurrent/invalid physical review transition")
 }
-fn dependencies(
+pub(super) fn dependencies(
     conn: &Connection,
     scope: &PhysicalReviewScopeV1,
     snapshot: &BindingLedgerSnapshotV1,
@@ -419,20 +419,7 @@ impl PhysicalStoreV1 {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
         super::audit(&tx)?;
-        let r = current_review(&tx, &a.review_id, a.review_revision)?;
-        a.validate(&r)?;
-        let (raw,state):(String,String)=tx.query_row("SELECT audit_json,state FROM physical_attempts WHERE root_id=?1 AND role='requester_executor'",[text(&a.root_id)],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        require(
-            raw == serde_json::to_string(a)?
-                && state == "open"
-                && r.state == PhysicalReviewStateV1::Approved
-                && now >= a.created_at
-                && now < a.expires_at
-                && *snapshot.registration_digest() == a.registration_digest
-                && *snapshot.epochs() == a.epochs,
-            "Closed/stale physical Root audit",
-        )?;
-        dependencies(&tx, &r.scope, snapshot, now)?;
+        validate_attempt_in(&tx, a, snapshot, now)?;
         tx.commit()?;
         Ok(())
     }
@@ -441,6 +428,7 @@ impl PhysicalStoreV1 {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::audit(&tx)?;
+        super::control_ledger::close_root(&tx, id)?;
         tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason=?2 WHERE root_id=?1 AND state='open'",params![text(id),reason])?;
         tx.commit()?;
         Ok(())
@@ -450,6 +438,7 @@ impl PhysicalStoreV1 {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::audit(&tx)?;
+        super::control_ledger::recover(&tx, reason == "interrupted")?;
         tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason=?1 WHERE state='open'",[reason])?;
         tx.commit()?;
         Ok(())
@@ -467,6 +456,10 @@ fn valid_reason(s: &str) -> bool {
     )
 }
 fn close_review(c: &Connection, id: &ReviewId, rev: u64, reason: &str) -> AppResult<()> {
+    let roots:Vec<String> = c.prepare("SELECT root_id FROM physical_attempts WHERE review_id=?1 AND review_revision=?2 AND state='open'")?.query_map(params![text(id),checked_integer(rev)?],|r|r.get(0))?.collect::<Result<_,_>>()?;
+    for root in roots {
+        super::control_ledger::close_root(c, &RootId::try_from(root)?)?;
+    }
     c.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason=?3 WHERE review_id=?1 AND review_revision=?2 AND state='open'",params![text(id),checked_integer(rev)?,reason])?;
     Ok(())
 }
@@ -587,5 +580,29 @@ pub(super) fn audit(conn: &Connection) -> AppResult<()> {
             "Invalid attempt closure",
         )?;
     }
+    Ok(())
+}
+
+pub(super) fn validate_attempt_in(
+    conn: &Connection,
+    a: &RootAuditV1,
+    snapshot: &BindingLedgerSnapshotV1,
+    now: UnixMillis,
+) -> AppResult<()> {
+    let r = current_review(conn, &a.review_id, a.review_revision)?;
+    a.validate(&r)?;
+    let (raw,state):(String,String)=conn.query_row("SELECT audit_json,state FROM physical_attempts WHERE root_id=?1 AND role='requester_executor'",[text(&a.root_id)],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    require(
+        raw == serde_json::to_string(a)?
+            && state == "open"
+            && r.state == PhysicalReviewStateV1::Approved
+            && now >= a.created_at
+            && now < a.expires_at
+            && *snapshot.registration_digest() == a.registration_digest
+            && (*snapshot.epochs() == a.epochs
+                || super::control_ledger::owns_epochs(conn, a, snapshot)?),
+        "Closed/stale physical Root audit",
+    )?;
+    dependencies(conn, &r.scope, snapshot, now)?;
     Ok(())
 }
