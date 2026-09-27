@@ -1,5 +1,6 @@
-//! Local Gate A only. A private supervised simulation owns the sole IPC client.
-//! This is adapter isolation, never a native epoch/lease fence or hardware proof.
+//! Explicit executor-local Gate A isolation and Gate B native-fence modes.
+//! Gate A retains its private supervised simulation; Gate B delegates to its
+//! owned native lane. Neither mode produces hardware or qualification proof.
 use super::*;
 use crate::host_identity::LocalRuntimeRef;
 use crate::physical::{binding::*, evidence::*, values::*};
@@ -629,19 +630,32 @@ fn exact_velocity(payload: &PhysicalIntentV1) -> AppResult<RequestV1> {
     })
 }
 /// Adapter owns no Core/store/approval handle. Its only writes consume sealed views.
-pub(in crate::physical) struct MicroDuckAdapterV1 {
-    run: Arc<GateARunV1>,
+pub(in crate::physical) enum MicroDuckAdapterV1 {
+    GateA(Arc<GateARunV1>),
+    GateB(Arc<gate_b::GateBNativeLaneV1>),
 }
 impl MicroDuckAdapterV1 {
     pub(in crate::physical) fn new(run: Arc<GateARunV1>) -> Self {
-        Self { run }
+        Self::GateA(run)
+    }
+    pub(in crate::physical) fn native_fence(run: Arc<gate_b::GateBNativeLaneV1>) -> Self {
+        Self::GateB(run)
+    }
+    fn gate_a(&self) -> AppResult<&Arc<GateARunV1>> {
+        match self {
+            Self::GateA(run) => Ok(run),
+            Self::GateB(_) => Err(invalid("NativeFence lane is not Gate A")),
+        }
     }
     async fn write(
         &self,
         view: AdmittedActionReadViewV1,
         refresh: bool,
     ) -> AppResult<Option<AdapterWriteReceiptV1>> {
-        let run = self.run.clone();
+        if let Self::GateB(run) = self {
+            return run.write(view, refresh).await;
+        }
+        let run = self.gate_a()?.clone();
         tokio::task::spawn_blocking(move || {
             run.validate_binding(&view.binding)?;
             let request = exact_velocity(&view.payload)?;
@@ -726,6 +740,7 @@ impl MicroDuckAdapterV1 {
                 action: view.action,
                 payload_digest: view.payload_digest,
                 accepted,
+                native: None,
             }))
         })
         .await
@@ -738,13 +753,17 @@ impl PhysicalEnvironmentAdapterV1 for MicroDuckAdapterV1 {
         view: NativeSessionInstallViewV1,
     ) -> LaneFuture<'_, SessionEnforcementEvidenceV1> {
         Box::pin(async move {
-            self.run.validate_binding(&view.binding)?;
+            if let Self::GateB(run) = self {
+                return run.install(view).await;
+            }
+            let run = self.gate_a()?;
+            run.validate_binding(&view.binding)?;
             require(
                 view.required == SessionEnforcementClassV1::AdapterIsolationOnly
                     && view.validity.allows(),
                 "Gate A cannot install NativeFence",
             )?;
-            let mut lane = self.run.lane.lock();
+            let mut lane = run.lane.lock();
             require(lane.installed.is_none(), "Gate A session already installed")?;
             lane.installed = Some((view.session.clone(), view.epochs.clone(), view.binding));
             Ok(Some(SessionEnforcementEvidenceV1 {
@@ -752,6 +771,7 @@ impl PhysicalEnvironmentAdapterV1 for MicroDuckAdapterV1 {
                 epochs: view.epochs,
                 request: view.request,
                 class: SessionEnforcementClassV1::AdapterIsolationOnly,
+                native: None,
             }))
         })
     }
@@ -762,8 +782,11 @@ impl PhysicalEnvironmentAdapterV1 for MicroDuckAdapterV1 {
         Box::pin(self.write(v, true))
     }
     fn fence(&self, v: NativeFenceRequestViewV1) -> LaneFuture<'_, SessionEnforcementEvidenceV1> {
-        let run = self.run.clone();
         Box::pin(async move {
+            if let Self::GateB(run) = self {
+                return run.fence(v).await;
+            }
+            let run = self.gate_a()?.clone();
             tokio::task::spawn_blocking(move || {
                 let installed = run
                     .lane
@@ -786,6 +809,7 @@ impl PhysicalEnvironmentAdapterV1 for MicroDuckAdapterV1 {
                     epochs: v.audit.epochs,
                     request: v.audit.request,
                     class: SessionEnforcementClassV1::AdapterIsolationOnly,
+                    native: None,
                 }))
             })
             .await

@@ -1,8 +1,9 @@
-//! Physical facts and Core-owned bounded task authority through Stage 7.
+//! Physical facts and Core-owned bounded task authority through Stage 8.
 //!
 //! Local MicroDuck Gate A requires a launcher-owned isolated simulation.
 //! Remote/product entry points reuse authenticated Room Control and local Core.
-//! No NativeFence or hardware authority.
+//! NativeFence is a separate executor-local mechanism; Stage 9 qualification
+//! and hardware authority remain unavailable.
 //! Successfully validating a claim does not authenticate its producer or qualify a body.
 #![allow(dead_code)] // Narrow environment integrations retain internal foundation APIs.
 
@@ -43,6 +44,8 @@ pub(crate) mod binding;
 pub(crate) mod contracts;
 pub(crate) mod core;
 pub(crate) mod evidence;
+#[path = "../../../native/microduck/overlay/duck-ipc-proto/src/task_authority.rs"]
+pub(in crate::physical) mod native_protocol;
 pub(crate) mod protocol;
 pub(crate) mod store;
 pub(crate) mod values;

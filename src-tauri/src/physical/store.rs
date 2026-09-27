@@ -22,6 +22,8 @@ pub(super) use core_ledger::RootAuditV1;
 #[path = "store_remote.rs"]
 mod remote_ledger;
 pub(super) use remote_ledger::RemoteRootLineageV2;
+#[path = "store_native.rs"]
+mod native_ledger;
 
 // Dedicated versioning; neither SQLite user_version nor other Pastey tables are repurposed.
 const SCHEMA: &str = r#"
@@ -176,6 +178,16 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
         core_ledger::audit(&tx)?;
         control_ledger::audit(&tx)?;
         evidence_ledger::audit(&tx)?;
+        remote_ledger::migrate(&tx)?;
+    }
+    let stage7 = Connection::open_in_memory()?;
+    stage7.execute_batch(&remote_ledger::stage7_ddl())?;
+    if schema_objects(&tx)? == schema_objects(&stage7)? {
+        audit_facts(&tx)?;
+        core_ledger::audit(&tx)?;
+        control_ledger::audit(&tx)?;
+        evidence_ledger::audit(&tx)?;
+        remote_ledger::audit(&tx)?;
         remote_ledger::migrate(&tx)?;
     }
     verify_schema(&tx)?;
@@ -504,7 +516,8 @@ fn audit(conn: &Connection) -> AppResult<()> {
     core_ledger::audit(conn)?;
     control_ledger::audit(conn)?;
     evidence_ledger::audit(conn)?;
-    remote_ledger::audit(conn)
+    remote_ledger::audit(conn)?;
+    native_ledger::audit(conn)
 }
 fn audit_facts(conn: &Connection) -> AppResult<()> {
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
@@ -649,6 +662,16 @@ pub(super) fn test_restore_stage6_schema(paths: &AppPaths) -> AppResult<()> {
     ]
     .join("\n");
     remote_ledger::rebuild(&tx, &ddl)?;
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn test_restore_stage7_schema(paths: &AppPaths) -> AppResult<()> {
+    let mut c = configured_connection(&paths.db_path)?;
+    c.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    remote_ledger::rebuild(&tx, &remote_ledger::stage7_ddl())?;
     tx.commit()?;
     Ok(())
 }

@@ -14,7 +14,9 @@ struct Pair {
 }
 impl Pair {
     fn new() -> Self {
-        let b = ControlFixture::new();
+        Self::with_executor(ControlFixture::new())
+    }
+    fn with_executor(b: ControlFixture) -> Self {
         let a_paths = AppPaths::new(
             std::env::temp_dir().join(format!("physical-a-{}", uuid::Uuid::new_v4())),
             PathBuf::new(),
@@ -648,3 +650,6 @@ async fn lost_action_ack_and_lost_result_keep_one_dispatch_and_reserved_budget()
         1
     );
 }
+
+#[path = "stage8_tests.rs"]
+mod stage8;

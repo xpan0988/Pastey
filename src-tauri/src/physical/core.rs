@@ -1,5 +1,5 @@
-//! Core-owned review and finite task authority. The sealed Stage 3 grant basis
-//! feeds the child Stage 4 control module; no real physical I/O.
+//! Core-owned review, authority, control and evidence. Local and authenticated
+//! remote requests share executor-local Gate A/NativeFence adapter boundaries.
 #[path = "control.rs"]
 mod control;
 #[path = "core_evidence.rs"]

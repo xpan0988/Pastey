@@ -1,0 +1,339 @@
+diff --git a/duck-ipc-proto/src/lib.rs b/duck-ipc-proto/src/lib.rs
+index be1e0bc..d5bf1d2 100644
+--- a/duck-ipc-proto/src/lib.rs
++++ b/duck-ipc-proto/src/lib.rs
+@@ -541,0 +542,2 @@ pub const JOINT_NAMES: [&str; 15] = [
++pub mod task_authority;
++
+diff --git a/robotd/src/intents.rs b/robotd/src/intents.rs
+index b3f515f..3120ea9 100644
+--- a/robotd/src/intents.rs
++++ b/robotd/src/intents.rs
+@@ -137,0 +138 @@ pub struct Intents {
++    pub task: crate::task_authority::Authority,
+@@ -270,0 +272 @@ impl Intents {
++            task: crate::task_authority::Authority::default(),
+diff --git a/robotd/src/main.rs b/robotd/src/main.rs
+index ab574b6..fdd4af1 100644
+--- a/robotd/src/main.rs
++++ b/robotd/src/main.rs
+@@ -26,0 +27 @@ mod sound;
++mod task_authority;
+@@ -229,0 +231,4 @@ struct Args {
++    /// Stage 8 isolated simulation native task guard; never enables hardware.
++    #[arg(long)]
++    pastey_task_identity: Option<PathBuf>,
++
+@@ -996,0 +1002,32 @@ async fn main() -> ExitCode {
++    if let Some(path) = &args.pastey_task_identity {
++        if !args.fake && args.sim.is_none() {
++            tracing::error!("native task mode currently requires isolated simulation/fake I/O");
++            return ExitCode::FAILURE;
++        }
++        let identity = (|| -> Result<_, Box<dyn std::error::Error>> {
++            let bytes = std::fs::read(path)?;
++            if bytes.len() > 1024 {
++                return Err("oversized native identity".into());
++            }
++            let launch: proto::task_authority::LaunchIdentity = serde_json::from_slice(&bytes)?;
++            let identity = proto::task_authority::Identity {
++                environment: launch.environment,
++                domain: launch.domain,
++                body: launch.body,
++                body_ref: launch.body_ref,
++                world: launch.world,
++                controller: task_authority::controller_incarnation()?,
++            };
++            intents
++                .task
++                .configure(identity)
++                .map_err(std::io::Error::other)?;
++            use std::os::unix::fs::PermissionsExt;
++            std::fs::set_permissions(&args.socket, std::fs::Permissions::from_mode(0o600))?;
++            Ok(())
++        })();
++        if let Err(error) = identity {
++            tracing::error!(%error, "cannot establish native task identity");
++            return ExitCode::FAILURE;
++        }
++    }
+@@ -2023,0 +2061 @@ async fn control_loop<T: RobotIo>(
++                intents.task.native_loss("native_io_loss");
+@@ -2071 +2109,24 @@ async fn control_loop<T: RobotIo>(
+-        let snapshot = intents.snapshot();
++        // Native task consumption linearization begins here. The loop never waits
++        // on IPC: contention means zero task twist. Keep the guard through apply,
++        // so a fence receipt can never precede a stale task target application.
++        #[cfg(test)]
++        intents.task.pause_at(false);
++        let mut task_use = if intents.task.enabled() {
++            intents.task.consume()
++        } else {
++            None
++        };
++        let mut snapshot = intents.snapshot();
++        let task_valid = task_use
++            .as_mut()
++            .is_some_and(|g| g.valid(proto::clock::monotonic_ns() / 1000));
++        if intents.task.enabled() {
++            snapshot.command.twist = task_use
++                .as_mut()
++                .map(|g| g.twist(proto::clock::monotonic_ns() / 1000))
++                .unwrap_or([0.0; 3]);
++            snapshot.twist_age = Duration::ZERO;
++            if !task_valid {
++                twist_ema = [0.0; 3];
++            }
++        }
+@@ -2664 +2725 @@ async fn control_loop<T: RobotIo>(
+-        let command = PolicyCommand {
++        let mut command = PolicyCommand {
+@@ -2996,0 +3058,3 @@ async fn control_loop<T: RobotIo>(
++                        if let Some(guard) = task_use.as_mut() {
++                            guard.invalidate("native_controller_loss");
++                        }
+@@ -3196,0 +3261,17 @@ async fn control_loop<T: RobotIo>(
++        #[cfg(test)]
++        intents.task.pause_at(true);
++        // Recheck at the actual actuator write boundary too. If a deadline
++        // elapsed during inference, discard this frame's motion targets. Keep
++        // balance enabled: the next tick uses zero twist through the unchanged
++        // standing controller. This is not torque-off or an emergency stop.
++        if intents.task.enabled()
++            && (task_valid || task_use.is_none())
++            && !task_use
++                .as_mut()
++                .is_some_and(|g| g.valid(proto::clock::monotonic_ns() / 1000))
++        {
++            twist_ema = [0.0; 3];
++            command.twist = [0.0; 3];
++            state.moving.store(false, Ordering::Relaxed);
++            targets = coast.known_positions(hold);
++        }
+@@ -3199 +3280,6 @@ async fn control_loop<T: RobotIo>(
+-            Err(e) => tracing::warn!(error = %e, "bus write failed"),
++            Err(e) => {
++                if let Some(guard) = task_use.as_mut() {
++                    guard.invalidate("native_write_loss");
++                }
++                tracing::warn!(error = %e, "bus write failed");
++            }
+@@ -3201,0 +3288,2 @@ async fn control_loop<T: RobotIo>(
++        drop(task_use); // native fence/install may now linearize
++
+@@ -3585,0 +3674,6 @@ async fn handle(
++    static NEXT_TASK_CONNECTION: AtomicU64 = AtomicU64::new(1);
++    let owner = NEXT_TASK_CONNECTION.fetch_add(1, Ordering::Relaxed);
++    let _task_connection = task_authority::Connection {
++        authority: &intents.task,
++        owner,
++    };
+@@ -3705,0 +3800,19 @@ async fn handle(
++        // Versioned native task family is consumed only by robotd. Other
++        // services retain their unchanged typed method tables and reject it.
++        if request.method == "robot.task" {
++            if let Some(id) = request.id.clone() {
++                let response = match serde_json::from_value::<proto::task_authority::Request>(
++                    request.params.clone().unwrap_or(serde_json::Value::Null),
++                ) {
++                    Ok(task) => {
++                        proto::Response::ok(Some(id), &intents.task.request_live(&task, owner))
++                    }
++                    Err(error) => proto::Response::err(
++                        Some(id),
++                        proto::Error::new(proto::code::INVALID_PARAMS, error.to_string()),
++                    ),
++                };
++                write_line(&mut write_half, &response).await?;
++            }
++            continue;
++        }
+@@ -3750,0 +3864,3 @@ fn apply_intent(state: &RobotState, intents: &Intents, call: &proto::Call) -> bo
++    if intents.task.enabled() {
++        return false;
++    } // notifications cannot bypass task ownership
+@@ -4303,0 +4420,21 @@ fn dispatch(
++    if intents.task.enabled() && call.method().starts_with("robot.") {
++        let read = matches!(
++            call,
++            proto::Call::RobotSubscribe(_)
++                | proto::Call::RobotHealth
++                | proto::Call::RobotSafeToRestart
++                | proto::Call::RobotModelApi
++                | proto::Call::RobotRemoteSessionActive
++                | proto::Call::RobotPolicies
++                | proto::Call::RobotModel
++                | proto::Call::RobotMode
++        );
++        let provision = matches!(call, proto::Call::RobotEnable(p) if p.on && !p.toggle)
++            && intents.task.can_provision();
++        if !read && !provision {
++            return proto::Response::ok(
++                Some(id),
++                &proto::IntentResult::refused("native task mode rejects unowned mutation"),
++            );
++        }
++    }
+@@ -8951,0 +9089,162 @@ mod tests {
++
++    // Deterministic injection inside the real native control loop, not a copy of
++    // its guard. FakeIo replaces only actuator I/O; no PPO/MuJoCo qualification.
++    async fn stage8_boundary_race(apply_pause: bool) {
++        use proto::task_authority::*;
++        let intents = Arc::new(Intents::new());
++        let identity = Identity {
++            environment: "env".into(),
++            domain: "motion".into(),
++            body: "body".into(),
++            body_ref: "duck".into(),
++            world: "world".into(),
++            controller: "controller".into(),
++        };
++        intents.task.configure(identity.clone()).unwrap();
++        let now = proto::clock::monotonic_ns() / 1000;
++        let install = Install {
++            protocol: PROTOCOL.into(),
++            profile: PROFILE.into(),
++            identity,
++            domain: "motion".into(),
++            session: "session".into(),
++            epoch: 1,
++            request: "install".into(),
++            lease_deadline_us: now + 2_000_000,
++        };
++        let action = Action {
++            install: install.clone(),
++            action: "action".into(),
++            payload_digest: "a".repeat(64),
++            deadline_us: now + if apply_pause { 100_000 } else { 1_000_000 },
++        };
++        let movement = Move {
++            action: action.clone(),
++            request: "move".into(),
++            sequence: 1,
++            twist: [0.05, 0.0, 0.0],
++        };
++        assert!(
++            intents
++                .task
++                .request(
++                    &Request::Install {
++                        descriptor: install.clone()
++                    },
++                    1,
++                    now
++                )
++                .accepted
++        );
++        assert!(
++            intents
++                .task
++                .request(
++                    &Request::Admit {
++                        descriptor: action.clone()
++                    },
++                    1,
++                    now
++                )
++                .accepted
++        );
++        assert!(
++            intents
++                .task
++                .request(
++                    &Request::Move {
++                        descriptor: movement.clone()
++                    },
++                    1,
++                    now
++                )
++                .accepted
++        );
++        let (entered, release) = intents.task.inject_pause(apply_pause);
++        let state = Arc::new(RobotState::new(
++            &Params::default(),
++            Path::new("/nonexistent"),
++            false,
++            false,
++        ));
++        let mut frames = state.state_tx.subscribe();
++        let loop_state = state.clone();
++        let loop_intents = intents.clone();
++        let run = tokio::spawn(async move {
++            let mut io = FakeIo::at(DEFAULT_POSITION);
++            control_loop_probe_with(&mut io, loop_state, loop_intents, Duration::from_millis(2))
++                .await;
++        });
++        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(2)).unwrap())
++            .await
++            .unwrap();
++        if apply_pause {
++            // Guard is already held. A fence cannot ACK while old targets could
++            // still be applied; delay past native refresh loss before releasing.
++            std::thread::spawn(move || {
++                std::thread::sleep(Duration::from_millis(210));
++                release.send(()).unwrap();
++            });
++        } else {
++            assert!(
++                intents
++                    .task
++                    .request(
++                        &Request::Fence {
++                            descriptor: Fence {
++                                install,
++                                next_epoch: 2,
++                                request: "fence".into()
++                            }
++                        },
++                        1,
++                        proto::clock::monotonic_ns() / 1000
++                    )
++                    .accepted
++            );
++            release.send(()).unwrap();
++        }
++        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(frame.movement.applied, [0.0; 3]);
++        assert_eq!(
++            frame.movement.requested,
++            if apply_pause {
++                [0.05, 0.0, 0.0]
++            } else {
++                [0.0; 3]
++            }
++        );
++        let receipt = intents.task.request_live(
++            &Request::Status {
++                protocol: PROTOCOL.into(),
++            },
++            1,
++        );
++        assert_eq!(receipt.consumed_sequence, if apply_pause { 1 } else { 0 });
++        assert!(receipt.fenced);
++        state.shutdown.store(true, Ordering::Relaxed);
++        run.await.unwrap();
++        assert!(
++            !intents
++                .task
++                .request(
++                    &Request::Move {
++                        descriptor: movement
++                    },
++                    1,
++                    proto::clock::monotonic_ns() / 1000
++                )
++                .accepted
++        );
++    }
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn stage8_received_then_fenced_before_real_control_consumption() {
++        stage8_boundary_race(false).await;
++    }
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn stage8_expiry_during_real_control_frame_discards_targets() {
++        stage8_boundary_race(true).await;
++    }

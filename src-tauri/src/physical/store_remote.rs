@@ -26,7 +26,7 @@ pub(in crate::physical) struct RemoteRootLineageV2 {
     pub semantic_digest: DigestV1,
 }
 
-pub(super) fn current_ddl() -> String {
+pub(super) fn stage7_ddl() -> String {
     [
         super::SCHEMA,
         super::core_ledger::SCHEMA,
@@ -39,7 +39,7 @@ pub(super) fn current_ddl() -> String {
         "CHECK(role IN ('requester_executor','executor_remote'))",
     ) + SCHEMA
 }
-/// Called only for an exactly recognized, audited Stage 6 schema, with foreign
+/// Called only for an exactly recognized, audited Stage 6 or 7 schema, with foreign
 /// keys disabled outside the transaction. Copy original values, including old
 /// audit JSON/digests; no historical row is reclassified or reconstructed.
 pub(super) fn migrate(c: &Connection) -> AppResult<()> {
@@ -347,4 +347,17 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         )?;
     }
     Ok(())
+}
+
+pub(super) fn current_ddl() -> String {
+    stage7_ddl()
+        .replace(
+            "CHECK(install_evidence='adapter_isolation_only')",
+            "CHECK(install_evidence IN ('adapter_isolation_only','native_fence'))",
+        )
+        .replace(
+            "CHECK(fence_ack='adapter_isolation_only')",
+            "CHECK(fence_ack IN ('adapter_isolation_only','native_fence'))",
+        )
+        + super::native_ledger::SCHEMA
 }

@@ -1,5 +1,7 @@
 //! Core's L2-L6 implementation. Adapter I/O is split into prepare/await/commit.
 //! Native adapter receipts remain separate from physical evidence and acceptance.
+#[path = "adapters/gate_b.rs"]
+pub(in crate::physical) mod gate_b;
 #[path = "adapters/microduck.rs"]
 pub(in crate::physical) mod microduck;
 use super::*;
@@ -165,6 +167,7 @@ pub(in crate::physical) struct SessionEnforcementEvidenceV1 {
     epochs: BTreeMap<DomainId, u64>,
     request: RequestId,
     class: SessionEnforcementClassV1,
+    native: Option<gate_b::NativeEnforcementReceiptV1>,
 }
 pub(in crate::physical) struct AdapterWriteReceiptV1 {
     session: SessionId,
@@ -173,6 +176,7 @@ pub(in crate::physical) struct AdapterWriteReceiptV1 {
     action: ActionId,
     payload_digest: DigestV1,
     accepted: bool,
+    native: Option<gate_b::NativeCommandReceiptV1>,
 }
 type LaneFuture<'a, T> = Pin<Box<dyn Future<Output = AppResult<Option<T>>> + Send + 'a>>;
 pub(in crate::physical) trait PhysicalEnvironmentAdapterV1:
@@ -363,6 +367,22 @@ impl PhysicalControlServiceV1 {
                 e.session == s.audit.id && e.class.meets(s.audit.enforcement),
                 "Installation evidence mismatch",
             )?;
+            if e.class == SessionEnforcementClassV1::NativeFence {
+                e.native
+                    .as_ref()
+                    .ok_or_else(|| {
+                        crate::error::AppError::InvalidInput("NativeFence receipt absent".into())
+                    })?
+                    .validate(
+                        &s.basis.scope().fields().environment,
+                        &s.audit.id,
+                        &s.audit.epochs,
+                        &s.audit.installation,
+                        false,
+                    )?;
+            } else {
+                require(e.native.is_none(), "Isolation cannot carry native proof")?;
+            }
             let snapshot = service.binding.ledger_snapshot(&s.root.binding)?;
             let (now, _) = service.binding.now()?;
             service.store.activate_session(
@@ -373,6 +393,7 @@ impl PhysicalControlServiceV1 {
                 &e.request,
                 &e.epochs,
                 e.class,
+                e.native.as_ref().map(|n| n.raw()),
             )
         })();
         if result.is_ok() {
@@ -734,7 +755,7 @@ impl PhysicalControlServiceV1 {
             service.control.operations.remove(a.grant.session.id());
         }
         service.validate_admitted_action(a)?;
-        let accepted = match result {
+        let (accepted, native) = match result {
             Ok(Some(reply))
                 if reply.session == a.audit.session
                     && reply.epochs == a.audit.epochs
@@ -742,9 +763,27 @@ impl PhysicalControlServiceV1 {
                     && reply.action == *a.id()
                     && reply.payload_digest == a.audit.proposal.payload_digest =>
             {
-                Some(reply.accepted)
+                let native_required =
+                    a.grant.session.audit.enforcement == SessionEnforcementClassV1::NativeFence;
+                let proof_valid = native_required == reply.native.is_some()
+                    && reply.native.as_ref().is_none_or(|n| {
+                        n.validate(
+                            &a.grant.session.basis.scope().fields().environment,
+                            &a.audit,
+                            &op,
+                            reply.accepted,
+                        )
+                        .is_ok()
+                    });
+                if proof_valid {
+                    (Some(reply.accepted), reply.native)
+                } else {
+                    // Missing/mismatched native proof follows the same durable
+                    // unknown disposition and closure as a lost adapter reply.
+                    (None, None)
+                }
             }
-            _ => None,
+            _ => (None, None),
         };
         let committed = (|| {
             let s = &a.grant.session;
@@ -760,6 +799,7 @@ impl PhysicalControlServiceV1 {
                     &op,
                     accepted,
                     refresh,
+                    native.as_ref().map(|n| n.raw()),
                 )?,
                 "Stale action callback",
             )?;
@@ -812,8 +852,21 @@ impl PhysicalControlServiceV1 {
                 if e.session == fence.session
                     && e.request == fence.request
                     && e.epochs == fence.epochs
-                    && e.class == SessionEnforcementClassV1::AdapterIsolationOnly =>
+                    && e.class.meets(s.audit.enforcement) =>
             {
+                if e.class == SessionEnforcementClassV1::NativeFence {
+                    let native = e.native.as_ref().ok_or_else(|| {
+                        crate::error::AppError::InvalidInput("Native fence receipt absent".into())
+                    })?;
+                    native.validate(
+                        &s.basis.scope().fields().environment,
+                        &fence.session,
+                        &fence.epochs,
+                        &fence.request,
+                        true,
+                    )?;
+                    service.store.record_native_fence(&fence, native.raw())?;
+                }
                 service.store.acknowledge_fence(&fence)
             }
             _ => Ok(false),
@@ -887,6 +940,7 @@ pub(in crate::physical) mod test_support {
                         v.request
                     },
                     class: SessionEnforcementClassV1::AdapterIsolationOnly,
+                    native: None,
                 }))
             })
         }
@@ -912,6 +966,7 @@ pub(in crate::physical) mod test_support {
                     action: v.action,
                     payload_digest: v.payload_digest,
                     accepted: !matches!(mode, Reply::Refusal),
+                    native: None,
                 }))
             })
         }
@@ -938,6 +993,7 @@ pub(in crate::physical) mod test_support {
                         v.audit.request
                     },
                     class: SessionEnforcementClassV1::AdapterIsolationOnly,
+                    native: None,
                 }))
             })
         }
@@ -1049,9 +1105,23 @@ impl PhysicalControlServiceV1 {
                 if e.session == fence.session
                     && e.request == fence.request
                     && e.epochs == fence.epochs
-                    && e.class == SessionEnforcementClassV1::AdapterIsolationOnly =>
+                    && e.class.meets(action.grant.session.audit.enforcement) =>
             {
-                core.lock().store.acknowledge_fence(&fence)
+                let service = core.lock();
+                if e.class == SessionEnforcementClassV1::NativeFence {
+                    let native = e.native.as_ref().ok_or_else(|| {
+                        crate::error::AppError::InvalidInput("Native fence receipt absent".into())
+                    })?;
+                    native.validate(
+                        &action.grant.session.basis.scope().fields().environment,
+                        &fence.session,
+                        &fence.epochs,
+                        &fence.request,
+                        true,
+                    )?;
+                    service.store.record_native_fence(&fence, native.raw())?;
+                }
+                service.store.acknowledge_fence(&fence)
             }
             _ => Ok(false),
         }

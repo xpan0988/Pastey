@@ -18,6 +18,9 @@ impl ControlFixture {
         Self::configured(false)
     }
     fn configured(native: bool) -> Self {
+        Self::configured_binding(native, binding())
+    }
+    fn configured_binding(native: bool, b: EnvironmentBindingViewV1) -> Self {
         let dir =
             std::env::temp_dir().join(format!("pastey-physical-stage4-{}", uuid::Uuid::new_v4()));
         let paths = AppPaths::new(dir.clone(), dir.join("logs"));
@@ -30,7 +33,6 @@ impl ControlFixture {
             clock.clone(),
         )
         .unwrap();
-        let b = binding();
         let resolver = core_fake::binding(&mut core);
         resolver.enroll(fake::enrollment(&b), None).unwrap();
         let challenge = resolver.begin_resolution(&b.environment).unwrap();

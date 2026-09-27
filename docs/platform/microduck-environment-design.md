@@ -1,6 +1,6 @@
 # MicroDuck Environment integration for Pastey 2.0
 
-Status: proposed architecture; no adapter, runtime changes, or hardware qualification implemented by this document.
+Status: revision-pinned research/design baseline. Current implemented behavior and evidence are recorded in the [implementation contract](../physical-environment-implementation.md), including Stage 6 Gate A and the [Stage 8 native overlay](../../native/microduck/README.md). Upstream observations below describe the unmodified pinned revision; Gate B changes are an explicit local overlay. This research document supplies no qualification or hardware evidence.
 
 Research date: 2026-09-26. Source baseline: Pastey `6d44e544ff06cc63074245996eed36162a51b95f`; MicroDuck `a9ec4b2079ef8ee7904014089c885bb07d57d63c`; microduck_rl `cb70b792312d559a4da09064d92009079671815f`. Revision-pinned source references appear at the end. “Current” below means these inspected revisions. Proposed interfaces and states are design requirements, not existing APIs.
 
