@@ -512,6 +512,38 @@ fn compiled_production_profile_is_pending_without_reviewed_artifact_pins() {
         serde_json::from_str(include_str!("../../../native/microduck/profile-v1.json")).unwrap();
     assert!(pins.validate().is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn python_environment_digest_matches_stage9a_independent_golden() {
+    // The preparation script verifies the same literal with an independently
+    // implemented Python encoder. Include Unicode, symlinked files and ignored
+    // bytecode so candidate pins cannot use a different inventory/JSON format.
+    struct Directory(std::path::PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = Directory(
+        std::env::temp_dir().join(format!("pastey-stage9a-hash-{}", uuid::Uuid::new_v4())),
+    );
+    let root = &dir.0;
+    std::fs::create_dir(root).unwrap();
+    std::fs::write(root.join("A.txt"), b"alpha\n").unwrap();
+    std::fs::write(root.join("é.txt"), b"beta").unwrap();
+    std::fs::create_dir(root.join("bin")).unwrap();
+    std::os::unix::fs::symlink("../A.txt", root.join("bin/python")).unwrap();
+    std::fs::create_dir(root.join("__pycache__")).unwrap();
+    std::fs::write(root.join("__pycache__/ignored"), b"ignored").unwrap();
+    std::fs::write(root.join("ignored.pyc"), b"ignored").unwrap();
+    assert_eq!(
+        test_environment_digest(root).unwrap(),
+        "f5e3ddcd49df7a6204739b6f02e3427a231cd6be882c8fd159df7bf264151168"
+    );
+    std::os::unix::fs::symlink("bin", root.join("linked-directory")).unwrap();
+    assert!(test_environment_digest(root).is_err());
+}
 #[test]
 fn gate_a_cannot_produce_native_binding_or_downgrade_native_run() {
     let n = NativeProfile::new();

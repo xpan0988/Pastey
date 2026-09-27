@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Owned Linux simulation supervisor, separate Gate A and native Gate B modes.
 
-Only the Rust launcher starts this inside fresh bwrap mount/PID/network namespaces.
+Owned Rust launches and Stage 9A readiness use fresh bwrap mount/PID/network namespaces.
 The pipe is private; it is not an enrollment/observation HTTP or socket service.
 All simulator observations are read-only instrumentation of upstream World/Body.
 No policy, Safety, RobotIo, actuator, tensor or physics implementation is changed.
@@ -247,7 +247,61 @@ def native_probes(rpc, next_sample, process, identity, sleep=time.sleep):
     return transcript, expiry_witnesses, expiry_moves, reference_trace
 
 
-def run():
+def build_simulator(root):
+    """Construct the exact production model; also used by Stage 9A pin discovery."""
+    sys.path.insert(0, str(Path(root) / "src"))
+    from mjlab_microduck.sim import body_server as native
+    import numpy as np
+    world = native.World(native.DEFAULT_SCENE)
+    body = native.Body(world, 0)
+    body.place(None, native.HOME_TRUNK_Z, offset_y=0.0)
+    world.bodies.append(body)
+    native.mujoco.mj_forward(world.model, world.data)
+    model_bytes = np.zeros(native.mujoco.mj_sizeModel(world.model), dtype=np.uint8)
+    native.mujoco.mj_saveModel(world.model, buffer=model_bytes)
+    digest = hashlib.sha256(model_bytes.tobytes()).hexdigest()
+    return native, np, world, body, digest
+
+
+def readiness_report(rpc, next_sample, identity, subscribed, assets, model_digest, engine):
+    """Read-only post-provisioning checks. Never installs/admit/moves a task."""
+    if any(subscribed.get(slot) != Path(path).name
+           for slot, path in zip(("walk", "stand"), assets)):
+        raise RuntimeError("both exact policies must be loaded and warmed by robotd")
+    observations = collect_standing(next_sample, tuple(identity[k] for k in ("controller", "body", "world")))
+    head = None
+    for s in observations:
+        source, sim, seq, tick = s["source_us"], s["simulation_us"], s["sequence"], s["native"].get("t_ns")
+        if (type(tick) is not int or not source <= tick // 1000 < source + 20_000
+                or source <= 0 or sim <= 0 or seq <= 0):
+            raise RuntimeError("readiness observation/native acquisition stale")
+        if head is not None:
+            old_source, old_sim, old_seq, old_tick = head
+            delta = source - old_source
+            if (not 0 < delta < 200_000 or seq <= old_seq or tick <= old_tick
+                    or sim <= old_sim or not delta // 2 <= sim - old_sim <= delta * 2 + 20_000):
+                raise RuntimeError("readiness clocks paused/reset or observation gap")
+        head = source, sim, seq, tick
+    now = time.monotonic_ns() // 1000
+    if not observations[-1]["source_us"] <= now < observations[-1]["source_us"] + 200_000:
+        raise RuntimeError("readiness final observation stale")
+    status = rpc("robot.task", dict(kind="status", protocol="microduck-task-v1"))
+    if (status.get("identity") != identity or status.get("fenced") is not True
+            or status.get("accepted") is not True or status.get("reason") != "not_installed"
+            or status.get("installed") is not None or status.get("action") is not None
+            or status.get("high_water_epoch") != 0 or status.get("sequence") != 0
+            or status.get("consumed_sequence") != 0
+            or status.get("protocol") != "microduck-task-v1"
+            or status.get("profile") != "reference-velocity-v1"):
+        raise RuntimeError("readiness native status/protocol mismatch")
+    return dict(stage="9A", readiness="READY", qualification=False, release=False,
+                modelSha256=model_digest, mujocoVersion=engine, identity=identity,
+                policyAvailability={slot: subscribed[slot] for slot in ("walk", "stand")},
+                nativeStatus=status, observations=observations,
+                namespaces=[os.readlink("/proc/self/ns/" + n) for n in ("mnt", "pid", "net")])
+
+
+def run(*, readiness_only=False):
     if len(sys.argv) not in (8, 12):
         raise RuntimeError("owned launcher arguments required")
     robotd, root, params, assets_json, daemon, body_id, world_id = sys.argv[1:8]
@@ -260,20 +314,9 @@ def run():
         snapshot_digest = artifact_snapshot_digest(params, json.loads(assets_json))
         identity = dict(environment=sys.argv[9], domain=sys.argv[10], body_ref=sys.argv[11],
                         body=body_id, world=world_id)
-    sys.path.insert(0, str(Path(root) / "src"))
-    from mjlab_microduck.sim import body_server as native
-    import numpy as np
-
     # Private loopback namespace, one body connection, no camera/ToF gateways or
     # external clients. Native stepping code and real RemoteIo remain unchanged.
-    world = native.World(native.DEFAULT_SCENE)
-    body = native.Body(world, 0)
-    body.place(None, native.HOME_TRUNK_Z, offset_y=0.0)
-    world.bodies.append(body)
-    native.mujoco.mj_forward(world.model, world.data)
-    model_bytes = np.zeros(native.mujoco.mj_sizeModel(world.model), dtype=np.uint8)
-    native.mujoco.mj_saveModel(world.model, buffer=model_bytes)
-    model_digest = hashlib.sha256(model_bytes.tobytes()).hexdigest()
+    native, np, world, body, model_digest = build_simulator(root)
     if pins and (model_digest != pins["compiledModelSha256"] or native.mujoco.__version__ != pins["mujocoVersion"]):
         raise RuntimeError("exact compiled simulator mismatch")
     records = collections.deque(maxlen=32)
@@ -322,9 +365,11 @@ def run():
         command += ["--pastey-task-identity", str(identity_path)]
     process = subprocess.Popen(command,
                                stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr)
+    shutting_down = threading.Event()
     def watch_native():
         process.wait()
-        os._exit(1)  # private child pipe closes; never transparently restart a daemon
+        if not shutting_down.is_set():
+            os._exit(1)  # private child pipe closes; never transparently restart a daemon
     threading.Thread(target=watch_native, daemon=True).start()
     try:
         stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -432,6 +477,16 @@ def run():
 
         # Drain any pre-ACK frames inside rpc; proof begins after that ACK.
         provision(rpc, next_sample, (daemon, body_id, world_id))
+        if readiness_only:
+            if not pins:
+                raise RuntimeError("Stage 9A requires exact native artifacts")
+            report = readiness_report(rpc, next_sample, identity, subscribed,
+                                      json.loads(assets_json), model_digest, native.mujoco.__version__)
+            check_native_artifacts(pins, original_params, original_assets)
+            if artifact_snapshot_digest(params, json.loads(assets_json)) != snapshot_digest:
+                raise RuntimeError("readiness artifact snapshot changed")
+            emit(report)  # Deliberately not a production Hello or qualification bundle.
+            return
         bundle = None
         if pins:
             transcript, expiry_witnesses, expiry_moves, reference_trace = native_probes(rpc, next_sample, process, identity)
@@ -493,6 +548,7 @@ def run():
             else:
                 raise RuntimeError("unsupported Gate A operation")
     finally:
+        shutting_down.set()
         process.terminate()
         try:
             process.wait(timeout=2)

@@ -99,4 +99,45 @@ there is no supported separate in-place controller restart that restores task st
 
 The [exact qualification contract](../../docs/physical-environment-implementation.md#stage-9-exact-simulator-qualification-and-release) defines the trusted Host installation-owner path, owned source rebuild, independent MuJoCo observations, one-second reference trace, expiry probes, reset/suspend boundary and record/release semantics. [profile-v1.json](profile-v1.json) pins both source revisions and explicitly leaves unknown real model/policy/Python/ORT identities null. Resource locators cannot override these compiled pins or mint qualification.
 
-The macOS host lacks Linux bubblewrap, the pinned Python 3.12 stack, MuJoCo/ONNX Runtime and exact PPO artifacts. No real simulator/controller qualification or production release record exists. Rust/native-oracle and Python orchestration tests exercise mechanism/qualification plumbing only; they cannot fill the missing golden identities or authorize release. No hardware qualification is performed.
+The production manifest remains pending. Stage 9A located and byte-verified the exact official walk/stand artifacts, but this macOS host cannot establish the Linux simulator/controller environment. No real simulator/controller qualification or production release record exists. Rust/native-oracle and Python orchestration tests exercise mechanism/qualification plumbing only; they cannot fill the missing golden identities or authorize release. No hardware qualification is performed.
+
+## Stage 9A reproducible environment and readiness
+
+[environment-v1.json](environment-v1.json) records independently retrieved upstream artifact provenance. It is **not** a production profile, a partial pin promotion or qualification evidence. The pinned native source's `Cargo.toml`/`scripts/seed-policies.sh` require the official policy set v5. That tag resolved to immutable [policy revision 1b56c396](https://huggingface.co/pollen-robotics/microduck-policies/tree/1b56c396825c052a4e26e95cf2b8d8298af9e9b4). Its manifest and both downloaded policies were independently hashed against the immutable upstream metadata. The reference pair follows the pinned native `scripts/duck-sim` launcher:
+
+| Resource | Exact source / identity |
+|---|---|
+| Walk | `alpha_walking.onnx`, SHA-256 `e36332d383997d51401897734cd3e79cf5038406feddb18b4d57ecfb141daa6c` |
+| Stand | `alpha_stand.onnx`, SHA-256 `1569268713e40deea795dd2922dba50d3621e15a872855408b6b1b125b1c094b` |
+| Parameters | Pinned native `deploy/robotd.toml`, template SHA-256 `1b9ddb2010405812df195d825c5765f3d2ace7360e7c7846af43ffe507fac742`; generated exact reference artifact adds only walk/stand locators and explicit `none` for the five unsupported slots |
+| Model | Pinned RL `src/mjlab_microduck/robot/microduck/scene.xml`, constructed through upstream `World`/`Body`, one duck, HOME placement, native timestep; compiled `mj_saveModel` bytes must be measured on Linux |
+| Python / MuJoCo / ORT | Private Python 3.12 venv; pinned RL `uv.lock` (SHA-256 `2eeeb680025baa737e7ccf3a87da3695a9d49b228de0bb60d8af0c022ab5f1aa`) selects MuJoCo 3.10.0, NumPy 2.4.1 and ONNX Runtime 1.24.4; robotd consumes the exact Linux `onnxruntime/capi/libonnxruntime.so.*` from that wheel via `ORT_DYLIB_PATH` |
+
+The newer default `velstand.onnx` is a separate single-policy configuration. It does not replace the required walk/stand pair. No policy training/export is needed: no checkpoint, training package or similarly named artifact is substituted. Unknown model/environment/executable/native-ORT production hashes stay null.
+
+Use a Linux x86_64 or aarch64 host with glibc compatible with the locked wheels (ORT requires >=2.28), Python 3.12 with venv/pip, Git, a C compiler/linker, Rust >=1.89/Cargo and bubblewrap. Its security policy must permit private user/mount/PID/network namespaces. The locked MuJoCo/GLFW import must have its host shared-library dependencies available; failures are reported rather than replaced by a different simulator. No GPU, training stack, container or VM is required by this headless body-server path. The following Linux sequence is prepared but **has not been executed on Linux here**:
+
+```bash
+# Keep source checkouts clean; the script archives them into its new work directory.
+git clone --no-checkout https://github.com/pollen-robotics/microduck.git /absolute/sources/microduck
+git -C /absolute/sources/microduck checkout --detach a9ec4b2079ef8ee7904014089c885bb07d57d63c
+git clone --no-checkout https://github.com/pollen-robotics/microduck_rl.git /absolute/sources/microduck_rl
+git -C /absolute/sources/microduck_rl checkout --detach cb70b792312d559a4da09064d92009079671815f
+
+/absolute/bin/python3.12 -B scripts/prepare-microduck-gate-b-environment.py \
+  --native-source /absolute/sources/microduck \
+  --rl-source /absolute/sources/microduck_rl \
+  --python /absolute/bin/python3.12 \
+  --work /absolute/new-external-stage9a-directory \
+  --report /absolute/new-stage9a-report.json
+```
+
+Both output paths must be new and outside Pastey. This command fetches only the immutable manifest/pair and the wheel dependency closure of MuJoCo, NumPy and ORT from the pinned lock, with pip `--require-hashes --only-binary=:all: --no-deps`. All 16 runtime packages (including `etils[epath]` dependencies) come from that lock; Torch/CUDA, mjlab training and BAM Python are not imported by upstream's headless body server. Unexpected lock sources, markers or missing exact wheels fail instead of resolving alternatives. The upstream lock's unrelated bcrypt wheel under ORT is excluded by distribution/version checking. Venv bootstrap pip is supplied by the selected Python's `ensurepip` and is included in the resulting environment digest.
+
+The script uses the existing owned clean archive/overlay builder with `cargo build --locked --release -p robotd`. It runs fresh bubblewrap namespaces with the production mount/PID/network isolation pattern. The first checks exact imports and constructs the single body/model for candidate pin discovery; a separate source copy at another path must reproduce the same compiled model identity, since Core packages each future launch at a fresh path. The readiness namespace independently constructs that model again, verifies the candidate bytes, starts real `robotd --sim`, unlinks its sole socket, verifies the native task protocol/profile/incarnation, subscribes, provisions enable and acquires advancing, fresh, measured upright observations. Both policies must be present; upstream's native loader validates and warms each network. A final status must still be `not_installed`, with no installed/action/sequence/epoch state. It performs **no task install/admit/move, reference trace, expiry qualification experiment, Core enrollment, reviewed action, consequence, L7 or release**.
+
+The readiness output has `stage: "9A"`, `qualification: false`, `release: false`; it is deliberately not the production supervisor Hello/evidence bundle and cannot be used for enrollment. The script writes candidate `ProfilePinsV1` only after all real checks pass, including different namespace IDs and unchanged pre/post runtime artifact hashes. It never edits [profile-v1.json](profile-v1.json). Independently review the JSON's Linux/tool/interpreter/import versions, consumed paths, overlay/binary digests, reproduced model identities, measured observations and native receipt before copying all seven concrete pin fields (eight resource identities) into the compiled profile. The parameters digest hashes the original reference file; the owned supervisor only rewrites the two policy locators in private copies and checks their bytes throughout readiness.
+
+Hashing matches production: SHA-256 over raw file bytes; the Python executable follows its canonical symlink target; venv SHA-256 covers compact UTF-8 JSON of a sorted map of relative POSIX file paths to file hashes, excluding `__pycache__` and `.pyc`, rejecting symlink directories and hashing symlink-file target bytes. A shared literal golden vector is independently checked in Python and by the existing Rust production hashing function. Environment pins identify the actual installation, including its paths/bootstrap files; another host must establish/review its own exact installation rather than copy unrelated hashes.
+
+Current Stage 9A result: **BLOCKED for Stage 9B**. Clean exact native/RL sources, template/lock bytes, official manifest/policy bytes and clean overlay reproduction were verified. The patched release binary built on macOS; this is not a Linux build. No supported Linux execution host/bubblewrap, Python 3.12 venv, MuJoCo/ORT imports, real simulator startup, PPO load or measured observations were available. No complete candidate/production pin set was computed or committed. Run the command above on the supported Linux host and independently review its real report; final qualification/release remains a separate Stage 9B task.

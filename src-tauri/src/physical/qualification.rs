@@ -777,6 +777,11 @@ fn sha_file(path: &std::path::Path) -> AppResult<String> {
     let bytes = std::fs::read(path)?;
     Ok(hex::encode(Sha256::digest(&bytes)))
 }
+#[cfg(test)]
+pub(crate) fn test_environment_digest(root: &std::path::Path) -> AppResult<String> {
+    environment_digest(root)
+}
+
 fn environment_digest(root: &std::path::Path) -> AppResult<String> {
     use sha2::{Digest, Sha256};
     fn visit(
