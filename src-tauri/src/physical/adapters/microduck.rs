@@ -126,6 +126,7 @@ impl GateAObservationProvenanceV1 {
 #[serde(deny_unknown_fields)]
 struct Hello {
     version: u8,
+    provisioned: bool,
     clock_us: u64,
     single_writer: bool,
     simulation: bool,
@@ -146,6 +147,7 @@ impl Hello {
     ) -> AppResult<()> {
         require(
             self.version == 1
+                && self.provisioned
                 && self.clock_us > 0
                 && self.single_writer
                 && self.simulation
@@ -552,12 +554,18 @@ impl GateARunV1 {
         result?.ok_or_else(|| invalid("No installed control session"))
     }
     pub(in crate::physical) fn poll_start(&self) -> AppResult<()> {
-        let r = self.exchange(&RequestV1::Sample)?;
-        self.sample(
-            r.sample.ok_or_else(|| invalid("No body acquisition"))?,
-            None,
-        )?;
-        self.validate_start()
+        let result = (|| {
+            let r = self.exchange(&RequestV1::Sample)?;
+            self.sample(
+                r.sample.ok_or_else(|| invalid("No body acquisition"))?,
+                None,
+            )?;
+            self.validate_start()
+        })();
+        if result.is_err() {
+            self.live.store(false, Ordering::Release);
+        }
+        result
     }
     fn disposition(
         &self,
@@ -797,12 +805,11 @@ struct SupervisorPipeV1 {
 #[cfg(unix)]
 impl SupervisorPipeV1 {
     fn frame(&mut self) -> AppResult<serde_json::Value> {
-        use std::{
-            io::Read,
-            os::fd::AsRawFd,
-            time::{Duration, Instant},
-        };
-        let deadline = Instant::now() + Duration::from_secs(2);
+        self.frame_with_timeout(std::time::Duration::from_secs(2))
+    }
+    fn frame_with_timeout(&mut self, timeout: std::time::Duration) -> AppResult<serde_json::Value> {
+        use std::{io::Read, os::fd::AsRawFd, time::Instant};
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(end) = self.buffered.iter().position(|b| *b == b'\n') {
                 require(end < MAX_FRAME, "Oversized supervisor frame")?;
@@ -992,7 +999,9 @@ impl GateARunV1 {
                     return Err(std::io::Error::last_os_error().into());
                 }
             }
-            let hello: Hello = serde_json::from_value(pipe.frame()?)?;
+            let hello: Hello = serde_json::from_value(
+                pipe.frame_with_timeout(std::time::Duration::from_secs(20))?,
+            )?;
             hello.validate(&ns_before, &controller, &body, &world)?;
             let fingerprint = digest(
                 "pastey-microduck-gate-a-world-v1",
@@ -1290,9 +1299,10 @@ mod isolation_tests {
             "pid:parent".into(),
             "net:parent".into(),
         ];
-        for fault in 0..8 {
+        for fault in 0..9 {
             let mut h = Hello {
                 version: 1,
+                provisioned: true,
                 clock_us: 1,
                 single_writer: true,
                 simulation: true,
@@ -1312,7 +1322,8 @@ mod isolation_tests {
                 4 => h.world = incarnation().unwrap(),
                 5 => h.simulation = false,
                 6 => h.model_digest.clear(),
-                _ => h.clock_us = 0,
+                7 => h.clock_us = 0,
+                _ => h.provisioned = false,
             }
             assert!(h.validate(&parent, &daemon, &body, &world).is_err());
         }

@@ -28,6 +28,60 @@ def emit(value):
     OUTPUT.flush()
 
 
+def provision(rpc, next_sample, identities, clock=time.monotonic_ns):
+    """One-shot simulation preparation before the launcher can accept a run.
+
+    No task identity or authority exists here. ACK is not a measurement. All
+    proof samples must have been acquired after ACK, with continuous clocks.
+    """
+    deadline = clock() // 1000 + 10_000_000
+    if rpc("robot.enable", {"on": True, "toggle": False}).get("accepted") is not True:
+        raise RuntimeError("simulation provisioning enable refused")
+    enabled_us = clock() // 1000
+    head = None
+    settled_since = None
+    while clock() // 1000 < deadline:
+        observation = next_sample()
+        now = clock() // 1000
+        if observation is None:
+            raise RuntimeError("provisioning observation lost")
+        if tuple(observation[k] for k in ("daemon", "body", "world")) != identities:
+            raise RuntimeError("provisioning incarnation replaced")
+        source, sim, seq = (observation[k] for k in ("source_us", "simulation_us", "sequence"))
+        # Subscription frames already queued when the ACK arrived cannot prove
+        # preparation. Discard only this bounded pre-ACK tail before first proof.
+        if head is None and type(source) is int and 0 <= now - source < 200_000 and source <= enabled_us:
+            continue
+        native = observation["native"]
+        tick = native.get("t_ns")
+        if (type(source) is not int or type(sim) is not int or type(seq) is not int
+                or type(tick) is not int or source <= enabled_us or sim <= 0 or seq <= 0
+                or not source <= tick // 1000 < source + 20_000
+                or not source <= now < source + 200_000):
+            raise RuntimeError("stale/unproved provisioning acquisition")
+        if head is not None:
+            old_source, old_sim, old_seq, old_tick = head
+            delta = source - old_source
+            if (not 0 < delta < 200_000 or seq <= old_seq or tick <= old_tick
+                    or not delta // 2 <= sim - old_sim <= delta * 2 + 20_000
+                    or sim <= old_sim):
+                raise RuntimeError("provisioning source gap/reset or paused simulator")
+        head = source, sim, seq, tick
+        oracle = observation.get("oracle")
+        values = None if oracle is None else [oracle.get(k) for k in
+                    ("yaw", "linear_speed", "angular_speed", "uncertainty")]
+        valid = (values is not None and all(type(v) in (int, float) and math.isfinite(v) for v in values)
+                 and oracle.get("upright") is True and abs(values[0]) <= 0.000001
+                 and 0 <= values[1] <= 0.02 and 0 <= values[2] <= 0.1
+                 and 0 <= values[3] <= 0.001
+                 and native.get("policy") in ("stand", "walk")
+                 and native.get("safety", {}).get("fallen") is False)
+        settled_since = (source if settled_since is None else settled_since) if valid else None
+        if settled_since is not None and source - settled_since >= 200_000:
+            return  # Only new continuous settled measurements seal preparation.
+    raise RuntimeError("simulation provisioning bring-up timeout")
+
+
 def run():
     robotd, root, params, assets_json, daemon, body_id, world_id = sys.argv[1:]
     sys.path.insert(0, str(Path(root) / "src"))
@@ -114,6 +168,7 @@ def run():
         def sample(state):
             nonlocal latest
             ns = state.get("t_ns")
+            latest = None  # Never return a cached observation after a mapping failure.
             if not isinstance(ns, int) or ns <= 0:
                 return
             with records_lock:
@@ -133,7 +188,10 @@ def run():
             native_id += 1
             wire.write((json.dumps(dict(jsonrpc="2.0", id=native_id,
                                         method=method, params=args)) + "\n").encode())
+            rpc_deadline = time.monotonic() + 2
             while True:
+                if time.monotonic() >= rpc_deadline:
+                    raise RuntimeError("native RPC timeout")
                 raw = wire.readline(MAX_LINE + 1)
                 if not raw or len(raw) > MAX_LINE:
                     raise RuntimeError("native stream lost/oversized")
@@ -157,7 +215,19 @@ def run():
             raise RuntimeError("native policy unavailable; no Gate A qualification")
         if subscribed.get("accepted") is not True:
             raise RuntimeError("subscription refused")
-        emit(dict(version=1, clock_us=time.monotonic_ns() // 1000, single_writer=True,
+        def next_sample():
+            raw_state = wire.readline(MAX_LINE + 1)
+            if not raw_state or len(raw_state) > MAX_LINE:
+                raise RuntimeError("state source lost")
+            message = json.loads(raw_state)
+            if message.get("method") != "robot.state":
+                raise RuntimeError("unexpected native frame")
+            sample(message["params"])
+            return latest
+
+        # Drain any pre-ACK frames inside rpc; proof begins after that ACK.
+        provision(rpc, next_sample, (daemon, body_id, world_id))
+        emit(dict(version=1, provisioned=True, clock_us=time.monotonic_ns() // 1000, single_writer=True,
                   model_digest=model_digest, simulation_engine=native.mujoco.__version__,
                   simulation=True, namespaces=[os.readlink("/proc/self/ns/" + n)
                                                 for n in ("mnt", "pid", "net")],
@@ -187,16 +257,7 @@ def run():
                 result = rpc("robot.stop", {})
                 emit(dict(sequence=request_sequence, reply=dict(accepted=result.get("accepted"), sample=None)))
             elif operation == "sample" and set(request) == {"operation"}:
-                # Wait for a new notification, not a cached receipt-time refresh.
-                raw_state = wire.readline(MAX_LINE + 1)
-                if not raw_state or len(raw_state) > MAX_LINE:
-                    raise RuntimeError("state source lost")
-                message = json.loads(raw_state)
-                if message.get("method") == "robot.state":
-                    sample(message["params"])
-                else:
-                    raise RuntimeError("unexpected native frame")
-                emit(dict(sequence=request_sequence, reply=dict(accepted=None, sample=latest)))
+                emit(dict(sequence=request_sequence, reply=dict(accepted=None, sample=next_sample())))
             else:
                 raise RuntimeError("unsupported Gate A operation")
     finally:

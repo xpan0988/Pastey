@@ -416,7 +416,14 @@ fn unsupported_methods_and_untrusted_producer_construction_are_unavailable() {
     let _ = <microduck::ValidatedGateAObservationV1 as AmbiguousIfDeserialize<_>>::marker;
     let _ = <microduck::ValidatedGateADispositionV1 as AmbiguousIfDeserialize<_>>::marker;
     let script = include_str!("../../../scripts/microduck-gate-a.py");
-    assert!(!script.contains("robot.enable"));
+    assert_eq!(script.matches("robot.enable").count(), 1);
+    let adapter = include_str!("adapters/microduck.rs");
+    assert!(!adapter.contains("robot.enable"));
+    assert!(script.contains(r#"rpc("robot.enable", {"on": True, "toggle": False})"#));
+    assert!(
+        script.find("provision(rpc, next_sample").unwrap()
+            < script.find("emit(dict(version=1").unwrap()
+    );
     assert!(!script.contains("robot.pose"));
     assert!(!script.contains("robot.do"));
 }
