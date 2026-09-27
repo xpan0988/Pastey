@@ -697,3 +697,21 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
     }
     Ok(())
 }
+
+impl PhysicalStoreV1 {
+    pub(in crate::physical) fn end_control_window(
+        &self,
+        root: &RootId,
+        action: &ActionId,
+    ) -> AppResult<()> {
+        let mut c = self.connection()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::audit(&tx)?;
+        let a = self::action(&tx, action)?;
+        require(&a.root == root, "Foreign ended action")?;
+        close_root(&tx, root)?;
+        tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason='expired' WHERE root_id=?1 AND state='open'",[text(root)])?;
+        tx.commit()?;
+        Ok(())
+    }
+}

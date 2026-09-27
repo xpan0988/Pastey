@@ -1,6 +1,9 @@
 //! Core's L2-L6 implementation. Adapter I/O is split into prepare/await/commit.
-//! No evaluator, physical consequence, acceptance, transport or real adapter.
+//! Native adapter receipts remain separate from physical evidence and acceptance.
+#[path = "adapters/microduck.rs"]
+pub(in crate::physical) mod microduck;
 use super::*;
+use crate::physical::binding::EnvironmentBindingViewV1;
 use crate::physical::store::{ActionAuditV1, FenceAuditV1, SessionAuditV1};
 use parking_lot::Mutex;
 use std::{future::Future, pin::Pin, sync::atomic::AtomicU64};
@@ -93,7 +96,7 @@ struct ProposalChallengeV1 {
     observations: Vec<ObservationId>,
     deadline: u64,
 }
-/// Minimal trusted observation input. Only the explicit fake producer exists.
+/// Minimal trusted observation input from the owned Gate A or explicit fake producer.
 /// It reports no position, effect, completion or simulator/hardware measurement.
 pub(in crate::physical) struct TrustedControlObservationV1 {
     id: ObservationId,
@@ -134,6 +137,7 @@ pub(in crate::physical) struct NativeSessionInstallViewV1 {
     epochs: BTreeMap<DomainId, u64>,
     request: RequestId,
     required: SessionEnforcementClassV1,
+    binding: EnvironmentBindingViewV1,
     validity: LaneValidityV1,
 }
 pub(in crate::physical) struct AdmittedActionReadViewV1 {
@@ -142,6 +146,8 @@ pub(in crate::physical) struct AdmittedActionReadViewV1 {
     request: RequestId,
     action: ActionId,
     payload: PhysicalIntentV1,
+    lineage: crate::physical::evidence::EvidenceLineageV1,
+    binding: EnvironmentBindingViewV1,
     payload_digest: DigestV1,
     deadline: u64,
     validity: LaneValidityV1,
@@ -157,7 +163,7 @@ pub(in crate::physical) struct SessionEnforcementEvidenceV1 {
     request: RequestId,
     class: SessionEnforcementClassV1,
 }
-pub(in crate::physical) struct FakeDispositionV1 {
+pub(in crate::physical) struct AdapterWriteReceiptV1 {
     session: SessionId,
     epochs: BTreeMap<DomainId, u64>,
     request: RequestId,
@@ -173,8 +179,8 @@ pub(in crate::physical) trait PhysicalEnvironmentAdapterV1:
         &self,
         view: NativeSessionInstallViewV1,
     ) -> LaneFuture<'_, SessionEnforcementEvidenceV1>;
-    fn apply(&self, view: AdmittedActionReadViewV1) -> LaneFuture<'_, FakeDispositionV1>;
-    fn refresh(&self, view: AdmittedActionReadViewV1) -> LaneFuture<'_, FakeDispositionV1>;
+    fn apply(&self, view: AdmittedActionReadViewV1) -> LaneFuture<'_, AdapterWriteReceiptV1>;
+    fn refresh(&self, view: AdmittedActionReadViewV1) -> LaneFuture<'_, AdapterWriteReceiptV1>;
     fn fence(&self, view: NativeFenceRequestViewV1)
         -> LaneFuture<'_, SessionEnforcementEvidenceV1>;
 }
@@ -327,6 +333,7 @@ impl PhysicalControlServiceV1 {
             epochs: s.audit.epochs.clone(),
             request: s.audit.installation.clone(),
             required: s.audit.enforcement,
+            binding: s.basis.scope().fields().environment.clone(),
             validity: LaneValidityV1 {
                 flags: vec![s.root.valid.clone(), s.valid.clone()],
                 clock: self.clock.clone(),
@@ -689,6 +696,8 @@ impl PhysicalControlServiceV1 {
             request: op,
             action: a.id().clone(),
             payload: a.audit.proposal.payload.clone(),
+            lineage: self.store.evidence_lineage(a.id())?,
+            binding: s.basis.scope().fields().environment.clone(),
             payload_digest: a.audit.proposal.payload_digest.clone(),
             deadline: a.deadline,
             validity: LaneValidityV1 {
@@ -753,7 +762,7 @@ impl PhysicalControlServiceV1 {
             )?;
             require(
                 accepted == Some(true),
-                "Fake lane refused or disposition unknown",
+                "Adapter refused or disposition unknown",
             )
         })();
         if committed.is_ok() && !refresh {
@@ -878,7 +887,7 @@ pub(in crate::physical) mod test_support {
                 }))
             })
         }
-        fn apply(&self, v: AdmittedActionReadViewV1) -> LaneFuture<'_, FakeDispositionV1> {
+        fn apply(&self, v: AdmittedActionReadViewV1) -> LaneFuture<'_, AdapterWriteReceiptV1> {
             Box::pin(async move {
                 let Some(mode) = self.next().await? else {
                     return Ok(None);
@@ -889,7 +898,7 @@ pub(in crate::physical) mod test_support {
                 {
                     return Ok(None);
                 }
-                Ok(Some(FakeDispositionV1 {
+                Ok(Some(AdapterWriteReceiptV1 {
                     session: v.session,
                     epochs: v.epochs,
                     request: if matches!(mode, Reply::Stale) {
@@ -903,7 +912,7 @@ pub(in crate::physical) mod test_support {
                 }))
             })
         }
-        fn refresh(&self, v: AdmittedActionReadViewV1) -> LaneFuture<'_, FakeDispositionV1> {
+        fn refresh(&self, v: AdmittedActionReadViewV1) -> LaneFuture<'_, AdapterWriteReceiptV1> {
             self.apply(v)
         }
         fn fence(
@@ -996,5 +1005,159 @@ pub(in crate::physical) mod test_support {
         active: bool,
     ) -> AppResult<()> {
         core.validate_control_session(s, active)
+    }
+}
+
+impl PhysicalControlServiceV1 {
+    /// The normal bounded command window ends control permission, not the task's
+    /// evidence adjudication. Cancellation uses revoke_control_session instead.
+    pub(in crate::physical) async fn end_gate_a_action(
+        core: &Mutex<Self>,
+        action: &Arc<AdmittedBodyActionV1>,
+        adapter: &microduck::MicroDuckAdapterV1,
+    ) -> AppResult<bool> {
+        let fence = {
+            let mut service = core.lock();
+            let s = &action.grant.session;
+            require(
+                Arc::ptr_eq(&service.issuer, &s.root.ingress.issuer),
+                "Foreign Core action end",
+            )?;
+            let (_, ticks) = service.clock.read()?;
+            require(
+                ticks >= action.deadline,
+                "Early end requires explicit cancellation",
+            )?;
+            service.control.invalidate_root(s.root.root_id());
+            s.root.valid.store(false, Ordering::Release);
+            service.roots.remove(s.root.root_id());
+            service
+                .store
+                .end_control_window(s.root.root_id(), action.id())?;
+            service.store.fence_request(s.id())?
+        };
+        let result = adapter
+            .fence(NativeFenceRequestViewV1 {
+                audit: fence.clone(),
+            })
+            .await;
+        match result {
+            Ok(Some(e))
+                if e.session == fence.session
+                    && e.request == fence.request
+                    && e.epochs == fence.epochs
+                    && e.class == SessionEnforcementClassV1::AdapterIsolationOnly =>
+            {
+                core.lock().store.acknowledge_fence(&fence)
+            }
+            _ => Ok(false),
+        }
+    }
+    pub(in crate::physical) fn ingest_gate_a(
+        &mut self,
+        ingress: &LocalCoreIngressV1,
+        session: &Arc<BodyControlSessionV1>,
+        run: &microduck::GateARunV1,
+        control: TrustedControlObservationV1,
+        continuing: bool,
+    ) -> AppResult<()> {
+        self.validate_ingress(ingress)?;
+        run.validate_binding(&session.basis.scope().fields().environment)?;
+        if continuing {
+            self.record_control_observation(session, control)?;
+        }
+        let (observations, dispositions) = run.drain_evidence();
+        for d in dispositions {
+            self.record_physical_disposition(
+                ingress,
+                crate::physical::evidence::gate_a_disposition(d),
+            )?;
+        }
+        for o in observations {
+            self.record_physical_observation(
+                ingress,
+                crate::physical::evidence::gate_a_observation(o),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl PhysicalControlServiceV1 {
+    /// Core's local same-action scheduler. One initial admission already exists;
+    /// missed timer slots do not cause catch-up writes or extend its deadline.
+    pub(in crate::physical) async fn run_gate_a_reference(
+        core: &Mutex<Self>,
+        session: &Arc<BodyControlSessionV1>,
+        action: &Arc<AdmittedBodyActionV1>,
+        run: Arc<microduck::GateARunV1>,
+        adapter: &microduck::MicroDuckAdapterV1,
+    ) -> AppResult<()> {
+        let mut result = Self::dispatch_admitted_action(core, action, adapter).await;
+        while result.is_ok() {
+            let ticks = match core.lock().clock.read() {
+                Ok((_, ticks)) => ticks,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            if ticks >= action.deadline {
+                break;
+            }
+            let next_refresh = ticks.saturating_add(50_000).min(action.deadline);
+            let sampled = {
+                let run = run.clone();
+                tokio::task::spawn_blocking(move || run.poll_control()).await
+            };
+            result = match sampled {
+                Ok(Ok(fact)) => {
+                    let mut service = core.lock();
+                    service.local_ingress().and_then(|ingress| {
+                        service.ingest_gate_a(&ingress, session, &run, fact, true)
+                    })
+                }
+                _ => Err(crate::error::AppError::InvalidInput(
+                    "Gate A observation lost".into(),
+                )),
+            };
+            if result.is_err() {
+                break;
+            }
+            let ticks = match core.lock().clock.read() {
+                Ok((_, ticks)) => ticks,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            // Sampling uses part of the 50 ms slot, rather than adding another
+            // 50 ms after it. Late samples cause one write, never a catch-up burst.
+            if ticks < next_refresh {
+                tokio::time::sleep(std::time::Duration::from_micros(next_refresh - ticks)).await;
+            }
+            let ticks = match core.lock().clock.read() {
+                Ok((_, ticks)) => ticks,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            if ticks >= action.deadline {
+                break;
+            }
+            result = Self::refresh_admitted_action(core, action, adapter).await;
+        }
+        if result.is_ok() {
+            result = Self::end_gate_a_action(core, action, adapter)
+                .await
+                .map(|_| ());
+        }
+        if result.is_err() {
+            // Stop is requested even after lost observation validity. It remains
+            // an isolation-only request, with unknown physical consequences.
+            let _ = Self::revoke_control_session(core, session, adapter).await;
+        }
+        result
     }
 }

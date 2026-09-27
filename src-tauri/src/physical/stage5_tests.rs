@@ -853,6 +853,7 @@ async fn registered_evaluator_timeout_and_simulation_hardware_boundary() {
             let mut o = f.observation(i + 1, 1_110_000 + i * 100_000);
             o.forward_m = Some(Finite::try_from(0.001).unwrap());
             ObservationRecordV1 {
+                gate_a: None,
                 receipt_us: o.capture_us,
                 receipt: receipt.clone(),
                 producer_qualification: f

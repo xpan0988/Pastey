@@ -81,10 +81,11 @@ impl PhysicalActionDispositionV1 {
 }
 
 // Neither claims, adapter ACKs nor DB bodies construct these authenticated inputs.
-// Production producer remains closed; only the explicit synthetic test producer
-// below may seal facts. Digests correlate its verified provenance, not authenticate it.
+// Only the owned Gate A supervisor or explicit synthetic test producer may seal
+// facts; no external DTO or arbitrary telemetry producer can do so. Digests correlate its verified provenance, not authenticate it.
 pub(super) struct TrustedObservationV1 {
     fact: PhysicalObservationV1,
+    provenance: Option<super::core::microduck::GateAObservationProvenanceV1>,
     qualification: Option<QualificationId>,
 }
 pub(super) struct TrustedDispositionV1 {
@@ -92,6 +93,11 @@ pub(super) struct TrustedDispositionV1 {
     qualification: Option<QualificationId>,
 }
 impl TrustedObservationV1 {
+    pub(super) fn gate_a_provenance(
+        &self,
+    ) -> Option<&super::core::microduck::GateAObservationProvenanceV1> {
+        self.provenance.as_ref()
+    }
     pub(super) fn qualification(&self) -> Option<&QualificationId> {
         self.qualification.as_ref()
     }
@@ -112,6 +118,8 @@ impl TrustedDispositionV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct ObservationRecordV1 {
     pub fact: PhysicalObservationV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_a: Option<super::core::microduck::GateAObservationProvenanceV1>,
     pub receipt_us: u64,
     pub receipt: RequestId,
     pub producer_qualification: QualificationId,
@@ -454,6 +462,7 @@ pub(super) mod test_support {
     use super::*;
     pub(in crate::physical) fn observation(fact: PhysicalObservationV1) -> TrustedObservationV1 {
         TrustedObservationV1 {
+            provenance: None,
             fact,
             qualification: None,
         }
@@ -471,6 +480,7 @@ pub(super) mod test_support {
         qualification: QualificationId,
     ) -> TrustedObservationV1 {
         TrustedObservationV1 {
+            provenance: None,
             fact,
             qualification: Some(qualification),
         }
@@ -486,5 +496,24 @@ pub(super) mod test_support {
     }
     pub(in crate::physical) fn handover(predicate: HandoverPredicateV1) -> TrustedHandoverPolicyV1 {
         TrustedHandoverPolicyV1 { predicate }
+    }
+}
+
+pub(super) fn gate_a_observation(
+    sealed: super::core::microduck::ValidatedGateAObservationV1,
+) -> TrustedObservationV1 {
+    let (fact, provenance) = sealed.into_fields();
+    TrustedObservationV1 {
+        fact,
+        provenance: Some(provenance),
+        qualification: None,
+    }
+}
+pub(super) fn gate_a_disposition(
+    sealed: super::core::microduck::ValidatedGateADispositionV1,
+) -> TrustedDispositionV1 {
+    TrustedDispositionV1 {
+        fact: sealed.into_fact(),
+        qualification: None,
     }
 }

@@ -760,3 +760,61 @@ pub(super) mod test_support {
         p.authenticated.store(false, Ordering::Release);
     }
 }
+
+/// Non-authority local launch context. Core captures current runtime/clock under
+/// its lock; the caller releases the lock before the supervisor/native I/O.
+pub(in crate::physical) struct GateALaunchContextV1 {
+    runtime: LocalRuntimeRef,
+    clock: Arc<dyn BindingClockV1>,
+    issuer: Arc<AtomicBool>,
+}
+impl GateALaunchContextV1 {
+    pub(in crate::physical) fn launch(
+        self,
+        config: microduck::GateALaunchV1,
+    ) -> AppResult<Arc<microduck::GateARunV1>> {
+        require(
+            self.issuer.load(Ordering::Acquire),
+            "Core launch context closed",
+        )?;
+        let run = microduck::GateARunV1::launch(config, self.runtime, self.clock)?;
+        require(
+            self.issuer.load(Ordering::Acquire),
+            "Core closed during launch",
+        )?;
+        Ok(Arc::new(run))
+    }
+}
+impl PhysicalControlServiceV1 {
+    pub(in crate::physical) fn prepare_gate_a_launch(
+        &self,
+        ingress: &LocalCoreIngressV1,
+    ) -> AppResult<GateALaunchContextV1> {
+        self.validate_ingress(ingress)?;
+        Ok(GateALaunchContextV1 {
+            runtime: self.runtime.clone(),
+            clock: self.clock.clone(),
+            issuer: self.issuer.clone(),
+        })
+    }
+    pub(in crate::physical) fn bind_gate_a_environment(
+        &mut self,
+        ingress: &LocalCoreIngressV1,
+        run: &microduck::GateARunV1,
+        expected: Option<u64>,
+    ) -> AppResult<EnvironmentBindingV1> {
+        self.validate_ingress(ingress)?;
+        self.binding.bind_gate_a(run, expected)
+    }
+    pub(in crate::physical) fn qualify_gate_a_environment(
+        &mut self,
+        ingress: &LocalCoreIngressV1,
+        run: &microduck::GateARunV1,
+        binding: &EnvironmentBindingV1,
+        profile: &PhysicalCapabilityProfileV1,
+        q: &PhysicalQualificationV1,
+    ) -> AppResult<()> {
+        self.validate_ingress(ingress)?;
+        self.binding.qualify_gate_a(run, binding, profile, q)
+    }
+}

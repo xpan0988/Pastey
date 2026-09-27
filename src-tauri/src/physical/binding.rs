@@ -112,8 +112,8 @@ impl EnvironmentBindingViewV1 {
 
 // Stage 2 trust owner. No external DTO, row, digest, endpoint name or telemetry
 // can construct these sealed inputs. A later authenticated native/supervisor
-// producer must live inside this module's trust boundary. Stage 2 has only the
-// explicitly fake test producer; there is no production trust ingress yet.
+// producer must live inside this module's trust boundary. Stage 6 adds only
+// the launcher-owned simulation Gate A stamps below; no generic claim ingress.
 use super::{
     contracts::{PhysicalCapabilityProfileV1, PhysicalQualificationV1},
     store::PhysicalStoreV1,
@@ -213,6 +213,7 @@ pub(super) struct TrustedBindingFactsV1 {
     configuration_digest: DigestV1,
     evidence_class: EvidenceClassV1,
     subsystems: BTreeMap<LabelV1, SubsystemBindingViewV1>,
+    producer_live: Option<Arc<AtomicBool>>,
 }
 pub(super) struct TrustedQualificationEvidenceV1 {
     owner: DigestV1,
@@ -273,6 +274,7 @@ pub(super) struct EnvironmentBindingV1 {
     provenance: BindingProvenanceV1,
     provenance_evidence_digest: DigestV1,
     valid: Arc<AtomicBool>,
+    producer_live: Option<Arc<AtomicBool>>,
 }
 impl EnvironmentBindingV1 {
     pub(super) fn view(&self) -> &EnvironmentBindingViewV1 {
@@ -493,6 +495,7 @@ impl PhysicalBindingResolverV1 {
             registration_digest: c.registration_digest,
             epochs: parking_lot::Mutex::new(c.epochs),
             deadline_ticks,
+            producer_live: facts.producer_live,
             provenance: facts.provenance,
             provenance_evidence_digest: facts.evidence_digest,
             valid,
@@ -503,6 +506,10 @@ impl PhysicalBindingResolverV1 {
             let (now, ticks) = self.now()?;
             require(
                 binding.valid.load(Ordering::Acquire)
+                    && binding
+                        .producer_live
+                        .as_ref()
+                        .is_none_or(|v| v.load(Ordering::Acquire))
                     && self
                         .live
                         .get(&binding.view.environment)
@@ -703,6 +710,7 @@ pub(super) mod test_support {
             } else {
                 BindingProvenanceV1::GateASupervisor
             },
+            producer_live: None,
             evidence_digest: view.configuration_digest.clone(),
             configuration_digest: view.configuration_digest.clone(),
             evidence_class: view.evidence_class,
@@ -737,5 +745,82 @@ pub(super) mod test_support {
     }
     pub(in crate::physical) fn live_count(r: &PhysicalBindingResolverV1) -> usize {
         r.live.len()
+    }
+}
+
+// Narrow production stamps require the non-deserializable, launcher-owned Gate A
+// supervisor receipt. No registration DTO or endpoint string can call this path.
+impl PhysicalBindingResolverV1 {
+    pub(in crate::physical) fn bind_gate_a(
+        &mut self,
+        run: &super::core::microduck::GateARunV1,
+        expected_revision: Option<u64>,
+    ) -> AppResult<EnvironmentBindingV1> {
+        run.validate_owner(&self.runtime, &self.clock)?;
+        run.validate_live()?;
+        run.bind_adapter_owner(self.adapter.clone())?;
+        let reg = run.registration(self.runtime.host_ref())?;
+        self.enroll(
+            TrustedEnrollmentV1 {
+                record: reg.clone(),
+            },
+            expected_revision,
+        )?;
+        let challenge = self.begin_resolution(&reg.environment)?;
+        self.resolve(TrustedBindingFactsV1 {
+            challenge,
+            runtime: self.runtime.clone(),
+            adapter: self.adapter.clone(),
+            endpoint_identity: reg.endpoint_identity.clone(),
+            owner: reg.provenance_owner.clone(),
+            provenance: BindingProvenanceV1::GateASupervisor,
+            evidence_digest: run.provenance_digest()?,
+            configuration_digest: reg.configuration_digest,
+            evidence_class: EvidenceClassV1::Simulation,
+            subsystems: reg.subsystems,
+            producer_live: Some(run.live_flag()),
+        })
+    }
+    pub(in crate::physical) fn qualify_gate_a(
+        &mut self,
+        run: &super::core::microduck::GateARunV1,
+        binding: &EnvironmentBindingV1,
+        profile: &PhysicalCapabilityProfileV1,
+        q: &PhysicalQualificationV1,
+    ) -> AppResult<()> {
+        run.validate_binding(binding.view())?;
+        run.validate_start()?;
+        require(
+            q.evidence_digest == run.provenance_digest()?
+                && q.conditions_digest == run.conditions_digest()?,
+            "Gate A qualification fingerprint mismatch",
+        )?;
+        require(
+            profile.evidence_class == EvidenceClassV1::Simulation
+                && profile.required_enforcement_class
+                    == SessionEnforcementClassV1::AdapterIsolationOnly,
+            "Gate A cannot qualify hardware or NativeFence",
+        )?;
+        require(
+            profile.execution.action_duration_us.get() <= 1_000_000
+                && profile.execution.total_execution_us.get() <= 1_000_000
+                && profile.freshness.proposal.0.get() <= 200_000
+                && profile.freshness.observation.max_age_us.get() <= 200_000
+                && profile.freshness.observation.max_gap_us.get() <= 200_000,
+            "Gate A reference duration/freshness ceiling exceeded",
+        )?;
+        self.record_qualification(
+            binding,
+            profile,
+            q,
+            TrustedQualificationEvidenceV1 {
+                owner: run
+                    .registration(self.runtime.host_ref())?
+                    .qualification_owner,
+                qualification_digest: q.digest()?,
+                provenance_digest: run.provenance_digest()?,
+                enforcement: SessionEnforcementClassV1::AdapterIsolationOnly,
+            },
+        )
     }
 }

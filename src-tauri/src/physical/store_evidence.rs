@@ -247,6 +247,7 @@ impl PhysicalStoreV1 {
             f.capture_us,
         )?;
         let record = ObservationRecordV1 {
+            gate_a: proof.gate_a_provenance().cloned(),
             fact: f.clone(),
             receipt_us,
             receipt: fresh_request()?,
@@ -750,6 +751,17 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         let (l, fid, seq, capture, receipt, ordered, qualified, hash) = if kind == "observation" {
             let o: ObservationRecordV1 = decode(&raw)?;
             o.fact.validate()?;
+            if let Some(p) = &o.gate_a {
+                p.validate()?;
+                require(
+                    p.receipt_us <= o.receipt_us
+                        && p.local_sequence == o.fact.sequence
+                        && p.sample.daemon == o.fact.lineage.controller
+                        && p.sample.body == o.fact.lineage.body_incarnation
+                        && Some(p.sample.world.clone()) == o.fact.lineage.world,
+                    "Gate A provenance/lineage mismatch",
+                )?;
+            }
             let (_, scope) = lineage(c, &o.fact.lineage.action)?;
             require(
                 producer_qualification(c, &scope, &o.producer_qualification)?.digest()?

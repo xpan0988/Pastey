@@ -1,7 +1,7 @@
-//! Physical facts and Core-owned bounded task authority through Stage 5.
+//! Physical facts and Core-owned bounded task authority through Stage 6.
 //!
-//! Private session/action admission uses only a deterministic test lane.
-//! No real native I/O, physical protocol or production evidence ingress.
+//! Local MicroDuck Gate A requires a launcher-owned isolated simulation.
+//! No remote protocol, product wiring, NativeFence or hardware authority.
 //! Successfully validating a claim does not authenticate its producer or qualify a body.
 #![allow(dead_code)] // Internal review/authority APIs await later product wiring.
 

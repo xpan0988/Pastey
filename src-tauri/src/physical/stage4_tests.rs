@@ -1150,3 +1150,6 @@ fn review_rejection_write_failure_closes_even_a_root_without_a_session() {
 
 #[path = "stage5_tests.rs"]
 mod stage5;
+
+#[path = "stage6_tests.rs"]
+mod stage6;
