@@ -1,3 +1,4 @@
+import { PhysicalReviewPanel } from "../../components/PhysicalReviewPanel";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useState } from "react";
 import type { BridgeRoute } from "../../lib/bridgeRouting";
@@ -125,6 +126,7 @@ export function BridgeWorkspace({ room, items, queueItems, task, developerMode, 
             </>
           )}
         </div>
+        <PhysicalReviewPanel roomId={room.id} peers={peers} />
         <TaskComposer
           mode={composerMode}
           roomId={room.id}

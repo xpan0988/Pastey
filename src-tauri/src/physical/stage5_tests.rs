@@ -972,6 +972,7 @@ async fn recognized_stage4_migration_keeps_quarantined_holder_epochs_and_consump
     let f = EvidenceFixture::new().await;
     f.cancel();
     let epoch = f.control.scalar("SELECT epoch FROM physical_domains");
+    crate::physical::store::test_restore_stage6_schema(&f.control.paths).unwrap();
     let sql = f.control.sql();
     sql.execute_batch("DROP TABLE physical_handovers; DROP TABLE physical_handover_policies; DROP TABLE physical_task_acceptance; DROP TABLE physical_reconciliations; DROP TABLE physical_consequences; DROP TABLE physical_evidence; DROP TABLE physical_evidence_schema; DROP TRIGGER physical_reservation_monotonic; DROP TRIGGER physical_reservations_keep; DROP INDEX physical_current_holder; ALTER TABLE physical_domain_reservations RENAME TO fixture_stage5_holders;").unwrap();
     for ddl in crate::physical::store::test_stage4_reservation_schema().unwrap() {
@@ -1301,3 +1302,6 @@ async fn an_evidence_clock_regression_closes_live_control_before_returning_error
     .await
     .is_err());
 }
+
+#[path = "stage7_tests.rs"]
+mod stage7;

@@ -172,7 +172,7 @@ pub(super) fn verify_version(c: &Connection) -> AppResult<()> {
 }
 pub(super) fn root(c: &Connection, id: &RootId) -> AppResult<RootAuditV1> {
     let raw: String = c.query_row(
-        "SELECT audit_json FROM physical_attempts WHERE root_id=?1 AND role='requester_executor'",
+        "SELECT audit_json FROM physical_attempts WHERE root_id=?1",
         [text(id)],
         |r| r.get(0),
     )?;
@@ -257,7 +257,7 @@ impl PhysicalStoreV1 {
             s.previous == *snapshot.epochs() && now < s.lease_expiry,
             "Stale session reservation",
         )?;
-        tx.execute("INSERT INTO physical_sessions(session_id,root_id,role,installation_id,binding_digest,profile_digest,qualification_digest,scope_digest,required_enforcement,lease_expiry,audit_digest,audit_json,state,revision) VALUES(?1,?2,'requester_executor',?3,?4,?5,?6,?7,?8,?9,?10,?11,'installing',1)",params![text(&s.id),text(&s.root),text(&s.installation),text(&s.binding_digest),text(&s.profile_digest),text(&s.qualification_digest),text(&s.scope.digest()?),tag(&s.enforcement)?,s.lease_expiry.get() as i64,text(&s.digest()?),serde_json::to_string(s)?])?;
+        tx.execute("INSERT INTO physical_sessions(session_id,root_id,role,installation_id,binding_digest,profile_digest,qualification_digest,scope_digest,required_enforcement,lease_expiry,audit_digest,audit_json,state,revision) VALUES(?1,?2,?12,?3,?4,?5,?6,?7,?8,?9,?10,?11,'installing',1)",params![text(&s.id),text(&s.root),text(&s.installation),text(&s.binding_digest),text(&s.profile_digest),text(&s.qualification_digest),text(&s.scope.digest()?),tag(&s.enforcement)?,s.lease_expiry.get() as i64,text(&s.digest()?),serde_json::to_string(s)?,a.role()])?;
         for (d, e) in &s.epochs {
             let n = tx.execute(
                 "UPDATE physical_domains SET epoch=?2 WHERE domain_id=?1 AND epoch=?3",
@@ -273,7 +273,7 @@ impl PhysicalStoreV1 {
                 params![text(d), text(&s.id), checked_integer(*e)?],
             )?;
         }
-        tx.execute("INSERT INTO physical_control_budgets(root_id,role,ceiling_us,ceiling_count) VALUES(?1,'requester_executor',?2,1)",params![text(&s.root),checked_integer(s.scope.fields().execution.total_execution_us.get())?])?;
+        tx.execute("INSERT INTO physical_control_budgets(root_id,role,ceiling_us,ceiling_count) VALUES(?1,?3,?2,1)",params![text(&s.root),checked_integer(s.scope.fields().execution.total_execution_us.get())?,a.role()])?;
         super::audit(&tx)?;
         tx.commit()?;
         Ok(ReservationReceiptV1 { session: s.clone() })
@@ -522,7 +522,7 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         for (col, value) in [
             ("session_id", text(&s.id)),
             ("root_id", text(&s.root)),
-            ("role", "requester_executor".into()),
+            ("role", a.role().into()),
             ("installation_id", text(&s.installation)),
             ("binding_digest", text(&s.binding_digest)),
             ("profile_digest", text(&s.profile_digest)),
@@ -604,7 +604,7 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         )?;
         require(has_budget, "Missing session budget ledger")?;
         let root_state: String = c.query_row(
-            "SELECT state FROM physical_attempts WHERE root_id=?1 AND role='requester_executor'",
+            "SELECT state FROM physical_attempts WHERE root_id=?1",
             [text(&s.root)],
             |r| r.get(0),
         )?;

@@ -400,3 +400,21 @@ test("Native Agent recovery drains only after the current item no longer require
     code: "result_return_retry_required",
   }), true);
 });
+
+test("physical review expiry, exact approval, and uncertain status stay separate", async () => {
+  const { physicalReviewFresh } = await import("../src/lib/physical");
+  const review = {
+    scope: { environment: { offerExpiry: 2000 }, qualification: { expiresAt: 1900 } },
+    approval: { expiresAt: 1800 },
+  } as import("../src/lib/physical").PhysicalReview;
+  assert.equal(physicalReviewFresh(review, 1799), true);
+  assert.equal(physicalReviewFresh(review, 1800), false);
+  assert.equal(physicalReviewFresh(null, 1000), false);
+  const panel = readFileSync("src/components/PhysicalReviewPanel.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  assert.match(bindings, /physical_product_command/);
+  assert.match(panel, /r\.state !== "approved"/);
+  assert.match(panel, /physicalReviewFresh\(r\)/);
+  assert.match(panel, /stop acknowledgement does not prove physical rest/);
+  assert.doesNotMatch(panel, /robot\.enable|setApproval|authorityToken/);
+});

@@ -779,7 +779,7 @@ fn future_peer_proof_checks_current_runtime_authenticated_host_and_session() {
         &runtime,
         &binding,
         &requester,
-        UnixMillis::try_from(2000).unwrap()
+        UnixMillis::try_from(2_000_000).unwrap()
     )
     .is_err());
     core_fake::invalidate_peer(&proof);
@@ -947,6 +947,7 @@ fn corrupt_core_schema_records_columns_and_missing_history_fail_closed() {
 #[test]
 fn recognized_stage2_schema_migrates_transactionally_and_keeps_facts() {
     let f = Fixture::new();
+    crate::physical::store::test_restore_stage6_schema(&f.paths).unwrap();
     let conn = f.sql();
     // Remove the Stage 4 extension to model an actual Stage 2 database.
     conn.execute_batch("DROP TABLE physical_handovers; DROP TABLE physical_handover_policies; DROP TABLE physical_task_acceptance; DROP TABLE physical_reconciliations; DROP TABLE physical_consequences; DROP TABLE physical_evidence; DROP TABLE physical_evidence_schema;").unwrap();

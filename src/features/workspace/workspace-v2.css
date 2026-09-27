@@ -300,3 +300,12 @@ button { color: inherit; }
   .v2-app-shell { grid-template-columns: 190px minmax(300px, 1fr) 250px; }
   .v2-settings-columns { grid-template-columns: 1fr; }
 }
+
+.v2-physical-panel { padding: 1rem; border-top: 1px solid var(--border, #ddd); font-size: .85rem; }
+.v2-physical-panel summary { cursor: pointer; font-weight: 600; }
+.v2-physical-panel select, .v2-physical-panel button { margin: .4rem; max-width: 100%; }
+.v2-physical-panel code { overflow-wrap: anywhere; }
+.v2-physical-panel pre { max-height: 18rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.v2-physical-panel dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: .6rem; }
+.v2-physical-panel dt { font-weight: 600; }
+.v2-physical-panel dd { margin: 0; }

@@ -68,6 +68,8 @@ BEGIN SELECT RAISE(ABORT,'physical attempt history required'); END;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::physical) struct RootAuditV1 {
     pub(in crate::physical) version: VersionV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::physical) remote_lineage: Option<super::RemoteRootLineageV2>,
     pub(in crate::physical) root_id: RootId,
     pub(in crate::physical) attempt_id: AttemptId,
     pub(in crate::physical) review_id: ReviewId,
@@ -90,6 +92,13 @@ pub(in crate::physical) struct RootAuditV1 {
     pub(in crate::physical) expires_at: UnixMillis,
 }
 impl RootAuditV1 {
+    pub(in crate::physical) fn role(&self) -> &'static str {
+        if self.remote_lineage.is_some() {
+            "executor_remote"
+        } else {
+            "requester_executor"
+        }
+    }
     fn digest(&self) -> AppResult<DigestV1> {
         digest("pastey-physical-root-audit-v1", self)
     }
@@ -115,7 +124,14 @@ impl RootAuditV1 {
                 && self.principal == self.approval.principal
                 && self.requester == s.requester
                 && self.executor == s.executor
-                && self.requester == self.executor
+                && (if let Some(remote) = &self.remote_lineage {
+                    remote.version == 2
+                        && self.requester != self.executor
+                        && remote.binding.peer_host_ref == self.requester
+                        && remote.binding.local_host_ref == self.executor
+                } else {
+                    self.requester == self.executor
+                })
                 && self.environment == s.environment.environment
                 && self.binding_digest == s.environment.digest()?
                 && self.profile_digest == s.profile.digest()?
@@ -405,7 +421,7 @@ impl PhysicalStoreV1 {
             "Approval/start no longer current",
         )?;
         dependencies(&tx, &r.scope, snapshot, now)?;
-        tx.execute("INSERT INTO physical_attempts(root_id,role,attempt_id,approval_id,review_id,review_revision,scope_digest,principal,requester,executor,environment_id,registration_digest,binding_digest,profile_digest,qualification_id,qualification_digest,policy_digest,runtime_generation,created_at,expires_at,audit_digest,audit_json,state,revision) VALUES(?1,'requester_executor',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,'open',1)",params![text(&a.root_id),text(&a.attempt_id),text(&a.approval.approval_id),text(&a.review_id),checked_integer(a.review_revision)?,text(&a.scope_digest),text(&a.principal),a.requester.as_str(),a.executor.as_str(),text(&a.environment),text(&a.registration_digest),text(&a.binding_digest),text(&a.profile_digest),text(&a.qualification_id),text(&a.qualification_digest),text(&a.policy_digest),a.runtime_generation,a.created_at.get() as i64,a.expires_at.get() as i64,text(&a.digest()?),serde_json::to_string(a)?])?;
+        tx.execute("INSERT INTO physical_attempts(root_id,role,attempt_id,approval_id,review_id,review_revision,scope_digest,principal,requester,executor,environment_id,registration_digest,binding_digest,profile_digest,qualification_id,qualification_digest,policy_digest,runtime_generation,created_at,expires_at,audit_digest,audit_json,state,revision) VALUES(?1,?22,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,'open',1)",params![text(&a.root_id),text(&a.attempt_id),text(&a.approval.approval_id),text(&a.review_id),checked_integer(a.review_revision)?,text(&a.scope_digest),text(&a.principal),a.requester.as_str(),a.executor.as_str(),text(&a.environment),text(&a.registration_digest),text(&a.binding_digest),text(&a.profile_digest),text(&a.qualification_id),text(&a.qualification_digest),text(&a.policy_digest),a.runtime_generation,a.created_at.get() as i64,a.expires_at.get() as i64,text(&a.digest()?),serde_json::to_string(a)?,a.role()])?;
         super::evidence_ledger::originate(&tx, &a.root_id)?;
         tx.execute("UPDATE physical_reviews SET state_revision=state_revision+1 WHERE review_id=?1 AND revision=?2 AND state='approved'",params![text(&a.review_id),checked_integer(a.review_revision)?])?;
         tx.commit()?;
@@ -601,7 +617,7 @@ pub(super) fn audit(conn: &Connection) -> AppResult<()> {
             row.get::<_, i64>(4)? == checked_integer(a.review_revision)?
                 && row.get::<_, i64>(17)? == a.created_at.get() as i64
                 && row.get::<_, i64>(18)? == a.expires_at.get() as i64
-                && row.get::<_, String>(24)? == "requester_executor"
+                && row.get::<_, String>(24)? == a.role()
                 && ((state == "open" && rev == 1 && reason.is_none())
                     || (state == "closed"
                         && rev == 2
@@ -620,7 +636,11 @@ pub(super) fn validate_attempt_in(
 ) -> AppResult<()> {
     let r = current_review(conn, &a.review_id, a.review_revision)?;
     a.validate(&r)?;
-    let (raw,state):(String,String)=conn.query_row("SELECT audit_json,state FROM physical_attempts WHERE root_id=?1 AND role='requester_executor'",[text(&a.root_id)],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let (raw, state): (String, String) = conn.query_row(
+        "SELECT audit_json,state FROM physical_attempts WHERE root_id=?1",
+        [text(&a.root_id)],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     require(
         raw == serde_json::to_string(a)?
             && state == "open"

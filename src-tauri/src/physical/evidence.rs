@@ -140,7 +140,7 @@ pub(super) struct DispositionRecordV1 {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum ConsequenceStateV1 {
+pub(crate) enum ConsequenceStateV1 {
     Unobserved,
     Partial,
     Verified,
@@ -192,7 +192,7 @@ pub(super) struct PhysicalReconciliationV1 {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum AcceptanceStateV1 {
+pub(crate) enum AcceptanceStateV1 {
     Pending,
     Accepted,
     Rejected,

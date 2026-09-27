@@ -7456,3 +7456,19 @@ mod tests {
         );
     }
 }
+
+#[tauri::command]
+pub async fn physical_product_command(
+    room_id: String,
+    target_host_ref: String,
+    request: crate::physical::core::PhysicalProductRequestV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::physical::core::PhysicalProductViewV1, String> {
+    let target = crate::host_identity::HostRef::parse_peer(target_host_ref, &state.local_host_ref)
+        .map_err(|e| e.message())?;
+    state
+        .inner()
+        .physical_product_command(&room_id, &target, request)
+        .await
+        .map_err(|e| e.message())
+}

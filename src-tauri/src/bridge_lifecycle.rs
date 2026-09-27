@@ -73,6 +73,33 @@ impl CurrentRemoteHostSession {
         Ok(current)
     }
 
+    /// Synchronous invalidation check for already authenticated physical Core
+    /// ingress. The initial live resolver still owns transport authentication;
+    /// each use rejects replacement of either the binding or private endpoint.
+    pub(crate) fn validate_current_physical_route(&self, state: &AppState) -> AppResult<()> {
+        let current = crate::host_runtime::current_host_session_binding(
+            state,
+            &self.binding.bridge_id,
+            &self.binding.peer_route_ref,
+        )?;
+        self.binding.validate_current(&current, storage::now_ts())?;
+        let peer = storage::list_bridge_peer_endpoints(&state.paths, &self.binding.bridge_id)?
+            .into_iter()
+            .find(|p| p.peer_session_id == self.binding.peer_route_ref)
+            .ok_or_else(|| AppError::InvalidInput("Physical peer route removed".into()))?;
+        if peer.liveness != BridgePeerLiveness::Connected
+            || peer.endpoint_host.as_deref() != Some(self.transfer_endpoint.host.as_str())
+            || peer.endpoint_port != Some(self.transfer_endpoint.port)
+            || peer.transport_public_key.as_deref()
+                != Some(self.transfer_endpoint.transport_public_key.as_str())
+        {
+            return Err(AppError::InvalidInput(
+                "Physical private transport route replaced".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Runs the existing authenticated Room Control capability query against
     /// this exact current remote Host and waits for its bounded observation.
     /// Route and session identifiers never leave Layer 4.

@@ -58,6 +58,9 @@ pub(in crate::physical) struct BodyControlSessionV1 {
     valid: Arc<AtomicBool>,
 }
 impl BodyControlSessionV1 {
+    pub(super) fn root(&self) -> &Arc<PhysicalAuthorityRootV1> {
+        &self.root
+    }
     pub(in crate::physical) fn id(&self) -> &SessionId {
         &self.audit.id
     }
@@ -1159,5 +1162,41 @@ impl PhysicalControlServiceV1 {
             let _ = Self::revoke_control_session(core, session, adapter).await;
         }
         result
+    }
+}
+
+impl PhysicalControlServiceV1 {
+    /// Both local and remote product callers propose through this same exact
+    /// challenge/admission path after executor-local trusted observation.
+    pub(in crate::physical) fn admit_reference_action(
+        &mut self,
+        session: Arc<BodyControlSessionV1>,
+    ) -> AppResult<Arc<AdmittedBodyActionV1>> {
+        let g = self.construct_session_grant(session)?;
+        self.issue_proposal_challenge(&g)?;
+        let challenge = &self.control.challenges[&g.id];
+        let proposal = PhysicalActionProposalV1 {
+            version: VersionV1,
+            attempt_id: g.session.root.audit.attempt_id.clone(),
+            action_id: g.action.clone(),
+            decision_sequence: g.sequence,
+            payload: g.session.basis.scope().fields().intent.clone(),
+            payload_digest: g.payload_digest.clone(),
+            challenge_id: challenge.id.clone(),
+            observations: challenge.observations.clone(),
+            requested_duration_us: g
+                .session
+                .basis
+                .scope()
+                .fields()
+                .execution
+                .action_duration_us,
+        };
+        match self.admit_physical_proposal(&g, proposal)? {
+            AdmissionOutcomeV1::Admitted(a) => Ok(a),
+            _ => Err(crate::error::AppError::InvalidInput(
+                "Reference action already admitted".into(),
+            )),
+        }
     }
 }

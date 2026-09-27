@@ -19,6 +19,9 @@ pub(super) use control_ledger::{
     ActionAuditV1, FenceAuditV1, ReservationReceiptV1, SessionAuditV1,
 };
 pub(super) use core_ledger::RootAuditV1;
+#[path = "store_remote.rs"]
+mod remote_ledger;
+pub(super) use remote_ledger::RemoteRootLineageV2;
 
 // Dedicated versioning; neither SQLite user_version nor other Pastey tables are repurposed.
 const SCHEMA: &str = r#"
@@ -123,6 +126,9 @@ pub(super) struct PhysicalStoreV1 {
 /// schema is rejected, never repaired by CREATE IF NOT EXISTS/default counters.
 pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
     let mut conn = configured_connection(&paths.db_path)?;
+    // Schema migration only: suspend FK checks outside the transaction, then
+    // verify every reference before committing and restore enforcement.
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let count: i64 = tx.query_row(
         "SELECT count(*) FROM sqlite_master WHERE name GLOB 'physical_*'",
@@ -160,9 +166,24 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
         control_ledger::audit(&tx)?;
         tx.execute_batch(evidence_ledger::SCHEMA)?;
     }
+    let stage6 = Connection::open_in_memory()?;
+    stage6.execute_batch(SCHEMA)?;
+    stage6.execute_batch(core_ledger::SCHEMA)?;
+    stage6.execute_batch(control_ledger::SCHEMA)?;
+    stage6.execute_batch(evidence_ledger::SCHEMA)?;
+    if schema_objects(&tx)? == schema_objects(&stage6)? {
+        audit_facts(&tx)?;
+        core_ledger::audit(&tx)?;
+        control_ledger::audit(&tx)?;
+        evidence_ledger::audit(&tx)?;
+        remote_ledger::migrate(&tx)?;
+    }
     verify_schema(&tx)?;
     audit(&tx)?;
+    let broken: bool = tx.prepare("PRAGMA foreign_key_check")?.exists([])?;
+    require(!broken, "Physical migration foreign key mismatch")?;
     tx.commit()?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     Ok(())
 }
 
@@ -203,10 +224,7 @@ fn expected_schema() -> AppResult<&'static Vec<(String, Option<String>)>> {
         std::sync::OnceLock::new();
     if EXPECTED.get().is_none() {
         let expected = Connection::open_in_memory()?;
-        expected.execute_batch(SCHEMA)?;
-        expected.execute_batch(core_ledger::SCHEMA)?;
-        expected.execute_batch(control_ledger::SCHEMA)?;
-        expected.execute_batch(evidence_ledger::SCHEMA)?;
+        expected.execute_batch(&remote_ledger::current_ddl())?;
         let _ = EXPECTED.set(schema_objects(&expected)?);
     }
     Ok(EXPECTED.get().expect("compiled schema initialized"))
@@ -242,7 +260,7 @@ impl PhysicalStoreV1 {
         tx.commit()?;
         Ok(store)
     }
-    fn connection(&self) -> AppResult<Connection> {
+    pub(in crate::physical) fn connection(&self) -> AppResult<Connection> {
         let conn = configured_connection(&self.path)?;
         verify_schema(&conn)?;
         Ok(conn)
@@ -485,7 +503,8 @@ fn audit(conn: &Connection) -> AppResult<()> {
     audit_facts(conn)?;
     core_ledger::audit(conn)?;
     control_ledger::audit(conn)?;
-    evidence_ledger::audit(conn)
+    evidence_ledger::audit(conn)?;
+    remote_ledger::audit(conn)
 }
 fn audit_facts(conn: &Connection) -> AppResult<()> {
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
@@ -615,4 +634,21 @@ pub(super) fn test_stage4_reservation_schema() -> AppResult<Vec<String>> {
         .query_map([], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
     Ok(rows)
+}
+
+#[cfg(test)]
+pub(super) fn test_restore_stage6_schema(paths: &AppPaths) -> AppResult<()> {
+    let mut c = configured_connection(&paths.db_path)?;
+    c.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ddl = [
+        SCHEMA,
+        core_ledger::SCHEMA,
+        control_ledger::SCHEMA,
+        evidence_ledger::SCHEMA,
+    ]
+    .join("\n");
+    remote_ledger::rebuild(&tx, &ddl)?;
+    tx.commit()?;
+    Ok(())
 }

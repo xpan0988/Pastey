@@ -30,6 +30,8 @@ npm run check:version
 git diff --check
 ```
 
+Physical provisioning/transport checks: `python3 -B scripts/test-microduck-gate-a.py`, `cargo test --manifest-path src-tauri/Cargo.toml stage7`, and `npm run test:frontend-integration`. The physical panel requires a current qualified executor environment/policy; discovery does not launch one. See [physical implementation](physical-environment-implementation.md#stage-7-remote-transport-and-product-contract) for durable replay, current-session ingress and evidence boundaries. Real Linux Gate A remains opt-in and separate from fake-adapter distributed tests.
+
 The Windows cross-check requires the GNU target and MinGW toolchain. It proves compilation, not native Windows confinement, safe-open behavior, machine setup, packaging, or physical E2E.
 
 Native Windows acceptance is five stop-on-failure scripts run from the repository root. Each run writes a self-contained log and safe sandbox diagnostics under the gitignored `artifacts/windows-acceptance/` directory and ends with a stable `PASTEY_ACCEPTANCE_STAGE_<N>_(PASS|FAIL|BLOCKED)` token. Exit codes are `0` for PASS, `1` when the intended stage ran and failed, and `2` when required product or Host state is absent.

@@ -176,7 +176,7 @@ pub(super) fn cancel(c: &Connection, id: &RootId) -> AppResult<()> {
     Ok(())
 }
 pub(super) fn originate(c: &Connection, id: &RootId) -> AppResult<()> {
-    c.execute("INSERT INTO physical_task_acceptance VALUES(?1,'requester_executor','pending',1,NULL,NULL)",[text(id)])?;
+    c.execute("INSERT INTO physical_task_acceptance SELECT root_id,role,'pending',1,NULL,NULL FROM physical_attempts WHERE root_id=?1",[text(id)])?;
     Ok(())
 }
 impl PhysicalStoreV1 {

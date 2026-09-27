@@ -1032,6 +1032,7 @@ async fn sqlite_write_failure_closes_live_flags_before_persistence_and_cannot_di
 async fn recognized_stage3_migration_preserves_consumed_approval_and_closes_root() {
     let f = ControlFixture::new();
     let (root, _) = f.root_basis();
+    crate::physical::store::test_restore_stage6_schema(&f.paths).unwrap();
     let sql = f.sql();
     sql.execute_batch("DROP TABLE physical_handovers; DROP TABLE physical_handover_policies; DROP TABLE physical_task_acceptance; DROP TABLE physical_reconciliations; DROP TABLE physical_consequences; DROP TABLE physical_evidence; DROP TABLE physical_evidence_schema;").unwrap();
     sql.execute_batch("DROP TABLE physical_actions; DROP TABLE physical_control_budgets; DROP TABLE physical_domain_reservations; DROP TABLE physical_sessions; DROP TABLE physical_control_schema;").unwrap();

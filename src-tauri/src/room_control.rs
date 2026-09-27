@@ -73,6 +73,7 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "developer_terminal.exit",
     "developer_terminal.close",
     "bridge_membership.departure",
+    "physical.control",
     "native_agent.invoke",
     "native_agent.status",
     "native_agent.cancel",
@@ -1511,6 +1512,50 @@ pub async fn receive_room_control_event_handler(
         // the bounded Room Control inbox.
         return encrypted_receipt_response(&event_key, &validated.event_id, &now_iso());
     }
+    if validated.kind == "physical.control" {
+        {
+            let mut runtime = ctx.state.room_control.lock();
+            let room_state = runtime.rooms.entry(room_id.clone()).or_default();
+            if !accept_rate_limited_event(room_state, OffsetDateTime::now_utc().unix_timestamp()) {
+                return control_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limited",
+                    "Physical control rate exceeded.",
+                );
+            }
+            // Transport cache remains bounded. Physical semantic replay below
+            // remains durable and can return a known result after a lost reply.
+            record_replay_id(
+                &mut room_state.seen_event_ids,
+                &mut room_state.seen_event_id_set,
+                validated.event_id.clone(),
+            );
+        }
+        // This branch is reachable only after decryption, current sender-key
+        // matching and directional event/session validation above. No history.
+        let result = receive_authenticated_physical(
+            ctx.state.clone(),
+            &room_id,
+            &inbound_peer.peer_session_id,
+            &session_ref(&inbound_peer.transport_public_key),
+            &session_ref(&local_key),
+            validated
+                .event
+                .get("payload")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )
+        .await;
+        if let Err(error) = result {
+            logging::write_error_line(&format!("Physical control rejected: {}", error.message()));
+            return control_error(
+                StatusCode::CONFLICT,
+                "physical_rejected",
+                "Physical control rejected.",
+            );
+        }
+        return encrypted_receipt_response(&event_key, &validated.event_id, &now_iso());
+    }
     if validated.kind.starts_with("native_agent.") {
         // Native Agent invocation is a bounded product protocol over the
         // existing authenticated current-session channel. Record replay before
@@ -2564,6 +2609,7 @@ fn validate_control_event(
             || raw_kind.starts_with("developer_terminal.")
             || raw_kind.starts_with("bridge_membership.")
             || raw_kind.starts_with("native_agent.")
+            || raw_kind == "physical.control"
         {
             &[
                 "schemaVersion",
@@ -2637,12 +2683,26 @@ fn validate_control_event(
         kind.as_str(),
         "native_agent.status" | "native_agent.reconciliation"
     );
-    if contains_unsafe_field(&event, allow_validated_native_code) {
+    // Physical data has its own closed typed schema (including environment
+    // views); the generic digital-command key denylist would reject those facts.
+    if kind != "physical.control" && contains_unsafe_field(&event, allow_validated_native_code) {
         return Err(AppError::InvalidInput(
             "Room control event contains unsafe fields.".into(),
         ));
     }
-    let (envelope_id, request_id) = if kind.starts_with("bridge_plan.") {
+    let (envelope_id, request_id) = if kind == "physical.control" {
+        if string_field(object, "protocolFamily")? != crate::physical::protocol::PROTOCOL
+            || object.get("previewOnly") != Some(&Value::Bool(false))
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid physical protocol event".into(),
+            ));
+        }
+        let m: crate::physical::protocol::PhysicalMessageV1 =
+            serde_json::from_value(Value::Object(payload.clone()))?;
+        m.validate()?;
+        (None, Some(String::from(m.semantic_id)))
+    } else if kind.starts_with("bridge_plan.") {
         if string_field(object, "protocolFamily")? != BRIDGE_PLAN_PROTOCOL_FAMILY
             || object.get("previewOnly") != Some(&Value::Bool(false))
         {
@@ -4011,5 +4071,195 @@ mod tests {
             Ok(_) => panic!("review expiry beyond permitted clock skew must be rejected"),
         };
         assert!(error.contains("review expiry"));
+    }
+}
+
+/// Sealed production proof. The constructor is private to this authenticated
+/// transport module; deserializing Host/session data cannot produce it.
+pub(crate) struct AuthenticatedPhysicalPeerV1 {
+    runtime: crate::host_identity::LocalRuntimeRef,
+    binding: crate::host_identity::HostSessionBinding,
+    current: Arc<dyn Fn() -> AppResult<()> + Send + Sync>,
+}
+impl AuthenticatedPhysicalPeerV1 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::host_identity::LocalRuntimeRef,
+        crate::host_identity::HostSessionBinding,
+        Arc<dyn Fn() -> AppResult<()> + Send + Sync>,
+    ) {
+        (self.runtime, self.binding, self.current)
+    }
+    #[cfg(test)]
+    pub(crate) fn fake(
+        runtime: crate::host_identity::LocalRuntimeRef,
+        binding: crate::host_identity::HostSessionBinding,
+        current: Arc<dyn Fn() -> AppResult<()> + Send + Sync>,
+    ) -> Self {
+        Self {
+            runtime,
+            binding,
+            current,
+        }
+    }
+}
+pub(crate) fn physical_event(
+    m: &crate::physical::protocol::PhysicalMessageV1,
+    c: &RoomControlSessionContext,
+) -> AppResult<Value> {
+    m.validate()?;
+    let mut event = native_agent_event("physical.control", serde_json::to_value(m)?, c)?;
+    event["protocolFamily"] = Value::String(crate::physical::protocol::PROTOCOL.into());
+    Ok(event)
+}
+async fn receive_authenticated_physical(
+    state: Arc<AppState>,
+    bridge: &str,
+    peer_route: &str,
+    source: &str,
+    target: &str,
+    payload: Value,
+) -> AppResult<()> {
+    use crate::physical::{core::PhysicalControlServiceV1, protocol::*};
+    let m: PhysicalMessageV1 = serde_json::from_value(payload)?;
+    let peer = if m.operation.is_response() {
+        &m.executor
+    } else {
+        &m.requester
+    };
+    let session = state
+        .resolve_current_remote_host_session(bridge, peer)
+        .await?;
+    let binding = session.binding().clone();
+    if binding.peer_route_ref != peer_route
+        || binding.peer_session_ref != source
+        || binding.local_session_ref != target
+        || binding.session_pair_ref != m.session_pair
+    {
+        return Err(AppError::InvalidInput(
+            "Physical authenticated direction/session changed".into(),
+        ));
+    }
+    let weak = Arc::downgrade(&state);
+    let current: Arc<dyn Fn() -> AppResult<()> + Send + Sync> = Arc::new(move || {
+        let state = weak
+            .upgrade()
+            .ok_or_else(|| AppError::InvalidInput("Physical runtime closed".into()))?;
+        session.validate_current_physical_route(&state)
+    });
+    let proof = AuthenticatedPhysicalPeerV1 {
+        runtime: state.local_runtime_ref.clone(),
+        binding,
+        current,
+    };
+    let (response, work) = {
+        let mut core = state.physical_control.lock();
+        let ingress = core.verified_peer_ingress(proof)?;
+        core.receive_physical(ingress, m)?
+    };
+    if let Some(work) = work {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                PhysicalControlServiceV1::perform_physical_work(&state.physical_control, work).await
+            {
+                logging::write_error_line(&format!(
+                    "Physical operation pending/unknown: {}",
+                    e.message()
+                ));
+            }
+            let _ = state.emit("physical-status-changed", &serde_json::json!({}));
+        });
+    }
+    if let Some(response) = response {
+        // A new exact current Host proof is required even for the return path.
+        let state = state.clone();
+        let bridge = bridge.to_owned();
+        tokio::spawn(async move {
+            let result = async {
+                let current = state
+                    .resolve_current_remote_host_session(&bridge, &response.requester)
+                    .await?;
+                if current.binding().session_pair_ref != response.session_pair {
+                    return Err(AppError::InvalidInput(
+                        "Physical response route replaced".into(),
+                    ));
+                }
+                let context = room_control_session_context_for_peer(
+                    &state,
+                    &bridge,
+                    &current.binding().peer_route_ref,
+                )?;
+                let event = physical_event(&response, &context)?;
+                send_room_control_event(
+                    state,
+                    &bridge,
+                    event,
+                    Some(selected_peer_route(&bridge, &context.peer_route_ref)),
+                )
+                .await?;
+                Ok::<_, AppError>(())
+            }
+            .await;
+            if result.is_err() {
+                logging::write_error_line(
+                    "Physical semantic reply delivery uncertain; status query required",
+                );
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod physical_transport_tests {
+    use super::*;
+    #[test]
+    fn physical_envelope_is_typed_directional_and_separate_from_history() {
+        use crate::physical::{protocol::*, values::RequestId};
+        let c = RoomControlSessionContext {
+            room_id: "room".into(),
+            local_session_ref: "a".into(),
+            peer_session_ref: "b".into(),
+            peer_route_ref: "route".into(),
+            peer_observation_ref: "observation".into(),
+            peer_connected: true,
+        };
+        let m = PhysicalMessageV1 {
+            protocol: PROTOCOL.into(),
+            semantic_id: RequestId::try_from(format!(
+                "physical-request:v1:{}",
+                uuid::Uuid::new_v4()
+            ))
+            .unwrap(),
+            session_pair: "pair".into(),
+            requester: crate::host_identity::HostRef::from_device_id("a").unwrap(),
+            executor: crate::host_identity::HostRef::from_device_id("b").unwrap(),
+            operation: PhysicalOperationV1::Discover,
+        };
+        let event = physical_event(&m, &c).unwrap();
+        assert!(
+            validate_control_event(event.clone(), "room", "a", "b", OffsetDateTime::now_utc())
+                .is_ok()
+        );
+        assert!(validate_control_event(
+            event.clone(),
+            "room",
+            "old-a",
+            "b",
+            OffsetDateTime::now_utc()
+        )
+        .is_err());
+        let mut changed = event.clone();
+        changed["payload"]["nativePermit"] = serde_json::json!({});
+        assert!(
+            validate_control_event(changed, "room", "a", "b", OffsetDateTime::now_utc()).is_err()
+        );
+        let mut changed = event;
+        changed["protocolFamily"] = serde_json::json!("physical-control-v2");
+        assert!(
+            validate_control_event(changed, "room", "a", "b", OffsetDateTime::now_utc()).is_err()
+        );
     }
 }

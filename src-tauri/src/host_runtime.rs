@@ -265,6 +265,10 @@ impl HostRuntime {
         // is not a Bridge Burn. Keep Native Agent's durable recovery envelope
         // and retained result material so a fresh session can reconcile it.
         let _ = self.native_agents.lock().revoke_bridge_session(room_id);
+        let _ = self
+            .physical_control
+            .lock()
+            .invalidate_physical_bridge(room_id);
         crate::native_v2_orchestration::interrupt_attempts_for_bridge(
             &self.paths,
             room_id,
@@ -996,5 +1000,62 @@ mod tests {
             .is_err());
         assert_eq!(runtime.local_host_ref, durable_host_ref);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+impl HostRuntime {
+    pub(crate) async fn physical_product_command(
+        self: &Arc<Self>,
+        bridge: &str,
+        target: &HostRef,
+        request: crate::physical::core::PhysicalProductRequestV1,
+    ) -> AppResult<crate::physical::core::PhysicalProductViewV1> {
+        let session = self
+            .resolve_current_remote_host_session(bridge, target)
+            .await?;
+        let projection = session.request_capability_projection(self.clone()).await?;
+        projection.require_physical_protocol()?;
+        let current = self
+            .resolve_current_remote_host_session(bridge, target)
+            .await?;
+        session
+            .binding()
+            .validate_current(current.binding(), storage::now_ts())?;
+        let (mut view, message) = self
+            .physical_control
+            .lock()
+            .physical_product(current.binding(), request)?;
+        if let Some(m) = message {
+            let latest = self
+                .resolve_current_remote_host_session(bridge, target)
+                .await?;
+            current
+                .binding()
+                .validate_current(latest.binding(), storage::now_ts())?;
+            let context = room_control::room_control_session_context_for_peer(
+                self,
+                bridge,
+                &latest.binding().peer_route_ref,
+            )?;
+            let event = room_control::physical_event(&m, &context)?;
+            // An encrypted delivery receipt does not resolve physical semantics.
+            let delivered = room_control::send_room_control_event(
+                self.clone(),
+                bridge,
+                event,
+                Some(room_control::selected_peer_route(
+                    bridge,
+                    &context.peer_route_ref,
+                )),
+            )
+            .await;
+            view.delivery_pending = true;
+            if delivered.is_err() {
+                logging::write_error_line(
+                    "Physical request delivery uncertain; durable correlation retained",
+                );
+            }
+        }
+        Ok(view)
     }
 }

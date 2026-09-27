@@ -4,10 +4,13 @@
 mod control;
 #[path = "core_evidence.rs"]
 mod evidence_core;
+#[path = "remote.rs"]
+mod remote;
 #[cfg(test)]
 pub(super) use control::test_support as control_test_support;
 pub(super) use control::*;
 pub(super) use evidence_core::CoreAcceptanceDecisionV1;
+pub(crate) use remote::*;
 
 use super::{
     binding::{BindingClockV1, EnvironmentBindingV1, PhysicalBindingResolverV1},
@@ -34,12 +37,13 @@ pub(super) struct LocalCoreIngressV1 {
     runtime: LocalRuntimeRef,
     issuer: Arc<AtomicBool>,
 }
-/// Future Stage 7 authenticated producer boundary. There is deliberately no
-/// production constructor/import operation. A Host/session DTO cannot make it.
-pub(super) struct VerifiedPeerCoreIngressV1 {
+/// Sealed Stage 7 peer ingress. Only authenticated current Room Control proof
+/// (or the explicit test oracle) can produce it; no Host/session DTO constructor.
+pub(crate) struct VerifiedPeerCoreIngressV1 {
     runtime: LocalRuntimeRef,
     binding: HostSessionBinding,
     authenticated: Arc<AtomicBool>,
+    current: Option<Arc<dyn Fn() -> AppResult<()> + Send + Sync>>,
 }
 impl VerifiedPeerCoreIngressV1 {
     fn validate(
@@ -51,10 +55,13 @@ impl VerifiedPeerCoreIngressV1 {
         now: UnixMillis,
     ) -> AppResult<()> {
         self.runtime.validate_current(runtime)?;
+        if let Some(current) = &self.current {
+            current()?;
+        }
         require(
             self.authenticated.load(Ordering::Acquire)
                 && &self.binding == current
-                && current.expires_at > now.get() as i64
+                && current.expires_at > (now.get() / 1000) as i64
                 && &current.peer_host_ref == requester
                 && &current.local_host_ref == executor
                 && executor == runtime.host_ref()
@@ -71,6 +78,7 @@ pub(super) struct PhysicalAuthorityRootV1 {
     scope: PhysicalReviewScopeV1,
     binding: Arc<EnvironmentBindingV1>,
     ingress: LocalCoreIngressV1,
+    peer: Option<Arc<VerifiedPeerCoreIngressV1>>,
     deadline_ticks: u64,
     valid: Arc<AtomicBool>,
 }
@@ -119,7 +127,7 @@ struct RootRegistrationV1 {
 }
 
 /// The single HostRuntime-owned physical service. Typed internal Core entry
-/// points only; production environmental producers/remote ingress remain closed.
+/// points; remote ingress joins the same authority/control path.
 pub(crate) struct PhysicalControlServiceV1 {
     binding: PhysicalBindingResolverV1,
     store: PhysicalStoreV1,
@@ -130,6 +138,7 @@ pub(crate) struct PhysicalControlServiceV1 {
     start_decisions: BTreeSet<ApprovalId>,
     control: ControlStateV1,
     clock: Arc<dyn BindingClockV1>,
+    remote: RemoteControlV1,
 }
 impl PhysicalControlServiceV1 {
     pub(crate) fn new(
@@ -152,6 +161,7 @@ impl PhysicalControlServiceV1 {
             start_decisions: BTreeSet::new(),
             control: ControlStateV1::default(),
             clock,
+            remote: RemoteControlV1::default(),
         })
     }
     pub(super) fn local_ingress(&self) -> AppResult<LocalCoreIngressV1> {
@@ -178,9 +188,7 @@ impl PhysicalControlServiceV1 {
         scope.fields().validate()?;
         let s = scope.fields();
         require(
-            s.requester == *self.runtime.host_ref()
-                && s.executor == *self.runtime.host_ref()
-                && s.environment == *binding.view(),
+            s.executor == *self.runtime.host_ref() && s.environment == *binding.view(),
             "Local Host/environment/binding mismatch",
         )?;
         let q =
@@ -231,6 +239,10 @@ impl PhysicalControlServiceV1 {
         scope: PhysicalReviewScopeV1,
     ) -> AppResult<PhysicalReviewRecordV1> {
         self.validate_ingress(ingress)?;
+        require(
+            scope.fields().requester == *self.runtime.host_ref(),
+            "Local review requester mismatch",
+        )?;
         self.current_scope(&scope, binding)?;
         let snapshot = self.binding.ledger_snapshot(binding)?;
         let (now, _) = self.binding.now()?;
@@ -357,6 +369,20 @@ impl PhysicalControlServiceV1 {
         binding: Arc<EnvironmentBindingV1>,
     ) -> AppResult<PhysicalAuthorityRootV1> {
         self.validate_ingress(ingress)?;
+        let r = self.store.review_for_approval(approval_id)?;
+        require(
+            r.scope.fields().requester == *self.runtime.host_ref(),
+            "Remote Start requires verified peer ingress",
+        )?;
+        self.start_exact_action_inner(approval_id, binding, None, None)
+    }
+    fn start_exact_action_inner(
+        &mut self,
+        approval_id: &ApprovalId,
+        binding: Arc<EnvironmentBindingV1>,
+        peer: Option<Arc<VerifiedPeerCoreIngressV1>>,
+        remote_lineage: Option<super::store::RemoteRootLineageV2>,
+    ) -> AppResult<PhysicalAuthorityRootV1> {
         require(
             !self.start_decisions.contains(approval_id),
             "Approval already used for a Core start decision",
@@ -374,7 +400,19 @@ impl PhysicalControlServiceV1 {
         let policy = self.policy.as_ref().ok_or_else(|| {
             crate::error::AppError::InvalidInput("No trusted executor policy".into())
         })?;
-        let narrowed = intersect(&r.scope, &policy.ceiling)?;
+        let mut ceiling = policy.ceiling.fields().clone();
+        if let Some(p) = &peer {
+            let (now, _) = self.binding.now()?;
+            p.validate(
+                &self.runtime,
+                &p.binding,
+                &r.scope.fields().requester,
+                &r.scope.fields().executor,
+                now,
+            )?;
+            ceiling.requester = r.scope.fields().requester.clone();
+        }
+        let narrowed = intersect(&r.scope, &PhysicalReviewScopeV1::try_from(ceiling)?)?;
         require(
             r.scope
                 .fields()
@@ -412,6 +450,7 @@ impl PhysicalControlServiceV1 {
         let s = r.scope.fields();
         let audit = RootAuditV1 {
             version: VersionV1,
+            remote_lineage,
             root_id: RootId::try_from(format!("physical-root:v1:{}", uuid::Uuid::new_v4()))?,
             attempt_id: AttemptId::try_from(format!(
                 "physical-attempt:v1:{}",
@@ -460,6 +499,7 @@ impl PhysicalControlServiceV1 {
             scope: r.scope,
             binding,
             ingress: self.local_ingress()?,
+            peer,
             deadline_ticks,
             valid,
         };
@@ -470,6 +510,16 @@ impl PhysicalControlServiceV1 {
     pub(super) fn validate_root(&mut self, root: &PhysicalAuthorityRootV1) -> AppResult<()> {
         let result = (|| {
             self.validate_ingress(&root.ingress)?;
+            if let Some(peer) = &root.peer {
+                let (now, _) = self.binding.now()?;
+                peer.validate(
+                    &self.runtime,
+                    &peer.binding,
+                    &root.audit.requester,
+                    &root.audit.executor,
+                    now,
+                )?;
+            }
             require(
                 root.valid.load(Ordering::Acquire)
                     && self.roots.get(root.root_id()).is_some_and(|entry| {
@@ -516,7 +566,11 @@ impl PhysicalControlServiceV1 {
         let policy = self.policy.as_ref().ok_or_else(|| {
             crate::error::AppError::InvalidInput("Executor policy missing".into())
         })?;
-        let ceiling = intersect(&root.scope, &policy.ceiling)?;
+        let mut policy_scope = policy.ceiling.fields().clone();
+        if root.peer.is_some() {
+            policy_scope.requester = root.audit.requester.clone();
+        }
+        let ceiling = intersect(&root.scope, &PhysicalReviewScopeV1::try_from(policy_scope)?)?;
         validate_narrowing(&ceiling, &requested)?;
         require(
             minimum.meets(policy.minimum_enforcement)
@@ -557,8 +611,12 @@ impl PhysicalControlServiceV1 {
         let policy = self.policy.as_ref().ok_or_else(|| {
             crate::error::AppError::InvalidInput("Executor policy missing".into())
         })?;
+        let mut ceiling = policy.ceiling.fields().clone();
+        if root.peer.is_some() {
+            ceiling.requester = root.audit.requester.clone();
+        }
         validate_narrowing(
-            &intersect(&root.scope, &policy.ceiling)?,
+            &intersect(&root.scope, &PhysicalReviewScopeV1::try_from(ceiling)?)?,
             &basis.narrowed_scope,
         )?;
         require(
@@ -745,6 +803,7 @@ pub(super) mod test_support {
             runtime,
             binding,
             authenticated: Arc::new(AtomicBool::new(true)),
+            current: None,
         }
     }
     pub(in crate::physical) fn validate_peer(
@@ -809,12 +868,20 @@ impl PhysicalControlServiceV1 {
     pub(in crate::physical) fn qualify_gate_a_environment(
         &mut self,
         ingress: &LocalCoreIngressV1,
-        run: &microduck::GateARunV1,
-        binding: &EnvironmentBindingV1,
+        run: &Arc<microduck::GateARunV1>,
+        binding: &Arc<EnvironmentBindingV1>,
         profile: &PhysicalCapabilityProfileV1,
         q: &PhysicalQualificationV1,
     ) -> AppResult<()> {
         self.validate_ingress(ingress)?;
-        self.binding.qualify_gate_a(run, binding, profile, q)
+        self.binding.qualify_gate_a(run, binding, profile, q)?;
+        // Discovery exposes only the later configured policy's bounded view.
+        // The lane itself stays executor-local and uses the same qualified run.
+        self.remote.environment = Some(ProductEnvironmentV1 {
+            binding: binding.clone(),
+            adapter: Arc::new(microduck::MicroDuckAdapterV1::new(run.clone())),
+            run: Some(run.clone()),
+        });
+        Ok(())
     }
 }

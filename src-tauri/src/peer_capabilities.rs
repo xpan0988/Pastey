@@ -202,6 +202,14 @@ pub(crate) fn local_diagnostic_projection(
             execution_world,
             managed_execution,
             state.native_agents.lock().native_capability_fact(),
+            HostCapabilityFact {
+                capability_id: "pastey.physical.control".into(),
+                available: true,
+                effect: "physical_protocol_compatibility".into(),
+                accepted_input_media_types: vec![],
+                unavailable_reason: None,
+                supported_protocols: vec![crate::physical::protocol::PROTOCOL.into()],
+            },
         ],
     }
 }
@@ -348,6 +356,23 @@ impl PeerCapabilityProjection {
         }
     }
 
+    /// Requires current-session physical protocol compatibility only; the
+    /// advertisement conveys no body availability or executable authority.
+    pub(crate) fn require_physical_protocol(&self) -> AppResult<()> {
+        if self.capabilities.iter().any(|f| {
+            f.capability_id == "pastey.physical.control"
+                && f.available
+                && f.supported_protocols
+                    .iter()
+                    .any(|p| p == crate::physical::protocol::PROTOCOL)
+        }) {
+            Ok(())
+        } else {
+            Err(AppError::InvalidInput(
+                "Physical protocol incompatible".into(),
+            ))
+        }
+    }
     /// Requires this exact current-session observation to advertise the
     /// concrete Codex capability and every exact schema an operation uses.
     /// The result deliberately grants no execution or Transfer authority.

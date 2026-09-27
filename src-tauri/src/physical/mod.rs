@@ -1,9 +1,10 @@
-//! Physical facts and Core-owned bounded task authority through Stage 6.
+//! Physical facts and Core-owned bounded task authority through Stage 7.
 //!
 //! Local MicroDuck Gate A requires a launcher-owned isolated simulation.
-//! No remote protocol, product wiring, NativeFence or hardware authority.
+//! Remote/product entry points reuse authenticated Room Control and local Core.
+//! No NativeFence or hardware authority.
 //! Successfully validating a claim does not authenticate its producer or qualify a body.
-#![allow(dead_code)] // Internal review/authority APIs await later product wiring.
+#![allow(dead_code)] // Narrow environment integrations retain internal foundation APIs.
 
 use crate::error::{AppError, AppResult};
 
@@ -42,6 +43,7 @@ pub(crate) mod binding;
 pub(crate) mod contracts;
 pub(crate) mod core;
 pub(crate) mod evidence;
+pub(crate) mod protocol;
 pub(crate) mod store;
 pub(crate) mod values;
 
