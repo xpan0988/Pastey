@@ -14,7 +14,7 @@ index b3f515f..3120ea9 100644
 @@ -270,0 +272 @@ impl Intents {
 +            task: crate::task_authority::Authority::default(),
 diff --git a/robotd/src/main.rs b/robotd/src/main.rs
-index ab574b6..fdd4af1 100644
+index ab574b6..fd168e1 100644
 --- a/robotd/src/main.rs
 +++ b/robotd/src/main.rs
 @@ -26,0 +27 @@ mod sound;
@@ -88,11 +88,35 @@ index ab574b6..fdd4af1 100644
 @@ -2664 +2725 @@ async fn control_loop<T: RobotIo>(
 -        let command = PolicyCommand {
 +        let mut command = PolicyCommand {
-@@ -2996,0 +3058,3 @@ async fn control_loop<T: RobotIo>(
+@@ -2952,0 +3014,8 @@ async fn control_loop<T: RobotIo>(
++        // Test-only injection at the controller result seam avoids requiring an
++        // ONNX runtime while exercising the real loop's inference-error branch.
++        #[cfg(test)]
++        let injected_controller_loss = intents.task.take_controller_failure();
++        #[cfg(not(test))]
++        let injected_controller_loss = false;
++        #[cfg(test)]
++        let driving = driving || injected_controller_loss;
+@@ -2987,2 +3056,11 @@ async fn control_loop<T: RobotIo>(
+-                let controller = controller.as_mut().expect("driving implies a controller");
+-                match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
++                let step = if injected_controller_loss {
++                    Err(PolicyError::Inference(
++                        "injected Stage 8 controller loss".into(),
++                    ))
++                } else {
++                    controller
++                        .as_mut()
++                        .expect("driving implies a controller")
++                        .step(sensors, &command, snapshot.pose.active, dt, scale_mult)
++                };
++                match step {
+@@ -2996,0 +3075,4 @@ async fn control_loop<T: RobotIo>(
++                        intents.task.native_loss("native_controller_loss");
 +                        if let Some(guard) = task_use.as_mut() {
 +                            guard.invalidate("native_controller_loss");
 +                        }
-@@ -3196,0 +3261,17 @@ async fn control_loop<T: RobotIo>(
+@@ -3196,0 +3279,17 @@ async fn control_loop<T: RobotIo>(
 +        #[cfg(test)]
 +        intents.task.pause_at(true);
 +        // Recheck at the actual actuator write boundary too. If a deadline
@@ -110,25 +134,26 @@ index ab574b6..fdd4af1 100644
 +            state.moving.store(false, Ordering::Relaxed);
 +            targets = coast.known_positions(hold);
 +        }
-@@ -3199 +3280,6 @@ async fn control_loop<T: RobotIo>(
+@@ -3199 +3298,7 @@ async fn control_loop<T: RobotIo>(
 -            Err(e) => tracing::warn!(error = %e, "bus write failed"),
 +            Err(e) => {
++                intents.task.native_loss("native_write_loss");
 +                if let Some(guard) = task_use.as_mut() {
 +                    guard.invalidate("native_write_loss");
 +                }
 +                tracing::warn!(error = %e, "bus write failed");
 +            }
-@@ -3201,0 +3288,2 @@ async fn control_loop<T: RobotIo>(
+@@ -3201,0 +3307,2 @@ async fn control_loop<T: RobotIo>(
 +        drop(task_use); // native fence/install may now linearize
 +
-@@ -3585,0 +3674,6 @@ async fn handle(
+@@ -3585,0 +3693,6 @@ async fn handle(
 +    static NEXT_TASK_CONNECTION: AtomicU64 = AtomicU64::new(1);
 +    let owner = NEXT_TASK_CONNECTION.fetch_add(1, Ordering::Relaxed);
 +    let _task_connection = task_authority::Connection {
 +        authority: &intents.task,
 +        owner,
 +    };
-@@ -3705,0 +3800,19 @@ async fn handle(
+@@ -3705,0 +3819,19 @@ async fn handle(
 +        // Versioned native task family is consumed only by robotd. Other
 +        // services retain their unchanged typed method tables and reject it.
 +        if request.method == "robot.task" {
@@ -148,11 +173,11 @@ index ab574b6..fdd4af1 100644
 +            }
 +            continue;
 +        }
-@@ -3750,0 +3864,3 @@ fn apply_intent(state: &RobotState, intents: &Intents, call: &proto::Call) -> bo
+@@ -3750,0 +3883,3 @@ fn apply_intent(state: &RobotState, intents: &Intents, call: &proto::Call) -> bo
 +    if intents.task.enabled() {
 +        return false;
 +    } // notifications cannot bypass task ownership
-@@ -4303,0 +4420,21 @@ fn dispatch(
+@@ -4303,0 +4439,21 @@ fn dispatch(
 +    if intents.task.enabled() && call.method().starts_with("robot.") {
 +        let read = matches!(
 +            call,
@@ -174,7 +199,7 @@ index ab574b6..fdd4af1 100644
 +            );
 +        }
 +    }
-@@ -8951,0 +9089,162 @@ mod tests {
+@@ -8951,0 +9108,450 @@ mod tests {
 +
 +    // Deterministic injection inside the real native control loop, not a copy of
 +    // its guard. FakeIo replaces only actuator I/O; no PPO/MuJoCo qualification.
@@ -336,4 +361,292 @@ index ab574b6..fdd4af1 100644
 +    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 +    async fn stage8_expiry_during_real_control_frame_discards_targets() {
 +        stage8_boundary_race(true).await;
++    }
++    // Actuator failure travels through the existing Safety::apply -> RobotIo
++    // write path. Read, gain and torque operations retain ordinary FakeIo behavior.
++    struct Stage8WriteLossIo {
++        io: FakeIo,
++        fail: bool,
++        failed: Arc<AtomicBool>,
++    }
++    impl RobotIo for Stage8WriteLossIo {
++        fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
++            self.io.read()
++        }
++        fn write(&mut self, t: &duck_control::JointTargets) -> duck_control::io::Result<()> {
++            if self.fail {
++                self.fail = false;
++                self.failed.store(true, Ordering::Release);
++                return Err(duck_control::io::IoError::Bus(
++                    "injected Stage 8 write loss".into(),
++                ));
++            }
++            self.io.write(t)
++        }
++        fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
++            self.io.set_gain(kp)
++        }
++        fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
++            self.io.set_torque(on)
++        }
++        fn reboot(&mut self, id: u8) -> duck_control::io::Result<()> {
++            self.io.reboot(id)
++        }
++        fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
++            self.io.slow_sensors()
++        }
++    }
++    async fn stage8_contended_failure(controller_loss: bool) {
++        use proto::task_authority::*;
++        let intents = Arc::new(Intents::new());
++        let identity = Identity {
++            environment: "env".into(),
++            domain: "motion".into(),
++            body: "body".into(),
++            body_ref: "duck".into(),
++            world: "world".into(),
++            controller: task_authority::controller_incarnation().unwrap(),
++        };
++        intents.task.configure(identity.clone()).unwrap();
++        let now = proto::clock::monotonic_ns() / 1000;
++        let mut install = Install {
++            protocol: PROTOCOL.into(),
++            profile: PROFILE.into(),
++            identity,
++            domain: "motion".into(),
++            session: "session".into(),
++            epoch: 1,
++            request: "install".into(),
++            lease_deadline_us: now + 2_000_000,
++        };
++        let mut action = Action {
++            install: install.clone(),
++            action: "action".into(),
++            payload_digest: "a".repeat(64),
++            deadline_us: now + 1_000_000,
++        };
++        let mut movement = Move {
++            action: action.clone(),
++            request: "move".into(),
++            sequence: 1,
++            twist: [0.05, 0.0, 0.0],
++        };
++        assert!(
++            intents
++                .task
++                .request_live(
++                    &Request::Install {
++                        descriptor: install.clone()
++                    },
++                    1
++                )
++                .accepted
++        );
++        assert!(
++            intents
++                .task
++                .request_live(
++                    &Request::Admit {
++                        descriptor: action.clone()
++                    },
++                    1
++                )
++                .accepted
++        );
++        assert!(
++            intents
++                .task
++                .request_live(
++                    &Request::Move {
++                        descriptor: movement.clone()
++                    },
++                    1
++                )
++                .accepted
++        );
++        let mut contention = intents.task.consume().unwrap();
++        assert_eq!(contention.twist(now), [0.05, 0.0, 0.0]);
++        if controller_loss {
++            intents.task.inject_controller_failure();
++        }
++        let (entered, release) = intents.task.inject_pause(true);
++        let state = Arc::new(RobotState::new(
++            &Params::default(),
++            Path::new("/nonexistent"),
++            false,
++            false,
++        ));
++        let mut frames = state.state_tx.subscribe();
++        let failed = Arc::new(AtomicBool::new(false));
++        let loop_state = state.clone();
++        let loop_intents = intents.clone();
++        let write_failed = failed.clone();
++        let run = tokio::spawn(async move {
++            let mut io = Stage8WriteLossIo {
++                io: FakeIo::at(DEFAULT_POSITION),
++                fail: !controller_loss,
++                failed: write_failed,
++            };
++            control_loop_probe_with(&mut io, loop_state, loop_intents, Duration::from_millis(2))
++                .await;
++        });
++        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(2)).unwrap())
++            .await
++            .unwrap();
++        release.send(()).unwrap();
++        // Completing a frame while the mutex remains held proves the loop did
++        // not block to acquire it, including in the native failure handler.
++        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(frame.movement.requested, [0.0; 3]);
++        assert_eq!(frame.movement.applied, [0.0; 3]);
++        assert_eq!(failed.load(Ordering::Acquire), !controller_loss);
++        // Make the next real frame acquire the guard after contention ends,
++        // before any IPC request could fold the loss and hide a consume bug.
++        let (next_entered, next_release) = intents.task.inject_pause(false);
++        tokio::task::spawn_blocking(move || {
++            next_entered.recv_timeout(Duration::from_secs(2)).unwrap()
++        })
++        .await
++        .unwrap();
++        while frames.try_recv().is_ok() {}
++        drop(contention);
++        next_release.send(()).unwrap();
++        let resumed = tokio::time::timeout(Duration::from_secs(2), frames.recv())
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(resumed.movement.requested, [0.0; 3]);
++        assert_eq!(resumed.movement.applied, [0.0; 3]);
++        let receipt = intents.task.request_live(
++            &Request::Status {
++                protocol: PROTOCOL.into(),
++            },
++            1,
++        );
++        assert!(receipt.fenced);
++        assert_eq!(
++            receipt.reason,
++            if controller_loss {
++                "native_controller_loss"
++            } else {
++                "native_write_loss"
++            }
++        );
++        movement.sequence = 2;
++        assert!(
++            !intents
++                .task
++                .request_live(
++                    &Request::Move {
++                        descriptor: movement.clone()
++                    },
++                    1
++                )
++                .accepted
++        );
++        assert_eq!(
++            intents
++                .task
++                .consume()
++                .unwrap()
++                .twist(proto::clock::monotonic_ns() / 1000),
++            [0.0; 3]
++        );
++        // Use fresh bounds to prove refusal is launch invalidation, not expiry.
++        let now = proto::clock::monotonic_ns() / 1000;
++        install.epoch = 3;
++        install.session = "new-session".into();
++        install.lease_deadline_us = now + 2_000_000;
++        assert!(
++            !intents
++                .task
++                .request_live(
++                    &Request::Install {
++                        descriptor: install.clone()
++                    },
++                    1
++                )
++                .accepted
++        );
++        let mut fresh_identity = install.identity.clone();
++        fresh_identity.controller = task_authority::controller_incarnation().unwrap();
++        assert!(intents.task.configure(fresh_identity.clone()).is_err());
++        state.shutdown.store(true, Ordering::Relaxed);
++        run.await.unwrap();
++        // A replacement launch has no old authority; old descriptors reject.
++        let fresh = task_authority::Authority::default();
++        fresh.configure(fresh_identity.clone()).unwrap();
++        assert!(
++            !fresh
++                .request_live(
++                    &Request::Move {
++                        descriptor: movement
++                    },
++                    1
++                )
++                .accepted
++        );
++        assert!(
++            !fresh
++                .request_live(
++                    &Request::Install {
++                        descriptor: install.clone()
++                    },
++                    1
++                )
++                .accepted
++        );
++        install.identity = fresh_identity;
++        install.lease_deadline_us = proto::clock::monotonic_ns() / 1000 + 2_000_000;
++        action.install = install.clone();
++        action.deadline_us = proto::clock::monotonic_ns() / 1000 + 1_000_000;
++        let movement = Move {
++            action: action.clone(),
++            request: "fresh-move".into(),
++            sequence: 1,
++            twist: [0.05, 0.0, 0.0],
++        };
++        assert!(
++            fresh
++                .request_live(
++                    &Request::Install {
++                        descriptor: install
++                    },
++                    1
++                )
++                .accepted
++        );
++        assert!(
++            fresh
++                .request_live(&Request::Admit { descriptor: action }, 1)
++                .accepted
++        );
++        assert!(
++            fresh
++                .request_live(
++                    &Request::Move {
++                        descriptor: movement
++                    },
++                    1
++                )
++                .accepted
++        );
++        assert_eq!(
++            fresh
++                .consume()
++                .unwrap()
++                .twist(proto::clock::monotonic_ns() / 1000),
++            [0.05, 0.0, 0.0]
++        );
++    }
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn stage8_controller_loss_under_contention_invalidates_launch() {
++        stage8_contended_failure(true).await;
++    }
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn stage8_write_loss_under_contention_invalidates_launch() {
++        stage8_contended_failure(false).await;
 +    }

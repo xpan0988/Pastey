@@ -71,7 +71,10 @@ resuming the old session. The adapter does not reconnect.
 Every native boot generates a fresh OS-random controller incarnation. No task
 state is restored. Old installation and buffered command descriptors mismatch the
 new identity even at the same socket name. Native read/controller/write failure
-latches closed and requires a fresh launch, preventing in-place task reconstruction.
+publishes a sticky atomic launch-loss latch even when the task mutex is contended.
+Consumption and IPC fold that latch into invalidated state; no same-launch install
+or higher epoch can clear it. Failure handling never waits for the task mutex.
+Only a fresh launch/controller incarnation can recover.
 Body/world identity comes from the trusted isolated launch, not task metadata. An
 in-place simulator/body reset without a native I/O discontinuity is unsupported;
 qualification must prove that reset cannot preserve this launch binding. The
@@ -83,7 +86,8 @@ profile qualification remain Stage 9 gates; no NativeFence qualification produce
 or automatic Gate A promotion is added.
 
 The deterministic harness injects pauses before real consumption and immediately
-before real apply; guard tests cover fence/refresh serialization, partial requests,
+before real apply, and holds the task mutex while injecting an inference-result
+error or an actuator write failure through the real loop. Guard tests cover fence/refresh serialization, partial requests,
 replay, controller replacement and native deadlines. The process harness delays
 ACK reads, restarts robotd/controller, drops a partial-fence connection and waits
 for independent native expiry. Process restart replaces the controller incarnation;

@@ -1,5 +1,6 @@
-//! Core-owned review, authority, control and evidence. Local and authenticated
-//! remote requests share executor-local Gate A/NativeFence adapter boundaries.
+//! Core-owned review, finite authority, control and evidence. Local and
+//! authenticated remote tasks share executor-local Gate A/NativeFence lanes.
+//! Native mechanism receipts remain separate from body qualification.
 #[path = "control.rs"]
 mod control;
 #[path = "core_evidence.rs"]

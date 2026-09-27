@@ -3,11 +3,15 @@
 use duck_ipc_proto::task_authority::*;
 use std::sync::{
     Mutex, MutexGuard,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 pub struct Authority {
     enabled: AtomicBool,
+    // Independent of state contention. First failure permanently closes this launch.
+    loss: AtomicU8,
+    #[cfg(test)]
+    controller_failure: AtomicBool,
     state: Mutex<State>,
     #[cfg(test)]
     pause: Mutex<
@@ -39,6 +43,9 @@ impl Default for Authority {
             #[cfg(test)]
             pause: Mutex::new(None),
             enabled: AtomicBool::new(false),
+            loss: AtomicU8::new(0),
+            #[cfg(test)]
+            controller_failure: AtomicBool::new(false),
             state: Mutex::new(State::new(Identity {
                 environment: "disabled".into(),
                 domain: "disabled".into(),
@@ -255,7 +262,7 @@ impl Authority {
         self.enabled.load(Ordering::Acquire)
     }
     pub fn configure(&self, identity: Identity) -> Result<(), &'static str> {
-        if !identity.validate() || self.enabled() {
+        if !identity.validate() || self.enabled() || self.loss.load(Ordering::Acquire) != 0 {
             return Err("invalid_native_configuration");
         }
         *self.state.lock().map_err(|_| "poisoned_native_guard")? = State::new(identity);
@@ -279,6 +286,7 @@ impl Authority {
             }
         };
         let now = clock(); // sample only AFTER acquiring the native application/fence lock
+        self.fold_loss(&mut s);
         s.expire(now);
         let request = match r {
             Request::Install { descriptor } => descriptor.request.as_str(),
@@ -287,7 +295,7 @@ impl Authority {
             Request::Fence { descriptor } => descriptor.request.as_str(),
             Request::Status { .. } => "status",
         };
-        let result = if !self.enabled() {
+        let mut result = if !self.enabled() {
             Err("native_task_mode_disabled")
         } else {
             match r {
@@ -309,6 +317,10 @@ impl Authority {
         if result.is_err() && matches!(r, Request::Move { .. }) && s.owner == owner {
             s.close("invalid_task_command");
         }
+        // A loss may have been published while this request held the mutex.
+        if self.fold_loss(&mut s) && !matches!(r, Request::Status { .. }) {
+            result = Err("native_reset_requires_fresh_launch");
+        }
         s.receipt(
             now,
             request,
@@ -323,16 +335,47 @@ impl Authority {
             }
         }
     }
+    fn fold_loss(&self, state: &mut State) -> bool {
+        let reason = match self.loss.load(Ordering::Acquire) {
+            0 => return false,
+            1 => "native_controller_loss",
+            2 => "native_write_loss",
+            3 => "native_io_loss",
+            _ => "native_launch_loss",
+        };
+        state.invalidate(reason);
+        true
+    }
+    /// Nonblocking even when the caller holds the consumption guard or another
+    /// thread owns it. No request, epoch or reconfiguration clears this latch.
     pub fn native_loss(&self, reason: &str) {
-        if let Ok(mut s) = self.state.lock() {
-            s.close(reason);
-            s.invalidated = true;
+        let code = match reason {
+            "native_controller_loss" => 1,
+            "native_write_loss" => 2,
+            "native_io_loss" => 3,
+            _ => 4,
+        };
+        let _ = self
+            .loss
+            .compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
+        if let Ok(mut s) = self.state.try_lock() {
+            self.fold_loss(&mut s);
         }
     }
+    #[cfg(test)]
+    pub fn inject_controller_failure(&self) {
+        self.controller_failure.store(true, Ordering::Release);
+    }
+    #[cfg(test)]
+    pub fn take_controller_failure(&self) -> bool {
+        self.controller_failure.swap(false, Ordering::AcqRel)
+    }
     pub fn can_provision(&self) -> bool {
-        self.state
-            .lock()
-            .is_ok_and(|s| s.high_water == 0 && s.installed.is_none() && !s.invalidated)
+        self.loss.load(Ordering::Acquire) == 0
+            && self
+                .state
+                .lock()
+                .is_ok_and(|s| s.high_water == 0 && s.installed.is_none() && !s.invalidated)
     }
     /// The loop never waits for IPC. A contended/poisoned lock means zero task
     /// twist and discarding this tick's motion targets. Held through native apply.
@@ -359,7 +402,9 @@ impl Authority {
         (rx, release)
     }
     pub fn consume(&self) -> Option<MutexGuard<'_, State>> {
-        self.state.try_lock().ok()
+        let mut state = self.state.try_lock().ok()?;
+        self.fold_loss(&mut state);
+        Some(state)
     }
 }
 
