@@ -81,7 +81,8 @@ impl PhysicalActionDispositionV1 {
 }
 
 // Neither claims, adapter ACKs nor DB bodies construct these authenticated inputs.
-// Only the owned Gate A supervisor or explicit synthetic test producer may seal
+// Only the owned simulation supervisor (Gate A or qualified native Gate B)
+// or explicit synthetic test producer may seal
 // facts; no external DTO or arbitrary telemetry producer can do so. Digests correlate its verified provenance, not authenticate it.
 pub(super) struct TrustedObservationV1 {
     fact: PhysicalObservationV1,

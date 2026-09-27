@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub(in crate::physical) struct ProductEnvironmentV1 {
     pub binding: Arc<EnvironmentBindingV1>,
     pub adapter: Arc<dyn PhysicalEnvironmentAdapterV1>,
-    pub run: Option<Arc<microduck::GateARunV1>>,
+    pub run: Option<Arc<microduck::MicroDuckRunV1>>,
 }
 #[derive(Default)]
 pub(super) struct RemoteControlV1 {
@@ -21,7 +21,7 @@ pub(in crate::physical) enum PhysicalWorkKindV1 {
         start: RequestId,
         session: Arc<BodyControlSessionV1>,
         adapter: Arc<dyn PhysicalEnvironmentAdapterV1>,
-        run: Option<Arc<microduck::GateARunV1>>,
+        run: Option<Arc<microduck::MicroDuckRunV1>>,
     },
     Cancel {
         session: Arc<BodyControlSessionV1>,
@@ -68,9 +68,36 @@ pub(crate) struct PhysicalProductViewV1 {
     pub start: Option<RequestId>,
     pub status: Option<PhysicalStatusV1>,
     pub delivery_pending: bool,
+    pub availability: PhysicalAvailabilityV1,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PhysicalAvailabilityV1 {
+    Qualified,
+    Released,
+    QualificationUnavailable,
+    QualificationExpired,
+    EnvironmentUnavailable,
 }
 
 impl PhysicalControlServiceV1 {
+    fn validate_product_lane(e: &ProductEnvironmentV1) -> AppResult<()> {
+        if e.binding.requires_owned_native_run() {
+            let run = e.run.as_ref().ok_or_else(|| {
+                crate::error::AppError::InvalidInput(
+                    "Native qualification observation lane unavailable".into(),
+                )
+            })?;
+            run.validate_binding(e.binding.view())?;
+            run.validate_fresh()?;
+            require(
+                run.gate_b_evidence().is_some()
+                    && e.adapter.owned_native_binding() == Some(e.binding.view().digest()?),
+                "Exact production NativeFence lane unavailable",
+            )?;
+        }
+        Ok(())
+    }
     /// This consumes only the sealed producer from authenticated Room Control.
     /// Neither a DTO nor a renderer-supplied session can call that producer.
     pub(crate) fn verified_peer_ingress(
@@ -165,6 +192,7 @@ impl PhysicalControlServiceV1 {
     ) -> AppResult<()> {
         self.validate_ingress(ingress)?;
         self.binding.validate_current(&environment.binding)?;
+        Self::validate_product_lane(&environment)?;
         let ceiling = self
             .policy
             .as_ref()
@@ -266,8 +294,12 @@ impl PhysicalControlServiceV1 {
                         .clone();
                     f.requester = m.requester.clone();
                     let scope = PhysicalReviewScopeV1::try_from(f)?;
-                    self.current_scope(&scope, &binding)?;
-                    offers.push(scope);
+                    if Self::validate_product_lane(self.remote.environment.as_ref().unwrap())
+                        .is_ok()
+                        && self.current_scope(&scope, &binding).is_ok()
+                    {
+                        offers.push(scope);
+                    }
                 }
                 PhysicalOperationV1::Environments { offers }
             }
@@ -283,6 +315,7 @@ impl PhysicalControlServiceV1 {
                             "No configured physical environment".into(),
                         )
                     })?;
+                    Self::validate_product_lane(environment)?;
                     let binding = environment.binding.clone();
                     let adapter = environment.adapter.clone();
                     let run = environment.run.clone();
@@ -591,12 +624,40 @@ impl PhysicalControlServiceV1 {
         } else {
             None
         };
+        let saved_offers = offers
+            .map(|r| serde_json::from_str::<Vec<PhysicalReviewScopeV1>>(&r))
+            .transpose()?;
+        let now = self.clock.read()?.0;
+        let availability = match &saved_offers {
+            None => PhysicalAvailabilityV1::EnvironmentUnavailable,
+            Some(v) if v.is_empty() => PhysicalAvailabilityV1::QualificationUnavailable,
+            Some(v)
+                if v.iter().all(|s| {
+                    now >= s.fields().qualification.expires_at
+                        || now >= s.fields().environment.offer_expiry
+                }) =>
+            {
+                PhysicalAvailabilityV1::QualificationExpired
+            }
+            Some(v)
+                if v.iter().any(|s| {
+                    s.fields().qualification.required_enforcement_class
+                        == SessionEnforcementClassV1::NativeFence
+                }) =>
+            {
+                PhysicalAvailabilityV1::Released
+            }
+            _ => PhysicalAvailabilityV1::Qualified,
+        };
         Ok(PhysicalProductViewV1 {
-            offers: offers
-                .map(|r| serde_json::from_str::<Vec<PhysicalReviewScopeV1>>(&r))
-                .transpose()?
+            availability,
+            offers: saved_offers
                 .unwrap_or_default()
                 .into_iter()
+                .filter(|s| {
+                    now < s.fields().qualification.expires_at
+                        && now < s.fields().environment.offer_expiry
+                })
                 .map(|scope| {
                     Ok(PhysicalOfferViewV1 {
                         scope_digest: scope.digest()?,
@@ -658,9 +719,14 @@ impl PhysicalControlServiceV1 {
                             return Err(error);
                         }
                     };
-                    let native = microduck::MicroDuckAdapterV1::new(run.clone());
-                    Self::run_gate_a_reference(core, &session, &action, run.clone(), &native)
-                        .await?;
+                    Self::run_gate_a_reference(
+                        core,
+                        &session,
+                        &action,
+                        run.clone(),
+                        adapter.as_ref(),
+                    )
+                    .await?;
                     // Same Stage 5 evaluator and L7 acceptance; no transport ACK
                     // or installation/write/stop ACK can become completion.
                     let settling_deadline = {

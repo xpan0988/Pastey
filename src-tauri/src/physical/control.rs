@@ -182,6 +182,9 @@ type LaneFuture<'a, T> = Pin<Box<dyn Future<Output = AppResult<Option<T>>> + Sen
 pub(in crate::physical) trait PhysicalEnvironmentAdapterV1:
     Send + Sync
 {
+    fn owned_native_binding(&self) -> Option<DigestV1> {
+        None
+    }
     fn install_session(
         &self,
         view: NativeSessionInstallViewV1,
@@ -342,7 +345,13 @@ impl PhysicalControlServiceV1 {
             required: s.audit.enforcement,
             binding: s.basis.scope().fields().environment.clone(),
             validity: LaneValidityV1 {
-                flags: vec![s.root.valid.clone(), s.valid.clone()],
+                flags: s
+                    .root
+                    .binding
+                    .runtime_flags()
+                    .into_iter()
+                    .chain([s.root.valid.clone(), s.valid.clone()])
+                    .collect(),
                 clock: self.clock.clone(),
                 deadline: s.deadline,
                 continuing: None,
@@ -725,12 +734,18 @@ impl PhysicalControlServiceV1 {
             payload_digest: a.audit.proposal.payload_digest.clone(),
             deadline: a.deadline,
             validity: LaneValidityV1 {
-                flags: vec![
-                    s.root.valid.clone(),
-                    s.valid.clone(),
-                    a.grant.valid.clone(),
-                    a.valid.clone(),
-                ],
+                flags: s
+                    .root
+                    .binding
+                    .runtime_flags()
+                    .into_iter()
+                    .chain([
+                        s.root.valid.clone(),
+                        s.valid.clone(),
+                        a.grant.valid.clone(),
+                        a.valid.clone(),
+                    ])
+                    .collect(),
                 clock: self.clock.clone(),
                 deadline: a.deadline.min(s.deadline),
                 continuing: Some(a.continuing_deadline.clone()),
@@ -1073,7 +1088,7 @@ impl PhysicalControlServiceV1 {
     pub(in crate::physical) async fn end_gate_a_action(
         core: &Mutex<Self>,
         action: &Arc<AdmittedBodyActionV1>,
-        adapter: &microduck::MicroDuckAdapterV1,
+        adapter: &dyn PhysicalEnvironmentAdapterV1,
     ) -> AppResult<bool> {
         let fence = {
             let mut service = core.lock();
@@ -1130,7 +1145,7 @@ impl PhysicalControlServiceV1 {
         &mut self,
         ingress: &LocalCoreIngressV1,
         session: &Arc<BodyControlSessionV1>,
-        run: &microduck::GateARunV1,
+        run: &microduck::MicroDuckRunV1,
         control: TrustedControlObservationV1,
         continuing: bool,
     ) -> AppResult<()> {
@@ -1163,8 +1178,8 @@ impl PhysicalControlServiceV1 {
         core: &Mutex<Self>,
         session: &Arc<BodyControlSessionV1>,
         action: &Arc<AdmittedBodyActionV1>,
-        run: Arc<microduck::GateARunV1>,
-        adapter: &microduck::MicroDuckAdapterV1,
+        run: Arc<microduck::MicroDuckRunV1>,
+        adapter: &dyn PhysicalEnvironmentAdapterV1,
     ) -> AppResult<()> {
         let mut result = Self::dispatch_admitted_action(core, action, adapter).await;
         while result.is_ok() {
@@ -1227,8 +1242,8 @@ impl PhysicalControlServiceV1 {
                 .map(|_| ());
         }
         if result.is_err() {
-            // Stop is requested even after lost observation validity. It remains
-            // an isolation-only request, with unknown physical consequences.
+            // Stop is requested even after lost observation validity. It uses the
+            // configured lane and retains unknown physical consequences.
             let _ = Self::revoke_control_session(core, session, adapter).await;
         }
         result

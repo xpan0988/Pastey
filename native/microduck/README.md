@@ -1,4 +1,4 @@
-# Stage 8 native MicroDuck Gate B
+# Native MicroDuck Gate B: Stage 8 mechanism and Stage 9 release gate
 
 This is a reproducible source overlay for MicroDuck commit
 `a9ec4b2079ef8ee7904014089c885bb07d57d63c`. It is not an upstream release,
@@ -58,8 +58,10 @@ action <=1 second and <=lease, missing valid refresh >=200 ms closes the task.
 Expiry is checked by the loop without Pastey traffic. Pastey maps remaining Core
 lifetime after a <=20 ms status round trip onto the earlier native sample, so
 transport delay shortens validity. No retry or refresh changes a deadline. This
-assumes progressing same-Host monotonic clocks; suspend, native-loop freeze and
-external platform watchdog behavior remain unqualified.
+assumes progressing same-Host monotonic clocks. Stage 9 binds awake/progressing-loop
+conditions, tests expiry on SIGSTOP resume, and excludes Host suspend or continuous
+protection while frozen. There is no independent watchdog. Real simulator evidence
+for those conditions remains pending.
 
 Exact descriptor duplicates are idempotent; higher epochs require a new install.
 A foreign connection cannot take an active owner. A stale fence cannot affect a
@@ -81,9 +83,9 @@ qualification must prove that reset cannot preserve this launch binding. The
 internal Pastey constructor requires a sealed live binding and a private owned
 socket; arbitrary JSON, paths, status replies or SQLite rows cannot mint it.
 This mechanism does not authenticate arbitrary public clients or implement operator
-preemption. Production isolated launch/enrollment, physical observations and exact
-profile qualification remain Stage 9 gates; no NativeFence qualification producer
-or automatic Gate A promotion is added.
+preemption. Stage 9 adds a separate exact owned simulator qualification producer,
+immutable evidence record and explicit release/withdrawal gate. It never promotes
+Gate A automatically; the production manifest remains `PENDING_ENVIRONMENT`.
 
 The deterministic harness injects pauses before real consumption and immediately
 before real apply, and holds the task mutex while injecting an inference-result
@@ -92,3 +94,9 @@ replay, controller replacement and native deadlines. The process harness delays
 ACK reads, restarts robotd/controller, drops a partial-fence connection and waits
 for independent native expiry. Process restart replaces the controller incarnation;
 there is no supported separate in-place controller restart that restores task state.
+
+## Stage 9 production qualification
+
+The [exact qualification contract](../../docs/physical-environment-implementation.md#stage-9-exact-simulator-qualification-and-release) defines the trusted Host installation-owner path, owned source rebuild, independent MuJoCo observations, one-second reference trace, expiry probes, reset/suspend boundary and record/release semantics. [profile-v1.json](profile-v1.json) pins both source revisions and explicitly leaves unknown real model/policy/Python/ORT identities null. Resource locators cannot override these compiled pins or mint qualification.
+
+The macOS host lacks Linux bubblewrap, the pinned Python 3.12 stack, MuJoCo/ONNX Runtime and exact PPO artifacts. No real simulator/controller qualification or production release record exists. Rust/native-oracle and Python orchestration tests exercise mechanism/qualification plumbing only; they cannot fill the missing golden identities or authorize release. No hardware qualification is performed.

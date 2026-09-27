@@ -21,9 +21,12 @@ function PhysicalHostReview({ roomId, host }: { roomId: string; host: string }) 
   const [error, setError] = useState("");
   const mounted = useRef(true);
   const [, updateExpiry] = useState(0);
-  const reviewExpiry = view?.review ? Math.min(view.review.scope.environment.offerExpiry, view.review.scope.qualification.expiresAt, view.review.approval?.expiresAt ?? Infinity) : null;
+  const reviewExpiry = view ? Math.min(
+    view.review ? Math.min(view.review.scope.environment.offerExpiry, view.review.scope.qualification.expiresAt, view.review.approval?.expiresAt ?? Infinity) : Infinity,
+    ...view.offers.map((offer) => Math.min(offer.scope.environment.offerExpiry, offer.scope.qualification.expiresAt)).filter((expiry) => expiry > Date.now()),
+  ) : null;
   useEffect(() => {
-    if (reviewExpiry === null) return;
+    if (reviewExpiry === null || !Number.isFinite(reviewExpiry)) return;
     const delay = reviewExpiry - Date.now();
     if (delay <= 0) return;
     const timer = window.setTimeout(() => updateExpiry((n) => n + 1), Math.min(delay + 1, 2147483647));
@@ -45,9 +48,10 @@ function PhysicalHostReview({ roomId, host }: { roomId: string; host: string }) 
     <button type="button" disabled={busy} onClick={() => void command({ kind: "discover" })}>Discover environments</button>
     <button type="button" disabled={busy} onClick={() => void command({ kind: "snapshot" })}>Refresh saved state</button>
     {view ? <>
-      {view.offers.length === 0 ? <p>No current qualified physical environment is offered. Real Gate A qualification may be pending.</p> : <ul>{view.offers.map((offer) => <li key={offer.scopeDigest}>
+      <p role="status">{({ qualified: "Qualified simulation environment", released: "Qualified and released NativeFence simulation profile", qualification_unavailable: "Qualification unavailable or withdrawn", qualification_expired: "Qualification expired", environment_unavailable: "Environment unavailable" })[view.offers.length > 0 && view.offers.every((offer) => Date.now() >= Math.min(offer.scope.environment.offerExpiry, offer.scope.qualification.expiresAt)) ? "qualification_expired" : view.availability ?? "environment_unavailable"]}</p>
+      {view.offers.length === 0 ? <p>No executable environment is offered. NativeFence simulation requires an exact, current simulator/controller qualification.</p> : <ul>{view.offers.map((offer) => <li key={offer.scopeDigest}>
         {offer.scope.environment.environment} · {offer.scope.environment.evidenceClass} · {offer.scope.qualification.requiredEnforcementClass.replace(/_/g, " ")}
-        <button type="button" disabled={busy || Date.now() >= offer.scope.environment.offerExpiry} onClick={() => void command({ kind: "compose", offer_digest: offer.scopeDigest })}>Compose exact review</button>
+        <button type="button" disabled={busy || Date.now() >= Math.min(offer.scope.environment.offerExpiry, offer.scope.qualification.expiresAt)} onClick={() => void command({ kind: "compose", offer_digest: offer.scopeDigest })}>Compose exact review</button>
       </li>)}</ul>}
       {scope && r ? <article>
         <strong>Exact physical review · {r.state}</strong>

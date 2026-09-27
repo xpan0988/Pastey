@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "state": "PENDING_ENVIRONMENT",
+  "upstream": "a9ec4b2079ef8ee7904014089c885bb07d57d63c",
+  "rlUpstream": "cb70b792312d559a4da09064d92009079671815f",
+  "protocol": "microduck-task-v1",
+  "profile": "reference-velocity-v1",
+  "mujocoVersion": null,
+  "compiledModelSha256": null,
+  "paramsSha256": null,
+  "policySha256": null,
+  "pythonEnvironmentSha256": null,
+  "pythonExecutableSha256": null,
+  "onnxRuntimeSha256": null
+}

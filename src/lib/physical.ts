@@ -34,6 +34,7 @@ export interface PhysicalProductView {
   start: string | null;
   status: PhysicalStatus | null;
   deliveryPending: boolean;
+  availability?: "qualified" | "released" | "qualification_unavailable" | "qualification_expired" | "environment_unavailable";
 }
 export type PhysicalProductRequest =
   | { kind: "discover" | "snapshot" }

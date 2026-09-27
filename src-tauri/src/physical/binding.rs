@@ -111,9 +111,9 @@ impl EnvironmentBindingViewV1 {
 }
 
 // Stage 2 trust owner. No external DTO, row, digest, endpoint name or telemetry
-// can construct these sealed inputs. A later authenticated native/supervisor
-// producer must live inside this module's trust boundary. Stage 6 adds only
-// the launcher-owned simulation Gate A stamps below; no generic claim ingress.
+// can construct these sealed inputs. Stages 6 and 9 seal launcher-owned
+// simulator facts for their separate Gate A and native Gate B paths below.
+// Generic claim ingress remains closed.
 use super::{
     contracts::{PhysicalCapabilityProfileV1, PhysicalQualificationV1},
     store::PhysicalStoreV1,
@@ -200,6 +200,7 @@ pub(super) struct TrustedEnrollmentV1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BindingProvenanceV1 {
     GateASupervisor,
+    GateBSupervisor,
     QualifiedNativeHandshake,
 }
 pub(super) struct TrustedBindingFactsV1 {
@@ -214,6 +215,7 @@ pub(super) struct TrustedBindingFactsV1 {
     evidence_class: EvidenceClassV1,
     subsystems: BTreeMap<LabelV1, SubsystemBindingViewV1>,
     producer_live: Option<Arc<AtomicBool>>,
+    producer_check: Option<Arc<dyn Fn() -> AppResult<()> + Send + Sync>>,
 }
 pub(super) struct TrustedQualificationEvidenceV1 {
     owner: DigestV1,
@@ -275,8 +277,19 @@ pub(super) struct EnvironmentBindingV1 {
     provenance_evidence_digest: DigestV1,
     valid: Arc<AtomicBool>,
     producer_live: Option<Arc<AtomicBool>>,
+    producer_check: Option<Arc<dyn Fn() -> AppResult<()> + Send + Sync>>,
 }
 impl EnvironmentBindingV1 {
+    pub(in crate::physical) fn requires_owned_native_run(&self) -> bool {
+        self.provenance == BindingProvenanceV1::GateBSupervisor
+    }
+    pub(super) fn runtime_flags(&self) -> Vec<Arc<AtomicBool>> {
+        let mut flags = vec![self.valid.clone()];
+        if let Some(producer) = &self.producer_live {
+            flags.push(producer.clone());
+        }
+        flags
+    }
     pub(super) fn view(&self) -> &EnvironmentBindingViewV1 {
         &self.view
     }
@@ -496,6 +509,7 @@ impl PhysicalBindingResolverV1 {
             epochs: parking_lot::Mutex::new(c.epochs),
             deadline_ticks,
             producer_live: facts.producer_live,
+            producer_check: facts.producer_check,
             provenance: facts.provenance,
             provenance_evidence_digest: facts.evidence_digest,
             valid,
@@ -504,6 +518,9 @@ impl PhysicalBindingResolverV1 {
     pub(super) fn validate_current(&mut self, binding: &EnvironmentBindingV1) -> AppResult<()> {
         let result = (|| {
             let (now, ticks) = self.now()?;
+            if let Some(check) = &binding.producer_check {
+                check()?;
+            }
             require(
                 binding.valid.load(Ordering::Acquire)
                     && binding
@@ -628,6 +645,15 @@ impl PhysicalBindingResolverV1 {
         let (now, _) = self.now()?;
         let q = self.store.qualification(id, now)?;
         q.validate_for(profile, &binding.view)?;
+        if binding.provenance == BindingProvenanceV1::GateBSupervisor {
+            let record = self.store.gate_b_record(id)?;
+            require(
+                record.qualification == q
+                    && record.registration_digest == binding.registration_digest
+                    && record.bundle.digest()? == binding.provenance_evidence_digest,
+                "Native qualification record/current producer mismatch",
+            )?;
+        }
         Ok(q)
     }
     pub(super) fn withdraw(&mut self, id: &QualificationId, revision: u64) -> AppResult<()> {
@@ -711,6 +737,7 @@ pub(super) mod test_support {
                 BindingProvenanceV1::GateASupervisor
             },
             producer_live: None,
+            producer_check: None,
             evidence_digest: view.configuration_digest.clone(),
             configuration_digest: view.configuration_digest.clone(),
             evidence_class: view.evidence_class,
@@ -753,10 +780,14 @@ pub(super) mod test_support {
 impl PhysicalBindingResolverV1 {
     pub(in crate::physical) fn bind_gate_a(
         &mut self,
-        run: &super::core::microduck::GateARunV1,
+        run: &super::core::microduck::MicroDuckRunV1,
         expected_revision: Option<u64>,
     ) -> AppResult<EnvironmentBindingV1> {
         run.validate_owner(&self.runtime, &self.clock)?;
+        require(
+            run.gate_b_evidence().is_none(),
+            "Gate B cannot enroll as Gate A",
+        )?;
         run.validate_live()?;
         run.bind_adapter_owner(self.adapter.clone())?;
         let reg = run.registration(self.runtime.host_ref())?;
@@ -779,11 +810,12 @@ impl PhysicalBindingResolverV1 {
             evidence_class: EvidenceClassV1::Simulation,
             subsystems: reg.subsystems,
             producer_live: Some(run.live_flag()),
+            producer_check: None,
         })
     }
     pub(in crate::physical) fn qualify_gate_a(
         &mut self,
-        run: &super::core::microduck::GateARunV1,
+        run: &super::core::microduck::MicroDuckRunV1,
         binding: &EnvironmentBindingV1,
         profile: &PhysicalCapabilityProfileV1,
         q: &PhysicalQualificationV1,
@@ -822,5 +854,150 @@ impl PhysicalBindingResolverV1 {
                 enforcement: SessionEnforcementClassV1::AdapterIsolationOnly,
             },
         )
+    }
+}
+
+impl PhysicalBindingResolverV1 {
+    pub(in crate::physical) fn bind_gate_b(
+        &mut self,
+        run: &Arc<super::core::microduck::MicroDuckRunV1>,
+        expected: Option<u64>,
+    ) -> AppResult<EnvironmentBindingV1> {
+        run.validate_owner(&self.runtime, &self.clock)?;
+        run.validate_live()?;
+        let evidence = run.gate_b_evidence().ok_or_else(|| {
+            crate::error::AppError::InvalidInput(
+                "Gate A/FakeIo/status cannot enroll NativeFence".into(),
+            )
+        })?;
+        evidence.validate()?;
+        run.validate_start()?;
+        run.bind_adapter_owner(self.adapter.clone())?;
+        let reg = run.registration(self.runtime.host_ref())?;
+        require(
+            reg.adapter_kind == LabelV1::try_from("microduck.gate-b".to_owned())?,
+            "Not an owned native launch",
+        )?;
+        let sub = reg.subsystems.values().next().unwrap();
+        require(
+            evidence.mechanism.iter().all(|r| {
+                r.identity.environment == String::from(reg.environment.clone())
+                    && r.identity.domain == String::from(sub.domains[0].clone())
+                    && r.identity.body_ref == String::from(sub.body.clone())
+            }),
+            "Qualification canonical native identity mismatch",
+        )?;
+        require(
+            reg.subsystems.len() == 1
+                && sub.controller_incarnation == evidence.controller
+                && sub.body_incarnation == evidence.body
+                && sub.world_incarnation.as_ref() == Some(&evidence.world),
+            "Qualification launch incarnation mismatch",
+        )?;
+        self.enroll(
+            TrustedEnrollmentV1 {
+                record: reg.clone(),
+            },
+            expected,
+        )?;
+        // Qualification probes have spent native epochs. Advance only ledger
+        // bookkeeping before sealing a binding; no task/holder is constructed.
+        let floor = evidence
+            .mechanism
+            .iter()
+            .map(|r| r.high_water_epoch)
+            .max()
+            .unwrap();
+        require(floor <= 16, "Unexpected qualification epoch floor")?;
+        loop {
+            let epochs = self.store.epochs(reg.resources.keys().cloned())?;
+            if epochs.values().all(|e| *e > floor) {
+                break;
+            }
+            self.store.advance_epochs(&epochs)?;
+        }
+        let challenge = self.begin_resolution(&reg.environment)?;
+        self.resolve(TrustedBindingFactsV1 {
+            challenge,
+            runtime: self.runtime.clone(),
+            adapter: self.adapter.clone(),
+            endpoint_identity: reg.endpoint_identity.clone(),
+            owner: reg.provenance_owner.clone(),
+            provenance: BindingProvenanceV1::GateBSupervisor,
+            evidence_digest: evidence.digest()?,
+            configuration_digest: reg.configuration_digest,
+            evidence_class: EvidenceClassV1::Simulation,
+            subsystems: reg.subsystems,
+            producer_live: Some(run.live_flag()),
+            producer_check: Some({
+                let run = run.clone();
+                Arc::new(move || run.validate_fresh())
+            }),
+        })
+    }
+    pub(in crate::physical) fn qualify_gate_b(
+        &mut self,
+        run: &super::core::microduck::MicroDuckRunV1,
+        binding: &EnvironmentBindingV1,
+        profile: &PhysicalCapabilityProfileV1,
+    ) -> AppResult<PhysicalQualificationV1> {
+        use super::core::qualification::{GateBQualificationRecordV1, CONDITIONS};
+        self.validate_current(binding)?;
+        run.validate_binding(binding.view())?;
+        run.validate_start()?;
+        let evidence = run.gate_b_evidence().ok_or_else(|| {
+            crate::error::AppError::InvalidInput("No owned NativeFence evidence".into())
+        })?;
+        evidence.validate()?;
+        profile.validate_binding(binding.view())?;
+        require(
+            binding.provenance == BindingProvenanceV1::GateBSupervisor
+                && binding.provenance_evidence_digest == evidence.digest()?
+                && profile.evidence_class == EvidenceClassV1::Simulation
+                && profile.required_enforcement_class == SessionEnforcementClassV1::NativeFence
+                && profile.execution.action_duration_us.get() == 1_000_000
+                && profile.execution.total_execution_us.get() == 1_000_000
+                && profile.velocity_limits.max_abs_vx_mps.get() == 0.05
+                && profile.velocity_limits.max_abs_vy_mps.get() == 0.
+                && profile.velocity_limits.max_abs_vyaw_radps.get() == 0.
+                && profile.execution.action_count == 1
+                && profile.execution.lease_duration_us.get() <= 3_000_000
+                && profile.freshness.proposal.0.get() <= 200_000
+                && profile.freshness.observation.max_age_us.get() <= 200_000
+                && profile.freshness.observation.max_gap_us.get() <= 200_000,
+            "Not the exact NativeFence simulation reference profile",
+        )?;
+        let (now, _) = self.now()?;
+        let q = PhysicalQualificationV1 {
+            version: VersionV1,
+            qualification_id: QualificationId::try_from(format!(
+                "qualification:v1:{}",
+                uuid::Uuid::new_v4()
+            ))?,
+            revision: 1,
+            profile_digest: profile.digest()?,
+            binding_digest: binding.view.digest()?,
+            required_enforcement_class: SessionEnforcementClassV1::NativeFence,
+            evidence_class: EvidenceClassV1::Simulation,
+            evidence_digest: evidence.digest()?,
+            conditions_digest: evidence.conditions_digest()?,
+            expires_at: binding.view.offer_expiry,
+        };
+        let record = GateBQualificationRecordV1 {
+            qualification: q.clone(),
+            registration_digest: binding.registration_digest.clone(),
+            bundle: evidence.clone(),
+            conditions: CONDITIONS.into(),
+            issued_at: now,
+        };
+        record.validate()?;
+        self.store.record_gate_b_qualification(
+            &binding.view.environment,
+            &binding.registration_digest,
+            &q,
+            &evidence.digest()?,
+            &record,
+        )?;
+        Ok(q)
     }
 }

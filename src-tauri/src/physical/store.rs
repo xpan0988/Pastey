@@ -24,6 +24,8 @@ mod remote_ledger;
 pub(super) use remote_ledger::RemoteRootLineageV2;
 #[path = "store_native.rs"]
 mod native_ledger;
+#[path = "store_qualification.rs"]
+mod qualification_ledger;
 
 // Dedicated versioning; neither SQLite user_version nor other Pastey tables are repurposed.
 const SCHEMA: &str = r#"
@@ -189,6 +191,17 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
         evidence_ledger::audit(&tx)?;
         remote_ledger::audit(&tx)?;
         remote_ledger::migrate(&tx)?;
+    }
+    let stage8 = Connection::open_in_memory()?;
+    stage8.execute_batch(&remote_ledger::stage8_ddl())?;
+    if schema_objects(&tx)? == schema_objects(&stage8)? {
+        audit_facts(&tx)?;
+        core_ledger::audit(&tx)?;
+        control_ledger::audit(&tx)?;
+        evidence_ledger::audit(&tx)?;
+        remote_ledger::audit(&tx)?;
+        native_ledger::audit(&tx)?;
+        tx.execute_batch(qualification_ledger::SCHEMA)?;
     }
     verify_schema(&tx)?;
     audit(&tx)?;
@@ -432,6 +445,16 @@ impl PhysicalStoreV1 {
         q: &PhysicalQualificationV1,
         provenance: &DigestV1,
     ) -> AppResult<()> {
+        self.record_qualification_inner(environment, registration_digest, q, provenance, None)
+    }
+    fn record_qualification_inner(
+        &self,
+        environment: &EnvironmentRefV1,
+        registration_digest: &DigestV1,
+        q: &PhysicalQualificationV1,
+        provenance: &DigestV1,
+        native: Option<&crate::physical::core::qualification::GateBQualificationRecordV1>,
+    ) -> AppResult<()> {
         q.validate()?;
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -443,6 +466,9 @@ impl PhysicalStoreV1 {
         // Strict insert: identities are immutable, including expiry/evidence. A
         // new qualification requires a new ID; withdrawal cannot be overwritten.
         tx.execute("INSERT INTO physical_qualifications(qualification_id,environment_id,revision,registration_digest,profile_digest,binding_digest,evidence_class,enforcement_class,evidence_digest,conditions_digest,provenance_digest,record_digest,record_json,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![text(&q.qualification_id),text(environment),checked_integer(q.revision)?,text(registration_digest),text(&q.profile_digest),text(&q.binding_digest),tag(&q.evidence_class)?,tag(&q.required_enforcement_class)?,text(&q.evidence_digest),text(&q.conditions_digest),text(provenance),text(&q.digest()?),serde_json::to_string(q)?,q.expires_at.get() as i64])?;
+        if let Some(record) = native {
+            qualification_ledger::insert(&tx, record)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -517,7 +543,8 @@ fn audit(conn: &Connection) -> AppResult<()> {
     control_ledger::audit(conn)?;
     evidence_ledger::audit(conn)?;
     remote_ledger::audit(conn)?;
-    native_ledger::audit(conn)
+    native_ledger::audit(conn)?;
+    qualification_ledger::audit(conn)
 }
 fn audit_facts(conn: &Connection) -> AppResult<()> {
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;

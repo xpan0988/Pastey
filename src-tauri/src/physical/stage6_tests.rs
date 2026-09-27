@@ -8,7 +8,7 @@ use supervisor::Fault;
 
 struct GateA {
     control: ControlFixture,
-    run: Arc<GateARunV1>,
+    run: Arc<MicroDuckRunV1>,
     harness: Arc<supervisor::Harness>,
     adapter: MicroDuckAdapterV1,
 }
@@ -412,7 +412,7 @@ fn unsupported_methods_and_untrusted_producer_construction_are_unavailable() {
     }
     impl<T: ?Sized> AmbiguousIfDeserialize<()> for T {}
     impl<T: ?Sized + for<'de> serde::Deserialize<'de>> AmbiguousIfDeserialize<u8> for T {}
-    let _ = <GateARunV1 as AmbiguousIfDeserialize<_>>::marker;
+    let _ = <MicroDuckRunV1 as AmbiguousIfDeserialize<_>>::marker;
     let _ = <microduck::ValidatedGateAObservationV1 as AmbiguousIfDeserialize<_>>::marker;
     let _ = <microduck::ValidatedGateADispositionV1 as AmbiguousIfDeserialize<_>>::marker;
     let script = include_str!("../../../scripts/microduck-gate-a.py");
@@ -430,7 +430,7 @@ fn unsupported_methods_and_untrusted_producer_construction_are_unavailable() {
 #[test]
 fn unqualified_platform_launch_fails_closed() {
     #[cfg(not(target_os = "linux"))]
-    assert!(GateARunV1::launch(
+    assert!(MicroDuckRunV1::launch(
         GateALaunchV1 {
             robotd: PathBuf::new(),
             python: PathBuf::new(),
@@ -656,7 +656,7 @@ fn local_robotd_simulator_supervision_probe() {
         domain: profile().domain,
         revision: 1,
     };
-    let run = GateARunV1::launch(
+    let run = MicroDuckRunV1::launch(
         c,
         LocalRuntimeRef::fresh(host("executor")),
         Arc::new(SystemBindingClockV1::default()),

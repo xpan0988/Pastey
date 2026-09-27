@@ -338,3 +338,6 @@ async fn exact_stage7_migration_preserves_remote_lineage_and_consumed_budget() {
         1
     );
 }
+
+#[path = "stage9_tests.rs"]
+mod stage9;

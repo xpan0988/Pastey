@@ -5,6 +5,8 @@
 mod control;
 #[path = "core_evidence.rs"]
 mod evidence_core;
+#[path = "qualification.rs"]
+pub(crate) mod qualification;
 #[path = "remote.rs"]
 mod remote;
 #[cfg(test)]
@@ -781,6 +783,14 @@ pub(super) mod test_support {
     pub(in crate::physical) fn root_open(root: &PhysicalAuthorityRootV1) -> bool {
         root.valid.load(Ordering::Acquire)
     }
+    pub(in crate::physical) fn has_product_environment(core: &PhysicalControlServiceV1) -> bool {
+        core.remote.environment.is_some()
+    }
+    pub(in crate::physical) fn product_adapter(
+        core: &PhysicalControlServiceV1,
+    ) -> Arc<dyn PhysicalEnvironmentAdapterV1> {
+        core.remote.environment.as_ref().unwrap().adapter.clone()
+    }
     pub(in crate::physical) fn runtime(core: &PhysicalControlServiceV1) -> LocalRuntimeRef {
         core.runtime.clone()
     }
@@ -832,12 +842,12 @@ impl GateALaunchContextV1 {
     pub(in crate::physical) fn launch(
         self,
         config: microduck::GateALaunchV1,
-    ) -> AppResult<Arc<microduck::GateARunV1>> {
+    ) -> AppResult<Arc<microduck::MicroDuckRunV1>> {
         require(
             self.issuer.load(Ordering::Acquire),
             "Core launch context closed",
         )?;
-        let run = microduck::GateARunV1::launch(config, self.runtime, self.clock)?;
+        let run = microduck::MicroDuckRunV1::launch(config, self.runtime, self.clock)?;
         require(
             self.issuer.load(Ordering::Acquire),
             "Core closed during launch",
@@ -860,7 +870,7 @@ impl PhysicalControlServiceV1 {
     pub(in crate::physical) fn bind_gate_a_environment(
         &mut self,
         ingress: &LocalCoreIngressV1,
-        run: &microduck::GateARunV1,
+        run: &microduck::MicroDuckRunV1,
         expected: Option<u64>,
     ) -> AppResult<EnvironmentBindingV1> {
         self.validate_ingress(ingress)?;
@@ -869,7 +879,7 @@ impl PhysicalControlServiceV1 {
     pub(in crate::physical) fn qualify_gate_a_environment(
         &mut self,
         ingress: &LocalCoreIngressV1,
-        run: &Arc<microduck::GateARunV1>,
+        run: &Arc<microduck::MicroDuckRunV1>,
         binding: &Arc<EnvironmentBindingV1>,
         profile: &PhysicalCapabilityProfileV1,
         q: &PhysicalQualificationV1,

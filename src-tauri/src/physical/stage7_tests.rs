@@ -50,17 +50,19 @@ impl Pair {
         )
         .unwrap();
         let i = b.core.lock().local_ingress().unwrap();
-        b.core
-            .lock()
-            .attach_product_environment(
-                &i,
-                ProductEnvironmentV1 {
-                    binding: b.live.clone(),
-                    adapter: Arc::new(FakeLane::new(vec![])),
-                    run: None,
-                },
-            )
-            .unwrap();
+        if !core_fake::has_product_environment(&b.core.lock()) {
+            b.core
+                .lock()
+                .attach_product_environment(
+                    &i,
+                    ProductEnvironmentV1 {
+                        binding: b.live.clone(),
+                        adapter: Arc::new(FakeLane::new(vec![])),
+                        run: None,
+                    },
+                )
+                .unwrap();
+        }
         Self {
             a_paths,
             a,

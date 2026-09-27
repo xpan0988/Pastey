@@ -349,7 +349,7 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-pub(super) fn current_ddl() -> String {
+pub(super) fn stage8_ddl() -> String {
     stage7_ddl()
         .replace(
             "CHECK(install_evidence='adapter_isolation_only')",
@@ -360,4 +360,8 @@ pub(super) fn current_ddl() -> String {
             "CHECK(fence_ack IN ('adapter_isolation_only','native_fence'))",
         )
         + super::native_ledger::SCHEMA
+}
+
+pub(super) fn current_ddl() -> String {
+    stage8_ddl() + super::qualification_ledger::SCHEMA
 }

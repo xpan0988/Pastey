@@ -1,9 +1,9 @@
-//! Physical facts and Core-owned bounded task authority through Stage 8.
+//! Physical facts and Core-owned bounded task authority through Stage 9.
 //!
 //! Local MicroDuck Gate A requires a launcher-owned isolated simulation.
 //! Remote/product entry points reuse authenticated Room Control and local Core.
-//! NativeFence is a separate executor-local mechanism; Stage 9 qualification
-//! and hardware authority remain unavailable.
+//! NativeFence release requires the Stage 9 exact owned qualification producer.
+//! The production simulator profile remains PENDING_ENVIRONMENT; no hardware authority.
 //! Successfully validating a claim does not authenticate its producer or qualify a body.
 #![allow(dead_code)] // Narrow environment integrations retain internal foundation APIs.
 

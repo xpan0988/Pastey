@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Owned Linux Gate A supervisor. No hardware or native fence.
+"""Owned Linux simulation supervisor, separate Gate A and native Gate B modes.
 
 Only the Rust launcher starts this inside fresh bwrap mount/PID/network namespaces.
 The pipe is private; it is not an enrollment/observation HTTP or socket service.
@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import socket
+import select
 import subprocess
 import sys
 import threading
@@ -82,8 +83,183 @@ def provision(rpc, next_sample, identities, clock=time.monotonic_ns):
     raise RuntimeError("simulation provisioning bring-up timeout")
 
 
+
+
+def artifact_snapshot_digest(params, assets):
+    return hashlib.sha256(b"".join(Path(p).read_bytes() for p in [params]+assets)).hexdigest()
+
+
+def snapshot_native_artifacts(params, assets_raw):
+    import re
+    import tomllib
+    assets = json.loads(assets_raw)
+    text = Path(params).read_text()
+    parsed = tomllib.loads(text)
+    policy = parsed.get("policy", {})
+    if policy.get("enabled") is not True or policy.get("mode", "walk") != "walk":
+        raise RuntimeError("exact reference policy must be explicitly enabled walk mode")
+    if [str(Path(policy.get(k, "")).resolve()) for k in ("walk", "stand")] != [str(Path(p).resolve()) for p in assets]:
+        raise RuntimeError("parameter policy locators do not match exact artifact manifest")
+    if any(policy.get(k) != "none" for k in ("sitstand", "ground_pick", "kick_left", "kick_right", "roulade")):
+        raise RuntimeError("other skills/postures must be explicitly disabled")
+    # Only locator strings are rewritten, once, inside the owned namespace.
+    # Every controller/Safety/physics parameter byte remains unchanged.
+    owned = []
+    for slot, source in zip(("walk", "stand"), assets):
+        target = Path("/tmp") / (slot + ".onnx")
+        target.write_bytes(Path(source).read_bytes())
+        owned.append(str(target))
+    lines = text.splitlines(keepends=True)
+    in_policy = False
+    replacements = 0
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("["):
+            in_policy = line.strip() == "[policy]"
+        if in_policy:
+            m = re.match(r"^(\s*)(walk|stand)\s*=.*?(\r?\n)?$", line)
+            if m:
+                lines[i] = m[1] + m[2] + " = " + json.dumps(owned[0 if m[2]=="walk" else 1]) + "\n"
+                replacements += 1
+    if replacements != 2:
+        raise RuntimeError("unsupported policy locator syntax")
+    target = Path("/tmp/robotd.toml")
+    target.write_text("".join(lines))
+    return str(target), json.dumps(owned)
+
+
+def check_native_artifacts(pins, params, assets):
+    if len(assets) != 2:
+        raise RuntimeError("exact walk/stand artifacts required")
+    sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+    if sha(params) != pins["paramsSha256"] or [sha(p) for p in assets] != pins["policySha256"]:
+        raise RuntimeError("reference parameter/policy artifact changed")
+    ort = os.environ.get("ORT_DYLIB_PATH")
+    if ort is None or sha(ort) != pins["onnxRuntimeSha256"]:
+        raise RuntimeError("exact native ONNX Runtime mismatch")
+
+
+
+def collect_standing(next_sample, identities, dwell_us=200_000):
+    result = []
+    until = time.monotonic_ns() // 1000 + 10_000_000
+    while time.monotonic_ns() // 1000 < until:
+        try:
+            s = next_sample()
+        except RuntimeError as error:
+            if str(error) != "stale native acquisition":
+                raise
+            result = []
+            continue
+        o = s.get("oracle")
+        ready = o and o["upright"] and abs(o["yaw"]) <= 1e-6 and o["linear_speed"] <= .02 and o["angular_speed"] <= .1 and o["uncertainty"] <= .001
+        if (s["daemon"], s["body"], s["world"]) != identities:
+            raise RuntimeError("qualification incarnation changed")
+        result = (result + [s])[-32:] if ready else []
+        if len(result) >= 3 and result[-1]["source_us"] - result[0]["source_us"] >= dwell_us:
+            return result
+    raise RuntimeError("measured standing qualification unavailable")
+
+
+def native_probes(rpc, next_sample, process, identity, sleep=time.sleep):
+    import signal
+    import uuid
+    transcript = []
+    expiry_witnesses = []
+    expiry_moves = []
+    def task(request):
+        r = rpc("robot.task", request)
+        if r.get("identity") != identity or r.get("protocol") != "microduck-task-v1" or r.get("profile") != "reference-velocity-v1":
+            raise RuntimeError("native probe identity/protocol mismatch")
+        return r
+    def status():
+        return task(dict(kind="status", protocol="microduck-task-v1"))
+    def pair(epoch, lease_us, action_us):
+        now = status()["native_us"]
+        install = dict(protocol="microduck-task-v1", profile="reference-velocity-v1", identity=identity,
+            domain=identity["domain"], session="physical-session:v1:"+str(uuid.uuid4()), epoch=epoch,
+            request="physical-request:v1:"+str(uuid.uuid4()), lease_deadline_us=now+lease_us)
+        ir = task(dict(kind="install", descriptor=install))
+        action = dict(install=install, action="physical-action:v1:"+str(uuid.uuid4()),
+            payload_digest=hashlib.sha256(b"qualification-reference-velocity").hexdigest(), deadline_us=now+action_us)
+        ar = task(dict(kind="admit", descriptor=action))
+        move = dict(action=action, request="physical-request:v1:"+str(uuid.uuid4()), sequence=1, twist=[.05,0,0])
+        mr = task(dict(kind="move", descriptor=move))
+        if not all(r.get("accepted") for r in (ir, ar, mr)):
+            raise RuntimeError("native mechanism unavailable")
+        return install, move, (ir, ar, mr)
+    identities = tuple(identity[k] for k in ("controller", "body", "world"))
+    reference_trace = [collect_standing(next_sample, identities)[-1]]
+    install, move, initial = pair(1, 2_000_000, 1_000_000)
+    transcript.extend(initial)
+    last_move = initial[-1]
+    for sequence in range(2, 21):
+        sleep(.05)
+        move["sequence"] = sequence
+        last_move = task(dict(kind="move", descriptor=move))
+        if not last_move.get("accepted"):
+            raise RuntimeError("reference qualification refresh failed")
+        reference_trace.append(next_sample())
+    transcript.append(last_move)
+    sleep(max(0, (move["action"]["deadline_us"] - time.monotonic_ns() // 1000) / 1_000_000))
+    transcript.append(task(dict(kind="fence", descriptor=dict(install=install, next_epoch=2,
+        request="physical-request:v1:"+str(uuid.uuid4())))))
+    reference_trace.extend(collect_standing(next_sample, identities, 500_000))
+    for epoch, lease, duration, delay, pause in [(3,1_000_000,600_000,.23,False),
+            (4,500_000,120_000,.15,False), (5,120_000,120_000,.15,False),
+            (6,500_000,120_000,.30,True)]:
+        install, move, setup = pair(epoch, lease, duration)
+        expiry_moves.append(setup[2])
+        if pause:
+            os.kill(process.pid, signal.SIGSTOP)
+        try:
+            sleep(delay)
+        finally:
+            if pause:
+                os.kill(process.pid, signal.SIGCONT)
+        # Read the loop's emitted state BEFORE any robot.task request can
+        # lazily expire authority. Requested twist is mechanism diagnostics,
+        # never measured displacement/rest or a consequence witness.
+        cutoff = (setup[2]["native_us"] + 200_000 if epoch == 3 else
+                  install["lease_deadline_us"] if epoch == 5 else move["action"]["deadline_us"]) + 20_000
+        witness = None
+        deadline = time.monotonic_ns() // 1000 + 2_000_000
+        while time.monotonic_ns() // 1000 < deadline:
+            try:
+                s = next_sample()
+            except RuntimeError as error:
+                if str(error) != "stale native acquisition":
+                    raise
+                continue
+            if s["source_us"] >= cutoff:
+                if s["native"].get("move", {}).get("requested") != [0, 0, 0]:
+                    raise RuntimeError("native loop did not independently discard expired task input")
+                witness = s
+                break
+        if witness is None:
+            raise RuntimeError("independent native expiry observation unavailable")
+        expiry_witnesses.append(witness)
+        transcript.append(status())
+        move["sequence"] = 2
+        rejection = task(dict(kind="move", descriptor=move))
+        if rejection.get("accepted"):
+            raise RuntimeError("native expiry allowed old action")
+        transcript.append(rejection)
+    return transcript, expiry_witnesses, expiry_moves, reference_trace
+
+
 def run():
-    robotd, root, params, assets_json, daemon, body_id, world_id = sys.argv[1:]
+    if len(sys.argv) not in (8, 12):
+        raise RuntimeError("owned launcher arguments required")
+    robotd, root, params, assets_json, daemon, body_id, world_id = sys.argv[1:8]
+    pins = json.loads(sys.argv[8]) if len(sys.argv) == 12 else None
+    identity = None
+    original_params, original_assets = params, json.loads(assets_json)
+    if pins:
+        check_native_artifacts(pins, original_params, original_assets)
+        params, assets_json = snapshot_native_artifacts(params, assets_json)
+        snapshot_digest = artifact_snapshot_digest(params, json.loads(assets_json))
+        identity = dict(environment=sys.argv[9], domain=sys.argv[10], body_ref=sys.argv[11],
+                        body=body_id, world=world_id)
     sys.path.insert(0, str(Path(root) / "src"))
     from mjlab_microduck.sim import body_server as native
     import numpy as np
@@ -98,6 +274,8 @@ def run():
     model_bytes = np.zeros(native.mujoco.mj_sizeModel(world.model), dtype=np.uint8)
     native.mujoco.mj_saveModel(world.model, buffer=model_bytes)
     model_digest = hashlib.sha256(model_bytes.tobytes()).hexdigest()
+    if pins and (model_digest != pins["compiledModelSha256"] or native.mujoco.__version__ != pins["mujocoVersion"]):
+        raise RuntimeError("exact compiled simulator mismatch")
     records = collections.deque(maxlen=32)
     original = body.sensors
     sequence = 0
@@ -137,7 +315,12 @@ def run():
     private = Path("/tmp/pastey-microduck-gate-a")
     private.mkdir(mode=0o700)
     endpoint = private / "robotd.sock"
-    process = subprocess.Popen([robotd, "--sim", "127.0.0.1:7801", "--socket", str(endpoint), "--params", params],
+    command = [robotd, "--sim", "127.0.0.1:7801", "--socket", str(endpoint), "--params", params]
+    if pins:
+        identity_path = private / "identity.json"
+        identity_path.write_text(json.dumps(identity))
+        command += ["--pastey-task-identity", str(identity_path)]
+    process = subprocess.Popen(command,
                                stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr)
     def watch_native():
         process.wait()
@@ -164,6 +347,7 @@ def run():
         wire = stream.makefile("rwb", buffering=0)
         native_id = 0
         latest = None
+        minimum_source_us = 0
 
         def sample(state):
             nonlocal latest
@@ -203,6 +387,16 @@ def run():
                         return dict(accepted=False)
                     return message["result"]
 
+        if pins:
+            status = rpc("robot.task", dict(kind="status", protocol="microduck-task-v1"))
+            actual = status.get("identity", {})
+            if (status.get("protocol") != "microduck-task-v1" or status.get("profile") != "reference-velocity-v1"
+                    or status.get("fenced") is not True
+                    or any(actual.get(k) != v for k, v in identity.items())
+                    or not actual.get("controller")):
+                raise RuntimeError("native task identity/protocol/mode unavailable")
+            identity = actual
+            daemon = actual["controller"]
         subscribed = rpc("robot.subscribe", dict(hz=50))
         assets=[Path(p) for p in json.loads(assets_json)]
         if not assets or len({p.name for p in assets})!=len(assets):
@@ -216,29 +410,58 @@ def run():
         if subscribed.get("accepted") is not True:
             raise RuntimeError("subscription refused")
         def next_sample():
-            raw_state = wire.readline(MAX_LINE + 1)
-            if not raw_state or len(raw_state) > MAX_LINE:
-                raise RuntimeError("state source lost")
-            message = json.loads(raw_state)
-            if message.get("method") != "robot.state":
-                raise RuntimeError("unexpected native frame")
-            sample(message["params"])
-            return latest
+            # Consume queued subscription frames without an authority-changing
+            # RPC. Idle monitoring is 20 Hz while robot.state is 50 Hz; returning
+            # one FIFO frame would eventually turn a healthy run into stale data.
+            until = time.monotonic() + 2
+            while time.monotonic() < until:
+                raw_state = wire.readline(MAX_LINE + 1)
+                if not raw_state or len(raw_state) > MAX_LINE:
+                    raise RuntimeError("state source lost")
+                message = json.loads(raw_state)
+                if message.get("method") != "robot.state":
+                    raise RuntimeError("unexpected native frame")
+                sample(message["params"])
+                if select.select([stream], [], [], 0)[0]:
+                    continue
+                if latest is not None and latest["source_us"] >= minimum_source_us:
+                    return latest
+                if latest is None:
+                    raise RuntimeError("stale native acquisition")
+            raise RuntimeError("fresh native acquisition timeout")
 
         # Drain any pre-ACK frames inside rpc; proof begins after that ACK.
         provision(rpc, next_sample, (daemon, body_id, world_id))
+        bundle = None
+        if pins:
+            transcript, expiry_witnesses, expiry_moves, reference_trace = native_probes(rpc, next_sample, process, identity)
+            # The last probe leaves authority closed. No probe renews a Core task.
+            # Establish fresh measured rest again before sealing enrollment.
+            observations = collect_standing(next_sample, (daemon, body_id, world_id))
+            bundle = dict(producer="pastey.microduck.qualification.v1", pins=pins,
+                artifactDigest=hashlib.sha256(Path(robotd).read_bytes()).hexdigest(),
+                controller=daemon, body=body_id, world=world_id, modelSha256=model_digest,
+                engine=native.mujoco.__version__, namespaces=[os.readlink("/proc/self/ns/"+n) for n in ("mnt","pid","net")],
+                parentNamespaces=json.loads(os.environ["PASTEY_PARENT_NAMESPACES"]),
+                soleWriter=True, realSimulation=True, nativePauseExpiry=True,
+                resetPolicy="owned-world-no-reset-api-replacement-launch-only",
+                mechanism=transcript, observations=observations, expiryWitnesses=expiry_witnesses,
+                expiryMoves=expiry_moves, referenceTrace=reference_trace)
+            if model_digest != pins["compiledModelSha256"] or native.mujoco.__version__ != pins["mujocoVersion"]:
+                raise RuntimeError("exact compiled simulator mismatch")
         emit(dict(version=1, provisioned=True, clock_us=time.monotonic_ns() // 1000, single_writer=True,
                   model_digest=model_digest, simulation_engine=native.mujoco.__version__,
                   simulation=True, namespaces=[os.readlink("/proc/self/ns/" + n)
                                                 for n in ("mnt", "pid", "net")],
-                  daemon=daemon, body=body_id, world=world_id))
+                  daemon=daemon, body=body_id, world=world_id, gate_b=bundle))
         last_sequence = 0
         for raw in sys.stdin:
             if len(raw) > MAX_LINE or process.poll() is not None:
                 raise RuntimeError("supervision lost")
             request = json.loads(raw)
             if request == {"operation": "clock"}:
-                emit(dict(clock_us=time.monotonic_ns() // 1000))
+                minimum_source_us = time.monotonic_ns() // 1000
+                emit(dict(clock_us=minimum_source_us))
                 continue
             if set(request) != {"sequence", "request"}:
                 raise RuntimeError("uncorrelated Gate A request")
@@ -248,12 +471,21 @@ def run():
             last_sequence = request_sequence
             request = request["request"]
             operation = request.get("operation")
-            if operation == "move" and set(request) == {"operation", "vx", "vy", "vyaw"}:
+            if pins:
+                check_native_artifacts(pins, original_params, original_assets)
+                if snapshot_digest != artifact_snapshot_digest(params, json.loads(assets_json)):
+                    raise RuntimeError("owned artifact snapshot changed")
+            if operation == "task" and pins and set(request) == {"operation", "request"}:
+                result = rpc("robot.task", request["request"])
+                if result.get("identity") != identity:
+                    raise RuntimeError("native controller/body/world changed")
+                emit(dict(sequence=request_sequence, reply=dict(accepted=None, sample=None, native=result)))
+            elif operation == "move" and not pins and set(request) == {"operation", "vx", "vy", "vyaw"}:
                 if (request["vx"], request["vy"], request["vyaw"]) != (0.05, 0, 0):
                     raise RuntimeError("non-reference velocity")
                 result = rpc("robot.move", dict(vx=0.05, vy=0, vyaw=0))
                 emit(dict(sequence=request_sequence, reply=dict(accepted=result.get("accepted"), sample=None)))
-            elif operation == "stop" and set(request) == {"operation"}:
+            elif operation == "stop" and not pins and set(request) == {"operation"}:
                 result = rpc("robot.stop", {})
                 emit(dict(sequence=request_sequence, reply=dict(accepted=result.get("accepted"), sample=None)))
             elif operation == "sample" and set(request) == {"operation"}:
