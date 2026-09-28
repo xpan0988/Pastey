@@ -45,7 +45,10 @@ def prepare(source, rl, output):
     archive = subprocess.check_output(["git", "-C", str(rl), "archive", RL_PIN])
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         tar.extractall(rl_copy, filter="data")
-    subprocess.run(["cargo", "build", "--locked", "--release", "-p", "robotd"], cwd=repo, check=True)
+    # The launcher consumes only this package's robotd. The CLI override wins
+    # over ambient CARGO_TARGET_DIR, including the outer Pastey build's target.
+    subprocess.run(["cargo", "build", "--locked", "--release", "-p", "robotd",
+                    "--target-dir", str(repo.resolve() / "target")], cwd=repo, check=True)
     return repo
 
 
