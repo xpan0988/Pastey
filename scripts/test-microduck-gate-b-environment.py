@@ -208,8 +208,8 @@ class EnvironmentPreparation(unittest.TestCase):
     def test_catalog_is_not_a_partial_production_profile(self):
         catalog = json.loads(env.CATALOG.read_text())
         profile = json.loads(env.PROFILE.read_text())
-        self.assertEqual(profile["state"], "PENDING_ENVIRONMENT")
-        self.assertIsNone(profile["policySha256"])
+        self.assertEqual(profile["state"], "READY_FOR_QUALIFICATION")
+        self.assertEqual(profile["policySha256"], [p["sha256"] for p in catalog["policies"]])
         self.assertEqual(catalog["upstream"], profile["upstream"])
         self.assertEqual(catalog["rlUpstream"], profile["rlUpstream"])
         self.assertEqual([p["slot"] for p in catalog["policies"]], ["walk", "stand"])

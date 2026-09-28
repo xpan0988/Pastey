@@ -768,10 +768,45 @@ fn producer_and_launch_inputs_have_no_dto_or_record_constructor() {
     no_impl!(GateBLocalInstallationV1, serde::de::DeserializeOwned);
 }
 #[test]
-fn compiled_production_profile_is_pending_without_reviewed_artifact_pins() {
+fn compiled_production_profile_validates_without_creating_qualification_or_release() {
     let pins: ProfilePinsV1 =
         serde_json::from_str(include_str!("../../../native/microduck/profile-v1.json")).unwrap();
-    assert!(pins.validate().is_err());
+    pins.validate().unwrap();
+    let mut pending = pins.clone();
+    pending.state = "PENDING_ENVIRONMENT".into();
+    assert!(pending.validate().is_err());
+    let mut incomplete = pins;
+    incomplete.compiled_model_sha256 = None;
+    assert!(incomplete.validate().is_err());
+
+    // Loading valid compiled pins and opening Core cannot enroll a body or
+    // produce the measured qualification/live binding required by release.
+    let dir = std::env::temp_dir().join(format!("pastey-reviewed-pins-{}", uuid::Uuid::new_v4()));
+    let paths = AppPaths::new(dir.clone(), dir.join("logs"));
+    paths.ensure_directories().unwrap();
+    storage::init_database(&paths).unwrap();
+    for _ in 0..2 {
+        let core = PhysicalControlServiceV1::new(
+            &paths,
+            LocalRuntimeRef::fresh(host("executor")),
+            Arc::new(Clock::new()),
+        )
+        .unwrap();
+        let db = rusqlite::Connection::open(&paths.db_path).unwrap();
+        for table in [
+            "physical_qualifications",
+            "physical_gate_b_qualifications",
+            "physical_attempts",
+            "physical_sessions",
+        ] {
+            let count: i64 = db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "pins must not populate {table}");
+        }
+        drop(core);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[cfg(unix)]

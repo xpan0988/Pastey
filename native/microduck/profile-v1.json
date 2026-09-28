@@ -1,15 +1,18 @@
 {
   "version": 1,
-  "state": "PENDING_ENVIRONMENT",
+  "state": "READY_FOR_QUALIFICATION",
   "upstream": "a9ec4b2079ef8ee7904014089c885bb07d57d63c",
   "rlUpstream": "cb70b792312d559a4da09064d92009079671815f",
   "protocol": "microduck-task-v1",
   "profile": "reference-velocity-v1",
-  "mujocoVersion": null,
-  "compiledModelSha256": null,
-  "paramsSha256": null,
-  "policySha256": null,
-  "pythonEnvironmentSha256": null,
-  "pythonExecutableSha256": null,
-  "onnxRuntimeSha256": null
+  "mujocoVersion": "3.10.0",
+  "compiledModelSha256": "65211bbd07045077ac9214cc79c749b42633c52179b915ae64bef506195302d0",
+  "paramsSha256": "cd34f277d88e57d2dcb0c19a66c0b0f1d9d7bf3be79dd6ff0e85ed6b1986996d",
+  "policySha256": [
+    "e36332d383997d51401897734cd3e79cf5038406feddb18b4d57ecfb141daa6c",
+    "1569268713e40deea795dd2922dba50d3621e15a872855408b6b1b125b1c094b"
+  ],
+  "pythonEnvironmentSha256": "bfc482470e08ba67ea5ae1f9aa3fd55284e80d672777d8fdee5c20cef0afe025",
+  "pythonExecutableSha256": "c86f21d0da9290ece2d7d49a3f7ed52aed59cb029abdf0ea25c79634f6cbe960",
+  "onnxRuntimeSha256": "f373ae5fd4d878ed17ebea26e5480bd3d0a15e3bd6bc94b878e6c1b73998d22a"
 }
