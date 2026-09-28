@@ -22,6 +22,66 @@ import time
 
 OUTPUT = sys.stdout
 MAX_LINE = 65536
+FRAME_SKEW_US = 20_000
+FRESHNESS_US = 200_000
+
+
+def same_control_frame(native_ns, source_us):
+    # Pinned robotd stamps read_at immediately BEFORE synchronous RemoteIo.read.
+    # The body handler's sensor acquisition follows that request on the same clock.
+    return (type(native_ns) is int and native_ns > 0 and type(source_us) is int and source_us > 0
+            and 0 <= source_us - native_ns // 1000 < FRAME_SKEW_US)
+
+
+class AcquisitionError(RuntimeError):
+    """Bounded numeric proof diagnostics; never copy arbitrary telemetry/identity."""
+    def __init__(self, message, observation, now_us, failed_conditions, enabled_us=None):
+        self.message = message
+        def number(value):
+            return value if type(value) is int and -(1 << 64) <= value < (1 << 64) else None
+        observation = observation or {}
+        native = observation.get("native", {})
+        tick = number(native.get("t_ns"))
+        self.data = dict(enabled_us=number(enabled_us), source_us=number(observation.get("source_us")),
+                         now_us=number(now_us), native_us=None if tick is None else tick // 1000,
+                         simulation_us=number(observation.get("simulation_us")),
+                         sequence=number(observation.get("sequence")), failed_conditions=failed_conditions)
+        self.set_enable(enabled_us)
+
+    def set_enable(self, enabled_us):
+        if type(enabled_us) is int and -(1 << 64) <= enabled_us < (1 << 64):
+            self.data["enabled_us"] = enabled_us
+        source, native, now, enabled = (self.data[k] for k in ("source_us", "native_us", "now_us", "enabled_us"))
+        self.data.update(source_minus_enabled_us=None if source is None or enabled is None else source - enabled,
+                         native_minus_source_us=None if native is None or source is None else native - source,
+                         now_minus_source_us=None if now is None or source is None else now - source)
+        self.args = (self.message + ": " + json.dumps(self.data, separators=(",", ":")),)
+
+
+def correlate_acquisition(records, native_ns, now_us, evicted_ns=0):
+    """First actual read after read-start, never a prior read or a later fallback.
+
+    Every body read has a record, including unavailable oracle measurements.
+    The owned pinned server has one native reader and one synchronous read/tick.
+    """
+    candidate = next((r for r in records if r["acquisition_ns"] >= native_ns), None)
+    if native_ns <= evicted_ns:
+        diagnostic = {} if candidate is None else candidate
+        raise AcquisitionError("stale native acquisition", dict(diagnostic, native={"t_ns": native_ns}), now_us,
+                               ["native_read_start > evicted_acquisition_ns"])
+    if candidate is None:
+        raise AcquisitionError("stale native acquisition", {"native": {"t_ns": native_ns}}, now_us,
+                               ["body_read_after_native_read_start_missing"])
+    sample = {k: v for k, v in candidate.items() if k != "acquisition_ns"}
+    sample["native"] = {"t_ns": native_ns}
+    failed = []
+    if not same_control_frame(native_ns, sample["source_us"]):
+        failed.append("0 <= source_us - native_us < 20000")
+    if not 0 <= now_us - sample["source_us"] < FRESHNESS_US:
+        failed.append("0 <= now_us - source_us < 200000")
+    if failed:
+        raise AcquisitionError("stale native acquisition", sample, now_us, failed)
+    return sample
 
 
 def emit(value):
@@ -40,33 +100,61 @@ def provision(rpc, next_sample, identities, clock=time.monotonic_ns):
         raise RuntimeError("simulation provisioning enable refused")
     enabled_us = clock() // 1000
     head = None
+    reported_pre_enable = False
     settled_since = None
     while clock() // 1000 < deadline:
-        observation = next_sample()
+        try:
+            observation = next_sample()
+        except AcquisitionError as error:
+            error.set_enable(enabled_us)
+            raise
         now = clock() // 1000
         if observation is None:
             raise RuntimeError("provisioning observation lost")
         if tuple(observation[k] for k in ("daemon", "body", "world")) != identities:
-            raise RuntimeError("provisioning incarnation replaced")
+            raise AcquisitionError("provisioning incarnation replaced", observation, now,
+                                   ["daemon/body/world match owned launch"], enabled_us)
         source, sim, seq = (observation[k] for k in ("source_us", "simulation_us", "sequence"))
         # Subscription frames already queued when the ACK arrived cannot prove
         # preparation. Discard only this bounded pre-ACK tail before first proof.
-        if head is None and type(source) is int and 0 <= now - source < 200_000 and source <= enabled_us:
-            continue
         native = observation["native"]
         tick = native.get("t_ns")
-        if (type(source) is not int or type(sim) is not int or type(seq) is not int
-                or type(tick) is not int or source <= enabled_us or sim <= 0 or seq <= 0
-                or not source <= tick // 1000 < source + 20_000
-                or not source <= now < source + 200_000):
-            raise RuntimeError("stale/unproved provisioning acquisition")
+        if (head is None and same_control_frame(tick, source) and 0 <= now - source < FRESHNESS_US
+                and min(source, tick // 1000) <= enabled_us):
+            if not reported_pre_enable:
+                print(AcquisitionError("discarded pre-enable provisioning candidate", observation, now,
+                                       [name for valid, name in (
+                                           (source > enabled_us, "source_us > enabled_us"),
+                                           (tick // 1000 > enabled_us, "native_us > enabled_us")) if not valid],
+                                       enabled_us), file=sys.stderr)
+                reported_pre_enable = True  # At most one diagnostic for a queued tail.
+            continue  # Neither a pre-enable frame nor its queued response proves enable.
+        conditions = [
+            (type(source) is int, "source_us_is_integer"),
+            (type(sim) is int and sim > 0, "simulation_us_is_positive_integer"),
+            (type(seq) is int and seq > 0, "sequence_is_positive_integer"),
+            (type(tick) is int and tick > 0, "native_t_ns_is_positive_integer"),
+            (type(source) is int and source > enabled_us, "source_us > enabled_us"),
+            (type(tick) is int and tick // 1000 > enabled_us, "native_us > enabled_us"),
+            (same_control_frame(tick, source), "0 <= source_us - native_us < 20000"),
+            (type(source) is int and 0 <= now - source < FRESHNESS_US, "0 <= now_us - source_us < 200000"),
+        ]
+        failed = [name for valid, name in conditions if not valid]
+        if failed:
+            raise AcquisitionError("stale/unproved provisioning acquisition", observation, now, failed, enabled_us)
         if head is not None:
             old_source, old_sim, old_seq, old_tick = head
             delta = source - old_source
-            if (not 0 < delta < 200_000 or seq <= old_seq or tick <= old_tick
-                    or not delta // 2 <= sim - old_sim <= delta * 2 + 20_000
-                    or sim <= old_sim):
-                raise RuntimeError("provisioning source gap/reset or paused simulator")
+            failed = [name for valid, name in [
+                (0 < delta < FRESHNESS_US, "0 < source_delta_us < 200000"),
+                (seq > old_seq, "sequence > previous_sequence"),
+                (tick > old_tick, "native_t_ns > previous_native_t_ns"),
+                (sim > old_sim, "simulation_us > previous_simulation_us"),
+                (delta // 2 <= sim - old_sim <= delta * 2 + FRAME_SKEW_US,
+                 "source_delta_us/2 <= simulation_delta_us <= source_delta_us*2+20000"),
+            ] if not valid]
+            if failed:
+                raise AcquisitionError("provisioning source gap/reset or paused simulator", observation, now, failed, enabled_us)
         head = source, sim, seq, tick
         oracle = observation.get("oracle")
         values = None if oracle is None else [oracle.get(k) for k in
@@ -139,14 +227,14 @@ def check_native_artifacts(pins, params, assets):
 
 
 
-def collect_standing(next_sample, identities, dwell_us=200_000):
+def collect_standing(next_sample, identities, dwell_us=200_000, minimum_native_us=0):
     result = []
     until = time.monotonic_ns() // 1000 + 10_000_000
     while time.monotonic_ns() // 1000 < until:
         try:
             s = next_sample()
         except RuntimeError as error:
-            if str(error) != "stale native acquisition":
+            if not str(error).startswith("stale native acquisition"):
                 raise
             result = []
             continue
@@ -154,6 +242,9 @@ def collect_standing(next_sample, identities, dwell_us=200_000):
         ready = o and o["upright"] and abs(o["yaw"]) <= 1e-6 and o["linear_speed"] <= .02 and o["angular_speed"] <= .1 and o["uncertainty"] <= .001
         if (s["daemon"], s["body"], s["world"]) != identities:
             raise RuntimeError("qualification incarnation changed")
+        if s["native"]["t_ns"] // 1000 < minimum_native_us:
+            result = []  # A pre-cutoff native frame cannot supply post-cutoff rest.
+            continue
         result = (result + [s])[-32:] if ready else []
         if len(result) >= 3 and result[-1]["source_us"] - result[0]["source_us"] >= dwell_us:
             return result
@@ -203,7 +294,8 @@ def native_probes(rpc, next_sample, process, identity, sleep=time.sleep):
     sleep(max(0, (move["action"]["deadline_us"] - time.monotonic_ns() // 1000) / 1_000_000))
     transcript.append(task(dict(kind="fence", descriptor=dict(install=install, next_epoch=2,
         request="physical-request:v1:"+str(uuid.uuid4())))))
-    reference_trace.extend(collect_standing(next_sample, identities, 500_000))
+    reference_trace.extend(collect_standing(next_sample, identities, 500_000,
+                                             minimum_native_us=transcript[-1]["native_us"]))
     for epoch, lease, duration, delay, pause in [(3,1_000_000,600_000,.23,False),
             (4,500_000,120_000,.15,False), (5,120_000,120_000,.15,False),
             (6,500_000,120_000,.30,True)]:
@@ -227,10 +319,10 @@ def native_probes(rpc, next_sample, process, identity, sleep=time.sleep):
             try:
                 s = next_sample()
             except RuntimeError as error:
-                if str(error) != "stale native acquisition":
+                if not str(error).startswith("stale native acquisition"):
                     raise
                 continue
-            if s["source_us"] >= cutoff:
+            if s["source_us"] >= cutoff and s["native"]["t_ns"] // 1000 >= cutoff:
                 if s["native"].get("move", {}).get("requested") != [0, 0, 0]:
                     raise RuntimeError("native loop did not independently discard expired task input")
                 witness = s
@@ -272,7 +364,7 @@ def readiness_report(rpc, next_sample, identity, subscribed, assets, model_diges
     head = None
     for s in observations:
         source, sim, seq, tick = s["source_us"], s["simulation_us"], s["sequence"], s["native"].get("t_ns")
-        if (type(tick) is not int or not source <= tick // 1000 < source + 20_000
+        if (not same_control_frame(tick, source)
                 or source <= 0 or sim <= 0 or seq <= 0):
             raise RuntimeError("readiness observation/native acquisition stale")
         if head is not None:
@@ -320,32 +412,36 @@ def run(*, readiness_only=False):
     if pins and (model_digest != pins["compiledModelSha256"] or native.mujoco.__version__ != pins["mujocoVersion"]):
         raise RuntimeError("exact compiled simulator mismatch")
     records = collections.deque(maxlen=32)
+    evicted_ns = 0
     original = body.sensors
     sequence = 0
     records_lock = threading.Lock()
 
     def sensors():
-        nonlocal sequence
-        acquisition_us = time.monotonic_ns() // 1000
+        nonlocal sequence, evicted_ns
+        acquisition_ns = time.monotonic_ns()
+        acquisition_us = acquisition_ns // 1000
         measured = original()
+        oracle = None
         with world.lock:
             # No splicing a later root pose into an older sensor acquisition.
-            if float(world.data.time) != measured["sim_time"]:
-                return measured
-            position = [float(x) for x in world.data.qpos[body.trunk:body.trunk + 3]]
-            quat = world.data.qpos[body.trunk + 3:body.trunk + 7].copy()
-            velocity = world.data.qvel[body.trunk_dof:body.trunk_dof + 6].copy()
-            gravity = native.gravity_in_trunk(quat)
-            yaw = math.atan2(2 * (quat[0] * quat[3] + quat[1] * quat[2]),
-                             1 - 2 * (quat[2] ** 2 + quat[3] ** 2))
-            oracle = dict(position=position, yaw=yaw,
-                          linear_speed=float(np.linalg.norm(velocity[:3])),
-                          angular_speed=float(np.linalg.norm(velocity[3:])),
-                          uncertainty=0.000001,
-                          upright=bool(gravity[2] < -0.9 and position[2] >= 0.08))
+            if float(world.data.time) == measured["sim_time"]:
+                position = [float(x) for x in world.data.qpos[body.trunk:body.trunk + 3]]
+                quat = world.data.qpos[body.trunk + 3:body.trunk + 7].copy()
+                velocity = world.data.qvel[body.trunk_dof:body.trunk_dof + 6].copy()
+                gravity = native.gravity_in_trunk(quat)
+                yaw = math.atan2(2 * (quat[0] * quat[3] + quat[1] * quat[2]),
+                                 1 - 2 * (quat[2] ** 2 + quat[3] ** 2))
+                oracle = dict(position=position, yaw=yaw,
+                              linear_speed=float(np.linalg.norm(velocity[:3])),
+                              angular_speed=float(np.linalg.norm(velocity[3:])),
+                              uncertainty=0.000001,
+                              upright=bool(gravity[2] < -0.9 and position[2] >= 0.08))
         with records_lock:
             sequence += 1
-            records.append(dict(source_us=acquisition_us,
+            if len(records) == records.maxlen:
+                evicted_ns = records[0]["acquisition_ns"]
+            records.append(dict(acquisition_ns=acquisition_ns, source_us=acquisition_us,
                                 simulation_us=round(measured["sim_time"] * 1000000),
                                 sequence=sequence, oracle=oracle))
         return measured
@@ -398,13 +494,10 @@ def run(*, readiness_only=False):
             nonlocal latest
             ns = state.get("t_ns")
             latest = None  # Never return a cached observation after a mapping failure.
-            if not isinstance(ns, int) or ns <= 0:
+            if type(ns) is not int or ns <= 0:
                 return
             with records_lock:
-                acquired = next((r.copy() for r in reversed(records)
-                                 if r["source_us"] * 1000 <= ns), None)
-            if acquired is None or time.monotonic_ns() // 1000 - acquired["source_us"] >= 200000:
-                return
+                acquired = correlate_acquisition(records, ns, time.monotonic_ns() // 1000, evicted_ns)
             # Preserve native commands/odometry as diagnostics; they are never
             # substituted for modeled root velocity or qualified uncertainty.
             acquired.update(daemon=daemon, body=body_id, world=world_id,
@@ -492,7 +585,8 @@ def run(*, readiness_only=False):
             transcript, expiry_witnesses, expiry_moves, reference_trace = native_probes(rpc, next_sample, process, identity)
             # The last probe leaves authority closed. No probe renews a Core task.
             # Establish fresh measured rest again before sealing enrollment.
-            observations = collect_standing(next_sample, (daemon, body_id, world_id))
+            observations = collect_standing(next_sample, (daemon, body_id, world_id),
+                                             minimum_native_us=transcript[-1]["native_us"])
             bundle = dict(producer="pastey.microduck.qualification.v1", pins=pins,
                 artifactDigest=hashlib.sha256(Path(robotd).read_bytes()).hexdigest(),
                 controller=daemon, body=body_id, world=world_id, modelSha256=model_digest,
@@ -559,5 +653,9 @@ def run(*, readiness_only=False):
 
 
 if __name__ == "__main__":
-    with contextlib.redirect_stdout(sys.stderr):
-        run()
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            run()
+    except AcquisitionError as error:
+        print(error, file=sys.stderr)  # Bounded proof data, without traceback paths.
+        sys.exit(1)

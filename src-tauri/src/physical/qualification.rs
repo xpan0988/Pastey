@@ -159,7 +159,7 @@ impl GateBEvidenceBundleV1 {
                     && s.source_us >= cutoff
                     && s.source_us <= r.native_us
                     && s.native.t_ns.is_some_and(|n| {
-                        n / 1000 >= s.source_us && n / 1000 - s.source_us < 20_000
+                        n / 1000 >= cutoff && microduck::same_control_frame(n, s.source_us)
                     })
                     && s.native
                         .movement
@@ -208,9 +208,10 @@ impl GateBEvidenceBundleV1 {
                     && sample.daemon == self.controller
                     && sample.body == self.body
                     && sample.world == self.world
-                    && sample.native.t_ns.is_some_and(|n| {
-                        n / 1000 >= sample.source_us && n / 1000 - sample.source_us < 20_000
-                    })
+                    && sample
+                        .native
+                        .t_ns
+                        .is_some_and(|n| microduck::same_control_frame(n, sample.source_us))
                     && sample.native.safety.as_ref().is_some_and(|s| !s.fallen)
                     && o.upright
                     && o.position.iter().all(|v| v.is_finite())
@@ -238,6 +239,7 @@ impl GateBEvidenceBundleV1 {
                 )?;
             }
             if sample.source_us >= self.mechanism[4].native_us
+                && sample.native.t_ns.unwrap() / 1000 >= self.mechanism[4].native_us
                 && o.linear_speed <= 0.02
                 && o.angular_speed <= 0.1
             {
@@ -257,7 +259,9 @@ impl GateBEvidenceBundleV1 {
             (0.01..=0.1).contains(&forward)
                 && lateral.abs() <= 0.03
                 && rest_since.is_some_and(|t| last.source_us - t >= 500_000)
-                && last.source_us >= self.mechanism[1].action.as_ref().unwrap().deadline_us,
+                && last.source_us >= self.mechanism[1].action.as_ref().unwrap().deadline_us
+                && last.native.t_ns.unwrap() / 1000
+                    >= self.mechanism[1].action.as_ref().unwrap().deadline_us,
             "Reference motion/measured settling qualification missing",
         )?;
         require(
@@ -269,16 +273,14 @@ impl GateBEvidenceBundleV1 {
             let n = s
                 .native
                 .t_ns
-                .ok_or_else(|| invalid("Native clock missing"))?
-                / 1000;
+                .ok_or_else(|| invalid("Native clock missing"))?;
             require(
                 s.daemon == self.controller
                     && s.body == self.body
                     && s.world == self.world
                     && s.source_us > 0
                     && s.simulation_us > 0
-                    && n >= s.source_us
-                    && n - s.source_us < 20_000
+                    && microduck::same_control_frame(n, s.source_us)
                     && s.oracle.as_ref().is_some_and(|o| {
                         o.upright
                             && o.position.iter().all(|v| v.is_finite())
@@ -312,7 +314,8 @@ impl GateBEvidenceBundleV1 {
         let s = last.unwrap();
         let o = s.oracle.as_ref().unwrap();
         require(
-            s.source_us >= self.mechanism.last().unwrap().native_us,
+            s.source_us >= self.mechanism.last().unwrap().native_us
+                && s.native.t_ns.unwrap() / 1000 >= self.mechanism.last().unwrap().native_us,
             "Measured qualification state predates native probes",
         )?;
         require(

@@ -223,6 +223,65 @@ struct NativeProfile {
     harness: Arc<supervisor::Harness>,
     adapter: Arc<dyn PhysicalEnvironmentAdapterV1>,
 }
+
+#[test]
+fn native_read_start_precedes_body_acquisition_with_strict_same_frame_bound() {
+    assert!(microduck::same_control_frame(100_000_000, 101_000));
+    // A real later acquisition can share the rounded microsecond with read-start.
+    assert!(microduck::same_control_frame(100_000_999, 100_000));
+    assert!(microduck::same_control_frame(100_000_000, 119_999));
+    assert!(!microduck::same_control_frame(100_000_000, 120_000));
+    assert!(!microduck::same_control_frame(100_001_000, 100_000));
+    assert!(!microduck::same_control_frame(0, 100_000));
+    assert!(!microduck::same_control_frame(u64::MAX, 100_000));
+
+    let mut enrollment = fake::enrollment(&binding());
+    let reg = fake::record(&mut enrollment).clone();
+    let mut b = bundle(&reg);
+    for s in b
+        .observations
+        .iter_mut()
+        .chain(&mut b.expiry_witnesses)
+        .chain(&mut b.reference_trace)
+    {
+        s.native.t_ns = Some((s.source_us - 1_000) * 1000);
+    }
+    b.validate().unwrap();
+    // All three persisted measurement paths enforce the same direction/skew.
+    for path in 0..3 {
+        for offset in [1_000_i64, -20_000] {
+            let mut bad = b.clone();
+            let s = match path {
+                0 => &mut bad.observations[0],
+                1 => &mut bad.expiry_witnesses[0],
+                _ => &mut bad.reference_trace[0],
+            };
+            s.native.t_ns = Some((s.source_us as i64 + offset) as u64 * 1000);
+            assert!(
+                bad.validate().is_err(),
+                "path {path}, native/source offset {offset}"
+            );
+        }
+    }
+    // A post-cutoff sensor acquisition from a frame started before expiry
+    // cannot witness native expiry, even when its skew is otherwise valid.
+    let mut bad = b.clone();
+    let cutoff = bad.expiry_moves[0].native_us + wire::REFRESH_LOSS_US;
+    bad.expiry_witnesses[0].source_us = cutoff + 1;
+    bad.expiry_witnesses[0].native.t_ns = Some((cutoff - 1) * 1000);
+    assert!(bad.validate().is_err());
+}
+
+#[test]
+fn production_observation_accepts_native_read_start_before_simulator_acquisition() {
+    let n = NativeProfile::new();
+    n.f.clock.set(1100, 100_000);
+    supervisor::sample(&n.run, &n.harness, 2, 100_000, 0., 0.);
+    supervisor::mutate(&n.harness, |s| {
+        s.native.t_ns = Some((s.source_us - 1_000) * 1000)
+    });
+    n.run.poll_start().unwrap();
+}
 impl NativeProfile {
     fn new() -> Self {
         let dir = std::env::temp_dir().join(format!("pastey-stage9-{}", uuid::Uuid::new_v4()));
@@ -776,7 +835,7 @@ fn expiry_and_observation_loss_deny_new_reviews() {
 }
 #[test]
 fn body_world_controller_reset_stale_pause_or_missing_oracle_loses_current_producer() {
-    for fault in 0..7 {
+    for fault in 0..10 {
         let n = NativeProfile::new();
         n.f.clock.set(1100, 100_000);
         supervisor::sample(&n.run, &n.harness, 2, 100_000, 0., 0.);
@@ -798,7 +857,10 @@ fn body_world_controller_reset_stale_pause_or_missing_oracle_loses_current_produ
             3 => s.simulation_us = 50_000,
             4 => s.source_us = 149_000,
             5 => s.oracle = None,
-            _ => s.sequence = 1,
+            6 => s.sequence = 1,
+            7 => s.native.t_ns = Some((s.source_us + 1_000) * 1000),
+            8 => s.native.t_ns = Some((s.source_us - 20_000) * 1000),
+            _ => s.native.t_ns = Some((s.source_us - 50_000) * 1000), // Cached prior frame.
         });
         assert!(n.run.poll_start().is_err());
         let mut c = n.f.core.lock();

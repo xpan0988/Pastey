@@ -45,8 +45,9 @@ class QualificationProducer(unittest.TestCase):
             if epoch >= 3:
                 witnessed.add(epoch)
             return dict(daemon="controller", body="body", world="world", source_us=now[0],
-                        native={"move": {"requested": [.05, 0, 0] if nonzero else [0, 0, 0]}})
-        def standing(next_sample, identities, dwell_us=200_000):
+                        native={"t_ns": (now[0]-1)*1000,
+                                "move": {"requested": [.05, 0, 0] if nonzero else [0, 0, 0]}})
+        def standing(next_sample, identities, dwell_us=200_000, minimum_native_us=0):
             now[0] += dwell_us
             return [sample()]
         def sleep(seconds):

@@ -150,10 +150,10 @@ class EnvironmentPreparation(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "SHA mismatch"):
                 env.fetch_exact("https://example.invalid/exact", Path(directory)/"policy", "a"*64)
 
-    def readiness(self, *, missing_stand=False, stale=False, paused=False, unfenced=False):
+    def readiness(self, *, missing_stand=False, stale=False, paused=False, unfenced=False, native_offset=-1000):
         identity = dict(controller="controller", body="body", world="world")
         samples = [dict(daemon="controller", body="body", world="world", source_us=t,
-                        simulation_us=t if not paused else 100_000, sequence=i+1, native={"t_ns": t*1000+1000})
+                        simulation_us=t if not paused else 100_000, sequence=i+1, native={"t_ns": (t+native_offset)*1000})
                    for i, t in enumerate((100_000, 200_000, 300_000))]
         status = dict(identity=identity, protocol="microduck-task-v1", profile="reference-velocity-v1", fenced=not unfenced,
                       accepted=True, reason="not_installed", installed=None, action=None,
@@ -183,6 +183,12 @@ class EnvironmentPreparation(unittest.TestCase):
         for fault in ("missing_stand", "stale", "paused", "unfenced"):
             with self.subTest(fault=fault), self.assertRaises(RuntimeError):
                 self.readiness(**{fault: True})
+
+    def test_readiness_rejects_reverse_order_and_exact_skew_ceiling(self):
+        self.readiness(native_offset=-19999)
+        for offset in (1000, -20000):
+            with self.subTest(offset=offset), self.assertRaisesRegex(RuntimeError, "acquisition"):
+                self.readiness(native_offset=offset)
 
     def test_catalog_is_not_a_partial_production_profile(self):
         catalog = json.loads(env.CATALOG.read_text())

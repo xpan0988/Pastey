@@ -13,6 +13,17 @@ const MAX_FRAME: usize = 256 * 1024;
 const REFRESH_US: u64 = 50_000;
 const RUN_MAX_US: u64 = 30_000_000;
 
+/// Pinned robotd saves CLOCK_MONOTONIC immediately before Safety/RemoteIo.read;
+/// the synchronous simulator sensor read follows, on the same Linux clock.
+/// Equal microseconds allow only timestamp quantization, not reversed ordering.
+pub(in crate::physical) fn same_control_frame(native_ns: u64, source_us: u64) -> bool {
+    native_ns > 0
+        && source_us > 0
+        && source_us
+            .checked_sub(native_ns / 1000)
+            .is_some_and(|d| d < 20_000)
+}
+
 /// Trusted local launch configuration, not a transferable DTO or product command.
 /// Sources and model configuration are pinned by content before launch.
 pub(in crate::physical) struct GateALaunchV1 {
@@ -99,7 +110,10 @@ impl GateAObservationProvenanceV1 {
         )?;
         let n = &self.sample.native;
         require(
-            n.t.is_finite() && n.t >= 0.0 && n.t_ns.is_some_and(|t| t > 0),
+            n.t.is_finite()
+                && n.t >= 0.0
+                && n.t_ns
+                    .is_some_and(|t| same_control_frame(t, self.sample.source_us)),
             "Missing native tick clock",
         )?;
         for v in n
@@ -483,7 +497,7 @@ impl MicroDuckRunV1 {
             .t_ns
             .ok_or_else(|| invalid("No native acquisition clock"))?;
         require(
-            native / 1000 >= sample.source_us && native / 1000 - sample.source_us < 20_000,
+            same_control_frame(native, sample.source_us),
             "Native tick/body acquisition mismatch",
         )?;
         let gap = lane
