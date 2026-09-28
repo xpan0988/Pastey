@@ -138,7 +138,8 @@ def correlate_acquisition(records, native_ns, now_us, evicted_ns=0):
     if candidate is None:
         raise AcquisitionError("stale native acquisition", {"native": {"t_ns": native_ns}}, now_us,
                                ["body_read_after_native_read_start_missing"])
-    sample = {k: v for k, v in candidate.items() if k != "acquisition_ns"}
+    # Upright components stay supervisor-local, never in Gate A/B evidence.
+    sample = {k: v for k, v in candidate.items() if k not in ("acquisition_ns", "_settling_components")}
     sample["native"] = {"t_ns": native_ns}
     failed = []
     if not same_control_frame(native_ns, sample["source_us"]):
@@ -155,7 +156,77 @@ def emit(value):
     OUTPUT.flush()
 
 
-def provision(rpc, next_sample, identities, clock=time.monotonic_ns):
+class SettlingTimeout(RuntimeError):
+    def __init__(self, data):
+        self.data = data
+        super().__init__("simulation provisioning bring-up timeout: "
+                         + json.dumps(data, allow_nan=False, separators=(",", ":")))
+
+
+class SettlingDiagnostics:
+    """Constant-space, timeout-only summary of fresh post-enable acquisitions.
+
+    Counts saturate at 2**32-1, times at u64; metrics clamp to +/-1e6, flagging clipping.
+    Nonfinite/missing final values are null and never enter finite extrema.
+    This observer does not supply or change any acceptance predicate.
+    """
+    def __init__(self):
+        self.data = dict(valid_acquisition_count=0, progress_window_completed=False,
+                         progress_window_completed_source_us=None,
+                         progress_window_completed_after_enable_us=None,
+                         longest_settling_streak_us=0, timing_clamped=False, settling_predicate_ever_true=False,
+                         failure_counts={k: 0 for k in (
+                             "oracle_available_finite", "oracle_upright", "abs_yaw_le_1e_6",
+                             "linear_speed_in_0_to_0_02", "angular_speed_in_0_to_0_1",
+                             "uncertainty_in_0_to_0_001", "native_policy_stand_walk", "native_not_fallen")},
+                         metrics={k: dict(final=None, min=None, max=None, clamped=False) for k in (
+                             "yaw", "abs_yaw", "linear_speed", "angular_speed", "uncertainty",
+                             "gravity_z", "trunk_height")})
+
+    def observe(self, observation, valid, settled_since, progress, enabled_us, components):
+        def finite(value):
+            return type(value) is int or (type(value) is float and math.isfinite(value))
+        data = self.data
+        def bounded_time(value):
+            clipped = max(0, min((1 << 64) - 1, value))
+            data["timing_clamped"] |= clipped != value
+            return clipped
+        data["valid_acquisition_count"] = min(data["valid_acquisition_count"] + 1, (1 << 32) - 1)
+        source = observation["source_us"]
+        if progress.completed and not data["progress_window_completed"]:
+            data.update(progress_window_completed=True, progress_window_completed_source_us=bounded_time(source),
+                        progress_window_completed_after_enable_us=bounded_time(source-enabled_us))
+        if valid:
+            data["settling_predicate_ever_true"] = True
+            data["longest_settling_streak_us"] = max(data["longest_settling_streak_us"], bounded_time(source-settled_since))
+        oracle = observation.get("oracle") or {}
+        native = observation["native"]
+        yaw, linear, angular, uncertainty = (oracle.get(k) for k in
+                                            ("yaw", "linear_speed", "angular_speed", "uncertainty"))
+        predicates = (all(finite(v) for v in (yaw, linear, angular, uncertainty)),
+                      oracle.get("upright") is True, finite(yaw) and abs(yaw) <= 1e-6,
+                      finite(linear) and 0 <= linear <= .02,
+                      finite(angular) and 0 <= angular <= .1,
+                      finite(uncertainty) and 0 <= uncertainty <= .001,
+                      native.get("policy") in ("stand", "walk"),
+                      native.get("safety", {}).get("fallen") is False)
+        for key, passed in zip(data["failure_counts"], predicates):
+            if not passed:
+                data["failure_counts"][key] = min(data["failure_counts"][key] + 1, (1 << 32) - 1)
+        components = components or {}
+        values = (yaw, abs(yaw) if finite(yaw) else None, linear, angular, uncertainty,
+                  components.get("gravity_z"), components.get("trunk_height"))
+        for metric, value in zip(data["metrics"].values(), values):
+            metric["final"] = None
+            if finite(value):
+                clipped = max(-1e6, min(1e6, value))
+                metric["final"] = clipped
+                metric["clamped"] |= clipped != value
+                metric["min"] = clipped if metric["min"] is None else min(metric["min"], clipped)
+                metric["max"] = clipped if metric["max"] is None else max(metric["max"], clipped)
+
+
+def provision(rpc, next_sample, identities, clock=time.monotonic_ns, *, settling_components=None):
     """One-shot simulation preparation before the launcher can accept a run.
 
     No task identity or authority exists here. ACK is not a measurement. All
@@ -166,6 +237,7 @@ def provision(rpc, next_sample, identities, clock=time.monotonic_ns):
         raise RuntimeError("simulation provisioning enable refused")
     enabled_us = clock() // 1000
     progress = SimulatorProgress()
+    diagnostics = SettlingDiagnostics()
     reported_pre_enable = False
     settled_since = None
     while clock() // 1000 < deadline:
@@ -219,9 +291,11 @@ def provision(rpc, next_sample, identities, clock=time.monotonic_ns):
                  and native.get("policy") in ("stand", "walk")
                  and native.get("safety", {}).get("fallen") is False)
         settled_since = (source if settled_since is None else settled_since) if valid else None
+        diagnostics.observe(observation, valid, settled_since, progress, enabled_us,
+                            None if settling_components is None else settling_components(observation))
         if progress.completed and settled_since is not None and source - settled_since >= 200_000:
             return  # Only new continuous settled measurements seal preparation.
-    raise RuntimeError("simulation provisioning bring-up timeout")
+    raise SettlingTimeout(diagnostics.data)
 
 
 
@@ -492,6 +566,7 @@ def run(*, readiness_only=False):
         acquisition_us = acquisition_ns // 1000
         measured = original()
         oracle = None
+        components = None
         with world.lock:
             # No splicing a later root pose into an older sensor acquisition.
             if float(world.data.time) == measured["sim_time"]:
@@ -506,13 +581,14 @@ def run(*, readiness_only=False):
                               angular_speed=float(np.linalg.norm(velocity[3:])),
                               uncertainty=0.000001,
                               upright=bool(gravity[2] < -0.9 and position[2] >= 0.08))
+                components = dict(gravity_z=float(gravity[2]), trunk_height=position[2])
         with records_lock:
             sequence += 1
             if len(records) == records.maxlen:
                 evicted_ns = records[0]["acquisition_ns"]
             records.append(dict(acquisition_ns=acquisition_ns, source_us=acquisition_us,
                                 simulation_us=round(measured["sim_time"] * 1000000),
-                                sequence=sequence, oracle=oracle))
+                                sequence=sequence, oracle=oracle, _settling_components=components))
         return measured
 
     body.sensors = sensors  # instrumentation only, returning original sensor data
@@ -638,7 +714,11 @@ def run(*, readiness_only=False):
             raise RuntimeError("fresh native acquisition timeout")
 
         # Drain any pre-ACK frames inside rpc; proof begins after that ACK.
-        provision(rpc, next_sample, (daemon, body_id, world_id))
+        def settling_components(observation):
+            with records_lock:
+                record = next((r for r in records if r["sequence"] == observation["sequence"]), None)
+                return None if record is None else record.get("_settling_components")
+        provision(rpc, next_sample, (daemon, body_id, world_id), settling_components=settling_components)
         if readiness_only:
             if not pins:
                 raise RuntimeError("Stage 9A requires exact native artifacts")
@@ -725,6 +805,6 @@ if __name__ == "__main__":
     try:
         with contextlib.redirect_stdout(sys.stderr):
             run()
-    except AcquisitionError as error:
-        print(error, file=sys.stderr)  # Bounded proof data, without traceback paths.
+    except (AcquisitionError, SettlingTimeout) as error:
+        print(error, file=sys.stderr)  # Bounded proof/settling data, without traceback paths.
         sys.exit(1)

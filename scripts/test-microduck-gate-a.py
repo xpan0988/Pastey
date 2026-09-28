@@ -1,9 +1,11 @@
 """Deterministic supervisor provisioning tests; no native integration claim."""
+import ast
 import copy
 import contextlib
 import importlib.util
 import io
 import json
+import sys
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -33,7 +35,7 @@ def progress_records(case):
 
 
 class Provisioning(unittest.TestCase):
-    def run_case(self, edit=lambda s, i: None, accepted=True, missing=False):
+    def run_case(self, edit=lambda s, i: None, accepted=True, missing=False, components=None):
         calls = []
         now = [100_000]
         count = [0]
@@ -53,7 +55,8 @@ class Provisioning(unittest.TestCase):
             edit(s, count[0])
             return s
         try:
-            gate.provision(rpc, sample, ("daemon", "body", "world"), lambda: now[0] * 1000)
+            gate.provision(rpc, sample, ("daemon", "body", "world"), lambda: now[0] * 1000,
+                           settling_components=components)
         finally:
             self.assertEqual(calls, [("robot.enable", {"on": True, "toggle": False})])
         return count[0]
@@ -148,6 +151,158 @@ class Provisioning(unittest.TestCase):
                              ("angular_speed", .2), ("yaw", .1)):
             with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "timeout"):
                 self.run_case(lambda s, i: s["oracle"].update({field: value}))
+
+    def timeout_summary(self, edit, components=None):
+        with self.assertRaises(gate.SettlingTimeout) as rejected:
+            self.run_case(edit, components=components)
+        error = rejected.exception
+        self.assertEqual(json.loads(str(error).split(": ", 1)[1]), error.data)
+        self.assertLess(len(str(error)), 2500)
+        self.assertEqual(error.data["valid_acquisition_count"], 500)
+        self.assertTrue(error.data["progress_window_completed"])
+        self.assertEqual(error.data["progress_window_completed_source_us"], 1119000)
+        self.assertEqual(error.data["progress_window_completed_after_enable_us"], 1019000)
+        return error.data
+
+    def test_timeout_distinguishes_each_settling_failure(self):
+        cases = [
+            (lambda s, i: s.update(oracle=None),
+             {"oracle_available_finite", "oracle_upright", "abs_yaw_le_1e_6",
+              "linear_speed_in_0_to_0_02", "angular_speed_in_0_to_0_1", "uncertainty_in_0_to_0_001"}),
+            (lambda s, i: s["oracle"].update(upright=False), {"oracle_upright"}),
+            (lambda s, i: s["oracle"].update(yaw=.1), {"abs_yaw_le_1e_6"}),
+            (lambda s, i: s["oracle"].update(linear_speed=.03), {"linear_speed_in_0_to_0_02"}),
+            (lambda s, i: s["oracle"].update(angular_speed=.2), {"angular_speed_in_0_to_0_1"}),
+            (lambda s, i: s["oracle"].update(uncertainty=.01), {"uncertainty_in_0_to_0_001"}),
+            (lambda s, i: s["native"].update(policy="limp"), {"native_policy_stand_walk"}),
+            (lambda s, i: s["native"]["safety"].update(fallen=True), {"native_not_fallen"}),
+        ]
+        for edit, failures in cases:
+            with self.subTest(failures=failures):
+                data = self.timeout_summary(edit)
+                self.assertEqual(data["failure_counts"],
+                                 {k: 500 if k in failures else 0 for k in data["failure_counts"]})
+                self.assertFalse(data["settling_predicate_ever_true"])
+                self.assertEqual(data["longest_settling_streak_us"], 0)
+        # Native not-fallen never substitutes for Pastey's stricter oracle upright.
+        self.assertEqual(self.timeout_summary(cases[1][0])["failure_counts"]["native_not_fallen"], 0)
+
+    def test_timeout_tracks_interrupted_streak_and_finite_extrema(self):
+        data = self.timeout_summary(lambda s, i: s["oracle"].update(yaw=-.1 if i % 10 == 0 else 0.))
+        self.assertTrue(data["settling_predicate_ever_true"])
+        self.assertEqual(data["longest_settling_streak_us"], 160000)  # 9 reads, below unchanged dwell.
+        self.assertEqual(data["failure_counts"]["abs_yaw_le_1e_6"], 50)
+        self.assertEqual(data["metrics"]["yaw"], dict(final=-.1, min=-.1, max=0., clamped=False))
+        self.assertEqual(data["metrics"]["abs_yaw"], dict(final=.1, min=0., max=.1, clamped=False))
+
+    def test_timeout_reports_metric_extrema_and_preserves_threshold_boundaries(self):
+        def edit(s, i):
+            s["native"]["safety"]["fallen"] = True  # Keep this a timeout, independently of metrics.
+            s["oracle"].update(yaw=(-1e-6, 0., 1e-6)[i % 3],
+                              linear_speed=(.01, .03, .02)[i % 3],
+                              angular_speed=(.05, .2, .1)[i % 3],
+                              uncertainty=(.0001, .002, .001)[i % 3])
+        data = self.timeout_summary(edit)
+        for field, final, low, high in (("yaw", 1e-6, -1e-6, 1e-6), ("abs_yaw", 1e-6, 0., 1e-6),
+                                       ("linear_speed", .02, .01, .03), ("angular_speed", .1, .05, .2),
+                                       ("uncertainty", .001, .0001, .002)):
+            self.assertEqual(data["metrics"][field], dict(final=final, min=low, max=high, clamped=False))
+        self.assertEqual(data["failure_counts"]["abs_yaw_le_1e_6"], 0)
+        for key in ("linear_speed_in_0_to_0_02", "angular_speed_in_0_to_0_1", "uncertainty_in_0_to_0_001"):
+            self.assertEqual(data["failure_counts"][key], 167)
+
+    def test_timeout_nonfinite_missing_and_clamped_values_are_bounded(self):
+        for field in ("yaw", "linear_speed", "angular_speed", "uncertainty"):
+            for value in (float("nan"), float("inf"), None):
+                with self.subTest(field=field, value=value):
+                    data = self.timeout_summary(lambda s, i: s["oracle"].update({field: value}))
+                    self.assertEqual(data["failure_counts"]["oracle_available_finite"], 500)
+                    self.assertEqual(data["metrics"][field], dict(final=None, min=None, max=None, clamped=False))
+        data = self.timeout_summary(lambda s, i: s["oracle"].update(yaw=-1e100, linear_speed=1e100,
+                                                                    angular_speed=1e100, uncertainty=1e100))
+        for field in ("yaw", "abs_yaw", "linear_speed", "angular_speed", "uncertainty"):
+            self.assertTrue(data["metrics"][field]["clamped"])
+            self.assertLessEqual(abs(data["metrics"][field]["final"]), 1e6)
+
+    def test_timeout_upright_components_remain_local_and_report_final_best(self):
+        data = self.timeout_summary(lambda s, i: s["oracle"].update(upright=False),
+                                    components=lambda s: dict(gravity_z=-.6-.1*(s["sequence"] % 5),
+                                                              trunk_height=.04+.01*(s["sequence"] % 5)))
+        self.assertAlmostEqual(data["metrics"]["gravity_z"]["final"], -.6)
+        self.assertAlmostEqual(data["metrics"]["gravity_z"]["min"], -1.)
+        self.assertAlmostEqual(data["metrics"]["trunk_height"]["final"], .04)
+        self.assertAlmostEqual(data["metrics"]["trunk_height"]["max"], .08)
+        record = dict(acquisition_ns=101000000, source_us=101000, simulation_us=100000, sequence=1,
+                      oracle={"upright": False}, _settling_components={"gravity_z": -.6, "trunk_height": .04})
+        acquired = gate.correlate_acquisition([record], 100000000, 102000)
+        self.assertEqual(set(acquired), {"source_us", "simulation_us", "sequence", "oracle", "native"})
+        self.assertEqual(acquired["oracle"], {"upright": False})
+
+    def test_timeout_excludes_arbitrary_native_and_oracle_content(self):
+        secret = "secret-content/permit/path/identity" * 10000
+        def edit(s, i):
+            s["native"].update(policy=secret, arbitrary=secret)
+            s["native"]["safety"]["unrelated"] = secret
+            s["oracle"].update(position=[secret], arbitrary=secret)
+        data = self.timeout_summary(edit, components=lambda s: dict(unrelated=secret))
+        encoded = json.dumps(data)
+        self.assertNotIn("secret-content", encoded)
+        self.assertNotIn("arbitrary", encoded)
+        self.assertNotIn("position", encoded)
+        self.assertEqual(set(data["failure_counts"]), set(gate.SettlingDiagnostics().data["failure_counts"]))
+
+    def test_timeout_counter_saturation_and_no_success_diagnostics(self):
+        diagnostics = gate.SettlingDiagnostics()
+        limit = (1 << 32) - 1
+        diagnostics.data["valid_acquisition_count"] = limit
+        diagnostics.data["failure_counts"] = {k: limit for k in diagnostics.data["failure_counts"]}
+        record = next(progress_records(PROGRESS_GOLDEN["cases"][0]))
+        record["oracle"] = None
+        diagnostics.observe(record, False, None, gate.SimulatorProgress(), 1, None)
+        self.assertEqual(diagnostics.data["valid_acquisition_count"], limit)
+        self.assertEqual(set(diagnostics.data["failure_counts"].values()), {limit})
+        progress = gate.SimulatorProgress()
+        progress.completed = True
+        record = next(progress_records(PROGRESS_GOLDEN["cases"][0]))
+        record["source_us"] = 10**10000
+        diagnostics.observe(record, True, 1, progress, 1, {"gravity_z": 10**10000})
+        self.assertTrue(diagnostics.data["timing_clamped"])
+        self.assertEqual(diagnostics.data["longest_settling_streak_us"], (1 << 64) - 1)
+        self.assertTrue(diagnostics.data["metrics"]["gravity_z"]["clamped"])
+        self.assertLess(len(str(gate.SettlingTimeout(diagnostics.data))), 2500)
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self.run_case(), 51)
+        self.assertEqual((out.getvalue(), err.getvalue()), ("", ""))
+
+    def test_timeout_without_acquisitions_reports_incomplete_window(self):
+        clock_values = iter((100000000, 10100000000, 10100000000))
+        with self.assertRaises(gate.SettlingTimeout) as rejected:
+            gate.provision(lambda *args: {"accepted": True}, lambda: self.fail("deadline already reached"),
+                           ("daemon", "body", "world"), lambda: next(clock_values))
+        data = rejected.exception.data
+        self.assertEqual(data["valid_acquisition_count"], 0)
+        self.assertFalse(data["progress_window_completed"])
+        self.assertIsNone(data["progress_window_completed_source_us"])
+        self.assertFalse(data["settling_predicate_ever_true"])
+
+    def test_timeout_entrypoint_emits_only_one_summary_without_traceback(self):
+        # Execute the actual entrypoint with a failing run, without launching native I/O.
+        tree = ast.parse(Path(gate.__file__).read_text())
+        entrypoint = tree.body[-1]
+        self.assertIsInstance(entrypoint, ast.If)
+        def run():
+            raise gate.SettlingTimeout(gate.SettlingDiagnostics().data)
+        scope = dict(__name__="__main__", run=run, sys=sys, contextlib=contextlib,
+                     AcquisitionError=gate.AcquisitionError, SettlingTimeout=gate.SettlingTimeout)
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit) as stopped:
+                exec(compile(ast.Module(body=[entrypoint], type_ignores=[]), gate.__file__, "exec"), scope)
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertNotIn(str(Path(gate.__file__).parent), err.getvalue())
+        self.assertLess(len(err.getvalue()), 2500)
 
     def test_task_adapter_has_no_enable_and_preparation_precedes_seal(self):
         source = Path(gate.__file__).read_text()
