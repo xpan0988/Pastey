@@ -296,10 +296,17 @@ fn simulator_progress_matches_shared_python_vectors() {
         let mut progress = microduck::SimulatorProgressV1::default();
         let mut sample = template.clone();
         sample.source_us = vectors["initialSourceUs"].as_u64().unwrap();
-        sample.simulation_us = vectors["initialSimulationUs"].as_u64().unwrap();
+        sample.simulation_us = case["initialSimulationUs"]
+            .as_u64()
+            .unwrap_or_else(|| vectors["initialSimulationUs"].as_u64().unwrap());
         sample.sequence = 1;
-        sample.native.t_ns =
-            Some((sample.source_us - vectors["nativeSourceSkewUs"].as_u64().unwrap()) * 1000);
+        sample.native.t_ns = Some(
+            (sample.source_us
+                - case["initialNativeSourceSkewUs"]
+                    .as_u64()
+                    .unwrap_or_else(|| vectors["nativeSourceSkewUs"].as_u64().unwrap()))
+                * 1000,
+        );
         progress.observe(&sample).unwrap();
         let mut accepted = true;
         'steps: for step in case["steps"].as_array().unwrap() {
@@ -309,10 +316,26 @@ fn simulator_progress_matches_shared_python_vectors() {
                     (sample.simulation_us as i64 + step[1].as_i64().unwrap()) as u64;
                 sample.sequence += 1;
                 sample.native.t_ns = Some(
-                    (sample.source_us - vectors["nativeSourceSkewUs"].as_u64().unwrap()) * 1000,
+                    sample.native.t_ns.unwrap()
+                        + step
+                            .get(3)
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or_else(|| step[0].as_u64().unwrap())
+                            * 1000,
                 );
-                if progress.observe(&sample).is_err() {
+                if let Err(error) = progress.observe(&sample) {
                     accepted = false;
+                    if let Some(index) = case["rejectedAtStep"].as_u64() {
+                        assert_eq!(sample.sequence - 1, index, "{}", case["name"]);
+                        assert!(
+                            error.to_string().contains(if case["failure"] == "phase" {
+                                "phase divergence"
+                            } else {
+                                "simulator regression"
+                            }),
+                            "{error}"
+                        );
+                    }
                     break 'steps;
                 }
             }
@@ -343,6 +366,9 @@ fn qualification_progress_accepts_jitter_and_rejects_stall_reset_gap_or_unfinish
     jitter.observations[1].simulation_us = jitter.observations[0].simulation_us + 20_000;
     jitter.reference_trace[1].simulation_us = jitter.reference_trace[0].simulation_us + 20_000;
     jitter.validate().unwrap();
+    jitter.observations[1].simulation_us = jitter.observations[0].simulation_us;
+    jitter.reference_trace[1].simulation_us = jitter.reference_trace[0].simulation_us;
+    jitter.validate().unwrap();
     for path in 0..2 {
         for fault in 0..6 {
             let mut bad = baseline.clone();
@@ -352,7 +378,12 @@ fn qualification_progress_accepts_jitter_and_rejects_stall_reset_gap_or_unfinish
                 &mut bad.reference_trace
             };
             match fault {
-                0 => samples[1].simulation_us = samples[0].simulation_us,
+                0 => {
+                    let initial = samples[0].simulation_us;
+                    for s in samples {
+                        s.simulation_us = initial;
+                    }
+                }
                 1 => samples[1].simulation_us = samples[0].simulation_us - 1,
                 2 => {
                     samples[1].source_us = samples[0].source_us + 200_000;
@@ -374,7 +405,7 @@ fn qualification_progress_accepts_jitter_and_rejects_stall_reset_gap_or_unfinish
 
 #[test]
 fn production_observation_progress_accepts_jitter_but_closes_on_sustained_drift() {
-    for speed in [1, 0, 3] {
+    for speed in [1, 0, 3, 4] {
         let n = NativeProfile::new();
         let mut failed = false;
         for i in 1..=11 {
@@ -383,9 +414,11 @@ fn production_observation_progress_accepts_jitter_but_closes_on_sustained_drift(
             supervisor::sample(&n.run, &n.harness, i + 1, source, 0., 0.);
             supervisor::mutate(&n.harness, |s| {
                 s.simulation_us = if speed == 1 && i == 1 {
-                    70_000
+                    50_000 // Independent sensor read repeats the initial world time.
                 } else if speed == 0 {
                     50_000 + i * 20_000
+                } else if speed == 4 {
+                    50_000 // Sustained repetition must exhaust the phase envelope.
                 } else {
                     50_000 + i * 100_000 * speed
                 };
@@ -543,7 +576,7 @@ fn exact_evidence_bundle_and_missing_or_wrong_inputs_fail_closed() {
             6 => b.namespaces[0] = b.parent_namespaces[0].clone(),
             7 => b.mechanism.truncate(1),
             8 => b.observations[1] = b.observations[0].clone(),
-            9 => b.observations[1].simulation_us = b.observations[0].simulation_us,
+            9 => b.observations[1].simulation_us = b.observations[0].simulation_us - 1,
             10 => {
                 b.observations[1].body =
                     IncarnationId::try_from(format!("incarnation:v1:{}", uuid::Uuid::new_v4()))
@@ -950,7 +983,7 @@ fn expiry_and_observation_loss_deny_new_reviews() {
     }
 }
 #[test]
-fn body_world_controller_reset_stale_pause_or_missing_oracle_loses_current_producer() {
+fn body_world_controller_reset_stale_or_missing_oracle_loses_current_producer() {
     for fault in 0..10 {
         let n = NativeProfile::new();
         n.f.clock.set(1100, 100_000);
@@ -970,7 +1003,7 @@ fn body_world_controller_reset_stale_pause_or_missing_oracle_loses_current_produ
                     IncarnationId::try_from(format!("incarnation:v1:{}", uuid::Uuid::new_v4()))
                         .unwrap()
             }
-            3 => s.simulation_us = 50_000,
+            3 => s.simulation_us = 49_999, // Regression, not a valid repeated batch.
             4 => s.source_us = 149_000,
             5 => s.oracle = None,
             6 => s.sequence = 1,

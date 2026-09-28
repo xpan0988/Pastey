@@ -315,7 +315,7 @@ async fn refusal_and_lost_ack_never_retry_or_replenish_budget() {
     }
 }
 #[tokio::test]
-async fn cached_native_paused_world_clock_gap_missing_and_replaced_incarnations_deny() {
+async fn cached_native_regressing_world_clock_gap_missing_and_replaced_incarnations_deny() {
     for fault in 0..8 {
         let f = GateA::new();
         let s = f.active().await;
@@ -327,7 +327,7 @@ async fn cached_native_paused_world_clock_gap_missing_and_replaced_incarnations_
         supervisor::sample(&f.run, &f.harness, 3, 110_000, 0.01, 0.05);
         supervisor::mutate(&f.harness, |sample| match fault {
             0 => sample.native.t_ns = Some(159_000_500), // cached pre-action tick
-            1 => sample.simulation_us = 60_000,
+            1 => sample.simulation_us = 59_999,
             2 => sample.sequence = 2,
             3 => sample.source_us = 120_000, // too old for clock mapping/native sample
             4 => sample.native.t_ns = None,

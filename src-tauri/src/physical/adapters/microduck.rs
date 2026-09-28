@@ -50,9 +50,10 @@ impl SimulatorProgressV1 {
                 sample.sequence > seq
                     && sample.source_us > source
                     && sample.source_us - source < 200_000
-                    && sample.simulation_us > sim
+                    // Sensor reads may repeat the world time between physics batches.
+                    && sample.simulation_us >= sim
                     && native > ns,
-                "Cached/paused/reset simulator or source gap",
+                "Cached source/native/sequence, simulator regression or source gap",
             )?;
         }
         if let Some((source, sim)) = self.anchor {

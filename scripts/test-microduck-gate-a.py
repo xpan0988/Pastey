@@ -15,17 +15,20 @@ PROGRESS_GOLDEN = json.loads((Path(__file__).parent / "fixtures/microduck-simula
 
 
 def progress_records(case):
-    source, sim, seq = PROGRESS_GOLDEN["initialSourceUs"], PROGRESS_GOLDEN["initialSimulationUs"], 1
+    source, sim, seq = PROGRESS_GOLDEN["initialSourceUs"], case.get("initialSimulationUs", PROGRESS_GOLDEN["initialSimulationUs"]), 1
+    native = (source-case.get("initialNativeSourceSkewUs", PROGRESS_GOLDEN["nativeSourceSkewUs"]))*1000
     def record():
         return dict(source_us=source, simulation_us=sim, sequence=seq,
                     daemon="daemon", body="body", world="world",
-                    native=dict(t_ns=(source-PROGRESS_GOLDEN["nativeSourceSkewUs"])*1000,
+                    native=dict(t_ns=native,
                                 policy="stand", safety={"fallen": False}),
                     oracle=dict(upright=True, yaw=0., linear_speed=0., angular_speed=0., uncertainty=.000001))
     yield record()
-    for ds, dt, repeat in case["steps"]:
+    for step in case["steps"]:
+        ds, dt, repeat = step[:3]
         for _ in range(repeat):
             source, sim, seq = source+ds, sim+dt, seq+1
+            native += (step[3] if len(step) > 3 else ds)*1000
             yield record()
 
 
@@ -230,6 +233,19 @@ class AcquisitionCorrelation(unittest.TestCase):
 
 
 class SimulatorProgressProof(unittest.TestCase):
+    def test_reported_adjacent_reads_repeat_world_time_with_fresh_advancing_acquisition(self):
+        case = next(c for c in PROGRESS_GOLDEN["cases"] if c["name"] == "adjacent-repeat-real-deltas")
+        records = progress_records(case)
+        previous, current = next(records), next(records)
+        self.assertEqual((previous["simulation_us"], current["simulation_us"]), (340000, 340000))
+        self.assertEqual(current["source_us"]-previous["source_us"], 25867)
+        self.assertEqual((current["native"]["t_ns"]-previous["native"]["t_ns"])//1000, 26150)
+        progress = gate.SimulatorProgress()
+        for record in (previous, current):
+            self.assertTrue(gate.same_control_frame(record["native"]["t_ns"], record["source_us"]))
+            progress.observe(record, record["source_us"]+17065)
+        self.assertFalse(progress.completed)  # Two fresh reads cannot finish startup proof.
+
     def test_shared_python_rust_vectors(self):
         for case in PROGRESS_GOLDEN["cases"]:
             with self.subTest(case=case["name"]):
@@ -238,8 +254,13 @@ class SimulatorProgressProof(unittest.TestCase):
                 try:
                     for record in progress_records(case):
                         progress.observe(record, record["source_us"]+17065)
-                except gate.AcquisitionError:
+                except gate.AcquisitionError as error:
                     accepted = False
+                    if "rejectedAtStep" in case:
+                        self.assertEqual(record["sequence"]-1, case["rejectedAtStep"])
+                        self.assertEqual(error.data["failed_conditions"],
+                                         ["abs(window_simulation_delta_us - window_source_delta_us) <= 272000"]
+                                         if case["failure"] == "phase" else ["simulation_us >= previous_simulation_us"])
                 self.assertEqual(accepted, case["accepted"])
                 if accepted:
                     self.assertEqual(progress.completed, case["completed"])
@@ -259,7 +280,7 @@ class SimulatorProgressProof(unittest.TestCase):
                                    ("daemon", "body", "world"), lambda: now[0]*1000)
                 else:
                     # Second-window failure must also be exercised after initial proof.
-                    if case["name"] == "second-window-slow":
+                    if case["name"].startswith("second-window-"):
                         continue
                     with self.assertRaises(RuntimeError):
                         gate.provision(lambda *args: {"accepted": True}, sample,
@@ -305,7 +326,7 @@ class SimulatorProgressProof(unittest.TestCase):
             record = original_sample()
             count[0] += 1
             if count[0] == 3:
-                record["simulation_us"] = 120000  # repeat the immediately previous raw tick
+                record["simulation_us"] = 119999  # regress below the previous raw tick
             return record
         with patch.object(gate.time, "monotonic_ns", side_effect=lambda: now[0]*1000):
             with self.assertRaises(gate.AcquisitionError):

@@ -106,7 +106,8 @@ class SimulatorProgress:
                 (0 < source - old_source < FRESHNESS_US, "0 < source_delta_us < 200000"),
                 (seq > old_seq, "sequence > previous_sequence"),
                 (tick > old_tick, "native_t_ns > previous_native_t_ns"),
-                (sim > old_sim, "simulation_us > previous_simulation_us"),
+                # Body.sensors reads the current world; physics steps independently.
+                (sim >= old_sim, "simulation_us >= previous_simulation_us"),
             ) if not valid]
         if not failed and self.anchor is not None:
             source_delta, sim_delta = source - self.anchor[0], sim - self.anchor[1]
