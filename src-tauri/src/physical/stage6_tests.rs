@@ -526,6 +526,34 @@ fn gate_a_cannot_qualify_longer_actions_or_weaker_freshness() {
     }
 }
 #[test]
+fn standing_is_heading_invariant_but_requires_rotational_rest() {
+    for yaw in [
+        0.3861663504503868,
+        -2.4,
+        3.1,
+        -8.,
+        8.,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ] {
+        for angular_speed in [0.003995644020477725, 0.100001] {
+            let f = GateA::new();
+            f.control.clock.set(1110, 110_000);
+            supervisor::sample(&f.run, &f.harness, 2, 110_000, 0., 0.);
+            supervisor::mutate(&f.harness, |s| {
+                let o = s.oracle.as_mut().unwrap();
+                o.yaw = yaw;
+                o.angular_speed = angular_speed;
+            });
+            assert_eq!(
+                f.run.poll_start().is_ok(),
+                yaw.is_finite() && angular_speed <= 0.1
+            );
+        }
+    }
+}
+#[test]
 fn missing_oracle_policy_label_or_stale_start_cannot_qualify() {
     for kind in 0..5 {
         let f = GateA::new();

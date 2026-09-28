@@ -163,6 +163,32 @@ class SettlingTimeout(RuntimeError):
                          + json.dumps(data, allow_nan=False, separators=(",", ":")))
 
 
+def finite(value):
+    return type(value) is int or (type(value) is float and math.isfinite(value))
+
+
+def standing_checks(observation):
+    """Shared provisioning/collection/diagnostic invariant; heading is evidence.
+
+    World yaw has no preferred zero. Angular speed proves rotational settling.
+    Keep native policy/not-fallen independent of the measured upright oracle.
+    """
+    oracle = observation.get("oracle") or {}
+    native = observation.get("native") or {}
+    yaw, linear, angular, uncertainty = (oracle.get(k) for k in
+                                        ("yaw", "linear_speed", "angular_speed", "uncertainty"))
+    return dict(
+        oracle_available_finite=all(finite(v) for v in (yaw, linear, angular, uncertainty)),
+        oracle_upright=oracle.get("upright") is True,
+        yaw_finite=finite(yaw),
+        linear_speed_in_0_to_0_02=finite(linear) and 0 <= linear <= .02,
+        angular_speed_in_0_to_0_1=finite(angular) and 0 <= angular <= .1,
+        uncertainty_in_0_to_0_001=finite(uncertainty) and 0 <= uncertainty <= .001,
+        native_policy_stand_walk=native.get("policy") in ("stand", "walk"),
+        native_not_fallen=(native.get("safety") or {}).get("fallen") is False,
+    )
+
+
 class SettlingDiagnostics:
     """Constant-space, timeout-only summary of fresh post-enable acquisitions.
 
@@ -175,17 +201,12 @@ class SettlingDiagnostics:
                          progress_window_completed_source_us=None,
                          progress_window_completed_after_enable_us=None,
                          longest_settling_streak_us=0, timing_clamped=False, settling_predicate_ever_true=False,
-                         failure_counts={k: 0 for k in (
-                             "oracle_available_finite", "oracle_upright", "abs_yaw_le_1e_6",
-                             "linear_speed_in_0_to_0_02", "angular_speed_in_0_to_0_1",
-                             "uncertainty_in_0_to_0_001", "native_policy_stand_walk", "native_not_fallen")},
+                         failure_counts=dict.fromkeys(standing_checks({}), 0),
                          metrics={k: dict(final=None, min=None, max=None, clamped=False) for k in (
                              "yaw", "abs_yaw", "linear_speed", "angular_speed", "uncertainty",
                              "gravity_z", "trunk_height")})
 
     def observe(self, observation, valid, settled_since, progress, enabled_us, components):
-        def finite(value):
-            return type(value) is int or (type(value) is float and math.isfinite(value))
         data = self.data
         def bounded_time(value):
             clipped = max(0, min((1 << 64) - 1, value))
@@ -200,17 +221,9 @@ class SettlingDiagnostics:
             data["settling_predicate_ever_true"] = True
             data["longest_settling_streak_us"] = max(data["longest_settling_streak_us"], bounded_time(source-settled_since))
         oracle = observation.get("oracle") or {}
-        native = observation["native"]
         yaw, linear, angular, uncertainty = (oracle.get(k) for k in
                                             ("yaw", "linear_speed", "angular_speed", "uncertainty"))
-        predicates = (all(finite(v) for v in (yaw, linear, angular, uncertainty)),
-                      oracle.get("upright") is True, finite(yaw) and abs(yaw) <= 1e-6,
-                      finite(linear) and 0 <= linear <= .02,
-                      finite(angular) and 0 <= angular <= .1,
-                      finite(uncertainty) and 0 <= uncertainty <= .001,
-                      native.get("policy") in ("stand", "walk"),
-                      native.get("safety", {}).get("fallen") is False)
-        for key, passed in zip(data["failure_counts"], predicates):
+        for key, passed in standing_checks(observation).items():
             if not passed:
                 data["failure_counts"][key] = min(data["failure_counts"][key] + 1, (1 << 32) - 1)
         components = components or {}
@@ -281,15 +294,7 @@ def provision(rpc, next_sample, identities, clock=time.monotonic_ns, *, settling
         if failed:
             raise AcquisitionError("stale/unproved provisioning acquisition", observation, now, failed, enabled_us)
         progress.observe(observation, now, enabled_us)
-        oracle = observation.get("oracle")
-        values = None if oracle is None else [oracle.get(k) for k in
-                    ("yaw", "linear_speed", "angular_speed", "uncertainty")]
-        valid = (values is not None and all(type(v) in (int, float) and math.isfinite(v) for v in values)
-                 and oracle.get("upright") is True and abs(values[0]) <= 0.000001
-                 and 0 <= values[1] <= 0.02 and 0 <= values[2] <= 0.1
-                 and 0 <= values[3] <= 0.001
-                 and native.get("policy") in ("stand", "walk")
-                 and native.get("safety", {}).get("fallen") is False)
+        valid = all(standing_checks(observation).values())
         settled_since = (source if settled_since is None else settled_since) if valid else None
         diagnostics.observe(observation, valid, settled_since, progress, enabled_us,
                             None if settling_components is None else settling_components(observation))
@@ -367,8 +372,7 @@ def collect_standing(next_sample, identities, dwell_us=200_000, minimum_native_u
                 raise
             result = []
             continue
-        o = s.get("oracle")
-        ready = o and o["upright"] and abs(o["yaw"]) <= 1e-6 and o["linear_speed"] <= .02 and o["angular_speed"] <= .1 and o["uncertainty"] <= .001
+        ready = all(standing_checks(s).values())
         if (s["daemon"], s["body"], s["world"]) != identities:
             raise RuntimeError("qualification incarnation changed")
         now = time.monotonic_ns() // 1000

@@ -64,6 +64,58 @@ class Provisioning(unittest.TestCase):
     def test_fresh_settled_proof_and_exactly_one_explicit_enable(self):
         self.assertEqual(self.run_case(), 51)
 
+    def test_standing_headings_and_predicate_parity(self):
+        # Run 007 values, plus both signs and headings beyond the atan2 range.
+        for yaw in (.3861663504503868, -2.4, 3.1, -8., 8.):
+            def edit(s, i):
+                s["oracle"].update(yaw=yaw, linear_speed=.0004905021411921403,
+                                   angular_speed=.003995644020477725)
+            with self.subTest(yaw=yaw):
+                self.assertEqual(self.run_case(edit), 51)
+                self.collect_case(edit)
+        for yaw in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(yaw=yaw):
+                edit = lambda s, i: s["oracle"].update(yaw=yaw)
+                with self.assertRaises(gate.SettlingTimeout):
+                    self.run_case(edit)
+                with self.assertRaisesRegex(RuntimeError, "standing qualification unavailable"):
+                    self.collect_case(edit)
+
+    def collect_case(self, edit):
+        now = [100000]
+        count = [0]
+        def sample():
+            count[0] += 1
+            now[0] += 20000
+            s = dict(source_us=now[0]-1000, simulation_us=now[0], sequence=count[0],
+                     daemon="daemon", body="body", world="world",
+                     native=dict(t_ns=(now[0]-2000)*1000, policy="stand", safety={"fallen": False}),
+                     oracle=dict(yaw=.386, upright=True, linear_speed=0., angular_speed=0., uncertainty=1e-6))
+            edit(s, count[0])
+            return s
+        with patch.object(gate.time, "monotonic_ns", side_effect=lambda: now[0]*1000):
+            return gate.collect_standing(sample, ("daemon", "body", "world"))
+
+    def test_collection_keeps_all_standing_guards(self):
+        edits = [lambda s, i: s["native"].update(policy="homing"),
+                 lambda s, i: s["native"]["safety"].update(fallen=True),
+                 lambda s, i: s["oracle"].update(upright=False)]
+        for key in ("linear_speed", "angular_speed", "uncertainty"):
+            for value in (-.01, float("nan"), float("inf")):
+                edits.append(lambda s, i, k=key, v=value: s["oracle"].update({k: v}))
+        edits += [lambda s, i: s["oracle"].update(angular_speed=.100001),
+                  lambda s, i: s["oracle"].update(linear_speed=.020001),
+                  lambda s, i: s["oracle"].update(uncertainty=.001001)]
+        for edit in edits:
+            with self.subTest(edit=edit):
+                with self.assertRaises(gate.SettlingTimeout):
+                    self.run_case(edit)
+                with self.assertRaisesRegex(RuntimeError, "standing qualification unavailable"):
+                    self.collect_case(edit)
+        # HOME_RAMP/policy transition is permitted before continuous settled proof.
+        records = self.collect_case(lambda s, i: s["native"].update(policy="homing" if i < 100 else "walk"))
+        self.assertGreaterEqual(records[0]["sequence"], 100)
+
     def test_exact_bounded_rejection_diagnostics(self):
         with self.assertRaises(gate.AcquisitionError) as rejected:
             self.run_case(lambda s, i: s["native"].update(t_ns=120_000_000))
@@ -148,7 +200,7 @@ class Provisioning(unittest.TestCase):
 
     def test_unsettled_uncertain_or_wrong_controller_times_out(self):
         for field, value in (("upright", False), ("uncertainty", .01), ("linear_speed", .03),
-                             ("angular_speed", .2), ("yaw", .1)):
+                             ("angular_speed", .2), ("yaw", float("nan"))):
             with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "timeout"):
                 self.run_case(lambda s, i: s["oracle"].update({field: value}))
 
@@ -167,10 +219,10 @@ class Provisioning(unittest.TestCase):
     def test_timeout_distinguishes_each_settling_failure(self):
         cases = [
             (lambda s, i: s.update(oracle=None),
-             {"oracle_available_finite", "oracle_upright", "abs_yaw_le_1e_6",
+             {"oracle_available_finite", "oracle_upright", "yaw_finite",
               "linear_speed_in_0_to_0_02", "angular_speed_in_0_to_0_1", "uncertainty_in_0_to_0_001"}),
             (lambda s, i: s["oracle"].update(upright=False), {"oracle_upright"}),
-            (lambda s, i: s["oracle"].update(yaw=.1), {"abs_yaw_le_1e_6"}),
+            (lambda s, i: s["oracle"].update(yaw=float("nan")), {"oracle_available_finite", "yaw_finite"}),
             (lambda s, i: s["oracle"].update(linear_speed=.03), {"linear_speed_in_0_to_0_02"}),
             (lambda s, i: s["oracle"].update(angular_speed=.2), {"angular_speed_in_0_to_0_1"}),
             (lambda s, i: s["oracle"].update(uncertainty=.01), {"uncertainty_in_0_to_0_001"}),
@@ -188,10 +240,11 @@ class Provisioning(unittest.TestCase):
         self.assertEqual(self.timeout_summary(cases[1][0])["failure_counts"]["native_not_fallen"], 0)
 
     def test_timeout_tracks_interrupted_streak_and_finite_extrema(self):
-        data = self.timeout_summary(lambda s, i: s["oracle"].update(yaw=-.1 if i % 10 == 0 else 0.))
+        data = self.timeout_summary(lambda s, i: s["oracle"].update(yaw=-.1 if i % 10 == 0 else 0.,
+                                                                       angular_speed=.2 if i % 10 == 0 else 0.))
         self.assertTrue(data["settling_predicate_ever_true"])
         self.assertEqual(data["longest_settling_streak_us"], 160000)  # 9 reads, below unchanged dwell.
-        self.assertEqual(data["failure_counts"]["abs_yaw_le_1e_6"], 50)
+        self.assertEqual(data["failure_counts"]["angular_speed_in_0_to_0_1"], 50)
         self.assertEqual(data["metrics"]["yaw"], dict(final=-.1, min=-.1, max=0., clamped=False))
         self.assertEqual(data["metrics"]["abs_yaw"], dict(final=.1, min=0., max=.1, clamped=False))
 
@@ -207,7 +260,7 @@ class Provisioning(unittest.TestCase):
                                        ("linear_speed", .02, .01, .03), ("angular_speed", .1, .05, .2),
                                        ("uncertainty", .001, .0001, .002)):
             self.assertEqual(data["metrics"][field], dict(final=final, min=low, max=high, clamped=False))
-        self.assertEqual(data["failure_counts"]["abs_yaw_le_1e_6"], 0)
+        self.assertEqual(data["failure_counts"]["yaw_finite"], 0)
         for key in ("linear_speed_in_0_to_0_02", "angular_speed_in_0_to_0_1", "uncertainty_in_0_to_0_001"):
             self.assertEqual(data["failure_counts"][key], 167)
 
@@ -379,7 +432,7 @@ class AcquisitionCorrelation(unittest.TestCase):
             sequence[0] += 1
             return dict(source_us=source, daemon="d", body="b", world="w",
                         simulation_us=source, sequence=sequence[0],
-                        native={"t_ns": (source-1000)*1000},
+                        native={"t_ns": (source-1000)*1000, "policy": "stand", "safety": {"fallen": False}},
                         oracle=dict(upright=True, yaw=0., linear_speed=0.,
                                     angular_speed=0., uncertainty=.000001))
         with patch.object(gate.time, "monotonic_ns", side_effect=lambda: now[0]*1000):
@@ -495,7 +548,7 @@ class SimulatorProgressProof(unittest.TestCase):
             now[0] = source+17065
             sequence[0] += 1
             return dict(source_us=source, simulation_us=source, sequence=sequence[0],
-                        daemon="d", body="b", world="w", native={"t_ns": (source-618)*1000},
+                        daemon="d", body="b", world="w", native={"t_ns": (source-618)*1000, "policy": "stand", "safety": {"fallen": False}},
                         oracle=dict(upright=True, yaw=0., linear_speed=0., angular_speed=0., uncertainty=.000001))
         with patch.object(gate.time, "monotonic_ns", side_effect=lambda: now[0]*1000):
             records = gate.collect_standing(sample, ("d", "b", "w"))

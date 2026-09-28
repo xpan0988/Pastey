@@ -486,11 +486,12 @@ impl MicroDuckRunV1 {
             "No qualified current body sample",
         )?;
         // A label alone cannot establish standing; the measured oracle is mandatory.
+        // World heading is arbitrary; angular speed establishes rotational rest.
         let o = lane.latest_oracle.as_ref();
         require(
             o.is_some_and(|o| {
                 o.upright
-                    && o.yaw.abs() <= 0.000001
+                    && o.yaw.is_finite()
                     && o.linear_speed <= 0.02
                     && o.angular_speed <= 0.1
                     && o.uncertainty <= 0.001

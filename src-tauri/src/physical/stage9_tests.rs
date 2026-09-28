@@ -559,6 +559,59 @@ impl NativeProfile {
     }
 }
 #[test]
+fn qualification_standing_and_reference_projection_are_heading_invariant() {
+    let mut enrollment = fake::enrollment(&binding());
+    let base = bundle(fake::record(&mut enrollment));
+    for yaw in [0.3861663504503868_f64, -2.4, 3.1, -8., 8.] {
+        let mut b = base.clone();
+        for s in &mut b.observations {
+            s.oracle.as_mut().unwrap().yaw = yaw;
+        }
+        for s in &mut b.reference_trace {
+            let o = s.oracle.as_mut().unwrap();
+            let forward = o.position[0];
+            o.yaw = yaw;
+            o.position[0] = 2. + forward * yaw.cos();
+            o.position[1] = -3. + forward * yaw.sin();
+        }
+        b.validate().unwrap();
+        // Body-relative lateral displacement must still reject at nonzero origin.
+        let mut lateral = b.clone();
+        let o = lateral
+            .reference_trace
+            .last_mut()
+            .unwrap()
+            .oracle
+            .as_mut()
+            .unwrap();
+        o.position[0] -= 0.04 * yaw.sin();
+        o.position[1] += 0.04 * yaw.cos();
+        assert!(lateral.validate().is_err());
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for location in 0..3 {
+                let mut invalid = b.clone();
+                let sample = match location {
+                    0 => invalid.reference_trace.first_mut().unwrap(),
+                    1 => invalid.reference_trace.last_mut().unwrap(),
+                    _ => invalid.observations.last_mut().unwrap(),
+                };
+                sample.oracle.as_mut().unwrap().yaw = bad;
+                assert!(invalid.validate().is_err());
+            }
+        }
+        for location in 0..3 {
+            let mut rotating = b.clone();
+            let sample = match location {
+                0 => rotating.reference_trace.first_mut().unwrap(),
+                1 => rotating.reference_trace.last_mut().unwrap(),
+                _ => rotating.observations.last_mut().unwrap(),
+            };
+            sample.oracle.as_mut().unwrap().angular_speed = 0.100001;
+            assert!(rotating.validate().is_err());
+        }
+    }
+}
+#[test]
 fn exact_evidence_bundle_and_missing_or_wrong_inputs_fail_closed() {
     let mut enrollment = fake::enrollment(&binding());
     let reg = fake::record(&mut enrollment).clone();

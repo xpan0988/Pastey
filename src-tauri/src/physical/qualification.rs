@@ -187,9 +187,11 @@ impl GateBEvidenceBundleV1 {
             .oracle
             .as_ref()
             .ok_or_else(|| invalid("No measured qualification origin"))?;
+        // Standing has no preferred world heading. Motion is projected below
+        // relative to this measured origin, while angular speed bounds settling.
         require(
             first.source_us <= self.mechanism[0].native_us
-                && origin.yaw.abs() <= 0.000001
+                && origin.yaw.is_finite()
                 && origin.linear_speed <= 0.02
                 && origin.angular_speed <= 0.1,
             "Reference trace lacks measured starting origin",
@@ -302,7 +304,7 @@ impl GateBEvidenceBundleV1 {
             "Measured qualification state predates native probes",
         )?;
         require(
-            o.yaw.abs() <= 0.000001
+            o.yaw.is_finite()
                 && o.linear_speed <= 0.02
                 && o.angular_speed <= 0.1
                 && s.native
