@@ -17,6 +17,19 @@ def load(name, filename):
 
 env = load("environment", "prepare-microduck-gate-b-environment.py")
 gate = load("supervisor", "microduck-gate-a.py")
+GOLDEN = json.loads((Path(__file__).parent / "fixtures/microduck-environment-digest-v1.json").read_text())
+
+
+def digest_fixture(root):
+    root.mkdir()
+    for relative, text in GOLDEN["files"].items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(text.encode())
+    for relative, target in GOLDEN["fileSymlinks"].items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(target)
 
 
 class EnvironmentPreparation(unittest.TestCase):
@@ -32,9 +45,74 @@ class EnvironmentPreparation(unittest.TestCase):
             (root / "ignored.pyc").write_text("ignored")
             self.assertEqual(env.environment_digest(root),
                              "f5e3ddcd49df7a6204739b6f02e3427a231cd6be882c8fd159df7bf264151168")
-            (root / "linked-directory").symlink_to("bin", target_is_directory=True)
-            with self.assertRaisesRegex(RuntimeError, "Symlinked"):
-                env.environment_digest(root)
+
+    def test_standard_venv_alias_shared_golden_and_identity_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "venv"
+            digest_fixture(root)
+            self.assertEqual(env.environment_digest(root), GOLDEN["digests"]["withoutDirectoryAlias"])
+            alias = root / "lib64"
+            alias.symlink_to("lib", target_is_directory=True)
+            with patch.object(env, "sha_file", wraps=env.sha_file) as hashed:
+                self.assertEqual(env.environment_digest(root), GOLDEN["digests"]["lib64ToLib"])
+                canonical_root = root.resolve()
+                self.assertEqual(sum(c.args[0] == canonical_root / "lib/package.py" for c in hashed.call_args_list), 1)
+                self.assertFalse(any(c.args[0].is_relative_to(canonical_root / "lib64") for c in hashed.call_args_list))
+            alias.unlink()
+            self.assertEqual(env.environment_digest(root), GOLDEN["digests"]["withoutDirectoryAlias"])
+            alias.symlink_to("other-lib", target_is_directory=True)
+            self.assertEqual(env.environment_digest(root), GOLDEN["digests"]["lib64ToOtherLib"])
+            alias.unlink()
+            alias.symlink_to("./lib", target_is_directory=True)
+            self.assertEqual(env.environment_digest(root), GOLDEN["digests"]["lib64ToDotLib"])
+            # Canonically resolve a relative directory-alias chain as well.
+            alias.unlink()
+            alias.symlink_to("current", target_is_directory=True)
+            (root / "current").symlink_to("lib", target_is_directory=True)
+            self.assertIsInstance(env.environment_digest(root), str)
+
+    def test_directory_alias_escape_broken_links_and_graph_cycles_rejected(self):
+        for fault in ("absolute-inside", "absolute-outside", "relative-outside", "broken",
+                      "self-cycle", "link-cycle", "ancestor-cycle", "sibling-cycle", "cache-cycle"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "venv"
+                digest_fixture(root)
+                outside = Path(directory) / "outside"
+                outside.mkdir()
+                alias = root / "lib64"
+                if fault == "absolute-inside":
+                    alias.symlink_to(root / "lib")
+                elif fault == "absolute-outside":
+                    alias.symlink_to(outside)
+                elif fault == "relative-outside":
+                    alias.symlink_to("../outside")
+                elif fault == "broken":
+                    alias.symlink_to("missing")
+                elif fault == "self-cycle":
+                    alias.symlink_to("lib64")
+                elif fault == "link-cycle":
+                    alias.symlink_to("current")
+                    (root / "current").symlink_to("lib64")
+                elif fault == "ancestor-cycle":
+                    (root / "lib/back").symlink_to("..")
+                elif fault == "sibling-cycle":
+                    (root / "lib/to-other").symlink_to("../other-lib")
+                    (root / "other-lib/to-lib").symlink_to("../lib")
+                else:
+                    (root / "__pycache__/back").symlink_to("..")
+                with self.assertRaises(RuntimeError):
+                    env.environment_digest(root)
+
+    def test_external_file_symlink_still_hashes_target_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "venv"
+            digest_fixture(root)
+            external = Path(directory) / "python"
+            external.write_bytes(b"executable")
+            (root / "bin/external-python").symlink_to(external)
+            before = env.environment_digest(root)
+            external.write_bytes(b"changed-executable")
+            self.assertNotEqual(before, env.environment_digest(root))
 
     def test_runtime_closure_uses_lock_hashes_extras_and_no_training(self):
         def package(name, dependencies=()):

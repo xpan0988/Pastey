@@ -541,8 +541,117 @@ fn python_environment_digest_matches_stage9a_independent_golden() {
         test_environment_digest(root).unwrap(),
         "f5e3ddcd49df7a6204739b6f02e3427a231cd6be882c8fd159df7bf264151168"
     );
-    std::os::unix::fs::symlink("bin", root.join("linked-directory")).unwrap();
-    assert!(test_environment_digest(root).is_err());
+}
+
+#[cfg(unix)]
+struct EnvironmentDigestDirectory(std::path::PathBuf);
+#[cfg(unix)]
+impl Drop for EnvironmentDigestDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+#[cfg(unix)]
+fn environment_digest_fixture() -> (EnvironmentDigestDirectory, std::path::PathBuf, Value) {
+    let dir = EnvironmentDigestDirectory(
+        std::env::temp_dir().join(format!("pastey-venv-symlinks-{}", uuid::Uuid::new_v4())),
+    );
+    let root = dir.0.join("venv");
+    std::fs::create_dir_all(&root).unwrap();
+    let golden: Value = serde_json::from_str(include_str!(
+        "../../../scripts/fixtures/microduck-environment-digest-v1.json"
+    ))
+    .unwrap();
+    for (relative, text) in golden["files"].as_object().unwrap() {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text.as_str().unwrap().as_bytes()).unwrap();
+    }
+    for (relative, target) in golden["fileSymlinks"].as_object().unwrap() {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target.as_str().unwrap(), path).unwrap();
+    }
+    (dir, root, golden)
+}
+
+#[cfg(unix)]
+#[test]
+fn python_environment_digest_standard_venv_alias_shared_golden() {
+    let (_dir, root, golden) = environment_digest_fixture();
+    let check = |name: &str| {
+        assert_eq!(
+            test_environment_digest(&root).unwrap(),
+            golden["digests"][name].as_str().unwrap()
+        );
+    };
+    check("withoutDirectoryAlias");
+    let alias = root.join("lib64");
+    std::os::unix::fs::symlink("lib", &alias).unwrap();
+    check("lib64ToLib");
+    std::fs::remove_file(&alias).unwrap();
+    check("withoutDirectoryAlias");
+    std::os::unix::fs::symlink("other-lib", &alias).unwrap();
+    check("lib64ToOtherLib");
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink("./lib", &alias).unwrap();
+    check("lib64ToDotLib");
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink("current", &alias).unwrap();
+    std::os::unix::fs::symlink("lib", root.join("current")).unwrap();
+    assert!(test_environment_digest(&root).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn python_environment_digest_rejects_unsafe_directory_aliases() {
+    use std::os::unix::fs::symlink;
+    for fault in [
+        "absolute-inside",
+        "absolute-outside",
+        "relative-outside",
+        "broken",
+        "self-cycle",
+        "link-cycle",
+        "ancestor-cycle",
+        "sibling-cycle",
+        "cache-cycle",
+    ] {
+        let (dir, root, _) = environment_digest_fixture();
+        let outside = dir.0.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let alias = root.join("lib64");
+        match fault {
+            "absolute-inside" => symlink(root.join("lib"), &alias).unwrap(),
+            "absolute-outside" => symlink(&outside, &alias).unwrap(),
+            "relative-outside" => symlink("../outside", &alias).unwrap(),
+            "broken" => symlink("missing", &alias).unwrap(),
+            "self-cycle" => symlink("lib64", &alias).unwrap(),
+            "link-cycle" => {
+                symlink("current", &alias).unwrap();
+                symlink("lib64", root.join("current")).unwrap();
+            }
+            "ancestor-cycle" => symlink("..", root.join("lib/back")).unwrap(),
+            "sibling-cycle" => {
+                symlink("../other-lib", root.join("lib/to-other")).unwrap();
+                symlink("../lib", root.join("other-lib/to-lib")).unwrap();
+            }
+            _ => symlink("..", root.join("__pycache__/back")).unwrap(),
+        }
+        assert!(test_environment_digest(&root).is_err(), "accepted {fault}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn python_environment_digest_preserves_external_file_symlinks() {
+    let (dir, root, _) = environment_digest_fixture();
+    let external = dir.0.join("python");
+    std::fs::write(&external, b"executable").unwrap();
+    std::os::unix::fs::symlink(&external, root.join("bin/external-python")).unwrap();
+    let before = test_environment_digest(&root).unwrap();
+    std::fs::write(&external, b"changed-executable").unwrap();
+    assert_ne!(before, test_environment_digest(&root).unwrap());
 }
 #[test]
 fn gate_a_cannot_produce_native_binding_or_downgrade_native_run() {

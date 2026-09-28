@@ -787,38 +787,89 @@ fn environment_digest(root: &std::path::Path) -> AppResult<String> {
     fn visit(
         root: &std::path::Path,
         dir: &std::path::Path,
-        files: &mut BTreeMap<String, String>,
+        ignored: bool,
+        files: &mut BTreeMap<String, serde_json::Value>,
+        graph: &mut BTreeMap<PathBuf, Vec<PathBuf>>,
     ) -> AppResult<()> {
+        let mut edges = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             let name = entry.file_name();
-            if name == "__pycache__" || path.extension().is_some_and(|e| e == "pyc") {
-                continue;
-            }
+            let skip_content =
+                ignored || name == "__pycache__" || path.extension().is_some_and(|e| e == "pyc");
             let meta = std::fs::symlink_metadata(&path)?;
-            require(
-                !(meta.file_type().is_symlink() && path.is_dir()),
-                "Symlinked Python environment directory unsupported",
-            )?;
+            if meta.file_type().is_symlink() {
+                let target = path.canonicalize()?; // broken links / resolution cycles fail
+                if target.is_dir() {
+                    let link = std::fs::read_link(&path)?;
+                    require(
+                        !link.is_absolute() && target.starts_with(root),
+                        "Python environment directory symlink escaped root or is absolute",
+                    )?;
+                    let relative = |p: &std::path::Path| -> AppResult<String> {
+                        p.strip_prefix(root)
+                            .map_err(|_| invalid("Environment path escaped"))?
+                            .to_str()
+                            .map(str::to_owned)
+                            .ok_or_else(|| invalid("Non-UTF-8 environment alias path"))
+                    };
+                    let link_text = link
+                        .to_str()
+                        .ok_or_else(|| invalid("Non-UTF-8 environment alias target"))?;
+                    files.insert(
+                        relative(&path)?,
+                        serde_json::json!(["directorySymlink", link_text, relative(&target)?]),
+                    );
+                    edges.push(target);
+                    continue; // hash physical target files once, never through an alias
+                }
+            }
             if path.is_dir() {
-                visit(root, &path, files)?;
-            } else {
+                edges.push(path.clone());
+                visit(root, &path, skip_content, files, graph)?;
+            } else if !skip_content {
                 require(path.is_file(), "Unsupported Python environment object")?;
                 files.insert(
                     path.strip_prefix(root)
                         .map_err(|_| invalid("Environment path escaped"))?
                         .to_string_lossy()
                         .into_owned(),
-                    sha_file(&path)?,
+                    serde_json::Value::String(sha_file(&path)?),
                 );
             }
         }
+        graph.insert(dir.to_path_buf(), edges);
         Ok(())
     }
+    fn check_cycles(
+        dir: &std::path::Path,
+        graph: &BTreeMap<PathBuf, Vec<PathBuf>>,
+        states: &mut BTreeMap<PathBuf, u8>,
+    ) -> AppResult<()> {
+        require(
+            states.get(dir) != Some(&1),
+            "Cyclic Python environment directory symlink graph",
+        )?;
+        if states.get(dir) == Some(&2) {
+            return Ok(());
+        }
+        states.insert(dir.to_path_buf(), 1);
+        for target in &graph[dir] {
+            check_cycles(target, graph, states)?;
+        }
+        states.insert(dir.to_path_buf(), 2);
+        Ok(())
+    }
+    let root = root.canonicalize()?;
     let mut files = BTreeMap::new();
-    visit(root, root, &mut files)?;
-    require(!files.is_empty(), "Empty Python environment")?;
+    let mut graph = BTreeMap::new();
+    visit(&root, &root, false, &mut files, &mut graph)?;
+    check_cycles(&root, &graph, &mut BTreeMap::new())?;
+    require(
+        files.values().any(serde_json::Value::is_string),
+        "Empty Python environment",
+    )?;
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&files)?)))
 }
 fn validate_installation(config: &GateBLaunchV1, pins: &ProfilePinsV1) -> AppResult<()> {

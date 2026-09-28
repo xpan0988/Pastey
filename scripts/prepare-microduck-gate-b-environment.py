@@ -40,25 +40,60 @@ def sha_file(path):
 
 
 def environment_digest(root):
-    """Exact qualification.rs BTreeMap<relative POSIX path, file SHA> semantics."""
-    root = Path(root)
+    """Sorted file hashes and directory-alias identities, matching qualification.rs.
+
+    Directory aliases are ["directorySymlink", link text, canonical root-relative
+    target]. Walk only physical directories; validate containment+alias edges
+    separately so aliases neither duplicate file hashes nor hide graph cycles.
+    """
+    root = Path(root).resolve(strict=True)
     files = {}
-    def visit(directory):
+    graph = {}
+    def relative(path):
+        text = path.relative_to(root).as_posix()
+        text.encode("utf-8", "strict")
+        return text
+    def visit(directory, ignored=False):
+        edges = graph.setdefault(directory, [])
         for path in directory.iterdir():
-            if path.name == "__pycache__" or path.suffix == ".pyc":
-                continue
-            if path.is_symlink() and path.is_dir():
-                raise RuntimeError("Symlinked Python environment directory unsupported")
+            skip_content = ignored or path.name == "__pycache__" or path.suffix == ".pyc"
+            if path.is_symlink():
+                try:
+                    path.stat()  # match native filesystem link-resolution limits
+                    target = path.resolve(strict=True)
+                except (OSError, RuntimeError) as error:
+                    raise RuntimeError("Broken or cyclic Python environment symlink") from error
+                if target.is_dir():
+                    link = path.readlink()
+                    if link.is_absolute() or not target.is_relative_to(root):
+                        raise RuntimeError("Python environment directory symlink escaped root or is absolute")
+                    link_text = os.readlink(path)  # retain ./ and other literal link spelling
+                    link_text.encode("utf-8", "strict")
+                    files[relative(path)] = ["directorySymlink", link_text, relative(target)]
+                    edges.append(target)
+                    continue
             if path.is_dir():
-                visit(path)
+                edges.append(path)
+                visit(path, skip_content)
+            elif skip_content:
+                continue
             elif path.is_file():
-                relative = path.relative_to(root).as_posix()
-                relative.encode("utf-8", "strict")
-                files[relative] = sha_file(path)
+                files[relative(path)] = sha_file(path)
             else:
                 raise RuntimeError("Unsupported Python environment object")
     visit(root)
-    if not files:
+    states = {}
+    def check_cycles(directory):
+        if states.get(directory) == 1:
+            raise RuntimeError("Cyclic Python environment directory symlink graph")
+        if states.get(directory) == 2:
+            return
+        states[directory] = 1
+        for target in graph[directory]:
+            check_cycles(target)
+        states[directory] = 2
+    check_cycles(root)
+    if not any(isinstance(value, str) for value in files.values()):
         raise RuntimeError("Empty Python environment")
     encoded = json.dumps(files, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()

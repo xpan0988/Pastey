@@ -1,0 +1,17 @@
+{
+  "files": {
+    "A.txt": "alpha\n",
+    "é.txt": "beta",
+    "lib/package.py": "library\n",
+    "other-lib/package.py": "other\n",
+    "__pycache__/ignored": "ignored",
+    "ignored.pyc": "ignored"
+  },
+  "fileSymlinks": {"bin/python": "../A.txt"},
+  "digests": {
+    "withoutDirectoryAlias": "d5c6de766921f7d09823db40b71ec5d0082fd188b3de35b6e615fe02c616e667",
+    "lib64ToLib": "b7fc3efc1384b02e26855619e0dbe8a1ef0204601fde6f37c486c748f2a7e31b",
+    "lib64ToOtherLib": "52446cd2d541d273e69b624471d570e1538b75b5bb59cbd6a9c2fb9ae31c32eb",
+    "lib64ToDotLib": "d45885b333592d7d478e1c802e52956dc9030d0ca965c6808386311cc5310943"
+  }
+}
