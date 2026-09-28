@@ -24,6 +24,62 @@ pub(in crate::physical) fn same_control_frame(native_ns: u64, source_us: u64) ->
             .is_some_and(|d| d < 20_000)
 }
 
+// Pinned body_server.run(): late-deadline reset 250 ms + batch 20 ms + sleep
+// slack 2 ms. Qualification envelope only; upstream makes no scheduling SLA.
+const PROGRESS_WINDOW_US: u64 = 1_000_000;
+const PROGRESS_PHASE_US: u64 = 272_000;
+
+#[derive(Clone, Default)]
+pub(in crate::physical) struct SimulatorProgressV1 {
+    // sequence, source, simulation, native read-start ns
+    head: Option<(u64, u64, u64, u64)>,
+    anchor: Option<(u64, u64)>,
+    pub(in crate::physical) completed: bool,
+}
+impl SimulatorProgressV1 {
+    pub(in crate::physical) fn observe(&mut self, sample: &GateASampleV1) -> AppResult<()> {
+        let native = sample.native.t_ns.unwrap_or(0);
+        require(
+            sample.sequence > 0
+                && sample.simulation_us > 0
+                && same_control_frame(native, sample.source_us),
+            "Invalid simulator progress acquisition",
+        )?;
+        if let Some((seq, source, sim, ns)) = self.head {
+            require(
+                sample.sequence > seq
+                    && sample.source_us > source
+                    && sample.source_us - source < 200_000
+                    && sample.simulation_us > sim
+                    && native > ns,
+                "Cached/paused/reset simulator or source gap",
+            )?;
+        }
+        if let Some((source, sim)) = self.anchor {
+            require(
+                (sample.simulation_us - sim).abs_diff(sample.source_us - source)
+                    <= PROGRESS_PHASE_US,
+                "Simulator progress window phase divergence",
+            )?;
+            // Check every sample, including closure, BEFORE renewing the anchor.
+            // Strict <200 ms source gaps bound a window's closure to <1.2 s.
+            if sample.source_us - source >= PROGRESS_WINDOW_US {
+                self.completed = true;
+                self.anchor = Some((sample.source_us, sample.simulation_us));
+            }
+        } else {
+            self.anchor = Some((sample.source_us, sample.simulation_us));
+        }
+        self.head = Some((
+            sample.sequence,
+            sample.source_us,
+            sample.simulation_us,
+            native,
+        ));
+        Ok(())
+    }
+}
+
 /// Trusted local launch configuration, not a transferable DTO or product command.
 /// Sources and model configuration are pinned by content before launch.
 pub(in crate::physical) struct GateALaunchV1 {
@@ -236,7 +292,7 @@ pub(super) struct LaneState {
     installed: Option<(SessionId, BTreeMap<DomainId, u64>, EnvironmentBindingViewV1)>,
     action: Option<(ActionId, PhysicalIntentV1, EvidenceLineageV1)>,
     origin: Option<(ActionId, OracleV1)>,
-    source_head: Option<(u64, u64, u64, u64)>,
+    progress: SimulatorProgressV1,
     sample_sequence: u64, // sequence, source, simulation, native tick
     last_apply: Option<u64>,
     observations: VecDeque<ValidatedGateAObservationV1>,
@@ -421,7 +477,7 @@ impl MicroDuckRunV1 {
         let (_, now) = self.clock.read()?;
         let lane = self.lane.lock();
         require(
-            lane.source_head.is_some()
+            lane.progress.head.is_some()
                 && lane.start_native
                 && lane
                     .latest_captured
@@ -501,19 +557,11 @@ impl MicroDuckRunV1 {
             "Native tick/body acquisition mismatch",
         )?;
         let gap = lane
-            .source_head
+            .progress
+            .head
             .map_or(0, |(_, t, _, _)| sample.source_us.saturating_sub(t));
-        require(
-            lane.source_head.is_none_or(|(seq, t, sim, ns)| {
-                sample.sequence > seq
-                    && sample.source_us > t
-                    && sample.simulation_us > sim
-                    && native > ns
-                    && sample.simulation_us - sim >= (sample.source_us - t) / 2
-                    && sample.simulation_us - sim <= (sample.source_us - t) * 2 + 20_000
-            }),
-            "Cached/reset native or simulator sample",
-        )?;
+        let mut progress = lane.progress.clone();
+        progress.observe(&sample)?;
         let id =
             ObservationId::try_from(format!("physical-observation:v1:{}", uuid::Uuid::new_v4()))?;
         let provenance = GateAObservationProvenanceV1 {
@@ -614,12 +662,7 @@ impl MicroDuckRunV1 {
             .is_some_and(|p| p == "stand" || p == "walk")
             && sample.native.safety.as_ref().is_some_and(|s| !s.fallen);
         lane.sample_sequence += 1;
-        lane.source_head = Some((
-            sample.sequence,
-            sample.source_us,
-            sample.simulation_us,
-            native,
-        ));
+        lane.progress = progress;
         Ok(control)
     }
     pub(in crate::physical) fn poll_control(&self) -> AppResult<TrustedControlObservationV1> {
@@ -1408,7 +1451,7 @@ impl MicroDuckRunV1 {
                 installed: None,
                 action: None,
                 origin: None,
-                source_head: None,
+                progress: SimulatorProgressV1::default(),
                 sample_sequence: 0,
                 last_apply: None,
                 observations: VecDeque::new(),

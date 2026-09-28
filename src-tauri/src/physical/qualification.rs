@@ -194,7 +194,7 @@ impl GateBEvidenceBundleV1 {
                 && origin.angular_speed <= 0.1,
             "Reference trace lacks measured starting origin",
         )?;
-        let mut previous: Option<&microduck::GateASampleV1> = None;
+        let mut progress = microduck::SimulatorProgressV1::default();
         let mut rest_since = None;
         for sample in &self.reference_trace {
             let o = sample
@@ -224,20 +224,7 @@ impl GateBEvidenceBundleV1 {
                     && (0. ..=0.001).contains(&o.uncertainty),
                 "Reference qualification measurement invalid",
             )?;
-            if let Some(p) = previous {
-                require(
-                    sample.sequence > p.sequence
-                        && sample.source_us > p.source_us
-                        && sample.source_us - p.source_us <= 200_000
-                        && sample.simulation_us > p.simulation_us
-                        && sample.native.t_ns > p.native.t_ns
-                        && sample.simulation_us - p.simulation_us
-                            >= (sample.source_us - p.source_us) / 2
-                        && sample.simulation_us - p.simulation_us
-                            <= (sample.source_us - p.source_us) * 2 + 20_000,
-                    "Reference trace cached/paused/reset",
-                )?;
-            }
+            progress.observe(sample)?;
             if sample.source_us >= self.mechanism[4].native_us
                 && sample.native.t_ns.unwrap() / 1000 >= self.mechanism[4].native_us
                 && o.linear_speed <= 0.02
@@ -247,8 +234,11 @@ impl GateBEvidenceBundleV1 {
             } else {
                 rest_since = None;
             }
-            previous = Some(sample);
         }
+        require(
+            progress.completed,
+            "Reference simulator progress window incomplete",
+        )?;
         let last = self.reference_trace.last().unwrap();
         let o = last.oracle.as_ref().unwrap();
         let dx = o.position[0] - origin.position[0];
@@ -269,6 +259,7 @@ impl GateBEvidenceBundleV1 {
             "Missing independent qualification observations",
         )?;
         let mut last: Option<&microduck::GateASampleV1> = None;
+        let mut progress = microduck::SimulatorProgressV1::default();
         for s in &self.observations {
             let n = s
                 .native
@@ -296,21 +287,13 @@ impl GateBEvidenceBundleV1 {
                     && s.native.safety.as_ref().is_some_and(|v| !v.fallen),
                 "Unqualified measured body provenance",
             )?;
-            if let Some(p) = last {
-                require(
-                    s.sequence > p.sequence
-                        && s.source_us > p.source_us
-                        && s.simulation_us > p.simulation_us
-                        && s.native.t_ns > p.native.t_ns
-                        && s.source_us - p.source_us <= 200_000
-                        && s.simulation_us - p.simulation_us >= (s.source_us - p.source_us) / 2
-                        && s.simulation_us - p.simulation_us
-                            <= (s.source_us - p.source_us) * 2 + 20_000,
-                    "Stale/cached/paused/reset qualification sample",
-                )?;
-            }
+            progress.observe(s)?;
             last = Some(s);
         }
+        require(
+            progress.completed,
+            "Standing simulator progress window incomplete",
+        )?;
         let s = last.unwrap();
         let o = s.oracle.as_ref().unwrap();
         require(

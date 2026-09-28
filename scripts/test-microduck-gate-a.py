@@ -11,6 +11,22 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("gate_a", Path(__file__).with_name("microduck-gate-a.py"))
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
+PROGRESS_GOLDEN = json.loads((Path(__file__).parent / "fixtures/microduck-simulator-progress-v1.json").read_text())
+
+
+def progress_records(case):
+    source, sim, seq = PROGRESS_GOLDEN["initialSourceUs"], PROGRESS_GOLDEN["initialSimulationUs"], 1
+    def record():
+        return dict(source_us=source, simulation_us=sim, sequence=seq,
+                    daemon="daemon", body="body", world="world",
+                    native=dict(t_ns=(source-PROGRESS_GOLDEN["nativeSourceSkewUs"])*1000,
+                                policy="stand", safety={"fallen": False}),
+                    oracle=dict(upright=True, yaw=0., linear_speed=0., angular_speed=0., uncertainty=.000001))
+    yield record()
+    for ds, dt, repeat in case["steps"]:
+        for _ in range(repeat):
+            source, sim, seq = source+ds, sim+dt, seq+1
+            yield record()
 
 
 class Provisioning(unittest.TestCase):
@@ -40,7 +56,7 @@ class Provisioning(unittest.TestCase):
         return count[0]
 
     def test_fresh_settled_proof_and_exactly_one_explicit_enable(self):
-        self.assertEqual(self.run_case(), 11)
+        self.assertEqual(self.run_case(), 51)
 
     def test_exact_bounded_rejection_diagnostics(self):
         with self.assertRaises(gate.AcquisitionError) as rejected:
@@ -73,12 +89,12 @@ class Provisioning(unittest.TestCase):
                 s.update(source_us=99000)
                 s["native"]["t_ns"] = 98000000
         with contextlib.redirect_stderr(io.StringIO()) as diagnostics:
-            self.assertEqual(self.run_case(queued), 13)  # Full dwell starts after tail.
+            self.assertEqual(self.run_case(queued), 53)  # Full progress window starts after tail.
         self.assertEqual(len(diagnostics.getvalue().splitlines()), 1)
         self.assertIn('"source_minus_enabled_us":-1000', diagnostics.getvalue())
         # A frame that started before ACK but acquired afterward is still excluded.
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(self.run_case(lambda s, i: s["native"].update(t_ns=99999000) if i == 1 else None), 12)
+            self.assertEqual(self.run_case(lambda s, i: s["native"].update(t_ns=99999000) if i == 1 else None), 52)
             with self.assertRaises(gate.AcquisitionError):
                 self.run_case(lambda s, i: (s.update(source_us=99000), s["native"].update(t_ns=98000000)))
 
@@ -196,16 +212,123 @@ class AcquisitionCorrelation(unittest.TestCase):
         self.assertEqual(rejected.exception.data["native_minus_source_us"], -20000)
 
     def test_standing_dwell_excludes_frame_started_before_causal_cutoff(self):
-        frames = iter((100500, 120000, 220000, 320000))
+        frames = iter((100500, *range(120000, 1120001, 100000)))
+        now = [100000]
+        sequence = [0]
         def sample():
             source = next(frames)
+            now[0] = source + 1
+            sequence[0] += 1
             return dict(source_us=source, daemon="d", body="b", world="w",
+                        simulation_us=source, sequence=sequence[0],
                         native={"t_ns": (source-1000)*1000},
                         oracle=dict(upright=True, yaw=0., linear_speed=0.,
                                     angular_speed=0., uncertainty=.000001))
-        with patch.object(gate.time, "monotonic_ns", return_value=400000000):
+        with patch.object(gate.time, "monotonic_ns", side_effect=lambda: now[0]*1000):
             result = gate.collect_standing(sample, ("d", "b", "w"), minimum_native_us=100000)
-        self.assertEqual([s["source_us"] for s in result], [120000, 220000, 320000])
+        self.assertEqual([s["source_us"] for s in result], list(range(120000, 1120001, 100000)))
+
+
+class SimulatorProgressProof(unittest.TestCase):
+    def test_shared_python_rust_vectors(self):
+        for case in PROGRESS_GOLDEN["cases"]:
+            with self.subTest(case=case["name"]):
+                progress = gate.SimulatorProgress()
+                accepted = True
+                try:
+                    for record in progress_records(case):
+                        progress.observe(record, record["source_us"]+17065)
+                except gate.AcquisitionError:
+                    accepted = False
+                self.assertEqual(accepted, case["accepted"])
+                if accepted:
+                    self.assertEqual(progress.completed, case["completed"])
+
+    def test_provisioning_accepts_jitter_and_rejects_slow_fast_or_incomplete_proof(self):
+        for case in PROGRESS_GOLDEN["cases"]:
+            with self.subTest(case=case["name"]):
+                records = iter(progress_records(case))
+                now = [80000]
+                def sample():
+                    record = next(records, None)
+                    if record:
+                        now[0] = record["source_us"]+17065
+                    return record
+                if case["accepted"] and case["completed"]:
+                    gate.provision(lambda *args: {"accepted": True}, sample,
+                                   ("daemon", "body", "world"), lambda: now[0]*1000)
+                else:
+                    # Second-window failure must also be exercised after initial proof.
+                    if case["name"] == "second-window-slow":
+                        continue
+                    with self.assertRaises(RuntimeError):
+                        gate.provision(lambda *args: {"accepted": True}, sample,
+                                       ("daemon", "body", "world"), lambda: now[0]*1000)
+
+    def test_bounded_delta_and_window_rejection_diagnostics(self):
+        case = next(c for c in PROGRESS_GOLDEN["cases"] if c["name"] == "slow")
+        progress = gate.SimulatorProgress()
+        with self.assertRaises(gate.AcquisitionError) as rejected:
+            for record in progress_records(case):
+                progress.observe(record, record["source_us"]+17065, enabled_us=80000)
+        data = rejected.exception.data
+        self.assertEqual((data["previous_source_us"], data["source_us"], data["source_delta_us"]),
+                         (400000, 500000, 100000))
+        self.assertEqual((data["previous_native_us"], data["native_us"], data["native_delta_us"]),
+                         (399382, 499382, 100000))
+        self.assertEqual(data["native_delta_ns"], 100000000)
+        self.assertEqual((data["previous_simulation_us"], data["simulation_us"], data["simulation_delta_us"]),
+                         (160000, 180000, 20000))
+        self.assertEqual(data["sequence_delta"], 1)
+        self.assertEqual((data["window_source_delta_us"], data["window_simulation_delta_us"]), (400000, 80000))
+        self.assertEqual(data["failed_conditions"],
+                         ["abs(window_simulation_delta_us - window_source_delta_us) <= 272000"])
+        self.assertLess(len(str(rejected.exception)), 1200)
+
+    def test_collector_retains_complete_bounded_window_and_validates_raw_samples(self):
+        case = PROGRESS_GOLDEN["cases"][0]
+        records = iter(progress_records(case))
+        now = [80000]
+        def sample():
+            record = next(records)
+            now[0] = record["source_us"]+17065
+            return record
+        with patch.object(gate.time, "monotonic_ns", side_effect=lambda: now[0]*1000):
+            result = gate.collect_standing(sample, ("daemon", "body", "world"))
+        self.assertEqual(len(result), 11)
+        self.assertEqual(result[-1]["source_us"]-result[0]["source_us"], 1000000)
+        # A bad raw read between retained 100 ms observations cannot be hidden.
+        records = iter(progress_records(case))
+        count = [0]
+        original_sample = sample
+        def bad_sample():
+            record = original_sample()
+            count[0] += 1
+            if count[0] == 3:
+                record["simulation_us"] = 120000  # repeat the immediately previous raw tick
+            return record
+        with patch.object(gate.time, "monotonic_ns", side_effect=lambda: now[0]*1000):
+            with self.assertRaises(gate.AcquisitionError):
+                gate.collect_standing(bad_sample, ("daemon", "body", "world"))
+
+    def test_thinning_cannot_create_a_stale_gap_in_retained_evidence(self):
+        sources = iter((100000, 180000, *range(340000, 1140001, 100000)))
+        now, sequence = [80000], [0]
+        def sample():
+            source = next(sources)
+            now[0] = source+17065
+            sequence[0] += 1
+            return dict(source_us=source, simulation_us=source, sequence=sequence[0],
+                        daemon="d", body="b", world="w", native={"t_ns": (source-618)*1000},
+                        oracle=dict(upright=True, yaw=0., linear_speed=0., angular_speed=0., uncertainty=.000001))
+        with patch.object(gate.time, "monotonic_ns", side_effect=lambda: now[0]*1000):
+            records = gate.collect_standing(sample, ("d", "b", "w"))
+        self.assertLessEqual(len(records), 32)
+        self.assertEqual([s["source_us"] for s in records[:3]], [100000, 180000, 340000])
+        progress = gate.SimulatorProgress()
+        for record in records:
+            progress.observe(record, now[0])
+        self.assertTrue(progress.completed)
 
 
 if __name__ == "__main__":

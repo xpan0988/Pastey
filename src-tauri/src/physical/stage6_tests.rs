@@ -602,10 +602,20 @@ async fn clock_suspend_and_slow_simulation_cannot_extend_authority() {
     PhysicalControlServiceV1::dispatch_admitted_action(&g.control.core, &a, &g.adapter)
         .await
         .unwrap();
-    g.control.clock.set(1110, 110_000);
-    supervisor::sample(&g.run, &g.harness, 3, 110_000, 0.0, 0.0);
-    supervisor::mutate(&g.harness, |s| s.simulation_us = 60_001);
-    assert!(g.run.poll_control().is_err());
+    // One jittered interval is not rate proof; sustained slow progress must close.
+    for j in 1..=4 {
+        let t = 60_000 + j * 100_000;
+        g.control.clock.set(1000 + t / 1000, t);
+        supervisor::sample(&g.run, &g.harness, 2 + j, t, 0.0, 0.0);
+        supervisor::mutate(&g.harness, |s| s.simulation_us = 60_000 + j * 20_000);
+        let result = g.run.poll_control();
+        assert_eq!(result.is_err(), j == 4);
+    }
+    assert!(
+        PhysicalControlServiceV1::refresh_admitted_action(&g.control.core, &a, &g.adapter)
+            .await
+            .is_err()
+    );
 }
 #[tokio::test]
 async fn lost_stop_ack_retains_pending_evidence_and_quarantine() {
@@ -615,6 +625,13 @@ async fn lost_stop_ack_retains_pending_evidence_and_quarantine() {
     PhysicalControlServiceV1::dispatch_admitted_action(&f.control.core, &a, &f.adapter)
         .await
         .unwrap();
+    // Supervision remains continuous even when no further task writes are sent.
+    for j in 1..=9 {
+        let t = 60_000 + j * 100_000;
+        f.control.clock.set(1000 + t / 1000, t);
+        supervisor::sample(&f.run, &f.harness, 2 + j, t, 0.0, 0.0);
+        f.run.poll_start().unwrap();
+    }
     supervisor::fault(&f.harness, Fault::Lost);
     f.control.clock.set(2060, 1_060_000);
     assert!(
@@ -623,7 +640,7 @@ async fn lost_stop_ack_retains_pending_evidence_and_quarantine() {
             .unwrap()
     );
     supervisor::fault(&f.harness, Fault::None);
-    f.observe(&s, 3, 1_070_000, 0.0, 0.0, false);
+    f.observe(&s, 12, 1_070_000, 0.0, 0.0, false);
     assert_ne!(f.consequence(&a).state, ConsequenceStateV1::Verified);
     assert_eq!(
         f.control

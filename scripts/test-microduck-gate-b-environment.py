@@ -150,11 +150,20 @@ class EnvironmentPreparation(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "SHA mismatch"):
                 env.fetch_exact("https://example.invalid/exact", Path(directory)/"policy", "a"*64)
 
-    def readiness(self, *, missing_stand=False, stale=False, paused=False, unfenced=False, native_offset=-1000):
+    def readiness(self, *, missing_stand=False, stale=False, paused=False, unfenced=False, native_offset=-1000,
+                  jitter=False, speed=1, short=False, regression=False, gap=False):
         identity = dict(controller="controller", body="body", world="world")
         samples = [dict(daemon="controller", body="body", world="world", source_us=t,
-                        simulation_us=t if not paused else 100_000, sequence=i+1, native={"t_ns": (t+native_offset)*1000})
-                   for i, t in enumerate((100_000, 200_000, 300_000))]
+                        simulation_us=int(100000 + (t-100000)*speed) if not paused else 100_000,
+                        sequence=i+1, native={"t_ns": (t+native_offset)*1000})
+                   for i, t in enumerate(range(100_000, 1100001 if not short else 300001, 100_000))]
+        if jitter:
+            samples[1]["simulation_us"] = 120000
+        if regression:
+            samples[1]["simulation_us"] = 80000
+        if gap:
+            samples[1]["source_us"] = 300000
+            samples[1]["native"]["t_ns"] = 299000000
         status = dict(identity=identity, protocol="microduck-task-v1", profile="reference-velocity-v1", fenced=not unfenced,
                       accepted=True, reason="not_installed", installed=None, action=None,
                       high_water_epoch=0, sequence=0, consumed_sequence=0)
@@ -164,7 +173,7 @@ class EnvironmentPreparation(unittest.TestCase):
             return status
         subscribed = dict(walk="walk.onnx", stand=None if missing_stand else "stand.onnx")
         with patch.object(gate, "collect_standing", return_value=samples), \
-                patch.object(gate.time, "monotonic_ns", return_value=(600_000 if stale else 301_000)*1000), \
+                patch.object(gate.time, "monotonic_ns", return_value=(samples[-1]["source_us"]+(300000 if stale else 1000))*1000), \
                 patch.object(gate.os, "readlink", side_effect=lambda p: p):
             result = gate.readiness_report(rpc, lambda: None, identity, subscribed,
                                           ["/tmp/walk.onnx", "/tmp/stand.onnx"], "model", "engine")
@@ -189,6 +198,12 @@ class EnvironmentPreparation(unittest.TestCase):
         for offset in (1000, -20000):
             with self.subTest(offset=offset), self.assertRaisesRegex(RuntimeError, "acquisition"):
                 self.readiness(native_offset=offset)
+
+    def test_readiness_accepts_scheduler_jitter_but_requires_bounded_progress_window(self):
+        self.readiness(jitter=True)
+        for options in ({"speed": .2}, {"speed": 3}, {"short": True}, {"regression": True}, {"gap": True}):
+            with self.subTest(options=options), self.assertRaises(RuntimeError):
+                self.readiness(**options)
 
     def test_catalog_is_not_a_partial_production_profile(self):
         catalog = json.loads(env.CATALOG.read_text())

@@ -24,6 +24,10 @@ OUTPUT = sys.stdout
 MAX_LINE = 65536
 FRAME_SKEW_US = 20_000
 FRESHNESS_US = 200_000
+# Pinned run(): 250 ms late-deadline reset + one 20 ms batch + 2 ms sleep slack.
+# This is a qualification acceptance envelope, not an upstream scheduling SLA.
+PROGRESS_WINDOW_US = 1_000_000
+PROGRESS_PHASE_US = 272_000
 
 
 def same_control_frame(native_ns, source_us):
@@ -35,7 +39,8 @@ def same_control_frame(native_ns, source_us):
 
 class AcquisitionError(RuntimeError):
     """Bounded numeric proof diagnostics; never copy arbitrary telemetry/identity."""
-    def __init__(self, message, observation, now_us, failed_conditions, enabled_us=None):
+    def __init__(self, message, observation, now_us, failed_conditions, enabled_us=None,
+                 previous=None, window=None):
         self.message = message
         def number(value):
             return value if type(value) is int and -(1 << 64) <= value < (1 << 64) else None
@@ -46,6 +51,25 @@ class AcquisitionError(RuntimeError):
                          now_us=number(now_us), native_us=None if tick is None else tick // 1000,
                          simulation_us=number(observation.get("simulation_us")),
                          sequence=number(observation.get("sequence")), failed_conditions=failed_conditions)
+        if previous is not None:
+            source, sim, seq, native_ns = (number(v) for v in previous)
+            native_us = None if native_ns is None else native_ns // 1000
+            self.data.update(previous_source_us=source, previous_native_us=native_us,
+                             previous_simulation_us=sim, previous_sequence=seq,
+                             native_t_ns=tick, previous_native_t_ns=native_ns,
+                             native_delta_ns=None if tick is None or native_ns is None else tick-native_ns)
+            for name, current, old in (("source_delta_us", self.data["source_us"], source),
+                                       ("native_delta_us", self.data["native_us"], native_us),
+                                       ("simulation_delta_us", self.data["simulation_us"], sim),
+                                       ("sequence_delta", self.data["sequence"], seq)):
+                self.data[name] = None if current is None or old is None else current - old
+        if window is not None:
+            source, sim = (number(v) for v in window)
+            self.data.update(window_source_us=source, window_simulation_us=sim,
+                             window_source_delta_us=None if source is None or self.data["source_us"] is None
+                             else self.data["source_us"] - source,
+                             window_simulation_delta_us=None if sim is None or self.data["simulation_us"] is None
+                             else self.data["simulation_us"] - sim)
         self.set_enable(enabled_us)
 
     def set_enable(self, enabled_us):
@@ -56,6 +80,47 @@ class AcquisitionError(RuntimeError):
                          native_minus_source_us=None if native is None or source is None else native - source,
                          now_minus_source_us=None if now is None or source is None else now - source)
         self.args = (self.message + ": " + json.dumps(self.data, separators=(",", ":")),)
+
+
+class SimulatorProgress:
+    """Constant-space, non-overlapping one-second source-clock windows.
+
+    Check cumulative phase divergence at EVERY observation, including a window's
+    closing sample, before reanchoring. A source gap <200 ms bounds closure to
+    <1.2 seconds. Startup cannot succeed with only an uncompleted short tail.
+    """
+    def __init__(self):
+        self.head = None
+        self.anchor = None
+        self.completed = False
+
+    def observe(self, observation, now_us, enabled_us=None):
+        source, sim, seq = (observation[k] for k in ("source_us", "simulation_us", "sequence"))
+        tick = observation["native"].get("t_ns")
+        failed = []
+        if not same_control_frame(tick, source) or type(sim) is not int or sim <= 0 or type(seq) is not int or seq <= 0:
+            failed.append("positive correlated source/native/simulation/sequence")
+        if not failed and self.head is not None:
+            old_source, old_sim, old_seq, old_tick = self.head
+            failed = [name for valid, name in (
+                (0 < source - old_source < FRESHNESS_US, "0 < source_delta_us < 200000"),
+                (seq > old_seq, "sequence > previous_sequence"),
+                (tick > old_tick, "native_t_ns > previous_native_t_ns"),
+                (sim > old_sim, "simulation_us > previous_simulation_us"),
+            ) if not valid]
+        if not failed and self.anchor is not None:
+            source_delta, sim_delta = source - self.anchor[0], sim - self.anchor[1]
+            if abs(sim_delta - source_delta) > PROGRESS_PHASE_US:
+                failed.append("abs(window_simulation_delta_us - window_source_delta_us) <= 272000")
+        if failed:
+            raise AcquisitionError("source gap/reset or paused simulator progress acquisition", observation, now_us,
+                                   failed, enabled_us, self.head, self.anchor)
+        self.head = source, sim, seq, tick
+        if self.anchor is None:
+            self.anchor = source, sim
+        elif source - self.anchor[0] >= PROGRESS_WINDOW_US:
+            self.completed = True
+            self.anchor = source, sim
 
 
 def correlate_acquisition(records, native_ns, now_us, evicted_ns=0):
@@ -99,7 +164,7 @@ def provision(rpc, next_sample, identities, clock=time.monotonic_ns):
     if rpc("robot.enable", {"on": True, "toggle": False}).get("accepted") is not True:
         raise RuntimeError("simulation provisioning enable refused")
     enabled_us = clock() // 1000
-    head = None
+    progress = SimulatorProgress()
     reported_pre_enable = False
     settled_since = None
     while clock() // 1000 < deadline:
@@ -119,7 +184,7 @@ def provision(rpc, next_sample, identities, clock=time.monotonic_ns):
         # preparation. Discard only this bounded pre-ACK tail before first proof.
         native = observation["native"]
         tick = native.get("t_ns")
-        if (head is None and same_control_frame(tick, source) and 0 <= now - source < FRESHNESS_US
+        if (progress.head is None and same_control_frame(tick, source) and 0 <= now - source < FRESHNESS_US
                 and min(source, tick // 1000) <= enabled_us):
             if not reported_pre_enable:
                 print(AcquisitionError("discarded pre-enable provisioning candidate", observation, now,
@@ -142,20 +207,7 @@ def provision(rpc, next_sample, identities, clock=time.monotonic_ns):
         failed = [name for valid, name in conditions if not valid]
         if failed:
             raise AcquisitionError("stale/unproved provisioning acquisition", observation, now, failed, enabled_us)
-        if head is not None:
-            old_source, old_sim, old_seq, old_tick = head
-            delta = source - old_source
-            failed = [name for valid, name in [
-                (0 < delta < FRESHNESS_US, "0 < source_delta_us < 200000"),
-                (seq > old_seq, "sequence > previous_sequence"),
-                (tick > old_tick, "native_t_ns > previous_native_t_ns"),
-                (sim > old_sim, "simulation_us > previous_simulation_us"),
-                (delta // 2 <= sim - old_sim <= delta * 2 + FRAME_SKEW_US,
-                 "source_delta_us/2 <= simulation_delta_us <= source_delta_us*2+20000"),
-            ] if not valid]
-            if failed:
-                raise AcquisitionError("provisioning source gap/reset or paused simulator", observation, now, failed, enabled_us)
-        head = source, sim, seq, tick
+        progress.observe(observation, now, enabled_us)
         oracle = observation.get("oracle")
         values = None if oracle is None else [oracle.get(k) for k in
                     ("yaw", "linear_speed", "angular_speed", "uncertainty")]
@@ -166,7 +218,7 @@ def provision(rpc, next_sample, identities, clock=time.monotonic_ns):
                  and native.get("policy") in ("stand", "walk")
                  and native.get("safety", {}).get("fallen") is False)
         settled_since = (source if settled_since is None else settled_since) if valid else None
-        if settled_since is not None and source - settled_since >= 200_000:
+        if progress.completed and settled_since is not None and source - settled_since >= 200_000:
             return  # Only new continuous settled measurements seal preparation.
     raise RuntimeError("simulation provisioning bring-up timeout")
 
@@ -229,6 +281,8 @@ def check_native_artifacts(pins, params, assets):
 
 def collect_standing(next_sample, identities, dwell_us=200_000, minimum_native_us=0):
     result = []
+    progress = SimulatorProgress()
+    previous = None
     until = time.monotonic_ns() // 1000 + 10_000_000
     while time.monotonic_ns() // 1000 < until:
         try:
@@ -242,12 +296,30 @@ def collect_standing(next_sample, identities, dwell_us=200_000, minimum_native_u
         ready = o and o["upright"] and abs(o["yaw"]) <= 1e-6 and o["linear_speed"] <= .02 and o["angular_speed"] <= .1 and o["uncertainty"] <= .001
         if (s["daemon"], s["body"], s["world"]) != identities:
             raise RuntimeError("qualification incarnation changed")
+        now = time.monotonic_ns() // 1000
+        if not 0 <= now - s["source_us"] < FRESHNESS_US:
+            raise AcquisitionError("standing acquisition stale", s, now,
+                                   ["0 <= now_us - source_us < 200000"])
+        progress.observe(s, now)
         if s["native"]["t_ns"] // 1000 < minimum_native_us:
             result = []  # A pre-cutoff native frame cannot supply post-cutoff rest.
             continue
-        result = (result + [s])[-32:] if ready else []
-        if len(result) >= 3 and result[-1]["source_us"] - result[0]["source_us"] >= dwell_us:
-            return result
+        if not ready:
+            result = []
+        else:
+            # Validate every raw observation, retain bounded evidence at ~10 Hz.
+            # Insert the previous raw sample if thinning would create a >=200 ms gap.
+            if result and s["source_us"] - result[-1]["source_us"] >= FRESHNESS_US:
+                result.append(previous)
+            if not result or s["source_us"] - result[-1]["source_us"] >= 100_000:
+                result = (result + [s])[-32:]
+            if len(result) >= 3 and result[-1]["source_us"] - result[0]["source_us"] >= max(dwell_us, PROGRESS_WINDOW_US):
+                retained = SimulatorProgress()
+                for record in result:
+                    retained.observe(record, now)
+                if retained.completed:
+                    return result
+        previous = s
     raise RuntimeError("measured standing qualification unavailable")
 
 
@@ -361,19 +433,15 @@ def readiness_report(rpc, next_sample, identity, subscribed, assets, model_diges
            for slot, path in zip(("walk", "stand"), assets)):
         raise RuntimeError("both exact policies must be loaded and warmed by robotd")
     observations = collect_standing(next_sample, tuple(identity[k] for k in ("controller", "body", "world")))
-    head = None
+    progress = SimulatorProgress()
     for s in observations:
         source, sim, seq, tick = s["source_us"], s["simulation_us"], s["sequence"], s["native"].get("t_ns")
         if (not same_control_frame(tick, source)
                 or source <= 0 or sim <= 0 or seq <= 0):
             raise RuntimeError("readiness observation/native acquisition stale")
-        if head is not None:
-            old_source, old_sim, old_seq, old_tick = head
-            delta = source - old_source
-            if (not 0 < delta < 200_000 or seq <= old_seq or tick <= old_tick
-                    or sim <= old_sim or not delta // 2 <= sim - old_sim <= delta * 2 + 20_000):
-                raise RuntimeError("readiness clocks paused/reset or observation gap")
-        head = source, sim, seq, tick
+        progress.observe(s, time.monotonic_ns() // 1000)
+    if not progress.completed:
+        raise RuntimeError("readiness simulator progress window incomplete")
     now = time.monotonic_ns() // 1000
     if not observations[-1]["source_us"] <= now < observations[-1]["source_us"] + 200_000:
         raise RuntimeError("readiness final observation stale")

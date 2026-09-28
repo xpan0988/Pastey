@@ -1,0 +1,18 @@
+{
+  "initialSourceUs": 100000,
+  "initialSimulationUs": 100000,
+  "nativeSourceSkewUs": 618,
+  "cases": [
+    {"name": "normal-20ms", "steps": [[20000, 20000, 50]], "accepted": true, "completed": true},
+    {"name": "jitter-and-catch-up", "steps": [[100000, 20000, 1], [20000, 100000, 1], [20000, 20000, 44]], "accepted": true, "completed": true},
+    {"name": "paused", "steps": [[20000, 0, 50]], "accepted": false},
+    {"name": "regression", "steps": [[20000, -20000, 1]], "accepted": false},
+    {"name": "source-gap-ceiling", "steps": [[200000, 200000, 1]], "accepted": false},
+    {"name": "slow", "steps": [[100000, 20000, 10]], "accepted": false},
+    {"name": "fast", "steps": [[20000, 60000, 50]], "accepted": false},
+    {"name": "unfinished-tail", "steps": [[20000, 20000, 10]], "accepted": true, "completed": false},
+    {"name": "phase-limit", "steps": [[100000, 372000, 1], [20000, 20000, 45]], "accepted": true, "completed": true},
+    {"name": "phase-limit-plus-one", "steps": [[100000, 372000, 1], [20000, 20001, 1]], "accepted": false},
+    {"name": "second-window-slow", "steps": [[20000, 20000, 50], [100000, 20000, 10]], "accepted": false}
+  ]
+}

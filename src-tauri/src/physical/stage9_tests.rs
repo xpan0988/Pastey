@@ -95,7 +95,7 @@ fn bundle(reg: &EnvironmentRegistrationV1) -> GateBEvidenceBundleV1 {
             }
         })
         .collect();
-    let observations = (1..=3)
+    let observations = (1..=11)
         .map(|i| microduck::GateASampleV1 {
             source_us: 3_000_000 + i * 100_000,
             simulation_us: i * 100_000,
@@ -281,6 +281,122 @@ fn production_observation_accepts_native_read_start_before_simulator_acquisition
         s.native.t_ns = Some((s.source_us - 1_000) * 1000)
     });
     n.run.poll_start().unwrap();
+}
+
+#[test]
+fn simulator_progress_matches_shared_python_vectors() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../scripts/fixtures/microduck-simulator-progress-v1.json"
+    ))
+    .unwrap();
+    let mut enrollment = fake::enrollment(&binding());
+    let reg = fake::record(&mut enrollment).clone();
+    let template = bundle(&reg).observations[0].clone();
+    for case in vectors["cases"].as_array().unwrap() {
+        let mut progress = microduck::SimulatorProgressV1::default();
+        let mut sample = template.clone();
+        sample.source_us = vectors["initialSourceUs"].as_u64().unwrap();
+        sample.simulation_us = vectors["initialSimulationUs"].as_u64().unwrap();
+        sample.sequence = 1;
+        sample.native.t_ns =
+            Some((sample.source_us - vectors["nativeSourceSkewUs"].as_u64().unwrap()) * 1000);
+        progress.observe(&sample).unwrap();
+        let mut accepted = true;
+        'steps: for step in case["steps"].as_array().unwrap() {
+            for _ in 0..step[2].as_u64().unwrap() {
+                sample.source_us += step[0].as_u64().unwrap();
+                sample.simulation_us =
+                    (sample.simulation_us as i64 + step[1].as_i64().unwrap()) as u64;
+                sample.sequence += 1;
+                sample.native.t_ns = Some(
+                    (sample.source_us - vectors["nativeSourceSkewUs"].as_u64().unwrap()) * 1000,
+                );
+                if progress.observe(&sample).is_err() {
+                    accepted = false;
+                    break 'steps;
+                }
+            }
+        }
+        assert_eq!(
+            accepted,
+            case["accepted"].as_bool().unwrap(),
+            "{}",
+            case["name"]
+        );
+        if accepted {
+            assert_eq!(
+                progress.completed,
+                case["completed"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+}
+
+#[test]
+fn qualification_progress_accepts_jitter_and_rejects_stall_reset_gap_or_unfinished_window() {
+    let mut enrollment = fake::enrollment(&binding());
+    let reg = fake::record(&mut enrollment).clone();
+    let baseline = bundle(&reg);
+    let mut jitter = baseline.clone();
+    jitter.observations[1].simulation_us = jitter.observations[0].simulation_us + 20_000;
+    jitter.reference_trace[1].simulation_us = jitter.reference_trace[0].simulation_us + 20_000;
+    jitter.validate().unwrap();
+    for path in 0..2 {
+        for fault in 0..6 {
+            let mut bad = baseline.clone();
+            let samples = if path == 0 {
+                &mut bad.observations
+            } else {
+                &mut bad.reference_trace
+            };
+            match fault {
+                0 => samples[1].simulation_us = samples[0].simulation_us,
+                1 => samples[1].simulation_us = samples[0].simulation_us - 1,
+                2 => {
+                    samples[1].source_us = samples[0].source_us + 200_000;
+                    samples[1].native.t_ns = Some(samples[1].source_us * 1000);
+                }
+                3 | 4 => {
+                    let initial = samples[0].simulation_us;
+                    for (i, s) in samples.iter_mut().enumerate() {
+                        s.simulation_us =
+                            initial + i as u64 * if fault == 3 { 20_000 } else { 300_000 };
+                    }
+                }
+                _ => samples.truncate(3),
+            }
+            assert!(bad.validate().is_err(), "path {path}, fault {fault}");
+        }
+    }
+}
+
+#[test]
+fn production_observation_progress_accepts_jitter_but_closes_on_sustained_drift() {
+    for speed in [1, 0, 3] {
+        let n = NativeProfile::new();
+        let mut failed = false;
+        for i in 1..=11 {
+            let source = 50_000 + i * 100_000;
+            n.f.clock.set(1000 + source / 1000, source);
+            supervisor::sample(&n.run, &n.harness, i + 1, source, 0., 0.);
+            supervisor::mutate(&n.harness, |s| {
+                s.simulation_us = if speed == 1 && i == 1 {
+                    70_000
+                } else if speed == 0 {
+                    50_000 + i * 20_000
+                } else {
+                    50_000 + i * 100_000 * speed
+                };
+            });
+            if n.run.poll_start().is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert_eq!(failed, speed != 1);
+    }
 }
 impl NativeProfile {
     fn new() -> Self {
@@ -949,6 +1065,15 @@ async fn native_receipts_without_displacement_remain_partial_and_fall_is_contrad
                 .await
                 .unwrap();
             }
+        } else {
+            // Keep source proof continuous without adding task refreshes or
+            // measured displacement to this deliberately partial outcome.
+            for j in 1..=9 {
+                let t = 60_000 + j * 100_000;
+                n.f.clock.set(1000 + t / 1000, t);
+                supervisor::sample(&n.run, &n.harness, 2 + j, t, 0., 0.);
+                n.run.poll_start().unwrap();
+            }
         }
         n.f.clock.set(2060, 1_060_000);
         PhysicalControlServiceV1::end_gate_a_action(&n.f.core, &a, n.adapter.as_ref())
@@ -960,7 +1085,7 @@ async fn native_receipts_without_displacement_remain_partial_and_fall_is_contrad
             supervisor::sample(
                 &n.run,
                 &n.harness,
-                if fall { 22 + i } else { 3 + i },
+                if fall { 22 + i } else { 12 + i },
                 t,
                 0.,
                 0.,
