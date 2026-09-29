@@ -1,4 +1,7 @@
-use super::{binding::*, contracts::*, core::microduck_capability as md, values::*};
+use super::{
+    binding::*, contracts::*, core::microduck_capability as md, evidence::WitnessRegistryV1,
+    values::*,
+};
 use crate::host_identity::HostRef;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
@@ -40,6 +43,22 @@ fn binding() -> EnvironmentBindingViewV1 {
         "offerId": id("binding-offer"), "offerExpiry": 2000
     }))
 }
+/// Test mapping of the former typed observation fields onto the binding's
+/// opaque measurement schema.
+fn measure(
+    o: &mut super::evidence::PhysicalObservationV1,
+    edit: impl FnOnce(&mut md::MeasurementV1),
+) {
+    let mut m: md::MeasurementV1 = o.measurements.decode().unwrap();
+    edit(&mut m);
+    o.measurements = m.encode().unwrap();
+}
+fn measured(o: &super::evidence::PhysicalObservationV1) -> md::MeasurementV1 {
+    o.measurements.decode().unwrap()
+}
+fn witnesses() -> WitnessRegistryV1 {
+    super::core::microduck_witness::witnesses()
+}
 fn completion_params() -> md::DisplacementSettledV1 {
     decode(json!({
         "frame": "world", "minForwardM": 0.01, "maxForwardM": 0.1, "maxLateralM": 0.03,
@@ -55,7 +74,7 @@ fn profile() -> PhysicalCapabilityProfileV1 {
     )
     .unwrap();
     decode(json!({
-        "version": 1, "capability": capability, "subsystem": "locomotion",
+        "version": 2, "capability": capability, "subsystem": "locomotion",
         "evidenceClass": "simulation", "requiredEnforcementClass": "adapter_isolation_only",
         "execution": {"actionDurationUs": 1000000, "leaseDurationUs": 1000000,
             "totalExecutionUs": 1000000, "actionCount": 1},
@@ -120,13 +139,13 @@ fn scope_fields() -> ReviewScopeFieldsV1 {
     let p = profile();
     let q = qualification(&p, &b);
     decode(
-        json!({"version": 1, "principal": "operator", "requester": host("requester"),
+        json!({"version": 2, "principal": "operator", "requester": host("requester"),
         "executor": b.executor, "environment": b, "profile": p, "qualification": q,
         "mode": "exact",
         "intent": velocity_intent(0.05, 0.0, 0.0),
         "bounds": p.capability.bounds, "execution": p.execution, "freshness": p.freshness,
         "completion": {"predicate": p.capability.completion_predicate,
-            "witness": "simulation_oracle", "observation": p.freshness.observation,
+            "requiredWitness": "simulation_oracle", "observation": p.freshness.observation,
             "evaluationWindowUs": 3000000},
         "loss": p.capability.loss_profile}),
     )
@@ -137,7 +156,7 @@ fn scope() -> PhysicalReviewScopeV1 {
 fn review() -> PhysicalReviewRecordV1 {
     let s = scope();
     decode(
-        json!({"version": 1, "reviewId": id("physical-review"), "revision": 1,
+        json!({"version": 2, "reviewId": id("physical-review"), "revision": 1,
         "scope": s, "scopeDigest": s.digest().unwrap(), "state": "reviewed", "approval": null}),
     )
 }
@@ -151,7 +170,7 @@ fn approval(r: &PhysicalReviewRecordV1) -> ApprovalCorrelationV1 {
 fn proposal() -> PhysicalActionProposalV1 {
     let s = scope();
     decode(
-        json!({"version": 1, "attemptId": id("physical-attempt"), "actionId": id("physical-action"),
+        json!({"version": 2, "attemptId": id("physical-attempt"), "actionId": id("physical-action"),
         "decisionSequence": 1, "payload": s.fields().intent,
         "payloadDigest": s.fields().intent.digest().unwrap(), "challengeId": id("physical-challenge"),
         "observations": [id("physical-observation")], "requestedDurationUs": 1000000}),
@@ -435,7 +454,7 @@ fn hardware_cannot_use_gate_a_or_simulation_oracle() {
         .world_incarnation = None;
     s.qualification = qualification(&s.profile, &s.environment);
     assert!(s.validate().is_err());
-    s.completion.witness = CompletionWitnessV1::NativeMeasured;
+    s.completion.required_witness = WitnessClassV1::IndependentMeasured;
     // Only a structurally compatible claim; this does not qualify real hardware.
     s.validate().unwrap();
 }
@@ -443,7 +462,7 @@ fn hardware_cannot_use_gate_a_or_simulation_oracle() {
 #[test]
 fn unknown_fields_versions_methods_frames_and_streams_fail_closed() {
     for (pointer, value) in [
-        ("/version", json!(2)),
+        ("/version", json!(3)),
         ("/mode", json!("stream")),
         ("/profile/capability", json!("robot_joint_targets")),
         ("/intent/capabilityId", json!("robot.do/v1")),
@@ -588,10 +607,10 @@ fn malformed_completion_and_required_contracts_are_rejected() {
 #[test]
 fn scope_hash_version_one_vector() {
     // Pin the canonical schema/ordering. A future encoding change must be versioned.
-    // Re-pinned for the descriptor encoding (physical ledger format 2).
+    // Re-pinned for wire version 2 / witness classes (physical ledger format 3).
     assert_eq!(
         String::from(scope().digest().unwrap()),
-        "d4817f35744852872ffac79359f1fbbdec99c63d124f5e46361a7d623917699d"
+        "5a6ceece29dd978d0af94ed1de5bd328daf4910629cfee275cb9da4274f2fde3"
     );
 }
 

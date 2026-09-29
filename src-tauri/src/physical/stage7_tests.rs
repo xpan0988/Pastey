@@ -27,6 +27,7 @@ impl Pair {
             &a_paths,
             LocalRuntimeRef::fresh(host("requester")),
             b.clock.clone(),
+            witnesses(),
         )
         .unwrap();
         let ab = HostSessionBinding::new(
@@ -273,7 +274,8 @@ async fn lost_start_reply_and_requester_restart_reuse_same_semantic_start() {
         .await
         .unwrap();
     let runtime = LocalRuntimeRef::fresh(host("requester"));
-    p.a = PhysicalControlServiceV1::new(&p.a_paths, runtime, p.b.clock.clone()).unwrap();
+    p.a =
+        PhysicalControlServiceV1::new(&p.a_paths, runtime, p.b.clock.clone(), witnesses()).unwrap();
     let PhysicalOperationV1::Start { review } = &m.operation else {
         panic!()
     };
@@ -302,6 +304,7 @@ async fn executor_restart_consumed_start_is_history_only() {
         &p.b.paths,
         LocalRuntimeRef::fresh(host("executor")),
         p.b.clock.clone(),
+        witnesses(),
     )
     .unwrap();
     let proof = p.proof(&mut restarted, p.ba.clone());
@@ -490,7 +493,8 @@ fn protocol_versions_variants_bounds_and_no_authority_deserialization() {
     for edit in 0..4 {
         let mut changed = value.clone();
         match edit {
-            0 => changed["protocol"] = json!("physical-control-v2"),
+            // The pre-descriptor protocol is refused outright.
+            0 => changed["protocol"] = json!("physical-control-v1"),
             1 => changed["operation"]["kind"] = json!("enable"),
             2 => changed["sessionPair"] = json!("x".repeat(1000)),
             _ => changed["root"] = json!({}),

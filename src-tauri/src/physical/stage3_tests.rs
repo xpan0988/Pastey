@@ -65,6 +65,7 @@ impl Fixture {
             &paths,
             LocalRuntimeRef::fresh(host("executor")),
             clock.clone(),
+            witnesses(),
         )
         .unwrap();
         let b = binding();
@@ -794,6 +795,7 @@ fn restart_closes_audit_and_never_reconstructs_root_or_reuses_approval() {
         &f.paths,
         LocalRuntimeRef::fresh(host("executor")),
         f.clock.clone(),
+        witnesses(),
     )
     .unwrap();
     assert_eq!(f.state(&root), "closed");

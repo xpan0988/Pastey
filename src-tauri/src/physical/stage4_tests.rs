@@ -65,6 +65,7 @@ impl ControlFixture {
             &paths,
             LocalRuntimeRef::fresh(host("executor")),
             clock.clone(),
+            witnesses(),
         )
         .unwrap();
         let mut p = profile();
@@ -784,6 +785,7 @@ async fn restart_closes_control_and_quarantines_domains_without_reconstructing_h
             &f.paths,
             LocalRuntimeRef::fresh(host("executor")),
             f.clock.clone(),
+            witnesses(),
         )
         .unwrap();
         assert_eq!(f.session_state(), "quarantined");
@@ -889,7 +891,7 @@ fn independent_sqlite_reservations_contend_atomically_without_service_lock() {
     let workers = pairs.map(|(root, basis)| {
         let a = core_fake::audit(&root);
         let audit = SessionAuditV1 {
-            version: VersionV1,
+            version: VersionV2,
             id: SessionId::try_from(format!("physical-session:v1:{}", uuid::Uuid::new_v4()))
                 .unwrap(),
             root: a.root_id.clone(),
@@ -1078,6 +1080,7 @@ async fn recognized_stage3_migration_preserves_consumed_approval_and_closes_root
         &f.paths,
         LocalRuntimeRef::fresh(host("executor")),
         f.clock.clone(),
+        witnesses(),
     )
     .unwrap();
     assert!(restarted.validate_root(&root).is_err());

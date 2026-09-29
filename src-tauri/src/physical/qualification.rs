@@ -662,6 +662,11 @@ impl PhysicalControlServiceV1 {
     }
 }
 
+/// The Host's binding witnesses for Core construction.
+pub(crate) fn host_witnesses() -> crate::physical::evidence::WitnessRegistryV1 {
+    super::microduck_witness::witnesses()
+}
+
 /// Host-local resource locators. No command, serde, UI settings, native socket,
 /// caller pin override or producer-evidence argument is exposed.
 pub(crate) struct GateBLocalInstallationV1 {

@@ -2,7 +2,7 @@
 use super::{contracts::*, evidence::*, require, values::*};
 use crate::{error::AppResult, host_identity::HostRef};
 use serde::{Deserialize, Serialize};
-pub(crate) const PROTOCOL: &str = "physical-control-v1";
+pub(crate) const PROTOCOL: &str = "physical-control-v2";
 pub(crate) const MAX_BYTES: usize = 48 * 1024;
 
 claim!(PhysicalMessageV1 {

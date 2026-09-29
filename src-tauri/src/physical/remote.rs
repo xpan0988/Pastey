@@ -477,7 +477,7 @@ impl PhysicalControlServiceV1 {
                     "Stale physical review data",
                 )?;
                 let r = PhysicalReviewRecordV1 {
-                    version: VersionV1,
+                    version: VersionV2,
                     review_id: ReviewId::try_from(format!(
                         "physical-review:v1:{}",
                         uuid::Uuid::new_v4()

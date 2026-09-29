@@ -337,6 +337,25 @@ impl ValidatedGateAObservationV1 {
     ) -> (PhysicalObservationV1, GateAObservationProvenanceV1) {
         (self.fact, self.provenance)
     }
+    /// The Gate A record rides along as opaque producer detail; Core correlates
+    /// only its device-neutral acquisition fields.
+    pub(in crate::physical) fn into_trusted(
+        self,
+    ) -> AppResult<crate::physical::evidence::TrustedObservationV1> {
+        self.provenance.validate()?;
+        let p = &self.provenance;
+        let provenance = crate::physical::evidence::ProducerProvenanceV1 {
+            receipt_us: p.receipt_us,
+            local_sequence: p.local_sequence,
+            controller: p.sample.daemon.clone(),
+            body_incarnation: p.sample.body.clone(),
+            world: Some(p.sample.world.clone()),
+            detail: serde_json::to_value(p)?,
+        };
+        Ok(crate::physical::evidence::producer_observation(
+            self.fact, provenance,
+        ))
+    }
 }
 pub(in crate::physical) struct ValidatedGateADispositionV1 {
     fact: PhysicalActionDispositionV1,
@@ -344,6 +363,11 @@ pub(in crate::physical) struct ValidatedGateADispositionV1 {
 impl ValidatedGateADispositionV1 {
     pub(in crate::physical) fn into_fact(self) -> PhysicalActionDispositionV1 {
         self.fact
+    }
+    pub(in crate::physical) fn into_trusted(
+        self,
+    ) -> crate::physical::evidence::TrustedDispositionV1 {
+        crate::physical::evidence::producer_disposition(self.fact)
     }
 }
 impl MicroDuckRunV1 {
@@ -594,16 +618,12 @@ impl MicroDuckRunV1 {
                 gap_us: gap,
             });
         if let Some(l) = l {
-            require(
-                l.frame == label("world"),
-                "Simulation oracle frame not qualified",
-            )?;
             if lane.origin.as_ref().is_none_or(|(a, _)| *a != l.action) {
                 if let Some(o) = sample.oracle.clone() {
                     lane.origin = Some((l.action.clone(), o));
                 }
             }
-            let measured = if l.witness == CompletionWitnessV1::SimulationOracle {
+            let measured = if l.witness == WitnessClassV1::SimulationOracle {
                 sample.oracle.as_ref()
             } else {
                 None
@@ -632,18 +652,23 @@ impl MicroDuckRunV1 {
                 sequence: provenance.local_sequence,
                 capture_us,
                 gap_us: gap,
-                forward_m: displacement.map(|(x, _)| Finite::try_from(x)).transpose()?,
-                lateral_m: displacement.map(|(_, y)| Finite::try_from(y)).transpose()?,
-                linear_speed_mps: measured
-                    .map(|o| NonNegative::try_from(o.linear_speed))
-                    .transpose()?,
-                angular_speed_radps: measured
-                    .map(|o| NonNegative::try_from(o.angular_speed))
-                    .transpose()?,
-                position_uncertainty_m: measured
-                    .map(|o| NonNegative::try_from(o.uncertainty))
-                    .transpose()?,
-                upright: measured.map(|o| o.upright),
+                measurements: super::microduck_capability::MeasurementV1 {
+                    // Simulation oracle measurements are world-frame.
+                    frame: label("world"),
+                    forward_m: displacement.map(|(x, _)| Finite::try_from(x)).transpose()?,
+                    lateral_m: displacement.map(|(_, y)| Finite::try_from(y)).transpose()?,
+                    linear_speed_mps: measured
+                        .map(|o| NonNegative::try_from(o.linear_speed))
+                        .transpose()?,
+                    angular_speed_radps: measured
+                        .map(|o| NonNegative::try_from(o.angular_speed))
+                        .transpose()?,
+                    position_uncertainty_m: measured
+                        .map(|o| NonNegative::try_from(o.uncertainty))
+                        .transpose()?,
+                    upright: measured.map(|o| o.upright),
+                }
+                .encode()?,
             };
             require(lane.observations.len() < 64, "Evidence channel overflow")?;
             lane.observations

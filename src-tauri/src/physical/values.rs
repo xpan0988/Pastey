@@ -4,21 +4,37 @@ use serde::{Deserialize, Serialize};
 use super::require;
 use crate::error::AppResult;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "u8", into = "u8")]
-pub(crate) struct VersionV1;
-impl TryFrom<u8> for VersionV1 {
-    type Error = crate::error::AppError;
-    fn try_from(value: u8) -> AppResult<Self> {
-        require(value == 1, "Unsupported physical contract version")?;
-        Ok(Self)
-    }
+// Claim wire versions. A claim's version rises whenever its wire shape changes,
+// including through a nested type; a mismatch is reported explicitly. Claims
+// serialize `version` first, so Pastey-produced data meets this check before
+// any unknown field.
+macro_rules! wire_version {
+    ($name:ident, $value:literal) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(try_from = "u8", into = "u8")]
+        pub(crate) struct $name;
+        impl TryFrom<u8> for $name {
+            type Error = crate::error::AppError;
+            fn try_from(value: u8) -> AppResult<Self> {
+                if value == $value {
+                    Ok(Self)
+                } else {
+                    Err(crate::error::AppError::InvalidInput(format!(
+                        "Physical claim version mismatch: expected {}, found {value}",
+                        $value
+                    )))
+                }
+            }
+        }
+        impl From<$name> for u8 {
+            fn from(_: $name) -> Self {
+                $value
+            }
+        }
+    };
 }
-impl From<VersionV1> for u8 {
-    fn from(_: VersionV1) -> Self {
-        1
-    }
-}
+wire_version!(VersionV1, 1);
+wire_version!(VersionV2, 2);
 
 macro_rules! identity {
     ($name:ident, $prefix:literal) => {

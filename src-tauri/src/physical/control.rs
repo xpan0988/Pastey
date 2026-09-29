@@ -6,6 +6,8 @@ pub(in crate::physical) mod gate_b;
 pub(in crate::physical) mod microduck;
 #[path = "adapters/microduck_capability.rs"]
 pub(in crate::physical) mod microduck_capability;
+#[path = "adapters/microduck_witness.rs"]
+pub(in crate::physical) mod microduck_witness;
 use super::*;
 use crate::physical::binding::EnvironmentBindingViewV1;
 use crate::physical::store::{ActionAuditV1, FenceAuditV1, SessionAuditV1};
@@ -248,7 +250,7 @@ impl PhysicalControlServiceV1 {
             SessionEnforcementClassV1::AdapterIsolationOnly
         };
         let audit = SessionAuditV1 {
-            version: VersionV1,
+            version: VersionV2,
             id: SessionId::try_from(format!("physical-session:v1:{}", uuid::Uuid::new_v4()))?,
             root: root.audit.root_id.clone(),
             installation: request_id()?,
@@ -619,7 +621,7 @@ impl PhysicalControlServiceV1 {
         )?;
         require(now < expires_at, "Action duration below audit precision")?;
         let audit = ActionAuditV1 {
-            version: VersionV1,
+            version: VersionV2,
             grant: g.id.clone(),
             session: g.session.audit.id.clone(),
             root: g.session.audit.root.clone(),
@@ -1043,7 +1045,7 @@ pub(in crate::physical) mod test_support {
     ) -> PhysicalActionProposalV1 {
         let c = &core.control.challenges[&g.id];
         PhysicalActionProposalV1 {
-            version: VersionV1,
+            version: VersionV2,
             attempt_id: g.session.root.audit.attempt_id.clone(),
             action_id: g.action.clone(),
             decision_sequence: g.sequence,
@@ -1158,16 +1160,10 @@ impl PhysicalControlServiceV1 {
         }
         let (observations, dispositions) = run.drain_evidence();
         for d in dispositions {
-            self.record_physical_disposition(
-                ingress,
-                crate::physical::evidence::gate_a_disposition(d),
-            )?;
+            self.record_physical_disposition(ingress, d.into_trusted())?;
         }
         for o in observations {
-            self.record_physical_observation(
-                ingress,
-                crate::physical::evidence::gate_a_observation(o),
-            )?;
+            self.record_physical_observation(ingress, o.into_trusted()?)?;
         }
         Ok(())
     }
@@ -1263,7 +1259,7 @@ impl PhysicalControlServiceV1 {
         self.issue_proposal_challenge(&g)?;
         let challenge = &self.control.challenges[&g.id];
         let proposal = PhysicalActionProposalV1 {
-            version: VersionV1,
+            version: VersionV2,
             attempt_id: g.session.root.audit.attempt_id.clone(),
             action_id: g.action.clone(),
             decision_sequence: g.sequence,

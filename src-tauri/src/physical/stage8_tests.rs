@@ -141,6 +141,7 @@ async fn real_robotd_local_install_action_fence_and_restart_history() {
         &f.paths,
         LocalRuntimeRef::fresh(host("executor")),
         f.clock.clone(),
+        witnesses(),
     )
     .unwrap();
     assert!(lane::validate_session(&mut restarted, &session, true).is_err());
@@ -306,6 +307,7 @@ async fn exact_stage7_migration_preserves_remote_lineage_and_consumed_budget() {
         &pair.b.paths,
         LocalRuntimeRef::fresh(host("executor")),
         pair.b.clock.clone(),
+        witnesses(),
     )
     .unwrap();
     let migrated: Vec<(String, String)> = pair

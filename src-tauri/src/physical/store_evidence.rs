@@ -48,6 +48,29 @@ CREATE TRIGGER physical_handover_immutable BEFORE UPDATE ON physical_handovers B
 CREATE TRIGGER physical_handover_keep BEFORE DELETE ON physical_handovers BEGIN SELECT RAISE(ABORT,'physical handover history required');END;
 "#;
 
+/// Stage 10: handover releases keep the witness verdict they rest on.
+pub(super) const HANDOVER_VERDICT_SCHEMA: &str = r#"
+CREATE TABLE physical_handover_verdicts(session_id TEXT PRIMARY KEY REFERENCES physical_handovers(session_id),digest TEXT NOT NULL CHECK(length(digest)=64),record_json TEXT NOT NULL) STRICT;
+CREATE TRIGGER physical_handover_verdict_immutable BEFORE UPDATE ON physical_handover_verdicts BEGIN SELECT RAISE(ABORT,'physical immutable handover verdict');END;
+CREATE TRIGGER physical_handover_verdict_keep BEFORE DELETE ON physical_handover_verdicts BEGIN SELECT RAISE(ABORT,'physical handover verdict required');END;
+"#;
+
+fn handover_policy_valid(
+    p: &HandoverPredicateV1,
+    s: &super::control_ledger::SessionAuditV1,
+) -> AppResult<()> {
+    p.freshness.validate()?;
+    let scope = s.scope.fields();
+    require(
+        p.qualification_digest == s.qualification_digest
+            && p.required_witness
+                .may_be_required(scope.environment.evidence_class)
+            && p.freshness.max_age_us <= scope.freshness.observation.max_age_us
+            && p.freshness.max_gap_us <= scope.freshness.observation.max_gap_us,
+        "Handover policy lineage mismatch",
+    )
+}
+
 pub(super) fn lineage(
     c: &Connection,
     id: &ActionId,
@@ -62,14 +85,13 @@ pub(super) fn lineage(
     )?;
     let scope: PhysicalReviewScopeV1 = decode(&raw)?;
     require(
-        x.completion_digest == digest("pastey-physical-completion-v1", &scope.fields().completion)?,
+        x.completion_digest == completion_digest(&scope)?,
         "Original completion mismatch",
     )?;
     let s = scope.fields();
     let sub = &s.environment.subsystems[&s.profile.subsystem];
-    let frame = completion(&scope)?.frame;
     let l = EvidenceLineageV1 {
-        version: VersionV1,
+        version: VersionV2,
         environment: a.environment,
         root: a.root_id,
         attempt: a.attempt_id,
@@ -80,10 +102,9 @@ pub(super) fn lineage(
         body: sub.body.clone(),
         body_incarnation: sub.body_incarnation.clone(),
         world: sub.world_incarnation.clone(),
-        frame,
-        schema: label("microduck.displacement-measured.v1"),
+        completion_ref: s.completion.predicate.id.clone(),
         evidence_class: s.environment.evidence_class,
-        witness: s.completion.witness,
+        witness: s.completion.required_witness,
         qualification_digest: s.qualification.digest()?,
         origin: digest("pastey-physical-measured-origin-v1", &(id, &a.scope_digest))?,
     };
@@ -216,7 +237,7 @@ impl PhysicalStoreV1 {
         super::audit(&tx)?;
         let (l, s) = lineage(&tx, &f.lineage.action)?;
         // Foreign root/session/action cannot even attach historical facts. Source
-        // reset/class/frame mismatch may be recorded but denies evaluation continuity.
+        // reset/class/lineage mismatch may be recorded but denies evaluation continuity.
         correlate(&l, &f.lineage)?;
         let prior: Option<String> = tx
             .query_row(
@@ -234,6 +255,9 @@ impl PhysicalStoreV1 {
             receipt_us >= f.capture_us && receipt_us <= i64::MAX as u64,
             "Unprovable observation receipt clock",
         )?;
+        if let Some(p) = proof.provenance() {
+            p.validate(f, receipt_us)?;
+        }
         let qid = proof
             .qualification()
             .unwrap_or(&s.fields().qualification.qualification_id);
@@ -248,7 +272,7 @@ impl PhysicalStoreV1 {
             f.capture_us,
         )?;
         let record = ObservationRecordV1 {
-            gate_a: proof.gate_a_provenance().cloned(),
+            producer: proof.provenance().cloned(),
             fact: f.clone(),
             receipt_us,
             receipt: fresh_request()?,
@@ -345,6 +369,7 @@ impl PhysicalStoreV1 {
         &self,
         id: &ActionId,
         now_us: u64,
+        witnesses: &WitnessRegistryV1,
     ) -> AppResult<PhysicalConsequenceV1> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -353,15 +378,15 @@ impl PhysicalStoreV1 {
         let rev = head(&tx, id)?;
         let (os, ds) = facts(&tx, id, rev)?;
         let old = consequence(&tx, id)?;
-        let (state, reason, gap, uncertainty) = evaluate(&s, &l, &os, &ds, now_us);
+        let e = evaluate(&s, &l, &os, &ds, now_us, witnesses);
+        let state = e.state;
         let x = PhysicalConsequenceV1 {
-            version: VersionV1,
+            version: VersionV2,
             root: l.root,
             attempt: l.attempt,
             action: id.clone(),
-            completion_digest: digest("pastey-physical-completion-v1", &s.fields().completion)?,
-            evaluator: label("microduck.displacement-settled.v1"),
-            evaluator_version: VersionV1,
+            completion_digest: completion_digest(&s)?,
+            completion_ref: l.completion_ref,
             evidence_class: l.evidence_class,
             witness: l.witness,
             revision: old.as_ref().map_or(1, |o| o.revision + 1),
@@ -369,10 +394,10 @@ impl PhysicalStoreV1 {
             evaluated_us: now_us,
             observations: os.iter().map(|o| o.fact.id.clone()).collect(),
             dispositions: ds.iter().map(|d| d.fact.id.clone()).collect(),
-            max_gap_us: gap,
-            max_uncertainty_m: uncertainty,
+            max_gap_us: e.max_gap_us,
+            verdict: e.verdict,
             state,
-            reason: label(reason),
+            reason: e.reason,
         };
         if let Some(old) = old {
             if old.evidence_revision == rev && old.state == state && old.reason == x.reason {
@@ -398,8 +423,9 @@ impl PhysicalStoreV1 {
     pub(in crate::physical) fn commit_acceptance(
         &self,
         proof: &crate::physical::core::CoreAcceptanceDecisionV1,
+        witnesses: &WitnessRegistryV1,
     ) -> AppResult<AcceptanceStateV1> {
-        let (root, attempt, id, revision, completion_digest, reject, now_us) = proof.fields();
+        let (root, attempt, id, revision, expected_completion, reject, now_us) = proof.fields();
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::audit(&tx)?;
@@ -407,15 +433,14 @@ impl PhysicalStoreV1 {
         require(
             l.root == *root
                 && l.attempt == *attempt
-                && digest("pastey-physical-completion-v1", &s.fields().completion)?
-                    == *completion_digest,
+                && completion_digest(&s)? == *expected_completion,
             "Acceptance lineage mismatch",
         )?;
         let x = consequence(&tx, id)?
             .ok_or_else(|| crate::error::AppError::InvalidInput("Missing consequence".into()))?;
         require(
             x.revision == revision
-                && x.completion_digest == *completion_digest
+                && x.completion_digest == *expected_completion
                 && x.evidence_revision == head(&tx, id)?,
             "Stale acceptance consequence",
         )?;
@@ -439,7 +464,7 @@ impl PhysicalStoreV1 {
                 }),
             "Acceptance qualification/enrollment no longer provable",
         )?;
-        let (current, _, _, _) = evaluate(&s, &l, &os, &ds, now_us);
+        let current = evaluate(&s, &l, &os, &ds, now_us, witnesses).state;
         require(
             if reject {
                 x.state == ConsequenceStateV1::Contradicted && current == x.state
@@ -478,18 +503,12 @@ impl PhysicalStoreV1 {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::audit(&tx)?;
         let s = super::control_ledger::session(&tx, &p.session)?;
-        require(
-            p.qualification_digest == s.qualification_digest
-                && completion(&s.scope).is_ok_and(|c| p.frame == c.frame)
-                && p.freshness.max_age_us <= s.scope.fields().freshness.observation.max_age_us
-                && p.freshness.max_gap_us <= s.scope.fields().freshness.observation.max_gap_us,
-            "Handover policy lineage mismatch",
-        )?;
+        handover_policy_valid(p, &s)?;
         tx.execute(
             "INSERT INTO physical_handover_policies VALUES(?1,?2,?3)",
             params![
                 text(&p.session),
-                text(&digest("pastey-physical-handover-policy-v1", p)?),
+                text(&p.digest()?),
                 serde_json::to_string(p)?
             ],
         )?;
@@ -501,6 +520,7 @@ impl PhysicalStoreV1 {
         id: &ActionId,
         now_us: u64,
         request_handover: bool,
+        witnesses: &WitnessRegistryV1,
     ) -> AppResult<PhysicalReconciliationV1> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -558,17 +578,45 @@ impl PhysicalStoreV1 {
                             && sub.body_incarnation == l.body_incarnation
                             && sub.world_incarnation == l.world
                     });
-                if continuous
-                    && os
-                        .iter()
-                        .rev()
-                        .find(|o| o.ordered && o.fact.lineage == l)
-                        .is_some_and(|o| {
-                            qualified(&tx, &l, &s, &o.producer_qualification, now_us)
-                                .unwrap_or(false)
-                        })
-                    && after.is_some_and(|after| safe_handover(&p, &l, &os, after, now_us))
-                {
+                let witness = witnesses.get(&p.predicate.id);
+                let verdict = match (continuous, after, witness) {
+                    (true, Some(after), Some(witness))
+                        if os
+                            .iter()
+                            .rev()
+                            .find(|o| o.ordered && o.fact.lineage == l)
+                            .is_some_and(|o| {
+                                qualified(&tx, &l, &s, &o.producer_qualification, now_us)
+                                    .unwrap_or(false)
+                            }) =>
+                    {
+                        let policy_digest = p.digest()?;
+                        witness
+                            .handover(&HandoverInputV1 {
+                                policy: &p,
+                                policy_digest: &policy_digest,
+                                lineage: &l,
+                                observations: &os,
+                                after_us: after,
+                                now_us,
+                            })
+                            .ok()
+                            .filter(|v| {
+                                handover_admitted(
+                                    &p,
+                                    &l,
+                                    &os,
+                                    after,
+                                    now_us,
+                                    v,
+                                    Some(witness.class()),
+                                )
+                            })
+                    }
+                    // Unknown, stale, unqualified or unwitnessed: stay quarantined.
+                    _ => None,
+                };
+                if let Some(verdict) = verdict {
                     tx.execute(
                         "INSERT INTO physical_handovers VALUES(?1,?2,?3,?4,?5,?6)",
                         params![
@@ -576,8 +624,16 @@ impl PhysicalStoreV1 {
                             text(id),
                             checked_integer(x.evidence_revision)?,
                             checked_integer(now_us)?,
-                            text(&digest("pastey-physical-handover-policy-v1", &p)?),
+                            text(&p.digest()?),
                             text(&source(&l)?)
+                        ],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO physical_handover_verdicts VALUES(?1,?2,?3)",
+                        params![
+                            text(&l.session),
+                            text(&digest("pastey-physical-witness-verdict-v1", &verdict)?),
+                            serde_json::to_string(&verdict)?
                         ],
                     )?;
                     tx.execute("UPDATE physical_domain_reservations SET state='released' WHERE session_id=?1 AND state='quarantined'",[text(&l.session)])?;
@@ -585,7 +641,7 @@ impl PhysicalStoreV1 {
             }
         }
         let is_released = released(&tx, &l.session)?;
-        let current = evaluate(&s, &l, &os, &ds, now_us).0;
+        let current = evaluate(&s, &l, &os, &ds, now_us, witnesses).state;
         let (retired, registration): (i64, String) = tx.query_row(
             "SELECT retired,registration_digest FROM physical_environments WHERE environment_id=?1",
             [text(&l.environment)],
@@ -731,7 +787,11 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         "physical_task_acceptance",
         "physical_handover_policies",
         "physical_handovers",
+        "physical_handover_verdicts",
     ] {
+        if !table_exists(c, table)? {
+            continue;
+        }
         require(
             !c.prepare(&format!("PRAGMA foreign_key_check({table})"))?
                 .exists([])?,
@@ -752,16 +812,8 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         let (l, fid, seq, capture, receipt, ordered, qualified, hash) = if kind == "observation" {
             let o: ObservationRecordV1 = decode(&raw)?;
             o.fact.validate()?;
-            if let Some(p) = &o.gate_a {
-                p.validate()?;
-                require(
-                    p.receipt_us <= o.receipt_us
-                        && p.local_sequence == o.fact.sequence
-                        && p.sample.daemon == o.fact.lineage.controller
-                        && p.sample.body == o.fact.lineage.body_incarnation
-                        && Some(p.sample.world.clone()) == o.fact.lineage.world,
-                    "Gate A provenance/lineage mismatch",
-                )?;
+            if let Some(p) = &o.producer {
+                p.validate(&o.fact, o.receipt_us)?;
             }
             let (_, scope) = lineage(c, &o.fact.lineage.action)?;
             require(
@@ -836,7 +888,16 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         let x: PhysicalConsequenceV1 = decode(&r.get::<_, String>("record_json")?)?;
         let (l, s) = lineage(c, &x.action)?;
         let (os, ds) = facts(c, &x.action, x.evidence_revision)?;
-        let (state, reason, gap, u) = evaluate(&s, &l, &os, &ds, x.evaluated_us);
+        let (state, reason, gap) = replay(
+            &s,
+            &l,
+            &os,
+            &ds,
+            x.evaluated_us,
+            x.verdict.as_ref(),
+            &x.reason,
+        )
+        .ok_or_else(|| crate::error::AppError::InvalidInput("Unprovable consequence".into()))?;
         let rev = revisions.entry(x.action.clone()).or_insert(0);
         *rev += 1;
         require(
@@ -844,17 +905,15 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
                 && x.evidence_revision <= head(c, &x.action)?
                 && x.root == l.root
                 && x.attempt == l.attempt
-                && x.completion_digest
-                    == digest("pastey-physical-completion-v1", &s.fields().completion)?
-                && x.evaluator == label("microduck.displacement-settled.v1")
+                && x.completion_digest == completion_digest(&s)?
+                && x.completion_ref == l.completion_ref
                 && x.evidence_class == l.evidence_class
                 && x.witness == l.witness
                 && x.observations == os.iter().map(|o| o.fact.id.clone()).collect::<Vec<_>>()
                 && x.dispositions == ds.iter().map(|d| d.fact.id.clone()).collect::<Vec<_>>()
                 && x.state == state
-                && x.reason == label(reason)
+                && x.reason == reason
                 && x.max_gap_us == gap
-                && x.max_uncertainty_m == u
                 && r.get::<_, String>("action_id")? == text(&x.action)
                 && r.get::<_, i64>("revision")? == checked_integer(x.revision)?
                 && r.get::<_, i64>("evidence_revision")? == checked_integer(x.evidence_revision)?
@@ -909,16 +968,11 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
         let p: HandoverPredicateV1 = decode(&r.get::<_, String>("record_json")?)?;
-        p.freshness.validate()?;
         let s = super::control_ledger::session(c, &p.session)?;
+        handover_policy_valid(&p, &s)?;
         require(
             r.get::<_, String>("session_id")? == text(&p.session)
-                && p.qualification_digest == s.qualification_digest
-                && completion(&s.scope).is_ok_and(|c| p.frame == c.frame)
-                && p.freshness.max_age_us <= s.scope.fields().freshness.observation.max_age_us
-                && p.freshness.max_gap_us <= s.scope.fields().freshness.observation.max_gap_us
-                && r.get::<_, String>("digest")?
-                    == text(&digest("pastey-physical-handover-policy-v1", &p)?),
+                && r.get::<_, String>("digest")? == text(&p.digest()?),
             "Handover policy mismatch",
         )?;
     }
@@ -935,6 +989,28 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         let p: HandoverPredicateV1 = decode(&raw)?;
         let rev = r.get::<_, i64>("evidence_revision")? as u64;
         let (os, ds) = facts(c, &id, rev)?;
+        let verdict_row: Option<(String, String)> =
+            if table_exists(c, "physical_handover_verdicts")? {
+                c.query_row(
+                    "SELECT digest,record_json FROM physical_handover_verdicts WHERE session_id=?1",
+                    [text(&l.session)],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?
+            } else {
+                None
+            };
+        let verdict: Option<WitnessVerdictV1> = match &verdict_row {
+            Some((hash, raw)) => {
+                let v: WitnessVerdictV1 = decode(raw)?;
+                require(
+                    *hash == text(&digest("pastey-physical-witness-verdict-v1", &v)?),
+                    "Handover verdict digest mismatch",
+                )?;
+                Some(v)
+            }
+            None => None,
+        };
         let after = ds
             .iter()
             .filter(|d| {
@@ -949,16 +1025,17 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         require(
             r.get::<_, String>("session_id")? == text(&l.session)
                 && rev <= head(c, &id)?
-                && r.get::<_, String>("policy_digest")?
-                    == text(&digest("pastey-physical-handover-policy-v1", &p)?)
+                && r.get::<_, String>("policy_digest")? == text(&p.digest()?)
                 && r.get::<_, String>("lineage_digest")? == text(&source(&l)?)
-                && after.is_some_and(|after| {
-                    safe_handover(
+                && after.zip(verdict.as_ref()).is_some_and(|(after, verdict)| {
+                    handover_admitted(
                         &p,
                         &l,
                         &os,
                         after,
                         r.get::<_, i64>("verified_us").unwrap_or(0) as u64,
+                        verdict,
+                        None,
                     )
                 }),
             "Unprovable handover",
@@ -1024,6 +1101,12 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn table_exists(c: &Connection, table: &str) -> AppResult<bool> {
+    Ok(
+        c.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?
+            .exists([table])?,
+    )
+}
 fn fence_matches(
     c: &Connection,
     session: &SessionId,

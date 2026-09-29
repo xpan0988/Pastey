@@ -363,6 +363,10 @@ pub(super) fn stage8_ddl() -> String {
         + super::native_ledger::SCHEMA
 }
 
-pub(super) fn current_ddl() -> String {
+pub(super) fn stage9_ddl() -> String {
     stage8_ddl() + super::qualification_ledger::SCHEMA
+}
+
+pub(super) fn current_ddl() -> String {
+    stage9_ddl() + super::evidence_ledger::HANDOVER_VERDICT_SCHEMA
 }

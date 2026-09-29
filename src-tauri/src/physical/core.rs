@@ -142,12 +142,16 @@ pub(crate) struct PhysicalControlServiceV1 {
     control: ControlStateV1,
     clock: Arc<dyn BindingClockV1>,
     remote: RemoteControlV1,
+    witnesses: super::evidence::WitnessRegistryV1,
 }
 impl PhysicalControlServiceV1 {
+    /// `witnesses` are the Host's binding witnesses by contract ID. A contract
+    /// without a registered witness can never be verified (fail-closed).
     pub(crate) fn new(
         paths: &AppPaths,
         runtime: LocalRuntimeRef,
         clock: Arc<dyn BindingClockV1>,
+        witnesses: super::evidence::WitnessRegistryV1,
     ) -> AppResult<Self> {
         let store = PhysicalStoreV1::open(paths)?;
         // One atomic startup closure before exposing Core. No stored row is converted
@@ -165,6 +169,7 @@ impl PhysicalControlServiceV1 {
             control: ControlStateV1::default(),
             clock,
             remote: RemoteControlV1::default(),
+            witnesses,
         })
     }
     pub(super) fn local_ingress(&self) -> AppResult<LocalCoreIngressV1> {
@@ -251,7 +256,7 @@ impl PhysicalControlServiceV1 {
         let snapshot = self.binding.ledger_snapshot(binding)?;
         let (now, _) = self.binding.now()?;
         let r = PhysicalReviewRecordV1 {
-            version: VersionV1,
+            version: VersionV2,
             review_id: ReviewId::try_from(format!("physical-review:v1:{}", uuid::Uuid::new_v4()))?,
             revision: 1,
             scope_digest: scope.digest()?,
@@ -758,6 +763,12 @@ pub(super) mod test_support {
     }
     pub(in crate::physical) fn store(core: &PhysicalControlServiceV1) -> &PhysicalStoreV1 {
         &core.store
+    }
+    pub(in crate::physical) fn set_witnesses(
+        core: &mut PhysicalControlServiceV1,
+        witnesses: crate::physical::evidence::WitnessRegistryV1,
+    ) {
+        core.witnesses = witnesses;
     }
     pub(in crate::physical) fn audit(root: &PhysicalAuthorityRootV1) -> RootAuditV1 {
         root.audit.clone()

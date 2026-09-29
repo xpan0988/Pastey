@@ -120,7 +120,7 @@ impl PhysicalControlServiceV1 {
             "Wrong Core evidence Host",
         )?;
         let now = self.evidence_now()?;
-        self.store.evaluate_consequence(id, now)
+        self.store.evaluate_consequence(id, now, &self.witnesses)
     }
     pub(in crate::physical) fn decide_physical_acceptance(
         &mut self,
@@ -159,7 +159,7 @@ impl PhysicalControlServiceV1 {
             reject,
             now_us,
         };
-        self.store.commit_acceptance(&proof)
+        self.store.commit_acceptance(&proof, &self.witnesses)
     }
     pub(in crate::physical) fn configure_physical_handover(
         &mut self,
@@ -181,6 +181,7 @@ impl PhysicalControlServiceV1 {
             "Wrong Core evidence Host",
         )?;
         let now = self.evidence_now()?;
-        self.store.reconcile(id, now, request_handover)
+        self.store
+            .reconcile(id, now, request_handover, &self.witnesses)
     }
 }

@@ -8,18 +8,20 @@ use serde::{Deserialize, Serialize};
 pub(in crate::physical) const VELOCITY_CAPABILITY: &str = "microduck.velocity/v1";
 const START_PREDICATE: &str = "microduck.standing-no-skill/v1";
 const LOSS_PROFILE: &str = "microduck.zero-twist/v1";
-const COMPLETION_PREDICATE: &str = "microduck.displacement-settled/v1";
+pub(in crate::physical) const COMPLETION_PREDICATE: &str = "microduck.displacement-settled/v1";
+pub(in crate::physical) const AT_REST_PREDICATE: &str = "microduck.at-rest/v1";
 
 // Schema documents are hashed, not interpreted, by Core. The typed structs
 // below are the enforcing implementation; both change together.
 const VELOCITY_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["frame","vxMps","vyMps","vyawRadps"],"properties":{"frame":{"enum":["trunk"]},"vxMps":{"type":"number"},"vyMps":{"type":"number"},"vyawRadps":{"type":"number"}}}"#;
 const COMPLETION_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["dwellUs","frame","maxForwardM","maxLateralM","maxPositionUncertaintyM","maxSettledAngularRadps","maxSettledSpeedMps","minForwardM","noFall"],"properties":{"dwellUs":{"type":"integer","minimum":1},"frame":{"type":"string"},"maxForwardM":{"minimum":0},"maxLateralM":{"minimum":0},"maxPositionUncertaintyM":{"minimum":0},"maxSettledAngularRadps":{"minimum":0},"maxSettledSpeedMps":{"minimum":0},"minForwardM":{"minimum":0},"noFall":{"const":true}}}"#;
 const EMPTY_SCHEMA: &str = r#"{"type":"object","additionalProperties":false}"#;
+const AT_REST_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["frame","maxAngularSpeedRadps","maxLinearSpeedMps","maxPositionUncertaintyM"],"properties":{"frame":{"type":"string"},"maxAngularSpeedRadps":{"minimum":0},"maxLinearSpeedMps":{"minimum":0},"maxPositionUncertaintyM":{"minimum":0}}}"#;
 
-fn schema_digest(schema: &'static str) -> AppResult<DigestV1> {
+pub(in crate::physical) fn schema_digest(schema: &'static str) -> AppResult<DigestV1> {
     digest("microduck-binding-schema-v1", &schema)
 }
-fn id(value: &str) -> SemanticIdV1 {
+pub(in crate::physical) fn id(value: &str) -> SemanticIdV1 {
     SemanticIdV1::try_from(value.to_owned()).expect("registered MicroDuck semantic ID")
 }
 
@@ -123,10 +125,9 @@ impl DisplacementSettledV1 {
     /// Decode the scope's completion predicate. Fails closed for any other
     /// predicate, schema, invalid parameters or a dwell beyond the review window.
     pub(in crate::physical) fn from_scope(scope: &PhysicalReviewScopeV1) -> AppResult<Self> {
-        Self::from_fields(scope.fields())
+        Self::from_contract(&scope.fields().completion)
     }
-    fn from_fields(fields: &ReviewScopeFieldsV1) -> AppResult<Self> {
-        let c = &fields.completion;
+    pub(in crate::physical) fn from_contract(c: &PhysicalCompletionContractV1) -> AppResult<Self> {
         require(
             c.predicate.id == id(COMPLETION_PREDICATE)
                 && c.predicate.params_schema_digest == schema_digest(COMPLETION_SCHEMA)?,
@@ -139,6 +140,59 @@ impl DisplacementSettledV1 {
             "Dwell exceeds completion evaluation window",
         )?;
         Ok(params)
+    }
+}
+
+/// One MicroDuck measurement sample in `frame`. Absent fields are unmeasured;
+/// the witness treats them as missing, never as zero.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(in crate::physical) struct MeasurementV1 {
+    pub frame: LabelV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_m: Option<Finite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lateral_m: Option<Finite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_speed_mps: Option<NonNegative>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angular_speed_radps: Option<NonNegative>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_uncertainty_m: Option<NonNegative>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upright: Option<bool>,
+}
+impl MeasurementV1 {
+    pub(in crate::physical) fn encode(&self) -> AppResult<CanonicalJsonV1> {
+        CanonicalJsonV1::encode(self)
+    }
+}
+
+/// MicroDuck at-rest (safe handover) predicate parameters. The dwell span and
+/// freshness are Core policy fields; these are the device thresholds.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(in crate::physical) struct AtRestV1 {
+    pub frame: LabelV1,
+    pub max_linear_speed_mps: NonNegative,
+    pub max_angular_speed_radps: NonNegative,
+    pub max_position_uncertainty_m: NonNegative,
+}
+impl AtRestV1 {
+    pub(in crate::physical) fn contract(&self) -> AppResult<ContractRefV1> {
+        Ok(ContractRefV1 {
+            id: id(AT_REST_PREDICATE),
+            params_schema_digest: schema_digest(AT_REST_SCHEMA)?,
+            params: CanonicalJsonV1::encode(self)?,
+        })
+    }
+    pub(in crate::physical) fn from_contract(c: &ContractRefV1) -> AppResult<Self> {
+        require(
+            c.id == id(AT_REST_PREDICATE)
+                && c.params_schema_digest == schema_digest(AT_REST_SCHEMA)?,
+            "Not a MicroDuck at-rest predicate",
+        )?;
+        c.params.decode()
     }
 }
 
@@ -223,6 +277,6 @@ pub(in crate::physical) fn validate_scope(fields: &ReviewScopeFieldsV1) -> AppRe
         "Not the MicroDuck velocity capability",
     )?;
     VelocityV1::from_intent(&fields.intent)?;
-    DisplacementSettledV1::from_fields(fields)?;
+    DisplacementSettledV1::from_contract(&fields.completion)?;
     Ok(())
 }

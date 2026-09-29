@@ -36,7 +36,8 @@ impl GateA {
         clock.set(1050, 50_000);
         supervisor::sample(&run, &harness, 1, 50_000, 0.0, 0.0);
         run.poll_start().unwrap();
-        let mut core = PhysicalControlServiceV1::new(&paths, runtime, clock.clone()).unwrap();
+        let mut core =
+            PhysicalControlServiceV1::new(&paths, runtime, clock.clone(), witnesses()).unwrap();
         let ingress = core.local_ingress().unwrap();
         let live = Arc::new(core.bind_gate_a_environment(&ingress, &run, None).unwrap());
         let mut p = profile();
@@ -397,11 +398,14 @@ async fn requested_applied_twist_and_missing_oracle_never_become_measured_veloci
         )
         .unwrap();
     let o: ObservationRecordV1 = serde_json::from_str(&raw).unwrap();
-    assert_eq!(o.fact.linear_speed_mps, None);
-    assert_eq!(o.fact.forward_m, None);
-    assert_eq!(o.fact.upright, None);
+    let m = measured(&o.fact);
+    assert_eq!(m.linear_speed_mps, None);
+    assert_eq!(m.forward_m, None);
+    assert_eq!(m.upright, None);
+    let detail: microduck::GateAObservationProvenanceV1 =
+        serde_json::from_value(o.producer.unwrap().detail).unwrap();
     assert_eq!(
-        o.gate_a.unwrap().sample.native.movement.unwrap().applied,
+        detail.sample.native.movement.unwrap().applied,
         [0.05, 0.0, 0.0]
     );
 }

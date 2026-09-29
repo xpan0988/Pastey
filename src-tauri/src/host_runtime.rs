@@ -199,6 +199,7 @@ impl HostRuntime {
             &paths,
             local_runtime_ref.clone(),
             Arc::new(crate::physical::binding::SystemBindingClockV1::default()),
+            crate::physical::core::qualification::host_witnesses(),
         )?;
         Ok(Self {
             paths: paths.clone(),

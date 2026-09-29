@@ -503,7 +503,8 @@ impl NativeProfile {
         clock.set(1050, 50_000);
         supervisor::sample(&run, &harness, 1, 50_000, 0., 0.);
         run.poll_start().unwrap();
-        let mut c = PhysicalControlServiceV1::new(&paths, runtime, clock.clone()).unwrap();
+        let mut c =
+            PhysicalControlServiceV1::new(&paths, runtime, clock.clone(), witnesses()).unwrap();
         let i = c.local_ingress().unwrap();
         let mut p = profile();
         p.required_enforcement_class = SessionEnforcementClassV1::NativeFence;
@@ -1185,6 +1186,7 @@ fn migrated_profile_requires_fresh_readiness_without_creating_qualification_or_r
             &paths,
             LocalRuntimeRef::fresh(host("executor")),
             Arc::new(Clock::new()),
+            witnesses(),
         )
         .unwrap();
         let db = rusqlite::Connection::open(&paths.db_path).unwrap();
@@ -1404,6 +1406,7 @@ fn immutable_record_reopens_as_evidence_and_cannot_restore_live_binding() {
         &n.f.paths,
         LocalRuntimeRef::fresh(host("executor")),
         n.f.clock.clone(),
+        witnesses(),
     )
     .unwrap();
     assert_eq!(
@@ -1832,7 +1835,7 @@ async fn real_owned_gate_b_qualification_review_execution_and_acceptance() {
     let clock = Arc::new(SystemBindingClockV1::default());
     let runtime = LocalRuntimeRef::fresh(host("executor"));
     let core = Arc::new(Mutex::new(
-        PhysicalControlServiceV1::new(&paths, runtime, clock.clone()).unwrap(),
+        PhysicalControlServiceV1::new(&paths, runtime, clock.clone(), witnesses()).unwrap(),
     ));
     let context = {
         let c = core.lock();

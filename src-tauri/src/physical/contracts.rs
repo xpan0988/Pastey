@@ -106,7 +106,7 @@ impl ExecutionBudgetV1 {
 }
 
 claim!(PhysicalCapabilityProfileV1 {
-    version: VersionV1,
+    version: VersionV2,
     capability: CapabilityDescriptorV1,
     subsystem: LabelV1,
     evidence_class: EvidenceClassV1,
@@ -203,18 +203,41 @@ impl PhysicalQualificationV1 {
     }
 }
 
+/// Who vouches for a physical consequence. Only the first two are physical
+/// evidence; a device reporting on itself is never independent evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CompletionWitnessV1 {
-    NativeMeasured,
+pub(crate) enum WitnessClassV1 {
+    /// Simulator ground truth. Never supports a hardware conclusion.
     SimulationOracle,
+    /// Measurement independent of the acting device's own control path.
+    IndependentMeasured,
+    /// The acting device's own report (odometry, ACK, status).
+    NativeSelfReport,
+}
+impl WitnessClassV1 {
+    /// Whether a contract may require this class. Requiring self-report would
+    /// let an ACK-equivalent substitute for a physical consequence.
+    pub fn may_be_required(self, evidence: EvidenceClassV1) -> bool {
+        match self {
+            Self::SimulationOracle => evidence == EvidenceClassV1::Simulation,
+            Self::IndependentMeasured => true,
+            Self::NativeSelfReport => false,
+        }
+    }
+    /// Whether a verdict from `self` satisfies a contract requiring `required`.
+    /// Classes are not interchangeable: an oracle does not substitute for a
+    /// measurement and self-report satisfies nothing.
+    pub fn satisfies(self, required: Self) -> bool {
+        self != Self::NativeSelfReport && self == required
+    }
 }
 
 // Review-time completion requirements. The predicate is the capability's own
-// (binding-evaluated) contract; Core checks witness, freshness and the window.
+// (binding-evaluated) contract; Core checks witness class, freshness and the window.
 claim!(PhysicalCompletionContractV1 {
     predicate: ContractRefV1,
-    witness: CompletionWitnessV1,
+    required_witness: WitnessClassV1,
     observation: ObservationFreshnessV1,
     evaluation_window_us: PositiveMicros,
 });
@@ -225,7 +248,7 @@ impl PhysicalCompletionContractV1 {
 }
 
 claim!(ReviewScopeFieldsV1 {
-    version: VersionV1,
+    version: VersionV2,
     principal: LabelV1,
     requester: HostRef,
     executor: HostRef,
@@ -280,9 +303,9 @@ impl ReviewScopeFieldsV1 {
             "Completion predicate differs from qualified capability",
         )?;
         require(
-            c.witness != CompletionWitnessV1::SimulationOracle
-                || self.environment.evidence_class == EvidenceClassV1::Simulation,
-            "Simulation oracle cannot support hardware completion",
+            c.required_witness
+                .may_be_required(self.environment.evidence_class),
+            "Completion witness cannot support this evidence class",
         )?;
         require(
             c.observation.max_age_us <= self.freshness.observation.max_age_us
@@ -346,7 +369,7 @@ pub(crate) enum PhysicalReviewStateV1 {
 
 // A review/approval record remains data; only Core owns approval/start operations.
 claim!(PhysicalReviewRecordV1 {
-    version: VersionV1,
+    version: VersionV2,
     review_id: ReviewId,
     revision: u64,
     scope: PhysicalReviewScopeV1,
@@ -386,7 +409,7 @@ impl PhysicalReviewRecordV1 {
 }
 
 claim!(PhysicalActionProposalV1 {
-    version: VersionV1,
+    version: VersionV2,
     attempt_id: AttemptId,
     action_id: ActionId,
     decision_sequence: u64,

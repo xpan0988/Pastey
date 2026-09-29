@@ -112,7 +112,7 @@ BEGIN SELECT RAISE(ABORT, 'physical domain membership required'); END;
 /// keeps only the identity/epoch/environment tables in RETAINED_TABLES.
 /// The marker table is orthogonal to the DDL stages: stage recognition ignores
 /// it, stage rebuilds leave it untouched and it is verified on its own.
-pub(super) const LEDGER_FORMAT: i64 = 2;
+pub(super) const LEDGER_FORMAT: i64 = 3;
 pub(super) const LEDGER_META_TABLE: &str = "physical_ledger_meta";
 const LEDGER_META: &str = "CREATE TABLE physical_ledger_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format_version INTEGER NOT NULL CHECK(format_version>=1)) STRICT;";
 // Per-stage `*_schema` singletons are version markers, not content.
@@ -287,6 +287,13 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
         remote_ledger::audit(&tx)?;
         native_ledger::audit(&tx)?;
         tx.execute_batch(qualification_ledger::SCHEMA)?;
+    }
+    // Additive: handover verdicts. The format gate admits no older-format
+    // handovers, so there is no history to backfill.
+    let stage9 = Connection::open_in_memory()?;
+    stage9.execute_batch(&remote_ledger::stage9_ddl())?;
+    if schema_objects(&tx)? == schema_objects(&stage9)? {
+        tx.execute_batch(evidence_ledger::HANDOVER_VERDICT_SCHEMA)?;
     }
     verify_schema(&tx)?;
     stamp_ledger_format(&tx)?;

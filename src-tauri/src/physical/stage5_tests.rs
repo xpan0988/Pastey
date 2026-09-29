@@ -20,7 +20,24 @@ impl EvidenceFixture {
         f
     }
     async fn undispatched() -> Self {
-        let control = ControlFixture::new();
+        Self::undispatched_with(ControlFixture::new()).await
+    }
+    /// Dispatched action over any configured control fixture.
+    async fn with(control: ControlFixture) -> Self {
+        let f = Self::undispatched_with(control).await;
+        PhysicalControlServiceV1::dispatch_admitted_action(
+            &f.control.core,
+            &f.action,
+            &FakeLane::new(vec![]),
+        )
+        .await
+        .unwrap();
+        f
+    }
+    fn witnesses(&self, witnesses: WitnessRegistryV1) {
+        core_fake::set_witnesses(&mut self.control.core.lock(), witnesses);
+    }
+    async fn undispatched_with(control: ControlFixture) -> Self {
         let s = control.active().await;
         let (g, p) = control.challenged(&s);
         let action = control.admit(&g, p);
@@ -47,12 +64,17 @@ impl EvidenceFixture {
             sequence: seq,
             capture_us: time,
             gap_us: 0,
-            forward_m: Some(Finite::try_from(0.05).unwrap()),
-            lateral_m: Some(Finite::try_from(0.0).unwrap()),
-            linear_speed_mps: Some(NonNegative::try_from(0.0).unwrap()),
-            angular_speed_radps: Some(NonNegative::try_from(0.0).unwrap()),
-            position_uncertainty_m: Some(NonNegative::try_from(0.0001).unwrap()),
-            upright: Some(true),
+            measurements: md::MeasurementV1 {
+                frame: evidence::label("world"),
+                forward_m: Some(Finite::try_from(0.05).unwrap()),
+                lateral_m: Some(Finite::try_from(0.0).unwrap()),
+                linear_speed_mps: Some(NonNegative::try_from(0.0).unwrap()),
+                angular_speed_radps: Some(NonNegative::try_from(0.0).unwrap()),
+                position_uncertainty_m: Some(NonNegative::try_from(0.0001).unwrap()),
+                upright: Some(true),
+            }
+            .encode()
+            .unwrap(),
         }
     }
     fn record(&self, f: PhysicalObservationV1) -> bool {
@@ -243,7 +265,7 @@ async fn partial_then_verified_and_late_contradiction_append_history() {
     assert!(verified.revision > partial.revision);
     assert_eq!(f.evaluate(), verified);
     let mut bad = f.observation(7, 1_710_000);
-    bad.upright = Some(false);
+    measure(&mut bad, |m| m.upright = Some(false));
     f.record(bad);
     let x = f.evaluate();
     assert_eq!(x.state, ConsequenceStateV1::Contradicted);
@@ -280,21 +302,25 @@ async fn completion_failure_matrix_never_accepts() {
     ] {
         let f = EvidenceFixture::new().await;
         f.trace(|o| match mode {
-            "too_little" => o.forward_m = Some(Finite::try_from(0.005).unwrap()),
-            "too_much" => o.forward_m = Some(Finite::try_from(0.101).unwrap()),
-            "lateral" => o.lateral_m = Some(Finite::try_from(-0.031).unwrap()),
-            "coasting" => o.linear_speed_mps = Some(NonNegative::try_from(0.021).unwrap()),
-            "angular" => o.angular_speed_radps = Some(NonNegative::try_from(0.101).unwrap()),
-            "uncertainty" => {
-                o.position_uncertainty_m = Some(NonNegative::try_from(0.0011).unwrap())
-            }
-            "fall" => o.upright = Some(false),
-            "missing_x" => o.forward_m = None,
-            "missing_y" => o.lateral_m = None,
-            "missing_v" => o.linear_speed_mps = None,
-            "missing_w" => o.angular_speed_radps = None,
-            "missing_u" => o.position_uncertainty_m = None,
-            "missing_up" => o.upright = None,
+            "too_little" => measure(o, |m| m.forward_m = Some(Finite::try_from(0.005).unwrap())),
+            "too_much" => measure(o, |m| m.forward_m = Some(Finite::try_from(0.101).unwrap())),
+            "lateral" => measure(o, |m| m.lateral_m = Some(Finite::try_from(-0.031).unwrap())),
+            "coasting" => measure(o, |m| {
+                m.linear_speed_mps = Some(NonNegative::try_from(0.021).unwrap())
+            }),
+            "angular" => measure(o, |m| {
+                m.angular_speed_radps = Some(NonNegative::try_from(0.101).unwrap())
+            }),
+            "uncertainty" => measure(o, |m| {
+                m.position_uncertainty_m = Some(NonNegative::try_from(0.0011).unwrap())
+            }),
+            "fall" => measure(o, |m| m.upright = Some(false)),
+            "missing_x" => measure(o, |m| m.forward_m = None),
+            "missing_y" => measure(o, |m| m.lateral_m = None),
+            "missing_v" => measure(o, |m| m.linear_speed_mps = None),
+            "missing_w" => measure(o, |m| m.angular_speed_radps = None),
+            "missing_u" => measure(o, |m| m.position_uncertainty_m = None),
+            "missing_up" => measure(o, |m| m.upright = None),
             _ => o.gap_us = 200_001,
         });
         let x = f.evaluate();
@@ -312,11 +338,17 @@ async fn inclusive_bounds_dwell_and_continuity_are_required() {
     for x in [0.01, 0.1] {
         let f = EvidenceFixture::new().await;
         f.trace(|o| {
-            o.forward_m = Some(Finite::try_from(x).unwrap());
-            o.lateral_m = Some(Finite::try_from(-0.03).unwrap());
-            o.linear_speed_mps = Some(NonNegative::try_from(0.02).unwrap());
-            o.angular_speed_radps = Some(NonNegative::try_from(0.1).unwrap());
-            o.position_uncertainty_m = Some(NonNegative::try_from(0.001).unwrap());
+            measure(o, |m| m.forward_m = Some(Finite::try_from(x).unwrap()));
+            measure(o, |m| m.lateral_m = Some(Finite::try_from(-0.03).unwrap()));
+            measure(o, |m| {
+                m.linear_speed_mps = Some(NonNegative::try_from(0.02).unwrap())
+            });
+            measure(o, |m| {
+                m.angular_speed_radps = Some(NonNegative::try_from(0.1).unwrap())
+            });
+            measure(o, |m| {
+                m.position_uncertainty_m = Some(NonNegative::try_from(0.001).unwrap())
+            });
         });
         assert_eq!(f.evaluate().state, ConsequenceStateV1::Verified);
     }
@@ -327,7 +359,9 @@ async fn inclusive_bounds_dwell_and_continuity_are_required() {
     }
     assert_eq!(f.evaluate().state, ConsequenceStateV1::Partial);
     let mut moving = f.observation(6, 1_610_000);
-    moving.linear_speed_mps = Some(NonNegative::try_from(0.03).unwrap());
+    measure(&mut moving, |m| {
+        m.linear_speed_mps = Some(NonNegative::try_from(0.03).unwrap())
+    });
     f.record(moving);
     assert_ne!(f.evaluate().state, ConsequenceStateV1::Verified);
 }
@@ -368,10 +402,14 @@ async fn wrong_incarnations_frames_origin_and_class_invalidate_trace() {
                         .unwrap(),
                 )
             }
-            "frame" => o.lineage.frame = evidence::label("other-world"),
-            "schema" => o.lineage.schema = evidence::label("other-schema"),
+            // The witness rejects measurements in another frame.
+            "frame" => measure(&mut o, |m| m.frame = evidence::label("other-world")),
+            "schema" => {
+                o.lineage.completion_ref =
+                    SemanticIdV1::try_from("other.completion/v1".to_owned()).unwrap()
+            }
             "origin" => o.lineage.origin = digest_value(),
-            "witness" => o.lineage.witness = CompletionWitnessV1::NativeMeasured,
+            "witness" => o.lineage.witness = WitnessClassV1::IndependentMeasured,
             _ => o.lineage.evidence_class = EvidenceClassV1::Hardware,
         }
         f.record(o);
@@ -514,17 +552,28 @@ impl EvidenceFixture {
         lane::action_session(&self.action)
     }
     fn configure_handover(&self) {
-        let p = HandoverPredicateV1 {
-            version: VersionV1,
+        self.configure_handover_requiring(WitnessClassV1::SimulationOracle)
+    }
+    fn at_rest_policy(&self, required: WitnessClassV1) -> HandoverPredicateV1 {
+        HandoverPredicateV1 {
+            version: VersionV2,
             session: self.lineage.session.clone(),
             qualification_digest: self.lineage.qualification_digest.clone(),
-            frame: self.lineage.frame.clone(),
-            max_linear_speed: NonNegative::try_from(0.02).unwrap(),
-            max_angular_speed: NonNegative::try_from(0.1).unwrap(),
-            max_uncertainty: NonNegative::try_from(0.001).unwrap(),
+            predicate: md::AtRestV1 {
+                frame: evidence::label("world"),
+                max_linear_speed_mps: NonNegative::try_from(0.02).unwrap(),
+                max_angular_speed_radps: NonNegative::try_from(0.1).unwrap(),
+                max_position_uncertainty_m: NonNegative::try_from(0.001).unwrap(),
+            }
+            .contract()
+            .unwrap(),
+            required_witness: required,
             dwell_us: micros(300_000),
             freshness: self.control.scope.fields().freshness.observation.clone(),
-        };
+        }
+    }
+    fn configure_handover_requiring(&self, required: WitnessClassV1) {
+        let p = self.at_rest_policy(required);
         let mut c = self.control.core.lock();
         let ingress = c.local_ingress().unwrap();
         c.configure_physical_handover(&ingress, producer::handover(p))
@@ -540,7 +589,9 @@ async fn verified_explicit_safe_handover_releases_holder_keeps_history_epoch_and
     f.disposition(1, 1_100_000, DispositionV1::Fenced);
     for i in 0..=3 {
         let mut o = f.observation(i + 1, 1_110_000 + i * 100_000);
-        o.forward_m = Some(Finite::try_from(0.0).unwrap());
+        measure(&mut o, |m| {
+            m.forward_m = Some(Finite::try_from(0.0).unwrap())
+        });
         f.record(o);
     }
     assert_ne!(f.evaluate().state, ConsequenceStateV1::Verified);
@@ -575,8 +626,10 @@ async fn unconfigured_moving_missing_or_reset_handover_never_releases() {
         for i in 0..=3 {
             let mut o = f.observation(i + 1, 1_110_000 + i * 100_000);
             match mode {
-                "moving" => o.linear_speed_mps = Some(NonNegative::try_from(1.0).unwrap()),
-                "missing" => o.upright = None,
+                "moving" => measure(&mut o, |m| {
+                    m.linear_speed_mps = Some(NonNegative::try_from(1.0).unwrap())
+                }),
+                "missing" => measure(&mut o, |m| m.upright = None),
                 "reset" => {
                     o.lineage.world = Some(
                         IncarnationId::try_from(format!("incarnation:v1:{}", uuid::Uuid::new_v4()))
@@ -603,6 +656,7 @@ async fn restart_preserves_history_and_terminal_state_without_live_objects() {
         &f.control.paths,
         LocalRuntimeRef::fresh(host("executor")),
         f.control.clock.clone(),
+        witnesses(),
     )
     .unwrap();
     let ingress = restarted.local_ingress().unwrap();
@@ -648,6 +702,7 @@ async fn unknown_dispatch_survives_restart_and_no_evidence_is_synthesized() {
         &f.control.paths,
         LocalRuntimeRef::fresh(host("executor")),
         f.control.clock.clone(),
+        witnesses(),
     )
     .unwrap();
     let ingress = c.local_ingress().unwrap();
@@ -688,7 +743,7 @@ async fn duplicate_identity_mutation_and_append_history_tampering_fail_closed() 
     let f = EvidenceFixture::new().await;
     let mut o = f.observation(1, 1_100_000);
     f.record(o.clone());
-    o.upright = Some(false);
+    measure(&mut o, |m| m.upright = Some(false));
     let mut c = f.control.core.lock();
     let ingress = c.local_ingress().unwrap();
     assert!(c
@@ -739,6 +794,7 @@ async fn wrong_core_host_cannot_accept_historical_consequence() {
         &f.control.paths,
         LocalRuntimeRef::fresh(host("requester")),
         f.control.clock.clone(),
+        witnesses(),
     )
     .unwrap();
     let ingress = other.local_ingress().unwrap();
@@ -850,9 +906,11 @@ async fn registered_evaluator_timeout_and_simulation_hardware_boundary() {
     let samples = (0..=4)
         .map(|i| {
             let mut o = f.observation(i + 1, 1_110_000 + i * 100_000);
-            o.forward_m = Some(Finite::try_from(0.001).unwrap());
+            measure(&mut o, |m| {
+                m.forward_m = Some(Finite::try_from(0.001).unwrap())
+            });
             ObservationRecordV1 {
-                gate_a: None,
+                producer: None,
                 receipt_us: o.capture_us,
                 receipt: receipt.clone(),
                 producer_qualification: f
@@ -876,15 +934,15 @@ async fn registered_evaluator_timeout_and_simulation_hardware_boundary() {
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        evidence::evaluate(&scope, &l, &samples, &ds, 1_510_000).0,
+        evidence::evaluate(&scope, &l, &samples, &ds, 1_510_000, &witnesses()).state,
         ConsequenceStateV1::Contradicted
     );
     let mut missing = samples.clone();
     for o in &mut missing {
-        o.fact.linear_speed_mps = None;
+        measure(&mut o.fact, |m| m.linear_speed_mps = None);
     }
     assert_ne!(
-        evidence::evaluate(&scope, &l, &missing, &ds, 1_510_000).0,
+        evidence::evaluate(&scope, &l, &missing, &ds, 1_510_000, &witnesses()).state,
         ConsequenceStateV1::Verified
     );
     // Hardware scope cannot ask for the oracle; neither claim validation nor
@@ -900,13 +958,13 @@ async fn registered_evaluator_timeout_and_simulation_hardware_boundary() {
     fields.qualification.evidence_class = EvidenceClassV1::Hardware;
     fields.qualification.binding_digest = fields.environment.digest().unwrap();
     assert!(PhysicalReviewScopeV1::try_from(fields.clone()).is_err());
-    fields.completion.witness = CompletionWitnessV1::NativeMeasured;
+    fields.completion.required_witness = WitnessClassV1::IndependentMeasured;
     let hardware = PhysicalReviewScopeV1::try_from(fields).unwrap();
     l.evidence_class = EvidenceClassV1::Hardware;
-    l.witness = CompletionWitnessV1::NativeMeasured;
+    l.witness = WitnessClassV1::IndependentMeasured;
     l.world = None;
     assert_eq!(
-        evidence::evaluate(&hardware, &l, &samples, &ds, 1_510_000).0,
+        evidence::evaluate(&hardware, &l, &samples, &ds, 1_510_000, &witnesses()).state,
         ConsequenceStateV1::OutcomeUnknown
     );
 }
@@ -921,7 +979,7 @@ async fn a_late_proven_violation_refines_unknown_without_erasing_the_gap() {
     let old = f.evaluate();
     assert_eq!(old.state, ConsequenceStateV1::OutcomeUnknown);
     let mut bad = f.observation(2, 1_210_000);
-    bad.upright = Some(false);
+    measure(&mut bad, |m| m.upright = Some(false));
     f.record(bad);
     let new = f.evaluate();
     assert_eq!(new.state, ConsequenceStateV1::Contradicted);
@@ -1008,7 +1066,7 @@ async fn reordered_trustworthy_contradiction_adds_history_without_renewing_fresh
     f.record(f.observation(3, 1_310_000));
     assert_eq!(f.evaluate().state, ConsequenceStateV1::OutcomeUnknown);
     let mut late = f.observation(2, 1_210_000);
-    late.upright = Some(false);
+    measure(&mut late, |m| m.upright = Some(false));
     let mut c = f.control.core.lock();
     let ingress = c.local_ingress().unwrap();
     c.record_physical_observation(&ingress, producer::observation(late))
@@ -1028,7 +1086,9 @@ async fn coasting_after_verified_dwell_requires_a_new_settled_dwell() {
     f.trace(|_| {});
     assert_eq!(f.evaluate().state, ConsequenceStateV1::Verified);
     let mut moving = f.observation(7, 1_710_000);
-    moving.linear_speed_mps = Some(NonNegative::try_from(0.1).unwrap());
+    measure(&mut moving, |m| {
+        m.linear_speed_mps = Some(NonNegative::try_from(0.1).unwrap())
+    });
     f.record(moving);
     assert_eq!(f.evaluate().state, ConsequenceStateV1::Partial);
     f.record(f.observation(8, 1_810_000));
@@ -1121,6 +1181,7 @@ async fn fresh_qualified_post_restart_handover_does_not_restore_old_authority() 
         &f.control.paths,
         LocalRuntimeRef::fresh(host("executor")),
         f.control.clock.clone(),
+        witnesses(),
     )
     .unwrap();
     let resolver = core_fake::binding(&mut c);
@@ -1303,3 +1364,5 @@ async fn an_evidence_clock_regression_closes_live_control_before_returning_error
 
 #[path = "stage7_tests.rs"]
 mod stage7;
+#[path = "witness_tests.rs"]
+mod witness;

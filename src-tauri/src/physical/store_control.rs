@@ -62,7 +62,7 @@ CREATE TRIGGER physical_actions_keep BEFORE DELETE ON physical_actions BEGIN SEL
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::physical) struct SessionAuditV1 {
-    pub(in crate::physical) version: VersionV1,
+    pub(in crate::physical) version: VersionV2,
     pub(in crate::physical) id: SessionId,
     pub(in crate::physical) root: RootId,
     pub(in crate::physical) installation: RequestId,
@@ -119,7 +119,7 @@ impl ReservationReceiptV1 {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::physical) struct ActionAuditV1 {
-    pub(in crate::physical) version: VersionV1,
+    pub(in crate::physical) version: VersionV2,
     pub(in crate::physical) grant: GrantId,
     pub(in crate::physical) session: SessionId,
     pub(in crate::physical) root: RootId,

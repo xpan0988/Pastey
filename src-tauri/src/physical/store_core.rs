@@ -386,7 +386,7 @@ impl PhysicalStoreV1 {
         let revision = expected.checked_add(1).unwrap_or(u64::MAX);
         checked_integer(revision)?;
         let r = PhysicalReviewRecordV1 {
-            version: VersionV1,
+            version: VersionV2,
             review_id: id.clone(),
             revision,
             scope_digest: scope.digest()?,
