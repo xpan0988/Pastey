@@ -434,15 +434,50 @@ def native_probes(rpc, next_sample, process, identity, sleep=time.sleep):
     install, move, initial = pair(1, 2_000_000, 1_000_000)
     transcript.extend(initial)
     last_move = initial[-1]
-    for sequence in range(2, 21):
-        sleep(.05)
-        move["sequence"] = sequence
-        last_move = task(dict(kind="move", descriptor=move))
-        if not last_move.get("accepted"):
-            raise RuntimeError("reference qualification refresh failed")
+    deadline = move["action"]["deadline_us"]
+    # Same Linux monotonic clock as native receipts. These are producer service
+    # margins, not changes to native 200 ms refresh loss / 1 s action limits.
+    interval_us, service_margin_us, expiry_guard_us = 50_000, 50_000, 50_000
+    refresh_loss_us = 200_000
+    final_target = deadline - refresh_loss_us + interval_us
+    while last_move["native_us"] < final_target:
+        due = min(last_move["native_us"] + interval_us, final_target)
+        while time.monotonic_ns() // 1000 < due:
+            sleep(max(0, due - time.monotonic_ns() // 1000) / 1_000_000)
+        sent_us = time.monotonic_ns() // 1000
+        if sent_us + service_margin_us >= min(last_move["native_us"] + refresh_loss_us,
+                                               deadline - expiry_guard_us):
+            raise RuntimeError("reference refresh scheduling margin exhausted")
+        previous_sequence = move["sequence"]
+        move["sequence"] += 1
+        receipt = task(dict(kind="move", descriptor=move))
+        if not receipt.get("accepted"):
+            # No status RPC: native requests themselves participate in expiry.
+            reason = receipt.get("reason")
+            diagnostic = dict(attempted_sequence=move["sequence"],
+                              reason=reason[:96] if isinstance(reason, str) else None,
+                              native_us=receipt.get("native_us"), action_deadline_us=deadline,
+                              previous_accepted_sequence=previous_sequence,
+                              previous_accepted_native_us=last_move["native_us"],
+                              fenced=receipt.get("fenced"),
+                              consumed_sequence=receipt.get("consumed_sequence"))
+            raise RuntimeError("reference qualification refresh rejected: "
+                               + json.dumps(diagnostic, separators=(",", ":")))
+        if (time.monotonic_ns() // 1000 - sent_us > service_margin_us
+                or not 0 < receipt["native_us"] - last_move["native_us"] < refresh_loss_us
+                or receipt["native_us"] >= deadline - expiry_guard_us):
+            raise RuntimeError("reference accepted refresh exceeded scheduling margin")
+        last_move = receipt
         reference_trace.append(next_sample())
+    if not final_target <= last_move["native_us"] < deadline - expiry_guard_us:
+        raise RuntimeError("reference final refresh outside guarded expiry window")
+    # The final receipt is after deadline-200ms and before the guarded deadline:
+    # refresh loss cannot precede action expiry. Keep sampling through the
+    # fixed expiry rather than ending the independent reference trace early.
     transcript.append(last_move)
-    sleep(max(0, (move["action"]["deadline_us"] - time.monotonic_ns() // 1000) / 1_000_000))
+    while time.monotonic_ns() // 1000 < deadline:
+        sleep(max(0, min(interval_us, deadline - time.monotonic_ns() // 1000)) / 1_000_000)
+        reference_trace.append(next_sample())
     transcript.append(task(dict(kind="fence", descriptor=dict(install=install, next_epoch=2,
         request="physical-request:v1:"+str(uuid.uuid4())))))
     reference_trace.extend(collect_standing(next_sample, identities, 500_000,
