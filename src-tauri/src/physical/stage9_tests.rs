@@ -612,6 +612,295 @@ fn qualification_standing_and_reference_projection_are_heading_invariant() {
     }
 }
 #[test]
+fn reference_motion_failure_diagnostics_report_exact_fields() {
+    let mut enrollment = fake::enrollment(&binding());
+    let mut b = bundle(fake::record(&mut enrollment));
+    let o = b
+        .reference_trace
+        .last_mut()
+        .unwrap()
+        .oracle
+        .as_mut()
+        .unwrap();
+    o.position[..2].copy_from_slice(&[0.009, 0.031]);
+    o.linear_speed = 0.02;
+    o.angular_speed = 0.1;
+    assert_eq!(
+        reference_failure_diagnostics(&b),
+        json!({
+            "origin_position_xy": [0., 0.], "origin_yaw": 0.,
+            "final_position_xy": [0.009, 0.031], "dx": 0.009, "dy": 0.031,
+            "forward_displacement": 0.009, "lateral_displacement": 0.031,
+            "required_forward_range": [0.01, 0.1], "required_abs_lateral_max": 0.03,
+            "final_linear_speed": 0.02, "final_angular_speed": 0.1,
+            "required_linear_speed_max": 0.02, "required_angular_speed_max": 0.1,
+            "rest_since_exists": true, "measured_continuous_settling_us": 600_000,
+            "required_settling_us": 500_000, "action_deadline_us": 1_100_000,
+            "settling_cutoff_native_us": 1_110_000,
+            "final_source_us": 1_750_000, "final_native_us": 1_750_000,
+            "conditions": {
+                "forward_in_range": false, "forward_min_met": false, "forward_max_met": true,
+                "lateral_within_limit": false, "settling_duration_met": true,
+                "source_deadline_met": true, "native_deadline_met": true,
+                "linear_speed_within_limit": true, "angular_speed_within_limit": true,
+                "source_settling_cutoff_met": true, "native_settling_cutoff_met": true
+            }
+        })
+    );
+}
+
+fn reference_failure_diagnostics(b: &GateBEvidenceBundleV1) -> serde_json::Value {
+    let error = b.validate().unwrap_err();
+    assert!(matches!(error, crate::error::AppError::InvalidInput(_)));
+    let message = error.to_string();
+    assert!(message.len() <= 2048, "diagnostic exceeded fixed bound");
+    assert!(!message.contains(['\n', '\r']));
+    assert_eq!(message, b.validate().unwrap_err().to_string());
+    serde_json::from_str(
+        message
+            .strip_prefix("Reference motion/measured settling qualification missing: ")
+            .expect("diagnostics must be confined to the final reference validation"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn reference_motion_failure_diagnostics_use_measured_origin_projection() {
+    let mut enrollment = fake::enrollment(&binding());
+    let mut b = bundle(fake::record(&mut enrollment));
+    for s in &mut b.reference_trace {
+        let o = s.oracle.as_mut().unwrap();
+        let forward = o.position[0];
+        o.yaw = std::f64::consts::FRAC_PI_2;
+        o.position[..2].copy_from_slice(&[2., -3. + forward]);
+    }
+    b.reference_trace
+        .last_mut()
+        .unwrap()
+        .oracle
+        .as_mut()
+        .unwrap()
+        .position[..2]
+        .copy_from_slice(&[2.04, -2.995]);
+    let d = reference_failure_diagnostics(&b);
+    assert_eq!(d["origin_position_xy"], json!([2., -3.]));
+    assert_eq!(d["origin_yaw"], json!(std::f64::consts::FRAC_PI_2));
+    assert_eq!(d["final_position_xy"], json!([2.04, -2.995]));
+    for (key, expected) in [
+        ("dx", 0.04),
+        ("dy", 0.005),
+        ("forward_displacement", 0.005),
+        ("lateral_displacement", -0.04),
+    ] {
+        assert!((d[key].as_f64().unwrap() - expected).abs() < 1e-12, "{key}");
+    }
+    assert_eq!(d["conditions"]["forward_in_range"], false);
+    assert_eq!(d["conditions"]["lateral_within_limit"], false);
+}
+
+#[test]
+fn reference_motion_failure_diagnostics_distinguish_displacement_and_settling() {
+    let mut enrollment = fake::enrollment(&binding());
+    let base = bundle(fake::record(&mut enrollment));
+    for fault in 0..8 {
+        let mut b = base.clone();
+        let mut conditions = json!({
+            "forward_in_range": true, "forward_min_met": true, "forward_max_met": true,
+            "lateral_within_limit": true, "settling_duration_met": true,
+            "source_deadline_met": true, "native_deadline_met": true,
+            "linear_speed_within_limit": true, "angular_speed_within_limit": true,
+            "source_settling_cutoff_met": true, "native_settling_cutoff_met": true
+        });
+        let mut settling_us = json!(600_000);
+        match fault {
+            0 | 1 => {
+                b.reference_trace
+                    .last_mut()
+                    .unwrap()
+                    .oracle
+                    .as_mut()
+                    .unwrap()
+                    .position[0] = if fault == 0 { 0.009999 } else { 0.100001 };
+                conditions["forward_in_range"] = json!(false);
+                conditions[if fault == 0 {
+                    "forward_min_met"
+                } else {
+                    "forward_max_met"
+                }] = json!(false);
+            }
+            2 | 3 => {
+                b.reference_trace
+                    .last_mut()
+                    .unwrap()
+                    .oracle
+                    .as_mut()
+                    .unwrap()
+                    .position[1] = if fault == 2 { 0.030001 } else { -0.030001 };
+                conditions["lateral_within_limit"] = json!(false);
+            }
+            4 | 5 => {
+                let o = b
+                    .reference_trace
+                    .last_mut()
+                    .unwrap()
+                    .oracle
+                    .as_mut()
+                    .unwrap();
+                if fault == 4 {
+                    o.linear_speed = 0.020001;
+                } else {
+                    o.angular_speed = 0.100001;
+                }
+                conditions[if fault == 4 {
+                    "linear_speed_within_limit"
+                } else {
+                    "angular_speed_within_limit"
+                }] = json!(false);
+                conditions["settling_duration_met"] = json!(false);
+                settling_us = serde_json::Value::Null;
+            }
+            6 => {
+                // Exactly 500ms still passes; one microsecond less fails.
+                b.reference_trace[11].oracle.as_mut().unwrap().linear_speed = 0.05;
+                b.validate().unwrap();
+                let s = b.reference_trace.last_mut().unwrap();
+                s.source_us -= 1;
+                s.simulation_us -= 1;
+                s.native.t_ns = Some(s.source_us * 1000 + 500);
+                conditions["settling_duration_met"] = json!(false);
+                settling_us = json!(499_999);
+            }
+            _ => {
+                // A previous streak cannot replace the current continuous streak.
+                b.reference_trace[14].oracle.as_mut().unwrap().angular_speed = 0.100001;
+                conditions["settling_duration_met"] = json!(false);
+                settling_us = json!(200_000);
+            }
+        }
+        let d = reference_failure_diagnostics(&b);
+        assert_eq!(d["conditions"], conditions, "fault {fault}");
+        assert_eq!(
+            d["measured_continuous_settling_us"], settling_us,
+            "fault {fault}"
+        );
+        assert_eq!(
+            d["rest_since_exists"],
+            !settling_us.is_null(),
+            "fault {fault}"
+        );
+    }
+    for forward in [0.01, 0.1] {
+        for lateral in [-0.03, 0.03] {
+            let mut b = base.clone();
+            let o = b
+                .reference_trace
+                .last_mut()
+                .unwrap()
+                .oracle
+                .as_mut()
+                .unwrap();
+            o.position[..2].copy_from_slice(&[forward, lateral]);
+            o.linear_speed = 0.02;
+            o.angular_speed = 0.1;
+            b.validate().unwrap();
+        }
+    }
+}
+
+#[test]
+fn reference_motion_failure_diagnostics_distinguish_fence_and_deadline_clocks() {
+    let mut enrollment = fake::enrollment(&binding());
+    let base = bundle(fake::record(&mut enrollment));
+    for cutoff in [1_750_000, 1_750_001] {
+        let mut b = base.clone();
+        b.mechanism[4].native_us = cutoff;
+        b.reference_trace.last_mut().unwrap().native.t_ns = Some(1_749_999_000);
+        let d = reference_failure_diagnostics(&b);
+        assert_eq!(d["settling_cutoff_native_us"], cutoff);
+        assert_eq!(
+            d["conditions"]["source_settling_cutoff_met"],
+            cutoff == 1_750_000
+        );
+        assert_eq!(d["conditions"]["native_settling_cutoff_met"], false);
+        assert_eq!(d["conditions"]["linear_speed_within_limit"], true);
+        assert_eq!(d["conditions"]["angular_speed_within_limit"], true);
+        assert_eq!(d["conditions"]["settling_duration_met"], false);
+        assert_eq!(d["rest_since_exists"], false);
+        assert!(d["measured_continuous_settling_us"].is_null());
+    }
+    for source_us in [1_099_999, 1_100_000] {
+        let mut b = base.clone();
+        b.mechanism[3].native_us = 400_000;
+        b.mechanism[4].native_us = 500_000;
+        b.reference_trace.truncate(12);
+        for s in &mut b.reference_trace[5..] {
+            s.oracle.as_mut().unwrap().linear_speed = 0.;
+        }
+        let s = b.reference_trace.last_mut().unwrap();
+        s.source_us = source_us;
+        s.simulation_us = source_us;
+        s.native.t_ns = Some((source_us - 1) * 1000);
+        let d = reference_failure_diagnostics(&b);
+        assert_eq!(d["final_source_us"], source_us);
+        assert_eq!(d["final_native_us"], source_us - 1);
+        assert_eq!(
+            d["conditions"]["source_deadline_met"],
+            source_us == 1_100_000
+        );
+        assert_eq!(d["conditions"]["native_deadline_met"], false);
+        assert_eq!(d["conditions"]["settling_duration_met"], true);
+        assert_eq!(d["measured_continuous_settling_us"], source_us - 550_000);
+        if source_us == 1_100_000 {
+            b.reference_trace.last_mut().unwrap().native.t_ns = Some(source_us * 1000);
+            b.validate().unwrap();
+        }
+    }
+    let mut earlier = base;
+    earlier.reference_trace[1].oracle = None;
+    assert_eq!(
+        earlier.validate().unwrap_err().to_string(),
+        "Reference trace lacks independent body measurement"
+    );
+}
+
+#[test]
+fn reference_motion_failure_diagnostics_bound_extreme_values_and_exclude_native_content() {
+    let mut enrollment = fake::enrollment(&binding());
+    let mut b = bundle(fake::record(&mut enrollment));
+    b.reference_trace[0].oracle.as_mut().unwrap().position[0] = -f64::MAX;
+    let s = b.reference_trace.last_mut().unwrap();
+    let o = s.oracle.as_mut().unwrap();
+    o.position[0] = f64::MAX;
+    o.linear_speed = f64::MAX;
+    o.angular_speed = f64::MAX;
+    s.native.policy = Some("private-native-policy-path-or-permit\n".repeat(10_000));
+    b.namespaces[0] = "private-namespace-identity".repeat(10_000);
+    let d = reference_failure_diagnostics(&b);
+    assert_eq!(d["origin_position_xy"][0], -f64::MAX);
+    assert_eq!(d["final_position_xy"][0], f64::MAX);
+    assert_eq!(d["final_linear_speed"], f64::MAX);
+    assert_eq!(d["final_angular_speed"], f64::MAX);
+    for key in [
+        "dx",
+        "forward_displacement",
+        "lateral_displacement",
+        "measured_continuous_settling_us",
+    ] {
+        assert!(d[key].is_null(), "{key}");
+    }
+    for key in [
+        "forward_in_range",
+        "lateral_within_limit",
+        "settling_duration_met",
+        "linear_speed_within_limit",
+        "angular_speed_within_limit",
+    ] {
+        assert_eq!(d["conditions"][key], false, "{key}");
+    }
+    assert!(!d.to_string().contains("private"));
+}
+
+#[test]
 fn exact_evidence_bundle_and_missing_or_wrong_inputs_fail_closed() {
     let mut enrollment = fake::enrollment(&binding());
     let reg = fake::record(&mut enrollment).clone();

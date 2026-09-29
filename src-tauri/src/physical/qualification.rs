@@ -198,6 +198,7 @@ impl GateBEvidenceBundleV1 {
         )?;
         let mut progress = microduck::SimulatorProgressV1::default();
         let mut rest_since = None;
+        let settling_cutoff_native_us = self.mechanism[4].native_us;
         for sample in &self.reference_trace {
             let o = sample
                 .oracle
@@ -227,8 +228,8 @@ impl GateBEvidenceBundleV1 {
                 "Reference qualification measurement invalid",
             )?;
             progress.observe(sample)?;
-            if sample.source_us >= self.mechanism[4].native_us
-                && sample.native.t_ns.unwrap() / 1000 >= self.mechanism[4].native_us
+            if sample.source_us >= settling_cutoff_native_us
+                && sample.native.t_ns.unwrap() / 1000 >= settling_cutoff_native_us
                 && o.linear_speed <= 0.02
                 && o.angular_speed <= 0.1
             {
@@ -247,15 +248,55 @@ impl GateBEvidenceBundleV1 {
         let dy = o.position[1] - origin.position[1];
         let forward = dx * origin.yaw.cos() + dy * origin.yaw.sin();
         let lateral = -dx * origin.yaw.sin() + dy * origin.yaw.cos();
-        require(
-            (0.01..=0.1).contains(&forward)
-                && lateral.abs() <= 0.03
-                && rest_since.is_some_and(|t| last.source_us - t >= 500_000)
-                && last.source_us >= self.mechanism[1].action.as_ref().unwrap().deadline_us
-                && last.native.t_ns.unwrap() / 1000
-                    >= self.mechanism[1].action.as_ref().unwrap().deadline_us,
-            "Reference motion/measured settling qualification missing",
-        )?;
+        let action_deadline_us = self.mechanism[1].action.as_ref().unwrap().deadline_us;
+        let final_native_us = last.native.t_ns.unwrap() / 1000;
+        let measured_continuous_settling_us = rest_since.map(|t| last.source_us - t);
+        let forward_in_range = (0.01..=0.1).contains(&forward);
+        let lateral_within_limit = lateral.abs() <= 0.03;
+        let settling_duration_met = measured_continuous_settling_us.is_some_and(|d| d >= 500_000);
+        let source_deadline_met = last.source_us >= action_deadline_us;
+        let native_deadline_met = final_native_us >= action_deadline_us;
+        if !(forward_in_range
+            && lateral_within_limit
+            && settling_duration_met
+            && source_deadline_met
+            && native_deadline_met)
+        {
+            // Failure-only, fixed numeric/boolean fields: no trace, native strings,
+            // identities or paths. JSON uses bounded f64/u64 encodings; overflowed
+            // displacement arithmetic is null, with the original predicates false.
+            let diagnostics = serde_json::json!({
+                "origin_position_xy": [origin.position[0], origin.position[1]],
+                "origin_yaw": origin.yaw,
+                "final_position_xy": [o.position[0], o.position[1]],
+                "dx": dx, "dy": dy,
+                "forward_displacement": forward, "lateral_displacement": lateral,
+                "required_forward_range": [0.01, 0.1], "required_abs_lateral_max": 0.03,
+                "final_linear_speed": o.linear_speed, "final_angular_speed": o.angular_speed,
+                "required_linear_speed_max": 0.02, "required_angular_speed_max": 0.1,
+                "rest_since_exists": rest_since.is_some(),
+                "measured_continuous_settling_us": measured_continuous_settling_us,
+                "required_settling_us": 500_000,
+                "action_deadline_us": action_deadline_us,
+                "settling_cutoff_native_us": settling_cutoff_native_us,
+                "final_source_us": last.source_us, "final_native_us": final_native_us,
+                "conditions": {
+                    "forward_in_range": forward_in_range,
+                    "forward_min_met": forward >= 0.01, "forward_max_met": forward <= 0.1,
+                    "lateral_within_limit": lateral_within_limit,
+                    "settling_duration_met": settling_duration_met,
+                    "source_deadline_met": source_deadline_met,
+                    "native_deadline_met": native_deadline_met,
+                    "linear_speed_within_limit": o.linear_speed <= 0.02,
+                    "angular_speed_within_limit": o.angular_speed <= 0.1,
+                    "source_settling_cutoff_met": last.source_us >= settling_cutoff_native_us,
+                    "native_settling_cutoff_met": final_native_us >= settling_cutoff_native_us
+                }
+            });
+            return Err(invalid(&format!(
+                "Reference motion/measured settling qualification missing: {diagnostics}"
+            )));
+        }
         require(
             self.observations.len() >= 3 && self.observations.len() <= 32,
             "Missing independent qualification observations",
