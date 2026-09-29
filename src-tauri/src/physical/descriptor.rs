@@ -75,6 +75,13 @@ impl TryFrom<BTreeMap<LabelV1, Sha256HexV1>> for ImplementationFingerprintV1 {
     }
 }
 impl ImplementationFingerprintV1 {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub fn entries(&self) -> &BTreeMap<LabelV1, Sha256HexV1> {
         &self.0
     }
@@ -168,17 +175,35 @@ impl Serialize for CanonicalJsonV1 {
     }
 }
 impl CanonicalJsonV1 {
-    pub fn value(&self) -> &Value {
-        &self.0
-    }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub fn empty_object() -> Self {
         Self(Value::Object(Map::new()))
     }
     /// Decode into a binding-owned typed schema. Callers must use a strict
     /// (deny_unknown_fields) type; failure is fail-closed.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub fn decode<T: serde::de::DeserializeOwned>(&self) -> AppResult<T> {
         Ok(T::deserialize(&self.0)?)
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub fn encode(value: &impl Serialize) -> AppResult<Self> {
         Self::try_from(serde_json::to_value(value)?)
     }
@@ -454,6 +479,13 @@ impl TryFrom<Vec<BoundV1>> for BoundSetV1 {
     }
 }
 impl BoundSetV1 {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub fn bounds(&self) -> &[BoundV1] {
         &self.0
     }

@@ -161,6 +161,13 @@ impl PhysicalControlServiceV1 {
         };
         self.store.commit_acceptance(&proof, &self.witnesses)
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(in crate::physical) fn configure_physical_handover(
         &mut self,
         ingress: &LocalCoreIngressV1,

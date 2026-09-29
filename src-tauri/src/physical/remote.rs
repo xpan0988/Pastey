@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 
 pub(in crate::physical) struct ProductEnvironmentV1 {
     pub binding: Arc<EnvironmentBindingV1>,
-    pub adapter: Arc<dyn PhysicalEnvironmentAdapterV1>,
-    pub run: Option<Arc<microduck::MicroDuckRunV1>>,
+    pub adapter: Arc<dyn EnvironmentBinding>,
+    /// Core drives the scope's one reference action from binding samples
+    /// after installation; otherwise the caller drives the session.
+    pub drive_reference: bool,
 }
 #[derive(Default)]
 pub(super) struct RemoteControlV1 {
@@ -18,14 +20,13 @@ pub(super) struct RemoteControlV1 {
 pub(crate) struct PhysicalWorkV1(pub(in crate::physical) PhysicalWorkKindV1);
 pub(in crate::physical) enum PhysicalWorkKindV1 {
     Install {
-        start: RequestId,
         session: Arc<BodyControlSessionV1>,
-        adapter: Arc<dyn PhysicalEnvironmentAdapterV1>,
-        run: Option<Arc<microduck::MicroDuckRunV1>>,
+        adapter: Arc<dyn EnvironmentBinding>,
+        drive_reference: bool,
     },
     Cancel {
         session: Arc<BodyControlSessionV1>,
-        adapter: Arc<dyn PhysicalEnvironmentAdapterV1>,
+        adapter: Arc<dyn EnvironmentBinding>,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -168,6 +169,13 @@ impl PhysicalControlServiceV1 {
             Ok(())
         }
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(in crate::physical) fn attach_product_environment(
         &mut self,
         ingress: &LocalCoreIngressV1,
@@ -296,7 +304,7 @@ impl PhysicalControlServiceV1 {
                     })?;
                     let binding = environment.binding.clone();
                     let adapter = environment.adapter.clone();
-                    let run = environment.run.clone();
+                    let drive_reference = environment.drive_reference;
                     self.current_scope(&review.scope, &binding)?;
                     let snapshot = self.binding.ledger_snapshot(&binding)?;
                     let (now, _) = self.binding.now()?;
@@ -329,10 +337,9 @@ impl PhysicalControlServiceV1 {
                         .executions
                         .insert(m.semantic_id.clone(), session.clone());
                     work = Some(PhysicalWorkKindV1::Install {
-                        start: m.semantic_id.clone(),
                         session,
                         adapter,
-                        run,
+                        drive_reference,
                     });
                 }
                 PhysicalOperationV1::Status {
@@ -664,15 +671,15 @@ impl PhysicalControlServiceV1 {
             PhysicalWorkKindV1::Install {
                 session,
                 adapter,
-                run,
+                drive_reference,
                 ..
             } => {
                 Self::install_control_session(core, &session, adapter.as_ref()).await?;
-                if let Some(run) = run {
+                if drive_reference {
                     let prepared = async {
-                        let fact = {
-                            let run = run.clone();
-                            tokio::task::spawn_blocking(move || run.poll_control())
+                        let sample = {
+                            let lane = adapter.clone();
+                            tokio::task::spawn_blocking(move || lane.observe())
                                 .await
                                 .map_err(|_| {
                                     crate::error::AppError::InvalidInput(
@@ -683,7 +690,13 @@ impl PhysicalControlServiceV1 {
                         let action = {
                             let mut service = core.lock();
                             let i = service.local_ingress()?;
-                            service.ingest_gate_a(&i, &session, &run, fact, true)?;
+                            service.ingest_binding_sample(
+                                &i,
+                                &session,
+                                adapter.as_ref(),
+                                sample,
+                                true,
+                            )?;
                             service.admit_reference_action(session.clone())?
                         };
                         Ok::<_, crate::error::AppError>(action)
@@ -697,14 +710,7 @@ impl PhysicalControlServiceV1 {
                             return Err(error);
                         }
                     };
-                    Self::run_gate_a_reference(
-                        core,
-                        &session,
-                        &action,
-                        run.clone(),
-                        adapter.as_ref(),
-                    )
-                    .await?;
+                    Self::run_reference_action(core, &session, &action, adapter.clone()).await?;
                     // Same Stage 5 evaluator and L7 acceptance; no transport ACK
                     // or installation/write/stop ACK can become completion.
                     let evaluation_deadline = {
@@ -730,9 +736,9 @@ impl PhysicalControlServiceV1 {
                         if core.lock().clock.read()?.1 >= evaluation_deadline {
                             break;
                         }
-                        let fact = {
-                            let run = run.clone();
-                            tokio::task::spawn_blocking(move || run.poll_control())
+                        let sample = {
+                            let lane = adapter.clone();
+                            tokio::task::spawn_blocking(move || lane.observe())
                                 .await
                                 .map_err(|_| {
                                     crate::error::AppError::InvalidInput(
@@ -755,7 +761,13 @@ impl PhysicalControlServiceV1 {
                                 return Err(error);
                             }
                         }
-                        service.ingest_gate_a(&i, &session, &run, fact, false)?;
+                        service.ingest_binding_sample(
+                            &i,
+                            &session,
+                            adapter.as_ref(),
+                            sample,
+                            false,
+                        )?;
                         let c = service.evaluate_physical_consequence(&i, action.id())?;
                         if c.state == crate::physical::evidence::ConsequenceStateV1::Verified {
                             service.decide_physical_acceptance(

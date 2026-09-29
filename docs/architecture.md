@@ -4,7 +4,7 @@ Pastey is cross-device infrastructure for general-capability Agents. A Host is a
 
 This is the product and architecture direction, not a claim of AGI or universal Agent integration. The current 2.0 implementation has a native Codex path and a distinct Generic Managed Worker path over a LAN-oriented current-session Bridge. Source code, validators, and tests are authoritative. The repository is at `2.0.0-beta.2`; its beta status does not establish physical Mac ↔ Windows Native Agent acceptance.
 
-The proposed [physical-environment control architecture](physical-environment-control.md) extends the environment/capability model to embodied systems through Core-owned authority, native enforcement, and observed consequences. [MicroDuck](platform/microduck-environment-design.md) is its first reference binding. These documents describe future physical integration, not current runtime support.
+The proposed [physical-environment control architecture](physical-environment-control.md) extends the environment/capability model to embodied systems through Core-owned authority, native enforcement, and observed consequences. Device-specific behavior lives in bindings that implement the [device binding protocol](device-binding-protocol.md); the earlier MicroDuck reference binding was removed (git tag `pre-physical-decouple`). These documents describe future physical integration, not current runtime support.
 
 ## Agent execution across Hosts
 

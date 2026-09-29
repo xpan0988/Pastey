@@ -162,16 +162,16 @@ async fn core_consults_the_binding_schema_check_before_review_start_and_grant() 
 }
 
 #[tokio::test]
-async fn microduck_binding_schema_check_admits_its_reference_scope() {
-    let f = ControlFixture::build_checked(binding(), Arc::new(md::validate_scope), |_| {}, |_| {});
+async fn fixture_binding_schema_check_admits_its_reference_scope() {
+    let f = ControlFixture::build_checked(binding(), Arc::new(fx::validate_scope), |_| {}, |_| {});
     let s = f.active().await;
     let (g, p) = f.challenged(&s);
     f.admit(&g, p);
-    // The same MicroDuck check rejects a foreign capability outright.
+    // The same fixture check rejects a foreign capability outright.
     let mut foreign = scope_fields();
     dispense_profile(&mut foreign.profile);
     dispense_fields(&mut foreign);
-    assert!(md::validate_scope(&foreign).is_err());
+    assert!(fx::validate_scope(&foreign).is_err());
 }
 
 fn fingerprint(entries: &[(&str, char)]) -> ImplementationFingerprintV1 {

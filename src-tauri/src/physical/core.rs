@@ -1,6 +1,6 @@
 //! Core-owned review, finite authority, control and evidence. Local and
-//! authenticated remote tasks share executor-local Gate A/NativeFence lanes.
-//! Native mechanism receipts remain separate from body qualification.
+//! authenticated remote tasks share the executor-local binding lane.
+//! Binding acknowledgments remain separate from body qualification.
 #[path = "control.rs"]
 mod control;
 #[path = "core_evidence.rs"]
@@ -89,6 +89,13 @@ impl PhysicalAuthorityRootV1 {
     pub(super) fn root_id(&self) -> &RootId {
         &self.audit.root_id
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(super) fn attempt_id(&self) -> &AttemptId {
         &self.audit.attempt_id
     }
@@ -210,6 +217,13 @@ impl PhysicalControlServiceV1 {
     }
     /// Trusted internal Host Core policy configuration. Not approval, enrollment,
     /// or a wire command. Changes close previous Roots before fallible work.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(super) fn configure_executor_policy(
         &mut self,
         ingress: &LocalCoreIngressV1,
@@ -244,6 +258,13 @@ impl PhysicalControlServiceV1 {
         });
         Ok(())
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(super) fn draft_review(
         &mut self,
         ingress: &LocalCoreIngressV1,
@@ -270,6 +291,13 @@ impl PhysicalControlServiceV1 {
         self.store.create_review(&r, &snapshot, now)?;
         Ok(r)
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(super) fn seal_review(
         &mut self,
         ingress: &LocalCoreIngressV1,
@@ -288,6 +316,13 @@ impl PhysicalControlServiceV1 {
     }
     /// Explicit human/Core decision over an existing sealed scope. This operation
     /// has no replacement target/effect input. Approval is data, not live authority.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(super) fn approve_review(
         &mut self,
         ingress: &LocalCoreIngressV1,
@@ -330,6 +365,13 @@ impl PhysicalControlServiceV1 {
         )?;
         Ok(a)
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(super) fn finish_review(
         &mut self,
         ingress: &LocalCoreIngressV1,
@@ -358,6 +400,13 @@ impl PhysicalControlServiceV1 {
         // The ledger invalidates exactly this review; live validation cannot repair it.
         Ok(r)
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(super) fn revise_review(
         &mut self,
         ingress: &LocalCoreIngressV1,
@@ -374,6 +423,13 @@ impl PhysicalControlServiceV1 {
         self.store
             .revise_review(id, expected, scope, &snapshot, now)
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(super) fn start_exact_action(
         &mut self,
         ingress: &LocalCoreIngressV1,
@@ -782,11 +838,6 @@ pub(super) mod test_support {
     pub(in crate::physical) fn has_product_environment(core: &PhysicalControlServiceV1) -> bool {
         core.remote.environment.is_some()
     }
-    pub(in crate::physical) fn product_adapter(
-        core: &PhysicalControlServiceV1,
-    ) -> Arc<dyn PhysicalEnvironmentAdapterV1> {
-        core.remote.environment.as_ref().unwrap().adapter.clone()
-    }
     pub(in crate::physical) fn runtime(core: &PhysicalControlServiceV1) -> LocalRuntimeRef {
         core.runtime.clone()
     }
@@ -795,12 +846,6 @@ pub(super) mod test_support {
         b: &PhysicalReviewScopeV1,
     ) -> AppResult<PhysicalReviewScopeV1> {
         intersect(a, b)
-    }
-    pub(in crate::physical) fn narrow(
-        a: &PhysicalReviewScopeV1,
-        b: &PhysicalReviewScopeV1,
-    ) -> AppResult<()> {
-        validate_narrowing(a, b)
     }
     pub(in crate::physical) fn peer(
         runtime: LocalRuntimeRef,
@@ -827,67 +872,60 @@ pub(super) mod test_support {
     }
 }
 
-/// Non-authority local launch context. Core captures current runtime/clock under
-/// its lock; the caller releases the lock before the supervisor/native I/O.
-pub(in crate::physical) struct GateALaunchContextV1 {
-    runtime: LocalRuntimeRef,
-    clock: Arc<dyn BindingClockV1>,
-    issuer: Arc<AtomicBool>,
-}
-impl GateALaunchContextV1 {
-    pub(in crate::physical) fn launch(
-        self,
-        config: microduck::GateALaunchV1,
-    ) -> AppResult<Arc<microduck::MicroDuckRunV1>> {
-        require(
-            self.issuer.load(Ordering::Acquire),
-            "Core launch context closed",
-        )?;
-        let run = microduck::MicroDuckRunV1::launch(config, self.runtime, self.clock)?;
-        require(
-            self.issuer.load(Ordering::Acquire),
-            "Core closed during launch",
-        )?;
-        Ok(Arc::new(run))
-    }
-}
 impl PhysicalControlServiceV1 {
-    pub(in crate::physical) fn prepare_gate_a_launch(
-        &self,
-        ingress: &LocalCoreIngressV1,
-    ) -> AppResult<GateALaunchContextV1> {
-        self.validate_ingress(ingress)?;
-        Ok(GateALaunchContextV1 {
-            runtime: self.runtime.clone(),
-            clock: self.clock.clone(),
-            issuer: self.issuer.clone(),
-        })
-    }
-    pub(in crate::physical) fn bind_gate_a_environment(
+    /// Enrolls and resolves the environment a binding describes. The sealed
+    /// result is Core's private proof; the binding itself holds no authority.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
+    pub(in crate::physical) fn bind_environment(
         &mut self,
         ingress: &LocalCoreIngressV1,
-        run: &microduck::MicroDuckRunV1,
+        lane: &Arc<dyn EnvironmentBinding>,
         expected: Option<u64>,
     ) -> AppResult<EnvironmentBindingV1> {
         self.validate_ingress(ingress)?;
-        self.binding.bind_gate_a(run, expected)
+        self.binding.bind_environment(lane, expected)
     }
-    pub(in crate::physical) fn qualify_gate_a_environment(
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
+    pub(in crate::physical) fn qualify_environment(
         &mut self,
         ingress: &LocalCoreIngressV1,
-        run: &Arc<microduck::MicroDuckRunV1>,
+        lane: &Arc<dyn EnvironmentBinding>,
         binding: &Arc<EnvironmentBindingV1>,
         profile: &PhysicalCapabilityProfileV1,
         q: &PhysicalQualificationV1,
     ) -> AppResult<()> {
         self.validate_ingress(ingress)?;
-        self.binding.qualify_gate_a(run, binding, profile, q)?;
+        self.binding
+            .qualify_environment(lane, binding, profile, q)?;
+        // Every contract the binding judges must have the same witness class in
+        // the Host registry Core was started with; otherwise fail closed.
+        let own = lane.witnesses();
+        for (contract, witness) in own.entries() {
+            require(
+                self.witnesses
+                    .get(contract)
+                    .is_some_and(|w| w.class() == witness.class()),
+                "Binding witness not registered with this Core",
+            )?;
+        }
         // Discovery exposes only the later configured policy's bounded view.
-        // The lane itself stays executor-local and uses the same qualified run.
+        // The lane itself stays executor-local and uses the same qualified binding.
         self.remote.environment = Some(ProductEnvironmentV1 {
             binding: binding.clone(),
-            adapter: Arc::new(microduck::MicroDuckAdapterV1::new(run.clone())),
-            run: Some(run.clone()),
+            adapter: lane.clone(),
+            drive_reference: true,
         });
         Ok(())
     }

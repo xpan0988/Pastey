@@ -61,8 +61,12 @@ if [[ -n "$core" ]]; then
 fi
 printf '%-58s %6s %8s\n' "file" "core" "binding"
 {
-  [[ -n "$core" ]] && printf '%s\n' "$core" | cut -d: -f1 | sort | uniq -c | awk '{print $2, $1, 0}'
-  [[ -n "$binding" ]] && printf '%s\n' "$binding" | cut -d: -f1 | sort | uniq -c | awk '{print $2, 0, $1}'
+  if [[ -n "$core" ]]; then
+    printf '%s\n' "$core" | cut -d: -f1 | sort | uniq -c | awk '{print $2, $1, 0}'
+  fi
+  if [[ -n "$binding" ]]; then
+    printf '%s\n' "$binding" | cut -d: -f1 | sort | uniq -c | awk '{print $2, 0, $1}'
+  fi
 } | sort -k2,2nr -k3,3nr | awk '{printf "%-58s %6s %8s\n", $1, ($2 ? $2 : "-"), ($3 ? $3 : "-")}'
 
 core_hits="$(count "$core")"

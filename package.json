@@ -18,6 +18,7 @@
     "build:checked:linux": "npm run check:version && npm run tauri -- build --bundles appimage,deb && node scripts/check-build-size.mjs",
     "preview": "vite preview",
     "test:frontend-integration": "node scripts/run-frontend-integration-tests.mjs",
+    "check:core-agnostic": "bash scripts/check-core-device-agnostic.sh --strict",
     "tauri": "cross-env CI=true tauri"
   },
   "dependencies": {

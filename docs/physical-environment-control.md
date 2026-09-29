@@ -2,7 +2,7 @@
 
 Status: target architecture and implementation plan, not implemented runtime behavior.
 
-Design date: 2026-09-26. Pastey source baseline: `5b7e389c86fc7b6fb61aea3e75e79ee370a6cfe1`. The [MicroDuck reference design](platform/microduck-environment-design.md) remains the concrete binding and isolated MuJoCo PoC specification. Its upstream baselines were rechecked against public HEAD: MicroDuck `a9ec4b2079ef8ee7904014089c885bb07d57d63c`, microduck_rl `cb70b792312d559a4da09064d92009079671815f`. No simulator or hardware qualification was performed for this document.
+Design date: 2026-09-26. Pastey source baseline: `5b7e389c86fc7b6fb61aea3e75e79ee370a6cfe1`. The MicroDuck reference design (removed; git tag `pre-physical-decouple`) was the concrete binding and isolated MuJoCo PoC specification; §12 keeps its mapping as history, and device bindings now follow the [device binding protocol](device-binding-protocol.md). Its upstream baselines were rechecked against public HEAD: MicroDuck `a9ec4b2079ef8ee7904014089c885bb07d57d63c`, microduck_rl `cb70b792312d559a4da09064d92009079671815f`. No simulator or hardware qualification was performed for this document.
 
 The [implementation architecture v1](physical-environment-implementation.md) maps this target into proposed Rust contracts, HostRuntime ownership, transactions, protocol messages, native fencing and a dependency-ordered coding sequence. It does not implement runtime support or change this target's authority/control boundary.
 
@@ -354,7 +354,7 @@ Core messages in this diagram may be local calls. A native autonomous skill need
 
 ## 12. MicroDuck reference binding
 
-The [reference document](platform/microduck-environment-design.md) remains authoritative for detailed source findings, exact PoC numbers and method limitations. The mapping below applies the target contracts without promoting `robot.*` into a universal physical API.
+The removed reference document (git tag `pre-physical-decouple`) was authoritative for detailed source findings, exact PoC numbers and method limitations. The mapping below applies the target contracts without promoting `robot.*` into a universal physical API.
 
 | Generic concept | MicroDuck binding at the inspected revisions |
 |---|---|
@@ -492,4 +492,4 @@ Source inspection and ProGraph navigation were used; direct source remains autho
 - **M4:** [Safety](https://github.com/pollen-robotics/microduck/blob/a9ec4b2079ef8ee7904014089c885bb07d57d63c/duck-control/src/safety.rs), [RobotIo](https://github.com/pollen-robotics/microduck/blob/a9ec4b2079ef8ee7904014089c885bb07d57d63c/duck-control/src/io.rs), and [native observation contract](https://github.com/pollen-robotics/microduck/blob/a9ec4b2079ef8ee7904014089c885bb07d57d63c/duck-control/src/obs.rs).
 - **M7:** [RemoteIo](https://github.com/pollen-robotics/microduck/blob/a9ec4b2079ef8ee7904014089c885bb07d57d63c/duck-control/src/sim.rs).
 - **M8:** [Native IPC schema](https://github.com/pollen-robotics/microduck/blob/a9ec4b2079ef8ee7904014089c885bb07d57d63c/duck-ipc-proto/src/lib.rs).
-- **R1:** [MuJoCo body server](https://github.com/pollen-robotics/microduck_rl/blob/cb70b792312d559a4da09064d92009079671815f/src/mjlab_microduck/sim/body_server.py). The [reference binding's source list](platform/microduck-environment-design.md#source-references) also records upstream architecture, simulation, training and export documentation.
+- **R1:** [MuJoCo body server](https://github.com/pollen-robotics/microduck_rl/blob/cb70b792312d559a4da09064d92009079671815f/src/mjlab_microduck/sim/body_server.py). The removed reference binding's source list (git tag `pre-physical-decouple`) also recorded upstream architecture, simulation, training and export documentation.

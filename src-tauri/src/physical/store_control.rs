@@ -302,7 +302,6 @@ impl PhysicalStoreV1 {
         request: &RequestId,
         epochs: &BTreeMap<DomainId, u64>,
         evidence: SessionEnforcementClassV1,
-        native: Option<&crate::physical::native_protocol::Receipt>,
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -312,20 +311,10 @@ impl PhysicalStoreV1 {
             s.installation == *request
                 && s.epochs == *epochs
                 && evidence.meets(s.enforcement)
-                && (evidence == SessionEnforcementClassV1::NativeFence) == native.is_some(),
+                // No native receipt verifier exists: NativeFence cannot be proven.
+                && evidence != SessionEnforcementClassV1::NativeFence,
             "Invalid installation evidence",
         )?;
-        if let Some(r) = native {
-            crate::physical::core::gate_b::validate_historical_receipt(
-                r,
-                &s.scope.fields().environment,
-                &s.id,
-                &s.epochs,
-                &s.installation,
-                false,
-            )?;
-            super::native_ledger::record(&tx, &s.id, "install", r)?;
-        }
         let n=tx.execute("UPDATE physical_sessions SET state='active',install_evidence=?2,revision=revision+1 WHERE session_id=?1 AND state='installing'",params![text(&s.id),tag(&evidence)?])?;
         require(n == 1, "Stale installation response")?;
         tx.commit()?;
@@ -392,7 +381,6 @@ impl PhysicalStoreV1 {
         op: &RequestId,
         result: Option<bool>,
         refresh: bool,
-        native: Option<&crate::physical::native_protocol::Receipt>,
     ) -> AppResult<bool> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -416,22 +404,6 @@ impl PhysicalStoreV1 {
             }
         };
         let n=tx.execute("UPDATE physical_actions SET disposition=?3,apply_result=COALESCE(apply_result,?4),operation_id=NULL,revision=revision+1 WHERE action_id=?1 AND state='open' AND operation_id=?2",params![text(&x.proposal.action_id),text(op),disposition,if refresh{None}else{result.map(|b|if b{"accepted"}else{"refused"})}])?;
-        if let Some(r) = native {
-            require(
-                s.enforcement == SessionEnforcementClassV1::NativeFence && result.is_some(),
-                "Invalid native command proof",
-            )?;
-            crate::physical::core::gate_b::validate_command_receipt(
-                r,
-                &s.scope.fields().environment,
-                x,
-                op,
-                result.unwrap(),
-            )?;
-            if n == 1 {
-                super::native_ledger::record(&tx, &s.id, "command", r)?;
-            }
-        }
         tx.commit()?;
         Ok(n == 1)
     }
@@ -458,47 +430,6 @@ impl PhysicalStoreV1 {
         let f = decode(&raw)?;
         tx.commit()?;
         Ok(f)
-    }
-    pub(in crate::physical) fn record_native_fence(
-        &self,
-        f: &FenceAuditV1,
-        r: &crate::physical::native_protocol::Receipt,
-    ) -> AppResult<()> {
-        let mut c = self.connection()?;
-        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
-        let raw: String = tx.query_row(
-            "SELECT audit_json FROM physical_sessions WHERE session_id=?1",
-            [text(&f.session)],
-            |r| r.get(0),
-        )?;
-        let session: SessionAuditV1 = decode(&raw)?;
-        require(
-            session.enforcement == SessionEnforcementClassV1::NativeFence,
-            "Native fence proof for isolation session",
-        )?;
-        crate::physical::core::gate_b::validate_historical_receipt(
-            r,
-            &session.scope.fields().environment,
-            &f.session,
-            &f.epochs,
-            &f.request,
-            true,
-        )?;
-        let old:Option<String>=tx.query_row("SELECT receipt_json FROM physical_native_receipts WHERE session_id=?1 AND kind='fence'",[text(&f.session)],|r|r.get(0)).optional()?;
-        if let Some(raw) = old {
-            let old: crate::physical::native_protocol::Receipt = decode(&raw)?;
-            require(
-                old.request == r.request
-                    && old.installed == r.installed
-                    && old.high_water_epoch == r.high_water_epoch,
-                "Changed native fence lineage",
-            )?;
-        } else {
-            super::native_ledger::record(&tx, &f.session, "fence", r)?;
-        }
-        tx.commit()?;
-        Ok(())
     }
     fn native_fence_receipt_for_ack(&self, f: &FenceAuditV1, c: &Connection) -> AppResult<bool> {
         let enforcement: String = c.query_row(

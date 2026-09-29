@@ -149,6 +149,10 @@ impl TrustedDispositionV1 {
     }
 }
 /// Only for an owned binding producer's sealed, validated acquisition.
+#[expect(
+    dead_code,
+    reason = "reachable only once a production binding is attached (Step D); unused by tests too"
+)]
 pub(super) fn producer_observation(
     fact: PhysicalObservationV1,
     provenance: ProducerProvenanceV1,
@@ -160,6 +164,10 @@ pub(super) fn producer_observation(
     }
 }
 /// Only for an owned binding producer's sealed disposition.
+#[expect(
+    dead_code,
+    reason = "reachable only once a production binding is attached (Step D); unused by tests too"
+)]
 pub(super) fn producer_disposition(fact: PhysicalActionDispositionV1) -> TrustedDispositionV1 {
     TrustedDispositionV1 {
         fact,
@@ -240,6 +248,13 @@ impl WitnessVerdictV1 {
         )
     }
     /// Seal a verdict over exactly these stored observations (capture order).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub fn over(
         action: &ActionId,
         contract_digest: &DigestV1,
@@ -282,6 +297,13 @@ pub(crate) struct ActionWindowV1 {
     pub terminal_us: Option<u64>,
     pub current_terminal: bool,
 }
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "reachable only once a production binding is attached (Step D)"
+    )
+)]
 pub(crate) struct CompletionInputV1<'a> {
     pub contract: &'a PhysicalCompletionContractV1,
     pub contract_digest: &'a DigestV1,
@@ -290,6 +312,13 @@ pub(crate) struct CompletionInputV1<'a> {
     pub window: ActionWindowV1,
     pub now_us: u64,
 }
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "reachable only once a production binding is attached (Step D)"
+    )
+)]
 pub(crate) struct HandoverInputV1<'a> {
     pub policy: &'a HandoverPredicateV1,
     pub policy_digest: &'a DigestV1,
@@ -310,12 +339,24 @@ pub(crate) trait PhysicalWitnessV1: Send + Sync {
 #[derive(Clone, Default)]
 pub(crate) struct WitnessRegistryV1(BTreeMap<SemanticIdV1, Arc<dyn PhysicalWitnessV1>>);
 impl WitnessRegistryV1 {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub fn with(mut self, contract: SemanticIdV1, witness: Arc<dyn PhysicalWitnessV1>) -> Self {
         self.0.insert(contract, witness);
         self
     }
     pub(super) fn get(&self, contract: &SemanticIdV1) -> Option<&Arc<dyn PhysicalWitnessV1>> {
         self.0.get(contract)
+    }
+    pub(super) fn entries(
+        &self,
+    ) -> impl Iterator<Item = (&SemanticIdV1, &Arc<dyn PhysicalWitnessV1>)> {
+        self.0.iter()
     }
 }
 

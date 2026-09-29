@@ -526,6 +526,13 @@ impl PhysicalStoreV1 {
     }
     /// Atomic CAS across canonical domains, ledger bookkeeping only. Domains
     /// remain quarantined; no holder, task, native receipt or permit is created.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(super) fn advance_epochs(&self, expected: &BTreeMap<DomainId, u64>) -> AppResult<()> {
         require(
             !expected.is_empty() && expected.len() <= 16,

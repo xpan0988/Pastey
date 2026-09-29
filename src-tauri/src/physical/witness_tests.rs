@@ -1,7 +1,7 @@
 //! Witness verdict admission: classes, freshness and bound evidence are Core's.
 use super::*;
 
-/// Delegates to the MicroDuck witness but vouches with another class.
+/// Delegates to the fixture witness but vouches with another class.
 struct Relabel {
     inner: WitnessRegistryV1,
     class: WitnessClassV1,
@@ -32,7 +32,7 @@ impl PhysicalWitnessV1 for Relabel {
         Ok(v)
     }
 }
-/// Delegates to the MicroDuck witness, then rewrites its verdict.
+/// Delegates to the fixture witness, then rewrites its verdict.
 struct Tamper(fn(&mut WitnessVerdictV1));
 impl PhysicalWitnessV1 for Tamper {
     fn class(&self) -> WitnessClassV1 {
@@ -50,10 +50,10 @@ impl PhysicalWitnessV1 for Tamper {
     }
 }
 fn completion_id() -> SemanticIdV1 {
-    md::id(md::COMPLETION_PREDICATE)
+    fx::id(fx::COMPLETION_PREDICATE)
 }
 fn at_rest_id() -> SemanticIdV1 {
-    md::id(md::AT_REST_PREDICATE)
+    fx::id(fx::AT_REST_PREDICATE)
 }
 fn only(witness: impl PhysicalWitnessV1 + 'static) -> WitnessRegistryV1 {
     let witness: Arc<dyn PhysicalWitnessV1> = Arc::new(witness);
@@ -74,7 +74,7 @@ async fn released_after_at_rest_trace(f: &EvidenceFixture) -> bool {
     for i in 0..=3 {
         let mut o = f.observation(i + 1, 1_110_000 + i * 100_000);
         measure(&mut o, |m| {
-            m.forward_m = Some(Finite::try_from(0.0).unwrap())
+            m.progress = Some(Finite::try_from(0.0).unwrap())
         });
         f.record(o);
     }
@@ -203,7 +203,7 @@ async fn unknown_stale_or_unwitnessed_handover_stays_quarantined() {
         for i in 0..samples {
             let mut o = f.observation(i + 1, 1_110_000 + i * 100_000);
             measure(&mut o, |m| {
-                m.forward_m = Some(Finite::try_from(0.0).unwrap())
+                m.progress = Some(Finite::try_from(0.0).unwrap())
             });
             f.record(o);
         }

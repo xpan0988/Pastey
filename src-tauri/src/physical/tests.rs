@@ -1,7 +1,4 @@
-use super::{
-    binding::*, contracts::*, core::microduck_capability as md, evidence::WitnessRegistryV1,
-    values::*,
-};
+use super::{binding::*, contracts::*, evidence::WitnessRegistryV1, test_fixture as fx, values::*};
 use crate::host_identity::HostRef;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
@@ -48,29 +45,26 @@ fn binding() -> EnvironmentBindingViewV1 {
 /// opaque measurement schema.
 fn measure(
     o: &mut super::evidence::PhysicalObservationV1,
-    edit: impl FnOnce(&mut md::MeasurementV1),
+    edit: impl FnOnce(&mut fx::MeasurementV1),
 ) {
-    let mut m: md::MeasurementV1 = o.measurements.decode().unwrap();
+    let mut m: fx::MeasurementV1 = o.measurements.decode().unwrap();
     edit(&mut m);
     o.measurements = m.encode().unwrap();
 }
-fn measured(o: &super::evidence::PhysicalObservationV1) -> md::MeasurementV1 {
-    o.measurements.decode().unwrap()
-}
 fn witnesses() -> WitnessRegistryV1 {
-    super::core::microduck_witness::witnesses()
+    super::test_fixture::witnesses()
 }
-fn completion_params() -> md::DisplacementSettledV1 {
+fn completion_params() -> fx::ReachedHeldV1 {
     decode(json!({
-        "frame": "world", "minForwardM": 0.01, "maxForwardM": 0.1, "maxLateralM": 0.03,
-        "maxSettledSpeedMps": 0.02, "maxSettledAngularRadps": 0.1,
-        "maxPositionUncertaintyM": 0.001, "noFall": true, "dwellUs": 500000
+        "frame": "world", "minProgress": 0.01, "maxProgress": 0.1, "maxDrift": 0.03,
+        "maxRate": 0.02, "maxSpin": 0.1,
+        "maxUncertainty": 0.001, "requireIntact": true, "dwellUs": 500000
     }))
 }
 fn profile() -> PhysicalCapabilityProfileV1 {
-    let capability = md::velocity_descriptor(
+    let capability = fx::setpoint_descriptor(
         vec![decode(json!(id("physical-domain")))],
-        md::velocity_bounds(0.1, 0.1, 0.2).unwrap(),
+        fx::setpoint_bounds(0.1, 0.1, 0.2).unwrap(),
         &completion_params(),
     )
     .unwrap();
@@ -82,11 +76,11 @@ fn profile() -> PhysicalCapabilityProfileV1 {
         "freshness": {"proposal": 200000, "observation": {"maxAgeUs": 200000, "maxGapUs": 200000}}
     }))
 }
-/// Test mapping of the former MicroDuck velocity fields onto a generic intent.
-fn velocity_intent(vx: f64, vy: f64, vyaw: f64) -> PhysicalIntentV1 {
-    md::VelocityV1::new(vx, vy, vyaw).unwrap().intent().unwrap()
+/// A fixture setpoint intent.
+fn setpoint_intent(a: f64, b: f64, c: f64) -> PhysicalIntentV1 {
+    fx::SetpointV1::new(a, b, c).unwrap().intent().unwrap()
 }
-/// Replace one AbsMax dimension of a bound set (former velocity limit fields).
+/// Replace one AbsMax dimension of a bound set.
 fn with_abs_max(bounds: &BoundSetV1, pointer: &str, max: f64) -> BoundSetV1 {
     let mut all = bounds.bounds().to_vec();
     let b = all
@@ -96,22 +90,10 @@ fn with_abs_max(bounds: &BoundSetV1, pointer: &str, max: f64) -> BoundSetV1 {
     b.kind = BoundKindV1::AbsMax(NonNegative::try_from(max).unwrap());
     BoundSetV1::try_from(all).unwrap()
 }
-fn abs_max(bounds: &BoundSetV1, pointer: &str) -> f64 {
-    match &bounds
-        .bounds()
-        .iter()
-        .find(|b| b.pointer.as_str() == pointer)
-        .unwrap()
-        .kind
-    {
-        BoundKindV1::AbsMax(m) => m.get(),
-        other => panic!("{other:?}"),
-    }
-}
 /// Change the capability's completion parameters in both the profile and the
 /// scope, re-binding the (untrusted fixture) qualification to the new profile.
-fn edit_completion(s: &mut ReviewScopeFieldsV1, edit: impl FnOnce(&mut md::DisplacementSettledV1)) {
-    let mut params: md::DisplacementSettledV1 = s
+fn edit_completion(s: &mut ReviewScopeFieldsV1, edit: impl FnOnce(&mut fx::ReachedHeldV1)) {
+    let mut params: fx::ReachedHeldV1 = s
         .profile
         .capability
         .completion_predicate
@@ -144,7 +126,7 @@ fn scope_fields() -> ReviewScopeFieldsV1 {
         json!({"version": 2, "principal": "operator", "requester": host("requester"),
         "executor": b.executor, "environment": b, "profile": p, "qualification": q,
         "mode": "exact",
-        "intent": velocity_intent(0.05, 0.0, 0.0),
+        "intent": setpoint_intent(0.05, 0.0, 0.0),
         "bounds": p.capability.bounds, "execution": p.execution, "freshness": p.freshness,
         "completion": {"predicate": p.capability.completion_predicate,
             "requiredWitness": "simulation_oracle", "observation": p.freshness.observation,
@@ -288,7 +270,7 @@ fn scope_hash_is_canonical_and_roundtrips() {
     // Different object key order/whitespace and signed zero have identical meaning.
     let raw = serde_json::to_string_pretty(&wire(&s))
         .unwrap()
-        .replace("\"vyMps\": 0.0", "\"vyMps\": -0.0");
+        .replace("\"b\": 0.0", "\"b\": -0.0");
     assert_eq!(
         s.digest().unwrap(),
         serde_json::from_str::<PhysicalReviewScopeV1>(&raw)
@@ -310,7 +292,7 @@ fn scope_hash_binds_effects_target_budgets_and_completion() {
     s.principal = label("other");
     changes.push(s);
     let mut s = scope_fields();
-    s.intent = velocity_intent(-0.05, 0.0, 0.0);
+    s.intent = setpoint_intent(-0.05, 0.0, 0.0);
     changes.push(s);
     let mut s = scope_fields();
     s.execution.action_duration_us = micros(900000);
@@ -320,7 +302,7 @@ fn scope_hash_binds_effects_target_budgets_and_completion() {
     changes.push(s);
     let mut s = scope_fields();
     edit_completion(&mut s, |c| {
-        c.max_forward_m = NonNegative::try_from(0.08).unwrap()
+        c.max_progress = NonNegative::try_from(0.08).unwrap()
     });
     changes.push(s);
     let mut s = scope_fields();
@@ -432,10 +414,10 @@ fn scope_cannot_widen_profile_or_substitute_target() {
     s.freshness.observation.max_age_us = micros(200001);
     changes.push(s);
     let mut s = scope_fields();
-    s.bounds = with_abs_max(&s.bounds, "/vxMps", 0.2);
+    s.bounds = with_abs_max(&s.bounds, "/a", 0.2);
     changes.push(s);
     let mut s = scope_fields();
-    s.intent = velocity_intent(0.2, 0.0, 0.0);
+    s.intent = setpoint_intent(0.2, 0.0, 0.0);
     changes.push(s);
     for fields in changes {
         assert!(PhysicalReviewScopeV1::try_from(fields).is_err());
@@ -468,7 +450,7 @@ fn unknown_fields_versions_methods_frames_and_streams_fail_closed() {
         ("/mode", json!("stream")),
         ("/profile/capability", json!("robot_joint_targets")),
         ("/intent/capabilityId", json!("robot.do/v1")),
-        ("/intent/payload/frame", json!("world")),
+        ("/intent/payload/mode", json!("world")),
         ("/profile/requiredEnforcementClass", json!("best_effort")),
         ("/environment/version", json!(3)),
         ("/execution/actionCount", json!(2)),
@@ -512,7 +494,7 @@ fn proposal_matches_exact_action_but_does_not_admit_it() {
     p.requested_duration_us = micros(1000001);
     assert!(p.validate_scope(&s).is_err());
     p.requested_duration_us = micros(1000000);
-    p.payload = velocity_intent(-0.05, 0.0, 0.0);
+    p.payload = setpoint_intent(-0.05, 0.0, 0.0);
     assert!(p.validate().is_err());
     p.payload_digest = p.payload.digest().unwrap();
     p.validate().unwrap();
@@ -566,7 +548,7 @@ fn subsystem_map_order_does_not_change_binding_digest() {
 fn malformed_completion_and_required_contracts_are_rejected() {
     // Core: completion, freshness, budget, start and loss substitutions.
     for (pointer, value) in [
-        ("/completion/predicate/params/minForwardM", json!(0.02)),
+        ("/completion/predicate/params/minProgress", json!(0.02)),
         ("/completion/predicate/id", json!("other.predicate/v1")),
         ("/completion/predicate/params", json!({})),
         ("/completion/observation/maxAgeUs", json!(200001)),
@@ -585,13 +567,13 @@ fn malformed_completion_and_required_contracts_are_rejected() {
         );
     }
     // Binding: device parameters are opaque to Core and rejected by the
-    // MicroDuck scope schema check that Core consults before review/start.
-    md::validate_scope(&scope_fields()).unwrap();
+    // fixture binding scope schema check that Core consults before review/start.
+    fx::validate_scope(&scope_fields()).unwrap();
     for (key, value) in [
-        ("minForwardM", json!(0.2)),
-        ("maxLateralM", json!(-0.03)),
+        ("minProgress", json!(0.2)),
+        ("maxDrift", json!(-0.03)),
         ("dwellUs", json!(4000000)),
-        ("noFall", json!(false)),
+        ("requireIntact", json!(false)),
         ("unexpected", json!(true)),
     ] {
         let mut s = scope_fields();
@@ -602,17 +584,18 @@ fn malformed_completion_and_required_contracts_are_rejected() {
         s.completion.predicate.params = params;
         s.qualification.profile_digest = s.profile.digest().unwrap();
         PhysicalReviewScopeV1::try_from(s.clone()).unwrap();
-        assert!(md::validate_scope(&s).is_err(), "{key}");
+        assert!(fx::validate_scope(&s).is_err(), "{key}");
     }
 }
 
 #[test]
 fn scope_hash_version_one_vector() {
     // Pin the canonical schema/ordering. A future encoding change must be versioned.
-    // Re-pinned for the implementation fingerprint (physical ledger format 4).
+    // Re-pinned when the fixture capability replaced the MicroDuck one: the
+    // encoding is unchanged, the hashed fixture content differs.
     assert_eq!(
         String::from(scope().digest().unwrap()),
-        "af649f7308308783adf17d8f744faec2589b261ffc8decb731a8467e1ae1371c"
+        "1ff7c1267c5866e46ea0b061b7c7e3f9c675fe61d25e33435281153c46a4705c"
     );
 }
 

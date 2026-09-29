@@ -30,9 +30,7 @@ npm run check:version
 git diff --check
 ```
 
-Physical provisioning/transport checks: `python3 -B scripts/test-microduck-gate-a.py`, `cargo test --manifest-path src-tauri/Cargo.toml stage7`, and `npm run test:frontend-integration`. The physical panel requires a current qualified executor environment/policy; discovery does not launch one. See [physical implementation](physical-environment-implementation.md#stage-7-remote-transport-and-product-contract) for durable replay, current-session ingress and evidence boundaries. Real Linux Gate A remains opt-in and separate from fake-adapter distributed tests.
-
-Stage 8 native mechanism checks are reproducible through the [pinned MicroDuck overlay](../native/microduck/README.md). Apply it to a clean pinned upstream checkout, run native Rust tests, then run `scripts/test-microduck-gate-b.py` and the opt-in `real_robotd_` Core tests with `PASTEY_GATE_B_ROBOTD` set to that explicitly built binary. They launch real robotd with FakeIo/no-policy and exercise native IPC/clock/consumption, separately from pure Rust authority tests. They do not qualify MuJoCo/PPO, hardware, LAN or a released NativeFence profile. Stage 9 qualification remains deferred.
+Physical checks: `cargo test --manifest-path src-tauri/Cargo.toml physical::` and `npm run test:frontend-integration`. `npm run check:core-agnostic` fails when device vocabulary appears in physical Core (CI runs it). No device binding is compiled in; tests use a generic fixture binding. Device bindings implement the [device binding protocol](device-binding-protocol.md). The retired MicroDuck Gate A/B route is in git tag `pre-physical-decouple`.
 
 The Windows cross-check requires the GNU target and MinGW toolchain. It proves compilation, not native Windows confinement, safe-open behavior, machine setup, packaging, or physical E2E.
 

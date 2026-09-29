@@ -1,15 +1,8 @@
-//! Core's L2-L6 implementation. Adapter I/O is split into prepare/await/commit.
-//! Native adapter receipts remain separate from physical evidence and acceptance.
-#[path = "adapters/gate_b.rs"]
-pub(in crate::physical) mod gate_b;
-#[path = "adapters/microduck.rs"]
-pub(in crate::physical) mod microduck;
-#[path = "adapters/microduck_capability.rs"]
-pub(in crate::physical) mod microduck_capability;
-#[path = "adapters/microduck_witness.rs"]
-pub(in crate::physical) mod microduck_witness;
+//! Core's L2-L6 implementation. Binding I/O is split into prepare/await/commit.
+//! Binding acknowledgments remain separate from physical evidence and acceptance.
 use super::*;
-use crate::physical::binding::EnvironmentBindingViewV1;
+use crate::physical::binding::{BindingDescriptionV1, EnvironmentBindingViewV1};
+use crate::physical::evidence::{TrustedDispositionV1, TrustedObservationV1, WitnessRegistryV1};
 use crate::physical::store::{ActionAuditV1, FenceAuditV1, SessionAuditV1};
 use parking_lot::Mutex;
 use std::{future::Future, pin::Pin, sync::atomic::AtomicU64};
@@ -97,6 +90,13 @@ impl AdmittedBodyActionV1 {
 }
 pub(in crate::physical) enum AdmissionOutcomeV1 {
     Admitted(Arc<AdmittedBodyActionV1>),
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     Duplicate(ActionId),
 }
 struct ProposalChallengeV1 {
@@ -105,7 +105,7 @@ struct ProposalChallengeV1 {
     observations: Vec<ObservationId>,
     deadline: u64,
 }
-/// Minimal trusted observation input from the owned Gate A or explicit fake producer.
+/// Minimal trusted observation input from a binding's sample or an explicit fake producer.
 /// It reports no position, effect, completion or simulator/hardware measurement.
 pub(in crate::physical) struct TrustedControlObservationV1 {
     id: ObservationId,
@@ -130,6 +130,13 @@ struct LaneValidityV1 {
     continuing: Option<Arc<AtomicU64>>,
 }
 impl LaneValidityV1 {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     fn allows(&self) -> bool {
         self.flags.iter().all(|f| f.load(Ordering::Acquire))
             && self.clock.read().is_ok_and(|(_, ticks)| {
@@ -141,6 +148,10 @@ impl LaneValidityV1 {
             })
     }
 }
+#[expect(
+    dead_code,
+    reason = "reachable only once a production binding is attached (Step D); unused by tests too"
+)]
 pub(in crate::physical) struct NativeSessionInstallViewV1 {
     session: SessionId,
     epochs: BTreeMap<DomainId, u64>,
@@ -149,6 +160,10 @@ pub(in crate::physical) struct NativeSessionInstallViewV1 {
     binding: EnvironmentBindingViewV1,
     validity: LaneValidityV1,
 }
+#[expect(
+    dead_code,
+    reason = "reachable only once a production binding is attached (Step D); unused by tests too"
+)]
 pub(in crate::physical) struct AdmittedActionReadViewV1 {
     session: SessionId,
     epochs: BTreeMap<DomainId, u64>,
@@ -161,17 +176,23 @@ pub(in crate::physical) struct AdmittedActionReadViewV1 {
     deadline: u64,
     validity: LaneValidityV1,
 }
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "reachable only once a production binding is attached (Step D)"
+    )
+)]
 pub(in crate::physical) struct NativeFenceRequestViewV1 {
     audit: FenceAuditV1,
 }
-/// Private evidence boundary. No DTO can assert trusted enforcement. The fake
-/// producer can only create isolation evidence, even when NativeFence is asked.
+/// Private evidence boundary. No DTO can assert trusted enforcement. No
+/// NativeFence receipt verifier exists, so NativeFence evidence fails closed.
 pub(in crate::physical) struct SessionEnforcementEvidenceV1 {
     session: SessionId,
     epochs: BTreeMap<DomainId, u64>,
     request: RequestId,
     class: SessionEnforcementClassV1,
-    native: Option<gate_b::NativeEnforcementReceiptV1>,
 }
 pub(in crate::physical) struct AdapterWriteReceiptV1 {
     session: SessionId,
@@ -180,15 +201,26 @@ pub(in crate::physical) struct AdapterWriteReceiptV1 {
     action: ActionId,
     payload_digest: DigestV1,
     accepted: bool,
-    native: Option<gate_b::NativeCommandReceiptV1>,
+}
+/// One executor-local binding sample: the control observation for the
+/// installed session and sealed evidence produced since the previous sample.
+pub(in crate::physical) struct BindingSampleV1 {
+    pub(in crate::physical) control: TrustedControlObservationV1,
+    pub(in crate::physical) observations: Vec<TrustedObservationV1>,
+    pub(in crate::physical) dispositions: Vec<TrustedDispositionV1>,
 }
 type LaneFuture<'a, T> = Pin<Box<dyn Future<Output = AppResult<Option<T>>> + Send + 'a>>;
-pub(in crate::physical) trait PhysicalEnvironmentAdapterV1:
-    Send + Sync
-{
-    fn owned_native_binding(&self) -> Option<DigestV1> {
-        None
-    }
+/// The one device-facing seam (docs/device-binding-protocol.md). A binding
+/// owns every device-specific HOW; Core owns authority. Core revalidates all
+/// a binding returns; a binding never calls Core and holds no authority. A
+/// reply is an acknowledgment only: not a physical consequence, and neither is
+/// task acceptance. `None` means the disposition is unknown.
+pub(in crate::physical) trait EnvironmentBinding: Send + Sync {
+    /// Trusted identity for one resolution: enrollment record, provenance and
+    /// conditions digests and the opaque implementation fingerprint.
+    fn describe(&self, host: &HostRef) -> AppResult<BindingDescriptionV1>;
+    /// One blocking executor-local sample for the installed session.
+    fn observe(&self) -> AppResult<BindingSampleV1>;
     fn install_session(
         &self,
         view: NativeSessionInstallViewV1,
@@ -197,6 +229,12 @@ pub(in crate::physical) trait PhysicalEnvironmentAdapterV1:
     fn refresh(&self, view: AdmittedActionReadViewV1) -> LaneFuture<'_, AdapterWriteReceiptV1>;
     fn fence(&self, view: NativeFenceRequestViewV1)
         -> LaneFuture<'_, SessionEnforcementEvidenceV1>;
+    /// Err once the device side is lost; Core then treats the binding as gone.
+    fn status(&self) -> AppResult<()>;
+    /// Witnesses for this binding's completion and handover contract IDs.
+    fn witnesses(&self) -> WitnessRegistryV1;
+    /// Reject-only scope schema check (`ScopeSchemaCheckV1`).
+    fn validate_scope(&self, scope: &ReviewScopeFieldsV1) -> AppResult<()>;
 }
 fn request_id() -> AppResult<RequestId> {
     RequestId::try_from(format!("physical-request:v1:{}", uuid::Uuid::new_v4()))
@@ -365,7 +403,7 @@ impl PhysicalControlServiceV1 {
     pub(in crate::physical) async fn install_control_session(
         core: &Mutex<Self>,
         s: &Arc<BodyControlSessionV1>,
-        adapter: &dyn PhysicalEnvironmentAdapterV1,
+        adapter: &dyn EnvironmentBinding,
     ) -> AppResult<()> {
         let view = { core.lock().prepare_install(s)? }; // guard and all transactions end here
         let evidence = adapter.install_session(view).await;
@@ -380,22 +418,10 @@ impl PhysicalControlServiceV1 {
                 e.session == s.audit.id && e.class.meets(s.audit.enforcement),
                 "Installation evidence mismatch",
             )?;
-            if e.class == SessionEnforcementClassV1::NativeFence {
-                e.native
-                    .as_ref()
-                    .ok_or_else(|| {
-                        crate::error::AppError::InvalidInput("NativeFence receipt absent".into())
-                    })?
-                    .validate(
-                        &s.basis.scope().fields().environment,
-                        &s.audit.id,
-                        &s.audit.epochs,
-                        &s.audit.installation,
-                        false,
-                    )?;
-            } else {
-                require(e.native.is_none(), "Isolation cannot carry native proof")?;
-            }
+            require(
+                e.class != SessionEnforcementClassV1::NativeFence,
+                "NativeFence receipt absent",
+            )?;
             let snapshot = service.binding.ledger_snapshot(&s.root.binding)?;
             let (now, _) = service.binding.now()?;
             service.store.activate_session(
@@ -406,7 +432,6 @@ impl PhysicalControlServiceV1 {
                 &e.request,
                 &e.epochs,
                 e.class,
-                e.native.as_ref().map(|n| n.raw()),
             )
         })();
         if result.is_ok() {
@@ -759,7 +784,7 @@ impl PhysicalControlServiceV1 {
     async fn action_write(
         core: &Mutex<Self>,
         a: &Arc<AdmittedBodyActionV1>,
-        adapter: &dyn PhysicalEnvironmentAdapterV1,
+        adapter: &dyn EnvironmentBinding,
         refresh: bool,
     ) -> AppResult<()> {
         let view = { core.lock().prepare_action_write(a, refresh)? };
@@ -774,7 +799,7 @@ impl PhysicalControlServiceV1 {
             service.control.operations.remove(a.grant.session.id());
         }
         service.validate_admitted_action(a)?;
-        let (accepted, native) = match result {
+        let accepted = match result {
             Ok(Some(reply))
                 if reply.session == a.audit.session
                     && reply.epochs == a.audit.epochs
@@ -782,27 +807,12 @@ impl PhysicalControlServiceV1 {
                     && reply.action == *a.id()
                     && reply.payload_digest == a.audit.proposal.payload_digest =>
             {
-                let native_required =
-                    a.grant.session.audit.enforcement == SessionEnforcementClassV1::NativeFence;
-                let proof_valid = native_required == reply.native.is_some()
-                    && reply.native.as_ref().is_none_or(|n| {
-                        n.validate(
-                            &a.grant.session.basis.scope().fields().environment,
-                            &a.audit,
-                            &op,
-                            reply.accepted,
-                        )
-                        .is_ok()
-                    });
-                if proof_valid {
-                    (Some(reply.accepted), reply.native)
-                } else {
-                    // Missing/mismatched native proof follows the same durable
-                    // unknown disposition and closure as a lost adapter reply.
-                    (None, None)
-                }
+                // A NativeFence session needs a native command proof, which no
+                // binding can supply: same unknown disposition as a lost reply.
+                (a.grant.session.audit.enforcement != SessionEnforcementClassV1::NativeFence)
+                    .then_some(reply.accepted)
             }
-            _ => (None, None),
+            _ => None,
         };
         let committed = (|| {
             let s = &a.grant.session;
@@ -818,7 +828,6 @@ impl PhysicalControlServiceV1 {
                     &op,
                     accepted,
                     refresh,
-                    native.as_ref().map(|n| n.raw()),
                 )?,
                 "Stale action callback",
             )?;
@@ -839,21 +848,21 @@ impl PhysicalControlServiceV1 {
     pub(in crate::physical) async fn dispatch_admitted_action(
         core: &Mutex<Self>,
         a: &Arc<AdmittedBodyActionV1>,
-        adapter: &dyn PhysicalEnvironmentAdapterV1,
+        adapter: &dyn EnvironmentBinding,
     ) -> AppResult<()> {
         Self::action_write(core, a, adapter, false).await
     }
     pub(in crate::physical) async fn refresh_admitted_action(
         core: &Mutex<Self>,
         a: &Arc<AdmittedBodyActionV1>,
-        adapter: &dyn PhysicalEnvironmentAdapterV1,
+        adapter: &dyn EnvironmentBinding,
     ) -> AppResult<()> {
         Self::action_write(core, a, adapter, true).await
     }
     pub(in crate::physical) async fn revoke_control_session(
         core: &Mutex<Self>,
         s: &Arc<BodyControlSessionV1>,
-        adapter: &dyn PhysicalEnvironmentAdapterV1,
+        adapter: &dyn EnvironmentBinding,
     ) -> AppResult<bool> {
         let fence = {
             let mut service = core.lock();
@@ -873,19 +882,10 @@ impl PhysicalControlServiceV1 {
                     && e.epochs == fence.epochs
                     && e.class.meets(s.audit.enforcement) =>
             {
-                if e.class == SessionEnforcementClassV1::NativeFence {
-                    let native = e.native.as_ref().ok_or_else(|| {
-                        crate::error::AppError::InvalidInput("Native fence receipt absent".into())
-                    })?;
-                    native.validate(
-                        &s.basis.scope().fields().environment,
-                        &fence.session,
-                        &fence.epochs,
-                        &fence.request,
-                        true,
-                    )?;
-                    service.store.record_native_fence(&fence, native.raw())?;
-                }
+                require(
+                    e.class != SessionEnforcementClassV1::NativeFence,
+                    "Native fence receipt absent",
+                )?;
                 service.store.acknowledge_fence(&fence)
             }
             _ => Ok(false),
@@ -938,7 +938,27 @@ pub(in crate::physical) mod test_support {
             }
         }
     }
-    impl PhysicalEnvironmentAdapterV1 for FakeLane {
+    impl EnvironmentBinding for FakeLane {
+        fn describe(&self, _: &HostRef) -> AppResult<BindingDescriptionV1> {
+            Err(crate::error::AppError::InvalidInput(
+                "Fake lane has no trusted description".into(),
+            ))
+        }
+        fn observe(&self) -> AppResult<BindingSampleV1> {
+            Err(crate::error::AppError::InvalidInput(
+                "Fake lane has no sample".into(),
+            ))
+        }
+        fn status(&self) -> AppResult<()> {
+            Ok(())
+        }
+        fn witnesses(&self) -> WitnessRegistryV1 {
+            crate::physical::test_fixture::witnesses()
+        }
+        // Fake lanes accept any schema; the hook itself is tested separately.
+        fn validate_scope(&self, _: &ReviewScopeFieldsV1) -> AppResult<()> {
+            Ok(())
+        }
         fn install_session(
             &self,
             v: NativeSessionInstallViewV1,
@@ -959,7 +979,6 @@ pub(in crate::physical) mod test_support {
                         v.request
                     },
                     class: SessionEnforcementClassV1::AdapterIsolationOnly,
-                    native: None,
                 }))
             })
         }
@@ -985,7 +1004,6 @@ pub(in crate::physical) mod test_support {
                     action: v.action,
                     payload_digest: v.payload_digest,
                     accepted: !matches!(mode, Reply::Refusal),
-                    native: None,
                 }))
             })
         }
@@ -1012,9 +1030,115 @@ pub(in crate::physical) mod test_support {
                         v.audit.request
                     },
                     class: SessionEnforcementClassV1::AdapterIsolationOnly,
-                    native: None,
                 }))
             })
+        }
+    }
+    /// A fake binding that describes itself and samples one control
+    /// observation per `observe`, after the first advancing the test clock by
+    /// `step_us` through `advance`. Sample `fail_after + 1` reports the binding
+    /// lost. It never produces physical evidence.
+    pub(in crate::physical) struct DescribedLane {
+        pub(in crate::physical) lane: FakeLane,
+        pub(in crate::physical) live: AtomicBool,
+        pub(in crate::physical) samples: AtomicU64,
+        pub(in crate::physical) fail_after: AtomicU64,
+        describe: Box<dyn Fn() -> BindingDescriptionV1 + Send + Sync>,
+        advance: Box<dyn Fn(u64) -> u64 + Send + Sync>,
+        step_us: u64,
+        installed: Mutex<Option<TrustedControlObservationV1>>,
+    }
+    impl DescribedLane {
+        pub(in crate::physical) fn new(
+            describe: impl Fn() -> BindingDescriptionV1 + Send + Sync + 'static,
+            advance: impl Fn(u64) -> u64 + Send + Sync + 'static,
+            step_us: u64,
+        ) -> Self {
+            Self {
+                lane: FakeLane::new(vec![]),
+                live: AtomicBool::new(true),
+                samples: AtomicU64::new(0),
+                fail_after: AtomicU64::new(u64::MAX),
+                describe: Box::new(describe),
+                advance: Box::new(advance),
+                step_us,
+                installed: Mutex::new(None),
+            }
+        }
+    }
+    impl EnvironmentBinding for DescribedLane {
+        fn describe(&self, _: &HostRef) -> AppResult<BindingDescriptionV1> {
+            Ok((self.describe)())
+        }
+        fn observe(&self) -> AppResult<BindingSampleV1> {
+            self.status()?;
+            let n = self.samples.fetch_add(1, Ordering::SeqCst) + 1;
+            if n > self.fail_after.load(Ordering::SeqCst) {
+                self.live.store(false, Ordering::Release);
+                return self.status().map(|_| unreachable!());
+            }
+            let ticks = (self.advance)(if n == 1 { 0 } else { self.step_us });
+            let template = self.installed.lock();
+            let t = template.as_ref().ok_or_else(|| {
+                crate::error::AppError::InvalidInput("No installed session".into())
+            })?;
+            Ok(BindingSampleV1 {
+                control: TrustedControlObservationV1 {
+                    id: ObservationId::try_from(format!(
+                        "physical-observation:v1:{}",
+                        uuid::Uuid::new_v4()
+                    ))?,
+                    session: t.session.clone(),
+                    source: t.source.clone(),
+                    body: t.body.clone(),
+                    world: t.world.clone(),
+                    captured_ticks: ticks,
+                    gap_us: 0,
+                },
+                observations: vec![],
+                dispositions: vec![],
+            })
+        }
+        fn install_session(
+            &self,
+            v: NativeSessionInstallViewV1,
+        ) -> LaneFuture<'_, SessionEnforcementEvidenceV1> {
+            let subsystem = v.binding.subsystems.values().next().unwrap();
+            *self.installed.lock() = Some(TrustedControlObservationV1 {
+                id: ObservationId::try_from(format!(
+                    "physical-observation:v1:{}",
+                    uuid::Uuid::new_v4()
+                ))
+                .unwrap(),
+                session: v.session.clone(),
+                source: subsystem.controller_incarnation.clone(),
+                body: subsystem.body_incarnation.clone(),
+                world: subsystem.world_incarnation.clone(),
+                captured_ticks: 0,
+                gap_us: 0,
+            });
+            self.lane.install_session(v)
+        }
+        fn apply(&self, v: AdmittedActionReadViewV1) -> LaneFuture<'_, AdapterWriteReceiptV1> {
+            self.lane.apply(v)
+        }
+        fn refresh(&self, v: AdmittedActionReadViewV1) -> LaneFuture<'_, AdapterWriteReceiptV1> {
+            self.lane.refresh(v)
+        }
+        fn fence(
+            &self,
+            v: NativeFenceRequestViewV1,
+        ) -> LaneFuture<'_, SessionEnforcementEvidenceV1> {
+            self.lane.fence(v)
+        }
+        fn status(&self) -> AppResult<()> {
+            require(self.live.load(Ordering::Acquire), "Fake binding lost")
+        }
+        fn witnesses(&self) -> WitnessRegistryV1 {
+            crate::physical::test_fixture::witnesses()
+        }
+        fn validate_scope(&self, scope: &ReviewScopeFieldsV1) -> AppResult<()> {
+            crate::physical::test_fixture::validate_scope(scope)
         }
     }
     pub(in crate::physical) fn observation(
@@ -1089,10 +1213,10 @@ pub(in crate::physical) mod test_support {
 impl PhysicalControlServiceV1 {
     /// The normal bounded command window ends control permission, not the task's
     /// evidence adjudication. Cancellation uses revoke_control_session instead.
-    pub(in crate::physical) async fn end_gate_a_action(
+    pub(in crate::physical) async fn end_reference_action(
         core: &Mutex<Self>,
         action: &Arc<AdmittedBodyActionV1>,
-        adapter: &dyn PhysicalEnvironmentAdapterV1,
+        adapter: &dyn EnvironmentBinding,
     ) -> AppResult<bool> {
         let fence = {
             let mut service = core.lock();
@@ -1127,43 +1251,35 @@ impl PhysicalControlServiceV1 {
                     && e.class.meets(action.grant.session.audit.enforcement) =>
             {
                 let service = core.lock();
-                if e.class == SessionEnforcementClassV1::NativeFence {
-                    let native = e.native.as_ref().ok_or_else(|| {
-                        crate::error::AppError::InvalidInput("Native fence receipt absent".into())
-                    })?;
-                    native.validate(
-                        &action.grant.session.basis.scope().fields().environment,
-                        &fence.session,
-                        &fence.epochs,
-                        &fence.request,
-                        true,
-                    )?;
-                    service.store.record_native_fence(&fence, native.raw())?;
-                }
+                require(
+                    e.class != SessionEnforcementClassV1::NativeFence,
+                    "Native fence receipt absent",
+                )?;
                 service.store.acknowledge_fence(&fence)
             }
             _ => Ok(false),
         }
     }
-    pub(in crate::physical) fn ingest_gate_a(
+    /// Records one binding sample. Outside the command window only the sealed
+    /// evidence is kept: a control observation there extends nothing.
+    pub(in crate::physical) fn ingest_binding_sample(
         &mut self,
         ingress: &LocalCoreIngressV1,
         session: &Arc<BodyControlSessionV1>,
-        run: &microduck::MicroDuckRunV1,
-        control: TrustedControlObservationV1,
+        lane: &dyn EnvironmentBinding,
+        sample: BindingSampleV1,
         continuing: bool,
     ) -> AppResult<()> {
         self.validate_ingress(ingress)?;
-        run.validate_binding(&session.basis.scope().fields().environment)?;
+        lane.status()?;
         if continuing {
-            self.record_control_observation(session, control)?;
+            self.record_control_observation(session, sample.control)?;
         }
-        let (observations, dispositions) = run.drain_evidence();
-        for d in dispositions {
-            self.record_physical_disposition(ingress, d.into_trusted())?;
+        for d in sample.dispositions {
+            self.record_physical_disposition(ingress, d)?;
         }
-        for o in observations {
-            self.record_physical_observation(ingress, o.into_trusted()?)?;
+        for o in sample.observations {
+            self.record_physical_observation(ingress, o)?;
         }
         Ok(())
     }
@@ -1172,13 +1288,13 @@ impl PhysicalControlServiceV1 {
 impl PhysicalControlServiceV1 {
     /// Core's local same-action scheduler. One initial admission already exists;
     /// missed timer slots do not cause catch-up writes or extend its deadline.
-    pub(in crate::physical) async fn run_gate_a_reference(
+    pub(in crate::physical) async fn run_reference_action(
         core: &Mutex<Self>,
         session: &Arc<BodyControlSessionV1>,
         action: &Arc<AdmittedBodyActionV1>,
-        run: Arc<microduck::MicroDuckRunV1>,
-        adapter: &dyn PhysicalEnvironmentAdapterV1,
+        lane: Arc<dyn EnvironmentBinding>,
     ) -> AppResult<()> {
+        let adapter = lane.as_ref();
         let mut result = Self::dispatch_admitted_action(core, action, adapter).await;
         while result.is_ok() {
             let ticks = match core.lock().clock.read() {
@@ -1193,18 +1309,18 @@ impl PhysicalControlServiceV1 {
             }
             let next_refresh = ticks.saturating_add(50_000).min(action.deadline);
             let sampled = {
-                let run = run.clone();
-                tokio::task::spawn_blocking(move || run.poll_control()).await
+                let lane = lane.clone();
+                tokio::task::spawn_blocking(move || lane.observe()).await
             };
             result = match sampled {
-                Ok(Ok(fact)) => {
+                Ok(Ok(sample)) => {
                     let mut service = core.lock();
                     service.local_ingress().and_then(|ingress| {
-                        service.ingest_gate_a(&ingress, session, &run, fact, true)
+                        service.ingest_binding_sample(&ingress, session, adapter, sample, true)
                     })
                 }
                 _ => Err(crate::error::AppError::InvalidInput(
-                    "Gate A observation lost".into(),
+                    "Binding observation lost".into(),
                 )),
             };
             if result.is_err() {
@@ -1235,7 +1351,7 @@ impl PhysicalControlServiceV1 {
             result = Self::refresh_admitted_action(core, action, adapter).await;
         }
         if result.is_ok() {
-            result = Self::end_gate_a_action(core, action, adapter)
+            result = Self::end_reference_action(core, action, adapter)
                 .await
                 .map(|_| ());
         }

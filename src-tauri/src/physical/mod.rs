@@ -1,11 +1,10 @@
-//! Physical facts and Core-owned bounded task authority through Stage 9.
+//! Physical facts and Core-owned bounded task authority.
 //!
-//! Local MicroDuck Gate A requires a launcher-owned isolated simulation.
+//! Core owns discovery, bounded authorization, lifecycle and consequence
+//! adjudication; every device-specific HOW lives behind `EnvironmentBinding`
+//! (see docs/device-binding-protocol.md). No binding is compiled in yet.
 //! Remote/product entry points reuse authenticated Room Control and local Core.
-//! NativeFence release requires the Stage 9 exact owned qualification producer.
-//! The production simulator profile remains PENDING_ENVIRONMENT; no hardware authority.
 //! Successfully validating a claim does not authenticate its producer or qualify a body.
-#![allow(dead_code)] // Narrow environment integrations retain internal foundation APIs.
 
 use crate::error::{AppError, AppResult};
 
@@ -45,11 +44,11 @@ pub(crate) mod contracts;
 pub(crate) mod core;
 pub(crate) mod descriptor;
 pub(crate) mod evidence;
-#[path = "../../../native/microduck/overlay/duck-ipc-proto/src/task_authority.rs"]
-pub(in crate::physical) mod native_protocol;
 pub(crate) mod protocol;
 pub(crate) mod store;
 pub(crate) mod values;
 
+#[cfg(test)]
+mod test_fixture;
 #[cfg(test)]
 mod tests;

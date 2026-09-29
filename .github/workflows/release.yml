@@ -71,6 +71,7 @@ jobs:
       - name: Check and test Linux verification targets
         if: runner.os == 'Linux'
         run: |
+          npm run check:core-agnostic
           cargo check --all-targets --all-features --manifest-path src-tauri/Cargo.toml
           cargo test --all-targets --all-features --manifest-path src-tauri/Cargo.toml
 

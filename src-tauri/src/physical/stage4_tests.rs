@@ -30,11 +30,7 @@ impl ControlFixture {
             },
             |fields| {
                 if native {
-                    fields.intent = velocity_intent(
-                        crate::physical::native_protocol::REFERENCE_FORWARD_MPS,
-                        0.0,
-                        0.0,
-                    );
+                    fields.intent = setpoint_intent(0.08, 0.0, 0.0);
                 }
             },
         )
@@ -110,6 +106,78 @@ impl ControlFixture {
             live,
             scope,
         }
+    }
+    /// As `build`, but enrolled, resolved and qualified through Core's
+    /// production path from a fake binding's own `describe()`, not test facts.
+    /// Each binding sample after the first advances the clock by 50 ms.
+    fn described(
+        registry: crate::physical::evidence::WitnessRegistryV1,
+        edit_profile: impl FnOnce(&mut PhysicalCapabilityProfileV1),
+    ) -> (crate::error::AppResult<Self>, Arc<lane::DescribedLane>) {
+        let dir =
+            std::env::temp_dir().join(format!("pastey-physical-stage4-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths::new(dir.clone(), dir.join("logs"));
+        paths.ensure_directories().unwrap();
+        storage::init_database(&paths).unwrap();
+        let clock = Arc::new(Clock::new());
+        let mut core = PhysicalControlServiceV1::new(
+            &paths,
+            LocalRuntimeRef::fresh(host("executor")),
+            clock.clone(),
+            registry,
+        )
+        .unwrap();
+        let b = binding();
+        let mut enrollment = fake::enrollment(&b);
+        let registration = fake::record(&mut enrollment).clone();
+        let fingerprint = b.implementation_fingerprint.clone();
+        let c = clock.clone();
+        let described = Arc::new(lane::DescribedLane::new(
+            move || crate::physical::binding::BindingDescriptionV1 {
+                registration: registration.clone(),
+                provenance_digest: digest_value(),
+                conditions_digest: digest_value(),
+                implementation_fingerprint: fingerprint.clone(),
+            },
+            move |step| {
+                let ticks = c.ticks.load(Ordering::SeqCst) + step;
+                c.set(c.wall.load(Ordering::SeqCst) + step / 1000, ticks);
+                ticks
+            },
+            50_000,
+        ));
+        let binding: Arc<dyn crate::physical::core::EnvironmentBinding> = described.clone();
+        let result = (|| {
+            let ingress = core.local_ingress()?;
+            let live = Arc::new(core.bind_environment(&ingress, &binding, None)?);
+            let mut p = profile();
+            edit_profile(&mut p);
+            let q = qualification(&p, live.view());
+            core.qualify_environment(&ingress, &binding, &live, &p, &q)?;
+            let mut fields = scope_fields();
+            fields.requester = host("executor");
+            fields.environment = live.view().clone();
+            fields.execution = p.execution.clone();
+            fields.profile = p;
+            fields.qualification = q;
+            let scope = PhysicalReviewScopeV1::try_from(fields)?;
+            core.configure_executor_policy(
+                &ingress,
+                &live,
+                scope.clone(),
+                scope.fields().profile.required_enforcement_class,
+                micros(1_000_000),
+            )?;
+            Ok((live, scope))
+        })();
+        let fixture = result.map(|(live, scope)| Self {
+            paths,
+            clock,
+            core: Arc::new(Mutex::new(core)),
+            live,
+            scope,
+        });
+        (fixture, described)
     }
     fn root_basis(&self) -> (Arc<PhysicalAuthorityRootV1>, Arc<PhysicalGrantBasisV1>) {
         let mut core = self.core.lock();
@@ -421,7 +489,7 @@ async fn wrong_challenge_observation_sequence_action_and_payload_fail_closed() {
             "sequence" => p.decision_sequence = 2,
             "action" => p.action_id = ActionId::try_from(id("physical-action")).unwrap(),
             "payload" => {
-                p.payload = changed(&f.scope, |s| s.intent = velocity_intent(0.06, 0.0, 0.0))
+                p.payload = changed(&f.scope, |s| s.intent = setpoint_intent(0.06, 0.0, 0.0))
                     .fields()
                     .intent
                     .clone();
@@ -491,7 +559,7 @@ async fn exact_duplicate_is_status_only_and_changed_digest_is_rejected() {
         AdmissionOutcomeV1::Duplicate(_)
     ));
     let mut changed = p;
-    changed.payload = velocity_intent(0.06, 0.0, 0.0);
+    changed.payload = setpoint_intent(0.06, 0.0, 0.0);
     changed.payload_digest = changed.payload.digest().unwrap();
     assert!(f.core.lock().admit_physical_proposal(&g, changed).is_err());
     assert_eq!(lane::deadline(&a), 100_000);
@@ -1195,6 +1263,3 @@ mod capability;
 mod ledger_format;
 #[path = "stage5_tests.rs"]
 mod stage5;
-
-#[path = "stage6_tests.rs"]
-mod stage6;

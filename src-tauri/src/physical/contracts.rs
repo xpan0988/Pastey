@@ -18,6 +18,13 @@ claim!(PhysicalIntentV1 {
     payload_digest: DigestV1,
 });
 impl PhysicalIntentV1 {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub fn new(capability_id: SemanticIdV1, payload: CanonicalJsonV1) -> AppResult<Self> {
         let payload_digest = payload_digest(&capability_id, &payload)?;
         Ok(Self {
@@ -47,6 +54,13 @@ fn payload_digest(id: &SemanticIdV1, payload: &CanonicalJsonV1) -> AppResult<Dig
 pub(crate) struct ProposalFreshnessV1(pub PositiveMicros);
 impl ProposalFreshnessV1 {
     /// Caller must establish age from a trusted local challenge, not sender time.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub fn allows_age(&self, age: std::time::Duration) -> bool {
         age < std::time::Duration::from_micros(self.0.get())
     }
@@ -61,6 +75,13 @@ impl ObservationFreshnessV1 {
         Ok(())
     }
     /// Pure bounds check; callers still need qualified capture-time provenance.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub fn allows(&self, age: std::time::Duration, gap: std::time::Duration) -> bool {
         age <= std::time::Duration::from_micros(self.max_age_us.get())
             && gap <= std::time::Duration::from_micros(self.max_gap_us.get())
@@ -197,6 +218,13 @@ impl PhysicalQualificationV1 {
             "Qualification cannot weaken profile enforcement",
         )
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub fn validate_enforcement(
         &self,
         profile: &PhysicalCapabilityProfileV1,

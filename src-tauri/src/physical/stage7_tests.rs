@@ -59,7 +59,7 @@ impl Pair {
                     ProductEnvironmentV1 {
                         binding: b.live.clone(),
                         adapter: Arc::new(FakeLane::new(vec![])),
-                        run: None,
+                        drive_reference: false,
                     },
                 )
                 .unwrap();
@@ -605,7 +605,7 @@ async fn lost_install_ack_cannot_retry_install_or_create_another_session() {
             ProductEnvironmentV1 {
                 binding: p.b.live.clone(),
                 adapter: Arc::new(FakeLane::new(vec![Reply::Lost])),
-                run: None,
+                drive_reference: false,
             },
         )
         .unwrap();
@@ -657,5 +657,158 @@ async fn lost_action_ack_and_lost_result_keep_one_dispatch_and_reserved_budget()
     );
 }
 
-#[path = "stage8_tests.rs"]
-mod stage8;
+#[tokio::test]
+async fn exact_stage7_migration_preserves_remote_lineage_and_consumed_budget() {
+    let mut pair = Pair::new();
+    let (_, session) = pair.start().await;
+    let (grant, proposal) = pair.b.challenged(&session);
+    let action = pair.b.admit(&grant, proposal);
+    PhysicalControlServiceV1::dispatch_admitted_action(
+        &pair.b.core,
+        &action,
+        &FakeLane::new(vec![Reply::Success]),
+    )
+    .await
+    .unwrap();
+    pair.b.core.lock().close().unwrap();
+    let audits: Vec<(String, String)> = pair
+        .b
+        .sql()
+        .prepare("SELECT session_id,audit_json FROM physical_sessions ORDER BY session_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let semantic = pair
+        .b
+        .scalar("SELECT count(*) FROM physical_semantic_messages");
+    crate::physical::store::test_restore_stage7_schema(&pair.b.paths).unwrap();
+    storage::init_database(&pair.b.paths).unwrap();
+    let _restarted = PhysicalControlServiceV1::new(
+        &pair.b.paths,
+        LocalRuntimeRef::fresh(host("executor")),
+        pair.b.clock.clone(),
+        witnesses(),
+    )
+    .unwrap();
+    let migrated: Vec<(String, String)> = pair
+        .b
+        .sql()
+        .prepare("SELECT session_id,audit_json FROM physical_sessions ORDER BY session_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(audits, migrated);
+    assert_eq!(
+        semantic,
+        pair.b
+            .scalar("SELECT count(*) FROM physical_semantic_messages")
+    );
+    assert_eq!(
+        pair.b
+            .scalar("SELECT consumed_us FROM physical_control_budgets"),
+        1_000_000
+    );
+    assert_eq!(
+        pair.b
+            .scalar("SELECT count(*) FROM physical_native_receipts"),
+        0
+    );
+    assert_eq!(
+        pair.b.scalar("SELECT version FROM physical_native_schema"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn described_binding_loss_mid_action_fences_once_and_never_accepts() {
+    // Core's production path: enrollment, resolution and qualification come from
+    // the binding's describe(); Core then drives the one reference action from
+    // its samples. The binding is lost at the fifth sample.
+    let (b, described) = ControlFixture::described(witnesses(), |p| {
+        p.execution.action_duration_us = micros(500_000);
+        p.execution.total_execution_us = micros(500_000);
+    });
+    described.fail_after.store(4, Ordering::SeqCst);
+    let mut p = Pair::with_executor(b.unwrap());
+    let m = p.approve();
+    let (reply, work) = p.deliver_b(m.clone()).unwrap();
+    p.deliver_a(reply.unwrap());
+    assert!(
+        PhysicalControlServiceV1::perform_physical_work(&p.b.core, work.unwrap())
+            .await
+            .is_err()
+    );
+    assert_eq!(described.samples.load(Ordering::SeqCst), 5);
+    // One admission and one dispatch; the three later writes refreshed it.
+    assert_eq!(p.b.scalar("SELECT count(*) FROM physical_actions"), 1);
+    assert_eq!(
+        p.b.scalar("SELECT sum(dispatch_intent) FROM physical_actions"),
+        1
+    );
+    assert_eq!(
+        p.b.scalar("SELECT refresh_sequence FROM physical_actions"),
+        3
+    );
+    assert_eq!(
+        p.b.scalar("SELECT consumed_us FROM physical_control_budgets"),
+        500_000
+    );
+    // Loss requested the stop; the stop ACK is not a consequence.
+    assert_eq!(
+        p.b.scalar(
+            "SELECT count(*) FROM physical_sessions WHERE fence_ack='adapter_isolation_only'"
+        ),
+        1
+    );
+    let status = p.query(&m.semantic_id);
+    assert_eq!(status.authority, PhysicalAuthorityStateV1::Closed);
+    assert_ne!(status.acceptance, AcceptanceStateV1::Accepted);
+    assert_ne!(status.consequence, ConsequenceStateV1::Verified);
+    // Nothing continues after the loss: a redelivered Start creates no work.
+    assert!(p.deliver_b(m).unwrap().1.is_none());
+    p.assert_single(1);
+}
+
+#[tokio::test]
+async fn described_binding_needs_its_own_fingerprints_liveness_and_registered_witnesses() {
+    // A binding whose witnesses this Core was not started with cannot qualify.
+    let (b, _) = ControlFixture::described(Default::default(), |_| {});
+    assert!(b.is_err());
+    let (b, described) = ControlFixture::described(witnesses(), |_| {});
+    let b = b.unwrap();
+    let lane: Arc<dyn crate::physical::core::EnvironmentBinding> = described.clone();
+    let mut core = b.core.lock();
+    let i = core.local_ingress().unwrap();
+    // Qualification data must match what the live binding describes.
+    let p = b.scope.fields().profile.clone();
+    let mut q = b.scope.fields().qualification.clone();
+    q.conditions_digest = decode(json!("b".repeat(64)));
+    assert!(core
+        .qualify_environment(&i, &lane, &b.live, &p, &q)
+        .is_err());
+    // The binding's own scope check runs on every scope Core considers.
+    core.draft_review(&i, &b.live, b.scope.clone()).unwrap();
+    // Core cannot see this parameter's meaning; only the binding rejects it.
+    let mut fields = b.scope.fields().clone();
+    let mut params = serde_json::to_value(&fields.completion.predicate.params).unwrap();
+    params["requireIntact"] = json!(false);
+    let params: CanonicalJsonV1 = decode(params);
+    fields.profile.capability.completion_predicate.params = params.clone();
+    fields.completion.predicate.params = params;
+    fields.qualification.profile_digest = fields.profile.digest().unwrap();
+    let error = PhysicalReviewScopeV1::try_from(fields)
+        .and_then(|s| core.draft_review(&i, &b.live, s))
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("requires the intact predicate"),
+        "{error}"
+    );
+    // Once the binding reports loss, its sealed binding is unusable.
+    described.live.store(false, Ordering::SeqCst);
+    assert!(core.draft_review(&i, &b.live, b.scope.clone()).is_err());
+}

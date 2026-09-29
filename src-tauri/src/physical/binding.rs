@@ -113,9 +113,9 @@ impl EnvironmentBindingViewV1 {
 }
 
 // Stage 2 trust owner. No external DTO, row, digest, endpoint name or telemetry
-// can construct these sealed inputs. Stages 6 and 9 seal launcher-owned
-// simulator facts for their separate Gate A and native Gate B paths below.
-// Generic claim ingress remains closed.
+// can construct these sealed inputs. Only a Host-compiled `EnvironmentBinding`
+// (bind_environment below) or a test fake supplies them. Generic claim
+// ingress remains closed.
 use super::{
     contracts::{PhysicalCapabilityProfileV1, PhysicalQualificationV1},
     store::PhysicalStoreV1,
@@ -201,8 +201,21 @@ pub(super) struct TrustedEnrollmentV1 {
 /// by its trusted producer. Hashing an arbitrary claim cannot create this stamp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BindingProvenanceV1 {
-    GateASupervisor,
+    /// Facts a Host-compiled binding reports about itself: simulation only,
+    /// never NativeFence (no native receipt verifier exists).
+    SelfDescribed,
+    /// No production producer; kept so tests can model a native handshake.
+    #[cfg(test)]
     QualifiedNativeHandshake,
+}
+/// What a binding reports for one resolution. Correlation data, not
+/// authentication: Core compares it with enrollment and qualification.
+pub(in crate::physical) struct BindingDescriptionV1 {
+    pub(in crate::physical) registration: EnvironmentRegistrationV1,
+    pub(in crate::physical) provenance_digest: DigestV1,
+    pub(in crate::physical) conditions_digest: DigestV1,
+    pub(in crate::physical) implementation_fingerprint:
+        super::descriptor::ImplementationFingerprintV1,
 }
 /// Binding-owned check of the device semantics Core does not interpret: the
 /// payload schema and contract parameters of a scope. Core calls it before any
@@ -225,7 +238,6 @@ pub(super) struct TrustedBindingFactsV1 {
     evidence_class: EvidenceClassV1,
     subsystems: BTreeMap<LabelV1, SubsystemBindingViewV1>,
     implementation_fingerprint: super::descriptor::ImplementationFingerprintV1,
-    producer_live: Option<Arc<AtomicBool>>,
     producer_check: Option<Arc<dyn Fn() -> AppResult<()> + Send + Sync>>,
     schema_check: ScopeSchemaCheckV1,
 }
@@ -288,7 +300,6 @@ pub(super) struct EnvironmentBindingV1 {
     provenance: BindingProvenanceV1,
     provenance_evidence_digest: DigestV1,
     valid: Arc<AtomicBool>,
-    producer_live: Option<Arc<AtomicBool>>,
     producer_check: Option<Arc<dyn Fn() -> AppResult<()> + Send + Sync>>,
     schema_check: ScopeSchemaCheckV1,
 }
@@ -300,11 +311,7 @@ impl EnvironmentBindingV1 {
         (self.schema_check)(scope)
     }
     pub(super) fn runtime_flags(&self) -> Vec<Arc<AtomicBool>> {
-        let mut flags = vec![self.valid.clone()];
-        if let Some(producer) = &self.producer_live {
-            flags.push(producer.clone());
-        }
-        flags
+        vec![self.valid.clone()]
     }
     pub(super) fn view(&self) -> &EnvironmentBindingViewV1 {
         &self.view
@@ -407,6 +414,13 @@ impl PhysicalBindingResolverV1 {
         self.invalidate_live(id);
         self.store.invalidate_qualifications(id)
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(super) fn retire(&mut self, id: &EnvironmentRefV1, expected: u64) -> AppResult<()> {
         self.invalidate_live(id); // deny locally even if persistence fails
         self.store.retire(id, expected)
@@ -464,9 +478,9 @@ impl PhysicalBindingResolverV1 {
             "Trusted environmental identity/configuration mismatch",
         )?;
         require(
-            facts.provenance != BindingProvenanceV1::GateASupervisor
+            facts.provenance != BindingProvenanceV1::SelfDescribed
                 || reg.evidence_class == EvidenceClassV1::Simulation,
-            "Gate A cannot prove hardware binding",
+            "A self-described binding cannot prove hardware",
         )?;
         // Evidence digest correlates a verified producer; it is not authentication.
         let deadline_ticks = c
@@ -525,7 +539,6 @@ impl PhysicalBindingResolverV1 {
             registration_digest: c.registration_digest,
             epochs: parking_lot::Mutex::new(c.epochs),
             deadline_ticks,
-            producer_live: facts.producer_live,
             producer_check: facts.producer_check,
             schema_check: facts.schema_check,
             provenance: facts.provenance,
@@ -541,10 +554,6 @@ impl PhysicalBindingResolverV1 {
             }
             require(
                 binding.valid.load(Ordering::Acquire)
-                    && binding
-                        .producer_live
-                        .as_ref()
-                        .is_none_or(|v| v.load(Ordering::Acquire))
                     && self
                         .live
                         .get(&binding.view.environment)
@@ -640,9 +649,9 @@ impl PhysicalBindingResolverV1 {
             "Unproven qualification provenance/enforcement",
         )?;
         require(
-            binding.provenance != BindingProvenanceV1::GateASupervisor
+            binding.provenance != BindingProvenanceV1::SelfDescribed
                 || q.required_enforcement_class == SessionEnforcementClassV1::AdapterIsolationOnly,
-            "Gate A binding cannot qualify Gate B",
+            "A self-described binding cannot qualify NativeFence",
         )?;
         self.store.record_qualification(
             &binding.view.environment,
@@ -665,6 +674,13 @@ impl PhysicalBindingResolverV1 {
         q.validate_for(profile, &binding.view)?;
         Ok(q)
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reachable only once a production binding is attached (Step D)"
+        )
+    )]
     pub(super) fn withdraw(&mut self, id: &QualificationId, revision: u64) -> AppResult<()> {
         self.store.withdraw(id, revision)
     }
@@ -750,9 +766,8 @@ pub(super) mod test_support {
             provenance: if native {
                 BindingProvenanceV1::QualifiedNativeHandshake
             } else {
-                BindingProvenanceV1::GateASupervisor
+                BindingProvenanceV1::SelfDescribed
             },
-            producer_live: None,
             producer_check: None,
             // Fake bindings accept any schema; the hook itself is tested separately.
             schema_check: Arc::new(|_| Ok(())),
@@ -794,18 +809,17 @@ pub(super) mod test_support {
     }
 }
 
-// Narrow production stamps require the non-deserializable, launcher-owned Gate A
-// supervisor receipt. No registration DTO or endpoint string can call this path.
+// Production stamps come only from a Host-compiled binding's own description.
+// No registration DTO or endpoint string can call this path.
 impl PhysicalBindingResolverV1 {
-    pub(in crate::physical) fn bind_gate_a(
+    pub(in crate::physical) fn bind_environment(
         &mut self,
-        run: &super::core::microduck::MicroDuckRunV1,
+        lane: &Arc<dyn super::core::EnvironmentBinding>,
         expected_revision: Option<u64>,
     ) -> AppResult<EnvironmentBindingV1> {
-        run.validate_owner(&self.runtime, &self.clock)?;
-        run.validate_live()?;
-        run.bind_adapter_owner(self.adapter.clone())?;
-        let reg = run.registration(self.runtime.host_ref())?;
+        lane.status()?;
+        let d = lane.describe(self.runtime.host_ref())?;
+        let reg = d.registration;
         self.enroll(
             TrustedEnrollmentV1 {
                 record: reg.clone(),
@@ -813,42 +827,46 @@ impl PhysicalBindingResolverV1 {
             expected_revision,
         )?;
         let challenge = self.begin_resolution(&reg.environment)?;
+        let live = lane.clone();
+        let schema = lane.clone();
         self.resolve(TrustedBindingFactsV1 {
             challenge,
             runtime: self.runtime.clone(),
             adapter: self.adapter.clone(),
             endpoint_identity: reg.endpoint_identity.clone(),
             owner: reg.provenance_owner.clone(),
-            provenance: BindingProvenanceV1::GateASupervisor,
-            evidence_digest: run.provenance_digest()?,
+            provenance: BindingProvenanceV1::SelfDescribed,
+            evidence_digest: d.provenance_digest,
             configuration_digest: reg.configuration_digest,
-            evidence_class: EvidenceClassV1::Simulation,
+            evidence_class: reg.evidence_class,
             subsystems: reg.subsystems,
-            implementation_fingerprint: run.implementation_fingerprint()?,
-            producer_live: Some(run.live_flag()),
-            producer_check: None,
-            schema_check: Arc::new(super::core::microduck_capability::validate_scope),
+            implementation_fingerprint: d.implementation_fingerprint,
+            producer_check: Some(Arc::new(move || live.status())),
+            schema_check: Arc::new(move |fields| schema.validate_scope(fields)),
         })
     }
-    pub(in crate::physical) fn qualify_gate_a(
+    pub(in crate::physical) fn qualify_environment(
         &mut self,
-        run: &super::core::microduck::MicroDuckRunV1,
+        lane: &Arc<dyn super::core::EnvironmentBinding>,
         binding: &EnvironmentBindingV1,
         profile: &PhysicalCapabilityProfileV1,
         q: &PhysicalQualificationV1,
     ) -> AppResult<()> {
-        run.validate_binding(binding.view())?;
-        run.validate_start()?;
+        lane.status()?;
+        let d = lane.describe(self.runtime.host_ref())?;
         require(
-            q.evidence_digest == run.provenance_digest()?
-                && q.conditions_digest == run.conditions_digest()?,
-            "Gate A qualification fingerprint mismatch",
+            binding.provenance == BindingProvenanceV1::SelfDescribed
+                && d.registration.digest()? == binding.registration_digest
+                && binding.provenance_evidence_digest == d.provenance_digest
+                && q.evidence_digest == d.provenance_digest
+                && q.conditions_digest == d.conditions_digest,
+            "Binding qualification fingerprint mismatch",
         )?;
         require(
             profile.evidence_class == EvidenceClassV1::Simulation
                 && profile.required_enforcement_class
                     == SessionEnforcementClassV1::AdapterIsolationOnly,
-            "Gate A cannot qualify hardware or NativeFence",
+            "A self-described binding cannot qualify hardware or NativeFence",
         )?;
         require(
             profile.execution.action_duration_us.get() <= 1_000_000
@@ -856,18 +874,16 @@ impl PhysicalBindingResolverV1 {
                 && profile.freshness.proposal.0.get() <= 200_000
                 && profile.freshness.observation.max_age_us.get() <= 200_000
                 && profile.freshness.observation.max_gap_us.get() <= 200_000,
-            "Gate A reference duration/freshness ceiling exceeded",
+            "Self-described reference duration/freshness ceiling exceeded",
         )?;
         self.record_qualification(
             binding,
             profile,
             q,
             TrustedQualificationEvidenceV1 {
-                owner: run
-                    .registration(self.runtime.host_ref())?
-                    .qualification_owner,
+                owner: d.registration.qualification_owner,
                 qualification_digest: q.digest()?,
-                provenance_digest: run.provenance_digest()?,
+                provenance_digest: d.provenance_digest,
                 enforcement: SessionEnforcementClassV1::AdapterIsolationOnly,
             },
         )
