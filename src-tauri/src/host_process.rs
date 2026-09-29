@@ -30,6 +30,13 @@ const ROOT_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 /// process-tree containment. The test-only relaxation exists solely to
 /// exercise bounded process mechanics without manufacturing qualification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Host bounded-process seam staged for a later controller launch; no product caller yet"
+    )
+)]
 pub(crate) enum HostProcessTreeRequirementV1 {
     RequireVerifiedTree,
     #[cfg(test)]
@@ -50,6 +57,13 @@ impl HostProcessTreeRequirementV1 {
 /// Seatbelt seam. No current specialist launch uses it, and it always denies
 /// network: provider-specific network policy belongs to a later slice.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Host bounded-process seam staged for a later controller launch; no product caller yet"
+    )
+)]
 pub(crate) enum HostProcessSandboxV1 {
     None,
     #[cfg(target_os = "macos")]
@@ -271,12 +285,26 @@ pub(crate) struct RunningHostProcessV1 {
 }
 
 impl RunningHostProcessV1 {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Host bounded-process seam staged for a later controller launch; no product caller yet"
+        )
+    )]
     pub(crate) fn control(&self) -> HostProcessControlV1 {
         self.control.clone()
     }
 
     /// Waits for the root process, bounds collection and wall clock, then
     /// requires the configured process-tree proof before returning output.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Host bounded-process seam staged for a later controller launch; no product caller yet"
+        )
+    )]
     pub(crate) fn wait(mut self) -> AppResult<Output> {
         let result = self.wait_bounded();
         if result.is_err() {
@@ -422,6 +450,13 @@ impl Drop for RunningHostProcessV1 {
 /// Launches one caller-specified process in a new Host-owned process group.
 /// macOS/Unix containment is required until an equivalent Windows Job Object
 /// implementation is available.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Host bounded-process seam staged for a later controller launch; no product caller yet"
+    )
+)]
 pub(crate) fn spawn_bounded_host_process(
     spec: HostBoundedProcessSpecV1,
 ) -> AppResult<RunningHostProcessV1> {

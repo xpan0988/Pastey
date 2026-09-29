@@ -12,6 +12,10 @@ const WITHHELD_DIAGNOSTIC: &str =
 const MAX_DIAGNOSTIC_BYTES: usize = 1_024;
 const MAX_PROBE_REPORT_BYTES: usize = 512;
 
+#[cfg_attr(
+    not(windows),
+    expect(dead_code, reason = "read only by the Windows Codex backend")
+)]
 pub(crate) const PROBE_DIAGNOSTIC_FILENAME: &str = "probe-diagnostics.txt";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
