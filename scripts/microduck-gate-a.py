@@ -318,14 +318,15 @@ def snapshot_native_artifacts(params, assets_raw):
     policy = parsed.get("policy", {})
     if policy.get("enabled") is not True or policy.get("mode", "walk") != "walk":
         raise RuntimeError("exact reference policy must be explicitly enabled walk mode")
-    if [str(Path(policy.get(k, "")).resolve()) for k in ("walk", "stand")] != [str(Path(p).resolve()) for p in assets]:
+    if (len(assets) != 1 or not isinstance(policy.get("walk"), str)
+            or (Path(params).parent / policy["walk"]).resolve() != Path(assets[0]).resolve()):
         raise RuntimeError("parameter policy locators do not match exact artifact manifest")
-    if any(policy.get(k) != "none" for k in ("sitstand", "ground_pick", "kick_left", "kick_right", "roulade")):
+    if any(policy.get(k) != "none" for k in ("stand", "sitstand", "ground_pick", "kick_left", "kick_right", "roulade")):
         raise RuntimeError("other skills/postures must be explicitly disabled")
     # Only locator strings are rewritten, once, inside the owned namespace.
     # Every controller/Safety/physics parameter byte remains unchanged.
     owned = []
-    for slot, source in zip(("walk", "stand"), assets):
+    for slot, source in zip(("walk",), assets):
         target = Path("/tmp") / (slot + ".onnx")
         target.write_bytes(Path(source).read_bytes())
         owned.append(str(target))
@@ -336,11 +337,11 @@ def snapshot_native_artifacts(params, assets_raw):
         if line.lstrip().startswith("["):
             in_policy = line.strip() == "[policy]"
         if in_policy:
-            m = re.match(r"^(\s*)(walk|stand)\s*=.*?(\r?\n)?$", line)
+            m = re.match(r"^(\s*)(walk)\s*=.*?(\r?\n)?$", line)
             if m:
-                lines[i] = m[1] + m[2] + " = " + json.dumps(owned[0 if m[2]=="walk" else 1]) + "\n"
+                lines[i] = m[1] + m[2] + " = " + json.dumps(owned[0]) + "\n"
                 replacements += 1
-    if replacements != 2:
+    if replacements != 1:
         raise RuntimeError("unsupported policy locator syntax")
     target = Path("/tmp/robotd.toml")
     target.write_text("".join(lines))
@@ -348,8 +349,8 @@ def snapshot_native_artifacts(params, assets_raw):
 
 
 def check_native_artifacts(pins, params, assets):
-    if len(assets) != 2:
-        raise RuntimeError("exact walk/stand artifacts required")
+    if len(assets) != 1:
+        raise RuntimeError("exact single velstand artifact required")
     sha = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
     if sha(params) != pins["paramsSha256"] or [sha(p) for p in assets] != pins["policySha256"]:
         raise RuntimeError("reference parameter/policy artifact changed")
@@ -614,11 +615,15 @@ def build_simulator(root):
     return native, np, world, body, digest
 
 
+def check_native_policy_slots(subscribed, assets):
+    if (len(assets) != 1 or subscribed.get("walk") != Path(assets[0]).name
+            or subscribed.get("stand") is not None):
+        raise RuntimeError("exact walk policy must be loaded and stand disabled")
+
+
 def readiness_report(rpc, next_sample, identity, subscribed, assets, model_digest, engine):
     """Read-only post-provisioning checks. Never installs/admit/moves a task."""
-    if any(subscribed.get(slot) != Path(path).name
-           for slot, path in zip(("walk", "stand"), assets)):
-        raise RuntimeError("both exact policies must be loaded and warmed by robotd")
+    check_native_policy_slots(subscribed, assets)
     observations = collect_standing(next_sample, tuple(identity[k] for k in ("controller", "body", "world")))
     progress = SimulatorProgress()
     for s in observations:
@@ -643,7 +648,7 @@ def readiness_report(rpc, next_sample, identity, subscribed, assets, model_diges
         raise RuntimeError("readiness native status/protocol mismatch")
     return dict(stage="9A", readiness="READY", qualification=False, release=False,
                 modelSha256=model_digest, mujocoVersion=engine, identity=identity,
-                policyAvailability={slot: subscribed[slot] for slot in ("walk", "stand")},
+                policyAvailability={slot: subscribed.get(slot) for slot in ("walk", "stand")},
                 nativeStatus=status, observations=observations,
                 namespaces=[os.readlink("/proc/self/ns/" + n) for n in ("mnt", "pid", "net")])
 
@@ -804,6 +809,8 @@ def run(*, readiness_only=False):
             name=subscribed.get(slot)
             if name is not None and name not in {p.name for p in assets}:
                 raise RuntimeError("unmanifested native policy")
+        if pins:
+            check_native_policy_slots(subscribed, assets)
         if subscribed.get("unavailable") is not None:
             raise RuntimeError("native policy unavailable; no Gate A qualification")
         if subscribed.get("accepted") is not True:

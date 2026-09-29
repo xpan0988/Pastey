@@ -23,20 +23,6 @@ REFERENCE_TWIST = [REFERENCE_FORWARD_MPS, 0.0, 0.0]
 
 
 class QualificationProducer(unittest.TestCase):
-    def test_reference_has_deliberate_margin_and_early_ema_crossing(self):
-        threshold, alpha, hz = 0.05, 0.2, 50
-        self.assertGreaterEqual(REFERENCE_FORWARD_MPS, threshold * 1.5)
-        self.assertLess(REFERENCE_FORWARD_MPS, 0.1)
-        old, reference, first_walk_tick = 0.0, 0.0, None
-        for tick in range(1, hz + 1):
-            old += alpha * (0.05 - old)
-            reference += alpha * (REFERENCE_FORWARD_MPS - reference)
-            self.assertLessEqual(old, threshold)
-            if reference > threshold and first_walk_tick is None:
-                first_walk_tick = tick
-        self.assertEqual(first_walk_tick, 5)
-        self.assertGreaterEqual(1_000_000 - first_walk_tick * 1_000_000 // hz, 900_000)
-
     def test_qualification_requires_owned_protocol_payload_without_a_default(self):
         argv = ["supervisor", "robotd", "rl", "params", "[]", "controller", "body", "world",
                 json.dumps({"version": 1}), "environment", "body-motion", "body-ref"]
@@ -225,26 +211,56 @@ class QualificationProducer(unittest.TestCase):
             for p in (params, walk, stand, ort):
                 p.write_bytes(p.name.encode())
             sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
-            pins = dict(paramsSha256=sha(params), policySha256=[sha(walk), sha(stand)], onnxRuntimeSha256=sha(ort))
+            pins = dict(paramsSha256=sha(params), policySha256=[sha(walk)], onnxRuntimeSha256=sha(ort))
             with patch.dict(os.environ, ORT_DYLIB_PATH=str(ort)):
-                gate.check_native_artifacts(pins, params, [walk, stand])
+                gate.check_native_artifacts(pins, params, [walk])
                 walk.write_bytes(b"replacement")
                 with self.assertRaisesRegex(RuntimeError, "artifact changed"):
-                    gate.check_native_artifacts(pins, params, [walk, stand])
+                    gate.check_native_artifacts(pins, params, [walk])
                 walk.write_bytes(b"walk")
                 ort.write_bytes(b"replacement")
                 with self.assertRaisesRegex(RuntimeError, "ONNX Runtime mismatch"):
-                    gate.check_native_artifacts(pins, params, [walk, stand])
+                    gate.check_native_artifacts(pins, params, [walk])
 
-    def test_profile_cannot_enable_posture_or_take_unlisted_policy(self):
+    def test_native_slot_receipt_requires_loaded_walk_and_absent_stand(self):
+        gate.check_native_policy_slots(dict(walk="walk.onnx", stand=None), ["/tmp/walk.onnx"])
+        gate.check_native_policy_slots(dict(walk="walk.onnx"), ["/tmp/walk.onnx"])
+        for receipt in ({"walk": None, "stand": None},
+                        {"walk": "wrong", "stand": None}, {"walk": "walk.onnx", "stand": "stand.onnx"}):
+            with self.subTest(receipt=receipt), self.assertRaises(RuntimeError):
+                gate.check_native_policy_slots(receipt, ["/tmp/walk.onnx"])
+
+    def test_snapshot_preserves_none_and_rejects_pair_or_other_skills(self):
         with tempfile.TemporaryDirectory() as directory:
-            params = Path(directory) / "robotd.toml"
-            params.write_text('[policy]\nenabled=true\nwalk="wrong"\nstand="wrong"\n')
-            with self.assertRaisesRegex(RuntimeError, "locators"):
-                gate.snapshot_native_artifacts(params, json.dumps(["walk", "stand"]))
-            params.write_text('[policy]\nenabled=true\nwalk="walk"\nstand="stand"\n')
-            with self.assertRaisesRegex(RuntimeError, "disabled"):
-                gate.snapshot_native_artifacts(params, json.dumps(["walk", "stand"]))
+            root = Path(directory)
+            walk = root / "velstand.onnx"
+            walk.write_bytes(b"policy")
+            params = root / "params.toml"
+            owned = root / "owned"
+            owned.mkdir()
+            text = ('[control]\nhz=50\n[policy]\nenabled=true\nmode="walk"\n'
+                    'walk="velstand.onnx"\nstand="none"\nsitstand="none"\n'
+                    'ground_pick="none"\nkick_left="none"\nkick_right="none"\nroulade="none"\n')
+            params.write_text(text)
+            def isolated_path(value):
+                if str(value) == "/tmp":
+                    return owned
+                if str(value) == "/tmp/robotd.toml":
+                    return owned / "robotd.toml"
+                return Path(value)
+            with patch.object(gate, "Path", side_effect=isolated_path):
+                target, assets = gate.snapshot_native_artifacts(params, json.dumps([str(walk)]))
+            self.assertEqual(Path(target).read_text(), text.replace('walk="velstand.onnx"',
+                             'walk = ' + json.dumps(str(owned / "walk.onnx"))))
+            self.assertEqual(json.loads(assets), [str(owned / "walk.onnx")])
+            self.assertEqual((owned / "walk.onnx").read_bytes(), b"policy")
+            for changed, paths in ((text, [str(walk), "stand.onnx"]),
+                                   (text.replace('stand="none"', 'stand="stand.onnx"'), [str(walk)]),
+                                   (text.replace('roulade="none"', 'roulade="skill.onnx"'), [str(walk)]),
+                                   (text.replace('velstand.onnx', 'wrong.onnx'), [str(walk)])):
+                params.write_text(changed)
+                with self.assertRaises(RuntimeError):
+                    gate.snapshot_native_artifacts(params, json.dumps(paths))
 
 
 class ReferenceSettling(unittest.TestCase):

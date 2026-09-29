@@ -5,10 +5,9 @@ pub const PROFILE: &str = "reference-velocity-v1";
 pub const MAX_LEASE_US: u64 = 3_000_000;
 pub const MAX_ACTION_US: u64 = 1_000_000;
 pub const REFRESH_LOSS_US: u64 = 200_000;
-/// Exact Pastey native reference, 0.03 m/s above the pinned 0.05 stand threshold.
-/// With alpha=0.2 at 50 Hz, EMA from zero crosses on tick 5 (100 ms).
-/// The one-second ideal command integral is ~0.0736 m, inside 0.01..=0.1 m;
-/// measured motion and settling must independently pass qualification.
+/// Exact bounded native reference command; independent of policy selection/tuning.
+/// Native velstand owns zero-command standing and forward gait behavior.
+/// Measured motion and settling must independently pass qualification.
 pub const REFERENCE_FORWARD_MPS: f64 = 0.08;
 pub const REFERENCE_TWIST: [f64; 3] = [REFERENCE_FORWARD_MPS, 0.0, 0.0];
 

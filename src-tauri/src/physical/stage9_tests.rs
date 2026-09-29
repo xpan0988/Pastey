@@ -12,7 +12,20 @@ use crate::physical::{
 fn pins() -> ProfilePinsV1 {
     serde_json::from_value(json!({"version":1,"state":"READY_FOR_QUALIFICATION","upstream":UPSTREAM,"rlUpstream":RL_UPSTREAM,
         "protocol":wire::PROTOCOL,"profile":wire::PROFILE,"mujocoVersion":"test-engine", "compiledModelSha256":"a".repeat(64),
-        "paramsSha256":"b".repeat(64),"policySha256":["c".repeat(64),"d".repeat(64)],"pythonEnvironmentSha256":"e".repeat(64),"pythonExecutableSha256":"f".repeat(64),"onnxRuntimeSha256":"1".repeat(64)})).unwrap()
+        "paramsSha256":"b".repeat(64),"policySha256":["c".repeat(64)],"pythonEnvironmentSha256":"e".repeat(64),"pythonExecutableSha256":"f".repeat(64),"onnxRuntimeSha256":"1".repeat(64)})).unwrap()
+}
+#[test]
+fn native_profile_requires_one_exact_policy_pin() {
+    let mut p = pins();
+    assert!(p.validate().is_ok());
+    for hashes in [
+        vec![],
+        vec!["c".repeat(64), "d".repeat(64)],
+        vec!["bad".into()],
+    ] {
+        p.policy_sha256 = Some(hashes);
+        assert!(p.validate().is_err());
+    }
 }
 fn bundle(reg: &EnvironmentRegistrationV1) -> GateBEvidenceBundleV1 {
     let sub = reg.subsystems.values().next().unwrap();
@@ -108,7 +121,7 @@ fn bundle(reg: &EnvironmentRegistrationV1) -> GateBEvidenceBundleV1 {
                 t_ns: Some((3_000_000 + i * 100_000) * 1000 + 500),
                 movement: None,
                 odom: None,
-                policy: Some("stand".into()),
+                policy: Some("walk".into()),
                 safety: Some(microduck::NativeSafetyV1 { fallen: false }),
             },
             oracle: Some(microduck::OracleV1 {
@@ -140,7 +153,7 @@ fn bundle(reg: &EnvironmentRegistrationV1) -> GateBEvidenceBundleV1 {
                         applied: [0., 0., 0.],
                     }),
                     odom: None,
-                    policy: Some("stand".into()),
+                    policy: Some("walk".into()),
                     safety: Some(microduck::NativeSafetyV1 { fallen: false }),
                 },
                 oracle: None,
@@ -1153,18 +1166,19 @@ fn producer_and_launch_inputs_have_no_dto_or_record_constructor() {
     no_impl!(GateBLocalInstallationV1, serde::de::DeserializeOwned);
 }
 #[test]
-fn compiled_production_profile_validates_without_creating_qualification_or_release() {
+fn migrated_profile_requires_fresh_readiness_without_creating_qualification_or_release() {
     let pins: ProfilePinsV1 =
         serde_json::from_str(include_str!("../../../native/microduck/profile-v1.json")).unwrap();
-    pins.validate().unwrap();
-    let mut pending = pins.clone();
-    pending.state = "PENDING_ENVIRONMENT".into();
-    assert!(pending.validate().is_err());
-    let mut incomplete = pins;
+    assert_eq!(pins.state, "PENDING_ENVIRONMENT");
+    assert!(pins.validate().is_err());
+    let mut reviewed = pins.clone();
+    reviewed.state = "READY_FOR_QUALIFICATION".into();
+    reviewed.validate().unwrap();
+    let mut incomplete = reviewed;
     incomplete.compiled_model_sha256 = None;
     assert!(incomplete.validate().is_err());
 
-    // Loading valid compiled pins and opening Core cannot enroll a body or
+    // Loading migrated compiled pins and opening Core cannot enroll a body or
     // produce the measured qualification/live binding required by release.
     let dir = std::env::temp_dir().join(format!("pastey-reviewed-pins-{}", uuid::Uuid::new_v4()));
     let paths = AppPaths::new(dir.clone(), dir.join("logs"));
@@ -1837,7 +1851,7 @@ async fn real_owned_gate_b_qualification_review_execution_and_acceptance() {
             python: path("PASTEY_GATE_B_PYTHON"),
             rl_root: path("PASTEY_GATE_B_RL"),
             params: path("PASTEY_GATE_B_PARAMS"),
-            policy_assets: vec![path("PASTEY_GATE_B_WALK"), path("PASTEY_GATE_B_STAND")],
+            policy_assets: vec![path("PASTEY_GATE_B_WALK")],
             environment: binding().environment,
             body: binding().subsystems.values().next().unwrap().body.clone(),
             domain: profile().domain,

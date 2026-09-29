@@ -154,9 +154,12 @@ def reference_params(template, policies):
     if (policy.get("enabled") is not True or policy.get("mode") != "walk"
             or any(slot in policy for slot in slots) or raw.count(b"[policy]\n") != 1):
         raise RuntimeError("Pinned params template/reference recipe changed")
-    values = dict(zip(("walk", "stand"), map(str, policies)))
-    values.update({slot: "none" for slot in slots[2:]})
-    insertion = "# Pastey reference-velocity-v1: exact upstream pair, other slots disabled.\n"
+    if len(policies) != 1 or Path(policies[0]).name != "velstand.onnx":
+        raise RuntimeError("Exact velstand artifact required")
+    # Stable locator relative to the reference params, resolved before native launch.
+    values = dict(walk="velstand.onnx")
+    values.update({slot: "none" for slot in slots[1:]})
+    insertion = "# Pastey reference-velocity-v1: native velstand, other slots disabled.\n"
     insertion += "".join(k + " = " + json.dumps(v, ensure_ascii=False) + "\n" for k, v in values.items())
     return raw.replace(b"[policy]\n", b"[policy]\n" + insertion.encode())
 
@@ -280,7 +283,7 @@ def prepare(args, report):
         raise RuntimeError("Upstream policy-set tensor contract mismatch")
     for item in catalog["policies"]:
         if not any(p["file"] == item["file"] and p["kind"] == "perpetual" for p in manifest["policies"]):
-            raise RuntimeError("Exact walk/stand artifact missing from immutable official set")
+            raise RuntimeError("Exact velstand artifact missing from immutable official set")
         path = work / item["file"]
         fetch_exact(base_url + item["file"], path, item["sha256"])
         policies.append(path)

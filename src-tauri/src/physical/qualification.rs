@@ -51,11 +51,11 @@ impl ProfilePinsV1 {
                 && hash(&self.python_executable_sha256)
                 && hash(&self.onnx_runtime_sha256)
                 && self.policy_sha256.as_ref().is_some_and(|v| {
-                    v.len() == 2
+                    v.len() == 1
                         && v.iter()
                             .all(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
                 }),
-            "PENDING_ENVIRONMENT: exact simulator/parameters/walk/stand/Python pins unavailable",
+            "PENDING_ENVIRONMENT: exact simulator/parameters/velstand/Python pins unavailable",
         )
     }
 }
@@ -670,7 +670,6 @@ pub(crate) struct GateBLocalInstallationV1 {
     pub(crate) python: PathBuf,
     pub(crate) params: PathBuf,
     pub(crate) walk: PathBuf,
-    pub(crate) stand: PathBuf,
     pub(crate) onnxruntime: PathBuf,
 }
 pub(crate) async fn provision_host(
@@ -702,7 +701,7 @@ pub(crate) async fn provision_host(
             python: files.python,
             rl_root: files.rl_source,
             params: files.params,
-            policy_assets: vec![files.walk, files.stand],
+            policy_assets: vec![files.walk],
             environment,
             body,
             domain: domain.clone(),

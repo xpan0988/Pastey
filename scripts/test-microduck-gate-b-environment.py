@@ -136,10 +136,13 @@ class EnvironmentPreparation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "template.toml"
             path.write_bytes(template)
-            generated = env.reference_params(path, [Path("/external/walk.onnx"), Path("/external/stand.onnx")])
+            generated = env.reference_params(path, [Path("/external/velstand.onnx")])
             self.assertEqual(generated.split(b"[policy]")[0], template.split(b"[policy]")[0])
             self.assertTrue(generated.endswith(b'enabled = true\nmode = "walk"\n'))
             self.assertIn(b'roulade = "none"', generated)
+            self.assertIn(b'stand = "none"', generated)
+            self.assertIn(b'walk = "velstand.onnx"', generated)
+            self.assertEqual(generated, env.reference_params(path, [Path("/another/velstand.onnx")]))
             path.write_bytes(template + b'walk = "replacement.onnx"\n')
             with self.assertRaisesRegex(RuntimeError, "recipe changed"):
                 env.reference_params(path, [Path("a"), Path("b")])
@@ -150,7 +153,7 @@ class EnvironmentPreparation(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "SHA mismatch"):
                 env.fetch_exact("https://example.invalid/exact", Path(directory)/"policy", "a"*64)
 
-    def readiness(self, *, missing_stand=False, stale=False, paused=False, unfenced=False, native_offset=-1000,
+    def readiness(self, *, unexpected_stand=False, stale=False, paused=False, unfenced=False, native_offset=-1000,
                   jitter=False, speed=1, short=False, regression=False, gap=False):
         identity = dict(controller="controller", body="body", world="world")
         samples = [dict(daemon="controller", body="body", world="world", source_us=t,
@@ -171,12 +174,14 @@ class EnvironmentPreparation(unittest.TestCase):
         def rpc(method, request):
             calls.append((method, copy.deepcopy(request)))
             return status
-        subscribed = dict(walk="walk.onnx", stand=None if missing_stand else "stand.onnx")
+        subscribed = dict(walk="walk.onnx")
+        if unexpected_stand:
+            subscribed["stand"] = "stand.onnx"
         with patch.object(gate, "collect_standing", return_value=samples), \
                 patch.object(gate.time, "monotonic_ns", return_value=(samples[-1]["source_us"]+(300000 if stale else 1000))*1000), \
                 patch.object(gate.os, "readlink", side_effect=lambda p: p):
             result = gate.readiness_report(rpc, lambda: None, identity, subscribed,
-                                          ["/tmp/walk.onnx", "/tmp/stand.onnx"], "model", "engine")
+                                          ["/tmp/walk.onnx"], "model", "engine")
         self.assertEqual(calls, [("robot.task", dict(kind="status", protocol="microduck-task-v1"))])
         self.assertEqual(result["stage"], "9A")
         self.assertIs(result["qualification"], False)
@@ -189,7 +194,7 @@ class EnvironmentPreparation(unittest.TestCase):
         self.readiness()
 
     def test_missing_policy_stale_paused_or_unfenced_denies_readiness(self):
-        for fault in ("missing_stand", "stale", "paused", "unfenced"):
+        for fault in ("unexpected_stand", "stale", "paused", "unfenced"):
             with self.subTest(fault=fault), self.assertRaises(RuntimeError):
                 self.readiness(**{fault: True})
 
@@ -208,11 +213,11 @@ class EnvironmentPreparation(unittest.TestCase):
     def test_catalog_is_not_a_partial_production_profile(self):
         catalog = json.loads(env.CATALOG.read_text())
         profile = json.loads(env.PROFILE.read_text())
-        self.assertEqual(profile["state"], "READY_FOR_QUALIFICATION")
+        self.assertEqual(profile["state"], "PENDING_ENVIRONMENT")
         self.assertEqual(profile["policySha256"], [p["sha256"] for p in catalog["policies"]])
         self.assertEqual(catalog["upstream"], profile["upstream"])
         self.assertEqual(catalog["rlUpstream"], profile["rlUpstream"])
-        self.assertEqual([p["slot"] for p in catalog["policies"]], ["walk", "stand"])
+        self.assertEqual([p["slot"] for p in catalog["policies"]], ["walk"])
         self.assertNotIn("state", catalog)
 
 

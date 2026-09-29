@@ -11,8 +11,7 @@
   "policyRevision": "1b56c396825c052a4e26e95cf2b8d8298af9e9b4",
   "policyManifestSha256": "622048c2c23ea58942023f66fd16b189a875fd169e88d85beb16ebbe63b20c94",
   "policies": [
-    {"slot": "walk", "file": "alpha_walking.onnx", "sha256": "e36332d383997d51401897734cd3e79cf5038406feddb18b4d57ecfb141daa6c"},
-    {"slot": "stand", "file": "alpha_stand.onnx", "sha256": "1569268713e40deea795dd2922dba50d3621e15a872855408b6b1b125b1c094b"}
+    {"slot": "walk", "file": "velstand.onnx", "sha256": "1c659be55da94bc5753b707de5c6a3e7c49931e05ca3b6991615cef1a8ba9a45"}
   ],
   "pythonMinor": "3.12",
   "runtimeRoots": ["mujoco", "numpy", "onnxruntime"],
