@@ -155,7 +155,6 @@ pub(in crate::physical) struct GateBNativeLaneV1 {
     binding: EnvironmentBindingViewV1,
     clock: Arc<dyn BindingClockV1>,
     live: AtomicBool,
-    supervisor: Option<Arc<super::microduck::MicroDuckRunV1>>,
     lane: Mutex<Lane>,
 }
 impl GateBNativeLaneV1 {
@@ -176,7 +175,6 @@ impl GateBNativeLaneV1 {
             binding: b,
             clock,
             live: AtomicBool::new(true),
-            supervisor: None,
             lane: Mutex::new(Lane {
                 socket: Some(socket),
                 sequence: 0,
@@ -199,66 +197,11 @@ impl GateBNativeLaneV1 {
         drop(lane);
         Ok(run)
     }
-    pub(in crate::physical) fn owned_binding(&self) -> Option<DigestV1> {
-        let run = self.supervisor.as_ref()?;
-        if !self.live.load(Ordering::Acquire) || run.validate_fresh().is_err() {
-            return None;
-        }
-        self.binding.digest().ok()
-    }
-    pub(in crate::physical) fn connect_supervisor(
-        supervisor: Arc<super::microduck::MicroDuckRunV1>,
-        binding: &EnvironmentBindingV1,
-        clock: Arc<dyn BindingClockV1>,
-    ) -> AppResult<Arc<Self>> {
-        supervisor.validate_binding(binding.view())?;
-        supervisor
-            .gate_b_evidence()
-            .ok_or_else(|| invalid("No native qualification producer"))?
-            .validate()?;
-        let run = Arc::new(Self {
-            binding: binding.view().clone(),
-            clock,
-            live: AtomicBool::new(true),
-            supervisor: Some(supervisor),
-            lane: Mutex::new(Lane {
-                #[cfg(unix)]
-                socket: None,
-                sequence: 0,
-                installed: None,
-                action: None,
-                requests: 0,
-            }),
-        });
-        let r = run.rpc(
-            &mut run.lane.lock(),
-            wire::Request::Status {
-                protocol: wire::PROTOCOL.into(),
-            },
-        )?;
-        require(
-            r.accepted && r.fenced,
-            "Qualification native lane remains active",
-        )?;
-        Ok(run)
-    }
     fn rpc(&self, lane: &mut Lane, request: wire::Request) -> AppResult<wire::Receipt> {
         require(
             self.live.load(Ordering::Acquire),
             "Native connection lost; no implicit reconnect",
         )?;
-        if let Some(supervisor) = &self.supervisor {
-            let result = (|| {
-                let r = supervisor.task(request)?;
-                validate_receipt(&r, &self.binding)?;
-                Ok(r)
-            })();
-            if result.is_err() {
-                self.live.store(false, Ordering::Release);
-                supervisor.live_flag().store(false, Ordering::Release);
-            }
-            return result;
-        }
         #[cfg(not(unix))]
         {
             let _ = (lane, request);
@@ -392,9 +335,6 @@ impl GateBNativeLaneV1 {
                 &view.request,
                 false,
             )?;
-            if let Some(observer) = &run.supervisor {
-                observer.native_install_observer(&view)?;
-            }
             lane.installed = Some(install);
             lane.action = None;
             lane.sequence = 0;
@@ -480,9 +420,6 @@ impl GateBNativeLaneV1 {
                 .sequence
                 .checked_add(1)
                 .ok_or_else(|| invalid("Native sequence exhausted"))?;
-            if let Some(observer) = &run.supervisor {
-                observer.native_action_observer(&view, refresh)?;
-            }
             let action = lane.action.as_ref().unwrap().0.clone();
             let sequence = lane.sequence;
             let raw = run.rpc(
@@ -504,18 +441,6 @@ impl GateBNativeLaneV1 {
                     && view.validity.allows(),
                 "Uncorrelated/late native command receipt",
             )?;
-            if !refresh {
-                if let Some(observer) = &run.supervisor {
-                    observer.native_disposition(
-                        if raw.accepted {
-                            crate::physical::evidence::DispositionV1::Accepted
-                        } else {
-                            crate::physical::evidence::DispositionV1::Refused
-                        },
-                        None,
-                    )?;
-                }
-            }
             Ok(Some(AdapterWriteReceiptV1 {
                 session: view.session,
                 epochs: view.epochs,
@@ -568,15 +493,6 @@ impl GateBNativeLaneV1 {
                 &view.audit.request,
                 true,
             )?;
-            if let Some(observer) = &run.supervisor {
-                // These are terminal task-window facts, never body rest.
-                observer
-                    .native_disposition(crate::physical::evidence::DispositionV1::Terminal, None)?;
-                observer.native_disposition(
-                    crate::physical::evidence::DispositionV1::Fenced,
-                    Some(view.audit.request.clone()),
-                )?;
-            }
             Ok(Some(SessionEnforcementEvidenceV1 {
                 session: view.audit.session,
                 epochs: view.audit.epochs,

@@ -112,7 +112,7 @@ BEGIN SELECT RAISE(ABORT, 'physical domain membership required'); END;
 /// keeps only the identity/epoch/environment tables in RETAINED_TABLES.
 /// The marker table is orthogonal to the DDL stages: stage recognition ignores
 /// it, stage rebuilds leave it untouched and it is verified on its own.
-pub(super) const LEDGER_FORMAT: i64 = 3;
+pub(super) const LEDGER_FORMAT: i64 = 4;
 pub(super) const LEDGER_META_TABLE: &str = "physical_ledger_meta";
 const LEDGER_META: &str = "CREATE TABLE physical_ledger_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format_version INTEGER NOT NULL CHECK(format_version>=1)) STRICT;";
 // Per-stage `*_schema` singletons are version markers, not content.
@@ -552,7 +552,7 @@ impl PhysicalStoreV1 {
         q: &PhysicalQualificationV1,
         provenance: &DigestV1,
     ) -> AppResult<()> {
-        self.record_qualification_inner(environment, registration_digest, q, provenance, None)
+        self.record_qualification_inner(environment, registration_digest, q, provenance)
     }
     fn record_qualification_inner(
         &self,
@@ -560,7 +560,6 @@ impl PhysicalStoreV1 {
         registration_digest: &DigestV1,
         q: &PhysicalQualificationV1,
         provenance: &DigestV1,
-        native: Option<&crate::physical::core::qualification::GateBQualificationRecordV1>,
     ) -> AppResult<()> {
         q.validate()?;
         let mut conn = self.connection()?;
@@ -573,9 +572,6 @@ impl PhysicalStoreV1 {
         // Strict insert: identities are immutable, including expiry/evidence. A
         // new qualification requires a new ID; withdrawal cannot be overwritten.
         tx.execute("INSERT INTO physical_qualifications(qualification_id,environment_id,revision,registration_digest,profile_digest,binding_digest,evidence_class,enforcement_class,evidence_digest,conditions_digest,provenance_digest,record_digest,record_json,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![text(&q.qualification_id),text(environment),checked_integer(q.revision)?,text(registration_digest),text(&q.profile_digest),text(&q.binding_digest),tag(&q.evidence_class)?,tag(&q.required_enforcement_class)?,text(&q.evidence_digest),text(&q.conditions_digest),text(provenance),text(&q.digest()?),serde_json::to_string(q)?,q.expires_at.get() as i64])?;
-        if let Some(record) = native {
-            qualification_ledger::insert(&tx, record)?;
-        }
         tx.commit()?;
         Ok(())
     }

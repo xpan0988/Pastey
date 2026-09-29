@@ -81,23 +81,6 @@ pub(crate) enum PhysicalAvailabilityV1 {
 }
 
 impl PhysicalControlServiceV1 {
-    fn validate_product_lane(e: &ProductEnvironmentV1) -> AppResult<()> {
-        if e.binding.requires_owned_native_run() {
-            let run = e.run.as_ref().ok_or_else(|| {
-                crate::error::AppError::InvalidInput(
-                    "Native qualification observation lane unavailable".into(),
-                )
-            })?;
-            run.validate_binding(e.binding.view())?;
-            run.validate_fresh()?;
-            require(
-                run.gate_b_evidence().is_some()
-                    && e.adapter.owned_native_binding() == Some(e.binding.view().digest()?),
-                "Exact production NativeFence lane unavailable",
-            )?;
-        }
-        Ok(())
-    }
     /// This consumes only the sealed producer from authenticated Room Control.
     /// Neither a DTO nor a renderer-supplied session can call that producer.
     pub(crate) fn verified_peer_ingress(
@@ -192,7 +175,6 @@ impl PhysicalControlServiceV1 {
     ) -> AppResult<()> {
         self.validate_ingress(ingress)?;
         self.binding.validate_current(&environment.binding)?;
-        Self::validate_product_lane(&environment)?;
         let ceiling = self
             .policy
             .as_ref()
@@ -294,10 +276,7 @@ impl PhysicalControlServiceV1 {
                         .clone();
                     f.requester = m.requester.clone();
                     let scope = PhysicalReviewScopeV1::try_from(f)?;
-                    if Self::validate_product_lane(self.remote.environment.as_ref().unwrap())
-                        .is_ok()
-                        && self.current_scope(&scope, &binding).is_ok()
-                    {
+                    if self.current_scope(&scope, &binding).is_ok() {
                         offers.push(scope);
                     }
                 }
@@ -315,7 +294,6 @@ impl PhysicalControlServiceV1 {
                             "No configured physical environment".into(),
                         )
                     })?;
-                    Self::validate_product_lane(environment)?;
                     let binding = environment.binding.clone();
                     let adapter = environment.adapter.clone();
                     let run = environment.run.clone();

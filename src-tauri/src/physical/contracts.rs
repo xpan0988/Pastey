@@ -149,11 +149,15 @@ impl PhysicalCapabilityProfileV1 {
 
 // Qualification *claim*. Valid syntax/compatibility is not trusted qualification.
 claim!(PhysicalQualificationV1 {
-    version: VersionV1,
+    version: VersionV2,
     qualification_id: QualificationId,
     revision: u64,
     profile_digest: DigestV1,
     binding_digest: DigestV1,
+    /// The binding implementation this qualification was issued for. Core
+    /// never interprets it; any difference from the live binding's report
+    /// makes the qualification unusable until a new record is issued.
+    implementation_fingerprint: ImplementationFingerprintV1,
     required_enforcement_class: SessionEnforcementClassV1,
     evidence_class: EvidenceClassV1,
     evidence_digest: DigestV1,
@@ -175,6 +179,10 @@ impl PhysicalQualificationV1 {
     ) -> AppResult<()> {
         self.validate()?;
         profile.validate_binding(binding)?;
+        require(
+            self.implementation_fingerprint == binding.implementation_fingerprint,
+            "Binding implementation fingerprint changed since qualification",
+        )?;
         require(
             self.profile_digest == profile.digest()? && self.binding_digest == binding.digest()?,
             "Qualification does not match exact profile/binding",

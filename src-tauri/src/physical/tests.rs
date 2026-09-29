@@ -31,7 +31,7 @@ fn host(name: &str) -> HostRef {
 
 fn binding() -> EnvironmentBindingViewV1 {
     decode(json!({
-        "version": 1, "environment": id("environment"), "executor": host("executor"),
+        "version": 2, "environment": id("environment"), "executor": host("executor"),
         "registrationRevision": 1, "adapterIncarnation": id("incarnation"),
         "subsystems": {"locomotion": {
             "body": id("body"), "controllerIncarnation": id("incarnation"),
@@ -40,6 +40,7 @@ fn binding() -> EnvironmentBindingViewV1 {
             "domains": [id("physical-domain")]
         }},
         "evidenceClass": "simulation", "configurationDigest": digest_value(),
+        "implementationFingerprint": {"test.controller": "c".repeat(64), "test.policy": "d".repeat(64)},
         "offerId": id("binding-offer"), "offerExpiry": 2000
     }))
 }
@@ -128,8 +129,9 @@ fn qualification(
     b: &EnvironmentBindingViewV1,
 ) -> PhysicalQualificationV1 {
     decode(
-        json!({"version": 1, "qualificationId": id("qualification"), "revision": 1,
+        json!({"version": 2, "qualificationId": id("qualification"), "revision": 1,
         "profileDigest": p.digest().unwrap(), "bindingDigest": b.digest().unwrap(),
+        "implementationFingerprint": b.implementation_fingerprint,
         "requiredEnforcementClass": p.required_enforcement_class, "evidenceClass": b.evidence_class,
         "evidenceDigest": digest_value(), "conditionsDigest": digest_value(), "expiresAt": 2000}),
     )
@@ -468,7 +470,7 @@ fn unknown_fields_versions_methods_frames_and_streams_fail_closed() {
         ("/intent/capabilityId", json!("robot.do/v1")),
         ("/intent/payload/frame", json!("world")),
         ("/profile/requiredEnforcementClass", json!("best_effort")),
-        ("/environment/version", json!(2)),
+        ("/environment/version", json!(3)),
         ("/execution/actionCount", json!(2)),
     ] {
         let mut v = wire(&scope());
@@ -607,10 +609,10 @@ fn malformed_completion_and_required_contracts_are_rejected() {
 #[test]
 fn scope_hash_version_one_vector() {
     // Pin the canonical schema/ordering. A future encoding change must be versioned.
-    // Re-pinned for wire version 2 / witness classes (physical ledger format 3).
+    // Re-pinned for the implementation fingerprint (physical ledger format 4).
     assert_eq!(
         String::from(scope().digest().unwrap()),
-        "5a6ceece29dd978d0af94ed1de5bd328daf4910629cfee275cb9da4274f2fde3"
+        "af649f7308308783adf17d8f744faec2589b261ffc8decb731a8467e1ae1371c"
     );
 }
 

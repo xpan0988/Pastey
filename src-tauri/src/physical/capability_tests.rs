@@ -173,3 +173,122 @@ async fn microduck_binding_schema_check_admits_its_reference_scope() {
     dispense_fields(&mut foreign);
     assert!(md::validate_scope(&foreign).is_err());
 }
+
+fn fingerprint(entries: &[(&str, char)]) -> ImplementationFingerprintV1 {
+    decode(json!(entries
+        .iter()
+        .map(|(name, fill)| ((*name).to_owned(), json!(fill.to_string().repeat(64))))
+        .collect::<serde_json::Map<_, _>>()))
+}
+
+#[test]
+fn implementation_fingerprints_are_opaque_ordered_and_reject_duplicates() {
+    let f = fingerprint(&[("b.component", 'b'), ("a.component", 'a')]);
+    // Order is canonical regardless of input order.
+    assert_eq!(
+        f,
+        fingerprint(&[("a.component", 'a'), ("b.component", 'b')])
+    );
+    let raw = r#"{"a.component":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","a.component":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#;
+    assert!(serde_json::from_str::<ImplementationFingerprintV1>(raw).is_err());
+    for bad in [
+        json!({}),
+        json!({"a": "A".repeat(64)}),
+        json!({"a": "a".repeat(63)}),
+    ] {
+        assert!(serde_json::from_value::<ImplementationFingerprintV1>(bad).is_err());
+    }
+}
+
+#[tokio::test]
+async fn any_fingerprint_change_invalidates_qualification_and_a_new_record_requalifies() {
+    let f = ControlFixture::new();
+    let p = f.scope.fields().profile.clone();
+    let q = f.scope.fields().qualification.clone();
+    let issued = f.live.view().implementation_fingerprint.clone();
+    q.validate_for(&p, f.live.view()).unwrap();
+    // Every single-entry change, and adding or removing an entry, invalidates it.
+    let mut changes = vec![];
+    for name in issued.entries().keys() {
+        let mut entries = issued.entries().clone();
+        entries.insert(name.clone(), Sha256HexV1::try_from("e".repeat(64)).unwrap());
+        changes.push(entries);
+        let mut entries = issued.entries().clone();
+        entries.remove(name);
+        if !entries.is_empty() {
+            changes.push(entries);
+        }
+    }
+    let mut added = issued.entries().clone();
+    added.insert(
+        label("test.extra"),
+        Sha256HexV1::try_from("f".repeat(64)).unwrap(),
+    );
+    changes.push(added);
+    for entries in changes {
+        let mut view = f.live.view().clone();
+        view.implementation_fingerprint = ImplementationFingerprintV1::try_from(entries).unwrap();
+        let error = q.validate_for(&p, &view).unwrap_err().to_string();
+        assert!(error.contains("fingerprint"), "{error}");
+    }
+
+    // A policy swap re-resolves the binding with one changed entry.
+    let mut swapped = binding();
+    swapped.implementation_fingerprint =
+        fingerprint(&[("test.controller", 'c'), ("test.policy", 'e')]);
+    let mut core = f.core.lock();
+    let resolver = core_fake::binding(&mut core);
+    let challenge = resolver.begin_resolution(&swapped.environment).unwrap();
+    let facts = fake::facts(resolver, challenge, &swapped, false);
+    let live = Arc::new(resolver.resolve(facts).unwrap());
+    assert!(resolver
+        .qualification(&live, &p, &q.qualification_id)
+        .is_err());
+    // Requalification is data only: a new record for the new implementation.
+    let mut renewed = qualification(&p, live.view());
+    renewed.qualification_id =
+        QualificationId::try_from(format!("qualification:v1:{}", uuid::Uuid::new_v4())).unwrap();
+    resolver
+        .record_qualification(
+            &live,
+            &p,
+            &renewed,
+            fake::evidence(&renewed, digest_value()),
+        )
+        .unwrap();
+    assert_eq!(
+        resolver
+            .qualification(&live, &p, &renewed.qualification_id)
+            .unwrap(),
+        renewed
+    );
+    // The requalified implementation reviews, approves and starts as before.
+    let mut fields = f.scope.fields().clone();
+    fields.environment = live.view().clone();
+    fields.qualification = renewed;
+    let scope = PhysicalReviewScopeV1::try_from(fields).unwrap();
+    let ingress = core.local_ingress().unwrap();
+    core.configure_executor_policy(
+        &ingress,
+        &live,
+        scope.clone(),
+        scope.fields().profile.required_enforcement_class,
+        micros(1_000_000),
+    )
+    .unwrap();
+    let r = core.draft_review(&ingress, &live, scope).unwrap();
+    core.seal_review(&ingress, &r.review_id, r.revision, &r.scope_digest)
+        .unwrap();
+    let a = core
+        .approve_review(
+            &ingress,
+            &r.review_id,
+            r.revision,
+            &r.scope_digest,
+            label("operator"),
+            UnixMillis::try_from(1900).unwrap(),
+        )
+        .unwrap();
+    core.start_exact_action(&ingress, &a.approval_id, live.clone())
+        .unwrap();
+}

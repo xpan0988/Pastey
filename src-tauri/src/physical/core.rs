@@ -5,8 +5,8 @@
 mod control;
 #[path = "core_evidence.rs"]
 mod evidence_core;
-#[path = "qualification.rs"]
-pub(crate) mod qualification;
+#[path = "adapters/host_bindings.rs"]
+pub(crate) mod host_bindings;
 #[path = "remote.rs"]
 mod remote;
 #[cfg(test)]

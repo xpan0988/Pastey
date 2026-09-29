@@ -210,8 +210,9 @@ pub(super) struct Hello {
     world: IncarnationId,
     model_digest: String,
     simulation_engine: String,
+    /// The retired Gate B qualification bundle; Gate A never adopts one.
     #[serde(default)]
-    gate_b: Option<super::qualification::GateBEvidenceBundleV1>,
+    gate_b: Option<serde_json::Value>,
 }
 impl Hello {
     pub(super) fn validate(
@@ -249,8 +250,6 @@ impl Hello {
 pub(super) struct ReplyV1 {
     accepted: Option<bool>,
     sample: Option<GateASampleV1>,
-    #[serde(default)]
-    pub(super) native: Option<crate::physical::native_protocol::Receipt>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -271,15 +270,8 @@ impl PipeReplyV1 {
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(super) enum RequestV1 {
     Sample,
-    Move {
-        vx: f64,
-        vy: f64,
-        vyaw: f64,
-    },
+    Move { vx: f64, vy: f64, vyaw: f64 },
     Stop,
-    Task {
-        request: crate::physical::native_protocol::Request,
-    },
 }
 trait GateATransportV1: Send {
     fn terminate(&mut self) {}
@@ -307,7 +299,6 @@ pub(super) struct LaneState {
 /// Anonymous child pipes are the trust boundary, not caller-supplied hello JSON.
 pub(in crate::physical) struct MicroDuckRunV1 {
     registration: EnvironmentRegistrationV1,
-    gate_b: Option<super::qualification::GateBEvidenceBundleV1>,
     runtime: LocalRuntimeRef,
     generation: IncarnationId,
     live: Arc<AtomicBool>,
@@ -318,13 +309,6 @@ pub(in crate::physical) struct MicroDuckRunV1 {
     binding_adapter: Mutex<Option<IncarnationId>>,
     last_clock: Mutex<Option<(UnixMillis, u64)>>,
     lane: Arc<Mutex<LaneState>>,
-    package: Option<OwnedPackageV1>,
-}
-struct OwnedPackageV1(PathBuf);
-impl Drop for OwnedPackageV1 {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 // Sealed measured inputs; no claim/row/ACK constructor outside this adapter.
 pub(in crate::physical) struct ValidatedGateAObservationV1 {
@@ -382,11 +366,6 @@ impl MicroDuckRunV1 {
             "Foreign Gate A clock owner",
         )
     }
-    pub(in crate::physical) fn gate_b_evidence(
-        &self,
-    ) -> Option<&super::qualification::GateBEvidenceBundleV1> {
-        self.gate_b.as_ref()
-    }
     pub(in crate::physical) fn live_flag(&self) -> Arc<AtomicBool> {
         self.live.clone()
     }
@@ -436,7 +415,6 @@ impl MicroDuckRunV1 {
                 self.clock_lower,
                 self.clock_upper,
                 &self.generation,
-                &self.gate_b,
             ),
         )
     }
@@ -545,14 +523,6 @@ impl MicroDuckRunV1 {
                 && Some(sample.world.clone()) == sub.world_incarnation,
             "Owned simulation source reset",
         )?;
-        if self.gate_b.is_some() {
-            require(
-                sample.oracle.as_ref().is_some_and(|o| {
-                    o.uncertainty.is_finite() && (0. ..=0.001).contains(&o.uncertainty)
-                }),
-                "Qualified native measurement source unavailable",
-            )?;
-        }
         let delta = sample
             .source_us
             .checked_sub(self.clock_source)
@@ -719,72 +689,6 @@ impl MicroDuckRunV1 {
             self.live.store(false, Ordering::Release);
         }
         result
-    }
-    pub(in crate::physical) fn native_install_observer(
-        &self,
-        v: &NativeSessionInstallViewV1,
-    ) -> AppResult<()> {
-        self.validate_binding(&v.binding)?;
-        require(
-            self.gate_b.is_some() && v.required == SessionEnforcementClassV1::NativeFence,
-            "Native observer needs exact qualified run",
-        )?;
-        let mut l = self.lane.lock();
-        require(l.installed.is_none(), "Observer already installed")?;
-        l.installed = Some((v.session.clone(), v.epochs.clone(), v.binding.clone()));
-        Ok(())
-    }
-    pub(in crate::physical) fn native_action_observer(
-        &self,
-        v: &AdmittedActionReadViewV1,
-        refresh: bool,
-    ) -> AppResult<()> {
-        self.validate_binding(&v.binding)?;
-        if !refresh {
-            self.validate_start()?;
-        }
-        let mut l = self.lane.lock();
-        require(
-            l.installed
-                .as_ref()
-                .is_some_and(|i| i.0 == v.session && i.1 == v.epochs),
-            "Observer session mismatch",
-        )?;
-        if refresh {
-            require(
-                l.action
-                    .as_ref()
-                    .is_some_and(|a| a.0 == v.action && a.1 == v.payload),
-                "Observer action changed",
-            )?;
-        } else {
-            require(l.action.is_none(), "Observer action already originated")?;
-            if let Some((a, _)) = l.origin.as_mut() {
-                *a = v.action.clone();
-            }
-            l.action = Some((v.action.clone(), v.payload.clone(), v.lineage.clone()));
-        }
-        Ok(())
-    }
-    pub(in crate::physical) fn native_disposition(
-        &self,
-        kind: DispositionV1,
-        fence: Option<RequestId>,
-    ) -> AppResult<()> {
-        let lineage = self.lane.lock().action.as_ref().map(|a| a.2.clone());
-        if let Some(l) = lineage {
-            self.disposition(l, kind, fence)?;
-        }
-        Ok(())
-    }
-    pub(in crate::physical) fn task(
-        &self,
-        request: crate::physical::native_protocol::Request,
-    ) -> AppResult<crate::physical::native_protocol::Receipt> {
-        require(self.gate_b.is_some(), "Gate A has no native task lane")?;
-        self.exchange(&RequestV1::Task { request })?
-            .native
-            .ok_or_else(|| invalid("Missing native receipt"))
     }
     fn disposition(
         &self,
@@ -963,12 +867,6 @@ impl MicroDuckAdapterV1 {
     }
 }
 impl PhysicalEnvironmentAdapterV1 for MicroDuckAdapterV1 {
-    fn owned_native_binding(&self) -> Option<DigestV1> {
-        match self {
-            Self::GateA(_) => None,
-            Self::GateB(lane) => lane.owned_binding(),
-        }
-    }
     fn install_session(
         &self,
         view: NativeSessionInstallViewV1,
@@ -1133,108 +1031,16 @@ impl MicroDuckRunV1 {
         runtime: LocalRuntimeRef,
         clock: Arc<dyn BindingClockV1>,
     ) -> AppResult<Self> {
-        Self::launch_isolated(config, runtime, clock, None, None, None)
-    }
-    pub(in crate::physical) fn launch_native(
-        config: super::qualification::GateBLaunchV1,
-        runtime: LocalRuntimeRef,
-        clock: Arc<dyn BindingClockV1>,
-    ) -> AppResult<Self> {
-        let pins = super::qualification::checked_installation(&config)?;
-        // Build from an exact clean checkout plus our compiled overlay in an
-        // owned temporary package. Caller-supplied binaries are never adopted.
-        let mut installation = config.installation;
-        let location =
-            std::env::temp_dir().join(format!("pastey-native-build-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&location)?;
-        let package = OwnedPackageV1(location);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&package.0, std::fs::Permissions::from_mode(0o700))?;
-        }
-        // Materialize the producer and overlay from the application binary,
-        // never execute mutable checkout scripts or adopt their claimed facts.
-        for (relative, bytes) in [
-            (
-                "scripts/prepare-microduck-gate-b.py",
-                include_bytes!("../../../../scripts/prepare-microduck-gate-b.py").as_slice(),
-            ),
-            (
-                "scripts/microduck-gate-a.py",
-                include_bytes!("../../../../scripts/microduck-gate-a.py").as_slice(),
-            ),
-            (
-                "native/microduck/upstream.patch",
-                include_bytes!("../../../../native/microduck/upstream.patch").as_slice(),
-            ),
-            (
-                "native/microduck/overlay/duck-ipc-proto/src/task_authority.rs",
-                include_bytes!(
-                    "../../../../native/microduck/overlay/duck-ipc-proto/src/task_authority.rs"
-                )
-                .as_slice(),
-            ),
-            (
-                "native/microduck/overlay/robotd/src/task_authority.rs",
-                include_bytes!("../../../../native/microduck/overlay/robotd/src/task_authority.rs")
-                    .as_slice(),
-            ),
-        ] {
-            let path = package.0.join(relative);
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            std::fs::write(path, bytes)?;
-        }
-        let output = package.0.join("package");
-        let status = std::process::Command::new(&installation.python)
-            .arg("-I")
-            .arg("-u")
-            .env_remove("PYTHONPATH")
-            .env_remove("PYTHONHOME")
-            .env_remove("LD_PRELOAD")
-            .env_remove("LD_LIBRARY_PATH")
-            .arg(package.0.join("scripts/prepare-microduck-gate-b.py"))
-            .arg(&config.robotd_source)
-            .arg(&installation.rl_root)
-            .arg(&output)
-            .status()?;
-        require(status.success(), "Exact owned native rebuild failed")?;
-        installation.robotd = output.join("microduck/target/release/robotd");
-        installation.rl_root = output.join("rl");
-        let ort = output.join("libonnxruntime.so");
-        std::fs::copy(config.onnxruntime, &ort)?;
-        // Supervisor copies and rewrites only artifact locators after checking
-        // the exact parameter bytes; controller configuration stays pinned.
-        let mut run = Self::launch_isolated(
-            installation,
-            runtime,
-            clock,
-            Some(pins),
-            Some(ort),
-            Some(package.0.join("scripts/microduck-gate-a.py")),
-        )?;
-        run.package = Some(package);
-        run.poll_start()?;
-        Ok(run)
+        Self::launch_isolated(config, runtime, clock)
     }
     fn launch_isolated(
         config: GateALaunchV1,
         runtime: LocalRuntimeRef,
         clock: Arc<dyn BindingClockV1>,
-        native_pins: Option<super::qualification::ProfilePinsV1>,
-        native_runtime: Option<PathBuf>,
-        native_script: Option<PathBuf>,
     ) -> AppResult<Self> {
         #[cfg(not(unix))]
         {
-            let _ = (
-                config,
-                runtime,
-                clock,
-                native_pins,
-                native_runtime,
-                native_script,
-            );
+            let _ = (config, runtime, clock);
             Err(invalid(
                 "Gate A needs a Linux isolated supervisor; no qualified local setup",
             ))
@@ -1248,10 +1054,8 @@ impl MicroDuckRunV1 {
                 os::fd::AsRawFd,
                 process::{Command, Stdio},
             };
-            let script = native_script
-                .unwrap_or_else(|| {
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/microduck-gate-a.py")
-                })
+            let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../scripts/microduck-gate-a.py")
                 .canonicalize()?;
             let robotd = config.robotd.canonicalize()?;
             // Keep the venv executable locator: resolving its symlink would
@@ -1289,7 +1093,7 @@ impl MicroDuckRunV1 {
                 artifacts.push(hex::encode(blake3::hash(&std::fs::read(path)?).as_bytes()));
             }
             let fingerprint = digest("pastey-microduck-gate-a-artifacts-v1", &artifacts)?;
-            let mut controller = incarnation()?;
+            let controller = incarnation()?;
             let body = incarnation()?;
             let world = incarnation()?;
             let ns_before: Vec<_> = ["mnt", "pid", "net"]
@@ -1323,7 +1127,6 @@ impl MicroDuckRunV1 {
             if let Some(env) = python.parent().and_then(|p| p.parent()) {
                 mounts.push(env.to_path_buf());
             }
-            mounts.extend(native_runtime.iter().cloned());
             mounts.sort();
             mounts.dedup();
             for path in mounts {
@@ -1343,7 +1146,8 @@ impl MicroDuckRunV1 {
                 .arg(String::from(controller.clone()))
                 .arg(String::from(body.clone()))
                 .arg(String::from(world.clone()))
-                .arg(serde_json::to_string(&native_pins)?)
+                // No compiled native pins: the Gate B qualification route is retired.
+                .arg("null")
                 .arg(String::from(config.environment.clone()))
                 .arg(String::from(config.domain.clone()))
                 .arg(String::from(config.body.clone()))
@@ -1355,7 +1159,6 @@ impl MicroDuckRunV1 {
                 .env_remove("PYTHONHOME")
                 .env_remove("LD_PRELOAD")
                 .env_remove("LD_LIBRARY_PATH")
-                .envs(native_runtime.iter().map(|p| ("ORT_DYLIB_PATH", p)))
                 .env(
                     "PASTEY_PARENT_NAMESPACES",
                     serde_json::to_string(&ns_before)?,
@@ -1391,29 +1194,13 @@ impl MicroDuckRunV1 {
                     return Err(std::io::Error::last_os_error().into());
                 }
             }
-            let hello: Hello = serde_json::from_value(pipe.frame_with_timeout(
-                std::time::Duration::from_secs(if native_pins.is_some() { 40 } else { 20 }),
-            )?)?;
-            if let Some(pins) = &native_pins {
-                let bundle = hello
-                    .gate_b
-                    .as_ref()
-                    .ok_or_else(|| invalid("Native qualification evidence missing"))?;
-                require(
-                    bundle.pins == *pins
-                        && bundle.body == body
-                        && bundle.world == world
-                        && bundle.parent_namespaces == ns_before,
-                    "Native launch pin/ownership mismatch",
-                )?;
-                bundle.validate()?;
-                controller = bundle.controller.clone();
-            } else {
-                require(
-                    hello.gate_b.is_none(),
-                    "Gate A cannot adopt NativeFence evidence",
-                )?;
-            }
+            let hello: Hello = serde_json::from_value(
+                pipe.frame_with_timeout(std::time::Duration::from_secs(20))?,
+            )?;
+            require(
+                hello.gate_b.is_none(),
+                "Gate A cannot adopt NativeFence evidence",
+            )?;
             hello.validate(&ns_before, &controller, &body, &world)?;
             let fingerprint = digest(
                 "pastey-microduck-gate-a-world-v1",
@@ -1428,15 +1215,10 @@ impl MicroDuckRunV1 {
                 .ok_or_else(|| invalid("Missing clock handshake"))?;
             let (_, upper) = clock.read()?;
             require(
-                source > 0
-                    && upper >= lower
-                    && upper - lower <= 10_000
-                    && hello.gate_b.as_ref().is_none_or(|b| {
-                        b.observations.last().is_some_and(|s| s.source_us <= source)
-                    }),
+                source > 0 && upper >= lower && upper - lower <= 10_000,
                 "Clock uncertainty too large",
             )?;
-            let mut reg = registration(
+            let reg = registration(
                 &config,
                 runtime.host_ref().clone(),
                 controller,
@@ -1444,12 +1226,7 @@ impl MicroDuckRunV1 {
                 world,
                 fingerprint,
             )?;
-            if native_pins.is_some() {
-                reg.adapter_kind = label("microduck.gate-b");
-            }
-            let mut run = Self::owned(reg, runtime, clock, source, lower, upper, Box::new(pipe))?;
-            run.gate_b = hello.gate_b;
-            Ok(run)
+            Self::owned(reg, runtime, clock, source, lower, upper, Box::new(pipe))
         }
     }
     fn owned(
@@ -1464,7 +1241,6 @@ impl MicroDuckRunV1 {
         registration.validate()?;
         Ok(Self {
             registration,
-            gate_b: None,
             runtime,
             generation: incarnation()?,
             live: Arc::new(AtomicBool::new(true)),
@@ -1489,13 +1265,20 @@ impl MicroDuckRunV1 {
                 latest_oracle: None,
                 latest_captured: None,
             })),
-            package: None,
         })
     }
+    /// Gate A reports its supervised artifact/world digest as one opaque entry.
+    pub(in crate::physical) fn implementation_fingerprint(
+        &self,
+    ) -> AppResult<ImplementationFingerprintV1> {
+        use sha2::{Digest, Sha256};
+        let configuration = String::from(self.registration.configuration_digest.clone());
+        ImplementationFingerprintV1::try_from(BTreeMap::from([(
+            label("microduck.gate-a.artifacts"),
+            Sha256HexV1::try_from(hex::encode(Sha256::digest(configuration.as_bytes())))?,
+        )]))
+    }
     pub(in crate::physical) fn conditions_digest(&self) -> AppResult<DigestV1> {
-        if let Some(b) = &self.gate_b {
-            return b.conditions_digest();
-        }
         digest(
             "pastey-microduck-gate-a-conditions-v1",
             &(
@@ -1573,96 +1356,15 @@ pub(in crate::physical) mod test_support {
         samples: Mutex<VecDeque<GateASampleV1>>,
         fault: Mutex<Fault>,
         commands: Mutex<Vec<String>>,
-        native: Mutex<Option<FakeNative>>,
-    }
-    // Native wire oracle only. No FakeIo or simulator qualification claim.
-    struct FakeNative {
-        clock: Arc<dyn BindingClockV1>,
-        source_anchor: u64,
-        identity: crate::physical::native_protocol::Identity,
-        install: Option<crate::physical::native_protocol::Install>,
-        action: Option<crate::physical::native_protocol::Action>,
-        high_water: u64,
-        sequence: u64,
-        fenced: bool,
-    }
-    impl FakeNative {
-        fn rpc(
-            &mut self,
-            request: &crate::physical::native_protocol::Request,
-        ) -> AppResult<crate::physical::native_protocol::Receipt> {
-            use crate::physical::native_protocol as w;
-            let now = self.clock.read()?.1 + self.source_anchor;
-            let (id, reason) = match request {
-                w::Request::Status { .. } => ("status".into(), "status"),
-                w::Request::Install { descriptor: i } => {
-                    require(i.epoch > self.high_water, "Fake stale install")?;
-                    self.high_water = i.epoch;
-                    self.install = Some(i.clone());
-                    self.action = None;
-                    self.fenced = false;
-                    self.sequence = 0;
-                    (i.request.clone(), "installed")
-                }
-                w::Request::Admit { descriptor: a } => {
-                    self.action = Some(a.clone());
-                    (a.action.clone(), "admitted")
-                }
-                w::Request::Move { descriptor: m } => {
-                    require(!self.fenced, "Fake fenced action")?;
-                    require(
-                        m.twist == w::REFERENCE_TWIST,
-                        "Fake changed native reference payload",
-                    )?;
-                    self.sequence = m.sequence;
-                    (m.request.clone(), "queued")
-                }
-                w::Request::Fence { descriptor: f } => {
-                    self.high_water = f.next_epoch;
-                    self.fenced = true;
-                    (f.request.clone(), "fenced")
-                }
-            };
-            Ok(w::Receipt {
-                protocol: w::PROTOCOL.into(),
-                profile: w::PROFILE.into(),
-                identity: self.identity.clone(),
-                native_us: now,
-                request: id,
-                accepted: true,
-                reason: reason.into(),
-                installed: self.install.clone(),
-                action: self.action.clone(),
-                sequence: self.sequence,
-                high_water_epoch: self.high_water,
-                fenced: self.fenced,
-                consumed_sequence: self.sequence,
-            })
-        }
     }
     struct FakeTransport(Arc<Harness>);
     impl GateATransportV1 for FakeTransport {
         fn exchange(&mut self, r: &RequestV1) -> AppResult<ReplyV1> {
             self.0.commands.lock().push(serde_json::to_string(r)?);
-            if let RequestV1::Task { request } = r {
-                return Ok(ReplyV1 {
-                    accepted: None,
-                    sample: None,
-                    native: Some(
-                        self.0
-                            .native
-                            .lock()
-                            .as_mut()
-                            .ok_or_else(|| invalid("Fake Gate A cannot task"))?
-                            .rpc(request)?,
-                    ),
-                });
-            }
             if matches!(r, RequestV1::Sample) {
                 return Ok(ReplyV1 {
                     accepted: None,
                     sample: self.0.samples.lock().pop_front(),
-                    native: None,
                 });
             }
             let fault = *self.0.fault.lock();
@@ -1671,17 +1373,14 @@ pub(in crate::physical) mod test_support {
                 Fault::Lost => Ok(ReplyV1 {
                     accepted: None,
                     sample: None,
-                    native: None,
                 }),
                 Fault::Refused => Ok(ReplyV1 {
                     accepted: Some(false),
                     sample: None,
-                    native: None,
                 }),
                 Fault::None => Ok(ReplyV1 {
                     accepted: Some(true),
                     sample: None,
-                    native: None,
                 }),
             }
         }
@@ -1704,7 +1403,6 @@ pub(in crate::physical) mod test_support {
             samples: Mutex::new(VecDeque::new()),
             fault: Mutex::new(Fault::None),
             commands: Mutex::new(Vec::new()),
-            native: Mutex::new(None),
         });
         let r = MicroDuckRunV1::owned(
             reg,
@@ -1718,39 +1416,6 @@ pub(in crate::physical) mod test_support {
         .unwrap();
         (Arc::new(r), h)
     }
-    pub(in crate::physical) fn native_run(
-        config: GateALaunchV1,
-        runtime: LocalRuntimeRef,
-        clock: Arc<dyn BindingClockV1>,
-        make_bundle: impl FnOnce(
-            &EnvironmentRegistrationV1,
-        ) -> super::super::qualification::GateBEvidenceBundleV1,
-    ) -> (Arc<MicroDuckRunV1>, Arc<Harness>) {
-        let (mut run, h) = run(config, runtime, clock.clone());
-        let r = Arc::get_mut(&mut run).unwrap();
-        r.registration.adapter_kind = label("microduck.gate-b");
-        r.gate_b = Some(make_bundle(&r.registration));
-        r.clock_source = 4_000_000;
-        let sub = r.registration.subsystems.values().next().unwrap();
-        *h.native.lock() = Some(FakeNative {
-            clock,
-            source_anchor: r.clock_source,
-            identity: crate::physical::native_protocol::Identity {
-                environment: String::from(r.registration.environment.clone()),
-                domain: String::from(sub.domains[0].clone()),
-                body: String::from(sub.body_incarnation.clone()),
-                body_ref: String::from(sub.body.clone()),
-                world: String::from(sub.world_incarnation.clone().unwrap()),
-                controller: String::from(sub.controller_incarnation.clone()),
-            },
-            install: None,
-            action: None,
-            high_water: 6,
-            sequence: 0,
-            fenced: true,
-        });
-        (run, h)
-    }
     pub(in crate::physical) fn sample(
         run: &MicroDuckRunV1,
         h: &Harness,
@@ -1761,11 +1426,7 @@ pub(in crate::physical) mod test_support {
     ) {
         let sub = &run.registration.subsystems[&label("locomotion")];
         let source = run.clock_source + ticks - 1_000;
-        let twist = if h.native.lock().is_some() {
-            crate::physical::native_protocol::REFERENCE_TWIST
-        } else {
-            [0.05, 0., 0.]
-        };
+        let twist = [0.05, 0., 0.];
         h.samples.lock().push_back(GateASampleV1 {
             source_us: source,
             simulation_us: ticks,

@@ -143,17 +143,6 @@ pub struct HostRuntime {
 }
 
 impl HostRuntime {
-    /// Trusted installation owner only; never a Tauri/renderer command. The
-    /// compiled profile pins and owned qualification producer decide release.
-    pub(crate) async fn qualify_native_microduck(
-        self: &Arc<Self>,
-        files: crate::physical::core::qualification::GateBLocalInstallationV1,
-        ceiling: crate::physical::contracts::ReviewScopeFieldsV1,
-        expected: Option<u64>,
-    ) -> AppResult<()> {
-        crate::physical::core::qualification::provision_host(self, files, ceiling, expected).await
-    }
-
     /// Performs the existing Host startup sequence against explicitly supplied
     /// paths. Desktop path discovery remains in the Tauri adapter.
     pub fn initialize(
@@ -199,7 +188,7 @@ impl HostRuntime {
             &paths,
             local_runtime_ref.clone(),
             Arc::new(crate::physical::binding::SystemBindingClockV1::default()),
-            crate::physical::core::qualification::host_witnesses(),
+            crate::physical::core::host_bindings::witnesses(),
         )?;
         Ok(Self {
             paths: paths.clone(),

@@ -32,6 +32,87 @@ fn is_key(key: &str) -> bool {
         && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+const MAX_FINGERPRINT_ENTRIES: usize = 64;
+
+/// Lowercase hex SHA-256 as reported by a binding. Core never recomputes it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) struct Sha256HexV1(String);
+impl TryFrom<String> for Sha256HexV1 {
+    type Error = AppError;
+    fn try_from(value: String) -> AppResult<Self> {
+        require(
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "Invalid SHA-256 hex",
+        )?;
+        Ok(Self(value))
+    }
+}
+impl From<Sha256HexV1> for String {
+    fn from(value: Sha256HexV1) -> Self {
+        value.0
+    }
+}
+
+/// A binding's self-reported implementation identity: an ordered map from
+/// opaque component names to SHA-256. Core never interprets the names; it
+/// only requires the live binding's fingerprint to equal the one a
+/// qualification was issued for, so any change makes that qualification
+/// unusable until a new record is issued.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImplementationFingerprintV1(BTreeMap<LabelV1, Sha256HexV1>);
+impl TryFrom<BTreeMap<LabelV1, Sha256HexV1>> for ImplementationFingerprintV1 {
+    type Error = AppError;
+    fn try_from(entries: BTreeMap<LabelV1, Sha256HexV1>) -> AppResult<Self> {
+        require(
+            !entries.is_empty() && entries.len() <= MAX_FINGERPRINT_ENTRIES,
+            "Implementation fingerprint needs 1..64 entries",
+        )?;
+        Ok(Self(entries))
+    }
+}
+impl ImplementationFingerprintV1 {
+    pub fn entries(&self) -> &BTreeMap<LabelV1, Sha256HexV1> {
+        &self.0
+    }
+}
+impl Serialize for ImplementationFingerprintV1 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+// Duplicate names are rejected: a silently overwritten entry would hide a component.
+impl<'de> Deserialize<'de> for ImplementationFingerprintV1 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Entries;
+        impl<'de> serde::de::Visitor<'de> for Entries {
+            type Value = BTreeMap<LabelV1, Sha256HexV1>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("unique implementation fingerprint entries")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = BTreeMap::new();
+                while let Some((name, hash)) = map.next_entry::<LabelV1, Sha256HexV1>()? {
+                    if out.insert(name, hash).is_some() || out.len() > MAX_FINGERPRINT_ENTRIES {
+                        return Err(serde::de::Error::custom(
+                            "Duplicate/excess implementation fingerprint entry",
+                        ));
+                    }
+                }
+                Ok(out)
+            }
+        }
+        let entries = deserializer.deserialize_map(Entries)?;
+        Self::try_from(entries).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Semantic identifier plus major version, e.g. `vendor.capability/v1`.
 /// Core compares it for equality only and never interprets the name.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
