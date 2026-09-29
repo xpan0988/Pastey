@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+// Depth/node/text/count limits below are Core-versioned wire constants: any
+// change must bump the wire version of every claim that carries these types.
 const MAX_ID_BYTES: usize = 128;
 // Total values (containers and leaves); with the text/key limits this bounds size.
 const MAX_JSON_NODES: usize = 128;

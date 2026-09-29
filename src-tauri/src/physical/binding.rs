@@ -205,7 +205,11 @@ enum BindingProvenanceV1 {
 }
 /// Binding-owned check of the device semantics Core does not interpret: the
 /// payload schema and contract parameters of a scope. Core calls it before any
-/// review, approval, start or grant; failure is fail-closed.
+/// review, approval, start or grant; failure is fail-closed. Constraints:
+/// - it can only reject: it sees an immutable scope and returns no replacement;
+/// - Core's own validation (BoundSet, budgets, freshness) runs first, never skipped;
+/// - results are never cached; each call runs against the live binding incarnation;
+/// - it is mandatory on every binding. Only test fakes may install accept-all.
 pub(super) type ScopeSchemaCheckV1 =
     Arc<dyn Fn(&super::contracts::ReviewScopeFieldsV1) -> AppResult<()> + Send + Sync>;
 pub(super) struct TrustedBindingFactsV1 {

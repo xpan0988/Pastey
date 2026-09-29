@@ -121,15 +121,44 @@ async fn core_consults_the_binding_schema_check_before_review_start_and_grant() 
         dispense_fields,
     );
     let (root, _) = f.root_basis();
+    // A second review is approved while the binding still accepts it.
+    let approval = {
+        let mut core = f.core.lock();
+        let ingress = core.local_ingress().unwrap();
+        let r = core
+            .draft_review(&ingress, &f.live, f.scope.clone())
+            .unwrap();
+        core.seal_review(&ingress, &r.review_id, r.revision, &r.scope_digest)
+            .unwrap();
+        core.approve_review(
+            &ingress,
+            &r.review_id,
+            r.revision,
+            &r.scope_digest,
+            label("operator"),
+            UnixMillis::try_from(1900).unwrap(),
+        )
+        .unwrap()
+    };
     reject.store(true, Ordering::SeqCst);
     let mut core = f.core.lock();
     let ingress = core.local_ingress().unwrap();
+    let minimum = f.scope.fields().profile.required_enforcement_class;
+    let by_hook = |e: crate::error::AppError| e.to_string().contains("binding schema");
+    // Review: a new draft is refused.
     assert!(core
         .draft_review(&ingress, &f.live, f.scope.clone())
-        .is_err());
-    // A live root re-validated against a now-rejecting binding closes.
-    assert!(core.validate_root(&root).is_err());
+        .is_err_and(by_hook));
+    // Start: an already approved review cannot originate a root.
+    assert!(core
+        .start_exact_action(&ingress, &approval.approval_id, f.live.clone())
+        .is_err_and(by_hook));
+    // Grant: the live root cannot construct a grant basis, and closes.
+    assert!(core
+        .construct_grant_basis(&root, f.scope.clone(), minimum)
+        .is_err_and(by_hook));
     assert!(!core_fake::root_open(&root));
+    assert!(core.validate_root(&root).is_err());
 }
 
 #[tokio::test]

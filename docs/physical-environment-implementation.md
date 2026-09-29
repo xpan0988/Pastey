@@ -860,6 +860,17 @@ Deferred: second physical binding and shared runtime extraction; multiple domain
 
 These questions affect later integration details or qualification, not authority ownership, first-stage type semantics or the required linearization points. No runtime implementation is authorized by this document alone.
 
+### Core/binding decoupling follow-ups
+
+Recorded during the physical Core/binding decoupling (tag `pre-physical-decouple`). Not yet scheduled.
+
+- **Per-transaction ledger audit is O(N) and consumes lease time.** Every store transaction runs the full ledger audit, which re-decodes and re-validates every stored record (reviews, sessions, actions, evidence), including scope digests. Measured on macOS, debug build, `real_robotd_remote_uses_the_same_executor_native_lane`: 1,515 record decodes between native install and admit took about 518 ms of a roughly 1.02 s window. The descriptor encoding enlarged the stored profile from 617 to about 1,800 bytes (scope 3,230 to 4,425 bytes). Per-scope decode plus digest rose from 422 to 612 µs, and `profile.digest` from 54 to 105 µs, dominated by unoptimized blake3. Install to admit then took about 0.75 s locally and 1.03 s remotely against a 1 s lease (baseline 0.58 s and 0.78 s), and the remote test failed deterministically. The temporary mitigation is `[profile.dev.package.blake3] opt-level = 3` for dev/test builds only, which restored about 0.60 s and 0.80 s. Test leases were not widened. Direction:
+  - run the full audit once at startup;
+  - at runtime, validate only the rows the current transaction writes and trust already-audited rows by digest;
+  - move admission-related validation ahead of session install where possible, so it does not consume lease time.
+- **Provisional restriction: completion parameters equal the qualified capability's.** A review scope's completion predicate must equal `profile.capability.completion_predicate`, parameters included, so a review cannot pick its own tolerances. This is a safe tightening. Open question: express completion tolerances as a narrowable `BoundSetV1`, so a review may tighten but never loosen them.
+- **`real_robotd_*` ignored tests are timing-sensitive under load.** At baseline (`fe4101d`, before any decoupling change) both failed once while a concurrent full physical test run loaded the machine. They passed 3 of 3 idle runs. They share the same debug-build install-to-admit margin as above (baseline remote about 78% of its 1 s lease).
+
 ## Validation and source record
 
 This design was derived from current source using ProGraph for navigation and direct inspection for behavior. In addition to the insertion-point sources in §2, `LocalRuntimeRef`/`HostSessionBinding`, current effect-envelope compilation, Room Control's validation/replay path, SQLite review transactions, Native Agent cancellation/reconciliation, and Host shutdown/session invalidation were checked. Source behavior is used only where explicitly labeled current.

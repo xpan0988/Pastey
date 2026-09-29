@@ -272,6 +272,9 @@ impl ReviewScopeFieldsV1 {
             "Loss contract mismatch",
         )?;
         let c = &self.completion;
+        // Provisional restriction: a review cannot choose its own completion
+        // parameters; they must equal the qualified capability's. Revisit
+        // whether tolerances become a narrowable BoundSet (tighten only).
         require(
             c.predicate == capability.completion_predicate,
             "Completion predicate differs from qualified capability",
