@@ -1,9 +1,11 @@
 /** Physical DTOs are review/status data; the renderer has no authority types. */
+export type PhysicalPayload = string | number | boolean | PhysicalPayload[] | { [key: string]: PhysicalPayload };
 export interface PhysicalScope {
   requester: string;
   executor: string;
   environment: { environment: string; evidenceClass: "simulation" | "hardware"; offerExpiry: number };
-  intent: { kind: "micro_duck_velocity_v1"; parameters: { vxMps: number; vyMps: number; vyawRadps: number; frame: string } };
+  /** Opaque capability payload; its schema and meaning belong to the device binding. */
+  intent: { capabilityId: string; payload: PhysicalPayload; payloadDigest: string };
   execution: { actionDurationUs: number; leaseDurationUs: number; totalExecutionUs: number; actionCount: number };
   qualification: { requiredEnforcementClass: "adapter_isolation_only" | "native_fence"; expiresAt: number };
   completion: unknown;
@@ -44,4 +46,11 @@ export type PhysicalProductRequest =
 export function physicalReviewFresh(review: PhysicalReview | null, now = Date.now()): boolean {
   return Boolean(review && now < review.scope.environment.offerExpiry && now < review.scope.qualification.expiresAt
     && (!review.approval || now < review.approval.expiresAt));
+}
+/** Flatten a payload into pointer = value lines for review, without interpreting it. */
+export function physicalPayloadEntries(payload: PhysicalPayload, prefix = ""): [string, string][] {
+  if (payload !== null && typeof payload === "object") {
+    return Object.entries(payload).flatMap(([key, value]) => physicalPayloadEntries(value, `${prefix}/${key}`));
+  }
+  return [[prefix || "/", String(payload)]];
 }

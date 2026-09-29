@@ -67,6 +67,7 @@ pub(super) fn lineage(
     )?;
     let s = scope.fields();
     let sub = &s.environment.subsystems[&s.profile.subsystem];
+    let frame = completion(&scope)?.frame;
     let l = EvidenceLineageV1 {
         version: VersionV1,
         environment: a.environment,
@@ -79,10 +80,10 @@ pub(super) fn lineage(
         body: sub.body.clone(),
         body_incarnation: sub.body_incarnation.clone(),
         world: sub.world_incarnation.clone(),
-        frame: completion(&scope).frame.clone(),
+        frame,
         schema: label("microduck.displacement-measured.v1"),
         evidence_class: s.environment.evidence_class,
-        witness: completion(&scope).witness,
+        witness: s.completion.witness,
         qualification_digest: s.qualification.digest()?,
         origin: digest("pastey-physical-measured-origin-v1", &(id, &a.scope_digest))?,
     };
@@ -255,7 +256,7 @@ impl PhysicalStoreV1 {
             producer_qualification: qid.clone(),
             producer_qualification_digest: producer_q.digest()?,
             qualified: qualified(&tx, &l, &s, qid, f.capture_us)?
-                && receipt_us - f.capture_us <= completion(&s).observation.max_age_us.get(),
+                && receipt_us - f.capture_us <= s.fields().completion.observation.max_age_us.get(),
         };
         insert_fact(
             &tx,
@@ -322,7 +323,7 @@ impl PhysicalStoreV1 {
             producer_qualification: qid.clone(),
             producer_qualification_digest: producer_q.digest()?,
             qualified: qualified(&tx, &l, &s, qid, f.capture_us)?
-                && receipt_us - f.capture_us <= completion(&s).observation.max_age_us.get(),
+                && receipt_us - f.capture_us <= s.fields().completion.observation.max_age_us.get(),
         };
         insert_fact(
             &tx,
@@ -479,7 +480,7 @@ impl PhysicalStoreV1 {
         let s = super::control_ledger::session(&tx, &p.session)?;
         require(
             p.qualification_digest == s.qualification_digest
-                && p.frame == completion(&s.scope).frame
+                && completion(&s.scope).is_ok_and(|c| p.frame == c.frame)
                 && p.freshness.max_age_us <= s.scope.fields().freshness.observation.max_age_us
                 && p.freshness.max_gap_us <= s.scope.fields().freshness.observation.max_gap_us,
             "Handover policy lineage mismatch",
@@ -913,7 +914,7 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         require(
             r.get::<_, String>("session_id")? == text(&p.session)
                 && p.qualification_digest == s.qualification_digest
-                && p.frame == completion(&s.scope).frame
+                && completion(&s.scope).is_ok_and(|c| p.frame == c.frame)
                 && p.freshness.max_age_us <= s.scope.fields().freshness.observation.max_age_us
                 && p.freshness.max_gap_us <= s.scope.fields().freshness.observation.max_gap_us
                 && r.get::<_, String>("digest")?

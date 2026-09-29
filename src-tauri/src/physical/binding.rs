@@ -203,6 +203,11 @@ enum BindingProvenanceV1 {
     GateBSupervisor,
     QualifiedNativeHandshake,
 }
+/// Binding-owned check of the device semantics Core does not interpret: the
+/// payload schema and contract parameters of a scope. Core calls it before any
+/// review, approval, start or grant; failure is fail-closed.
+pub(super) type ScopeSchemaCheckV1 =
+    Arc<dyn Fn(&super::contracts::ReviewScopeFieldsV1) -> AppResult<()> + Send + Sync>;
 pub(super) struct TrustedBindingFactsV1 {
     challenge: BindingChallengeV1,
     runtime: LocalRuntimeRef,
@@ -216,6 +221,7 @@ pub(super) struct TrustedBindingFactsV1 {
     subsystems: BTreeMap<LabelV1, SubsystemBindingViewV1>,
     producer_live: Option<Arc<AtomicBool>>,
     producer_check: Option<Arc<dyn Fn() -> AppResult<()> + Send + Sync>>,
+    schema_check: ScopeSchemaCheckV1,
 }
 pub(super) struct TrustedQualificationEvidenceV1 {
     owner: DigestV1,
@@ -278,8 +284,15 @@ pub(super) struct EnvironmentBindingV1 {
     valid: Arc<AtomicBool>,
     producer_live: Option<Arc<AtomicBool>>,
     producer_check: Option<Arc<dyn Fn() -> AppResult<()> + Send + Sync>>,
+    schema_check: ScopeSchemaCheckV1,
 }
 impl EnvironmentBindingV1 {
+    pub(super) fn validate_scope_schema(
+        &self,
+        scope: &super::contracts::ReviewScopeFieldsV1,
+    ) -> AppResult<()> {
+        (self.schema_check)(scope)
+    }
     pub(in crate::physical) fn requires_owned_native_run(&self) -> bool {
         self.provenance == BindingProvenanceV1::GateBSupervisor
     }
@@ -510,6 +523,7 @@ impl PhysicalBindingResolverV1 {
             deadline_ticks,
             producer_live: facts.producer_live,
             producer_check: facts.producer_check,
+            schema_check: facts.schema_check,
             provenance: facts.provenance,
             provenance_evidence_digest: facts.evidence_digest,
             valid,
@@ -719,6 +733,13 @@ pub(super) mod test_support {
     ) -> &mut EnvironmentRegistrationV1 {
         &mut e.record
     }
+    pub(in crate::physical) fn with_schema_check(
+        mut facts: TrustedBindingFactsV1,
+        check: ScopeSchemaCheckV1,
+    ) -> TrustedBindingFactsV1 {
+        facts.schema_check = check;
+        facts
+    }
     pub(in crate::physical) fn facts(
         resolver: &PhysicalBindingResolverV1,
         c: BindingChallengeV1,
@@ -738,6 +759,8 @@ pub(super) mod test_support {
             },
             producer_live: None,
             producer_check: None,
+            // Fake bindings accept any schema; the hook itself is tested separately.
+            schema_check: Arc::new(|_| Ok(())),
             evidence_digest: view.configuration_digest.clone(),
             configuration_digest: view.configuration_digest.clone(),
             evidence_class: view.evidence_class,
@@ -811,6 +834,7 @@ impl PhysicalBindingResolverV1 {
             subsystems: reg.subsystems,
             producer_live: Some(run.live_flag()),
             producer_check: None,
+            schema_check: Arc::new(super::core::microduck_capability::validate_scope),
         })
     }
     pub(in crate::physical) fn qualify_gate_a(
@@ -933,6 +957,7 @@ impl PhysicalBindingResolverV1 {
                 let run = run.clone();
                 Arc::new(move || run.validate_fresh())
             }),
+            schema_check: Arc::new(super::core::microduck_capability::validate_scope),
         })
     }
     pub(in crate::physical) fn qualify_gate_b(
@@ -957,10 +982,13 @@ impl PhysicalBindingResolverV1 {
                 && profile.required_enforcement_class == SessionEnforcementClassV1::NativeFence
                 && profile.execution.action_duration_us.get() == 1_000_000
                 && profile.execution.total_execution_us.get() == 1_000_000
-                && profile.velocity_limits.max_abs_vx_mps.get()
-                    == crate::physical::native_protocol::REFERENCE_FORWARD_MPS
-                && profile.velocity_limits.max_abs_vy_mps.get() == 0.
-                && profile.velocity_limits.max_abs_vyaw_radps.get() == 0.
+                && super::core::microduck_capability::require_velocity_descriptor(
+                    &profile.capability,
+                    crate::physical::native_protocol::REFERENCE_FORWARD_MPS,
+                    0.,
+                    0.,
+                )
+                .is_ok()
                 && profile.execution.action_count == 1
                 && profile.execution.lease_duration_us.get() <= 3_000_000
                 && profile.freshness.proposal.0.get() <= 200_000

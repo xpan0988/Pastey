@@ -7,7 +7,10 @@ use serde::{de::DeserializeOwned, Serialize};
 use super::{
     binding::EnvironmentRegistrationV1, contracts::PhysicalQualificationV1, require, values::*,
 };
-use crate::{error::AppResult, storage::AppPaths};
+use crate::{
+    error::{AppError, AppResult},
+    storage::AppPaths,
+};
 
 #[path = "store_control.rs"]
 mod control_ledger;
@@ -102,6 +105,84 @@ CREATE TRIGGER physical_environment_domains_keep BEFORE DELETE ON physical_envir
 BEGIN SELECT RAISE(ABORT, 'physical domain membership required'); END;
 "#;
 
+/// Physical ledger *content* format, independent of the DDL stage versions.
+/// Bump it whenever a persisted record body (scope, intent, evidence or
+/// qualification JSON) changes incompatibly. Record bodies are never migrated:
+/// a ledger holding rows in an older format fails closed until reset, which
+/// keeps only the identity/epoch/environment tables in RETAINED_TABLES.
+/// The marker table is orthogonal to the DDL stages: stage recognition ignores
+/// it, stage rebuilds leave it untouched and it is verified on its own.
+pub(super) const LEDGER_FORMAT: i64 = 2;
+pub(super) const LEDGER_META_TABLE: &str = "physical_ledger_meta";
+const LEDGER_META: &str = "CREATE TABLE physical_ledger_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format_version INTEGER NOT NULL CHECK(format_version>=1)) STRICT;";
+// Per-stage `*_schema` singletons are version markers, not content.
+const RETAINED_TABLES: [&str; 6] = [
+    "physical_schema",
+    "physical_ledger_meta",
+    "physical_domains",
+    "physical_aliases",
+    "physical_environments",
+    "physical_environment_domains",
+];
+fn ledger_meta_objects(conn: &Connection) -> AppResult<Vec<(String, Option<String>)>> {
+    Ok(conn
+        .prepare("SELECT name, sql FROM sqlite_master WHERE tbl_name=?1 ORDER BY name")?
+        .query_map([LEDGER_META_TABLE], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?)
+}
+fn ledger_format(conn: &Connection) -> AppResult<Option<i64>> {
+    if ledger_meta_objects(conn)?.is_empty() {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT format_version FROM physical_ledger_meta WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+/// Runs before any stage audit decodes a record body. Detection is by format
+/// marker and row presence only; Core carries no decoder for older formats.
+fn ledger_format_gate(conn: &Connection) -> AppResult<()> {
+    let found = ledger_format(conn)?;
+    if found == Some(LEDGER_FORMAT) {
+        return Ok(());
+    }
+    require(
+        found.is_none_or(|v| v < LEDGER_FORMAT),
+        "Unknown newer physical ledger format",
+    )?;
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'physical_*' ORDER BY name")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for table in tables
+        .iter()
+        .filter(|t| !RETAINED_TABLES.contains(&t.as_str()) && !t.ends_with("_schema"))
+    {
+        let rows: i64 =
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
+        if rows > 0 {
+            return Err(AppError::InvalidInput(format!(
+                "legacy physical ledger (pre-decouple); reset required: format {} holds rows in {table}, \
+                 expected format {LEDGER_FORMAT} (see docs/development.md)",
+                found.map_or("none".to_owned(), |v| v.to_string())
+            )));
+        }
+    }
+    Ok(())
+}
+/// Only reachable after the gate proved no content rows exist in an older format.
+fn stamp_ledger_format(conn: &Connection) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO physical_ledger_meta(singleton,format_version) VALUES(1,?1) \
+         ON CONFLICT(singleton) DO UPDATE SET format_version=excluded.format_version",
+        [LEDGER_FORMAT],
+    )?;
+    Ok(())
+}
+
 fn text<T: Clone + Into<String>>(value: &T) -> String {
     value.clone().into()
 }
@@ -141,6 +222,10 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
     )?;
     if count == 0 {
         tx.execute_batch(SCHEMA)?;
+    }
+    ledger_format_gate(&tx)?;
+    if ledger_meta_objects(&tx)?.is_empty() {
+        tx.execute_batch(LEDGER_META)?;
     }
     // Only a complete, exactly recognized Stage 2 schema may gain the Core extension.
     let base = Connection::open_in_memory()?;
@@ -204,6 +289,7 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
         tx.execute_batch(qualification_ledger::SCHEMA)?;
     }
     verify_schema(&tx)?;
+    stamp_ledger_format(&tx)?;
     audit(&tx)?;
     let broken: bool = tx.prepare("PRAGMA foreign_key_check")?.exists([])?;
     require(!broken, "Physical migration foreign key mismatch")?;
@@ -238,8 +324,8 @@ fn verify_durability(conn: &Connection) -> AppResult<()> {
 }
 fn schema_objects(conn: &Connection) -> AppResult<Vec<(String, Option<String>)>> {
     Ok(conn
-        .prepare("SELECT name, sql FROM sqlite_master WHERE name GLOB 'physical_*' OR tbl_name GLOB 'physical_*' ORDER BY name")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .prepare("SELECT name, sql FROM sqlite_master WHERE (name GLOB 'physical_*' OR tbl_name GLOB 'physical_*') AND tbl_name!=?1 ORDER BY name")?
+        .query_map([LEDGER_META_TABLE], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?)
 }
 fn expected_schema() -> AppResult<&'static Vec<(String, Option<String>)>> {
@@ -254,10 +340,24 @@ fn expected_schema() -> AppResult<&'static Vec<(String, Option<String>)>> {
     }
     Ok(EXPECTED.get().expect("compiled schema initialized"))
 }
+fn expected_ledger_meta() -> AppResult<&'static Vec<(String, Option<String>)>> {
+    static EXPECTED: std::sync::OnceLock<Vec<(String, Option<String>)>> =
+        std::sync::OnceLock::new();
+    if EXPECTED.get().is_none() {
+        let expected = Connection::open_in_memory()?;
+        expected.execute_batch(LEDGER_META)?;
+        let _ = EXPECTED.set(ledger_meta_objects(&expected)?);
+    }
+    Ok(EXPECTED.get().expect("compiled ledger marker initialized"))
+}
 fn verify_schema(conn: &Connection) -> AppResult<()> {
     require(
         &schema_objects(conn)? == expected_schema()?,
         "Incompatible physical ledger schema",
+    )?;
+    require(
+        &ledger_meta_objects(conn)? == expected_ledger_meta()?,
+        "Incompatible physical ledger format marker",
     )?;
     control_ledger::verify_version(conn)?;
     core_ledger::verify_version(conn)?;
@@ -538,6 +638,10 @@ fn load_registration(
     decode(&raw)
 }
 fn audit(conn: &Connection) -> AppResult<()> {
+    require(
+        ledger_format(conn)? == Some(LEDGER_FORMAT),
+        "Physical ledger format mismatch",
+    )?;
     audit_facts(conn)?;
     core_ledger::audit(conn)?;
     control_ledger::audit(conn)?;

@@ -109,6 +109,22 @@ For a single-machine dual-instance smoke, create/join a Bridge and exercise sele
 - Source-level Native Agent reliability and deterministic two-Host state validation are complete. The test-only pair harness uses two independent durable Host states; it does not exercise physical machines.
 - Physical Native Agent proof still requires packaged builds on a Mac and a Windows Host and recorded acceptance evidence. The deterministic pair harness does not replace this pending procedure.
 
+## Physical ledger format resets (development)
+
+The physical ledger stores record bodies (review scopes, intents, evidence, qualification records) whose format is versioned by `physical_ledger_meta.format_version`. Record bodies are never migrated. When a build changes that format, starting Pastey against a ledger holding older-format rows fails closed with `legacy physical ledger (pre-decouple); reset required`. Ledgers whose older-format tables are all empty upgrade in place.
+
+Quit Pastey, then reset the development ledger:
+
+```bash
+python3 -B scripts/reset-physical-ledger.py --dry-run "$HOME/Library/Application Support/dev.localfirst.pastey/db.sqlite"
+```
+
+```bash
+python3 -B scripts/reset-physical-ledger.py "$HOME/Library/Application Support/dev.localfirst.pastey/db.sqlite"
+```
+
+Use the `db.sqlite` under `PASTEY_APP_DATA_DIR` when that override is set; the default path differs on Windows and Linux. The reset keeps physical domains (with their epoch floors), aliases, environment registrations and environment/domain membership. It removes qualifications, reviews, attempts, sessions, actions, evidence and the remote/native/qualification ledgers, so no old approval or root can be reused. The next start rebuilds the empty later-stage tables and stamps the current format.
+
 ## Native Agent focused validation
 
 The Native Agent path has focused Rust coverage in `native_agent`, `commands`, `room_control`, `transfer`, `storage`, and `host_runtime`. Run the available module tests with:

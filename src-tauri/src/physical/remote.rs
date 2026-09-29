@@ -729,23 +729,27 @@ impl PhysicalControlServiceV1 {
                     .await?;
                     // Same Stage 5 evaluator and L7 acceptance; no transport ACK
                     // or installation/write/stop ACK can become completion.
-                    let settling_deadline = {
+                    let evaluation_deadline = {
                         let service = core.lock();
                         let (_, ticks) = service.clock.read()?;
                         ticks
                             .checked_add(
-                                crate::physical::evidence::completion(session.root().scope())
-                                    .settling_timeout_us
+                                session
+                                    .root()
+                                    .scope()
+                                    .fields()
+                                    .completion
+                                    .evaluation_window_us
                                     .get(),
                             )
                             .ok_or_else(|| {
                                 crate::error::AppError::InvalidInput(
-                                    "Physical settling deadline overflow".into(),
+                                    "Physical evaluation deadline overflow".into(),
                                 )
                             })?
                     };
                     loop {
-                        if core.lock().clock.read()?.1 >= settling_deadline {
+                        if core.lock().clock.read()?.1 >= evaluation_deadline {
                             break;
                         }
                         let fact = {

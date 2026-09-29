@@ -417,4 +417,8 @@ test("physical review expiry, exact approval, and uncertain status stay separate
   assert.match(panel, /physicalReviewFresh\(r\)/);
   assert.match(panel, /stop acknowledgement does not prove physical rest/);
   assert.doesNotMatch(panel, /robot\.enable|setApproval|authorityToken/);
+  // The renderer shows capability payloads generically, never device fields.
+  assert.doesNotMatch(panel, /vxMps|vyawRadps|micro_duck/);
+  const { physicalPayloadEntries } = await import("../src/lib/physical");
+  assert.deepEqual(physicalPayloadEntries({ volumeMl: 5, nozzle: { id: "a" } }), [["/volumeMl", "5"], ["/nozzle/id", "a"]]);
 });

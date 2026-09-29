@@ -1,4 +1,5 @@
 //! Versioned claims for exact physical actions. None is executable authority.
+pub(crate) use super::descriptor::*;
 use super::{binding::EnvironmentBindingViewV1, require, values::*};
 use crate::{error::AppResult, host_identity::HostRef};
 use serde::{Deserialize, Serialize};
@@ -9,67 +10,35 @@ pub(crate) enum PhysicalScopeModeV1 {
     Exact,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CapabilityV1 {
-    MicroDuckVelocityV1,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum MicroDuckFrameV1 {
-    Trunk,
-}
-
-claim!(MicroDuckVelocityV1 {
-    vx_mps: Finite,
-    vy_mps: Finite,
-    vyaw_radps: Finite,
-    frame: MicroDuckFrameV1,
+// Exact capability payload. Its schema (payload_schema_digest) and meaning
+// belong to the binding; Core checks identity, digest and bounded dimensions.
+claim!(PhysicalIntentV1 {
+    capability_id: SemanticIdV1,
+    payload: CanonicalJsonV1,
+    payload_digest: DigestV1,
 });
-impl MicroDuckVelocityV1 {
-    pub fn validate(&self) -> AppResult<()> {
-        Ok(())
-    } // Checked scalar/frame types.
-}
-
-/// A capability-specific payload, not a universal body command vector.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "parameters",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub(crate) enum PhysicalIntentV1 {
-    MicroDuckVelocityV1(MicroDuckVelocityV1),
-}
 impl PhysicalIntentV1 {
+    pub fn new(capability_id: SemanticIdV1, payload: CanonicalJsonV1) -> AppResult<Self> {
+        let payload_digest = payload_digest(&capability_id, &payload)?;
+        Ok(Self {
+            capability_id,
+            payload,
+            payload_digest,
+        })
+    }
+    pub fn validate(&self) -> AppResult<()> {
+        require(
+            self.payload_digest == payload_digest(&self.capability_id, &self.payload)?,
+            "Intent payload digest mismatch",
+        )
+    }
     pub fn digest(&self) -> AppResult<DigestV1> {
-        digest("pastey-physical-intent-v1", self)
+        self.validate()?;
+        Ok(self.payload_digest.clone())
     }
 }
-
-claim!(VelocityLimitsV1 {
-    max_abs_vx_mps: NonNegative,
-    max_abs_vy_mps: NonNegative,
-    max_abs_vyaw_radps: NonNegative,
-});
-impl VelocityLimitsV1 {
-    pub fn validate(&self) -> AppResult<()> {
-        Ok(())
-    }
-    pub fn contains(&self, intent: &PhysicalIntentV1) -> bool {
-        let PhysicalIntentV1::MicroDuckVelocityV1(v) = intent;
-        v.vx_mps.get().abs() <= self.max_abs_vx_mps.get()
-            && v.vy_mps.get().abs() <= self.max_abs_vy_mps.get()
-            && v.vyaw_radps.get().abs() <= self.max_abs_vyaw_radps.get()
-    }
-    pub(super) fn is_subset_of(&self, ceiling: &Self) -> bool {
-        self.max_abs_vx_mps <= ceiling.max_abs_vx_mps
-            && self.max_abs_vy_mps <= ceiling.max_abs_vy_mps
-            && self.max_abs_vyaw_radps <= ceiling.max_abs_vyaw_radps
-    }
+fn payload_digest(id: &SemanticIdV1, payload: &CanonicalJsonV1) -> AppResult<DigestV1> {
+    digest("pastey-physical-intent-v1", &(id, payload))
 }
 
 /// Admission-time constraint. Not a lease or action lifetime.
@@ -136,35 +105,14 @@ impl ExecutionBudgetV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum NativeBoundaryV1 {
-    MicroDuckRobotIntentV1,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum LossContractV1 {
-    MicroDuckZeroTwistV1,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum StartContractV1 {
-    MicroDuckStandingNoSkillV1,
-}
-
 claim!(PhysicalCapabilityProfileV1 {
     version: VersionV1,
-    capability: CapabilityV1,
-    native_boundary: NativeBoundaryV1,
+    capability: CapabilityDescriptorV1,
     subsystem: LabelV1,
-    domain: DomainId,
     evidence_class: EvidenceClassV1,
     required_enforcement_class: SessionEnforcementClassV1,
-    velocity_limits: VelocityLimitsV1,
     execution: ExecutionBudgetV1,
     freshness: PhysicalFreshnessV1,
-    start: StartContractV1,
-    loss: LossContractV1,
 });
 impl PhysicalCapabilityProfileV1 {
     pub fn validate(&self) -> AppResult<()> {
@@ -173,7 +121,7 @@ impl PhysicalCapabilityProfileV1 {
         require(
             self.evidence_class != EvidenceClassV1::Hardware
                 || self.required_enforcement_class == SessionEnforcementClassV1::NativeFence,
-            "The isolation-only MicroDuck profile is simulation-only",
+            "An isolation-only profile is simulation-only",
         )
     }
     pub fn digest(&self) -> AppResult<DigestV1> {
@@ -188,11 +136,13 @@ impl PhysicalCapabilityProfileV1 {
             "Profile evidence class mismatch",
         )?;
         require(
-            binding
-                .subsystems
-                .get(&self.subsystem)
-                .is_some_and(|s| s.domains.contains(&self.domain)),
-            "Missing profile subsystem/domain",
+            binding.subsystems.get(&self.subsystem).is_some_and(|s| {
+                self.capability
+                    .conflict_domains
+                    .iter()
+                    .all(|d| s.domains.contains(d))
+            }),
+            "Missing profile subsystem/conflict domain",
         )
     }
 }
@@ -260,47 +210,18 @@ pub(crate) enum CompletionWitnessV1 {
     SimulationOracle,
 }
 
-// Parameters only: no evaluator, observation stream or acceptance implementation.
-claim!(MicroDuckCompletionV1 {
+// Review-time completion requirements. The predicate is the capability's own
+// (binding-evaluated) contract; Core checks witness, freshness and the window.
+claim!(PhysicalCompletionContractV1 {
+    predicate: ContractRefV1,
     witness: CompletionWitnessV1,
-    frame: LabelV1,
-    min_forward_m: NonNegative,
-    max_forward_m: NonNegative,
-    max_lateral_m: NonNegative,
-    max_settled_speed_mps: NonNegative,
-    max_settled_angular_radps: NonNegative,
-    max_position_uncertainty_m: NonNegative,
-    no_fall: bool,
-    dwell_us: PositiveMicros,
-    settling_timeout_us: PositiveMicros,
     observation: ObservationFreshnessV1,
+    evaluation_window_us: PositiveMicros,
 });
-impl MicroDuckCompletionV1 {
+impl PhysicalCompletionContractV1 {
     pub fn validate(&self) -> AppResult<()> {
-        require(
-            self.min_forward_m <= self.max_forward_m,
-            "Inverted displacement interval",
-        )?;
-        require(
-            self.dwell_us <= self.settling_timeout_us,
-            "Dwell exceeds settling timeout",
-        )?;
-        require(
-            self.no_fall,
-            "MicroDuck v1 requires the no-fall completion predicate",
-        )?;
         self.observation.validate()
     }
-}
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "parameters",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub(crate) enum PhysicalCompletionContractV1 {
-    MicroDuckDisplacementSettledV1(MicroDuckCompletionV1),
 }
 
 claim!(ReviewScopeFieldsV1 {
@@ -313,11 +234,11 @@ claim!(ReviewScopeFieldsV1 {
     qualification: PhysicalQualificationV1,
     mode: PhysicalScopeModeV1,
     intent: PhysicalIntentV1,
-    velocity_limits: VelocityLimitsV1,
+    bounds: BoundSetV1,
     execution: ExecutionBudgetV1,
     freshness: PhysicalFreshnessV1,
     completion: PhysicalCompletionContractV1,
-    loss: LossContractV1,
+    loss: ContractRefV1,
 });
 impl ReviewScopeFieldsV1 {
     pub fn validate(&self) -> AppResult<()> {
@@ -328,11 +249,15 @@ impl ReviewScopeFieldsV1 {
             .validate_for(&self.profile, &self.environment)?;
         self.execution.validate()?;
         self.freshness.validate()?;
+        let capability = &self.profile.capability;
         require(
-            self.velocity_limits
-                .is_subset_of(&self.profile.velocity_limits)
-                && self.velocity_limits.contains(&self.intent),
-            "Intent/velocity bounds exceed profile",
+            self.intent.capability_id == capability.capability_id,
+            "Intent capability differs from profile",
+        )?;
+        require(
+            self.bounds.is_subset_of(&capability.bounds)
+                && self.bounds.contains(&self.intent.payload),
+            "Intent/bounds exceed profile",
         )?;
         require(
             self.execution.is_subset_of(&self.profile.execution),
@@ -342,9 +267,15 @@ impl ReviewScopeFieldsV1 {
             self.freshness.is_subset_of(&self.profile.freshness),
             "Freshness weakens profile",
         )?;
-        require(self.loss == self.profile.loss, "Loss contract mismatch")?;
-        let PhysicalCompletionContractV1::MicroDuckDisplacementSettledV1(c) = &self.completion;
-        c.validate()?;
+        require(
+            self.loss == capability.loss_profile,
+            "Loss contract mismatch",
+        )?;
+        let c = &self.completion;
+        require(
+            c.predicate == capability.completion_predicate,
+            "Completion predicate differs from qualified capability",
+        )?;
         require(
             c.witness != CompletionWitnessV1::SimulationOracle
                 || self.environment.evidence_class == EvidenceClassV1::Simulation,

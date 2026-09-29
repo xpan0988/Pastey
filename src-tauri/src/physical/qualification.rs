@@ -1,5 +1,5 @@
 //! Exact owned MicroDuck qualification. Data never reconstructs the producer.
-use super::{microduck, *};
+use super::{microduck, microduck_capability, *};
 use crate::physical::{binding::*, native_protocol as wire};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -718,7 +718,7 @@ pub(crate) async fn provision_host(
     let result = (|| {
         // The Host's review policy remains HOW-independent and is validated against
         // this exact fixed capability ceiling. It cannot supply qualification facts.
-        ceiling.profile.domain = domain;
+        ceiling.profile.capability.conflict_domains = vec![domain];
         ceiling.profile.required_enforcement_class = SessionEnforcementClassV1::NativeFence;
         let mut c = host.physical_control.lock();
         let i = c.local_ingress()?;
@@ -727,12 +727,12 @@ pub(crate) async fn provision_host(
         ceiling.qualification = q;
         ceiling.executor = host.local_host_ref.clone();
         ceiling.requester = host.local_host_ref.clone();
-        let PhysicalIntentV1::MicroDuckVelocityV1(v) = &ceiling.intent;
         require(
-            v.frame == MicroDuckFrameV1::Trunk
-                && v.vx_mps.get() == wire::REFERENCE_FORWARD_MPS
-                && v.vy_mps.get() == 0.
-                && v.vyaw_radps.get() == 0.,
+            microduck_capability::VelocityV1::from_intent(&ceiling.intent)?.is(
+                wire::REFERENCE_FORWARD_MPS,
+                0.,
+                0.,
+            ),
             "Native release exact intent mismatch",
         )?;
         let scope = PhysicalReviewScopeV1::try_from(ceiling)?;

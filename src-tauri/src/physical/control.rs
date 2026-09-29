@@ -4,6 +4,8 @@
 pub(in crate::physical) mod gate_b;
 #[path = "adapters/microduck.rs"]
 pub(in crate::physical) mod microduck;
+#[path = "adapters/microduck_capability.rs"]
+pub(in crate::physical) mod microduck_capability;
 use super::*;
 use crate::physical::binding::EnvironmentBindingViewV1;
 use crate::physical::store::{ActionAuditV1, FenceAuditV1, SessionAuditV1};

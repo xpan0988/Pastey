@@ -808,12 +808,9 @@ pub(super) fn label(s: &str) -> LabelV1 {
     LabelV1::try_from(s.to_owned()).expect("registered label")
 }
 fn exact_velocity(payload: &PhysicalIntentV1) -> AppResult<RequestV1> {
-    let PhysicalIntentV1::MicroDuckVelocityV1(v) = payload;
+    let v = super::microduck_capability::VelocityV1::from_intent(payload)?;
     require(
-        v.frame == MicroDuckFrameV1::Trunk
-            && v.vx_mps.get() == 0.05
-            && v.vy_mps.get() == 0.0
-            && v.vyaw_radps.get() == 0.0,
+        v.is(0.05, 0.0, 0.0),
         "Gate A enables only the exact reference velocity",
     )?;
     Ok(RequestV1::Move {

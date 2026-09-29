@@ -811,9 +811,8 @@ async fn durable_consequence_and_reconciliation_cannot_be_rewritten() {
 async fn registered_evaluator_timeout_and_simulation_hardware_boundary() {
     let f = EvidenceFixture::new().await;
     let mut fields = f.control.scope.fields().clone();
-    let PhysicalCompletionContractV1::MicroDuckDisplacementSettledV1(c) = &mut fields.completion;
-    c.dwell_us = micros(100_000);
-    c.settling_timeout_us = micros(300_000);
+    edit_completion(&mut fields, |c| c.dwell_us = micros(100_000));
+    fields.completion.evaluation_window_us = micros(300_000);
     let scope = PhysicalReviewScopeV1::try_from(fields.clone()).unwrap();
     let mut l = f.lineage.clone();
     let receipt =
@@ -901,8 +900,7 @@ async fn registered_evaluator_timeout_and_simulation_hardware_boundary() {
     fields.qualification.evidence_class = EvidenceClassV1::Hardware;
     fields.qualification.binding_digest = fields.environment.digest().unwrap();
     assert!(PhysicalReviewScopeV1::try_from(fields.clone()).is_err());
-    let PhysicalCompletionContractV1::MicroDuckDisplacementSettledV1(c) = &mut fields.completion;
-    c.witness = CompletionWitnessV1::NativeMeasured;
+    fields.completion.witness = CompletionWitnessV1::NativeMeasured;
     let hardware = PhysicalReviewScopeV1::try_from(fields).unwrap();
     l.evidence_class = EvidenceClassV1::Hardware;
     l.witness = CompletionWitnessV1::NativeMeasured;

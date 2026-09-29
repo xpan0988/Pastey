@@ -421,12 +421,9 @@ impl GateBNativeLaneV1 {
                 view.binding == run.binding && view.validity.allows(),
                 "Invalid native action view",
             )?;
-            let PhysicalIntentV1::MicroDuckVelocityV1(payload) = &view.payload;
+            let payload = super::microduck_capability::VelocityV1::from_intent(&view.payload)?;
             require(
-                payload.frame == MicroDuckFrameV1::Trunk
-                    && payload.vx_mps.get() == wire::REFERENCE_FORWARD_MPS
-                    && payload.vy_mps.get() == 0.0
-                    && payload.vyaw_radps.get() == 0.0,
+                payload.is(wire::REFERENCE_FORWARD_MPS, 0.0, 0.0),
                 "Native profile admits only exact reference velocity",
             )?;
             let mut lane = run.lane.lock();

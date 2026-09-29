@@ -43,6 +43,7 @@ macro_rules! claim {
 pub(crate) mod binding;
 pub(crate) mod contracts;
 pub(crate) mod core;
+pub(crate) mod descriptor;
 pub(crate) mod evidence;
 #[path = "../../../native/microduck/overlay/duck-ipc-proto/src/task_authority.rs"]
 pub(in crate::physical) mod native_protocol;

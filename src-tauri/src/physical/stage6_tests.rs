@@ -28,7 +28,7 @@ impl GateA {
             policy_assets: vec![],
             environment: binding().environment,
             body: binding().subsystems[&label("locomotion")].body.clone(),
-            domain: profile().domain,
+            domain: profile().capability.conflict_domains[0].clone(),
             revision: 1,
         };
         let runtime = LocalRuntimeRef::fresh(executor);
@@ -439,7 +439,7 @@ fn unqualified_platform_launch_fails_closed() {
             policy_assets: vec![],
             environment: binding().environment,
             body: binding().subsystems[&label("locomotion")].body.clone(),
-            domain: profile().domain,
+            domain: profile().capability.conflict_domains[0].clone(),
             revision: 1
         },
         LocalRuntimeRef::fresh(host("executor")),
@@ -461,12 +461,7 @@ fn exact_si_trunk_mapping_rejects_every_changed_velocity() {
         (0.05, 0., 0.01),
         (-0.05, 0., 0.),
     ] {
-        let changed = PhysicalIntentV1::MicroDuckVelocityV1(MicroDuckVelocityV1 {
-            vx_mps: Finite::try_from(vx).unwrap(),
-            vy_mps: Finite::try_from(vy).unwrap(),
-            vyaw_radps: Finite::try_from(yaw).unwrap(),
-            frame: MicroDuckFrameV1::Trunk,
-        });
+        let changed = velocity_intent(vx, vy, yaw);
         assert!(supervisor::mapping(&changed).is_err());
     }
 }
@@ -698,7 +693,7 @@ fn local_robotd_simulator_supervision_probe() {
         .collect(),
         environment: binding().environment,
         body: binding().subsystems[&label("locomotion")].body.clone(),
-        domain: profile().domain,
+        domain: profile().capability.conflict_domains[0].clone(),
         revision: 1,
     };
     let run = MicroDuckRunV1::launch(

@@ -240,10 +240,10 @@ struct NativeProfile {
 #[tokio::test]
 async fn native_reference_payload_matches_protocol_on_dispatch_and_refresh() {
     let n = NativeProfile::new();
-    let PhysicalIntentV1::MicroDuckVelocityV1(v) = &n.f.scope.fields().intent;
+    let v = md::VelocityV1::from_intent(&n.f.scope.fields().intent).unwrap();
     assert_eq!(v.vx_mps.get(), wire::REFERENCE_FORWARD_MPS);
     assert_eq!(
-        n.f.scope.fields().velocity_limits.max_abs_vx_mps.get(),
+        abs_max(&n.f.scope.fields().bounds, "/vxMps"),
         wire::REFERENCE_FORWARD_MPS
     );
     let s = n.active().await;
@@ -496,7 +496,7 @@ impl NativeProfile {
             policy_assets: vec![],
             environment: binding().environment,
             body: binding().subsystems.values().next().unwrap().body.clone(),
-            domain: profile().domain,
+            domain: profile().capability.conflict_domains[0].clone(),
             revision: 1,
         };
         let (run, harness) = supervisor::native_run(config, runtime.clone(), clock.clone(), bundle);
@@ -508,10 +508,7 @@ impl NativeProfile {
         let mut p = profile();
         p.required_enforcement_class = SessionEnforcementClassV1::NativeFence;
         p.execution.lease_duration_us = micros(2_000_000);
-        p.velocity_limits.max_abs_vx_mps =
-            NonNegative::try_from(wire::REFERENCE_FORWARD_MPS).unwrap();
-        p.velocity_limits.max_abs_vy_mps = NonNegative::try_from(0.).unwrap();
-        p.velocity_limits.max_abs_vyaw_radps = NonNegative::try_from(0.).unwrap();
+        p.capability.bounds = md::velocity_bounds(wire::REFERENCE_FORWARD_MPS, 0., 0.).unwrap();
         let (live, q) = c.enroll_qualify_gate_b(&i, &run, &p, None).unwrap();
         let mut fields = scope_fields();
         fields.requester = host("executor");
@@ -519,9 +516,8 @@ impl NativeProfile {
         fields.profile = p.clone();
         fields.qualification = q;
         fields.execution = p.execution.clone();
-        fields.velocity_limits = p.velocity_limits.clone();
-        let PhysicalIntentV1::MicroDuckVelocityV1(v) = &mut fields.intent;
-        v.vx_mps = Finite::try_from(wire::REFERENCE_FORWARD_MPS).unwrap();
+        fields.bounds = p.capability.bounds.clone();
+        fields.intent = velocity_intent(wire::REFERENCE_FORWARD_MPS, 0., 0.);
         let scope = PhysicalReviewScopeV1::try_from(fields).unwrap();
         c.configure_executor_policy(
             &i,
@@ -1362,7 +1358,7 @@ fn gate_a_cannot_produce_native_binding_or_downgrade_native_run() {
         policy_assets: vec![],
         environment: binding().environment,
         body: binding().subsystems.values().next().unwrap().body.clone(),
-        domain: profile().domain,
+        domain: profile().capability.conflict_domains[0].clone(),
         revision: 2,
     };
     let (run, h) = supervisor::run(config, core_fake::runtime(&c), n.f.clock.clone());
@@ -1739,7 +1735,7 @@ fn qualified_record_cannot_authorize_replacement_controller_or_offer() {
             .unwrap()
             .body
             .clone(),
-        domain: n.f.scope.fields().profile.domain.clone(),
+        domain: n.f.scope.fields().profile.capability.conflict_domains[0].clone(),
         revision: 2,
     };
     let runtime = core_fake::runtime(&n.f.core.lock());
@@ -1810,7 +1806,7 @@ fn production_owned_launcher_denies_this_platform_before_adopting_any_path() {
             policy_assets: vec![],
             environment: binding().environment,
             body: binding().subsystems.values().next().unwrap().body.clone(),
-            domain: profile().domain,
+            domain: profile().capability.conflict_domains[0].clone(),
             revision: 1,
         },
     };
@@ -1854,7 +1850,7 @@ async fn real_owned_gate_b_qualification_review_execution_and_acceptance() {
             policy_assets: vec![path("PASTEY_GATE_B_WALK")],
             environment: binding().environment,
             body: binding().subsystems.values().next().unwrap().body.clone(),
-            domain: profile().domain,
+            domain: profile().capability.conflict_domains[0].clone(),
             revision: 1,
         },
     };
@@ -1885,9 +1881,7 @@ async fn real_owned_gate_b_qualification_review_execution_and_acceptance() {
     let mut p = profile();
     p.required_enforcement_class = SessionEnforcementClassV1::NativeFence;
     p.execution.lease_duration_us = micros(2_000_000);
-    p.velocity_limits.max_abs_vx_mps = NonNegative::try_from(wire::REFERENCE_FORWARD_MPS).unwrap();
-    p.velocity_limits.max_abs_vy_mps = NonNegative::try_from(0.).unwrap();
-    p.velocity_limits.max_abs_vyaw_radps = NonNegative::try_from(0.).unwrap();
+    p.capability.bounds = md::velocity_bounds(wire::REFERENCE_FORWARD_MPS, 0., 0.).unwrap();
     let (scope, session, adapter) = {
         let mut c = core.lock();
         let i = c.local_ingress().unwrap();
@@ -1898,9 +1892,8 @@ async fn real_owned_gate_b_qualification_review_execution_and_acceptance() {
         fields.profile = p.clone();
         fields.qualification = q;
         fields.execution = p.execution.clone();
-        fields.velocity_limits = p.velocity_limits.clone();
-        let PhysicalIntentV1::MicroDuckVelocityV1(v) = &mut fields.intent;
-        v.vx_mps = Finite::try_from(wire::REFERENCE_FORWARD_MPS).unwrap();
+        fields.bounds = p.capability.bounds.clone();
+        fields.intent = velocity_intent(wire::REFERENCE_FORWARD_MPS, 0., 0.);
         let scope = PhysicalReviewScopeV1::try_from(fields).unwrap();
         c.configure_executor_policy(
             &i,
@@ -1954,7 +1947,7 @@ async fn real_owned_gate_b_qualification_review_execution_and_acceptance() {
     )
     .await
     .unwrap();
-    let until = clock.read().unwrap().1 + completion(&scope).settling_timeout_us.get();
+    let until = clock.read().unwrap().1 + scope.fields().completion.evaluation_window_us.get();
     let result = loop {
         assert!(
             clock.read().unwrap().1 < until,

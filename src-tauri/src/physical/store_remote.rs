@@ -47,8 +47,9 @@ pub(super) fn migrate(c: &Connection) -> AppResult<()> {
 }
 pub(super) fn rebuild(c: &Connection, ddl: &str) -> AppResult<()> {
     use rusqlite::types::Value;
-    let names: Vec<String> = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'physical_*' ORDER BY name")?
-        .query_map([], |r| r.get(0))?.collect::<Result<_,_>>()?;
+    // The ledger format marker is not part of any DDL stage and is kept as is.
+    let names: Vec<String> = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'physical_*' AND name!=?1 ORDER BY name")?
+        .query_map([super::LEDGER_META_TABLE], |r| r.get(0))?.collect::<Result<_,_>>()?;
     let mut saved = Vec::new();
     for name in &names {
         let mut stmt = c.prepare(&format!("SELECT * FROM {name}"))?;
@@ -64,9 +65,9 @@ pub(super) fn rebuild(c: &Connection, ddl: &str) -> AppResult<()> {
     }
     let triggers: Vec<String> = c
         .prepare(
-            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name GLOB 'physical_*'",
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name GLOB 'physical_*' AND tbl_name!=?1",
         )?
-        .query_map([], |r| r.get(0))?
+        .query_map([super::LEDGER_META_TABLE], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
     for t in triggers {
         c.execute_batch(&format!("DROP TRIGGER {t}"))?;

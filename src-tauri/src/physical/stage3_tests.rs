@@ -185,7 +185,7 @@ fn immutable_scope_and_new_revision_expire_old_approval_and_root() {
         )
         .is_err());
     let scope = changed(&f.scope, |s| {
-        s.velocity_limits.max_abs_vx_mps = NonNegative::try_from(0.08).unwrap()
+        s.bounds = with_abs_max(&s.bounds, "/vxMps", 0.08)
     });
     let ingress = f.core.local_ingress().unwrap();
     let next = f
@@ -497,7 +497,7 @@ fn root_expiry_is_wall_and_monotonic_and_never_reopens() {
 fn executor_policy_is_intersection_and_grant_basis_is_only_narrower() {
     let mut f = Fixture::new();
     let narrow = changed(&f.scope, |s| {
-        s.velocity_limits.max_abs_vx_mps = NonNegative::try_from(0.06).unwrap();
+        s.bounds = with_abs_max(&s.bounds, "/vxMps", 0.06);
         s.execution.action_duration_us = micros(800000);
         s.execution.total_execution_us = micros(900000);
         s.execution.lease_duration_us = micros(850000);
@@ -538,9 +538,9 @@ fn executor_policy_is_intersection_and_grant_basis_is_only_narrower() {
 fn widening_each_ceiling_rejected() {
     let mut f = Fixture::new();
     let narrowed = changed(&f.scope, |s| {
-        s.velocity_limits.max_abs_vx_mps = NonNegative::try_from(0.06).unwrap();
-        s.velocity_limits.max_abs_vy_mps = NonNegative::try_from(0.06).unwrap();
-        s.velocity_limits.max_abs_vyaw_radps = NonNegative::try_from(0.06).unwrap();
+        s.bounds = with_abs_max(&s.bounds, "/vxMps", 0.06);
+        s.bounds = with_abs_max(&s.bounds, "/vyMps", 0.06);
+        s.bounds = with_abs_max(&s.bounds, "/vyawRadps", 0.06);
         s.execution.action_duration_us = micros(800000);
         s.execution.lease_duration_us = micros(800000);
         s.execution.total_execution_us = micros(800000);
@@ -567,9 +567,9 @@ fn widening_each_ceiling_rejected() {
         "proposal",
     ] {
         let wider = changed(&narrowed, |s| match mode {
-            "vx" => s.velocity_limits.max_abs_vx_mps = NonNegative::try_from(0.07).unwrap(),
-            "vy" => s.velocity_limits.max_abs_vy_mps = NonNegative::try_from(0.07).unwrap(),
-            "yaw" => s.velocity_limits.max_abs_vyaw_radps = NonNegative::try_from(0.07).unwrap(),
+            "vx" => s.bounds = with_abs_max(&s.bounds, "/vxMps", 0.07),
+            "vy" => s.bounds = with_abs_max(&s.bounds, "/vyMps", 0.07),
+            "yaw" => s.bounds = with_abs_max(&s.bounds, "/vyawRadps", 0.07),
             "duration" => {
                 s.execution.action_duration_us = micros(900000);
                 s.execution.total_execution_us = micros(900000);
@@ -630,18 +630,18 @@ fn material_intent_target_completion_profile_and_qualification_substitution_deni
     ] {
         let changed = changed(&f.scope, |s| match mode {
             "intent" => {
-                let PhysicalIntentV1::MicroDuckVelocityV1(v) = &mut s.intent;
-                v.vx_mps = Finite::try_from(-0.05).unwrap();
+                s.intent = velocity_intent(-0.05, 0.0, 0.0);
             }
             "completion" => {
-                let PhysicalCompletionContractV1::MicroDuckDisplacementSettledV1(c) =
-                    &mut s.completion;
-                c.min_forward_m = NonNegative::try_from(0.02).unwrap();
+                edit_completion(s, |c| {
+                    c.min_forward_m = NonNegative::try_from(0.02).unwrap()
+                });
             }
             "requester" => s.requester = host("other"),
             "qualification" => s.qualification.conditions_digest = decode(json!("b".repeat(64))),
             _ => {
-                s.profile.velocity_limits.max_abs_vx_mps = NonNegative::try_from(0.2).unwrap();
+                s.profile.capability.bounds =
+                    with_abs_max(&s.profile.capability.bounds, "/vxMps", 0.2);
                 s.qualification.profile_digest = s.profile.digest().unwrap();
             }
         });
@@ -688,9 +688,8 @@ fn loss_substitution_and_simulation_promotion_rejected() {
 fn narrowing_cannot_change_intent_to_fit_smaller_limits() {
     let mut f = Fixture::new();
     let too_small = changed(&f.scope, |s| {
-        s.velocity_limits.max_abs_vx_mps = NonNegative::try_from(0.01).unwrap();
-        let PhysicalIntentV1::MicroDuckVelocityV1(v) = &mut s.intent;
-        v.vx_mps = Finite::try_from(0.01).unwrap();
+        s.bounds = with_abs_max(&s.bounds, "/vxMps", 0.01);
+        s.intent = velocity_intent(0.01, 0.0, 0.0);
     });
     assert!(core_fake::intersect_scope(&f.scope, &too_small).is_err());
     let root = f.root();

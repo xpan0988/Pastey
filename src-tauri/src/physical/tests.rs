@@ -1,4 +1,4 @@
-use super::{binding::*, contracts::*, values::*};
+use super::{binding::*, contracts::*, core::microduck_capability as md, values::*};
 use crate::host_identity::HostRef;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
@@ -40,18 +40,69 @@ fn binding() -> EnvironmentBindingViewV1 {
         "offerId": id("binding-offer"), "offerExpiry": 2000
     }))
 }
-fn profile() -> PhysicalCapabilityProfileV1 {
+fn completion_params() -> md::DisplacementSettledV1 {
     decode(json!({
-        "version": 1, "capability": "micro_duck_velocity_v1",
-        "nativeBoundary": "micro_duck_robot_intent_v1", "subsystem": "locomotion",
-        "domain": id("physical-domain"), "evidenceClass": "simulation",
-        "requiredEnforcementClass": "adapter_isolation_only",
-        "velocityLimits": {"maxAbsVxMps": 0.1, "maxAbsVyMps": 0.1, "maxAbsVyawRadps": 0.2},
+        "frame": "world", "minForwardM": 0.01, "maxForwardM": 0.1, "maxLateralM": 0.03,
+        "maxSettledSpeedMps": 0.02, "maxSettledAngularRadps": 0.1,
+        "maxPositionUncertaintyM": 0.001, "noFall": true, "dwellUs": 500000
+    }))
+}
+fn profile() -> PhysicalCapabilityProfileV1 {
+    let capability = md::velocity_descriptor(
+        vec![decode(json!(id("physical-domain")))],
+        md::velocity_bounds(0.1, 0.1, 0.2).unwrap(),
+        &completion_params(),
+    )
+    .unwrap();
+    decode(json!({
+        "version": 1, "capability": capability, "subsystem": "locomotion",
+        "evidenceClass": "simulation", "requiredEnforcementClass": "adapter_isolation_only",
         "execution": {"actionDurationUs": 1000000, "leaseDurationUs": 1000000,
             "totalExecutionUs": 1000000, "actionCount": 1},
-        "freshness": {"proposal": 200000, "observation": {"maxAgeUs": 200000, "maxGapUs": 200000}},
-        "start": "micro_duck_standing_no_skill_v1", "loss": "micro_duck_zero_twist_v1"
+        "freshness": {"proposal": 200000, "observation": {"maxAgeUs": 200000, "maxGapUs": 200000}}
     }))
+}
+/// Test mapping of the former MicroDuck velocity fields onto a generic intent.
+fn velocity_intent(vx: f64, vy: f64, vyaw: f64) -> PhysicalIntentV1 {
+    md::VelocityV1::new(vx, vy, vyaw).unwrap().intent().unwrap()
+}
+/// Replace one AbsMax dimension of a bound set (former velocity limit fields).
+fn with_abs_max(bounds: &BoundSetV1, pointer: &str, max: f64) -> BoundSetV1 {
+    let mut all = bounds.bounds().to_vec();
+    let b = all
+        .iter_mut()
+        .find(|b| b.pointer.as_str() == pointer)
+        .unwrap();
+    b.kind = BoundKindV1::AbsMax(NonNegative::try_from(max).unwrap());
+    BoundSetV1::try_from(all).unwrap()
+}
+fn abs_max(bounds: &BoundSetV1, pointer: &str) -> f64 {
+    match &bounds
+        .bounds()
+        .iter()
+        .find(|b| b.pointer.as_str() == pointer)
+        .unwrap()
+        .kind
+    {
+        BoundKindV1::AbsMax(m) => m.get(),
+        other => panic!("{other:?}"),
+    }
+}
+/// Change the capability's completion parameters in both the profile and the
+/// scope, re-binding the (untrusted fixture) qualification to the new profile.
+fn edit_completion(s: &mut ReviewScopeFieldsV1, edit: impl FnOnce(&mut md::DisplacementSettledV1)) {
+    let mut params: md::DisplacementSettledV1 = s
+        .profile
+        .capability
+        .completion_predicate
+        .params
+        .decode()
+        .unwrap();
+    edit(&mut params);
+    let contract = params.contract().unwrap();
+    s.profile.capability.completion_predicate = contract.clone();
+    s.completion.predicate = contract;
+    s.qualification.profile_digest = s.profile.digest().unwrap();
 }
 fn qualification(
     p: &PhysicalCapabilityProfileV1,
@@ -72,16 +123,12 @@ fn scope_fields() -> ReviewScopeFieldsV1 {
         json!({"version": 1, "principal": "operator", "requester": host("requester"),
         "executor": b.executor, "environment": b, "profile": p, "qualification": q,
         "mode": "exact",
-        "intent": {"kind": "micro_duck_velocity_v1", "parameters": {
-            "vxMps": 0.05, "vyMps": 0.0, "vyawRadps": 0.0, "frame": "trunk"}},
-        "velocityLimits": p.velocity_limits, "execution": p.execution, "freshness": p.freshness,
-        "completion": {"kind": "micro_duck_displacement_settled_v1", "parameters": {
-            "witness": "simulation_oracle", "frame": "world",
-            "minForwardM": 0.01, "maxForwardM": 0.1, "maxLateralM": 0.03,
-            "maxSettledSpeedMps": 0.02, "maxSettledAngularRadps": 0.1,
-            "maxPositionUncertaintyM": 0.001, "noFall": true,
-            "dwellUs": 500000, "settlingTimeoutUs": 3000000,
-            "observation": p.freshness.observation}}, "loss": p.loss}),
+        "intent": velocity_intent(0.05, 0.0, 0.0),
+        "bounds": p.capability.bounds, "execution": p.execution, "freshness": p.freshness,
+        "completion": {"predicate": p.capability.completion_predicate,
+            "witness": "simulation_oracle", "observation": p.freshness.observation,
+            "evaluationWindowUs": 3000000},
+        "loss": p.capability.loss_profile}),
     )
 }
 fn scope() -> PhysicalReviewScopeV1 {
@@ -242,8 +289,7 @@ fn scope_hash_binds_effects_target_budgets_and_completion() {
     s.principal = label("other");
     changes.push(s);
     let mut s = scope_fields();
-    let PhysicalIntentV1::MicroDuckVelocityV1(v) = &mut s.intent;
-    v.vx_mps = Finite::try_from(-0.05).unwrap();
+    s.intent = velocity_intent(-0.05, 0.0, 0.0);
     changes.push(s);
     let mut s = scope_fields();
     s.execution.action_duration_us = micros(900000);
@@ -252,8 +298,9 @@ fn scope_hash_binds_effects_target_budgets_and_completion() {
     s.freshness.proposal = ProposalFreshnessV1(micros(100000));
     changes.push(s);
     let mut s = scope_fields();
-    let PhysicalCompletionContractV1::MicroDuckDisplacementSettledV1(c) = &mut s.completion;
-    c.max_forward_m = NonNegative::try_from(0.08).unwrap();
+    edit_completion(&mut s, |c| {
+        c.max_forward_m = NonNegative::try_from(0.08).unwrap()
+    });
     changes.push(s);
     let mut s = scope_fields();
     s.environment.adapter_incarnation =
@@ -345,9 +392,9 @@ fn qualification_binds_profile_binding_and_evidence_class() {
     wrong.evidence_class = EvidenceClassV1::Hardware;
     assert!(wrong.validate_for(&p, &b).is_err());
     let mut p = p;
-    p.domain = decode(json!(
+    p.capability.conflict_domains = vec![decode(json!(
         "physical-domain:v1:00000000-0000-4000-8000-000000000002"
-    ));
+    ))];
     assert!(p.validate_binding(&b).is_err());
 }
 
@@ -364,11 +411,10 @@ fn scope_cannot_widen_profile_or_substitute_target() {
     s.freshness.observation.max_age_us = micros(200001);
     changes.push(s);
     let mut s = scope_fields();
-    s.velocity_limits.max_abs_vx_mps = NonNegative::try_from(0.2).unwrap();
+    s.bounds = with_abs_max(&s.bounds, "/vxMps", 0.2);
     changes.push(s);
     let mut s = scope_fields();
-    let PhysicalIntentV1::MicroDuckVelocityV1(v) = &mut s.intent;
-    v.vx_mps = Finite::try_from(0.2).unwrap();
+    s.intent = velocity_intent(0.2, 0.0, 0.0);
     changes.push(s);
     for fields in changes {
         assert!(PhysicalReviewScopeV1::try_from(fields).is_err());
@@ -389,8 +435,7 @@ fn hardware_cannot_use_gate_a_or_simulation_oracle() {
         .world_incarnation = None;
     s.qualification = qualification(&s.profile, &s.environment);
     assert!(s.validate().is_err());
-    let PhysicalCompletionContractV1::MicroDuckDisplacementSettledV1(c) = &mut s.completion;
-    c.witness = CompletionWitnessV1::NativeMeasured;
+    s.completion.witness = CompletionWitnessV1::NativeMeasured;
     // Only a structurally compatible claim; this does not qualify real hardware.
     s.validate().unwrap();
 }
@@ -401,8 +446,8 @@ fn unknown_fields_versions_methods_frames_and_streams_fail_closed() {
         ("/version", json!(2)),
         ("/mode", json!("stream")),
         ("/profile/capability", json!("robot_joint_targets")),
-        ("/intent/kind", json!("robot_do")),
-        ("/intent/parameters/frame", json!("world")),
+        ("/intent/capabilityId", json!("robot.do/v1")),
+        ("/intent/payload/frame", json!("world")),
         ("/profile/requiredEnforcementClass", json!("best_effort")),
         ("/environment/version", json!(2)),
         ("/execution/actionCount", json!(2)),
@@ -419,7 +464,7 @@ fn unknown_fields_versions_methods_frames_and_streams_fail_closed() {
         "/profile",
         "/environment",
         "/intent",
-        "/intent/parameters",
+        "/intent/payload",
         "/freshness/observation",
     ] {
         let mut v = wire(&scope());
@@ -446,8 +491,7 @@ fn proposal_matches_exact_action_but_does_not_admit_it() {
     p.requested_duration_us = micros(1000001);
     assert!(p.validate_scope(&s).is_err());
     p.requested_duration_us = micros(1000000);
-    let PhysicalIntentV1::MicroDuckVelocityV1(v) = &mut p.payload;
-    v.vx_mps = Finite::try_from(-0.05).unwrap();
+    p.payload = velocity_intent(-0.05, 0.0, 0.0);
     assert!(p.validate().is_err());
     p.payload_digest = p.payload.digest().unwrap();
     p.validate().unwrap();
@@ -499,16 +543,18 @@ fn subsystem_map_order_does_not_change_binding_digest() {
 
 #[test]
 fn malformed_completion_and_required_contracts_are_rejected() {
+    // Core: completion, freshness, budget, start and loss substitutions.
     for (pointer, value) in [
-        ("/completion/parameters/minForwardM", json!(0.2)),
-        ("/completion/parameters/maxLateralM", json!(-0.03)),
-        ("/completion/parameters/dwellUs", json!(4000000)),
-        ("/completion/parameters/noFall", json!(false)),
-        ("/completion/parameters/observation/maxAgeUs", json!(200001)),
+        ("/completion/predicate/params/minForwardM", json!(0.02)),
+        ("/completion/predicate/id", json!("other.predicate/v1")),
+        ("/completion/predicate/params", json!({})),
+        ("/completion/observation/maxAgeUs", json!(200001)),
+        ("/completion/evaluationWindowUs", json!(0)),
         ("/freshness/proposal", json!(0)),
         ("/execution/totalExecutionUs", json!(500000)),
-        ("/profile/start", json!("unrestricted")),
+        ("/profile/capability/startPredicate", json!("unrestricted")),
         ("/loss", json!("disable_torque")),
+        ("/loss/id", json!("disable.torque/v1")),
     ] {
         let mut v = wire(&scope());
         *v.pointer_mut(pointer).unwrap() = value;
@@ -517,14 +563,35 @@ fn malformed_completion_and_required_contracts_are_rejected() {
             "{pointer}"
         );
     }
+    // Binding: device parameters are opaque to Core and rejected by the
+    // MicroDuck scope schema check that Core consults before review/start.
+    md::validate_scope(&scope_fields()).unwrap();
+    for (key, value) in [
+        ("minForwardM", json!(0.2)),
+        ("maxLateralM", json!(-0.03)),
+        ("dwellUs", json!(4000000)),
+        ("noFall", json!(false)),
+        ("unexpected", json!(true)),
+    ] {
+        let mut s = scope_fields();
+        let mut params = wire(&s.completion.predicate.params);
+        params[key] = value;
+        let params: CanonicalJsonV1 = decode(params);
+        s.profile.capability.completion_predicate.params = params.clone();
+        s.completion.predicate.params = params;
+        s.qualification.profile_digest = s.profile.digest().unwrap();
+        PhysicalReviewScopeV1::try_from(s.clone()).unwrap();
+        assert!(md::validate_scope(&s).is_err(), "{key}");
+    }
 }
 
 #[test]
 fn scope_hash_version_one_vector() {
     // Pin the canonical schema/ordering. A future encoding change must be versioned.
+    // Re-pinned for the descriptor encoding (physical ledger format 2).
     assert_eq!(
         String::from(scope().digest().unwrap()),
-        "a2026bfa34d35d3c33476a9baeb08444f6fef9ffd00e6fa53d3ca58a16604b89"
+        "d4817f35744852872ffac79359f1fbbdec99c63d124f5e46361a7d623917699d"
     );
 }
 

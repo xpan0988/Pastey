@@ -21,6 +21,40 @@ impl ControlFixture {
         Self::configured_binding(native, binding())
     }
     fn configured_binding(native: bool, b: EnvironmentBindingViewV1) -> Self {
+        Self::build(
+            b,
+            |p| {
+                if native {
+                    p.required_enforcement_class = SessionEnforcementClassV1::NativeFence;
+                }
+            },
+            |fields| {
+                if native {
+                    fields.intent = velocity_intent(
+                        crate::physical::native_protocol::REFERENCE_FORWARD_MPS,
+                        0.0,
+                        0.0,
+                    );
+                }
+            },
+        )
+    }
+    /// Any capability profile: `edit_profile` runs before qualification and
+    /// `edit_fields` sees the qualified profile already installed in the scope.
+    fn build(
+        b: EnvironmentBindingViewV1,
+        edit_profile: impl FnOnce(&mut PhysicalCapabilityProfileV1),
+        edit_fields: impl FnOnce(&mut ReviewScopeFieldsV1),
+    ) -> Self {
+        Self::build_checked(b, Arc::new(|_| Ok(())), edit_profile, edit_fields)
+    }
+    /// As `build`, with the binding's scope schema check installed.
+    fn build_checked(
+        b: EnvironmentBindingViewV1,
+        schema_check: crate::physical::binding::ScopeSchemaCheckV1,
+        edit_profile: impl FnOnce(&mut PhysicalCapabilityProfileV1),
+        edit_fields: impl FnOnce(&mut ReviewScopeFieldsV1),
+    ) -> Self {
         let dir =
             std::env::temp_dir().join(format!("pastey-physical-stage4-{}", uuid::Uuid::new_v4()));
         let paths = AppPaths::new(dir.clone(), dir.join("logs"));
@@ -33,15 +67,21 @@ impl ControlFixture {
             clock.clone(),
         )
         .unwrap();
+        let mut p = profile();
+        edit_profile(&mut p);
         let resolver = core_fake::binding(&mut core);
         resolver.enroll(fake::enrollment(&b), None).unwrap();
         let challenge = resolver.begin_resolution(&b.environment).unwrap();
-        let facts = fake::facts(resolver, challenge, &b, native);
+        let facts = fake::with_schema_check(
+            fake::facts(
+                resolver,
+                challenge,
+                &b,
+                p.required_enforcement_class == SessionEnforcementClassV1::NativeFence,
+            ),
+            schema_check,
+        );
         let live = Arc::new(resolver.resolve(facts).unwrap());
-        let mut p = profile();
-        if native {
-            p.required_enforcement_class = SessionEnforcementClassV1::NativeFence;
-        }
         let q = qualification(&p, live.view());
         resolver
             .record_qualification(&live, &p, &q, fake::evidence(&q, digest_value()))
@@ -51,11 +91,7 @@ impl ControlFixture {
         fields.environment = live.view().clone();
         fields.profile = p;
         fields.qualification = q;
-        if native {
-            let PhysicalIntentV1::MicroDuckVelocityV1(v) = &mut fields.intent;
-            v.vx_mps =
-                Finite::try_from(crate::physical::native_protocol::REFERENCE_FORWARD_MPS).unwrap();
-        }
+        edit_fields(&mut fields);
         let scope = PhysicalReviewScopeV1::try_from(fields).unwrap();
         let ingress = core.local_ingress().unwrap();
         core.configure_executor_policy(
@@ -384,14 +420,10 @@ async fn wrong_challenge_observation_sequence_action_and_payload_fail_closed() {
             "sequence" => p.decision_sequence = 2,
             "action" => p.action_id = ActionId::try_from(id("physical-action")).unwrap(),
             "payload" => {
-                p.payload = changed(&f.scope, |s| {
-                    let mut v = wire(&s.intent);
-                    v["parameters"]["vxMps"] = json!(0.06);
-                    s.intent = decode(v);
-                })
-                .fields()
-                .intent
-                .clone();
+                p.payload = changed(&f.scope, |s| s.intent = velocity_intent(0.06, 0.0, 0.0))
+                    .fields()
+                    .intent
+                    .clone();
                 p.payload_digest = p.payload.digest().unwrap();
             }
             _ => p.requested_duration_us = micros(1_000_001),
@@ -458,9 +490,7 @@ async fn exact_duplicate_is_status_only_and_changed_digest_is_rejected() {
         AdmissionOutcomeV1::Duplicate(_)
     ));
     let mut changed = p;
-    let mut payload = wire(&changed.payload);
-    payload["parameters"]["vxMps"] = json!(0.06);
-    changed.payload = decode(payload);
+    changed.payload = velocity_intent(0.06, 0.0, 0.0);
     changed.payload_digest = changed.payload.digest().unwrap();
     assert!(f.core.lock().admit_physical_proposal(&g, changed).is_err());
     assert_eq!(lane::deadline(&a), 100_000);
@@ -1156,6 +1186,10 @@ fn review_rejection_write_failure_closes_even_a_root_without_a_session() {
     assert_eq!(f.scalar("SELECT count(*) FROM physical_sessions"), 0);
 }
 
+#[path = "capability_tests.rs"]
+mod capability;
+#[path = "ledger_format_tests.rs"]
+mod ledger_format;
 #[path = "stage5_tests.rs"]
 mod stage5;
 

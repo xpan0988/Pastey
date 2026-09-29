@@ -224,10 +224,12 @@ impl TrustedHandoverPolicyV1 {
     }
 }
 
-pub(super) fn completion(scope: &PhysicalReviewScopeV1) -> &MicroDuckCompletionV1 {
-    let PhysicalCompletionContractV1::MicroDuckDisplacementSettledV1(c) =
-        &scope.fields().completion;
-    c
+// Stage 5 evaluator parameters, decoded by the owning binding. Phase 2 moves
+// this evaluator behind the binding's witness boundary.
+pub(super) fn completion(
+    scope: &PhysicalReviewScopeV1,
+) -> AppResult<super::core::microduck_capability::DisplacementSettledV1> {
+    super::core::microduck_capability::DisplacementSettledV1::from_scope(scope)
 }
 pub(super) fn label(s: &str) -> LabelV1 {
     LabelV1::try_from(s.to_owned()).expect("registered label")
@@ -242,10 +244,13 @@ pub(super) fn evaluate(
     now_us: u64,
 ) -> (ConsequenceStateV1, &'static str, u64, Option<NonNegative>) {
     use ConsequenceStateV1::*;
-    let c = completion(scope);
+    let contract = &scope.fields().completion;
     if observations.is_empty() && dispositions.is_empty() {
         return (Unobserved, "no_evidence", 0, None);
     }
+    let Ok(c) = completion(scope) else {
+        return (OutcomeUnknown, "invalid_completion_contract", 0, None);
+    };
     let max_uncertainty = observations
         .iter()
         .filter_map(|o| o.fact.position_uncertainty_m)
@@ -331,7 +336,9 @@ pub(super) fn evaluate(
     if samples.is_empty() {
         return result(OutcomeUnknown, "missing_observations");
     }
-    let deadline = end.checked_add(c.settling_timeout_us.get()).unwrap_or(0);
+    let deadline = end
+        .checked_add(contract.evaluation_window_us.get())
+        .unwrap_or(0);
     if deadline == 0 {
         return result(OutcomeUnknown, "time_overflow");
     }
@@ -350,8 +357,8 @@ pub(super) fn evaluate(
         let delta = last
             .map(|last| f.capture_us - last)
             .unwrap_or_else(|| f.capture_us - start.unwrap());
-        if f.gap_us > c.observation.max_gap_us.get()
-            || delta > c.observation.max_gap_us.get()
+        if f.gap_us > contract.observation.max_gap_us.get()
+            || delta > contract.observation.max_gap_us.get()
             || last_sequence.is_some_and(|seq| f.sequence != seq + 1)
         {
             gap = true;
@@ -394,7 +401,7 @@ pub(super) fn evaluate(
         }
     }
     let last = last.unwrap();
-    if now_us < last || now_us - last > c.observation.max_age_us.get() {
+    if now_us < last || now_us - last > contract.observation.max_age_us.get() {
         return result(OutcomeUnknown, "stale_observation");
     }
     if gap {

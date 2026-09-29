@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { physicalProductCommand } from "../lib/tauri";
-import { physicalReviewFresh, type PhysicalProductRequest, type PhysicalProductView } from "../lib/physical";
+import { physicalPayloadEntries, physicalReviewFresh, type PhysicalProductRequest, type PhysicalProductView } from "../lib/physical";
 import type { BridgePeerSession } from "../lib/bridgePeers";
 
 export function PhysicalReviewPanel({ roomId, peers }: { roomId: string; peers: BridgePeerSession[] }) {
@@ -56,7 +56,7 @@ function PhysicalHostReview({ roomId, host }: { roomId: string; host: string }) 
       {scope && r ? <article>
         <strong>Exact physical review · {r.state}</strong>
         <p>Environment {scope.environment.environment} · {scope.environment.evidenceClass} · {scope.qualification.requiredEnforcementClass.replace(/_/g, " ")}</p>
-        <p>Intent: {scope.intent.kind} · {scope.intent.parameters.vxMps} m/s forward, {scope.intent.parameters.vyMps} m/s lateral, {scope.intent.parameters.vyawRadps} rad/s yaw · {scope.intent.parameters.frame}</p>
+        <p>Intent: {scope.intent.capabilityId} · {physicalPayloadEntries(scope.intent.payload).map(([pointer, value]) => `${pointer} = ${value}`).join(", ")}</p>
         <p>Action duration ≤ {scope.execution.actionDurationUs / 1e6} s · budget ≤ {scope.execution.totalExecutionUs / 1e6} s · {scope.execution.actionCount} action</p>
         <details><summary>Completion predicate and exact effects</summary><pre>{JSON.stringify(scope, null, 2)}</pre></details>
         {!fresh ? <p role="status">This review is stale. Discover and compose a fresh review.</p> : null}

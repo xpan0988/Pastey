@@ -194,6 +194,7 @@ impl PhysicalControlServiceV1 {
             s.executor == *self.runtime.host_ref() && s.environment == *binding.view(),
             "Local Host/environment/binding mismatch",
         )?;
+        binding.validate_scope_schema(s)?;
         let q =
             self.binding
                 .qualification(binding, &s.profile, &s.qualification.qualification_id)?;
@@ -685,12 +686,12 @@ pub(super) fn validate_narrowing(
     let a = reviewed.fields();
     let b = narrowed.fields();
     let mut semantic = b.clone();
-    semantic.velocity_limits = a.velocity_limits.clone();
+    semantic.bounds = a.bounds.clone();
     semantic.execution = a.execution.clone();
     semantic.freshness = a.freshness.clone();
     require(
         semantic == *a
-            && b.velocity_limits.is_subset_of(&a.velocity_limits)
+            && b.bounds.is_subset_of(&a.bounds)
             && b.execution.is_subset_of(&a.execution)
             && b.freshness.is_subset_of(&a.freshness),
         "Materially changed intent/lineage/contracts or widened bounds",
@@ -703,7 +704,7 @@ fn intersect(
     let a = reviewed.fields();
     let b = policy.fields();
     let mut semantic = b.clone();
-    semantic.velocity_limits = a.velocity_limits.clone();
+    semantic.bounds = a.bounds.clone();
     semantic.execution = a.execution.clone();
     semantic.freshness = a.freshness.clone();
     require(
@@ -711,26 +712,7 @@ fn intersect(
         "Executor policy substitutes reviewed semantics",
     )?;
     let mut result = a.clone();
-    result.velocity_limits = VelocityLimitsV1 {
-        max_abs_vx_mps: NonNegative::try_from(
-            a.velocity_limits
-                .max_abs_vx_mps
-                .get()
-                .min(b.velocity_limits.max_abs_vx_mps.get()),
-        )?,
-        max_abs_vy_mps: NonNegative::try_from(
-            a.velocity_limits
-                .max_abs_vy_mps
-                .get()
-                .min(b.velocity_limits.max_abs_vy_mps.get()),
-        )?,
-        max_abs_vyaw_radps: NonNegative::try_from(
-            a.velocity_limits
-                .max_abs_vyaw_radps
-                .get()
-                .min(b.velocity_limits.max_abs_vyaw_radps.get()),
-        )?,
-    };
+    result.bounds = a.bounds.intersect(&b.bounds)?;
     result.execution = ExecutionBudgetV1 {
         action_duration_us: a
             .execution
