@@ -346,3 +346,69 @@ fn older_claim_versions_fail_with_an_explicit_version_error() {
         .to_string()
         .contains("version mismatch"));
 }
+
+#[tokio::test]
+async fn startup_refuses_stored_verdicts_the_registered_witness_does_not_vouch_for() {
+    // A self-report witness's verification is refused and stored as such.
+    let f = EvidenceFixture::with(requiring_independent_measurement()).await;
+    f.witnesses(Relabel::registry(WitnessClassV1::NativeSelfReport));
+    f.trace(|_| {});
+    let x = f.evaluate();
+    assert_eq!(x.reason, evidence::label("witness_class_insufficient"));
+    // Tamper the stored class so the audit's registry-free replay agrees with
+    // a Verified finding: the replay alone cannot see this.
+    let mut t = x.clone();
+    let v = t.verdict.as_mut().unwrap();
+    v.witness_class = WitnessClassV1::IndependentMeasured;
+    t.reason = v.reason.clone();
+    t.state = ConsequenceStateV1::Verified;
+    let sql = f.control.sql();
+    let trigger: String = sql
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='physical_consequence_immutable'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    sql.execute_batch("DROP TRIGGER physical_consequence_immutable")
+        .unwrap();
+    sql.execute(
+        "UPDATE physical_consequences SET state='verified',digest=?1,record_json=?2 WHERE action_id=?3 AND revision=?4",
+        rusqlite::params![
+            String::from(digest("pastey-physical-consequence-v1", &t).unwrap()),
+            serde_json::to_string(&t).unwrap(),
+            String::from(t.action.clone()),
+            t.revision as i64
+        ],
+    )
+    .unwrap();
+    sql.execute_batch(&trigger).unwrap();
+    drop(sql);
+    // The registry-free ledger audit accepts the tampered row.
+    PhysicalStoreV1::open(&f.control.paths).unwrap();
+    let restart = |witnesses: WitnessRegistryV1| {
+        PhysicalControlServiceV1::new(
+            &f.control.paths,
+            LocalRuntimeRef::fresh(host("executor")),
+            f.control.clock.clone(),
+            witnesses,
+        )
+        .map(|_| ())
+    };
+    for (name, witnesses) in [
+        (
+            "registered self-report",
+            Relabel::registry(WitnessClassV1::NativeSelfReport),
+        ),
+        ("registered oracle", super::witnesses()),
+        ("absent", WitnessRegistryV1::default()),
+    ] {
+        let error = restart(witnesses).unwrap_err().to_string();
+        assert!(
+            error.contains("manual intervention required"),
+            "{name}: {error}"
+        );
+    }
+    // Only a registry whose witness really vouches with that class starts.
+    restart(Relabel::registry(WitnessClassV1::IndependentMeasured)).unwrap();
+}

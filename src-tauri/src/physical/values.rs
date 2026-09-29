@@ -7,7 +7,11 @@ use crate::error::AppResult;
 // Claim wire versions. A claim's version rises whenever its wire shape changes,
 // including through a nested type; a mismatch is reported explicitly. Claims
 // serialize `version` first, so Pastey-produced data meets this check before
-// any unknown field.
+// any unknown field. This is the third line of defense for stale shapes: the
+// ledger format gate refuses older persisted records first, and the remote
+// protocol family (physical-control-v2) refuses older peers before decoding.
+// Arbitrary key order in foreign input still fails closed, only with a less
+// specific error.
 macro_rules! wire_version {
     ($name:ident, $value:literal) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

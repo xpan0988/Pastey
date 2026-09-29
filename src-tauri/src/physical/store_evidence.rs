@@ -201,7 +201,54 @@ pub(super) fn originate(c: &Connection, id: &RootId) -> AppResult<()> {
     c.execute("INSERT INTO physical_task_acceptance SELECT root_id,role,'pending',1,NULL,NULL FROM physical_attempts WHERE root_id=?1",[text(id)])?;
     Ok(())
 }
+fn registered_class(
+    witnesses: &WitnessRegistryV1,
+    contract: &SemanticIdV1,
+    claimed: WitnessClassV1,
+) -> AppResult<()> {
+    let registered = witnesses.get(contract).map(|w| w.class());
+    if registered == Some(claimed) {
+        return Ok(());
+    }
+    Err(crate::error::AppError::InvalidInput(format!(
+        "Stored witness verdict for {} claims {claimed:?} but the registered witness is {}; \
+         manual intervention required",
+        contract.as_str(),
+        registered.map_or("absent".to_owned(), |c| format!("{c:?}")),
+    )))
+}
 impl PhysicalStoreV1 {
+    /// Every stored verdict must carry the class of the witness registered for
+    /// its contract. The per-transaction audit cannot check this (it has no
+    /// registry), so Core runs it before it is exposed; any mismatch or missing
+    /// witness refuses startup rather than trusting the stored claim.
+    pub(in crate::physical) fn verify_witness_classes(
+        &self,
+        witnesses: &WitnessRegistryV1,
+    ) -> AppResult<()> {
+        let mut c = self.connection()?;
+        let tx = c.transaction()?;
+        super::audit(&tx)?;
+        let mut stmt = tx.prepare("SELECT record_json FROM physical_consequences")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let x: PhysicalConsequenceV1 = decode(&r.get::<_, String>(0)?)?;
+            if let Some(v) = &x.verdict {
+                registered_class(witnesses, &x.completion_ref, v.witness_class)?;
+            }
+        }
+        let mut stmt = tx.prepare(
+            "SELECT p.record_json,v.record_json FROM physical_handover_verdicts v \
+             JOIN physical_handover_policies p USING(session_id)",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let p: HandoverPredicateV1 = decode(&r.get::<_, String>(0)?)?;
+            let v: WitnessVerdictV1 = decode(&r.get::<_, String>(1)?)?;
+            registered_class(witnesses, &p.predicate.id, v.witness_class)?;
+        }
+        Ok(())
+    }
     pub(in crate::physical) fn evidence_host(
         &self,
         id: &ActionId,

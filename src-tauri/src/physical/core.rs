@@ -154,6 +154,9 @@ impl PhysicalControlServiceV1 {
         witnesses: super::evidence::WitnessRegistryV1,
     ) -> AppResult<Self> {
         let store = PhysicalStoreV1::open(paths)?;
+        // The ledger audit replays Core checks without a registry; the witness
+        // class each stored verdict claims is only provable against this one.
+        store.verify_witness_classes(&witnesses)?;
         // One atomic startup closure before exposing Core. No stored row is converted
         // to a Root. Old approval consumption survives this transaction.
         store.close_open_attempts("interrupted")?;
