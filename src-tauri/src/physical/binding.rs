@@ -702,12 +702,12 @@ pub(super) mod test_support {
             .map(|d| {
                 (
                     d.clone(),
-                    LabelV1::try_from("mechanism.motion".to_owned()).unwrap(),
+                    LabelV1::try_from("test.resource".to_owned()).unwrap(),
                 )
             })
             .collect();
         let aliases = [(
-            LabelV1::try_from("velocity".to_owned()).unwrap(),
+            LabelV1::try_from("test.alias".to_owned()).unwrap(),
             view.domains().first().unwrap().to_owned().clone(),
         )]
         .into_iter()

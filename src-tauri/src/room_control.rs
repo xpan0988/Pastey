@@ -4257,7 +4257,8 @@ mod physical_transport_tests {
             validate_control_event(changed, "room", "a", "b", OffsetDateTime::now_utc()).is_err()
         );
         let mut changed = event;
-        changed["protocolFamily"] = serde_json::json!("physical-control-v2");
+        // The pre-descriptor physical family is refused.
+        changed["protocolFamily"] = serde_json::json!("physical-control-v1");
         assert!(
             validate_control_event(changed, "room", "a", "b", OffsetDateTime::now_utc()).is_err()
         );
