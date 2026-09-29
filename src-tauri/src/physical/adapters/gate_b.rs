@@ -424,7 +424,7 @@ impl GateBNativeLaneV1 {
             let PhysicalIntentV1::MicroDuckVelocityV1(payload) = &view.payload;
             require(
                 payload.frame == MicroDuckFrameV1::Trunk
-                    && payload.vx_mps.get() == 0.05
+                    && payload.vx_mps.get() == wire::REFERENCE_FORWARD_MPS
                     && payload.vy_mps.get() == 0.0
                     && payload.vyaw_radps.get() == 0.0,
                 "Native profile admits only exact reference velocity",
@@ -495,7 +495,7 @@ impl GateBNativeLaneV1 {
                         action: action.clone(),
                         request: String::from(view.request.clone()),
                         sequence,
-                        twist: [0.05, 0.0, 0.0],
+                        twist: wire::REFERENCE_TWIST,
                     },
                 },
             )?;

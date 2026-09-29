@@ -957,7 +957,8 @@ impl PhysicalBindingResolverV1 {
                 && profile.required_enforcement_class == SessionEnforcementClassV1::NativeFence
                 && profile.execution.action_duration_us.get() == 1_000_000
                 && profile.execution.total_execution_us.get() == 1_000_000
-                && profile.velocity_limits.max_abs_vx_mps.get() == 0.05
+                && profile.velocity_limits.max_abs_vx_mps.get()
+                    == crate::physical::native_protocol::REFERENCE_FORWARD_MPS
                 && profile.velocity_limits.max_abs_vy_mps.get() == 0.
                 && profile.velocity_limits.max_abs_vyaw_radps.get() == 0.
                 && profile.execution.action_count == 1

@@ -4,6 +4,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import tempfile
@@ -12,6 +13,9 @@ import unittest
 
 PROTOCOL = "microduck-task-v1"
 PROFILE = "reference-velocity-v1"
+protocol = Path(__file__).resolve().parents[1] / "native/microduck/overlay/duck-ipc-proto/src/task_authority.rs"
+REFERENCE_TWIST = [float(re.search(
+    r"^pub const REFERENCE_FORWARD_MPS: f64 = ([0-9.]+);$", protocol.read_text(), re.M).group(1)), 0.0, 0.0]
 
 class NativeGateB(unittest.TestCase):
     def setUp(self):
@@ -77,7 +81,7 @@ class NativeGateB(unittest.TestCase):
         self.assertTrue(self.rpc("install", descriptor=self.install)["accepted"])
         self.action = dict(install=self.install, action="action", payload_digest="a" * 64, deadline_us=status["native_us"] + action_us)
         self.assertTrue(self.rpc("admit", descriptor=self.action)["accepted"])
-        self.move = dict(action=self.action, request="move", sequence=1, twist=[.05, 0, 0])
+        self.move = dict(action=self.action, request="move", sequence=1, twist=REFERENCE_TWIST)
         self.fence = dict(install=self.install, next_epoch=2, request="fence")
 
     def test_install_consumption_and_same_action_refresh(self):

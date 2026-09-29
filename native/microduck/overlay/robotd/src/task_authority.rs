@@ -225,7 +225,7 @@ impl State {
         if !self.current(&m.action.install, owner) || self.action.as_ref() != Some(&m.action) {
             return Err("invalid_action_session");
         }
-        if m.twist != [0.05, 0.0, 0.0]
+        if m.twist != REFERENCE_TWIST
             || !bounded(&m.request)
             || m.sequence == 0
             || m.sequence <= self.sequence
@@ -439,6 +439,40 @@ impl Drop for Connection<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reference_clears_pinned_standing_threshold_early_under_native_ema() {
+        let threshold = duck_control::policy::DEFAULT_STANDING_THRESHOLD;
+        let control = robotd_params::Control::default();
+        assert_eq!(threshold, 0.05);
+        assert_eq!(control.cmd_alpha, 0.2);
+        assert_eq!(control.hz, 50);
+        assert_eq!(MAX_ACTION_US, 1_000_000);
+        assert_eq!(REFRESH_LOSS_US, 200_000);
+        assert_eq!(MAX_LEASE_US, 3_000_000);
+        assert!(REFERENCE_FORWARD_MPS >= threshold * 1.5);
+        assert!(REFERENCE_FORWARD_MPS < 0.1);
+        assert_eq!(REFERENCE_TWIST, [REFERENCE_FORWARD_MPS, 0.0, 0.0]);
+        let ticks = MAX_ACTION_US * u64::from(control.hz) / 1_000_000;
+        let (mut old, mut reference, mut first_walk_tick, mut integral) = (0., 0., None, 0.);
+        for tick in 1..=ticks {
+            // Exercise the pinned daemon's actual smoother, not another EMA.
+            crate::slew(&mut old, 0.05, control.cmd_alpha);
+            crate::slew(&mut reference, REFERENCE_FORWARD_MPS, control.cmd_alpha);
+            assert!(old <= threshold, "old payload must always select Stand");
+            if reference > threshold {
+                first_walk_tick.get_or_insert(tick);
+            }
+            integral += reference / f64::from(control.hz);
+        }
+        assert_eq!(first_walk_tick, Some(5));
+        let crossing_us = first_walk_tick.unwrap() * 1_000_000 / u64::from(control.hz);
+        assert_eq!(crossing_us, 100_000);
+        assert!(MAX_ACTION_US - crossing_us >= 900_000);
+        // Command integral only: PPO/measured displacement still needs the real gate.
+        assert!((integral - 0.0736).abs() < 1e-6);
+        assert!((0.01..=0.1).contains(&integral));
+    }
+
     fn fixture() -> (Authority, Install, Action, Move, Fence) {
         let n = Authority::default();
         let identity = Identity {
@@ -470,7 +504,7 @@ mod tests {
             action: a.clone(),
             request: "move-1".into(),
             sequence: 1,
-            twist: [0.05, 0.0, 0.0],
+            twist: REFERENCE_TWIST,
         };
         let f = Fence {
             install: i.clone(),
@@ -620,7 +654,7 @@ mod tests {
         let (n, i, a, mut m, _) = fixture();
         installed(&n, &i, &a);
         queued(&n, &m);
-        assert_eq!(n.consume().unwrap().twist(40), [0.05, 0.0, 0.0]);
+        assert_eq!(n.consume().unwrap().twist(40), REFERENCE_TWIST);
         m.sequence = 2;
         m.request = "refresh".into();
         assert!(n.request(&Request::Move { descriptor: m }, 1, 50).accepted);
@@ -654,6 +688,38 @@ mod tests {
                 _ => m.action.install.identity.controller = "old".into(),
             }
             assert!(!n.request(&Request::Move { descriptor: m }, 1, 50).accepted);
+        }
+    }
+    #[test]
+    fn exact_reference_payload_rejects_old_velocity_and_any_changed_component() {
+        let x = REFERENCE_FORWARD_MPS;
+        for twist in [
+            [0.05, 0., 0.],
+            [f64::from_bits(x.to_bits() - 1), 0., 0.],
+            [f64::from_bits(x.to_bits() + 1), 0., 0.],
+            [-x, 0., 0.],
+            [x, f64::MIN_POSITIVE, 0.],
+            [x, -f64::MIN_POSITIVE, 0.],
+            [x, 0., f64::MIN_POSITIVE],
+            [x, 0., -f64::MIN_POSITIVE],
+            [f64::NAN, 0., 0.],
+            [x, f64::NAN, 0.],
+            [x, 0., f64::NAN],
+            [f64::INFINITY, 0., 0.],
+            [x, f64::INFINITY, 0.],
+            [x, 0., f64::INFINITY],
+        ] {
+            let (n, i, a, mut m, _) = fixture();
+            installed(&n, &i, &a);
+            queued(&n, &m);
+            m.twist = twist;
+            m.sequence = 2;
+            let r = n.request(&Request::Move { descriptor: m }, 1, 50);
+            assert!(!r.accepted, "{twist:?}");
+            assert_eq!(r.reason, "changed_payload_or_stale_sequence");
+            assert!(r.fenced);
+            assert_eq!(r.sequence, 1);
+            assert_eq!(n.consume().unwrap().twist(60), [0.; 3]);
         }
     }
     #[test]
@@ -738,7 +804,7 @@ mod tests {
         queued(&n, &m);
         let n = std::sync::Arc::new(n);
         let mut apply = n.consume().unwrap();
-        assert_eq!(apply.twist(40), [0.05, 0.0, 0.0]);
+        assert_eq!(apply.twist(40), REFERENCE_TWIST);
         let (start_tx, start_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let peer = n.clone();
@@ -862,7 +928,7 @@ mod tests {
         queued(&n, &m);
         let encoded = serde_json::to_vec(&Request::Fence { descriptor: f }).unwrap();
         assert!(serde_json::from_slice::<Request>(&encoded[..encoded.len() - 1]).is_err());
-        assert_eq!(n.consume().unwrap().twist(40), [0.05, 0.0, 0.0]);
+        assert_eq!(n.consume().unwrap().twist(40), REFERENCE_TWIST);
         // Transport loss while a partial request is buffered closes authority.
         n.disconnect(1);
         assert_eq!(n.consume().unwrap().twist(50), [0.0; 3]);

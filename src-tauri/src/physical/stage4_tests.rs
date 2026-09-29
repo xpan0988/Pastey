@@ -51,6 +51,11 @@ impl ControlFixture {
         fields.environment = live.view().clone();
         fields.profile = p;
         fields.qualification = q;
+        if native {
+            let PhysicalIntentV1::MicroDuckVelocityV1(v) = &mut fields.intent;
+            v.vx_mps =
+                Finite::try_from(crate::physical::native_protocol::REFERENCE_FORWARD_MPS).unwrap();
+        }
         let scope = PhysicalReviewScopeV1::try_from(fields).unwrap();
         let ingress = core.local_ingress().unwrap();
         core.configure_executor_policy(

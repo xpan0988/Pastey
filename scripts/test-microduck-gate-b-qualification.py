@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,8 +14,36 @@ spec = importlib.util.spec_from_file_location("qualification", Path(__file__).wi
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 
+# Fixture reads the single Rust protocol constant; the production owned Rust
+# launcher serializes that same REFERENCE_TWIST into the supervisor arguments.
+protocol = Path(__file__).resolve().parents[1] / "native/microduck/overlay/duck-ipc-proto/src/task_authority.rs"
+REFERENCE_FORWARD_MPS = float(re.search(
+    r"^pub const REFERENCE_FORWARD_MPS: f64 = ([0-9.]+);$", protocol.read_text(), re.M).group(1))
+REFERENCE_TWIST = [REFERENCE_FORWARD_MPS, 0.0, 0.0]
+
 
 class QualificationProducer(unittest.TestCase):
+    def test_reference_has_deliberate_margin_and_early_ema_crossing(self):
+        threshold, alpha, hz = 0.05, 0.2, 50
+        self.assertGreaterEqual(REFERENCE_FORWARD_MPS, threshold * 1.5)
+        self.assertLess(REFERENCE_FORWARD_MPS, 0.1)
+        old, reference, first_walk_tick = 0.0, 0.0, None
+        for tick in range(1, hz + 1):
+            old += alpha * (0.05 - old)
+            reference += alpha * (REFERENCE_FORWARD_MPS - reference)
+            self.assertLessEqual(old, threshold)
+            if reference > threshold and first_walk_tick is None:
+                first_walk_tick = tick
+        self.assertEqual(first_walk_tick, 5)
+        self.assertGreaterEqual(1_000_000 - first_walk_tick * 1_000_000 // hz, 900_000)
+
+    def test_qualification_requires_owned_protocol_payload_without_a_default(self):
+        argv = ["supervisor", "robotd", "rl", "params", "[]", "controller", "body", "world",
+                json.dumps({"version": 1}), "environment", "body-motion", "body-ref"]
+        with patch.object(gate.sys, "argv", argv):
+            with self.assertRaisesRegex(RuntimeError, "owned native reference payload required"):
+                gate.run()
+
     def probe(self, nonzero=False, wrong_identity=False, rpc_us=100, sample_us=100,
               reject_sequence=None, slow_sample=False, slow_rpc=False):
         now = [1_000_000]
@@ -35,6 +64,7 @@ class QualificationProducer(unittest.TestCase):
             elif kind == "admit":
                 current["action"] = request["descriptor"]
             elif kind == "move":
+                self.assertEqual(request["descriptor"]["twist"], REFERENCE_TWIST)
                 if slow_rpc and current["install"]["epoch"] == 1 and request["descriptor"]["sequence"] == 2:
                     now[0] += 210_000
                 current["move"] = copy.deepcopy(request["descriptor"])
@@ -70,7 +100,7 @@ class QualificationProducer(unittest.TestCase):
             return dict(daemon="controller", body="body", world="world", source_us=now[0],
                         simulation_us=now[0], sequence=now[0],
                         native={"t_ns": (now[0]-1)*1000,
-                                "move": {"requested": [.05, 0, 0] if nonzero else [0, 0, 0]}})
+                                "move": {"requested": REFERENCE_TWIST if nonzero else [0, 0, 0]}})
         def standing(next_sample, identities, dwell_us=200_000, minimum_native_us=0):
             result = [sample()]
             for _ in range(10):
@@ -81,7 +111,8 @@ class QualificationProducer(unittest.TestCase):
             now[0] += int(seconds * 1_000_000)
         with patch.object(gate.time, "monotonic_ns", lambda: now[0] * 1000), \
                 patch.object(gate, "collect_standing", standing), patch.object(gate.os, "kill") as kill:
-            result = gate.native_probes(rpc, sample, type("Process", (), {"pid": 123})(), identity, sleep)
+            result = gate.native_probes(rpc, sample, type("Process", (), {"pid": 123})(),
+                                       identity, REFERENCE_TWIST, sleep)
             self.assertEqual(kill.call_count, 2)
         return result, calls
 

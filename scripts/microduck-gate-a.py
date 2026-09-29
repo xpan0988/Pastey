@@ -402,7 +402,7 @@ def collect_standing(next_sample, identities, dwell_us=200_000, minimum_native_u
     raise RuntimeError("measured standing qualification unavailable")
 
 
-def native_probes(rpc, next_sample, process, identity, sleep=time.sleep):
+def native_probes(rpc, next_sample, process, identity, reference_twist, sleep=time.sleep):
     import signal
     import uuid
     transcript = []
@@ -424,7 +424,8 @@ def native_probes(rpc, next_sample, process, identity, sleep=time.sleep):
         action = dict(install=install, action="physical-action:v1:"+str(uuid.uuid4()),
             payload_digest=hashlib.sha256(b"qualification-reference-velocity").hexdigest(), deadline_us=now+action_us)
         ar = task(dict(kind="admit", descriptor=action))
-        move = dict(action=action, request="physical-request:v1:"+str(uuid.uuid4()), sequence=1, twist=[.05,0,0])
+        move = dict(action=action, request="physical-request:v1:"+str(uuid.uuid4()), sequence=1,
+                    twist=reference_twist)
         mr = task(dict(kind="move", descriptor=move))
         if not all(r.get("accepted") for r in (ir, ar, mr)):
             raise RuntimeError("native mechanism unavailable")
@@ -576,10 +577,14 @@ def readiness_report(rpc, next_sample, identity, subscribed, assets, model_diges
 
 
 def run(*, readiness_only=False):
-    if len(sys.argv) not in (8, 12):
+    if len(sys.argv) not in (8, 12, 13):
         raise RuntimeError("owned launcher arguments required")
     robotd, root, params, assets_json, daemon, body_id, world_id = sys.argv[1:8]
-    pins = json.loads(sys.argv[8]) if len(sys.argv) == 12 else None
+    pins = json.loads(sys.argv[8]) if len(sys.argv) >= 12 else None
+    # Readiness keeps its existing arguments; qualification requires the exact
+    # compiled protocol payload supplied by the owned Rust launcher, no default.
+    if pins and not readiness_only and len(sys.argv) != 13:
+        raise RuntimeError("owned native reference payload required")
     identity = None
     original_params, original_assets = params, json.loads(assets_json)
     if pins:
@@ -770,7 +775,9 @@ def run(*, readiness_only=False):
             return
         bundle = None
         if pins:
-            transcript, expiry_witnesses, expiry_moves, reference_trace = native_probes(rpc, next_sample, process, identity)
+            reference_twist = json.loads(sys.argv[12])
+            transcript, expiry_witnesses, expiry_moves, reference_trace = native_probes(
+                rpc, next_sample, process, identity, reference_twist)
             # The last probe leaves authority closed. No probe renews a Core task.
             # Establish fresh measured rest again before sealing enrollment.
             observations = collect_standing(next_sample, (daemon, body_id, world_id),

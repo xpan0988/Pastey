@@ -731,7 +731,7 @@ pub(crate) async fn provision_host(
         let PhysicalIntentV1::MicroDuckVelocityV1(v) = &ceiling.intent;
         require(
             v.frame == MicroDuckFrameV1::Trunk
-                && v.vx_mps.get() == 0.05
+                && v.vx_mps.get() == wire::REFERENCE_FORWARD_MPS
                 && v.vy_mps.get() == 0.
                 && v.vyaw_radps.get() == 0.,
             "Native release exact intent mismatch",

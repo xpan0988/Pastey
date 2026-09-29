@@ -42,6 +42,8 @@ It is outside task authority and requires the trusted isolated launcher.
 
 ## Native boundary and limits
 
+The sole native movement is `REFERENCE_TWIST`, defined by `REFERENCE_FORWARD_MPS = 0.08 m/s` in the [task protocol](overlay/duck-ipc-proto/src/task_authority.rs). It has a 0.03 m/s margin above the pinned inclusive 0.05 standing threshold; native EMA at alpha 0.2 / 50 Hz crosses on tick 5 (100 ms), leaving about 900 ms of the one-second action for walking. The ideal EMA command integral is about 0.0736 m; measured displacement still must pass the unchanged 0.01–0.1 m gate. The [authoritative derivation and Stage 8/9 boundary contract](../../docs/physical-environment-implementation.md#stage-8-native-consumption-contract) distinguish the command model from real qualification. Guard, adapter, owned Python producer and native fixtures share the protocol constant; the guard still rejects every changed numeric payload. Upstream selection, tuning, policies, environment pins and authority limits are retained. Reported run `009h` isolated the old threshold collision; the corrected payload is not yet qualified.
+
 `robot.task` receives metadata. Move ACK means queued admission, not effect. The
 control loop takes the same guard mutex used by install/fence, validates and
 consumes tagged pending intent before controller shaping, and retains the guard

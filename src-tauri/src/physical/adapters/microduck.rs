@@ -1325,6 +1325,10 @@ impl MicroDuckRunV1 {
                 .arg(String::from(config.environment.clone()))
                 .arg(String::from(config.domain.clone()))
                 .arg(String::from(config.body.clone()))
+                // Owned producer input from the same compiled protocol as robotd.
+                .arg(serde_json::to_string(
+                    &crate::physical::native_protocol::REFERENCE_TWIST,
+                )?)
                 .env_remove("PYTHONPATH")
                 .env_remove("PYTHONHOME")
                 .env_remove("LD_PRELOAD")
@@ -1584,6 +1588,10 @@ pub(in crate::physical) mod test_support {
                 }
                 w::Request::Move { descriptor: m } => {
                     require(!self.fenced, "Fake fenced action")?;
+                    require(
+                        m.twist == w::REFERENCE_TWIST,
+                        "Fake changed native reference payload",
+                    )?;
                     self.sequence = m.sequence;
                     (m.request.clone(), "queued")
                 }
@@ -1731,6 +1739,11 @@ pub(in crate::physical) mod test_support {
     ) {
         let sub = &run.registration.subsystems[&label("locomotion")];
         let source = run.clock_source + ticks - 1_000;
+        let twist = if h.native.lock().is_some() {
+            crate::physical::native_protocol::REFERENCE_TWIST
+        } else {
+            [0.05, 0., 0.]
+        };
         h.samples.lock().push_back(GateASampleV1 {
             source_us: source,
             simulation_us: ticks,
@@ -1742,8 +1755,8 @@ pub(in crate::physical) mod test_support {
                 t: ticks as f64 / 1e6,
                 t_ns: Some(source * 1000 + 500),
                 movement: Some(NativeTwistV1 {
-                    requested: [0.05, 0., 0.],
-                    applied: [0.05, 0., 0.],
+                    requested: twist,
+                    applied: twist,
                 }),
                 odom: None,
                 policy: Some("stand".into()),

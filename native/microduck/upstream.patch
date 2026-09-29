@@ -236,7 +236,7 @@ index ab574b6..fd168e1 100644
 +            action: action.clone(),
 +            request: "move".into(),
 +            sequence: 1,
-+            twist: [0.05, 0.0, 0.0],
++            twist: REFERENCE_TWIST,
 +        };
 +        assert!(
 +            intents
@@ -326,7 +326,7 @@ index ab574b6..fd168e1 100644
 +        assert_eq!(
 +            frame.movement.requested,
 +            if apply_pause {
-+                [0.05, 0.0, 0.0]
++                REFERENCE_TWIST
 +            } else {
 +                [0.0; 3]
 +            }
@@ -429,7 +429,7 @@ index ab574b6..fd168e1 100644
 +            action: action.clone(),
 +            request: "move".into(),
 +            sequence: 1,
-+            twist: [0.05, 0.0, 0.0],
++            twist: REFERENCE_TWIST,
 +        };
 +        assert!(
 +            intents
@@ -465,7 +465,7 @@ index ab574b6..fd168e1 100644
 +                .accepted
 +        );
 +        let mut contention = intents.task.consume().unwrap();
-+        assert_eq!(contention.twist(now), [0.05, 0.0, 0.0]);
++        assert_eq!(contention.twist(now), REFERENCE_TWIST);
 +        if controller_loss {
 +            intents.task.inject_controller_failure();
 +        }
@@ -607,7 +607,7 @@ index ab574b6..fd168e1 100644
 +            action: action.clone(),
 +            request: "fresh-move".into(),
 +            sequence: 1,
-+            twist: [0.05, 0.0, 0.0],
++            twist: REFERENCE_TWIST,
 +        };
 +        assert!(
 +            fresh
@@ -639,7 +639,7 @@ index ab574b6..fd168e1 100644
 +                .consume()
 +                .unwrap()
 +                .twist(proto::clock::monotonic_ns() / 1000),
-+            [0.05, 0.0, 0.0]
++            REFERENCE_TWIST
 +        );
 +    }
 +    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

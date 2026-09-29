@@ -224,6 +224,42 @@ struct NativeProfile {
     adapter: Arc<dyn PhysicalEnvironmentAdapterV1>,
 }
 
+#[tokio::test]
+async fn native_reference_payload_matches_protocol_on_dispatch_and_refresh() {
+    let n = NativeProfile::new();
+    let PhysicalIntentV1::MicroDuckVelocityV1(v) = &n.f.scope.fields().intent;
+    assert_eq!(v.vx_mps.get(), wire::REFERENCE_FORWARD_MPS);
+    assert_eq!(
+        n.f.scope.fields().velocity_limits.max_abs_vx_mps.get(),
+        wire::REFERENCE_FORWARD_MPS
+    );
+    let s = n.active().await;
+    let a = n.admit(&s);
+    PhysicalControlServiceV1::dispatch_admitted_action(&n.f.core, &a, n.adapter.as_ref())
+        .await
+        .unwrap();
+    n.observe(&s, 3, 110_000, 0.003, wire::REFERENCE_FORWARD_MPS, true);
+    PhysicalControlServiceV1::refresh_admitted_action(&n.f.core, &a, n.adapter.as_ref())
+        .await
+        .unwrap();
+    let moves: Vec<_> = supervisor::commands(&n.harness)
+        .into_iter()
+        .filter_map(|command| {
+            let value: serde_json::Value = serde_json::from_str(&command).unwrap();
+            match serde_json::from_value::<wire::Request>(value.get("request")?.clone()).unwrap() {
+                wire::Request::Move { descriptor } => Some(descriptor),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(moves.len(), 2);
+    assert_eq!(moves[0].twist, wire::REFERENCE_TWIST);
+    assert_eq!(moves[1].twist, wire::REFERENCE_TWIST);
+    assert_eq!(moves[0].sequence, 1);
+    assert_eq!(moves[1].sequence, 2);
+    assert_eq!(moves[0].action, moves[1].action);
+}
+
 #[test]
 fn native_read_start_precedes_body_acquisition_with_strict_same_frame_bound() {
     assert!(microduck::same_control_frame(100_000_000, 101_000));
@@ -459,7 +495,8 @@ impl NativeProfile {
         let mut p = profile();
         p.required_enforcement_class = SessionEnforcementClassV1::NativeFence;
         p.execution.lease_duration_us = micros(2_000_000);
-        p.velocity_limits.max_abs_vx_mps = NonNegative::try_from(0.05).unwrap();
+        p.velocity_limits.max_abs_vx_mps =
+            NonNegative::try_from(wire::REFERENCE_FORWARD_MPS).unwrap();
         p.velocity_limits.max_abs_vy_mps = NonNegative::try_from(0.).unwrap();
         p.velocity_limits.max_abs_vyaw_radps = NonNegative::try_from(0.).unwrap();
         let (live, q) = c.enroll_qualify_gate_b(&i, &run, &p, None).unwrap();
@@ -470,6 +507,8 @@ impl NativeProfile {
         fields.qualification = q;
         fields.execution = p.execution.clone();
         fields.velocity_limits = p.velocity_limits.clone();
+        let PhysicalIntentV1::MicroDuckVelocityV1(v) = &mut fields.intent;
+        v.vx_mps = Finite::try_from(wire::REFERENCE_FORWARD_MPS).unwrap();
         let scope = PhysicalReviewScopeV1::try_from(fields).unwrap();
         c.configure_executor_policy(
             &i,
@@ -945,7 +984,7 @@ fn exact_evidence_bundle_and_missing_or_wrong_inputs_fail_closed() {
                     .movement
                     .as_mut()
                     .unwrap()
-                    .requested = [0.05, 0., 0.]
+                    .requested = wire::REFERENCE_TWIST
             }
             19 => b.mechanism[0].installed = None,
             20 => b.reference_trace.clear(),
@@ -1775,7 +1814,7 @@ async fn real_owned_gate_b_qualification_review_execution_and_acceptance() {
     let mut p = profile();
     p.required_enforcement_class = SessionEnforcementClassV1::NativeFence;
     p.execution.lease_duration_us = micros(2_000_000);
-    p.velocity_limits.max_abs_vx_mps = NonNegative::try_from(0.05).unwrap();
+    p.velocity_limits.max_abs_vx_mps = NonNegative::try_from(wire::REFERENCE_FORWARD_MPS).unwrap();
     p.velocity_limits.max_abs_vy_mps = NonNegative::try_from(0.).unwrap();
     p.velocity_limits.max_abs_vyaw_radps = NonNegative::try_from(0.).unwrap();
     let (scope, session, adapter) = {
@@ -1789,6 +1828,8 @@ async fn real_owned_gate_b_qualification_review_execution_and_acceptance() {
         fields.qualification = q;
         fields.execution = p.execution.clone();
         fields.velocity_limits = p.velocity_limits.clone();
+        let PhysicalIntentV1::MicroDuckVelocityV1(v) = &mut fields.intent;
+        v.vx_mps = Finite::try_from(wire::REFERENCE_FORWARD_MPS).unwrap();
         let scope = PhysicalReviewScopeV1::try_from(fields).unwrap();
         c.configure_executor_policy(
             &i,
