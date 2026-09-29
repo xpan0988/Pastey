@@ -5,8 +5,6 @@
 //! materialized only into an immutable process-local binding. None of these
 //! types are Plan authority, effect authority, or Worker-visible handles.
 
-#![allow(dead_code)] // The private Phase 6 coordinator seam is not product attached.
-
 use std::{
     collections::HashMap,
     fmt,

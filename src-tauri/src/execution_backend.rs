@@ -520,10 +520,6 @@ fn macos_process_memory_bytes(process_group: i32) -> u64 {
     }
 }
 
-fn invalid<T>(message: &str) -> AppResult<T> {
-    Err(AppError::InvalidInput(message.into()))
-}
-
 fn unavailable<T>(message: &str) -> AppResult<T> {
     Err(AppError::InvalidInput(message.into()))
 }

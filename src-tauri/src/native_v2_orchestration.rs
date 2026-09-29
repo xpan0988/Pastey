@@ -151,22 +151,6 @@ pub enum NativeV2ProductStateV1 {
     Cancelled,
 }
 
-impl NativeV2ProductStateV1 {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Draft => "draft",
-            Self::Approved => "approved",
-            Self::CheckingReadiness => "checking_readiness",
-            Self::Preparing => "preparing",
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Interrupted => "interrupted",
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeV2PlanStatusV1 {
@@ -2530,35 +2514,6 @@ fn fail_receiver_external(
         "UPDATE native_v2_receiver_attempts SET state = 'failed', failure_code = ?2,
          updated_at = ?3 WHERE attempt_id = ?1 AND state = 'running'",
         params![attempt_id, code, now],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn fail_requester_attempt(
-    paths: &AppPaths,
-    attempt_id: &str,
-    code: &str,
-    now: i64,
-) -> AppResult<()> {
-    let mut conn = connection(paths)?;
-    let tx = conn.transaction()?;
-    let revision_id: String = tx.query_row(
-        "SELECT revision_id FROM native_v2_product_attempts WHERE attempt_id = ?1",
-        [attempt_id],
-        |row| row.get(0),
-    )?;
-    tx.execute(
-        "UPDATE native_v2_product_attempts SET state = 'failed', failure_code = ?2,
-         updated_at = ?3 WHERE attempt_id = ?1
-         AND state IN ('checking_readiness','preparing','running')",
-        params![attempt_id, code, now],
-    )?;
-    tx.execute(
-        "UPDATE native_v2_product_revisions SET state = 'failed', failure_code = ?2,
-         updated_at = ?3 WHERE revision_id = ?1
-         AND state IN ('checking_readiness','preparing','running')",
-        params![revision_id, code, now],
     )?;
     tx.commit()?;
     Ok(())

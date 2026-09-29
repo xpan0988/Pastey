@@ -172,7 +172,6 @@ impl ManagedObjectBindingService {
     }
 
     /// Establishes revision 1 of a newly acquired logical object.
-    #[allow(dead_code)] // Generic Inbox/drag/drop/generated callers attach incrementally.
     pub(crate) fn acquire_new(
         &mut self,
         input: HostArtifactAcquisition,
@@ -210,7 +209,6 @@ impl ManagedObjectBindingService {
     /// Re-establishes the same exact logical revision at this Host after an
     /// explicit Transfer. It cannot create N+1 and requires the expected
     /// content identity from Core-owned lineage.
-    #[allow(dead_code)] // Used by protocol v2 after the Phase 4 migration.
     pub(crate) fn bind_transferred_revision(
         &mut self,
         input: HostArtifactAcquisition,

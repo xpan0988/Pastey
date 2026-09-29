@@ -883,36 +883,6 @@ fn insert_worker_attempt(
     Ok(())
 }
 
-fn codex_attempt_qualification_generation(
-    paths: &crate::storage::AppPaths,
-    attempt_id: &str,
-) -> AppResult<Option<u64>> {
-    connection(paths)?
-        .query_row(
-            "SELECT qualification_generation FROM bridge_plan_v2_codex_attempt_bindings
-             WHERE attempt_id = ?1",
-            [attempt_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Into::into)
-}
-
-fn pi_attempt_qualification_generation(
-    paths: &crate::storage::AppPaths,
-    attempt_id: &str,
-) -> AppResult<Option<u64>> {
-    connection(paths)?
-        .query_row(
-            "SELECT qualification_generation FROM bridge_plan_v2_pi_attempt_bindings
-             WHERE attempt_id = ?1",
-            [attempt_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Into::into)
-}
-
 fn worker_attempt_selection(
     paths: &crate::storage::AppPaths,
     attempt_id: &str,

@@ -106,7 +106,6 @@ pub struct PlanParticipant {
 pub struct PlanParticipants(Vec<PlanParticipant>);
 
 impl PlanParticipants {
-    #[allow(dead_code)] // Native v2 Composer/outbound construction is not exposed yet.
     pub fn new(plan_id: &str, hosts: impl IntoIterator<Item = HostRef>) -> AppResult<Self> {
         let mut by_host = BTreeMap::new();
         for host_ref in hosts {

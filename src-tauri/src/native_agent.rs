@@ -2306,7 +2306,6 @@ impl NativeAgentServiceV1 {
         )
     }
 
-    #[allow(dead_code)]
     fn apply_exact_workspace_result_with_crash(
         &mut self,
         movement_id: &str,
