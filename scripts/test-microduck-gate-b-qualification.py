@@ -45,7 +45,7 @@ class QualificationProducer(unittest.TestCase):
                 gate.run()
 
     def probe(self, nonzero=False, wrong_identity=False, rpc_us=100, sample_us=100,
-              reject_sequence=None, slow_sample=False, slow_rpc=False):
+              reject_sequence=None, slow_sample=False, slow_rpc=False, deceleration_us=0):
         now = [1_000_000]
         current = {}
         witnessed = set()
@@ -68,6 +68,8 @@ class QualificationProducer(unittest.TestCase):
                 if slow_rpc and current["install"]["epoch"] == 1 and request["descriptor"]["sequence"] == 2:
                     now[0] += 210_000
                 current["move"] = copy.deepcopy(request["descriptor"])
+            elif kind == "fence":
+                current["fence_us"] = now[0]
             if kind == "status" and current.get("install", {}).get("epoch", 0) >= 3:
                 self.assertIn(current["install"]["epoch"], witnessed,
                               "status must not lazily expire the probe before a loop witness")
@@ -97,10 +99,16 @@ class QualificationProducer(unittest.TestCase):
             epoch = current.get("install", {}).get("epoch", 0)
             if epoch >= 3:
                 witnessed.add(epoch)
+            moving = (epoch == 1 and "fence_us" in current
+                      and now[0] - current["fence_us"] <= deceleration_us)
             return dict(daemon="controller", body="body", world="world", source_us=now[0],
                         simulation_us=now[0], sequence=now[0],
                         native={"t_ns": (now[0]-1)*1000,
-                                "move": {"requested": REFERENCE_TWIST if nonzero else [0, 0, 0]}})
+                                "move": {"requested": REFERENCE_TWIST if nonzero else [0, 0, 0]},
+                                "policy": "stand", "safety": {"fallen": False}},
+                        oracle=dict(position=[.04, 0., .125], yaw=0., upright=True,
+                                    linear_speed=.04 if moving else 0., angular_speed=.2 if moving else 0.,
+                                    uncertainty=1e-6))
         def standing(next_sample, identities, dwell_us=200_000, minimum_native_us=0):
             result = [sample()]
             for _ in range(10):
@@ -163,6 +171,22 @@ class QualificationProducer(unittest.TestCase):
         self.assertEqual(len(self.accepted), 2)
         self.assertEqual(sum(kind == "status" for kind, _ in self.calls), 1)
 
+    def test_reference_action_keeps_more_than_200_ms_of_post_fence_deceleration(self):
+        (transcript, _, _, trace), _ = self.probe(rpc_us=1_000, sample_us=20_000,
+                                                deceleration_us=320_000)
+        fence = transcript[4]["native_us"]
+        transition = [s for s in trace if s["source_us"] >= fence and s["oracle"]["linear_speed"] > .02]
+        self.assertGreater(transition[-1]["source_us"] - fence, 200_000)
+        self.assertTrue(all(s["oracle"]["angular_speed"] > .1 for s in transition))
+        self.assertLessEqual(len(trace), 64)
+        self.assertTrue(all(0 < b["source_us"]-a["source_us"] < 200_000
+                            and b["native"]["t_ns"] > a["native"]["t_ns"] and b["sequence"] > a["sequence"]
+                            for a, b in zip(trace, trace[1:])))
+        progress = gate.SimulatorProgress()
+        for s in trace:
+            progress.observe(s, trace[-1]["source_us"])
+        self.assertTrue(progress.completed)
+
     def test_accepted_but_over_budget_rpc_fails_closed(self):
         with self.assertRaisesRegex(RuntimeError, "accepted refresh exceeded scheduling margin"):
             self.probe(rpc_us=60_000)
@@ -221,6 +245,130 @@ class QualificationProducer(unittest.TestCase):
             params.write_text('[policy]\nenabled=true\nwalk="walk"\nstand="stand"\n')
             with self.assertRaisesRegex(RuntimeError, "disabled"):
                 gate.snapshot_native_artifacts(params, json.dumps(["walk", "stand"]))
+
+
+class ReferenceSettling(unittest.TestCase):
+    @staticmethod
+    def frame(source, sequence, linear=0., angular=0.):
+        return dict(daemon="d", body="b", world="w", source_us=source, simulation_us=source,
+                    sequence=sequence, native=dict(t_ns=(source-1)*1000, policy="walk", safety={"fallen": False}),
+                    oracle=dict(position=[.04, 0., .125], yaw=.386, upright=True,
+                                linear_speed=linear, angular_speed=angular, uncertainty=1e-6))
+
+    def collect(self, events, prefix_count=11, mutate=None, standing=False, cutoff_offset=1):
+        self.prefix = [self.frame(1_000_000+i*100_000, i+1, .08 if i else 0.) for i in range(prefix_count)]
+        source, sequence = [self.prefix[-1]["source_us"]], [self.prefix[-1]["sequence"]]
+        now, self.acquired = [source[0]], []
+        events = iter(events)
+        def sample():
+            event = next(events)
+            if isinstance(event, Exception):
+                raise event
+            delta, linear, angular = event
+            source[0] += delta
+            sequence[0] += 1
+            s = self.frame(source[0], sequence[0], linear, angular)
+            if mutate:
+                mutate(s, len(self.acquired))
+            now[0] = source[0]
+            self.acquired.append(s)
+            return s
+        with patch.object(gate.time, "monotonic_ns", lambda: now[0]*1000):
+            if standing:
+                return gate.collect_standing(sample, ("d", "b", "w"), 500_000, source[0]+cutoff_offset)
+            return gate.collect_reference_settling(sample, ("d", "b", "w"), self.prefix, source[0]+cutoff_offset)
+
+    def assert_continuous(self, trace):
+        self.assertLessEqual(len(trace), 64)
+        for a, b in zip(trace, trace[1:]):
+            self.assertTrue(0 < b["source_us"]-a["source_us"] < 200_000)
+            self.assertGreater(b["native"]["t_ns"], a["native"]["t_ns"])
+            self.assertGreater(b["sequence"], a["sequence"])
+        progress = gate.SimulatorProgress()
+        for s in trace:
+            progress.observe(s, trace[-1]["source_us"])
+        self.assertTrue(progress.completed)
+        for s in trace[len(self.prefix):]:
+            self.assertTrue(any(s is acquired for acquired in self.acquired), "only real frames may be retained")
+
+    def test_transitional_frames_bridge_deceleration_without_a_splice(self):
+        trace = self.collect([(20_000, .08, .2)]*16 + [(20_000, .02, .1)]*30)
+        self.assert_continuous(trace)
+        self.assertEqual(trace[:len(self.prefix)], self.prefix)
+        self.assertIs(trace[len(self.prefix)], self.acquired[0])
+        moving = [s for s in trace[len(self.prefix):] if not all(gate.standing_checks(s).values())]
+        self.assertGreater(moving[-1]["source_us"]-self.prefix[-1]["source_us"], 200_000)
+        resting = next(s for s in trace[len(self.prefix):] if all(gate.standing_checks(s).values()))
+        self.assertEqual(trace[-1]["source_us"]-resting["source_us"], 500_000)
+
+    def test_sub_cadence_speed_interruptions_reset_the_real_settling_interval(self):
+        for linear, angular in ((.020001, .1), (.02, .100001)):
+            with self.subTest(linear=linear, angular=angular):
+                trace = self.collect([(20_000, .08, .2)]*15 + [(20_000, .02, .1)]*24
+                                     + [(20_000, linear, angular)] + [(20_000, .02, .1)]*30)
+                self.assert_continuous(trace)
+                self.assertTrue(any(s is self.acquired[39] for s in trace))
+                self.assertTrue(any(s is self.acquired[40] for s in trace))
+                self.assertEqual(trace[-1]["source_us"]-self.acquired[40]["source_us"], 500_000)
+                self.assertEqual(len(self.acquired), 66)
+
+    def test_499999_us_of_rest_is_insufficient_and_500000_us_is_required(self):
+        trace = self.collect([(20_000, .02, .1)]*25 + [(19_999, .02, .1), (1, .02, .1)])
+        self.assertEqual(len(self.acquired), 27)
+        self.assertEqual(trace[-1]["source_us"]-self.acquired[0]["source_us"], 500_000)
+        self.assertIs(trace[-1], self.acquired[-1])
+        self.assert_continuous(trace)
+
+    def test_native_cutoff_and_complete_progress_window_are_still_required(self):
+        trace = self.collect([(20_000, 0., 0.)]*60, prefix_count=1, cutoff_offset=20_000)
+        self.assertLess(self.acquired[0]["native"]["t_ns"]//1000, self.prefix[-1]["source_us"]+20_000)
+        self.assertIs(trace[1], self.acquired[1])
+        self.assertGreaterEqual(trace[-1]["source_us"]-trace[0]["source_us"], 1_000_000)
+        self.assert_continuous(trace)
+
+    def test_thinning_bridges_only_with_real_acquisitions(self):
+        # The second 180 ms acquisition would make a 270 ms retained gap.
+        trace = self.collect([(90_000, .08, .2), (90_000, .08, .2), (180_000, .08, .2)]
+                             + [(90_000, 0., 0.)]*10)
+        self.assertTrue(any(s is self.acquired[1] for s in trace))
+        self.assert_continuous(trace)
+
+    def test_genuine_200_ms_acquisition_gap_fails_closed(self):
+        for gap in (200_000, 200_001):
+            with self.subTest(gap=gap), self.assertRaises(gate.AcquisitionError) as caught:
+                self.collect([(20_000, .08, .2)]*3 + [(gap, 0., 0.)])
+            self.assertEqual(caught.exception.data["source_delta_us"], gap)
+            self.assertIn("0 < source_delta_us < 200000", caught.exception.data["failed_conditions"])
+
+    def test_unretained_raw_frames_cannot_hide_regression_or_replacement(self):
+        def cached_source(s):
+            s["source_us"] = self.acquired[-1]["source_us"]
+            s["native"]["t_ns"] = self.acquired[-1]["native"]["t_ns"]
+        edits = [(cached_source, "source_delta_us"),
+                 (lambda s: s.update(sequence=self.acquired[-1]["sequence"]), "sequence >"),
+                 (lambda s: s["native"].update(t_ns=self.acquired[-1]["native"]["t_ns"]), "native_t_ns >"),
+                 (lambda s: s.update(simulation_us=self.acquired[-1]["simulation_us"]-1), "simulation_us >="),
+                 (lambda s: s.update(world="replacement"), "incarnation changed"),
+                 (lambda s: s["oracle"].update(upright=False), "oracle_upright"),
+                 (lambda s: s["native"]["safety"].update(fallen=True), "native_not_fallen")]
+        for edit, message in edits:
+            with self.subTest(message=message), self.assertRaisesRegex(RuntimeError, message):
+                self.collect([(10_000, .08, .2)]*3, mutate=lambda s, i: edit(s) if i == 1 else None)
+        with self.assertRaisesRegex(RuntimeError, "stale native acquisition"):
+            self.collect([(20_000, .08, .2), RuntimeError("stale native acquisition")])
+
+    def test_evidence_limit_fails_without_trimming_or_splicing(self):
+        with self.assertRaisesRegex(RuntimeError, "evidence limit exceeded \\(64 samples\\)"):
+            self.collect([(20_000, .08, .2)]*400)
+        self.assertEqual(len(self.prefix), 11)
+        self.assertLess(self.acquired[-1]["source_us"]-self.prefix[-1]["source_us"], 10_000_000)
+
+    def test_pure_standing_collection_still_discards_the_moving_prefix(self):
+        trace = self.collect([(20_000, .08, .2)]*16 + [(20_000, .02, .1)]*55, standing=True)
+        self.assertTrue(all(all(gate.standing_checks(s).values()) for s in trace))
+        self.assertIs(trace[0], self.acquired[16])
+        self.assertGreaterEqual(trace[-1]["source_us"]-trace[0]["source_us"], 1_000_000)
+        self.assertLessEqual(len(trace), 32)
 
 
 if __name__ == "__main__":

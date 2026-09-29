@@ -402,6 +402,78 @@ def collect_standing(next_sample, identities, dwell_us=200_000, minimum_native_u
     raise RuntimeError("measured standing qualification unavailable")
 
 
+def collect_reference_settling(next_sample, identities, reference_trace, minimum_native_us):
+    """Bridge the fenced motion to measured rest without dropping deceleration.
+
+    Validate every acquisition and the retained trace independently. Thin real
+    observations at ~10 Hz, retaining every rest start/interruption and any raw
+    bridge needed for a strict <200 ms gap. Never trim the continuous prefix.
+    """
+    result = list(reference_trace)
+    if not result or len(result) > 64:
+        raise RuntimeError("reference settling requires a bounded continuous prefix")
+    raw_progress, retained_progress = SimulatorProgress(), SimulatorProgress()
+    now = time.monotonic_ns() // 1000
+    for record in result:
+        raw_progress.observe(record, now)
+        retained_progress.observe(record, now)
+    previous = result[-1]
+    rest_since = None
+    post_fence_started = False
+    until = now + 10_000_000
+
+    def retain(record):
+        if len(result) >= 64:
+            raise RuntimeError("reference settling evidence limit exceeded (64 samples)")
+        retained_progress.observe(record, now)
+        result.append(record)
+
+    while time.monotonic_ns() // 1000 < until:
+        s = next_sample()  # Acquisition loss cannot be repaired by resetting a trace.
+        now = time.monotonic_ns() // 1000
+        if (s["daemon"], s["body"], s["world"]) != identities:
+            raise RuntimeError("qualification incarnation changed")
+        if not 0 <= now - s["source_us"] < FRESHNESS_US:
+            raise AcquisitionError("reference settling acquisition stale", s, now,
+                                   ["0 <= now_us - source_us < 200000"])
+        raw_progress.observe(s, now)
+        checks = standing_checks(s)
+        oracle = s.get("oracle") or {}
+        transition_checks = {k: checks[k] for k in (
+            "oracle_available_finite", "oracle_upright", "uncertainty_in_0_to_0_001", "native_not_fallen")}
+        position = oracle.get("position")
+        transition_checks.update(
+            position_finite=isinstance(position, (list, tuple)) and len(position) == 3
+                            and all(finite(v) for v in position),
+            linear_speed_finite_nonnegative=finite(oracle.get("linear_speed")) and oracle["linear_speed"] >= 0,
+            angular_speed_finite_nonnegative=finite(oracle.get("angular_speed")) and oracle["angular_speed"] >= 0)
+        if not all(transition_checks.values()):
+            raise AcquisitionError("reference settling measurement invalid", s, now,
+                                   [k for k, valid in transition_checks.items() if not valid])
+
+        post_fence = (s["source_us"] >= minimum_native_us
+                      and s["native"]["t_ns"] // 1000 >= minimum_native_us)
+        begin = post_fence and not post_fence_started
+        post_fence_started |= post_fence
+        ready = all(checks.values()) and post_fence
+        changed = ready != (rest_since is not None)
+        if ready:
+            if rest_since is None:
+                rest_since = s["source_us"]
+        else:
+            rest_since = None
+        settled = rest_since is not None and s["source_us"] - rest_since >= 500_000
+        if s["source_us"] - result[-1]["source_us"] >= FRESHNESS_US:
+            retain(previous)
+        if (begin or changed or (settled and retained_progress.completed)
+                or s["source_us"] - result[-1]["source_us"] >= 100_000):
+            retain(s)
+        if settled and retained_progress.completed:
+            return result
+        previous = s
+    raise RuntimeError("measured reference settling qualification unavailable")
+
+
 def native_probes(rpc, next_sample, process, identity, reference_twist, sleep=time.sleep):
     import signal
     import uuid
@@ -481,8 +553,8 @@ def native_probes(rpc, next_sample, process, identity, reference_twist, sleep=ti
         reference_trace.append(next_sample())
     transcript.append(task(dict(kind="fence", descriptor=dict(install=install, next_epoch=2,
         request="physical-request:v1:"+str(uuid.uuid4())))))
-    reference_trace.extend(collect_standing(next_sample, identities, 500_000,
-                                             minimum_native_us=transcript[-1]["native_us"]))
+    reference_trace = collect_reference_settling(next_sample, identities, reference_trace,
+                                                minimum_native_us=transcript[-1]["native_us"])
     for epoch, lease, duration, delay, pause in [(3,1_000_000,600_000,.23,False),
             (4,500_000,120_000,.15,False), (5,120_000,120_000,.15,False),
             (6,500_000,120_000,.30,True)]:

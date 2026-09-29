@@ -651,6 +651,63 @@ fn qualification_standing_and_reference_projection_are_heading_invariant() {
     }
 }
 #[test]
+fn reference_settling_retains_deceleration_and_requires_unbroken_real_rest() {
+    let mut enrollment = fake::enrollment(&binding());
+    let mut b = bundle(fake::record(&mut enrollment));
+    let template = b.reference_trace.last().unwrap().clone();
+    b.reference_trace.extend((18..=20).map(|i| {
+        let mut s = template.clone();
+        s.source_us = 50_000 + i * 100_000;
+        s.simulation_us = s.source_us;
+        s.sequence = i + 1;
+        s.native.t_ns = Some(s.source_us * 1000);
+        s
+    }));
+    // Fence at 1.11 s, physical transition through 1.45 s, rest from 1.55 s.
+    // Every transition frame remains upright/not-fallen and correlated.
+    for s in &mut b.reference_trace[11..15] {
+        let o = s.oracle.as_mut().unwrap();
+        o.linear_speed = 0.04;
+        o.angular_speed = 0.2;
+    }
+    for s in &mut b.reference_trace[15..] {
+        let o = s.oracle.as_mut().unwrap();
+        o.linear_speed = 0.02;
+        o.angular_speed = 0.1;
+    }
+    b.validate().unwrap();
+
+    let mut spliced = b.clone();
+    spliced.reference_trace.drain(11..15);
+    assert!(spliced
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("Cached source/native/sequence, simulator regression or source gap"));
+    let mut short_rest = b.clone();
+    short_rest.reference_trace.pop();
+    assert!(short_rest
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .starts_with("Reference motion/measured settling qualification missing:"));
+    for angular in [false, true] {
+        let mut interrupted = b.clone();
+        let o = interrupted.reference_trace[18].oracle.as_mut().unwrap();
+        if angular {
+            o.angular_speed = 0.100001;
+        } else {
+            o.linear_speed = 0.020001;
+        }
+        assert!(interrupted
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .starts_with("Reference motion/measured settling qualification missing:"));
+    }
+}
+
+#[test]
 fn reference_motion_failure_diagnostics_report_exact_fields() {
     let mut enrollment = fake::enrollment(&binding());
     let mut b = bundle(fake::record(&mut enrollment));
