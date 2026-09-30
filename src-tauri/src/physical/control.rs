@@ -139,13 +139,6 @@ struct LaneValidityV1 {
     continuing: Option<Arc<AtomicU64>>,
 }
 impl LaneValidityV1 {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no production binding is attached; the reference bindings are test-only"
-        )
-    )]
     fn allows(&self) -> bool {
         self.flags.iter().all(|f| f.load(Ordering::Acquire))
             && self.clock.read().is_ok_and(|(_, ticks)| {
@@ -157,10 +150,6 @@ impl LaneValidityV1 {
             })
     }
 }
-#[expect(
-    dead_code,
-    reason = "no production binding is attached; the reference bindings are test-only; unused by tests too"
-)]
 pub(in crate::physical) struct NativeSessionInstallViewV1 {
     session: SessionId,
     epochs: BTreeMap<DomainId, u64>,
@@ -169,10 +158,6 @@ pub(in crate::physical) struct NativeSessionInstallViewV1 {
     binding: EnvironmentBindingViewV1,
     validity: LaneValidityV1,
 }
-#[expect(
-    dead_code,
-    reason = "no production binding is attached; the reference bindings are test-only; unused by tests too"
-)]
 pub(in crate::physical) struct AdmittedActionReadViewV1 {
     session: SessionId,
     epochs: BTreeMap<DomainId, u64>,
@@ -187,13 +172,6 @@ pub(in crate::physical) struct AdmittedActionReadViewV1 {
     deadline: u64,
     validity: LaneValidityV1,
 }
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no production binding is attached; the reference bindings are test-only"
-    )
-)]
 pub(in crate::physical) struct NativeFenceRequestViewV1 {
     audit: FenceAuditV1,
 }
@@ -223,6 +201,157 @@ pub(in crate::physical) struct BindingSampleV1 {
     pub(in crate::physical) dispositions: Vec<TrustedDispositionV1>,
 }
 type LaneFuture<'a, T> = Pin<Box<dyn Future<Output = AppResult<Option<T>>> + Send + 'a>>;
+
+// The binding side of the views: what a binding reads before it acts, and the
+// only replies it can build. A reply names exactly the view it answers; Core
+// revalidates every field all the same.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by bindings; the reference bindings are test-only"
+    )
+)]
+impl NativeSessionInstallViewV1 {
+    pub(in crate::physical) fn session(&self) -> &SessionId {
+        &self.session
+    }
+    pub(in crate::physical) fn epochs(&self) -> &BTreeMap<DomainId, u64> {
+        &self.epochs
+    }
+    pub(in crate::physical) fn binding(&self) -> &EnvironmentBindingViewV1 {
+        &self.binding
+    }
+    /// The enforcement class the reviewed scope requires of the install.
+    pub(in crate::physical) fn required(&self) -> SessionEnforcementClassV1 {
+        self.required
+    }
+    /// The session lease deadline, in the Host's monotonic ticks.
+    pub(in crate::physical) fn deadline(&self) -> u64 {
+        self.validity.deadline
+    }
+    /// Whether Core still allows a native write for this view.
+    pub(in crate::physical) fn allows(&self) -> bool {
+        self.validity.allows()
+    }
+    /// Adapter-isolation evidence for exactly this installation.
+    pub(in crate::physical) fn isolated(&self) -> SessionEnforcementEvidenceV1 {
+        SessionEnforcementEvidenceV1 {
+            session: self.session.clone(),
+            epochs: self.epochs.clone(),
+            request: self.request.clone(),
+            class: SessionEnforcementClassV1::AdapterIsolationOnly,
+        }
+    }
+}
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by bindings; the reference bindings are test-only"
+    )
+)]
+impl AdmittedActionReadViewV1 {
+    pub(in crate::physical) fn session(&self) -> &SessionId {
+        &self.session
+    }
+    pub(in crate::physical) fn epochs(&self) -> &BTreeMap<DomainId, u64> {
+        &self.epochs
+    }
+    pub(in crate::physical) fn action(&self) -> &ActionId {
+        &self.action
+    }
+    pub(in crate::physical) fn option(&self) -> &LabelV1 {
+        &self.option
+    }
+    pub(in crate::physical) fn payload_digest(&self) -> &DigestV1 {
+        &self.payload_digest
+    }
+    /// The evidence lineage every fact about this action must carry.
+    pub(in crate::physical) fn lineage(&self) -> &crate::physical::evidence::EvidenceLineageV1 {
+        &self.lineage
+    }
+    pub(in crate::physical) fn binding(&self) -> &EnvironmentBindingViewV1 {
+        &self.binding
+    }
+    /// The action deadline, in the Host's monotonic ticks.
+    pub(in crate::physical) fn deadline(&self) -> u64 {
+        self.deadline
+    }
+    /// Whether Core still allows the write. Checked immediately before it.
+    pub(in crate::physical) fn allows(&self) -> bool {
+        self.validity.allows() && self.deadline == self.validity.deadline
+    }
+    /// The write receipt for exactly this action: `accepted` or refused.
+    pub(in crate::physical) fn receipt(&self, accepted: bool) -> AdapterWriteReceiptV1 {
+        AdapterWriteReceiptV1 {
+            session: self.session.clone(),
+            epochs: self.epochs.clone(),
+            request: self.request.clone(),
+            action: self.action.clone(),
+            payload_digest: self.payload_digest.clone(),
+            accepted,
+        }
+    }
+}
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by bindings; the reference bindings are test-only"
+    )
+)]
+impl NativeFenceRequestViewV1 {
+    pub(in crate::physical) fn session(&self) -> &SessionId {
+        &self.audit.session
+    }
+    /// The fence request a producer's `fenced` disposition must name.
+    pub(in crate::physical) fn request(&self) -> &RequestId {
+        &self.audit.request
+    }
+    /// The epochs the fence advances to; the runtime's high-water mark.
+    pub(in crate::physical) fn epochs(&self) -> &BTreeMap<DomainId, u64> {
+        &self.audit.epochs
+    }
+    /// Adapter-isolation evidence that exactly this fence was applied.
+    pub(in crate::physical) fn fenced(&self) -> SessionEnforcementEvidenceV1 {
+        SessionEnforcementEvidenceV1 {
+            session: self.audit.session.clone(),
+            epochs: self.audit.epochs.clone(),
+            request: self.audit.request.clone(),
+            class: SessionEnforcementClassV1::AdapterIsolationOnly,
+        }
+    }
+}
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "built by bindings; the reference bindings are test-only"
+    )
+)]
+impl TrustedControlObservationV1 {
+    /// One control observation of the installed session's source, body and
+    /// world incarnations, captured at `captured_ticks`, with a fresh ID.
+    pub(in crate::physical) fn sampled(
+        session: &SessionId,
+        subsystem: &crate::physical::binding::SubsystemBindingViewV1,
+        captured_ticks: u64,
+    ) -> AppResult<Self> {
+        Ok(Self {
+            id: ObservationId::try_from(format!(
+                "physical-observation:v1:{}",
+                uuid::Uuid::new_v4()
+            ))?,
+            session: session.clone(),
+            source: subsystem.controller_incarnation.clone(),
+            body: subsystem.body_incarnation.clone(),
+            world: subsystem.world_incarnation.clone(),
+            captured_ticks,
+            gap_us: 0,
+        })
+    }
+}
 /// The one device-facing seam (docs/device-binding-protocol.md). A binding
 /// owns every device-specific HOW; Core owns authority. Core revalidates all
 /// a binding returns; a binding never calls Core and holds no authority. A

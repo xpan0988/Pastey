@@ -1,6 +1,6 @@
 # Physical environments
 
-Pastey can authorize, schedule and adjudicate actions on physical or simulated bodies that a Host owns. This document describes what exists in the code today. Device runtime requirements are in the [device binding protocol](device-binding-protocol.md); the acceptance scenario is in [`tests/physical_demo`](../tests/physical_demo/README.md). No device binding is compiled into the Host yet, so no production path can move a body.
+Pastey can authorize, schedule and adjudicate actions on physical or simulated bodies that a Host owns. This document describes what exists in the code today. Device runtime requirements are in the [device binding protocol](device-binding-protocol.md); the acceptance scenario is in [`tests/physical_demo`](../tests/physical_demo/README.md). No device binding is compiled into the Host yet, so no production path can move a body. Two simulated reference bindings, compiled for tests only, exercise every path: a body in a two-room flat and a dispenser filling a cup.
 
 ## Place in Pastey
 
@@ -25,6 +25,8 @@ Core understands only opaque identifiers, digests, bounded dimensions, fingerpri
 | Decision options | Binding holds payloads | Admits by option name and payload digest; never sees the payload |
 | Effect bound | Binding declares, witness checks | Accepts `witnessed` only with a registered witness of the required class; admits a Contradicted verdict and ends the stream |
 
+A Host installs one executor policy per environment: a ceiling scope, a minimum enforcement class and a root lifetime. Changing an environment's policy closes that environment's Roots first; other environments keep theirs.
+
 The witness registry is fixed when Core starts. At startup Core checks stored verdicts against it; at qualification it requires the binding's witnesses to match it by class.
 
 ### Decision streams
@@ -48,6 +50,8 @@ Completion and the end of a stream are driven by an executor-side timer (`stream
 
 - **Verified:** the witness verifies the completion contract. Core accepts the task if the scope says `automatic`, or leaves acceptance to a review decision if it says `await_review`; either way the stream ends and fences.
 - **Uncertain:** the budget is spent and the last action has run out, the tool session closes or its idle lease expires, the Bridge route is lost (on the executor this is indistinguishable from a crashed brain), the binding is lost, or authority is revoked. The outcome stays uncertain unless already verified, and nothing resumes.
+
+Either way the fence leaves the body's conflict domains quarantined. No new session can reserve them until a safe handover releases them: the binding keeps producing sealed evidence of the fenced body, and a witness must verify the Host's handover predicate (for example "at rest") after the producer's `fenced` disposition. Core's own fence also advances the live resolution's epoch snapshot to the fence epochs, exactly as recorded in the ledger. Once the domains are released, the same offer can therefore serve a new approval; any other epoch movement still invalidates the resolution.
 
 There is no separate exact mode: a single reviewed action is a one-option stream with `actionCount` 1.
 
@@ -77,19 +81,26 @@ These hold for every path and are covered by tests under `src-tauri/src/physical
 | Evidence and witnesses | `physical/evidence.rs`, `core_evidence.rs` |
 | Ledger (staged DDL, audits) | `physical/store*.rs` |
 | Host witness registry | `physical/adapters/host_bindings.rs` (empty) |
+| Reference bindings (simulated, tests only) | `physical/bindings/` |
 
-Run `cargo test --manifest-path src-tauri/Cargo.toml physical::`. The demo tests are ignored until Step D: `cargo test --manifest-path src-tauri/Cargo.toml physical_demo -- --ignored`. For development ledger resets, see [development](development.md#physical-ledger-format-resets-development).
+Run `cargo test --manifest-path src-tauri/Cargo.toml physical::`; the acceptance demo (`physical_demo`) is part of it. For development ledger resets, see [development](development.md#physical-ledger-format-resets-development).
 
 ## Open issues
 
-- **The per-transaction ledger audit is O(N).** Every store transaction re-decodes and re-validates all stored records, which consumed about half of a 1 s lease in a debug build. `[profile.dev.package.blake3] opt-level = 3` is a temporary mitigation. Direction:
+- **The per-transaction ledger audit is O(N).** Every store transaction re-decodes and re-validates all stored records. Two mitigations are in place:
+  - an exact memo skips an audit when `PRAGMA data_version` shows nothing has committed since the last passing audit, so every commit is still audited by the next transaction;
+  - `[profile.dev.package.blake3] opt-level = 3`.
+
+  A long stream still writes on every timer tick; the demo's walks take tens of seconds in a debug build. Direction:
   - audit fully at startup;
   - at runtime validate only the rows a transaction writes;
   - move admission checks ahead of installation.
 - **Completion parameters must equal the qualified capability's.** This is a safe restriction. Open question: express completion tolerances as a narrowable `BoundSetV1`.
 - **No NativeFence proof path.** A binding-supplied receipt verifier whose checks the ledger audit can replay is needed before any `NativeFence` claim.
 - **The idle lease may be short for slow brains.** One action plus one decision interval suits a controller loop; a model that thinks for seconds between calls would be treated as crashed. If that matters, the lease should become its own reviewed scope field.
-- **Stream termination by a verified witness is not yet exercised end to end.** It needs a binding that produces witness evidence: the Step D reference binding.
+- **The product path offers one environment per Host.** Qualifying an environment makes it the offered one; `attach_product_environment` overrides that. Several bodies on one Host are reachable over the bridge only one at a time, although Core runs their streams side by side (the demo's second body uses the local path).
+- **A remote approval lives at most 30 s and bounds its Root.** A stream started over the bridge must finish within that window; longer tasks need a reviewed approval lifetime.
+- **The reference bindings are test-only.** A Host that wants a simulator outside tests must compile it in, attach it and start Core with its witnesses.
 - **Deferred capabilities:**
   - multiple domains and coupled bodies;
   - perception and world-model capabilities, and bulk media carriage (Room Control carries bounded summaries only);

@@ -2,7 +2,8 @@
 //!
 //! Core owns discovery, bounded authorization, lifecycle and consequence
 //! adjudication; every device-specific HOW lives behind `EnvironmentBinding`
-//! (see docs/device-binding-protocol.md). No binding is compiled in yet.
+//! (see docs/device-binding-protocol.md). No production binding is compiled
+//! in; the simulated reference bindings in `bindings/` are test-only.
 //! Remote/product entry points reuse authenticated Room Control and local Core.
 //! Successfully validating a claim does not authenticate its producer or qualify a body.
 
@@ -49,7 +50,7 @@ pub(crate) mod store;
 pub(crate) mod values;
 
 #[cfg(test)]
-mod physical_demo_tests;
+mod bindings;
 #[cfg(test)]
 mod test_fixture;
 #[cfg(test)]

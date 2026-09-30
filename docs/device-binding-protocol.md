@@ -31,6 +31,8 @@ A decision-stream capability declares its options in the descriptor: each option
 
 Views carry a validity handle (Core flags, clock and deadline). A binding SHOULD check it immediately before any native write and MUST NOT write once it no longer allows.
 
+A binding reads a view only through its accessors (session, epochs, binding, action, option, payload digest, evidence lineage, deadline, `allows`). It answers only with replies built from the view it answers: `isolated()` for an installation, `receipt(accepted)` for a write, `fenced()` for a fence. Core revalidates every field regardless. Evidence enters as a producer's sealed observations and dispositions in the next sample. `src-tauri/src/physical/bindings/sim.rs` is a reference runtime: a simulated device side that meets the requirements below, used by the physical demo.
+
 ## 3. Device-side runtime requirements
 
 These requirements apply to the runtime that consumes commands next to the actuators: a daemon, firmware task or simulator process. They must hold without Pastey: a crashed binding process, a lost network or a dead Host must still leave the device stopped.
@@ -68,6 +70,7 @@ These requirements apply to the runtime that consumes commands next to the actua
 - **R17.** The fence MUST serialize with the actuation critical section. Once the fence is acknowledged, no command from the fenced session reaches the actuators. A command received before the fence but not yet consumed MUST NOT reach the controller.
 - **R18.** A fence racing a refresh MUST leave the old action closed, whichever arrives first.
 - **R19.** After a fence, delayed commands and replays MUST be rejected. A delayed acknowledgment is inert data and MUST NOT change runtime state.
+- **R19a.** After a fence the runtime SHOULD keep producing sealed evidence of the body, never commands, and report a `fenced` disposition naming the fence request. A safe handover rests on that trace; without it the domains stay quarantined.
 
 ### 3.6 Connection and device loss
 

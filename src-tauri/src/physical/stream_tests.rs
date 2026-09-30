@@ -641,3 +641,6 @@ async fn remote_tools_run_on_the_executor_and_die_with_the_bridge() {
     ));
     p.assert_single(1);
 }
+
+#[path = "physical_demo_tests.rs"]
+mod physical_demo;

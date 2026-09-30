@@ -149,9 +149,12 @@ impl TrustedDispositionV1 {
     }
 }
 /// Only for an owned binding producer's sealed, validated acquisition.
-#[expect(
-    dead_code,
-    reason = "no production binding is attached; the reference bindings are test-only; unused by tests too"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by bindings; the reference bindings are test-only"
+    )
 )]
 pub(super) fn producer_observation(
     fact: PhysicalObservationV1,
@@ -164,9 +167,12 @@ pub(super) fn producer_observation(
     }
 }
 /// Only for an owned binding producer's sealed disposition.
-#[expect(
-    dead_code,
-    reason = "no production binding is attached; the reference bindings are test-only; unused by tests too"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by bindings; the reference bindings are test-only"
+    )
 )]
 pub(super) fn producer_disposition(fact: PhysicalActionDispositionV1) -> TrustedDispositionV1 {
     TrustedDispositionV1 {
