@@ -14,26 +14,48 @@ fn volume_bounds(min: f64, max: f64) -> BoundSetV1 {
 fn contract(id: &str) -> ContractRefV1 {
     decode(json!({"id": id, "paramsSchemaDigest": "c".repeat(64), "params": {}}))
 }
-fn dispense_intent(volume_ml: f64) -> PhysicalIntentV1 {
-    PhysicalIntentV1::new(semantic(DISPENSE), decode(json!({"volumeMl": volume_ml}))).unwrap()
+/// A dispenser option's payload digest (the binding holds the payload).
+fn pour_digest(option: &str) -> DigestV1 {
+    digest("test-dispense-option-v1", &option).unwrap()
 }
 fn dispense_profile(p: &mut PhysicalCapabilityProfileV1) {
     p.capability = CapabilityDescriptorV1 {
         capability_id: semantic(DISPENSE),
         payload_schema_digest: decode(json!("d".repeat(64))),
-        invocation_mode: InvocationModeV1::ExactLeased,
+        invocation_mode: InvocationModeV1::DecisionStream,
         conflict_domains: p.capability.conflict_domains.clone(),
         bounds: volume_bounds(0.0, 10.0),
         start_predicate: contract("test.nozzle-primed/v1"),
         loss_profile: contract("test.valve-closed/v1"),
         completion_predicate: contract("test.volume-dispensed/v1"),
-        decision_stream: None,
+        decision_stream: DecisionStreamDescriptorV1 {
+            options: ["pour_4ml", "pour_5ml"]
+                .iter()
+                .map(|o| DecisionOptionV1 {
+                    name: label(o),
+                    payload_digest: pour_digest(o),
+                })
+                .collect(),
+            min_decision_interval_us: micros(200_000),
+            observation_fields: vec![],
+        },
         effect_bound: None,
     };
 }
 fn dispense_fields(f: &mut ReviewScopeFieldsV1) {
     let c = &f.profile.capability;
-    f.intent = Some(dispense_intent(5.0));
+    f.stream = DecisionStreamScopeV1 {
+        options: vec![label("pour_5ml")],
+        min_decision_interval_us: micros(200_000),
+        observation: ObservationFlowV1 {
+            fields: vec![],
+            min_interval_us: micros(100_000),
+            destination: f.requester.clone(),
+        },
+        on_completion: CompletionAcceptanceV1::Automatic,
+        // Nothing here can witness a physical limit: intent only.
+        effect_bound: EffectBoundV1::IntentOnly,
+    };
     f.bounds = c.bounds.clone();
     f.loss = c.loss_profile.clone();
     f.completion.predicate = c.completion_predicate.clone();
@@ -51,24 +73,16 @@ fn with_bounds(
 async fn non_motion_capability_reviews_grants_and_admits_through_generic_core() {
     let f = ControlFixture::build(binding(), dispense_profile, dispense_fields);
     assert_eq!(
-        f.scope
-            .fields()
-            .intent
-            .as_ref()
-            .unwrap()
-            .capability_id
-            .as_str(),
+        f.scope.fields().profile.capability.capability_id.as_str(),
         DISPENSE
     );
     let (root, _) = f.root_basis();
 
-    // Narrowing to a volume interval that still contains the exact intent.
+    // Narrowing the declared volume interval.
     let narrowed = with_bounds(&f.scope, volume_bounds(2.0, 6.0)).unwrap();
     let minimum = f.scope.fields().profile.required_enforcement_class;
-    // Widening beyond the reviewed/qualified ceiling cannot even form a scope,
-    // and an interval that excludes the exact intent is rejected likewise.
+    // Widening beyond the reviewed/qualified ceiling cannot even form a scope.
     assert!(with_bounds(&f.scope, volume_bounds(0.0, 12.0)).is_err());
-    assert!(with_bounds(&f.scope, volume_bounds(0.0, 4.0)).is_err());
     let basis = Arc::new(
         f.core
             .lock()
@@ -76,9 +90,9 @@ async fn non_motion_capability_reviews_grants_and_admits_through_generic_core() 
             .unwrap(),
     );
     assert_eq!(basis.scope(), &narrowed);
-    // A different non-motion payload is a material change, not a narrowing.
+    // A different option is a material change, not a narrowing.
     let mut substituted = narrowed.fields().clone();
-    substituted.intent = Some(dispense_intent(3.0));
+    substituted.stream.options = vec![label("pour_4ml")];
     let substituted = PhysicalReviewScopeV1::try_from(substituted).unwrap();
     assert!(f
         .core
@@ -91,22 +105,28 @@ async fn non_motion_capability_reviews_grants_and_admits_through_generic_core() 
         .await
         .unwrap();
     let (g, p) = f.challenged(&s);
-    assert_eq!(p.payload, Some(dispense_intent(5.0)));
+    assert_eq!(p.option.as_str(), "pour_5ml");
+    assert_eq!(p.payload_digest, pour_digest("pour_5ml"));
     let a = f.admit(&g, p);
     assert_eq!(
         lane::status(&f.core.lock(), &a),
-        ("open".into(), "not_sent".into(), 1_000_000, 0)
+        (
+            "open".into(),
+            crate::physical::store::ActionDispositionV1::NotSent,
+            100_000,
+            0
+        )
     );
 }
 
 #[tokio::test]
-async fn non_motion_proposal_outside_exact_intent_is_not_admitted() {
+async fn non_motion_proposal_outside_the_approved_option_is_not_admitted() {
     let f = ControlFixture::build(binding(), dispense_profile, dispense_fields);
     let s = f.active().await;
     let (g, mut p) = f.challenged(&s);
-    // In-bounds but not the reviewed exact payload.
-    p.payload = Some(dispense_intent(4.0));
-    p.payload_digest = p.payload.as_ref().unwrap().digest().unwrap();
+    // Declared by the capability, but not approved.
+    p.option = label("pour_4ml");
+    p.payload_digest = pour_digest("pour_4ml");
     assert!(!matches!(
         f.core.lock().admit_physical_proposal(&g, p),
         Ok(AdmissionOutcomeV1::Admitted(_))

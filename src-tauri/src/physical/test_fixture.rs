@@ -1,4 +1,4 @@
-//! Test-only binding semantics: a three-channel setpoint capability, its
+//! Test-only binding semantics: a named-option stream capability, its
 //! reached-and-held completion predicate, the at-rest handover predicate and a
 //! simulation-oracle witness over the fixture's own measurement schema. Core
 //! sees only IDs, schema digests, canonical params and bounded dimensions.
@@ -7,7 +7,6 @@ use crate::physical::{contracts::*, evidence::*, require, values::*};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-pub(in crate::physical) const SETPOINT_CAPABILITY: &str = "test.setpoint/v1";
 const START_PREDICATE: &str = "test.ready/v1";
 const LOSS_PROFILE: &str = "test.hold-zero/v1";
 pub(in crate::physical) const COMPLETION_PREDICATE: &str = "test.reached-and-held/v1";
@@ -36,44 +35,6 @@ pub(in crate::physical) fn schema_digest(schema: &'static str) -> AppResult<Dige
 }
 pub(in crate::physical) fn id(value: &str) -> SemanticIdV1 {
     SemanticIdV1::try_from(value.to_owned()).expect("registered test semantic ID")
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(in crate::physical) enum ModeV1 {
-    Fixed,
-}
-
-/// Typed setpoint payload. Strict decoding is the schema check.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(in crate::physical) struct SetpointV1 {
-    pub a: Finite,
-    pub b: Finite,
-    pub c: Finite,
-    pub mode: ModeV1,
-}
-impl SetpointV1 {
-    pub(in crate::physical) fn new(a: f64, b: f64, c: f64) -> AppResult<Self> {
-        Ok(Self {
-            a: Finite::try_from(a)?,
-            b: Finite::try_from(b)?,
-            c: Finite::try_from(c)?,
-            mode: ModeV1::Fixed,
-        })
-    }
-    pub(in crate::physical) fn intent(&self) -> AppResult<PhysicalIntentV1> {
-        PhysicalIntentV1::new(id(SETPOINT_CAPABILITY), CanonicalJsonV1::encode(self)?)
-    }
-    /// Binding-side decode of a Core intent; fails closed on any other capability.
-    pub(in crate::physical) fn from_intent(intent: &PhysicalIntentV1) -> AppResult<Self> {
-        intent.validate()?;
-        require(
-            intent.capability_id == id(SETPOINT_CAPABILITY),
-            "Not a test setpoint intent",
-        )?;
-        intent.payload.decode()
-    }
 }
 
 /// Per-channel magnitude ceilings.
@@ -212,28 +173,6 @@ pub(in crate::physical) fn hold_zero_loss() -> AppResult<ContractRefV1> {
     empty_contract(LOSS_PROFILE)
 }
 
-/// The setpoint capability as descriptor data.
-pub(in crate::physical) fn setpoint_descriptor(
-    conflict_domains: Vec<DomainId>,
-    bounds: BoundSetV1,
-    completion: &ReachedHeldV1,
-) -> AppResult<CapabilityDescriptorV1> {
-    let descriptor = CapabilityDescriptorV1 {
-        capability_id: id(SETPOINT_CAPABILITY),
-        payload_schema_digest: schema_digest(SETPOINT_SCHEMA)?,
-        invocation_mode: InvocationModeV1::ExactLeased,
-        conflict_domains,
-        bounds,
-        start_predicate: empty_contract(START_PREDICATE)?,
-        loss_profile: hold_zero_loss()?,
-        completion_predicate: completion.contract()?,
-        decision_stream: None,
-        effect_bound: None,
-    };
-    descriptor.validate()?;
-    Ok(descriptor)
-}
-
 /// The same body as a decision stream: named options, each a fixed payload
 /// held here (Core gets only names and digests), and a decision-rate floor.
 pub(in crate::physical) const STREAM_OPTIONS: [&str; 5] =
@@ -266,62 +205,32 @@ pub(in crate::physical) fn stream_descriptor(
         start_predicate: empty_contract(START_PREDICATE)?,
         loss_profile: hold_zero_loss()?,
         completion_predicate: completion.contract()?,
-        decision_stream: Some(DecisionStreamDescriptorV1 {
+        decision_stream: DecisionStreamDescriptorV1 {
             options,
             min_decision_interval_us: PositiveMicros::try_from(min_decision_interval_us)?,
             observation_fields: OBSERVATION_FIELDS
                 .iter()
                 .map(|f| JsonPointerV1::try_from(f.to_string()))
                 .collect::<AppResult<_>>()?,
-        }),
+        },
         effect_bound: Some(effect_contract()?),
     };
     descriptor.validate()?;
     Ok(descriptor)
 }
 
-fn setpoint_dimensions(bounds: &BoundSetV1) -> bool {
-    let pointers: Vec<_> = bounds.bounds().iter().map(|b| b.pointer.as_str()).collect();
-    pointers == ["/a", "/b", "/c", "/mode"]
-        && bounds.bounds()[..3]
-            .iter()
-            .all(|b| matches!(b.kind, BoundKindV1::AbsMax(_)))
-        && bounds.bounds()[3].kind == BoundKindV1::Const(BoundScalarV1::Text("fixed".into()))
-}
-
 /// The fixture binding's scope schema check: the descriptor is exactly the
-/// setpoint capability with valid parameters, the intent decodes under its
-/// payload schema and the completion parameters are valid for the window.
+/// fixture's stream capability and the completion parameters are valid for
+/// the review window.
 pub(in crate::physical) fn validate_scope(fields: &ReviewScopeFieldsV1) -> AppResult<()> {
     let capability = &fields.profile.capability;
-    if fields.mode == PhysicalScopeModeV1::DecisionStream {
-        let completion: ReachedHeldV1 = capability.completion_predicate.params.decode()?;
-        let declared = capability.decision_stream.as_ref().ok_or_else(|| {
-            crate::error::AppError::InvalidInput("Not the test stream capability".into())
-        })?;
-        let expected = stream_descriptor(
-            capability.conflict_domains.clone(),
-            &completion,
-            declared.min_decision_interval_us.get(),
-        )?;
-        require(*capability == expected, "Not the test stream capability")?;
-        ReachedHeldV1::from_contract(&fields.completion)?;
-        return Ok(());
-    }
-    require(
-        setpoint_dimensions(&capability.bounds),
-        "Setpoint bounds must be per-channel ceilings in fixed mode",
-    )?;
     let completion: ReachedHeldV1 = capability.completion_predicate.params.decode()?;
-    let expected = setpoint_descriptor(
+    let expected = stream_descriptor(
         capability.conflict_domains.clone(),
-        capability.bounds.clone(),
         &completion,
+        capability.decision_stream.min_decision_interval_us.get(),
     )?;
-    require(*capability == expected, "Not the test setpoint capability")?;
-    SetpointV1::from_intent(fields.intent.as_ref().ok_or_else(|| {
-        crate::error::AppError::InvalidInput("Setpoint scope needs an exact intent".into())
-    })?)?;
+    require(*capability == expected, "Not the test stream capability")?;
     ReachedHeldV1::from_contract(&fields.completion)?;
     Ok(())
 }

@@ -102,29 +102,6 @@ fn bound_sets_are_sorted_unique_leaf_only_and_finite() {
 }
 
 #[test]
-fn contains_requires_every_leaf_bounded_and_every_bound_resolved() {
-    let b = set(json!([
-        abs_max("/a", 1.),
-        {"pointer": "/mode", "kind": {"const": "x"}},
-        interval("/nested/v", 0., 2.),
-    ]));
-    assert!(b.contains(&payload(json!({"a": -1, "mode": "x", "nested": {"v": 2}}))));
-    for outside in [
-        json!({"a": 1.01, "mode": "x", "nested": {"v": 1}}),
-        json!({"a": 0, "mode": "y", "nested": {"v": 1}}),
-        json!({"a": 0, "mode": "x", "nested": {"v": -0.1}}),
-        // Unknown extra dimension, missing dimension, wrong leaf type.
-        json!({"a": 0, "mode": "x", "nested": {"v": 1}, "extra": 0}),
-        json!({"a": 0, "mode": "x"}),
-        json!({"a": "0", "mode": "x", "nested": {"v": 1}}),
-        json!({"a": 0, "mode": true, "nested": {"v": 1}}),
-        json!({"a": 0, "mode": "x", "nested": {"w": 1}}),
-    ] {
-        assert!(!b.contains(&payload(outside.clone())), "{outside}");
-    }
-}
-
-#[test]
 fn subset_only_narrows_same_dimensions() {
     let ceiling = two_axis(1., 2.);
     assert!(two_axis(0.5, 2.).is_subset_of(&ceiling));
@@ -183,19 +160,4 @@ fn intersect_is_the_greatest_common_narrowing_or_fails_closed() {
     assert!(text(json!({"const": "x"}))
         .intersect(&set(json!([abs_max("/a", 1.)])))
         .is_err());
-}
-
-#[test]
-fn intent_digest_binds_capability_and_canonical_payload() {
-    use super::super::contracts::PhysicalIntentV1;
-    let id = |s: &str| SemanticIdV1::try_from(s.to_owned()).unwrap();
-    let a = PhysicalIntentV1::new(id("test.dispense/v1"), payload(json!({"volumeMl": 5}))).unwrap();
-    let b =
-        PhysicalIntentV1::new(id("test.dispense/v1"), payload(json!({"volumeMl": 5.0}))).unwrap();
-    let c = PhysicalIntentV1::new(id("test.pour/v1"), payload(json!({"volumeMl": 5}))).unwrap();
-    assert_eq!(a.digest().unwrap(), b.digest().unwrap());
-    assert_ne!(a.digest().unwrap(), c.digest().unwrap());
-    let mut forged = serde_json::to_value(&a).unwrap();
-    forged["payload"]["volumeMl"] = json!(6);
-    assert!(serde_json::from_value::<PhysicalIntentV1>(forged).is_err());
 }

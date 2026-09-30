@@ -96,6 +96,14 @@ pub(super) fn stage10(ddl: &str) -> String {
     .replace(
         "ceiling_count INTEGER NOT NULL CHECK(ceiling_count=1)",
         "ceiling_count INTEGER NOT NULL CHECK(ceiling_count>=1)",
+    )
+    .replace(
+        "disposition TEXT NOT NULL CHECK(disposition IN ('not_sent','dispatch_unknown','fake_accepted','fake_refused'))",
+        "disposition TEXT NOT NULL CHECK(disposition IN ('not_sent','dispatch_unknown','accepted','refused'))",
+    )
+    .replace(
+        "CHECK(disposition!='fake_accepted' OR apply_result='accepted'),CHECK(disposition!='fake_refused' OR apply_result='refused')",
+        "CHECK(disposition!='accepted' OR apply_result='accepted'),CHECK(disposition!='refused' OR apply_result='refused')",
     ) + DECISION_SCHEMA
         + EFFECT_BOUND_SCHEMA
 }
@@ -181,14 +189,9 @@ impl ActionAuditV1 {
                 && self.session == s.id
                 && self.epochs == s.epochs
                 && self.proposal.attempt_id == a.attempt_id
-                && if s.scope.fields().mode == PhysicalScopeModeV1::DecisionStream {
-                    self.proposal.decision_sequence
-                        <= u64::from(s.scope.fields().execution.action_count)
-                        && self.reserved_us == self.proposal.requested_duration_us.get()
-                } else {
-                    self.proposal.decision_sequence == 1
-                        && self.reserved_us == s.scope.fields().execution.action_duration_us.get()
-                }
+                && self.proposal.decision_sequence
+                    <= u64::from(s.scope.fields().execution.action_count)
+                && self.reserved_us == self.proposal.requested_duration_us.get()
                 && self.reserved_us <= s.scope.fields().execution.total_execution_us.get()
                 && self.expires_at <= s.lease_expiry
                 && self.expires_at > a.created_at
@@ -375,7 +378,7 @@ impl PhysicalStoreV1 {
         x: &ActionAuditV1,
         snapshot: &BindingLedgerSnapshotV1,
         now: UnixMillis,
-        proposer: Option<&LabelV1>,
+        proposer: &LabelV1,
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -383,14 +386,8 @@ impl PhysicalStoreV1 {
         current_session(&tx, a, s, snapshot, now, true)?;
         x.validate(s, a)?;
         require(now < x.expires_at, "Action lifetime exhausted")?;
-        let stream = s.scope.fields().mode == PhysicalScopeModeV1::DecisionStream;
-        // Exact: one action, and only while nothing was consumed. Stream: the
-        // count and time ceilings accumulate across every decision.
-        let n = if stream {
-            tx.execute("UPDATE physical_control_budgets SET reserved_us=reserved_us+?2,reserved_count=reserved_count+1,revision=revision+1 WHERE root_id=?1 AND reserved_count<ceiling_count AND reserved_us+?2<=ceiling_us",params![text(&a.root_id),checked_integer(x.reserved_us)?])?
-        } else {
-            tx.execute("UPDATE physical_control_budgets SET reserved_us=reserved_us+?2,reserved_count=reserved_count+1,revision=revision+1 WHERE root_id=?1 AND reserved_count=0 AND reserved_us+?2<=ceiling_us AND consumed_us=0",params![text(&a.root_id),checked_integer(x.reserved_us)?])?
-        };
+        // The count and time ceilings accumulate across every decision.
+        let n = tx.execute("UPDATE physical_control_budgets SET reserved_us=reserved_us+?2,reserved_count=reserved_count+1,revision=revision+1 WHERE root_id=?1 AND reserved_count<ceiling_count AND reserved_us+?2<=ceiling_us",params![text(&a.root_id),checked_integer(x.reserved_us)?])?;
         require(n == 1, "Insufficient cumulative budget")?;
         let previous: i64 = tx.query_row(
             "SELECT count(*) FROM physical_actions WHERE root_id=?1",
@@ -401,26 +398,20 @@ impl PhysicalStoreV1 {
             previous + 1 == checked_integer(x.proposal.decision_sequence)?,
             "Decision sequence gap",
         )?;
-        if stream {
-            // Replacement fence: the previous decision closes in the same
-            // transaction that admits this one.
-            tx.execute("UPDATE physical_actions SET state='closed',operation_id=NULL,revision=revision+1 WHERE root_id=?1 AND state='open'",[text(&x.root)])?;
-        }
+        // Replacement fence: the previous decision closes in the same
+        // transaction that admits this one.
+        tx.execute("UPDATE physical_actions SET state='closed',operation_id=NULL,revision=revision+1 WHERE root_id=?1 AND state='open'",[text(&x.root)])?;
         tx.execute("INSERT INTO physical_actions(action_id,root_id,session_id,grant_id,decision_sequence,payload_digest,proposal_digest,challenge_id,requested_us,reserved_us,expires_at,audit_digest,audit_json,state,revision,disposition) VALUES(?1,?2,?3,?4,?13,?5,?6,?7,?8,?9,?10,?11,?12,'open',1,'not_sent')",params![text(&x.proposal.action_id),text(&x.root),text(&x.session),text(&x.grant),text(&x.proposal.payload_digest),text(&digest("pastey-physical-proposal-v1",&x.proposal)?),text(&x.proposal.challenge_id),checked_integer(x.proposal.requested_duration_us.get())?,checked_integer(x.reserved_us)?,x.expires_at.get() as i64,text(&x.digest()?),serde_json::to_string(x)?,checked_integer(x.proposal.decision_sequence)?])?;
-        match (stream, proposer, &x.proposal.option) {
-            (true, Some(proposer), Some(option)) => insert_decision(
-                &tx,
-                &x.root,
-                proposer.as_str(),
-                option.as_str(),
-                x.proposal.requested_duration_us.get(),
-                None,
-                Some(&x.proposal.action_id),
-                now,
-            )?,
-            (false, None, None) => {}
-            _ => require(false, "Decision record/proposer mismatch")?,
-        }
+        insert_decision(
+            &tx,
+            &x.root,
+            proposer.as_str(),
+            x.proposal.option.as_str(),
+            x.proposal.requested_duration_us.get(),
+            None,
+            Some(&x.proposal.action_id),
+            now,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -432,7 +423,6 @@ impl PhysicalStoreV1 {
         snapshot: &BindingLedgerSnapshotV1,
         now: UnixMillis,
         op: &RequestId,
-        refresh: bool,
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -443,15 +433,9 @@ impl PhysicalStoreV1 {
             "Action immutable snapshot mismatch",
         )?;
         require(now < x.expires_at, "Action expired")?;
-        let n = if refresh {
-            tx.execute("UPDATE physical_actions SET operation_id=?2,refresh_sequence=refresh_sequence+1,revision=revision+1 WHERE action_id=?1 AND state='open' AND disposition='fake_accepted' AND operation_id IS NULL",params![text(&x.proposal.action_id),text(op)])?
-        } else {
-            tx.execute("UPDATE physical_actions SET dispatch_intent=1,disposition='dispatch_unknown',operation_id=?2,revision=revision+1 WHERE action_id=?1 AND state='open' AND dispatch_intent=0 AND operation_id IS NULL",params![text(&x.proposal.action_id),text(op)])?
-        };
+        let n = tx.execute("UPDATE physical_actions SET dispatch_intent=1,disposition=?3,operation_id=?2,revision=revision+1 WHERE action_id=?1 AND state='open' AND dispatch_intent=0 AND operation_id IS NULL",params![text(&x.proposal.action_id),text(op),tag(&ActionDispositionV1::DispatchUnknown)?])?;
         require(n == 1, "Duplicate/uncertain/in-flight dispatch")?;
-        if !refresh {
-            tx.execute("UPDATE physical_control_budgets SET consumed_us=reserved_us,revision=revision+1 WHERE root_id=?1",[text(&x.root)])?;
-        }
+        tx.execute("UPDATE physical_control_budgets SET consumed_us=reserved_us,revision=revision+1 WHERE root_id=?1",[text(&x.root)])?;
         tx.commit()?;
         Ok(())
     }
@@ -464,7 +448,6 @@ impl PhysicalStoreV1 {
         now: UnixMillis,
         op: &RequestId,
         result: Option<bool>,
-        refresh: bool,
     ) -> AppResult<bool> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -474,33 +457,31 @@ impl PhysicalStoreV1 {
             action(&tx, &x.proposal.action_id)? == *x && now < x.expires_at,
             "Closed/mismatched action callback",
         )?;
-        let disposition = if refresh {
-            if result == Some(true) {
-                "fake_accepted"
-            } else {
-                "dispatch_unknown"
-            }
-        } else {
-            match result {
-                Some(true) => "fake_accepted",
-                Some(false) => "fake_refused",
-                None => "dispatch_unknown",
-            }
+        let disposition = match result {
+            Some(true) => ActionDispositionV1::Accepted,
+            Some(false) => ActionDispositionV1::Refused,
+            None => ActionDispositionV1::DispatchUnknown,
         };
-        let n=tx.execute("UPDATE physical_actions SET disposition=?3,apply_result=COALESCE(apply_result,?4),operation_id=NULL,revision=revision+1 WHERE action_id=?1 AND state='open' AND operation_id=?2",params![text(&x.proposal.action_id),text(op),disposition,if refresh{None}else{result.map(|b|if b{"accepted"}else{"refused"})}])?;
+        let n=tx.execute("UPDATE physical_actions SET disposition=?3,apply_result=COALESCE(apply_result,?4),operation_id=NULL,revision=revision+1 WHERE action_id=?1 AND state='open' AND operation_id=?2",params![text(&x.proposal.action_id),text(op),tag(&disposition)?,result.map(|b|if b{"accepted"}else{"refused"})])?;
         tx.commit()?;
         Ok(n == 1)
     }
+    /// (state, disposition, reserved, consumed) of an action and its root.
     pub(in crate::physical) fn action_status(
         &self,
         id: &ActionId,
-    ) -> AppResult<(String, String, u64, u64)> {
+    ) -> AppResult<(String, ActionDispositionV1, u64, u64)> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
         super::audit(&tx)?;
-        let v=tx.query_row("SELECT a.state,a.disposition,b.reserved_us,b.consumed_us FROM physical_actions a JOIN physical_control_budgets b USING(root_id) WHERE action_id=?1",[text(id)],|r|Ok((r.get(0)?,r.get(1)?,r.get::<_,i64>(2)? as u64,r.get::<_,i64>(3)? as u64)))?;
+        let (state, disposition, reserved, consumed): (String, String, i64, i64) = tx.query_row("SELECT a.state,a.disposition,b.reserved_us,b.consumed_us FROM physical_actions a JOIN physical_control_budgets b USING(root_id) WHERE action_id=?1",[text(id)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         tx.commit()?;
-        Ok(v)
+        Ok((
+            state,
+            serde_json::from_value(serde_json::Value::String(disposition))?,
+            reserved as u64,
+            consumed as u64,
+        ))
     }
     pub(in crate::physical) fn fence_request(&self, id: &SessionId) -> AppResult<FenceAuditV1> {
         let mut c = self.connection()?;
@@ -628,6 +609,16 @@ fn insert_decision(
         ],
     )?;
     Ok(())
+}
+/// The binding's native reply to an action's one write, as the ledger keeps
+/// it. It is an acknowledgment, never a physical consequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActionDispositionV1 {
+    NotSent,
+    DispatchUnknown,
+    Accepted,
+    Refused,
 }
 /// One decision-stream record as the ledger keeps it.
 #[derive(Clone, Debug, PartialEq)]
@@ -761,7 +752,7 @@ fn s_state_quarantined(c: &Connection, root: &RootId) -> AppResult<bool> {
 }
 pub(super) fn recover(c: &Connection, restart: bool) -> AppResult<()> {
     if restart {
-        c.execute("UPDATE physical_actions SET disposition='dispatch_unknown',operation_id=NULL,revision=revision+1 WHERE state='open' AND dispatch_intent=1 AND disposition!='fake_refused'",[])?;
+        c.execute("UPDATE physical_actions SET disposition='dispatch_unknown',operation_id=NULL,revision=revision+1 WHERE state='open' AND dispatch_intent=1 AND disposition!='refused'",[])?;
     }
     let ids: Vec<String> = c
         .prepare("SELECT root_id FROM physical_sessions WHERE state!='quarantined'")?
@@ -1026,7 +1017,7 @@ fn audit_decisions(c: &Connection) -> AppResult<()> {
             let x = self::action(c, &ActionId::try_from(action)?)?;
             require(
                 text(&x.root) == root
-                    && x.proposal.option.as_ref().map(|o| o.as_str()) == Some(option.as_str())
+                    && x.proposal.option.as_str() == option
                     && checked_integer(x.proposal.requested_duration_us.get())? == requested,
                 "Decision record/action mismatch",
             )?;

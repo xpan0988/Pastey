@@ -62,10 +62,10 @@ fn completion_params() -> fx::ReachedHeldV1 {
     }))
 }
 fn profile() -> PhysicalCapabilityProfileV1 {
-    let capability = fx::setpoint_descriptor(
+    let capability = fx::stream_descriptor(
         vec![decode(json!(id("physical-domain")))],
-        fx::setpoint_bounds(0.1, 0.1, 0.2).unwrap(),
         &completion_params(),
+        200_000,
     )
     .unwrap();
     decode(json!({
@@ -76,9 +76,9 @@ fn profile() -> PhysicalCapabilityProfileV1 {
         "freshness": {"proposal": 200000, "observation": {"maxAgeUs": 200000, "maxGapUs": 200000}}
     }))
 }
-/// A fixture setpoint intent.
-fn setpoint_intent(a: f64, b: f64, c: f64) -> PhysicalIntentV1 {
-    fx::SetpointV1::new(a, b, c).unwrap().intent().unwrap()
+/// A one-option stream (the former exact action), choosing `option`.
+fn one_option(s: &mut ReviewScopeFieldsV1, option: &str) {
+    s.stream.options = vec![label(option)];
 }
 /// Replace one AbsMax dimension of a bound set.
 fn with_abs_max(bounds: &BoundSetV1, pointer: &str, max: f64) -> BoundSetV1 {
@@ -125,8 +125,12 @@ fn scope_fields() -> ReviewScopeFieldsV1 {
     decode(
         json!({"version": 2, "principal": "operator", "requester": host("requester"),
         "executor": b.executor, "environment": b, "profile": p, "qualification": q,
-        "mode": "exact",
-        "intent": setpoint_intent(0.05, 0.0, 0.0),
+        "stream": {"options": ["forward"], "minDecisionIntervalUs": 200000,
+            "observation": {"fields": fx::OBSERVATION_FIELDS, "minIntervalUs": 100000,
+                "destination": host("requester")},
+            "onCompletion": "automatic",
+            "effectBound": {"verification": "witnessed",
+                "predicate": fx::effect_contract().unwrap(), "requiredWitness": "simulation_oracle"}},
         "bounds": p.capability.bounds, "execution": p.execution, "freshness": p.freshness,
         "completion": {"predicate": p.capability.completion_predicate,
             "requiredWitness": "simulation_oracle", "observation": p.freshness.observation,
@@ -152,11 +156,10 @@ fn approval(r: &PhysicalReviewRecordV1) -> ApprovalCorrelationV1 {
     )
 }
 fn proposal() -> PhysicalActionProposalV1 {
-    let s = scope();
     decode(
         json!({"version": 2, "attemptId": id("physical-attempt"), "actionId": id("physical-action"),
-        "decisionSequence": 1, "payload": s.fields().intent,
-        "payloadDigest": s.fields().intent.as_ref().unwrap().digest().unwrap(), "challengeId": id("physical-challenge"),
+        "decisionSequence": 1, "option": "forward",
+        "payloadDigest": fx::option_digest("forward").unwrap(), "challengeId": id("physical-challenge"),
         "observations": [id("physical-observation")], "requestedDurationUs": 1000000}),
     )
 }
@@ -286,13 +289,13 @@ fn scope_hash_binds_effects_target_budgets_and_completion() {
     let original = scope();
     let mut changes: Vec<ReviewScopeFieldsV1> = vec![];
     let mut s = scope_fields();
-    s.requester = host("other");
+    s.for_requester(&host("other"));
     changes.push(s);
     let mut s = scope_fields();
     s.principal = label("other");
     changes.push(s);
     let mut s = scope_fields();
-    s.intent = Some(setpoint_intent(-0.05, 0.0, 0.0));
+    one_option(&mut s, "stop");
     changes.push(s);
     let mut s = scope_fields();
     s.execution.action_duration_us = micros(900000);
@@ -417,7 +420,7 @@ fn scope_cannot_widen_profile_or_substitute_target() {
     s.bounds = with_abs_max(&s.bounds, "/a", 0.2);
     changes.push(s);
     let mut s = scope_fields();
-    s.intent = Some(setpoint_intent(0.2, 0.0, 0.0));
+    one_option(&mut s, "teleport");
     changes.push(s);
     for fields in changes {
         assert!(PhysicalReviewScopeV1::try_from(fields).is_err());
@@ -439,6 +442,9 @@ fn hardware_cannot_use_gate_a_or_simulation_oracle() {
     s.qualification = qualification(&s.profile, &s.environment);
     assert!(s.validate().is_err());
     s.completion.required_witness = WitnessClassV1::IndependentMeasured;
+    // A simulation oracle cannot vouch for a hardware effect bound either.
+    assert!(s.validate().is_err());
+    s.stream.effect_bound = EffectBoundV1::IntentOnly;
     // Only a structurally compatible claim; this does not qualify real hardware.
     s.validate().unwrap();
 }
@@ -447,10 +453,10 @@ fn hardware_cannot_use_gate_a_or_simulation_oracle() {
 fn unknown_fields_versions_methods_frames_and_streams_fail_closed() {
     for (pointer, value) in [
         ("/version", json!(3)),
-        ("/mode", json!("stream")),
+        ("/stream/minDecisionIntervalUs", json!(0)),
         ("/profile/capability", json!("robot_joint_targets")),
-        ("/intent/capabilityId", json!("robot.do/v1")),
-        ("/intent/payload/mode", json!("world")),
+        ("/stream/effectBound/verification", json!("hoped")),
+        ("/stream/onCompletion", json!("sometimes")),
         ("/profile/requiredEnforcementClass", json!("best_effort")),
         ("/environment/version", json!(3)),
         ("/execution/actionCount", json!(2)),
@@ -466,8 +472,9 @@ fn unknown_fields_versions_methods_frames_and_streams_fail_closed() {
         "",
         "/profile",
         "/environment",
-        "/intent",
-        "/intent/payload",
+        "/stream",
+        "/stream/observation",
+        "/stream/effectBound",
         "/freshness/observation",
     ] {
         let mut v = wire(&scope());
@@ -487,17 +494,19 @@ fn unknown_fields_versions_methods_frames_and_streams_fail_closed() {
 }
 
 #[test]
-fn proposal_matches_exact_action_but_does_not_admit_it() {
+fn proposal_matches_the_approved_option_but_does_not_admit_it() {
     let s = scope();
     let mut p = proposal();
     p.validate_scope(&s).unwrap();
     p.requested_duration_us = micros(1000001);
     assert!(p.validate_scope(&s).is_err());
     p.requested_duration_us = micros(1000000);
-    p.payload = Some(setpoint_intent(-0.05, 0.0, 0.0));
-    assert!(p.validate().is_err());
-    p.payload_digest = p.payload.as_ref().unwrap().digest().unwrap();
+    // A declared but unapproved option, then a digest that is not the option's.
+    p.option = label("stop");
+    p.payload_digest = fx::option_digest("stop").unwrap();
     p.validate().unwrap();
+    assert!(p.validate_scope(&s).is_err());
+    p.option = label("forward");
     assert!(p.validate_scope(&s).is_err());
     p.observations.clear();
     assert!(p.validate().is_err());
@@ -592,44 +601,12 @@ fn malformed_completion_and_required_contracts_are_rejected() {
 /// turn_right of the declared five, 200 ms rate, up to three actions.
 fn stream_fields() -> ReviewScopeFieldsV1 {
     let mut s = scope_fields();
-    let completion: fx::ReachedHeldV1 = s
-        .profile
-        .capability
-        .completion_predicate
-        .params
-        .decode()
-        .unwrap();
-    s.profile.capability = fx::stream_descriptor(
-        s.profile.capability.conflict_domains.clone(),
-        &completion,
-        200_000,
-    )
-    .unwrap();
     s.profile.execution.action_count = 3;
     s.qualification = qualification(&s.profile, &s.environment);
-    s.mode = PhysicalScopeModeV1::DecisionStream;
-    s.intent = None;
-    s.stream = Some(DecisionStreamScopeV1 {
-        options: ["forward", "stop", "turn_left", "turn_right"]
-            .iter()
-            .map(|o| label(o))
-            .collect(),
-        min_decision_interval_us: micros(200_000),
-        observation: ObservationFlowV1 {
-            fields: fx::OBSERVATION_FIELDS
-                .iter()
-                .map(|f| decode(json!(f)))
-                .collect(),
-            min_interval_us: micros(100_000),
-            destination: s.requester.clone(),
-        },
-        on_completion: CompletionAcceptanceV1::Automatic,
-        effect_bound: EffectBoundV1::Witnessed {
-            predicate: fx::effect_contract().unwrap(),
-            required_witness: WitnessClassV1::SimulationOracle,
-        },
-    });
-    s.bounds = s.profile.capability.bounds.clone();
+    s.stream.options = ["forward", "stop", "turn_left", "turn_right"]
+        .iter()
+        .map(|o| label(o))
+        .collect();
     s.execution = s.profile.execution.clone();
     s
 }
@@ -640,24 +617,14 @@ fn decision_stream_scopes_stay_inside_the_declared_capability() {
     let cases: Vec<(&str, Box<dyn Fn(&mut ReviewScopeFieldsV1)>)> = vec![
         (
             "undeclared option",
-            Box::new(|s| s.stream.as_mut().unwrap().options.push(label("teleport"))),
+            Box::new(|s| s.stream.options.push(label("teleport"))),
         ),
-        (
-            "unsorted options",
-            Box::new(|s| s.stream.as_mut().unwrap().options.reverse()),
-        ),
+        ("unsorted options", Box::new(|s| s.stream.options.reverse())),
         (
             "faster than declared",
-            Box::new(|s| s.stream.as_mut().unwrap().min_decision_interval_us = micros(100_000)),
+            Box::new(|s| s.stream.min_decision_interval_us = micros(100_000)),
         ),
-        (
-            "stream mode with an exact intent",
-            Box::new(|s| s.intent = Some(setpoint_intent(0.05, 0.0, 0.0))),
-        ),
-        (
-            "exact mode with stream fields",
-            Box::new(|s| s.mode = PhysicalScopeModeV1::Exact),
-        ),
+        ("no approved option", Box::new(|s| s.stream.options.clear())),
         (
             "more actions than the profile",
             Box::new(|s| s.execution.action_count = 4),
@@ -668,16 +635,10 @@ fn decision_stream_scopes_stay_inside_the_declared_capability() {
         edit(&mut s);
         assert!(PhysicalReviewScopeV1::try_from(s).is_err(), "{case}");
     }
-    // An exact capability still admits exactly one action.
-    let mut s = scope_fields();
-    s.profile.execution.action_count = 2;
-    assert!(s.profile.validate().is_err());
-    // An exact scope cannot sit on a decision-stream capability.
-    let mut s = stream_fields();
-    s.mode = PhysicalScopeModeV1::Exact;
-    s.stream = None;
-    s.intent = Some(setpoint_intent(0.05, 0.0, 0.0));
-    assert!(PhysicalReviewScopeV1::try_from(s).is_err());
+    // A single action is a one-option stream with one action.
+    let one = scope();
+    assert_eq!(one.fields().stream.options, [label("forward")]);
+    assert_eq!(one.fields().execution.action_count, 1);
 }
 
 #[test]
@@ -685,7 +646,7 @@ fn observation_flow_is_declared_bounded_and_only_narrowed() {
     let base = stream_fields();
     let edit = |f: &dyn Fn(&mut ObservationFlowV1)| {
         let mut s = stream_fields();
-        f(&mut s.stream.as_mut().unwrap().observation);
+        f(&mut s.stream.observation);
         s
     };
     // A field the capability does not declare, or another destination Host.
@@ -706,30 +667,30 @@ fn observation_flow_is_declared_bounded_and_only_narrowed() {
     assert!(super::core::test_support::narrow(&fewer, &reviewed).is_err());
     assert!(super::core::test_support::narrow(&slower, &reviewed).is_err());
     let both = super::core::test_support::intersect_scope(&fewer, &slower).unwrap();
-    let flow = both.fields().stream.clone().unwrap().observation;
+    let flow = both.fields().stream.clone().observation;
     assert_eq!(flow.fields.len(), 1);
     assert_eq!(flow.min_interval_us, micros(500_000));
     // Automatic acceptance may narrow to review, never the reverse.
     let mut review = stream_fields();
-    review.stream.as_mut().unwrap().on_completion = CompletionAcceptanceV1::AwaitReview;
+    review.stream.on_completion = CompletionAcceptanceV1::AwaitReview;
     let review = PhysicalReviewScopeV1::try_from(review).unwrap();
     super::core::test_support::narrow(&reviewed, &review).unwrap();
     assert!(super::core::test_support::narrow(&review, &reviewed).is_err());
     let both = super::core::test_support::intersect_scope(&reviewed, &review).unwrap();
     assert_eq!(
-        both.fields().stream.as_ref().unwrap().on_completion,
+        both.fields().stream.on_completion,
         CompletionAcceptanceV1::AwaitReview
     );
     // A witnessed effect bound must be the capability's own and never changes;
     // intent-only is always allowed, and it is a different scope.
     let mut other = stream_fields();
-    other.stream.as_mut().unwrap().effect_bound = EffectBoundV1::Witnessed {
+    other.stream.effect_bound = EffectBoundV1::Witnessed {
         predicate: fx::hold_zero_loss().unwrap(),
         required_witness: WitnessClassV1::SimulationOracle,
     };
     assert!(PhysicalReviewScopeV1::try_from(other).is_err());
     let mut intent_only = stream_fields();
-    intent_only.stream.as_mut().unwrap().effect_bound = EffectBoundV1::IntentOnly;
+    intent_only.stream.effect_bound = EffectBoundV1::IntentOnly;
     let intent_only = PhysicalReviewScopeV1::try_from(intent_only).unwrap();
     assert!(super::core::test_support::narrow(&reviewed, &intent_only).is_err());
     assert!(super::core::test_support::narrow(&intent_only, &reviewed).is_err());
@@ -743,7 +704,7 @@ fn decision_stream_narrowing_only_drops_options_and_slows_the_rate() {
     let reviewed = PhysicalReviewScopeV1::try_from(stream_fields()).unwrap();
     let narrowed = |edit: &dyn Fn(&mut DecisionStreamScopeV1)| {
         let mut s = stream_fields();
-        edit(s.stream.as_mut().unwrap());
+        edit(&mut s.stream);
         PhysicalReviewScopeV1::try_from(s).unwrap()
     };
     let fewer = narrowed(&|d| d.options.retain(|o| o.as_str() != "turn_left"));
@@ -755,7 +716,7 @@ fn decision_stream_narrowing_only_drops_options_and_slows_the_rate() {
     assert!(super::core::test_support::narrow(&slower, &reviewed).is_err());
     // Policy intersection keeps the common options and the slower rate.
     let both = super::core::test_support::intersect_scope(&fewer, &slower).unwrap();
-    let stream = both.fields().stream.clone().unwrap();
+    let stream = both.fields().stream.clone();
     assert!(!stream.allows(&label("turn_left")));
     assert_eq!(stream.min_decision_interval_us, micros(400_000));
 }
@@ -763,11 +724,11 @@ fn decision_stream_narrowing_only_drops_options_and_slows_the_rate() {
 #[test]
 fn scope_hash_version_one_vector() {
     // Pin the canonical schema/ordering. A future encoding change must be versioned.
-    // Re-pinned when the fixture capability replaced the MicroDuck one: the
-    // encoding is unchanged, the hashed fixture content differs.
+    // Re-pinned for ledger format 5: exact scopes became one-option decision
+    // streams, so the scope encoding itself changed.
     assert_eq!(
         String::from(scope().digest().unwrap()),
-        "1ff7c1267c5866e46ea0b061b7c7e3f9c675fe61d25e33435281153c46a4705c"
+        "042b99cc3b66f43e5332a6c0e848befd2a378707822d5ab55e0469304741e562"
     );
 }
 

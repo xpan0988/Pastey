@@ -178,13 +178,8 @@ async fn exact_trace_verified_and_one_time_core_acceptance_closes_authority() {
         2
     );
     assert_eq!(f.control.session_state(), "quarantined");
-    assert!(PhysicalControlServiceV1::refresh_admitted_action(
-        &f.control.core,
-        &f.action,
-        &FakeLane::new(vec![])
-    )
-    .await
-    .is_err());
+    // No write permission remains for the closed action.
+    assert!(!lane::action_valid(&mut f.control.core.lock(), &f.action));
 }
 #[tokio::test]
 async fn duplicate_old_samples_and_dispositions_do_not_advance_freshness() {
@@ -238,7 +233,7 @@ async fn duplicate_old_samples_and_dispositions_do_not_advance_freshness() {
 #[tokio::test]
 async fn missing_evidence_and_fake_apply_ack_cannot_complete() {
     let f = EvidenceFixture::new().await;
-    assert_eq!(f.control.disposition(), "fake_accepted");
+    assert_eq!(f.control.disposition(), "accepted");
     assert_eq!(f.evaluate().state, ConsequenceStateV1::Unobserved);
     f.anchors();
     let x = f.evaluate();
@@ -461,7 +456,7 @@ async fn cancel_first_late_verified_is_history_and_not_task_acceptance() {
     assert_eq!(
         f.control
             .scalar("SELECT consumed_us FROM physical_control_budgets"),
-        1_000_000
+        100_000
     );
     assert_eq!(f.control.session_state(), "quarantined");
 }
@@ -711,7 +706,7 @@ async fn unknown_dispatch_survives_restart_and_no_evidence_is_synthesized() {
     assert_eq!(
         f.control
             .scalar("SELECT consumed_us FROM physical_control_budgets"),
-        1_000_000
+        100_000
     );
 }
 #[test]
@@ -951,6 +946,7 @@ async fn registered_evaluator_timeout_and_simulation_hardware_boundary() {
     fields.qualification.binding_digest = fields.environment.digest().unwrap();
     assert!(PhysicalReviewScopeV1::try_from(fields.clone()).is_err());
     fields.completion.required_witness = WitnessClassV1::IndependentMeasured;
+    fields.stream.effect_bound = EffectBoundV1::IntentOnly;
     let hardware = PhysicalReviewScopeV1::try_from(fields).unwrap();
     l.evidence_class = EvidenceClassV1::Hardware;
     l.witness = WitnessClassV1::IndependentMeasured;
@@ -1015,8 +1011,11 @@ async fn scope_supersession_cancels_pending_historical_task_after_interruption()
     );
 }
 
+// Ledger format 5: every action is a decision with a decision record, which no
+// stage before 10 can hold. A populated older-stage ledger is refused, not
+// migrated, and the refused startup changes nothing.
 #[tokio::test]
-async fn recognized_stage4_migration_keeps_quarantined_holder_epochs_and_consumption() {
+async fn populated_stage4_ledger_without_decision_records_fails_closed_unchanged() {
     let f = EvidenceFixture::new().await;
     f.cancel();
     let epoch = f.control.scalar("SELECT epoch FROM physical_domains");
@@ -1027,28 +1026,28 @@ async fn recognized_stage4_migration_keeps_quarantined_holder_epochs_and_consump
         sql.execute_batch(&ddl).unwrap();
     }
     sql.execute_batch("INSERT INTO physical_domain_reservations SELECT * FROM fixture_stage5_holders; DROP TABLE fixture_stage5_holders;").unwrap();
-    storage::init_database(&f.control.paths).unwrap();
-    PhysicalStoreV1::open(&f.control.paths).unwrap();
-    assert_eq!(
-        f.control.scalar("SELECT epoch FROM physical_domains"),
-        epoch
+    let held = || {
+        (
+            f.control.scalar("SELECT epoch FROM physical_domains"),
+            f.control
+                .scalar("SELECT consumed_us FROM physical_control_budgets"),
+            f.control.scalar(
+                "SELECT count(*) FROM physical_domain_reservations WHERE state='quarantined'",
+            ),
+            f.control
+                .scalar("SELECT count(*) FROM sqlite_master WHERE name='physical_decisions'"),
+        )
+    };
+    // The rebuild copied every row exactly.
+    assert_eq!(held(), (epoch, 100_000, 1, 0));
+    // Startup refuses the ledger; a later open finds no recognized schema.
+    let refused = storage::init_database(&f.control.paths).err().unwrap();
+    assert!(
+        refused.to_string().contains("without decision record"),
+        "{refused}"
     );
-    assert_eq!(
-        f.control
-            .scalar("SELECT consumed_us FROM physical_control_budgets"),
-        1_000_000
-    );
-    assert_eq!(
-        f.control
-            .scalar("SELECT count(*) FROM physical_domain_reservations WHERE state='quarantined'"),
-        1
-    );
-    assert_eq!(
-        core_fake::store(&f.control.core.lock())
-            .acceptance(&f.lineage.root)
-            .unwrap(),
-        AcceptanceStateV1::Cancelled
-    );
+    assert!(PhysicalStoreV1::open(&f.control.paths).is_err());
+    assert_eq!(held(), (epoch, 100_000, 1, 0));
 }
 
 #[tokio::test]
@@ -1319,13 +1318,8 @@ async fn trusted_observation_reset_closes_shared_environment_authority_before_an
             .unwrap(),
         AcceptanceStateV1::Cancelled
     );
-    assert!(PhysicalControlServiceV1::refresh_admitted_action(
-        &f.control.core,
-        &f.action,
-        &FakeLane::new(vec![])
-    )
-    .await
-    .is_err());
+    // No write permission remains for the closed action.
+    assert!(!lane::action_valid(&mut f.control.core.lock(), &f.action));
     assert_eq!(f.evaluate().state, ConsequenceStateV1::OutcomeUnknown);
 }
 #[tokio::test]
@@ -1345,13 +1339,8 @@ async fn an_evidence_clock_regression_closes_live_control_before_returning_error
             .unwrap(),
         AcceptanceStateV1::Cancelled
     );
-    assert!(PhysicalControlServiceV1::refresh_admitted_action(
-        &f.control.core,
-        &f.action,
-        &FakeLane::new(vec![])
-    )
-    .await
-    .is_err());
+    // No write permission remains for the closed action.
+    assert!(!lane::action_valid(&mut f.control.core.lock(), &f.action));
 }
 
 #[path = "stage7_tests.rs"]

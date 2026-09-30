@@ -417,10 +417,8 @@ test("physical review expiry, exact approval, and uncertain status stay separate
   assert.match(panel, /physicalReviewFresh\(r\)/);
   assert.match(panel, /stop acknowledgement does not prove physical rest/);
   assert.doesNotMatch(panel, /robot\.enable|setApproval|authorityToken/);
-  // The renderer shows capability payloads generically, never device fields.
-  assert.doesNotMatch(panel, /vxMps|vyawRadps|micro_duck/);
-  const { physicalPayloadEntries } = await import("../src/lib/physical");
-  assert.deepEqual(physicalPayloadEntries({ volumeMl: 5, nozzle: { id: "a" } }), [["/volumeMl", "5"], ["/nozzle/id", "a"]]);
+  // The renderer shows option names only, never payloads or device fields.
+  assert.doesNotMatch(panel, /vxMps|vyawRadps|micro_duck|payload/i);
 });
 
 test("physical review shows a decision-stream scope, including its observation flow", async () => {
@@ -435,7 +433,6 @@ test("physical review shows a decision-stream scope, including its observation f
   };
   const stream = physicalScopeSummary({
     ...base,
-    mode: "decision_stream",
     stream: {
       options: ["forward", "stop", "turn_left", "turn_right"],
       minDecisionIntervalUs: 200000,
@@ -446,7 +443,6 @@ test("physical review shows a decision-stream scope, including its observation f
   } as import("../src/lib/physical").PhysicalScope);
   assert.deepEqual(Object.fromEntries(stream), {
     "Executor Host": "host:body",
-    Mode: "Decision stream",
     "Approved options": "forward, stop, turn_left, turn_right",
     "Decision rate": "at most one decision per 0.2 s",
     "Per action": "≤ 0.5 s",
@@ -457,11 +453,12 @@ test("physical review shows a decision-stream scope, including its observation f
     "Effect bound": "flat.stays-inside/v1, checked by a simulation oracle witness",
     "On completion": "Awaits a review decision",
   });
+  // A single reviewed action is a one-option stream with one action.
   const intentOnly = physicalScopeSummary({
     ...base,
-    mode: "decision_stream",
+    execution: { ...base.execution, actionCount: 1 },
     stream: {
-      options: ["pour_small"],
+      options: ["pour_5ml"],
       minDecisionIntervalUs: 500000,
       observation: { fields: [], minIntervalUs: 500000, destination: "host:brain" },
       onCompletion: "automatic",
@@ -470,16 +467,9 @@ test("physical review shows a decision-stream scope, including its observation f
   } as import("../src/lib/physical").PhysicalScope);
   assert.equal(Object.fromEntries(intentOnly)["Effect bound"], "Intent only: constrains the brain's choices, not what the body does");
   assert.equal(Object.fromEntries(intentOnly)["Observations sent"], "none");
-  // An exact scope still renders, without a stream section.
-  const exact = physicalScopeSummary({
-    ...base,
-    mode: "exact",
-    execution: { ...base.execution, actionCount: 1 },
-    intent: { capabilityId: "test.dispense/v1", payload: { volumeMl: 5 }, payloadDigest: "d" },
-  } as import("../src/lib/physical").PhysicalScope);
-  assert.equal(Object.fromEntries(exact).Intent, "test.dispense/v1 · /volumeMl = 5");
-  assert.equal(Object.fromEntries(exact)["Observations sent"], undefined);
-  assert.equal(Object.fromEntries(exact)["In total"], "≤ 30 s · ≤ 1 action");
+  assert.equal(Object.fromEntries(intentOnly)["Approved options"], "pour_5ml");
+  assert.equal(Object.fromEntries(intentOnly)["In total"], "≤ 30 s · ≤ 1 action");
+  assert.equal(Object.fromEntries(intentOnly)["On completion"], "Accepted automatically");
   // The panel renders these rows and no longer reads scope.intent directly.
   const panel = readFileSync("src/components/PhysicalReviewPanel.tsx", "utf8");
   assert.match(panel, /physicalScopeSummary\(scope\)/);

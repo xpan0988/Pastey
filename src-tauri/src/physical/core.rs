@@ -213,14 +213,10 @@ impl PhysicalControlServiceV1 {
         binding.validate_scope_schema(s)?;
         // A witnessed effect bound needs a witness of the required class on
         // this Host; otherwise the authorization must say intent-only.
-        if let Some(DecisionStreamScopeV1 {
-            effect_bound:
-                EffectBoundV1::Witnessed {
-                    predicate,
-                    required_witness,
-                },
-            ..
-        }) = &s.stream
+        if let EffectBoundV1::Witnessed {
+            predicate,
+            required_witness,
+        } = &s.stream.effect_bound
         {
             require(
                 self.witnesses
@@ -773,14 +769,9 @@ pub(super) fn validate_narrowing(
     semantic.execution = a.execution.clone();
     semantic.freshness = a.freshness.clone();
     semantic.stream = a.stream.clone();
-    let stream_narrowed = match (&a.stream, &b.stream) {
-        (None, None) => true,
-        (Some(a), Some(b)) => b.is_subset_of(a),
-        _ => false,
-    };
     require(
         semantic == *a
-            && stream_narrowed
+            && b.stream.is_subset_of(&a.stream)
             && b.bounds.is_subset_of(&a.bounds)
             && b.execution.is_subset_of(&a.execution)
             && b.freshness.is_subset_of(&a.freshness),
@@ -804,11 +795,7 @@ fn intersect(
     )?;
     let mut result = a.clone();
     result.bounds = a.bounds.intersect(&b.bounds)?;
-    result.stream = match (&a.stream, &b.stream) {
-        (None, None) => None,
-        (Some(a), Some(b)) => Some(a.intersect(b)?),
-        _ => require(false, "Executor policy changes the invocation mode").map(|_| None)?,
-    };
+    result.stream = a.stream.intersect(&b.stream)?;
     result.execution = ExecutionBudgetV1 {
         action_duration_us: a
             .execution

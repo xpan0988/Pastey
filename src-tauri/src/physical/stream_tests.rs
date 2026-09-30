@@ -117,7 +117,7 @@ async fn each_decision_is_admitted_recorded_rate_limited_and_replaces_the_last()
     assert_eq!(
         first,
         DecisionToolReplyV1::Allowed {
-            disposition: "accepted".into()
+            disposition: crate::physical::store::ActionDispositionV1::Accepted
         }
     );
     // Faster than the approved decision rate.
@@ -502,25 +502,13 @@ async fn a_bound_this_host_cannot_witness_must_be_marked_intent_only() {
     let i = core.local_ingress().unwrap();
     assert!(core.draft_review(&i, &f.live, f.scope.clone()).is_err());
     let mut fields = f.scope.fields().clone();
-    fields.stream.as_mut().unwrap().effect_bound = EffectBoundV1::IntentOnly;
+    fields.stream.effect_bound = EffectBoundV1::IntentOnly;
     core.draft_review(
         &i,
         &f.live,
         PhysicalReviewScopeV1::try_from(fields).unwrap(),
     )
     .unwrap();
-}
-
-#[tokio::test]
-async fn exact_scopes_have_no_decision_tools() {
-    let f = ControlFixture::new();
-    let s = f.active().await;
-    let lane: Arc<dyn crate::physical::core::EnvironmentBinding> = Arc::new(FakeLane::new(vec![]));
-    let mut core = f.core.lock();
-    let i = core.local_ingress().unwrap();
-    assert!(core
-        .open_tool_session(&i, &s, lane, caller("brain"))
-        .is_err());
 }
 
 #[tokio::test]
@@ -597,7 +585,7 @@ async fn remote_tools_run_on_the_executor_and_die_with_the_bridge() {
         read(&mut p, &call_id),
         ToolOutcomeV1::Reply {
             reply: DecisionToolReplyV1::Allowed {
-                disposition: "accepted".into()
+                disposition: crate::physical::store::ActionDispositionV1::Accepted
             }
         }
     );

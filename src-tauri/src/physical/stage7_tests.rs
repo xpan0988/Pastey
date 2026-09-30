@@ -384,7 +384,7 @@ async fn remote_action_result_l7_reconciliation_and_lost_reply_have_local_parity
         let mut core = p.b.core.lock();
         core.record_control_observation(&s, lane::observation(&s, 0, 0))
             .unwrap();
-        lane::admit_exact(&mut core, &s)
+        lane::admit_first(&mut core, &s)
     };
     PhysicalControlServiceV1::dispatch_admitted_action(&p.b.core, &action, &FakeLane::new(vec![]))
         .await
@@ -631,7 +631,7 @@ async fn lost_action_ack_and_lost_result_keep_one_dispatch_and_reserved_budget()
         let mut core = p.b.core.lock();
         core.record_control_observation(&s, lane::observation(&s, 0, 0))
             .unwrap();
-        lane::admit_exact(&mut core, &s)
+        lane::admit_first(&mut core, &s)
     };
     assert!(PhysicalControlServiceV1::dispatch_admitted_action(
         &p.b.core,
@@ -655,8 +655,11 @@ async fn lost_action_ack_and_lost_result_keep_one_dispatch_and_reserved_budget()
     );
 }
 
+// Ledger format 5: a stage 7 ledger cannot hold decision records, so a
+// populated one is refused, not migrated, and the refused startup changes
+// nothing.
 #[tokio::test]
-async fn exact_stage7_migration_preserves_remote_lineage_and_consumed_budget() {
+async fn populated_stage7_ledger_without_decision_records_fails_closed_unchanged() {
     let mut pair = Pair::new();
     let (_, session) = pair.start().await;
     let (grant, proposal) = pair.b.challenged(&session);
@@ -669,55 +672,47 @@ async fn exact_stage7_migration_preserves_remote_lineage_and_consumed_budget() {
     .await
     .unwrap();
     pair.b.core.lock().close().unwrap();
-    let audits: Vec<(String, String)> = pair
-        .b
-        .sql()
-        .prepare("SELECT session_id,audit_json FROM physical_sessions ORDER BY session_id")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    let semantic = pair
-        .b
-        .scalar("SELECT count(*) FROM physical_semantic_messages");
+    let held = |pair: &Pair| {
+        let audits: Vec<(String, String)> = pair
+            .b
+            .sql()
+            .prepare("SELECT session_id,audit_json FROM physical_sessions ORDER BY session_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        (
+            audits,
+            pair.b
+                .scalar("SELECT count(*) FROM physical_semantic_messages"),
+            pair.b
+                .scalar("SELECT consumed_us FROM physical_control_budgets"),
+        )
+    };
+    let before = held(&pair);
+    assert_eq!(before.2, 100_000);
     crate::physical::store::test_restore_stage7_schema(&pair.b.paths).unwrap();
-    storage::init_database(&pair.b.paths).unwrap();
-    let _restarted = PhysicalControlServiceV1::new(
+    // The rebuild copied every row exactly.
+    assert_eq!(held(&pair), before);
+    // Startup refuses the ledger; a later open finds no recognized schema.
+    let refused = storage::init_database(&pair.b.paths).err().unwrap();
+    assert!(
+        refused.to_string().contains("without decision record"),
+        "{refused}"
+    );
+    assert!(PhysicalControlServiceV1::new(
         &pair.b.paths,
         LocalRuntimeRef::fresh(host("executor")),
         pair.b.clock.clone(),
         witnesses(),
     )
-    .unwrap();
-    let migrated: Vec<(String, String)> = pair
-        .b
-        .sql()
-        .prepare("SELECT session_id,audit_json FROM physical_sessions ORDER BY session_id")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(audits, migrated);
-    assert_eq!(
-        semantic,
-        pair.b
-            .scalar("SELECT count(*) FROM physical_semantic_messages")
-    );
+    .is_err());
+    assert_eq!(held(&pair), before);
     assert_eq!(
         pair.b
-            .scalar("SELECT consumed_us FROM physical_control_budgets"),
-        1_000_000
-    );
-    assert_eq!(
-        pair.b
-            .scalar("SELECT count(*) FROM physical_native_receipts"),
+            .scalar("SELECT count(*) FROM sqlite_master WHERE name='physical_decisions'"),
         0
-    );
-    assert_eq!(
-        pair.b.scalar("SELECT version FROM physical_native_schema"),
-        1
     );
 }
 

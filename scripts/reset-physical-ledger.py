@@ -2,15 +2,15 @@
 """Reset a development physical ledger whose record format is out of date.
 
 Pastey refuses to start with a physical ledger whose content format predates the
-current build ("legacy physical ledger (pre-decouple); reset required"). Record
+current build ("legacy physical ledger (older format); reset required"). Record
 bodies are never migrated. This tool returns the ledger to the Stage 2 base
 schema so the next Pastey start rebuilds every later stage empty.
 
 Kept untouched: physical domains (including their epoch floors), aliases,
 environment registrations and environment/domain membership.
 Removed: qualifications, reviews, attempts, sessions, actions, evidence,
-remote/native/qualification ledgers and the ledger format marker. Old reviews,
-approvals and roots can therefore never be reused.
+decision records, remote/native/qualification ledgers and the ledger format
+marker. Old reviews, approvals and roots can therefore never be reused.
 
 Quit Pastey first. Usage: reset-physical-ledger.py [--dry-run] PATH/TO/pastey.db
 """

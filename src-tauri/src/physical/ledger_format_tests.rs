@@ -44,11 +44,11 @@ async fn older_or_missing_format_with_content_fails_closed_until_reset() {
     for (marker, expected) in [
         (
             "DROP TABLE physical_ledger_meta",
-            "legacy physical ledger (pre-decouple); reset required",
+            "legacy physical ledger (older format); reset required",
         ),
         (
             "UPDATE physical_ledger_meta SET format_version=1",
-            "legacy physical ledger (pre-decouple); reset required",
+            "legacy physical ledger (older format); reset required",
         ),
         (
             "UPDATE physical_ledger_meta SET format_version=99",

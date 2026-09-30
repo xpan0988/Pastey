@@ -80,7 +80,7 @@ impl Fixture {
             .record_qualification(&live, &p, &q, fake::evidence(&q, digest_value()))
             .unwrap();
         let mut fields = scope_fields();
-        fields.requester = host("executor");
+        fields.for_requester(&host("executor"));
         fields.environment = live.view().clone();
         fields.qualification = q;
         let scope = PhysicalReviewScopeV1::try_from(fields).unwrap();
@@ -357,7 +357,7 @@ fn wrong_host_environment_body_and_claimed_binding_denied() {
         let mut f = Fixture::new();
         let mut fields = f.scope.fields().clone();
         match mode {
-            "requester" => fields.requester = host("other"),
+            "requester" => fields.for_requester(&host("other")),
             "executor" => {
                 fields.executor = host("other");
                 fields.environment.executor = host("other");
@@ -620,13 +620,11 @@ fn material_intent_target_completion_profile_and_qualification_substitution_deni
         "profile",
     ] {
         let changed = changed(&f.scope, |s| match mode {
-            "intent" => {
-                s.intent = Some(setpoint_intent(-0.05, 0.0, 0.0));
-            }
+            "intent" => one_option(s, "stop"),
             "completion" => {
                 edit_completion(s, |c| c.min_progress = NonNegative::try_from(0.02).unwrap());
             }
-            "requester" => s.requester = host("other"),
+            "requester" => s.for_requester(&host("other")),
             "qualification" => s.qualification.conditions_digest = decode(json!("b".repeat(64))),
             _ => {
                 s.profile.capability.bounds = with_abs_max(&s.profile.capability.bounds, "/a", 0.2);
@@ -677,7 +675,7 @@ fn narrowing_cannot_change_intent_to_fit_smaller_limits() {
     let mut f = Fixture::new();
     let too_small = changed(&f.scope, |s| {
         s.bounds = with_abs_max(&s.bounds, "/a", 0.01);
-        s.intent = Some(setpoint_intent(0.01, 0.0, 0.0));
+        one_option(s, "stop");
     });
     assert!(core_fake::intersect_scope(&f.scope, &too_small).is_err());
     let root = f.root();

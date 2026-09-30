@@ -903,11 +903,7 @@ impl PhysicalControlServiceV1 {
                 // Installation only. Decisions come from the brain through
                 // the decision-stream tools; Core proposes nothing itself.
                 Self::install_control_session(core, &session, adapter.as_ref()).await?;
-                let stream = if session.is_stream() {
-                    Some(core.lock().stream_runtime(&session, adapter)?)
-                } else {
-                    None
-                };
+                let stream = Some(core.lock().stream_runtime(&session, adapter)?);
                 Ok(PhysicalWorkDoneV1 {
                     reply: None,
                     stream,

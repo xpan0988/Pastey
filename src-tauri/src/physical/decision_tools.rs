@@ -21,15 +21,24 @@ pub(crate) enum DecisionToolCallV1 {
 }
 
 /// What a caller learns. Admission is allowed or refused; `disposition` is the
-/// binding's native reply to the write ("accepted", "refused" or "unknown").
+/// binding's native reply to the write (accepted, refused or dispatch_unknown).
 /// Neither is a physical consequence: only the witness decides that.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum DecisionToolReplyV1 {
-    Allowed { disposition: String },
-    Refused { reason: String },
-    Observation { view: CanonicalJsonV1 },
-    Budget { actions: u64, execution_us: u64 },
+    Allowed {
+        disposition: crate::physical::store::ActionDispositionV1,
+    },
+    Refused {
+        reason: String,
+    },
+    Observation {
+        view: CanonicalJsonV1,
+    },
+    Budget {
+        actions: u64,
+        execution_us: u64,
+    },
 }
 
 /// Executor-side runtime of one stream: the binding lane, serialized
@@ -71,9 +80,7 @@ fn refused(reason: impl Into<String>) -> DecisionToolReplyV1 {
     }
 }
 fn stream_scope(s: &BodyControlSessionV1) -> AppResult<&DecisionStreamScopeV1> {
-    s.basis.scope().fields().stream.as_ref().ok_or_else(|| {
-        crate::error::AppError::InvalidInput("Tools exist only for decision streams".into())
-    })
+    Ok(&s.basis.scope().fields().stream)
 }
 
 impl PhysicalControlServiceV1 {
@@ -508,14 +515,8 @@ impl PhysicalControlServiceV1 {
         // stream inside Core (no retry, budget kept); the caller learns only
         // the disposition.
         let _ = Self::dispatch_admitted_action(core, &action, ts.stream.lane.as_ref()).await;
-        let disposition = match core.lock().store.action_status(action.id())?.1.as_str() {
-            "fake_accepted" => "accepted",
-            "fake_refused" => "refused",
-            _ => "unknown",
-        };
-        Ok(DecisionToolReplyV1::Allowed {
-            disposition: disposition.into(),
-        })
+        let disposition = core.lock().store.action_status(action.id())?.1;
+        Ok(DecisionToolReplyV1::Allowed { disposition })
     }
     /// Ends a tool session and with it the stream: authority closes first,
     /// then the fence is requested. The outcome stays uncertain unless the

@@ -109,7 +109,7 @@ For a single-machine dual-instance smoke, create/join a Bridge and exercise sele
 
 ## Physical ledger format resets (development)
 
-The physical ledger stores record bodies (review scopes, intents, evidence, qualification records) whose format is versioned by `physical_ledger_meta.format_version`. Record bodies are never migrated. When a build changes that format, starting Pastey against a ledger holding older-format rows fails closed with `legacy physical ledger (pre-decouple); reset required`. Ledgers whose older-format tables are all empty upgrade in place.
+The physical ledger stores record bodies (review scopes, actions, evidence, qualification records) whose format is versioned by `physical_ledger_meta.format_version`. Record bodies are never migrated. The current format is 5: every scope is a decision stream (a single reviewed action is a one-option stream), actions carry the chosen option, and dispositions read `accepted`/`refused`. Any development ledger that holds rows from format 4 or earlier must be reset. When a build changes that format, starting Pastey against a ledger holding older-format rows fails closed with `legacy physical ledger (older format); reset required`. Ledgers whose older-format tables are all empty upgrade in place.
 
 Quit Pastey, then reset the development ledger:
 
@@ -121,7 +121,7 @@ python3 -B scripts/reset-physical-ledger.py --dry-run "$HOME/Library/Application
 python3 -B scripts/reset-physical-ledger.py "$HOME/Library/Application Support/dev.localfirst.pastey/db.sqlite"
 ```
 
-Use the `db.sqlite` under `PASTEY_APP_DATA_DIR` when that override is set; the default path differs on Windows and Linux. The reset keeps physical domains (with their epoch floors), aliases, environment registrations and environment/domain membership. It removes qualifications, reviews, attempts, sessions, actions, evidence and the remote/native/qualification ledgers, so no old approval or root can be reused. The next start rebuilds the empty later-stage tables and stamps the current format.
+Use the `db.sqlite` under `PASTEY_APP_DATA_DIR` when that override is set; the default path differs on Windows and Linux. The reset keeps physical domains (with their epoch floors), aliases, environment registrations and environment/domain membership. It removes qualifications, reviews, attempts, sessions, actions, decision records, evidence and the remote/native/qualification ledgers, so no old approval or root can be reused. The next start rebuilds the empty later-stage tables and stamps the current format.
 
 ## Native Agent focused validation
 

@@ -50,6 +50,17 @@ pub(super) fn rebuild(c: &Connection, ddl: &str) -> AppResult<()> {
     // The ledger format marker is not part of any DDL stage and is kept as is.
     let names: Vec<String> = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'physical_*' AND name!=?1 ORDER BY name")?
         .query_map([super::LEDGER_META_TABLE], |r| r.get(0))?.collect::<Result<_,_>>()?;
+    // Dispositions were renamed with ledger format 5 (fake_accepted/
+    // fake_refused became accepted/refused). Rows follow the target DDL.
+    let legacy_target = ddl.contains("'fake_accepted'");
+    let disposition_column: Option<usize> = if names.iter().any(|n| n == "physical_actions") {
+        c.prepare("SELECT * FROM physical_actions")?
+            .column_names()
+            .iter()
+            .position(|n| *n == "disposition")
+    } else {
+        None
+    };
     let mut saved = Vec::new();
     for name in &names {
         let mut stmt = c.prepare(&format!("SELECT * FROM {name}"))?;
@@ -96,11 +107,28 @@ pub(super) fn rebuild(c: &Connection, ddl: &str) -> AppResult<()> {
         }
         let placeholders = vec!["?"; columns].join(",");
         let mut stmt = c.prepare(&format!("INSERT INTO {name} VALUES({placeholders})"))?;
-        for row in rows {
+        for mut row in rows {
+            if let Some(i) = disposition_column.filter(|_| name == "physical_actions") {
+                translate_disposition(&mut row[i], legacy_target);
+            }
             stmt.execute(rusqlite::params_from_iter(row))?;
         }
     }
     Ok(())
+}
+
+fn translate_disposition(value: &mut rusqlite::types::Value, legacy: bool) {
+    use rusqlite::types::Value;
+    if let Value::Text(t) = value {
+        let renamed = match (legacy, t.as_str()) {
+            (true, "accepted") => "fake_accepted",
+            (true, "refused") => "fake_refused",
+            (false, "fake_accepted") => "accepted",
+            (false, "fake_refused") => "refused",
+            _ => return,
+        };
+        *t = renamed.to_owned();
+    }
 }
 
 impl PhysicalStoreV1 {
@@ -252,12 +280,11 @@ impl PhysicalStoreV1 {
         if let Some((id, d)) = action {
             let id = ActionId::try_from(id)?;
             s.action = Some(id.clone());
-            s.dispatch = match d.as_str() {
-                "not_sent" => PhysicalDispatchStateV1::NotSent,
-                "dispatch_intent" => PhysicalDispatchStateV1::IntentCommitted,
-                "fake_accepted" => PhysicalDispatchStateV1::Acknowledged,
-                "fake_refused" => PhysicalDispatchStateV1::Refused,
-                _ => PhysicalDispatchStateV1::Unknown,
+            s.dispatch = match serde_json::from_value(serde_json::Value::String(d))? {
+                super::ActionDispositionV1::NotSent => PhysicalDispatchStateV1::NotSent,
+                super::ActionDispositionV1::Accepted => PhysicalDispatchStateV1::Acknowledged,
+                super::ActionDispositionV1::Refused => PhysicalDispatchStateV1::Refused,
+                super::ActionDispositionV1::DispatchUnknown => PhysicalDispatchStateV1::Unknown,
             };
             if let Some(raw) = c.query_row("SELECT record_json FROM physical_consequences WHERE action_id=?1 ORDER BY revision DESC LIMIT 1",[text(&id)],|r|r.get::<_,String>(0)).optional()? {
                 let consequence: crate::physical::evidence::PhysicalConsequenceV1=decode(&raw)?;

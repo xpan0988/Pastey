@@ -4,13 +4,6 @@ use super::{binding::EnvironmentBindingViewV1, require, values::*};
 use crate::{error::AppResult, host_identity::HostRef};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum PhysicalScopeModeV1 {
-    Exact,
-    DecisionStream,
-}
-
 // What `observe` may send to the brain, how often and to which Host. Fields
 // not listed never leave the executor: it filters every reply (fail-closed).
 claim!(ObservationFlowV1 {
@@ -141,44 +134,6 @@ impl DecisionStreamScopeV1 {
     }
 }
 
-// Exact capability payload. Its schema (payload_schema_digest) and meaning
-// belong to the binding; Core checks identity, digest and bounded dimensions.
-claim!(PhysicalIntentV1 {
-    capability_id: SemanticIdV1,
-    payload: CanonicalJsonV1,
-    payload_digest: DigestV1,
-});
-impl PhysicalIntentV1 {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
-        )
-    )]
-    pub fn new(capability_id: SemanticIdV1, payload: CanonicalJsonV1) -> AppResult<Self> {
-        let payload_digest = payload_digest(&capability_id, &payload)?;
-        Ok(Self {
-            capability_id,
-            payload,
-            payload_digest,
-        })
-    }
-    pub fn validate(&self) -> AppResult<()> {
-        require(
-            self.payload_digest == payload_digest(&self.capability_id, &self.payload)?,
-            "Intent payload digest mismatch",
-        )
-    }
-    pub fn digest(&self) -> AppResult<DigestV1> {
-        self.validate()?;
-        Ok(self.payload_digest.clone())
-    }
-}
-fn payload_digest(id: &SemanticIdV1, payload: &CanonicalJsonV1) -> AppResult<DigestV1> {
-    digest("pastey-physical-intent-v1", &(id, payload))
-}
-
 /// Admission-time constraint. Not a lease or action lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -273,11 +228,6 @@ impl PhysicalCapabilityProfileV1 {
     pub fn validate(&self) -> AppResult<()> {
         self.execution.validate()?;
         self.freshness.validate()?;
-        require(
-            self.capability.invocation_mode == InvocationModeV1::DecisionStream
-                || self.execution.action_count == 1,
-            "An exact capability admits one action",
-        )?;
         require(
             self.evidence_class != EvidenceClassV1::Hardware
                 || self.required_enforcement_class == SessionEnforcementClassV1::NativeFence,
@@ -430,13 +380,9 @@ claim!(ReviewScopeFieldsV1 {
     environment: EnvironmentBindingViewV1,
     profile: PhysicalCapabilityProfileV1,
     qualification: PhysicalQualificationV1,
-    mode: PhysicalScopeModeV1,
-    /// The exact payload; present exactly in `Exact` mode.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    intent: Option<PhysicalIntentV1>,
-    /// The approved options and rate; present exactly in `DecisionStream` mode.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    stream: Option<DecisionStreamScopeV1>,
+    /// The approved options, rates, observation flow, completion handling
+    /// and effect bound. A single action is a one-option stream.
+    stream: DecisionStreamScopeV1,
     bounds: BoundSetV1,
     execution: ExecutionBudgetV1,
     freshness: PhysicalFreshnessV1,
@@ -448,9 +394,7 @@ impl ReviewScopeFieldsV1 {
     /// follows the requester, whose brain receives it.
     pub fn for_requester(&mut self, requester: &HostRef) {
         self.requester = requester.clone();
-        if let Some(stream) = self.stream.as_mut() {
-            stream.observation.destination = requester.clone();
-        }
+        self.stream.observation.destination = requester.clone();
     }
     pub fn validate(&self) -> AppResult<()> {
         validate_host(&self.requester)?;
@@ -461,66 +405,42 @@ impl ReviewScopeFieldsV1 {
         self.execution.validate()?;
         self.freshness.validate()?;
         let capability = &self.profile.capability;
-        match (self.mode, &self.intent, &self.stream) {
-            (PhysicalScopeModeV1::Exact, Some(intent), None) => {
-                require(
-                    capability.invocation_mode == InvocationModeV1::ExactLeased
-                        && self.execution.action_count == 1,
-                    "Exact scope needs an exact one-action capability",
-                )?;
-                require(
-                    intent.capability_id == capability.capability_id,
-                    "Intent capability differs from profile",
-                )?;
-                require(
-                    self.bounds.is_subset_of(&capability.bounds)
-                        && self.bounds.contains(&intent.payload),
-                    "Intent/bounds exceed profile",
-                )?;
-            }
-            (PhysicalScopeModeV1::DecisionStream, None, Some(stream)) => {
-                stream.validate()?;
-                let declared = capability.decision_stream.as_ref().ok_or_else(|| {
-                    crate::error::AppError::InvalidInput(
-                        "Decision-stream scope needs a decision-stream capability".into(),
-                    )
-                })?;
-                require(
-                    stream.options.iter().all(|o| declared.option(o).is_some())
-                        && stream.min_decision_interval_us >= declared.min_decision_interval_us,
-                    "Approved options/rate exceed the declared capability",
-                )?;
-                stream.observation.validate()?;
-                require(
-                    stream
-                        .observation
-                        .fields
-                        .iter()
-                        .all(|f| declared.observation_fields.binary_search(f).is_ok()),
-                    "Observation field not declared by the capability",
-                )?;
-                require(
-                    stream.observation.destination == self.requester,
-                    "Observations may only flow to the requester's brain",
-                )?;
-                if let EffectBoundV1::Witnessed {
-                    predicate,
-                    required_witness,
-                } = &stream.effect_bound
-                {
-                    require(
-                        capability.effect_bound.as_ref() == Some(predicate)
-                            && required_witness.may_be_required(self.environment.evidence_class),
-                        "Effect bound not declared, or its witness cannot support this evidence",
-                    )?;
-                }
-                require(
-                    self.bounds.is_subset_of(&capability.bounds),
-                    "Bounds exceed profile",
-                )?;
-            }
-            _ => require(false, "Scope mode and invocation fields disagree")?,
+        let stream = &self.stream;
+        stream.validate()?;
+        let declared = &capability.decision_stream;
+        require(
+            stream.options.iter().all(|o| declared.option(o).is_some())
+                && stream.min_decision_interval_us >= declared.min_decision_interval_us,
+            "Approved options/rate exceed the declared capability",
+        )?;
+        stream.observation.validate()?;
+        require(
+            stream
+                .observation
+                .fields
+                .iter()
+                .all(|f| declared.observation_fields.binary_search(f).is_ok()),
+            "Observation field not declared by the capability",
+        )?;
+        require(
+            stream.observation.destination == self.requester,
+            "Observations may only flow to the requester's brain",
+        )?;
+        if let EffectBoundV1::Witnessed {
+            predicate,
+            required_witness,
+        } = &stream.effect_bound
+        {
+            require(
+                capability.effect_bound.as_ref() == Some(predicate)
+                    && required_witness.may_be_required(self.environment.evidence_class),
+                "Effect bound not declared, or its witness cannot support this evidence",
+            )?;
         }
+        require(
+            self.bounds.is_subset_of(&capability.bounds),
+            "Bounds exceed profile",
+        )?;
         require(
             self.execution.is_subset_of(&self.profile.execution),
             "Execution budget exceeds profile",
@@ -652,12 +572,8 @@ claim!(PhysicalActionProposalV1 {
     attempt_id: AttemptId,
     action_id: ActionId,
     decision_sequence: u64,
-    /// The exact payload (exact mode) or the chosen option (decision stream):
-    /// exactly one is present.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    payload: Option<PhysicalIntentV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    option: Option<LabelV1>,
+    /// The chosen option. Its payload stays with the binding.
+    option: LabelV1,
     payload_digest: DigestV1,
     challenge_id: ChallengeId,
     observations: Vec<ObservationId>,
@@ -665,15 +581,7 @@ claim!(PhysicalActionProposalV1 {
 });
 impl PhysicalActionProposalV1 {
     pub fn validate(&self) -> AppResult<()> {
-        require(
-            self.decision_sequence > 0
-                && match (&self.payload, &self.option) {
-                    (Some(payload), None) => self.payload_digest == payload.digest()?,
-                    (None, Some(_)) => true,
-                    _ => false,
-                },
-            "Invalid proposal identity/digest",
-        )?;
+        require(self.decision_sequence > 0, "Invalid proposal sequence")?;
         require(
             !self.observations.is_empty()
                 && self.observations.len() <= 64
@@ -686,22 +594,15 @@ impl PhysicalActionProposalV1 {
     pub fn validate_scope(&self, scope: &PhysicalReviewScopeV1) -> AppResult<()> {
         self.validate()?;
         let f = scope.fields();
-        let matches = match (f.mode, &self.option) {
-            (PhysicalScopeModeV1::Exact, None) => self.payload == f.intent,
-            (PhysicalScopeModeV1::DecisionStream, Some(option)) => {
-                f.stream.as_ref().is_some_and(|s| s.allows(option))
-                    && f.profile
-                        .capability
-                        .decision_stream
-                        .as_ref()
-                        .and_then(|d| d.option(option))
-                        .is_some_and(|o| o.payload_digest == self.payload_digest)
-            }
-            _ => false,
-        };
         require(
-            matches && self.requested_duration_us <= f.execution.action_duration_us,
-            "Proposal outside the reviewed action or approved options",
+            f.stream.allows(&self.option)
+                && f.profile
+                    .capability
+                    .decision_stream
+                    .option(&self.option)
+                    .is_some_and(|o| o.payload_digest == self.payload_digest)
+                && self.requested_duration_us <= f.execution.action_duration_us,
+            "Proposal outside the approved options",
         )
     }
 }

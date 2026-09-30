@@ -249,29 +249,6 @@ impl CanonicalJsonV1 {
     pub fn encode(value: &impl Serialize) -> AppResult<Self> {
         Self::try_from(serde_json::to_value(value)?)
     }
-    /// JSON pointer of every scalar leaf; containers are not dimensions.
-    fn leaves(&self) -> BTreeMap<String, &Value> {
-        fn visit<'a>(prefix: String, value: &'a Value, out: &mut BTreeMap<String, &'a Value>) {
-            match value {
-                Value::Object(map) => {
-                    for (k, v) in map {
-                        visit(format!("{prefix}/{k}"), v, out)
-                    }
-                }
-                Value::Array(items) => {
-                    for (i, v) in items.iter().enumerate() {
-                        visit(format!("{prefix}/{i}"), v, out)
-                    }
-                }
-                scalar => {
-                    out.insert(prefix, scalar);
-                }
-            }
-        }
-        let mut out = BTreeMap::new();
-        visit(String::new(), &self.0, &mut out);
-        out
-    }
 }
 fn canonical(value: Value, depth: usize, budget: &mut usize) -> AppResult<Value> {
     require(
@@ -390,13 +367,6 @@ impl BoundScalarV1 {
             Self::Text(s) => require(s.len() <= MAX_TEXT_BYTES, "Bound text too long"),
         }
     }
-    fn matches(&self, value: &Value) -> bool {
-        match (self, value) {
-            (Self::Flag(a), Value::Bool(b)) => a == b,
-            (Self::Text(a), Value::String(b)) => a == b,
-            _ => false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -438,14 +408,6 @@ impl BoundKindV1 {
             Self::Interval { min, max } => Extent::Numeric(min.get(), max.get()),
             Self::Enum(values) => Extent::Discrete(values.iter().collect()),
             Self::Const(value) => Extent::Discrete([value].into()),
-        }
-    }
-    fn contains(&self, value: &Value) -> bool {
-        match self.extent() {
-            Extent::Numeric(lo, hi) => value
-                .as_f64()
-                .is_some_and(|v| v.is_finite() && lo <= v && v <= hi),
-            Extent::Discrete(set) => set.iter().any(|s| s.matches(value)),
         }
     }
     fn is_subset_of(&self, ceiling: &Self) -> bool {
@@ -545,15 +507,6 @@ impl BoundSetV1 {
                 .zip(&other.0)
                 .all(|(a, b)| a.pointer == b.pointer)
     }
-    pub fn contains(&self, payload: &CanonicalJsonV1) -> bool {
-        let leaves = payload.leaves();
-        leaves.len() == self.0.len()
-            && self.0.iter().all(|b| {
-                leaves
-                    .get(b.pointer.as_str())
-                    .is_some_and(|value| b.kind.contains(value))
-            })
-    }
     /// Dimensions are identical and every bound is no wider than the ceiling.
     pub fn is_subset_of(&self, ceiling: &Self) -> bool {
         self.same_dimensions(ceiling)
@@ -595,8 +548,6 @@ impl ContractRefV1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InvocationModeV1 {
-    /// One exact reviewed payload, applied under a Core lease with refresh.
-    ExactLeased,
     /// A finite stream of decisions among named options, each a fixed payload
     /// held by the binding. Core admits every decision and sees only option
     /// names and payload digests.
@@ -657,9 +608,8 @@ claim!(CapabilityDescriptorV1 {
     start_predicate: ContractRefV1,
     loss_profile: ContractRefV1,
     completion_predicate: ContractRefV1,
-    /// Present exactly for `DecisionStream`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    decision_stream: Option<DecisionStreamDescriptorV1>,
+    /// The named options and their rate and observation limits.
+    decision_stream: DecisionStreamDescriptorV1,
     /// A limit on physical effects the binding's witness can verify (for
     /// example "stays inside the flat"). Absent: nothing can verify one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -672,11 +622,6 @@ impl CapabilityDescriptorV1 {
                 && self.conflict_domains.len() <= MAX_CONFLICT_DOMAINS
                 && self.conflict_domains.windows(2).all(|w| w[0] < w[1]),
             "Conflict domains must be non-empty, bounded, sorted and unique",
-        )?;
-        require(
-            (self.invocation_mode == InvocationModeV1::DecisionStream)
-                == self.decision_stream.is_some(),
-            "Decision options are declared exactly for decision streams",
         )
     }
 }

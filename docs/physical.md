@@ -17,11 +17,11 @@ Core understands only opaque identifiers, digests, bounded dimensions, fingerpri
 
 | Concept | Owned by | What Core does with it |
 |---|---|---|
-| `CapabilityDescriptorV1` | Binding | Compares capability ID, payload schema digest, invocation mode, conflict domains, bounds, start/loss/completion contract references and decision options by equality and digest |
-| `BoundSetV1` | Binding declares, review narrows | Checks that an exact payload lies inside every bounded leaf; intersects and narrows bounds, never widens |
+| `CapabilityDescriptorV1` | Binding | Compares capability ID, payload schema digest, invocation mode, conflict domains, start/loss/completion contract references, effect bound and decision options by equality and digest |
+| `BoundSetV1` | Binding declares, review narrows | Intersects and narrows bounded dimensions, never widens. Payloads are fixed decision options, so admission checks the option's digest, not a payload against bounds |
 | `ImplementationFingerprintV1` | Binding reports | Requires exact equality with the qualification record; any change makes the qualification unusable |
 | Witnesses (`PhysicalWitnessV1`) | Binding | Receives verdicts over stored observations and recomputes their window and evidence digest. Classes: `SimulationOracle`, `IndependentMeasured`, `NativeSelfReport` (never sufficient) |
-| `EnvironmentBinding` | Binding | Calls `describe`, `evaluate_start`, `observe`, `install_session`, `apply`, `refresh`, `fence`, `status`, `witnesses`, `validate_scope`; revalidates every result |
+| `EnvironmentBinding` | Binding | Calls `describe`, `evaluate_start`, `observe`, `install_session`, `apply`, `fence`, `status`, `witnesses`, `validate_scope`; revalidates every result |
 | Decision options | Binding holds payloads | Admits by option name and payload digest; never sees the payload |
 | Effect bound | Binding declares, witness checks | Accepts `witnessed` only with a registered witness of the required class; admits a Contradicted verdict and ends the stream |
 
@@ -49,7 +49,7 @@ Completion and the end of a stream are driven by an executor-side timer (`stream
 - **Verified:** the witness verifies the completion contract. Core accepts the task if the scope says `automatic`, or leaves acceptance to a review decision if it says `await_review`; either way the stream ends and fences.
 - **Uncertain:** the budget is spent and the last action has run out, the tool session closes or its idle lease expires, the Bridge route is lost (on the executor this is indistinguishable from a crashed brain), the binding is lost, or authority is revoked. The outcome stays uncertain unless already verified, and nothing resumes.
 
-Exact (`ExactLeased`) scopes, one reviewed payload with at most one action, remain in the contracts and tests but have no product proposer.
+There is no separate exact mode: a single reviewed action is a one-option stream with `actionCount` 1.
 
 ## Invariants
 
@@ -86,7 +86,6 @@ Run `cargo test --manifest-path src-tauri/Cargo.toml physical::`. The demo tests
   - audit fully at startup;
   - at runtime validate only the rows a transaction writes;
   - move admission checks ahead of installation.
-- **Exact mode has no product proposer.** Migrate exact scopes to one-option decision streams, or remove exact mode.
 - **Completion parameters must equal the qualified capability's.** This is a safe restriction. Open question: express completion tolerances as a narrowable `BoundSetV1`.
 - **No NativeFence proof path.** A binding-supplied receipt verifier whose checks the ledger audit can replay is needed before any `NativeFence` claim.
 - **The idle lease may be short for slow brains.** One action plus one decision interval suits a controller loop; a model that thinks for seconds between calls would be treated as crashed. If that matters, the lease should become its own reviewed scope field.

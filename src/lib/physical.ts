@@ -1,14 +1,11 @@
 /** Physical DTOs are review/status data; the renderer has no authority types. */
-export type PhysicalPayload = string | number | boolean | PhysicalPayload[] | { [key: string]: PhysicalPayload };
 export interface PhysicalScope {
   requester: string;
   executor: string;
   environment: { environment: string; evidenceClass: "simulation" | "hardware"; offerExpiry: number };
-  mode: "exact" | "decision_stream";
-  /** Exact mode: opaque capability payload; its schema and meaning belong to the device binding. */
-  intent?: { capabilityId: string; payload: PhysicalPayload; payloadDigest: string };
-  /** Decision stream: the approved options, rate and observation flow. */
-  stream?: {
+  /** The approved options (payloads stay with the binding), rate and observation flow.
+   * A single reviewed action is a one-option stream with actionCount 1. */
+  stream: {
     options: string[];
     minDecisionIntervalUs: number;
     observation: { fields: string[]; minIntervalUs: number; destination: string };
@@ -59,48 +56,26 @@ export function physicalReviewFresh(review: PhysicalReview | null, now = Date.no
     && (!review.approval || now < review.approval.expiresAt));
 }
 const seconds = (us: number) => `${us / 1e6} s`;
-/** Review rows for a scope. Exact and decision-stream scopes both show where,
- * what, how often, how much, until when, who judges and what flows back. */
+/** Review rows for a scope: where, what, how often, how much, until when,
+ * who judges and what flows back. */
 export function physicalScopeSummary(scope: PhysicalScope): [string, string][] {
-  const rows: [string, string][] = [["Executor Host", scope.executor]];
-  if (scope.stream) {
-    const s = scope.stream;
-    rows.push(
-      ["Mode", "Decision stream"],
-      ["Approved options", s.options.join(", ")],
-      ["Decision rate", `at most one decision per ${seconds(s.minDecisionIntervalUs)}`],
-    );
-  } else if (scope.intent) {
-    rows.push(
-      ["Mode", "Exact action"],
-      ["Intent", `${scope.intent.capabilityId} · ${physicalPayloadEntries(scope.intent.payload).map(([pointer, value]) => `${pointer} = ${value}`).join(", ")}`],
-    );
-  }
-  rows.push(
+  const s = scope.stream;
+  const o = s.observation;
+  const e = s.effectBound;
+  return [
+    ["Executor Host", scope.executor],
+    ["Approved options", s.options.join(", ")],
+    ["Decision rate", `at most one decision per ${seconds(s.minDecisionIntervalUs)}`],
     ["Per action", `≤ ${seconds(scope.execution.actionDurationUs)}`],
     ["In total", `≤ ${seconds(scope.execution.totalExecutionUs)} · ≤ ${scope.execution.actionCount} action${scope.execution.actionCount === 1 ? "" : "s"}`],
     ["Completion", `${scope.completion.predicate.id} within ${seconds(scope.completion.evaluationWindowUs)}`],
     ["Witness class", scope.completion.requiredWitness.replace(/_/g, " ")],
-  );
-  if (scope.stream) {
-    const o = scope.stream.observation;
-    rows.push(["Observations sent", o.fields.length === 0
+    ["Observations sent", o.fields.length === 0
       ? "none"
-      : `${o.fields.join(", ")} to ${o.destination}, at most one per ${seconds(o.minIntervalUs)}`]);
-    const e = scope.stream.effectBound;
-    rows.push(
-      ["Effect bound", e.verification === "witnessed"
-        ? `${e.predicate.id}, checked by a ${e.requiredWitness.replace(/_/g, " ")} witness`
-        : "Intent only: constrains the brain's choices, not what the body does"],
-      ["On completion", scope.stream.onCompletion === "automatic" ? "Accepted automatically" : "Awaits a review decision"],
-    );
-  }
-  return rows;
-}
-/** Flatten a payload into pointer = value lines for review, without interpreting it. */
-export function physicalPayloadEntries(payload: PhysicalPayload, prefix = ""): [string, string][] {
-  if (payload !== null && typeof payload === "object") {
-    return Object.entries(payload).flatMap(([key, value]) => physicalPayloadEntries(value, `${prefix}/${key}`));
-  }
-  return [[prefix || "/", String(payload)]];
+      : `${o.fields.join(", ")} to ${o.destination}, at most one per ${seconds(o.minIntervalUs)}`],
+    ["Effect bound", e.verification === "witnessed"
+      ? `${e.predicate.id}, checked by a ${e.requiredWitness.replace(/_/g, " ")} witness`
+      : "Intent only: constrains the brain's choices, not what the body does"],
+    ["On completion", s.onCompletion === "automatic" ? "Accepted automatically" : "Awaits a review decision"],
+  ];
 }

@@ -19,7 +19,8 @@ mod core_ledger;
 #[path = "store_evidence.rs"]
 mod evidence_ledger;
 pub(super) use control_ledger::{
-    ActionAuditV1, DecisionRecordV1, FenceAuditV1, ReservationReceiptV1, SessionAuditV1,
+    ActionAuditV1, ActionDispositionV1, DecisionRecordV1, FenceAuditV1, ReservationReceiptV1,
+    SessionAuditV1,
 };
 pub(super) use core_ledger::RootAuditV1;
 #[path = "store_remote.rs"]
@@ -112,7 +113,7 @@ BEGIN SELECT RAISE(ABORT, 'physical domain membership required'); END;
 /// keeps only the identity/epoch/environment tables in RETAINED_TABLES.
 /// The marker table is orthogonal to the DDL stages: stage recognition ignores
 /// it, stage rebuilds leave it untouched and it is verified on its own.
-pub(super) const LEDGER_FORMAT: i64 = 4;
+pub(super) const LEDGER_FORMAT: i64 = 5;
 pub(super) const LEDGER_META_TABLE: &str = "physical_ledger_meta";
 const LEDGER_META: &str = "CREATE TABLE physical_ledger_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format_version INTEGER NOT NULL CHECK(format_version>=1)) STRICT;";
 // Per-stage `*_schema` singletons are version markers, not content.
@@ -165,7 +166,7 @@ fn ledger_format_gate(conn: &Connection) -> AppResult<()> {
             conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
         if rows > 0 {
             return Err(AppError::InvalidInput(format!(
-                "legacy physical ledger (pre-decouple); reset required: format {} holds rows in {table}, \
+                "legacy physical ledger (older format); reset required: format {} holds rows in {table}, \
                  expected format {LEDGER_FORMAT} (see docs/development.md)",
                 found.map_or("none".to_owned(), |v| v.to_string())
             )));
@@ -809,6 +810,8 @@ pub(super) fn test_restore_stage6_schema(paths: &AppPaths) -> AppResult<()> {
         evidence_ledger::SCHEMA,
     ]
     .join("\n");
+    // Earlier stages had no decision records.
+    tx.execute_batch("DROP TABLE physical_decisions")?;
     remote_ledger::rebuild(&tx, &ddl)?;
     tx.commit()?;
     Ok(())
@@ -819,6 +822,7 @@ pub(super) fn test_restore_stage7_schema(paths: &AppPaths) -> AppResult<()> {
     let mut c = configured_connection(&paths.db_path)?;
     c.execute_batch("PRAGMA foreign_keys=OFF;")?;
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch("DROP TABLE physical_decisions")?;
     remote_ledger::rebuild(&tx, &remote_ledger::stage7_ddl())?;
     tx.commit()?;
     Ok(())

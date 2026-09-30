@@ -28,11 +28,7 @@ impl ControlFixture {
                     p.required_enforcement_class = SessionEnforcementClassV1::NativeFence;
                 }
             },
-            |fields| {
-                if native {
-                    fields.intent = Some(setpoint_intent(0.08, 0.0, 0.0));
-                }
-            },
+            |_| {},
         )
     }
     /// Any capability profile: `edit_profile` runs before qualification and
@@ -84,7 +80,7 @@ impl ControlFixture {
             .record_qualification(&live, &p, &q, fake::evidence(&q, digest_value()))
             .unwrap();
         let mut fields = scope_fields();
-        fields.requester = host("executor");
+        fields.for_requester(&host("executor"));
         fields.environment = live.view().clone();
         fields.profile = p;
         fields.qualification = q;
@@ -135,28 +131,11 @@ impl ControlFixture {
                 p.execution.action_count = count;
             },
             |f| {
-                f.mode = PhysicalScopeModeV1::DecisionStream;
-                f.intent = None;
-                f.stream = Some(DecisionStreamScopeV1 {
-                    options: ["forward", "stop", "turn_left", "turn_right"]
-                        .iter()
-                        .map(|o| label(o))
-                        .collect(),
-                    min_decision_interval_us: micros(200_000),
-                    observation: ObservationFlowV1 {
-                        fields: fx::OBSERVATION_FIELDS
-                            .iter()
-                            .map(|f| decode(json!(f)))
-                            .collect(),
-                        min_interval_us: micros(100_000),
-                        destination: f.requester.clone(),
-                    },
-                    on_completion: CompletionAcceptanceV1::Automatic,
-                    effect_bound: EffectBoundV1::Witnessed {
-                        predicate: fx::effect_contract().unwrap(),
-                        required_witness: WitnessClassV1::SimulationOracle,
-                    },
-                });
+                f.stream.options = ["forward", "stop", "turn_left", "turn_right"]
+                    .iter()
+                    .map(|o| label(o))
+                    .collect();
+                f.stream.observation.destination = f.requester.clone();
                 f.bounds = f.profile.capability.bounds.clone();
                 f.execution = f.profile.execution.clone();
             },
@@ -210,7 +189,7 @@ impl ControlFixture {
             let q = qualification(&p, live.view());
             core.qualify_environment(&ingress, &binding, &live, &p, &q)?;
             let mut fields = scope_fields();
-            fields.requester = host("executor");
+            fields.for_requester(&host("executor"));
             fields.environment = live.view().clone();
             fields.execution = p.execution.clone();
             fields.profile = p;
@@ -350,7 +329,12 @@ async fn atomic_reservation_activation_and_full_conservative_budget() {
     let a = f.admit(&g, p);
     assert_eq!(
         lane::status(&f.core.lock(), &a),
-        ("open".into(), "not_sent".into(), 1_000_000, 0)
+        (
+            "open".into(),
+            crate::physical::store::ActionDispositionV1::NotSent,
+            100_000,
+            0
+        )
     );
     assert_eq!(lane::deadline(&a), 100_000);
 }
@@ -512,11 +496,17 @@ fn no_grant_or_challenge_before_active_session() {
     assert!(f.core.lock().construct_session_grant(s).is_err());
 }
 #[tokio::test]
-async fn challenge_cannot_renew_and_freshness_boundary_is_closed() {
+async fn a_replaced_challenge_voids_the_old_one_and_freshness_boundary_is_closed() {
     let f = ControlFixture::new();
     let s = f.active().await;
     let (g, p) = f.challenged(&s);
-    assert!(f.core.lock().issue_proposal_challenge(&g).is_err());
+    // A new challenge replaces the unused one; the old proposal no longer fits.
+    f.core.lock().issue_proposal_challenge(&g).unwrap();
+    assert!(f
+        .core
+        .lock()
+        .admit_physical_proposal(&g, p.clone())
+        .is_err());
     f.clock.set(1200, 200_000);
     assert!(f.core.lock().admit_physical_proposal(&g, p).is_err());
     assert_eq!(f.scalar("SELECT count(*) FROM physical_actions"), 0);
@@ -544,13 +534,9 @@ async fn wrong_challenge_observation_sequence_action_and_payload_fail_closed() {
             "sequence" => p.decision_sequence = 2,
             "action" => p.action_id = ActionId::try_from(id("physical-action")).unwrap(),
             "payload" => {
-                p.payload = changed(&f.scope, |s| {
-                    s.intent = Some(setpoint_intent(0.06, 0.0, 0.0))
-                })
-                .fields()
-                .intent
-                .clone();
-                p.payload_digest = p.payload.as_ref().unwrap().digest().unwrap();
+                // A declared option the review did not approve.
+                p.option = label("stop");
+                p.payload_digest = fx::option_digest("stop").unwrap();
             }
             _ => p.requested_duration_us = micros(1_000_001),
         }
@@ -616,8 +602,8 @@ async fn exact_duplicate_is_status_only_and_changed_digest_is_rejected() {
         AdmissionOutcomeV1::Duplicate(_)
     ));
     let mut changed = p;
-    changed.payload = Some(setpoint_intent(0.06, 0.0, 0.0));
-    changed.payload_digest = changed.payload.as_ref().unwrap().digest().unwrap();
+    changed.option = label("stop");
+    changed.payload_digest = fx::option_digest("stop").unwrap();
     assert!(f.core.lock().admit_physical_proposal(&g, changed).is_err());
     assert_eq!(lane::deadline(&a), 100_000);
     assert_eq!(
@@ -628,7 +614,7 @@ async fn exact_duplicate_is_status_only_and_changed_digest_is_rejected() {
     assert_eq!(f.scalar("SELECT count(*) FROM physical_actions"), 1);
     assert_eq!(
         f.scalar("SELECT reserved_us FROM physical_control_budgets"),
-        1_000_000
+        100_000
     );
 }
 #[tokio::test]
@@ -689,7 +675,7 @@ async fn dispatch_intent_commits_before_apply_and_duplicate_dispatch_denies() {
     assert_eq!(f.scalar("SELECT dispatch_intent FROM physical_actions"), 1);
     assert_eq!(
         f.scalar("SELECT consumed_us FROM physical_control_budgets"),
-        1_000_000
+        100_000
     );
     assert!(
         PhysicalControlServiceV1::dispatch_admitted_action(&f.core, &a, &*lane)
@@ -698,7 +684,7 @@ async fn dispatch_intent_commits_before_apply_and_duplicate_dispatch_denies() {
     );
     lane.release.notify_one();
     pending.await.unwrap().unwrap();
-    assert_eq!(f.disposition(), "fake_accepted");
+    assert_eq!(f.disposition(), "accepted");
     assert_eq!(lane.calls.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
@@ -717,7 +703,7 @@ async fn refusal_and_uncertain_apply_retain_full_budget_and_never_resend() {
         assert_eq!(
             f.disposition(),
             if matches!(reply, Reply::Refusal) {
-                "fake_refused"
+                "refused"
             } else {
                 "dispatch_unknown"
             }
@@ -730,45 +716,12 @@ async fn refusal_and_uncertain_apply_retain_full_budget_and_never_resend() {
         assert_eq!(lane.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             f.scalar("SELECT consumed_us FROM physical_control_budgets"),
-            1_000_000
+            100_000
         );
     }
 }
 #[tokio::test]
-async fn refresh_preserves_action_deadline_identity_and_budget() {
-    let f = ControlFixture::new();
-    let s = f.active().await;
-    let (g, p) = f.challenged(&s);
-    let a = f.admit(&g, p);
-    let lane = FakeLane::new(vec![]);
-    PhysicalControlServiceV1::dispatch_admitted_action(&f.core, &a, &lane)
-        .await
-        .unwrap();
-    let deadline = lane::deadline(&a);
-    f.clock.set(1050, 50_000);
-    f.core
-        .lock()
-        .record_control_observation(&s, lane::observation(&s, 50_000, 0))
-        .unwrap();
-    PhysicalControlServiceV1::refresh_admitted_action(&f.core, &a, &lane)
-        .await
-        .unwrap();
-    assert_eq!(lane::deadline(&a), deadline);
-    assert_eq!(f.scalar("SELECT count(*) FROM physical_actions"), 1);
-    assert_eq!(
-        f.scalar("SELECT consumed_us FROM physical_control_budgets"),
-        1_000_000
-    );
-    f.clock.set(1100, 100_000);
-    assert!(
-        PhysicalControlServiceV1::refresh_admitted_action(&f.core, &a, &lane)
-            .await
-            .is_err()
-    );
-    assert_eq!(lane.calls.load(Ordering::SeqCst), 2);
-}
-#[tokio::test]
-async fn observation_expiry_stops_refresh_without_revival() {
+async fn observation_expiry_ends_the_action_without_revival() {
     let f = ControlFixture::new();
     let s = f.active().await;
     let (g, _) = f.challenged(&s);
@@ -778,17 +731,16 @@ async fn observation_expiry_stops_refresh_without_revival() {
     PhysicalControlServiceV1::dispatch_admitted_action(&f.core, &a, &lane)
         .await
         .unwrap();
+    // The observation that kept it valid expired: the action is over and no
+    // later observation can revive it.
     f.clock.set(1200, 200_000);
-    assert!(
-        PhysicalControlServiceV1::refresh_admitted_action(&f.core, &a, &lane)
-            .await
-            .is_err()
-    );
-    assert!(f
+    assert!(!lane::action_valid(&mut f.core.lock(), &a));
+    f.clock.set(1250, 250_000);
+    let _ = f
         .core
         .lock()
-        .record_control_observation(&s, lane::observation(&s, 200_000, 0))
-        .is_err());
+        .record_control_observation(&s, lane::observation(&s, 250_000, 0));
+    assert!(!lane::action_valid(&mut f.core.lock(), &a));
     assert_eq!(lane.calls.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
@@ -847,7 +799,7 @@ async fn revoke_racing_apply_keeps_unknown_and_late_reply_cannot_reopen() {
     assert_eq!(f.disposition(), "dispatch_unknown");
     assert_eq!(
         f.scalar("SELECT consumed_us FROM physical_control_budgets"),
-        1_000_000
+        100_000
     );
     assert_eq!(f.session_state(), "quarantined");
 }
@@ -929,7 +881,7 @@ async fn restart_closes_control_and_quarantines_domains_without_reconstructing_h
         );
         assert_eq!(
             f.scalar("SELECT consumed_us FROM physical_control_budgets"),
-            if dispatched { 1_000_000 } else { 0 }
+            if dispatched { 100_000 } else { 0 }
         );
         assert!(lane::validate_session(&mut restarted, &s, true).is_err());
         assert!(restarted.issue_proposal_challenge(&g).is_err());
@@ -1103,50 +1055,16 @@ async fn fresh_observations_maintain_validity_only_inside_fixed_horizon() {
             .lock()
             .record_control_observation(&s, lane::observation(&s, ticks, 0))
             .unwrap();
-        PhysicalControlServiceV1::refresh_admitted_action(&f.core, &a, &adapter)
-            .await
-            .unwrap();
+        assert!(lane::action_valid(&mut f.core.lock(), &a), "{ticks}");
     }
+    // Fresh observations never move the fixed action deadline.
     assert_eq!(lane::deadline(&a), 500_000);
+    f.clock.set(1500, 500_000);
+    assert!(!lane::action_valid(&mut f.core.lock(), &a));
     assert_eq!(
         f.scalar("SELECT consumed_us FROM physical_control_budgets"),
-        1_000_000
+        500_000
     );
-    f.clock.set(1500, 500_000);
-    assert!(
-        PhysicalControlServiceV1::refresh_admitted_action(&f.core, &a, &adapter)
-            .await
-            .is_err()
-    );
-}
-#[tokio::test]
-async fn uncertain_refresh_keeps_reservation_and_cannot_retry() {
-    for reply in [Reply::Lost, Reply::Io, Reply::Stale, Reply::Refusal] {
-        let f = ControlFixture::new();
-        let s = f.active().await;
-        let (g, p) = f.challenged(&s);
-        let a = f.admit(&g, p);
-        let adapter = FakeLane::new(vec![Reply::Success, reply]);
-        PhysicalControlServiceV1::dispatch_admitted_action(&f.core, &a, &adapter)
-            .await
-            .unwrap();
-        assert!(
-            PhysicalControlServiceV1::refresh_admitted_action(&f.core, &a, &adapter)
-                .await
-                .is_err()
-        );
-        assert_eq!(f.disposition(), "dispatch_unknown");
-        assert!(
-            PhysicalControlServiceV1::refresh_admitted_action(&f.core, &a, &adapter)
-                .await
-                .is_err()
-        );
-        assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            f.scalar("SELECT consumed_us FROM physical_control_budgets"),
-            1_000_000
-        );
-    }
 }
 #[tokio::test]
 async fn late_fence_ack_is_exact_idempotent_and_holds_no_lock_or_transaction() {
@@ -1230,7 +1148,7 @@ fn an_active_audit_row_without_private_installation_proof_cannot_construct_a_gra
     assert_eq!(f.session_state(), "quarantined");
 }
 #[tokio::test]
-async fn rolled_back_dispatch_rows_cannot_repeat_apply_or_fabricate_refresh_proof() {
+async fn rolled_back_dispatch_rows_cannot_repeat_apply() {
     for dispatched in [false, true] {
         let f = ControlFixture::new();
         let s = f.active().await;
@@ -1261,7 +1179,7 @@ async fn rolled_back_dispatch_rows_cannot_repeat_apply_or_fabricate_refresh_proo
             )
             .unwrap();
         } else {
-            sql.execute("UPDATE physical_actions SET dispatch_intent=1,disposition='fake_accepted',apply_result='accepted',revision=3",[]).unwrap();
+            sql.execute("UPDATE physical_actions SET dispatch_intent=1,disposition='accepted',apply_result='accepted',revision=3",[]).unwrap();
             sql.execute(
                 "UPDATE physical_control_budgets SET consumed_us=reserved_us,revision=3",
                 [],
@@ -1273,15 +1191,8 @@ async fn rolled_back_dispatch_rows_cannot_repeat_apply_or_fabricate_refresh_proo
         }
         PhysicalStoreV1::open(&f.paths).unwrap(); // Structurally coherent data does not reconstruct private proof.
         let calls = adapter.calls.load(Ordering::SeqCst);
-        if dispatched {
-            assert!(
-                PhysicalControlServiceV1::dispatch_admitted_action(&f.core, &a, &adapter)
-                    .await
-                    .is_err()
-            );
-        }
         assert!(
-            PhysicalControlServiceV1::refresh_admitted_action(&f.core, &a, &adapter)
+            PhysicalControlServiceV1::dispatch_admitted_action(&f.core, &a, &adapter)
                 .await
                 .is_err()
         );
