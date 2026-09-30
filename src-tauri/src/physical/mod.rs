@@ -49,6 +49,8 @@ pub(crate) mod store;
 pub(crate) mod values;
 
 #[cfg(test)]
+mod physical_demo_tests;
+#[cfg(test)]
 mod test_fixture;
 #[cfg(test)]
 mod tests;
