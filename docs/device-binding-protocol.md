@@ -2,7 +2,7 @@
 
 A device binding is the only place Pastey knows *how* a device works. Physical Core owns capability discovery, bounded authorization (root, grant, narrowing), lifecycle (session, lease, epoch, fence), cross-device scheduling and consequence adjudication. A binding owns payload schemas, completion and handover parameters, witnesses, native I/O and the device-side runtime. This document states what a binding must provide and what its device-side runtime must guarantee.
 
-Requirement keywords (MUST, MUST NOT, SHOULD) are normative. Section 3 is the fence contract. Section 5 maps it to the conformance tests that exercised it on the retired MicroDuck overlay.
+Requirement keywords (MUST, MUST NOT, SHOULD) are normative. Section 3 is the fence contract. Section 5 maps it to the conformance tests that exercised it on the first, since removed, device runtime.
 
 ## 1. Boundary
 
@@ -88,7 +88,7 @@ These requirements apply to the runtime that consumes commands next to the actua
 
 ## 5. Conformance material
 
-The requirements above were exercised by the robotd task-authority overlay tests, in `native/microduck/overlay/robotd/src/task_authority.rs` at git tag `pre-physical-decouple`, and the Python process tests in `scripts/test-microduck-gate-b.py` there. A new device runtime SHOULD port these to its own tests.
+The requirements above were exercised by the task-authority tests of the first device runtime and by its process tests against a running daemon, both at git tag `pre-physical-decouple`. A new device runtime SHOULD port these to its own tests.
 
 | Requirements | Former overlay test |
 |---|---|

@@ -30,7 +30,7 @@ npm run check:version
 git diff --check
 ```
 
-Physical checks: `cargo test --manifest-path src-tauri/Cargo.toml physical::` and `npm run test:frontend-integration`. `npm run check:core-agnostic` fails when device vocabulary appears in physical Core (CI runs it). No device binding is compiled in; tests use a generic fixture binding. Device bindings implement the [device binding protocol](device-binding-protocol.md). The retired MicroDuck Gate A/B route is in git tag `pre-physical-decouple`.
+Physical checks: `cargo test --manifest-path src-tauri/Cargo.toml physical::` and `npm run test:frontend-integration`. `npm run check:core-agnostic` fails when device vocabulary appears in physical Core (CI runs it). No device binding is compiled in; tests use a generic fixture binding. See [physical environments](physical.md) and the [device binding protocol](device-binding-protocol.md).
 
 The Windows cross-check requires the GNU target and MinGW toolchain. It proves compilation, not native Windows confinement, safe-open behavior, machine setup, packaging, or physical E2E.
 

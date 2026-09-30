@@ -23,7 +23,7 @@ Pastey → selected Host → native Agent session → original workspace → nat
 ```
 
 Pastey neither scans the workspace merely to observe edits nor creates a
-ManagedObject, Scratch lease, provider broker, managed Worker run, or effect
+ManagedObject, managed Worker run, or effect
 translation. A Host-private native session is keyed by Host + Agent + canonical
 workspace. Related tasks resume that session; an unrelated workspace receives a
 different session. The native session identifier is never a Plan semantic.
