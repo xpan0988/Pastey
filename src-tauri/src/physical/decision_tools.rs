@@ -54,13 +54,15 @@ fn refused(reason: impl Into<String>) -> DecisionToolReplyV1 {
 }
 
 impl PhysicalControlServiceV1 {
-    /// Opens a tool session for a local stream. Remote callers open theirs
-    /// through the bridge with verified peer ingress.
+    /// Opens a tool session for a local stream. Optional: a same-Host brain
+    /// may drive its body through the binding without Pastey; this path gives
+    /// it Pastey's envelope and records. Remote callers open theirs through
+    /// the bridge with verified peer ingress.
     #[cfg_attr(
         not(test),
         expect(
             dead_code,
-            reason = "local tool sessions are reached by the MCP server step"
+            reason = "the optional local path has no product caller yet"
         )
     )]
     pub(in crate::physical) fn open_tool_session(
@@ -309,7 +311,7 @@ impl PhysicalControlServiceV1 {
         not(test),
         expect(
             dead_code,
-            reason = "local tool sessions are reached by the MCP server step"
+            reason = "the optional local path has no product caller yet"
         )
     )]
     pub(in crate::physical) fn decision_records(
