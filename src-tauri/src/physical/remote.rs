@@ -337,7 +337,7 @@ impl PhysicalControlServiceV1 {
                         .ceiling
                         .fields()
                         .clone();
-                    f.requester = m.requester.clone();
+                    f.for_requester(&m.requester);
                     let scope = PhysicalReviewScopeV1::try_from(f)?;
                     if self.current_scope(&scope, &binding).is_ok() {
                         offers.push(scope);
@@ -529,7 +529,12 @@ impl PhysicalControlServiceV1 {
                     },
                     Some(e) => {
                         let lane = e.adapter.clone();
-                        match self.open_tool_session_inner(&session, lane, caller.clone()) {
+                        match self.open_tool_session_inner(
+                            &session,
+                            lane,
+                            caller.clone(),
+                            &p.binding.peer_host_ref,
+                        ) {
                             Ok(ts) => {
                                 let stale: Vec<RequestId> = self
                                     .remote

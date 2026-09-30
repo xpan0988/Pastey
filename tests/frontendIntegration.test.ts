@@ -422,3 +422,49 @@ test("physical review expiry, exact approval, and uncertain status stay separate
   const { physicalPayloadEntries } = await import("../src/lib/physical");
   assert.deepEqual(physicalPayloadEntries({ volumeMl: 5, nozzle: { id: "a" } }), [["/volumeMl", "5"], ["/nozzle/id", "a"]]);
 });
+
+test("physical review shows a decision-stream scope, including its observation flow", async () => {
+  const { physicalScopeSummary } = await import("../src/lib/physical");
+  const base = {
+    requester: "host:brain",
+    executor: "host:body",
+    environment: { environment: "environment:v1:a", evidenceClass: "simulation", offerExpiry: 2000 },
+    execution: { actionDurationUs: 500000, leaseDurationUs: 3000000, totalExecutionUs: 30000000, actionCount: 60 },
+    qualification: { requiredEnforcementClass: "adapter_isolation_only", expiresAt: 2000 },
+    completion: { predicate: { id: "flat.in-room/v1" }, requiredWitness: "simulation_oracle", evaluationWindowUs: 3000000 },
+  };
+  const stream = physicalScopeSummary({
+    ...base,
+    mode: "decision_stream",
+    stream: {
+      options: ["forward", "stop", "turn_left", "turn_right"],
+      minDecisionIntervalUs: 200000,
+      observation: { fields: ["/heading", "/room"], minIntervalUs: 100000, destination: "host:brain" },
+    },
+  } as import("../src/lib/physical").PhysicalScope);
+  assert.deepEqual(Object.fromEntries(stream), {
+    "Executor Host": "host:body",
+    Mode: "Decision stream",
+    "Approved options": "forward, stop, turn_left, turn_right",
+    "Decision rate": "at most one decision per 0.2 s",
+    "Per action": "≤ 0.5 s",
+    "In total": "≤ 30 s · ≤ 60 actions",
+    Completion: "flat.in-room/v1 within 3 s",
+    "Witness class": "simulation oracle",
+    "Observations sent": "/heading, /room to host:brain, at most one per 0.1 s",
+  });
+  // An exact scope still renders, without a stream section.
+  const exact = physicalScopeSummary({
+    ...base,
+    mode: "exact",
+    execution: { ...base.execution, actionCount: 1 },
+    intent: { capabilityId: "test.dispense/v1", payload: { volumeMl: 5 }, payloadDigest: "d" },
+  } as import("../src/lib/physical").PhysicalScope);
+  assert.equal(Object.fromEntries(exact).Intent, "test.dispense/v1 · /volumeMl = 5");
+  assert.equal(Object.fromEntries(exact)["Observations sent"], undefined);
+  assert.equal(Object.fromEntries(exact)["In total"], "≤ 30 s · ≤ 1 action");
+  // The panel renders these rows and no longer reads scope.intent directly.
+  const panel = readFileSync("src/components/PhysicalReviewPanel.tsx", "utf8");
+  assert.match(panel, /physicalScopeSummary\(scope\)/);
+  assert.doesNotMatch(panel, /scope\.intent\./);
+});

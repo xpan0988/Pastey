@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { physicalProductCommand } from "../lib/tauri";
-import { physicalPayloadEntries, physicalReviewFresh, type PhysicalProductRequest, type PhysicalProductView } from "../lib/physical";
+import { physicalReviewFresh, physicalScopeSummary, type PhysicalProductRequest, type PhysicalProductView } from "../lib/physical";
 import type { BridgePeerSession } from "../lib/bridgePeers";
 
 export function PhysicalReviewPanel({ roomId, peers }: { roomId: string; peers: BridgePeerSession[] }) {
@@ -51,16 +51,15 @@ function PhysicalHostReview({ roomId, host }: { roomId: string; host: string }) 
       <p role="status">{({ qualified: "Qualified simulation environment", released: "Qualified and released NativeFence simulation profile", qualification_unavailable: "Qualification unavailable or withdrawn", qualification_expired: "Qualification expired", environment_unavailable: "Environment unavailable" })[view.offers.length > 0 && view.offers.every((offer) => Date.now() >= Math.min(offer.scope.environment.offerExpiry, offer.scope.qualification.expiresAt)) ? "qualification_expired" : view.availability ?? "environment_unavailable"]}</p>
       {view.offers.length === 0 ? <p>No executable environment is offered. NativeFence simulation requires an exact, current simulator/controller qualification.</p> : <ul>{view.offers.map((offer) => <li key={offer.scopeDigest}>
         {offer.scope.environment.environment} · {offer.scope.environment.evidenceClass} · {offer.scope.qualification.requiredEnforcementClass.replace(/_/g, " ")}
-        <button type="button" disabled={busy || Date.now() >= Math.min(offer.scope.environment.offerExpiry, offer.scope.qualification.expiresAt)} onClick={() => void command({ kind: "compose", offer_digest: offer.scopeDigest })}>Compose exact review</button>
+        <button type="button" disabled={busy || Date.now() >= Math.min(offer.scope.environment.offerExpiry, offer.scope.qualification.expiresAt)} onClick={() => void command({ kind: "compose", offer_digest: offer.scopeDigest })}>Compose review</button>
       </li>)}</ul>}
       {scope && r ? <article>
-        <strong>Exact physical review · {r.state}</strong>
+        <strong>Physical review · {r.state}</strong>
         <p>Environment {scope.environment.environment} · {scope.environment.evidenceClass} · {scope.qualification.requiredEnforcementClass.replace(/_/g, " ")}</p>
-        <p>Intent: {scope.intent.capabilityId} · {physicalPayloadEntries(scope.intent.payload).map(([pointer, value]) => `${pointer} = ${value}`).join(", ")}</p>
-        <p>Action duration ≤ {scope.execution.actionDurationUs / 1e6} s · budget ≤ {scope.execution.totalExecutionUs / 1e6} s · {scope.execution.actionCount} action</p>
-        <details><summary>Completion predicate and exact effects</summary><pre>{JSON.stringify(scope, null, 2)}</pre></details>
+        <dl>{physicalScopeSummary(scope).map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
+        <details><summary>Complete reviewed scope</summary><pre>{JSON.stringify(scope, null, 2)}</pre></details>
         {!fresh ? <p role="status">This review is stale. Discover and compose a fresh review.</p> : null}
-        <button type="button" disabled={busy || !fresh || r.state !== "reviewed"} onClick={() => void command({ kind: "approve", review_id: r.reviewId, scope_digest: r.scopeDigest })}>Approve exact scope</button>
+        <button type="button" disabled={busy || !fresh || r.state !== "reviewed"} onClick={() => void command({ kind: "approve", review_id: r.reviewId, scope_digest: r.scopeDigest })}>Approve this scope</button>
         <button type="button" disabled={busy || !fresh || r.state !== "approved" || view.start !== null} onClick={() => void command({ kind: "start", review_id: r.reviewId, scope_digest: r.scopeDigest })}>Start approved action</button>
       </article> : null}
       <div aria-live="polite">

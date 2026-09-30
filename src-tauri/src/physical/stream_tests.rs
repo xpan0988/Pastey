@@ -37,6 +37,10 @@ async fn open(
         .unwrap();
     (s, ts)
 }
+/// The active session of a stream fixture (there is exactly one).
+fn ts_session(f: &ControlFixture) -> Arc<BodyControlSessionV1> {
+    lane::only_session(&f.core.lock())
+}
 fn caller(name: &str) -> LabelV1 {
     LabelV1::try_from(name.to_owned()).unwrap()
 }
@@ -291,6 +295,41 @@ async fn an_unmet_start_predicate_prevents_installation() {
 }
 
 #[tokio::test]
+async fn observations_carry_only_declared_fields_at_the_declared_rate() {
+    let f = ControlFixture::stream(1_200_000, 6);
+    let described = lane_for(&f);
+    let (_, ts) = open(&f, &described).await;
+    let DecisionToolReplyV1::Observation { view } =
+        call(&f, &ts, DecisionToolCallV1::Observe).await
+    else {
+        panic!("no observation");
+    };
+    // The binding's view also holds "secret" and "pose.y"; neither is declared.
+    assert_eq!(
+        serde_json::to_value(&view).unwrap(),
+        json!({"pose": {"x": 1}, "sample": 1})
+    );
+    // Faster than the declared observation rate is refused.
+    assert!(matches!(
+        call(&f, &ts, DecisionToolCallV1::Observe).await,
+        DecisionToolReplyV1::Refused { reason } if reason.contains("rate")
+    ));
+    advance(&f, 100);
+    assert!(matches!(
+        call(&f, &ts, DecisionToolCallV1::Observe).await,
+        DecisionToolReplyV1::Observation { .. }
+    ));
+    // A tool session opens only for the declared destination Host.
+    let lane: Arc<dyn crate::physical::core::EnvironmentBinding> = described.clone();
+    let s = ts_session(&f);
+    assert!(f
+        .core
+        .lock()
+        .open_tool_session_inner(&s, lane, caller("brain.elsewhere"), &host("elsewhere"))
+        .is_err());
+}
+
+#[tokio::test]
 async fn exact_scopes_have_no_decision_tools() {
     let f = ControlFixture::new();
     let s = f.active().await;
@@ -379,6 +418,30 @@ async fn remote_tools_run_on_the_executor_and_die_with_the_bridge() {
             }
         }
     );
+    // An observation crosses the bridge with the declared fields only.
+    advance(&p.b, 100);
+    let (obs_id, om) = request(
+        &mut p,
+        PhysicalProductRequestV1::ToolCall {
+            start: start.semantic_id.clone(),
+            tool_session: tool_session.clone(),
+            call: DecisionToolCallV1::Observe,
+        },
+    );
+    let (_, work) = p.deliver_b(om).unwrap();
+    let reply = PhysicalControlServiceV1::perform_physical_work(&p.b.core, work.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    p.deliver_a(reply);
+    let ToolOutcomeV1::Reply {
+        reply: DecisionToolReplyV1::Observation { view },
+    } = read(&mut p, &obs_id)
+    else {
+        panic!("no observation relayed");
+    };
+    let view = serde_json::to_value(&view).unwrap();
+    assert!(view.get("secret").is_none() && view["pose"].get("y").is_none());
     // A replayed call runs nothing again.
     let (replayed, work) = p.deliver_b(m).unwrap();
     assert!(work.is_none());

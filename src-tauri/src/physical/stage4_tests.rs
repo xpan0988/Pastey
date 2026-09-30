@@ -143,6 +143,14 @@ impl ControlFixture {
                         .map(|o| label(o))
                         .collect(),
                     min_decision_interval_us: micros(200_000),
+                    observation: ObservationFlowV1 {
+                        fields: fx::OBSERVATION_FIELDS
+                            .iter()
+                            .map(|f| decode(json!(f)))
+                            .collect(),
+                        min_interval_us: micros(100_000),
+                        destination: f.requester.clone(),
+                    },
                 });
                 f.bounds = f.profile.capability.bounds.clone();
                 f.execution = f.profile.execution.clone();

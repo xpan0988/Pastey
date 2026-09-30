@@ -226,6 +226,8 @@ pub(in crate::physical) fn setpoint_descriptor(
 /// held here (Core gets only names and digests), and a decision-rate floor.
 pub(in crate::physical) const STREAM_OPTIONS: [&str; 5] =
     ["forward", "sprint", "stop", "turn_left", "turn_right"];
+/// Fields of the fixture's brain view a review may release.
+pub(in crate::physical) const OBSERVATION_FIELDS: [&str; 2] = ["/pose/x", "/sample"];
 pub(in crate::physical) fn option_digest(name: &str) -> AppResult<DigestV1> {
     digest("test-stream-option-v1", &name)
 }
@@ -255,6 +257,10 @@ pub(in crate::physical) fn stream_descriptor(
         decision_stream: Some(DecisionStreamDescriptorV1 {
             options,
             min_decision_interval_us: PositiveMicros::try_from(min_decision_interval_us)?,
+            observation_fields: OBSERVATION_FIELDS
+                .iter()
+                .map(|f| JsonPointerV1::try_from(f.to_string()))
+                .collect::<AppResult<_>>()?,
         }),
     };
     descriptor.validate()?;

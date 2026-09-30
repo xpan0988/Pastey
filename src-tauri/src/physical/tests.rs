@@ -615,6 +615,14 @@ fn stream_fields() -> ReviewScopeFieldsV1 {
             .map(|o| label(o))
             .collect(),
         min_decision_interval_us: micros(200_000),
+        observation: ObservationFlowV1 {
+            fields: fx::OBSERVATION_FIELDS
+                .iter()
+                .map(|f| decode(json!(f)))
+                .collect(),
+            min_interval_us: micros(100_000),
+            destination: s.requester.clone(),
+        },
     });
     s.bounds = s.profile.capability.bounds.clone();
     s.execution = s.profile.execution.clone();
@@ -665,6 +673,40 @@ fn decision_stream_scopes_stay_inside_the_declared_capability() {
     s.stream = None;
     s.intent = Some(setpoint_intent(0.05, 0.0, 0.0));
     assert!(PhysicalReviewScopeV1::try_from(s).is_err());
+}
+
+#[test]
+fn observation_flow_is_declared_bounded_and_only_narrowed() {
+    let base = stream_fields();
+    let edit = |f: &dyn Fn(&mut ObservationFlowV1)| {
+        let mut s = stream_fields();
+        f(&mut s.stream.as_mut().unwrap().observation);
+        s
+    };
+    // A field the capability does not declare, or another destination Host.
+    assert!(PhysicalReviewScopeV1::try_from(edit(&|o| {
+        o.fields.push(decode(json!("/secret")))
+    }))
+    .is_err());
+    assert!(PhysicalReviewScopeV1::try_from(edit(&|o| o.destination = host("elsewhere"))).is_err());
+    // Narrowing may drop fields or slow the rate, never the reverse.
+    let reviewed = PhysicalReviewScopeV1::try_from(base).unwrap();
+    let fewer =
+        PhysicalReviewScopeV1::try_from(edit(&|o| o.fields.retain(|f| f.as_str() != "/pose/x")))
+            .unwrap();
+    let slower =
+        PhysicalReviewScopeV1::try_from(edit(&|o| o.min_interval_us = micros(500_000))).unwrap();
+    super::core::test_support::narrow(&reviewed, &fewer).unwrap();
+    super::core::test_support::narrow(&reviewed, &slower).unwrap();
+    assert!(super::core::test_support::narrow(&fewer, &reviewed).is_err());
+    assert!(super::core::test_support::narrow(&slower, &reviewed).is_err());
+    let both = super::core::test_support::intersect_scope(&fewer, &slower).unwrap();
+    let flow = both.fields().stream.clone().unwrap().observation;
+    assert_eq!(flow.fields.len(), 1);
+    assert_eq!(flow.min_interval_us, micros(500_000));
+    // The filter keeps declared leaves only.
+    let view: CanonicalJsonV1 = decode(json!({"sample": 3, "secret": 1, "pose": {"x": 1, "y": 2}}));
+    assert_eq!(wire(&view.select(&flow.fields)), json!({"sample": 3}));
 }
 
 #[test]

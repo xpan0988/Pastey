@@ -9,7 +9,7 @@ The physical layer follows the same division as the rest of Pastey (see [archite
 - **A body is a Host-native capability.** A device binding and its device-side runtime own control, safety, payload meaning and the loss policy, just as a native Agent owns its tools and sandbox. Pastey never runs a control loop and never translates a device's native interface into its own vocabulary.
 - **A brain is any Agent.** Pastey defines no brain and no reasoning loop. A brain is an authenticated caller of the tools an approval exposes.
 - **Pastey intervenes only when intent, authority or observations cross Hosts.** A brain on the same Host as its body may drive the body through the binding's own interface without Pastey. The local decision-stream path (a local tool session on the executor's Core) is an option for a same-Host brain that wants Pastey's envelope, records and witness adjudication; nothing requires it. When the brain runs on another Host, that Host only relays tool requests over the Bridge (`physical-control-v2`); admission, evidence and consequence stay on the Host that owns the body (the executor).
-- **Cross-device authority is visible in Review.** One approval shows the executor, environment, capability, approved options, decision rate, per-action and cumulative ceilings, completion contract and required witness class. Observation data returned to a remote brain is not yet part of the reviewed scope (see open issues).
+- **Cross-device authority is visible in Review.** One approval shows the executor, environment, capability, approved options, decision rate, per-action and cumulative ceilings, completion contract, required witness class and the observation flow: which fields `observe` may send, at what maximum rate, to which Host's brain. The executor filters every observation to the declared fields before it leaves (fail-closed); a tool session opens only for the declared destination.
 
 ## Core and binding
 
@@ -88,8 +88,6 @@ Run `cargo test --manifest-path src-tauri/Cargo.toml physical::`. The demo tests
 - **Completion parameters must equal the qualified capability's.** This is a safe restriction. Open question: express completion tolerances as a narrowable `BoundSetV1`.
 - **No NativeFence proof path.** A binding-supplied receipt verifier whose checks the ledger audit can replay is needed before any `NativeFence` claim.
 - **Tool sessions have no idle lease.** If a brain dies while its Bridge stays up, only the binding's local self-stop halts the body; the stream stays open until the root expires.
-- **Observation flow is not in the reviewed scope.** Observations returned to a remote brain cross Hosts but are not declared or bounded in Review.
-- **The review UI shows exact scopes only.** `PhysicalReviewPanel` reads `scope.intent`; it cannot show a decision-stream scope's options or rate.
 - **Stream termination by a verified witness is not yet exercised end to end.** It needs a binding that produces witness evidence: the Step D reference binding.
 - **Deferred capabilities:**
   - multiple domains and coupled bodies;

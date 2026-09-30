@@ -278,6 +278,18 @@ impl PhysicalStoreV1 {
             |r| r.get(0),
         )?;
         s.acceptance = serde_json::from_value(serde_json::Value::String(acceptance))?;
+        // Authority closed before a terminal verdict: the durable record is the
+        // closure (quarantine and fence) next to unfinished evidence, and the
+        // outcome is uncertain. Verified and Contradicted results remain.
+        if s.authority == PhysicalAuthorityStateV1::Closed
+            && matches!(
+                s.consequence,
+                crate::physical::evidence::ConsequenceStateV1::Unobserved
+                    | crate::physical::evidence::ConsequenceStateV1::Partial
+            )
+        {
+            s.consequence = crate::physical::evidence::ConsequenceStateV1::OutcomeUnknown;
+        }
         Ok(s)
     }
 }

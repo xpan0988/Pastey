@@ -175,7 +175,48 @@ impl Serialize for CanonicalJsonV1 {
         self.0.serialize(serializer)
     }
 }
+fn insert_path(map: &mut Map<String, Value>, keys: &[&str], value: Value) {
+    match keys {
+        [last] => {
+            map.insert((*last).to_owned(), value);
+        }
+        [first, rest @ ..] => {
+            if let Some(inner) = map
+                .entry((*first).to_owned())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+            {
+                insert_path(inner, rest, value);
+            }
+        }
+        [] => {}
+    }
+}
 impl CanonicalJsonV1 {
+    /// Keeps only the object leaves at `pointers`; everything else is dropped.
+    /// A pointer that does not resolve through objects contributes nothing.
+    pub fn select(&self, pointers: &[JsonPointerV1]) -> Self {
+        let mut out = Map::new();
+        for p in pointers {
+            let keys: Vec<&str> = p.as_str().split('/').skip(1).collect();
+            let mut source = &self.0;
+            let mut found = true;
+            for k in &keys {
+                match source.as_object().and_then(|m| m.get(*k)) {
+                    Some(v) => source = v,
+                    None => {
+                        found = false;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                continue;
+            }
+            insert_path(&mut out, &keys, source.clone());
+        }
+        Self(Value::Object(out))
+    }
     #[cfg_attr(
         not(test),
         expect(
@@ -579,6 +620,8 @@ impl DecisionOptionV1 {
 claim!(DecisionStreamDescriptorV1 {
     options: Vec<DecisionOptionV1>,
     min_decision_interval_us: PositiveMicros,
+    /// Fields of the binding's brain-facing view that a review may release.
+    observation_fields: Vec<JsonPointerV1>,
 });
 impl DecisionStreamDescriptorV1 {
     pub fn validate(&self) -> AppResult<()> {
@@ -587,6 +630,11 @@ impl DecisionStreamDescriptorV1 {
                 && self.options.len() <= MAX_DECISION_OPTIONS
                 && self.options.windows(2).all(|w| w[0].name < w[1].name),
             "Decision options must be non-empty, bounded, sorted and unique",
+        )?;
+        require(
+            self.observation_fields.len() <= MAX_BOUNDS
+                && self.observation_fields.windows(2).all(|w| w[0] < w[1]),
+            "Observation fields must be bounded, sorted and unique",
         )
     }
     pub fn option(&self, name: &LabelV1) -> Option<&DecisionOptionV1> {

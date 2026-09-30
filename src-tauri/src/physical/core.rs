@@ -479,7 +479,7 @@ impl PhysicalControlServiceV1 {
                 &r.scope.fields().executor,
                 now,
             )?;
-            ceiling.requester = r.scope.fields().requester.clone();
+            ceiling.for_requester(&r.scope.fields().requester);
         }
         let narrowed = intersect(&r.scope, &PhysicalReviewScopeV1::try_from(ceiling)?)?;
         require(
@@ -637,7 +637,7 @@ impl PhysicalControlServiceV1 {
         })?;
         let mut policy_scope = policy.ceiling.fields().clone();
         if root.peer.is_some() {
-            policy_scope.requester = root.audit.requester.clone();
+            policy_scope.for_requester(&root.audit.requester);
         }
         let ceiling = intersect(&root.scope, &PhysicalReviewScopeV1::try_from(policy_scope)?)?;
         validate_narrowing(&ceiling, &requested)?;
@@ -682,7 +682,7 @@ impl PhysicalControlServiceV1 {
         })?;
         let mut ceiling = policy.ceiling.fields().clone();
         if root.peer.is_some() {
-            ceiling.requester = root.audit.requester.clone();
+            ceiling.for_requester(&root.audit.requester);
         }
         validate_narrowing(
             &intersect(&root.scope, &PhysicalReviewScopeV1::try_from(ceiling)?)?,

@@ -4,11 +4,18 @@ export interface PhysicalScope {
   requester: string;
   executor: string;
   environment: { environment: string; evidenceClass: "simulation" | "hardware"; offerExpiry: number };
-  /** Opaque capability payload; its schema and meaning belong to the device binding. */
-  intent: { capabilityId: string; payload: PhysicalPayload; payloadDigest: string };
+  mode: "exact" | "decision_stream";
+  /** Exact mode: opaque capability payload; its schema and meaning belong to the device binding. */
+  intent?: { capabilityId: string; payload: PhysicalPayload; payloadDigest: string };
+  /** Decision stream: the approved options, rate and observation flow. */
+  stream?: {
+    options: string[];
+    minDecisionIntervalUs: number;
+    observation: { fields: string[]; minIntervalUs: number; destination: string };
+  };
   execution: { actionDurationUs: number; leaseDurationUs: number; totalExecutionUs: number; actionCount: number };
   qualification: { requiredEnforcementClass: "adapter_isolation_only" | "native_fence"; expiresAt: number };
-  completion: unknown;
+  completion: { predicate: { id: string }; requiredWitness: string; evaluationWindowUs: number };
   [field: string]: unknown;
 }
 export interface PhysicalReview {
@@ -46,6 +53,38 @@ export type PhysicalProductRequest =
 export function physicalReviewFresh(review: PhysicalReview | null, now = Date.now()): boolean {
   return Boolean(review && now < review.scope.environment.offerExpiry && now < review.scope.qualification.expiresAt
     && (!review.approval || now < review.approval.expiresAt));
+}
+const seconds = (us: number) => `${us / 1e6} s`;
+/** Review rows for a scope. Exact and decision-stream scopes both show where,
+ * what, how often, how much, until when, who judges and what flows back. */
+export function physicalScopeSummary(scope: PhysicalScope): [string, string][] {
+  const rows: [string, string][] = [["Executor Host", scope.executor]];
+  if (scope.stream) {
+    const s = scope.stream;
+    rows.push(
+      ["Mode", "Decision stream"],
+      ["Approved options", s.options.join(", ")],
+      ["Decision rate", `at most one decision per ${seconds(s.minDecisionIntervalUs)}`],
+    );
+  } else if (scope.intent) {
+    rows.push(
+      ["Mode", "Exact action"],
+      ["Intent", `${scope.intent.capabilityId} · ${physicalPayloadEntries(scope.intent.payload).map(([pointer, value]) => `${pointer} = ${value}`).join(", ")}`],
+    );
+  }
+  rows.push(
+    ["Per action", `≤ ${seconds(scope.execution.actionDurationUs)}`],
+    ["In total", `≤ ${seconds(scope.execution.totalExecutionUs)} · ≤ ${scope.execution.actionCount} action${scope.execution.actionCount === 1 ? "" : "s"}`],
+    ["Completion", `${scope.completion.predicate.id} within ${seconds(scope.completion.evaluationWindowUs)}`],
+    ["Witness class", scope.completion.requiredWitness.replace(/_/g, " ")],
+  );
+  if (scope.stream) {
+    const o = scope.stream.observation;
+    rows.push(["Observations sent", o.fields.length === 0
+      ? "none"
+      : `${o.fields.join(", ")} to ${o.destination}, at most one per ${seconds(o.minIntervalUs)}`]);
+  }
+  return rows;
 }
 /** Flatten a payload into pointer = value lines for review, without interpreting it. */
 export function physicalPayloadEntries(payload: PhysicalPayload, prefix = ""): [string, string][] {

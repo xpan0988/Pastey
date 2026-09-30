@@ -40,6 +40,8 @@ pub(crate) struct ToolSessionV1 {
     session: Arc<BodyControlSessionV1>,
     lane: Arc<dyn EnvironmentBinding>,
     open: AtomicBool,
+    /// Ticks of the last released observation, for the declared rate.
+    last_observation: parking_lot::Mutex<Option<u64>>,
 }
 impl ToolSessionV1 {
     pub(crate) fn id(&self) -> &RequestId {
@@ -77,17 +79,28 @@ impl PhysicalControlServiceV1 {
             session.root().peer.is_none(),
             "A remote stream's tools are reached through its bridge",
         )?;
-        self.open_tool_session_inner(session, lane, caller)
+        let destination = self.runtime.host_ref().clone();
+        self.open_tool_session_inner(session, lane, caller, &destination)
     }
     pub(in crate::physical) fn open_tool_session_inner(
         &mut self,
         session: &Arc<BodyControlSessionV1>,
         lane: Arc<dyn EnvironmentBinding>,
         caller: LabelV1,
+        destination: &HostRef,
     ) -> AppResult<Arc<ToolSessionV1>> {
+        let stream = session
+            .basis
+            .scope()
+            .fields()
+            .stream
+            .as_ref()
+            .ok_or_else(|| {
+                crate::error::AppError::InvalidInput("Tools exist only for decision streams".into())
+            })?;
         require(
-            session.basis.scope().fields().mode == PhysicalScopeModeV1::DecisionStream,
-            "Tools exist only for decision streams",
+            stream.observation.destination == *destination,
+            "Observations are declared for another Host",
         )?;
         self.validate_control_session(session, true)?;
         lane.status()?;
@@ -104,6 +117,7 @@ impl PhysicalControlServiceV1 {
             session: session.clone(),
             lane,
             open: AtomicBool::new(true),
+            last_observation: parking_lot::Mutex::new(None),
         });
         self.control.tool_sessions.insert(ts.id.clone(), ts.clone());
         Ok(ts)
@@ -177,10 +191,34 @@ impl PhysicalControlServiceV1 {
                     execution_us,
                 })
             }
-            DecisionToolCallV1::Observe => match Self::sample(core, ts).await {
-                Ok(view) => Ok(DecisionToolReplyV1::Observation { view }),
-                Err(e) => Ok(refused(e.message())),
-            },
+            DecisionToolCallV1::Observe => {
+                let flow = ts
+                    .session
+                    .basis
+                    .scope()
+                    .fields()
+                    .stream
+                    .as_ref()
+                    .map(|s| s.observation.clone())
+                    .ok_or_else(|| {
+                        crate::error::AppError::InvalidInput("Not a decision stream".into())
+                    })?;
+                let (_, ticks) = core.lock().clock.read()?;
+                {
+                    let mut last = ts.last_observation.lock();
+                    if last.is_some_and(|l| ticks.saturating_sub(l) < flow.min_interval_us.get()) {
+                        return Ok(refused("Observation rate ceiling exceeded"));
+                    }
+                    *last = Some(ticks);
+                }
+                match Self::sample(core, ts).await {
+                    // Only declared fields leave the executor.
+                    Ok(view) => Ok(DecisionToolReplyV1::Observation {
+                        view: view.select(&flow.fields),
+                    }),
+                    Err(e) => Ok(refused(e.message())),
+                }
+            }
             DecisionToolCallV1::Decide {
                 option,
                 duration_us,

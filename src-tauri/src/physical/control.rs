@@ -1259,7 +1259,10 @@ pub(in crate::physical) mod test_support {
                     captured_ticks: ticks,
                     gap_us: 0,
                 },
-                view: CanonicalJsonV1::encode(&serde_json::json!({"sample": n}))?,
+                // The binding's full view; only reviewed fields may leave.
+                view: CanonicalJsonV1::encode(&serde_json::json!({
+                    "sample": n, "secret": "undeclared", "pose": {"x": 1, "y": 2}
+                }))?,
                 observations: vec![],
                 dispositions: vec![],
             })
@@ -1368,6 +1371,12 @@ pub(in crate::physical) mod test_support {
             AdmissionOutcomeV1::Admitted(a) => a,
             AdmissionOutcomeV1::Duplicate(_) => panic!("expected a new admission"),
         }
+    }
+    pub(in crate::physical) fn only_session(
+        core: &PhysicalControlServiceV1,
+    ) -> Arc<BodyControlSessionV1> {
+        assert_eq!(core.control.sessions.len(), 1);
+        core.control.sessions.values().next().unwrap().clone()
     }
     pub(in crate::physical) fn action_session(
         a: &AdmittedBodyActionV1,

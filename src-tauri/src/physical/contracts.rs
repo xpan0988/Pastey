@@ -11,11 +11,52 @@ pub(crate) enum PhysicalScopeModeV1 {
     DecisionStream,
 }
 
-// The approved part of a decision-stream capability: an option subset and a
-// decision-rate ceiling (shortest interval between two admitted decisions).
+// What `observe` may send to the brain, how often and to which Host. Fields
+// not listed never leave the executor: it filters every reply (fail-closed).
+claim!(ObservationFlowV1 {
+    fields: Vec<JsonPointerV1>,
+    min_interval_us: PositiveMicros,
+    destination: HostRef,
+});
+impl ObservationFlowV1 {
+    pub fn validate(&self) -> AppResult<()> {
+        require(
+            self.fields.windows(2).all(|w| w[0] < w[1]),
+            "Observation fields must be sorted and unique",
+        )
+    }
+    fn is_subset_of(&self, ceiling: &Self) -> bool {
+        self.fields
+            .iter()
+            .all(|f| ceiling.fields.binary_search(f).is_ok())
+            && self.min_interval_us >= ceiling.min_interval_us
+            && self.destination == ceiling.destination
+    }
+    fn intersect(&self, other: &Self) -> AppResult<Self> {
+        require(
+            self.destination == other.destination,
+            "Observation destination differs",
+        )?;
+        Ok(Self {
+            fields: self
+                .fields
+                .iter()
+                .filter(|f| other.fields.binary_search(f).is_ok())
+                .cloned()
+                .collect(),
+            min_interval_us: self.min_interval_us.max(other.min_interval_us),
+            destination: self.destination.clone(),
+        })
+    }
+}
+
+// The approved part of a decision-stream capability: an option subset, a
+// decision-rate ceiling (shortest interval between two admitted decisions)
+// and the observation flow to the brain.
 claim!(DecisionStreamScopeV1 {
     options: Vec<LabelV1>,
     min_decision_interval_us: PositiveMicros,
+    observation: ObservationFlowV1,
 });
 impl DecisionStreamScopeV1 {
     pub fn validate(&self) -> AppResult<()> {
@@ -30,6 +71,7 @@ impl DecisionStreamScopeV1 {
     pub(super) fn is_subset_of(&self, ceiling: &Self) -> bool {
         self.options.iter().all(|o| ceiling.allows(o))
             && self.min_decision_interval_us >= ceiling.min_decision_interval_us
+            && self.observation.is_subset_of(&ceiling.observation)
     }
     pub(super) fn intersect(&self, other: &Self) -> AppResult<Self> {
         let narrowed = Self {
@@ -42,6 +84,7 @@ impl DecisionStreamScopeV1 {
             min_decision_interval_us: self
                 .min_decision_interval_us
                 .max(other.min_decision_interval_us),
+            observation: self.observation.intersect(&other.observation)?,
         };
         narrowed.validate()?;
         Ok(narrowed)
@@ -351,6 +394,14 @@ claim!(ReviewScopeFieldsV1 {
     loss: ContractRefV1,
 });
 impl ReviewScopeFieldsV1 {
+    /// The same scope offered to another requester: the observation flow
+    /// follows the requester, whose brain receives it.
+    pub fn for_requester(&mut self, requester: &HostRef) {
+        self.requester = requester.clone();
+        if let Some(stream) = self.stream.as_mut() {
+            stream.observation.destination = requester.clone();
+        }
+    }
     pub fn validate(&self) -> AppResult<()> {
         validate_host(&self.requester)?;
         self.environment
@@ -388,6 +439,19 @@ impl ReviewScopeFieldsV1 {
                     stream.options.iter().all(|o| declared.option(o).is_some())
                         && stream.min_decision_interval_us >= declared.min_decision_interval_us,
                     "Approved options/rate exceed the declared capability",
+                )?;
+                stream.observation.validate()?;
+                require(
+                    stream
+                        .observation
+                        .fields
+                        .iter()
+                        .all(|f| declared.observation_fields.binary_search(f).is_ok()),
+                    "Observation field not declared by the capability",
+                )?;
+                require(
+                    stream.observation.destination == self.requester,
+                    "Observations may only flow to the requester's brain",
                 )?;
                 require(
                     self.bounds.is_subset_of(&capability.bounds),
