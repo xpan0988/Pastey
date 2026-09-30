@@ -35,6 +35,15 @@ const MAX_ACTION_MS: u64 = 500;
 const MAX_TOTAL_EXECUTION_MS: u64 = 30_000;
 const MAX_ACTIONS: u64 = 60;
 
+// Criterion 5: a second, deliberately different body. A dispenser filling a
+// cup: its own option names, payload schema (millilitres, not motion) and
+// observation format, under the same DecisionStream and the same Core.
+const DISPENSER_APPROVED: [&str; 2] = ["pour_small", "idle"];
+const DISPENSER_UNAPPROVED: &str = "pour_large";
+const DISPENSER_MAX_ACTION_MS: u64 = 1_000;
+const DISPENSER_MAX_TOTAL_EXECUTION_MS: u64 = 5_000;
+const DISPENSER_MAX_ACTIONS: u64 = 10;
+
 /// Result of one tool call: admission only, never a physical consequence.
 #[derive(Clone, Debug, PartialEq)]
 #[expect(dead_code, reason = "constructed by the Step C tool surface")]
@@ -104,6 +113,19 @@ impl DemoV1 {
             "2D kinematic reference binding (two rooms, a door, walls; SimulationOracle witness; local timeout self-stop)",
             "D",
         )
+    }
+    /// The walk and a dispenser, each with its own binding and approval,
+    /// attached to one Core instance.
+    fn two_bodies_one_core() -> (Self, Self) {
+        let _ = decision_stream_mode();
+        missing(
+            "second binding: a dispenser (own options, payload schema and observation format)",
+            "D",
+        )
+    }
+    /// Identity of the Core instance serving this demo.
+    fn core_identity(&self) -> String {
+        missing("Core instance identity for attached bindings", "C")
     }
     fn approval_count(&self) -> u64 {
         missing("decision-stream approval ledger query", "C")
@@ -431,9 +453,11 @@ async fn physical_demo_4_proposer_admission_and_body_are_recorded_apart_and_the_
             },
         )
         .allowed());
-    let (allowed, _) = drive(&demo, &mut brain);
+    let (allowed, refused) = drive(&demo, &mut brain);
+    // The rule brain stays inside the envelope: it is never refused.
+    assert_eq!(refused, 0);
     let records = demo.records();
-    assert_eq!(records.len() as u64, allowed + 1);
+    assert_eq!(records.len() as u64, allowed + refused + 1);
     for r in &records {
         assert!(!r.proposer.is_empty());
         match &r.admission {
@@ -450,4 +474,82 @@ async fn physical_demo_4_proposer_admission_and_body_are_recorded_apart_and_the_
     // Arrival is the witness's verdict, not an ACK and not the brain's claim.
     assert_eq!(demo.consequence(), ConsequenceV1::Verified);
     assert_eq!(demo.truth().room, "bedroom");
+}
+
+#[tokio::test]
+#[ignore = "physical demo: needs DecisionStream (Step C) and the reference bindings (Step D)"]
+async fn physical_demo_5_bodies_are_replaceable_under_the_same_core() {
+    let (walk, pour) = DemoV1::two_bodies_one_core();
+    // Same Core instance, same DecisionStream machinery; nothing body-specific.
+    assert_eq!(walk.core_identity(), pour.core_identity());
+    let caller = "brain:rules";
+    // Option-subset approval: only the approved options become tools.
+    let mut tools = pour.tool_names(caller);
+    tools.sort();
+    let mut expected: Vec<String> = DISPENSER_APPROVED
+        .iter()
+        .map(|o| o.to_string())
+        .chain(["observe".into(), "remaining_budget".into()])
+        .collect();
+    expected.sort();
+    assert_eq!(tools, expected);
+    // The dispenser's observation is its own format, not the walk's.
+    let observation = pour.observe(caller);
+    assert!(observation.get("room").is_none());
+    // Out-of-envelope proposals are refused.
+    for call in [
+        DecisionCallV1 {
+            option: DISPENSER_UNAPPROVED.into(),
+            duration_ms: 100,
+        },
+        DecisionCallV1 {
+            option: "forward".into(),
+            duration_ms: 100,
+        },
+        DecisionCallV1 {
+            option: "pour_small".into(),
+            duration_ms: DISPENSER_MAX_ACTION_MS + 1,
+        },
+    ] {
+        assert!(!pour.call(caller, &call).allowed(), "{call:?}");
+    }
+    // Cumulative budget holds across decisions.
+    let pour_small = DecisionCallV1 {
+        option: "pour_small".into(),
+        duration_ms: DISPENSER_MAX_ACTION_MS,
+    };
+    for _ in 0..(DISPENSER_MAX_ACTIONS * 2) {
+        pour.call(caller, &pour_small);
+        pour.wait_ms(DISPENSER_MAX_ACTION_MS);
+    }
+    let (actions, execution_ms) = pour.consumed();
+    assert!(actions <= DISPENSER_MAX_ACTIONS);
+    assert!(execution_ms <= DISPENSER_MAX_TOTAL_EXECUTION_MS);
+    let truth = pour.truth();
+    assert!(truth
+        .executed_options
+        .iter()
+        .all(|o| DISPENSER_APPROVED.contains(&o.as_str())));
+    // Revocation mid-stream on a fresh pair: uncertain, and nothing resumes.
+    let (walk, pour) = DemoV1::two_bodies_one_core();
+    assert!(pour.call(caller, &pour_small).allowed());
+    pour.revoke();
+    pour.wait_ms(DISPENSER_MAX_ACTION_MS * 2);
+    assert!(pour.truth().stopped);
+    assert_eq!(pour.consequence(), ConsequenceV1::Uncertain);
+    let executed = pour.truth().executed_options.len();
+    pour.recover();
+    pour.wait_ms(DISPENSER_MAX_ACTION_MS * 2);
+    assert_eq!(pour.truth().executed_options.len(), executed);
+    assert!(!pour.call(caller, &pour_small).allowed());
+    // The walk under the same Core is untouched by the dispenser's revocation.
+    assert!(walk
+        .call(
+            caller,
+            &DecisionCallV1 {
+                option: "forward".into(),
+                duration_ms: MAX_ACTION_MS,
+            },
+        )
+        .allowed());
 }

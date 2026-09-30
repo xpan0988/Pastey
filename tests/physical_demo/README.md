@@ -1,12 +1,12 @@
 # Physical demo: walk from the living room to the bedroom
 
-This is the acceptance specification for Pastey's physical layer. The executable form is [`src-tauri/src/physical/physical_demo_tests.rs`](../../src-tauri/src/physical/physical_demo_tests.rs). Its tests are `#[ignore]`d until the decision stream (Step C) and the reference binding (Step D) exist:
+This is the acceptance specification for Pastey's physical layer. The executable form is [`src-tauri/src/physical/physical_demo_tests.rs`](../../src-tauri/src/physical/physical_demo_tests.rs). Its tests are `#[ignore]`d until the decision stream (Step C) and the reference bindings (Step D) exist:
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml physical_demo -- --ignored
 ```
 
-Each test fails at the first capability the demo still lacks, with `physical demo: missing capability <name> (Step <C|D>)`. Building a capability replaces its stub in the test harness. The test bodies are the criteria: they may be tightened, never weakened. When all four pass, the `#[ignore]` attributes come off and the demo joins the regular suite.
+Each test fails at the first capability the demo still lacks, with `physical demo: missing capability <name> (Step <C|D>)`. Building a capability replaces its stub in the test harness. The test bodies are the criteria: they may be tightened, never weakened. When all five pass, the `#[ignore]` attributes come off and the demo joins the regular suite.
 
 ## Scenario
 
@@ -68,7 +68,20 @@ For every step the ledger keeps three separate records:
 - **who allowed it:** Core's admission decision, with a reason when refused;
 - **what the body did:** the binding's disposition and observations. It exists only for allowed steps; refused proposals never have one.
 
+With one refused proposal from a second caller and a rule-brain walk, the ledger has exactly allowed + refused + 1 step records. The rule brain itself is never refused.
+
 Arrival in the bedroom comes from the witness verdict over stored observations. An acknowledgment or a brain's claim never counts.
+
+### 5. Bodies are replaceable
+
+`physical_demo_5_bodies_are_replaceable_under_the_same_core`
+
+A second binding, deliberately unlike the reference body: a dispenser filling a cup. Its option names are `pour_small`, `pour_large` and `idle`; its payload schema is volumes, not motion; its observation format has no rooms. It runs with the walk under the same Core instance and the same DecisionStream, with no Core change:
+
+- **option-subset approval:** approving `pour_small` and `idle` exposes exactly those two tools plus `observe` and `remaining_budget`;
+- **refusals:** an unapproved option (`pour_large`), a foreign option (`forward`) and an over-long action are refused;
+- **cumulative budget:** repeated pours never exceed 10 actions or 5 s in total, and the simulator executed only approved options;
+- **revocation:** revoking mid-stream stops the dispenser, records the outcome as uncertain and resumes nothing after recovery. The walk under the same Core is unaffected.
 
 ## Hard constraints
 
