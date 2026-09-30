@@ -19,7 +19,7 @@ mod core_ledger;
 #[path = "store_evidence.rs"]
 mod evidence_ledger;
 pub(super) use control_ledger::{
-    ActionAuditV1, FenceAuditV1, ReservationReceiptV1, SessionAuditV1,
+    ActionAuditV1, DecisionRecordV1, FenceAuditV1, ReservationReceiptV1, SessionAuditV1,
 };
 pub(super) use core_ledger::RootAuditV1;
 #[path = "store_remote.rs"]
@@ -294,6 +294,13 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
     stage9.execute_batch(&remote_ledger::stage9_ddl())?;
     if schema_objects(&tx)? == schema_objects(&stage9)? {
         tx.execute_batch(evidence_ledger::HANDOVER_VERDICT_SCHEMA)?;
+    }
+    // Decision streams: several actions per root and the decision record. The
+    // relaxed constraints admit every existing row, which the rebuild copies.
+    let stage9_full = Connection::open_in_memory()?;
+    stage9_full.execute_batch(&remote_ledger::stage9_full_ddl())?;
+    if schema_objects(&tx)? == schema_objects(&stage9_full)? {
+        remote_ledger::rebuild(&tx, &remote_ledger::current_ddl())?;
     }
     verify_schema(&tx)?;
     stamp_ledger_format(&tx)?;

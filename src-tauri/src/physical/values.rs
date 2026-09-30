@@ -141,6 +141,11 @@ impl From<LabelV1> for String {
         value.0
     }
 }
+impl LabelV1 {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "f64", into = "f64")]

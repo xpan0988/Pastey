@@ -61,6 +61,41 @@ pub(crate) enum PhysicalOperationV1 {
         start: RequestId,
         status: PhysicalStatusV1,
     },
+    /// Decision-stream tools, forwarded to the executor's dispatcher. The
+    /// requester only relays; admission happens on the executor.
+    ToolOpen {
+        start: RequestId,
+        caller: LabelV1,
+    },
+    ToolCall {
+        start: RequestId,
+        tool_session: RequestId,
+        call: super::core::DecisionToolCallV1,
+    },
+    ToolClose {
+        start: RequestId,
+        tool_session: RequestId,
+    },
+    ToolResult {
+        request: RequestId,
+        outcome: ToolOutcomeV1,
+    },
+}
+/// The executor's answer to one forwarded tool request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ToolOutcomeV1 {
+    Opened {
+        tool_session: RequestId,
+        tools: Vec<String>,
+    },
+    Reply {
+        reply: super::core::DecisionToolReplyV1,
+    },
+    Closed,
+    Failed {
+        reason: String,
+    },
 }
 impl PhysicalOperationV1 {
     fn validate(&self) -> AppResult<()> {
@@ -79,12 +114,19 @@ impl PhysicalOperationV1 {
                 )?;
             }
             Self::Status { status, .. } => status.validate()?,
+            Self::ToolResult {
+                outcome: ToolOutcomeV1::Opened { tools, .. },
+                ..
+            } => require(tools.len() <= 40, "Too many tools")?,
             _ => {}
         }
         Ok(())
     }
     pub(crate) fn is_response(&self) -> bool {
-        matches!(self, Self::Environments { .. } | Self::Status { .. })
+        matches!(
+            self,
+            Self::Environments { .. } | Self::Status { .. } | Self::ToolResult { .. }
+        )
     }
 }
 claim!(PhysicalStatusV1 {

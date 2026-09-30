@@ -59,6 +59,34 @@ CREATE TRIGGER physical_reservations_keep BEFORE DELETE ON physical_domain_reser
 CREATE TRIGGER physical_budgets_keep BEFORE DELETE ON physical_control_budgets BEGIN SELECT RAISE(ABORT,'physical budget history required');END;
 CREATE TRIGGER physical_actions_keep BEFORE DELETE ON physical_actions BEGIN SELECT RAISE(ABORT,'physical action history required');END;
 "#;
+/// Stage 10: decision streams. One record per tool proposal, kept apart from
+/// the action row (Core's admission) and the evidence (what the body did).
+pub(super) const DECISION_SCHEMA: &str = r#"
+CREATE TABLE physical_decisions(
+ root_id TEXT NOT NULL,sequence INTEGER NOT NULL CHECK(sequence>=1),proposer TEXT NOT NULL CHECK(length(proposer) BETWEEN 1 AND 128),
+ option TEXT NOT NULL CHECK(length(option) BETWEEN 1 AND 128),requested_us INTEGER NOT NULL CHECK(requested_us>=0),
+ outcome TEXT NOT NULL CHECK(outcome IN ('allowed','refused')),reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 256),
+ action_id TEXT REFERENCES physical_actions(action_id),recorded_at INTEGER NOT NULL CHECK(recorded_at>0),
+ PRIMARY KEY(root_id,sequence),CHECK((outcome='allowed')=(action_id IS NOT NULL))
+) STRICT;
+CREATE TRIGGER physical_decisions_immutable BEFORE UPDATE ON physical_decisions BEGIN SELECT RAISE(ABORT,'physical decision record immutable');END;
+CREATE TRIGGER physical_decisions_keep BEFORE DELETE ON physical_decisions BEGIN SELECT RAISE(ABORT,'physical decision history required');END;
+"#;
+/// Stage 10 relaxes the one-action constraints of the control tables.
+pub(super) fn stage10(ddl: &str) -> String {
+    ddl.replace(
+        "action_id TEXT PRIMARY KEY,root_id TEXT NOT NULL UNIQUE,session_id TEXT NOT NULL UNIQUE REFERENCES physical_sessions(session_id),grant_id TEXT NOT NULL UNIQUE,",
+        "action_id TEXT PRIMARY KEY,root_id TEXT NOT NULL,session_id TEXT NOT NULL REFERENCES physical_sessions(session_id),grant_id TEXT NOT NULL,",
+    )
+    .replace(
+        "decision_sequence INTEGER NOT NULL CHECK(decision_sequence=1)",
+        "decision_sequence INTEGER NOT NULL CHECK(decision_sequence>=1)",
+    )
+    .replace(
+        "ceiling_count INTEGER NOT NULL CHECK(ceiling_count=1)",
+        "ceiling_count INTEGER NOT NULL CHECK(ceiling_count>=1)",
+    ) + DECISION_SCHEMA
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::physical) struct SessionAuditV1 {
@@ -141,8 +169,14 @@ impl ActionAuditV1 {
                 && self.session == s.id
                 && self.epochs == s.epochs
                 && self.proposal.attempt_id == a.attempt_id
-                && self.proposal.decision_sequence == 1
-                && self.reserved_us == s.scope.fields().execution.action_duration_us.get()
+                && if s.scope.fields().mode == PhysicalScopeModeV1::DecisionStream {
+                    self.proposal.decision_sequence
+                        <= u64::from(s.scope.fields().execution.action_count)
+                        && self.reserved_us == self.proposal.requested_duration_us.get()
+                } else {
+                    self.proposal.decision_sequence == 1
+                        && self.reserved_us == s.scope.fields().execution.action_duration_us.get()
+                }
                 && self.reserved_us <= s.scope.fields().execution.total_execution_us.get()
                 && self.expires_at <= s.lease_expiry
                 && self.expires_at > a.created_at
@@ -273,7 +307,7 @@ impl PhysicalStoreV1 {
                 params![text(d), text(&s.id), checked_integer(*e)?],
             )?;
         }
-        tx.execute("INSERT INTO physical_control_budgets(root_id,role,ceiling_us,ceiling_count) VALUES(?1,?3,?2,1)",params![text(&s.root),checked_integer(s.scope.fields().execution.total_execution_us.get())?,a.role()])?;
+        tx.execute("INSERT INTO physical_control_budgets(root_id,role,ceiling_us,ceiling_count) VALUES(?1,?3,?2,?4)",params![text(&s.root),checked_integer(s.scope.fields().execution.total_execution_us.get())?,a.role(),i64::from(s.scope.fields().execution.action_count)])?;
         super::audit(&tx)?;
         tx.commit()?;
         Ok(ReservationReceiptV1 { session: s.clone() })
@@ -320,6 +354,8 @@ impl PhysicalStoreV1 {
         tx.commit()?;
         Ok(())
     }
+    /// `proposer` names the tool caller of a decision-stream proposal. Its
+    /// allowed decision record commits in the same transaction as the action.
     pub(in crate::physical) fn admit_action(
         &self,
         a: &RootAuditV1,
@@ -327,6 +363,7 @@ impl PhysicalStoreV1 {
         x: &ActionAuditV1,
         snapshot: &BindingLedgerSnapshotV1,
         now: UnixMillis,
+        proposer: Option<&LabelV1>,
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -334,9 +371,44 @@ impl PhysicalStoreV1 {
         current_session(&tx, a, s, snapshot, now, true)?;
         x.validate(s, a)?;
         require(now < x.expires_at, "Action lifetime exhausted")?;
-        let n=tx.execute("UPDATE physical_control_budgets SET reserved_us=reserved_us+?2,reserved_count=reserved_count+1,revision=revision+1 WHERE root_id=?1 AND reserved_count=0 AND reserved_us+?2<=ceiling_us AND consumed_us=0",params![text(&a.root_id),checked_integer(x.reserved_us)?])?;
+        let stream = s.scope.fields().mode == PhysicalScopeModeV1::DecisionStream;
+        // Exact: one action, and only while nothing was consumed. Stream: the
+        // count and time ceilings accumulate across every decision.
+        let n = if stream {
+            tx.execute("UPDATE physical_control_budgets SET reserved_us=reserved_us+?2,reserved_count=reserved_count+1,revision=revision+1 WHERE root_id=?1 AND reserved_count<ceiling_count AND reserved_us+?2<=ceiling_us",params![text(&a.root_id),checked_integer(x.reserved_us)?])?
+        } else {
+            tx.execute("UPDATE physical_control_budgets SET reserved_us=reserved_us+?2,reserved_count=reserved_count+1,revision=revision+1 WHERE root_id=?1 AND reserved_count=0 AND reserved_us+?2<=ceiling_us AND consumed_us=0",params![text(&a.root_id),checked_integer(x.reserved_us)?])?
+        };
         require(n == 1, "Insufficient cumulative budget")?;
-        tx.execute("INSERT INTO physical_actions(action_id,root_id,session_id,grant_id,decision_sequence,payload_digest,proposal_digest,challenge_id,requested_us,reserved_us,expires_at,audit_digest,audit_json,state,revision,disposition) VALUES(?1,?2,?3,?4,1,?5,?6,?7,?8,?9,?10,?11,?12,'open',1,'not_sent')",params![text(&x.proposal.action_id),text(&x.root),text(&x.session),text(&x.grant),text(&x.proposal.payload_digest),text(&digest("pastey-physical-proposal-v1",&x.proposal)?),text(&x.proposal.challenge_id),checked_integer(x.proposal.requested_duration_us.get())?,checked_integer(x.reserved_us)?,x.expires_at.get() as i64,text(&x.digest()?),serde_json::to_string(x)?])?;
+        let previous: i64 = tx.query_row(
+            "SELECT count(*) FROM physical_actions WHERE root_id=?1",
+            [text(&x.root)],
+            |r| r.get(0),
+        )?;
+        require(
+            previous + 1 == checked_integer(x.proposal.decision_sequence)?,
+            "Decision sequence gap",
+        )?;
+        if stream {
+            // Replacement fence: the previous decision closes in the same
+            // transaction that admits this one.
+            tx.execute("UPDATE physical_actions SET state='closed',operation_id=NULL,revision=revision+1 WHERE root_id=?1 AND state='open'",[text(&x.root)])?;
+        }
+        tx.execute("INSERT INTO physical_actions(action_id,root_id,session_id,grant_id,decision_sequence,payload_digest,proposal_digest,challenge_id,requested_us,reserved_us,expires_at,audit_digest,audit_json,state,revision,disposition) VALUES(?1,?2,?3,?4,?13,?5,?6,?7,?8,?9,?10,?11,?12,'open',1,'not_sent')",params![text(&x.proposal.action_id),text(&x.root),text(&x.session),text(&x.grant),text(&x.proposal.payload_digest),text(&digest("pastey-physical-proposal-v1",&x.proposal)?),text(&x.proposal.challenge_id),checked_integer(x.proposal.requested_duration_us.get())?,checked_integer(x.reserved_us)?,x.expires_at.get() as i64,text(&x.digest()?),serde_json::to_string(x)?,checked_integer(x.proposal.decision_sequence)?])?;
+        match (stream, proposer, &x.proposal.option) {
+            (true, Some(proposer), Some(option)) => insert_decision(
+                &tx,
+                &x.root,
+                proposer.as_str(),
+                option.as_str(),
+                x.proposal.requested_duration_us.get(),
+                None,
+                Some(&x.proposal.action_id),
+                now,
+            )?,
+            (false, None, None) => {}
+            _ => require(false, "Decision record/proposer mismatch")?,
+        }
         tx.commit()?;
         Ok(())
     }
@@ -496,6 +568,157 @@ pub(super) fn close_root(c: &Connection, id: &RootId) -> AppResult<()> {
         c.execute("UPDATE physical_actions SET state='closed',operation_id=NULL,revision=revision+1 WHERE root_id=?1 AND state='open'",[text(id)])?;
     }
     Ok(())
+}
+/// Refusal reasons are Core error text, bounded for the ledger.
+fn bounded_reason(reason: &str) -> String {
+    let mut end = reason.len().min(256);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 {
+        "refused".into()
+    } else {
+        reason[..end].into()
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn insert_decision(
+    c: &Connection,
+    root: &RootId,
+    proposer: &str,
+    option: &str,
+    requested_us: u64,
+    refusal: Option<&str>,
+    action: Option<&ActionId>,
+    now: UnixMillis,
+) -> AppResult<()> {
+    let sequence: i64 = c.query_row(
+        "SELECT count(*)+1 FROM physical_decisions WHERE root_id=?1",
+        [text(root)],
+        |r| r.get(0),
+    )?;
+    c.execute(
+        "INSERT INTO physical_decisions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            text(root),
+            sequence,
+            proposer,
+            option,
+            checked_integer(requested_us)?,
+            if refusal.is_some() {
+                "refused"
+            } else {
+                "allowed"
+            },
+            bounded_reason(refusal.unwrap_or("admitted")),
+            action.map(text),
+            now.get() as i64
+        ],
+    )?;
+    Ok(())
+}
+/// One decision-stream record as the ledger keeps it.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::physical) struct DecisionRecordV1 {
+    pub(in crate::physical) sequence: u64,
+    pub(in crate::physical) proposer: String,
+    pub(in crate::physical) option: String,
+    pub(in crate::physical) allowed: bool,
+    pub(in crate::physical) reason: String,
+    pub(in crate::physical) action: Option<ActionId>,
+}
+impl PhysicalStoreV1 {
+    /// Records a refused proposal. It never reaches the body, so it has no action.
+    pub(in crate::physical) fn record_refusal(
+        &self,
+        root: &RootId,
+        proposer: &LabelV1,
+        option: &str,
+        requested_us: u64,
+        reason: &str,
+        now: UnixMillis,
+    ) -> AppResult<()> {
+        let mut c = self.connection()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::audit(&tx)?;
+        let option = if option.is_empty() || option.len() > 128 {
+            "<invalid>"
+        } else {
+            option
+        };
+        insert_decision(
+            &tx,
+            root,
+            proposer.as_str(),
+            option,
+            requested_us,
+            Some(reason),
+            None,
+            now,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(in crate::physical) fn decisions(&self, root: &RootId) -> AppResult<Vec<DecisionRecordV1>> {
+        let c = self.connection()?;
+        let rows = c
+            .prepare("SELECT sequence,proposer,option,outcome,reason,action_id FROM physical_decisions WHERE root_id=?1 ORDER BY sequence")?
+            .query_map([text(root)], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(sequence, proposer, option, outcome, reason, action)| {
+                Ok(DecisionRecordV1 {
+                    sequence: sequence as u64,
+                    proposer,
+                    option,
+                    allowed: outcome == "allowed",
+                    reason,
+                    action: action.map(ActionId::try_from).transpose()?,
+                })
+            })
+            .collect()
+    }
+    /// The latest decision that reached dispatch intent, if any.
+    pub(in crate::physical) fn latest_dispatched_action(
+        &self,
+        root: &RootId,
+    ) -> AppResult<Option<ActionId>> {
+        let c = self.connection()?;
+        let id: Option<String> = c
+            .query_row(
+                "SELECT action_id FROM physical_actions WHERE root_id=?1 AND dispatch_intent=1 ORDER BY decision_sequence DESC LIMIT 1",
+                [text(root)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        id.map(ActionId::try_from).transpose()
+    }
+    /// (actions left, execution time left) under the root's cumulative ceilings.
+    pub(in crate::physical) fn remaining_budget(&self, root: &RootId) -> AppResult<(u64, u64)> {
+        let c = self.connection()?;
+        let (cc, rc, cu, ru): (i64, i64, i64, i64) = c.query_row(
+            "SELECT ceiling_count,reserved_count,ceiling_us,reserved_us FROM physical_control_budgets WHERE root_id=?1",
+            [text(root)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        Ok(((cc - rc).max(0) as u64, (cu - ru).max(0) as u64))
+    }
+}
+fn s_state_quarantined(c: &Connection, root: &RootId) -> AppResult<bool> {
+    Ok(c.query_row(
+        "SELECT state='quarantined' FROM physical_sessions WHERE root_id=?1",
+        [text(root)],
+        |r| r.get(0),
+    )?)
 }
 pub(super) fn recover(c: &Connection, restart: bool) -> AppResult<()> {
     if restart {
@@ -660,7 +883,8 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
             )?;
         }
         require(
-            row.get::<_, i64>("decision_sequence")? == 1
+            row.get::<_, i64>("decision_sequence")?
+                == checked_integer(x.proposal.decision_sequence)?
                 && row.get::<_, i64>("requested_us")?
                     == checked_integer(x.proposal.requested_duration_us.get())?
                 && row.get::<_, i64>("reserved_us")? == checked_integer(x.reserved_us)?
@@ -694,20 +918,30 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         require(
             row.get::<_, i64>("ceiling_us")?
                 == checked_integer(s.scope.fields().execution.total_execution_us.get())?
-                && row.get::<_, i64>("ceiling_count")? == 1,
+                && row.get::<_, i64>("ceiling_count")?
+                    == i64::from(s.scope.fields().execution.action_count),
             "Budget ceiling mismatch",
         )?;
-        let values: Option<(i64, i64, String)> = c
-            .query_row(
-                "SELECT reserved_us,dispatch_intent,state FROM physical_actions WHERE root_id=?1",
-                [text(&id)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        let (reserved, count, consumed) = match values {
-            None => (0, 0, 0),
-            Some((_n, 0, state)) if state == "closed" => (0, 0, 0),
-            Some((n, d, _)) => (n, 1, if d == 1 { n } else { 0 }),
+        // Admission reserves in decision order; each dispatch consumes all
+        // that is reserved so far. A root closed before any dispatch
+        // released its whole reservation.
+        let actions: Vec<(i64, i64)> = c
+            .prepare("SELECT reserved_us,dispatch_intent FROM physical_actions WHERE root_id=?1 ORDER BY decision_sequence")?
+            .query_map([text(&id)], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let released = s_state_quarantined(c, &id)? && actions.iter().all(|(_, d)| *d == 0);
+        let (reserved, count, consumed) = if released {
+            (0, 0, 0)
+        } else {
+            let mut total = 0i64;
+            let mut consumed = 0i64;
+            for (r, d) in &actions {
+                total += r;
+                if *d == 1 {
+                    consumed = total;
+                }
+            }
+            (total, actions.len() as i64, consumed)
         };
         require(
             row.get::<_, i64>("reserved_us")? == reserved
@@ -716,23 +950,53 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
             "Budget reservation/dispatch mismatch",
         )?;
     }
-    Ok(())
+    audit_decisions(c)
 }
-
-impl PhysicalStoreV1 {
-    pub(in crate::physical) fn end_control_window(
-        &self,
-        root: &RootId,
-        action: &ActionId,
-    ) -> AppResult<()> {
-        let mut c = self.connection()?;
-        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
-        let a = self::action(&tx, action)?;
-        require(&a.root == root, "Foreign ended action")?;
-        close_root(&tx, root)?;
-        tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason='expired' WHERE root_id=?1 AND state='open'",[text(root)])?;
-        tx.commit()?;
-        Ok(())
+/// Decision records: contiguous per root, and every allowed record names an
+/// action of that root with the same option; every stream action has one.
+fn audit_decisions(c: &Connection) -> AppResult<()> {
+    // Earlier DDL stages are audited during migration, before stage 10.
+    let staged: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='physical_decisions')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !staged {
+        return Ok(());
     }
+    let mut stmt = c.prepare(
+        "SELECT root_id,sequence,option,requested_us,action_id FROM physical_decisions ORDER BY root_id,sequence",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected: BTreeMap<String, i64> = BTreeMap::new();
+    for (root, sequence, option, requested, action) in rows {
+        let next = expected.entry(root.clone()).or_insert(1);
+        require(sequence == *next, "Decision record gap")?;
+        *next += 1;
+        if let Some(action) = action {
+            let x = self::action(c, &ActionId::try_from(action)?)?;
+            require(
+                text(&x.root) == root
+                    && x.proposal.option.as_ref().map(|o| o.as_str()) == Some(option.as_str())
+                    && checked_integer(x.proposal.requested_duration_us.get())? == requested,
+                "Decision record/action mismatch",
+            )?;
+        }
+    }
+    let unrecorded: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM physical_actions a WHERE json_extract(a.audit_json,'$.proposal.option') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM physical_decisions d WHERE d.action_id=a.action_id))",
+        [],
+        |r| r.get(0),
+    )?;
+    require(!unrecorded, "Stream action without decision record")
 }

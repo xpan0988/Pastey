@@ -99,6 +99,7 @@ impl PhysicalAuthorityRootV1 {
     pub(super) fn attempt_id(&self) -> &AttemptId {
         &self.audit.attempt_id
     }
+    #[cfg_attr(not(test), expect(dead_code, reason = "read only by tests"))]
     pub(super) fn scope(&self) -> &PhysicalReviewScopeV1 {
         &self.scope
     }
@@ -753,8 +754,15 @@ pub(super) fn validate_narrowing(
     semantic.bounds = a.bounds.clone();
     semantic.execution = a.execution.clone();
     semantic.freshness = a.freshness.clone();
+    semantic.stream = a.stream.clone();
+    let stream_narrowed = match (&a.stream, &b.stream) {
+        (None, None) => true,
+        (Some(a), Some(b)) => b.is_subset_of(a),
+        _ => false,
+    };
     require(
         semantic == *a
+            && stream_narrowed
             && b.bounds.is_subset_of(&a.bounds)
             && b.execution.is_subset_of(&a.execution)
             && b.freshness.is_subset_of(&a.freshness),
@@ -771,12 +779,18 @@ fn intersect(
     semantic.bounds = a.bounds.clone();
     semantic.execution = a.execution.clone();
     semantic.freshness = a.freshness.clone();
+    semantic.stream = a.stream.clone();
     require(
         semantic == *a,
         "Executor policy substitutes reviewed semantics",
     )?;
     let mut result = a.clone();
     result.bounds = a.bounds.intersect(&b.bounds)?;
+    result.stream = match (&a.stream, &b.stream) {
+        (None, None) => None,
+        (Some(a), Some(b)) => Some(a.intersect(b)?),
+        _ => require(false, "Executor policy changes the invocation mode").map(|_| None)?,
+    };
     result.execution = ExecutionBudgetV1 {
         action_duration_us: a
             .execution
@@ -840,6 +854,12 @@ pub(super) mod test_support {
     }
     pub(in crate::physical) fn runtime(core: &PhysicalControlServiceV1) -> LocalRuntimeRef {
         core.runtime.clone()
+    }
+    pub(in crate::physical) fn narrow(
+        a: &PhysicalReviewScopeV1,
+        b: &PhysicalReviewScopeV1,
+    ) -> AppResult<()> {
+        validate_narrowing(a, b)
     }
     pub(in crate::physical) fn intersect_scope(
         a: &PhysicalReviewScopeV1,
@@ -925,7 +945,6 @@ impl PhysicalControlServiceV1 {
         self.remote.environment = Some(ProductEnvironmentV1 {
             binding: binding.clone(),
             adapter: lane.clone(),
-            drive_reference: true,
         });
         Ok(())
     }

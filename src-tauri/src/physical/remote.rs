@@ -7,26 +7,32 @@ use serde::{Deserialize, Serialize};
 pub(in crate::physical) struct ProductEnvironmentV1 {
     pub binding: Arc<EnvironmentBindingV1>,
     pub adapter: Arc<dyn EnvironmentBinding>,
-    /// Core drives the scope's one reference action from binding samples
-    /// after installation; otherwise the caller drives the session.
-    pub drive_reference: bool,
 }
 #[derive(Default)]
 pub(super) struct RemoteControlV1 {
     pub(super) environment: Option<ProductEnvironmentV1>,
     executions: BTreeMap<RequestId, Arc<BodyControlSessionV1>>,
     peers: Vec<Arc<VerifiedPeerCoreIngressV1>>,
+    /// Requester side: tool outcomes relayed back, by request, until read.
+    tool_results: BTreeMap<RequestId, ToolOutcomeV1>,
+    /// Executor side: which authenticated route opened each tool session.
+    tool_routes: BTreeMap<RequestId, HostSessionBinding>,
 }
 pub(crate) struct PhysicalWorkV1(pub(in crate::physical) PhysicalWorkKindV1);
 pub(in crate::physical) enum PhysicalWorkKindV1 {
     Install {
         session: Arc<BodyControlSessionV1>,
         adapter: Arc<dyn EnvironmentBinding>,
-        drive_reference: bool,
     },
     Cancel {
         session: Arc<BodyControlSessionV1>,
         adapter: Arc<dyn EnvironmentBinding>,
+    },
+    /// A forwarded tool call or close; `reply` is the response to send back.
+    Tool {
+        tool_session: Arc<ToolSessionV1>,
+        call: Option<DecisionToolCallV1>,
+        reply: PhysicalMessageV1,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,6 +60,24 @@ pub(crate) enum PhysicalProductRequestV1 {
         start: RequestId,
     },
     Snapshot,
+    /// Relay decision-stream tool requests to the executor's dispatcher.
+    ToolOpen {
+        start: RequestId,
+        caller: LabelV1,
+    },
+    ToolCall {
+        start: RequestId,
+        tool_session: RequestId,
+        call: DecisionToolCallV1,
+    },
+    ToolClose {
+        start: RequestId,
+        tool_session: RequestId,
+    },
+    /// Reads (and consumes) a relayed tool outcome.
+    ToolResult {
+        request: RequestId,
+    },
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +94,9 @@ pub(crate) struct PhysicalProductViewV1 {
     pub status: Option<PhysicalStatusV1>,
     pub delivery_pending: bool,
     pub availability: PhysicalAvailabilityV1,
+    /// The tool request just sent, or the outcome read back.
+    pub tool_request: Option<RequestId>,
+    pub tool: Option<ToolOutcomeV1>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -236,6 +263,26 @@ impl PhysicalControlServiceV1 {
             c.execute("INSERT INTO physical_remote_offers VALUES(?1,?2,?3) ON CONFLICT(peer) DO UPDATE SET session_pair=excluded.session_pair,offers_json=excluded.offers_json",rusqlite::params![m.executor.as_str(),m.session_pair,serde_json::to_string(offers)?])?;
             return Ok((None, None));
         }
+        if let PhysicalOperationV1::ToolResult { request, outcome } = &m.operation {
+            let original = self.store.semantic_message(&m.executor, request)?;
+            require(
+                matches!(
+                    original.operation,
+                    PhysicalOperationV1::ToolOpen { .. }
+                        | PhysicalOperationV1::ToolCall { .. }
+                        | PhysicalOperationV1::ToolClose { .. }
+                ) && original.requester == m.requester
+                    && original.executor == m.executor,
+                "Uncorrelated tool result",
+            )?;
+            if self.remote.tool_results.len() >= 256 {
+                self.remote.tool_results.pop_first();
+            }
+            self.remote
+                .tool_results
+                .insert(request.clone(), outcome.clone());
+            return Ok((None, None));
+        }
         if let PhysicalOperationV1::Status { start, status } = &m.operation {
             let original = self.store.semantic_message(&m.executor, start)?;
             require(
@@ -265,6 +312,14 @@ impl PhysicalControlServiceV1 {
             return Ok((None, None));
         }
         let fresh = self.store.claim_semantic(&m.requester, &m)?;
+        if matches!(
+            m.operation,
+            PhysicalOperationV1::ToolOpen { .. }
+                | PhysicalOperationV1::ToolCall { .. }
+                | PhysicalOperationV1::ToolClose { .. }
+        ) {
+            return self.receive_tool_request(&p, m, fresh);
+        }
         let mut work = None;
         let operation = match &m.operation {
             PhysicalOperationV1::Discover => {
@@ -304,7 +359,6 @@ impl PhysicalControlServiceV1 {
                     })?;
                     let binding = environment.binding.clone();
                     let adapter = environment.adapter.clone();
-                    let drive_reference = environment.drive_reference;
                     self.current_scope(&review.scope, &binding)?;
                     let snapshot = self.binding.ledger_snapshot(&binding)?;
                     let (now, _) = self.binding.now()?;
@@ -336,11 +390,7 @@ impl PhysicalControlServiceV1 {
                     self.remote
                         .executions
                         .insert(m.semantic_id.clone(), session.clone());
-                    work = Some(PhysicalWorkKindV1::Install {
-                        session,
-                        adapter,
-                        drive_reference,
-                    });
+                    work = Some(PhysicalWorkKindV1::Install { session, adapter });
                 }
                 PhysicalOperationV1::Status {
                     start: m.semantic_id.clone(),
@@ -406,6 +456,132 @@ impl PhysicalControlServiceV1 {
             operation,
         };
         Ok((Some(response), work.map(PhysicalWorkV1)))
+    }
+    /// Executor side. Tool requests must arrive over the authenticated route
+    /// that started the stream (and, for calls, opened the tool session). A
+    /// replayed request is answered without running anything again.
+    fn receive_tool_request(
+        &mut self,
+        p: &Arc<VerifiedPeerCoreIngressV1>,
+        m: PhysicalMessageV1,
+        fresh: bool,
+    ) -> AppResult<(Option<PhysicalMessageV1>, Option<PhysicalWorkV1>)> {
+        let reply_to = |outcome: ToolOutcomeV1| -> AppResult<PhysicalMessageV1> {
+            Ok(PhysicalMessageV1 {
+                protocol: PROTOCOL.into(),
+                semantic_id: request_id()?,
+                session_pair: m.session_pair.clone(),
+                requester: m.requester.clone(),
+                executor: m.executor.clone(),
+                operation: PhysicalOperationV1::ToolResult {
+                    request: m.semantic_id.clone(),
+                    outcome,
+                },
+            })
+        };
+        if !fresh {
+            let reply = reply_to(ToolOutcomeV1::Failed {
+                reason: "Duplicate tool request".into(),
+            })?;
+            return Ok((Some(reply), None));
+        }
+        let (PhysicalOperationV1::ToolOpen { start, .. }
+        | PhysicalOperationV1::ToolCall { start, .. }
+        | PhysicalOperationV1::ToolClose { start, .. }) = &m.operation
+        else {
+            unreachable!("tool operations only")
+        };
+        let located = (|| {
+            let original = self.store.semantic_message(&m.requester, start)?;
+            require(
+                matches!(original.operation, PhysicalOperationV1::Start { .. })
+                    && original.requester == m.requester
+                    && original.executor == m.executor,
+                "Tool request without its Start",
+            )?;
+            let session = self.remote.executions.get(start).cloned().ok_or_else(|| {
+                crate::error::AppError::InvalidInput("No live stream for this Start".into())
+            })?;
+            require(
+                session
+                    .root()
+                    .peer
+                    .as_ref()
+                    .is_some_and(|q| q.binding == p.binding),
+                "Tool request over another route",
+            )?;
+            Ok::<_, crate::error::AppError>(session)
+        })();
+        let session = match located {
+            Ok(s) => s,
+            Err(e) => {
+                let reply = reply_to(ToolOutcomeV1::Failed {
+                    reason: e.message().to_owned(),
+                })?;
+                return Ok((Some(reply), None));
+            }
+        };
+        match &m.operation {
+            PhysicalOperationV1::ToolOpen { caller, .. } => {
+                let outcome = match self.remote.environment.as_ref() {
+                    None => ToolOutcomeV1::Failed {
+                        reason: "No configured physical environment".into(),
+                    },
+                    Some(e) => {
+                        let lane = e.adapter.clone();
+                        match self.open_tool_session_inner(&session, lane, caller.clone()) {
+                            Ok(ts) => {
+                                let stale: Vec<RequestId> = self
+                                    .remote
+                                    .tool_routes
+                                    .keys()
+                                    .filter(|id| self.tool_session(id).is_none())
+                                    .cloned()
+                                    .collect();
+                                for id in stale {
+                                    self.remote.tool_routes.remove(&id);
+                                }
+                                self.remote
+                                    .tool_routes
+                                    .insert(ts.id().clone(), p.binding.clone());
+                                ToolOutcomeV1::Opened {
+                                    tool_session: ts.id().clone(),
+                                    tools: self.tool_names(&ts),
+                                }
+                            }
+                            Err(e) => ToolOutcomeV1::Failed {
+                                reason: e.message().to_owned(),
+                            },
+                        }
+                    }
+                };
+                Ok((Some(reply_to(outcome)?), None))
+            }
+            PhysicalOperationV1::ToolCall { tool_session, .. }
+            | PhysicalOperationV1::ToolClose { tool_session, .. } => {
+                let call = call_of(&m.operation);
+                let ts = self
+                    .tool_session(tool_session)
+                    .filter(|_| self.remote.tool_routes.get(tool_session) == Some(&p.binding));
+                match ts {
+                    Some(ts) => Ok((
+                        None,
+                        Some(PhysicalWorkV1(PhysicalWorkKindV1::Tool {
+                            tool_session: ts,
+                            call,
+                            reply: reply_to(ToolOutcomeV1::Closed)?,
+                        })),
+                    )),
+                    None => Ok((
+                        Some(reply_to(ToolOutcomeV1::Failed {
+                            reason: "Unknown tool session for this route".into(),
+                        })?),
+                        None,
+                    )),
+                }
+            }
+            _ => unreachable!("tool operations only"),
+        }
     }
     fn remote_status(&self, peer: &HostRef, start: &RequestId) -> AppResult<PhysicalStatusV1> {
         if let Some(session) = self.remote.executions.get(start) {
@@ -555,11 +731,41 @@ impl PhysicalControlServiceV1 {
             PhysicalProductRequestV1::Reconcile { start } => {
                 operation = Some(PhysicalOperationV1::Reconcile { start })
             }
+            PhysicalProductRequestV1::ToolOpen { start, caller } => {
+                operation = Some(PhysicalOperationV1::ToolOpen { start, caller })
+            }
+            PhysicalProductRequestV1::ToolCall {
+                start,
+                tool_session,
+                call,
+            } => {
+                operation = Some(PhysicalOperationV1::ToolCall {
+                    start,
+                    tool_session,
+                    call,
+                })
+            }
+            PhysicalProductRequestV1::ToolClose {
+                start,
+                tool_session,
+            } => {
+                operation = Some(PhysicalOperationV1::ToolClose {
+                    start,
+                    tool_session,
+                })
+            }
+            PhysicalProductRequestV1::ToolResult { request } => {
+                view.tool_request = Some(request.clone());
+                view.tool = self.remote.tool_results.remove(&request);
+            }
         }
         if let Some(
             PhysicalOperationV1::StatusQuery { start }
             | PhysicalOperationV1::Cancel { start }
-            | PhysicalOperationV1::Reconcile { start },
+            | PhysicalOperationV1::Reconcile { start }
+            | PhysicalOperationV1::ToolOpen { start, .. }
+            | PhysicalOperationV1::ToolCall { start, .. }
+            | PhysicalOperationV1::ToolClose { start, .. },
         ) = &operation
         {
             let original = self.store.semantic_message(&b.peer_host_ref, start)?;
@@ -584,6 +790,14 @@ impl PhysicalControlServiceV1 {
             if matches!(m.operation, PhysicalOperationV1::Start { .. }) {
                 view.start = Some(m.semantic_id.clone());
                 view.status = Some(PhysicalStatusV1::pending());
+            }
+            if matches!(
+                m.operation,
+                PhysicalOperationV1::ToolOpen { .. }
+                    | PhysicalOperationV1::ToolCall { .. }
+                    | PhysicalOperationV1::ToolClose { .. }
+            ) {
+                view.tool_request = Some(m.semantic_id.clone());
             }
         }
         Ok((view, message))
@@ -635,6 +849,8 @@ impl PhysicalControlServiceV1 {
             _ => PhysicalAvailabilityV1::Qualified,
         };
         Ok(PhysicalProductViewV1 {
+            tool_request: None,
+            tool: None,
             availability,
             offers: saved_offers
                 .unwrap_or_default()
@@ -660,132 +876,55 @@ impl PhysicalControlServiceV1 {
 use rusqlite::OptionalExtension;
 
 impl PhysicalControlServiceV1 {
+    /// Runs deferred binding I/O. Returns a reply for the transport to send
+    /// back to the requester, when the work has one.
     pub(crate) async fn perform_physical_work(
         core: &Mutex<Self>,
         work: PhysicalWorkV1,
-    ) -> AppResult<()> {
+    ) -> AppResult<Option<PhysicalMessageV1>> {
         match work.0 {
             PhysicalWorkKindV1::Cancel { session, adapter } => {
                 Self::revoke_control_session(core, &session, adapter.as_ref()).await?;
+                Ok(None)
             }
-            PhysicalWorkKindV1::Install {
-                session,
-                adapter,
-                drive_reference,
-                ..
-            } => {
+            PhysicalWorkKindV1::Install { session, adapter } => {
+                // Installation only. Decisions come from the brain through
+                // the decision-stream tools; Core proposes nothing itself.
                 Self::install_control_session(core, &session, adapter.as_ref()).await?;
-                if drive_reference {
-                    let prepared = async {
-                        let sample = {
-                            let lane = adapter.clone();
-                            tokio::task::spawn_blocking(move || lane.observe())
-                                .await
-                                .map_err(|_| {
-                                    crate::error::AppError::InvalidInput(
-                                        "Physical observation task failed".into(),
-                                    )
-                                })??
-                        };
-                        let action = {
-                            let mut service = core.lock();
-                            let i = service.local_ingress()?;
-                            service.ingest_binding_sample(
-                                &i,
-                                &session,
-                                adapter.as_ref(),
-                                sample,
-                                true,
-                            )?;
-                            service.admit_reference_action(session.clone())?
-                        };
-                        Ok::<_, crate::error::AppError>(action)
-                    }
-                    .await;
-                    let action = match prepared {
-                        Ok(action) => action,
-                        Err(error) => {
-                            let _ = Self::revoke_control_session(core, &session, adapter.as_ref())
-                                .await;
-                            return Err(error);
-                        }
-                    };
-                    Self::run_reference_action(core, &session, &action, adapter.clone()).await?;
-                    // Same Stage 5 evaluator and L7 acceptance; no transport ACK
-                    // or installation/write/stop ACK can become completion.
-                    let evaluation_deadline = {
-                        let service = core.lock();
-                        let (_, ticks) = service.clock.read()?;
-                        ticks
-                            .checked_add(
-                                session
-                                    .root()
-                                    .scope()
-                                    .fields()
-                                    .completion
-                                    .evaluation_window_us
-                                    .get(),
-                            )
-                            .ok_or_else(|| {
-                                crate::error::AppError::InvalidInput(
-                                    "Physical evaluation deadline overflow".into(),
-                                )
-                            })?
-                    };
-                    loop {
-                        if core.lock().clock.read()?.1 >= evaluation_deadline {
-                            break;
-                        }
-                        let sample = {
-                            let lane = adapter.clone();
-                            tokio::task::spawn_blocking(move || lane.observe())
-                                .await
-                                .map_err(|_| {
-                                    crate::error::AppError::InvalidInput(
-                                        "Physical observation task failed".into(),
-                                    )
-                                })??
-                        };
-                        let mut service = core.lock();
-                        let i = service.local_ingress()?;
-                        if let Some(peer) = &session.root().peer {
-                            let (now, _) = service.binding.now()?;
-                            if let Err(error) = peer.validate(
-                                &service.runtime,
-                                &peer.binding,
-                                &session.root().audit.requester,
-                                &session.root().audit.executor,
-                                now,
-                            ) {
-                                service.close_root(session.root())?;
-                                return Err(error);
-                            }
-                        }
-                        service.ingest_binding_sample(
-                            &i,
-                            &session,
-                            adapter.as_ref(),
-                            sample,
-                            false,
-                        )?;
-                        let c = service.evaluate_physical_consequence(&i, action.id())?;
-                        if c.state == crate::physical::evidence::ConsequenceStateV1::Verified {
-                            service.decide_physical_acceptance(
-                                &i,
-                                &c.root,
-                                &c.attempt,
-                                &c.action,
-                                c.revision,
-                                &c.completion_digest,
-                                false,
-                            )?;
-                            break;
-                        }
-                    }
+                Ok(None)
+            }
+            PhysicalWorkKindV1::Tool {
+                tool_session,
+                call,
+                mut reply,
+            } => {
+                let outcome = match call {
+                    Some(call) => match Self::call_tool(core, &tool_session, call).await {
+                        Ok(reply) => ToolOutcomeV1::Reply { reply },
+                        Err(e) => ToolOutcomeV1::Failed {
+                            reason: e.message().to_owned(),
+                        },
+                    },
+                    None => match Self::close_tool_session(core, &tool_session).await {
+                        Ok(_) => ToolOutcomeV1::Closed,
+                        Err(e) => ToolOutcomeV1::Failed {
+                            reason: e.message().to_owned(),
+                        },
+                    },
+                };
+                if let PhysicalOperationV1::ToolResult { outcome: o, .. } = &mut reply.operation {
+                    *o = outcome;
                 }
+                Ok(Some(reply))
             }
         }
-        Ok(())
+    }
+}
+
+fn call_of(operation: &PhysicalOperationV1) -> Option<DecisionToolCallV1> {
+    match operation {
+        PhysicalOperationV1::ToolCall { call, .. } => Some(call.clone()),
+        _ => None,
     }
 }
 

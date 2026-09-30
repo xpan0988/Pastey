@@ -8,6 +8,44 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PhysicalScopeModeV1 {
     Exact,
+    DecisionStream,
+}
+
+// The approved part of a decision-stream capability: an option subset and a
+// decision-rate ceiling (shortest interval between two admitted decisions).
+claim!(DecisionStreamScopeV1 {
+    options: Vec<LabelV1>,
+    min_decision_interval_us: PositiveMicros,
+});
+impl DecisionStreamScopeV1 {
+    pub fn validate(&self) -> AppResult<()> {
+        require(
+            !self.options.is_empty() && self.options.windows(2).all(|w| w[0] < w[1]),
+            "Approved options must be non-empty, sorted and unique",
+        )
+    }
+    pub fn allows(&self, option: &LabelV1) -> bool {
+        self.options.binary_search(option).is_ok()
+    }
+    pub(super) fn is_subset_of(&self, ceiling: &Self) -> bool {
+        self.options.iter().all(|o| ceiling.allows(o))
+            && self.min_decision_interval_us >= ceiling.min_decision_interval_us
+    }
+    pub(super) fn intersect(&self, other: &Self) -> AppResult<Self> {
+        let narrowed = Self {
+            options: self
+                .options
+                .iter()
+                .filter(|o| other.allows(o))
+                .cloned()
+                .collect(),
+            min_decision_interval_us: self
+                .min_decision_interval_us
+                .max(other.min_decision_interval_us),
+        };
+        narrowed.validate()?;
+        Ok(narrowed)
+    }
 }
 
 // Exact capability payload. Its schema (payload_schema_digest) and meaning
@@ -112,7 +150,10 @@ claim!(ExecutionBudgetV1 {
 });
 impl ExecutionBudgetV1 {
     pub fn validate(&self) -> AppResult<()> {
-        require(self.action_count == 1, "Stage 1 supports one exact action")?;
+        require(
+            self.action_count >= 1,
+            "Execution needs at least one action",
+        )?;
         require(
             self.action_duration_us <= self.total_execution_us,
             "Action duration exceeds cumulative execution budget",
@@ -139,6 +180,11 @@ impl PhysicalCapabilityProfileV1 {
     pub fn validate(&self) -> AppResult<()> {
         self.execution.validate()?;
         self.freshness.validate()?;
+        require(
+            self.capability.invocation_mode == InvocationModeV1::DecisionStream
+                || self.execution.action_count == 1,
+            "An exact capability admits one action",
+        )?;
         require(
             self.evidence_class != EvidenceClassV1::Hardware
                 || self.required_enforcement_class == SessionEnforcementClassV1::NativeFence,
@@ -292,7 +338,12 @@ claim!(ReviewScopeFieldsV1 {
     profile: PhysicalCapabilityProfileV1,
     qualification: PhysicalQualificationV1,
     mode: PhysicalScopeModeV1,
-    intent: PhysicalIntentV1,
+    /// The exact payload; present exactly in `Exact` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intent: Option<PhysicalIntentV1>,
+    /// The approved options and rate; present exactly in `DecisionStream` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream: Option<DecisionStreamScopeV1>,
     bounds: BoundSetV1,
     execution: ExecutionBudgetV1,
     freshness: PhysicalFreshnessV1,
@@ -309,15 +360,42 @@ impl ReviewScopeFieldsV1 {
         self.execution.validate()?;
         self.freshness.validate()?;
         let capability = &self.profile.capability;
-        require(
-            self.intent.capability_id == capability.capability_id,
-            "Intent capability differs from profile",
-        )?;
-        require(
-            self.bounds.is_subset_of(&capability.bounds)
-                && self.bounds.contains(&self.intent.payload),
-            "Intent/bounds exceed profile",
-        )?;
+        match (self.mode, &self.intent, &self.stream) {
+            (PhysicalScopeModeV1::Exact, Some(intent), None) => {
+                require(
+                    capability.invocation_mode == InvocationModeV1::ExactLeased
+                        && self.execution.action_count == 1,
+                    "Exact scope needs an exact one-action capability",
+                )?;
+                require(
+                    intent.capability_id == capability.capability_id,
+                    "Intent capability differs from profile",
+                )?;
+                require(
+                    self.bounds.is_subset_of(&capability.bounds)
+                        && self.bounds.contains(&intent.payload),
+                    "Intent/bounds exceed profile",
+                )?;
+            }
+            (PhysicalScopeModeV1::DecisionStream, None, Some(stream)) => {
+                stream.validate()?;
+                let declared = capability.decision_stream.as_ref().ok_or_else(|| {
+                    crate::error::AppError::InvalidInput(
+                        "Decision-stream scope needs a decision-stream capability".into(),
+                    )
+                })?;
+                require(
+                    stream.options.iter().all(|o| declared.option(o).is_some())
+                        && stream.min_decision_interval_us >= declared.min_decision_interval_us,
+                    "Approved options/rate exceed the declared capability",
+                )?;
+                require(
+                    self.bounds.is_subset_of(&capability.bounds),
+                    "Bounds exceed profile",
+                )?;
+            }
+            _ => require(false, "Scope mode and invocation fields disagree")?,
+        }
         require(
             self.execution.is_subset_of(&self.profile.execution),
             "Execution budget exceeds profile",
@@ -449,7 +527,12 @@ claim!(PhysicalActionProposalV1 {
     attempt_id: AttemptId,
     action_id: ActionId,
     decision_sequence: u64,
-    payload: PhysicalIntentV1,
+    /// The exact payload (exact mode) or the chosen option (decision stream):
+    /// exactly one is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload: Option<PhysicalIntentV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    option: Option<LabelV1>,
     payload_digest: DigestV1,
     challenge_id: ChallengeId,
     observations: Vec<ObservationId>,
@@ -458,7 +541,12 @@ claim!(PhysicalActionProposalV1 {
 impl PhysicalActionProposalV1 {
     pub fn validate(&self) -> AppResult<()> {
         require(
-            self.decision_sequence > 0 && self.payload_digest == self.payload.digest()?,
+            self.decision_sequence > 0
+                && match (&self.payload, &self.option) {
+                    (Some(payload), None) => self.payload_digest == payload.digest()?,
+                    (None, Some(_)) => true,
+                    _ => false,
+                },
             "Invalid proposal identity/digest",
         )?;
         require(
@@ -472,10 +560,23 @@ impl PhysicalActionProposalV1 {
     /// authority, observation provenance or budgets already consumed by an attempt.
     pub fn validate_scope(&self, scope: &PhysicalReviewScopeV1) -> AppResult<()> {
         self.validate()?;
+        let f = scope.fields();
+        let matches = match (f.mode, &self.option) {
+            (PhysicalScopeModeV1::Exact, None) => self.payload == f.intent,
+            (PhysicalScopeModeV1::DecisionStream, Some(option)) => {
+                f.stream.as_ref().is_some_and(|s| s.allows(option))
+                    && f.profile
+                        .capability
+                        .decision_stream
+                        .as_ref()
+                        .and_then(|d| d.option(option))
+                        .is_some_and(|o| o.payload_digest == self.payload_digest)
+            }
+            _ => false,
+        };
         require(
-            self.payload == scope.fields().intent
-                && self.requested_duration_us <= scope.fields().execution.action_duration_us,
-            "Proposal differs from exact reviewed action",
+            matches && self.requested_duration_us <= f.execution.action_duration_us,
+            "Proposal outside the reviewed action or approved options",
         )
     }
 }

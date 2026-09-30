@@ -4160,56 +4160,65 @@ async fn receive_authenticated_physical(
     };
     if let Some(work) = work {
         let state = state.clone();
+        let bridge = bridge.to_owned();
         tokio::spawn(async move {
-            if let Err(e) =
-                PhysicalControlServiceV1::perform_physical_work(&state.physical_control, work).await
+            match PhysicalControlServiceV1::perform_physical_work(&state.physical_control, work)
+                .await
             {
-                logging::write_error_line(&format!(
+                Ok(Some(reply)) => send_physical_reply(state.clone(), bridge, reply),
+                Ok(None) => {}
+                Err(e) => logging::write_error_line(&format!(
                     "Physical operation pending/unknown: {}",
                     e.message()
-                ));
+                )),
             }
             let _ = state.emit("physical-status-changed", &serde_json::json!({}));
         });
     }
     if let Some(response) = response {
-        // A new exact current Host proof is required even for the return path.
-        let state = state.clone();
-        let bridge = bridge.to_owned();
-        tokio::spawn(async move {
-            let result = async {
-                let current = state
-                    .resolve_current_remote_host_session(&bridge, &response.requester)
-                    .await?;
-                if current.binding().session_pair_ref != response.session_pair {
-                    return Err(AppError::InvalidInput(
-                        "Physical response route replaced".into(),
-                    ));
-                }
-                let context = room_control_session_context_for_peer(
-                    &state,
-                    &bridge,
-                    &current.binding().peer_route_ref,
-                )?;
-                let event = physical_event(&response, &context)?;
-                send_room_control_event(
-                    state,
-                    &bridge,
-                    event,
-                    Some(selected_peer_route(&bridge, &context.peer_route_ref)),
-                )
-                .await?;
-                Ok::<_, AppError>(())
-            }
-            .await;
-            if result.is_err() {
-                logging::write_error_line(
-                    "Physical semantic reply delivery uncertain; status query required",
-                );
-            }
-        });
+        send_physical_reply(state.clone(), bridge.to_owned(), response);
     }
     Ok(())
+}
+/// Sends one physical reply. A new exact current Host proof is required even
+/// for the return path; a replaced route drops the reply (status query repairs).
+fn send_physical_reply(
+    state: Arc<AppState>,
+    bridge: String,
+    response: crate::physical::protocol::PhysicalMessageV1,
+) {
+    tokio::spawn(async move {
+        let result = async {
+            let current = state
+                .resolve_current_remote_host_session(&bridge, &response.requester)
+                .await?;
+            if current.binding().session_pair_ref != response.session_pair {
+                return Err(AppError::InvalidInput(
+                    "Physical response route replaced".into(),
+                ));
+            }
+            let context = room_control_session_context_for_peer(
+                &state,
+                &bridge,
+                &current.binding().peer_route_ref,
+            )?;
+            let event = physical_event(&response, &context)?;
+            send_room_control_event(
+                state,
+                &bridge,
+                event,
+                Some(selected_peer_route(&bridge, &context.peer_route_ref)),
+            )
+            .await?;
+            Ok::<_, AppError>(())
+        }
+        .await;
+        if result.is_err() {
+            logging::write_error_line(
+                "Physical semantic reply delivery uncertain; status query required",
+            );
+        }
+    });
 }
 
 #[cfg(test)]

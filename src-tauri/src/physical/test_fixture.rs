@@ -216,6 +216,46 @@ pub(in crate::physical) fn setpoint_descriptor(
         start_predicate: empty_contract(START_PREDICATE)?,
         loss_profile: hold_zero_loss()?,
         completion_predicate: completion.contract()?,
+        decision_stream: None,
+    };
+    descriptor.validate()?;
+    Ok(descriptor)
+}
+
+/// The same body as a decision stream: named options, each a fixed payload
+/// held here (Core gets only names and digests), and a decision-rate floor.
+pub(in crate::physical) const STREAM_OPTIONS: [&str; 5] =
+    ["forward", "sprint", "stop", "turn_left", "turn_right"];
+pub(in crate::physical) fn option_digest(name: &str) -> AppResult<DigestV1> {
+    digest("test-stream-option-v1", &name)
+}
+pub(in crate::physical) fn stream_descriptor(
+    conflict_domains: Vec<DomainId>,
+    completion: &ReachedHeldV1,
+    min_decision_interval_us: u64,
+) -> AppResult<CapabilityDescriptorV1> {
+    let options = STREAM_OPTIONS
+        .iter()
+        .map(|name| {
+            Ok(DecisionOptionV1 {
+                name: LabelV1::try_from(name.to_string())?,
+                payload_digest: option_digest(name)?,
+            })
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    let descriptor = CapabilityDescriptorV1 {
+        capability_id: id("test.setpoint-stream/v1"),
+        payload_schema_digest: schema_digest(SETPOINT_SCHEMA)?,
+        invocation_mode: InvocationModeV1::DecisionStream,
+        conflict_domains,
+        bounds: setpoint_bounds(0.1, 0.1, 0.2)?,
+        start_predicate: empty_contract(START_PREDICATE)?,
+        loss_profile: hold_zero_loss()?,
+        completion_predicate: completion.contract()?,
+        decision_stream: Some(DecisionStreamDescriptorV1 {
+            options,
+            min_decision_interval_us: PositiveMicros::try_from(min_decision_interval_us)?,
+        }),
     };
     descriptor.validate()?;
     Ok(descriptor)
@@ -235,6 +275,20 @@ fn setpoint_dimensions(bounds: &BoundSetV1) -> bool {
 /// payload schema and the completion parameters are valid for the window.
 pub(in crate::physical) fn validate_scope(fields: &ReviewScopeFieldsV1) -> AppResult<()> {
     let capability = &fields.profile.capability;
+    if fields.mode == PhysicalScopeModeV1::DecisionStream {
+        let completion: ReachedHeldV1 = capability.completion_predicate.params.decode()?;
+        let declared = capability.decision_stream.as_ref().ok_or_else(|| {
+            crate::error::AppError::InvalidInput("Not the test stream capability".into())
+        })?;
+        let expected = stream_descriptor(
+            capability.conflict_domains.clone(),
+            &completion,
+            declared.min_decision_interval_us.get(),
+        )?;
+        require(*capability == expected, "Not the test stream capability")?;
+        ReachedHeldV1::from_contract(&fields.completion)?;
+        return Ok(());
+    }
     require(
         setpoint_dimensions(&capability.bounds),
         "Setpoint bounds must be per-channel ceilings in fixed mode",
@@ -246,7 +300,9 @@ pub(in crate::physical) fn validate_scope(fields: &ReviewScopeFieldsV1) -> AppRe
         &completion,
     )?;
     require(*capability == expected, "Not the test setpoint capability")?;
-    SetpointV1::from_intent(&fields.intent)?;
+    SetpointV1::from_intent(fields.intent.as_ref().ok_or_else(|| {
+        crate::error::AppError::InvalidInput("Setpoint scope needs an exact intent".into())
+    })?)?;
     ReachedHeldV1::from_contract(&fields.completion)?;
     Ok(())
 }

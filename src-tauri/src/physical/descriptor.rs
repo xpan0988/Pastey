@@ -18,6 +18,7 @@ const MAX_ARRAY_ITEMS: usize = 16;
 const MAX_TEXT_BYTES: usize = 256;
 const MAX_BOUNDS: usize = 32;
 const MAX_POINTER_SEGMENTS: usize = 8;
+const MAX_DECISION_OPTIONS: usize = 32;
 const MAX_ENUM_VALUES: usize = 32;
 const MAX_CONFLICT_DOMAINS: usize = 16;
 // Largest magnitude at which every integer is exactly representable as f64.
@@ -555,6 +556,45 @@ impl ContractRefV1 {
 pub(crate) enum InvocationModeV1 {
     /// One exact reviewed payload, applied under a Core lease with refresh.
     ExactLeased,
+    /// A finite stream of decisions among named options, each a fixed payload
+    /// held by the binding. Core admits every decision and sees only option
+    /// names and payload digests.
+    DecisionStream,
+}
+
+// One named option of a decision stream. The payload stays with the binding;
+// Core compares names and digests only.
+claim!(DecisionOptionV1 {
+    name: LabelV1,
+    payload_digest: DigestV1,
+});
+impl DecisionOptionV1 {
+    pub fn validate(&self) -> AppResult<()> {
+        Ok(())
+    }
+}
+
+// The options a decision-stream capability offers, and the shortest interval
+// between two decisions the binding supports.
+claim!(DecisionStreamDescriptorV1 {
+    options: Vec<DecisionOptionV1>,
+    min_decision_interval_us: PositiveMicros,
+});
+impl DecisionStreamDescriptorV1 {
+    pub fn validate(&self) -> AppResult<()> {
+        require(
+            !self.options.is_empty()
+                && self.options.len() <= MAX_DECISION_OPTIONS
+                && self.options.windows(2).all(|w| w[0].name < w[1].name),
+            "Decision options must be non-empty, bounded, sorted and unique",
+        )
+    }
+    pub fn option(&self, name: &LabelV1) -> Option<&DecisionOptionV1> {
+        self.options
+            .binary_search_by(|o| o.name.cmp(name))
+            .ok()
+            .map(|i| &self.options[i])
+    }
 }
 
 // A capability as data. Constructed by the environment binding; Core holds no
@@ -569,6 +609,9 @@ claim!(CapabilityDescriptorV1 {
     start_predicate: ContractRefV1,
     loss_profile: ContractRefV1,
     completion_predicate: ContractRefV1,
+    /// Present exactly for `DecisionStream`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision_stream: Option<DecisionStreamDescriptorV1>,
 });
 impl CapabilityDescriptorV1 {
     pub fn validate(&self) -> AppResult<()> {
@@ -577,6 +620,11 @@ impl CapabilityDescriptorV1 {
                 && self.conflict_domains.len() <= MAX_CONFLICT_DOMAINS
                 && self.conflict_domains.windows(2).all(|w| w[0] < w[1]),
             "Conflict domains must be non-empty, bounded, sorted and unique",
+        )?;
+        require(
+            (self.invocation_mode == InvocationModeV1::DecisionStream)
+                == self.decision_stream.is_some(),
+            "Decision options are declared exactly for decision streams",
         )
     }
 }

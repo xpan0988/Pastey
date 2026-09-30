@@ -156,7 +156,7 @@ fn proposal() -> PhysicalActionProposalV1 {
     decode(
         json!({"version": 2, "attemptId": id("physical-attempt"), "actionId": id("physical-action"),
         "decisionSequence": 1, "payload": s.fields().intent,
-        "payloadDigest": s.fields().intent.digest().unwrap(), "challengeId": id("physical-challenge"),
+        "payloadDigest": s.fields().intent.as_ref().unwrap().digest().unwrap(), "challengeId": id("physical-challenge"),
         "observations": [id("physical-observation")], "requestedDurationUs": 1000000}),
     )
 }
@@ -292,7 +292,7 @@ fn scope_hash_binds_effects_target_budgets_and_completion() {
     s.principal = label("other");
     changes.push(s);
     let mut s = scope_fields();
-    s.intent = setpoint_intent(-0.05, 0.0, 0.0);
+    s.intent = Some(setpoint_intent(-0.05, 0.0, 0.0));
     changes.push(s);
     let mut s = scope_fields();
     s.execution.action_duration_us = micros(900000);
@@ -417,7 +417,7 @@ fn scope_cannot_widen_profile_or_substitute_target() {
     s.bounds = with_abs_max(&s.bounds, "/a", 0.2);
     changes.push(s);
     let mut s = scope_fields();
-    s.intent = setpoint_intent(0.2, 0.0, 0.0);
+    s.intent = Some(setpoint_intent(0.2, 0.0, 0.0));
     changes.push(s);
     for fields in changes {
         assert!(PhysicalReviewScopeV1::try_from(fields).is_err());
@@ -494,9 +494,9 @@ fn proposal_matches_exact_action_but_does_not_admit_it() {
     p.requested_duration_us = micros(1000001);
     assert!(p.validate_scope(&s).is_err());
     p.requested_duration_us = micros(1000000);
-    p.payload = setpoint_intent(-0.05, 0.0, 0.0);
+    p.payload = Some(setpoint_intent(-0.05, 0.0, 0.0));
     assert!(p.validate().is_err());
-    p.payload_digest = p.payload.digest().unwrap();
+    p.payload_digest = p.payload.as_ref().unwrap().digest().unwrap();
     p.validate().unwrap();
     assert!(p.validate_scope(&s).is_err());
     p.observations.clear();
@@ -586,6 +586,107 @@ fn malformed_completion_and_required_contracts_are_rejected() {
         PhysicalReviewScopeV1::try_from(s.clone()).unwrap();
         assert!(fx::validate_scope(&s).is_err(), "{key}");
     }
+}
+
+/// The fixture's decision-stream scope: options forward/stop/turn_left/
+/// turn_right of the declared five, 200 ms rate, up to three actions.
+fn stream_fields() -> ReviewScopeFieldsV1 {
+    let mut s = scope_fields();
+    let completion: fx::ReachedHeldV1 = s
+        .profile
+        .capability
+        .completion_predicate
+        .params
+        .decode()
+        .unwrap();
+    s.profile.capability = fx::stream_descriptor(
+        s.profile.capability.conflict_domains.clone(),
+        &completion,
+        200_000,
+    )
+    .unwrap();
+    s.profile.execution.action_count = 3;
+    s.qualification = qualification(&s.profile, &s.environment);
+    s.mode = PhysicalScopeModeV1::DecisionStream;
+    s.intent = None;
+    s.stream = Some(DecisionStreamScopeV1 {
+        options: ["forward", "stop", "turn_left", "turn_right"]
+            .iter()
+            .map(|o| label(o))
+            .collect(),
+        min_decision_interval_us: micros(200_000),
+    });
+    s.bounds = s.profile.capability.bounds.clone();
+    s.execution = s.profile.execution.clone();
+    s
+}
+
+#[test]
+fn decision_stream_scopes_stay_inside_the_declared_capability() {
+    PhysicalReviewScopeV1::try_from(stream_fields()).unwrap();
+    let cases: Vec<(&str, Box<dyn Fn(&mut ReviewScopeFieldsV1)>)> = vec![
+        (
+            "undeclared option",
+            Box::new(|s| s.stream.as_mut().unwrap().options.push(label("teleport"))),
+        ),
+        (
+            "unsorted options",
+            Box::new(|s| s.stream.as_mut().unwrap().options.reverse()),
+        ),
+        (
+            "faster than declared",
+            Box::new(|s| s.stream.as_mut().unwrap().min_decision_interval_us = micros(100_000)),
+        ),
+        (
+            "stream mode with an exact intent",
+            Box::new(|s| s.intent = Some(setpoint_intent(0.05, 0.0, 0.0))),
+        ),
+        (
+            "exact mode with stream fields",
+            Box::new(|s| s.mode = PhysicalScopeModeV1::Exact),
+        ),
+        (
+            "more actions than the profile",
+            Box::new(|s| s.execution.action_count = 4),
+        ),
+    ];
+    for (case, edit) in cases {
+        let mut s = stream_fields();
+        edit(&mut s);
+        assert!(PhysicalReviewScopeV1::try_from(s).is_err(), "{case}");
+    }
+    // An exact capability still admits exactly one action.
+    let mut s = scope_fields();
+    s.profile.execution.action_count = 2;
+    assert!(s.profile.validate().is_err());
+    // An exact scope cannot sit on a decision-stream capability.
+    let mut s = stream_fields();
+    s.mode = PhysicalScopeModeV1::Exact;
+    s.stream = None;
+    s.intent = Some(setpoint_intent(0.05, 0.0, 0.0));
+    assert!(PhysicalReviewScopeV1::try_from(s).is_err());
+}
+
+#[test]
+fn decision_stream_narrowing_only_drops_options_and_slows_the_rate() {
+    let reviewed = PhysicalReviewScopeV1::try_from(stream_fields()).unwrap();
+    let narrowed = |edit: &dyn Fn(&mut DecisionStreamScopeV1)| {
+        let mut s = stream_fields();
+        edit(s.stream.as_mut().unwrap());
+        PhysicalReviewScopeV1::try_from(s).unwrap()
+    };
+    let fewer = narrowed(&|d| d.options.retain(|o| o.as_str() != "turn_left"));
+    let slower = narrowed(&|d| d.min_decision_interval_us = micros(400_000));
+    super::core::test_support::narrow(&reviewed, &fewer).unwrap();
+    super::core::test_support::narrow(&reviewed, &slower).unwrap();
+    // Widening back is refused.
+    assert!(super::core::test_support::narrow(&fewer, &reviewed).is_err());
+    assert!(super::core::test_support::narrow(&slower, &reviewed).is_err());
+    // Policy intersection keeps the common options and the slower rate.
+    let both = super::core::test_support::intersect_scope(&fewer, &slower).unwrap();
+    let stream = both.fields().stream.clone().unwrap();
+    assert!(!stream.allows(&label("turn_left")));
+    assert_eq!(stream.min_decision_interval_us, micros(400_000));
 }
 
 #[test]

@@ -27,11 +27,12 @@ fn dispense_profile(p: &mut PhysicalCapabilityProfileV1) {
         start_predicate: contract("test.nozzle-primed/v1"),
         loss_profile: contract("test.valve-closed/v1"),
         completion_predicate: contract("test.volume-dispensed/v1"),
+        decision_stream: None,
     };
 }
 fn dispense_fields(f: &mut ReviewScopeFieldsV1) {
     let c = &f.profile.capability;
-    f.intent = dispense_intent(5.0);
+    f.intent = Some(dispense_intent(5.0));
     f.bounds = c.bounds.clone();
     f.loss = c.loss_profile.clone();
     f.completion.predicate = c.completion_predicate.clone();
@@ -48,7 +49,16 @@ fn with_bounds(
 #[tokio::test]
 async fn non_motion_capability_reviews_grants_and_admits_through_generic_core() {
     let f = ControlFixture::build(binding(), dispense_profile, dispense_fields);
-    assert_eq!(f.scope.fields().intent.capability_id.as_str(), DISPENSE);
+    assert_eq!(
+        f.scope
+            .fields()
+            .intent
+            .as_ref()
+            .unwrap()
+            .capability_id
+            .as_str(),
+        DISPENSE
+    );
     let (root, _) = f.root_basis();
 
     // Narrowing to a volume interval that still contains the exact intent.
@@ -67,7 +77,7 @@ async fn non_motion_capability_reviews_grants_and_admits_through_generic_core() 
     assert_eq!(basis.scope(), &narrowed);
     // A different non-motion payload is a material change, not a narrowing.
     let mut substituted = narrowed.fields().clone();
-    substituted.intent = dispense_intent(3.0);
+    substituted.intent = Some(dispense_intent(3.0));
     let substituted = PhysicalReviewScopeV1::try_from(substituted).unwrap();
     assert!(f
         .core
@@ -80,7 +90,7 @@ async fn non_motion_capability_reviews_grants_and_admits_through_generic_core() 
         .await
         .unwrap();
     let (g, p) = f.challenged(&s);
-    assert_eq!(p.payload, dispense_intent(5.0));
+    assert_eq!(p.payload, Some(dispense_intent(5.0)));
     let a = f.admit(&g, p);
     assert_eq!(
         lane::status(&f.core.lock(), &a),
@@ -94,8 +104,8 @@ async fn non_motion_proposal_outside_exact_intent_is_not_admitted() {
     let s = f.active().await;
     let (g, mut p) = f.challenged(&s);
     // In-bounds but not the reviewed exact payload.
-    p.payload = dispense_intent(4.0);
-    p.payload_digest = p.payload.digest().unwrap();
+    p.payload = Some(dispense_intent(4.0));
+    p.payload_digest = p.payload.as_ref().unwrap().digest().unwrap();
     assert!(!matches!(
         f.core.lock().admit_physical_proposal(&g, p),
         Ok(AdmissionOutcomeV1::Admitted(_))

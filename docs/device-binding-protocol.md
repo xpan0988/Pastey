@@ -24,7 +24,10 @@ Defined in `src-tauri/src/physical/control.rs`. Core calls a binding; a binding 
 | `install_session(view)` | Session enforcement evidence for exactly the view's session, epochs and request | Activates the session only if the class meets the reviewed minimum. `NativeFence` evidence is refused: no receipt verifier exists |
 | `apply(view)` / `refresh(view)` | Write receipt for exactly the view's session, epochs, request, action and payload digest | Records `accepted`/`refused`; anything else, a mismatch or a missing reply is unknown and closes the root |
 | `fence(view)` | Fence evidence for exactly the stored fence request | Records the fence acknowledgment only; the consequence stays unknown until a witness decides |
-| `observe()` | One control observation for the installed session, plus sealed observations and dispositions produced since the previous sample | Checks source/body/world incarnations, capture order, age, gap and identity replay; evidence lineage must match the stored action |
+| `evaluate_start(predicate)` | `Ok` only if the device is in the capability's start state; read-only | Runs before installation; a rejection means the session never starts |
+| `observe()` | One control observation for the installed session, sealed observations and dispositions produced since the previous sample, and an opaque view for a brain | Checks source/body/world incarnations, capture order, age, gap and identity replay; evidence lineage must match the stored action. The view is passed to the brain untouched |
+
+A decision-stream capability declares its options in the descriptor: each option is a name plus the digest of a fixed payload the binding holds, together with the shortest interval between decisions the binding supports. Core admits a decision by option name and digest; the apply view carries the option name and digest, and the binding must verify the digest against its payload before writing.
 
 Views carry a validity handle (Core flags, clock and deadline). A binding SHOULD check it immediately before any native write and MUST NOT write once it no longer allows.
 
@@ -107,7 +110,12 @@ The requirements above were exercised by the robotd task-authority overlay tests
 
 The Python process tests covered the same properties against a running daemon: install/consume/refresh, delayed ACK and replay after fence, expiry without Pastey, missing refresh, lease expiry without an action, disconnect/partial fence/reconnect, controller restart and invalid owned commands.
 
-## 6. Open points
+## 6. Decision streams
+
+A brain reaches a stream only through the executor's tool dispatcher: one tool per approved option, `observe` and `remaining_budget`. Every decision is a new proposal: a fresh sample, a fresh challenge, then admission (option approved and declared, digest, rate, per-action duration, cumulative count and time), then one write. Admitting a decision fences the previous one: its validity closes first, then one ledger transaction closes it and admits the next. A tool result is only allowed (with the binding's native disposition) or refused (with a reason); it never reports a physical consequence. Every proposal is recorded with its caller, allowed or refused.
+
+The stream ends when the witness verifies the completion contract (Core accepts and fences), when the budget is spent, or when authority closes: closing the tool session, losing the bridge route (indistinguishable on the executor from a crashed brain), losing the binding, or revocation. After a close the outcome is uncertain unless already verified, and nothing resumes.
+
+## 7. Open points
 
 - **NativeFence.** No binding can supply a verifiable native receipt, so `NativeFence` installation, command and fence evidence fail closed. A future receipt format needs a binding-supplied verifier whose checks Core can replay from the ledger.
-- **Start predicate.** A binding's start predicate (the state the device must be in before a session) has no trait method yet. The retired MicroDuck path checked it inside its own qualification.

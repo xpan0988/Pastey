@@ -244,7 +244,7 @@ impl PhysicalStoreV1 {
         }
         let action: Option<(String, String)> = c
             .query_row(
-                "SELECT action_id,disposition FROM physical_actions WHERE root_id=?1",
+                "SELECT action_id,disposition FROM physical_actions WHERE root_id=?1 ORDER BY decision_sequence DESC LIMIT 1",
                 [text(root)],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -367,6 +367,10 @@ pub(super) fn stage9_ddl() -> String {
     stage8_ddl() + super::qualification_ledger::SCHEMA
 }
 
-pub(super) fn current_ddl() -> String {
+pub(super) fn stage9_full_ddl() -> String {
     stage9_ddl() + super::evidence_ledger::HANDOVER_VERDICT_SCHEMA
+}
+
+pub(super) fn current_ddl() -> String {
+    super::control_ledger::stage10(&stage9_full_ddl())
 }

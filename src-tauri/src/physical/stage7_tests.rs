@@ -59,7 +59,6 @@ impl Pair {
                     ProductEnvironmentV1 {
                         binding: b.live.clone(),
                         adapter: Arc::new(FakeLane::new(vec![])),
-                        drive_reference: false,
                     },
                 )
                 .unwrap();
@@ -385,7 +384,7 @@ async fn remote_action_result_l7_reconciliation_and_lost_reply_have_local_parity
         let mut core = p.b.core.lock();
         core.record_control_observation(&s, lane::observation(&s, 0, 0))
             .unwrap();
-        core.admit_reference_action(s.clone()).unwrap()
+        lane::admit_exact(&mut core, &s)
     };
     PhysicalControlServiceV1::dispatch_admitted_action(&p.b.core, &action, &FakeLane::new(vec![]))
         .await
@@ -605,7 +604,6 @@ async fn lost_install_ack_cannot_retry_install_or_create_another_session() {
             ProductEnvironmentV1 {
                 binding: p.b.live.clone(),
                 adapter: Arc::new(FakeLane::new(vec![Reply::Lost])),
-                drive_reference: false,
             },
         )
         .unwrap();
@@ -633,7 +631,7 @@ async fn lost_action_ack_and_lost_result_keep_one_dispatch_and_reserved_budget()
         let mut core = p.b.core.lock();
         core.record_control_observation(&s, lane::observation(&s, 0, 0))
             .unwrap();
-        core.admit_reference_action(s.clone()).unwrap()
+        lane::admit_exact(&mut core, &s)
     };
     assert!(PhysicalControlServiceV1::dispatch_admitted_action(
         &p.b.core,
@@ -724,60 +722,18 @@ async fn exact_stage7_migration_preserves_remote_lineage_and_consumed_budget() {
 }
 
 #[tokio::test]
-async fn described_binding_loss_mid_action_fences_once_and_never_accepts() {
-    // Core's production path: enrollment, resolution and qualification come from
-    // the binding's describe(); Core then drives the one reference action from
-    // its samples. The binding is lost at the fifth sample.
-    let (b, described) = ControlFixture::described(witnesses(), |p| {
-        p.execution.action_duration_us = micros(500_000);
-        p.execution.total_execution_us = micros(500_000);
-    });
-    described.fail_after.store(4, Ordering::SeqCst);
-    let mut p = Pair::with_executor(b.unwrap());
-    let m = p.approve();
-    let (reply, work) = p.deliver_b(m.clone()).unwrap();
-    p.deliver_a(reply.unwrap());
-    assert!(
-        PhysicalControlServiceV1::perform_physical_work(&p.b.core, work.unwrap())
-            .await
-            .is_err()
-    );
-    assert_eq!(described.samples.load(Ordering::SeqCst), 5);
-    // One admission and one dispatch; the three later writes refreshed it.
-    assert_eq!(p.b.scalar("SELECT count(*) FROM physical_actions"), 1);
-    assert_eq!(
-        p.b.scalar("SELECT sum(dispatch_intent) FROM physical_actions"),
-        1
-    );
-    assert_eq!(
-        p.b.scalar("SELECT refresh_sequence FROM physical_actions"),
-        3
-    );
-    assert_eq!(
-        p.b.scalar("SELECT consumed_us FROM physical_control_budgets"),
-        500_000
-    );
-    // Loss requested the stop; the stop ACK is not a consequence.
-    assert_eq!(
-        p.b.scalar(
-            "SELECT count(*) FROM physical_sessions WHERE fence_ack='adapter_isolation_only'"
-        ),
-        1
-    );
-    let status = p.query(&m.semantic_id);
-    assert_eq!(status.authority, PhysicalAuthorityStateV1::Closed);
-    assert_ne!(status.acceptance, AcceptanceStateV1::Accepted);
-    assert_ne!(status.consequence, ConsequenceStateV1::Verified);
-    // Nothing continues after the loss: a redelivered Start creates no work.
-    assert!(p.deliver_b(m).unwrap().1.is_none());
-    p.assert_single(1);
-}
-
-#[tokio::test]
 async fn described_binding_needs_its_own_fingerprints_liveness_and_registered_witnesses() {
     // A binding whose witnesses this Core was not started with cannot qualify.
     let (b, _) = ControlFixture::described(Default::default(), |_| {});
     assert!(b.is_err());
+    // Duration and freshness ceilings are the qualified profile's data, not
+    // Core constants: a 2 s action with 1 s freshness qualifies.
+    let (b, _) = ControlFixture::described(witnesses(), |p| {
+        p.execution.action_duration_us = micros(2_000_000);
+        p.execution.total_execution_us = micros(2_000_000);
+        p.freshness.observation.max_age_us = micros(1_000_000);
+    });
+    assert!(b.is_ok());
     let (b, described) = ControlFixture::described(witnesses(), |_| {});
     let b = b.unwrap();
     let lane: Arc<dyn crate::physical::core::EnvironmentBinding> = described.clone();
@@ -812,3 +768,6 @@ async fn described_binding_needs_its_own_fingerprints_liveness_and_registered_wi
     described.live.store(false, Ordering::SeqCst);
     assert!(core.draft_review(&i, &b.live, b.scope.clone()).is_err());
 }
+
+#[path = "stream_tests.rs"]
+mod stream;

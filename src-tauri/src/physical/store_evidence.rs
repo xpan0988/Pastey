@@ -532,13 +532,6 @@ impl PhysicalStoreV1 {
         tx.commit()?;
         Ok(state)
     }
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
-        )
-    )]
     pub(in crate::physical) fn acceptance(&self, id: &RootId) -> AppResult<AcceptanceStateV1> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;

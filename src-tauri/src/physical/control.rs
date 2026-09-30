@@ -1,9 +1,12 @@
 //! Core's L2-L6 implementation. Binding I/O is split into prepare/await/commit.
 //! Binding acknowledgments remain separate from physical evidence and acceptance.
+#[path = "decision_tools.rs"]
+mod decision_tools;
 use super::*;
 use crate::physical::binding::{BindingDescriptionV1, EnvironmentBindingViewV1};
 use crate::physical::evidence::{TrustedDispositionV1, TrustedObservationV1, WitnessRegistryV1};
 use crate::physical::store::{ActionAuditV1, FenceAuditV1, SessionAuditV1};
+pub(crate) use decision_tools::*;
 use parking_lot::Mutex;
 use std::{future::Future, pin::Pin, sync::atomic::AtomicU64};
 
@@ -16,6 +19,15 @@ pub(super) struct ControlStateV1 {
     observations: BTreeMap<SessionId, ObservationValidityV1>,
     observation_ids: BTreeSet<ObservationId>,
     operations: BTreeMap<SessionId, RequestId>,
+    cursors: BTreeMap<GrantId, DecisionCursorV1>,
+    tool_sessions: BTreeMap<RequestId, Arc<ToolSessionV1>>,
+}
+/// Process-local position in a grant's decision sequence. Exact grants admit
+/// sequence 1 only; a decision stream advances it on every admission.
+struct DecisionCursorV1 {
+    sequence: u64,
+    action: ActionId,
+    last_admitted: Option<u64>,
 }
 impl ControlStateV1 {
     pub(super) fn invalidate_root(&mut self, id: &RootId) {
@@ -67,9 +79,8 @@ impl BodyControlSessionV1 {
 pub(in crate::physical) struct BodyActionGrantV1 {
     id: GrantId,
     session: Arc<BodyControlSessionV1>,
-    action: ActionId,
-    sequence: u64,
-    payload_digest: DigestV1,
+    /// Exact mode only: the one reviewed payload's digest.
+    payload_digest: Option<DigestV1>,
     completion_digest: DigestV1,
     loss_digest: DigestV1,
     valid: Arc<AtomicBool>,
@@ -169,7 +180,10 @@ pub(in crate::physical) struct AdmittedActionReadViewV1 {
     epochs: BTreeMap<DomainId, u64>,
     request: RequestId,
     action: ActionId,
-    payload: PhysicalIntentV1,
+    /// Exact mode: the reviewed payload. Stream: the chosen option, whose
+    /// payload the binding holds and checks against `payload_digest`.
+    payload: Option<PhysicalIntentV1>,
+    option: Option<LabelV1>,
     lineage: crate::physical::evidence::EvidenceLineageV1,
     binding: EnvironmentBindingViewV1,
     payload_digest: DigestV1,
@@ -203,8 +217,10 @@ pub(in crate::physical) struct AdapterWriteReceiptV1 {
     accepted: bool,
 }
 /// One executor-local binding sample: the control observation for the
-/// installed session and sealed evidence produced since the previous sample.
+/// installed session, sealed evidence produced since the previous sample, and
+/// the binding's own read-only view for a brain (opaque to Core).
 pub(in crate::physical) struct BindingSampleV1 {
+    pub(in crate::physical) view: CanonicalJsonV1,
     pub(in crate::physical) control: TrustedControlObservationV1,
     pub(in crate::physical) observations: Vec<TrustedObservationV1>,
     pub(in crate::physical) dispositions: Vec<TrustedDispositionV1>,
@@ -235,9 +251,15 @@ pub(in crate::physical) trait EnvironmentBinding: Send + Sync {
     fn witnesses(&self) -> WitnessRegistryV1;
     /// Reject-only scope schema check (`ScopeSchemaCheckV1`).
     fn validate_scope(&self, scope: &ReviewScopeFieldsV1) -> AppResult<()>;
+    /// Read-only evaluation of the capability's start predicate against the
+    /// device's current state. A rejection means the session cannot start.
+    fn evaluate_start(&self, predicate: &ContractRefV1) -> AppResult<()>;
 }
 fn request_id() -> AppResult<RequestId> {
     RequestId::try_from(format!("physical-request:v1:{}", uuid::Uuid::new_v4()))
+}
+fn new_action_id() -> AppResult<ActionId> {
+    ActionId::try_from(format!("physical-action:v1:{}", uuid::Uuid::new_v4()))
 }
 fn checked_deadline(ticks: u64, duration: u64) -> AppResult<u64> {
     ticks
@@ -406,7 +428,13 @@ impl PhysicalControlServiceV1 {
         adapter: &dyn EnvironmentBinding,
     ) -> AppResult<()> {
         let view = { core.lock().prepare_install(s)? }; // guard and all transactions end here
-        let evidence = adapter.install_session(view).await;
+                                                        // The start predicate is read-only and runs before any native write.
+        let start =
+            adapter.evaluate_start(&s.basis.scope().fields().profile.capability.start_predicate);
+        let evidence = match start {
+            Ok(()) => adapter.install_session(view).await,
+            Err(e) => Err(e),
+        };
         let mut service = core.lock();
         service.control.operations.remove(s.id());
         let mut result = (|| {
@@ -461,14 +489,20 @@ impl PhysicalControlServiceV1 {
         let f = s.basis.scope().fields();
         let g = Arc::new(BodyActionGrantV1 {
             id: GrantId::try_from(format!("physical-grant:v1:{}", uuid::Uuid::new_v4()))?,
-            action: ActionId::try_from(format!("physical-action:v1:{}", uuid::Uuid::new_v4()))?,
-            sequence: 1,
-            payload_digest: f.intent.digest()?,
+            payload_digest: f.intent.as_ref().map(|i| i.digest()).transpose()?,
             completion_digest: digest("pastey-physical-completion-v1", &f.completion)?,
             loss_digest: digest("pastey-physical-loss-v1", &f.loss)?,
             session: s,
             valid: Arc::new(AtomicBool::new(true)),
         });
+        self.control.cursors.insert(
+            g.id.clone(),
+            DecisionCursorV1 {
+                sequence: 1,
+                action: new_action_id()?,
+                last_admitted: None,
+            },
+        );
         self.control
             .grants
             .insert(g.session.id().clone(), g.clone());
@@ -530,17 +564,23 @@ impl PhysicalControlServiceV1 {
         }
         // A fresh fact may maintain an already live action only before its old
         // continuing deadline. It never resurrects one or adds any budget.
+        let stream = f.mode == PhysicalScopeModeV1::DecisionStream;
         for a in self.control.actions.values() {
-            if a.audit.session == s.audit.id {
-                require(
-                    a.valid.load(Ordering::Acquire)
-                        && ticks < a.deadline
-                        && ticks < a.continuing_deadline.load(Ordering::Acquire),
-                    "Observation cannot revive expired action",
-                )?;
-                a.continuing_deadline
-                    .store(deadline.min(a.deadline), Ordering::Release);
+            if a.audit.session != s.audit.id {
+                continue;
             }
+            let live = a.valid.load(Ordering::Acquire)
+                && ticks < a.deadline
+                && ticks < a.continuing_deadline.load(Ordering::Acquire);
+            if stream && !live {
+                // A superseded or finished decision is over; the device
+                // stopped it at its own deadline. It is never revived.
+                a.valid.store(false, Ordering::Release);
+                continue;
+            }
+            require(live, "Observation cannot revive expired action")?;
+            a.continuing_deadline
+                .store(deadline.min(a.deadline), Ordering::Release);
         }
         self.control.observation_ids.insert(fact.id.clone());
         self.control.observations.insert(
@@ -558,8 +598,11 @@ impl PhysicalControlServiceV1 {
         g: &BodyActionGrantV1,
     ) -> AppResult<ChallengeId> {
         self.validate_control_grant(g)?;
+        // An exact grant gets one challenge. A stream needs a fresh one per
+        // decision; admission consumes it and an unused one may be replaced.
         require(
-            !self.control.challenges.contains_key(&g.id),
+            g.session.basis.scope().fields().mode == PhysicalScopeModeV1::DecisionStream
+                || !self.control.challenges.contains_key(&g.id),
             "Challenge cannot be renewed",
         )?;
         let (_, ticks) = self.binding.now()?;
@@ -588,31 +631,111 @@ impl PhysicalControlServiceV1 {
         );
         Ok(id)
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "exact scopes have no product proposer since the reference driver was removed"
+        )
+    )]
     pub(in crate::physical) fn admit_physical_proposal(
         &mut self,
         g: &Arc<BodyActionGrantV1>,
         proposal: PhysicalActionProposalV1,
     ) -> AppResult<AdmissionOutcomeV1> {
-        proposal.validate_scope(g.session.basis.scope())?;
+        self.admit_proposal_as(g, proposal, None)
+    }
+    /// Admits one decision a tool caller chose. Core builds the proposal from
+    /// the caller's option and a fresh challenge; it never chooses an option.
+    pub(in crate::physical) fn admit_decision(
+        &mut self,
+        g: &Arc<BodyActionGrantV1>,
+        proposer: &LabelV1,
+        option: &LabelV1,
+        duration: PositiveMicros,
+    ) -> AppResult<Arc<AdmittedBodyActionV1>> {
+        let f = g.session.basis.scope().fields();
         require(
-            proposal.attempt_id == g.session.root.audit.attempt_id
-                && proposal.action_id == g.action
-                && proposal.decision_sequence == g.sequence
-                && proposal.payload_digest == g.payload_digest,
-            "Proposal identity mismatch",
+            f.mode == PhysicalScopeModeV1::DecisionStream,
+            "Not a decision stream",
         )?;
-        if let Some(existing) = self.control.actions.get(&g.action) {
+        let declared = f
+            .profile
+            .capability
+            .decision_stream
+            .as_ref()
+            .and_then(|d| d.option(option))
+            .ok_or_else(|| {
+                crate::error::AppError::InvalidInput("Option not declared by the capability".into())
+            })?
+            .payload_digest
+            .clone();
+        self.issue_proposal_challenge(g)?;
+        let challenge = &self.control.challenges[&g.id];
+        let cursor = &self.control.cursors[&g.id];
+        let proposal = PhysicalActionProposalV1 {
+            version: VersionV2,
+            attempt_id: g.session.root.audit.attempt_id.clone(),
+            action_id: cursor.action.clone(),
+            decision_sequence: cursor.sequence,
+            payload: None,
+            option: Some(option.clone()),
+            payload_digest: declared,
+            challenge_id: challenge.id.clone(),
+            observations: challenge.observations.clone(),
+            requested_duration_us: duration,
+        };
+        match self.admit_proposal_as(g, proposal, Some(proposer))? {
+            AdmissionOutcomeV1::Admitted(a) => Ok(a),
+            AdmissionOutcomeV1::Duplicate(_) => Err(crate::error::AppError::InvalidInput(
+                "Duplicate decision".into(),
+            )),
+        }
+    }
+    fn admit_proposal_as(
+        &mut self,
+        g: &Arc<BodyActionGrantV1>,
+        proposal: PhysicalActionProposalV1,
+        proposer: Option<&LabelV1>,
+    ) -> AppResult<AdmissionOutcomeV1> {
+        proposal.validate_scope(g.session.basis.scope())?;
+        if let Some(existing) = self.control.actions.get(&proposal.action_id) {
             require(
                 existing.audit.grant == g.id
                     && existing.audit.session == g.session.audit.id
+                    && existing.audit.proposal.decision_sequence == proposal.decision_sequence
                     && existing.audit.proposal.payload == proposal.payload
+                    && existing.audit.proposal.option == proposal.option
                     && existing.audit.proposal.payload_digest == proposal.payload_digest,
                 "Changed payload under admitted identity",
             )?;
             return Ok(AdmissionOutcomeV1::Duplicate(existing.id().clone()));
         }
+        let scope = g.session.basis.scope().fields();
+        let stream = scope.stream.as_ref();
+        let cursor = self
+            .control
+            .cursors
+            .get(&g.id)
+            .ok_or_else(|| crate::error::AppError::InvalidInput("Unknown grant".into()))?;
+        require(
+            proposal.attempt_id == g.session.root.audit.attempt_id
+                && proposal.action_id == cursor.action
+                && proposal.decision_sequence == cursor.sequence
+                && g.payload_digest
+                    .as_ref()
+                    .is_none_or(|d| *d == proposal.payload_digest),
+            "Proposal identity mismatch",
+        )?;
+        let last_admitted = cursor.last_admitted;
         self.validate_control_grant(g)?;
         let (now, ticks) = self.binding.now()?;
+        if let (Some(stream), Some(last)) = (stream, last_admitted) {
+            require(
+                ticks.saturating_sub(last) >= stream.min_decision_interval_us.get(),
+                "Decision rate ceiling exceeded",
+            )?;
+        }
         let challenge = self.control.challenges.get(&g.id).ok_or_else(|| {
             crate::error::AppError::InvalidInput("No post-activation challenge".into())
         })?;
@@ -651,27 +774,54 @@ impl PhysicalControlServiceV1 {
             session: g.session.audit.id.clone(),
             root: g.session.audit.root.clone(),
             epochs: g.session.audit.epochs.clone(),
-            reserved_us: g
-                .session
-                .basis
-                .scope()
-                .fields()
-                .execution
-                .action_duration_us
-                .get(),
+            // An exact action reserves its full reviewed duration; a stream
+            // decision reserves what it requests, accumulated per root.
+            reserved_us: if stream.is_some() {
+                proposal.requested_duration_us.get()
+            } else {
+                scope.execution.action_duration_us.get()
+            },
             expires_at,
             completion_digest: g.completion_digest.clone(),
             loss_digest: g.loss_digest.clone(),
             proposal,
         };
         let snapshot = self.binding.ledger_snapshot(&g.session.root.binding)?;
+        // Replacement fence: a new decision ends the previous one. Its RAM
+        // validity closes first, then one transaction closes its row and
+        // admits the new action, so the two never overlap.
+        let superseded: Vec<ActionId> = self
+            .control
+            .actions
+            .values()
+            .filter(|a| a.audit.grant == g.id && a.valid.load(Ordering::Acquire))
+            .map(|a| a.id().clone())
+            .collect();
+        require(
+            stream.is_some() || superseded.is_empty(),
+            "Exact grant already admitted its action",
+        )?;
+        for id in &superseded {
+            self.control.actions[id]
+                .valid
+                .store(false, Ordering::Release);
+        }
         self.store.admit_action(
             &g.session.root.audit,
             &g.session.audit,
             &audit,
             &snapshot,
             now,
+            proposer,
         )?;
+        if stream.is_some() {
+            self.control.challenges.remove(&g.id);
+        }
+        if let Some(cursor) = self.control.cursors.get_mut(&g.id) {
+            cursor.sequence += 1;
+            cursor.action = new_action_id()?;
+            cursor.last_admitted = Some(ticks);
+        }
         let action = Arc::new(AdmittedBodyActionV1 {
             audit,
             grant: g.clone(),
@@ -758,6 +908,7 @@ impl PhysicalControlServiceV1 {
             request: op,
             action: a.id().clone(),
             payload: a.audit.proposal.payload.clone(),
+            option: a.audit.proposal.option.clone(),
             lineage: self.store.evidence_lineage(a.id())?,
             binding: s.basis.scope().fields().environment.clone(),
             payload_digest: a.audit.proposal.payload_digest.clone(),
@@ -852,6 +1003,13 @@ impl PhysicalControlServiceV1 {
     ) -> AppResult<()> {
         Self::action_write(core, a, adapter, false).await
     }
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "exact scopes have no product proposer since the reference driver was removed"
+        )
+    )]
     pub(in crate::physical) async fn refresh_admitted_action(
         core: &Mutex<Self>,
         a: &Arc<AdmittedBodyActionV1>,
@@ -959,6 +1117,9 @@ pub(in crate::physical) mod test_support {
         fn validate_scope(&self, _: &ReviewScopeFieldsV1) -> AppResult<()> {
             Ok(())
         }
+        fn evaluate_start(&self, _: &ContractRefV1) -> AppResult<()> {
+            Ok(())
+        }
         fn install_session(
             &self,
             v: NativeSessionInstallViewV1,
@@ -987,10 +1148,11 @@ pub(in crate::physical) mod test_support {
                 let Some(mode) = self.next().await? else {
                     return Ok(None);
                 };
-                if !v.validity.allows()
-                    || v.payload.digest()? != v.payload_digest
-                    || v.deadline != v.validity.deadline
-                {
+                let digest_ok = match &v.payload {
+                    Some(p) => p.digest()? == v.payload_digest,
+                    None => v.option.is_some(),
+                };
+                if !v.validity.allows() || !digest_ok || v.deadline != v.validity.deadline {
                     return Ok(None);
                 }
                 Ok(Some(AdapterWriteReceiptV1 {
@@ -1043,6 +1205,7 @@ pub(in crate::physical) mod test_support {
         pub(in crate::physical) live: AtomicBool,
         pub(in crate::physical) samples: AtomicU64,
         pub(in crate::physical) fail_after: AtomicU64,
+        pub(in crate::physical) start_ready: AtomicBool,
         describe: Box<dyn Fn() -> BindingDescriptionV1 + Send + Sync>,
         advance: Box<dyn Fn(u64) -> u64 + Send + Sync>,
         step_us: u64,
@@ -1059,6 +1222,7 @@ pub(in crate::physical) mod test_support {
                 live: AtomicBool::new(true),
                 samples: AtomicU64::new(0),
                 fail_after: AtomicU64::new(u64::MAX),
+                start_ready: AtomicBool::new(true),
                 describe: Box::new(describe),
                 advance: Box::new(advance),
                 step_us,
@@ -1095,6 +1259,7 @@ pub(in crate::physical) mod test_support {
                     captured_ticks: ticks,
                     gap_us: 0,
                 },
+                view: CanonicalJsonV1::encode(&serde_json::json!({"sample": n}))?,
                 observations: vec![],
                 dispositions: vec![],
             })
@@ -1140,6 +1305,12 @@ pub(in crate::physical) mod test_support {
         fn validate_scope(&self, scope: &ReviewScopeFieldsV1) -> AppResult<()> {
             crate::physical::test_fixture::validate_scope(scope)
         }
+        fn evaluate_start(&self, _: &ContractRefV1) -> AppResult<()> {
+            require(
+                self.start_ready.load(Ordering::Acquire),
+                "Start predicate unmet",
+            )
+        }
     }
     pub(in crate::physical) fn observation(
         s: &BodyControlSessionV1,
@@ -1168,16 +1339,34 @@ pub(in crate::physical) mod test_support {
         duration: u64,
     ) -> PhysicalActionProposalV1 {
         let c = &core.control.challenges[&g.id];
+        let cursor = &core.control.cursors[&g.id];
+        let f = g.session.basis.scope().fields();
         PhysicalActionProposalV1 {
             version: VersionV2,
             attempt_id: g.session.root.audit.attempt_id.clone(),
-            action_id: g.action.clone(),
-            decision_sequence: g.sequence,
-            payload: g.session.basis.scope().fields().intent.clone(),
-            payload_digest: g.payload_digest.clone(),
+            action_id: cursor.action.clone(),
+            decision_sequence: cursor.sequence,
+            payload: f.intent.clone(),
+            option: None,
+            payload_digest: f.intent.as_ref().unwrap().digest().unwrap(),
             challenge_id: c.id.clone(),
             observations: c.observations.clone(),
             requested_duration_us: PositiveMicros::try_from(duration).unwrap(),
+        }
+    }
+    /// Test-only exact admission (grant, challenge, full-duration proposal).
+    /// Product code never proposes; brains do, through the decision tools.
+    pub(in crate::physical) fn admit_exact(
+        core: &mut PhysicalControlServiceV1,
+        s: &Arc<BodyControlSessionV1>,
+    ) -> Arc<AdmittedBodyActionV1> {
+        let g = core.construct_session_grant(s.clone()).unwrap();
+        core.issue_proposal_challenge(&g).unwrap();
+        let duration = s.basis.scope().fields().execution.action_duration_us.get();
+        let p = proposal(core, &g, duration);
+        match core.admit_physical_proposal(&g, p).unwrap() {
+            AdmissionOutcomeV1::Admitted(a) => a,
+            AdmissionOutcomeV1::Duplicate(_) => panic!("expected a new admission"),
         }
     }
     pub(in crate::physical) fn action_session(
@@ -1211,55 +1400,6 @@ pub(in crate::physical) mod test_support {
 }
 
 impl PhysicalControlServiceV1 {
-    /// The normal bounded command window ends control permission, not the task's
-    /// evidence adjudication. Cancellation uses revoke_control_session instead.
-    pub(in crate::physical) async fn end_reference_action(
-        core: &Mutex<Self>,
-        action: &Arc<AdmittedBodyActionV1>,
-        adapter: &dyn EnvironmentBinding,
-    ) -> AppResult<bool> {
-        let fence = {
-            let mut service = core.lock();
-            let s = &action.grant.session;
-            require(
-                Arc::ptr_eq(&service.issuer, &s.root.ingress.issuer),
-                "Foreign Core action end",
-            )?;
-            let (_, ticks) = service.clock.read()?;
-            require(
-                ticks >= action.deadline,
-                "Early end requires explicit cancellation",
-            )?;
-            service.control.invalidate_root(s.root.root_id());
-            s.root.valid.store(false, Ordering::Release);
-            service.roots.remove(s.root.root_id());
-            service
-                .store
-                .end_control_window(s.root.root_id(), action.id())?;
-            service.store.fence_request(s.id())?
-        };
-        let result = adapter
-            .fence(NativeFenceRequestViewV1 {
-                audit: fence.clone(),
-            })
-            .await;
-        match result {
-            Ok(Some(e))
-                if e.session == fence.session
-                    && e.request == fence.request
-                    && e.epochs == fence.epochs
-                    && e.class.meets(action.grant.session.audit.enforcement) =>
-            {
-                let service = core.lock();
-                require(
-                    e.class != SessionEnforcementClassV1::NativeFence,
-                    "Native fence receipt absent",
-                )?;
-                service.store.acknowledge_fence(&fence)
-            }
-            _ => Ok(false),
-        }
-    }
     /// Records one binding sample. Outside the command window only the sealed
     /// evidence is kept: a control observation there extends nothing.
     pub(in crate::physical) fn ingest_binding_sample(
@@ -1282,120 +1422,5 @@ impl PhysicalControlServiceV1 {
             self.record_physical_observation(ingress, o)?;
         }
         Ok(())
-    }
-}
-
-impl PhysicalControlServiceV1 {
-    /// Core's local same-action scheduler. One initial admission already exists;
-    /// missed timer slots do not cause catch-up writes or extend its deadline.
-    pub(in crate::physical) async fn run_reference_action(
-        core: &Mutex<Self>,
-        session: &Arc<BodyControlSessionV1>,
-        action: &Arc<AdmittedBodyActionV1>,
-        lane: Arc<dyn EnvironmentBinding>,
-    ) -> AppResult<()> {
-        let adapter = lane.as_ref();
-        let mut result = Self::dispatch_admitted_action(core, action, adapter).await;
-        while result.is_ok() {
-            let ticks = match core.lock().clock.read() {
-                Ok((_, ticks)) => ticks,
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            };
-            if ticks >= action.deadline {
-                break;
-            }
-            let next_refresh = ticks.saturating_add(50_000).min(action.deadline);
-            let sampled = {
-                let lane = lane.clone();
-                tokio::task::spawn_blocking(move || lane.observe()).await
-            };
-            result = match sampled {
-                Ok(Ok(sample)) => {
-                    let mut service = core.lock();
-                    service.local_ingress().and_then(|ingress| {
-                        service.ingest_binding_sample(&ingress, session, adapter, sample, true)
-                    })
-                }
-                _ => Err(crate::error::AppError::InvalidInput(
-                    "Binding observation lost".into(),
-                )),
-            };
-            if result.is_err() {
-                break;
-            }
-            let ticks = match core.lock().clock.read() {
-                Ok((_, ticks)) => ticks,
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            };
-            // Sampling uses part of the 50 ms slot, rather than adding another
-            // 50 ms after it. Late samples cause one write, never a catch-up burst.
-            if ticks < next_refresh {
-                tokio::time::sleep(std::time::Duration::from_micros(next_refresh - ticks)).await;
-            }
-            let ticks = match core.lock().clock.read() {
-                Ok((_, ticks)) => ticks,
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            };
-            if ticks >= action.deadline {
-                break;
-            }
-            result = Self::refresh_admitted_action(core, action, adapter).await;
-        }
-        if result.is_ok() {
-            result = Self::end_reference_action(core, action, adapter)
-                .await
-                .map(|_| ());
-        }
-        if result.is_err() {
-            // Stop is requested even after lost observation validity. It uses the
-            // configured lane and retains unknown physical consequences.
-            let _ = Self::revoke_control_session(core, session, adapter).await;
-        }
-        result
-    }
-}
-
-impl PhysicalControlServiceV1 {
-    /// Both local and remote product callers propose through this same exact
-    /// challenge/admission path after executor-local trusted observation.
-    pub(in crate::physical) fn admit_reference_action(
-        &mut self,
-        session: Arc<BodyControlSessionV1>,
-    ) -> AppResult<Arc<AdmittedBodyActionV1>> {
-        let g = self.construct_session_grant(session)?;
-        self.issue_proposal_challenge(&g)?;
-        let challenge = &self.control.challenges[&g.id];
-        let proposal = PhysicalActionProposalV1 {
-            version: VersionV2,
-            attempt_id: g.session.root.audit.attempt_id.clone(),
-            action_id: g.action.clone(),
-            decision_sequence: g.sequence,
-            payload: g.session.basis.scope().fields().intent.clone(),
-            payload_digest: g.payload_digest.clone(),
-            challenge_id: challenge.id.clone(),
-            observations: challenge.observations.clone(),
-            requested_duration_us: g
-                .session
-                .basis
-                .scope()
-                .fields()
-                .execution
-                .action_duration_us,
-        };
-        match self.admit_physical_proposal(&g, proposal)? {
-            AdmissionOutcomeV1::Admitted(a) => Ok(a),
-            _ => Err(crate::error::AppError::InvalidInput(
-                "Reference action already admitted".into(),
-            )),
-        }
     }
 }

@@ -621,7 +621,7 @@ fn material_intent_target_completion_profile_and_qualification_substitution_deni
     ] {
         let changed = changed(&f.scope, |s| match mode {
             "intent" => {
-                s.intent = setpoint_intent(-0.05, 0.0, 0.0);
+                s.intent = Some(setpoint_intent(-0.05, 0.0, 0.0));
             }
             "completion" => {
                 edit_completion(s, |c| c.min_progress = NonNegative::try_from(0.02).unwrap());
@@ -677,7 +677,7 @@ fn narrowing_cannot_change_intent_to_fit_smaller_limits() {
     let mut f = Fixture::new();
     let too_small = changed(&f.scope, |s| {
         s.bounds = with_abs_max(&s.bounds, "/a", 0.01);
-        s.intent = setpoint_intent(0.01, 0.0, 0.0);
+        s.intent = Some(setpoint_intent(0.01, 0.0, 0.0));
     });
     assert!(core_fake::intersect_scope(&f.scope, &too_small).is_err());
     let root = f.root();

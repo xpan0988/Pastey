@@ -868,14 +868,8 @@ impl PhysicalBindingResolverV1 {
                     == SessionEnforcementClassV1::AdapterIsolationOnly,
             "A self-described binding cannot qualify hardware or NativeFence",
         )?;
-        require(
-            profile.execution.action_duration_us.get() <= 1_000_000
-                && profile.execution.total_execution_us.get() <= 1_000_000
-                && profile.freshness.proposal.0.get() <= 200_000
-                && profile.freshness.observation.max_age_us.get() <= 200_000
-                && profile.freshness.observation.max_gap_us.get() <= 200_000,
-            "Self-described reference duration/freshness ceiling exceeded",
-        )?;
+        // Duration and freshness ceilings are the qualified profile's own
+        // data (bound by `profile_digest`); every scope must fit inside them.
         self.record_qualification(
             binding,
             profile,

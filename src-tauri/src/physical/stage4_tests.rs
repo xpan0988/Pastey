@@ -30,7 +30,7 @@ impl ControlFixture {
             },
             |fields| {
                 if native {
-                    fields.intent = setpoint_intent(0.08, 0.0, 0.0);
+                    fields.intent = Some(setpoint_intent(0.08, 0.0, 0.0));
                 }
             },
         )
@@ -106,6 +106,48 @@ impl ControlFixture {
             live,
             scope,
         }
+    }
+    /// A decision-stream fixture: the test stream capability (min interval
+    /// 200 ms), approving forward/stop/turn_left/turn_right, actions up to
+    /// 500 ms, `total_us` cumulative execution and `count` actions.
+    fn stream(total_us: u64, count: u32) -> Self {
+        Self::stream_checked(total_us, count, Arc::new(|_| Ok(())))
+    }
+    fn stream_checked(
+        total_us: u64,
+        count: u32,
+        check: crate::physical::binding::ScopeSchemaCheckV1,
+    ) -> Self {
+        Self::build_checked(
+            binding(),
+            check,
+            |p| {
+                let completion: fx::ReachedHeldV1 =
+                    p.capability.completion_predicate.params.decode().unwrap();
+                p.capability = fx::stream_descriptor(
+                    p.capability.conflict_domains.clone(),
+                    &completion,
+                    200_000,
+                )
+                .unwrap();
+                p.execution.action_duration_us = micros(500_000);
+                p.execution.total_execution_us = micros(total_us);
+                p.execution.action_count = count;
+            },
+            |f| {
+                f.mode = PhysicalScopeModeV1::DecisionStream;
+                f.intent = None;
+                f.stream = Some(DecisionStreamScopeV1 {
+                    options: ["forward", "stop", "turn_left", "turn_right"]
+                        .iter()
+                        .map(|o| label(o))
+                        .collect(),
+                    min_decision_interval_us: micros(200_000),
+                });
+                f.bounds = f.profile.capability.bounds.clone();
+                f.execution = f.profile.execution.clone();
+            },
+        )
     }
     /// As `build`, but enrolled, resolved and qualified through Core's
     /// production path from a fake binding's own `describe()`, not test facts.
@@ -489,11 +531,13 @@ async fn wrong_challenge_observation_sequence_action_and_payload_fail_closed() {
             "sequence" => p.decision_sequence = 2,
             "action" => p.action_id = ActionId::try_from(id("physical-action")).unwrap(),
             "payload" => {
-                p.payload = changed(&f.scope, |s| s.intent = setpoint_intent(0.06, 0.0, 0.0))
-                    .fields()
-                    .intent
-                    .clone();
-                p.payload_digest = p.payload.digest().unwrap();
+                p.payload = changed(&f.scope, |s| {
+                    s.intent = Some(setpoint_intent(0.06, 0.0, 0.0))
+                })
+                .fields()
+                .intent
+                .clone();
+                p.payload_digest = p.payload.as_ref().unwrap().digest().unwrap();
             }
             _ => p.requested_duration_us = micros(1_000_001),
         }
@@ -559,8 +603,8 @@ async fn exact_duplicate_is_status_only_and_changed_digest_is_rejected() {
         AdmissionOutcomeV1::Duplicate(_)
     ));
     let mut changed = p;
-    changed.payload = setpoint_intent(0.06, 0.0, 0.0);
-    changed.payload_digest = changed.payload.digest().unwrap();
+    changed.payload = Some(setpoint_intent(0.06, 0.0, 0.0));
+    changed.payload_digest = changed.payload.as_ref().unwrap().digest().unwrap();
     assert!(f.core.lock().admit_physical_proposal(&g, changed).is_err());
     assert_eq!(lane::deadline(&a), 100_000);
     assert_eq!(
