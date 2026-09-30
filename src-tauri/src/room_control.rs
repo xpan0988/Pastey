@@ -4165,8 +4165,24 @@ async fn receive_authenticated_physical(
             match PhysicalControlServiceV1::perform_physical_work(&state.physical_control, work)
                 .await
             {
-                Ok(Some(reply)) => send_physical_reply(state.clone(), bridge, reply),
-                Ok(None) => {}
+                Ok(done) => {
+                    if let Some(reply) = done.reply {
+                        send_physical_reply(state.clone(), bridge, reply);
+                    }
+                    // The executor timer drives completion and the stream's
+                    // end; it never waits for a brain to call.
+                    if let Some(stream) = done.stream {
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            PhysicalControlServiceV1::supervise_stream(
+                                &state.physical_control,
+                                stream,
+                            )
+                            .await;
+                            let _ = state.emit("physical-status-changed", &serde_json::json!({}));
+                        });
+                    }
+                }
                 Err(e) => logging::write_error_line(&format!(
                     "Physical operation pending/unknown: {}",
                     e.message()

@@ -32,13 +32,29 @@ pub(crate) enum DecisionToolReplyV1 {
     Budget { actions: u64, execution_us: u64 },
 }
 
+/// Executor-side runtime of one stream: the binding lane, serialized
+/// sampling (the timer and tool calls must not interleave observations), the
+/// last brain activity for the idle lease, and the end latch. Process-local.
+pub(crate) struct StreamRuntimeV1 {
+    session: Arc<BodyControlSessionV1>,
+    lane: Arc<dyn EnvironmentBinding>,
+    sampling: tokio::sync::Mutex<()>,
+    last_activity: AtomicU64,
+    ended: AtomicBool,
+}
+/// Result of one executor timer tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamTickV1 {
+    Continue(std::time::Duration),
+    Ended,
+}
+
 /// One authenticated caller of one stream. Process-local: no serde, no clone,
 /// never restored. Closing it closes the stream.
 pub(crate) struct ToolSessionV1 {
     id: RequestId,
     caller: LabelV1,
-    session: Arc<BodyControlSessionV1>,
-    lane: Arc<dyn EnvironmentBinding>,
+    stream: Arc<StreamRuntimeV1>,
     open: AtomicBool,
     /// Ticks of the last released observation, for the declared rate.
     last_observation: parking_lot::Mutex<Option<u64>>,
@@ -53,6 +69,11 @@ fn refused(reason: impl Into<String>) -> DecisionToolReplyV1 {
     DecisionToolReplyV1::Refused {
         reason: reason.into(),
     }
+}
+fn stream_scope(s: &BodyControlSessionV1) -> AppResult<&DecisionStreamScopeV1> {
+    s.basis.scope().fields().stream.as_ref().ok_or_else(|| {
+        crate::error::AppError::InvalidInput("Tools exist only for decision streams".into())
+    })
 }
 
 impl PhysicalControlServiceV1 {
@@ -82,6 +103,30 @@ impl PhysicalControlServiceV1 {
         let destination = self.runtime.host_ref().clone();
         self.open_tool_session_inner(session, lane, caller, &destination)
     }
+    /// The stream's executor runtime, created once per installed session.
+    pub(in crate::physical) fn stream_runtime(
+        &mut self,
+        session: &Arc<BodyControlSessionV1>,
+        lane: Arc<dyn EnvironmentBinding>,
+    ) -> AppResult<Arc<StreamRuntimeV1>> {
+        stream_scope(session)?;
+        if let Some(existing) = self.control.streams.get(session.id()) {
+            return Ok(existing.clone());
+        }
+        self.validate_control_session(session, true)?;
+        let (_, ticks) = self.clock.read()?;
+        let stream = Arc::new(StreamRuntimeV1 {
+            session: session.clone(),
+            lane,
+            sampling: tokio::sync::Mutex::new(()),
+            last_activity: AtomicU64::new(ticks),
+            ended: AtomicBool::new(false),
+        });
+        self.control
+            .streams
+            .insert(session.id().clone(), stream.clone());
+        Ok(stream)
+    }
     pub(in crate::physical) fn open_tool_session_inner(
         &mut self,
         session: &Arc<BodyControlSessionV1>,
@@ -89,21 +134,14 @@ impl PhysicalControlServiceV1 {
         caller: LabelV1,
         destination: &HostRef,
     ) -> AppResult<Arc<ToolSessionV1>> {
-        let stream = session
-            .basis
-            .scope()
-            .fields()
-            .stream
-            .as_ref()
-            .ok_or_else(|| {
-                crate::error::AppError::InvalidInput("Tools exist only for decision streams".into())
-            })?;
         require(
-            stream.observation.destination == *destination,
+            stream_scope(session)?.observation.destination == *destination,
             "Observations are declared for another Host",
         )?;
         self.validate_control_session(session, true)?;
         lane.status()?;
+        let stream = self.stream_runtime(session, lane)?;
+        require(!stream.ended.load(Ordering::Acquire), "Stream ended")?;
         self.control
             .tool_sessions
             .retain(|_, t| t.open.load(Ordering::Acquire));
@@ -111,11 +149,12 @@ impl PhysicalControlServiceV1 {
             self.control.tool_sessions.len() < 64,
             "Too many tool sessions",
         )?;
+        let (_, ticks) = self.clock.read()?;
+        stream.last_activity.fetch_max(ticks, Ordering::AcqRel);
         let ts = Arc::new(ToolSessionV1 {
             id: request_id()?,
             caller,
-            session: session.clone(),
-            lane,
+            stream,
             open: AtomicBool::new(true),
             last_observation: parking_lot::Mutex::new(None),
         });
@@ -127,13 +166,7 @@ impl PhysicalControlServiceV1 {
     }
     /// Tool names: the approved options plus the two read-only queries.
     pub(in crate::physical) fn tool_names(&self, ts: &ToolSessionV1) -> Vec<String> {
-        let mut names: Vec<String> = ts
-            .session
-            .basis
-            .scope()
-            .fields()
-            .stream
-            .as_ref()
+        let mut names: Vec<String> = stream_scope(&ts.stream.session)
             .map(|s| s.options.iter().map(|o| o.as_str().to_owned()).collect())
             .unwrap_or_default();
         names.extend([OBSERVE_TOOL.to_owned(), BUDGET_TOOL.to_owned()]);
@@ -142,6 +175,7 @@ impl PhysicalControlServiceV1 {
     fn tool_session_current(&self, ts: &ToolSessionV1) -> AppResult<()> {
         require(
             ts.open.load(Ordering::Acquire)
+                && !ts.stream.ended.load(Ordering::Acquire)
                 && self
                     .control
                     .tool_sessions
@@ -153,7 +187,8 @@ impl PhysicalControlServiceV1 {
 
     /// Runs one tool call. Every `Decide` is a new proposal through Core
     /// admission and is recorded (proposer, allowed or refused, reason); a
-    /// refused proposal never reaches the body.
+    /// refused proposal never reaches the body. Completion and the stream's
+    /// end are driven by `stream_tick`, never by a call.
     pub(in crate::physical) async fn call_tool(
         core: &Mutex<Self>,
         ts: &Arc<ToolSessionV1>,
@@ -170,7 +205,7 @@ impl PhysicalControlServiceV1 {
                 let service = core.lock();
                 let (now, _) = service.clock.read()?;
                 service.store.record_refusal(
-                    ts.session.root().root_id(),
+                    ts.stream.session.root().root_id(),
                     &ts.caller,
                     option,
                     *duration_us,
@@ -180,30 +215,21 @@ impl PhysicalControlServiceV1 {
             }
             return Ok(refused(e.message()));
         }
+        let (_, ticks) = core.lock().clock.read()?;
+        ts.stream.last_activity.fetch_max(ticks, Ordering::AcqRel);
         match call {
             DecisionToolCallV1::RemainingBudget => {
                 let service = core.lock();
                 let (actions, execution_us) = service
                     .store
-                    .remaining_budget(ts.session.root().root_id())?;
+                    .remaining_budget(ts.stream.session.root().root_id())?;
                 Ok(DecisionToolReplyV1::Budget {
                     actions,
                     execution_us,
                 })
             }
             DecisionToolCallV1::Observe => {
-                let flow = ts
-                    .session
-                    .basis
-                    .scope()
-                    .fields()
-                    .stream
-                    .as_ref()
-                    .map(|s| s.observation.clone())
-                    .ok_or_else(|| {
-                        crate::error::AppError::InvalidInput("Not a decision stream".into())
-                    })?;
-                let (_, ticks) = core.lock().clock.read()?;
+                let flow = stream_scope(&ts.stream.session)?.observation.clone();
                 {
                     let mut last = ts.last_observation.lock();
                     if last.is_some_and(|l| ticks.saturating_sub(l) < flow.min_interval_us.get()) {
@@ -211,7 +237,7 @@ impl PhysicalControlServiceV1 {
                     }
                     *last = Some(ticks);
                 }
-                match Self::sample(core, ts).await {
+                match Self::sample(core, &ts.stream).await {
                     // Only declared fields leave the executor.
                     Ok(view) => Ok(DecisionToolReplyV1::Observation {
                         view: view.select(&flow.fields),
@@ -225,10 +251,15 @@ impl PhysicalControlServiceV1 {
             } => Self::decide(core, ts, option, duration_us).await,
         }
     }
-    /// Samples the binding and records the sample. A lost binding closes the
-    /// stream: its body stops by the binding's own loss policy.
-    async fn sample(core: &Mutex<Self>, ts: &Arc<ToolSessionV1>) -> AppResult<CanonicalJsonV1> {
-        let lane = ts.lane.clone();
+    /// Samples the binding and records the sample, one sample at a time per
+    /// stream. A lost binding ends the stream: its body stops by the
+    /// binding's own loss policy.
+    async fn sample(
+        core: &Mutex<Self>,
+        stream: &Arc<StreamRuntimeV1>,
+    ) -> AppResult<CanonicalJsonV1> {
+        let _serial = stream.sampling.lock().await;
+        let lane = stream.lane.clone();
         let sampled = tokio::task::spawn_blocking(move || lane.observe())
             .await
             .map_err(|_| crate::error::AppError::InvalidInput("Binding sample failed".into()))
@@ -237,26 +268,116 @@ impl PhysicalControlServiceV1 {
             let view = sample.view.clone();
             let mut service = core.lock();
             let ingress = service.local_ingress()?;
-            service.ingest_binding_sample(&ingress, &ts.session, ts.lane.as_ref(), sample, true)?;
+            service.ingest_binding_sample(
+                &ingress,
+                &stream.session,
+                stream.lane.as_ref(),
+                sample,
+                true,
+            )?;
             Ok(view)
         });
         if recorded.is_err() {
-            ts.open.store(false, Ordering::Release);
-            let _ = Self::revoke_control_session(core, &ts.session, ts.lane.as_ref()).await;
-            return recorded;
-        }
-        // The stream's termination condition is its completion contract. Once
-        // the witness verifies it, Core accepts the task and ends the stream.
-        let terminated = core.lock().evaluate_stream(ts);
-        if terminated.unwrap_or(false) {
-            let _ = Self::revoke_control_session(core, &ts.session, ts.lane.as_ref()).await;
+            drop(_serial);
+            Self::end_stream(core, stream).await;
         }
         recorded
     }
-    /// Evaluates the latest dispatched decision. Returns true once the task
-    /// was accepted by this or an earlier evaluation.
-    fn evaluate_stream(&mut self, ts: &ToolSessionV1) -> AppResult<bool> {
-        let root = ts.session.root().root_id().clone();
+    /// Ends the stream once: its tool sessions close, authority closes and
+    /// the fence is requested. The outcome stays whatever the witness last
+    /// verified; otherwise it is uncertain.
+    async fn end_stream(core: &Mutex<Self>, stream: &Arc<StreamRuntimeV1>) {
+        if stream.ended.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        {
+            let mut service = core.lock();
+            service.control.tool_sessions.retain(|_, t| {
+                if Arc::ptr_eq(&t.stream, stream) {
+                    t.open.store(false, Ordering::Release);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        let _ = Self::revoke_control_session(core, &stream.session, stream.lane.as_ref()).await;
+    }
+    /// One executor timer tick: the stream's completion and end never depend
+    /// on a brain calling. It samples, evaluates the latest dispatched
+    /// decision and ends the stream on verified completion, a spent budget,
+    /// an expired idle lease (treated like a crashed brain) or closed
+    /// authority. The next tick comes after half the observation gap.
+    pub(in crate::physical) async fn stream_tick(
+        core: &Mutex<Self>,
+        stream: &Arc<StreamRuntimeV1>,
+    ) -> AppResult<StreamTickV1> {
+        if stream.ended.load(Ordering::Acquire) {
+            return Ok(StreamTickV1::Ended);
+        }
+        let scope = stream.session.basis.scope().fields().clone();
+        let flow = stream_scope(&stream.session)?.clone();
+        let period = std::time::Duration::from_micros(
+            (scope.freshness.observation.max_gap_us.get() / 2).max(1),
+        );
+        let (live, idle) = {
+            let mut service = core.lock();
+            let (_, ticks) = service.clock.read()?;
+            let live = service
+                .validate_control_session(&stream.session, true)
+                .is_ok();
+            let idle = ticks.saturating_sub(stream.last_activity.load(Ordering::Acquire))
+                > flow.idle_lease_us(&scope.execution);
+            (live, idle)
+        };
+        if !live || idle {
+            Self::end_stream(core, stream).await;
+            return Ok(StreamTickV1::Ended);
+        }
+        if Self::sample(core, stream).await.is_err() {
+            return Ok(StreamTickV1::Ended);
+        }
+        let (verified, spent) = {
+            let mut service = core.lock();
+            let verified = service.evaluate_stream(stream, flow.on_completion)?;
+            let root = stream.session.root().root_id().clone();
+            let (actions, time) = service.store.remaining_budget(&root)?;
+            let (_, ticks) = service.clock.read()?;
+            let busy = service.control.actions.values().any(|a| {
+                a.audit.session == stream.session.audit.id
+                    && a.valid.load(Ordering::Acquire)
+                    && ticks < a.deadline
+            });
+            (verified, (actions == 0 || time == 0) && !busy)
+        };
+        if verified || spent {
+            Self::end_stream(core, stream).await;
+            return Ok(StreamTickV1::Ended);
+        }
+        Ok(StreamTickV1::Continue(period))
+    }
+    /// Drives `stream_tick` on its own period until the stream ends. The
+    /// executor spawns this for every installed stream.
+    pub(crate) async fn supervise_stream(core: &Mutex<Self>, stream: Arc<StreamRuntimeV1>) {
+        loop {
+            match Self::stream_tick(core, &stream).await {
+                Ok(StreamTickV1::Continue(d)) => tokio::time::sleep(d).await,
+                Ok(StreamTickV1::Ended) => break,
+                Err(_) => {
+                    Self::end_stream(core, &stream).await;
+                    break;
+                }
+            }
+        }
+    }
+    /// Evaluates the latest dispatched decision. Returns true once the
+    /// completion is verified (and, if the scope says so, accepted).
+    fn evaluate_stream(
+        &mut self,
+        stream: &StreamRuntimeV1,
+        on_completion: CompletionAcceptanceV1,
+    ) -> AppResult<bool> {
+        let root = stream.session.root().root_id().clone();
         if self.store.acceptance(&root)? != crate::physical::evidence::AcceptanceStateV1::Pending {
             return Ok(true);
         }
@@ -265,22 +386,24 @@ impl PhysicalControlServiceV1 {
         };
         let ingress = self.local_ingress()?;
         // Not yet decidable (no terminal, missing evidence) is not an error of
-        // the stream; the next sample evaluates again.
+        // the stream; the next tick evaluates again.
         let Ok(c) = self.evaluate_physical_consequence(&ingress, &action) else {
             return Ok(false);
         };
         if c.state != crate::physical::evidence::ConsequenceStateV1::Verified {
             return Ok(false);
         }
-        self.decide_physical_acceptance(
-            &ingress,
-            &c.root,
-            &c.attempt,
-            &c.action,
-            c.revision,
-            &c.completion_digest,
-            false,
-        )?;
+        if on_completion == CompletionAcceptanceV1::Automatic {
+            self.decide_physical_acceptance(
+                &ingress,
+                &c.root,
+                &c.attempt,
+                &c.action,
+                c.revision,
+                &c.completion_digest,
+                false,
+            )?;
+        }
         Ok(true)
     }
     async fn decide(
@@ -289,7 +412,7 @@ impl PhysicalControlServiceV1 {
         option: String,
         duration_us: u64,
     ) -> AppResult<DecisionToolReplyV1> {
-        let root = ts.session.root().root_id().clone();
+        let root = ts.stream.session.root().root_id().clone();
         let refuse = |reason: String| -> AppResult<DecisionToolReplyV1> {
             let service = core.lock();
             let (now, _) = service.clock.read()?;
@@ -307,13 +430,13 @@ impl PhysicalControlServiceV1 {
             (_, Err(_)) => return refuse("Invalid action duration".into()),
         };
         // A fresh trusted sample precedes every challenge.
-        if let Err(e) = Self::sample(core, ts).await {
+        if let Err(e) = Self::sample(core, &ts.stream).await {
             return refuse(e.message().to_owned());
         }
         let admitted = {
             let mut service = core.lock();
             service
-                .construct_session_grant(ts.session.clone())
+                .construct_session_grant(ts.stream.session.clone())
                 .and_then(|g| service.admit_decision(&g, &ts.caller, &label, duration))
         };
         let action = match admitted {
@@ -323,7 +446,7 @@ impl PhysicalControlServiceV1 {
         // The write's native reply. A refusal or unknown reply closes the
         // stream inside Core (no retry, budget kept); the caller learns only
         // the disposition.
-        let _ = Self::dispatch_admitted_action(core, &action, ts.lane.as_ref()).await;
+        let _ = Self::dispatch_admitted_action(core, &action, ts.stream.lane.as_ref()).await;
         let disposition = match core.lock().store.action_status(action.id())?.1.as_str() {
             "fake_accepted" => "accepted",
             "fake_refused" => "refused",
@@ -339,10 +462,10 @@ impl PhysicalControlServiceV1 {
     pub(in crate::physical) async fn close_tool_session(
         core: &Mutex<Self>,
         ts: &Arc<ToolSessionV1>,
-    ) -> AppResult<bool> {
+    ) -> AppResult<()> {
         ts.open.store(false, Ordering::Release);
-        core.lock().control.tool_sessions.remove(&ts.id);
-        Self::revoke_control_session(core, &ts.session, ts.lane.as_ref()).await
+        Self::end_stream(core, &ts.stream).await;
+        Ok(())
     }
     /// The records of a stream, in order.
     #[cfg_attr(
@@ -356,6 +479,11 @@ impl PhysicalControlServiceV1 {
         &self,
         ts: &ToolSessionV1,
     ) -> AppResult<Vec<crate::physical::store::DecisionRecordV1>> {
-        self.store.decisions(ts.session.root().root_id())
+        self.store.decisions(ts.stream.session.root().root_id())
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_stream(ts: &ToolSessionV1) -> Arc<StreamRuntimeV1> {
+    ts.stream.clone()
 }

@@ -21,6 +21,7 @@ pub(super) struct ControlStateV1 {
     operations: BTreeMap<SessionId, RequestId>,
     cursors: BTreeMap<GrantId, DecisionCursorV1>,
     tool_sessions: BTreeMap<RequestId, Arc<ToolSessionV1>>,
+    streams: BTreeMap<SessionId, Arc<StreamRuntimeV1>>,
 }
 /// Process-local position in a grant's decision sequence. Exact grants admit
 /// sequence 1 only; a decision stream advances it on every admission.
@@ -74,6 +75,9 @@ impl BodyControlSessionV1 {
     }
     pub(in crate::physical) fn id(&self) -> &SessionId {
         &self.audit.id
+    }
+    pub(in crate::physical) fn is_stream(&self) -> bool {
+        self.basis.scope().fields().stream.is_some()
     }
 }
 pub(in crate::physical) struct BodyActionGrantV1 {
@@ -1371,6 +1375,9 @@ pub(in crate::physical) mod test_support {
             AdmissionOutcomeV1::Admitted(a) => a,
             AdmissionOutcomeV1::Duplicate(_) => panic!("expected a new admission"),
         }
+    }
+    pub(in crate::physical) fn stream_of(ts: &ToolSessionV1) -> Arc<StreamRuntimeV1> {
+        decision_tools::test_stream(ts)
     }
     pub(in crate::physical) fn only_session(
         core: &PhysicalControlServiceV1,

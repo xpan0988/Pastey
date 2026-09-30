@@ -32,7 +32,7 @@ A capability with `InvocationModeV1::DecisionStream` declares named options, eac
 
 - an option subset and a decision-rate ceiling,
 - a per-action duration, a total execution time and a total action count,
-- the completion contract, which is the termination condition.
+- the completion contract, which is the termination condition, and whether a verified completion is accepted automatically or awaits a review decision (`on_completion`).
 
 The executor-side tool dispatcher (`physical/decision_tools.rs`) exposes one tool per approved option, `observe` (the binding's opaque view) and `remaining_budget`. It works the same for local callers and for requests relayed over the Bridge. Each decision is a new proposal:
 
@@ -42,10 +42,10 @@ The executor-side tool dispatcher (`physical/decision_tools.rs`) exposes one too
 
 Admitting a decision fences the previous one: its validity closes first, then one ledger transaction closes it and admits the next. A tool result is only allowed (with the binding's native disposition) or refused (with a reason). Every proposal is recorded in `physical_decisions` with its caller.
 
-A stream ends in one of two ways:
+Completion and the end of a stream are driven by an executor-side timer (`stream_tick`, spawned per installed stream), never by brain calls. Every half observation gap it samples the binding, evaluates the latest dispatched decision and checks the budget and the tool-session idle lease. The lease is one action duration plus one decision interval, both scope data; expiry is handled like a crashed brain. Sampling is serialized per stream. A stream ends in one of two ways:
 
-- **Verified:** the witness verifies the completion contract, Core accepts the task and fences.
-- **Uncertain:** the budget is spent, the tool session closes, the Bridge route is lost (on the executor this is indistinguishable from a crashed brain), the binding is lost, or authority is revoked. The outcome stays uncertain unless already verified, and nothing resumes.
+- **Verified:** the witness verifies the completion contract. Core accepts the task if the scope says `automatic`, or leaves acceptance to a review decision if it says `await_review`; either way the stream ends and fences.
+- **Uncertain:** the budget is spent and the last action has run out, the tool session closes or its idle lease expires, the Bridge route is lost (on the executor this is indistinguishable from a crashed brain), the binding is lost, or authority is revoked. The outcome stays uncertain unless already verified, and nothing resumes.
 
 Exact (`ExactLeased`) scopes, one reviewed payload with at most one action, remain in the contracts and tests but have no product proposer.
 
@@ -87,7 +87,7 @@ Run `cargo test --manifest-path src-tauri/Cargo.toml physical::`. The demo tests
 - **Exact mode has no product proposer.** Migrate exact scopes to one-option decision streams, or remove exact mode.
 - **Completion parameters must equal the qualified capability's.** This is a safe restriction. Open question: express completion tolerances as a narrowable `BoundSetV1`.
 - **No NativeFence proof path.** A binding-supplied receipt verifier whose checks the ledger audit can replay is needed before any `NativeFence` claim.
-- **Tool sessions have no idle lease.** If a brain dies while its Bridge stays up, only the binding's local self-stop halts the body; the stream stays open until the root expires.
+- **The idle lease may be short for slow brains.** One action plus one decision interval suits a controller loop; a model that thinks for seconds between calls would be treated as crashed. If that matters, the lease should become its own reviewed scope field.
 - **Stream termination by a verified witness is not yet exercised end to end.** It needs a binding that produces witness evidence: the Step D reference binding.
 - **Deferred capabilities:**
   - multiple domains and coupled bodies;

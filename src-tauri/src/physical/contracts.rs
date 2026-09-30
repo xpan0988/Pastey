@@ -50,13 +50,23 @@ impl ObservationFlowV1 {
     }
 }
 
+/// What happens when the witness verifies the completion contract. Either
+/// way the stream ends; `AwaitReview` leaves task acceptance to a decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompletionAcceptanceV1 {
+    Automatic,
+    AwaitReview,
+}
+
 // The approved part of a decision-stream capability: an option subset, a
-// decision-rate ceiling (shortest interval between two admitted decisions)
-// and the observation flow to the brain.
+// decision-rate ceiling (shortest interval between two admitted decisions),
+// the observation flow to the brain and what verified completion does.
 claim!(DecisionStreamScopeV1 {
     options: Vec<LabelV1>,
     min_decision_interval_us: PositiveMicros,
     observation: ObservationFlowV1,
+    on_completion: CompletionAcceptanceV1,
 });
 impl DecisionStreamScopeV1 {
     pub fn validate(&self) -> AppResult<()> {
@@ -72,6 +82,16 @@ impl DecisionStreamScopeV1 {
         self.options.iter().all(|o| ceiling.allows(o))
             && self.min_decision_interval_us >= ceiling.min_decision_interval_us
             && self.observation.is_subset_of(&ceiling.observation)
+            && (self.on_completion == ceiling.on_completion
+                || self.on_completion == CompletionAcceptanceV1::AwaitReview)
+    }
+    /// A brain that neither acts nor observes for one action plus one
+    /// decision interval is treated as crashed.
+    pub fn idle_lease_us(&self, execution: &ExecutionBudgetV1) -> u64 {
+        execution
+            .action_duration_us
+            .get()
+            .saturating_add(self.min_decision_interval_us.get())
     }
     pub(super) fn intersect(&self, other: &Self) -> AppResult<Self> {
         let narrowed = Self {
@@ -85,6 +105,11 @@ impl DecisionStreamScopeV1 {
                 .min_decision_interval_us
                 .max(other.min_decision_interval_us),
             observation: self.observation.intersect(&other.observation)?,
+            on_completion: if self.on_completion == other.on_completion {
+                self.on_completion
+            } else {
+                CompletionAcceptanceV1::AwaitReview
+            },
         };
         narrowed.validate()?;
         Ok(narrowed)

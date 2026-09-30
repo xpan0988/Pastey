@@ -19,6 +19,13 @@ pub(super) struct RemoteControlV1 {
     tool_routes: BTreeMap<RequestId, HostSessionBinding>,
 }
 pub(crate) struct PhysicalWorkV1(pub(in crate::physical) PhysicalWorkKindV1);
+/// What finished work hands back to the transport: a reply to send and a
+/// stream whose executor timer must now run (`supervise_stream`).
+#[derive(Default)]
+pub(crate) struct PhysicalWorkDoneV1 {
+    pub reply: Option<PhysicalMessageV1>,
+    pub stream: Option<Arc<StreamRuntimeV1>>,
+}
 pub(in crate::physical) enum PhysicalWorkKindV1 {
     Install {
         session: Arc<BodyControlSessionV1>,
@@ -882,21 +889,29 @@ use rusqlite::OptionalExtension;
 
 impl PhysicalControlServiceV1 {
     /// Runs deferred binding I/O. Returns a reply for the transport to send
-    /// back to the requester, when the work has one.
+    /// back to the requester, and a stream the executor must supervise.
     pub(crate) async fn perform_physical_work(
         core: &Mutex<Self>,
         work: PhysicalWorkV1,
-    ) -> AppResult<Option<PhysicalMessageV1>> {
+    ) -> AppResult<PhysicalWorkDoneV1> {
         match work.0 {
             PhysicalWorkKindV1::Cancel { session, adapter } => {
                 Self::revoke_control_session(core, &session, adapter.as_ref()).await?;
-                Ok(None)
+                Ok(PhysicalWorkDoneV1::default())
             }
             PhysicalWorkKindV1::Install { session, adapter } => {
                 // Installation only. Decisions come from the brain through
                 // the decision-stream tools; Core proposes nothing itself.
                 Self::install_control_session(core, &session, adapter.as_ref()).await?;
-                Ok(None)
+                let stream = if session.is_stream() {
+                    Some(core.lock().stream_runtime(&session, adapter)?)
+                } else {
+                    None
+                };
+                Ok(PhysicalWorkDoneV1 {
+                    reply: None,
+                    stream,
+                })
             }
             PhysicalWorkKindV1::Tool {
                 tool_session,
@@ -920,7 +935,10 @@ impl PhysicalControlServiceV1 {
                 if let PhysicalOperationV1::ToolResult { outcome: o, .. } = &mut reply.operation {
                     *o = outcome;
                 }
-                Ok(Some(reply))
+                Ok(PhysicalWorkDoneV1 {
+                    reply: Some(reply),
+                    stream: None,
+                })
             }
         }
     }

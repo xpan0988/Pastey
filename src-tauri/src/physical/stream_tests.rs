@@ -1,6 +1,6 @@
 //! Step C: decision streams through the executor-side tool dispatcher.
 use super::*;
-use crate::physical::core::{DecisionToolCallV1, DecisionToolReplyV1, ToolSessionV1};
+use crate::physical::core::{DecisionToolCallV1, DecisionToolReplyV1, StreamTickV1, ToolSessionV1};
 use crate::physical::protocol::ToolOutcomeV1;
 
 /// A fake binding sampling at the fixture clock's current time.
@@ -239,9 +239,13 @@ async fn closing_a_tool_session_ends_the_stream_uncertain_and_nothing_resumes() 
     let described = lane_for(&f);
     let (s, ts) = open(&f, &described).await;
     assert!(allowed(&call(&f, &ts, decide("forward", 400)).await));
-    assert!(PhysicalControlServiceV1::close_tool_session(&f.core, &ts)
+    PhysicalControlServiceV1::close_tool_session(&f.core, &ts)
         .await
-        .unwrap());
+        .unwrap();
+    assert_eq!(
+        f.scalar("SELECT count(*) FROM physical_sessions WHERE fence_ack IS NOT NULL"),
+        1
+    );
     assert_eq!(f.session_state(), "quarantined");
     let status = core_fake::store(&f.core.lock())
         .physical_status(&lane::session_audit(&s).root)
@@ -329,6 +333,80 @@ async fn observations_carry_only_declared_fields_at_the_declared_rate() {
         .is_err());
 }
 
+/// Runs executor timer ticks every 100 ms of simulated time.
+async fn tick_for(f: &ControlFixture, ts: &Arc<ToolSessionV1>, ms: u64) -> StreamTickV1 {
+    let stream = lane::stream_of(ts);
+    let mut last = StreamTickV1::Continue(std::time::Duration::ZERO);
+    for _ in 0..ms / 100 {
+        advance(f, 100);
+        last = PhysicalControlServiceV1::stream_tick(&f.core, &stream)
+            .await
+            .unwrap();
+        if last == StreamTickV1::Ended {
+            break;
+        }
+    }
+    last
+}
+
+#[tokio::test]
+async fn the_timer_ends_an_idle_stream_like_a_crashed_brain() {
+    let f = ControlFixture::stream(1_200_000, 6);
+    let described = lane_for(&f);
+    let (s, ts) = open(&f, &described).await;
+    assert!(allowed(&call(&f, &ts, decide("forward", 300)).await));
+    // The timer keeps sampling on its own; the brain never calls again. The
+    // idle lease is one action plus one decision interval (700 ms).
+    assert!(matches!(
+        tick_for(&f, &ts, 600).await,
+        StreamTickV1::Continue(_)
+    ));
+    assert_eq!(f.session_state(), "active");
+    assert_eq!(tick_for(&f, &ts, 200).await, StreamTickV1::Ended);
+    assert_eq!(f.session_state(), "quarantined");
+    let status = core_fake::store(&f.core.lock())
+        .physical_status(&lane::session_audit(&s).root)
+        .unwrap();
+    assert_eq!(status.consequence, ConsequenceStateV1::OutcomeUnknown);
+    assert!(!allowed(&call(&f, &ts, decide("stop", 100)).await));
+}
+
+#[tokio::test]
+async fn the_timer_ends_a_stream_whose_budget_is_spent() {
+    // One action in total: once it ran out, nothing is left to authorize.
+    let f = ControlFixture::stream(1_200_000, 1);
+    let described = lane_for(&f);
+    let (_, ts) = open(&f, &described).await;
+    assert!(allowed(&call(&f, &ts, decide("forward", 300)).await));
+    // While the action runs the stream stays open.
+    assert!(matches!(
+        tick_for(&f, &ts, 200).await,
+        StreamTickV1::Continue(_)
+    ));
+    assert_eq!(tick_for(&f, &ts, 200).await, StreamTickV1::Ended);
+    assert_eq!(f.session_state(), "quarantined");
+}
+
+#[tokio::test]
+async fn the_supervisor_stops_once_the_stream_has_ended() {
+    let f = ControlFixture::stream(1_200_000, 6);
+    let described = lane_for(&f);
+    let (_, ts) = open(&f, &described).await;
+    let core = f.core.clone();
+    let stream = lane::stream_of(&ts);
+    let supervisor =
+        tokio::spawn(
+            async move { PhysicalControlServiceV1::supervise_stream(&core, stream).await },
+        );
+    PhysicalControlServiceV1::close_tool_session(&f.core, &ts)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
+        .await
+        .expect("supervisor still running")
+        .unwrap();
+}
+
 #[tokio::test]
 async fn exact_scopes_have_no_decision_tools() {
     let f = ControlFixture::new();
@@ -408,6 +486,7 @@ async fn remote_tools_run_on_the_executor_and_die_with_the_bridge() {
     let reply = PhysicalControlServiceV1::perform_physical_work(&p.b.core, work.unwrap())
         .await
         .unwrap()
+        .reply
         .unwrap();
     p.deliver_a(reply);
     assert_eq!(
@@ -432,6 +511,7 @@ async fn remote_tools_run_on_the_executor_and_die_with_the_bridge() {
     let reply = PhysicalControlServiceV1::perform_physical_work(&p.b.core, work.unwrap())
         .await
         .unwrap()
+        .reply
         .unwrap();
     p.deliver_a(reply);
     let ToolOutcomeV1::Reply {

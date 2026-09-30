@@ -623,6 +623,7 @@ fn stream_fields() -> ReviewScopeFieldsV1 {
             min_interval_us: micros(100_000),
             destination: s.requester.clone(),
         },
+        on_completion: CompletionAcceptanceV1::Automatic,
     });
     s.bounds = s.profile.capability.bounds.clone();
     s.execution = s.profile.execution.clone();
@@ -704,6 +705,17 @@ fn observation_flow_is_declared_bounded_and_only_narrowed() {
     let flow = both.fields().stream.clone().unwrap().observation;
     assert_eq!(flow.fields.len(), 1);
     assert_eq!(flow.min_interval_us, micros(500_000));
+    // Automatic acceptance may narrow to review, never the reverse.
+    let mut review = stream_fields();
+    review.stream.as_mut().unwrap().on_completion = CompletionAcceptanceV1::AwaitReview;
+    let review = PhysicalReviewScopeV1::try_from(review).unwrap();
+    super::core::test_support::narrow(&reviewed, &review).unwrap();
+    assert!(super::core::test_support::narrow(&review, &reviewed).is_err());
+    let both = super::core::test_support::intersect_scope(&reviewed, &review).unwrap();
+    assert_eq!(
+        both.fields().stream.as_ref().unwrap().on_completion,
+        CompletionAcceptanceV1::AwaitReview
+    );
     // The filter keeps declared leaves only.
     let view: CanonicalJsonV1 = decode(json!({"sample": 3, "secret": 1, "pose": {"x": 1, "y": 2}}));
     assert_eq!(wire(&view.select(&flow.fields)), json!({"sample": 3}));

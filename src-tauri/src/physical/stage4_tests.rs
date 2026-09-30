@@ -151,6 +151,7 @@ impl ControlFixture {
                         min_interval_us: micros(100_000),
                         destination: f.requester.clone(),
                     },
+                    on_completion: CompletionAcceptanceV1::Automatic,
                 });
                 f.bounds = f.profile.capability.bounds.clone();
                 f.execution = f.profile.execution.clone();
