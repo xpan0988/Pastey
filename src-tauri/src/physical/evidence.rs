@@ -151,7 +151,7 @@ impl TrustedDispositionV1 {
 /// Only for an owned binding producer's sealed, validated acquisition.
 #[expect(
     dead_code,
-    reason = "reachable only once a production binding is attached (Step D); unused by tests too"
+    reason = "no production binding is attached; the reference bindings are test-only; unused by tests too"
 )]
 pub(super) fn producer_observation(
     fact: PhysicalObservationV1,
@@ -166,7 +166,7 @@ pub(super) fn producer_observation(
 /// Only for an owned binding producer's sealed disposition.
 #[expect(
     dead_code,
-    reason = "reachable only once a production binding is attached (Step D); unused by tests too"
+    reason = "no production binding is attached; the reference bindings are test-only; unused by tests too"
 )]
 pub(super) fn producer_disposition(fact: PhysicalActionDispositionV1) -> TrustedDispositionV1 {
     TrustedDispositionV1 {
@@ -294,7 +294,7 @@ pub(crate) struct ActionWindowV1 {
     not(test),
     expect(
         dead_code,
-        reason = "reachable only once a production binding is attached (Step D)"
+        reason = "no production binding is attached; the reference bindings are test-only"
     )
 )]
 pub(crate) struct CompletionInputV1<'a> {
@@ -309,7 +309,7 @@ pub(crate) struct CompletionInputV1<'a> {
     not(test),
     expect(
         dead_code,
-        reason = "reachable only once a production binding is attached (Step D)"
+        reason = "no production binding is attached; the reference bindings are test-only"
     )
 )]
 pub(crate) struct HandoverInputV1<'a> {
@@ -340,7 +340,7 @@ pub(crate) trait PhysicalWitnessV1: Send + Sync {
     not(test),
     expect(
         dead_code,
-        reason = "reachable only once a production binding is attached (Step D)"
+        reason = "no production binding is attached; the reference bindings are test-only"
     )
 )]
 pub(crate) struct EffectBoundInputV1<'a> {
@@ -358,7 +358,7 @@ impl WitnessRegistryV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub fn with(mut self, contract: SemanticIdV1, witness: Arc<dyn PhysicalWitnessV1>) -> Self {

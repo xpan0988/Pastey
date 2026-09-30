@@ -298,7 +298,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<ReservationReceiptV1> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         super::core_ledger::validate_attempt_in(&tx, a, snapshot, now)?;
         let r = super::core_ledger::current_review(&tx, &a.review_id, a.review_revision)?;
         s.validate(a, &r)?;
@@ -323,7 +323,7 @@ impl PhysicalStoreV1 {
             )?;
         }
         tx.execute("INSERT INTO physical_control_budgets(root_id,role,ceiling_us,ceiling_count) VALUES(?1,?3,?2,?4)",params![text(&s.root),checked_integer(s.scope.fields().execution.total_execution_us.get())?,a.role(),i64::from(s.scope.fields().execution.action_count)])?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         tx.commit()?;
         Ok(ReservationReceiptV1 { session: s.clone() })
     }
@@ -337,7 +337,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         current_session(&tx, a, s, snapshot, now, active)?;
         tx.commit()?;
         Ok(())
@@ -354,7 +354,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         current_session(&tx, a, s, snapshot, now, false)?;
         require(
             s.installation == *request
@@ -382,7 +382,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         current_session(&tx, a, s, snapshot, now, true)?;
         x.validate(s, a)?;
         require(now < x.expires_at, "Action lifetime exhausted")?;
@@ -426,7 +426,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         current_session(&tx, a, s, snapshot, now, true)?;
         require(
             action(&tx, &x.proposal.action_id)? == *x,
@@ -451,7 +451,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<bool> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         current_session(&tx, a, s, snapshot, now, true)?;
         require(
             action(&tx, &x.proposal.action_id)? == *x && now < x.expires_at,
@@ -473,7 +473,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<(String, ActionDispositionV1, u64, u64)> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let (state, disposition, reserved, consumed): (String, String, i64, i64) = tx.query_row("SELECT a.state,a.disposition,b.reserved_us,b.consumed_us FROM physical_actions a JOIN physical_control_budgets b USING(root_id) WHERE action_id=?1",[text(id)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         tx.commit()?;
         Ok((
@@ -486,7 +486,7 @@ impl PhysicalStoreV1 {
     pub(in crate::physical) fn fence_request(&self, id: &SessionId) -> AppResult<FenceAuditV1> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let raw: String = tx.query_row(
             "SELECT fence_json FROM physical_sessions WHERE session_id=?1 AND state='quarantined'",
             [text(id)],
@@ -513,7 +513,7 @@ impl PhysicalStoreV1 {
     pub(in crate::physical) fn acknowledge_fence(&self, f: &FenceAuditV1) -> AppResult<bool> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let native = self.native_fence_receipt_for_ack(f, &tx)?;
         let class = if native {
             "native_fence"
@@ -643,7 +643,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let option = if option.is_empty() || option.len() > 128 {
             "<invalid>"
         } else {
@@ -700,7 +700,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         tx.execute(
             "INSERT INTO physical_effect_bound_violations VALUES(?1,?2,?3,?4,?5)",
             params![

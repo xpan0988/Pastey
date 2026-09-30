@@ -93,7 +93,7 @@ impl PhysicalAuthorityRootV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(super) fn attempt_id(&self) -> &AttemptId {
@@ -144,7 +144,9 @@ pub(crate) struct PhysicalControlServiceV1 {
     store: PhysicalStoreV1,
     runtime: LocalRuntimeRef,
     issuer: Arc<AtomicBool>,
-    policy: Option<ExecutorPolicyV1>,
+    /// One trusted policy per environment this Host executes for. A change
+    /// closes only that environment's Roots.
+    policies: BTreeMap<EnvironmentRefV1, ExecutorPolicyV1>,
     roots: BTreeMap<RootId, RootRegistrationV1>,
     start_decisions: BTreeSet<ApprovalId>,
     control: ControlStateV1,
@@ -174,7 +176,7 @@ impl PhysicalControlServiceV1 {
             store,
             runtime,
             issuer: Arc::new(AtomicBool::new(true)),
-            policy: None,
+            policies: BTreeMap::new(),
             roots: BTreeMap::new(),
             start_decisions: BTreeSet::new(),
             control: ControlStateV1::default(),
@@ -230,13 +232,15 @@ impl PhysicalControlServiceV1 {
                 .qualification(binding, &s.profile, &s.qualification.qualification_id)?;
         require(q == s.qualification, "Exact trusted qualification mismatch")
     }
-    /// Trusted internal Host Core policy configuration. Not approval, enrollment,
-    /// or a wire command. Changes close previous Roots before fallible work.
+    /// Trusted internal Host Core policy configuration for one environment.
+    /// Not approval, enrollment, or a wire command. A change closes that
+    /// environment's previous Roots before fallible work; other environments
+    /// keep theirs.
     #[cfg_attr(
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(super) fn configure_executor_policy(
@@ -248,9 +252,11 @@ impl PhysicalControlServiceV1 {
         max_lifetime: PositiveMicros,
     ) -> AppResult<()> {
         self.validate_ingress(ingress)?;
-        self.invalidate_live();
-        self.policy = None;
-        self.store.close_open_attempts("revoked")?;
+        let environment = binding.view().environment.clone();
+        self.invalidate_environment(&environment);
+        self.policies.remove(&environment);
+        self.store
+            .close_environment_attempts(&environment, "revoked")?;
         self.current_scope(&ceiling, binding)?;
         require(
             minimum.meets(ceiling.fields().profile.required_enforcement_class)
@@ -265,19 +271,22 @@ impl PhysicalControlServiceV1 {
             "pastey-physical-executor-policy-v1",
             &(&ceiling, minimum, max_lifetime),
         )?;
-        self.policy = Some(ExecutorPolicyV1 {
-            ceiling,
-            minimum_enforcement: minimum,
-            max_root_lifetime: max_lifetime,
-            digest: fingerprint,
-        });
+        self.policies.insert(
+            environment,
+            ExecutorPolicyV1 {
+                ceiling,
+                minimum_enforcement: minimum,
+                max_root_lifetime: max_lifetime,
+                digest: fingerprint,
+            },
+        );
         Ok(())
     }
     #[cfg_attr(
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(super) fn draft_review(
@@ -310,7 +319,7 @@ impl PhysicalControlServiceV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(super) fn seal_review(
@@ -335,7 +344,7 @@ impl PhysicalControlServiceV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(super) fn approve_review(
@@ -384,7 +393,7 @@ impl PhysicalControlServiceV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(super) fn finish_review(
@@ -419,7 +428,7 @@ impl PhysicalControlServiceV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(super) fn revise_review(
@@ -442,7 +451,7 @@ impl PhysicalControlServiceV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(super) fn start_exact_action(
@@ -480,9 +489,15 @@ impl PhysicalControlServiceV1 {
             .clone()
             .ok_or_else(|| crate::error::AppError::InvalidInput("Missing approval".into()))?;
         self.current_scope(&r.scope, &binding)?;
-        let policy = self.policy.as_ref().ok_or_else(|| {
-            crate::error::AppError::InvalidInput("No trusted executor policy".into())
-        })?;
+        // Field borrow: the binding clock is read while the policy is held.
+        let policy = self
+            .policies
+            .get(&binding.view().environment)
+            .ok_or_else(|| {
+                crate::error::AppError::InvalidInput(
+                    "No trusted executor policy for this environment".into(),
+                )
+            })?;
         let mut ceiling = policy.ceiling.fields().clone();
         if let Some(p) = &peer {
             let (now, _) = self.binding.now()?;
@@ -618,9 +633,7 @@ impl PhysicalControlServiceV1 {
                 ticks < root.deadline_ticks && now < root.audit.expires_at,
                 "Root expired",
             )?;
-            let policy = self.policy.as_ref().ok_or_else(|| {
-                crate::error::AppError::InvalidInput("Executor policy missing".into())
-            })?;
+            let policy = self.policy(&root.audit.environment)?;
             require(
                 policy.digest == root.audit.policy_digest,
                 "Executor policy changed",
@@ -646,9 +659,7 @@ impl PhysicalControlServiceV1 {
         minimum: SessionEnforcementClassV1,
     ) -> AppResult<PhysicalGrantBasisV1> {
         self.validate_root(root)?;
-        let policy = self.policy.as_ref().ok_or_else(|| {
-            crate::error::AppError::InvalidInput("Executor policy missing".into())
-        })?;
+        let policy = self.policy(&root.audit.environment)?;
         let mut policy_scope = policy.ceiling.fields().clone();
         if root.peer.is_some() {
             policy_scope.for_requester(&root.audit.requester);
@@ -691,9 +702,7 @@ impl PhysicalControlServiceV1 {
                 && basis.reviewed_digest == root.audit.scope_digest,
             "Foreign/closed grant basis",
         )?;
-        let policy = self.policy.as_ref().ok_or_else(|| {
-            crate::error::AppError::InvalidInput("Executor policy missing".into())
-        })?;
+        let policy = self.policy(&root.audit.environment)?;
         let mut ceiling = policy.ceiling.fields().clone();
         if root.peer.is_some() {
             ceiling.for_requester(&root.audit.requester);
@@ -728,6 +737,26 @@ impl PhysicalControlServiceV1 {
             {
                 entry.valid.store(false, Ordering::Release);
                 control.invalidate_root(root);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    fn policy(&self, environment: &EnvironmentRefV1) -> AppResult<&ExecutorPolicyV1> {
+        self.policies.get(environment).ok_or_else(|| {
+            crate::error::AppError::InvalidInput(
+                "No trusted executor policy for this environment".into(),
+            )
+        })
+    }
+    /// Closes RAM authority of one environment's Roots.
+    fn invalidate_environment(&mut self, environment: &EnvironmentRefV1) {
+        let control = &mut self.control;
+        self.roots.retain(|id, entry| {
+            if &entry.environment == environment {
+                entry.valid.store(false, Ordering::Release);
+                control.invalidate_root(id);
                 false
             } else {
                 true
@@ -904,7 +933,7 @@ impl PhysicalControlServiceV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(in crate::physical) fn bind_environment(
@@ -920,7 +949,7 @@ impl PhysicalControlServiceV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(in crate::physical) fn qualify_environment(

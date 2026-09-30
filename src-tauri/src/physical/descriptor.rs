@@ -80,7 +80,7 @@ impl ImplementationFingerprintV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub fn entries(&self) -> &BTreeMap<LabelV1, Sha256HexV1> {
@@ -221,7 +221,7 @@ impl CanonicalJsonV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub fn empty_object() -> Self {
@@ -233,7 +233,7 @@ impl CanonicalJsonV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub fn decode<T: serde::de::DeserializeOwned>(&self) -> AppResult<T> {
@@ -243,7 +243,7 @@ impl CanonicalJsonV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub fn encode(value: &impl Serialize) -> AppResult<Self> {
@@ -487,7 +487,7 @@ impl BoundSetV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub fn bounds(&self) -> &[BoundV1] {

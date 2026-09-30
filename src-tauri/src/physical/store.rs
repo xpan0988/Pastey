@@ -206,6 +206,17 @@ fn decode<T: DeserializeOwned + Serialize>(raw: &str) -> AppResult<T> {
 /// Path-only module-local store. Opening it does not restore any live binding.
 pub(super) struct PhysicalStoreV1 {
     path: PathBuf,
+    audited: parking_lot::Mutex<AuditMemoV1>,
+}
+/// Exact memo of the full ledger audit. The audit is a pure function of the
+/// ledger, and `PRAGMA data_version` on a connection that never writes
+/// changes whenever any other connection or process commits. An unchanged
+/// version therefore means the ledger is exactly what last passed the audit.
+/// Every commit, this Core's own included, is audited by the next
+/// transaction, as before.
+struct AuditMemoV1 {
+    watch: Connection,
+    version: Option<i64>,
 }
 
 /// Called only through the existing database startup owner. A partial or unknown
@@ -393,12 +404,40 @@ impl PhysicalStoreV1 {
     pub(super) fn open(paths: &AppPaths) -> AppResult<Self> {
         let store = Self {
             path: paths.db_path.clone(),
+            audited: parking_lot::Mutex::new(AuditMemoV1 {
+                watch: configured_connection(&paths.db_path)?,
+                version: None,
+            }),
         };
         let mut conn = store.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        audit(&tx)?;
+        store.audit(&tx)?;
         tx.commit()?;
         Ok(store)
+    }
+    /// The full ledger audit for this transaction's snapshot, skipped only
+    /// when no connection has committed since the last passing audit.
+    fn audit(&self, tx: &Connection) -> AppResult<()> {
+        let mut memo = self.audited.lock();
+        let version = |m: &AuditMemoV1| -> AppResult<i64> {
+            Ok(m.watch.query_row("PRAGMA data_version", [], |r| r.get(0))?)
+        };
+        let before = version(&memo)?;
+        // Starts the snapshot of a deferred transaction; an immediate one has
+        // held the write lock since it began, so nothing commits meanwhile.
+        tx.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i64>(0)
+        })?;
+        let after = version(&memo)?;
+        if memo.version == Some(after) {
+            return Ok(());
+        }
+        memo.version = None;
+        audit(tx)?;
+        if before == after {
+            memo.version = Some(after);
+        }
+        Ok(())
     }
     pub(in crate::physical) fn connection(&self) -> AppResult<Connection> {
         let conn = configured_connection(&self.path)?;
@@ -413,7 +452,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<EnvironmentRegistrationV1> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
-        audit(&tx)?;
+        self.audit(&tx)?;
         let value = load_registration(&tx, id, true)?;
         tx.commit()?;
         Ok(value)
@@ -426,7 +465,7 @@ impl PhysicalStoreV1 {
         record.validate()?;
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        audit(&tx)?;
+        self.audit(&tx)?;
         match expected_revision {
             None => {
                 require(
@@ -497,14 +536,14 @@ impl PhysicalStoreV1 {
                 }
             }
         }
-        audit(&tx)?;
+        self.audit(&tx)?;
         tx.commit()?;
         Ok(())
     }
     pub(super) fn retire(&self, id: &EnvironmentRefV1, expected: u64) -> AppResult<()> {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        audit(&tx)?;
+        self.audit(&tx)?;
         let old = load_registration(&tx, id, true)?;
         require(old.revision == expected, "Retirement revision mismatch")?;
         bump_environment_domains(&tx, id)?;
@@ -519,7 +558,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<BTreeMap<DomainId, u64>> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
-        audit(&tx)?;
+        self.audit(&tx)?;
         let mut result = BTreeMap::new();
         for domain in domains {
             let epoch: i64 = tx.query_row(
@@ -538,7 +577,7 @@ impl PhysicalStoreV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(super) fn advance_epochs(&self, expected: &BTreeMap<DomainId, u64>) -> AppResult<()> {
@@ -548,7 +587,7 @@ impl PhysicalStoreV1 {
         )?;
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        audit(&tx)?;
+        self.audit(&tx)?;
         for (domain, epoch) in expected {
             let next = checked_integer(epoch.checked_add(1).unwrap_or(u64::MAX))?;
             let n = tx.execute(
@@ -579,7 +618,7 @@ impl PhysicalStoreV1 {
         q.validate()?;
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        audit(&tx)?;
+        self.audit(&tx)?;
         require(
             load_registration(&tx, environment, true)?.digest()? == *registration_digest,
             "Qualification enrollment mismatch",
@@ -597,7 +636,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<PhysicalQualificationV1> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
-        audit(&tx)?;
+        self.audit(&tx)?;
         let (raw,withdrawal,env,reg): (String,i64,String,String) = tx.query_row("SELECT record_json,withdrawal_revision,environment_id,registration_digest FROM physical_qualifications WHERE qualification_id=?1",[text(id)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         let q: PhysicalQualificationV1 = decode(&raw)?;
         require(
@@ -615,7 +654,7 @@ impl PhysicalStoreV1 {
     pub(super) fn withdraw(&self, id: &QualificationId, revision: u64) -> AppResult<()> {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        audit(&tx)?;
+        self.audit(&tx)?;
         let n = tx.execute("UPDATE physical_qualifications SET withdrawal_revision=?2 WHERE qualification_id=?1 AND revision < ?2 AND withdrawal_revision < ?2",params![text(id),checked_integer(revision)?])?;
         require(n == 1, "Missing/stale qualification withdrawal")?;
         tx.commit()?;
@@ -627,7 +666,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<()> {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        audit(&tx)?;
+        self.audit(&tx)?;
         load_registration(&tx, environment, true)?;
         withdraw_environment(&tx, environment)?;
         tx.commit()?;

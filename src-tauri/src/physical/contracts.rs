@@ -144,7 +144,7 @@ impl ProposalFreshnessV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub fn allows_age(&self, age: std::time::Duration) -> bool {
@@ -165,7 +165,7 @@ impl ObservationFreshnessV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub fn allows(&self, age: std::time::Duration, gap: std::time::Duration) -> bool {
@@ -311,7 +311,7 @@ impl PhysicalQualificationV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub fn validate_enforcement(

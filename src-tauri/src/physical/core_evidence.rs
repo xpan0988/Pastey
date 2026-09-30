@@ -62,22 +62,13 @@ impl PhysicalControlServiceV1 {
             "Foreign evidence lineage",
         )?;
         if expected != *fact {
-            let control = &mut self.control;
-            self.roots.retain(|id, entry| {
-                if entry.environment == expected.environment {
-                    entry.valid.store(false, Ordering::Release);
-                    control.invalidate_root(id);
-                    false
-                } else {
-                    true
-                }
-            });
+            self.invalidate_environment(&expected.environment);
             // Close private proof first, before fallible ledger closure. A trusted
             // reset is denial evidence, never a new enrollment or incarnation.
             self.binding
                 .invalidate_evidence_continuity(&expected.environment)?;
             self.store
-                .close_environment_attempts(&expected.environment)?;
+                .close_environment_attempts(&expected.environment, "dependency_invalidated")?;
         }
         Ok(())
     }
@@ -165,7 +156,7 @@ impl PhysicalControlServiceV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(in crate::physical) fn configure_physical_handover(

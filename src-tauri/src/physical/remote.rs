@@ -207,7 +207,7 @@ impl PhysicalControlServiceV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(in crate::physical) fn attach_product_environment(
@@ -218,11 +218,7 @@ impl PhysicalControlServiceV1 {
         self.validate_ingress(ingress)?;
         self.binding.validate_current(&environment.binding)?;
         let ceiling = self
-            .policy
-            .as_ref()
-            .ok_or_else(|| {
-                crate::error::AppError::InvalidInput("Physical policy unavailable".into())
-            })?
+            .policy(&environment.binding.view().environment)?
             .ceiling
             .clone();
         self.current_scope(&ceiling, &environment.binding)?;
@@ -334,13 +330,7 @@ impl PhysicalControlServiceV1 {
                 if let Some(e) = &self.remote.environment {
                     let binding = e.binding.clone();
                     let mut f = self
-                        .policy
-                        .as_ref()
-                        .ok_or_else(|| {
-                            crate::error::AppError::InvalidInput(
-                                "Physical policy unavailable".into(),
-                            )
-                        })?
+                        .policy(&binding.view().environment)?
                         .ceiling
                         .fields()
                         .clone();

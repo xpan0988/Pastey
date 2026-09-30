@@ -110,6 +110,40 @@ pub(super) fn lineage(
     };
     Ok((l, scope))
 }
+/// `lineage` memoized for one audit pass. Within one transaction the ledger
+/// does not change, so every row of an action has the same lineage.
+struct LineagesV1<'c> {
+    c: &'c Connection,
+    known: BTreeMap<ActionId, (EvidenceLineageV1, PhysicalReviewScopeV1)>,
+    qualifications: BTreeMap<(ActionId, QualificationId), DigestV1>,
+}
+impl<'c> LineagesV1<'c> {
+    fn new(c: &'c Connection) -> Self {
+        Self {
+            c,
+            known: BTreeMap::new(),
+            qualifications: BTreeMap::new(),
+        }
+    }
+    fn get(&mut self, id: &ActionId) -> AppResult<&(EvidenceLineageV1, PhysicalReviewScopeV1)> {
+        if !self.known.contains_key(id) {
+            let found = lineage(self.c, id)?;
+            self.known.insert(id.clone(), found);
+        }
+        Ok(&self.known[id])
+    }
+    /// The digest of `producer_qualification` for an action's scope.
+    fn qualification(&mut self, action: &ActionId, id: &QualificationId) -> AppResult<DigestV1> {
+        let key = (action.clone(), id.clone());
+        if let Some(d) = self.qualifications.get(&key) {
+            return Ok(d.clone());
+        }
+        let scope = self.get(action)?.1.clone();
+        let d = producer_qualification(self.c, &scope, id)?.digest()?;
+        self.qualifications.insert(key, d.clone());
+        Ok(d)
+    }
+}
 fn producer_qualification(
     c: &Connection,
     scope: &PhysicalReviewScopeV1,
@@ -228,7 +262,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let mut stmt = tx.prepare("SELECT record_json FROM physical_consequences")?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
@@ -255,7 +289,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<crate::host_identity::HostRef> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let (_, scope) = lineage(&tx, id)?;
         let host = scope.fields().executor.clone();
         tx.commit()?;
@@ -267,7 +301,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<EvidenceLineageV1> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let (l, _) = lineage(&tx, id)?;
         tx.commit()?;
         Ok(l)
@@ -281,7 +315,7 @@ impl PhysicalStoreV1 {
         f.validate()?;
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let (l, s) = lineage(&tx, &f.lineage.action)?;
         // Foreign root/session/action cannot even attach historical facts. Source
         // reset/class/lineage mismatch may be recorded but denies evaluation continuity.
@@ -354,7 +388,7 @@ impl PhysicalStoreV1 {
         f.validate()?;
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let (l, s) = lineage(&tx, &f.lineage.action)?;
         correlate(&l, &f.lineage)?;
         let prior: Option<String> = tx
@@ -420,7 +454,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<(EvidenceLineageV1, Vec<ObservationRecordV1>)> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let (l, _) = lineage(&tx, id)?;
         let rev = head(&tx, id)?;
         let (os, _) = facts(&tx, id, rev)?;
@@ -435,7 +469,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<PhysicalConsequenceV1> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let (l, s) = lineage(&tx, id)?;
         let rev = head(&tx, id)?;
         let (os, ds) = facts(&tx, id, rev)?;
@@ -490,7 +524,7 @@ impl PhysicalStoreV1 {
         let (root, attempt, id, revision, expected_completion, reject, now_us) = proof.fields();
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let (l, s) = lineage(&tx, id)?;
         require(
             l.root == *root
@@ -550,7 +584,7 @@ impl PhysicalStoreV1 {
     pub(in crate::physical) fn acceptance(&self, id: &RootId) -> AppResult<AcceptanceStateV1> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let v = acceptance(&tx, id)?;
         tx.commit()?;
         Ok(v)
@@ -563,7 +597,7 @@ impl PhysicalStoreV1 {
         p.freshness.validate()?;
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let s = super::control_ledger::session(&tx, &p.session)?;
         handover_policy_valid(p, &s)?;
         tx.execute(
@@ -586,7 +620,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<PhysicalReconciliationV1> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let (l, s) = lineage(&tx, id)?;
         let x = consequence(&tx, id)?.ok_or_else(|| {
             crate::error::AppError::InvalidInput("Evaluate before reconciliation".into())
@@ -764,7 +798,7 @@ impl PhysicalStoreV1 {
                 serde_json::to_string(&r)?
             ],
         )?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         tx.commit()?;
         Ok(r)
     }
@@ -862,6 +896,7 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
     }
     let missing:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM physical_attempts a LEFT JOIN physical_task_acceptance t USING(root_id) WHERE t.root_id IS NULL)",[],|r|r.get(0))?;
     require(!missing, "Missing task terminal state")?;
+    let mut lineages = LineagesV1::new(c);
     let mut stmt = c.prepare("SELECT * FROM physical_evidence ORDER BY action_id,revision")?;
     let mut rows = stmt.query([])?;
     let mut revisions = BTreeMap::<String, u64>::new();
@@ -877,9 +912,8 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
             if let Some(p) = &o.producer {
                 p.validate(&o.fact, o.receipt_us)?;
             }
-            let (_, scope) = lineage(c, &o.fact.lineage.action)?;
             require(
-                producer_qualification(c, &scope, &o.producer_qualification)?.digest()?
+                lineages.qualification(&o.fact.lineage.action, &o.producer_qualification)?
                     == o.producer_qualification_digest,
                 "Observation producer qualification mismatch",
             )?;
@@ -896,9 +930,8 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         } else {
             let d: DispositionRecordV1 = decode(&raw)?;
             d.fact.validate()?;
-            let (_, scope) = lineage(c, &d.fact.lineage.action)?;
             require(
-                producer_qualification(c, &scope, &d.producer_qualification)?.digest()?
+                lineages.qualification(&d.fact.lineage.action, &d.producer_qualification)?
                     == d.producer_qualification_digest,
                 "Disposition producer qualification mismatch",
             )?;
@@ -913,8 +946,7 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
                 digest("pastey-physical-evidence-record-v1", &d)?,
             )
         };
-        let (expected, _) = lineage(c, &l.action)?;
-        correlate(&expected, &l)?;
+        correlate(&lineages.get(&l.action)?.0, &l)?;
         let src = text(&source(&l)?);
         let old = sources
             .entry((action.clone(), kind, src.clone()))
@@ -948,7 +980,7 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
     let mut revisions = BTreeMap::<ActionId, u64>::new();
     while let Some(r) = rows.next()? {
         let x: PhysicalConsequenceV1 = decode(&r.get::<_, String>("record_json")?)?;
-        let (l, s) = lineage(c, &x.action)?;
+        let (l, s) = lineages.get(&x.action)?.clone();
         let (os, ds) = facts(c, &x.action, x.evidence_revision)?;
         let (state, reason, gap) = replay(
             &s,

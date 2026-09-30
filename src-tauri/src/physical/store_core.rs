@@ -270,7 +270,7 @@ impl PhysicalStoreV1 {
         )?;
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         dependencies(&tx, &r.scope, snapshot, now)?;
         insert_review(&tx, r)?;
         tx.commit()?;
@@ -283,7 +283,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<PhysicalReviewRecordV1> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let r = load_review(&tx, id, revision)?;
         tx.commit()?;
         Ok(r)
@@ -294,7 +294,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<PhysicalReviewRecordV1> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let (id, rev): (String, i64) = tx.query_row(
             "SELECT review_id,revision FROM physical_reviews WHERE approval_id=?1",
             [text(id)],
@@ -314,7 +314,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<PhysicalReviewRecordV1> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let mut r = current_review(&tx, id, revision)?;
         require(r.scope_digest == *digest, "Approval/review digest mismatch")?;
         let previous = r.state;
@@ -371,7 +371,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<PhysicalReviewRecordV1> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let mut old = current_review(&tx, id, expected)?;
         dependencies(&tx, &scope, snapshot, now)?;
         if !matches!(
@@ -408,7 +408,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         let r = current_review(&tx, &a.review_id, a.review_revision)?;
         a.validate(&r)?;
         require(
@@ -435,7 +435,7 @@ impl PhysicalStoreV1 {
     ) -> AppResult<()> {
         let mut c = self.connection()?;
         let tx = c.transaction()?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         validate_attempt_in(&tx, a, snapshot, now)?;
         tx.commit()?;
         Ok(())
@@ -444,7 +444,7 @@ impl PhysicalStoreV1 {
         require(valid_reason(reason), "Invalid Root close reason")?;
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         super::evidence_ledger::cancel(&tx, id)?;
         super::control_ledger::close_root(&tx, id)?;
         tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason=?2 WHERE root_id=?1 AND state='open'",params![text(id),reason])?;
@@ -454,10 +454,12 @@ impl PhysicalStoreV1 {
     pub(in crate::physical) fn close_environment_attempts(
         &self,
         environment: &EnvironmentRefV1,
+        reason: &str,
     ) -> AppResult<()> {
+        require(valid_reason(reason), "Invalid Root close reason")?;
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         tx.execute("UPDATE physical_task_acceptance SET state='cancelled',revision=2 WHERE state='pending' AND root_id IN (SELECT root_id FROM physical_attempts WHERE environment_id=?1)",[text(environment)])?;
         let roots: Vec<String> = tx
             .prepare(
@@ -468,7 +470,7 @@ impl PhysicalStoreV1 {
         for root in roots {
             super::control_ledger::close_root(&tx, &RootId::try_from(root)?)?;
         }
-        tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason='dependency_invalidated' WHERE environment_id=?1 AND state='open'",[text(environment)])?;
+        tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason=?2 WHERE environment_id=?1 AND state='open'",params![text(environment),reason])?;
         tx.commit()?;
         Ok(())
     }
@@ -476,7 +478,7 @@ impl PhysicalStoreV1 {
         require(valid_reason(reason), "Invalid Root close reason")?;
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::audit(&tx)?;
+        self.audit(&tx)?;
         if !matches!(reason, "interrupted" | "shutdown") {
             tx.execute("UPDATE physical_task_acceptance SET state='cancelled',revision=2 WHERE state='pending'", [])?;
         }

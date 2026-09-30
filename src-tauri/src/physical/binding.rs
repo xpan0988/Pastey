@@ -418,7 +418,7 @@ impl PhysicalBindingResolverV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(super) fn retire(&mut self, id: &EnvironmentRefV1, expected: u64) -> AppResult<()> {
@@ -614,6 +614,41 @@ impl PhysicalBindingResolverV1 {
         *binding.epochs.lock() = s.epochs.clone();
         Ok(())
     }
+    /// Core's own fence moved this environment's domains to the fence epochs
+    /// in the ledger. The live resolution follows exactly that transition, so
+    /// the same offer stays usable once a verified handover has released the
+    /// domains; any other epoch movement still invalidates it.
+    pub(super) fn follow_fence(
+        &mut self,
+        binding: &EnvironmentBindingV1,
+        fence: &super::store::FenceAuditV1,
+    ) -> AppResult<()> {
+        require(
+            binding.valid.load(Ordering::Acquire)
+                && self
+                    .live
+                    .get(&binding.view.environment)
+                    .is_some_and(|entry| {
+                        entry.offer == binding.view.offer_id
+                            && Arc::ptr_eq(&entry.valid, &binding.valid)
+                    }),
+            "Fenced binding is not current",
+        )?;
+        let reg = self.store.registration(&binding.view.environment)?;
+        let current = self.store.epochs(reg.resources.keys().cloned())?;
+        let mut epochs = binding.epochs.lock();
+        let mut next = epochs.clone();
+        for (domain, epoch) in &fence.epochs {
+            require(
+                next.get(domain).is_some_and(|old| old < epoch),
+                "Fence outside this resolution",
+            )?;
+            next.insert(domain.clone(), *epoch);
+        }
+        require(next == current, "Domain ledger moved beyond the fence")?;
+        *epochs = next;
+        Ok(())
+    }
     pub(super) fn ledger_snapshot(
         &mut self,
         binding: &EnvironmentBindingV1,
@@ -678,7 +713,7 @@ impl PhysicalBindingResolverV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     pub(super) fn withdraw(&mut self, id: &QualificationId, revision: u64) -> AppResult<()> {

@@ -103,7 +103,7 @@ pub(in crate::physical) enum AdmissionOutcomeV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     Duplicate(ActionId),
@@ -143,7 +143,7 @@ impl LaneValidityV1 {
         not(test),
         expect(
             dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
+            reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
     fn allows(&self) -> bool {
@@ -159,7 +159,7 @@ impl LaneValidityV1 {
 }
 #[expect(
     dead_code,
-    reason = "reachable only once a production binding is attached (Step D); unused by tests too"
+    reason = "no production binding is attached; the reference bindings are test-only; unused by tests too"
 )]
 pub(in crate::physical) struct NativeSessionInstallViewV1 {
     session: SessionId,
@@ -171,7 +171,7 @@ pub(in crate::physical) struct NativeSessionInstallViewV1 {
 }
 #[expect(
     dead_code,
-    reason = "reachable only once a production binding is attached (Step D); unused by tests too"
+    reason = "no production binding is attached; the reference bindings are test-only; unused by tests too"
 )]
 pub(in crate::physical) struct AdmittedActionReadViewV1 {
     session: SessionId,
@@ -191,7 +191,7 @@ pub(in crate::physical) struct AdmittedActionReadViewV1 {
     not(test),
     expect(
         dead_code,
-        reason = "reachable only once a production binding is attached (Step D)"
+        reason = "no production binding is attached; the reference bindings are test-only"
     )
 )]
 pub(in crate::physical) struct NativeFenceRequestViewV1 {
@@ -943,7 +943,11 @@ impl PhysicalControlServiceV1 {
         let fence = {
             let mut service = core.lock();
             service.close_root(&s.root)?;
-            service.store.fence_request(s.id())?
+            let fence = service.store.fence_request(s.id())?;
+            // A resolution that cannot follow stays invalid: the Host must
+            // resolve the environment again.
+            let _ = service.binding.follow_fence(&s.root.binding, &fence);
+            fence
         };
         let evidence = adapter
             .fence(NativeFenceRequestViewV1 {
