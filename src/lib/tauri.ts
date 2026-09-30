@@ -736,6 +736,9 @@ export async function logFrontendDiagnostic(line: string): Promise<boolean> {
   return invoke("log_frontend_diagnostic", { line });
 }
 
+export function physicalMcpConnection(roomId: string, targetHostRef: string, start: string) {
+  return invoke<import("./physical").PhysicalMcpConnection>("physical_mcp_connection", { roomId, targetHostRef, start });
+}
 export function physicalProductCommand(roomId: string, targetHostRef: string, request: import("./physical").PhysicalProductRequest) {
   return invoke<import("./physical").PhysicalProductView>("physical_product_command", { roomId, targetHostRef, request });
 }

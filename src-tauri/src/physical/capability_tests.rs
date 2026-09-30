@@ -55,6 +55,8 @@ fn dispense_fields(f: &mut ReviewScopeFieldsV1) {
         on_completion: CompletionAcceptanceV1::Automatic,
         // Nothing here can witness a physical limit: intent only.
         effect_bound: EffectBoundV1::IntentOnly,
+        idle_lease_us: micros(700_000),
+        approval_lifetime_us: micros(30_000_000),
     };
     f.bounds = c.bounds.clone();
     f.loss = c.loss_profile.clone();

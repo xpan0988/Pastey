@@ -191,6 +191,7 @@ struct SimStateV1<B> {
 }
 
 /// What the simulator actually did. Tests read it; Pastey never does.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(in crate::physical) struct SimTruthV1 {
     pub view: Value,
@@ -296,6 +297,7 @@ impl<B: SimBodyV1> SimBindingV1<B> {
         })
     }
     /// The simulator's ground truth, brought up to the current time.
+    #[cfg(test)]
     pub(in crate::physical) fn truth(&self) -> AppResult<SimTruthV1> {
         let mut s = self.state.lock();
         let (capture, ticks) = self.now()?;
@@ -311,6 +313,7 @@ impl<B: SimBodyV1> SimBindingV1<B> {
     }
     /// Someone moves the body by hand while no session owns it (a person
     /// carrying it back). The world stays the same world.
+    #[cfg(test)]
     pub(in crate::physical) fn carry(&self, place: impl FnOnce(&mut B)) -> AppResult<()> {
         let (capture, ticks) = self.now()?;
         let mut s = self.state.lock();

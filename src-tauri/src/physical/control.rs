@@ -206,7 +206,7 @@ type LaneFuture<'a, T> = Pin<Box<dyn Future<Output = AppResult<Option<T>>> + Sen
 // only replies it can build. A reply names exactly the view it answers; Core
 // revalidates every field all the same.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "physical-sim")),
     expect(
         dead_code,
         reason = "used by bindings; the reference bindings are test-only"
@@ -245,7 +245,7 @@ impl NativeSessionInstallViewV1 {
     }
 }
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "physical-sim")),
     expect(
         dead_code,
         reason = "used by bindings; the reference bindings are test-only"
@@ -295,7 +295,7 @@ impl AdmittedActionReadViewV1 {
     }
 }
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "physical-sim")),
     expect(
         dead_code,
         reason = "used by bindings; the reference bindings are test-only"
@@ -324,7 +324,7 @@ impl NativeFenceRequestViewV1 {
     }
 }
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "physical-sim")),
     expect(
         dead_code,
         reason = "built by bindings; the reference bindings are test-only"

@@ -13,6 +13,8 @@ export interface PhysicalScope {
     effectBound:
       | { verification: "witnessed"; predicate: { id: string }; requiredWitness: string }
       | { verification: "intent_only" };
+    idleLeaseUs: number;
+    approvalLifetimeUs: number;
   };
   execution: { actionDurationUs: number; leaseDurationUs: number; totalExecutionUs: number; actionCount: number };
   qualification: { requiredEnforcementClass: "adapter_isolation_only" | "native_fence"; expiresAt: number };
@@ -27,6 +29,20 @@ export interface PhysicalReview {
   state: "draft" | "reviewed" | "approved" | "rejected" | "expired";
   approval: { approvalId: string; expiresAt: number } | null;
 }
+/** One decision record: who proposed which option, and the executor's admission. */
+export interface PhysicalDecision {
+  sequence: number;
+  proposer: string;
+  option: string;
+  allowed: boolean;
+  reason: string;
+}
+/** The witness's latest verdict; Core's own conclusion is `consequence`. */
+export interface PhysicalWitnessConclusion {
+  witnessClass: string;
+  result: "verified" | "partial" | "contradicted" | "unknown";
+  reason: string;
+}
 export interface PhysicalStatus {
   review: string;
   authority: "pending" | "open" | "closed";
@@ -37,6 +53,18 @@ export interface PhysicalStatus {
   reconciliation: "pending" | "recorded";
   enforcementPending: boolean;
   quarantined: boolean;
+  root?: string | null;
+  session?: string | null;
+  action?: string | null;
+  consequenceReason?: string | null;
+  witness?: PhysicalWitnessConclusion | null;
+  decisions?: PhysicalDecision[];
+}
+/** What an agent's MCP configuration runs to drive a started stream. */
+export interface PhysicalMcpConnection {
+  command: string;
+  args: string[];
+  grantPath: string;
 }
 export interface PhysicalProductView {
   offers: { scopeDigest: string; scope: PhysicalScope }[];
@@ -77,5 +105,34 @@ export function physicalScopeSummary(scope: PhysicalScope): [string, string][] {
       ? `${e.predicate.id}, checked by a ${e.requiredWitness.replace(/_/g, " ")} witness`
       : "Intent only: constrains the brain's choices, not what the body does"],
     ["On completion", s.onCompletion === "automatic" ? "Accepted automatically" : "Awaits a review decision"],
+    ["Approval valid for", `${seconds(s.approvalLifetimeUs)} after approval`],
+    ["Idle lease", `the stream ends after ${seconds(s.idleLeaseUs)} without a tool call`],
   ];
+}
+const words = (value: string) => value.replace(/_/g, " ");
+/** Status rows, without the decision records and the witness verdict. */
+export function physicalStatusRows(status: PhysicalStatus): [string, string][] {
+  return ([
+    ["Authority", status.authority],
+    ["Installation", status.installation],
+    ["Dispatch", status.dispatch],
+    ["Consequence", status.consequenceReason ? `${status.consequence} (${status.consequenceReason})` : status.consequence],
+    ["Acceptance", status.acceptance],
+    ["Reconciliation", status.reconciliation],
+    ["Enforcement pending", status.enforcementPending ? "yes" : "no"],
+    ["Quarantined", status.quarantined ? "yes" : "no"],
+  ] as [string, string][]).map(([label, value]) => [label, words(value)]);
+}
+/** The witness's verdict, apart from Core's conclusion. */
+export function physicalWitnessSummary(status: PhysicalStatus): string {
+  const w = status.witness;
+  return w ? `${words(w.witnessClass)} witness: ${w.result} (${words(w.reason)})` : "No witness verdict yet";
+}
+/** One decision record as a table row: sequence, proposer, option, admission. */
+export function physicalDecisionRow(d: PhysicalDecision): [string, string, string, string] {
+  return [String(d.sequence), d.proposer, d.option, d.allowed ? "allowed" : `refused: ${d.reason}`];
+}
+/** The MCP server entry an agent configuration needs. */
+export function physicalMcpConfig(c: PhysicalMcpConnection): string {
+  return JSON.stringify({ mcpServers: { "pastey-physical": { command: c.command, args: c.args } } }, null, 2);
 }

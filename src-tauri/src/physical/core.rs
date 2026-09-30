@@ -237,7 +237,7 @@ impl PhysicalControlServiceV1 {
     /// environment's previous Roots before fallible work; other environments
     /// keep theirs.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "physical-sim")),
         expect(
             dead_code,
             reason = "no production binding is attached; the reference bindings are test-only"
@@ -364,6 +364,10 @@ impl PhysicalControlServiceV1 {
                 && r.scope_digest == *exact_digest
                 && principal == r.scope.fields().principal
                 && now < expires_at
+                && expires_at.get()
+                    <= now
+                        .get()
+                        .saturating_add(r.scope.fields().stream.approval_lifetime_us.get() / 1000)
                 && expires_at <= r.scope.fields().environment.offer_expiry
                 && expires_at <= r.scope.fields().qualification.expires_at,
             "Invalid exact approval decision/expiry",
@@ -930,7 +934,7 @@ impl PhysicalControlServiceV1 {
     /// Enrolls and resolves the environment a binding describes. The sealed
     /// result is Core's private proof; the binding itself holds no authority.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "physical-sim")),
         expect(
             dead_code,
             reason = "no production binding is attached; the reference bindings are test-only"
@@ -946,7 +950,7 @@ impl PhysicalControlServiceV1 {
         self.binding.bind_environment(lane, expected)
     }
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "physical-sim")),
         expect(
             dead_code,
             reason = "no production binding is attached; the reference bindings are test-only"

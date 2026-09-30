@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { physicalProductCommand } from "../lib/tauri";
-import { physicalReviewFresh, physicalScopeSummary, type PhysicalProductRequest, type PhysicalProductView } from "../lib/physical";
+import { physicalMcpConnection, physicalProductCommand } from "../lib/tauri";
+import { physicalDecisionRow, physicalMcpConfig, physicalReviewFresh, physicalScopeSummary, physicalStatusRows, physicalWitnessSummary, type PhysicalMcpConnection, type PhysicalProductRequest, type PhysicalProductView } from "../lib/physical";
 import type { BridgePeerSession } from "../lib/bridgePeers";
 
 export function PhysicalReviewPanel({ roomId, peers }: { roomId: string; peers: BridgePeerSession[] }) {
@@ -19,6 +19,7 @@ function PhysicalHostReview({ roomId, host }: { roomId: string; host: string }) 
   const [view, setView] = useState<PhysicalProductView | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [mcp, setMcp] = useState<PhysicalMcpConnection | null>(null);
   const mounted = useRef(true);
   const [, updateExpiry] = useState(0);
   const reviewExpiry = view ? Math.min(
@@ -33,6 +34,12 @@ function PhysicalHostReview({ roomId, host }: { roomId: string; host: string }) 
     return () => window.clearTimeout(timer);
   }, [reviewExpiry]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  async function connectBrain(start: string) {
+    setBusy(true); setError("");
+    try { const connection = await physicalMcpConnection(roomId, host, start); if (mounted.current) setMcp(connection); }
+    catch (e) { if (mounted.current) setError(String(e)); }
+    finally { if (mounted.current) setBusy(false); }
+  }
   async function command(request: PhysicalProductRequest) {
     setBusy(true); setError("");
     try { const result = await physicalProductCommand(roomId, host, request); if (mounted.current) setView(result); }
@@ -64,13 +71,26 @@ function PhysicalHostReview({ roomId, host }: { roomId: string; host: string }) 
       </article> : null}
       <div aria-live="polite">
         {view.deliveryPending ? <p>Delivery or semantic reply pending. Execution and consequences may be unknown.</p> : null}
-        {status ? <dl>{Object.entries(status).map(([key, value]) => <div key={key}><dt>{key.replace(/([A-Z])/g, " $1")}</dt><dd>{String(value ?? "unknown").replace(/_/g, " ")}</dd></div>)}</dl> : null}
+        {status ? <>
+          <dl>{physicalStatusRows(status).map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
+          <p>{physicalWitnessSummary(status)}</p>
+          {status.decisions && status.decisions.length > 0 ? <table>
+            <caption>Decision records (latest {status.decisions.length})</caption>
+            <thead><tr><th>#</th><th>Proposer</th><th>Option</th><th>Admission</th></tr></thead>
+            <tbody>{status.decisions.map((d) => { const [n, who, option, admission] = physicalDecisionRow(d); return <tr key={n}><td>{n}</td><td>{who}</td><td>{option}</td><td>{admission}</td></tr>; })}</tbody>
+          </table> : <p>No decision records yet.</p>}
+        </> : null}
       </div>
       {view.start ? <div>
         <button type="button" disabled={busy} onClick={() => void command({ kind: "status", start: view.start! })}>Query executor status</button>
         <button type="button" disabled={busy} onClick={() => void command({ kind: "cancel", start: view.start! })}>Cancel task authority</button>
         <button type="button" disabled={busy} onClick={() => void command({ kind: "reconcile", start: view.start! })}>Reconcile consequences</button>
         <p>Cancellation delivery may be uncertain. A stop acknowledgement does not prove physical rest.</p>
+        <button type="button" disabled={busy} onClick={() => void connectBrain(view.start!)}>Connect an MCP brain</button>
+        {mcp ? <div>
+          <p>Add this server to the agent's MCP configuration. It is good for one connection; closing it ends the stream as a crashed brain would.</p>
+          <pre>{physicalMcpConfig(mcp)}</pre>
+        </div> : null}
       </div> : null}
     </> : null}
     {error ? <p role="alert">{error}</p> : null}

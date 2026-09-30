@@ -439,6 +439,8 @@ test("physical review shows a decision-stream scope, including its observation f
       observation: { fields: ["/heading", "/room"], minIntervalUs: 100000, destination: "host:brain" },
       onCompletion: "await_review",
       effectBound: { verification: "witnessed", predicate: { id: "flat.stays-inside/v1" }, requiredWitness: "simulation_oracle" },
+      idleLeaseUs: 120000000,
+      approvalLifetimeUs: 1800000000,
     },
   } as import("../src/lib/physical").PhysicalScope);
   assert.deepEqual(Object.fromEntries(stream), {
@@ -452,6 +454,8 @@ test("physical review shows a decision-stream scope, including its observation f
     "Observations sent": "/heading, /room to host:brain, at most one per 0.1 s",
     "Effect bound": "flat.stays-inside/v1, checked by a simulation oracle witness",
     "On completion": "Awaits a review decision",
+    "Approval valid for": "1800 s after approval",
+    "Idle lease": "the stream ends after 120 s without a tool call",
   });
   // A single reviewed action is a one-option stream with one action.
   const intentOnly = physicalScopeSummary({
@@ -463,6 +467,8 @@ test("physical review shows a decision-stream scope, including its observation f
       observation: { fields: [], minIntervalUs: 500000, destination: "host:brain" },
       onCompletion: "automatic",
       effectBound: { verification: "intent_only" },
+      idleLeaseUs: 700000,
+      approvalLifetimeUs: 30000000,
     },
   } as import("../src/lib/physical").PhysicalScope);
   assert.equal(Object.fromEntries(intentOnly)["Effect bound"], "Intent only: constrains the brain's choices, not what the body does");
@@ -474,4 +480,35 @@ test("physical review shows a decision-stream scope, including its observation f
   const panel = readFileSync("src/components/PhysicalReviewPanel.tsx", "utf8");
   assert.match(panel, /physicalScopeSummary\(scope\)/);
   assert.doesNotMatch(panel, /scope\.intent\./);
+});
+
+test("physical status shows decision records and the witness verdict apart from Core's conclusion", async () => {
+  const { physicalStatusRows, physicalWitnessSummary, physicalDecisionRow, physicalMcpConfig } = await import("../src/lib/physical");
+  const status = {
+    review: "approved", authority: "closed", installation: "quarantined", dispatch: "acknowledged",
+    consequence: "verified", acceptance: "accepted", reconciliation: "pending", enforcementPending: false, quarantined: true,
+    consequenceReason: "completion_held",
+    witness: { witnessClass: "simulation_oracle", result: "verified", reason: "completion_held" },
+    decisions: [
+      { sequence: 1, proposer: "mcp:claude-code", option: "turn_right", allowed: true, reason: "" },
+      { sequence: 2, proposer: "mcp:claude-code", option: "sprint", allowed: false, reason: "Option not approved" },
+    ],
+  } as import("../src/lib/physical").PhysicalStatus;
+  assert.deepEqual(Object.fromEntries(physicalStatusRows(status)), {
+    Authority: "closed", Installation: "quarantined", Dispatch: "acknowledged",
+    Consequence: "verified (completion held)", Acceptance: "accepted", Reconciliation: "pending",
+    "Enforcement pending": "no", Quarantined: "yes",
+  });
+  assert.equal(physicalWitnessSummary(status), "simulation oracle witness: verified (completion held)");
+  assert.equal(physicalWitnessSummary({ ...status, witness: null }), "No witness verdict yet");
+  assert.deepEqual(status.decisions!.map(physicalDecisionRow), [
+    ["1", "mcp:claude-code", "turn_right", "allowed"],
+    ["2", "mcp:claude-code", "sprint", "refused: Option not approved"],
+  ]);
+  assert.deepEqual(JSON.parse(physicalMcpConfig({ command: "/Applications/Pastey", args: ["--physical-mcp", "/tmp/g.json"], grantPath: "/tmp/g.json" })),
+    { mcpServers: { "pastey-physical": { command: "/Applications/Pastey", args: ["--physical-mcp", "/tmp/g.json"] } } });
+  const panel = readFileSync("src/components/PhysicalReviewPanel.tsx", "utf8");
+  assert.match(panel, /physicalMcpConnection\(roomId, host, start\)/);
+  assert.match(panel, /physicalDecisionRow\(d\)/);
+  assert.doesNotMatch(panel, /Object\.entries\(status\)/);
 });

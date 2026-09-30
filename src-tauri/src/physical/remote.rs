@@ -204,7 +204,7 @@ impl PhysicalControlServiceV1 {
         }
     }
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "physical-sim")),
         expect(
             dead_code,
             reason = "no production binding is attached; the reference bindings are test-only"
@@ -671,9 +671,10 @@ impl PhysicalControlServiceV1 {
                         && r.scope.fields().executor == b.peer_host_ref,
                     "Invalid exact physical approval",
                 )?;
+                // The approved scope states how long its approval may last.
                 let expiry = now
                     .get()
-                    .saturating_add(30_000)
+                    .saturating_add(r.scope.fields().stream.approval_lifetime_us.get() / 1000)
                     .min(r.scope.fields().environment.offer_expiry.get())
                     .min(r.scope.fields().qualification.expires_at.get());
                 require(now.get() < expiry, "Stale physical approval")?;

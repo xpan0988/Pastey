@@ -45,12 +45,17 @@ pub(crate) mod contracts;
 pub(crate) mod core;
 pub(crate) mod descriptor;
 pub(crate) mod evidence;
+pub(crate) mod mcp;
 pub(crate) mod protocol;
 pub(crate) mod store;
 pub(crate) mod values;
 
-#[cfg(test)]
-mod bindings;
+#[cfg(any(test, feature = "physical-sim"))]
+pub(crate) mod bindings;
+#[cfg(all(feature = "physical-sim", not(debug_assertions)))]
+compile_error!(
+    "physical-sim is a development switch: release builds must not contain the reference bindings"
+);
 #[cfg(test)]
 mod test_fixture;
 #[cfg(test)]

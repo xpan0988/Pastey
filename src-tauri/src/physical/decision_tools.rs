@@ -334,7 +334,7 @@ impl PhysicalControlServiceV1 {
                 .validate_control_session(&stream.session, true)
                 .is_ok();
             let idle = ticks.saturating_sub(stream.last_activity.load(Ordering::Acquire))
-                > flow.idle_lease_us(&scope.execution);
+                > flow.idle_lease_us.get();
             (live, idle)
         };
         if !live || idle {

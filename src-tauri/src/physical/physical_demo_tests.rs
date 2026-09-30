@@ -16,6 +16,7 @@
 //! assertions are the acceptance criteria and must not weaken.
 use super::*;
 use crate::physical::bindings::{
+    dev::EnvelopeV1,
     dispenser::DispenserBodyV1,
     flat::FlatBodyV1,
     sim::{self, SimBindingV1, SimBodyV1, SimTruthV1},
@@ -112,15 +113,6 @@ fn block<F: std::future::Future>(f: F) -> F::Output {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
 }
 
-/// The approved envelope of one body.
-struct EnvelopeV1 {
-    options: &'static [&'static str],
-    fields: &'static [&'static str],
-    min_decision_interval_us: u64,
-    action_us: u64,
-    total_us: u64,
-    count: u32,
-}
 const WALK: EnvelopeV1 = EnvelopeV1 {
     options: &["forward", "stop", "turn_left", "turn_right"],
     fields: &["/headingToGoal", "/room"],
@@ -128,6 +120,11 @@ const WALK: EnvelopeV1 = EnvelopeV1 {
     action_us: MAX_ACTION_MS * 1000,
     total_us: MAX_TOTAL_EXECUTION_MS * 1000,
     count: MAX_ACTIONS as u32,
+    lease_us: 60_000_000,
+    idle_lease_us: MAX_ACTION_MS * 1000 + 1_000_000 / MAX_DECISIONS_PER_SECOND,
+    approval_lifetime_us: 30_000_000,
+    root_lifetime_us: 120_000_000,
+    max_gap_us: MAX_GAP_US,
 };
 const POUR: EnvelopeV1 = EnvelopeV1 {
     options: &["idle", "pour_small"],
@@ -136,67 +133,22 @@ const POUR: EnvelopeV1 = EnvelopeV1 {
     action_us: DISPENSER_MAX_ACTION_MS * 1000,
     total_us: DISPENSER_MAX_TOTAL_EXECUTION_MS * 1000,
     count: DISPENSER_MAX_ACTIONS as u32,
+    lease_us: 60_000_000,
+    idle_lease_us: DISPENSER_MAX_ACTION_MS * 1000 + 500_000,
+    approval_lifetime_us: 30_000_000,
+    root_lifetime_us: 120_000_000,
+    max_gap_us: MAX_GAP_US,
 };
 
-/// Enrolls, resolves and qualifies one simulated environment through Core's
-/// production path (the binding's own `describe()`), then installs the Host
-/// policy whose ceiling is `envelope` for brains on `requester`.
+/// Attaches one simulated environment the way a Host does (see
+/// `bindings::dev::attach`).
 fn attach<B: SimBodyV1>(
     core: &mut PhysicalControlServiceV1,
     lane: &Arc<SimBindingV1<B>>,
     requester: &HostRef,
     envelope: &EnvelopeV1,
 ) -> (Arc<EnvironmentBindingV1>, PhysicalReviewScopeV1) {
-    let ingress = core.local_ingress().unwrap();
-    let binding: Arc<dyn crate::physical::core::EnvironmentBinding> = lane.clone();
-    let live = Arc::new(core.bind_environment(&ingress, &binding, None).unwrap());
-    let view = live.view().clone();
-    let domains = view.domains().into_iter().cloned().collect();
-    let capability = sim::capability::<B>(domains).unwrap();
-    let freshness = json!({"proposal": 200_000,
-        "observation": {"maxAgeUs": 500_000, "maxGapUs": MAX_GAP_US}});
-    let execution = json!({"actionDurationUs": envelope.action_us, "leaseDurationUs": 60_000_000,
-        "totalExecutionUs": envelope.total_us, "actionCount": envelope.count});
-    let profile: PhysicalCapabilityProfileV1 = decode(json!({
-        "version": 2, "capability": capability, "subsystem": B::SUBSYSTEM,
-        "evidenceClass": "simulation", "requiredEnforcementClass": "adapter_isolation_only",
-        "execution": execution, "freshness": freshness}));
-    let described =
-        crate::physical::core::EnvironmentBinding::describe(lane.as_ref(), &view.executor).unwrap();
-    let q: PhysicalQualificationV1 = decode(json!({"version": 2,
-        "qualificationId": format!("qualification:v1:{}", uuid::Uuid::new_v4()), "revision": 1,
-        "profileDigest": profile.digest().unwrap(), "bindingDigest": view.digest().unwrap(),
-        "implementationFingerprint": view.implementation_fingerprint,
-        "requiredEnforcementClass": "adapter_isolation_only", "evidenceClass": "simulation",
-        "evidenceDigest": described.provenance_digest, "conditionsDigest": described.conditions_digest,
-        "expiresAt": view.offer_expiry}));
-    core.qualify_environment(&ingress, &binding, &live, &profile, &q)
-        .unwrap();
-    let scope = PhysicalReviewScopeV1::try_from(decode::<ReviewScopeFieldsV1>(json!({
-        "version": 2, "principal": "operator", "requester": requester,
-        "executor": view.executor, "environment": view, "profile": profile, "qualification": q,
-        "stream": {"options": envelope.options,
-            "minDecisionIntervalUs": envelope.min_decision_interval_us,
-            "observation": {"fields": envelope.fields, "minIntervalUs": 100_000,
-                "destination": requester},
-            "onCompletion": "automatic",
-            "effectBound": {"verification": "witnessed", "predicate": B::effect_contract().unwrap(),
-                "requiredWitness": "simulation_oracle"}},
-        "bounds": capability.bounds, "execution": execution, "freshness": freshness,
-        "completion": {"predicate": capability.completion_predicate,
-            "requiredWitness": "simulation_oracle", "observation": freshness["observation"],
-            "evaluationWindowUs": 3_000_000},
-        "loss": capability.loss_profile})))
-    .unwrap();
-    core.configure_executor_policy(
-        &ingress,
-        &live,
-        scope.clone(),
-        SessionEnforcementClassV1::AdapterIsolationOnly,
-        micros(120_000_000),
-    )
-    .unwrap();
-    (live, scope)
+    crate::physical::bindings::dev::attach(core, lane, requester, envelope).unwrap()
 }
 
 /// The executor Host: one Core with the reference bindings attached, and the
@@ -226,6 +178,10 @@ impl ExecutorV1 {
     /// Starts the executor Host: Core with its bindings' witnesses, the flat
     /// (offered over the bridge) and, with `with_cup`, the dispenser.
     fn launch(with_cup: bool) -> Arc<Self> {
+        Self::launch_walk(with_cup, &WALK)
+    }
+    /// As `launch`, offering the walk under `walk`.
+    fn launch_walk(with_cup: bool, walk: &EnvelopeV1) -> Arc<Self> {
         let dir =
             std::env::temp_dir().join(format!("pastey-physical-demo-{}", uuid::Uuid::new_v4()));
         let paths = AppPaths::new(dir.clone(), dir.join("logs"));
@@ -245,7 +201,7 @@ impl ExecutorV1 {
         .unwrap();
         let flat =
             Arc::new(SimBindingV1::<FlatBodyV1>::launch(&host("executor"), clock.clone()).unwrap());
-        let (flat_live, flat_scope) = attach(&mut core, &flat, &host("requester"), &WALK);
+        let (flat_live, flat_scope) = attach(&mut core, &flat, &host("requester"), walk);
         let cup = with_cup.then(|| {
             let cup = Arc::new(
                 SimBindingV1::<DispenserBodyV1>::launch(&host("executor"), clock.clone()).unwrap(),
@@ -337,7 +293,11 @@ impl ExecutorV1 {
                 r.revision,
                 &r.scope_digest,
                 label("operator"),
-                UnixMillis::try_from(now.get() + 60_000).unwrap(),
+                // The longest approval the scope allows.
+                UnixMillis::try_from(
+                    now.get() + scope.fields().stream.approval_lifetime_us.get() / 1000,
+                )
+                .unwrap(),
             )
             .unwrap();
         drop(c);
@@ -1446,3 +1406,45 @@ async fn a_policy_change_closes_only_its_own_environment() {
     assert!(!pour.call("brain:rules", &pour_small).allowed());
     assert!(walk.call("brain:rules", &forward).allowed());
 }
+
+/// The development switch attaches a reference body the way a Host does and
+/// offers it over the bridge. It fails closed: an unknown body is refused,
+/// and a Core started without the body's witnesses cannot qualify it.
+#[test]
+fn the_development_switch_offers_a_reference_body_and_fails_closed() {
+    use crate::physical::bindings::dev::ReferenceBodyV1;
+    assert!(ReferenceBodyV1::parse("robot").is_err());
+    for (body, registered) in [
+        (ReferenceBodyV1::Flat, true),
+        (ReferenceBodyV1::Flat, false),
+    ] {
+        let dir =
+            std::env::temp_dir().join(format!("pastey-physical-dev-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths::new(dir.clone(), dir.join("logs"));
+        paths.ensure_directories().unwrap();
+        storage::init_database(&paths).unwrap();
+        let clock = Arc::new(Clock::new());
+        let registry = if registered {
+            body.witnesses().unwrap()
+        } else {
+            crate::physical::evidence::WitnessRegistryV1::default()
+        };
+        let mut core = PhysicalControlServiceV1::new(
+            &paths,
+            LocalRuntimeRef::fresh(host("executor")),
+            clock.clone(),
+            registry,
+        )
+        .unwrap();
+        let attached = body.attach(&mut core, &host("executor"), clock);
+        assert_eq!(attached.is_ok(), registered, "{attached:?}");
+        assert_eq!(core_fake::has_product_environment(&core), registered);
+        let _ = core.close();
+        drop(core);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    assert!(ReferenceBodyV1::Cup.witnesses().is_ok());
+}
+
+#[path = "mcp_tests.rs"]
+mod mcp;

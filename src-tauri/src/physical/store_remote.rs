@@ -308,6 +308,12 @@ impl PhysicalStoreV1 {
             if let Some(raw) = c.query_row("SELECT record_json FROM physical_consequences WHERE action_id=?1 ORDER BY revision DESC LIMIT 1",[text(&id)],|r|r.get::<_,String>(0)).optional()? {
                 let consequence: crate::physical::evidence::PhysicalConsequenceV1=decode(&raw)?;
                 s.consequence=consequence.state;
+                s.consequence_reason = Some(consequence.reason.clone());
+                s.witness = consequence.verdict.map(|v| WitnessConclusionV1 {
+                    witness_class: v.witness_class,
+                    result: v.result,
+                    reason: v.reason,
+                });
             }
             let reconciled: bool = c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM physical_reconciliations WHERE action_id=?1)",
@@ -318,6 +324,20 @@ impl PhysicalStoreV1 {
                 s.reconciliation = PhysicalReconciliationStateV1::Recorded;
             }
         }
+        let mut decisions = c
+            .prepare("SELECT sequence,proposer,option,outcome,reason FROM physical_decisions WHERE root_id=?1 ORDER BY sequence DESC LIMIT ?2")?
+            .query_map(params![text(root), STATUS_DECISIONS as i64], |r| {
+                Ok(DecisionSummaryV1 {
+                    sequence: r.get::<_, i64>(0)? as u64,
+                    proposer: status_text(r.get(1)?),
+                    option: status_text(r.get(2)?),
+                    allowed: r.get::<_, String>(3)? == "allowed",
+                    reason: status_text(r.get(4)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        decisions.reverse();
+        s.decisions = decisions;
         let acceptance: String = c.query_row(
             "SELECT state FROM physical_task_acceptance WHERE root_id=?1",
             [text(root)],

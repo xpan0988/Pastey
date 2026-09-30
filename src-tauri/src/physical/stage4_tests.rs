@@ -374,13 +374,21 @@ async fn a_raw_file_edit_is_caught_by_the_next_transaction() {
             r.get(0)
         })
         .unwrap();
+    // Every stored copy, so the live row is among them (an old row version
+    // may also sit in a freed page that no audit reads).
     let mut bytes = std::fs::read(&f.paths.db_path).unwrap();
-    let at = bytes
+    let mut edited = 0;
+    let mut at = 0;
+    while let Some(found) = bytes[at..]
         .windows(digest.len())
         .position(|w| w == digest.as_bytes())
-        .expect("digest stored in the main file");
-    let last = at + digest.len() - 1;
-    bytes[last] = if bytes[last] == b'0' { b'1' } else { b'0' };
+    {
+        let last = at + found + digest.len() - 1;
+        bytes[last] = if bytes[last] == b'0' { b'1' } else { b'0' };
+        edited += 1;
+        at = last + 1;
+    }
+    assert!(edited > 0, "digest stored in the main file");
     std::fs::write(&f.paths.db_path, bytes).unwrap();
     assert!(core_fake::store(&f.core.lock())
         .evidence_host(a.id())

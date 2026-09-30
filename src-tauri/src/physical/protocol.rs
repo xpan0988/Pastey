@@ -129,6 +129,53 @@ impl PhysicalOperationV1 {
         )
     }
 }
+/// Decision records a status carries: the most recent ones.
+pub(crate) const STATUS_DECISIONS: usize = 32;
+const MAX_DECISION_TEXT: usize = 256;
+/// Cuts recorded caller text to what a status carries, at a character
+/// boundary.
+pub(crate) fn status_text(mut text: String) -> String {
+    if text.len() > MAX_DECISION_TEXT {
+        let mut end = MAX_DECISION_TEXT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+// One decision record as Review shows it: who proposed which option, and
+// Core's admission (allowed, or refused with the reason). A refused
+// proposal keeps the caller's text as recorded.
+claim!(DecisionSummaryV1 {
+    sequence: u64,
+    proposer: String,
+    option: String,
+    allowed: bool,
+    reason: String,
+});
+impl DecisionSummaryV1 {
+    pub(crate) fn validate(&self) -> AppResult<()> {
+        require(
+            self.proposer.len() <= MAX_DECISION_TEXT
+                && self.option.len() <= MAX_DECISION_TEXT
+                && self.reason.len() <= MAX_DECISION_TEXT,
+            "Oversized decision record",
+        )
+    }
+}
+// The witness's latest verdict on the completion contract. Core's own
+// conclusion is the status's `consequence`.
+claim!(WitnessConclusionV1 {
+    witness_class: WitnessClassV1,
+    result: WitnessResultV1,
+    reason: LabelV1,
+});
+impl WitnessConclusionV1 {
+    pub(crate) fn validate(&self) -> AppResult<()> {
+        Ok(())
+    }
+}
 claim!(PhysicalStatusV1 {
     review: PhysicalReviewStateV1,
     authority: PhysicalAuthorityStateV1,
@@ -141,7 +188,11 @@ claim!(PhysicalStatusV1 {
     quarantined: bool,
     root: Option<RootId>,
     session: Option<SessionId>,
-    action: Option<ActionId>
+    action: Option<ActionId>,
+    /// Why Core concluded `consequence` for the latest action.
+    consequence_reason: Option<LabelV1>,
+    witness: Option<WitnessConclusionV1>,
+    decisions: Vec<DecisionSummaryV1>
 });
 impl PhysicalStatusV1 {
     pub(in crate::physical) fn validate(&self) -> AppResult<()> {
@@ -149,6 +200,10 @@ impl PhysicalStatusV1 {
             self.acceptance != AcceptanceStateV1::Accepted
                 || self.consequence == ConsequenceStateV1::Verified,
             "Task acceptance lacks verified consequence",
+        )?;
+        require(
+            self.decisions.len() <= STATUS_DECISIONS,
+            "Too many decision records",
         )
     }
     pub(crate) fn pending() -> Self {
@@ -165,6 +220,9 @@ impl PhysicalStatusV1 {
             root: None,
             session: None,
             action: None,
+            consequence_reason: None,
+            witness: None,
+            decisions: Vec::new(),
         }
     }
 }

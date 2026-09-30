@@ -7458,6 +7458,23 @@ mod tests {
 }
 
 #[tauri::command]
+pub async fn physical_mcp_connection(
+    room_id: String,
+    target_host_ref: String,
+    start: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::physical::mcp::McpConnectionV1, String> {
+    let target = crate::host_identity::HostRef::parse_peer(target_host_ref, &state.local_host_ref)
+        .map_err(|e| e.message())?;
+    let start = crate::physical::values::RequestId::try_from(start).map_err(|e| e.message())?;
+    state
+        .inner()
+        .physical_mcp_connection(&room_id, &target, start)
+        .await
+        .map_err(|e| e.message())
+}
+
+#[tauri::command]
 pub async fn physical_product_command(
     room_id: String,
     target_host_ref: String,

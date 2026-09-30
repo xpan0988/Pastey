@@ -126,6 +126,7 @@ fn scope_fields() -> ReviewScopeFieldsV1 {
         json!({"version": 2, "principal": "operator", "requester": host("requester"),
         "executor": b.executor, "environment": b, "profile": p, "qualification": q,
         "stream": {"options": ["forward"], "minDecisionIntervalUs": 200000,
+            "idleLeaseUs": 700000, "approvalLifetimeUs": 30000000,
             "observation": {"fields": fx::OBSERVATION_FIELDS, "minIntervalUs": 100000,
                 "destination": host("requester")},
             "onCompletion": "automatic",
@@ -719,16 +720,27 @@ fn decision_stream_narrowing_only_drops_options_and_slows_the_rate() {
     let stream = both.fields().stream.clone();
     assert!(!stream.allows(&label("turn_left")));
     assert_eq!(stream.min_decision_interval_us, micros(400_000));
+    // The idle lease and the approval lifetime only shorten.
+    let short_lease = narrowed(&|d| d.idle_lease_us = micros(300_000));
+    let short_approval = narrowed(&|d| d.approval_lifetime_us = micros(5_000_000));
+    super::core::test_support::narrow(&reviewed, &short_lease).unwrap();
+    super::core::test_support::narrow(&reviewed, &short_approval).unwrap();
+    assert!(super::core::test_support::narrow(&short_lease, &reviewed).is_err());
+    assert!(super::core::test_support::narrow(&short_approval, &reviewed).is_err());
+    let both = super::core::test_support::intersect_scope(&short_lease, &short_approval).unwrap();
+    let stream = both.fields().stream.clone();
+    assert_eq!(stream.idle_lease_us, micros(300_000));
+    assert_eq!(stream.approval_lifetime_us, micros(5_000_000));
 }
 
 #[test]
 fn scope_hash_version_one_vector() {
     // Pin the canonical schema/ordering. A future encoding change must be versioned.
-    // Re-pinned for ledger format 5: exact scopes became one-option decision
-    // streams, so the scope encoding itself changed.
+    // Re-pinned for ledger format 6: the stream scope gained the idle lease
+    // and the approval lifetime, so the scope encoding itself changed.
     assert_eq!(
         String::from(scope().digest().unwrap()),
-        "042b99cc3b66f43e5332a6c0e848befd2a378707822d5ab55e0469304741e562"
+        "28b2bf57cf0db9073b5d267080f760c7979b14b1cc6adc27cac112f15b0f8a1b"
     );
 }
 

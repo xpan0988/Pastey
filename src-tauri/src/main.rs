@@ -82,11 +82,11 @@ use crate::{
         list_nearby_devices, list_received_room_control_events, list_room_items, list_rooms,
         log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
         mark_join_prompt_rendered, open_logs_folder, pair_bridge_peer, pending_join_requests,
-        physical_product_command, propose_remote_native_codex_workspace_movement,
-        reconcile_remote_native_agent_task, refresh_selected_peer_capabilities, reject_nearby_join,
-        request_developer_terminal, request_nearby_join, resize_developer_terminal,
-        retry_native_agent_workspace_result_return, reveal_in_folder,
-        reveal_native_agent_conflict_result, revoke_bridge_peer_pairing,
+        physical_mcp_connection, physical_product_command,
+        propose_remote_native_codex_workspace_movement, reconcile_remote_native_agent_task,
+        refresh_selected_peer_capabilities, reject_nearby_join, request_developer_terminal,
+        request_nearby_join, resize_developer_terminal, retry_native_agent_workspace_result_return,
+        reveal_in_folder, reveal_native_agent_conflict_result, revoke_bridge_peer_pairing,
         run_bridge_device_diagnostics, run_bridge_device_self_check, run_loopback_benchmark,
         run_peer_link_benchmark, select_bridge_plan_search_candidate,
         select_managed_execute_runtime, select_managed_worker_provider,
@@ -127,6 +127,13 @@ fn main() {
     #[cfg(windows)]
     if windows_codex_backend::run_helper_if_requested() {
         return;
+    }
+    // An agent's MCP client launches this as a stdio server for one approved
+    // physical decision stream; it pipes to the running Host and exits.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(at) = args.iter().position(|a| a == "--physical-mcp") {
+        let grant = args.get(at + 1).map(String::as_str).unwrap_or_default();
+        std::process::exit(physical::mcp::run_stdio_bridge(grant));
     }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -209,6 +216,7 @@ fn main() {
             cancel_native_v2_plan_attempt,
             list_native_agent_capabilities,
             start_native_codex_task,
+            physical_mcp_connection,
             physical_product_command,
             get_native_agent_task_status,
             cancel_native_agent_task,

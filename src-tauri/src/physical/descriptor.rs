@@ -230,7 +230,7 @@ impl CanonicalJsonV1 {
     /// Decode into a binding-owned typed schema. Callers must use a strict
     /// (deny_unknown_fields) type; failure is fail-closed.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "physical-sim")),
         expect(
             dead_code,
             reason = "no production binding is attached; the reference bindings are test-only"

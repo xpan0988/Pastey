@@ -70,13 +70,19 @@ pub(crate) enum CompletionAcceptanceV1 {
 
 // The approved part of a decision-stream capability: an option subset, a
 // decision-rate ceiling (shortest interval between two admitted decisions),
-// the observation flow to the brain and what verified completion does.
+// the observation flow to the brain, what verified completion does, and how
+// long the approval and a silent brain may last.
 claim!(DecisionStreamScopeV1 {
     options: Vec<LabelV1>,
     min_decision_interval_us: PositiveMicros,
     observation: ObservationFlowV1,
     on_completion: CompletionAcceptanceV1,
     effect_bound: EffectBoundV1,
+    /// The longest a brain may go without a tool call; then the stream ends
+    /// as if the brain had crashed.
+    idle_lease_us: PositiveMicros,
+    /// How long an approval of this scope stays usable. It bounds the Root.
+    approval_lifetime_us: PositiveMicros,
 });
 impl DecisionStreamScopeV1 {
     pub fn validate(&self) -> AppResult<()> {
@@ -95,14 +101,8 @@ impl DecisionStreamScopeV1 {
             && (self.on_completion == ceiling.on_completion
                 || self.on_completion == CompletionAcceptanceV1::AwaitReview)
             && self.effect_bound == ceiling.effect_bound
-    }
-    /// A brain that neither acts nor observes for one action plus one
-    /// decision interval is treated as crashed.
-    pub fn idle_lease_us(&self, execution: &ExecutionBudgetV1) -> u64 {
-        execution
-            .action_duration_us
-            .get()
-            .saturating_add(self.min_decision_interval_us.get())
+            && self.idle_lease_us <= ceiling.idle_lease_us
+            && self.approval_lifetime_us <= ceiling.approval_lifetime_us
     }
     pub(super) fn intersect(&self, other: &Self) -> AppResult<Self> {
         let narrowed = Self {
@@ -128,6 +128,8 @@ impl DecisionStreamScopeV1 {
                 )?;
                 self.effect_bound.clone()
             },
+            idle_lease_us: self.idle_lease_us.min(other.idle_lease_us),
+            approval_lifetime_us: self.approval_lifetime_us.min(other.approval_lifetime_us),
         };
         narrowed.validate()?;
         Ok(narrowed)

@@ -103,6 +103,7 @@ pub(in crate::physical) struct FlatBodyV1 {
 }
 impl FlatBodyV1 {
     /// Back at the start pose, at rest (someone carried it there).
+    #[cfg(test)]
     pub(in crate::physical) fn place_at_start(&mut self) {
         *self = Self::initial();
     }

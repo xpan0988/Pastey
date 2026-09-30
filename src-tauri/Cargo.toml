@@ -64,6 +64,9 @@ windows-sys = { version = "0.61.2", features = [
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 native-windows-acceptance = []
+# Development only: compiles the simulated reference bodies into the Host so
+# `PASTEY_PHYSICAL_SIM=flat|cup` can offer one. Release builds refuse it.
+physical-sim = []
 
 [profile.dev-fast]
 inherits = "dev"

@@ -150,7 +150,7 @@ impl TrustedDispositionV1 {
 }
 /// Only for an owned binding producer's sealed, validated acquisition.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "physical-sim")),
     expect(
         dead_code,
         reason = "used by bindings; the reference bindings are test-only"
@@ -168,7 +168,7 @@ pub(super) fn producer_observation(
 }
 /// Only for an owned binding producer's sealed disposition.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "physical-sim")),
     expect(
         dead_code,
         reason = "used by bindings; the reference bindings are test-only"
@@ -343,7 +343,7 @@ pub(crate) trait PhysicalWitnessV1: Send + Sync {
     }
 }
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "physical-sim")),
     expect(
         dead_code,
         reason = "no production binding is attached; the reference bindings are test-only"
@@ -361,7 +361,7 @@ pub(crate) struct EffectBoundInputV1<'a> {
 pub(crate) struct WitnessRegistryV1(BTreeMap<SemanticIdV1, Arc<dyn PhysicalWitnessV1>>);
 impl WitnessRegistryV1 {
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "physical-sim")),
         expect(
             dead_code,
             reason = "no production binding is attached; the reference bindings are test-only"

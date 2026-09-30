@@ -109,7 +109,7 @@ For a single-machine dual-instance smoke, create/join a Bridge and exercise sele
 
 ## Physical ledger format resets (development)
 
-The physical ledger stores record bodies (review scopes, actions, evidence, qualification records) whose format is versioned by `physical_ledger_meta.format_version`. Record bodies are never migrated. The current format is 5: every scope is a decision stream (a single reviewed action is a one-option stream), actions carry the chosen option, and dispositions read `accepted`/`refused`. Any development ledger that holds rows from format 4 or earlier must be reset. When a build changes that format, starting Pastey against a ledger holding older-format rows fails closed with `legacy physical ledger (older format); reset required`. Ledgers whose older-format tables are all empty upgrade in place.
+The physical ledger stores record bodies (review scopes, actions, evidence, qualification records) whose format is versioned by `physical_ledger_meta.format_version`. Record bodies are never migrated. The current format is 6: every scope is a decision stream (a single reviewed action is a one-option stream) that states its approval lifetime and idle lease, actions carry the chosen option, dispositions read `accepted`/`refused`, and a stored status carries decision records and the witness verdict. Any development ledger that holds rows from format 5 or earlier must be reset. When a build changes that format, starting Pastey against a ledger holding older-format rows fails closed with `legacy physical ledger (older format); reset required`. Ledgers whose older-format tables are all empty upgrade in place.
 
 Quit Pastey, then reset the development ledger:
 

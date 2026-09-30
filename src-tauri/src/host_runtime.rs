@@ -69,6 +69,8 @@ pub struct HostRuntime {
     /// Host-owned physical Core; local and authenticated remote tasks share
     /// executor-local Gate A/NativeFence lanes and separate consequence evidence.
     pub(crate) physical_control: Mutex<crate::physical::core::PhysicalControlServiceV1>,
+    /// Loopback endpoint for MCP brains driving an approved stream from here.
+    pub(crate) physical_mcp: crate::physical::mcp::McpHostV1,
     pub config: RwLock<StoredConfig>,
     pub active_servers: Mutex<HashMap<String, ActiveRoomServer>>,
     pub active_file_transfers: Mutex<HashMap<String, transfer::ActiveFileTransfer>>,
@@ -183,17 +185,23 @@ impl HostRuntime {
             WorkerProviderConfigServiceV1::new(paths.clone(), config::master_key(&config)?)?;
         let managed_runtime_configs = ManagedRuntimeConfigServiceV1::new(paths.clone())?;
         let local_runtime_ref = LocalRuntimeRef::fresh(local_host_ref.clone());
-        let physical_control = crate::physical::core::PhysicalControlServiceV1::new(
+        let host_bindings =
+            crate::physical::core::host_bindings::HostBindingsV1::from_environment()?;
+        let physical_clock: Arc<dyn crate::physical::binding::BindingClockV1> =
+            Arc::new(crate::physical::binding::SystemBindingClockV1::default());
+        let mut physical_control = crate::physical::core::PhysicalControlServiceV1::new(
             &paths,
             local_runtime_ref.clone(),
-            Arc::new(crate::physical::binding::SystemBindingClockV1::default()),
-            crate::physical::core::host_bindings::witnesses(),
+            physical_clock.clone(),
+            host_bindings.witnesses()?,
         )?;
+        host_bindings.attach(&mut physical_control, &local_host_ref, physical_clock)?;
         Ok(Self {
             paths: paths.clone(),
             local_host_ref: local_host_ref.clone(),
             local_runtime_ref,
             physical_control: Mutex::new(physical_control),
+            physical_mcp: Default::default(),
             config: RwLock::new(config),
             active_servers: Mutex::new(HashMap::new()),
             active_file_transfers: Mutex::new(HashMap::new()),
@@ -993,7 +1001,97 @@ mod tests {
     }
 }
 
+/// A brain-side MCP connection's relay: the requester's own product path,
+/// which sends over the Bridge and reads the replies that came back.
+struct PhysicalMcpRelayV1 {
+    host: std::sync::Weak<HostRuntime>,
+    bridge: String,
+    target: HostRef,
+}
+impl crate::physical::mcp::ToolRelayV1 for PhysicalMcpRelayV1 {
+    fn send(
+        &self,
+        request: crate::physical::core::PhysicalProductRequestV1,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = AppResult<crate::physical::values::RequestId>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let host = self
+                .host
+                .upgrade()
+                .ok_or_else(|| crate::error::AppError::InvalidInput("Host closed".into()))?;
+            host.physical_product_command(&self.bridge, &self.target, request)
+                .await?
+                .tool_request
+                .ok_or_else(|| crate::error::AppError::InvalidInput("Not a tool request".into()))
+        })
+    }
+    fn outcome<'a>(
+        &'a self,
+        request: &'a crate::physical::values::RequestId,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = AppResult<Option<crate::physical::protocol::ToolOutcomeV1>>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let host = self
+                .host
+                .upgrade()
+                .ok_or_else(|| crate::error::AppError::InvalidInput("Host closed".into()))?;
+            let current = host
+                .resolve_current_remote_host_session(&self.bridge, &self.target)
+                .await?;
+            let (view, _) = host.physical_control.lock().physical_product(
+                current.binding(),
+                crate::physical::core::PhysicalProductRequestV1::ToolResult {
+                    request: request.clone(),
+                },
+            )?;
+            Ok(view.tool)
+        })
+    }
+}
+
 impl HostRuntime {
+    /// Grants one MCP connection to the stream this Host started on
+    /// `target` (the executor). The returned command is what an agent's MCP
+    /// configuration runs; the brain's tools reach the executor over the
+    /// Bridge.
+    pub(crate) async fn physical_mcp_connection(
+        self: &Arc<Self>,
+        bridge: &str,
+        target: &HostRef,
+        start: crate::physical::values::RequestId,
+    ) -> AppResult<crate::physical::mcp::McpConnectionV1> {
+        let current = self
+            .resolve_current_remote_host_session(bridge, target)
+            .await?;
+        let (view, _) = self.physical_control.lock().physical_product(
+            current.binding(),
+            crate::physical::core::PhysicalProductRequestV1::Snapshot,
+        )?;
+        if view.start.as_ref() != Some(&start) {
+            return Err(crate::error::AppError::InvalidInput(
+                "No such started physical stream on this Bridge".into(),
+            ));
+        }
+        let relay = Arc::new(PhysicalMcpRelayV1 {
+            host: Arc::downgrade(self),
+            bridge: bridge.to_owned(),
+            target: target.clone(),
+        });
+        self.physical_mcp
+            .grant(&self.paths.app_data_dir.join("physical-mcp"), relay, start)
+            .await
+    }
     pub(crate) async fn physical_product_command(
         self: &Arc<Self>,
         bridge: &str,
