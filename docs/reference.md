@@ -139,7 +139,6 @@ Native sessions are Host-private. `NativeAgentServiceV1` keeps Codex sessions pe
 | Process world controller | `src-tauri/src/execution_world.rs` |
 | Platform execution backend seam | `src-tauri/src/execution_backend.rs` |
 | Windows Codex-derived process backend and setup | Pastey adapter `src-tauri/src/windows_codex_backend.rs`; pinned mechanics `src-tauri/crates/windows-codex-sandbox/`; setup command `--pastey-setup-windows-codex-sandbox-v1`; verifier command `--pastey-verify-windows-codex-sandbox-v1`; provenance `UPSTREAM.md`; local divergence `PATCHES.md` |
-| Network broker | `src-tauri/src/network_broker.rs` |
 | Core claim/result finalizer | `src-tauri/src/managed_execution.rs` |
 | Worker Harness/provider | `src-tauri/src/worker_harness.rs`, `worker_provider.rs` |
 | Provider configuration | `src-tauri/src/worker_provider_config.rs` |
@@ -202,7 +201,7 @@ The frontend uses `@xterm/xterm` and `@xterm/addon-fit`. Host shell selection is
 | Plan lifecycle and native-v2 orchestration | Rust `host_identity`, `host_runtime`, `host_admission`, `bridge_plan`, `bridge_plan_v2`, `native_v2_orchestration`, and `managed_worker_coordinator` tests |
 | Worker/provider/runtime configuration | Rust `worker_harness`, `worker_provider`, `worker_provider_config`, `managed_runtime_config`, and `managed_worker_coordinator` tests |
 | NodeList/capability/confirmation boundaries | Rust `diagnostics`, `commands`, `peer_capabilities`, `capability_probe`, and `capability_acquisition_confirmation` tests; frontend integration tests |
-| Effects/results | Rust `effect_authority`, `managed_resources`, `execution_world`, `network_broker`, and `managed_execution` tests; opt-in native Windows `windows_execution_world` integration test |
+| Effects/results | Rust `effect_authority`, `managed_resources`, `execution_world` and `managed_execution` tests; opt-in native Windows `windows_execution_world` integration test |
 | Layer 4 and transfer | `scripts/run-layer4-validation-matrix.mjs`, `scripts/run-transfer-planner-tests.mjs`, Rust transport/protocol tests |
 | Developer Terminal | Rust terminal/HostRuntime tests plus native physical platform checks |
 | Native Agent task/session/movement and conflict recovery | Rust `native_agent`, `commands`, `room_control`, `transfer`, `storage`, and `host_runtime` tests, including the test-only two-Host pair harness; renderer types/lifecycle in `src/lib/tauri.ts` and `src/features/workspace/AgentTaskLifecycle.tsx` |

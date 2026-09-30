@@ -3,8 +3,8 @@
 //! This module is deliberately disconnected from live Bridge Plan dispatch.
 //! It contains only pure contracts, process-local authority state, deterministic
 //! lowering, and backend ports. Host-private managed resource resolution lives
-//! in `managed_resources`; contained process effects live in `execution_world`;
-//! independently scoped brokered network effects live in `network_broker`.
+//! in `managed_resources`; contained process effects live in `execution_world`.
+//! Network effects have no backend: sandboxing is owned by the Host.
 //! No live Bridge Plan dispatch is attached.
 
 #![allow(dead_code)] // The generic authority surface is broader than the live Worker catalog.
@@ -1156,72 +1156,6 @@ pub(crate) fn execution_world_ref_for(
     )?))
 }
 
-/// Derives a process-local opaque scope identity from an exact run and a
-/// Host-owned canonical scope descriptor. The descriptor itself never enters
-/// a Worker request or the immutable Plan/wire contract.
-pub(crate) fn network_scope_ref_for(
-    draft: &ManagedRunDraftV1,
-    canonical_scope_digest: &str,
-) -> AppResult<NetworkScopeRefV1> {
-    network_scope_ref_for_context(
-        &draft.context_ref,
-        &draft.run_control_ref,
-        &draft.context.host_ref,
-        canonical_scope_digest,
-    )
-}
-
-pub(crate) fn network_scope_ref_for_context(
-    context_ref: &AuthorityContextRefV1,
-    run_control_ref: &ManagedRunRefV1,
-    host_ref: &HostRef,
-    canonical_scope_digest: &str,
-) -> AppResult<NetworkScopeRefV1> {
-    validate_id(canonical_scope_digest, "network scope descriptor")?;
-    Ok(NetworkScopeRefV1(domain_hash(
-        "pastey-network-scope-v1",
-        &(
-            context_ref.as_str(),
-            run_control_ref.as_str(),
-            host_ref.as_str(),
-            canonical_scope_digest,
-        ),
-    )?))
-}
-
-pub(crate) fn network_destination_ref_for(
-    draft: &ManagedRunDraftV1,
-    canonical_destination_digest: &str,
-) -> AppResult<String> {
-    network_destination_ref_for_context(
-        &draft.context_ref,
-        &draft.run_control_ref,
-        &draft.context.host_ref,
-        canonical_destination_digest,
-    )
-}
-
-pub(crate) fn network_destination_ref_for_context(
-    context_ref: &AuthorityContextRefV1,
-    run_control_ref: &ManagedRunRefV1,
-    host_ref: &HostRef,
-    canonical_destination_digest: &str,
-) -> AppResult<String> {
-    validate_id(
-        canonical_destination_digest,
-        "network destination descriptor",
-    )?;
-    domain_hash(
-        "pastey-network-destination-v1",
-        &(
-            context_ref.as_str(),
-            run_control_ref.as_str(),
-            host_ref.as_str(),
-            canonical_destination_digest,
-        ),
-    )
-}
-
 #[derive(Clone, Debug)]
 struct ResourceAuthorityRecordV1 {
     grant: ResourceGrantV1,
@@ -1796,16 +1730,6 @@ impl EffectAuthorityStateV1 {
     /// Returns the next exact effect sequence for a still-active run. This is
     /// observation only: callers must still lower and enforce an immutable
     /// request through this authority before any Host backend can act.
-    pub(crate) fn next_request_sequence(&self, run_ref: &ManagedRunRefV1) -> AppResult<u64> {
-        let run = self
-            .runs
-            .get(run_ref)
-            .ok_or_else(|| AppError::InvalidInput("Managed run is unavailable.".into()))?;
-        if run.state != ManagedRunStateV1::Active {
-            return invalid("Managed run is not active for the next effect.");
-        }
-        Ok(run.next_request_sequence)
-    }
 
     #[cfg(test)]
     pub(crate) fn evidence_for_test(&self, run_ref: &ManagedRunRefV1) -> Vec<EffectEvidenceV1> {
@@ -2018,87 +1942,6 @@ impl EffectAuthorityStateV1 {
             grants.push(record.grant.clone());
         }
         Ok((envelope.world.clone(), grants))
-    }
-
-    /// Revalidates a Host-private broker attachment. This returns only the
-    /// immutable grant already present in the envelope and never resolves a
-    /// destination, opens a socket, or widens network authority.
-    pub(crate) fn validate_network_attachment(
-        &self,
-        scope_ref: &NetworkScopeRefV1,
-        destination_ref: &str,
-        envelope_ref: &EffectEnvelopeRefV1,
-        run_control_ref: &ManagedRunRefV1,
-        context: &AuthorityContextV1,
-        current: &CurrentHostAuthorityV1,
-    ) -> AppResult<NetworkGrantV1> {
-        let envelope = self
-            .envelopes
-            .get(envelope_ref)
-            .ok_or_else(|| AppError::InvalidInput("Effect envelope is unavailable.".into()))?;
-        let run = self
-            .runs
-            .get(run_control_ref)
-            .ok_or_else(|| AppError::InvalidInput("Managed run is unavailable.".into()))?;
-        let NetworkAuthorityV1::Scoped(grant) = &envelope.network else {
-            return invalid("Network authority is default-denied.");
-        };
-        if context.validate().is_err()
-            || context != &envelope.context
-            || envelope.run_control_ref != *run_control_ref
-            || run.envelope_ref != *envelope_ref
-            || run.context_ref != envelope.context_ref
-            || run.state != ManagedRunStateV1::Active
-            || grant.context_ref != envelope.context_ref
-            || grant.run_control_ref != *run_control_ref
-            || grant.host_ref != context.host_ref
-            || !grant.scope_refs.contains(scope_ref)
-            || !grant.destination_refs.contains(destination_ref)
-            || grant.expires_at <= current.now
-            || current.now >= run.expires_at
-            || current.now >= context.expires_at
-            || !current.bridge_active
-            || current.burned
-            || current.disconnected
-            || current.restarted
-            || current.execution_freshness.authority_ref() != context.session_binding_ref
-            || current.execution_freshness.bridge_id() != context.bridge_id
-            || current.execution_freshness.local_host_ref() != &context.host_ref
-            || current.execution_freshness.expires_at() <= current.now
-        {
-            return invalid(
-                "Network attachment context, Host, session, run, destination, or lifecycle is mismatched.",
-            );
-        }
-        Ok((**grant).clone())
-    }
-
-    pub(crate) fn validate_network_request_attachment(
-        &self,
-        request: &EffectRequestV1,
-        current: &CurrentHostAuthorityV1,
-    ) -> AppResult<NetworkGrantV1> {
-        self.validate_exact_request_context(request, current)?;
-        let run = self
-            .runs
-            .get(&request.run_control_ref)
-            .ok_or_else(|| AppError::InvalidInput("Managed run is unavailable.".into()))?;
-        if request.sequence != run.next_request_sequence
-            || self.intents.contains_key(&request.request_id)
-        {
-            return invalid("Network request is replayed, skipped, or out of order.");
-        }
-        let EffectRequestKindV1::Network(effect) = &request.effect else {
-            return invalid("Expected a brokered network request.");
-        };
-        self.validate_network_attachment(
-            &effect.scope_ref,
-            &effect.destination_ref,
-            &request.envelope_ref,
-            &request.run_control_ref,
-            &request.context,
-            current,
-        )
     }
 
     pub(crate) fn validate_terminal_resource_evidence(

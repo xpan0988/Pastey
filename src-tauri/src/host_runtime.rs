@@ -24,7 +24,7 @@ use crate::{
     managed_execution::ManagedProcessWorldSpecV1,
     managed_objects, managed_resources,
     managed_runtime_config::ManagedRuntimeConfigServiceV1,
-    network_broker, peer_capabilities, room_control, storage,
+    peer_capabilities, room_control, storage,
     storage::AppPaths,
     transfer, transfer_orchestration,
     worker_harness::WorkerHarnessRunV1,
@@ -111,7 +111,6 @@ pub struct HostRuntime {
     pub(crate) execution_worlds: Arc<execution_world::ExecutionWorldServiceV1>,
     /// Independent Host-owned network broker. It owns all managed
     /// sockets and remains unreachable from live Plan dispatch.
-    pub(crate) network_broker: Arc<network_broker::NetworkBrokerServiceV1>,
     /// Host-private managed handle resolver. It retains private paths
     /// and copy-on-write overlays only in this process. Declaration after the
     /// world controller preserves kill-before-root-removal drop ordering.
@@ -232,7 +231,6 @@ impl HostRuntime {
             )),
             effect_authority: Mutex::new(effect_authority::EffectAuthorityStateV1::default()),
             execution_worlds: Arc::new(execution_world::ExecutionWorldServiceV1::default()),
-            network_broker: Arc::new(network_broker::NetworkBrokerServiceV1::default()),
             managed_resources: Mutex::new(managed_resources::ManagedResourceResolverV1::new(
                 managed_resource_root,
             )),
@@ -292,7 +290,6 @@ impl HostRuntime {
         worker_runs.retain(|_, record| record.bridge_id() != room_id);
         drop(worker_runs);
         self.execution_worlds.terminate_bridge(room_id);
-        self.network_broker.terminate_bridge(room_id);
         self.effect_authority.lock().revoke_bridge(room_id);
         self.managed_resources.lock().purge_bridge(room_id);
         self.managed_objects.lock().purge_bridge(room_id);
@@ -317,7 +314,6 @@ impl HostRuntime {
     ) -> AppResult<()> {
         self.cancel_worker_run(run_ref);
         self.execution_worlds.terminate_run(run_ref);
-        self.network_broker.terminate_run(run_ref);
         self.managed_resources.lock().purge_run(run_ref);
         crate::managed_execution::interrupt_claim_for_run(&self.paths, run_ref);
         self.effect_authority
@@ -344,21 +340,14 @@ impl HostRuntime {
         let mut run_refs = self
             .execution_worlds
             .run_refs_for_session(session_binding_ref);
-        let network_run_refs = self
-            .network_broker
-            .run_refs_for_session(session_binding_ref);
         run_refs.extend(
             self.effect_authority
                 .lock()
                 .run_refs_for_session(session_binding_ref),
         );
         self.execution_worlds.terminate_session(session_binding_ref);
-        self.network_broker.terminate_session(session_binding_ref);
         let mut resources = self.managed_resources.lock();
         for run_ref in run_refs {
-            resources.purge_run(&run_ref);
-        }
-        for run_ref in network_run_refs {
             resources.purge_run(&run_ref);
         }
         drop(resources);
@@ -389,7 +378,6 @@ impl HostRuntime {
             .purge_all();
         self.execution_worlds.terminate_all();
         self.native_agents.lock().shutdown();
-        self.network_broker.terminate_all();
         self.managed_objects.lock().purge_all();
         self.effect_authority.lock().revoke_all();
         self.managed_resources.lock().purge_all();

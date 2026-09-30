@@ -180,7 +180,7 @@ Windows uses `WindowsCodexBackendV1` to implement this platform seam over a Code
 
 ### Network
 
-`NetworkBrokerServiceV1` is an independent Host-owned TCP/DNS authority domain outside the execution world. It requires its own scopes, budgets, revalidation, closure, and evidence. The Worker catalog does not expose it. Provider HTTPS is control-plane transport, not a `NetworkGrant`, task effect, or reusable egress channel.
+Pastey has no network broker; the former Phase 5 `NetworkBrokerServiceV1` was removed because sandboxing and egress belong to the Host. Network effects in the authority vocabulary have no backend, and the Worker catalog exposes no network tool. Provider HTTPS is control-plane transport, not a `NetworkGrant`, task effect, or reusable egress channel.
 
 Developer Terminal uses a separate grant/type/store/lifecycle and can never satisfy an EffectEnvelope or process binding.
 
@@ -297,7 +297,6 @@ Distributed delivery failure remains unable to prove remote native-process termi
 | Execute through Core with no lineage when an exact process binding exists | Raw shell/terminal/process authority |
 | Durable generation-bound provider state, streaming adapter, and safe local configuration/health product surface | Provider marketplace, routing, fallback, or additional provider backends |
 | Bridge Device Check fixed Generic Managed E2E self-check through the ordinary native-v2 lifecycle | Its external-provider/API and packaged Mac ↔ Windows evidence remain Generic Managed subsystem limits |
-| Phase 5 Host network broker | Worker network tools or automatic task egress |
 | Cancellation/revocation/restart/Burn fail closed in state and Core authority; Bridge Burn purges only Bridge-bound Native Agent outer state and retained app-owned results | Guaranteed cross-partition native-process termination |
 | Bounded non-secret product/Worker status events and authoritative lifecycle presentation, including Native Agent reconciliation/Stop/Return repair | Result content projection or Native Agent history/task browsing |
 

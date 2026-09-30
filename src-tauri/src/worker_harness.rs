@@ -1258,23 +1258,6 @@ impl HostRuntime {
             }
         }
     }
-
-    /// Private production-provider entrypoint. Host resolves one immutable,
-    /// generation-bound binding before the claim/run begins; the Worker never
-    /// receives provider configuration or credentials.
-    pub(crate) fn run_v2_worker_with_provider_selection(
-        &self,
-        request: ManagedStepClaimRequestV1,
-        limits: WorkerRunLimitsV1,
-        selection: crate::worker_provider_config::WorkerProviderSelectionV1,
-    ) -> AppResult<WorkerRunCompletionV1> {
-        let binding = self.worker_provider_configs.resolve(&selection)?;
-        let mut provider =
-            crate::worker_provider::OpenAICompatibleStreamingWorkerProviderV1::from_binding(
-                binding,
-            )?;
-        self.run_v2_worker(request, limits, &mut provider)
-    }
 }
 
 fn completion_evidence_ids(

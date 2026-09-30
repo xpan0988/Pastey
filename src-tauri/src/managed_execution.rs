@@ -107,7 +107,6 @@ pub(crate) struct ManagedStepGrantV1 {
     pub(crate) output_slot: Option<ResourceHandleRefV1>,
     /// Model-visible semantic projection for the one Transform step. This is
     /// not a Plan, grant, path, or Host-selection capability.
-    pub(crate) transform_intent: Option<String>,
     /// One exact semantic intent projection for the already claimed primitive.
     pub(crate) operation_intent: String,
     pub(crate) output_revision: Option<u64>,
@@ -544,13 +543,6 @@ impl HostRuntime {
             let _ = authority.revoke_run(&envelope.run_control_ref);
             return Err(error);
         }
-        let transform_intent = match &source.step {
-            PlanStepV2::Transform {
-                modification_intent,
-                ..
-            } => Some(modification_intent.clone()),
-            _ => None,
-        };
         let operation_intent = match &source.step {
             PlanStepV2::Transform {
                 modification_intent,
@@ -566,7 +558,6 @@ impl HostRuntime {
             access,
             input_handle: input_grant.handle_ref,
             output_slot: output_grant.map(|grant| grant.handle_ref),
-            transform_intent,
             operation_intent,
             output_revision,
             process_world,
@@ -652,15 +643,12 @@ impl HostRuntime {
         if !self
             .execution_worlds
             .run_is_quiescent(&proposal.run_control_ref)
-            || !self
-                .network_broker
-                .run_is_quiescent(&proposal.run_control_ref)
         {
             return fail_claim(
                 &self.paths,
                 &proposal.attempt_id,
                 &proposal.step_id,
-                "Managed process or network authority is not quiescent.",
+                "Managed process is not quiescent.",
             );
         }
         let access = ManagedResourceAccessV1 {
@@ -767,15 +755,12 @@ impl HostRuntime {
         if !self
             .execution_worlds
             .run_is_quiescent(&proposal.run_control_ref)
-            || !self
-                .network_broker
-                .run_is_quiescent(&proposal.run_control_ref)
         {
             return fail_claim(
                 &self.paths,
                 &proposal.attempt_id,
                 &proposal.step_id,
-                "Managed process or network authority is not quiescent.",
+                "Managed process is not quiescent.",
             );
         }
         let result = AuthoritativeExecuteResultV1 {

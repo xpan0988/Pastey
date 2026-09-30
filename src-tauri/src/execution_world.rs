@@ -172,8 +172,6 @@ struct ExecutionWorldStateV1 {
 #[derive(Clone, Debug)]
 pub(crate) struct CompletedProcessObservationV1 {
     owner: WorldOwnerV1,
-    pub(crate) state: String,
-    pub(crate) exit_code: Option<i32>,
     pub(crate) stdout_excerpt: Vec<u8>,
     pub(crate) stdout_truncated: bool,
     pub(crate) stderr_excerpt: Vec<u8>,
@@ -542,8 +540,6 @@ impl ExecutionWorldServiceV1 {
             domain_hash("pastey-process-resource-effects-v1", &resource_facts)?;
         let completed = CompletedProcessObservationV1 {
             owner: process.owner.clone(),
-            state: observation.state.clone(),
-            exit_code: observation.exit_code,
             stdout_excerpt: process.stdout.excerpt.lock().clone(),
             stdout_truncated: process.stdout.exceeded.load(Ordering::SeqCst),
             stderr_excerpt: process.stderr.excerpt.lock().clone(),

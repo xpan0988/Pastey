@@ -215,7 +215,7 @@ Close/exit, disconnect, explicit departure, session replacement, Burn, shutdown,
 | Worker task Network effects | Not exposed | Not exposed | Not exposed |
 | Developer Terminal | Native PTY | Native PTY path | ConPTY/PowerShell |
 
-The Host-owned network broker exists as an independent Phase 5 authority domain, but the Worker has no network tool or automatic escalation. Provider HTTPS is Host control-plane infrastructure and cannot be reused as task egress.
+Pastey has no network broker: sandboxing and egress belong to the Host, and the Worker has no network tool or automatic escalation. Provider HTTPS is Host control-plane infrastructure and cannot be reused as task egress.
 
 ## Current product boundary
 

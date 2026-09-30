@@ -5456,7 +5456,9 @@ fn codex_completed_turn_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{fs, sync::Arc};
 
     mod pair_harness {
         use super::*;
@@ -5525,9 +5527,12 @@ done
             ),
         )
         .unwrap();
-        let mut permissions = fs::metadata(&agent).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&agent, permissions).unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&agent).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&agent, permissions).unwrap();
+        }
         (root, workspace, agent)
     }
 
@@ -5559,9 +5564,12 @@ done
 "##,
         )
         .unwrap();
-        let mut permissions = fs::metadata(&agent).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&agent, permissions).unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&agent).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&agent, permissions).unwrap();
+        }
         (root, workspace, agent)
     }
 
@@ -5578,9 +5586,12 @@ exit 1
             ),
         )
         .unwrap();
-        let mut permissions = fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&executable, permissions).unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&executable).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&executable, permissions).unwrap();
+        }
         executable
     }
 

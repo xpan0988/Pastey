@@ -240,10 +240,6 @@ impl ManagedRunWorkspaceV1 {
         })
     }
 
-    pub(crate) fn access(&self) -> &ManagedResourceAccessV1 {
-        &self.access
-    }
-
     pub(crate) fn projection(&self) -> WorkerWorkspaceProjectionV1 {
         self.projection.clone()
     }
