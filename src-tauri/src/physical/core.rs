@@ -211,6 +211,24 @@ impl PhysicalControlServiceV1 {
             "Local Host/environment/binding mismatch",
         )?;
         binding.validate_scope_schema(s)?;
+        // A witnessed effect bound needs a witness of the required class on
+        // this Host; otherwise the authorization must say intent-only.
+        if let Some(DecisionStreamScopeV1 {
+            effect_bound:
+                EffectBoundV1::Witnessed {
+                    predicate,
+                    required_witness,
+                },
+            ..
+        }) = &s.stream
+        {
+            require(
+                self.witnesses
+                    .get(&predicate.id)
+                    .is_some_and(|w| w.class().satisfies(*required_witness)),
+                "Effect bound cannot be verified on this Host; mark it intent-only",
+            )?;
+        }
         let q =
             self.binding
                 .qualification(binding, &s.profile, &s.qualification.qualification_id)?;

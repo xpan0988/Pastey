@@ -152,6 +152,10 @@ impl ControlFixture {
                         destination: f.requester.clone(),
                     },
                     on_completion: CompletionAcceptanceV1::Automatic,
+                    effect_bound: EffectBoundV1::Witnessed {
+                        predicate: fx::effect_contract().unwrap(),
+                        required_witness: WitnessClassV1::SimulationOracle,
+                    },
                 });
                 f.bounds = f.profile.capability.bounds.clone();
                 f.execution = f.profile.execution.clone();

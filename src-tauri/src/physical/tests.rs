@@ -624,6 +624,10 @@ fn stream_fields() -> ReviewScopeFieldsV1 {
             destination: s.requester.clone(),
         },
         on_completion: CompletionAcceptanceV1::Automatic,
+        effect_bound: EffectBoundV1::Witnessed {
+            predicate: fx::effect_contract().unwrap(),
+            required_witness: WitnessClassV1::SimulationOracle,
+        },
     });
     s.bounds = s.profile.capability.bounds.clone();
     s.execution = s.profile.execution.clone();
@@ -716,6 +720,19 @@ fn observation_flow_is_declared_bounded_and_only_narrowed() {
         both.fields().stream.as_ref().unwrap().on_completion,
         CompletionAcceptanceV1::AwaitReview
     );
+    // A witnessed effect bound must be the capability's own and never changes;
+    // intent-only is always allowed, and it is a different scope.
+    let mut other = stream_fields();
+    other.stream.as_mut().unwrap().effect_bound = EffectBoundV1::Witnessed {
+        predicate: fx::hold_zero_loss().unwrap(),
+        required_witness: WitnessClassV1::SimulationOracle,
+    };
+    assert!(PhysicalReviewScopeV1::try_from(other).is_err());
+    let mut intent_only = stream_fields();
+    intent_only.stream.as_mut().unwrap().effect_bound = EffectBoundV1::IntentOnly;
+    let intent_only = PhysicalReviewScopeV1::try_from(intent_only).unwrap();
+    assert!(super::core::test_support::narrow(&reviewed, &intent_only).is_err());
+    assert!(super::core::test_support::narrow(&intent_only, &reviewed).is_err());
     // The filter keeps declared leaves only.
     let view: CanonicalJsonV1 = decode(json!({"sample": 3, "secret": 1, "pose": {"x": 1, "y": 2}}));
     assert_eq!(wire(&view.select(&flow.fields)), json!({"sample": 3}));

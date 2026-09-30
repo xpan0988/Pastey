@@ -50,6 +50,22 @@ impl ObservationFlowV1 {
     }
 }
 
+/// The limit on physical effects an authorization carries. `Witnessed`: the
+/// binding declares the predicate and a registered witness of the required
+/// class checks it while the stream runs; a violation ends the stream.
+/// `IntentOnly`: no witness can check it, and the authorization says so
+/// plainly: it constrains the brain's choices, not what the body does.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "verification", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum EffectBoundV1 {
+    Witnessed {
+        predicate: ContractRefV1,
+        #[serde(rename = "requiredWitness")]
+        required_witness: WitnessClassV1,
+    },
+    IntentOnly,
+}
+
 /// What happens when the witness verifies the completion contract. Either
 /// way the stream ends; `AwaitReview` leaves task acceptance to a decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +83,7 @@ claim!(DecisionStreamScopeV1 {
     min_decision_interval_us: PositiveMicros,
     observation: ObservationFlowV1,
     on_completion: CompletionAcceptanceV1,
+    effect_bound: EffectBoundV1,
 });
 impl DecisionStreamScopeV1 {
     pub fn validate(&self) -> AppResult<()> {
@@ -84,6 +101,7 @@ impl DecisionStreamScopeV1 {
             && self.observation.is_subset_of(&ceiling.observation)
             && (self.on_completion == ceiling.on_completion
                 || self.on_completion == CompletionAcceptanceV1::AwaitReview)
+            && self.effect_bound == ceiling.effect_bound
     }
     /// A brain that neither acts nor observes for one action plus one
     /// decision interval is treated as crashed.
@@ -109,6 +127,13 @@ impl DecisionStreamScopeV1 {
                 self.on_completion
             } else {
                 CompletionAcceptanceV1::AwaitReview
+            },
+            effect_bound: {
+                require(
+                    self.effect_bound == other.effect_bound,
+                    "Effect bound differs",
+                )?;
+                self.effect_bound.clone()
             },
         };
         narrowed.validate()?;
@@ -478,6 +503,17 @@ impl ReviewScopeFieldsV1 {
                     stream.observation.destination == self.requester,
                     "Observations may only flow to the requester's brain",
                 )?;
+                if let EffectBoundV1::Witnessed {
+                    predicate,
+                    required_witness,
+                } = &stream.effect_bound
+                {
+                    require(
+                        capability.effect_bound.as_ref() == Some(predicate)
+                            && required_witness.may_be_required(self.environment.evidence_class),
+                        "Effect bound not declared, or its witness cannot support this evidence",
+                    )?;
+                }
                 require(
                     self.bounds.is_subset_of(&capability.bounds),
                     "Bounds exceed profile",

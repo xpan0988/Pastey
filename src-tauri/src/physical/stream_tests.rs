@@ -407,6 +407,110 @@ async fn the_supervisor_stops_once_the_stream_has_ended() {
         .unwrap();
 }
 
+/// Records one qualified observation of the latest action's lineage with
+/// the given measured progress.
+fn observe_progress(f: &ControlFixture, progress: f64) {
+    let mut core = f.core.lock();
+    let store = core_fake::store(&core);
+    let root = f
+        .sql()
+        .query_row("SELECT root_id FROM physical_attempts", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap();
+    let action = store
+        .latest_dispatched_action(&RootId::try_from(root).unwrap())
+        .unwrap()
+        .unwrap();
+    let lineage = store.evidence_lineage(&action).unwrap();
+    let qualification = f.scope.fields().qualification.qualification_id.clone();
+    let seq =
+        f.scalar("SELECT count(*) FROM physical_evidence WHERE kind='observation'") as u64 + 1;
+    let ticks = f.clock.ticks.load(Ordering::SeqCst);
+    let fact = PhysicalObservationV1 {
+        lineage,
+        id: ObservationId::try_from(format!("physical-observation:v1:{}", uuid::Uuid::new_v4()))
+            .unwrap(),
+        sequence: seq,
+        capture_us: 1_000_000 + ticks,
+        gap_us: 0,
+        measurements: fx::MeasurementV1 {
+            frame: evidence::label("world"),
+            progress: Some(Finite::try_from(progress).unwrap()),
+            drift: None,
+            rate: None,
+            spin: None,
+            uncertainty: Some(NonNegative::try_from(0.0001).unwrap()),
+            intact: Some(true),
+        }
+        .encode()
+        .unwrap(),
+    };
+    let i = core.local_ingress().unwrap();
+    core.record_physical_observation(&i, producer::qualified_observation(fact, qualification))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_witnessed_effect_bound_violation_ends_the_stream_and_is_recorded() {
+    let f = ControlFixture::stream(1_200_000, 6);
+    let described = lane_for(&f);
+    let (s, ts) = open(&f, &described).await;
+    assert!(allowed(&call(&f, &ts, decide("forward", 300)).await));
+    // Inside the bound (progress 0.1 of at most 0.2): the stream goes on.
+    observe_progress(&f, 0.1);
+    assert!(matches!(
+        tick_for(&f, &ts, 100).await,
+        StreamTickV1::Continue(_)
+    ));
+    // Outside it: the witness contradicts the bound and Core ends the stream.
+    observe_progress(&f, 0.5);
+    assert_eq!(tick_for(&f, &ts, 100).await, StreamTickV1::Ended);
+    assert_eq!(
+        f.scalar(
+            "SELECT count(*) FROM physical_attempts WHERE close_reason='effect_bound_violated'"
+        ),
+        1
+    );
+    assert_eq!(
+        f.scalar("SELECT count(*) FROM physical_effect_bound_violations"),
+        1
+    );
+    assert_eq!(f.session_state(), "quarantined");
+    let status = core_fake::store(&f.core.lock())
+        .physical_status(&lane::session_audit(&s).root)
+        .unwrap();
+    assert_eq!(status.authority, PhysicalAuthorityStateV1::Closed);
+    assert!(!allowed(&call(&f, &ts, decide("stop", 100)).await));
+}
+
+#[tokio::test]
+async fn a_bound_this_host_cannot_witness_must_be_marked_intent_only() {
+    let f = ControlFixture::stream(1_200_000, 6);
+    // This Host has no witness for the extent bound.
+    let mut core = f.core.lock();
+    core_fake::set_witnesses(
+        &mut core,
+        crate::physical::evidence::WitnessRegistryV1::default().with(
+            fx::id(fx::COMPLETION_PREDICATE),
+            witnesses()
+                .get(&fx::id(fx::COMPLETION_PREDICATE))
+                .unwrap()
+                .clone(),
+        ),
+    );
+    let i = core.local_ingress().unwrap();
+    assert!(core.draft_review(&i, &f.live, f.scope.clone()).is_err());
+    let mut fields = f.scope.fields().clone();
+    fields.stream.as_mut().unwrap().effect_bound = EffectBoundV1::IntentOnly;
+    core.draft_review(
+        &i,
+        &f.live,
+        PhysicalReviewScopeV1::try_from(fields).unwrap(),
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 async fn exact_scopes_have_no_decision_tools() {
     let f = ControlFixture::new();

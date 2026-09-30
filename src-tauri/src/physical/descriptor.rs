@@ -660,6 +660,10 @@ claim!(CapabilityDescriptorV1 {
     /// Present exactly for `DecisionStream`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     decision_stream: Option<DecisionStreamDescriptorV1>,
+    /// A limit on physical effects the binding's witness can verify (for
+    /// example "stays inside the flat"). Absent: nothing can verify one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effect_bound: Option<ContractRefV1>,
 });
 impl CapabilityDescriptorV1 {
     pub fn validate(&self) -> AppResult<()> {

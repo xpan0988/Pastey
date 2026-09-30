@@ -72,9 +72,20 @@ CREATE TABLE physical_decisions(
 CREATE TRIGGER physical_decisions_immutable BEFORE UPDATE ON physical_decisions BEGIN SELECT RAISE(ABORT,'physical decision record immutable');END;
 CREATE TRIGGER physical_decisions_keep BEFORE DELETE ON physical_decisions BEGIN SELECT RAISE(ABORT,'physical decision history required');END;
 "#;
+/// A root closed because its witnessed effect bound was contradicted, with
+/// the verdict Core admitted.
+pub(super) const EFFECT_BOUND_SCHEMA: &str = r#"
+CREATE TABLE physical_effect_bound_violations(root_id TEXT PRIMARY KEY,action_id TEXT NOT NULL REFERENCES physical_actions(action_id),digest TEXT NOT NULL CHECK(length(digest)=64),record_json TEXT NOT NULL,recorded_at INTEGER NOT NULL CHECK(recorded_at>0)) STRICT;
+CREATE TRIGGER physical_effect_bound_immutable BEFORE UPDATE ON physical_effect_bound_violations BEGIN SELECT RAISE(ABORT,'physical effect bound verdict immutable');END;
+CREATE TRIGGER physical_effect_bound_keep BEFORE DELETE ON physical_effect_bound_violations BEGIN SELECT RAISE(ABORT,'physical effect bound verdict required');END;
+"#;
 /// Stage 10 relaxes the one-action constraints of the control tables.
 pub(super) fn stage10(ddl: &str) -> String {
     ddl.replace(
+        "close_reason TEXT CHECK(close_reason IN ('interrupted','shutdown','revoked','dependency_invalidated','superseded','expired'))",
+        "close_reason TEXT CHECK(close_reason IN ('interrupted','shutdown','revoked','dependency_invalidated','superseded','expired','effect_bound_violated'))",
+    )
+    .replace(
         "action_id TEXT PRIMARY KEY,root_id TEXT NOT NULL UNIQUE,session_id TEXT NOT NULL UNIQUE REFERENCES physical_sessions(session_id),grant_id TEXT NOT NULL UNIQUE,",
         "action_id TEXT PRIMARY KEY,root_id TEXT NOT NULL,session_id TEXT NOT NULL REFERENCES physical_sessions(session_id),grant_id TEXT NOT NULL,",
     )
@@ -86,6 +97,7 @@ pub(super) fn stage10(ddl: &str) -> String {
         "ceiling_count INTEGER NOT NULL CHECK(ceiling_count=1)",
         "ceiling_count INTEGER NOT NULL CHECK(ceiling_count>=1)",
     ) + DECISION_SCHEMA
+        + EFFECT_BOUND_SCHEMA
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -686,6 +698,33 @@ impl PhysicalStoreV1 {
                 })
             })
             .collect()
+    }
+    /// Records the admitted Contradicted verdict and closes the root with
+    /// `effect_bound_violated`, in one transaction.
+    pub(in crate::physical) fn record_effect_violation(
+        &self,
+        root: &RootId,
+        verdict: &crate::physical::evidence::WitnessVerdictV1,
+        now: UnixMillis,
+    ) -> AppResult<()> {
+        let mut c = self.connection()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::audit(&tx)?;
+        tx.execute(
+            "INSERT INTO physical_effect_bound_violations VALUES(?1,?2,?3,?4,?5)",
+            params![
+                text(root),
+                text(&verdict.action),
+                text(&digest("pastey-physical-effect-violation-v1", verdict)?),
+                serde_json::to_string(verdict)?,
+                now.get() as i64
+            ],
+        )?;
+        super::evidence_ledger::cancel(&tx, root)?;
+        close_root(&tx, root)?;
+        tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason='effect_bound_violated' WHERE root_id=?1 AND state='open'",[text(root)])?;
+        tx.commit()?;
+        Ok(())
     }
     /// The latest decision that reached dispatch intent, if any.
     pub(in crate::physical) fn latest_dispatched_action(

@@ -412,6 +412,21 @@ impl PhysicalStoreV1 {
         tx.commit()?;
         Ok(true)
     }
+    /// An action's lineage and current stored observations, for an effect
+    /// bound check.
+    pub(in crate::physical) fn effect_bound_facts(
+        &self,
+        id: &ActionId,
+    ) -> AppResult<(EvidenceLineageV1, Vec<ObservationRecordV1>)> {
+        let mut c = self.connection()?;
+        let tx = c.transaction()?;
+        super::audit(&tx)?;
+        let (l, _) = lineage(&tx, id)?;
+        let rev = head(&tx, id)?;
+        let (os, _) = facts(&tx, id, rev)?;
+        tx.commit()?;
+        Ok((l, os))
+    }
     pub(in crate::physical) fn evaluate_consequence(
         &self,
         id: &ActionId,

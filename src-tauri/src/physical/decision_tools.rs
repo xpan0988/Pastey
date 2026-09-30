@@ -337,6 +337,10 @@ impl PhysicalControlServiceV1 {
         if Self::sample(core, stream).await.is_err() {
             return Ok(StreamTickV1::Ended);
         }
+        if core.lock().check_effect_bound(stream)? {
+            Self::end_stream(core, stream).await;
+            return Ok(StreamTickV1::Ended);
+        }
         let (verified, spent) = {
             let mut service = core.lock();
             let verified = service.evaluate_stream(stream, flow.on_completion)?;
@@ -369,6 +373,63 @@ impl PhysicalControlServiceV1 {
                 }
             }
         }
+    }
+    /// Checks a witnessed effect bound over the latest dispatched decision.
+    /// An admitted Contradicted verdict (its window and evidence recomputed
+    /// from the stored observations it cites) is recorded and closes the root
+    /// with `effect_bound_violated`. Returns true on a violation.
+    fn check_effect_bound(&mut self, stream: &StreamRuntimeV1) -> AppResult<bool> {
+        let EffectBoundV1::Witnessed {
+            predicate,
+            required_witness,
+        } = &stream_scope(&stream.session)?.effect_bound
+        else {
+            return Ok(false);
+        };
+        let root = stream.session.root().root_id().clone();
+        let Some(action) = self.store.latest_dispatched_action(&root)? else {
+            return Ok(false);
+        };
+        let Some(witness) = self.witnesses.get(&predicate.id).cloned() else {
+            return Ok(false);
+        };
+        let (lineage, observations) = self.store.effect_bound_facts(&action)?;
+        let predicate_digest = digest("pastey-physical-effect-bound-v1", predicate)?;
+        let (now, _) = self.clock.read()?;
+        let input = crate::physical::evidence::EffectBoundInputV1 {
+            predicate,
+            predicate_digest: &predicate_digest,
+            lineage: &lineage,
+            observations: &observations,
+        };
+        let Ok(verdict) = witness.effect_bound(&input) else {
+            return Ok(false);
+        };
+        if verdict.result != crate::physical::evidence::WitnessResultV1::Contradicted {
+            return Ok(false);
+        }
+        let cited: Vec<_> = verdict
+            .observations
+            .iter()
+            .filter_map(|id| observations.iter().find(|o| &o.fact.id == id))
+            .collect();
+        let rebuilt = crate::physical::evidence::WitnessVerdictV1::over(
+            &action,
+            &predicate_digest,
+            verdict.result,
+            verdict.witness_class,
+            verdict.reason.as_str(),
+            &cited,
+        )?;
+        if rebuilt != verdict
+            || cited.is_empty()
+            || !verdict.witness_class.satisfies(*required_witness)
+        {
+            return Ok(false);
+        }
+        self.control.invalidate_root(&root);
+        self.store.record_effect_violation(&root, &verdict, now)?;
+        Ok(true)
     }
     /// Evaluates the latest dispatched decision. Returns true once the
     /// completion is verified (and, if the scope says so, accepted).

@@ -12,6 +12,17 @@ const START_PREDICATE: &str = "test.ready/v1";
 const LOSS_PROFILE: &str = "test.hold-zero/v1";
 pub(in crate::physical) const COMPLETION_PREDICATE: &str = "test.reached-and-held/v1";
 pub(in crate::physical) const AT_REST_PREDICATE: &str = "test.at-rest/v1";
+/// Effect bound: measured progress never exceeds `maxProgress`.
+pub(in crate::physical) const EXTENT_PREDICATE: &str = "test.within-extent/v1";
+const EXTENT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["maxProgress"],"properties":{"maxProgress":{"minimum":0}}}"#;
+/// The stream capability's effect bound: progress stays within 0.2.
+pub(in crate::physical) fn effect_contract() -> AppResult<ContractRefV1> {
+    Ok(ContractRefV1 {
+        id: id(EXTENT_PREDICATE),
+        params_schema_digest: schema_digest(EXTENT_SCHEMA)?,
+        params: CanonicalJsonV1::encode(&serde_json::json!({"maxProgress": 0.2}))?,
+    })
+}
 
 // Schema documents are hashed, not interpreted, by Core. The typed structs
 // below are the enforcing implementation; both change together.
@@ -217,6 +228,7 @@ pub(in crate::physical) fn setpoint_descriptor(
         loss_profile: hold_zero_loss()?,
         completion_predicate: completion.contract()?,
         decision_stream: None,
+        effect_bound: None,
     };
     descriptor.validate()?;
     Ok(descriptor)
@@ -262,6 +274,7 @@ pub(in crate::physical) fn stream_descriptor(
                 .map(|f| JsonPointerV1::try_from(f.to_string()))
                 .collect::<AppResult<_>>()?,
         }),
+        effect_bound: Some(effect_contract()?),
     };
     descriptor.validate()?;
     Ok(descriptor)
@@ -324,6 +337,7 @@ pub(in crate::physical) fn witnesses() -> WitnessRegistryV1 {
     });
     WitnessRegistryV1::default()
         .with(id(COMPLETION_PREDICATE), witness.clone())
+        .with(id(EXTENT_PREDICATE), witness.clone())
         .with(id(AT_REST_PREDICATE), witness)
 }
 
@@ -474,6 +488,43 @@ impl PhysicalWitnessV1 for FixtureWitnessV1 {
             return verdict(Contradicted, "hold_timeout", &refs(0));
         }
         verdict(Partial, "hold_or_dwell_incomplete", &[])
+    }
+
+    fn effect_bound(&self, i: &EffectBoundInputV1<'_>) -> AppResult<WitnessVerdictV1> {
+        use WitnessResultV1::*;
+        require(
+            i.predicate.id == id(EXTENT_PREDICATE),
+            "Not the extent bound",
+        )?;
+        let max: f64 = i.predicate.params.decode::<serde_json::Value>()?["maxProgress"]
+            .as_f64()
+            .ok_or_else(|| crate::error::AppError::InvalidInput("Bad extent".into()))?;
+        let outside: Vec<&ObservationRecordV1> = i
+            .observations
+            .iter()
+            .filter(|o| {
+                o.qualified
+                    && o.fact
+                        .measurements
+                        .decode::<MeasurementV1>()
+                        .ok()
+                        .and_then(|m| m.progress)
+                        .is_some_and(|p| p.get() > max)
+            })
+            .collect();
+        let (result, reason) = if outside.is_empty() {
+            (Unknown, "no_violation_seen")
+        } else {
+            (Contradicted, "left_extent")
+        };
+        WitnessVerdictV1::over(
+            &i.lineage.action,
+            i.predicate_digest,
+            result,
+            self.class,
+            reason,
+            &outside,
+        )
     }
 
     fn handover(&self, i: &HandoverInputV1<'_>) -> AppResult<WitnessVerdictV1> {

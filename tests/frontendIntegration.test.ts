@@ -440,6 +440,8 @@ test("physical review shows a decision-stream scope, including its observation f
       options: ["forward", "stop", "turn_left", "turn_right"],
       minDecisionIntervalUs: 200000,
       observation: { fields: ["/heading", "/room"], minIntervalUs: 100000, destination: "host:brain" },
+      onCompletion: "await_review",
+      effectBound: { verification: "witnessed", predicate: { id: "flat.stays-inside/v1" }, requiredWitness: "simulation_oracle" },
     },
   } as import("../src/lib/physical").PhysicalScope);
   assert.deepEqual(Object.fromEntries(stream), {
@@ -452,7 +454,22 @@ test("physical review shows a decision-stream scope, including its observation f
     Completion: "flat.in-room/v1 within 3 s",
     "Witness class": "simulation oracle",
     "Observations sent": "/heading, /room to host:brain, at most one per 0.1 s",
+    "Effect bound": "flat.stays-inside/v1, checked by a simulation oracle witness",
+    "On completion": "Awaits a review decision",
   });
+  const intentOnly = physicalScopeSummary({
+    ...base,
+    mode: "decision_stream",
+    stream: {
+      options: ["pour_small"],
+      minDecisionIntervalUs: 500000,
+      observation: { fields: [], minIntervalUs: 500000, destination: "host:brain" },
+      onCompletion: "automatic",
+      effectBound: { verification: "intent_only" },
+    },
+  } as import("../src/lib/physical").PhysicalScope);
+  assert.equal(Object.fromEntries(intentOnly)["Effect bound"], "Intent only: constrains the brain's choices, not what the body does");
+  assert.equal(Object.fromEntries(intentOnly)["Observations sent"], "none");
   // An exact scope still renders, without a stream section.
   const exact = physicalScopeSummary({
     ...base,

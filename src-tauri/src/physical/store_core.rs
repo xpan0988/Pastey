@@ -495,6 +495,7 @@ fn valid_reason(s: &str) -> bool {
             | "dependency_invalidated"
             | "superseded"
             | "expired"
+            | "effect_bound_violated"
     )
 }
 fn close_review(c: &Connection, id: &ReviewId, rev: u64, reason: &str) -> AppResult<()> {

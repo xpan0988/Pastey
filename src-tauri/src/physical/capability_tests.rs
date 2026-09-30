@@ -28,6 +28,7 @@ fn dispense_profile(p: &mut PhysicalCapabilityProfileV1) {
         loss_profile: contract("test.valve-closed/v1"),
         completion_predicate: contract("test.volume-dispensed/v1"),
         decision_stream: None,
+        effect_bound: None,
     };
 }
 fn dispense_fields(f: &mut ReviewScopeFieldsV1) {

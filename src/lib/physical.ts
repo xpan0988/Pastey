@@ -12,6 +12,10 @@ export interface PhysicalScope {
     options: string[];
     minDecisionIntervalUs: number;
     observation: { fields: string[]; minIntervalUs: number; destination: string };
+    onCompletion: "automatic" | "await_review";
+    effectBound:
+      | { verification: "witnessed"; predicate: { id: string }; requiredWitness: string }
+      | { verification: "intent_only" };
   };
   execution: { actionDurationUs: number; leaseDurationUs: number; totalExecutionUs: number; actionCount: number };
   qualification: { requiredEnforcementClass: "adapter_isolation_only" | "native_fence"; expiresAt: number };
@@ -83,6 +87,13 @@ export function physicalScopeSummary(scope: PhysicalScope): [string, string][] {
     rows.push(["Observations sent", o.fields.length === 0
       ? "none"
       : `${o.fields.join(", ")} to ${o.destination}, at most one per ${seconds(o.minIntervalUs)}`]);
+    const e = scope.stream.effectBound;
+    rows.push(
+      ["Effect bound", e.verification === "witnessed"
+        ? `${e.predicate.id}, checked by a ${e.requiredWitness.replace(/_/g, " ")} witness`
+        : "Intent only: constrains the brain's choices, not what the body does"],
+      ["On completion", scope.stream.onCompletion === "automatic" ? "Accepted automatically" : "Awaits a review decision"],
+    );
   }
   return rows;
 }

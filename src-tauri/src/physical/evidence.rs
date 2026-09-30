@@ -248,13 +248,6 @@ impl WitnessVerdictV1 {
         )
     }
     /// Seal a verdict over exactly these stored observations (capture order).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "reachable only once a production binding is attached (Step D)"
-        )
-    )]
     pub fn over(
         action: &ActionId,
         contract_digest: &DigestV1,
@@ -333,6 +326,28 @@ pub(crate) trait PhysicalWitnessV1: Send + Sync {
     fn class(&self) -> WitnessClassV1;
     fn completion(&self, input: &CompletionInputV1<'_>) -> AppResult<WitnessVerdictV1>;
     fn handover(&self, input: &HandoverInputV1<'_>) -> AppResult<WitnessVerdictV1>;
+    /// Checks an effect bound over an action's stored observations.
+    /// `Contradicted` means the body left the bound. A witness that does not
+    /// judge effect bounds fails, so no scope can claim it verifies one.
+    fn effect_bound(&self, input: &EffectBoundInputV1<'_>) -> AppResult<WitnessVerdictV1> {
+        let _ = input;
+        Err(crate::error::AppError::InvalidInput(
+            "Witness does not judge effect bounds".into(),
+        ))
+    }
+}
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "reachable only once a production binding is attached (Step D)"
+    )
+)]
+pub(crate) struct EffectBoundInputV1<'a> {
+    pub predicate: &'a ContractRefV1,
+    pub predicate_digest: &'a DigestV1,
+    pub lineage: &'a EvidenceLineageV1,
+    pub observations: &'a [ObservationRecordV1],
 }
 /// Witnesses by contract ID, installed by the Host when Core is constructed so
 /// historical actions stay evaluable after restart without a live binding.
