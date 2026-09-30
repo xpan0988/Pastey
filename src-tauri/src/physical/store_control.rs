@@ -324,7 +324,7 @@ impl PhysicalStoreV1 {
         }
         tx.execute("INSERT INTO physical_control_budgets(root_id,role,ceiling_us,ceiling_count) VALUES(?1,?3,?2,?4)",params![text(&s.root),checked_integer(s.scope.fields().execution.total_execution_us.get())?,a.role(),i64::from(s.scope.fields().execution.action_count)])?;
         self.audit(&tx)?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(ReservationReceiptV1 { session: s.clone() })
     }
     pub(in crate::physical) fn validate_session(
@@ -339,7 +339,7 @@ impl PhysicalStoreV1 {
         let tx = c.transaction()?;
         self.audit(&tx)?;
         current_session(&tx, a, s, snapshot, now, active)?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     pub(in crate::physical) fn activate_session(
@@ -366,7 +366,7 @@ impl PhysicalStoreV1 {
         )?;
         let n=tx.execute("UPDATE physical_sessions SET state='active',install_evidence=?2,revision=revision+1 WHERE session_id=?1 AND state='installing'",params![text(&s.id),tag(&evidence)?])?;
         require(n == 1, "Stale installation response")?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     /// `proposer` names the tool caller of a decision-stream proposal. Its
@@ -412,7 +412,7 @@ impl PhysicalStoreV1 {
             Some(&x.proposal.action_id),
             now,
         )?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     pub(in crate::physical) fn prepare_write(
@@ -436,7 +436,7 @@ impl PhysicalStoreV1 {
         let n = tx.execute("UPDATE physical_actions SET dispatch_intent=1,disposition=?3,operation_id=?2,revision=revision+1 WHERE action_id=?1 AND state='open' AND dispatch_intent=0 AND operation_id IS NULL",params![text(&x.proposal.action_id),text(op),tag(&ActionDispositionV1::DispatchUnknown)?])?;
         require(n == 1, "Duplicate/uncertain/in-flight dispatch")?;
         tx.execute("UPDATE physical_control_budgets SET consumed_us=reserved_us,revision=revision+1 WHERE root_id=?1",[text(&x.root)])?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     pub(in crate::physical) fn finish_write(
@@ -463,7 +463,7 @@ impl PhysicalStoreV1 {
             None => ActionDispositionV1::DispatchUnknown,
         };
         let n=tx.execute("UPDATE physical_actions SET disposition=?3,apply_result=COALESCE(apply_result,?4),operation_id=NULL,revision=revision+1 WHERE action_id=?1 AND state='open' AND operation_id=?2",params![text(&x.proposal.action_id),text(op),tag(&disposition)?,result.map(|b|if b{"accepted"}else{"refused"})])?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(n == 1)
     }
     /// (state, disposition, reserved, consumed) of an action and its root.
@@ -475,7 +475,7 @@ impl PhysicalStoreV1 {
         let tx = c.transaction()?;
         self.audit(&tx)?;
         let (state, disposition, reserved, consumed): (String, String, i64, i64) = tx.query_row("SELECT a.state,a.disposition,b.reserved_us,b.consumed_us FROM physical_actions a JOIN physical_control_budgets b USING(root_id) WHERE action_id=?1",[text(id)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok((
             state,
             serde_json::from_value(serde_json::Value::String(disposition))?,
@@ -493,7 +493,7 @@ impl PhysicalStoreV1 {
             |r| r.get(0),
         )?;
         let f = decode(&raw)?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(f)
     }
     fn native_fence_receipt_for_ack(&self, f: &FenceAuditV1, c: &Connection) -> AppResult<bool> {
@@ -521,7 +521,7 @@ impl PhysicalStoreV1 {
             "adapter_isolation_only"
         };
         let n=tx.execute("UPDATE physical_sessions SET fence_ack=?3,revision=revision+1 WHERE session_id=?1 AND state='quarantined' AND fence_json=?2 AND fence_ack IS NULL",params![text(&f.session),serde_json::to_string(f)?,class])?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(n == 1)
     }
 }
@@ -659,7 +659,7 @@ impl PhysicalStoreV1 {
             None,
             now,
         )?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     pub(in crate::physical) fn decisions(&self, root: &RootId) -> AppResult<Vec<DecisionRecordV1>> {
@@ -714,7 +714,7 @@ impl PhysicalStoreV1 {
         super::evidence_ledger::cancel(&tx, root)?;
         close_root(&tx, root)?;
         tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason='effect_bound_violated' WHERE root_id=?1 AND state='open'",[text(root)])?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     /// The latest decision that reached dispatch intent, if any.
@@ -763,7 +763,7 @@ pub(super) fn recover(c: &Connection, restart: bool) -> AppResult<()> {
     }
     Ok(())
 }
-pub(super) fn audit(c: &Connection) -> AppResult<()> {
+pub(super) fn audit(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()> {
     verify_version(c)?;
     for table in [
         "physical_sessions",
@@ -772,12 +772,15 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         "physical_actions",
     ] {
         require(
-            !c.prepare(&format!("PRAGMA foreign_key_check({table})"))?
-                .exists([])?,
+            !scope.full()
+                || !c
+                    .prepare(&format!("PRAGMA foreign_key_check({table})"))?
+                    .exists([])?,
             "Control ledger foreign key violation",
         )?;
     }
-    let mut stmt = c.prepare("SELECT * FROM physical_sessions")?;
+    let roots = scope.filter("root_id", "root");
+    let mut stmt = c.prepare(&format!("SELECT * FROM physical_sessions WHERE {roots}"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let s: SessionAuditV1 = decode(&row.get::<_, String>("audit_json")?)?;
@@ -887,7 +890,7 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
             "Closed Root has live session",
         )?;
     }
-    let mut stmt = c.prepare("SELECT * FROM physical_actions")?;
+    let mut stmt = c.prepare(&format!("SELECT * FROM physical_actions WHERE {roots}"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let x: ActionAuditV1 = decode(&row.get::<_, String>("audit_json")?)?;
@@ -935,7 +938,9 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
             "Live action without active session",
         )?;
     }
-    let mut stmt = c.prepare("SELECT * FROM physical_control_budgets")?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT * FROM physical_control_budgets WHERE {roots}"
+    ))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let id: RootId = RootId::try_from(row.get::<_, String>("root_id")?)?;
@@ -980,11 +985,11 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
             "Budget reservation/dispatch mismatch",
         )?;
     }
-    audit_decisions(c)
+    audit_decisions(c, scope)
 }
 /// Decision records: contiguous per root, and every allowed record names an
 /// action of that root with the same option; every stream action has one.
-fn audit_decisions(c: &Connection) -> AppResult<()> {
+fn audit_decisions(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()> {
     // Earlier DDL stages are audited during migration, before stage 10.
     let staged: bool = c.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='physical_decisions')",
@@ -994,9 +999,10 @@ fn audit_decisions(c: &Connection) -> AppResult<()> {
     if !staged {
         return Ok(());
     }
-    let mut stmt = c.prepare(
-        "SELECT root_id,sequence,option,requested_us,action_id FROM physical_decisions ORDER BY root_id,sequence",
-    )?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT root_id,sequence,option,requested_us,action_id FROM physical_decisions WHERE {} ORDER BY root_id,sequence",
+        scope.filter("root_id", "root")
+    ))?;
     let rows = stmt
         .query_map([], |r| {
             Ok((
@@ -1024,7 +1030,7 @@ fn audit_decisions(c: &Connection) -> AppResult<()> {
         }
     }
     let unrecorded: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM physical_actions a WHERE json_extract(a.audit_json,'$.proposal.option') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM physical_decisions d WHERE d.action_id=a.action_id))",
+        &format!("SELECT EXISTS(SELECT 1 FROM physical_actions a WHERE {} AND json_extract(a.audit_json,'$.proposal.option') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM physical_decisions d WHERE d.action_id=a.action_id))", scope.filter("a.root_id", "root")),
         [],
         |r| r.get(0),
     )?;

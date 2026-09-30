@@ -74,7 +74,7 @@ impl VerifiedPeerCoreIngressV1 {
     }
 }
 
-/// Constructor is exclusively in Core::start_exact_action after the durable
+/// Constructor is exclusively in Core::start_approved_root after the durable
 /// transaction. Private fields, no serde/Clone/From/TryFrom or row constructor.
 pub(super) struct PhysicalAuthorityRootV1 {
     audit: RootAuditV1,
@@ -454,7 +454,7 @@ impl PhysicalControlServiceV1 {
             reason = "no production binding is attached; the reference bindings are test-only"
         )
     )]
-    pub(super) fn start_exact_action(
+    pub(super) fn start_approved_root(
         &mut self,
         ingress: &LocalCoreIngressV1,
         approval_id: &ApprovalId,
@@ -466,9 +466,9 @@ impl PhysicalControlServiceV1 {
             r.scope.fields().requester == *self.runtime.host_ref(),
             "Remote Start requires verified peer ingress",
         )?;
-        self.start_exact_action_inner(approval_id, binding, None, None)
+        self.start_approved_root_inner(approval_id, binding, None, None)
     }
-    fn start_exact_action_inner(
+    fn start_approved_root_inner(
         &mut self,
         approval_id: &ApprovalId,
         binding: Arc<EnvironmentBindingV1>,

@@ -1553,7 +1553,10 @@ mod stage2 {
                 [String::from(second_domain())]
             )
             .is_err());
-        for mode in ["WAL", "TRUNCATE", "PERSIST", "DELETE"] {
+        // The Host's ledger connection stays open, and SQLite lets only the
+        // last open connection leave WAL mode: WAL is checked on its own
+        // ledger below.
+        for mode in ["TRUNCATE", "PERSIST", "DELETE"] {
             f.sql()
                 .execute_batch(&format!("PRAGMA journal_mode={mode}"))
                 .unwrap();
@@ -1573,6 +1576,15 @@ mod stage2 {
                 "{setting}"
             );
         }
+        let wal = Fixture::new();
+        wal.sql().execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        PhysicalStoreV1::open(&wal.paths).unwrap();
+        assert_eq!(
+            wal.sql()
+                .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
     }
     #[test]
     fn missing_subsystem_and_changed_ledger_during_handshake_deny_resolution() {

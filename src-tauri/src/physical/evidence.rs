@@ -611,6 +611,10 @@ pub(super) struct EvaluationV1 {
 }
 const WITNESS_UNAVAILABLE: &str = "witness_unavailable";
 const WITNESS_FAILED: &str = "witness_failed";
+/// The verdict's class differs from the registered witness's. Such a verdict
+/// is not stored: restart and the audit prove stored verdicts against the
+/// Host registry, and this one cannot be.
+const WITNESS_CLASS_MISMATCH: &str = "witness_class_mismatch";
 
 /// Device-neutral preconditions: returns the action window or an early result.
 fn preflight(
@@ -792,11 +796,12 @@ pub(super) fn evaluate(
         &verdict,
         Some(witness.class()),
     );
+    let verdict = (reason.as_str() != WITNESS_CLASS_MISMATCH).then_some(verdict);
     EvaluationV1 {
         state,
         reason,
         max_gap_us,
-        verdict: Some(verdict),
+        verdict,
     }
 }
 /// Re-derive a stored evaluation without a witness (ledger audit): the Core
@@ -820,7 +825,7 @@ pub(super) fn replay(
         }
     };
     match verdict {
-        None => [WITNESS_UNAVAILABLE, WITNESS_FAILED]
+        None => [WITNESS_UNAVAILABLE, WITNESS_FAILED, WITNESS_CLASS_MISMATCH]
             .contains(&String::from(stored_reason.clone()).as_str())
             .then(|| {
                 (

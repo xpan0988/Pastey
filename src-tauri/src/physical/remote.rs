@@ -262,8 +262,8 @@ impl PhysicalControlServiceV1 {
                 }),
                 "Foreign physical offers",
             )?;
-            let c = self.store.connection()?;
-            c.execute("INSERT INTO physical_remote_offers VALUES(?1,?2,?3) ON CONFLICT(peer) DO UPDATE SET session_pair=excluded.session_pair,offers_json=excluded.offers_json",rusqlite::params![m.executor.as_str(),m.session_pair,serde_json::to_string(offers)?])?;
+            self.store
+                .save_remote_offers(&m.executor, &m.session_pair, offers)?;
             return Ok((None, None));
         }
         if let PhysicalOperationV1::ToolResult { request, outcome } = &m.operation {
@@ -366,7 +366,7 @@ impl PhysicalControlServiceV1 {
                         semantic_id: m.semantic_id.clone(),
                         semantic_digest: m.digest()?,
                     };
-                    let root = Arc::new(self.start_exact_action_inner(
+                    let root = Arc::new(self.start_approved_root_inner(
                         &review.approval.as_ref().unwrap().approval_id,
                         binding,
                         Some(p.clone()),
@@ -589,8 +589,10 @@ impl PhysicalControlServiceV1 {
         if let Some(session) = self.remote.executions.get(start) {
             return self.store.physical_status(session.root().root_id());
         }
-        let c = self.store.connection()?;
-        let root:Option<String>=c.query_row("SELECT root_id FROM physical_attempts WHERE role='executor_remote' AND requester=?1 AND json_extract(audit_json,'$.remoteLineage.semanticId')=?2",rusqlite::params![peer.as_str(),String::from(start.clone())],|r|r.get(0)).optional()?;
+        let root: Option<String> = {
+            let c = self.store.connection()?;
+            c.query_row("SELECT root_id FROM physical_attempts WHERE role='executor_remote' AND requester=?1 AND json_extract(audit_json,'$.remoteLineage.semanticId')=?2",rusqlite::params![peer.as_str(),String::from(start.clone())],|r|r.get(0)).optional()?
+        };
         if let Some(root) = root {
             self.store.physical_status(&RootId::try_from(root)?)
         } else {
@@ -702,8 +704,10 @@ impl PhysicalControlServiceV1 {
                         && r.approval.as_ref().is_some_and(|a| now < a.expires_at),
                     "Stale/unapproved physical Start",
                 )?;
-                let c = self.store.connection()?;
-                let old:Option<String>=c.query_row("SELECT message_json FROM physical_semantic_messages WHERE peer=?1 AND json_extract(message_json,'$.operation.review.reviewId')=?2",rusqlite::params![b.peer_host_ref.as_str(),String::from(review_id)],|r|r.get(0)).optional()?;
+                let old: Option<String> = {
+                    let c = self.store.connection()?;
+                    c.query_row("SELECT message_json FROM physical_semantic_messages WHERE peer=?1 AND json_extract(message_json,'$.operation.review.reviewId')=?2",rusqlite::params![b.peer_host_ref.as_str(),String::from(review_id)],|r|r.get(0)).optional()?
+                };
                 if let Some(raw) = old {
                     let m: PhysicalMessageV1 = serde_json::from_str(&raw)?;
                     require(
@@ -820,6 +824,7 @@ impl PhysicalControlServiceV1 {
         let review_id = review.as_ref().map(|r| String::from(r.review_id.clone()));
         let start:Option<String>=c.query_row("SELECT semantic_id FROM physical_semantic_messages WHERE peer=?1 AND json_extract(message_json,'$.operation.kind')='start' AND (?2 IS NULL OR json_extract(message_json,'$.operation.review.reviewId')=?2) ORDER BY rowid DESC LIMIT 1",rusqlite::params![b.peer_host_ref.as_str(),review_id],|r|r.get(0)).optional()?;
         let start = start.map(RequestId::try_from).transpose()?;
+        drop(c);
         let status = if let Some(id) = &start {
             self.store.semantic_result(&b.peer_host_ref, id)?
         } else {

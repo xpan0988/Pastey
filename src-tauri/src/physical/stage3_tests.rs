@@ -133,7 +133,7 @@ impl Fixture {
     ) -> crate::error::AppResult<PhysicalAuthorityRootV1> {
         let ingress = self.core.local_ingress()?;
         self.core
-            .start_exact_action(&ingress, &a.approval_id, self.live.clone())
+            .start_approved_root(&ingress, &a.approval_id, self.live.clone())
     }
     fn root(&mut self) -> PhysicalAuthorityRootV1 {
         let (_, a) = self.approved();
@@ -303,14 +303,14 @@ fn draft_and_reviewed_rows_are_not_start_authority() {
     let ingress = f.core.local_ingress().unwrap();
     assert!(f
         .core
-        .start_exact_action(&ingress, &id, f.live.clone())
+        .start_approved_root(&ingress, &id, f.live.clone())
         .is_err());
     f.core
         .seal_review(&ingress, &r.review_id, 1, &r.scope_digest)
         .unwrap();
     assert!(f
         .core
-        .start_exact_action(&ingress, &id, f.live.clone())
+        .start_approved_root(&ingress, &id, f.live.clone())
         .is_err());
     assert_eq!(f.count("physical_attempts"), 0);
 }
@@ -795,7 +795,7 @@ fn restart_closes_audit_and_never_reconstructs_root_or_reuses_approval() {
     assert!(f.core.validate_root(&root).is_err());
     let ingress = restarted.local_ingress().unwrap();
     assert!(restarted
-        .start_exact_action(&ingress, &a.approval_id, f.live.clone())
+        .start_approved_root(&ingress, &a.approval_id, f.live.clone())
         .is_err());
     assert_eq!(f.count("physical_attempts"), 1);
 }
@@ -1048,7 +1048,7 @@ fn concurrent_core_starts_return_only_one_live_root() {
                     let mut service = core.lock();
                     let ingress = service.local_ingress().unwrap();
                     service
-                        .start_exact_action(&ingress, &approval.approval_id, live.clone())
+                        .start_approved_root(&ingress, &approval.approval_id, live.clone())
                         .is_ok()
                 })
             })

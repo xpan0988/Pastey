@@ -595,7 +595,7 @@ impl DemoV1 {
                 let session = {
                     let mut c = core.lock();
                     let i = c.local_ingress().unwrap();
-                    let root = Arc::new(c.start_exact_action(&i, approval, live.clone()).unwrap());
+                    let root = Arc::new(c.start_approved_root(&i, approval, live.clone()).unwrap());
                     let basis = Arc::new(
                         c.construct_grant_basis(
                             &root,

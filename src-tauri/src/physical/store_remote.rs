@@ -158,7 +158,7 @@ impl PhysicalStoreV1 {
                 serde_json::to_string(m)?
             ],
         )?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(true)
     }
     pub(in crate::physical) fn semantic_message(
@@ -193,8 +193,25 @@ impl PhysicalStoreV1 {
         id: &RequestId,
         s: &PhysicalStatusV1,
     ) -> AppResult<()> {
-        let c = self.connection()?;
-        require(c.execute("UPDATE physical_semantic_messages SET result_json=?3 WHERE peer=?1 AND semantic_id=?2",params![peer.as_str(),text(id),serde_json::to_string(s)?])? == 1, "Unknown physical result correlation")
+        let mut c = self.connection()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.audit(&tx)?;
+        require(tx.execute("UPDATE physical_semantic_messages SET result_json=?3 WHERE peer=?1 AND semantic_id=?2",params![peer.as_str(),text(id),serde_json::to_string(s)?])? == 1, "Unknown physical result correlation")?;
+        self.commit(tx)
+    }
+    /// The executor's latest offers for this requester, cached for the
+    /// product view.
+    pub(in crate::physical) fn save_remote_offers(
+        &self,
+        peer: &crate::host_identity::HostRef,
+        pair: &str,
+        offers: &[PhysicalReviewScopeV1],
+    ) -> AppResult<()> {
+        let mut c = self.connection()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.audit(&tx)?;
+        tx.execute("INSERT INTO physical_remote_offers VALUES(?1,?2,?3) ON CONFLICT(peer) DO UPDATE SET session_pair=excluded.session_pair,offers_json=excluded.offers_json",params![peer.as_str(),pair,serde_json::to_string(offers)?])?;
+        self.commit(tx)
     }
     pub(in crate::physical) fn save_remote_review(
         &self,
@@ -202,9 +219,11 @@ impl PhysicalStoreV1 {
         pair: &str,
     ) -> AppResult<()> {
         r.validate()?;
-        let c = self.connection()?;
-        c.execute("INSERT INTO physical_remote_reviews VALUES(?1,?2,?3) ON CONFLICT(review_id) DO UPDATE SET record_json=excluded.record_json WHERE physical_remote_reviews.session_pair=excluded.session_pair",params![text(&r.review_id),serde_json::to_string(r)?,pair])?;
-        Ok(())
+        let mut c = self.connection()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.audit(&tx)?;
+        tx.execute("INSERT INTO physical_remote_reviews VALUES(?1,?2,?3) ON CONFLICT(review_id) DO UPDATE SET record_json=excluded.record_json WHERE physical_remote_reviews.session_pair=excluded.session_pair",params![text(&r.review_id),serde_json::to_string(r)?,pair])?;
+        self.commit(tx)
     }
     pub(in crate::physical) fn remote_review(
         &self,
@@ -237,7 +256,7 @@ impl PhysicalStoreV1 {
             "Stale remote review",
         )?;
         tx.execute("INSERT INTO physical_reviews(review_id,revision,scope_digest,scope_json,state,state_revision,approval_id,approval_principal,approved_at,approval_expiry,record_json) VALUES(?1,1,?2,?3,'approved',3,?4,?5,?6,?7,?8)", params![text(&r.review_id),text(&r.scope_digest),serde_json::to_string(&r.scope)?,text(&a.approval_id),text(&a.principal),a.approved_at.get() as i64,a.expires_at.get() as i64,serde_json::to_string(r)?])?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     pub(in crate::physical) fn physical_status(
@@ -321,14 +340,14 @@ impl PhysicalStoreV1 {
     }
 }
 
-pub(super) fn audit(c: &Connection) -> AppResult<()> {
+pub(super) fn audit(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()> {
     let version: i64 = c.query_row(
         "SELECT version FROM physical_remote_schema WHERE singleton=1",
         [],
         |r| r.get(0),
     )?;
     require(version == 1, "Unknown physical remote schema")?;
-    let mut stmt=c.prepare("SELECT peer,semantic_id,digest,session_pair,message_json,result_json FROM physical_semantic_messages")?;
+    let mut stmt=c.prepare(&format!("SELECT peer,semantic_id,digest,session_pair,message_json,result_json FROM physical_semantic_messages WHERE {}", scope.filter("peer||' '||semantic_id", "semantic")))?;
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
         let m: PhysicalMessageV1 = decode(&r.get::<_, String>(4)?)?;
@@ -349,18 +368,26 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
             )?;
         }
     }
-    let mut stmt = c.prepare("SELECT record_json FROM physical_remote_reviews")?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT record_json FROM physical_remote_reviews WHERE {}",
+        scope.filter("review_id", "remote_review")
+    ))?;
     for raw in stmt.query_map([], |r| r.get::<_, String>(0))? {
         let review: PhysicalReviewRecordV1 = decode(&raw?)?;
         review.validate()?;
     }
-    let mut stmt = c.prepare("SELECT offers_json FROM physical_remote_offers")?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT offers_json FROM physical_remote_offers WHERE {}",
+        scope.filter("peer", "offer")
+    ))?;
     for raw in stmt.query_map([], |r| r.get::<_, String>(0))? {
         let offers: Vec<PhysicalReviewScopeV1> = decode(&raw?)?;
         require(offers.len() <= 8, "Oversized cached physical offers")?;
     }
-    let mut stmt =
-        c.prepare("SELECT audit_json FROM physical_attempts WHERE role='executor_remote'")?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT audit_json FROM physical_attempts WHERE role='executor_remote' AND {}",
+        scope.filter("root_id", "root")
+    ))?;
     for raw in stmt.query_map([], |r| r.get::<_, String>(0))? {
         let root: RootAuditV1 = decode(&raw?)?;
         let lineage = root.remote_lineage.as_ref().ok_or_else(|| {

@@ -11,7 +11,7 @@ CREATE UNIQUE INDEX physical_native_transitions ON physical_native_receipts(sess
 CREATE TRIGGER physical_native_immutable BEFORE UPDATE ON physical_native_receipts BEGIN SELECT RAISE(ABORT,'native evidence immutable');END;
 CREATE TRIGGER physical_native_keep BEFORE DELETE ON physical_native_receipts BEGIN SELECT RAISE(ABORT,'native evidence history required');END;
 "#;
-pub(super) fn audit(c: &Connection) -> AppResult<()> {
+pub(super) fn audit(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()> {
     let version: i64 = c.query_row(
         "SELECT version FROM physical_native_schema WHERE singleton=1",
         [],
@@ -25,6 +25,6 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         rows == 0,
         "Retired native receipt records present; reset required",
     )?;
-    let native:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM physical_sessions WHERE install_evidence='native_fence' OR fence_ack='native_fence')",[],|r|r.get(0))?;
+    let native:bool=c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM physical_sessions WHERE {} AND (install_evidence='native_fence' OR fence_ack='native_fence'))", scope.filter("root_id", "root")),[],|r|r.get(0))?;
     require(!native, "Missing native enforcement receipt")
 }

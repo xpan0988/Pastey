@@ -87,14 +87,12 @@ Run `cargo test --manifest-path src-tauri/Cargo.toml physical::`; the acceptance
 
 ## Open issues
 
-- **The per-transaction ledger audit is O(N).** Every store transaction re-decodes and re-validates all stored records. Two mitigations are in place:
-  - an exact memo skips an audit when `PRAGMA data_version` shows nothing has committed since the last passing audit, so every commit is still audited by the next transaction;
-  - `[profile.dev.package.blake3] opt-level = 3`.
+- **Other writers to the ledger's database file cost a full audit.** The ledger is audited in full at startup. After that, each transaction validates, before it commits, only the rows it wrote and the groups they belong to (a Root with its sessions, actions, decisions, budgets and evidence; a review; a domain); unchanged rows are trusted by their stored digests. The whole ledger is audited again whenever:
+  - another connection or process has committed (`PRAGMA data_version` on the ledger's one connection);
+  - the ledger's files changed in a way this connection did not cause (file stamps; the connection is first reopened so no cached page survives);
+  - a transaction wrote an enrollment, qualification or schema row.
 
-  A long stream still writes on every timer tick; the demo's walks take tens of seconds in a debug build. Direction:
-  - audit fully at startup;
-  - at runtime validate only the rows a transaction writes;
-  - move admission checks ahead of installation.
+  The physical tables share the application's database file, so writes by other Pastey modules also trigger full audits. A separate ledger file would avoid that. `[profile.dev.package.blake3] opt-level = 3` remains as a debug-build mitigation.
 - **Completion parameters must equal the qualified capability's.** This is a safe restriction. Open question: express completion tolerances as a narrowable `BoundSetV1`.
 - **No NativeFence proof path.** A binding-supplied receipt verifier whose checks the ledger audit can replay is needed before any `NativeFence` claim.
 - **The idle lease may be short for slow brains.** One action plus one decision interval suits a controller loop; a model that thinks for seconds between calls would be treated as crashed. If that matters, the lease should become its own reviewed scope field.

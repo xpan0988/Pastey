@@ -232,7 +232,7 @@ impl ControlFixture {
             )
             .unwrap();
         let root = Arc::new(
-            core.start_exact_action(&ingress, &a.approval_id, self.live.clone())
+            core.start_approved_root(&ingress, &a.approval_id, self.live.clone())
                 .unwrap(),
         );
         let basis = Arc::new(
@@ -304,6 +304,87 @@ impl Drop for ControlFixture {
         let _ = self.core.lock().close();
         let _ = std::fs::remove_dir_all(&self.paths.app_data_dir);
     }
+}
+
+/// Runs only as the child process of the test below: another process that
+/// edits the ledger directly. The edit passes every trigger and leaves the
+/// schema alone; only the audit can tell.
+#[test]
+#[ignore = "a helper process for another_process_writing_the_ledger_is_caught_by_the_next_transaction"]
+fn ledger_writer_process() {
+    let Ok(path) = std::env::var("PASTEY_PHYSICAL_TAMPER_DB") else {
+        return;
+    };
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE physical_control_budgets SET reserved_us=0,reserved_count=0,revision=revision+1",
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn another_process_writing_the_ledger_is_caught_by_the_next_transaction() {
+    let f = ControlFixture::new();
+    let s = f.active().await;
+    let (g, p) = f.challenged(&s);
+    let a = f.admit(&g, p);
+    // This Core's own transactions are validated incrementally and pass.
+    assert!(core_fake::store(&f.core.lock())
+        .evidence_host(a.id())
+        .is_ok());
+    let helper = format!(
+        "{}::ledger_writer_process",
+        module_path!().split_once("::").unwrap().1
+    );
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", &helper, "--test-threads=1"])
+        .env("PASTEY_PHYSICAL_TAMPER_DB", &f.paths.db_path)
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&child.stdout);
+    assert!(child.status.success() && out.contains("1 passed"), "{out}");
+    // The very next transaction audits the whole ledger and refuses it.
+    let refused = core_fake::store(&f.core.lock())
+        .evidence_host(a.id())
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("Budget reservation/dispatch mismatch"),
+        "{refused}"
+    );
+}
+
+/// An edit that bypasses SQLite (bytes written into the file) changes no
+/// data version and no schema. The file stamps catch it: the ledger
+/// connection reopens, with no cached page, and the whole ledger is audited.
+#[tokio::test]
+async fn a_raw_file_edit_is_caught_by_the_next_transaction() {
+    let f = ControlFixture::new();
+    let s = f.active().await;
+    let (g, p) = f.challenged(&s);
+    let a = f.admit(&g, p);
+    assert!(core_fake::store(&f.core.lock())
+        .evidence_host(a.id())
+        .is_ok());
+    let digest: String = f
+        .sql()
+        .query_row("SELECT scope_digest FROM physical_attempts", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut bytes = std::fs::read(&f.paths.db_path).unwrap();
+    let at = bytes
+        .windows(digest.len())
+        .position(|w| w == digest.as_bytes())
+        .expect("digest stored in the main file");
+    let last = at + digest.len() - 1;
+    bytes[last] = if bytes[last] == b'0' { b'1' } else { b'0' };
+    std::fs::write(&f.paths.db_path, bytes).unwrap();
+    assert!(core_fake::store(&f.core.lock())
+        .evidence_host(a.id())
+        .is_err());
 }
 
 #[tokio::test]

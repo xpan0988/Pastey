@@ -1,5 +1,5 @@
 //! Host-private durable facts. Rows and epoch operations never convey permission.
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -205,18 +205,182 @@ fn decode<T: DeserializeOwned + Serialize>(raw: &str) -> AppResult<T> {
 
 /// Path-only module-local store. Opening it does not restore any live binding.
 pub(super) struct PhysicalStoreV1 {
-    path: PathBuf,
-    audited: parking_lot::Mutex<AuditMemoV1>,
+    ledger: Arc<LedgerV1>,
 }
-/// Exact memo of the full ledger audit. The audit is a pure function of the
-/// ledger, and `PRAGMA data_version` on a connection that never writes
-/// changes whenever any other connection or process commits. An unchanged
-/// version therefore means the ledger is exactly what last passed the audit.
-/// Every commit, this Core's own included, is audited by the next
-/// transaction, as before.
-struct AuditMemoV1 {
-    watch: Connection,
-    version: Option<i64>,
+
+/// One ledger file as this process uses it: every physical store on the file
+/// shares this one connection, whose hooks keep the write journal.
+///
+/// Audit model. The first transaction audits the whole ledger (startup).
+/// From then on the ledger is trusted at the `PRAGMA data_version` it was
+/// audited at; that version changes only when another connection or process
+/// commits, and then the next transaction audits the whole ledger again
+/// (fail-closed). This connection's own transactions validate, before they
+/// commit, exactly the rows they wrote and the groups those rows belong to
+/// (a Root with its sessions, actions, decisions, budgets and evidence; a
+/// review; a domain), trusting unchanged audited rows by their stored
+/// digests. A commit whose writes were not validated is refused by the
+/// commit hook.
+struct LedgerV1 {
+    path: PathBuf,
+    /// The file the connection opened. A deleted or replaced file is never
+    /// read through the old connection.
+    file: FileIdentityV1,
+    /// The files as this connection last left them.
+    stamp: parking_lot::Mutex<FileStampV1>,
+    connection: parking_lot::Mutex<Connection>,
+    /// The thread holding `connection`: re-entering it from the same thread
+    /// is a bug and fails at once instead of waiting forever.
+    owner: parking_lot::Mutex<Option<std::thread::ThreadId>>,
+    journal: Arc<parking_lot::Mutex<JournalV1>>,
+}
+/// The ledger connection, held for one transaction or query.
+pub(in crate::physical) struct LedgerGuardV1<'a> {
+    connection: parking_lot::MutexGuard<'a, Connection>,
+    owner: &'a parking_lot::Mutex<Option<std::thread::ThreadId>>,
+}
+impl Drop for LedgerGuardV1<'_> {
+    fn drop(&mut self) {
+        *self.owner.lock() = None;
+    }
+}
+impl std::ops::Deref for LedgerGuardV1<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+impl std::ops::DerefMut for LedgerGuardV1<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
+}
+#[derive(Default)]
+struct JournalV1 {
+    /// Rows the open transaction inserted or updated, by table and rowid.
+    rows: Vec<(String, i64)>,
+    deleted: bool,
+    /// The data version of the last fully audited or validated state.
+    trusted: Option<i64>,
+}
+impl JournalV1 {
+    fn pending(&self) -> bool {
+        !self.rows.is_empty() || self.deleted
+    }
+}
+/// Which file a path names: device and inode where the platform has them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentityV1(u64, u64);
+impl FileIdentityV1 {
+    fn of(path: &std::path::Path) -> AppResult<Self> {
+        let m = std::fs::metadata(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self(m.dev(), m.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            let created = m
+                .created()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| AppError::InvalidInput("Physical ledger file time".into()))?;
+            Ok(Self(created.as_secs(), u64::from(created.subsec_nanos())))
+        }
+    }
+}
+type LedgersV1 = parking_lot::Mutex<BTreeMap<PathBuf, std::sync::Weak<LedgerV1>>>;
+/// Ledgers open in this process, by file.
+fn ledgers() -> &'static LedgersV1 {
+    static LEDGERS: std::sync::OnceLock<LedgersV1> = std::sync::OnceLock::new();
+    LEDGERS.get_or_init(Default::default)
+}
+/// When the ledger's files last changed: the database, its WAL and its
+/// rollback journal. A change this connection did not make is either another
+/// connection's commit or an edit that bypassed SQLite; both reopen the
+/// connection (no cached page survives) and audit the whole ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileStampV1(Vec<Option<(std::time::SystemTime, u64)>>);
+impl FileStampV1 {
+    fn of(path: &std::path::Path) -> AppResult<Self> {
+        let mut stamps = Vec::new();
+        for suffix in ["", "-wal", "-journal"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            stamps.push(match std::fs::metadata(std::path::PathBuf::from(name)) {
+                Ok(m) => Some((m.modified()?, m.len())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            });
+        }
+        Ok(Self(stamps))
+    }
+}
+impl LedgerV1 {
+    fn open(path: &std::path::Path) -> AppResult<Arc<Self>> {
+        let mut open = ledgers().lock();
+        if let Some(ledger) = open.get(path).and_then(|l| l.upgrade()) {
+            if ledger.current().is_ok() {
+                return Ok(ledger);
+            }
+        }
+        let journal = Arc::new(parking_lot::Mutex::new(JournalV1::default()));
+        let connection = connect(path, &journal)?;
+        let ledger = Arc::new(Self {
+            path: path.to_owned(),
+            file: FileIdentityV1::of(path)?,
+            stamp: parking_lot::Mutex::new(FileStampV1::of(path)?),
+            connection: parking_lot::Mutex::new(connection),
+            owner: parking_lot::Mutex::new(None),
+            journal,
+        });
+        open.retain(|_, l| l.strong_count() > 0);
+        open.insert(path.to_owned(), Arc::downgrade(&ledger));
+        Ok(ledger)
+    }
+    /// The path still names the file this connection opened.
+    fn current(&self) -> AppResult<()> {
+        require(
+            FileIdentityV1::of(&self.path).is_ok_and(|f| f == self.file),
+            "Physical ledger file missing or replaced",
+        )
+    }
+}
+/// The ledger connection with its journal hooks and scope table.
+fn connect(
+    path: &std::path::Path,
+    journal: &Arc<parking_lot::Mutex<JournalV1>>,
+) -> AppResult<Connection> {
+    let connection = configured_connection(path)?;
+    connection.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS physical_audit_scope(kind TEXT NOT NULL,key TEXT NOT NULL,PRIMARY KEY(kind,key))",
+    )?;
+    let written = journal.clone();
+    connection.update_hook(Some(
+        move |action: rusqlite::hooks::Action, db: &str, table: &str, rowid: i64| {
+            if db != "main" {
+                return;
+            }
+            let mut j = written.lock();
+            match action {
+                rusqlite::hooks::Action::SQLITE_INSERT | rusqlite::hooks::Action::SQLITE_UPDATE => {
+                    j.rows.push((table.into(), rowid))
+                }
+                _ => j.deleted = true,
+            }
+        },
+    ));
+    // A commit that wrote without passing validation becomes a rollback;
+    // `commit` drains the journal just before committing.
+    let committing = journal.clone();
+    connection.commit_hook(Some(move || committing.lock().pending()));
+    let rolled_back = journal.clone();
+    connection.rollback_hook(Some(move || {
+        let mut j = rolled_back.lock();
+        j.rows.clear();
+        j.deleted = false;
+    }));
+    Ok(connection)
 }
 
 /// Called only through the existing database startup owner. A partial or unknown
@@ -244,7 +408,7 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
     base.execute_batch(SCHEMA)?;
     if schema_objects(&tx)? == schema_objects(&base)? {
         verify_base_version(&tx)?;
-        audit_facts(&tx)?;
+        audit_facts(&tx, AuditScopeV1::Full)?;
         tx.execute_batch(core_ledger::SCHEMA)?;
     }
     let stage3 = Connection::open_in_memory()?;
@@ -253,8 +417,8 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
     if schema_objects(&tx)? == schema_objects(&stage3)? {
         verify_base_version(&tx)?;
         core_ledger::verify_version(&tx)?;
-        audit_facts(&tx)?;
-        core_ledger::audit(&tx)?;
+        audit_facts(&tx, AuditScopeV1::Full)?;
+        core_ledger::audit(&tx, AuditScopeV1::Full)?;
         tx.execute_batch(control_ledger::SCHEMA)?;
     }
     let stage4 = Connection::open_in_memory()?;
@@ -262,9 +426,9 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
     stage4.execute_batch(core_ledger::SCHEMA)?;
     stage4.execute_batch(control_ledger::SCHEMA)?;
     if schema_objects(&tx)? == schema_objects(&stage4)? {
-        audit_facts(&tx)?;
-        core_ledger::audit(&tx)?;
-        control_ledger::audit(&tx)?;
+        audit_facts(&tx, AuditScopeV1::Full)?;
+        core_ledger::audit(&tx, AuditScopeV1::Full)?;
+        control_ledger::audit(&tx, AuditScopeV1::Full)?;
         tx.execute_batch(evidence_ledger::SCHEMA)?;
     }
     let stage6 = Connection::open_in_memory()?;
@@ -273,31 +437,31 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
     stage6.execute_batch(control_ledger::SCHEMA)?;
     stage6.execute_batch(evidence_ledger::SCHEMA)?;
     if schema_objects(&tx)? == schema_objects(&stage6)? {
-        audit_facts(&tx)?;
-        core_ledger::audit(&tx)?;
-        control_ledger::audit(&tx)?;
-        evidence_ledger::audit(&tx)?;
+        audit_facts(&tx, AuditScopeV1::Full)?;
+        core_ledger::audit(&tx, AuditScopeV1::Full)?;
+        control_ledger::audit(&tx, AuditScopeV1::Full)?;
+        evidence_ledger::audit(&tx, AuditScopeV1::Full)?;
         remote_ledger::migrate(&tx)?;
     }
     let stage7 = Connection::open_in_memory()?;
     stage7.execute_batch(&remote_ledger::stage7_ddl())?;
     if schema_objects(&tx)? == schema_objects(&stage7)? {
-        audit_facts(&tx)?;
-        core_ledger::audit(&tx)?;
-        control_ledger::audit(&tx)?;
-        evidence_ledger::audit(&tx)?;
-        remote_ledger::audit(&tx)?;
+        audit_facts(&tx, AuditScopeV1::Full)?;
+        core_ledger::audit(&tx, AuditScopeV1::Full)?;
+        control_ledger::audit(&tx, AuditScopeV1::Full)?;
+        evidence_ledger::audit(&tx, AuditScopeV1::Full)?;
+        remote_ledger::audit(&tx, AuditScopeV1::Full)?;
         remote_ledger::migrate(&tx)?;
     }
     let stage8 = Connection::open_in_memory()?;
     stage8.execute_batch(&remote_ledger::stage8_ddl())?;
     if schema_objects(&tx)? == schema_objects(&stage8)? {
-        audit_facts(&tx)?;
-        core_ledger::audit(&tx)?;
-        control_ledger::audit(&tx)?;
-        evidence_ledger::audit(&tx)?;
-        remote_ledger::audit(&tx)?;
-        native_ledger::audit(&tx)?;
+        audit_facts(&tx, AuditScopeV1::Full)?;
+        core_ledger::audit(&tx, AuditScopeV1::Full)?;
+        control_ledger::audit(&tx, AuditScopeV1::Full)?;
+        evidence_ledger::audit(&tx, AuditScopeV1::Full)?;
+        remote_ledger::audit(&tx, AuditScopeV1::Full)?;
+        native_ledger::audit(&tx, AuditScopeV1::Full)?;
         tx.execute_batch(qualification_ledger::SCHEMA)?;
     }
     // Additive: handover verdicts. The format gate admits no older-format
@@ -316,7 +480,7 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
     }
     verify_schema(&tx)?;
     stamp_ledger_format(&tx)?;
-    audit(&tx)?;
+    audit(&tx, AuditScopeV1::Full)?;
     let broken: bool = tx.prepare("PRAGMA foreign_key_check")?.exists([])?;
     require(!broken, "Physical migration foreign key mismatch")?;
     tx.commit()?;
@@ -403,44 +567,87 @@ fn verify_base_version(conn: &Connection) -> AppResult<()> {
 impl PhysicalStoreV1 {
     pub(super) fn open(paths: &AppPaths) -> AppResult<Self> {
         let store = Self {
-            path: paths.db_path.clone(),
-            audited: parking_lot::Mutex::new(AuditMemoV1 {
-                watch: configured_connection(&paths.db_path)?,
-                version: None,
-            }),
+            ledger: LedgerV1::open(&paths.db_path)?,
         };
-        let mut conn = store.connection()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        store.audit(&tx)?;
-        tx.commit()?;
+        {
+            let mut conn = store.connection()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            store.audit(&tx)?;
+            store.commit(tx)?;
+        }
         Ok(store)
     }
-    /// The full ledger audit for this transaction's snapshot, skipped only
-    /// when no connection has committed since the last passing audit.
+    /// Establishes that this transaction's snapshot is trusted: unchanged
+    /// since the last full audit or validated write on this connection, or
+    /// else fully audited now.
     fn audit(&self, tx: &Connection) -> AppResult<()> {
-        let mut memo = self.audited.lock();
-        let version = |m: &AuditMemoV1| -> AppResult<i64> {
-            Ok(m.watch.query_row("PRAGMA data_version", [], |r| r.get(0))?)
-        };
-        let before = version(&memo)?;
-        // Starts the snapshot of a deferred transaction; an immediate one has
-        // held the write lock since it began, so nothing commits meanwhile.
+        // Starts the snapshot of a deferred transaction; the data version is
+        // then that snapshot's. An immediate one holds the write lock.
         tx.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
             r.get::<_, i64>(0)
         })?;
-        let after = version(&memo)?;
-        if memo.version == Some(after) {
-            return Ok(());
+        let version: i64 = tx.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        {
+            let mut j = self.ledger.journal.lock();
+            if j.trusted == Some(version) {
+                return Ok(());
+            }
+            j.trusted = None;
         }
-        memo.version = None;
-        audit(tx)?;
-        if before == after {
-            memo.version = Some(after);
-        }
+        tx.execute("DELETE FROM temp.physical_audit_scope", [])?;
+        audit(tx, AuditScopeV1::Full)?;
+        self.ledger.journal.lock().trusted = Some(version);
         Ok(())
     }
-    pub(in crate::physical) fn connection(&self) -> AppResult<Connection> {
-        let conn = configured_connection(&self.path)?;
+    /// Validates exactly what this transaction wrote, then commits it.
+    pub(super) fn commit(&self, tx: rusqlite::Transaction<'_>) -> AppResult<()> {
+        let (rows, deleted) = {
+            let mut j = self.ledger.journal.lock();
+            (std::mem::take(&mut j.rows), std::mem::take(&mut j.deleted))
+        };
+        if deleted {
+            tx.execute("DELETE FROM temp.physical_audit_scope", [])?;
+            audit(&tx, AuditScopeV1::Full)?;
+        } else if !rows.is_empty() {
+            validate_written(&tx, &rows)?;
+        }
+        tx.commit()?;
+        *self.ledger.stamp.lock() = FileStampV1::of(&self.ledger.path)?;
+        Ok(())
+    }
+    /// The ledger's one connection, for one transaction at a time. A journal
+    /// left by a transaction that neither committed nor rolled back makes the
+    /// next audit a full one.
+    pub(in crate::physical) fn connection(&self) -> AppResult<LedgerGuardV1<'_>> {
+        let me = std::thread::current().id();
+        require(
+            *self.ledger.owner.lock() != Some(me),
+            "Physical ledger connection re-entered",
+        )?;
+        let connection = self.ledger.connection.lock();
+        *self.ledger.owner.lock() = Some(me);
+        let mut conn = LedgerGuardV1 {
+            connection,
+            owner: &self.ledger.owner,
+        };
+        self.ledger.current()?;
+        let stamp = FileStampV1::of(&self.ledger.path)?;
+        if stamp != *self.ledger.stamp.lock() {
+            *conn = connect(&self.ledger.path, &self.ledger.journal)?;
+            let mut j = self.ledger.journal.lock();
+            j.trusted = None;
+            j.rows.clear();
+            j.deleted = false;
+            *self.ledger.stamp.lock() = stamp;
+        }
+        {
+            let mut j = self.ledger.journal.lock();
+            if j.pending() {
+                j.trusted = None;
+                j.rows.clear();
+                j.deleted = false;
+            }
+        }
         verify_schema(&conn)?;
         Ok(conn)
     }
@@ -454,7 +661,7 @@ impl PhysicalStoreV1 {
         let tx = conn.transaction()?;
         self.audit(&tx)?;
         let value = load_registration(&tx, id, true)?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(value)
     }
     pub(super) fn enroll(
@@ -537,7 +744,7 @@ impl PhysicalStoreV1 {
             }
         }
         self.audit(&tx)?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     pub(super) fn retire(&self, id: &EnvironmentRefV1, expected: u64) -> AppResult<()> {
@@ -549,7 +756,7 @@ impl PhysicalStoreV1 {
         bump_environment_domains(&tx, id)?;
         withdraw_environment(&tx, id)?;
         tx.execute("UPDATE physical_environments SET retired=1,denial_revision=?2 WHERE environment_id=?1 AND retired=0 AND revision=?3",params![text(id),checked_integer(expected.checked_add(1).unwrap_or(u64::MAX))?,checked_integer(expected)?])?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     pub(super) fn epochs(
@@ -568,7 +775,7 @@ impl PhysicalStoreV1 {
             )?;
             result.insert(domain, epoch as u64);
         }
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(result)
     }
     /// Atomic CAS across canonical domains, ledger bookkeeping only. Domains
@@ -596,7 +803,7 @@ impl PhysicalStoreV1 {
             )?;
             require(n == 1, "Stale/conflicting physical domain ledger operation")?;
         }
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     pub(super) fn record_qualification(
@@ -626,7 +833,7 @@ impl PhysicalStoreV1 {
         // Strict insert: identities are immutable, including expiry/evidence. A
         // new qualification requires a new ID; withdrawal cannot be overwritten.
         tx.execute("INSERT INTO physical_qualifications(qualification_id,environment_id,revision,registration_digest,profile_digest,binding_digest,evidence_class,enforcement_class,evidence_digest,conditions_digest,provenance_digest,record_digest,record_json,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![text(&q.qualification_id),text(environment),checked_integer(q.revision)?,text(registration_digest),text(&q.profile_digest),text(&q.binding_digest),tag(&q.evidence_class)?,tag(&q.required_enforcement_class)?,text(&q.evidence_digest),text(&q.conditions_digest),text(provenance),text(&q.digest()?),serde_json::to_string(q)?,q.expires_at.get() as i64])?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     pub(super) fn qualification(
@@ -648,7 +855,7 @@ impl PhysicalStoreV1 {
                 == reg,
             "Qualification dependency invalidated",
         )?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(q)
     }
     pub(super) fn withdraw(&self, id: &QualificationId, revision: u64) -> AppResult<()> {
@@ -657,7 +864,7 @@ impl PhysicalStoreV1 {
         self.audit(&tx)?;
         let n = tx.execute("UPDATE physical_qualifications SET withdrawal_revision=?2 WHERE qualification_id=?1 AND revision < ?2 AND withdrawal_revision < ?2",params![text(id),checked_integer(revision)?])?;
         require(n == 1, "Missing/stale qualification withdrawal")?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     pub(super) fn invalidate_qualifications(
@@ -669,7 +876,7 @@ impl PhysicalStoreV1 {
         self.audit(&tx)?;
         load_registration(&tx, environment, true)?;
         withdraw_environment(&tx, environment)?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
 }
@@ -694,34 +901,137 @@ fn load_registration(
     require(!active || retired == 0, "Physical environment retired")?;
     decode(&raw)
 }
-fn audit(conn: &Connection) -> AppResult<()> {
+/// Which rows an audit pass covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AuditScopeV1 {
+    /// Every row, plus page integrity and foreign keys.
+    Full,
+    /// The groups named in `temp.physical_audit_scope` by kind: `root`,
+    /// `action`, `session`, `review`, `domain`, `semantic`, `remote_review`
+    /// and `offer`. SQLite enforces foreign keys on this connection's own
+    /// writes; the full audit rechecks them.
+    Touched,
+}
+impl AuditScopeV1 {
+    pub(super) fn full(self) -> bool {
+        self == Self::Full
+    }
+    /// A condition restricting `column` to this scope's keys of `kind`.
+    pub(super) fn filter(self, column: &str, kind: &str) -> String {
+        match self {
+            Self::Full => "1".into(),
+            Self::Touched => format!(
+                "{column} IN (SELECT key FROM temp.physical_audit_scope WHERE kind='{kind}')"
+            ),
+        }
+    }
+}
+/// Ledger tables whose rows belong to a group, and the key expressions that
+/// name the group. A write to any other physical table (enrollment,
+/// qualification, schema and format markers, retired tables) makes the
+/// validation a full audit.
+const GROUPED_TABLES: &[(&str, &[(&str, &str)])] = &[
+    (
+        "physical_attempts",
+        &[("root", "root_id"), ("review", "review_id")],
+    ),
+    ("physical_reviews", &[("review", "review_id")]),
+    ("physical_sessions", &[("root", "root_id")]),
+    (
+        "physical_domain_reservations",
+        &[("session", "session_id"), ("domain", "domain_id")],
+    ),
+    ("physical_domains", &[("domain", "domain_id")]),
+    ("physical_control_budgets", &[("root", "root_id")]),
+    ("physical_actions", &[("root", "root_id")]),
+    ("physical_decisions", &[("root", "root_id")]),
+    ("physical_evidence", &[("action", "action_id")]),
+    ("physical_consequences", &[("action", "action_id")]),
+    ("physical_reconciliations", &[("action", "action_id")]),
+    ("physical_task_acceptance", &[("root", "root_id")]),
+    ("physical_handover_policies", &[("session", "session_id")]),
+    ("physical_handovers", &[("session", "session_id")]),
+    ("physical_handover_verdicts", &[("session", "session_id")]),
+    ("physical_effect_bound_violations", &[("root", "root_id")]),
+    (
+        "physical_semantic_messages",
+        &[("semantic", "peer||' '||semantic_id")],
+    ),
+    ("physical_remote_reviews", &[("remote_review", "review_id")]),
+    ("physical_remote_offers", &[("offer", "peer")]),
+];
+/// Validates the rows a transaction wrote and every group they belong to,
+/// before it commits. Every check the full audit makes on those groups runs
+/// unchanged; rows outside them were audited and have not changed.
+fn validate_written(tx: &Connection, rows: &[(String, i64)]) -> AppResult<()> {
+    tx.execute("DELETE FROM temp.physical_audit_scope", [])?;
+    for (table, rowid) in rows {
+        let Some((_, keys)) = GROUPED_TABLES.iter().find(|(t, _)| t == table) else {
+            tx.execute("DELETE FROM temp.physical_audit_scope", [])?;
+            return audit(tx, AuditScopeV1::Full);
+        };
+        for (kind, key) in *keys {
+            tx.execute(
+                &format!("INSERT OR IGNORE INTO temp.physical_audit_scope SELECT '{kind}',{key} FROM {table} WHERE rowid=?1"),
+                [rowid],
+            )?;
+        }
+    }
+    // Groups reach their Roots, and Roots their members: a check on one
+    // member of a Root reads the others.
+    tx.execute_batch(
+        "INSERT OR IGNORE INTO temp.physical_audit_scope SELECT 'root',root_id FROM physical_sessions WHERE session_id IN (SELECT key FROM temp.physical_audit_scope WHERE kind='session');
+         INSERT OR IGNORE INTO temp.physical_audit_scope SELECT 'root',root_id FROM physical_actions WHERE action_id IN (SELECT key FROM temp.physical_audit_scope WHERE kind='action');
+         INSERT OR IGNORE INTO temp.physical_audit_scope SELECT 'root',s.root_id FROM physical_domain_reservations r JOIN physical_sessions s USING(session_id) WHERE r.domain_id IN (SELECT key FROM temp.physical_audit_scope WHERE kind='domain');
+         INSERT OR IGNORE INTO temp.physical_audit_scope SELECT 'root',root_id FROM physical_attempts WHERE review_id IN (SELECT key FROM temp.physical_audit_scope WHERE kind='review');
+         INSERT OR IGNORE INTO temp.physical_audit_scope SELECT 'root',root_id FROM physical_attempts WHERE role='executor_remote' AND requester||' '||json_extract(audit_json,'$.remoteLineage.semanticId') IN (SELECT key FROM temp.physical_audit_scope WHERE kind='semantic');
+         INSERT OR IGNORE INTO temp.physical_audit_scope SELECT 'review',review_id FROM physical_attempts WHERE root_id IN (SELECT key FROM temp.physical_audit_scope WHERE kind='root');
+         INSERT OR IGNORE INTO temp.physical_audit_scope SELECT 'session',session_id FROM physical_sessions WHERE root_id IN (SELECT key FROM temp.physical_audit_scope WHERE kind='root');
+         INSERT OR IGNORE INTO temp.physical_audit_scope SELECT 'action',action_id FROM physical_actions WHERE root_id IN (SELECT key FROM temp.physical_audit_scope WHERE kind='root');",
+    )?;
+    audit(tx, AuditScopeV1::Touched)
+}
+/// The ledger audit over `scope`. A migration's connection has no scope
+/// table and always audits in full.
+fn audit(conn: &Connection, scope: AuditScopeV1) -> AppResult<()> {
     require(
         ledger_format(conn)? == Some(LEDGER_FORMAT),
         "Physical ledger format mismatch",
     )?;
-    audit_facts(conn)?;
-    core_ledger::audit(conn)?;
-    control_ledger::audit(conn)?;
-    evidence_ledger::audit(conn)?;
-    remote_ledger::audit(conn)?;
-    native_ledger::audit(conn)?;
+    let domains = !scope.full()
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.physical_audit_scope WHERE kind='domain')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?;
+    if scope.full() || domains {
+        audit_facts(conn, scope)?;
+    }
+    core_ledger::audit(conn, scope)?;
+    control_ledger::audit(conn, scope)?;
+    evidence_ledger::audit(conn, scope)?;
+    remote_ledger::audit(conn, scope)?;
+    native_ledger::audit(conn, scope)?;
     qualification_ledger::audit(conn)
 }
-fn audit_facts(conn: &Connection) -> AppResult<()> {
-    let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    require(integrity == "ok", "Corrupt physical ledger")?;
-    // Validate this module's relationships, not legacy rows owned elsewhere.
-    for table in [
-        "physical_aliases",
-        "physical_environment_domains",
-        "physical_qualifications",
-    ] {
-        require(
-            !conn
-                .prepare(&format!("PRAGMA foreign_key_check({table})"))?
-                .exists([])?,
-            "Physical ledger foreign key violation",
-        )?;
+/// Enrollment, qualification, alias and domain rows: few, audited whole.
+fn audit_facts(conn: &Connection, scope: AuditScopeV1) -> AppResult<()> {
+    if scope.full() {
+        let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        require(integrity == "ok", "Corrupt physical ledger")?;
+        // Validate this module's relationships, not legacy rows owned elsewhere.
+        for table in [
+            "physical_aliases",
+            "physical_environment_domains",
+            "physical_qualifications",
+        ] {
+            require(
+                !conn
+                    .prepare(&format!("PRAGMA foreign_key_check({table})"))?
+                    .exists([])?,
+                "Physical ledger foreign key violation",
+            )?;
+        }
     }
     let mut rows = conn.prepare("SELECT environment_id,host_ref,revision,configuration_ref,configuration_digest,registration_digest,record_json,retired,denial_revision FROM physical_environments")?;
     let mut query = rows.query([])?;

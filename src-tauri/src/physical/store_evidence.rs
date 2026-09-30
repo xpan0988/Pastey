@@ -292,7 +292,7 @@ impl PhysicalStoreV1 {
         self.audit(&tx)?;
         let (_, scope) = lineage(&tx, id)?;
         let host = scope.fields().executor.clone();
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(host)
     }
     pub(in crate::physical) fn evidence_lineage(
@@ -303,7 +303,7 @@ impl PhysicalStoreV1 {
         let tx = c.transaction()?;
         self.audit(&tx)?;
         let (l, _) = lineage(&tx, id)?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(l)
     }
     pub(in crate::physical) fn record_observation(
@@ -376,7 +376,7 @@ impl PhysicalStoreV1 {
             record.qualified,
             &record,
         )?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(true)
     }
     pub(in crate::physical) fn record_disposition(
@@ -443,7 +443,7 @@ impl PhysicalStoreV1 {
             record.qualified,
             &record,
         )?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(true)
     }
     /// An action's lineage and current stored observations, for an effect
@@ -458,7 +458,7 @@ impl PhysicalStoreV1 {
         let (l, _) = lineage(&tx, id)?;
         let rev = head(&tx, id)?;
         let (os, _) = facts(&tx, id, rev)?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok((l, os))
     }
     pub(in crate::physical) fn evaluate_consequence(
@@ -512,7 +512,7 @@ impl PhysicalStoreV1 {
                 serde_json::to_string(&x)?
             ],
         )?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(x)
     }
     // Called only by the Core-owned evidence child module, never an evidence DTO.
@@ -578,7 +578,7 @@ impl PhysicalStoreV1 {
         let state = acceptance(&tx, root)?;
         super::control_ledger::close_root(&tx, root)?;
         tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason='revoked' WHERE root_id=?1 AND state='open'",[text(root)])?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(state)
     }
     pub(in crate::physical) fn acceptance(&self, id: &RootId) -> AppResult<AcceptanceStateV1> {
@@ -586,7 +586,7 @@ impl PhysicalStoreV1 {
         let tx = c.transaction()?;
         self.audit(&tx)?;
         let v = acceptance(&tx, id)?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(v)
     }
     pub(in crate::physical) fn configure_handover(
@@ -608,7 +608,7 @@ impl PhysicalStoreV1 {
                 serde_json::to_string(p)?
             ],
         )?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(())
     }
     pub(in crate::physical) fn reconcile(
@@ -799,7 +799,7 @@ impl PhysicalStoreV1 {
             ],
         )?;
         self.audit(&tx)?;
-        tx.commit()?;
+        self.commit(tx)?;
         Ok(r)
     }
 }
@@ -870,7 +870,7 @@ fn insert_fact(
     Ok(())
 }
 
-pub(super) fn audit(c: &Connection) -> AppResult<()> {
+pub(super) fn audit(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()> {
     let v: Vec<i64> = c
         .prepare("SELECT version FROM physical_evidence_schema WHERE singleton=1")?
         .query_map([], |r| r.get(0))?
@@ -889,15 +889,20 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
             continue;
         }
         require(
-            !c.prepare(&format!("PRAGMA foreign_key_check({table})"))?
-                .exists([])?,
+            !scope.full()
+                || !c
+                    .prepare(&format!("PRAGMA foreign_key_check({table})"))?
+                    .exists([])?,
             "Evidence foreign key violation",
         )?;
     }
-    let missing:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM physical_attempts a LEFT JOIN physical_task_acceptance t USING(root_id) WHERE t.root_id IS NULL)",[],|r|r.get(0))?;
+    let missing:bool=c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM physical_attempts a LEFT JOIN physical_task_acceptance t USING(root_id) WHERE {} AND t.root_id IS NULL)", scope.filter("a.root_id", "root")),[],|r|r.get(0))?;
     require(!missing, "Missing task terminal state")?;
     let mut lineages = LineagesV1::new(c);
-    let mut stmt = c.prepare("SELECT * FROM physical_evidence ORDER BY action_id,revision")?;
+    let actions = scope.filter("action_id", "action");
+    let mut stmt = c.prepare(&format!(
+        "SELECT * FROM physical_evidence WHERE {actions} ORDER BY action_id,revision"
+    ))?;
     let mut rows = stmt.query([])?;
     let mut revisions = BTreeMap::<String, u64>::new();
     let mut sources = BTreeMap::<(String, String, String), (u64, u64)>::new();
@@ -975,7 +980,9 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
             "Evidence column/body mismatch",
         )?;
     }
-    let mut stmt = c.prepare("SELECT * FROM physical_consequences ORDER BY action_id,revision")?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT * FROM physical_consequences WHERE {actions} ORDER BY action_id,revision"
+    ))?;
     let mut rows = stmt.query([])?;
     let mut revisions = BTreeMap::<ActionId, u64>::new();
     while let Some(r) = rows.next()? {
@@ -1018,7 +1025,10 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
             "Unprovable consequence",
         )?;
     }
-    let mut stmt = c.prepare("SELECT * FROM physical_task_acceptance")?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT * FROM physical_task_acceptance WHERE {}",
+        scope.filter("root_id", "root")
+    ))?;
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
         let state: String = r.get("state")?;
@@ -1058,7 +1068,10 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
             )?;
         }
     }
-    let mut stmt = c.prepare("SELECT * FROM physical_handover_policies")?;
+    let sessions = scope.filter("session_id", "session");
+    let mut stmt = c.prepare(&format!(
+        "SELECT * FROM physical_handover_policies WHERE {sessions}"
+    ))?;
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
         let p: HandoverPredicateV1 = decode(&r.get::<_, String>("record_json")?)?;
@@ -1070,7 +1083,9 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
             "Handover policy mismatch",
         )?;
     }
-    let mut stmt = c.prepare("SELECT * FROM physical_handovers")?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT * FROM physical_handovers WHERE {sessions}"
+    ))?;
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
         let id = ActionId::try_from(r.get::<_, String>("action_id")?)?;
@@ -1137,8 +1152,9 @@ pub(super) fn audit(c: &Connection) -> AppResult<()> {
         let bad:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM physical_domain_reservations WHERE session_id=?1 AND state!='released')",[text(&l.session)],|r|r.get(0))?;
         require(!bad, "Incomplete handover release")?;
     }
-    let mut stmt =
-        c.prepare("SELECT * FROM physical_reconciliations ORDER BY action_id,revision")?;
+    let mut stmt = c.prepare(&format!(
+        "SELECT * FROM physical_reconciliations WHERE {actions} ORDER BY action_id,revision"
+    ))?;
     let mut rows = stmt.query([])?;
     let mut revisions = BTreeMap::<ActionId, u64>::new();
     while let Some(r) = rows.next()? {

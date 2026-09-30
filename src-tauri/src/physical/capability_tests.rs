@@ -182,7 +182,7 @@ async fn core_consults_the_binding_schema_check_before_review_start_and_grant() 
         .is_err_and(by_hook));
     // Start: an already approved review cannot originate a root.
     assert!(core
-        .start_exact_action(&ingress, &approval.approval_id, f.live.clone())
+        .start_approved_root(&ingress, &approval.approval_id, f.live.clone())
         .is_err_and(by_hook));
     // Grant: the live root cannot construct a grant basis, and closes.
     assert!(core
@@ -320,6 +320,6 @@ async fn any_fingerprint_change_invalidates_qualification_and_a_new_record_requa
             UnixMillis::try_from(1900).unwrap(),
         )
         .unwrap();
-    core.start_exact_action(&ingress, &a.approval_id, live.clone())
+    core.start_approved_root(&ingress, &a.approval_id, live.clone())
         .unwrap();
 }
