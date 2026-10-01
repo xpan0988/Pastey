@@ -303,9 +303,15 @@ button { color: inherit; }
 
 .v2-physical-panel { padding: 1rem; border-top: 1px solid var(--border, #ddd); font-size: .85rem; }
 .v2-physical-panel summary { cursor: pointer; font-weight: 600; }
-.v2-physical-panel select, .v2-physical-panel button { margin: .4rem; max-width: 100%; }
+.v2-physical-panel > label { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .6rem 0; }
+.v2-physical-panel select { min-width: 0; max-width: 100%; height: 32px; padding: 0 24px 0 8px; border: 1px solid #3b3b40; border-radius: 6px; background: #29292d; color: #efedf2; font-size: 12px; }
+.v2-physical-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .6rem 0; }
+.v2-physical-panel li { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .4rem 0; }
+.v2-physical-panel li > span { min-width: 0; overflow-wrap: anywhere; }
 .v2-physical-panel code { overflow-wrap: anywhere; }
 .v2-physical-panel pre { max-height: 18rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
-.v2-physical-panel dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: .6rem; }
+.v2-physical-panel dl { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 200px), 1fr)); gap: .5rem 1rem; margin: .6rem 0; }
+.v2-physical-panel dl > div { min-width: 0; }
+.v2-physical-panel dt, .v2-physical-panel dd { min-width: 0; overflow-wrap: anywhere; }
 .v2-physical-panel dt { font-weight: 600; }
 .v2-physical-panel dd { margin: 0; }

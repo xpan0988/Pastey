@@ -52,13 +52,15 @@ function PhysicalHostReview({ roomId, host }: { roomId: string; host: string }) 
   const status = view?.status;
   return <section aria-label="Physical review and status" aria-busy={busy}>
     <p>Host <code>{host}</code></p>
-    <button type="button" disabled={busy} onClick={() => void command({ kind: "discover" })}>Discover environments</button>
-    <button type="button" disabled={busy} onClick={() => void command({ kind: "snapshot" })}>Refresh saved state</button>
+    <div className="v2-physical-actions">
+      <button type="button" className="v2-button" disabled={busy} onClick={() => void command({ kind: "discover" })}>Discover environments</button>
+      <button type="button" className="v2-button" disabled={busy} onClick={() => void command({ kind: "snapshot" })}>Refresh saved state</button>
+    </div>
     {view ? <>
       <p role="status">{({ qualified: "Qualified simulation environment", released: "Qualified and released NativeFence simulation profile", qualification_unavailable: "Qualification unavailable or withdrawn", qualification_expired: "Qualification expired", environment_unavailable: "Environment unavailable" })[view.offers.length > 0 && view.offers.every((offer) => Date.now() >= Math.min(offer.scope.environment.offerExpiry, offer.scope.qualification.expiresAt)) ? "qualification_expired" : view.availability ?? "environment_unavailable"]}</p>
       {view.offers.length === 0 ? <p>No executable environment is offered. NativeFence simulation requires an exact, current simulator/controller qualification.</p> : <ul>{view.offers.map((offer) => <li key={offer.scopeDigest}>
-        {offer.scope.environment.environment} · {offer.scope.environment.evidenceClass} · {offer.scope.qualification.requiredEnforcementClass.replace(/_/g, " ")}
-        <button type="button" disabled={busy || Date.now() >= Math.min(offer.scope.environment.offerExpiry, offer.scope.qualification.expiresAt)} onClick={() => void command({ kind: "compose", offer_digest: offer.scopeDigest })}>Compose review</button>
+        <span>{offer.scope.environment.environment} · {offer.scope.environment.evidenceClass} · {offer.scope.qualification.requiredEnforcementClass.replace(/_/g, " ")}</span>
+        <button type="button" className="v2-button" disabled={busy || Date.now() >= Math.min(offer.scope.environment.offerExpiry, offer.scope.qualification.expiresAt)} onClick={() => void command({ kind: "compose", offer_digest: offer.scopeDigest })}>Compose review</button>
       </li>)}</ul>}
       {scope && r ? <article>
         <strong>Physical review · {r.state}</strong>
@@ -66,8 +68,10 @@ function PhysicalHostReview({ roomId, host }: { roomId: string; host: string }) 
         <dl>{physicalScopeSummary(scope).map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
         <details><summary>Complete reviewed scope</summary><pre>{JSON.stringify(scope, null, 2)}</pre></details>
         {!fresh ? <p role="status">This review is stale. Discover and compose a fresh review.</p> : null}
-        <button type="button" disabled={busy || !fresh || r.state !== "reviewed"} onClick={() => void command({ kind: "approve", review_id: r.reviewId, scope_digest: r.scopeDigest })}>Approve this scope</button>
-        <button type="button" disabled={busy || !fresh || r.state !== "approved" || view.start !== null} onClick={() => void command({ kind: "start", review_id: r.reviewId, scope_digest: r.scopeDigest })}>Start approved action</button>
+        <div className="v2-physical-actions">
+          <button type="button" className={r.state === "reviewed" ? "v2-button primary" : "v2-button"} disabled={busy || !fresh || r.state !== "reviewed"} onClick={() => void command({ kind: "approve", review_id: r.reviewId, scope_digest: r.scopeDigest })}>Approve this scope</button>
+          <button type="button" className={r.state === "approved" && view.start === null ? "v2-button primary" : "v2-button"} disabled={busy || !fresh || r.state !== "approved" || view.start !== null} onClick={() => void command({ kind: "start", review_id: r.reviewId, scope_digest: r.scopeDigest })}>Start approved action</button>
+        </div>
       </article> : null}
       <div aria-live="polite">
         {view.deliveryPending ? <p>Delivery or semantic reply pending. Execution and consequences may be unknown.</p> : null}
@@ -82,11 +86,15 @@ function PhysicalHostReview({ roomId, host }: { roomId: string; host: string }) 
         </> : null}
       </div>
       {view.start ? <div>
-        <button type="button" disabled={busy} onClick={() => void command({ kind: "status", start: view.start! })}>Query executor status</button>
-        <button type="button" disabled={busy} onClick={() => void command({ kind: "cancel", start: view.start! })}>Cancel task authority</button>
-        <button type="button" disabled={busy} onClick={() => void command({ kind: "reconcile", start: view.start! })}>Reconcile consequences</button>
+        <div className="v2-physical-actions">
+          <button type="button" className="v2-button" disabled={busy} onClick={() => void command({ kind: "status", start: view.start! })}>Query executor status</button>
+          <button type="button" className="v2-button danger" disabled={busy} onClick={() => void command({ kind: "cancel", start: view.start! })}>Cancel task authority</button>
+          <button type="button" className="v2-button" disabled={busy} onClick={() => void command({ kind: "reconcile", start: view.start! })}>Reconcile consequences</button>
+        </div>
         <p>Cancellation delivery may be uncertain. A stop acknowledgement does not prove physical rest.</p>
-        <button type="button" disabled={busy} onClick={() => void connectBrain(view.start!)}>Connect an MCP brain</button>
+        <div className="v2-physical-actions">
+          <button type="button" className="v2-button" disabled={busy} onClick={() => void connectBrain(view.start!)}>Connect an MCP brain</button>
+        </div>
         {mcp ? <div>
           <p>Add this server to the agent's MCP configuration. It is good for one connection; closing it ends the stream as a crashed brain would.</p>
           <pre>{physicalMcpConfig(mcp)}</pre>
