@@ -8,7 +8,11 @@ use crate::physical::evidence::{TrustedDispositionV1, TrustedObservationV1, Witn
 use crate::physical::store::{ActionAuditV1, FenceAuditV1, SessionAuditV1};
 pub(crate) use decision_tools::*;
 use parking_lot::Mutex;
-use std::{future::Future, pin::Pin, sync::atomic::AtomicU64};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicU64, AtomicU8},
+};
 
 #[derive(Default)]
 pub(super) struct ControlStateV1 {
@@ -1424,6 +1428,9 @@ pub(in crate::physical) mod test_support {
     }
     pub(in crate::physical) fn stream_of(ts: &ToolSessionV1) -> Arc<StreamRuntimeV1> {
         decision_tools::test_stream(ts)
+    }
+    pub(in crate::physical) fn last_activity(stream: &StreamRuntimeV1) -> u64 {
+        decision_tools::test_last_activity(stream)
     }
     pub(in crate::physical) fn only_session(
         core: &PhysicalControlServiceV1,

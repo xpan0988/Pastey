@@ -92,7 +92,12 @@ pub(crate) enum ToolOutcomeV1 {
     Reply {
         reply: super::core::DecisionToolReplyV1,
     },
+    /// The tool session closed and ended the stream (its brain had
+    /// committed, or the stream had already ended).
     Closed,
+    /// The tool session closed before it committed: only its reservation
+    /// was released, and the stream is unaffected.
+    Released,
     Failed {
         reason: String,
     },

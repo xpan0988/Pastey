@@ -1222,16 +1222,26 @@ async fn physical_demo_4_proposer_admission_and_body_are_recorded_apart_and_the_
 ) {
     let demo = DemoV1::living_room_to_bedroom();
     let mut brain = RuleBrainV1;
-    // One refused proposal from a second caller, then the rule brain's walk.
+    // One refused proposal from the brain that drives the stream, then its
+    // walk. A stream has one brain: once it committed, a second caller is
+    // turned away before it can propose anything.
     assert!(!demo
         .call(
-            "brain:other",
+            "brain:rules",
             &DecisionCallV1 {
                 option: UNAPPROVED_OPTION.into(),
                 duration_ms: 100,
             },
         )
         .allowed());
+    let other = demo.call(
+        "brain:other",
+        &DecisionCallV1 {
+            option: APPROVED_OPTIONS[0].into(),
+            duration_ms: 100,
+        },
+    );
+    assert!(matches!(other, ToolResultV1::Refused { reason } if reason.contains("already drives")));
     let (allowed, refused) = drive(&demo, &mut brain);
     // The rule brain stays inside the envelope: it is never refused.
     assert_eq!(refused, 0);
@@ -1248,8 +1258,8 @@ async fn physical_demo_4_proposer_admission_and_body_are_recorded_apart_and_the_
             ToolResultV1::Refused { .. } => assert!(r.body.is_none()),
         }
     }
-    assert!(records.iter().any(|r| r.proposer == "brain:other"));
-    assert!(records.iter().any(|r| r.proposer == "brain:rules"));
+    assert!(records.iter().all(|r| r.proposer == "brain:rules"));
+    assert!(records.iter().any(|r| !r.admission.allowed()));
     // Arrival is the witness's verdict, not an ACK and not the brain's claim.
     assert_eq!(demo.consequence(), ConsequenceV1::Verified);
     assert_eq!(demo.truth().room, "bedroom");

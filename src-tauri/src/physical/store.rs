@@ -965,6 +965,19 @@ const GROUPED_TABLES: &[(&str, &[(&str, &str)])] = &[
 /// unchanged; rows outside them were audited and have not changed.
 fn validate_written(tx: &Connection, rows: &[(String, i64)]) -> AppResult<()> {
     tx.execute("DELETE FROM temp.physical_audit_scope", [])?;
+    // Appends to the immutable evidence tables at the head of their actions
+    // are validated row by row against their audited predecessors, which is
+    // what the group audit concludes about them (see `validate_appended`).
+    // The checks every transaction runs still run, with no group in scope.
+    if !rows.is_empty()
+        && rows
+            .iter()
+            .all(|(table, _)| evidence_ledger::APPEND_ONLY.contains(&table.as_str()))
+        && evidence_ledger::appended_at_head(tx, rows)?
+    {
+        audit(tx, AuditScopeV1::Touched)?;
+        return evidence_ledger::validate_appended(tx, rows);
+    }
     for (table, rowid) in rows {
         let Some((_, keys)) = GROUPED_TABLES.iter().find(|(t, _)| t == table) else {
             tx.execute("DELETE FROM temp.physical_audit_scope", [])?;

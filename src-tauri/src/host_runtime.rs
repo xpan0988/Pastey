@@ -1083,13 +1083,28 @@ impl HostRuntime {
                 "No such started physical stream on this Bridge".into(),
             ));
         }
+        // The grant never outlives the approval that started the stream.
+        let approval = view
+            .review
+            .as_ref()
+            .and_then(|r| r.approval.as_ref())
+            .ok_or_else(|| {
+                crate::error::AppError::InvalidInput("The stream has no exact approval".into())
+            })?;
+        let until =
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(approval.expires_at.get());
         let relay = Arc::new(PhysicalMcpRelayV1 {
             host: Arc::downgrade(self),
             bridge: bridge.to_owned(),
             target: target.clone(),
         });
         self.physical_mcp
-            .grant(&self.paths.app_data_dir.join("physical-mcp"), relay, start)
+            .grant(
+                &self.paths.app_data_dir.join("physical-mcp"),
+                relay,
+                start,
+                until,
+            )
             .await
     }
     pub(crate) async fn physical_product_command(

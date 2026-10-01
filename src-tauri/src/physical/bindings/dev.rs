@@ -49,7 +49,7 @@ pub(in crate::physical) const DEV_FLAT: EnvelopeV1 = EnvelopeV1 {
     total_us: 60_000_000,
     count: 60,
     lease_us: 1_800_000_000,
-    idle_lease_us: 120_000_000,
+    idle_lease_us: 1_800_000_000,
     approval_lifetime_us: 1_800_000_000,
     root_lifetime_us: 1_800_000_000,
     max_gap_us: 400_000,

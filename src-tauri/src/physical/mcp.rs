@@ -10,10 +10,31 @@
 //! `observe` and `remaining_budget`), every call is forwarded as written,
 //! and admission, records and consequences stay on the executor.
 //!
-//! The MCP connection carries the tool session. Opening it (`initialize`)
-//! opens the session; losing it closes the session, which ends the stream
-//! as a crashed brain would. If even that close cannot reach the executor,
-//! the stream's idle lease ends it there.
+//! The MCP connection carries the tool session, and the executor alone
+//! decides what a connection has done to the stream:
+//!
+//! - `initialize` opens a tool session to learn the executor's tool list and
+//!   closes it at once. The executor answers that close `Released`: the
+//!   session never committed and the stream is untouched.
+//!   `notifications/initialized`, `tools/list` and `ping` never reach the
+//!   executor.
+//! - The first `tools/call` opens the stream's single tool session again and
+//!   forwards the call on it. The executor commits the session when it
+//!   accepts that call; from then on this brain drives the stream and no
+//!   other may attach.
+//! - When the connection ends, its open session is closed. A session that
+//!   never committed is released and nothing else changes. A committed one
+//!   ends the stream as a crashed brain would: authority closes first, then
+//!   the fence, uncertain unless already verified, and nothing resumes. If
+//!   that close cannot reach the executor, the stream's idle lease ends it
+//!   there.
+//!
+//! A grant admits one connection at a time until its absolute deadline, set
+//! no later than the approval's expiry. When a connection ends, its grant is
+//! used again only if the executor answered every close of that connection
+//! with `Released` (or it never opened a session for that connection);
+//! anything else (a commit, an ended stream, a lost or unknown reply) spends
+//! it for good.
 use super::core::{
     DecisionToolCallV1, DecisionToolReplyV1, PhysicalProductRequestV1, BUDGET_TOOL, OBSERVE_TOOL,
 };
@@ -43,9 +64,23 @@ const REPLY_POLL: Duration = Duration::from_millis(20);
 /// The first line a stdio bridge sends: this marker and the grant token.
 const HELLO: &str = "PASTEY-PHYSICAL-MCP/1";
 
-struct OpenedV1 {
-    tool_session: RequestId,
-    tools: Vec<String>,
+/// How one connection ended, for its grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectionEndV1 {
+    /// The executor confirmed this connection left the stream unaffected
+    /// (or never opened a session for it): the grant may admit another.
+    Unaffected,
+    /// A brain committed, the stream ended, or an executor reply was lost or
+    /// unknown: the grant is spent.
+    Spent,
+}
+
+/// Why a tool session did not open.
+enum OpenFailureV1 {
+    /// The executor refused; it holds nothing for this request.
+    Refused(String),
+    /// No usable reply: a reservation may exist on the executor.
+    Unknown(String),
 }
 
 async fn relayed(
@@ -116,6 +151,42 @@ fn tool_call(params: &Value) -> DecisionToolCallV1 {
     }
 }
 
+async fn open_session(
+    relay: &dyn ToolRelayV1,
+    start: &RequestId,
+    caller: &LabelV1,
+) -> Result<(RequestId, Vec<String>), OpenFailureV1> {
+    let open = PhysicalProductRequestV1::ToolOpen {
+        start: start.clone(),
+        caller: caller.clone(),
+    };
+    match relayed(relay, open).await {
+        Ok(ToolOutcomeV1::Opened {
+            tool_session,
+            tools,
+        }) => Ok((tool_session, tools)),
+        Ok(ToolOutcomeV1::Failed { reason }) => Err(OpenFailureV1::Refused(reason)),
+        Ok(other) => Err(OpenFailureV1::Unknown(format!(
+            "Unexpected executor reply: {other:?}"
+        ))),
+        Err(e) => Err(OpenFailureV1::Unknown(e.message().to_owned())),
+    }
+}
+
+/// Closes a tool session; true only if the executor answered that it
+/// released the session and the stream is unaffected.
+async fn close_session(
+    relay: &dyn ToolRelayV1,
+    start: &RequestId,
+    tool_session: RequestId,
+) -> bool {
+    let close = PhysicalProductRequestV1::ToolClose {
+        start: start.clone(),
+        tool_session,
+    };
+    matches!(relayed(relay, close).await, Ok(ToolOutcomeV1::Released))
+}
+
 fn tool_result(outcome: AppResult<ToolOutcomeV1>) -> Value {
     let (body, error) = match outcome {
         Ok(ToolOutcomeV1::Reply { reply }) => {
@@ -144,18 +215,23 @@ async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, message: &Value) -> A
 }
 
 /// Serves one MCP connection (newline-delimited JSON-RPC) for the stream
-/// that `start` began, until the client goes away.
+/// that `start` began, until the client goes away. Returns whether the
+/// executor confirmed the stream unaffected by this connection.
 pub(crate) async fn serve<R, W>(
     relay: &dyn ToolRelayV1,
     start: &RequestId,
     mut reader: R,
     mut writer: W,
-) -> AppResult<()>
+) -> AppResult<ConnectionEndV1>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut opened: Option<OpenedV1> = None;
+    // The caller label and the executor's tool list, from `initialize`.
+    let mut initialized: Option<(LabelV1, Vec<String>)> = None;
+    // The stream's tool session this connection holds, once a call opened it.
+    let mut session: Option<RequestId> = None;
+    let mut end = ConnectionEndV1::Unaffected;
     let mut line = String::new();
     loop {
         line.clear();
@@ -163,63 +239,94 @@ where
             break;
         }
         let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
-            write_line(
-                &mut writer,
-                &json!({"jsonrpc": "2.0", "id": null,
-                "error": {"code": -32700, "message": "Parse error"}}),
-            )
-            .await?;
+            let parse = json!({"jsonrpc": "2.0", "id": null,
+                "error": {"code": -32700, "message": "Parse error"}});
+            if write_line(&mut writer, &parse).await.is_err() {
+                break;
+            }
             continue;
         };
-        // Notifications (no id) need no answer.
+        let method = message["method"].as_str().unwrap_or_default();
+        // Notifications (no id) need no answer. `notifications/initialized`
+        // is a no-op: the connection is ready once `initialize` is answered,
+        // so a client that omits it is served alike, and it never reaches the
+        // executor or commits anything.
         let Some(id) = message.get("id").cloned() else {
             continue;
         };
         let params = message.get("params").cloned().unwrap_or(Value::Null);
-        let method = message["method"].as_str().unwrap_or_default();
         let answer = match method {
             "initialize" => {
-                let open = PhysicalProductRequestV1::ToolOpen {
-                    start: start.clone(),
-                    caller: caller(&params)?,
-                };
-                match relayed(relay, open).await {
-                    Ok(ToolOutcomeV1::Opened {
-                        tool_session,
-                        tools,
-                    }) => {
-                        opened = Some(OpenedV1 {
-                            tool_session,
-                            tools,
-                        });
-                        let requested = params["protocolVersion"].as_str().unwrap_or_default();
-                        let version = PROTOCOL_VERSIONS
-                            .into_iter()
-                            .find(|v| *v == requested)
-                            .unwrap_or(PROTOCOL_VERSIONS[0]);
-                        Ok(json!({"protocolVersion": version,
-                            "capabilities": {"tools": {"listChanged": false}},
-                            "serverInfo": {"name": "pastey-physical", "version": env!("CARGO_PKG_VERSION")},
-                            "instructions": "Each tool is one approved option of a physical decision stream on another Host, or one of the two read-only queries. Every call is admitted or refused by the executor; a reply never reports a physical consequence."}))
+                if initialized.is_none() {
+                    // Opening and at once closing a session yields the
+                    // executor's tool list; the executor releases it and the
+                    // stream stays as it was.
+                    match caller(&params) {
+                        Err(e) => Err(e.message().to_owned()),
+                        Ok(label) => match open_session(relay, start, &label).await {
+                            Ok((probe, tools)) => {
+                                if !close_session(relay, start, probe).await {
+                                    end = ConnectionEndV1::Spent;
+                                }
+                                initialized = Some((label, tools));
+                                Ok(())
+                            }
+                            Err(OpenFailureV1::Refused(reason)) => Err(format!(
+                                "The executor did not open a tool session: {reason}"
+                            )),
+                            Err(OpenFailureV1::Unknown(reason)) => {
+                                end = ConnectionEndV1::Spent;
+                                Err(reason)
+                            }
+                        },
                     }
-                    Ok(other) => Err(format!(
-                        "The executor did not open a tool session: {other:?}"
-                    )),
-                    Err(e) => Err(e.message().to_owned()),
+                } else {
+                    Ok(())
                 }
+                .map(|()| {
+                    let requested = params["protocolVersion"].as_str().unwrap_or_default();
+                    let version = PROTOCOL_VERSIONS
+                        .into_iter()
+                        .find(|v| *v == requested)
+                        .unwrap_or(PROTOCOL_VERSIONS[0]);
+                    json!({"protocolVersion": version,
+                        "capabilities": {"tools": {"listChanged": false}},
+                        "serverInfo": {"name": "pastey-physical", "version": env!("CARGO_PKG_VERSION")},
+                        "instructions": "Each tool is one approved option of a physical decision stream on another Host, or one of the two read-only queries. Every call is admitted or refused by the executor; a reply never reports a physical consequence."})
+                })
             }
             "ping" => Ok(json!({})),
-            "tools/list" => match &opened {
-                Some(o) => Ok(
-                    json!({"tools": o.tools.iter().map(|t| tool_definition(t)).collect::<Vec<_>>()}),
+            "tools/list" => match &initialized {
+                Some((_, tools)) => Ok(
+                    json!({"tools": tools.iter().map(|t| tool_definition(t)).collect::<Vec<_>>()}),
                 ),
                 None => Err("Initialize first".into()),
             },
-            "tools/call" => match &opened {
-                Some(o) => {
+            "tools/call" => match &initialized {
+                Some((label, _)) => {
+                    if session.is_none() {
+                        match open_session(relay, start, label).await {
+                            Ok((opened, _)) => session = Some(opened),
+                            Err(OpenFailureV1::Refused(reason)) => {
+                                let refused = Ok(ToolOutcomeV1::Failed { reason });
+                                if write_line(&mut writer, &json!({"jsonrpc": "2.0", "id": id, "result": tool_result(refused)})).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(OpenFailureV1::Unknown(reason)) => {
+                                end = ConnectionEndV1::Spent;
+                                let unknown = Err(AppError::InvalidInput(reason));
+                                if write_line(&mut writer, &json!({"jsonrpc": "2.0", "id": id, "result": tool_result(unknown)})).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let call = PhysicalProductRequestV1::ToolCall {
                         start: start.clone(),
-                        tool_session: o.tool_session.clone(),
+                        tool_session: session.clone().expect("opened above"),
                         call: tool_call(&params),
                     };
                     Ok(tool_result(relayed(relay, call).await))
@@ -227,12 +334,11 @@ where
                 None => Err("Initialize first".into()),
             },
             other => {
-                write_line(
-                    &mut writer,
-                    &json!({"jsonrpc": "2.0", "id": id,
-                    "error": {"code": -32601, "message": format!("Method not found: {other}")}}),
-                )
-                .await?;
+                let unknown = json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": format!("Method not found: {other}")}});
+                if write_line(&mut writer, &unknown).await.is_err() {
+                    break;
+                }
                 continue;
             }
         };
@@ -246,22 +352,24 @@ where
             break;
         }
     }
-    // The connection is gone: so is the brain. Closing its tool session ends
-    // the stream now; nothing it proposed resumes.
-    if let Some(o) = opened {
-        let close = PhysicalProductRequestV1::ToolClose {
-            start: start.clone(),
-            tool_session: o.tool_session,
-        };
-        let _ = relayed(relay, close).await;
+    // The connection is gone: so is its brain. The executor decides what
+    // that means: a session that never committed is released, a committed
+    // one ends the stream now and nothing it proposed resumes.
+    if let Some(open) = session {
+        if !close_session(relay, start, open).await {
+            end = ConnectionEndV1::Spent;
+        }
     }
-    Ok(())
+    Ok(end)
 }
 
-/// One stream an MCP brain may drive, bound to a secret token.
+/// One stream an MCP brain may drive, bound to a secret token. It admits
+/// one connection at a time, and none after `deadline`.
 struct GrantV1 {
     relay: Arc<dyn ToolRelayV1>,
     start: RequestId,
+    deadline: tokio::time::Instant,
+    in_use: bool,
 }
 /// The Host's loopback endpoint for MCP brains. Tokens live only in this
 /// process; a restart invalidates every grant file.
@@ -283,20 +391,31 @@ fn token_key(token: &str) -> String {
     hex::encode(sha2::Sha256::digest(token.as_bytes()))
 }
 impl McpHostV1 {
-    /// Grants one MCP connection at a time to the stream `start` began. The
-    /// grant file holds the loopback port and the token; only this user can
-    /// read it.
+    /// Grants one MCP connection at a time to the stream `start` began,
+    /// until `until` (no later than the approval's expiry; nothing extends
+    /// it). The grant file holds the loopback port and the token; only this
+    /// user can read it.
     pub(crate) async fn grant(
         &self,
         directory: &std::path::Path,
         relay: Arc<dyn ToolRelayV1>,
         start: RequestId,
+        until: std::time::SystemTime,
     ) -> AppResult<McpConnectionV1> {
+        let left = until
+            .duration_since(std::time::SystemTime::now())
+            .map_err(|_| AppError::InvalidInput("The approval has expired".into()))?;
         let port = self.listen().await?;
         let token = hex::encode(rand::random::<[u8; 32]>());
-        self.grants
-            .lock()
-            .insert(token_key(&token), GrantV1 { relay, start });
+        self.grants.lock().insert(
+            token_key(&token),
+            GrantV1 {
+                relay,
+                start,
+                deadline: tokio::time::Instant::now() + left,
+                in_use: false,
+            },
+        );
         std::fs::create_dir_all(directory)?;
         let path = directory.join(format!("{}.json", uuid::Uuid::new_v4()));
         write_private(
@@ -346,12 +465,39 @@ async fn accept(
         .strip_prefix(HELLO)
         .map(str::trim)
         .unwrap_or_default();
-    // One connection per grant: the token is spent on use.
-    let grant = grants
-        .lock()
-        .remove(&token_key(token))
-        .ok_or_else(|| AppError::InvalidInput("Unknown MCP grant".into()))?;
-    serve(grant.relay.as_ref(), &grant.start, reader, write).await
+    // One connection at a time per grant, and none after its deadline.
+    let key = token_key(token);
+    let (relay, start) = {
+        let mut grants = grants.lock();
+        let grant = grants
+            .get_mut(&key)
+            .ok_or_else(|| AppError::InvalidInput("Unknown or spent MCP grant".into()))?;
+        if tokio::time::Instant::now() >= grant.deadline {
+            grants.remove(&key);
+            return Err(AppError::InvalidInput("Expired MCP grant".into()));
+        }
+        if grant.in_use {
+            return Err(AppError::InvalidInput("MCP grant already in use".into()));
+        }
+        grant.in_use = true;
+        (grant.relay.clone(), grant.start.clone())
+    };
+    let end = serve(relay.as_ref(), &start, reader, write).await;
+    // Re-armed only when the executor confirmed the stream unaffected, and
+    // never past the deadline; otherwise the token is spent for good.
+    let mut grants = grants.lock();
+    match grants.get_mut(&key) {
+        Some(grant)
+            if matches!(end, Ok(ConnectionEndV1::Unaffected))
+                && tokio::time::Instant::now() < grant.deadline =>
+        {
+            grant.in_use = false;
+        }
+        _ => {
+            grants.remove(&key);
+        }
+    }
+    end.map(|_| ())
 }
 
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> AppResult<()> {

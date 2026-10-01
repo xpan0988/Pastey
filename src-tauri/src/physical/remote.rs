@@ -918,7 +918,8 @@ impl PhysicalControlServiceV1 {
                         },
                     },
                     None => match Self::close_tool_session(core, &tool_session).await {
-                        Ok(_) => ToolOutcomeV1::Closed,
+                        Ok(ToolCloseV1::Released) => ToolOutcomeV1::Released,
+                        Ok(ToolCloseV1::Ended) => ToolOutcomeV1::Closed,
                         Err(e) => ToolOutcomeV1::Failed {
                             reason: e.message().to_owned(),
                         },

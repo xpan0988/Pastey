@@ -907,78 +907,14 @@ pub(super) fn audit(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()>
     let mut revisions = BTreeMap::<String, u64>::new();
     let mut sources = BTreeMap::<(String, String, String), (u64, u64)>::new();
     while let Some(r) = rows.next()? {
-        let id: String = r.get("id")?;
-        let action: String = r.get("action_id")?;
-        let kind: String = r.get("kind")?;
-        let raw: String = r.get("record_json")?;
-        let (l, fid, seq, capture, receipt, ordered, qualified, hash) = if kind == "observation" {
-            let o: ObservationRecordV1 = decode(&raw)?;
-            o.fact.validate()?;
-            if let Some(p) = &o.producer {
-                p.validate(&o.fact, o.receipt_us)?;
-            }
-            require(
-                lineages.qualification(&o.fact.lineage.action, &o.producer_qualification)?
-                    == o.producer_qualification_digest,
-                "Observation producer qualification mismatch",
-            )?;
-            (
-                o.fact.lineage.clone(),
-                text(&o.fact.id),
-                o.fact.sequence,
-                o.fact.capture_us,
-                o.receipt_us,
-                o.ordered,
-                o.qualified,
-                digest("pastey-physical-evidence-record-v1", &o)?,
-            )
-        } else {
-            let d: DispositionRecordV1 = decode(&raw)?;
-            d.fact.validate()?;
-            require(
-                lineages.qualification(&d.fact.lineage.action, &d.producer_qualification)?
-                    == d.producer_qualification_digest,
-                "Disposition producer qualification mismatch",
-            )?;
-            (
-                d.fact.lineage.clone(),
-                text(&d.fact.id),
-                d.fact.sequence,
-                d.fact.capture_us,
-                d.receipt_us,
-                d.ordered,
-                d.qualified,
-                digest("pastey-physical-evidence-record-v1", &d)?,
-            )
-        };
-        correlate(&lineages.get(&l.action)?.0, &l)?;
-        let src = text(&source(&l)?);
-        let old = sources
-            .entry((action.clone(), kind, src.clone()))
-            .or_insert((0, 0));
-        require(
-            ordered == (seq > old.0 && capture > old.1),
-            "Evidence source order mismatch",
-        )?;
-        if ordered {
-            *old = (seq, capture);
-        }
-        let revision = revisions.entry(action.clone()).or_insert(0);
+        let revision = revisions.entry(r.get("action_id")?).or_insert(0);
         *revision += 1;
-        require(
-            id == fid
-                && action == text(&l.action)
-                && r.get::<_, i64>("sequence")? == checked_integer(seq)?
-                && r.get::<_, i64>("revision")? == checked_integer(*revision)?
-                && r.get::<_, i64>("capture_us")? == checked_integer(capture)?
-                && r.get::<_, i64>("receipt_us")? == checked_integer(receipt)?
-                && receipt >= capture
-                && r.get::<_, String>("source_digest")? == src
-                && r.get::<_, bool>("ordered")? == ordered
-                && r.get::<_, bool>("qualified")? == qualified
-                && r.get::<_, String>("digest")? == text(&hash),
-            "Evidence column/body mismatch",
-        )?;
+        let (key, ordered) = evidence_row(r, &mut lineages, *revision, &mut |key| {
+            Ok(sources.get(key).copied().unwrap_or((0, 0)))
+        })?;
+        if let Some(latest) = ordered {
+            sources.insert(key, latest);
+        }
     }
     let mut stmt = c.prepare(&format!(
         "SELECT * FROM physical_consequences WHERE {actions} ORDER BY action_id,revision"
@@ -986,44 +922,11 @@ pub(super) fn audit(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()>
     let mut rows = stmt.query([])?;
     let mut revisions = BTreeMap::<ActionId, u64>::new();
     while let Some(r) = rows.next()? {
-        let x: PhysicalConsequenceV1 = decode(&r.get::<_, String>("record_json")?)?;
-        let (l, s) = lineages.get(&x.action)?.clone();
-        let (os, ds) = facts(c, &x.action, x.evidence_revision)?;
-        let (state, reason, gap) = replay(
-            &s,
-            &l,
-            &os,
-            &ds,
-            x.evaluated_us,
-            x.verdict.as_ref(),
-            &x.reason,
-        )
-        .ok_or_else(|| crate::error::AppError::InvalidInput("Unprovable consequence".into()))?;
-        let rev = revisions.entry(x.action.clone()).or_insert(0);
-        *rev += 1;
-        require(
-            x.revision == *rev
-                && x.evidence_revision <= head(c, &x.action)?
-                && x.root == l.root
-                && x.attempt == l.attempt
-                && x.completion_digest == completion_digest(&s)?
-                && x.completion_ref == l.completion_ref
-                && x.evidence_class == l.evidence_class
-                && x.witness == l.witness
-                && x.observations == os.iter().map(|o| o.fact.id.clone()).collect::<Vec<_>>()
-                && x.dispositions == ds.iter().map(|d| d.fact.id.clone()).collect::<Vec<_>>()
-                && x.state == state
-                && x.reason == reason
-                && x.max_gap_us == gap
-                && r.get::<_, String>("action_id")? == text(&x.action)
-                && r.get::<_, i64>("revision")? == checked_integer(x.revision)?
-                && r.get::<_, i64>("evidence_revision")? == checked_integer(x.evidence_revision)?
-                && r.get::<_, String>("state")? == tag(&state)?
-                && r.get::<_, String>("completion_digest")? == text(&x.completion_digest)
-                && r.get::<_, String>("digest")?
-                    == text(&digest("pastey-physical-consequence-v1", &x)?),
-            "Unprovable consequence",
-        )?;
+        consequence_row(c, r, &mut lineages, &mut |action| {
+            let rev = revisions.entry(action.clone()).or_insert(0);
+            *rev += 1;
+            Ok(*rev)
+        })?;
     }
     let mut stmt = c.prepare(&format!(
         "SELECT * FROM physical_task_acceptance WHERE {}",
@@ -1207,6 +1110,224 @@ pub(super) fn audit(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()>
                     == text(&digest("pastey-physical-reconciliation-v1", &x)?),
             "Reconciliation column/body mismatch",
         )?;
+    }
+    Ok(())
+}
+
+/// The key of an evidence row's source: action, kind and source digest.
+type SourceKeyV1 = (String, String, String);
+
+/// One evidence row's checks, given what its predecessors leave: the revision
+/// it must carry and, through `prior`, the latest ordered (sequence, capture)
+/// of its source before it ((0, 0) if none). Returns its source key and, if
+/// it is ordered, its own (sequence, capture).
+fn evidence_row(
+    r: &rusqlite::Row<'_>,
+    lineages: &mut LineagesV1<'_>,
+    revision: u64,
+    prior: &mut dyn FnMut(&SourceKeyV1) -> AppResult<(u64, u64)>,
+) -> AppResult<(SourceKeyV1, Option<(u64, u64)>)> {
+    let id: String = r.get("id")?;
+    let action: String = r.get("action_id")?;
+    let kind: String = r.get("kind")?;
+    let raw: String = r.get("record_json")?;
+    let (l, fid, seq, capture, receipt, ordered, qualified, hash) = if kind == "observation" {
+        let o: ObservationRecordV1 = decode(&raw)?;
+        o.fact.validate()?;
+        if let Some(p) = &o.producer {
+            p.validate(&o.fact, o.receipt_us)?;
+        }
+        require(
+            lineages.qualification(&o.fact.lineage.action, &o.producer_qualification)?
+                == o.producer_qualification_digest,
+            "Observation producer qualification mismatch",
+        )?;
+        (
+            o.fact.lineage.clone(),
+            text(&o.fact.id),
+            o.fact.sequence,
+            o.fact.capture_us,
+            o.receipt_us,
+            o.ordered,
+            o.qualified,
+            digest("pastey-physical-evidence-record-v1", &o)?,
+        )
+    } else {
+        let d: DispositionRecordV1 = decode(&raw)?;
+        d.fact.validate()?;
+        require(
+            lineages.qualification(&d.fact.lineage.action, &d.producer_qualification)?
+                == d.producer_qualification_digest,
+            "Disposition producer qualification mismatch",
+        )?;
+        (
+            d.fact.lineage.clone(),
+            text(&d.fact.id),
+            d.fact.sequence,
+            d.fact.capture_us,
+            d.receipt_us,
+            d.ordered,
+            d.qualified,
+            digest("pastey-physical-evidence-record-v1", &d)?,
+        )
+    };
+    correlate(&lineages.get(&l.action)?.0, &l)?;
+    let src = text(&source(&l)?);
+    let key = (action.clone(), kind, src.clone());
+    let old = prior(&key)?;
+    require(
+        ordered == (seq > old.0 && capture > old.1),
+        "Evidence source order mismatch",
+    )?;
+    require(
+        id == fid
+            && action == text(&l.action)
+            && r.get::<_, i64>("sequence")? == checked_integer(seq)?
+            && r.get::<_, i64>("revision")? == checked_integer(revision)?
+            && r.get::<_, i64>("capture_us")? == checked_integer(capture)?
+            && r.get::<_, i64>("receipt_us")? == checked_integer(receipt)?
+            && receipt >= capture
+            && r.get::<_, String>("source_digest")? == src
+            && r.get::<_, bool>("ordered")? == ordered
+            && r.get::<_, bool>("qualified")? == qualified
+            && r.get::<_, String>("digest")? == text(&hash),
+        "Evidence column/body mismatch",
+    )?;
+    Ok((key, ordered.then_some((seq, capture))))
+}
+/// One consequence row's checks: it is replayed on exactly the evidence it
+/// cites, and must carry the revision `revision` assigns its action.
+fn consequence_row(
+    c: &Connection,
+    r: &rusqlite::Row<'_>,
+    lineages: &mut LineagesV1<'_>,
+    revision: &mut dyn FnMut(&ActionId) -> AppResult<u64>,
+) -> AppResult<()> {
+    let x: PhysicalConsequenceV1 = decode(&r.get::<_, String>("record_json")?)?;
+    let (l, s) = lineages.get(&x.action)?.clone();
+    let (os, ds) = facts(c, &x.action, x.evidence_revision)?;
+    let (state, reason, gap) = replay(
+        &s,
+        &l,
+        &os,
+        &ds,
+        x.evaluated_us,
+        x.verdict.as_ref(),
+        &x.reason,
+    )
+    .ok_or_else(|| crate::error::AppError::InvalidInput("Unprovable consequence".into()))?;
+    let rev = revision(&x.action)?;
+    require(
+        x.revision == rev
+            && x.evidence_revision <= head(c, &x.action)?
+            && x.root == l.root
+            && x.attempt == l.attempt
+            && x.completion_digest == completion_digest(&s)?
+            && x.completion_ref == l.completion_ref
+            && x.evidence_class == l.evidence_class
+            && x.witness == l.witness
+            && x.observations == os.iter().map(|o| o.fact.id.clone()).collect::<Vec<_>>()
+            && x.dispositions == ds.iter().map(|d| d.fact.id.clone()).collect::<Vec<_>>()
+            && x.state == state
+            && x.reason == reason
+            && x.max_gap_us == gap
+            && r.get::<_, String>("action_id")? == text(&x.action)
+            && r.get::<_, i64>("revision")? == checked_integer(x.revision)?
+            && r.get::<_, i64>("evidence_revision")? == checked_integer(x.evidence_revision)?
+            && r.get::<_, String>("state")? == tag(&state)?
+            && r.get::<_, String>("completion_digest")? == text(&x.completion_digest)
+            && r.get::<_, String>("digest")?
+                == text(&digest("pastey-physical-consequence-v1", &x)?),
+        "Unprovable consequence",
+    )
+}
+
+/// The append-only evidence tables. Their rows can only be inserted (the
+/// schema's triggers refuse updates and deletes).
+pub(super) const APPEND_ONLY: [&str; 2] = ["physical_evidence", "physical_consequences"];
+
+/// Whether `rows` (all in `APPEND_ONLY`) are appends at the head of their
+/// actions: for each table and action, the written rows are exactly the
+/// rows from the lowest written revision up.
+pub(super) fn appended_at_head(c: &Connection, rows: &[(String, i64)]) -> AppResult<bool> {
+    let mut written = BTreeMap::<(&str, String), (i64, i64)>::new();
+    for (table, rowid) in rows {
+        let (action, revision): (String, i64) = c.query_row(
+            &format!("SELECT action_id,revision FROM {table} WHERE rowid=?1"),
+            [rowid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let entry = written
+            .entry((table.as_str(), action))
+            .or_insert((revision, 0));
+        entry.0 = entry.0.min(revision);
+        entry.1 += 1;
+    }
+    for ((table, action), (lowest, count)) in &written {
+        let at_or_above: i64 = c.query_row(
+            &format!("SELECT count(*) FROM {table} WHERE action_id=?1 AND revision>=?2"),
+            params![action, lowest],
+            |r| r.get(0),
+        )?;
+        if at_or_above != *count {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Validates evidence and consequence rows appended at the head of their
+/// actions with exactly the checks the group audit runs on them. Their
+/// predecessors were audited and are immutable, so the state the group audit
+/// would reach before each appended row is read from them: the revision is
+/// one past the highest earlier revision, and a source's latest ordered
+/// (sequence, capture) is that of its latest earlier ordered row. No check on
+/// any other row reads a later evidence or consequence row: consequences,
+/// handovers, reconciliations and acceptances cite fixed revisions, and the
+/// evidence head they compare with only grows.
+pub(super) fn validate_appended(c: &Connection, rows: &[(String, i64)]) -> AppResult<()> {
+    let mut lineages = LineagesV1::new(c);
+    // Evidence first: a consequence is replayed on the evidence it cites.
+    let mut ordered: Vec<(usize, String, i64, i64)> = Vec::new();
+    for (table, rowid) in rows {
+        let rank = APPEND_ONLY.iter().position(|t| t == table).unwrap_or(0);
+        let (action, revision): (String, i64) = c.query_row(
+            &format!("SELECT action_id,revision FROM {table} WHERE rowid=?1"),
+            [rowid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        ordered.push((rank, action, revision, *rowid));
+    }
+    ordered.sort();
+    for (rank, action, revision, rowid) in ordered {
+        let table = APPEND_ONLY[rank];
+        let earlier: i64 = c.query_row(
+            &format!(
+                "SELECT COALESCE(max(revision),0) FROM {table} WHERE action_id=?1 AND revision<?2"
+            ),
+            params![action, revision],
+            |r| r.get(0),
+        )?;
+        let expected = u64::try_from(earlier + 1)
+            .map_err(|_| crate::error::AppError::InvalidInput("Evidence revision".into()))?;
+        let mut stmt = c.prepare(&format!("SELECT * FROM {table} WHERE rowid=?1"))?;
+        let mut found = stmt.query([rowid])?;
+        let r = found
+            .next()?
+            .ok_or_else(|| crate::error::AppError::InvalidInput("Appended row missing".into()))?;
+        if rank == 0 {
+            evidence_row(r, &mut lineages, expected, &mut |(action, kind, source)| {
+                Ok(c.query_row(
+                    "SELECT sequence,capture_us FROM physical_evidence WHERE action_id=?1 AND kind=?2 AND source_digest=?3 AND ordered=1 AND revision<?4 ORDER BY revision DESC LIMIT 1",
+                    params![action, kind, source, revision],
+                    |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+                )
+                .optional()?
+                .unwrap_or((0, 0)))
+            })?;
+        } else {
+            consequence_row(c, r, &mut lineages, &mut |_| Ok(expected))?;
+        }
     }
     Ok(())
 }

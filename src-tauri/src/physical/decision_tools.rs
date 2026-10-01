@@ -41,14 +41,24 @@ pub(crate) enum DecisionToolReplyV1 {
     },
 }
 
+/// How long an unused tool-session reservation may hold the stream's single
+/// tool session before the executor releases it (a relay that never sent its
+/// close). Never longer than half the stream's idle lease: before any brain
+/// commits, that lease runs from installation, so a stale reservation must
+/// lapse while the stream can still take a retry. Expiry releases only the
+/// reservation, never the stream.
+pub(in crate::physical) const RESERVATION_US: u64 = 60_000_000;
+
 /// Executor-side runtime of one stream: the binding lane, serialized
 /// sampling (the timer and tool calls must not interleave observations), the
-/// last brain activity for the idle lease, and the end latch. Process-local.
+/// last brain activity for the idle lease, the commit latch (a brain has
+/// begun using the stream) and the end latch. Process-local.
 pub(crate) struct StreamRuntimeV1 {
     session: Arc<BodyControlSessionV1>,
     lane: Arc<dyn EnvironmentBinding>,
     sampling: tokio::sync::Mutex<()>,
     last_activity: AtomicU64,
+    committed: AtomicBool,
     ended: AtomicBool,
 }
 /// Result of one executor timer tick.
@@ -58,13 +68,60 @@ pub(crate) enum StreamTickV1 {
     Ended,
 }
 
+/// A tool session is reserved when it opens, committed by the executor on
+/// its first accepted tool call, and closed once.
+const RESERVED: u8 = 0;
+const COMMITTED: u8 = 1;
+const CLOSED: u8 = 2;
+
+/// The clock the executor timer schedules ticks on, in microseconds.
+pub(in crate::physical) trait TickTimerV1: Send + Sync {
+    fn now_us(&self) -> u64;
+    /// Returns once `now_us()` has reached `deadline_us`.
+    fn sleep_until(
+        &self,
+        deadline_us: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+}
+/// The runtime's monotonic clock.
+struct TokioTickTimerV1(tokio::time::Instant);
+impl TokioTickTimerV1 {
+    fn new() -> Self {
+        Self(tokio::time::Instant::now())
+    }
+}
+impl TickTimerV1 for TokioTickTimerV1 {
+    fn now_us(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+    fn sleep_until(
+        &self,
+        deadline_us: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(tokio::time::sleep_until(
+            self.0 + std::time::Duration::from_micros(deadline_us),
+        ))
+    }
+}
+/// The deadline of the tick after one due at `last`: a period later, or now
+/// if that has already passed.
+pub(in crate::physical) fn next_tick_deadline(last: u64, period: u64, now: u64) -> u64 {
+    last.saturating_add(period).max(now)
+}
+
 /// One authenticated caller of one stream. Process-local: no serde, no clone,
-/// never restored. Closing it closes the stream.
+/// never restored. A stream has at most one open tool session. Closing a
+/// reserved session releases it and leaves the stream as it was; closing a
+/// committed one ends the stream.
 pub(crate) struct ToolSessionV1 {
     id: RequestId,
     caller: LabelV1,
     stream: Arc<StreamRuntimeV1>,
-    open: AtomicBool,
+    state: AtomicU8,
+    /// This session committed; it stays set once the session closes.
+    committed: AtomicBool,
+    /// Ticks when the reservation was made, for its expiry.
+    reserved_at: u64,
     /// Ticks of the last released observation, for the declared rate.
     last_observation: parking_lot::Mutex<Option<u64>>,
 }
@@ -72,6 +129,25 @@ impl ToolSessionV1 {
     pub(crate) fn id(&self) -> &RequestId {
         &self.id
     }
+    fn is_open(&self) -> bool {
+        self.state.load(Ordering::Acquire) != CLOSED
+    }
+    fn reservation_expired(&self, ticks: u64) -> bool {
+        let idle = stream_scope(&self.stream.session)
+            .map(|s| s.idle_lease_us.get())
+            .unwrap_or(0);
+        ticks.saturating_sub(self.reserved_at) > RESERVATION_US.min(idle / 2)
+    }
+}
+/// What closing a tool session did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolCloseV1 {
+    /// The session was never committed: only its reservation was released;
+    /// the stream, Root, installation and ledger are untouched.
+    Released,
+    /// A committed brain is gone (or the stream had already ended): the
+    /// stream is over.
+    Ended,
 }
 
 fn refused(reason: impl Into<String>) -> DecisionToolReplyV1 {
@@ -127,6 +203,7 @@ impl PhysicalControlServiceV1 {
             lane,
             sampling: tokio::sync::Mutex::new(()),
             last_activity: AtomicU64::new(ticks),
+            committed: AtomicBool::new(false),
             ended: AtomicBool::new(false),
         });
         self.control
@@ -149,20 +226,33 @@ impl PhysicalControlServiceV1 {
         lane.status()?;
         let stream = self.stream_runtime(session, lane)?;
         require(!stream.ended.load(Ordering::Acquire), "Stream ended")?;
-        self.control
-            .tool_sessions
-            .retain(|_, t| t.open.load(Ordering::Acquire));
+        // Once a brain has used the stream, no other brain may attach to it.
+        require(
+            !stream.committed.load(Ordering::Acquire),
+            "A brain already drives this stream",
+        )?;
+        let (_, ticks) = self.clock.read()?;
+        self.expire_reservations(ticks);
+        require(
+            !self
+                .control
+                .tool_sessions
+                .values()
+                .any(|t| Arc::ptr_eq(&t.stream, &stream)),
+            "A tool session is already open for this stream",
+        )?;
         require(
             self.control.tool_sessions.len() < 64,
             "Too many tool sessions",
         )?;
-        let (_, ticks) = self.clock.read()?;
-        stream.last_activity.fetch_max(ticks, Ordering::AcqRel);
+        // A reservation is not brain activity: the idle lease is untouched.
         let ts = Arc::new(ToolSessionV1 {
             id: request_id()?,
             caller,
             stream,
-            open: AtomicBool::new(true),
+            state: AtomicU8::new(RESERVED),
+            committed: AtomicBool::new(false),
+            reserved_at: ticks,
             last_observation: parking_lot::Mutex::new(None),
         });
         self.control.tool_sessions.insert(ts.id.clone(), ts.clone());
@@ -179,9 +269,21 @@ impl PhysicalControlServiceV1 {
         names.extend([OBSERVE_TOOL.to_owned(), BUDGET_TOOL.to_owned()]);
         names
     }
+    /// Releases expired reservations and forgets closed sessions. No stream
+    /// is affected.
+    fn expire_reservations(&mut self, ticks: u64) {
+        for t in self.control.tool_sessions.values() {
+            if t.reservation_expired(ticks) {
+                let _ =
+                    t.state
+                        .compare_exchange(RESERVED, CLOSED, Ordering::AcqRel, Ordering::Acquire);
+            }
+        }
+        self.control.tool_sessions.retain(|_, t| t.is_open());
+    }
     fn tool_session_current(&self, ts: &ToolSessionV1) -> AppResult<()> {
         require(
-            ts.open.load(Ordering::Acquire)
+            ts.is_open()
                 && !ts.stream.ended.load(Ordering::Acquire)
                 && self
                     .control
@@ -190,6 +292,25 @@ impl PhysicalControlServiceV1 {
                     .is_some_and(|t| std::ptr::eq(t.as_ref(), ts)),
             "Tool session closed",
         )
+    }
+    /// Accepts a call on the current tool session. The first accepted call
+    /// commits the session (and the stream to this brain) here, under the
+    /// Core lock; an expired reservation is released instead.
+    fn commit_tool_session(&mut self, ts: &ToolSessionV1) -> AppResult<()> {
+        self.tool_session_current(ts)?;
+        if ts.state.load(Ordering::Acquire) == RESERVED {
+            let (_, ticks) = self.clock.read()?;
+            if ts.reservation_expired(ticks) {
+                self.expire_reservations(ticks);
+                return Err(crate::error::AppError::InvalidInput(
+                    "Tool session reservation expired".into(),
+                ));
+            }
+            ts.state.store(COMMITTED, Ordering::Release);
+            ts.committed.store(true, Ordering::Release);
+            ts.stream.committed.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Runs one tool call. Every `Decide` is a new proposal through Core
@@ -201,7 +322,7 @@ impl PhysicalControlServiceV1 {
         ts: &Arc<ToolSessionV1>,
         call: DecisionToolCallV1,
     ) -> AppResult<DecisionToolReplyV1> {
-        let current = core.lock().tool_session_current(ts);
+        let current = core.lock().commit_tool_session(ts);
         if let Err(e) = current {
             // A closed session still answers, and a proposal on it is recorded.
             if let DecisionToolCallV1::Decide {
@@ -301,7 +422,7 @@ impl PhysicalControlServiceV1 {
             let mut service = core.lock();
             service.control.tool_sessions.retain(|_, t| {
                 if Arc::ptr_eq(&t.stream, stream) {
-                    t.open.store(false, Ordering::Release);
+                    t.state.store(CLOSED, Ordering::Release);
                     false
                 } else {
                     true
@@ -367,12 +488,29 @@ impl PhysicalControlServiceV1 {
         }
         Ok(StreamTickV1::Continue(period))
     }
-    /// Drives `stream_tick` on its own period until the stream ends. The
-    /// executor spawns this for every installed stream.
+    /// Drives `stream_tick` until the stream ends. The executor spawns this
+    /// for every installed stream.
     pub(crate) async fn supervise_stream(core: &Mutex<Self>, stream: Arc<StreamRuntimeV1>) {
+        Self::supervise_stream_on(core, stream, &TokioTickTimerV1::new()).await
+    }
+    /// Runs ticks on absolute deadlines: the first at once, each next one a
+    /// period after the previous deadline, so a tick's own work does not
+    /// stretch the time between samples. A tick that overruns its period is
+    /// followed at once, and the schedule restarts from then: missed ticks
+    /// are not caught up.
+    pub(in crate::physical) async fn supervise_stream_on(
+        core: &Mutex<Self>,
+        stream: Arc<StreamRuntimeV1>,
+        timer: &dyn TickTimerV1,
+    ) {
+        let mut deadline = timer.now_us();
         loop {
+            timer.sleep_until(deadline).await;
             match Self::stream_tick(core, &stream).await {
-                Ok(StreamTickV1::Continue(d)) => tokio::time::sleep(d).await,
+                Ok(StreamTickV1::Continue(period)) => {
+                    let period = u64::try_from(period.as_micros()).unwrap_or(u64::MAX);
+                    deadline = next_tick_deadline(deadline, period, timer.now_us());
+                }
                 Ok(StreamTickV1::Ended) => break,
                 Err(_) => {
                     Self::end_stream(core, &stream).await;
@@ -518,16 +656,39 @@ impl PhysicalControlServiceV1 {
         let disposition = core.lock().store.action_status(action.id())?.1;
         Ok(DecisionToolReplyV1::Allowed { disposition })
     }
-    /// Ends a tool session and with it the stream: authority closes first,
-    /// then the fence is requested. The outcome stays uncertain unless the
-    /// witness already verified the completion contract.
+    /// Closes a tool session. A session that never committed only releases
+    /// its reservation: the stream, Root, installation and ledger are
+    /// untouched and another session may open. A committed session's brain is
+    /// gone, which ends the stream: authority closes first, then the fence is
+    /// requested. The outcome stays uncertain unless the witness already
+    /// verified the completion contract; nothing resumes.
     pub(in crate::physical) async fn close_tool_session(
         core: &Mutex<Self>,
         ts: &Arc<ToolSessionV1>,
-    ) -> AppResult<()> {
-        ts.open.store(false, Ordering::Release);
-        Self::end_stream(core, &ts.stream).await;
-        Ok(())
+    ) -> AppResult<ToolCloseV1> {
+        // Under the Core lock, so a close and a commit never interleave.
+        let committed = {
+            let mut service = core.lock();
+            ts.state.store(CLOSED, Ordering::Release);
+            if service
+                .control
+                .tool_sessions
+                .get(&ts.id)
+                .is_some_and(|t| Arc::ptr_eq(t, ts))
+            {
+                service.control.tool_sessions.remove(&ts.id);
+            }
+            ts.committed.load(Ordering::Acquire)
+        };
+        if committed {
+            Self::end_stream(core, &ts.stream).await;
+            return Ok(ToolCloseV1::Ended);
+        }
+        Ok(if ts.stream.ended.load(Ordering::Acquire) {
+            ToolCloseV1::Ended
+        } else {
+            ToolCloseV1::Released
+        })
     }
     /// The records of a stream, in order.
     #[cfg_attr(
@@ -548,4 +709,9 @@ impl PhysicalControlServiceV1 {
 #[cfg(test)]
 pub(super) fn test_stream(ts: &ToolSessionV1) -> Arc<StreamRuntimeV1> {
     ts.stream.clone()
+}
+/// The stream's idle-lease clock: ticks of the last brain activity.
+#[cfg(test)]
+pub(super) fn test_last_activity(stream: &StreamRuntimeV1) -> u64 {
+    stream.last_activity.load(Ordering::Acquire)
 }
