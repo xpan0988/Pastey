@@ -575,6 +575,43 @@ pub fn inbound_controller_binding(
     )
 }
 
+/// The read-only twin of `current_host_session_binding` for authority checks
+/// on a hot path, over the room and peer rows the caller has just read. It
+/// writes nothing and fails closed exactly where the resolving variant
+/// would: inactive room, unknown or unrouteable peer, a route the legacy
+/// projection would retire, a missing local session, or no peer HostRef.
+pub(crate) fn current_host_session_binding_read_only(
+    state: &HostRuntime,
+    room: &crate::models::StoredRoom,
+    peers: &[crate::models::StoredBridgePeerEndpoint],
+    peer_session_id: &str,
+) -> AppResult<HostSessionBinding> {
+    let context = room_control::room_control_session_context_for_peer_read_only(
+        state,
+        room,
+        peers,
+        peer_session_id,
+    )?;
+    let peer = peers
+        .iter()
+        .find(|peer| peer.peer_session_id == context.peer_route_ref)
+        .ok_or_else(|| crate::error::AppError::NotFound("Bridge peer not found".into()))?;
+    let peer_host_ref = peer
+        .logical_host_ref
+        .clone()
+        .ok_or_else(|| crate::error::AppError::InvalidInput("Peer HostRef is unavailable.".into()))
+        .and_then(HostRef::parse)?;
+    HostSessionBinding::new(
+        &room.id,
+        state.local_host_ref.clone(),
+        peer_host_ref,
+        &context.local_session_ref,
+        &context.peer_session_ref,
+        &context.peer_route_ref,
+        room.expires_at,
+    )
+}
+
 /// Resolves the exact current Layer 4 association for a durable logical peer.
 /// Absence, disconnect, restart recovery, stale route replacement, expiry, or
 /// Burn all fail closed. Constructing this value grants no Plan authority.

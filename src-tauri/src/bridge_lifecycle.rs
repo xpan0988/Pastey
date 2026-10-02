@@ -76,15 +76,24 @@ impl CurrentRemoteHostSession {
     /// Synchronous invalidation check for already authenticated physical Core
     /// ingress. The initial live resolver still owns transport authentication;
     /// each use rejects replacement of either the binding or private endpoint.
+    ///
+    /// Read-only: it runs on every authority check of a live stream, so it
+    /// must not write the database (a write there makes the physical ledger
+    /// audit itself in full on its next transaction). It reads the room and
+    /// its peer rows once and checks them as resolution would, including the
+    /// route retirement the legacy projection refresh would perform.
     pub(crate) fn validate_current_physical_route(&self, state: &AppState) -> AppResult<()> {
-        let current = crate::host_runtime::current_host_session_binding(
+        let room = storage::get_room_by_id(&state.paths, &self.binding.bridge_id)?;
+        let peers = storage::list_bridge_peer_endpoints(&state.paths, &self.binding.bridge_id)?;
+        let current = crate::host_runtime::current_host_session_binding_read_only(
             state,
-            &self.binding.bridge_id,
+            &room,
+            &peers,
             &self.binding.peer_route_ref,
         )?;
         self.binding.validate_current(&current, storage::now_ts())?;
-        let peer = storage::list_bridge_peer_endpoints(&state.paths, &self.binding.bridge_id)?
-            .into_iter()
+        let peer = peers
+            .iter()
             .find(|p| p.peer_session_id == self.binding.peer_route_ref)
             .ok_or_else(|| AppError::InvalidInput("Physical peer route removed".into()))?;
         if peer.liveness != BridgePeerLiveness::Connected
@@ -645,6 +654,138 @@ mod tests {
 
         fn store(&self, peer: &StoredBridgePeerEndpoint) {
             storage::upsert_bridge_peer_endpoint(&self.runtime.paths, peer).unwrap();
+        }
+    }
+
+    impl ResolverFixture {
+        /// A two-Host Bridge as a joined room records it: the room's legacy
+        /// peer columns name the remote endpoint, and the projected legacy
+        /// peer row carries the remote HostRef. Returns that row's route.
+        fn legacy_peer(&self) -> String {
+            storage::update_room_peer(
+                &self.runtime.paths,
+                ROOM_ID,
+                Some("127.0.0.1"),
+                Some(self.remote_port),
+                Some("remote"),
+                Some(&self.remote_key),
+                RoomStatus::Active,
+            )
+            .unwrap();
+            storage::bind_legacy_room_peer_host_ref(
+                &self.runtime.paths,
+                ROOM_ID,
+                self.remote_host.as_str(),
+            )
+            .unwrap();
+            storage::legacy_bridge_peer_session_id(ROOM_ID)
+        }
+    }
+
+    fn data_version(observer: &rusqlite::Connection) -> i64 {
+        observer
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn physical_route_validation_writes_nothing() {
+        let fixture = ResolverFixture::new("route-read-only").await;
+        let route = fixture.legacy_peer();
+        let session = fixture
+            .runtime
+            .resolve_current_remote_host_session(ROOM_ID, &fixture.remote_host)
+            .await
+            .unwrap();
+        assert_eq!(session.binding().peer_route_ref, route);
+        // Another connection sees every commit to the database file.
+        let observer = rusqlite::Connection::open(&fixture.runtime.paths.db_path).unwrap();
+        let before = data_version(&observer);
+        for _ in 0..20 {
+            session
+                .validate_current_physical_route(&fixture.runtime)
+                .unwrap();
+        }
+        assert_eq!(data_version(&observer), before);
+        // On an unchanged Bridge the resolving path writes nothing either.
+        crate::host_runtime::current_host_session_binding(&fixture.runtime, ROOM_ID, &route)
+            .unwrap();
+        assert_eq!(data_version(&observer), before);
+        // When the projection has drifted, resolving refreshes it (a
+        // commit); validation still never writes.
+        rusqlite::Connection::open(&fixture.runtime.paths.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE bridge_peers SET display_name='drifted' WHERE room_id=?1 AND peer_session_id=?2",
+                rusqlite::params![ROOM_ID, route],
+            )
+            .unwrap();
+        let drifted = data_version(&observer);
+        session
+            .validate_current_physical_route(&fixture.runtime)
+            .unwrap();
+        assert_eq!(data_version(&observer), drifted);
+        crate::host_runtime::current_host_session_binding(&fixture.runtime, ROOM_ID, &route)
+            .unwrap();
+        assert_ne!(data_version(&observer), drifted);
+    }
+
+    #[tokio::test]
+    async fn physical_route_validation_fails_closed_on_replacement_expiry_and_burn() {
+        for case in [
+            "endpoint_changed",
+            "key_changed",
+            "row_removed",
+            "not_connected",
+            "legacy_endpoint_moved",
+            "room_expired",
+            "bridge_burned",
+            "local_session_replaced",
+        ] {
+            let fixture = ResolverFixture::new(&format!("route-{case}")).await;
+            let route = fixture.legacy_peer();
+            let session = fixture
+                .runtime
+                .resolve_current_remote_host_session(ROOM_ID, &fixture.remote_host)
+                .await
+                .unwrap();
+            session
+                .validate_current_physical_route(&fixture.runtime)
+                .unwrap();
+            let db = rusqlite::Connection::open(&fixture.runtime.paths.db_path).unwrap();
+            let sql = |statement: &str| {
+                db.execute(statement, rusqlite::params![route, ROOM_ID])
+                    .unwrap();
+            };
+            match case {
+                "endpoint_changed" => sql("UPDATE bridge_peers SET endpoint_port=endpoint_port+1 WHERE peer_session_id=?1 AND room_id=?2"),
+                "key_changed" => sql("UPDATE bridge_peers SET transport_public_key='replaced-key' WHERE peer_session_id=?1 AND room_id=?2"),
+                "row_removed" => sql("DELETE FROM bridge_peers WHERE peer_session_id=?1 AND room_id=?2"),
+                "not_connected" => sql("UPDATE bridge_peers SET liveness='reconnecting' WHERE peer_session_id=?1 AND room_id=?2"),
+                // The room now names another legacy peer endpoint: refreshing
+                // the projection would retire this route.
+                "legacy_endpoint_moved" => sql("UPDATE rooms SET peer_transport_public_key='other-key' WHERE id=?2 AND ?1 IS NOT NULL"),
+                "room_expired" => {
+                    db.execute(
+                        "UPDATE rooms SET expires_at=?1 WHERE id=?2",
+                        rusqlite::params![storage::now_ts() - 1, ROOM_ID],
+                    )
+                    .unwrap();
+                }
+                "bridge_burned" => sql("UPDATE rooms SET status='burned' WHERE id=?2 AND ?1 IS NOT NULL"),
+                "local_session_replaced" => {
+                    let mut servers = fixture.runtime.active_servers.lock();
+                    let server = servers.get_mut(ROOM_ID).unwrap();
+                    server.transport_secret = crate::crypto::random_key();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                session
+                    .validate_current_physical_route(&fixture.runtime)
+                    .is_err(),
+                "{case} still validated"
+            );
         }
     }
 

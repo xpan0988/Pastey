@@ -869,6 +869,36 @@ fn mark_legacy_bridge_peer_rows_replaced(
     Ok(())
 }
 
+/// Whether refreshing the legacy peer projection
+/// (`sync_legacy_bridge_peer_endpoint`) would retire the peer row
+/// `peer_session_id`: the room's legacy peer endpoint matches no connected
+/// row, so a new legacy session would replace every legacy-named row. Reads
+/// only what it is given; writes nothing.
+pub fn legacy_bridge_peer_projection_retires(
+    room: &StoredRoom,
+    peers: &[StoredBridgePeerEndpoint],
+    peer_session_id: &str,
+) -> bool {
+    let (Some(endpoint_host), Some(endpoint_port), Some(transport_public_key)) = (
+        room.peer_host.as_deref().filter(|value| !value.is_empty()),
+        room.peer_port,
+        room.peer_transport_public_key
+            .as_deref()
+            .filter(|value| !value.is_empty()),
+    ) else {
+        return false;
+    };
+    let current = peers.iter().any(|peer| {
+        bridge_peer_endpoint_matches(peer, endpoint_host, endpoint_port, transport_public_key)
+            && peer.liveness == BridgePeerLiveness::Connected
+    });
+    if current || peers.is_empty() {
+        return false;
+    }
+    let base = legacy_bridge_peer_session_id(&room.id);
+    peer_session_id == base || peer_session_id.starts_with(&format!("{base}:reconnect:"))
+}
+
 pub fn sync_legacy_bridge_peer_endpoint(
     paths: &AppPaths,
     room: &StoredRoom,
@@ -930,8 +960,40 @@ pub fn sync_legacy_bridge_peer_endpoint(
         durable_identity_id,
         updated_at: now_ts(),
     };
+    // A refresh that would change nothing writes nothing: `updated_at` then
+    // keeps the time of the last real change.
+    if let Some(stored) = peers
+        .iter()
+        .find(|stored| same_bridge_peer_projection(stored, &peer))
+    {
+        return Ok(Some(stored.clone()));
+    }
     upsert_bridge_peer_endpoint(paths, &peer)?;
     Ok(Some(peer))
+}
+
+/// Whether `stored` already holds everything `desired` would write through
+/// `upsert_bridge_peer_endpoint`, apart from `updated_at`. The upsert keeps a
+/// stored `logical_host_ref` when `desired` has none, so that field is
+/// compared by the value the row would have afterwards.
+fn same_bridge_peer_projection(
+    stored: &StoredBridgePeerEndpoint,
+    desired: &StoredBridgePeerEndpoint,
+) -> bool {
+    stored.room_id == desired.room_id
+        && stored.peer_session_id == desired.peer_session_id
+        && stored.display_name == desired.display_name
+        && stored.endpoint_host == desired.endpoint_host
+        && stored.endpoint_port == desired.endpoint_port
+        && stored.transport_public_key == desired.transport_public_key
+        && stored.liveness == desired.liveness
+        && stored.join_method == desired.join_method
+        && stored.logical_host_ref
+            == desired
+                .logical_host_ref
+                .clone()
+                .or_else(|| stored.logical_host_ref.clone())
+        && stored.durable_identity_id == desired.durable_identity_id
 }
 
 pub fn pair_bridge_peer(
@@ -2719,6 +2781,223 @@ mod tests {
             logs_dir: root.join("logs"),
             config_path: root.join("config.json"),
         }
+    }
+
+    /// A room whose legacy peer columns name a connected peer, as a joined
+    /// two-Host Bridge records it, with its projected peer row.
+    fn legacy_room(name: &str) -> (AppPaths, StoredRoom, String) {
+        let paths = test_paths(name);
+        init_database(&paths).unwrap();
+        let room = create_room(
+            &paths,
+            &[7u8; 32],
+            "123456",
+            15,
+            LocalRole::Joined,
+            Some("legacy-sync-room".into()),
+            Some(now_ts() + 3_600),
+        )
+        .unwrap();
+        update_room_peer(
+            &paths,
+            &room.id,
+            Some("10.0.0.2"),
+            Some(4100),
+            Some("remote"),
+            Some("remote-key"),
+            RoomStatus::Active,
+        )
+        .unwrap();
+        let route = legacy_bridge_peer_session_id(&room.id);
+        (paths, room, route)
+    }
+    fn remote_host() -> crate::host_identity::HostRef {
+        crate::host_identity::HostRef::from_device_id("legacy-sync-remote").unwrap()
+    }
+    fn data_version(observer: &Connection) -> i64 {
+        observer
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap()
+    }
+    fn peer_row(paths: &AppPaths, room_id: &str, route: &str) -> StoredBridgePeerEndpoint {
+        list_bridge_peer_endpoints(paths, room_id)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.peer_session_id == route)
+            .unwrap()
+    }
+    /// Syncs the projection of `room` as stored now, returning whether the
+    /// database file changed.
+    fn synced_with_commit(paths: &AppPaths, room_id: &str, observer: &Connection) -> bool {
+        let before = data_version(observer);
+        let room = get_room_by_id(paths, room_id).unwrap();
+        sync_legacy_bridge_peer_endpoint(paths, &room).unwrap();
+        data_version(observer) != before
+    }
+
+    #[test]
+    fn an_unchanged_legacy_peer_projection_is_not_rewritten() {
+        let (paths, room, route) = legacy_room("pastey_sync_unchanged");
+        bind_legacy_room_peer_host_ref(&paths, &room.id, remote_host().as_str()).unwrap();
+        let stored = peer_row(&paths, &room.id, &route);
+        let observer = Connection::open(&paths.db_path).unwrap();
+        for _ in 0..10 {
+            assert!(!synced_with_commit(&paths, &room.id, &observer));
+        }
+        // Nothing moved, not even the time of the last change, and the
+        // learned HostRef is kept.
+        let after = peer_row(&paths, &room.id, &route);
+        assert_eq!(after, stored);
+        assert_eq!(
+            after.logical_host_ref.as_deref(),
+            Some(remote_host().as_str())
+        );
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn every_semantic_change_to_the_legacy_peer_projection_commits() {
+        let (paths, room, route) = legacy_room("pastey_sync_changes");
+        let observer = Connection::open(&paths.db_path).unwrap();
+        let sql = |statement: &str| {
+            Connection::open(&paths.db_path)
+                .unwrap()
+                .execute(statement, params![room.id, route])
+                .unwrap();
+        };
+        // A projected column that drifted from the room is written back.
+        for drift in [
+            "UPDATE bridge_peers SET display_name='stale' WHERE room_id=?1 AND peer_session_id=?2",
+            "UPDATE bridge_peers SET join_method='nearby_accept' WHERE room_id=?1 AND peer_session_id=?2",
+            "UPDATE bridge_peers SET durable_identity_id='gone' WHERE room_id=?1 AND peer_session_id=?2",
+        ] {
+            sql(drift);
+            assert!(synced_with_commit(&paths, &room.id, &observer), "{drift}");
+            assert!(!synced_with_commit(&paths, &room.id, &observer), "{drift}");
+        }
+        // The room's peer is renamed.
+        update_room_peer(
+            &paths,
+            &room.id,
+            Some("10.0.0.2"),
+            Some(4100),
+            Some("renamed"),
+            Some("remote-key"),
+            RoomStatus::Active,
+        )
+        .unwrap();
+        assert_eq!(
+            peer_row(&paths, &room.id, &route).display_name.as_deref(),
+            Some("renamed")
+        );
+        assert!(!synced_with_commit(&paths, &room.id, &observer));
+        // The room is no longer active: the projection is disconnected.
+        sql("UPDATE rooms SET status='peer_left' WHERE id=?1 AND ?2 IS NOT NULL");
+        assert!(synced_with_commit(&paths, &room.id, &observer));
+        assert_eq!(
+            peer_row(&paths, &room.id, &route).liveness,
+            BridgePeerLiveness::Disconnected
+        );
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn a_new_legacy_endpoint_or_key_still_retires_the_old_route() {
+        for (host, port, key) in [
+            ("10.0.0.9", 4100, "remote-key"),
+            ("10.0.0.2", 4200, "remote-key"),
+            ("10.0.0.2", 4100, "rotated-key"),
+        ] {
+            let (paths, room, route) = legacy_room("pastey_sync_retire");
+            bind_legacy_room_peer_host_ref(&paths, &room.id, remote_host().as_str()).unwrap();
+            let observer = Connection::open(&paths.db_path).unwrap();
+            let before = data_version(&observer);
+            update_room_peer(
+                &paths,
+                &room.id,
+                Some(host),
+                Some(port),
+                Some("remote"),
+                Some(key),
+                RoomStatus::Active,
+            )
+            .unwrap();
+            assert_ne!(data_version(&observer), before);
+            // The old route is retired and a new legacy session carries the
+            // new endpoint, with no HostRef until the peer proves it again.
+            let old = peer_row(&paths, &room.id, &route);
+            assert_eq!(old.liveness, BridgePeerLiveness::Stale);
+            assert!(old.transport_public_key.is_none());
+            let current = list_bridge_peer_endpoints(&paths, &room.id)
+                .unwrap()
+                .into_iter()
+                .find(|p| p.liveness == BridgePeerLiveness::Connected)
+                .unwrap();
+            assert_ne!(current.peer_session_id, route);
+            assert_eq!(current.transport_public_key.as_deref(), Some(key));
+            assert_eq!(current.endpoint_port, Some(port));
+            assert!(current.logical_host_ref.is_none());
+            // The read-only check agrees: the old route is retired.
+            let room = get_room_by_id(&paths, &room.id).unwrap();
+            let peers = list_bridge_peer_endpoints(&paths, &room.id).unwrap();
+            assert!(!legacy_bridge_peer_projection_retires(
+                &room,
+                &peers,
+                &current.peer_session_id
+            ));
+            let _ = fs::remove_dir_all(paths.app_data_dir);
+        }
+    }
+
+    #[test]
+    fn only_real_changes_move_a_peer_to_the_most_recent_position() {
+        let (paths, room, route) = legacy_room("pastey_sync_order");
+        let other = StoredBridgePeerEndpoint {
+            room_id: room.id.clone(),
+            peer_session_id: "other-peer".into(),
+            display_name: Some("other".into()),
+            endpoint_host: Some("10.0.0.3".into()),
+            endpoint_port: Some(4300),
+            transport_public_key: Some("other-key".into()),
+            liveness: BridgePeerLiveness::Connected,
+            join_method: BridgePeerJoinMethod::ManualCode,
+            logical_host_ref: None,
+            durable_identity_id: None,
+            updated_at: now_ts() - 100,
+        };
+        upsert_bridge_peer_endpoint(&paths, &other).unwrap();
+        Connection::open(&paths.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE bridge_peers SET updated_at=?3 WHERE room_id=?1 AND peer_session_id=?2",
+                params![room.id, route, now_ts() - 200],
+            )
+            .unwrap();
+        let order = || {
+            list_bridge_peer_endpoints(&paths, &room.id)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.peer_session_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(), [route.clone(), "other-peer".into()]);
+        // An unchanged refresh keeps the order.
+        let room_now = get_room_by_id(&paths, &room.id).unwrap();
+        sync_legacy_bridge_peer_endpoint(&paths, &room_now).unwrap();
+        assert_eq!(order(), [route.clone(), "other-peer".into()]);
+        // A real change makes the legacy peer the most recent again.
+        update_room_peer(
+            &paths,
+            &room.id,
+            Some("10.0.0.2"),
+            Some(4100),
+            Some("renamed"),
+            Some("remote-key"),
+            RoomStatus::Active,
+        )
+        .unwrap();
+        assert_eq!(order(), ["other-peer".to_string(), route]);
+        let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 
     #[test]

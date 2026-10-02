@@ -839,16 +839,47 @@ pub(crate) fn room_control_session_context_for_peer(
     }
     let _ = storage::sync_legacy_bridge_peer_endpoint(&state.paths, &room)?;
     let peers = storage::list_bridge_peer_endpoints(&state.paths, room_id)?;
-    let route = selected_peer_control_route(room_id, peer_session_id);
-    let peer = resolve_room_control_route(Some(&route), room_id, &room, &peers)?;
+    selected_peer_session_context(state, &room, &peers, peer_session_id)
+}
+
+/// The read-only twin of `room_control_session_context_for_peer` for
+/// authority checks on a hot path: given the room and its peer rows as just
+/// read, it writes nothing (in particular it does not refresh the legacy
+/// peer projection). Where that refresh would retire the route, it fails
+/// closed instead.
+pub(crate) fn room_control_session_context_for_peer_read_only(
+    state: &AppState,
+    room: &crate::models::StoredRoom,
+    peers: &[StoredBridgePeerEndpoint],
+    peer_session_id: &str,
+) -> AppResult<RoomControlSessionContext> {
+    if room.status != RoomStatus::Active {
+        return Err(AppError::InvalidInput("Room is not active.".into()));
+    }
+    if storage::legacy_bridge_peer_projection_retires(room, peers, peer_session_id) {
+        return Err(AppError::InvalidInput(
+            "Room control route was replaced by a new legacy peer session.".into(),
+        ));
+    }
+    selected_peer_session_context(state, room, peers, peer_session_id)
+}
+
+fn selected_peer_session_context(
+    state: &AppState,
+    room: &crate::models::StoredRoom,
+    peers: &[StoredBridgePeerEndpoint],
+    peer_session_id: &str,
+) -> AppResult<RoomControlSessionContext> {
+    let route = selected_peer_control_route(&room.id, peer_session_id);
+    let peer = resolve_room_control_route(Some(&route), &room.id, room, peers)?;
     let local_key = state
         .active_servers
         .lock()
-        .get(room_id)
+        .get(&room.id)
         .map(|server| server.transport_public_key())
         .ok_or_else(|| AppError::InvalidInput("Room session is unavailable.".into()))?;
     Ok(RoomControlSessionContext {
-        room_id: room_id.to_string(),
+        room_id: room.id.clone(),
         local_session_ref: session_ref(&local_key),
         peer_session_ref: session_ref(&peer.transport_public_key),
         peer_route_ref: peer.peer_session_id.clone(),
