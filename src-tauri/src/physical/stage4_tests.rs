@@ -1469,11 +1469,23 @@ mod callback_finalization {
         lane: &FakeLane,
         then: impl FnOnce(&mut PhysicalControlServiceV1),
     ) {
+        return_after_reads(f, lane, 2, then)
+    }
+    /// As `return_while_core_is_held`, for a lane that makes `reads` clock
+    /// readings in all once released (a held lane makes no boundary check
+    /// after the wait: only the dispatch's own reading follows).
+    fn return_after_reads(
+        f: &ControlFixture,
+        lane: &FakeLane,
+        reads: u64,
+        then: impl FnOnce(&mut PhysicalControlServiceV1),
+    ) {
         let mut core = f.core.lock();
-        let reads = f.clock.reads.load(Ordering::SeqCst);
+        let before = f.clock.reads.load(Ordering::SeqCst);
         lane.release.notify_one();
-        // The lane's own boundary check, then the dispatch's return reading.
-        while f.clock.reads.load(Ordering::SeqCst) < reads + 2 {
+        let started = std::time::Instant::now();
+        while f.clock.reads.load(Ordering::SeqCst) < before + reads {
+            assert!(started.elapsed().as_secs() < 10, "the write never returned");
             std::thread::yield_now();
         }
         then(&mut core);
@@ -1914,21 +1926,255 @@ mod callback_finalization {
         audit_passes(&f);
     }
 
-    // h. Waiting for Core never makes a timely result late.
+    /// Starts the write on `lane`; returns it once the lane holds it.
+    async fn writing_on(
+        f: &ControlFixture,
+        a: &Arc<AdmittedBodyActionV1>,
+        lane: Arc<FakeLane>,
+    ) -> tokio::task::JoinHandle<crate::error::AppResult<()>> {
+        let (c, action, l) = (f.core.clone(), a.clone(), lane.clone());
+        let pending = tokio::spawn(async move {
+            PhysicalControlServiceV1::dispatch_admitted_action(&c, &action, &*l).await
+        });
+        lane.entered.notified().await;
+        pending
+    }
+    fn root_state(f: &ControlFixture) -> (String, Option<String>) {
+        f.sql()
+            .query_row(
+                "SELECT state,close_reason FROM physical_attempts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+    /// The supervisor's sample at the current time, as a tick takes it.
+    fn supervisor_sample(
+        core: &mut PhysicalControlServiceV1,
+        f: &ControlFixture,
+        s: &Arc<BodyControlSessionV1>,
+    ) -> crate::error::AppResult<()> {
+        let ticks = f.clock.ticks.load(Ordering::SeqCst);
+        core.record_control_observation(s, lane::observation(s, ticks, 0))
+    }
+
+    // h. Waiting for Core never makes a timely result late, and never by
+    // itself ends the stream.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_timely_result_that_waits_for_core_is_not_late() {
+    async fn a_timely_acceptance_that_waits_for_core_still_counts() {
         let f = ControlFixture::new();
-        let (_, a) = admitted(&f, 100_000).await;
+        let (s, a) = admitted(&f, 100_000).await;
         let (pending, lane) = writing(&f, &a, vec![Reply::Delayed]).await;
-        // Returned at 0 ms of 100; Core is busy until 150 ms.
-        return_while_core_is_held(&f, &lane, |_| advance_ms(&f, 150));
-        let result = pending.await.unwrap();
-        // The action row holds the timely result, with no late history. (The
-        // stream still closes: whether the action may still count is checked
-        // when Core takes the result.)
+        let (lifetimes, budget_at_dispatch) = (lane::lifetimes(&a), budget(&f));
+        // Returned at 0 ms of 100; Core is busy until 150 ms, and the
+        // supervisor's sample meanwhile finds the action past its deadline.
+        return_while_core_is_held(&f, &lane, |core| {
+            advance_ms(&f, 150);
+            supervisor_sample(core, &f, &s).unwrap();
+        });
+        pending.await.unwrap().unwrap();
         assert_eq!(f.disposition(), "accepted");
         assert!(callbacks(&f).is_empty());
-        assert!(result.is_err_and(|e| e.message() == "Action deadline passed"));
+        assert_eq!(root_state(&f), ("open".into(), None));
+        assert_eq!(f.session_state(), "active");
+        // Nothing is extended: the action stays over, and every lifetime and
+        // the budget are as they were when the write was sent.
+        assert_eq!(lane::lifetimes(&a), lifetimes);
+        assert_eq!(budget(&f), budget_at_dispatch);
+        assert!(!lane::action_valid(&mut f.core.lock(), &a));
+        assert!(PhysicalControlServiceV1::dispatch_admitted_action(
+            &f.core,
+            &a,
+            &FakeLane::new(vec![])
+        )
+        .await
+        .is_err());
+        assert!(f.core.lock().construct_session_grant(s).is_ok());
+        audit_passes(&f);
+    }
+
+    // An action the supervisor found past its time is over for every new
+    // use; checking it again (as a second dispatch of it would) refuses that
+    // use, and records no other reason: the timely result still counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checking_a_lapsed_action_again_does_not_revoke_its_timely_result() {
+        let f = ControlFixture::new();
+        let (s, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::Delayed]).await;
+        return_while_core_is_held(&f, &lane, |core| {
+            advance_ms(&f, 150);
+            supervisor_sample(core, &f, &s).unwrap();
+            assert!(!lane::action_valid(core, &a));
+        });
+        pending.await.unwrap().unwrap();
+        assert_eq!(f.disposition(), "accepted");
+        assert_eq!(root_state(&f), ("open".into(), None));
+        audit_passes(&f);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timely_refusal_that_waits_for_core_closes_only_by_the_refusal_rule() {
+        let f = ControlFixture::new();
+        let (_, a) = admitted(&f, 100_000).await;
+        let lane = Arc::new(FakeLane::held(vec![Reply::Refusal]));
+        let pending = writing_on(&f, &a, lane.clone()).await;
+        return_after_reads(&f, &lane, 1, |_| advance_ms(&f, 150));
+        let result = pending.await.unwrap();
+        // The refusal rule closes the Root, not the wait: the reason is the
+        // refusal, not an expired deadline.
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.message() == "Adapter refused or disposition unknown"),
+            "{result:?}"
+        );
+        assert_eq!(f.disposition(), "refused");
+        assert!(callbacks(&f).is_empty());
+        assert_eq!(root_state(&f), ("closed".into(), Some("revoked".into())));
+        audit_passes(&f);
+    }
+
+    #[tokio::test]
+    async fn a_result_returned_at_or_after_the_deadline_stays_late() {
+        for after_ms in [100, 150] {
+            let f = ControlFixture::new();
+            let (_, a) = admitted(&f, 100_000).await;
+            let (pending, lane) = writing(&f, &a, vec![Reply::LateSuccess]).await;
+            advance_ms(&f, after_ms);
+            lane.release.notify_one();
+            let result = pending.await.unwrap();
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.message() == "Action deadline passed"),
+                "{after_ms} ms: {result:?}"
+            );
+            let history = callbacks(&f);
+            assert_eq!(history.len(), 1);
+            assert!(history[0].late && history[0].returned_at >= history[0].deadline_at);
+            assert_eq!(
+                history[0].returned_at - history[0].deadline_at,
+                after_ms as i64 - 100
+            );
+            assert_eq!(root_state(&f).0, "closed");
+            audit_passes(&f);
+        }
+    }
+
+    // Closure, revocation and supersession during the wait are judged when
+    // Core takes the result, and fail closed even for a timely result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revocation_during_the_wait_fails_closed_for_a_timely_result() {
+        type Revoke = fn(&mut PhysicalControlServiceV1, &BodyControlSessionV1);
+        let revocations: [(&str, Revoke); 3] = [
+            ("root closed", |core, s| {
+                lane::close_session_root(core, s).unwrap()
+            }),
+            ("review revoked", lane::invalidate_review_of),
+            (
+                "environment policy or binding changed",
+                lane::invalidate_environment_of,
+            ),
+        ];
+        for (what, revoke) in revocations {
+            let f = ControlFixture::new();
+            let (s, a) = admitted(&f, 100_000).await;
+            let (pending, lane) = writing(&f, &a, vec![Reply::Delayed]).await;
+            let lifetimes = lane::lifetimes(&a);
+            return_while_core_is_held(&f, &lane, |core| {
+                advance_ms(&f, 40);
+                revoke(core, &s);
+            });
+            assert!(pending.await.unwrap().is_err(), "{what}");
+            // The timely result is kept as history of the closed action.
+            assert_eq!(f.disposition(), "dispatch_unknown", "{what}");
+            let history = callbacks(&f);
+            assert_eq!(history.len(), 1, "{what}");
+            assert_eq!(
+                (
+                    history[0].result.as_str(),
+                    history[0].state.as_str(),
+                    history[0].late
+                ),
+                ("accepted", "closed", false),
+                "{what}"
+            );
+            assert_eq!(root_state(&f).0, "closed", "{what}");
+            assert_eq!(f.session_state(), "quarantined", "{what}");
+            assert!(f.core.lock().construct_session_grant(s).is_err(), "{what}");
+            assert_eq!(lane::lifetimes(&a), lifetimes, "{what}");
+            audit_passes(&f);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_superseding_decision_during_the_wait_fails_closed_for_a_timely_result() {
+        let f = ControlFixture::stream(1_200_000, 6);
+        let (s, a) = admitted(&f, 500_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::Delayed]).await;
+        return_while_core_is_held(&f, &lane, |core| {
+            for _ in 0..3 {
+                advance_ms(&f, 80);
+                supervisor_sample(core, &f, &s).unwrap();
+            }
+            let next = core
+                .admit_decision(
+                    &lane::grant_of(&a),
+                    &LabelV1::try_from("test.proposer".to_owned()).unwrap(),
+                    &LabelV1::try_from("stop".to_owned()).unwrap(),
+                    PositiveMicros::try_from(100_000).unwrap(),
+                )
+                .unwrap();
+            assert_ne!(next.id(), a.id());
+        });
+        assert!(pending.await.unwrap().is_err());
+        let history = callbacks(&f);
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            (
+                history[0].result.as_str(),
+                history[0].state.as_str(),
+                history[0].late
+            ),
+            ("accepted", "closed", false)
+        );
+        assert_eq!(root_state(&f).0, "closed");
+        audit_passes(&f);
+    }
+
+    // The supervisor takes Core first: its sample finds the observation
+    // stale (which ends the stream, as before) and it closes the Root. The
+    // timely result is appended to the closed action's history only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_supervisor_ending_the_stream_during_the_wait_reopens_nothing() {
+        let f = ControlFixture::new();
+        let (s, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::Delayed]).await;
+        let mut closed_row = None;
+        return_while_core_is_held(&f, &lane, |core| {
+            advance_ms(&f, 40);
+            let ticks = f.clock.ticks.load(Ordering::SeqCst);
+            let stale =
+                core.record_control_observation(&s, lane::observation(&s, ticks, 10_000_000));
+            assert!(stale.is_err_and(|e| e.message() == "Observation stale or gapped"));
+            lane::close_session_root(core, &s).unwrap();
+            closed_row = Some(action_row(&f));
+        });
+        let result = pending.await.unwrap();
+        assert!(result.is_err_and(|e| e.message() == "Action closed before its result"));
+        assert_eq!(Some(action_row(&f)), closed_row);
+        let history = callbacks(&f);
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            (
+                history[0].result.as_str(),
+                history[0].state.as_str(),
+                history[0].late
+            ),
+            ("accepted", "closed", false)
+        );
+        assert_eq!(root_state(&f), ("closed".into(), Some("revoked".into())));
+        assert!(f.core.lock().construct_session_grant(s).is_err());
         audit_passes(&f);
     }
 

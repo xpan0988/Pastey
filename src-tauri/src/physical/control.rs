@@ -50,7 +50,7 @@ impl ControlStateV1 {
         }
         for a in self.actions.values() {
             if &a.audit.root == id {
-                a.valid.store(false, Ordering::Release);
+                a.revoke();
             }
         }
     }
@@ -62,7 +62,7 @@ impl ControlStateV1 {
             g.valid.store(false, Ordering::Release);
         }
         for a in self.actions.values() {
-            a.valid.store(false, Ordering::Release);
+            a.revoke();
         }
     }
 }
@@ -97,10 +97,23 @@ pub(in crate::physical) struct AdmittedBodyActionV1 {
     continuing_deadline: Arc<AtomicU64>,
     dispatch_decision: AtomicBool,
     valid: Arc<AtomicBool>,
+    /// Why `valid` was cleared: `revoked` for anything but time (superseded,
+    /// its Root, session or grant closed), `lapsed` for its deadline or
+    /// observation freshness only. A clear with neither counts as revoked.
+    revoked: AtomicBool,
+    lapsed: AtomicBool,
 }
 impl AdmittedBodyActionV1 {
     pub(in crate::physical) fn id(&self) -> &ActionId {
         &self.audit.proposal.action_id
+    }
+    fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
+        self.valid.store(false, Ordering::Release);
+    }
+    fn lapse(&self) {
+        self.lapsed.store(true, Ordering::Release);
+        self.valid.store(false, Ordering::Release);
     }
 }
 pub(in crate::physical) enum AdmissionOutcomeV1 {
@@ -698,13 +711,13 @@ impl PhysicalControlServiceV1 {
             if a.audit.session != s.audit.id {
                 continue;
             }
-            let live = a.valid.load(Ordering::Acquire)
-                && ticks < a.deadline
-                && ticks < a.continuing_deadline.load(Ordering::Acquire);
-            if !live {
-                // A superseded or finished decision is over; the device
-                // stopped it at its own deadline. It is never revived.
-                a.valid.store(false, Ordering::Release);
+            if !a.valid.load(Ordering::Acquire) {
+                continue;
+            }
+            if !(ticks < a.deadline && ticks < a.continuing_deadline.load(Ordering::Acquire)) {
+                // A finished decision is over; the device stopped it at its
+                // own deadline. It is never revived.
+                a.lapse();
                 continue;
             }
             a.continuing_deadline
@@ -903,9 +916,7 @@ impl PhysicalControlServiceV1 {
             .map(|a| a.id().clone())
             .collect();
         for id in &superseded {
-            self.control.actions[id]
-                .valid
-                .store(false, Ordering::Release);
+            self.control.actions[id].revoke();
         }
         self.store.admit_action(
             &g.session.root.audit,
@@ -928,6 +939,8 @@ impl PhysicalControlServiceV1 {
             continuing_deadline: Arc::new(AtomicU64::new(observation.deadline.min(deadline))),
             dispatch_decision: AtomicBool::new(false),
             valid: Arc::new(AtomicBool::new(true)),
+            revoked: AtomicBool::new(false),
+            lapsed: AtomicBool::new(false),
         });
         self.control
             .actions
@@ -936,30 +949,60 @@ impl PhysicalControlServiceV1 {
         Ok(AdmissionOutcomeV1::Admitted(action))
     }
     fn validate_admitted_action(&mut self, a: &AdmittedBodyActionV1) -> AppResult<()> {
+        self.validate_admitted_action_at(a, None)
+    }
+    /// With `returned` (the tick at which the binding's write returned), the
+    /// action's own time limits, its deadline and its observation freshness
+    /// (what its lane validity carries), are judged at that tick; everything
+    /// else is judged now. Without it, all of it is judged now.
+    fn validate_admitted_action_at(
+        &mut self,
+        a: &AdmittedBodyActionV1,
+        returned: Option<u64>,
+    ) -> AppResult<()> {
+        let (mut timed_out, mut cleared_before) = (false, false);
         let result = (|| {
             self.validate_control_grant(&a.grant)?;
             let (_, ticks) = self.binding.now()?;
+            // After the write, a validity cleared only because time ran out
+            // is judged by the times below.
+            let current = match returned {
+                None => a.valid.load(Ordering::Acquire),
+                Some(_) => {
+                    !a.revoked.load(Ordering::Acquire)
+                        && (a.valid.load(Ordering::Acquire) || a.lapsed.load(Ordering::Acquire))
+                }
+            };
+            let registered = self
+                .control
+                .actions
+                .get(a.id())
+                .is_some_and(|entry| Arc::ptr_eq(&entry.valid, &a.valid));
+            // A validity cleared earlier keeps the reason recorded then; one
+            // cleared with no recorded reason counts as revoked.
+            cleared_before = registered
+                && (a.revoked.load(Ordering::Acquire) || a.lapsed.load(Ordering::Acquire));
+            require(registered && current, "Action superseded or closed")?;
+            cleared_before = false;
+            let at = returned.map_or(ticks, |r| r.min(ticks));
+            timed_out = true;
+            require(at < a.deadline, "Action deadline passed")?;
             require(
-                a.valid.load(Ordering::Acquire)
-                    && self
-                        .control
-                        .actions
-                        .get(a.id())
-                        .is_some_and(|entry| Arc::ptr_eq(&entry.valid, &a.valid)),
-                "Action superseded or closed",
-            )?;
-            require(ticks < a.deadline, "Action deadline passed")?;
-            require(
-                ticks < a.continuing_deadline.load(Ordering::Acquire),
+                at < a.continuing_deadline.load(Ordering::Acquire),
                 "Action observation freshness lapsed",
             )?;
+            timed_out = false;
             require(
                 self.store.action_status(a.id())?.0 == "open",
                 "Durable action closed",
             )
         })();
         if result.is_err() {
-            a.valid.store(false, Ordering::Release);
+            if timed_out {
+                a.lapse();
+            } else if !cleared_before {
+                a.revoke();
+            }
         }
         result
     }
@@ -1042,7 +1085,10 @@ impl PhysicalControlServiceV1 {
         // recorded regardless, in one ledger transaction: on the action if it
         // is still open (after its deadline too), as history if it closed
         // while the write was out. Nothing here returns before that record.
-        let still_valid = service.validate_admitted_action(a);
+        // Whether a recorded result still counts judges the action's time
+        // limits when the write returned, so waiting for Core never expires
+        // it; closure, revocation and supersession are judged now.
+        let still_valid = service.validate_admitted_action_at(a, returned);
         let accepted = match result {
             Ok(Some(reply))
                 if reply.session == a.audit.session
@@ -1539,6 +1585,34 @@ pub(in crate::physical) mod test_support {
                 lock_wait_us: 0,
             },
         )
+    }
+    /// Invalidates `s`'s Root in memory the way a policy or binding change
+    /// for its environment does.
+    pub(in crate::physical) fn invalidate_environment_of(
+        core: &mut PhysicalControlServiceV1,
+        s: &BodyControlSessionV1,
+    ) {
+        core.invalidate_environment(&s.root.audit.environment);
+    }
+    /// Invalidates `s`'s Root in memory the way revoking its review does.
+    pub(in crate::physical) fn invalidate_review_of(
+        core: &mut PhysicalControlServiceV1,
+        s: &BodyControlSessionV1,
+    ) {
+        core.invalidate_review(&s.root.audit.review_id, s.root.audit.review_revision, None);
+    }
+    pub(in crate::physical) fn grant_of(a: &AdmittedBodyActionV1) -> Arc<BodyActionGrantV1> {
+        a.grant.clone()
+    }
+    /// Every live lifetime an action depends on, in ticks: its deadline, its
+    /// observation freshness, its session's lease and its Root's expiry.
+    pub(in crate::physical) fn lifetimes(a: &AdmittedBodyActionV1) -> [u64; 4] {
+        [
+            a.deadline,
+            a.continuing_deadline.load(Ordering::Acquire),
+            a.grant.session.deadline,
+            a.grant.session.root.deadline_ticks,
+        ]
     }
     /// Closes `s`'s Root, as any close of a stream does.
     pub(in crate::physical) fn close_session_root(
