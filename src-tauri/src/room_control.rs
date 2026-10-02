@@ -90,6 +90,16 @@ const NATIVE_AGENT_PROTOCOL_FAMILY: &str = "native_agent";
 const BRIDGE_MEMBERSHIP_SCHEMA: &str = "pastey-bridge-membership-v1";
 const MAX_TERMINAL_EVENTS_PER_MINUTE: usize = 3_000;
 const MAX_TERMINAL_BURST_EVENTS: usize = 256;
+/// Physical control has its own bound, apart from the generic Room Control
+/// quota. A Physical stream's valid traffic is far below it: its MCP relay
+/// sends one request and waits for its reply (or 30 s) before the next, and
+/// the executor rate-limits decisions and observations itself; the bound
+/// only caps transport abuse. It must sit well above valid traffic: a
+/// rejected request means nothing happened, but a rejected reply means the
+/// action may have happened and only a status query repairs the requester's
+/// view.
+const MAX_PHYSICAL_EVENTS_PER_MINUTE: usize = 3_000;
+const MAX_PHYSICAL_BURST_EVENTS: usize = 256;
 
 /// Writes only fixed capability metadata and reason codes. In particular, it
 /// never includes a transport key, endpoint, route binding, path, or grant.
@@ -469,6 +479,9 @@ struct RoomControlRoomState {
     terminal_seen_event_ids: VecDeque<String>,
     terminal_seen_event_id_set: HashSet<String>,
     terminal_received_at_seconds: VecDeque<i64>,
+    physical_seen_event_ids: VecDeque<String>,
+    physical_seen_event_id_set: HashSet<String>,
+    physical_received_at_seconds: VecDeque<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1547,18 +1560,22 @@ pub async fn receive_room_control_event_handler(
         {
             let mut runtime = ctx.state.room_control.lock();
             let room_state = runtime.rooms.entry(room_id.clone()).or_default();
-            if !accept_rate_limited_event(room_state, OffsetDateTime::now_utc().unix_timestamp()) {
+            if !accept_physical_rate_limited_event(
+                room_state,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            ) {
                 return control_error(
                     StatusCode::TOO_MANY_REQUESTS,
-                    "rate_limited",
-                    "Physical control rate exceeded.",
+                    "physical_rate_limited",
+                    "Physical control event rate exceeded.",
                 );
             }
-            // Transport cache remains bounded. Physical semantic replay below
-            // remains durable and can return a known result after a lost reply.
+            // Transport cache remains bounded and separate from other Room
+            // Control events. Physical semantic replay below remains durable
+            // and can return a known result after a lost reply.
             record_replay_id(
-                &mut room_state.seen_event_ids,
-                &mut room_state.seen_event_id_set,
+                &mut room_state.physical_seen_event_ids,
+                &mut room_state.physical_seen_event_id_set,
                 validated.event_id.clone(),
             );
         }
@@ -3055,6 +3072,7 @@ async fn control_response_failure(response: reqwest::Response) -> AppError {
         Some("session_mismatch") => "Room control session mismatch.",
         Some("inbox_full") => "Room control inbox is full.",
         Some("terminal_rate_limited") => "Developer Terminal flow-control limit was reached.",
+        Some("physical_rate_limited") => "Physical control flow-control limit was reached.",
         Some("rate_limited") => "Room control rate limit was reached.",
         Some("terminal_sequence_rejected") => "Developer Terminal sequence was rejected.",
         Some("terminal_authority_rejected") => "Developer Terminal authority rejected the event.",
@@ -3148,6 +3166,29 @@ fn accept_rate_limited_event(room: &mut RoomControlRoomState, now_seconds: i64) 
         return false;
     }
     room.received_at_seconds.push_back(now_seconds);
+    true
+}
+
+/// Physical control's own bound; it never touches the generic quota.
+fn accept_physical_rate_limited_event(room: &mut RoomControlRoomState, now_seconds: i64) -> bool {
+    while room
+        .physical_received_at_seconds
+        .front()
+        .is_some_and(|timestamp| *timestamp <= now_seconds - 60)
+    {
+        room.physical_received_at_seconds.pop_front();
+    }
+    let burst_count = room
+        .physical_received_at_seconds
+        .iter()
+        .filter(|timestamp| **timestamp > now_seconds - 2)
+        .count();
+    if room.physical_received_at_seconds.len() >= MAX_PHYSICAL_EVENTS_PER_MINUTE
+        || burst_count >= MAX_PHYSICAL_BURST_EVENTS
+    {
+        return false;
+    }
+    room.physical_received_at_seconds.push_back(now_seconds);
     true
 }
 
@@ -3656,6 +3697,100 @@ mod tests {
             assert!(accept_rate_limited_event(&mut room, 100));
         }
         assert!(!accept_rate_limited_event(&mut room, 100));
+    }
+
+    #[test]
+    fn physical_and_generic_quotas_are_independent_in_both_directions() {
+        // The generic quota is exhausted: Physical control still flows.
+        let mut room = RoomControlRoomState::default();
+        for second in 0..MAX_EVENTS_PER_MINUTE as i64 {
+            assert!(accept_rate_limited_event(&mut room, 100 + second));
+        }
+        let exhausted = 100 + MAX_EVENTS_PER_MINUTE as i64;
+        assert!(!accept_rate_limited_event(&mut room, exhausted));
+        for _ in 0..MAX_PHYSICAL_BURST_EVENTS {
+            assert!(accept_physical_rate_limited_event(&mut room, exhausted));
+        }
+        // Physical control is exhausted: generic events still flow.
+        let mut room = RoomControlRoomState::default();
+        for _ in 0..MAX_PHYSICAL_BURST_EVENTS {
+            assert!(accept_physical_rate_limited_event(&mut room, 10));
+        }
+        assert!(!accept_physical_rate_limited_event(&mut room, 10));
+        for _ in 0..MAX_BURST_EVENTS {
+            assert!(accept_rate_limited_event(&mut room, 10));
+        }
+        assert!(room.received_at_seconds.len() == MAX_BURST_EVENTS);
+        assert!(room.physical_received_at_seconds.len() == MAX_PHYSICAL_BURST_EVENTS);
+    }
+
+    #[test]
+    fn the_physical_limiter_is_finite_per_burst_and_per_minute() {
+        let mut room = RoomControlRoomState::default();
+        // A burst is capped within two seconds and recovers after them.
+        for _ in 0..MAX_PHYSICAL_BURST_EVENTS {
+            assert!(accept_physical_rate_limited_event(&mut room, 1_000));
+        }
+        assert!(!accept_physical_rate_limited_event(&mut room, 1_001));
+        assert!(accept_physical_rate_limited_event(&mut room, 1_002));
+        // Spread evenly below the burst cap, a minute still holds at most
+        // the per-minute bound.
+        let mut room = RoomControlRoomState::default();
+        let mut accepted = 0;
+        for event in 0..(MAX_PHYSICAL_EVENTS_PER_MINUTE * 2) {
+            let second = 2_000 + (event / 100) as i64;
+            if second >= 2_060 {
+                break;
+            }
+            if accept_physical_rate_limited_event(&mut room, second) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, MAX_PHYSICAL_EVENTS_PER_MINUTE);
+        assert!(!accept_physical_rate_limited_event(&mut room, 2_059));
+        // Valid Physical traffic (a few events a second for minutes) is
+        // nowhere near either bound.
+        let mut room = RoomControlRoomState::default();
+        for tenth in 0..(10 * 60 * 5) {
+            assert!(accept_physical_rate_limited_event(
+                &mut room,
+                3_000 + tenth / 10
+            ));
+        }
+    }
+
+    #[test]
+    fn physical_replay_ids_do_not_evict_other_room_control_replay_ids() {
+        let mut room = RoomControlRoomState::default();
+        record_replay_id(
+            &mut room.seen_event_ids,
+            &mut room.seen_event_id_set,
+            "generic-event".into(),
+        );
+        for n in 0..(MAX_REPLAY_ITEMS * 2) {
+            record_replay_id(
+                &mut room.physical_seen_event_ids,
+                &mut room.physical_seen_event_id_set,
+                format!("physical-{n}"),
+            );
+        }
+        assert!(room.seen_event_id_set.contains("generic-event"));
+        assert!(room.physical_seen_event_ids.len() <= MAX_REPLAY_ITEMS);
+    }
+
+    #[test]
+    fn burn_purge_removes_physical_rate_and_replay_state() {
+        let mut runtime = RoomControlRuntimeState::default();
+        let mut room = RoomControlRoomState::default();
+        assert!(accept_physical_rate_limited_event(&mut room, 1));
+        record_replay_id(
+            &mut room.physical_seen_event_ids,
+            &mut room.physical_seen_event_id_set,
+            "physical".into(),
+        );
+        runtime.rooms.insert("room".into(), room);
+        assert!(runtime.purge_room("room"));
+        assert!(runtime.rooms.get("room").is_none());
     }
 
     #[test]

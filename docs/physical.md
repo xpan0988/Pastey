@@ -122,6 +122,11 @@ A brain on another Host reaches the stream through a Host-owned MCP server on it
   - An agent's first tool call costs one extra Bridge round trip (the session opens on it).
   - Two grants for the same Start (Connect clicked twice) can both initialize; the first to call commits and the other's calls are refused.
 
+### Bridge transport for Physical control
+
+- **Physical control has its own flow control.** `physical.control` events count against their own in-memory bound (3,000 per minute and 256 per 2 seconds per Bridge), never against the generic Room Control quota, and generic events never count against it; their transport replay cache is separate too. Both are cleared with the Bridge's other Room Control state on Burn and purge. A rejection carries its own code, `physical_rate_limited`. The bound only caps transport abuse: the MCP relay sends one request and waits for its reply before the next, and the executor limits decisions and observations itself. It must stay well above valid traffic, because the two directions fail differently: a rejected request means nothing happened, while a rejected reply means the action may have happened and only a status query repairs the requester's view.
+- **Protocol compatibility is asked once per Host session.** `pastey.physical.control` is protocol metadata, not authority. The first Physical command on a Host session (Discover, Start, Status or any tool request) asks the executor's capabilities; the answer is kept for that exact `HostSessionBinding` (route, session references, session pair and expiry) and reused only while it stays exactly the same and unexpired. Any replacement asks again, an incompatible answer forgets it, and Burn or purge clears it. Every command still validates the current session and route.
+
 ### Driving the reference body from an MCP brain (development)
 
 A development build can offer the simulated flat (see [`tests/physical_demo`](../tests/physical_demo/README.md)) as a real executor. The `physical-sim` Cargo feature compiles the reference bindings into the Host; a release build refuses to compile with it.

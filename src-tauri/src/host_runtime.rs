@@ -103,6 +103,7 @@ pub struct HostRuntime {
     /// Receiver-local Search grants. They are process-local only.
     pub(crate) bridge_plan_protocol_authority: Mutex<bridge_plan::ProtocolSearchAuthorityStore>,
     pub(crate) peer_capabilities: Mutex<peer_capabilities::PeerCapabilityStore>,
+    pub(crate) physical_compatibility: Mutex<PhysicalCompatibilityV1>,
     pub(crate) host_admission: HostAdmissionService,
     pub(crate) managed_objects: Mutex<managed_objects::ManagedObjectBindingService>,
     /// Managed-effect contracts, control state, and evidence. No live
@@ -233,6 +234,7 @@ impl HostRuntime {
                 bridge_plan::ProtocolSearchAuthorityStore::default(),
             ),
             peer_capabilities: Mutex::new(peer_capabilities::PeerCapabilityStore::default()),
+            physical_compatibility: Mutex::new(PhysicalCompatibilityV1::default()),
             host_admission: HostAdmissionService::new(local_host_ref.clone()),
             managed_objects: Mutex::new(managed_objects::ManagedObjectBindingService::new(
                 local_host_ref,
@@ -273,6 +275,7 @@ impl HostRuntime {
         // is not a Bridge Burn. Keep Native Agent's durable recovery envelope
         // and retained result material so a fresh session can reconcile it.
         let _ = self.native_agents.lock().revoke_bridge_session(room_id);
+        self.physical_compatibility.lock().purge_room(room_id);
         let _ = self
             .physical_control
             .lock()
@@ -952,6 +955,103 @@ mod tests {
         );
     }
 
+    fn physical_projection(
+        route: &str,
+        protocol: &str,
+    ) -> peer_capabilities::PeerCapabilityProjection {
+        peer_capabilities::PeerCapabilityProjection {
+            schema_version: peer_capabilities::PEER_CAPABILITY_SCHEMA.into(),
+            peer_session_id: route.into(),
+            observed_at: storage::now_ts(),
+            capabilities: vec![peer_capabilities::HostCapabilityFact {
+                capability_id: "pastey.physical.control".into(),
+                available: true,
+                accepted_input_media_types: vec![],
+                effect: "physical_protocol_compatibility".into(),
+                supported_protocols: vec![protocol.into()],
+                unavailable_reason: None,
+            }],
+        }
+    }
+    fn physical_binding(route: &str, peer_session: &str, expires_at: i64) -> HostSessionBinding {
+        HostSessionBinding::new(
+            "bridge",
+            HostRef::from_device_id("compat-local").unwrap(),
+            HostRef::from_device_id("compat-peer").unwrap(),
+            "local-session",
+            peer_session,
+            route,
+            expires_at,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn physical_compatibility_is_reused_only_for_the_exact_unexpired_session() {
+        let now = storage::now_ts();
+        let current = physical_binding("route-1", "peer-session-1", now + 600);
+        let compatible = physical_projection("route-1", crate::physical::protocol::PROTOCOL);
+        let mut known = PhysicalCompatibilityV1::default();
+        assert!(!known.holds(&current, now));
+        known.establish(&current, &compatible).unwrap();
+        assert!(known.holds(&current, now));
+        // A replaced route or peer session is a different binding: asked again.
+        assert!(!known.holds(
+            &physical_binding("route-2", "peer-session-1", now + 600),
+            now
+        ));
+        assert!(!known.holds(
+            &physical_binding("route-1", "peer-session-2", now + 600),
+            now
+        ));
+        // An expired binding is never reused.
+        assert!(!known.holds(&current, current.expires_at));
+        // A new session that answers with an incompatible protocol is refused,
+        // and the earlier fact for that peer is forgotten.
+        let replaced = physical_binding("route-1", "peer-session-2", now + 600);
+        let incompatible = physical_projection("route-1", "physical-control-v1");
+        assert!(known.establish(&replaced, &incompatible).is_err());
+        assert!(!known.holds(&replaced, now));
+        assert!(!known.holds(&current, now));
+        // Burn or purge of the Bridge forgets it.
+        known.establish(&current, &compatible).unwrap();
+        known.purge_room("other-bridge");
+        assert!(known.holds(&current, now));
+        known.purge_room("bridge");
+        assert!(!known.holds(&current, now));
+    }
+
+    #[test]
+    fn purging_a_bridge_forgets_its_physical_compatibility() {
+        let root = std::env::temp_dir().join(format!(
+            "pastey-host-runtime-physical-compat-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::new(root.clone(), root.join("logs"));
+        paths.ensure_directories().unwrap();
+        storage::init_database(&paths).unwrap();
+        let runtime = HostRuntime::new(
+            paths.clone(),
+            test_config(),
+            Arc::new(RecordingEventSink::default()),
+            Arc::new(RecordingTaskSpawner::default()),
+        )
+        .unwrap();
+        let now = storage::now_ts();
+        let current = physical_binding("route-1", "peer-session-1", now + 600);
+        runtime
+            .physical_compatibility
+            .lock()
+            .establish(
+                &current,
+                &physical_projection("route-1", crate::physical::protocol::PROTOCOL),
+            )
+            .unwrap();
+        runtime.purge_room("bridge");
+        assert!(!runtime.physical_compatibility.lock().holds(&current, now));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn burn_purges_worker_run_registry_after_cancellation() {
         let root = std::env::temp_dir().join(format!(
@@ -1035,6 +1135,50 @@ mod tests {
             .is_err());
         assert_eq!(runtime.local_host_ref, durable_host_ref);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// The physical protocol compatibility each exact current Host session has
+/// shown. `pastey.physical.control` is protocol metadata, not authority: it
+/// is asked for once per Host session and reused only while the session is
+/// exactly the same `HostSessionBinding` (route, session refs, session pair
+/// and expiry) and unexpired. Any replacement asks again; Burn and purge
+/// forget it.
+#[derive(Default)]
+pub(crate) struct PhysicalCompatibilityV1 {
+    known: std::collections::BTreeMap<(String, String), HostSessionBinding>,
+}
+impl PhysicalCompatibilityV1 {
+    fn key(binding: &HostSessionBinding) -> (String, String) {
+        (
+            binding.bridge_id.clone(),
+            binding.peer_host_ref.as_str().to_owned(),
+        )
+    }
+    /// Whether this exact, unexpired session has shown compatibility.
+    pub(crate) fn holds(&self, binding: &HostSessionBinding, now: i64) -> bool {
+        binding.expires_at > now
+            && self
+                .known
+                .get(&Self::key(binding))
+                .is_some_and(|known| known == binding)
+    }
+    /// Records compatibility for `binding` if `projection` (this session's
+    /// capability answer) shows it; otherwise forgets any earlier fact for
+    /// that peer and fails.
+    pub(crate) fn establish(
+        &mut self,
+        binding: &HostSessionBinding,
+        projection: &peer_capabilities::PeerCapabilityProjection,
+    ) -> AppResult<()> {
+        let key = Self::key(binding);
+        self.known.remove(&key);
+        projection.require_physical_protocol()?;
+        self.known.insert(key, binding.clone());
+        Ok(())
+    }
+    pub(crate) fn purge_room(&mut self, room_id: &str) {
+        self.known.retain(|(bridge, _), _| bridge != room_id);
     }
 }
 
@@ -1153,8 +1297,18 @@ impl HostRuntime {
         let session = self
             .resolve_current_remote_host_session(bridge, target)
             .await?;
-        let projection = session.request_capability_projection(self.clone()).await?;
-        projection.require_physical_protocol()?;
+        // Protocol compatibility is asked once per exact Host session; every
+        // command below still validates the current session and route.
+        let known = self
+            .physical_compatibility
+            .lock()
+            .holds(session.binding(), storage::now_ts());
+        if !known {
+            let projection = session.request_capability_projection(self.clone()).await?;
+            self.physical_compatibility
+                .lock()
+                .establish(session.binding(), &projection)?;
+        }
         let current = self
             .resolve_current_remote_host_session(bridge, target)
             .await?;
