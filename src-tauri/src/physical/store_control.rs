@@ -79,6 +79,31 @@ CREATE TABLE physical_effect_bound_violations(root_id TEXT PRIMARY KEY,action_id
 CREATE TRIGGER physical_effect_bound_immutable BEFORE UPDATE ON physical_effect_bound_violations BEGIN SELECT RAISE(ABORT,'physical effect bound verdict immutable');END;
 CREATE TRIGGER physical_effect_bound_keep BEFORE DELETE ON physical_effect_bound_violations BEGIN SELECT RAISE(ABORT,'physical effect bound verdict required');END;
 "#;
+/// The exact result of a write Core attempted that it could not record on
+/// the action itself: one that came back after the action's deadline, or
+/// after the action was closed (the closed row is immutable and keeps its
+/// dispatch_unknown disposition). History only: it names the write's
+/// operation, when `apply` returned (before any wait for Core), when it was
+/// recorded, the deadline, and whether the action row was still open. It
+/// never revives, extends, refunds or authorizes anything, and Verified,
+/// acceptance, grants and budget never read it.
+pub(super) const ACTION_CALLBACK_SCHEMA: &str = r#"
+CREATE TABLE physical_action_callbacks(
+ operation_id TEXT PRIMARY KEY,
+ action_id TEXT NOT NULL UNIQUE REFERENCES physical_actions(action_id),
+ payload_digest TEXT NOT NULL,
+ apply_result TEXT NOT NULL CHECK(apply_result IN ('accepted','refused')),
+ action_state TEXT NOT NULL CHECK(action_state IN ('open','closed')),
+ apply_returned_at INTEGER NOT NULL CHECK(apply_returned_at>0),
+ recorded_at INTEGER NOT NULL CHECK(recorded_at>=apply_returned_at),
+ lock_wait_us INTEGER NOT NULL CHECK(lock_wait_us>=0),
+ deadline_at INTEGER NOT NULL CHECK(deadline_at>0),
+ late INTEGER NOT NULL CHECK(late=(apply_returned_at>=deadline_at)),
+ CHECK(action_state='closed' OR late=1)
+) STRICT;
+CREATE TRIGGER physical_action_callbacks_immutable BEFORE UPDATE ON physical_action_callbacks BEGIN SELECT RAISE(ABORT,'physical immutable action callback');END;
+CREATE TRIGGER physical_action_callbacks_keep BEFORE DELETE ON physical_action_callbacks BEGIN SELECT RAISE(ABORT,'physical action callback history required');END;
+"#;
 /// Stage 10 relaxes the one-action constraints of the control tables.
 pub(super) fn stage10(ddl: &str) -> String {
     ddl.replace(
@@ -400,7 +425,7 @@ impl PhysicalStoreV1 {
         )?;
         // Replacement fence: the previous decision closes in the same
         // transaction that admits this one.
-        tx.execute("UPDATE physical_actions SET state='closed',operation_id=NULL,revision=revision+1 WHERE root_id=?1 AND state='open'",[text(&x.root)])?;
+        tx.execute("UPDATE physical_actions SET state='closed',revision=revision+1 WHERE root_id=?1 AND state='open'",[text(&x.root)])?;
         tx.execute("INSERT INTO physical_actions(action_id,root_id,session_id,grant_id,decision_sequence,payload_digest,proposal_digest,challenge_id,requested_us,reserved_us,expires_at,audit_digest,audit_json,state,revision,disposition) VALUES(?1,?2,?3,?4,?13,?5,?6,?7,?8,?9,?10,?11,?12,'open',1,'not_sent')",params![text(&x.proposal.action_id),text(&x.root),text(&x.session),text(&x.grant),text(&x.proposal.payload_digest),text(&digest("pastey-physical-proposal-v1",&x.proposal)?),text(&x.proposal.challenge_id),checked_integer(x.proposal.requested_duration_us.get())?,checked_integer(x.reserved_us)?,x.expires_at.get() as i64,text(&x.digest()?),serde_json::to_string(x)?,checked_integer(x.proposal.decision_sequence)?])?;
         insert_decision(
             &tx,
@@ -439,32 +464,85 @@ impl PhysicalStoreV1 {
         self.commit(tx)?;
         Ok(())
     }
+    /// Records what the binding answered for the write `cb.op` of `x`, in one
+    /// transaction. Recording needs the exact action and session, a write
+    /// still waiting for its result, and nothing more: not the action's
+    /// deadline, not current authority. An open action is finalized (a result
+    /// after its deadline also leaves history); a closed one stays exactly as
+    /// it closed, and an exact result only appends history. Whether the
+    /// session was still current is reported, never required.
     pub(in crate::physical) fn finish_write(
         &self,
         a: &RootAuditV1,
         s: &SessionAuditV1,
         x: &ActionAuditV1,
-        snapshot: &BindingLedgerSnapshotV1,
-        now: UnixMillis,
-        op: &RequestId,
-        result: Option<bool>,
-    ) -> AppResult<bool> {
+        snapshot: Option<&BindingLedgerSnapshotV1>,
+        cb: &WriteCallbackV1<'_>,
+    ) -> AppResult<CallbackRecordV1> {
         let mut c = self.connection()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.audit(&tx)?;
-        current_session(&tx, a, s, snapshot, now, true)?;
-        require(
-            action(&tx, &x.proposal.action_id)? == *x && now < x.expires_at,
-            "Closed/mismatched action callback",
+        let raw: String = tx.query_row(
+            "SELECT audit_json FROM physical_sessions WHERE session_id=?1",
+            [text(&s.id)],
+            |r| r.get(0),
         )?;
-        let disposition = match result {
-            Some(true) => ActionDispositionV1::Accepted,
-            Some(false) => ActionDispositionV1::Refused,
-            None => ActionDispositionV1::DispatchUnknown,
+        require(
+            action(&tx, &x.proposal.action_id)? == *x && raw == serde_json::to_string(s)?,
+            "Mismatched action callback",
+        )?;
+        let (state, waiting): (String, bool) = tx.query_row(
+            "SELECT state,operation_id=?2 AND disposition=?3 AND apply_result IS NULL AND NOT EXISTS(SELECT 1 FROM physical_action_callbacks WHERE operation_id=?2) FROM physical_actions WHERE action_id=?1",
+            params![
+                text(&x.proposal.action_id),
+                text(cb.op),
+                tag(&ActionDispositionV1::DispatchUnknown)?
+            ],
+            |r| Ok((r.get(0)?, r.get::<_, Option<bool>>(1)?.unwrap_or(false))),
+        )?;
+        if !waiting {
+            self.commit(tx)?;
+            return Ok(CallbackRecordV1::Unrecorded);
+        }
+        let applied = cb.result.map(|b| if b { "accepted" } else { "refused" });
+        let late = cb.returned_at >= x.expires_at;
+        let outcome = if state == "open" {
+            let current = snapshot
+                .is_some_and(|snap| current_session(&tx, a, s, snap, cb.recorded_at, true).is_ok());
+            let disposition = match cb.result {
+                Some(true) => ActionDispositionV1::Accepted,
+                Some(false) => ActionDispositionV1::Refused,
+                None => ActionDispositionV1::DispatchUnknown,
+            };
+            // A result keeps the operation that produced it; a write that
+            // came back without one releases it, so nothing can follow.
+            let n=tx.execute("UPDATE physical_actions SET disposition=?3,apply_result=?4,operation_id=CASE WHEN ?4 IS NULL THEN NULL ELSE operation_id END,revision=revision+1 WHERE action_id=?1 AND state='open' AND operation_id=?2",params![text(&x.proposal.action_id),text(cb.op),tag(&disposition)?,applied])?;
+            require(n == 1, "Mismatched action callback")?;
+            CallbackRecordV1::Finalized { current }
+        } else {
+            CallbackRecordV1::AfterClose
         };
-        let n=tx.execute("UPDATE physical_actions SET disposition=?3,apply_result=COALESCE(apply_result,?4),operation_id=NULL,revision=revision+1 WHERE action_id=?1 AND state='open' AND operation_id=?2",params![text(&x.proposal.action_id),text(op),tag(&disposition)?,result.map(|b|if b{"accepted"}else{"refused"})])?;
+        if let Some(applied) = applied {
+            if state == "closed" || late {
+                tx.execute(
+                    "INSERT INTO physical_action_callbacks VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    params![
+                        text(cb.op),
+                        text(&x.proposal.action_id),
+                        text(&x.proposal.payload_digest),
+                        applied,
+                        state,
+                        checked_integer(cb.returned_at.get())?,
+                        checked_integer(cb.recorded_at.get())?,
+                        checked_integer(cb.lock_wait_us)?,
+                        checked_integer(x.expires_at.get())?,
+                        late
+                    ],
+                )?;
+            }
+        }
         self.commit(tx)?;
-        Ok(n == 1)
+        Ok(outcome)
     }
     /// (state, disposition, reserved, consumed) of an action and its root.
     pub(in crate::physical) fn action_status(
@@ -558,7 +636,9 @@ pub(super) fn close_root(c: &Connection, id: &RootId) -> AppResult<()> {
         c.execute("UPDATE physical_domain_reservations SET state='quarantined' WHERE session_id=?1 AND state='held'",[text(&s.id)])?;
         // Only rows that provably never reached dispatch intent release reservation.
         c.execute("UPDATE physical_control_budgets SET reserved_us=0,reserved_count=0,revision=revision+1 WHERE root_id=?1 AND consumed_us=0",[text(id)])?;
-        c.execute("UPDATE physical_actions SET state='closed',operation_id=NULL,revision=revision+1 WHERE root_id=?1 AND state='open'",[text(id)])?;
+        // A write still out keeps its operation: its exact result, if it
+        // comes back, is history for this closed row (never a change to it).
+        c.execute("UPDATE physical_actions SET state='closed',revision=revision+1 WHERE root_id=?1 AND state='open'",[text(id)])?;
     }
     Ok(())
 }
@@ -619,6 +699,28 @@ pub(crate) enum ActionDispositionV1 {
     DispatchUnknown,
     Accepted,
     Refused,
+}
+/// What came back for one write Core attempted, as Core saw it.
+pub(in crate::physical) struct WriteCallbackV1<'a> {
+    pub op: &'a RequestId,
+    /// The exact receipt's result; `None` for anything else.
+    pub result: Option<bool>,
+    /// When `apply` returned, before any wait for Core.
+    pub returned_at: UnixMillis,
+    pub recorded_at: UnixMillis,
+    pub lock_wait_us: u64,
+}
+/// What the ledger kept of a write's callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::physical) enum CallbackRecordV1 {
+    /// The open action now holds the result; `current` says whether its
+    /// session still held its authority when it was recorded.
+    Finalized { current: bool },
+    /// The action had closed with the write still out: it stays as it
+    /// closed; an exact result was appended as history.
+    AfterClose,
+    /// Not this action's write, or its result was already taken.
+    Unrecorded,
 }
 /// One decision-stream record as the ledger keeps it.
 #[derive(Clone, Debug, PartialEq)]
@@ -752,7 +854,7 @@ fn s_state_quarantined(c: &Connection, root: &RootId) -> AppResult<bool> {
 }
 pub(super) fn recover(c: &Connection, restart: bool) -> AppResult<()> {
     if restart {
-        c.execute("UPDATE physical_actions SET disposition='dispatch_unknown',operation_id=NULL,revision=revision+1 WHERE state='open' AND dispatch_intent=1 AND disposition!='refused'",[])?;
+        c.execute("UPDATE physical_actions SET disposition='dispatch_unknown',revision=revision+1 WHERE state='open' AND dispatch_intent=1 AND disposition!='refused'",[])?;
     }
     let ids: Vec<String> = c
         .prepare("SELECT root_id FROM physical_sessions WHERE state!='quarantined'")?
@@ -985,7 +1087,62 @@ pub(super) fn audit(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()>
             "Budget reservation/dispatch mismatch",
         )?;
     }
+    audit_action_callbacks(c, scope)?;
     audit_decisions(c, scope)
+}
+
+/// A callback row is the exact result of its action's one write, kept as
+/// history. Against the action's immutable snapshot and row: the same
+/// operation, payload and deadline, and `late` as the times say. A row
+/// recorded on an open action holds the same result (restart recovery may
+/// later call an accepted write's disposition unknown); one recorded after
+/// the action closed finds it closed with the write still unknown. The
+/// time the Root closed is not compared: a write can return before the
+/// close and be recorded after it.
+fn audit_action_callbacks(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()> {
+    let exists: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='physical_action_callbacks')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(());
+    }
+    let mut stmt = c.prepare(&format!(
+        "SELECT c.operation_id,c.payload_digest,c.apply_result,c.action_state,c.apply_returned_at,c.recorded_at,c.deadline_at,c.late,a.payload_digest,a.expires_at,a.state,a.disposition,a.apply_result,a.operation_id,a.dispatch_intent FROM physical_action_callbacks c LEFT JOIN physical_actions a USING(action_id) WHERE {}",
+        scope.filter("c.action_id", "action")
+    ))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let op: String = r.get(0)?;
+        RequestId::try_from(op.clone())?;
+        let applied: String = r.get(2)?;
+        let (returned, recorded, deadline): (i64, i64, i64) = (r.get(4)?, r.get(5)?, r.get(6)?);
+        let snapshot_matches = r.get::<_, Option<String>>(8)?.as_deref()
+            == Some(&*r.get::<_, String>(1)?)
+            && r.get::<_, Option<i64>>(9)? == Some(deadline)
+            && r.get::<_, bool>(7)? == (returned >= deadline)
+            && recorded >= returned
+            && r.get::<_, Option<i64>>(14)? == Some(1)
+            && r.get::<_, Option<String>>(13)?.as_deref() == Some(op.as_str());
+        let (disposition, result): (Option<String>, Option<String>) = (r.get(11)?, r.get(12)?);
+        let row_matches = match r.get::<_, String>(3)?.as_str() {
+            "open" => {
+                r.get::<_, bool>(7)?
+                    && result.as_deref() == Some(applied.as_str())
+                    && (disposition.as_deref() == Some(applied.as_str())
+                        || (applied == "accepted"
+                            && disposition.as_deref() == Some("dispatch_unknown")))
+            }
+            _ => {
+                r.get::<_, Option<String>>(10)?.as_deref() == Some("closed")
+                    && disposition.as_deref() == Some("dispatch_unknown")
+                    && result.is_none()
+            }
+        };
+        require(snapshot_matches && row_matches, "Action callback mismatch")?;
+    }
+    Ok(())
 }
 /// Decision records: contiguous per root, and every allowed record names an
 /// action of that root with the same option; every stream action has one.

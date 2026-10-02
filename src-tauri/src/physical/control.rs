@@ -5,7 +5,9 @@ mod decision_tools;
 use super::*;
 use crate::physical::binding::{BindingDescriptionV1, EnvironmentBindingViewV1};
 use crate::physical::evidence::{TrustedDispositionV1, TrustedObservationV1, WitnessRegistryV1};
-use crate::physical::store::{ActionAuditV1, FenceAuditV1, SessionAuditV1};
+use crate::physical::store::{
+    ActionAuditV1, CallbackRecordV1, FenceAuditV1, SessionAuditV1, WriteCallbackV1,
+};
 pub(crate) use decision_tools::*;
 use parking_lot::Mutex;
 use std::{
@@ -943,10 +945,13 @@ impl PhysicalControlServiceV1 {
                         .control
                         .actions
                         .get(a.id())
-                        .is_some_and(|entry| Arc::ptr_eq(&entry.valid, &a.valid))
-                    && ticks < a.deadline
-                    && ticks < a.continuing_deadline.load(Ordering::Acquire),
-                "Action/observation validity expired",
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.valid, &a.valid)),
+                "Action superseded or closed",
+            )?;
+            require(ticks < a.deadline, "Action deadline passed")?;
+            require(
+                ticks < a.continuing_deadline.load(Ordering::Acquire),
+                "Action observation freshness lapsed",
             )?;
             require(
                 self.store.action_status(a.id())?.0 == "open",
@@ -1018,14 +1023,26 @@ impl PhysicalControlServiceV1 {
         a: &Arc<AdmittedBodyActionV1>,
         adapter: &dyn EnvironmentBinding,
     ) -> AppResult<()> {
-        let view = { core.lock().prepare_action_write(a)? };
+        let (view, clock) = {
+            let mut service = core.lock();
+            (service.prepare_action_write(a)?, service.clock.clone())
+        };
         let op = view.request.clone();
         let result = adapter.apply(view).await;
+        // Read before waiting for Core: the wait never makes a timely result
+        // look late.
+        let returned = clock.read().ok().map(|(_, ticks)| ticks);
         let mut service = core.lock();
         if service.control.operations.get(a.grant.session.id()) == Some(&op) {
             service.control.operations.remove(a.grant.session.id());
         }
-        service.validate_admitted_action(a)?;
+        // Two questions, kept apart. Whether the action may still execute was
+        // decided before the write (and the binding checks it again at the
+        // write). What the binding answered for the write Core attempted is
+        // recorded regardless, in one ledger transaction: on the action if it
+        // is still open (after its deadline too), as history if it closed
+        // while the write was out. Nothing here returns before that record.
+        let still_valid = service.validate_admitted_action(a);
         let accepted = match result {
             Ok(Some(reply))
                 if reply.session == a.audit.session
@@ -1043,20 +1060,37 @@ impl PhysicalControlServiceV1 {
         };
         let committed = (|| {
             let s = &a.grant.session;
-            let snapshot = service.binding.ledger_snapshot(&s.root.binding)?;
-            let (now, _) = service.binding.now()?;
-            require(
-                service.store.finish_write(
-                    &s.root.audit,
-                    &s.audit,
-                    &a.audit,
-                    &snapshot,
-                    now,
-                    &op,
-                    accepted,
-                )?,
-                "Stale action callback",
+            let (now, ticks) = service.binding.now()?;
+            let lock_wait_us = returned.map_or(0, |r| ticks.saturating_sub(r));
+            let returned_at =
+                UnixMillis::try_from(now.get().saturating_sub(lock_wait_us.div_ceil(1000)))?;
+            // A closed or fenced Root has no current snapshot; the record does
+            // not need one, only the report of whether authority held.
+            let snapshot = service.binding.ledger_snapshot(&s.root.binding).ok();
+            let record = service.store.finish_write(
+                &s.root.audit,
+                &s.audit,
+                &a.audit,
+                snapshot.as_ref(),
+                &WriteCallbackV1 {
+                    op: &op,
+                    result: accepted,
+                    returned_at,
+                    recorded_at: now,
+                    lock_wait_us,
+                },
             )?;
+            match record {
+                CallbackRecordV1::Finalized { current } => {
+                    require(current, "Session reservation no longer current")?
+                }
+                CallbackRecordV1::AfterClose => require(false, "Action closed before its result")?,
+                CallbackRecordV1::Unrecorded => require(false, "Stale action callback")?,
+            }
+            // A result recorded after the action lost its authority never
+            // revives it: the stream closes as for any refusal or unknown
+            // disposition.
+            still_valid?;
             require(
                 accepted == Some(true),
                 "Adapter refused or disposition unknown",
@@ -1119,12 +1153,27 @@ pub(in crate::physical) mod test_support {
         Io,
         Stale,
         Delayed,
+        /// Writes: accepted if Core allowed the write when it reached the
+        /// lane, then the receipt waits for `release` (it can arrive late).
+        LateSuccess,
+        /// Writes: the lane refuses at its own boundary, after waiting for
+        /// `release`, with an exact receipt.
+        LateRefusal,
+        /// Writes: an otherwise exact receipt naming another session,
+        /// other epochs, another action or another payload.
+        WrongSession,
+        WrongEpochs,
+        WrongAction,
+        WrongPayload,
     }
     pub(in crate::physical) struct FakeLane {
         script: Mutex<VecDeque<Reply>>,
         pub(in crate::physical) entered: Notify,
         pub(in crate::physical) release: Notify,
         pub(in crate::physical) calls: AtomicU64,
+        /// Every call waits for `release`, and a write answers whatever Core
+        /// then says (as the late modes do).
+        hold: bool,
     }
     impl FakeLane {
         pub(in crate::physical) fn new(script: Vec<Reply>) -> Self {
@@ -1133,12 +1182,24 @@ pub(in crate::physical) mod test_support {
                 entered: Notify::new(),
                 release: Notify::new(),
                 calls: AtomicU64::new(0),
+                hold: false,
+            }
+        }
+        pub(in crate::physical) fn held(script: Vec<Reply>) -> Self {
+            Self {
+                hold: true,
+                ..Self::new(script)
             }
         }
         async fn next(&self) -> AppResult<Option<Reply>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let reply = self.script.lock().pop_front().unwrap_or(Reply::Success);
-            if matches!(reply, Reply::Delayed) {
+            if self.hold
+                || matches!(
+                    reply,
+                    Reply::Delayed | Reply::LateSuccess | Reply::LateRefusal
+                )
+            {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
@@ -1200,23 +1261,51 @@ pub(in crate::physical) mod test_support {
         }
         fn apply(&self, v: AdmittedActionReadViewV1) -> LaneFuture<'_, AdapterWriteReceiptV1> {
             Box::pin(async move {
+                // The lane's own boundary check, as a device makes it.
+                let allowed_on_entry = v.validity.allows() && v.deadline == v.validity.deadline;
                 let Some(mode) = self.next().await? else {
                     return Ok(None);
                 };
-                if !v.validity.allows() || v.deadline != v.validity.deadline {
+                let late = self.hold || matches!(mode, Reply::LateSuccess | Reply::LateRefusal);
+                if !late && (!v.validity.allows() || v.deadline != v.validity.deadline) {
                     return Ok(None);
                 }
+                let mut epochs = v.epochs;
+                if matches!(mode, Reply::WrongEpochs) {
+                    for e in epochs.values_mut() {
+                        *e += 1;
+                    }
+                }
                 Ok(Some(AdapterWriteReceiptV1 {
-                    session: v.session,
-                    epochs: v.epochs,
+                    session: if matches!(mode, Reply::WrongSession) {
+                        SessionId::try_from(format!(
+                            "physical-session:v1:{}",
+                            uuid::Uuid::new_v4()
+                        ))?
+                    } else {
+                        v.session
+                    },
+                    epochs,
                     request: if matches!(mode, Reply::Stale) {
                         request_id()?
                     } else {
                         v.request
                     },
-                    action: v.action,
-                    payload_digest: v.payload_digest,
-                    accepted: !matches!(mode, Reply::Refusal),
+                    action: if matches!(mode, Reply::WrongAction) {
+                        new_action_id()?
+                    } else {
+                        v.action
+                    },
+                    payload_digest: if matches!(mode, Reply::WrongPayload) {
+                        DigestV1::try_from("b".repeat(64))?
+                    } else {
+                        v.payload_digest
+                    },
+                    accepted: match mode {
+                        Reply::Refusal | Reply::LateRefusal => false,
+                        Reply::LateSuccess => allowed_on_entry,
+                        _ => true,
+                    },
                 }))
             })
         }
@@ -1425,6 +1514,38 @@ pub(in crate::physical) mod test_support {
             AdmissionOutcomeV1::Admitted(a) => a,
             AdmissionOutcomeV1::Duplicate(_) => panic!("expected a new admission"),
         }
+    }
+    /// Offers the ledger the result of `a`'s write `op` again, as a second
+    /// callback for the same write would.
+    pub(in crate::physical) fn finish_again(
+        core: &mut PhysicalControlServiceV1,
+        a: &AdmittedBodyActionV1,
+        op: &RequestId,
+        result: Option<bool>,
+    ) -> AppResult<CallbackRecordV1> {
+        let s = &a.grant.session;
+        let snapshot = core.binding.ledger_snapshot(&s.root.binding).ok();
+        let (now, _) = core.binding.now()?;
+        core.store.finish_write(
+            &s.root.audit,
+            &s.audit,
+            &a.audit,
+            snapshot.as_ref(),
+            &WriteCallbackV1 {
+                op,
+                result,
+                returned_at: now,
+                recorded_at: now,
+                lock_wait_us: 0,
+            },
+        )
+    }
+    /// Closes `s`'s Root, as any close of a stream does.
+    pub(in crate::physical) fn close_session_root(
+        core: &mut PhysicalControlServiceV1,
+        s: &BodyControlSessionV1,
+    ) -> AppResult<()> {
+        core.close_root(&s.root)
     }
     pub(in crate::physical) fn stream_of(ts: &ToolSessionV1) -> Arc<StreamRuntimeV1> {
         decision_tools::test_stream(ts)

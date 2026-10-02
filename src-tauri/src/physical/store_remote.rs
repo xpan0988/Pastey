@@ -457,6 +457,10 @@ pub(super) fn stage9_full_ddl() -> String {
     stage9_ddl() + super::evidence_ledger::HANDOVER_VERDICT_SCHEMA
 }
 
-pub(super) fn current_ddl() -> String {
+pub(super) fn stage10_ddl() -> String {
     super::control_ledger::stage10(&stage9_full_ddl())
+}
+
+pub(super) fn current_ddl() -> String {
+    stage10_ddl() + super::control_ledger::ACTION_CALLBACK_SCHEMA
 }

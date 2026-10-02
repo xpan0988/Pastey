@@ -1320,3 +1320,636 @@ mod capability;
 mod ledger_format;
 #[path = "stage5_tests.rs"]
 mod stage5;
+
+/// Finalizing the write of an admitted action: what may still execute is
+/// decided before the write; the exact result of the write is recorded
+/// whenever it comes back, and a late one revives nothing.
+mod callback_finalization {
+    use super::*;
+    use crate::physical::store::CallbackRecordV1;
+
+    /// Admits one action of `duration_us` on a fresh active session.
+    async fn admitted(
+        f: &ControlFixture,
+        duration_us: u64,
+    ) -> (Arc<BodyControlSessionV1>, Arc<AdmittedBodyActionV1>) {
+        let s = f.active().await;
+        let g = {
+            let mut core = f.core.lock();
+            let g = core.construct_session_grant(s.clone()).unwrap();
+            let ticks = f.clock.ticks.load(Ordering::SeqCst);
+            core.record_control_observation(&s, lane::observation(&s, ticks, 0))
+                .unwrap();
+            core.issue_proposal_challenge(&g).unwrap();
+            g
+        };
+        let p = lane::proposal(&f.core.lock(), &g, duration_us);
+        (s, f.admit(&g, p))
+    }
+    fn advance_ms(f: &ControlFixture, ms: u64) {
+        let wall = f.clock.wall.load(Ordering::SeqCst) + ms;
+        let ticks = f.clock.ticks.load(Ordering::SeqCst) + ms * 1000;
+        f.clock.set(wall, ticks);
+    }
+    /// Starts the write; returns it and the lane, which is waiting.
+    async fn writing(
+        f: &ControlFixture,
+        a: &Arc<AdmittedBodyActionV1>,
+        script: Vec<Reply>,
+    ) -> (
+        tokio::task::JoinHandle<crate::error::AppResult<()>>,
+        Arc<FakeLane>,
+    ) {
+        let lane = Arc::new(FakeLane::new(script));
+        let (c, action, l) = (f.core.clone(), a.clone(), lane.clone());
+        let pending = tokio::spawn(async move {
+            PhysicalControlServiceV1::dispatch_admitted_action(&c, &action, &*l).await
+        });
+        lane.entered.notified().await;
+        (pending, lane)
+    }
+    /// A callback history row, as the ledger keeps it.
+    #[derive(Debug, PartialEq)]
+    struct CallbackRow {
+        op: String,
+        result: String,
+        state: String,
+        late: bool,
+        returned_at: i64,
+        recorded_at: i64,
+        lock_wait_us: i64,
+        deadline_at: i64,
+    }
+    fn callbacks(f: &ControlFixture) -> Vec<CallbackRow> {
+        f.sql()
+            .prepare("SELECT operation_id,apply_result,action_state,late,apply_returned_at,recorded_at,lock_wait_us,deadline_at FROM physical_action_callbacks")
+            .unwrap()
+            .query_map([], |r| {
+                Ok(CallbackRow {
+                    op: r.get(0)?,
+                    result: r.get(1)?,
+                    state: r.get(2)?,
+                    late: r.get(3)?,
+                    returned_at: r.get(4)?,
+                    recorded_at: r.get(5)?,
+                    lock_wait_us: r.get(6)?,
+                    deadline_at: r.get(7)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+    fn expires_at(f: &ControlFixture) -> i64 {
+        f.scalar("SELECT expires_at FROM physical_actions")
+    }
+    fn budget(f: &ControlFixture) -> (i64, i64) {
+        f.sql()
+            .query_row(
+                "SELECT reserved_us,consumed_us FROM physical_control_budgets",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+    /// Every column of the one action row.
+    fn action_row(f: &ControlFixture) -> Vec<rusqlite::types::Value> {
+        f.sql()
+            .query_row("SELECT * FROM physical_actions", [], |r| {
+                (0..r.as_ref().column_count())
+                    .map(|i| r.get(i))
+                    .collect::<Result<_, _>>()
+            })
+            .unwrap()
+    }
+    fn operation(f: &ControlFixture) -> String {
+        f.sql()
+            .query_row("SELECT operation_id FROM physical_actions", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+    fn audit_passes(f: &ControlFixture) {
+        crate::physical::store::test_full_audit(&f.sql()).unwrap();
+    }
+    /// Nothing comes back from a callback: no grant, no budget, no Verified
+    /// or Accepted, and the Root and session stay closed.
+    fn nothing_revived(
+        f: &ControlFixture,
+        s: &Arc<BodyControlSessionV1>,
+        budget_before: (i64, i64),
+    ) {
+        assert_eq!(budget(f), budget_before);
+        assert!(f.core.lock().construct_session_grant(s.clone()).is_err());
+        assert_eq!(f.scalar("SELECT state='closed' FROM physical_actions"), 1);
+        assert_eq!(f.scalar("SELECT state='closed' FROM physical_attempts"), 1);
+        assert_eq!(f.session_state(), "quarantined");
+        let root = f
+            .sql()
+            .query_row("SELECT root_id FROM physical_attempts", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+        let status = core_fake::store(&f.core.lock())
+            .physical_status(&RootId::try_from(root).unwrap())
+            .unwrap();
+        assert_ne!(
+            status.consequence,
+            crate::physical::evidence::ConsequenceStateV1::Verified
+        );
+        assert_ne!(
+            status.acceptance,
+            crate::physical::evidence::AcceptanceStateV1::Accepted
+        );
+    }
+    /// Holds Core while the lane's write returns, until the dispatch has read
+    /// the clock for that return; `then` runs with Core still held.
+    fn return_while_core_is_held(
+        f: &ControlFixture,
+        lane: &FakeLane,
+        then: impl FnOnce(&mut PhysicalControlServiceV1),
+    ) {
+        let mut core = f.core.lock();
+        let reads = f.clock.reads.load(Ordering::SeqCst);
+        lane.release.notify_one();
+        // The lane's own boundary check, then the dispatch's return reading.
+        while f.clock.reads.load(Ordering::SeqCst) < reads + 2 {
+            std::thread::yield_now();
+        }
+        then(&mut core);
+    }
+
+    #[tokio::test]
+    async fn an_exact_refusal_after_the_deadline_is_recorded_as_refused() {
+        let f = ControlFixture::new();
+        let (_, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::LateRefusal]).await;
+        advance_ms(&f, 150);
+        lane.release.notify_one();
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(f.disposition(), "refused");
+        assert_eq!(
+            f.scalar("SELECT apply_result='refused' FROM physical_actions"),
+            1
+        );
+        let late = callbacks(&f);
+        assert_eq!(late.len(), 1);
+        assert_eq!(
+            (late[0].result.as_str(), late[0].state.as_str()),
+            ("refused", "open")
+        );
+        assert!(late[0].late && late[0].returned_at >= late[0].deadline_at);
+        assert_eq!(late[0].deadline_at, expires_at(&f));
+        // Fail-closed as for any refusal; the budget stays consumed.
+        assert_eq!(f.scalar("SELECT state='closed' FROM physical_attempts"), 1);
+        let (reserved, consumed) = budget(&f);
+        assert_eq!(reserved, consumed);
+        audit_passes(&f);
+    }
+
+    #[tokio::test]
+    async fn an_exact_acceptance_after_the_deadline_is_history_only() {
+        let f = ControlFixture::new();
+        let (s, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::LateSuccess]).await;
+        let budget_at_dispatch = budget(&f);
+        advance_ms(&f, 150);
+        lane.release.notify_one();
+        let result = pending.await.unwrap();
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.message() == "Action deadline passed"),
+            "{result:?}"
+        );
+        // The fact is recorded and marked late.
+        assert_eq!(f.disposition(), "accepted");
+        let late = callbacks(&f);
+        assert_eq!(late.len(), 1);
+        assert_eq!(
+            (late[0].result.as_str(), late[0].state.as_str()),
+            ("accepted", "open")
+        );
+        assert!(late[0].late && late[0].deadline_at == expires_at(&f));
+        // Nothing is revived or extended: the action, session and Root are
+        // closed, no grant can be constructed, and no budget comes back.
+        nothing_revived(&f, &s, budget_at_dispatch);
+        assert!(PhysicalControlServiceV1::dispatch_admitted_action(
+            &f.core,
+            &a,
+            &FakeLane::new(vec![])
+        )
+        .await
+        .is_err());
+        audit_passes(&f);
+    }
+
+    #[tokio::test]
+    async fn a_lost_or_unanswered_write_stays_dispatch_unknown() {
+        for script in [vec![Reply::Lost], vec![Reply::Io]] {
+            let f = ControlFixture::new();
+            let (_, a) = admitted(&f, 100_000).await;
+            let lane = FakeLane::new(script);
+            assert!(
+                PhysicalControlServiceV1::dispatch_admitted_action(&f.core, &a, &lane)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(f.disposition(), "dispatch_unknown");
+            assert!(callbacks(&f).is_empty());
+            audit_passes(&f);
+        }
+        // A lane that answers nothing once the action has expired.
+        let f = ControlFixture::new();
+        let (_, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::Delayed]).await;
+        advance_ms(&f, 150);
+        lane.release.notify_one();
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(f.disposition(), "dispatch_unknown");
+        assert!(callbacks(&f).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_receipt_for_anything_else_stays_dispatch_unknown() {
+        for mode in [
+            Reply::WrongSession,
+            Reply::WrongEpochs,
+            Reply::Stale,
+            Reply::WrongAction,
+            Reply::WrongPayload,
+        ] {
+            let f = ControlFixture::new();
+            let (_, a) = admitted(&f, 100_000).await;
+            let lane = FakeLane::new(vec![mode]);
+            assert!(
+                PhysicalControlServiceV1::dispatch_admitted_action(&f.core, &a, &lane)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(f.disposition(), "dispatch_unknown");
+            assert_eq!(
+                f.scalar("SELECT apply_result IS NULL FROM physical_actions"),
+                1
+            );
+            assert!(callbacks(&f).is_empty());
+            assert_eq!(f.scalar("SELECT state='closed' FROM physical_attempts"), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_refusal_revives_and_refunds_nothing() {
+        let f = ControlFixture::new();
+        let (s, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::LateRefusal]).await;
+        let consumed_at_dispatch = budget(&f).1;
+        advance_ms(&f, 150);
+        lane.release.notify_one();
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(budget(&f).1, consumed_at_dispatch);
+        assert!(f.core.lock().construct_session_grant(s).is_err());
+        assert_eq!(f.scalar("SELECT state='closed' FROM physical_actions"), 1);
+        assert_eq!(f.scalar("SELECT state='closed' FROM physical_attempts"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_callback_for_the_same_write_changes_nothing() {
+        let f = ControlFixture::new();
+        let (_, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::LateRefusal]).await;
+        let op = RequestId::try_from(operation(&f)).unwrap();
+        advance_ms(&f, 150);
+        lane.release.notify_one();
+        assert!(pending.await.unwrap().is_err());
+        let row = action_row(&f);
+        for replay in [Some(true), Some(false), None] {
+            let again = lane::finish_again(&mut f.core.lock(), &a, &op, replay);
+            assert_eq!(again.unwrap(), CallbackRecordV1::Unrecorded, "{replay:?}");
+        }
+        assert_eq!(f.disposition(), "refused");
+        assert_eq!(action_row(&f), row);
+        assert_eq!(callbacks(&f).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_expired_action_never_reaches_the_lane() {
+        let f = ControlFixture::new();
+        let (_, a) = admitted(&f, 100_000).await;
+        advance_ms(&f, 150);
+        let lane = FakeLane::new(vec![]);
+        let result = PhysicalControlServiceV1::dispatch_admitted_action(&f.core, &a, &lane).await;
+        assert!(result.is_err_and(|e| e.message() == "Action deadline passed"));
+        assert_eq!(lane.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(f.disposition(), "not_sent");
+    }
+
+    /// Ends the stream while the write is out: the Root closes, and with
+    /// `fence` the session is also fenced by the lane. Returns the closed
+    /// action row and the budget as they were at the close.
+    async fn close_while_out(
+        f: &ControlFixture,
+        s: &Arc<BodyControlSessionV1>,
+        fence: bool,
+    ) -> (Vec<rusqlite::types::Value>, (i64, i64)) {
+        if fence {
+            let fence_lane = FakeLane::new(vec![Reply::Success]);
+            assert!(
+                PhysicalControlServiceV1::revoke_control_session(&f.core, s, &fence_lane)
+                    .await
+                    .unwrap()
+            );
+        } else {
+            lane::close_session_root(&mut f.core.lock(), s).unwrap();
+        }
+        assert_eq!(f.scalar("SELECT state='closed' FROM physical_actions"), 1);
+        (action_row(f), budget(f))
+    }
+
+    // a, b, c: an exact result after the Root closed (and after the fence)
+    // is history; the closed row is untouched and nothing comes back.
+    #[tokio::test]
+    async fn an_exact_result_after_the_root_closed_is_history_only() {
+        for (reply, fence, late_ms) in [
+            (Reply::LateSuccess, false, 0),
+            (Reply::LateRefusal, false, 150),
+            (Reply::LateSuccess, true, 150),
+            (Reply::LateRefusal, true, 0),
+        ] {
+            let f = ControlFixture::new();
+            let (s, a) = admitted(&f, 100_000).await;
+            let (pending, lane) = writing(&f, &a, vec![reply]).await;
+            let op = operation(&f);
+            let (row, budget_at_close) = close_while_out(&f, &s, fence).await;
+            advance_ms(&f, late_ms);
+            lane.release.notify_one();
+            let result = pending.await.unwrap();
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.message() == "Action closed before its result"),
+                "{result:?}"
+            );
+            // The closed action row is byte-identical and still unknown.
+            assert_eq!(action_row(&f), row);
+            assert_eq!(f.disposition(), "dispatch_unknown");
+            let history = callbacks(&f);
+            assert_eq!(history.len(), 1);
+            let expected = if matches!(reply, Reply::LateSuccess) {
+                "accepted"
+            } else {
+                "refused"
+            };
+            assert_eq!(history[0].op, op);
+            assert_eq!(
+                (history[0].result.as_str(), history[0].state.as_str()),
+                (expected, "closed")
+            );
+            assert_eq!(history[0].late, late_ms > 100, "late after {late_ms} ms");
+            assert_eq!(history[0].deadline_at, expires_at(&f));
+            nothing_revived(&f, &s, budget_at_close);
+            audit_passes(&f);
+        }
+    }
+
+    // d. A receipt that does not name this write exactly is not recorded,
+    // before or after the close.
+    #[tokio::test]
+    async fn a_mismatched_receipt_after_the_root_closed_is_not_recorded() {
+        for mode in [
+            Reply::WrongSession,
+            Reply::WrongEpochs,
+            Reply::Stale,
+            Reply::WrongAction,
+            Reply::WrongPayload,
+        ] {
+            let f = ControlFixture::new();
+            let (s, a) = admitted(&f, 100_000).await;
+            let lane = Arc::new(FakeLane::held(vec![mode]));
+            let (c, action, l) = (f.core.clone(), a.clone(), lane.clone());
+            let pending = tokio::spawn(async move {
+                PhysicalControlServiceV1::dispatch_admitted_action(&c, &action, &*l).await
+            });
+            lane.entered.notified().await;
+            let (row, budget_at_close) = close_while_out(&f, &s, false).await;
+            lane.release.notify_one();
+            assert!(pending.await.unwrap().is_err());
+            assert_eq!(action_row(&f), row);
+            assert_eq!(f.disposition(), "dispatch_unknown");
+            assert!(callbacks(&f).is_empty());
+            nothing_revived(&f, &s, budget_at_close);
+            audit_passes(&f);
+        }
+    }
+
+    // e. A second callback for a write recorded after the close is refused
+    // by Core and by the table.
+    #[tokio::test]
+    async fn a_duplicate_callback_after_the_root_closed_changes_nothing() {
+        let f = ControlFixture::new();
+        let (s, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::LateSuccess]).await;
+        let op = RequestId::try_from(operation(&f)).unwrap();
+        close_while_out(&f, &s, false).await;
+        lane.release.notify_one();
+        assert!(pending.await.unwrap().is_err());
+        let (row, history) = (action_row(&f), callbacks(&f));
+        assert_eq!(history.len(), 1);
+        for replay in [Some(true), Some(false), None] {
+            let again = lane::finish_again(&mut f.core.lock(), &a, &op, replay);
+            assert_eq!(again.unwrap(), CallbackRecordV1::Unrecorded, "{replay:?}");
+        }
+        assert_eq!((action_row(&f), callbacks(&f)), (row, history));
+        // The table holds one row per write and per action.
+        let sql = f.sql();
+        let insert = "INSERT INTO physical_action_callbacks SELECT ?1,action_id,payload_digest,'refused','closed',apply_returned_at,recorded_at,0,deadline_at,late FROM physical_action_callbacks";
+        let other_op = format!("physical-request:v1:{}", uuid::Uuid::new_v4());
+        for op in [String::from(op), other_op] {
+            let e = sql.execute(insert, [op]).unwrap_err();
+            assert!(e.to_string().contains("UNIQUE"), "{e}");
+        }
+        audit_passes(&f);
+    }
+
+    // f. A close and a callback race only under Core: whichever goes first,
+    // the outcome is consistent and the ledger audits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_callback_racing_the_close_is_consistent_either_way() {
+        // The callback first: the result is recorded on the open action, and
+        // the close then closes it as it is.
+        let f = ControlFixture::new();
+        let (s, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::LateSuccess]).await;
+        lane.release.notify_one();
+        pending.await.unwrap().unwrap();
+        close_while_out(&f, &s, true).await;
+        assert_eq!(f.disposition(), "accepted");
+        assert!(callbacks(&f).is_empty());
+        audit_passes(&f);
+
+        // The close first, while the write had already returned and waited
+        // for Core: history, timed by the return. The audit does not compare
+        // that time with the close.
+        let f = ControlFixture::new();
+        let (s, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::Delayed]).await;
+        let mut closed_row = None;
+        return_while_core_is_held(&f, &lane, |core| {
+            advance_ms(&f, 40);
+            lane::close_session_root(core, &s).unwrap();
+            closed_row = Some(action_row(&f));
+        });
+        let result = pending.await.unwrap();
+        assert!(result.is_err_and(|e| e.message() == "Action closed before its result"));
+        let history = callbacks(&f);
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            (history[0].result.as_str(), history[0].state.as_str()),
+            ("accepted", "closed")
+        );
+        assert!(!history[0].late);
+        assert_eq!(history[0].lock_wait_us, 40_000);
+        assert_eq!(history[0].returned_at + 40, history[0].recorded_at);
+        assert_eq!(Some(action_row(&f)), closed_row);
+        audit_passes(&f);
+    }
+
+    // g. The audit checks every callback row against its action; the table
+    // is append-only.
+    #[tokio::test]
+    async fn the_ledger_refuses_a_callback_row_its_action_contradicts() {
+        let f = ControlFixture::new();
+        let (s, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::LateSuccess]).await;
+        close_while_out(&f, &s, false).await;
+        lane.release.notify_one();
+        assert!(pending.await.unwrap().is_err());
+        audit_passes(&f);
+        let mut sql = f.sql();
+        // Each time, the recorded row with one fact changed (put back in
+        // place of the recorded one, in a transaction rolled back after).
+        let other_op = format!("'physical-request:v1:{}'", uuid::Uuid::new_v4());
+        let digest = format!("'{}'", "a".repeat(64));
+        let contradictions = [
+            ("operation_id", other_op.as_str()),
+            ("payload_digest", digest.as_str()),
+            ("deadline_at", "deadline_at-1"),
+            ("action_state", "'open'"),
+        ];
+        for (column, value) in contradictions {
+            let tx = sql.transaction().unwrap();
+            tx.execute_batch(&format!(
+                "DROP TRIGGER physical_action_callbacks_keep;
+                 CREATE TEMP TABLE kept AS SELECT * FROM physical_action_callbacks;
+                 DELETE FROM physical_action_callbacks;
+                 UPDATE temp.kept SET {column}={value};
+                 UPDATE temp.kept SET late=1, apply_returned_at=max(apply_returned_at,deadline_at), recorded_at=max(recorded_at,deadline_at);
+                 INSERT INTO physical_action_callbacks SELECT * FROM temp.kept;"
+            ))
+            .unwrap();
+            let refused = crate::physical::store::test_full_audit(&tx).unwrap_err();
+            assert!(
+                refused.to_string().contains("Action callback mismatch"),
+                "{column}: {refused}"
+            );
+            tx.rollback().unwrap();
+        }
+        // The schema itself refuses times that contradict the late flag.
+        for edit in ["late=1-late", "recorded_at=apply_returned_at-1"] {
+            let tx = sql.transaction().unwrap();
+            let e = tx
+                .execute_batch(&format!(
+                    "DROP TRIGGER physical_action_callbacks_immutable;
+                     UPDATE physical_action_callbacks SET {edit};"
+                ))
+                .unwrap_err();
+            assert!(e.to_string().contains("CHECK"), "{edit}: {e}");
+            tx.rollback().unwrap();
+        }
+        // Append-only.
+        let e = sql
+            .execute("UPDATE physical_action_callbacks SET lock_wait_us=1", [])
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("physical immutable action callback"),
+            "{e}"
+        );
+        let e = sql
+            .execute("DELETE FROM physical_action_callbacks", [])
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("physical action callback history required"),
+            "{e}"
+        );
+        audit_passes(&f);
+    }
+
+    // Restart recovery after a late result was recorded on the open action
+    // but before the Root closed: the accepted write's disposition becomes
+    // unknown, the recorded result and its history stay, and the ledger
+    // audits.
+    #[tokio::test]
+    async fn restart_after_a_late_result_keeps_its_history_consistent() {
+        let f = ControlFixture::new();
+        let (_, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::Delayed]).await;
+        let op = RequestId::try_from(operation(&f)).unwrap();
+        advance_ms(&f, 150);
+        let record = lane::finish_again(&mut f.core.lock(), &a, &op, Some(true)).unwrap();
+        assert_eq!(record, CallbackRecordV1::Finalized { current: true });
+        assert_eq!(callbacks(&f).len(), 1);
+        core_fake::store(&f.core.lock())
+            .close_open_attempts("interrupted")
+            .unwrap();
+        assert_eq!(f.disposition(), "dispatch_unknown");
+        assert_eq!(
+            f.scalar("SELECT apply_result='accepted' FROM physical_actions"),
+            1
+        );
+        assert_eq!(operation(&f), String::from(op));
+        audit_passes(&f);
+        lane.release.notify_one();
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(callbacks(&f).len(), 1);
+        audit_passes(&f);
+    }
+
+    // h. Waiting for Core never makes a timely result late.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timely_result_that_waits_for_core_is_not_late() {
+        let f = ControlFixture::new();
+        let (_, a) = admitted(&f, 100_000).await;
+        let (pending, lane) = writing(&f, &a, vec![Reply::Delayed]).await;
+        // Returned at 0 ms of 100; Core is busy until 150 ms.
+        return_while_core_is_held(&f, &lane, |_| advance_ms(&f, 150));
+        let result = pending.await.unwrap();
+        // The action row holds the timely result, with no late history. (The
+        // stream still closes: whether the action may still count is checked
+        // when Core takes the result.)
+        assert_eq!(f.disposition(), "accepted");
+        assert!(callbacks(&f).is_empty());
+        assert!(result.is_err_and(|e| e.message() == "Action deadline passed"));
+        audit_passes(&f);
+    }
+
+    #[tokio::test]
+    async fn an_expired_deadline_and_lapsed_observation_freshness_are_told_apart() {
+        // The action's own deadline (100 ms) passes first.
+        let f = ControlFixture::new();
+        let (_, a) = admitted(&f, 100_000).await;
+        advance_ms(&f, 150);
+        let r =
+            PhysicalControlServiceV1::dispatch_admitted_action(&f.core, &a, &FakeLane::new(vec![]))
+                .await;
+        assert!(r.is_err_and(|e| e.message() == "Action deadline passed"));
+        // A longer action (500 ms) outlives its observation's freshness
+        // (200 ms here): that is the reason given.
+        let f = ControlFixture::new();
+        let (_, a) = admitted(&f, 500_000).await;
+        advance_ms(&f, 250);
+        let r =
+            PhysicalControlServiceV1::dispatch_admitted_action(&f.core, &a, &FakeLane::new(vec![]))
+                .await;
+        assert!(r.is_err_and(|e| e.message() == "Action observation freshness lapsed"));
+    }
+}

@@ -19,8 +19,8 @@ mod core_ledger;
 #[path = "store_evidence.rs"]
 mod evidence_ledger;
 pub(super) use control_ledger::{
-    ActionAuditV1, ActionDispositionV1, DecisionRecordV1, FenceAuditV1, ReservationReceiptV1,
-    SessionAuditV1,
+    ActionAuditV1, ActionDispositionV1, CallbackRecordV1, DecisionRecordV1, FenceAuditV1,
+    ReservationReceiptV1, SessionAuditV1, WriteCallbackV1,
 };
 pub(super) use core_ledger::RootAuditV1;
 #[path = "store_remote.rs"]
@@ -477,6 +477,14 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
     stage9_full.execute_batch(&remote_ledger::stage9_full_ddl())?;
     if schema_objects(&tx)? == schema_objects(&stage9_full)? {
         remote_ledger::rebuild(&tx, &remote_ledger::current_ddl())?;
+    }
+    // Additive: action callbacks kept as history. Older ledgers recorded
+    // none (a result after the deadline or after the action closed stayed
+    // dispatch_unknown), so there is no history to backfill.
+    let stage10 = Connection::open_in_memory()?;
+    stage10.execute_batch(&remote_ledger::stage10_ddl())?;
+    if schema_objects(&tx)? == schema_objects(&stage10)? {
+        tx.execute_batch(control_ledger::ACTION_CALLBACK_SCHEMA)?;
     }
     verify_schema(&tx)?;
     stamp_ledger_format(&tx)?;
@@ -944,6 +952,7 @@ const GROUPED_TABLES: &[(&str, &[(&str, &str)])] = &[
     ("physical_domains", &[("domain", "domain_id")]),
     ("physical_control_budgets", &[("root", "root_id")]),
     ("physical_actions", &[("root", "root_id")]),
+    ("physical_action_callbacks", &[("action", "action_id")]),
     ("physical_decisions", &[("root", "root_id")]),
     ("physical_evidence", &[("action", "action_id")]),
     ("physical_consequences", &[("action", "action_id")]),
@@ -1145,6 +1154,11 @@ pub(super) fn test_connection(paths: &AppPaths) -> AppResult<Connection> {
 #[cfg(test)]
 pub(super) fn test_verify_durability(conn: &Connection) -> AppResult<()> {
     verify_durability(conn)
+}
+
+#[cfg(test)]
+pub(super) fn test_full_audit(conn: &Connection) -> AppResult<()> {
+    audit(conn, AuditScopeV1::Full)
 }
 
 #[cfg(test)]
