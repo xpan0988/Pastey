@@ -252,6 +252,9 @@ pub(super) struct TrustedQualificationEvidenceV1 {
 /// Audit timestamps constrain expiry, never reconstruct live deadlines.
 pub(crate) trait BindingClockV1: Send + Sync {
     fn read(&self) -> AppResult<(UnixMillis, u64)>;
+    /// Tests: a write's return tick has just been read.
+    #[cfg(test)]
+    fn write_returned(&self) {}
 }
 pub(crate) struct SystemBindingClockV1 {
     origin: Instant,

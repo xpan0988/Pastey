@@ -19,8 +19,8 @@ mod core_ledger;
 #[path = "store_evidence.rs"]
 mod evidence_ledger;
 pub(super) use control_ledger::{
-    ActionAuditV1, ActionDispositionV1, CallbackRecordV1, DecisionRecordV1, FenceAuditV1,
-    ReservationReceiptV1, SessionAuditV1, WriteCallbackV1,
+    deadline_reached, ActionAuditV1, ActionDispositionV1, CallbackRecordV1, DecisionRecordV1,
+    FenceAuditV1, ReservationReceiptV1, SessionAuditV1, WriteCallbackV1,
 };
 pub(super) use core_ledger::RootAuditV1;
 #[path = "store_remote.rs"]
@@ -485,6 +485,14 @@ pub(crate) fn initialize(paths: &AppPaths) -> AppResult<()> {
     stage10.execute_batch(&remote_ledger::stage10_ddl())?;
     if schema_objects(&tx)? == schema_objects(&stage10)? {
         tx.execute_batch(control_ledger::ACTION_CALLBACK_SCHEMA)?;
+    }
+    // Additive: write callbacks judged on the executor's monotonic clock.
+    // The wall-clock callback table keeps its rows (audited as written) and
+    // takes no new ones.
+    let stage10_callbacks = Connection::open_in_memory()?;
+    stage10_callbacks.execute_batch(&remote_ledger::stage10_callbacks_ddl())?;
+    if schema_objects(&tx)? == schema_objects(&stage10_callbacks)? {
+        tx.execute_batch(control_ledger::WRITE_CALLBACK_SCHEMA)?;
     }
     verify_schema(&tx)?;
     stamp_ledger_format(&tx)?;
@@ -953,6 +961,7 @@ const GROUPED_TABLES: &[(&str, &[(&str, &str)])] = &[
     ("physical_control_budgets", &[("root", "root_id")]),
     ("physical_actions", &[("root", "root_id")]),
     ("physical_action_callbacks", &[("action", "action_id")]),
+    ("physical_write_callbacks", &[("action", "action_id")]),
     ("physical_decisions", &[("root", "root_id")]),
     ("physical_evidence", &[("action", "action_id")]),
     ("physical_consequences", &[("action", "action_id")]),

@@ -104,6 +104,38 @@ CREATE TABLE physical_action_callbacks(
 CREATE TRIGGER physical_action_callbacks_immutable BEFORE UPDATE ON physical_action_callbacks BEGIN SELECT RAISE(ABORT,'physical immutable action callback');END;
 CREATE TRIGGER physical_action_callbacks_keep BEFORE DELETE ON physical_action_callbacks BEGIN SELECT RAISE(ABORT,'physical action callback history required');END;
 "#;
+/// Exact write results kept as history, judged on the executor's monotonic
+/// clock: `late` is exactly `deadline_reached(returned_tick, deadline_tick)`,
+/// the rule runtime validity uses, with both ticks at microsecond
+/// resolution. Ticks mean something only inside the executor process that
+/// wrote them; wall-clock times are informational. It replaces
+/// `physical_action_callbacks` (which judged lateness in wall-clock
+/// milliseconds): that table keeps its rows and takes no new ones.
+pub(super) const WRITE_CALLBACK_SCHEMA: &str = r#"
+CREATE TABLE physical_write_callbacks(
+ operation_id TEXT PRIMARY KEY,
+ action_id TEXT NOT NULL UNIQUE REFERENCES physical_actions(action_id),
+ payload_digest TEXT NOT NULL,
+ apply_result TEXT NOT NULL CHECK(apply_result IN ('accepted','refused')),
+ action_state TEXT NOT NULL CHECK(action_state IN ('open','closed')),
+ returned_tick INTEGER NOT NULL CHECK(returned_tick>=0),
+ deadline_tick INTEGER NOT NULL CHECK(deadline_tick>0),
+ late INTEGER NOT NULL CHECK(late=(returned_tick>=deadline_tick)),
+ lock_wait_us INTEGER NOT NULL CHECK(lock_wait_us>=0),
+ recorded_at INTEGER NOT NULL CHECK(recorded_at>0),
+ deadline_at INTEGER NOT NULL CHECK(deadline_at>0),
+ CHECK(action_state='closed' OR late=1)
+) STRICT;
+CREATE TRIGGER physical_write_callbacks_immutable BEFORE UPDATE ON physical_write_callbacks BEGIN SELECT RAISE(ABORT,'physical immutable write callback');END;
+CREATE TRIGGER physical_write_callbacks_keep BEFORE DELETE ON physical_write_callbacks BEGIN SELECT RAISE(ABORT,'physical write callback history required');END;
+CREATE TRIGGER physical_action_callbacks_retired BEFORE INSERT ON physical_action_callbacks BEGIN SELECT RAISE(ABORT,'physical action callbacks retired');END;
+"#;
+/// Whether `tick` is at or past `deadline`, on the executor's monotonic
+/// clock. The one rule for an action's deadline: runtime validity, the
+/// binding's validity handle and the recorded `late` all use it.
+pub(in crate::physical) fn deadline_reached(tick: u64, deadline: u64) -> bool {
+    tick >= deadline
+}
 /// Stage 10 relaxes the one-action constraints of the control tables.
 pub(super) fn stage10(ddl: &str) -> String {
     ddl.replace(
@@ -492,7 +524,7 @@ impl PhysicalStoreV1 {
             "Mismatched action callback",
         )?;
         let (state, waiting): (String, bool) = tx.query_row(
-            "SELECT state,operation_id=?2 AND disposition=?3 AND apply_result IS NULL AND NOT EXISTS(SELECT 1 FROM physical_action_callbacks WHERE operation_id=?2) FROM physical_actions WHERE action_id=?1",
+            "SELECT state,operation_id=?2 AND disposition=?3 AND apply_result IS NULL AND NOT EXISTS(SELECT 1 FROM physical_action_callbacks WHERE operation_id=?2) AND NOT EXISTS(SELECT 1 FROM physical_write_callbacks WHERE operation_id=?2) FROM physical_actions WHERE action_id=?1",
             params![
                 text(&x.proposal.action_id),
                 text(cb.op),
@@ -505,7 +537,7 @@ impl PhysicalStoreV1 {
             return Ok(CallbackRecordV1::Unrecorded);
         }
         let applied = cb.result.map(|b| if b { "accepted" } else { "refused" });
-        let late = cb.returned_at >= x.expires_at;
+        let late = deadline_reached(cb.returned_tick, cb.deadline_tick);
         let outcome = if state == "open" {
             let current = snapshot
                 .is_some_and(|snap| current_session(&tx, a, s, snap, cb.recorded_at, true).is_ok());
@@ -525,18 +557,19 @@ impl PhysicalStoreV1 {
         if let Some(applied) = applied {
             if state == "closed" || late {
                 tx.execute(
-                    "INSERT INTO physical_action_callbacks VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    "INSERT INTO physical_write_callbacks VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     params![
                         text(cb.op),
                         text(&x.proposal.action_id),
                         text(&x.proposal.payload_digest),
                         applied,
                         state,
-                        checked_integer(cb.returned_at.get())?,
-                        checked_integer(cb.recorded_at.get())?,
+                        checked_integer(cb.returned_tick)?,
+                        checked_integer(cb.deadline_tick)?,
+                        late,
                         checked_integer(cb.lock_wait_us)?,
-                        checked_integer(x.expires_at.get())?,
-                        late
+                        checked_integer(cb.recorded_at.get())?,
+                        checked_integer(x.expires_at.get())?
                     ],
                 )?;
             }
@@ -705,8 +738,11 @@ pub(in crate::physical) struct WriteCallbackV1<'a> {
     pub op: &'a RequestId,
     /// The exact receipt's result; `None` for anything else.
     pub result: Option<bool>,
-    /// When `apply` returned, before any wait for Core.
-    pub returned_at: UnixMillis,
+    /// Monotonic ticks (microseconds) when `apply` returned, before any wait
+    /// for Core, and the action's deadline on the same clock.
+    pub returned_tick: u64,
+    pub deadline_tick: u64,
+    /// Wall-clock time of the record; informational only.
     pub recorded_at: UnixMillis,
     pub lock_wait_us: u64,
 }
@@ -1088,6 +1124,7 @@ pub(super) fn audit(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()>
         )?;
     }
     audit_action_callbacks(c, scope)?;
+    audit_write_callbacks(c, scope)?;
     audit_decisions(c, scope)
 }
 
@@ -1141,6 +1178,65 @@ fn audit_action_callbacks(c: &Connection, scope: super::AuditScopeV1) -> AppResu
             }
         };
         require(snapshot_matches && row_matches, "Action callback mismatch")?;
+    }
+    Ok(())
+}
+/// A write callback row is the exact result of its action's one write, kept
+/// as history. Within the row, `late` is the deadline rule applied to its
+/// own ticks; ticks are compared with nothing else (they belong to the
+/// executor process that wrote them). Against the action's row: the same
+/// operation, payload and wall-clock deadline copy; an open-state row holds
+/// the action's result (restart recovery may later call an accepted write's
+/// disposition unknown) and is late, a closed-state row finds the action
+/// closed with the write still unknown. A write is recorded in one table
+/// only. The time the Root closed is not compared.
+fn audit_write_callbacks(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()> {
+    let exists: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='physical_write_callbacks')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(());
+    }
+    let mut stmt = c.prepare(&format!(
+        "SELECT c.operation_id,c.payload_digest,c.apply_result,c.action_state,c.returned_tick,c.deadline_tick,c.late,c.deadline_at,a.payload_digest,a.expires_at,a.state,a.disposition,a.apply_result,a.operation_id,a.dispatch_intent,EXISTS(SELECT 1 FROM physical_action_callbacks o WHERE o.operation_id=c.operation_id OR o.action_id=c.action_id) FROM physical_write_callbacks c LEFT JOIN physical_actions a USING(action_id) WHERE {}",
+        scope.filter("c.action_id", "action")
+    ))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let op: String = r.get(0)?;
+        RequestId::try_from(op.clone())?;
+        let applied: String = r.get(2)?;
+        let (returned, deadline): (i64, i64) = (r.get(4)?, r.get(5)?);
+        let late: bool = r.get(6)?;
+        let in_row = returned >= 0
+            && deadline > 0
+            && late == deadline_reached(returned as u64, deadline as u64);
+        let against_action = r.get::<_, Option<String>>(8)?.as_deref()
+            == Some(&*r.get::<_, String>(1)?)
+            && r.get::<_, Option<i64>>(9)? == Some(r.get::<_, i64>(7)?)
+            && r.get::<_, Option<i64>>(14)? == Some(1)
+            && r.get::<_, Option<String>>(13)?.as_deref() == Some(op.as_str())
+            && !r.get::<_, bool>(15)?;
+        let (disposition, result): (Option<String>, Option<String>) = (r.get(11)?, r.get(12)?);
+        let state_matches = match r.get::<_, String>(3)?.as_str() {
+            "open" => {
+                late && result.as_deref() == Some(applied.as_str())
+                    && (disposition.as_deref() == Some(applied.as_str())
+                        || (applied == "accepted"
+                            && disposition.as_deref() == Some("dispatch_unknown")))
+            }
+            _ => {
+                r.get::<_, Option<String>>(10)?.as_deref() == Some("closed")
+                    && disposition.as_deref() == Some("dispatch_unknown")
+                    && result.is_none()
+            }
+        };
+        require(
+            in_row && against_action && state_matches,
+            "Write callback mismatch",
+        )?;
     }
     Ok(())
 }

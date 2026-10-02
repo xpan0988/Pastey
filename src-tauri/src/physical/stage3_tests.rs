@@ -18,6 +18,8 @@ struct Clock {
     ticks: AtomicU64,
     reads: AtomicU64,
     expire_after: AtomicU64,
+    /// Writes whose return tick a dispatch has read.
+    returns: AtomicU64,
 }
 impl Clock {
     fn new() -> Self {
@@ -26,6 +28,7 @@ impl Clock {
             ticks: AtomicU64::new(0),
             reads: AtomicU64::new(0),
             expire_after: AtomicU64::new(0),
+            returns: AtomicU64::new(0),
         }
     }
     fn set(&self, wall: u64, ticks: u64) {
@@ -44,6 +47,9 @@ impl BindingClockV1 for Clock {
             UnixMillis::try_from(self.wall.load(Ordering::SeqCst))?,
             self.ticks.load(Ordering::SeqCst),
         ))
+    }
+    fn write_returned(&self) {
+        self.returns.fetch_add(1, Ordering::SeqCst);
     }
 }
 struct Fixture {

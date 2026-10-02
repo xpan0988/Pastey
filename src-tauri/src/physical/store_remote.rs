@@ -461,6 +461,11 @@ pub(super) fn stage10_ddl() -> String {
     super::control_ledger::stage10(&stage9_full_ddl())
 }
 
-pub(super) fn current_ddl() -> String {
+/// Stage 10 with the first (wall-clock) callback table.
+pub(super) fn stage10_callbacks_ddl() -> String {
     stage10_ddl() + super::control_ledger::ACTION_CALLBACK_SCHEMA
+}
+
+pub(super) fn current_ddl() -> String {
+    stage10_callbacks_ddl() + super::control_ledger::WRITE_CALLBACK_SCHEMA
 }

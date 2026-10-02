@@ -6,7 +6,8 @@ use super::*;
 use crate::physical::binding::{BindingDescriptionV1, EnvironmentBindingViewV1};
 use crate::physical::evidence::{TrustedDispositionV1, TrustedObservationV1, WitnessRegistryV1};
 use crate::physical::store::{
-    ActionAuditV1, CallbackRecordV1, FenceAuditV1, SessionAuditV1, WriteCallbackV1,
+    deadline_reached, ActionAuditV1, CallbackRecordV1, FenceAuditV1, SessionAuditV1,
+    WriteCallbackV1,
 };
 pub(crate) use decision_tools::*;
 use parking_lot::Mutex;
@@ -161,7 +162,7 @@ impl LaneValidityV1 {
     fn allows(&self) -> bool {
         self.flags.iter().all(|f| f.load(Ordering::Acquire))
             && self.clock.read().is_ok_and(|(_, ticks)| {
-                ticks < self.deadline
+                !deadline_reached(ticks, self.deadline)
                     && self
                         .continuing
                         .as_ref()
@@ -986,7 +987,7 @@ impl PhysicalControlServiceV1 {
             cleared_before = false;
             let at = returned.map_or(ticks, |r| r.min(ticks));
             timed_out = true;
-            require(at < a.deadline, "Action deadline passed")?;
+            require(!deadline_reached(at, a.deadline), "Action deadline passed")?;
             require(
                 at < a.continuing_deadline.load(Ordering::Acquire),
                 "Action observation freshness lapsed",
@@ -1075,6 +1076,8 @@ impl PhysicalControlServiceV1 {
         // Read before waiting for Core: the wait never makes a timely result
         // look late.
         let returned = clock.read().ok().map(|(_, ticks)| ticks);
+        #[cfg(test)]
+        clock.write_returned();
         let mut service = core.lock();
         if service.control.operations.get(a.grant.session.id()) == Some(&op) {
             service.control.operations.remove(a.grant.session.id());
@@ -1106,10 +1109,11 @@ impl PhysicalControlServiceV1 {
         };
         let committed = (|| {
             let s = &a.grant.session;
-            let (now, ticks) = service.binding.now()?;
-            let lock_wait_us = returned.map_or(0, |r| ticks.saturating_sub(r));
-            let returned_at =
-                UnixMillis::try_from(now.get().saturating_sub(lock_wait_us.div_ceil(1000)))?;
+            // The record is judged in ticks; its wall time is informational,
+            // so it is read without the resolver (whose regression check ran
+            // in the validity check above).
+            let (now, ticks) = clock.read()?;
+            let returned_tick = returned.unwrap_or(ticks);
             // A closed or fenced Root has no current snapshot; the record does
             // not need one, only the report of whether authority held.
             let snapshot = service.binding.ledger_snapshot(&s.root.binding).ok();
@@ -1121,9 +1125,10 @@ impl PhysicalControlServiceV1 {
                 &WriteCallbackV1 {
                     op: &op,
                     result: accepted,
-                    returned_at,
+                    returned_tick,
+                    deadline_tick: a.deadline,
                     recorded_at: now,
-                    lock_wait_us,
+                    lock_wait_us: ticks.saturating_sub(returned_tick),
                 },
             )?;
             match record {
@@ -1571,7 +1576,7 @@ pub(in crate::physical) mod test_support {
     ) -> AppResult<CallbackRecordV1> {
         let s = &a.grant.session;
         let snapshot = core.binding.ledger_snapshot(&s.root.binding).ok();
-        let (now, _) = core.binding.now()?;
+        let (now, ticks) = core.binding.now()?;
         core.store.finish_write(
             &s.root.audit,
             &s.audit,
@@ -1580,7 +1585,8 @@ pub(in crate::physical) mod test_support {
             &WriteCallbackV1 {
                 op,
                 result,
-                returned_at: now,
+                returned_tick: ticks,
+                deadline_tick: a.deadline,
                 recorded_at: now,
                 lock_wait_us: 0,
             },
