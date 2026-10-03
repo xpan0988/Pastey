@@ -262,11 +262,404 @@ struct JournalV1 {
     deleted: bool,
     /// The data version of the last fully audited or validated state.
     trusted: Option<i64>,
+    /// The evidence and consequence history validated at `trusted`. It exists
+    /// only together with `trusted` and is dropped with it.
+    history: Option<Arc<HistoryBaselineV1>>,
+    /// Tests: compare every bounded group validation with the full one.
+    #[cfg(test)]
+    no_oracle: bool,
 }
 impl JournalV1 {
     fn pending(&self) -> bool {
         !self.rows.is_empty() || self.deleted
     }
+    /// Forgets the trusted state: the next transaction audits in full.
+    fn distrust(&mut self) {
+        self.trusted = None;
+        self.history = None;
+    }
+}
+
+/// Bounded Root-group validation (docs/physical.md, "Ledger validation").
+///
+/// Evidence and consequence rows are validated once, when they are appended:
+/// by the full audit, or by `validate_appended` at the head of their action
+/// under a trusted snapshot. Triggers refuse every later change to them, and
+/// every input their checks read (the action, attempt and review rows that
+/// derive their lineage) is immutable too; producer qualifications live in
+/// ungrouped tables whose writes audit in full. A change by any other
+/// connection or process moves `PRAGMA data_version` (or the file stamp) and
+/// makes the next transaction audit in full. So a write that changes no
+/// history row does not need to replay history that is still exactly the
+/// validated history. That history is recorded here: for each Root, each
+/// action's evidence and consequence heads at the trusted data version.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HistoryBaselineV1 {
+    /// The data version at which these heads were validated; equal to the
+    /// journal's `trusted` while the baseline holds.
+    version: i64,
+    roots: BTreeMap<String, BTreeMap<String, HistoryHeadV1>>,
+}
+/// One action's highest evidence and consequence revisions (0 for none).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HistoryHeadV1 {
+    evidence: i64,
+    consequences: i64,
+}
+impl HistoryBaselineV1 {
+    /// Adopts newly validated heads of the listed actions.
+    fn learn(&mut self, heads: BTreeMap<String, BTreeMap<String, HistoryHeadV1>>) {
+        for (root, actions) in heads {
+            self.roots.entry(root).or_default().extend(actions);
+        }
+    }
+    /// Whether every listed action's history is exactly validated history:
+    /// none at all, or the heads this baseline holds for it.
+    fn covers(&self, heads: &BTreeMap<String, BTreeMap<String, HistoryHeadV1>>) -> bool {
+        heads.iter().all(|(root, actions)| {
+            actions.iter().all(|(action, head)| {
+                *head == HistoryHeadV1::default()
+                    || self.roots.get(root).and_then(|r| r.get(action)) == Some(head)
+            })
+        })
+    }
+}
+/// The current history heads of every action, or of the actions in the
+/// audit scope, by Root. Indexed lookups only: (action_id, revision) is
+/// unique in both history tables.
+fn history_heads(
+    c: &Connection,
+    scope: AuditScopeV1,
+) -> AppResult<BTreeMap<String, BTreeMap<String, HistoryHeadV1>>> {
+    let mut stmt = c.prepare(&format!(
+        "SELECT a.root_id,a.action_id,
+         COALESCE((SELECT max(revision) FROM physical_evidence e WHERE e.action_id=a.action_id),0),
+         COALESCE((SELECT max(revision) FROM physical_consequences q WHERE q.action_id=a.action_id),0)
+         FROM physical_actions a WHERE {}",
+        scope.filter("a.action_id", "action")
+    ))?;
+    let mut heads = BTreeMap::<String, BTreeMap<String, HistoryHeadV1>>::new();
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        heads.entry(r.get(0)?).or_default().insert(
+            r.get(1)?,
+            HistoryHeadV1 {
+                evidence: r.get(2)?,
+                consequences: r.get(3)?,
+            },
+        );
+    }
+    Ok(heads)
+}
+
+/// What one write may touch. Every store write declares its kind; a write may
+/// skip replaying history only if its kind declares no history table and it
+/// wrote no history row. Debug builds refuse a declared write that touches a
+/// table its kind does not declare.
+pub(super) struct WriteKindV1 {
+    pub(super) name: &'static str,
+    pub(super) tables: &'static [&'static str],
+}
+impl WriteKindV1 {
+    /// Declared, and declares no evidence or consequence table.
+    fn preserves_history(&self) -> bool {
+        !self.tables.is_empty()
+            && !self
+                .tables
+                .iter()
+                .any(|t| evidence_ledger::APPEND_ONLY.contains(t))
+    }
+    #[cfg(debug_assertions)]
+    fn check(&self, rows: &[(String, i64)]) -> AppResult<()> {
+        match rows
+            .iter()
+            .find(|(t, _)| !self.tables.contains(&t.as_str()))
+        {
+            Some((table, _)) => Err(AppError::InvalidInput(format!(
+                "Undeclared physical ledger write: {table} in {}",
+                self.name
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+/// A transaction that declares nothing (one that only reads, or a test's own
+/// write): its writes, if any, take the full validation and never skip any.
+const UNDECLARED: WriteKindV1 = WriteKindV1 {
+    name: "undeclared",
+    tables: &[],
+};
+/// The tables each write kind touches (see `WriteKindV1`). A Root's closure
+/// (`control_ledger::close_root`) writes actions, budgets, reservations,
+/// domains and sessions.
+mod kinds {
+    use super::WriteKindV1;
+    pub(super) const ACKNOWLEDGE_FENCE: WriteKindV1 = WriteKindV1 {
+        name: "acknowledge_fence",
+        tables: &["physical_sessions"],
+    };
+    pub(super) const ACTIVATE_SESSION: WriteKindV1 = WriteKindV1 {
+        name: "activate_session",
+        tables: &["physical_sessions"],
+    };
+    pub(super) const ADMIT_ACTION: WriteKindV1 = WriteKindV1 {
+        name: "admit_action",
+        tables: &[
+            "physical_actions",
+            "physical_control_budgets",
+            "physical_decisions",
+        ],
+    };
+    pub(super) const ADVANCE_EPOCHS: WriteKindV1 = WriteKindV1 {
+        name: "advance_epochs",
+        tables: &["physical_domains"],
+    };
+    pub(super) const CLAIM_SEMANTIC: WriteKindV1 = WriteKindV1 {
+        name: "claim_semantic",
+        tables: &["physical_semantic_messages"],
+    };
+    pub(super) const CLOSE_ATTEMPT: WriteKindV1 = WriteKindV1 {
+        name: "close_attempt",
+        tables: &[
+            "physical_actions",
+            "physical_attempts",
+            "physical_control_budgets",
+            "physical_domain_reservations",
+            "physical_domains",
+            "physical_sessions",
+            "physical_task_acceptance",
+        ],
+    };
+    pub(super) const CLOSE_ENVIRONMENT_ATTEMPTS: WriteKindV1 = WriteKindV1 {
+        name: "close_environment_attempts",
+        tables: &[
+            "physical_actions",
+            "physical_attempts",
+            "physical_control_budgets",
+            "physical_domain_reservations",
+            "physical_domains",
+            "physical_sessions",
+            "physical_task_acceptance",
+        ],
+    };
+    pub(super) const CLOSE_OPEN_ATTEMPTS: WriteKindV1 = WriteKindV1 {
+        name: "close_open_attempts",
+        tables: &[
+            "physical_actions",
+            "physical_attempts",
+            "physical_control_budgets",
+            "physical_domain_reservations",
+            "physical_domains",
+            "physical_sessions",
+            "physical_task_acceptance",
+        ],
+    };
+    pub(super) const COMMIT_ACCEPTANCE: WriteKindV1 = WriteKindV1 {
+        name: "commit_acceptance",
+        tables: &[
+            "physical_actions",
+            "physical_attempts",
+            "physical_control_budgets",
+            "physical_domain_reservations",
+            "physical_domains",
+            "physical_sessions",
+            "physical_task_acceptance",
+        ],
+    };
+    pub(super) const CONFIGURE_HANDOVER: WriteKindV1 = WriteKindV1 {
+        name: "configure_handover",
+        tables: &["physical_handover_policies"],
+    };
+    pub(super) const CREATE_REVIEW: WriteKindV1 = WriteKindV1 {
+        name: "create_review",
+        tables: &["physical_reviews"],
+    };
+    pub(super) const ENROLL: WriteKindV1 = WriteKindV1 {
+        name: "enroll",
+        tables: &[
+            "physical_aliases",
+            "physical_domains",
+            "physical_environment_domains",
+            "physical_environments",
+            "physical_qualifications",
+        ],
+    };
+    pub(super) const EVALUATE_CONSEQUENCE: WriteKindV1 = WriteKindV1 {
+        name: "evaluate_consequence",
+        tables: &["physical_consequences"],
+    };
+    pub(super) const FINISH_WRITE: WriteKindV1 = WriteKindV1 {
+        name: "finish_write",
+        tables: &["physical_actions", "physical_write_callbacks"],
+    };
+    pub(super) const IMPORT_APPROVED_REVIEW: WriteKindV1 = WriteKindV1 {
+        name: "import_approved_review",
+        tables: &["physical_reviews"],
+    };
+    pub(super) const INVALIDATE_QUALIFICATIONS: WriteKindV1 = WriteKindV1 {
+        name: "invalidate_qualifications",
+        tables: &["physical_qualifications"],
+    };
+    pub(super) const ORIGINATE_ATTEMPT: WriteKindV1 = WriteKindV1 {
+        name: "originate_attempt",
+        tables: &[
+            "physical_attempts",
+            "physical_reviews",
+            "physical_task_acceptance",
+        ],
+    };
+    pub(super) const PREPARE_WRITE: WriteKindV1 = WriteKindV1 {
+        name: "prepare_write",
+        tables: &["physical_actions", "physical_control_budgets"],
+    };
+    pub(super) const RECONCILE: WriteKindV1 = WriteKindV1 {
+        name: "reconcile",
+        tables: &[
+            "physical_domain_reservations",
+            "physical_handover_verdicts",
+            "physical_handovers",
+            "physical_reconciliations",
+        ],
+    };
+    pub(super) const RECORD_DISPOSITION: WriteKindV1 = WriteKindV1 {
+        name: "record_disposition",
+        tables: &["physical_evidence"],
+    };
+    pub(super) const RECORD_EFFECT_VIOLATION: WriteKindV1 = WriteKindV1 {
+        name: "record_effect_violation",
+        tables: &[
+            "physical_actions",
+            "physical_attempts",
+            "physical_control_budgets",
+            "physical_domain_reservations",
+            "physical_domains",
+            "physical_effect_bound_violations",
+            "physical_sessions",
+            "physical_task_acceptance",
+        ],
+    };
+    pub(super) const RECORD_OBSERVATION: WriteKindV1 = WriteKindV1 {
+        name: "record_observation",
+        tables: &["physical_evidence"],
+    };
+    pub(super) const RECORD_QUALIFICATION: WriteKindV1 = WriteKindV1 {
+        name: "record_qualification_inner",
+        tables: &["physical_qualifications"],
+    };
+    pub(super) const RECORD_REFUSAL: WriteKindV1 = WriteKindV1 {
+        name: "record_refusal",
+        tables: &["physical_decisions"],
+    };
+    pub(super) const RESERVE_SESSION: WriteKindV1 = WriteKindV1 {
+        name: "reserve_session",
+        tables: &[
+            "physical_control_budgets",
+            "physical_domain_reservations",
+            "physical_domains",
+            "physical_sessions",
+        ],
+    };
+    pub(super) const RETIRE: WriteKindV1 = WriteKindV1 {
+        name: "retire",
+        tables: &[
+            "physical_domains",
+            "physical_environments",
+            "physical_qualifications",
+        ],
+    };
+    pub(super) const REVISE_REVIEW: WriteKindV1 = WriteKindV1 {
+        name: "revise_review",
+        tables: &[
+            "physical_actions",
+            "physical_attempts",
+            "physical_control_budgets",
+            "physical_domain_reservations",
+            "physical_domains",
+            "physical_reviews",
+            "physical_sessions",
+            "physical_task_acceptance",
+        ],
+    };
+    pub(super) const SAVE_REMOTE_OFFERS: WriteKindV1 = WriteKindV1 {
+        name: "save_remote_offers",
+        tables: &["physical_remote_offers"],
+    };
+    pub(super) const SAVE_REMOTE_REVIEW: WriteKindV1 = WriteKindV1 {
+        name: "save_remote_review",
+        tables: &["physical_remote_reviews"],
+    };
+    pub(super) const SAVE_SEMANTIC_RESULT: WriteKindV1 = WriteKindV1 {
+        name: "save_semantic_result",
+        tables: &["physical_semantic_messages"],
+    };
+    pub(super) const TRANSITION_REVIEW: WriteKindV1 = WriteKindV1 {
+        name: "transition_review",
+        tables: &[
+            "physical_actions",
+            "physical_attempts",
+            "physical_control_budgets",
+            "physical_domain_reservations",
+            "physical_domains",
+            "physical_reviews",
+            "physical_sessions",
+            "physical_task_acceptance",
+        ],
+    };
+    pub(super) const WITHDRAW_QUALIFICATION: WriteKindV1 = WriteKindV1 {
+        name: "withdraw_qualification",
+        tables: &["physical_qualifications"],
+    };
+    /// Tests: a write of evidence together with a Root's budget row (a
+    /// history change that is not a bounded append).
+    #[cfg(test)]
+    pub(super) const TEST_HISTORY_AND_BUDGET: WriteKindV1 = WriteKindV1 {
+        name: "test_history_and_budget",
+        tables: &["physical_control_budgets", "physical_evidence"],
+    };
+    #[cfg(test)]
+    pub(super) const ALL: &[&WriteKindV1] = &[
+        &ACKNOWLEDGE_FENCE,
+        &ACTIVATE_SESSION,
+        &ADMIT_ACTION,
+        &ADVANCE_EPOCHS,
+        &CLAIM_SEMANTIC,
+        &CLOSE_ATTEMPT,
+        &CLOSE_ENVIRONMENT_ATTEMPTS,
+        &CLOSE_OPEN_ATTEMPTS,
+        &COMMIT_ACCEPTANCE,
+        &CONFIGURE_HANDOVER,
+        &CREATE_REVIEW,
+        &ENROLL,
+        &EVALUATE_CONSEQUENCE,
+        &FINISH_WRITE,
+        &IMPORT_APPROVED_REVIEW,
+        &INVALIDATE_QUALIFICATIONS,
+        &ORIGINATE_ATTEMPT,
+        &PREPARE_WRITE,
+        &RECONCILE,
+        &RECORD_DISPOSITION,
+        &RECORD_EFFECT_VIOLATION,
+        &RECORD_OBSERVATION,
+        &RECORD_QUALIFICATION,
+        &RECORD_REFUSAL,
+        &RESERVE_SESSION,
+        &RETIRE,
+        &REVISE_REVIEW,
+        &SAVE_REMOTE_OFFERS,
+        &SAVE_REMOTE_REVIEW,
+        &SAVE_SEMANTIC_RESULT,
+        &TRANSITION_REVIEW,
+        &WITHDRAW_QUALIFICATION,
+        &TEST_HISTORY_AND_BUDGET,
+    ];
+}
+/// What the Root-group validation of one commit adopts once it commits.
+enum LearnedV1 {
+    Nothing,
+    /// Everything was audited in full: the whole baseline.
+    All(BTreeMap<String, BTreeMap<String, HistoryHeadV1>>),
+    /// These Roots' history was validated or confirmed unchanged.
+    Roots(BTreeMap<String, BTreeMap<String, HistoryHeadV1>>),
 }
 /// Which file a path names: device and inode where the platform has them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -608,27 +1001,83 @@ impl PhysicalStoreV1 {
             if j.trusted == Some(version) {
                 return Ok(());
             }
-            j.trusted = None;
+            j.distrust();
         }
         tx.execute("DELETE FROM temp.physical_audit_scope", [])?;
+        #[cfg(test)]
+        validation_stats::record("trust_audit", "full");
         audit(tx, AuditScopeV1::Full)?;
-        self.ledger.journal.lock().trusted = Some(version);
+        // The history baseline is established by, and only by, a full audit
+        // (or by validations under the trust it starts).
+        let heads = history_heads(tx, AuditScopeV1::Full)?;
+        let mut j = self.ledger.journal.lock();
+        j.trusted = Some(version);
+        j.history = Some(Arc::new(HistoryBaselineV1 {
+            version,
+            roots: heads,
+        }));
         Ok(())
     }
-    /// Validates exactly what this transaction wrote, then commits it.
+    /// Commits a transaction of no declared kind: whatever it wrote is
+    /// validated without skipping anything.
     pub(super) fn commit(&self, tx: rusqlite::Transaction<'_>) -> AppResult<()> {
-        let (rows, deleted) = {
+        self.commit_as(tx, &UNDECLARED)
+    }
+    /// Validates exactly what this transaction wrote, then commits it.
+    pub(super) fn commit_as(
+        &self,
+        tx: rusqlite::Transaction<'_>,
+        kind: &WriteKindV1,
+    ) -> AppResult<()> {
+        let (rows, deleted, trusted, history) = {
             let mut j = self.ledger.journal.lock();
-            (std::mem::take(&mut j.rows), std::mem::take(&mut j.deleted))
+            (
+                std::mem::take(&mut j.rows),
+                std::mem::take(&mut j.deleted),
+                j.trusted,
+                j.history.clone(),
+            )
         };
-        if deleted {
+        #[cfg(debug_assertions)]
+        if !kind.tables.is_empty() {
+            kind.check(&rows)?;
+        }
+        let learned = if deleted {
             tx.execute("DELETE FROM temp.physical_audit_scope", [])?;
             audit(&tx, AuditScopeV1::Full)?;
+            #[cfg(test)]
+            validation_stats::record(kind.name, "full");
+            LearnedV1::All(history_heads(&tx, AuditScopeV1::Full)?)
         } else if !rows.is_empty() {
-            validate_written(&tx, &rows)?;
-        }
+            let trust = TrustV1 {
+                trusted,
+                history: history.as_deref(),
+                #[cfg(test)]
+                oracle: !self.ledger.journal.lock().no_oracle,
+            };
+            validate_written(&tx, &rows, kind, &trust)?
+        } else {
+            LearnedV1::Nothing
+        };
+        drop(history);
         tx.commit()?;
         *self.ledger.stamp.lock() = FileStampV1::of(&self.ledger.path)?;
+        // Own commits leave this connection's data version unchanged, so the
+        // baseline stays at `trusted`; it is extended only if nothing
+        // distrusted the ledger meanwhile.
+        let mut j = self.ledger.journal.lock();
+        let trusted = j.trusted;
+        if let (Some(b), Some(v)) = (j.history.as_mut(), trusted) {
+            // The transaction's own reference is gone: this updates in place.
+            let b = Arc::make_mut(b);
+            if b.version == v {
+                match learned {
+                    LearnedV1::Nothing => {}
+                    LearnedV1::All(heads) => b.roots = heads,
+                    LearnedV1::Roots(heads) => b.learn(heads),
+                }
+            }
+        }
         Ok(())
     }
     /// The ledger's one connection, for one transaction at a time. A journal
@@ -651,7 +1100,7 @@ impl PhysicalStoreV1 {
         if stamp != *self.ledger.stamp.lock() {
             *conn = connect(&self.ledger.path, &self.ledger.journal)?;
             let mut j = self.ledger.journal.lock();
-            j.trusted = None;
+            j.distrust();
             j.rows.clear();
             j.deleted = false;
             *self.ledger.stamp.lock() = stamp;
@@ -659,7 +1108,7 @@ impl PhysicalStoreV1 {
         {
             let mut j = self.ledger.journal.lock();
             if j.pending() {
-                j.trusted = None;
+                j.distrust();
                 j.rows.clear();
                 j.deleted = false;
             }
@@ -760,7 +1209,7 @@ impl PhysicalStoreV1 {
             }
         }
         self.audit(&tx)?;
-        self.commit(tx)?;
+        self.commit_as(tx, &kinds::ENROLL)?;
         Ok(())
     }
     pub(super) fn retire(&self, id: &EnvironmentRefV1, expected: u64) -> AppResult<()> {
@@ -772,7 +1221,7 @@ impl PhysicalStoreV1 {
         bump_environment_domains(&tx, id)?;
         withdraw_environment(&tx, id)?;
         tx.execute("UPDATE physical_environments SET retired=1,denial_revision=?2 WHERE environment_id=?1 AND retired=0 AND revision=?3",params![text(id),checked_integer(expected.checked_add(1).unwrap_or(u64::MAX))?,checked_integer(expected)?])?;
-        self.commit(tx)?;
+        self.commit_as(tx, &kinds::RETIRE)?;
         Ok(())
     }
     pub(super) fn epochs(
@@ -819,7 +1268,7 @@ impl PhysicalStoreV1 {
             )?;
             require(n == 1, "Stale/conflicting physical domain ledger operation")?;
         }
-        self.commit(tx)?;
+        self.commit_as(tx, &kinds::ADVANCE_EPOCHS)?;
         Ok(())
     }
     pub(super) fn record_qualification(
@@ -849,7 +1298,7 @@ impl PhysicalStoreV1 {
         // Strict insert: identities are immutable, including expiry/evidence. A
         // new qualification requires a new ID; withdrawal cannot be overwritten.
         tx.execute("INSERT INTO physical_qualifications(qualification_id,environment_id,revision,registration_digest,profile_digest,binding_digest,evidence_class,enforcement_class,evidence_digest,conditions_digest,provenance_digest,record_digest,record_json,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![text(&q.qualification_id),text(environment),checked_integer(q.revision)?,text(registration_digest),text(&q.profile_digest),text(&q.binding_digest),tag(&q.evidence_class)?,tag(&q.required_enforcement_class)?,text(&q.evidence_digest),text(&q.conditions_digest),text(provenance),text(&q.digest()?),serde_json::to_string(q)?,q.expires_at.get() as i64])?;
-        self.commit(tx)?;
+        self.commit_as(tx, &kinds::RECORD_QUALIFICATION)?;
         Ok(())
     }
     pub(super) fn qualification(
@@ -880,7 +1329,7 @@ impl PhysicalStoreV1 {
         self.audit(&tx)?;
         let n = tx.execute("UPDATE physical_qualifications SET withdrawal_revision=?2 WHERE qualification_id=?1 AND revision < ?2 AND withdrawal_revision < ?2",params![text(id),checked_integer(revision)?])?;
         require(n == 1, "Missing/stale qualification withdrawal")?;
-        self.commit(tx)?;
+        self.commit_as(tx, &kinds::WITHDRAW_QUALIFICATION)?;
         Ok(())
     }
     pub(super) fn invalidate_qualifications(
@@ -892,7 +1341,7 @@ impl PhysicalStoreV1 {
         self.audit(&tx)?;
         load_registration(&tx, environment, true)?;
         withdraw_environment(&tx, environment)?;
-        self.commit(tx)?;
+        self.commit_as(tx, &kinds::INVALIDATE_QUALIFICATIONS)?;
         Ok(())
     }
 }
@@ -927,16 +1376,24 @@ pub(super) enum AuditScopeV1 {
     /// and `offer`. SQLite enforces foreign keys on this connection's own
     /// writes; the full audit rechecks them.
     Touched,
+    /// As `Touched`, for a write that changed no evidence or consequence row
+    /// while every in-scope action's history is exactly the validated
+    /// baseline: those rows are not replayed; every other check runs.
+    TouchedValidatedHistory,
 }
 impl AuditScopeV1 {
     pub(super) fn full(self) -> bool {
         self == Self::Full
     }
+    /// Whether evidence and consequence rows in scope are replayed.
+    pub(super) fn replays_history(self) -> bool {
+        self != Self::TouchedValidatedHistory
+    }
     /// A condition restricting `column` to this scope's keys of `kind`.
     pub(super) fn filter(self, column: &str, kind: &str) -> String {
         match self {
             Self::Full => "1".into(),
-            Self::Touched => format!(
+            Self::Touched | Self::TouchedValidatedHistory => format!(
                 "{column} IN (SELECT key FROM temp.physical_audit_scope WHERE kind='{kind}')"
             ),
         }
@@ -978,10 +1435,25 @@ const GROUPED_TABLES: &[(&str, &[(&str, &str)])] = &[
     ("physical_remote_reviews", &[("remote_review", "review_id")]),
     ("physical_remote_offers", &[("offer", "peer")]),
 ];
+/// The trust a commit validates under: the journal as the transaction found it.
+struct TrustV1<'a> {
+    trusted: Option<i64>,
+    history: Option<&'a HistoryBaselineV1>,
+    /// Tests: also run the full group audit and require the same outcome.
+    #[cfg(test)]
+    oracle: bool,
+}
 /// Validates the rows a transaction wrote and every group they belong to,
 /// before it commits. Every check the full audit makes on those groups runs
-/// unchanged; rows outside them were audited and have not changed.
-fn validate_written(tx: &Connection, rows: &[(String, i64)]) -> AppResult<()> {
+/// unchanged; rows outside them were audited and have not changed. History
+/// rows of the groups are replayed unless the write changed none of them and
+/// all of them are the validated baseline (see `HistoryBaselineV1`).
+fn validate_written(
+    tx: &Connection,
+    rows: &[(String, i64)],
+    kind: &WriteKindV1,
+    trust: &TrustV1<'_>,
+) -> AppResult<LearnedV1> {
     tx.execute("DELETE FROM temp.physical_audit_scope", [])?;
     // Appends to the immutable evidence tables at the head of their actions
     // are validated row by row against their audited predecessors, which is
@@ -994,12 +1466,16 @@ fn validate_written(tx: &Connection, rows: &[(String, i64)]) -> AppResult<()> {
         && evidence_ledger::appended_at_head(tx, rows)?
     {
         audit(tx, AuditScopeV1::Touched)?;
-        return evidence_ledger::validate_appended(tx, rows);
+        evidence_ledger::validate_appended(tx, rows)?;
+        return Ok(LearnedV1::Roots(appended_heads(tx, rows)?));
     }
     for (table, rowid) in rows {
         let Some((_, keys)) = GROUPED_TABLES.iter().find(|(t, _)| t == table) else {
             tx.execute("DELETE FROM temp.physical_audit_scope", [])?;
-            return audit(tx, AuditScopeV1::Full);
+            audit(tx, AuditScopeV1::Full)?;
+            #[cfg(test)]
+            validation_stats::record(kind.name, "full");
+            return Ok(LearnedV1::All(history_heads(tx, AuditScopeV1::Full)?));
         };
         for (kind, key) in *keys {
             tx.execute(
@@ -1020,7 +1496,111 @@ fn validate_written(tx: &Connection, rows: &[(String, i64)]) -> AppResult<()> {
          INSERT OR IGNORE INTO temp.physical_audit_scope SELECT 'session',session_id FROM physical_sessions WHERE root_id IN (SELECT key FROM temp.physical_audit_scope WHERE kind='root');
          INSERT OR IGNORE INTO temp.physical_audit_scope SELECT 'action',action_id FROM physical_actions WHERE root_id IN (SELECT key FROM temp.physical_audit_scope WHERE kind='root');",
     )?;
-    audit(tx, AuditScopeV1::Touched)
+    // Every in-scope action's history heads, read now under this transaction's
+    // lock: the history the groups would replay.
+    let heads = history_heads(tx, AuditScopeV1::Touched)?;
+    let bounded = kind.preserves_history()
+        && rows
+            .iter()
+            .all(|(table, _)| !evidence_ledger::APPEND_ONLY.contains(&table.as_str()))
+        && trust
+            .history
+            .is_some_and(|b| trust.trusted == Some(b.version) && b.covers(&heads))
+        // Re-read at commit: no other connection has committed since the
+        // trust (and the baseline with it) was established.
+        && trust.trusted == Some(data_version(tx)?);
+    if !bounded {
+        #[cfg(test)]
+        validation_stats::record(kind.name, "replayed");
+        audit(tx, AuditScopeV1::Touched)?;
+        return Ok(LearnedV1::Roots(heads));
+    }
+    #[cfg(test)]
+    validation_stats::record(kind.name, "bounded");
+    let result = audit(tx, AuditScopeV1::TouchedValidatedHistory);
+    #[cfg(test)]
+    if trust.oracle {
+        let oracle = audit(tx, AuditScopeV1::Touched);
+        assert_eq!(
+            result.as_ref().map_err(|e| e.message().to_owned()),
+            oracle.as_ref().map_err(|e| e.message().to_owned()),
+            "bounded Root-group validation diverged from the group audit ({})",
+            kind.name
+        );
+    }
+    result?;
+    Ok(LearnedV1::Roots(heads))
+}
+/// This connection's `PRAGMA data_version`: it changes when any other
+/// connection or process commits to the file.
+fn data_version(c: &Connection) -> AppResult<i64> {
+    Ok(c.query_row("PRAGMA data_version", [], |r| r.get(0))?)
+}
+/// The heads, by Root, of the actions whose history these appended rows extend.
+fn appended_heads(
+    c: &Connection,
+    rows: &[(String, i64)],
+) -> AppResult<BTreeMap<String, BTreeMap<String, HistoryHeadV1>>> {
+    let mut heads = BTreeMap::<String, BTreeMap<String, HistoryHeadV1>>::new();
+    for (table, rowid) in rows {
+        let (root, action, evidence, consequences): (String, String, i64, i64) = c.query_row(
+            &format!(
+                "SELECT a.root_id,a.action_id,
+                 COALESCE((SELECT max(revision) FROM physical_evidence e WHERE e.action_id=a.action_id),0),
+                 COALESCE((SELECT max(revision) FROM physical_consequences q WHERE q.action_id=a.action_id),0)
+                 FROM physical_actions a WHERE a.action_id=(SELECT action_id FROM {table} WHERE rowid=?1)"
+            ),
+            [rowid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        heads.entry(root).or_default().insert(
+            action,
+            HistoryHeadV1 {
+                evidence,
+                consequences,
+            },
+        );
+    }
+    Ok(heads)
+}
+
+/// Tests: which validation each commit took, and how many history rows the
+/// audits on this thread read.
+#[cfg(test)]
+pub(in crate::physical) mod validation_stats {
+    use std::cell::RefCell;
+    #[derive(Clone, Debug, Default)]
+    pub(in crate::physical) struct StatsV1 {
+        /// (write kind, "bounded" | "replayed" | "full").
+        pub validations: Vec<(&'static str, &'static str)>,
+        /// Evidence and consequence rows decoded by audits.
+        pub history_rows: u64,
+    }
+    thread_local! {
+        static STATS: RefCell<StatsV1> = RefCell::default();
+    }
+    pub(super) fn record(kind: &'static str, path: &'static str) {
+        STATS.with(|s| s.borrow_mut().validations.push((kind, path)));
+        // A whole-suite tally across threads, when asked for.
+        if let Ok(file) = std::env::var("PASTEY_TEST_LEDGER_VALIDATION_LOG") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(file)
+            {
+                // One write per line, so lines from parallel tests never mix.
+                let _ = f.write_all(format!("{kind}\t{path}\n").as_bytes());
+            }
+        }
+    }
+    pub(in crate::physical) fn history_row() {
+        STATS.with(|s| s.borrow_mut().history_rows += 1);
+    }
+    /// This thread's tally since the last call.
+    pub(in crate::physical) fn take() -> StatsV1 {
+        STATS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
 }
 /// The ledger audit over `scope`. A migration's connection has no scope
 /// table and always audits in full.
@@ -1211,4 +1791,71 @@ pub(super) fn test_restore_stage7_schema(paths: &AppPaths) -> AppResult<()> {
     remote_ledger::rebuild(&tx, &remote_ledger::stage7_ddl())?;
     tx.commit()?;
     Ok(())
+}
+
+/// Tests: the trusted history baseline, and writes as a declared kind.
+#[cfg(test)]
+impl PhysicalStoreV1 {
+    /// The baseline as (data version, Root -> action -> (evidence head,
+    /// consequence head)), if the ledger is trusted.
+    pub(in crate::physical) fn test_history_baseline(
+        &self,
+    ) -> Option<(i64, BTreeMap<String, BTreeMap<String, (i64, i64)>>)> {
+        let j = self.ledger.journal.lock();
+        j.history.as_ref().map(|b| {
+            (
+                b.version,
+                b.roots
+                    .iter()
+                    .map(|(root, actions)| {
+                        let heads = actions
+                            .iter()
+                            .map(|(a, h)| (a.clone(), (h.evidence, h.consequences)))
+                            .collect();
+                        (root.clone(), heads)
+                    })
+                    .collect(),
+            )
+        })
+    }
+    /// Replaces one action's validated heads (a baseline that no longer
+    /// matches the history).
+    pub(in crate::physical) fn test_set_history_head(
+        &self,
+        root: &str,
+        action: &str,
+        heads: (i64, i64),
+    ) {
+        let mut j = self.ledger.journal.lock();
+        let b = Arc::make_mut(j.history.as_mut().expect("a trusted baseline"));
+        b.roots.entry(root.to_owned()).or_default().insert(
+            action.to_owned(),
+            HistoryHeadV1 {
+                evidence: heads.0,
+                consequences: heads.1,
+            },
+        );
+    }
+    /// Stops comparing bounded validations with the full group audit (for
+    /// measuring the bounded work alone).
+    pub(in crate::physical) fn test_without_oracle(&self) {
+        self.ledger.journal.lock().no_oracle = true;
+    }
+    /// Runs `write` in one immediate transaction and commits it as the
+    /// declared kind named `kind`.
+    pub(in crate::physical) fn test_write_as(
+        &self,
+        kind: &str,
+        write: impl FnOnce(&Connection) -> rusqlite::Result<()>,
+    ) -> AppResult<()> {
+        let kind = kinds::ALL
+            .iter()
+            .find(|k| k.name == kind)
+            .unwrap_or_else(|| panic!("no write kind {kind}"));
+        let mut c = self.connection()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.audit(&tx)?;
+        write(&tx)?;
+        self.commit_as(tx, kind)
+    }
 }

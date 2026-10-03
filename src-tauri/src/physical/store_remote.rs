@@ -158,7 +158,7 @@ impl PhysicalStoreV1 {
                 serde_json::to_string(m)?
             ],
         )?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::CLAIM_SEMANTIC)?;
         Ok(true)
     }
     pub(in crate::physical) fn semantic_message(
@@ -197,7 +197,7 @@ impl PhysicalStoreV1 {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.audit(&tx)?;
         require(tx.execute("UPDATE physical_semantic_messages SET result_json=?3 WHERE peer=?1 AND semantic_id=?2",params![peer.as_str(),text(id),serde_json::to_string(s)?])? == 1, "Unknown physical result correlation")?;
-        self.commit(tx)
+        self.commit_as(tx, &super::kinds::SAVE_SEMANTIC_RESULT)
     }
     /// The executor's latest offers for this requester, cached for the
     /// product view.
@@ -211,7 +211,7 @@ impl PhysicalStoreV1 {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.audit(&tx)?;
         tx.execute("INSERT INTO physical_remote_offers VALUES(?1,?2,?3) ON CONFLICT(peer) DO UPDATE SET session_pair=excluded.session_pair,offers_json=excluded.offers_json",params![peer.as_str(),pair,serde_json::to_string(offers)?])?;
-        self.commit(tx)
+        self.commit_as(tx, &super::kinds::SAVE_REMOTE_OFFERS)
     }
     pub(in crate::physical) fn save_remote_review(
         &self,
@@ -223,7 +223,7 @@ impl PhysicalStoreV1 {
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.audit(&tx)?;
         tx.execute("INSERT INTO physical_remote_reviews VALUES(?1,?2,?3) ON CONFLICT(review_id) DO UPDATE SET record_json=excluded.record_json WHERE physical_remote_reviews.session_pair=excluded.session_pair",params![text(&r.review_id),serde_json::to_string(r)?,pair])?;
-        self.commit(tx)
+        self.commit_as(tx, &super::kinds::SAVE_REMOTE_REVIEW)
     }
     pub(in crate::physical) fn remote_review(
         &self,
@@ -256,7 +256,7 @@ impl PhysicalStoreV1 {
             "Stale remote review",
         )?;
         tx.execute("INSERT INTO physical_reviews(review_id,revision,scope_digest,scope_json,state,state_revision,approval_id,approval_principal,approved_at,approval_expiry,record_json) VALUES(?1,1,?2,?3,'approved',3,?4,?5,?6,?7,?8)", params![text(&r.review_id),text(&r.scope_digest),serde_json::to_string(&r.scope)?,text(&a.approval_id),text(&a.principal),a.approved_at.get() as i64,a.expires_at.get() as i64,serde_json::to_string(r)?])?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::IMPORT_APPROVED_REVIEW)?;
         Ok(())
     }
     pub(in crate::physical) fn physical_status(

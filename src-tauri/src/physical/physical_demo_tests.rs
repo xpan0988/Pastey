@@ -1456,5 +1456,7 @@ fn the_development_switch_offers_a_reference_body_and_fails_closed() {
     assert!(ReferenceBodyV1::Cup.witnesses().is_ok());
 }
 
+#[path = "bounded_validation_tests.rs"]
+mod bounded_validation;
 #[path = "mcp_tests.rs"]
 mod mcp;

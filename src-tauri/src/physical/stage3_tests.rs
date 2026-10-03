@@ -20,6 +20,8 @@ struct Clock {
     expire_after: AtomicU64,
     /// Writes whose return tick a dispatch has read.
     returns: AtomicU64,
+    /// When set, the clock runs on from these readings in real time.
+    live: parking_lot::Mutex<Option<(std::time::Instant, u64, u64)>>,
 }
 impl Clock {
     fn new() -> Self {
@@ -29,7 +31,17 @@ impl Clock {
             reads: AtomicU64::new(0),
             expire_after: AtomicU64::new(0),
             returns: AtomicU64::new(0),
+            live: parking_lot::Mutex::new(None),
         }
+    }
+    /// From now on time passes as it does on a Host: work under the Core
+    /// lock costs an action its lifetime.
+    fn follow_real_time(&self) {
+        *self.live.lock() = Some((
+            std::time::Instant::now(),
+            self.wall.load(Ordering::SeqCst),
+            self.ticks.load(Ordering::SeqCst),
+        ));
     }
     fn set(&self, wall: u64, ticks: u64) {
         self.wall.store(wall, Ordering::SeqCst);
@@ -42,6 +54,13 @@ impl BindingClockV1 for Clock {
         let threshold = self.expire_after.load(Ordering::SeqCst);
         if threshold > 0 && read >= threshold {
             self.set(1900, 900000);
+        }
+        if let Some((since, wall, ticks)) = *self.live.lock() {
+            let elapsed = since.elapsed();
+            return Ok((
+                UnixMillis::try_from(wall + elapsed.as_millis() as u64)?,
+                ticks + elapsed.as_micros() as u64,
+            ));
         }
         Ok((
             UnixMillis::try_from(self.wall.load(Ordering::SeqCst))?,

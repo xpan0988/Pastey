@@ -203,6 +203,8 @@ fn facts(
     let mut rows = stmt.query(params![text(id), checked_integer(revision)?])?;
     while let Some(r) = rows.next()? {
         let raw: String = r.get(1)?;
+        #[cfg(test)]
+        super::validation_stats::history_row();
         match r.get::<_, String>(0)?.as_str() {
             "observation" => os.push(decode(&raw)?),
             _ => ds.push(decode(&raw)?),
@@ -376,7 +378,7 @@ impl PhysicalStoreV1 {
             record.qualified,
             &record,
         )?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::RECORD_OBSERVATION)?;
         Ok(true)
     }
     pub(in crate::physical) fn record_disposition(
@@ -443,7 +445,7 @@ impl PhysicalStoreV1 {
             record.qualified,
             &record,
         )?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::RECORD_DISPOSITION)?;
         Ok(true)
     }
     /// An action's lineage and current stored observations, for an effect
@@ -512,7 +514,7 @@ impl PhysicalStoreV1 {
                 serde_json::to_string(&x)?
             ],
         )?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::EVALUATE_CONSEQUENCE)?;
         Ok(x)
     }
     // Called only by the Core-owned evidence child module, never an evidence DTO.
@@ -578,7 +580,7 @@ impl PhysicalStoreV1 {
         let state = acceptance(&tx, root)?;
         super::control_ledger::close_root(&tx, root)?;
         tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason='revoked' WHERE root_id=?1 AND state='open'",[text(root)])?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::COMMIT_ACCEPTANCE)?;
         Ok(state)
     }
     pub(in crate::physical) fn acceptance(&self, id: &RootId) -> AppResult<AcceptanceStateV1> {
@@ -608,7 +610,7 @@ impl PhysicalStoreV1 {
                 serde_json::to_string(p)?
             ],
         )?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::CONFIGURE_HANDOVER)?;
         Ok(())
     }
     pub(in crate::physical) fn reconcile(
@@ -799,7 +801,7 @@ impl PhysicalStoreV1 {
             ],
         )?;
         self.audit(&tx)?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::RECONCILE)?;
         Ok(r)
     }
 }
@@ -898,35 +900,39 @@ pub(super) fn audit(c: &Connection, scope: super::AuditScopeV1) -> AppResult<()>
     }
     let missing:bool=c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM physical_attempts a LEFT JOIN physical_task_acceptance t USING(root_id) WHERE {} AND t.root_id IS NULL)", scope.filter("a.root_id", "root")),[],|r|r.get(0))?;
     require(!missing, "Missing task terminal state")?;
-    let mut lineages = LineagesV1::new(c);
     let actions = scope.filter("action_id", "action");
-    let mut stmt = c.prepare(&format!(
-        "SELECT * FROM physical_evidence WHERE {actions} ORDER BY action_id,revision"
-    ))?;
-    let mut rows = stmt.query([])?;
-    let mut revisions = BTreeMap::<String, u64>::new();
-    let mut sources = BTreeMap::<(String, String, String), (u64, u64)>::new();
-    while let Some(r) = rows.next()? {
-        let revision = revisions.entry(r.get("action_id")?).or_insert(0);
-        *revision += 1;
-        let (key, ordered) = evidence_row(r, &mut lineages, *revision, &mut |key| {
-            Ok(sources.get(key).copied().unwrap_or((0, 0)))
-        })?;
-        if let Some(latest) = ordered {
-            sources.insert(key, latest);
+    // Evidence and consequence history: replayed unless the scope says every
+    // in-scope row is unchanged validated history (`TouchedValidatedHistory`).
+    if scope.replays_history() {
+        let mut lineages = LineagesV1::new(c);
+        let mut stmt = c.prepare(&format!(
+            "SELECT * FROM physical_evidence WHERE {actions} ORDER BY action_id,revision"
+        ))?;
+        let mut rows = stmt.query([])?;
+        let mut revisions = BTreeMap::<String, u64>::new();
+        let mut sources = BTreeMap::<(String, String, String), (u64, u64)>::new();
+        while let Some(r) = rows.next()? {
+            let revision = revisions.entry(r.get("action_id")?).or_insert(0);
+            *revision += 1;
+            let (key, ordered) = evidence_row(r, &mut lineages, *revision, &mut |key| {
+                Ok(sources.get(key).copied().unwrap_or((0, 0)))
+            })?;
+            if let Some(latest) = ordered {
+                sources.insert(key, latest);
+            }
         }
-    }
-    let mut stmt = c.prepare(&format!(
-        "SELECT * FROM physical_consequences WHERE {actions} ORDER BY action_id,revision"
-    ))?;
-    let mut rows = stmt.query([])?;
-    let mut revisions = BTreeMap::<ActionId, u64>::new();
-    while let Some(r) = rows.next()? {
-        consequence_row(c, r, &mut lineages, &mut |action| {
-            let rev = revisions.entry(action.clone()).or_insert(0);
-            *rev += 1;
-            Ok(*rev)
-        })?;
+        let mut stmt = c.prepare(&format!(
+            "SELECT * FROM physical_consequences WHERE {actions} ORDER BY action_id,revision"
+        ))?;
+        let mut rows = stmt.query([])?;
+        let mut revisions = BTreeMap::<ActionId, u64>::new();
+        while let Some(r) = rows.next()? {
+            consequence_row(c, r, &mut lineages, &mut |action| {
+                let rev = revisions.entry(action.clone()).or_insert(0);
+                *rev += 1;
+                Ok(*rev)
+            })?;
+        }
     }
     let mut stmt = c.prepare(&format!(
         "SELECT * FROM physical_task_acceptance WHERE {}",
@@ -1127,6 +1133,8 @@ fn evidence_row(
     revision: u64,
     prior: &mut dyn FnMut(&SourceKeyV1) -> AppResult<(u64, u64)>,
 ) -> AppResult<(SourceKeyV1, Option<(u64, u64)>)> {
+    #[cfg(test)]
+    super::validation_stats::history_row();
     let id: String = r.get("id")?;
     let action: String = r.get("action_id")?;
     let kind: String = r.get("kind")?;
@@ -1203,6 +1211,8 @@ fn consequence_row(
     lineages: &mut LineagesV1<'_>,
     revision: &mut dyn FnMut(&ActionId) -> AppResult<u64>,
 ) -> AppResult<()> {
+    #[cfg(test)]
+    super::validation_stats::history_row();
     let x: PhysicalConsequenceV1 = decode(&r.get::<_, String>("record_json")?)?;
     let (l, s) = lineages.get(&x.action)?.clone();
     let (os, ds) = facts(c, &x.action, x.evidence_revision)?;

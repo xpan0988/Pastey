@@ -273,7 +273,7 @@ impl PhysicalStoreV1 {
         self.audit(&tx)?;
         dependencies(&tx, &r.scope, snapshot, now)?;
         insert_review(&tx, r)?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::CREATE_REVIEW)?;
         Ok(())
     }
     pub(in crate::physical) fn review(
@@ -358,7 +358,7 @@ impl PhysicalStoreV1 {
         ) {
             close_review(&tx, id, revision, "superseded")?;
         }
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::TRANSITION_REVIEW)?;
         Ok(r)
     }
     pub(in crate::physical) fn revise_review(
@@ -395,7 +395,7 @@ impl PhysicalStoreV1 {
             approval: None,
         };
         insert_review(&tx, &r)?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::REVISE_REVIEW)?;
         Ok(r)
     }
     /// Approval consumption and audit insertion are one immediate transaction.
@@ -424,7 +424,7 @@ impl PhysicalStoreV1 {
         tx.execute("INSERT INTO physical_attempts(root_id,role,attempt_id,approval_id,review_id,review_revision,scope_digest,principal,requester,executor,environment_id,registration_digest,binding_digest,profile_digest,qualification_id,qualification_digest,policy_digest,runtime_generation,created_at,expires_at,audit_digest,audit_json,state,revision) VALUES(?1,?22,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,'open',1)",params![text(&a.root_id),text(&a.attempt_id),text(&a.approval.approval_id),text(&a.review_id),checked_integer(a.review_revision)?,text(&a.scope_digest),text(&a.principal),a.requester.as_str(),a.executor.as_str(),text(&a.environment),text(&a.registration_digest),text(&a.binding_digest),text(&a.profile_digest),text(&a.qualification_id),text(&a.qualification_digest),text(&a.policy_digest),a.runtime_generation,a.created_at.get() as i64,a.expires_at.get() as i64,text(&a.digest()?),serde_json::to_string(a)?,a.role()])?;
         super::evidence_ledger::originate(&tx, &a.root_id)?;
         tx.execute("UPDATE physical_reviews SET state_revision=state_revision+1 WHERE review_id=?1 AND revision=?2 AND state='approved'",params![text(&a.review_id),checked_integer(a.review_revision)?])?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::ORIGINATE_ATTEMPT)?;
         Ok(())
     }
     pub(in crate::physical) fn validate_attempt(
@@ -448,7 +448,7 @@ impl PhysicalStoreV1 {
         super::evidence_ledger::cancel(&tx, id)?;
         super::control_ledger::close_root(&tx, id)?;
         tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason=?2 WHERE root_id=?1 AND state='open'",params![text(id),reason])?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::CLOSE_ATTEMPT)?;
         Ok(())
     }
     pub(in crate::physical) fn close_environment_attempts(
@@ -471,7 +471,7 @@ impl PhysicalStoreV1 {
             super::control_ledger::close_root(&tx, &RootId::try_from(root)?)?;
         }
         tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason=?2 WHERE environment_id=?1 AND state='open'",params![text(environment),reason])?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::CLOSE_ENVIRONMENT_ATTEMPTS)?;
         Ok(())
     }
     pub(in crate::physical) fn close_open_attempts(&self, reason: &str) -> AppResult<()> {
@@ -484,7 +484,7 @@ impl PhysicalStoreV1 {
         }
         super::control_ledger::recover(&tx, reason == "interrupted")?;
         tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason=?1 WHERE state='open'",[reason])?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::CLOSE_OPEN_ATTEMPTS)?;
         Ok(())
     }
 }

@@ -178,6 +178,59 @@ These hold for every path and are covered by tests under `src-tauri/src/physical
 - **ack ≠ consequence ≠ acceptance:** a binding reply never completes an action. Only an admitted witness verdict can verify a consequence, and only Core's acceptance decision completes the task.
 - **Simulation never supports hardware:** a self-described binding can only prove simulation. A `SimulationOracle` witness can only be required for simulation evidence.
 
+## Ledger validation
+
+The physical ledger is audited in full by the first transaction on its connection. From then on it is trusted at the `PRAGMA data_version` that audit saw. Each later transaction checks that version first, and audits in full again if another connection or process has committed since. It also audits in full if the files changed underneath it (file stamps), or if the previous transaction left its journal unfinished. Before a transaction commits, it validates the rows it wrote and the groups they belong to. Groups are a Root with its sessions, actions, decisions, budgets and evidence; a review; a domain; a remote message. A write to an ungrouped table, or any delete, is validated by a full audit.
+
+**Bounded Root-group validation.** A group validation does not replay the Root's evidence and consequence history when all of the following hold:
+
+1. The write's declared kind names no history table, and the write changed no history row.
+2. The ledger is trusted, and `PRAGMA data_version`, re-read inside the transaction just before COMMIT, still equals the trusted version.
+3. Every action in scope has no history, or history whose heads (highest evidence and consequence revisions) equal the validated baseline.
+
+Every other check of the groups still runs.
+
+Why this gives the same verdicts as replaying:
+
+1. **Each history row was validated once, before it existed for anyone else.** It was validated by the full audit that established the trust, or when it was appended at the head of its action, by `validate_appended` against audited predecessors, or, if its write changed history any other way, by the replay of its whole group. The commit hook refuses any commit whose writes were not validated.
+2. **History is immutable.** Triggers refuse UPDATE and DELETE on evidence and consequences, and any delete makes the validation a full audit.
+3. **Every other input of a history row's checks is immutable or fully audited when it changes.**
+   - Lineage comes from the action's, attempt's, session's and review's audit JSON and identity columns, which triggers keep immutable.
+   - Producer qualifications live in ungrouped tables, so writing them is validated by a full audit.
+   - Checks against the evidence head (`evidence_revision <= head`) stay true, because heads only grow.
+4. **Changes from outside are detected.**
+   - Another connection's or process's commit changes this connection's `data_version`, or the file stamp. The next transaction then distrusts the ledger, drops the baseline and audits in full.
+   - The schema and trigger pins are verified each time the connection is taken.
+
+So replaying a Root's unchanged history would reach exactly the verdict its rows already received.
+
+**Atomicity.** The ledger has one long-lived connection per file and process. The trust, the baseline and `data_version` all belong to that connection.
+- A transaction's trust check, its heads and the re-read of `data_version` all run inside the transaction. For writes this is `BEGIN IMMEDIATE`, which holds the database write lock until COMMIT: no other connection can commit in rollback-journal mode, and in WAL mode the snapshot is the latest.
+- Hence a commit by another connection between the baseline and a write is seen by that write's start-of-transaction check, or at the latest by the re-read.
+- A reconnected connection starts its `data_version` afresh. The baseline is dropped with the trust whenever the connection is reopened, so versions of different connections are never compared.
+
+**The baseline.** It records, per Root, each action's validated evidence and consequence heads at the trusted version. It lives in memory only; there is no format change.
+- **Established** by every full audit: startup, a foreign commit, a reopened connection, an unfinished journal, a delete, or a write to an ungrouped table.
+- **Advanced** by every validated append and by every group validation, whether the history was replayed or confirmed unchanged.
+- **Dropped** whenever the trust is dropped.
+- **Restart:** re-establishes it with the full audit that the first transaction runs.
+- **Mismatch:** a write that changes history other than by a bounded append, or that finds heads differing from the baseline, replays the whole group. That replay re-validates the history and records its heads.
+
+**Write kinds.** Every store write declares the tables it touches (`kinds` in `physical/store.rs`). Only a kind that declares no history table can skip the replay. Debug builds abort a declared write that touches a table its kind does not declare. A commit with no declared kind never skips anything.
+
+**What a bounded validation still checks.** Written rows and their groups are checked against the rules that couple them to history:
+- **Budgets:** reconstructed from the Root's actions and their dispatch intents.
+- **Sessions:** checked against attempts, domains, reservations and fences.
+- **Actions:** checked against their sessions.
+- **Decisions:** sequenced.
+- **Terminal acceptance:** requires closed authority, the cited consequence revision and a dispatched action.
+- **Reconciliations:** replayed on their cited consequence.
+- **Handovers:** checked against their policy, verdict and evidence up to their revision. This is the one check that still reads history, linearly in the action's evidence, and only when a handover exists.
+
+Each of these is an indexed lookup on the written or grouped rows. Triggers refuse epoch, reservation, attempt and acceptance regressions before validation runs.
+
+Under `cfg(test)`, every bounded validation also runs the full group audit and must reach the same verdict; only timing tests turn this off (`test_without_oracle`). Tests are in `physical/bounded_validation_tests.rs`.
+
 ## Code and checks
 
 | Area | Files |
@@ -196,13 +249,20 @@ Run `cargo test --manifest-path src-tauri/Cargo.toml physical::`; the acceptance
 
 ## Open issues
 
-- **Other writers to the ledger's database file cost a full audit.** The ledger is audited in full at startup. After that, each transaction validates, before it commits, only the rows it wrote and the groups they belong to (a Root with its sessions, actions, decisions, budgets and evidence; a review; a domain); unchanged rows are trusted by their stored digests. Evidence and consequence rows are immutable: a transaction that only appends them at the head of their actions validates each appended row against its audited predecessors with the same checks, without re-reading the Root. The whole ledger is audited again whenever:
-  - another connection or process has committed (`PRAGMA data_version` on the ledger's one connection);
-  - the ledger's files changed in a way this connection did not cause (file stamps; the connection is first reopened so no cached page survives);
-  - a transaction wrote an enrollment, qualification or schema row.
-
-  The physical tables share the application's database file, so writes by other Pastey modules also trigger full audits. A separate ledger file would avoid that. `[profile.dev.package.blake3] opt-level = 3` remains as a debug-build mitigation.
-- **A stream's tick still grows with the current action's evidence.** Each tick evaluates the latest action's consequence and its effect bound over all of that action's evidence (the witness's input, the reported gap and continuity span the whole series), and records a new consequence revision that lists every observation. A body that keeps reporting after its action ends (the reference bindings do, while the brain thinks) adds one observation per tick, so the tick grows linearly: in a debug build about 0.25 ms per stored observation, about 550 ms at 2,000. The full audit replays every consequence revision on its evidence, so it grows with the square: about 9 s at 500 observations and 140 s at 2,000, under the Core lock. Bounding these needs incremental evaluation or a consequence record that does not restate the series (a ledger format change).
+- **Other writers to the ledger's database file cost a full audit, under the Core lock.** The full audit replays every consequence revision on its evidence, which takes time quadratic in a Root's history. In a debug build it took 24.3–25.6 s at about 850 observations and 91 s at 1,600 (measured on a copy of a real ledger and on the demo harness). It runs at startup and after any commit by another connection or process. The physical tables share the application's database file, so any other Pastey module's write triggers it. See [Ledger validation](#ledger-validation). Bounded validation does not change this; a separate ledger file, or a full audit that does not replay unchanged history, would. `[profile.dev.package.blake3] opt-level = 3` remains as a debug-build mitigation.
+- **What still grows on the write path.** A Root-keyed write's validation reads no history; in a debug build it took 18–20 ms at every size from 100 to 1,600 observations. Its remaining costs per transaction:
+  - the file-stamp and schema-pin check and the trust check: a read transaction takes about 0.25 ms at every size;
+  - one indexed head lookup per action of the Roots in scope;
+  - the handover check, which reads an action's evidence linearly, and only when a handover exists.
+- **A stream's tick still grows with the current action's evidence, and so does the history.**
+  - Each tick evaluates the latest action's consequence and its effect bound over all of that action's evidence; the witness's input, the reported gap and continuity span the whole series.
+  - Each tick records a new consequence revision that lists every observation, and validating that append replays it on its evidence.
+  - A body that keeps reporting after its action ends adds one observation and one consequence revision per tick. The reference bindings do this while the brain thinks: `sim.rs` keeps sampling the ended action's lineage. Core records evidence and consequence revisions for an action past its deadline and evaluation window.
+  - The demo harness's tick (debug build) took 70 ms at 100 observations, 244 ms at 800 and 451 ms at 1,600.
+  - Consequence records grow by about 64 bytes per observation they list: about 51 KB each at 1,600, 22 MB in total at 850.
+  - At the 200 ms tick of a 400 ms gap that is 5 observations and 5 revisions per second, 18,000 of each per hour. The consequence bytes grow with the square: about 290 MB after 10 minutes and about 10 GB after an hour (projected from the measured 64 bytes per listed observation).
+  - Only the stream's lifetime bounds this: a 30-minute stream reaches about 9,000 observations.
+  - Bounding it needs incremental evaluation, no evidence past an action's evaluation window, or a consequence record that does not restate the series (a ledger format change).
 - **Completion parameters must equal the qualified capability's.** This is a safe restriction. Open question: express completion tolerances as a narrowable `BoundSetV1`.
 - **No NativeFence proof path.** A binding-supplied receipt verifier whose checks the ledger audit can replay is needed before any `NativeFence` claim.
 - **The product path offers one environment per Host.** Qualifying an environment makes it the offered one; `attach_product_environment` overrides that. Several bodies on one Host are reachable over the bridge only one at a time, although Core runs their streams side by side (the demo's second body uses the local path).

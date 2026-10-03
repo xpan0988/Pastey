@@ -381,7 +381,7 @@ impl PhysicalStoreV1 {
         }
         tx.execute("INSERT INTO physical_control_budgets(root_id,role,ceiling_us,ceiling_count) VALUES(?1,?3,?2,?4)",params![text(&s.root),checked_integer(s.scope.fields().execution.total_execution_us.get())?,a.role(),i64::from(s.scope.fields().execution.action_count)])?;
         self.audit(&tx)?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::RESERVE_SESSION)?;
         Ok(ReservationReceiptV1 { session: s.clone() })
     }
     pub(in crate::physical) fn validate_session(
@@ -423,7 +423,7 @@ impl PhysicalStoreV1 {
         )?;
         let n=tx.execute("UPDATE physical_sessions SET state='active',install_evidence=?2,revision=revision+1 WHERE session_id=?1 AND state='installing'",params![text(&s.id),tag(&evidence)?])?;
         require(n == 1, "Stale installation response")?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::ACTIVATE_SESSION)?;
         Ok(())
     }
     /// `proposer` names the tool caller of a decision-stream proposal. Its
@@ -469,7 +469,7 @@ impl PhysicalStoreV1 {
             Some(&x.proposal.action_id),
             now,
         )?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::ADMIT_ACTION)?;
         Ok(())
     }
     pub(in crate::physical) fn prepare_write(
@@ -493,7 +493,7 @@ impl PhysicalStoreV1 {
         let n = tx.execute("UPDATE physical_actions SET dispatch_intent=1,disposition=?3,operation_id=?2,revision=revision+1 WHERE action_id=?1 AND state='open' AND dispatch_intent=0 AND operation_id IS NULL",params![text(&x.proposal.action_id),text(op),tag(&ActionDispositionV1::DispatchUnknown)?])?;
         require(n == 1, "Duplicate/uncertain/in-flight dispatch")?;
         tx.execute("UPDATE physical_control_budgets SET consumed_us=reserved_us,revision=revision+1 WHERE root_id=?1",[text(&x.root)])?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::PREPARE_WRITE)?;
         Ok(())
     }
     /// Records what the binding answered for the write `cb.op` of `x`, in one
@@ -533,7 +533,7 @@ impl PhysicalStoreV1 {
             |r| Ok((r.get(0)?, r.get::<_, Option<bool>>(1)?.unwrap_or(false))),
         )?;
         if !waiting {
-            self.commit(tx)?;
+            self.commit_as(tx, &super::kinds::FINISH_WRITE)?;
             return Ok(CallbackRecordV1::Unrecorded);
         }
         let applied = cb.result.map(|b| if b { "accepted" } else { "refused" });
@@ -574,7 +574,7 @@ impl PhysicalStoreV1 {
                 )?;
             }
         }
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::FINISH_WRITE)?;
         Ok(outcome)
     }
     /// (state, disposition, reserved, consumed) of an action and its root.
@@ -632,7 +632,7 @@ impl PhysicalStoreV1 {
             "adapter_isolation_only"
         };
         let n=tx.execute("UPDATE physical_sessions SET fence_ack=?3,revision=revision+1 WHERE session_id=?1 AND state='quarantined' AND fence_json=?2 AND fence_ack IS NULL",params![text(&f.session),serde_json::to_string(f)?,class])?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::ACKNOWLEDGE_FENCE)?;
         Ok(n == 1)
     }
 }
@@ -797,7 +797,7 @@ impl PhysicalStoreV1 {
             None,
             now,
         )?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::RECORD_REFUSAL)?;
         Ok(())
     }
     pub(in crate::physical) fn decisions(&self, root: &RootId) -> AppResult<Vec<DecisionRecordV1>> {
@@ -852,7 +852,7 @@ impl PhysicalStoreV1 {
         super::evidence_ledger::cancel(&tx, root)?;
         close_root(&tx, root)?;
         tx.execute("UPDATE physical_attempts SET state='closed',revision=2,close_reason='effect_bound_violated' WHERE root_id=?1 AND state='open'",[text(root)])?;
-        self.commit(tx)?;
+        self.commit_as(tx, &super::kinds::RECORD_EFFECT_VIOLATION)?;
         Ok(())
     }
     /// The latest decision that reached dispatch intent, if any.
