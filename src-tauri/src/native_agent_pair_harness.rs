@@ -64,9 +64,12 @@ done
             ),
         )
         .unwrap();
-        let mut permissions = fs::metadata(&agent).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&agent, permissions).unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&agent).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&agent, permissions).unwrap();
+        }
         let requester_paths = durable_paths(&root.join("requester"));
         let executor_paths = durable_paths(&root.join("executor"));
         assert_ne!(requester_paths.db_path, executor_paths.db_path);
