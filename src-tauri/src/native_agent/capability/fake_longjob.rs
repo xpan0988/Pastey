@@ -59,6 +59,7 @@ struct FakeStateV1 {
     complete_despite_cancel: bool,
     lose_observation: bool,
     observation_lost: bool,
+    shutdowns: usize,
 }
 
 #[derive(Default)]
@@ -109,6 +110,10 @@ impl FakeLongJobAdapterV1 {
 
     pub(in crate::native_agent) fn progress(&self, task_id: &str) -> Option<u32> {
         self.with(|state| state.jobs.get(task_id).map(|job| job.progress))
+    }
+
+    pub(in crate::native_agent) fn shutdowns(&self) -> usize {
+        self.with(|state| state.shutdowns)
     }
 
     pub(in crate::native_agent) fn cancel_requested(&self, task_id: &str) -> bool {
@@ -196,6 +201,7 @@ impl NativeCapabilityAdapterV1 for FakeLongJobAdapterV1 {
 
     fn shutdown(&self) {
         self.with(|state| {
+            state.shutdowns += 1;
             for job in state.jobs.values_mut() {
                 job.cancel = true;
             }

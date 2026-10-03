@@ -11,7 +11,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, Weak,
     },
     thread,
     time::{Duration, Instant},
@@ -88,7 +88,13 @@ fn parse_input(input: &OpaqueCapabilityPayloadV1) -> AppResult<(CodexInvocationI
 pub(in crate::native_agent) struct CodexNativeAdapterV1 {
     executable: Mutex<PathBuf>,
     sessions: Mutex<HashMap<PathBuf, NativeCodexSessionV1>>,
-    task_workspaces: Mutex<HashMap<String, PathBuf>>,
+    /// The workspace and the exact app-server each task started on. A task
+    /// acts only on its own controller, never on a later session that has
+    /// replaced it at the same workspace; `Weak` keeps a finished session
+    /// from being held open by its tasks.
+    task_sessions: Mutex<HashMap<String, (PathBuf, Weak<CodexAppServerV1>)>>,
+    #[cfg(test)]
+    shutdowns: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for CodexNativeAdapterV1 {
@@ -96,7 +102,9 @@ impl Default for CodexNativeAdapterV1 {
         Self {
             executable: Mutex::new(PathBuf::from("codex")),
             sessions: Mutex::default(),
-            task_workspaces: Mutex::default(),
+            task_sessions: Mutex::default(),
+            #[cfg(test)]
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -156,24 +164,28 @@ impl CodexNativeAdapterV1 {
             .unwrap_or(0)
     }
 
+    #[cfg(test)]
+    pub(in crate::native_agent) fn has_task(&self, task_id: &str) -> bool {
+        self.task_sessions
+            .lock()
+            .is_ok_and(|tasks| tasks.contains_key(task_id))
+    }
+
+    #[cfg(test)]
+    pub(in crate::native_agent) fn shutdown_count(&self) -> usize {
+        self.shutdowns.load(Ordering::SeqCst)
+    }
+
+    /// The task's own app-server, while it is still alive.
     fn task_controller(&self, task_id: &str) -> AppResult<(PathBuf, Arc<CodexAppServerV1>)> {
-        let workspace = self
-            .task_workspaces
+        self.task_sessions
             .lock()
             .ok()
-            .and_then(|tasks| tasks.get(task_id).cloned())
-            .ok_or_else(|| AppError::InvalidInput("Native Agent session is unavailable.".into()))?;
-        let controller = self
-            .sessions
-            .lock()
-            .ok()
-            .and_then(|sessions| {
-                sessions
-                    .get(&workspace)
-                    .map(|session| session.controller.clone())
+            .and_then(|tasks| {
+                let (workspace, controller) = tasks.get(task_id)?;
+                Some((workspace.clone(), controller.upgrade()?))
             })
-            .ok_or_else(|| AppError::InvalidInput("Native Agent session is unavailable.".into()))?;
-        Ok((workspace, controller))
+            .ok_or_else(|| AppError::InvalidInput("Native Agent session is unavailable.".into()))
     }
 
     fn forget_session_of(&self, workspace: &Path, controller: &Arc<CodexAppServerV1>) {
@@ -262,8 +274,8 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
             }
         };
         drop(sessions);
-        if let Ok(mut tasks) = self.task_workspaces.lock() {
-            tasks.insert(task_id.to_owned(), workspace);
+        if let Ok(mut tasks) = self.task_sessions.lock() {
+            tasks.insert(task_id.to_owned(), (workspace, Arc::downgrade(&controller)));
         }
         Ok(StartedInvocationV1 {
             session_reused,
@@ -285,31 +297,33 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
         Ok(())
     }
 
+    /// Burn: forget this task and end the session it ran on, but nothing a
+    /// later session at the same workspace or any other task started.
     fn release(&self, task_id: &str) {
-        let workspace = self
-            .task_workspaces
+        let Some((workspace, controller)) = self
+            .task_sessions
             .lock()
             .ok()
-            .and_then(|mut tasks| tasks.remove(task_id));
-        let session = workspace.and_then(|workspace| {
-            self.sessions
-                .lock()
-                .ok()
-                .and_then(|mut sessions| sessions.remove(&workspace))
-        });
-        if let Some(session) = session {
-            let _ = session.controller.cancel_owned_turn_or_session();
+            .and_then(|mut tasks| tasks.remove(task_id))
+        else {
+            return;
+        };
+        if let Some(controller) = controller.upgrade() {
+            self.forget_session_of(&workspace, &controller);
+            let _ = controller.cancel_owned_turn_or_session();
         }
     }
 
     fn shutdown(&self) {
+        #[cfg(test)]
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut sessions) = self.sessions.lock() {
             for session in sessions.values() {
                 session.controller.shutdown();
             }
             sessions.clear();
         }
-        if let Ok(mut tasks) = self.task_workspaces.lock() {
+        if let Ok(mut tasks) = self.task_sessions.lock() {
             tasks.clear();
         }
     }
