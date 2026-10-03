@@ -179,7 +179,8 @@ pub(crate) struct NativeAgentReconciliationV1 {
     pub(crate) result_digest: Option<String>,
     pub(crate) apply_completed: bool,
     pub(crate) code: Option<String>,
-    /// The executor's recorded terminal output, opaque to Pastey.
+    /// The executor's recorded terminal output, opaque to Pastey. Untrusted
+    /// capability-owned data; see `NativeAgentTaskStatusV1::output`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) task_output: Option<OpaqueCapabilityPayloadV1>,
 }
@@ -517,6 +518,12 @@ pub(crate) struct NativeAgentTaskStatusV1 {
     pub(crate) result: Option<String>,
     pub(crate) code: Option<String>,
     /// Terminal output of a capability that reports one, opaque to Pastey.
+    ///
+    /// Trust boundary: this is untrusted, capability-owned data. It reaches
+    /// the renderer through every IPC command that returns this status.
+    /// Neither Core nor the renderer may interpret it as HTML, code, a
+    /// command, a path or a URL to act on; UI consumers treat it only as
+    /// data (for example, escaped text).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) output: Option<OpaqueCapabilityPayloadV1>,
 }
@@ -525,7 +532,8 @@ pub(crate) struct NativeAgentTaskStatusV1 {
 pub(crate) struct NativeAgentServiceV1 {
     /// Capabilities this Host can run, dispatched by capability id.
     adapters: Vec<Arc<dyn NativeCapabilityAdapterV1>>,
-    /// Workspace movement drives Codex sessions directly.
+    /// Workspace movement's typed alias of the registered Codex adapter. It
+    /// owns nothing: `adapters` owns every adapter's lifecycle.
     codex: Arc<CodexNativeAdapterV1>,
     tasks: Arc<Mutex<HashMap<String, NativeAgentTaskStatusV1>>>,
     /// Exclusivity keys held by observed invocations, with their task.
@@ -4078,10 +4086,13 @@ impl NativeAgentServiceV1 {
     }
 
     pub(crate) fn shutdown(&mut self) {
+        // The registry owns adapter lifecycles: each registered adapter is
+        // shut down exactly once. `codex` is only movement's typed alias of
+        // the registered Codex adapter; when Codex is not registered it can
+        // never have started a session.
         for adapter in &self.adapters {
             adapter.shutdown();
         }
-        self.codex.shutdown();
         self.active_exclusivity
             .lock()
             .ok()
@@ -5586,6 +5597,189 @@ exit 1
             thread::sleep(Duration::from_millis(250));
         }
         panic!("installed Codex did not return a bounded terminal outcome")
+    }
+
+    #[test]
+    fn cancelling_without_an_adapter_session_still_records_cancellation_durably() {
+        let root = std::env::temp_dir().join(format!("pastey-native-cancel-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let paths = durable_paths(&root);
+        let task_id = "native-agent:uncertain-after-restart";
+        {
+            let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+            service.tasks.lock().unwrap().insert(
+                task_id.into(),
+                NativeAgentTaskStatusV1 {
+                    schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
+                    task_id: task_id.into(),
+                    agent_id: CODEX_CAPABILITY_ID.into(),
+                    workspace_name: "workspace".into(),
+                    session_reused: false,
+                    state: NativeAgentTaskStateV1::Interrupted,
+                    result: None,
+                    code: Some("native_agent_outcome_unknown".into()),
+                    output: None,
+                },
+            );
+            service.task_workspaces.insert(task_id.into(), root.clone());
+            service
+                .task_bridges
+                .insert(task_id.into(), "room-uncertain".into());
+            service
+                .persist_envelope(task_id, Some(&NativeAgentServiceV1::task_digest("task")))
+                .unwrap();
+        }
+        // After restart the Codex adapter has no session for this uncertain
+        // task. Cancellation is still recorded; only the native stop is
+        // uncertain.
+        let mut restarted = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        assert!(!restarted.codex.has_task(task_id));
+        let cancelled = restarted.cancel_task(task_id).unwrap();
+        assert_eq!(cancelled.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(
+            cancelled.code.as_deref(),
+            Some("native_agent_cancel_delivery_uncertain")
+        );
+        let stored = crate::storage::get_native_agent_envelope(&paths, task_id)
+            .unwrap()
+            .unwrap();
+        let persisted: PersistedNativeAgentEnvelopeV1 =
+            serde_json::from_str(&stored.record_json).unwrap();
+        assert_eq!(persisted.task, cancelled);
+        let again = NativeAgentServiceV1::with_paths(paths).unwrap();
+        assert_eq!(again.task_status(task_id).unwrap(), cancelled);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancelling_an_old_task_never_touches_a_replacement_session() {
+        let (root, workspace, agent) = fixture();
+        let mut service = NativeAgentServiceV1::default();
+        let old = service
+            .start_codex_task_with_executable(&agent, &workspace, "first")
+            .unwrap();
+        wait_for_terminal(&service, &old.task_id);
+        let canonical = workspace.canonicalize().unwrap();
+        let old_controller = service.codex.session_controller(&canonical).unwrap();
+        // Movement cleanup closes the session; a later task starts a new one.
+        service.codex.shutdown_session(&canonical);
+        let newer = service
+            .start_codex_task_with_executable(&agent, &workspace, "second")
+            .unwrap();
+        assert!(!newer.session_reused);
+        assert_eq!(
+            wait_for_terminal(&service, &newer.task_id).state,
+            NativeAgentTaskStateV1::Completed
+        );
+        let replacement = service.codex.session_controller(&canonical).unwrap();
+        assert!(!Arc::ptr_eq(&old_controller, &replacement));
+        // The old task's stop acts only on its own app-server.
+        let _ = service.codex.cancel(&old.task_id);
+        assert!(Arc::ptr_eq(
+            &service.codex.session_controller(&canonical).unwrap(),
+            &replacement
+        ));
+        // Once that app-server is gone the stop is uncertain, and the
+        // replacement is still untouched.
+        drop(old_controller);
+        assert!(service.codex.cancel(&old.task_id).is_err());
+        service.codex.release(&old.task_id);
+        assert!(Arc::ptr_eq(
+            &service.codex.session_controller(&canonical).unwrap(),
+            &replacement
+        ));
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn releasing_one_task_leaves_other_tasks_adapters_and_sessions_alone() {
+        let (root, workspace, agent) = fixture();
+        let other_workspace = root.join("other");
+        fs::create_dir(&other_workspace).unwrap();
+        let codex = Arc::new(CodexNativeAdapterV1::default());
+        let fake = Arc::new(capability::fake_longjob::FakeLongJobAdapterV1::default());
+        let mut service =
+            NativeAgentServiceV1::with_adapters(codex.clone(), vec![codex.clone(), fake.clone()]);
+        let first = service
+            .start_codex_task_with_executable(&agent, &workspace, "first")
+            .unwrap();
+        let other = service
+            .start_codex_task_with_executable(&agent, &other_workspace, "other")
+            .unwrap();
+        wait_for_terminal(&service, &first.task_id);
+        wait_for_terminal(&service, &other.task_id);
+        fake.hold();
+        let job_input: OpaqueCapabilityPayloadV1 =
+            serde_json::from_value(json!({ "steps": 1, "payload": 1 })).unwrap();
+        service
+            .start_invocation_in_movement(
+                capability::fake_longjob::FAKE_LONGJOB_ID,
+                "task-fake-job",
+                &job_input,
+                None,
+            )
+            .unwrap();
+        let canonical = workspace.canonicalize().unwrap();
+        let other_canonical = other_workspace.canonicalize().unwrap();
+        // A later session in the first workspace is not the first task's.
+        let first_controller = codex.session_controller(&canonical).unwrap();
+        codex.shutdown_session(&canonical);
+        let later = service
+            .start_codex_task_with_executable(&agent, &workspace, "later")
+            .unwrap();
+        wait_for_terminal(&service, &later.task_id);
+        let later_controller = codex.session_controller(&canonical).unwrap();
+        assert!(!Arc::ptr_eq(&first_controller, &later_controller));
+
+        codex.release(&first.task_id);
+        assert!(!codex.has_task(&first.task_id));
+        assert!(codex.has_task(&other.task_id));
+        assert!(codex.has_task(&later.task_id));
+        assert!(Arc::ptr_eq(
+            &codex.session_controller(&canonical).unwrap(),
+            &later_controller
+        ));
+        assert!(codex.has_session(&other_canonical));
+        assert!(!fake.cancel_requested("task-fake-job"));
+        // Releasing another adapter's task id is a no-op on each side.
+        codex.release("task-fake-job");
+        NativeCapabilityAdapterV1::release(fake.as_ref(), &other.task_id);
+        assert!(!fake.cancel_requested("task-fake-job"));
+        assert!(codex.has_task(&other.task_id));
+        assert!(codex.has_session(&other_canonical));
+        // Releasing the other task ends only its own session.
+        codex.release(&other.task_id);
+        assert!(!codex.has_session(&other_canonical));
+        assert!(Arc::ptr_eq(
+            &codex.session_controller(&canonical).unwrap(),
+            &later_controller
+        ));
+        fake.release();
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shutdown_reaches_each_registered_adapter_exactly_once() {
+        // The typed Codex handle is the registered Codex adapter, not a
+        // second owner of it.
+        let mut service = NativeAgentServiceV1::default();
+        assert_eq!(service.adapters.len(), 1);
+        assert_eq!(
+            Arc::as_ptr(&service.adapters[0]) as *const (),
+            Arc::as_ptr(&service.codex) as *const ()
+        );
+        service.shutdown();
+        assert_eq!(service.codex.shutdown_count(), 1);
+
+        let codex = Arc::new(CodexNativeAdapterV1::default());
+        let fake = Arc::new(capability::fake_longjob::FakeLongJobAdapterV1::default());
+        let mut both =
+            NativeAgentServiceV1::with_adapters(codex.clone(), vec![codex.clone(), fake.clone()]);
+        both.shutdown();
+        assert_eq!(codex.shutdown_count(), 1);
+        assert_eq!(fake.shutdowns(), 1);
     }
 
     #[test]

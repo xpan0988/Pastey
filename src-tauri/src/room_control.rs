@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -2629,7 +2630,10 @@ fn validate_control_event(
         kind.as_str(),
         "native_agent.status" | "native_agent.reconciliation"
     );
-    if contains_unsafe_field(&event, allow_validated_native_code) {
+    if contains_unsafe_field(
+        &transport_field_view(&kind, &event),
+        allow_validated_native_code,
+    ) {
         return Err(AppError::InvalidInput(
             "Room control event contains unsafe fields.".into(),
         ));
@@ -3094,6 +3098,42 @@ fn bounded_string_field(object: &Map<String, Value>, field: &str, max: usize) ->
         ));
     }
     Ok(value.to_string())
+}
+
+/// The event as the transport's field-name check sees it. A native
+/// capability's invocation input and terminal output are capability-owned
+/// JSON whose field names Pastey does not interpret, so exactly that one
+/// subtree of exactly these kinds and schemas is replaced by null. Every
+/// other part of the event, including that subtree's siblings, is checked as
+/// before; the subtree itself is still bounded and typed with its message.
+fn transport_field_view<'a>(kind: &str, event: &'a Value) -> Cow<'a, Value> {
+    if event.get("protocolFamily").and_then(Value::as_str) != Some(NATIVE_AGENT_PROTOCOL_FAMILY) {
+        return Cow::Borrowed(event);
+    }
+    let payload_schema = event
+        .pointer("/payload/schemaVersion")
+        .and_then(Value::as_str);
+    let opaque = match (kind, payload_schema) {
+        ("native_agent.invoke", Some(crate::native_agent::NATIVE_AGENT_INVOKE_V2_SCHEMA)) => {
+            "/payload/input"
+        }
+        ("native_agent.status", Some(crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA)) => {
+            "/payload/status/output"
+        }
+        (
+            "native_agent.reconciliation",
+            Some(crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA),
+        ) => "/payload/taskOutput",
+        _ => return Cow::Borrowed(event),
+    };
+    if event.pointer(opaque).is_none() {
+        return Cow::Borrowed(event);
+    }
+    let mut view = event.clone();
+    if let Some(subtree) = view.pointer_mut(opaque) {
+        *subtree = Value::Null;
+    }
+    Cow::Owned(view)
 }
 
 fn contains_unsafe_field(value: &Value, allow_validated_native_code: bool) -> bool {
@@ -3881,7 +3921,7 @@ mod tests {
     }
 
     #[test]
-    fn a_generic_invoke_keeps_the_task_keyed_replay_id_and_transport_field_rules() {
+    fn a_generic_invoke_keeps_the_task_keyed_replay_id_and_an_opaque_input() {
         let now = OffsetDateTime::now_utc();
         let invoke = |input: Value| {
             native_agent_event(
@@ -3920,15 +3960,246 @@ mod tests {
             first.request_id.as_deref(),
             Some("native-agent-invoke:task-generic")
         );
-        // The transport's existing forbidden-field rule still applies inside
-        // opaque input; Core does not interpret it otherwise.
-        assert!(validate_control_event(
+        // The input is capability-owned: its field names are not transport
+        // vocabulary, so names Room Control forbids elsewhere pass inside it.
+        let opaque_names = validate_control_event(
             invoke(serde_json::json!({ "steps": 2, "payload": { "command": "x" } })),
             "room",
             "source",
             "target",
             now,
         )
+        .unwrap();
+        assert_eq!(opaque_names.request_id, first.request_id);
+    }
+
+    /// Field names Room Control forbids as transport vocabulary, nested in
+    /// objects and in objects inside arrays.
+    fn capability_owned_json() -> Value {
+        serde_json::json!({
+            "path": "/srv/job",
+            "command": "run",
+            "args": ["--fast", { "env": { "token": "t" } }],
+            "env": { "contents": "x" },
+            "token": "opaque",
+            "nested": { "deep": [{ "path": 1 }, [{ "command": { "args": [] } }]] },
+        })
+    }
+
+    const UNSAFE_REJECTION: &str = "Room control event contains unsafe fields.";
+
+    fn validate_native(event: Value) -> AppResult<ValidatedControlEvent> {
+        validate_control_event(event, "room", "source", "target", OffsetDateTime::now_utc())
+    }
+
+    fn rejected_as_unsafe(event: Value) {
+        let error = validate_native(event).err().expect("event was accepted");
+        assert_eq!(error.message(), UNSAFE_REJECTION);
+    }
+
+    fn generic_invoke_payload(input: Value) -> Value {
+        serde_json::to_value(crate::native_agent::NativeAgentInvokeV2 {
+            schema_version: crate::native_agent::NATIVE_AGENT_INVOKE_V2_SCHEMA.into(),
+            task_id: "task-opaque".into(),
+            target_host_ref: "host:remote".into(),
+            agent_capability: "fake.longjob.v1".into(),
+            input: serde_json::from_value(input).unwrap(),
+        })
+        .unwrap()
+    }
+
+    fn opaque_status_payload(output: Option<Value>) -> Value {
+        serde_json::to_value(crate::native_agent::NativeAgentStatusV1 {
+            schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: "task-opaque".into(),
+            executing_host_ref: "host:remote".into(),
+            status: crate::native_agent::NativeAgentTaskStatusV1 {
+                schema_version: crate::native_agent::NATIVE_AGENT_TASK_SCHEMA.into(),
+                task_id: "task-opaque".into(),
+                agent_id: "fake.longjob.v1".into(),
+                workspace_name: "longjob".into(),
+                session_reused: false,
+                state: crate::native_agent::NativeAgentTaskStateV1::Completed,
+                result: None,
+                code: None,
+                output: output.map(|value| serde_json::from_value(value).unwrap()),
+            },
+        })
+        .unwrap()
+    }
+
+    fn opaque_reconciliation_payload(output: Option<Value>) -> Value {
+        serde_json::to_value(crate::native_agent::NativeAgentReconciliationV1 {
+            schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: "task-opaque".into(),
+            movement_id: None,
+            executing_host_ref: "host:remote".into(),
+            task_state: crate::native_agent::NativeAgentTaskStateV1::Completed,
+            movement_state: None,
+            result_digest: None,
+            apply_completed: false,
+            code: None,
+            task_output: output.map(|value| serde_json::from_value(value).unwrap()),
+        })
+        .unwrap()
+    }
+
+    fn native_event(kind: &str, payload: Value) -> Value {
+        native_agent_event(kind, payload, &native_agent_test_context()).unwrap()
+    }
+
+    #[test]
+    fn capability_owned_json_is_opaque_only_at_its_exact_subtree() {
+        // Allowed: exactly the opaque subtree of exactly these schemas.
+        let invoke = native_event(
+            "native_agent.invoke",
+            generic_invoke_payload(capability_owned_json()),
+        );
+        let status = native_event(
+            "native_agent.status",
+            opaque_status_payload(Some(capability_owned_json())),
+        );
+        let reconciliation = native_event(
+            "native_agent.reconciliation",
+            opaque_reconciliation_payload(Some(capability_owned_json())),
+        );
+        for event in [&invoke, &status, &reconciliation] {
+            validate_native(event.clone()).unwrap();
+        }
+        assert_eq!(
+            validate_native(invoke.clone())
+                .unwrap()
+                .request_id
+                .as_deref(),
+            Some("native-agent-invoke:task-opaque")
+        );
+
+        // Rejected: the same names anywhere else in those very events.
+        let hostile = capability_owned_json();
+        let mut payload_top = invoke.clone();
+        payload_top["payload"]["path"] = Value::from("/etc");
+        rejected_as_unsafe(payload_top);
+        for sibling in ["extra", "inputs", "output"] {
+            let mut event = invoke.clone();
+            event["payload"][sibling] = hostile.clone();
+            rejected_as_unsafe(event);
+        }
+        for sibling in ["output", "extra"] {
+            let mut event = status.clone();
+            event["payload"][sibling] = hostile.clone();
+            rejected_as_unsafe(event);
+        }
+        let mut status_sibling = status.clone();
+        status_sibling["payload"]["status"]["outputs"] = hostile.clone();
+        rejected_as_unsafe(status_sibling);
+        for sibling in ["output", "input", "taskOutputs"] {
+            let mut event = reconciliation.clone();
+            event["payload"][sibling] = hostile.clone();
+            rejected_as_unsafe(event);
+        }
+        // The event top level keeps its exact field set.
+        let mut top = invoke.clone();
+        top["command"] = Value::from("run");
+        assert!(validate_native(top).is_err());
+    }
+
+    #[test]
+    fn capability_owned_names_stay_forbidden_outside_the_exact_schemas() {
+        let hostile = capability_owned_json();
+        // A v1 invoke keeps its existing transport rules at the same path.
+        let mut v1 = native_event(
+            "native_agent.invoke",
+            serde_json::to_value(crate::native_agent::NativeAgentInvokeV1 {
+                schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                task_id: "task-v1".into(),
+                target_host_ref: "host:remote".into(),
+                agent_capability: crate::native_agent::CODEX_CAPABILITY_ID.into(),
+                workspace: "/workspace".into(),
+                task: "edit".into(),
+                resume: true,
+            })
+            .unwrap(),
+        );
+        validate_native(v1.clone()).unwrap();
+        v1["payload"]["input"] = hostile.clone();
+        rejected_as_unsafe(v1);
+        // Other native Agent kinds get no exemption at the same paths.
+        let mut cancel = native_event(
+            "native_agent.cancel",
+            serde_json::to_value(crate::native_agent::NativeAgentCancelV1 {
+                schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                task_id: "task-opaque".into(),
+                target_host_ref: "host:remote".into(),
+            })
+            .unwrap(),
+        );
+        validate_native(cancel.clone()).unwrap();
+        cancel["payload"]["input"] = hostile.clone();
+        rejected_as_unsafe(cancel);
+        // A matching shape under another kind, family or schema is checked.
+        let invoke = native_event(
+            "native_agent.invoke",
+            generic_invoke_payload(hostile.clone()),
+        );
+        let status = native_event(
+            "native_agent.status",
+            opaque_status_payload(Some(hostile.clone())),
+        );
+        for (kind, family) in [
+            (
+                "developer_terminal.input",
+                DEVELOPER_TERMINAL_PROTOCOL_FAMILY,
+            ),
+            ("peer_capability.response", PEER_CAPABILITY_PROTOCOL_FAMILY),
+            ("native_agent.status", PEER_CAPABILITY_PROTOCOL_FAMILY),
+        ] {
+            let mut event = invoke.clone();
+            event["kind"] = Value::from(kind);
+            event["protocolFamily"] = Value::from(family);
+            rejected_as_unsafe(event);
+        }
+        for kind in ["developer_terminal.output", "native_agent.reconciliation"] {
+            let mut event = status.clone();
+            event["kind"] = Value::from(kind);
+            if kind.starts_with("developer_terminal.") {
+                event["protocolFamily"] = Value::from(DEVELOPER_TERMINAL_PROTOCOL_FAMILY);
+            }
+            rejected_as_unsafe(event);
+        }
+        let mut other_schema = invoke.clone();
+        other_schema["payload"]["schemaVersion"] =
+            Value::from(crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA);
+        rejected_as_unsafe(other_schema);
+        let mut other_status_schema = status;
+        other_status_schema["payload"]["schemaVersion"] =
+            Value::from(crate::native_agent::NATIVE_AGENT_INVOKE_V2_SCHEMA);
+        rejected_as_unsafe(other_status_schema);
+    }
+
+    #[test]
+    fn opaque_capability_json_keeps_its_size_bound() {
+        let sized = |bytes: usize| serde_json::json!({ "steps": 1, "payload": "x".repeat(bytes) });
+        // The adapter seam's opaque payload bound (16 KiB).
+        let limit = 16 * 1024;
+        validate_native(native_event(
+            "native_agent.invoke",
+            generic_invoke_payload(sized(limit - 64)),
+        ))
+        .unwrap();
+        assert!(validate_native(native_event(
+            "native_agent.invoke",
+            generic_invoke_payload(sized(limit + 1)),
+        ))
+        .is_err());
+        assert!(validate_native(native_event(
+            "native_agent.status",
+            opaque_status_payload(Some(sized(limit + 1))),
+        ))
+        .is_err());
+        assert!(validate_native(native_event(
+            "native_agent.reconciliation",
+            opaque_reconciliation_payload(Some(sized(limit + 1))),
+        ))
         .is_err());
     }
 
