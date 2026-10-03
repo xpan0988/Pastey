@@ -1460,3 +1460,21 @@ fn the_development_switch_offers_a_reference_body_and_fails_closed() {
 mod bounded_validation;
 #[path = "mcp_tests.rs"]
 mod mcp;
+
+/// TEMP-TRACE: per-decision phase timing over the Bridge path on a real
+/// ledger file. Run with `cargo test temp_trace_decision_timing -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread")] // TEMP-TRACE
+#[ignore = "TEMP-TRACE measurement"] // TEMP-TRACE
+async fn temp_trace_decision_timing() { // TEMP-TRACE
+    let long = EnvelopeV1 { idle_lease_us: 900_000_000, lease_us: 900_000_000, approval_lifetime_us: 900_000_000, root_lifetime_us: 900_000_000, ..WALK }; // TEMP-TRACE
+    let executor = ExecutorV1::launch_walk(false, &long); // TEMP-TRACE
+    let demo = executor.walk(); // TEMP-TRACE
+    demo.started(); // TEMP-TRACE
+    for n in 0..12 { // TEMP-TRACE
+        demo.wait_ms(400); // TEMP-TRACE
+        let option = if n % 2 == 0 { "turn_left" } else { "turn_right" }; // TEMP-TRACE
+        let r = demo.call("brain:timing", &DecisionCallV1 { option: option.into(), duration_ms: 300 }); // TEMP-TRACE
+        eprintln!("TEMP-TRACE call {n} allowed={}", r.allowed()); // TEMP-TRACE
+        crate::physical::temp_trace::flush(); // TEMP-TRACE
+    } // TEMP-TRACE
+} // TEMP-TRACE

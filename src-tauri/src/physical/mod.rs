@@ -48,6 +48,7 @@ pub(crate) mod evidence;
 pub(crate) mod mcp;
 pub(crate) mod protocol;
 pub(crate) mod store;
+pub(crate) mod temp_trace; // TEMP-TRACE
 pub(crate) mod values;
 
 #[cfg(any(test, feature = "physical-sim"))]

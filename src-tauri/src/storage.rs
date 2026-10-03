@@ -966,8 +966,10 @@ pub fn sync_legacy_bridge_peer_endpoint(
         .iter()
         .find(|stored| same_bridge_peer_projection(stored, &peer))
     {
+        sync_legacy_trace(false); // TEMP-TRACE
         return Ok(Some(stored.clone()));
     }
+    sync_legacy_trace(true); // TEMP-TRACE
     upsert_bridge_peer_endpoint(paths, &peer)?;
     Ok(Some(peer))
 }
@@ -995,6 +997,10 @@ fn same_bridge_peer_projection(
                 .or_else(|| stored.logical_host_ref.clone())
         && stored.durable_identity_id == desired.durable_identity_id
 }
+fn sync_legacy_trace(wrote: bool) { // TEMP-TRACE
+    crate::physical::temp_trace::SYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
+    if wrote { crate::physical::temp_trace::SYNC_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); } // TEMP-TRACE
+} // TEMP-TRACE
 
 pub fn pair_bridge_peer(
     paths: &AppPaths,

@@ -1003,10 +1003,13 @@ impl PhysicalStoreV1 {
             }
             j.distrust();
         }
+        let trace_started = std::time::Instant::now(); // TEMP-TRACE
         tx.execute("DELETE FROM temp.physical_audit_scope", [])?;
         #[cfg(test)]
         validation_stats::record("trust_audit", "full");
         audit(tx, AuditScopeV1::Full)?;
+        crate::physical::temp_trace::FULL_AUDITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
+        crate::physical::temp_trace::FULL_AUDIT_US.fetch_add(trace_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
         // The history baseline is established by, and only by, a full audit
         // (or by validations under the trust it starts).
         let heads = history_heads(tx, AuditScopeV1::Full)?;
@@ -1029,6 +1032,7 @@ impl PhysicalStoreV1 {
         tx: rusqlite::Transaction<'_>,
         kind: &WriteKindV1,
     ) -> AppResult<()> {
+        crate::physical::temp_trace::PHYSICAL_COMMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
         let (rows, deleted, trusted, history) = {
             let mut j = self.ledger.journal.lock();
             (
@@ -1098,6 +1102,7 @@ impl PhysicalStoreV1 {
         self.ledger.current()?;
         let stamp = FileStampV1::of(&self.ledger.path)?;
         if stamp != *self.ledger.stamp.lock() {
+            crate::physical::temp_trace::RECONNECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
             *conn = connect(&self.ledger.path, &self.ledger.journal)?;
             let mut j = self.ledger.journal.lock();
             j.distrust();

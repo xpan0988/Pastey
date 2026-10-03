@@ -524,6 +524,9 @@ impl PhysicalControlServiceV1 {
             self.store
                 .validate_session(&s.root.audit, &s.audit, &snapshot, now, active)
         })();
+        if let Err(e) = &result { // TEMP-TRACE
+            crate::physical::temp_trace::push(format!("validate_control_session failed (dependency_invalidated) {} root={} error={}", crate::physical::temp_trace::stamp(), crate::physical::temp_trace::short(s.root.root_id()), e.message())); // TEMP-TRACE
+        } // TEMP-TRACE
         if result.is_err() {
             s.valid.store(false, Ordering::Release);
             s.root.valid.store(false, Ordering::Release);
@@ -694,11 +697,17 @@ impl PhysicalControlServiceV1 {
         let freshness = &f.freshness.observation;
         let deadline =
             checked_deadline(fact.captured_ticks, freshness.max_age_us.get())?.min(s.deadline);
+        if !(ticks < deadline && fact.gap_us < freshness.max_gap_us.get()) { // TEMP-TRACE
+            crate::physical::temp_trace::push(format!("record_control_observation FAILED stale_or_gapped {} ticks_now={ticks} captured={} age_us={} max_age_us={} deadline={deadline} session_deadline={} declared_gap_us={} max_gap_us={}", crate::physical::temp_trace::stamp(), fact.captured_ticks, ticks.saturating_sub(fact.captured_ticks), freshness.max_age_us.get(), s.deadline, fact.gap_us, freshness.max_gap_us.get())); // TEMP-TRACE
+        } // TEMP-TRACE
         require(
             ticks < deadline && fact.gap_us < freshness.max_gap_us.get(),
             "Observation stale or gapped",
         )?;
         if let Some(previous) = self.control.observations.get(s.id()) {
+            if !(previous.id != fact.id && fact.captured_ticks >= previous.captured && fact.captured_ticks - previous.captured < freshness.max_gap_us.get()) { // TEMP-TRACE
+                crate::physical::temp_trace::push(format!("record_control_observation FAILED replay_order_gap {} captured={} previous={} gap_us={} max_gap_us={} max_age_us={} same_id={}", crate::physical::temp_trace::stamp(), fact.captured_ticks, previous.captured, fact.captured_ticks.saturating_sub(previous.captured), freshness.max_gap_us.get(), freshness.max_age_us.get(), previous.id == fact.id)); // TEMP-TRACE
+            } // TEMP-TRACE
             require(
                 previous.id != fact.id
                     && fact.captured_ticks >= previous.captured
@@ -919,6 +928,7 @@ impl PhysicalControlServiceV1 {
         for id in &superseded {
             self.control.actions[id].revoke();
         }
+        let trace_write = std::time::Instant::now(); // TEMP-TRACE
         self.store.admit_action(
             &g.session.root.audit,
             &g.session.audit,
@@ -927,6 +937,7 @@ impl PhysicalControlServiceV1 {
             now,
             proposer,
         )?;
+        crate::physical::temp_trace::LAST_ADMIT_WRITE_US.store(trace_write.elapsed().as_micros() as u64, Ordering::Relaxed); // TEMP-TRACE
         self.control.challenges.remove(&g.id);
         if let Some(cursor) = self.control.cursors.get_mut(&g.id) {
             cursor.sequence += 1;
@@ -1026,10 +1037,12 @@ impl PhysicalControlServiceV1 {
             "Action already had a Core dispatch decision",
         )?;
         let op = request_id()?;
+        let trace_write = std::time::Instant::now(); // TEMP-TRACE
         let snapshot = self.binding.ledger_snapshot(&s.root.binding)?;
         let (now, _) = self.binding.now()?;
         self.store
             .prepare_write(&s.root.audit, &s.audit, &a.audit, &snapshot, now, &op)?;
+        crate::physical::temp_trace::LAST_PREPARE_WRITE_US.store(trace_write.elapsed().as_micros() as u64, Ordering::Relaxed); // TEMP-TRACE
         self.control.operations.insert(s.id().clone(), op.clone());
         Ok(AdmittedActionReadViewV1 {
             session: s.audit.id.clone(),
@@ -1067,18 +1080,35 @@ impl PhysicalControlServiceV1 {
         a: &Arc<AdmittedBodyActionV1>,
         adapter: &dyn EnvironmentBinding,
     ) -> AppResult<()> {
+        let trace_action = crate::physical::temp_trace::short(a.id()); // TEMP-TRACE
+        let trace_prepare_wait = std::time::Instant::now(); // TEMP-TRACE
+        let trace_prepare_wait_us: u64; // TEMP-TRACE
+        let trace_prepare_us: u64; // TEMP-TRACE
         let (view, clock) = {
             let mut service = core.lock();
-            (service.prepare_action_write(a)?, service.clock.clone())
+            trace_prepare_wait_us = trace_prepare_wait.elapsed().as_micros() as u64; // TEMP-TRACE
+            let trace_started = std::time::Instant::now(); // TEMP-TRACE
+            let trace_prepared = service.prepare_action_write(a); // TEMP-TRACE
+            trace_prepare_us = trace_started.elapsed().as_micros() as u64; // TEMP-TRACE
+            if let Err(e) = &trace_prepared { crate::physical::temp_trace::push(format!("dispatch action={trace_action} {} prepare FAILED (nothing written, nothing applied) prepare_lock_wait_us={trace_prepare_wait_us} prepare_us={trace_prepare_us} error={}", crate::physical::temp_trace::stamp(), e.message())); } // TEMP-TRACE
+            (trace_prepared?, service.clock.clone()) // TEMP-TRACE: restore `(service.prepare_action_write(a)?, service.clock.clone())`
         };
         let op = view.request.clone();
+        let trace_entry_tick = clock.read().map(|(_, t)| t).unwrap_or(0); // TEMP-TRACE
+        let trace_entry_mono = crate::physical::temp_trace::mono_us(); // TEMP-TRACE
+        let trace_apply_started = std::time::Instant::now(); // TEMP-TRACE
         let result = adapter.apply(view).await;
         // Read before waiting for Core: the wait never makes a timely result
         // look late.
         let returned = clock.read().ok().map(|(_, ticks)| ticks);
         #[cfg(test)]
         clock.write_returned();
+        let trace_apply_us = trace_apply_started.elapsed().as_micros(); // TEMP-TRACE
+        let trace_callback_tick = returned.unwrap_or(0); // TEMP-TRACE
+        let trace_apply = match &result { Ok(Some(r)) => format!("receipt accepted={} session_match={} epochs_match={} request_match={} action_match={} payload_match={}", r.accepted, r.session == a.audit.session, r.epochs == a.audit.epochs, r.request == op, r.action == *a.id(), r.payload_digest == a.audit.proposal.payload_digest), Ok(None) => "no_receipt".to_owned(), Err(e) => format!("apply_error={}", e.message()) }; // TEMP-TRACE
+        let trace_wait = std::time::Instant::now(); // TEMP-TRACE
         let mut service = core.lock();
+        let trace_waited_us = trace_wait.elapsed().as_micros(); // TEMP-TRACE
         if service.control.operations.get(a.grant.session.id()) == Some(&op) {
             service.control.operations.remove(a.grant.session.id());
         }
@@ -1092,6 +1122,7 @@ impl PhysicalControlServiceV1 {
         // limits when the write returned, so waiting for Core never expires
         // it; closure, revocation and supersession are judged now.
         let still_valid = service.validate_admitted_action_at(a, returned);
+        if let Err(e) = &still_valid { let ticks = service.binding.now().map(|(_, t)| t).unwrap_or(0); crate::physical::temp_trace::push(format!("dispatch action={trace_action} {} applied ({trace_apply}) apply_us={trace_apply_us} core_lock_wait_us={trace_waited_us} post-apply validity FAILED ticks={ticks} deadline={} continuing_deadline={} valid_flag={} error={}", crate::physical::temp_trace::stamp(), a.deadline, a.continuing_deadline.load(Ordering::Acquire), a.valid.load(Ordering::Acquire), e.message())); } // TEMP-TRACE
         let accepted = match result {
             Ok(Some(reply))
                 if reply.session == a.audit.session
@@ -1107,6 +1138,8 @@ impl PhysicalControlServiceV1 {
             }
             _ => None,
         };
+        let mut trace_finish_us = 0u128; // TEMP-TRACE
+        let mut trace_record = None; // TEMP-TRACE
         let committed = (|| {
             let s = &a.grant.session;
             // The record is judged in ticks; its wall time is informational,
@@ -1117,6 +1150,7 @@ impl PhysicalControlServiceV1 {
             // A closed or fenced Root has no current snapshot; the record does
             // not need one, only the report of whether authority held.
             let snapshot = service.binding.ledger_snapshot(&s.root.binding).ok();
+            let trace_finish = std::time::Instant::now(); // TEMP-TRACE
             let record = service.store.finish_write(
                 &s.root.audit,
                 &s.audit,
@@ -1131,6 +1165,8 @@ impl PhysicalControlServiceV1 {
                     lock_wait_us: ticks.saturating_sub(returned_tick),
                 },
             )?;
+            trace_finish_us = trace_finish.elapsed().as_micros(); // TEMP-TRACE
+            trace_record = Some((record, ticks.saturating_sub(returned_tick), returned_tick as i64 - a.deadline as i64)); // TEMP-TRACE
             match record {
                 CallbackRecordV1::Finalized { current } => {
                     require(current, "Session reservation no longer current")?
@@ -1147,6 +1183,7 @@ impl PhysicalControlServiceV1 {
                 "Adapter refused or disposition unknown",
             )
         })();
+        crate::physical::temp_trace::push(format!("dispatch action={trace_action} {} applied ({trace_apply}) prepare_lock_wait_us={trace_prepare_wait_us} prepare_us={trace_prepare_us} prepare_ledger_write_us={} entry_mono_us={trace_entry_mono} entry_tick={trace_entry_tick} deadline_tick={} remaining_at_entry_us={} apply_us={trace_apply_us} callback_tick={trace_callback_tick} callback_after_deadline_us={} callback_lock_wait_us={trace_waited_us} finish_write_us={trace_finish_us} record(kind,lock_wait_us,returned_minus_deadline_us)={trace_record:?} accepted_for_commit={accepted:?} commit={:?}", crate::physical::temp_trace::stamp(), crate::physical::temp_trace::LAST_PREPARE_WRITE_US.load(Ordering::Relaxed), a.deadline, a.deadline as i64 - trace_entry_tick as i64, trace_callback_tick as i64 - a.deadline as i64, committed.as_ref().map_err(|e| e.message().to_owned()))); // TEMP-TRACE
         if committed.is_err() {
             // Uncertainty never retains a usable lane permit or creates a retry.
             let _ = service.close_root(&a.grant.session.root);

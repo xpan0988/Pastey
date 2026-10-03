@@ -60,6 +60,7 @@ pub(crate) struct StreamRuntimeV1 {
     last_activity: AtomicU64,
     committed: AtomicBool,
     ended: AtomicBool,
+    trace: crate::physical::temp_trace::StreamTraceV1, // TEMP-TRACE
 }
 /// Result of one executor timer tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,6 +206,7 @@ impl PhysicalControlServiceV1 {
             last_activity: AtomicU64::new(ticks),
             committed: AtomicBool::new(false),
             ended: AtomicBool::new(false),
+            trace: Default::default(), // TEMP-TRACE
         });
         self.control
             .streams
@@ -392,7 +394,9 @@ impl PhysicalControlServiceV1 {
             .await
             .map_err(|_| crate::error::AppError::InvalidInput("Binding sample failed".into()))
             .and_then(|r| r);
+        let mut trace_captured: Option<u64> = None; // TEMP-TRACE
         let recorded = sampled.and_then(|sample| {
+            trace_captured = Some(sample.control.captured_ticks); // TEMP-TRACE
             let view = sample.view.clone();
             let mut service = core.lock();
             let ingress = service.local_ingress()?;
@@ -405,6 +409,20 @@ impl PhysicalControlServiceV1 {
             )?;
             Ok(view)
         });
+        { // TEMP-TRACE
+            let t = &stream.trace; // TEMP-TRACE
+            let previous = t.last_capture.load(Ordering::Relaxed); // TEMP-TRACE
+            let gap = match trace_captured { Some(c) if previous > 0 => c.saturating_sub(previous), _ => 0 }; // TEMP-TRACE
+            t.samples.fetch_add(1, Ordering::Relaxed); // TEMP-TRACE
+            t.max_gap_us.fetch_max(gap, Ordering::Relaxed); // TEMP-TRACE
+            if let (Ok(_), Some(c)) = (&recorded, trace_captured) { t.last_capture.store(c, Ordering::Relaxed); } // TEMP-TRACE
+            if let Err(e) = &recorded { // TEMP-TRACE
+                let f = &stream.session.basis.scope().fields().freshness.observation; // TEMP-TRACE
+                crate::physical::temp_trace::push(format!("sample FAILED {} root={} captured={trace_captured:?} previous_captured={previous} gap_us={gap} max_gap_us={} max_age_us={} {} {} error={}", crate::physical::temp_trace::stamp(), crate::physical::temp_trace::short(stream.session.root().root_id()), f.max_gap_us.get(), f.max_age_us.get(), t.this_tick(), crate::physical::temp_trace::audits(), e.message())); // TEMP-TRACE
+                t.note_end("sample_error", e.message().to_owned()); // TEMP-TRACE
+                crate::physical::temp_trace::flush(); // TEMP-TRACE
+            } // TEMP-TRACE
+        } // TEMP-TRACE
         if recorded.is_err() {
             drop(_serial);
             Self::end_stream(core, stream).await;
@@ -418,6 +436,7 @@ impl PhysicalControlServiceV1 {
         if stream.ended.swap(true, Ordering::AcqRel) {
             return;
         }
+        let trace_started = crate::physical::temp_trace::stamp(); // TEMP-TRACE
         {
             let mut service = core.lock();
             service.control.tool_sessions.retain(|_, t| {
@@ -429,7 +448,10 @@ impl PhysicalControlServiceV1 {
                 }
             });
         }
-        let _ = Self::revoke_control_session(core, &stream.session, stream.lane.as_ref()).await;
+        let trace_revoked = Self::revoke_control_session(core, &stream.session, stream.lane.as_ref()).await; // TEMP-TRACE: restore `let _ = Self::revoke_control_session(core, &stream.session, stream.lane.as_ref()).await;`
+        let (trace_why, trace_detail) = stream.trace.end_reason(); // TEMP-TRACE
+        crate::physical::temp_trace::push(format!("end_stream reason={trace_why} detail={trace_detail:?} started {trace_started} finished {} root={} revoke={:?} {} {}", crate::physical::temp_trace::stamp(), crate::physical::temp_trace::short(stream.session.root().root_id()), trace_revoked.as_ref().map_err(|e| e.message().to_owned()), stream.trace.summary(), crate::physical::temp_trace::audits())); // TEMP-TRACE
+        crate::physical::temp_trace::flush(); // TEMP-TRACE
     }
     /// One executor timer tick: the stream's completion and end never depend
     /// on a brain calling. It samples, evaluates the latest dispatched
@@ -448,24 +470,34 @@ impl PhysicalControlServiceV1 {
         let period = std::time::Duration::from_micros(
             (scope.freshness.observation.max_gap_us.get() / 2).max(1),
         );
+        let trace_phase = std::time::Instant::now(); // TEMP-TRACE
         let (live, idle) = {
             let mut service = core.lock();
             let (_, ticks) = service.clock.read()?;
-            let live = service
-                .validate_control_session(&stream.session, true)
-                .is_ok();
+            let trace_validated = service.validate_control_session(&stream.session, true); // TEMP-TRACE
+            let live = trace_validated.is_ok(); // TEMP-TRACE: restore `let live = service.validate_control_session(&stream.session, true).is_ok();`
             let idle = ticks.saturating_sub(stream.last_activity.load(Ordering::Acquire))
                 > flow.idle_lease_us.get();
+            if let Err(e) = &trace_validated { stream.trace.note_end("live_false", e.message().to_owned()); } // TEMP-TRACE
+            if idle { stream.trace.note_end("idle", format!("ticks={ticks} last_activity={} idle_lease_us={}", stream.last_activity.load(Ordering::Acquire), flow.idle_lease_us.get())); } // TEMP-TRACE
             (live, idle)
         };
+        stream.trace.phase(0, trace_phase); // TEMP-TRACE
         if !live || idle {
             Self::end_stream(core, stream).await;
             return Ok(StreamTickV1::Ended);
         }
+        let trace_phase = std::time::Instant::now(); // TEMP-TRACE
         if Self::sample(core, stream).await.is_err() {
             return Ok(StreamTickV1::Ended);
         }
-        if core.lock().check_effect_bound(stream)? {
+        stream.trace.phase(1, trace_phase); // TEMP-TRACE
+        let trace_phase = std::time::Instant::now(); // TEMP-TRACE
+        let trace_bound = core.lock().check_effect_bound(stream)?; // TEMP-TRACE
+        stream.trace.phase(2, trace_phase); // TEMP-TRACE
+        let trace_phase = std::time::Instant::now(); // TEMP-TRACE
+        if trace_bound { // TEMP-TRACE: restore `if core.lock().check_effect_bound(stream)? {` and drop the four lines above
+            stream.trace.note_end("effect_bound", String::new()); // TEMP-TRACE
             Self::end_stream(core, stream).await;
             return Ok(StreamTickV1::Ended);
         }
@@ -482,7 +514,9 @@ impl PhysicalControlServiceV1 {
             });
             (verified, (actions == 0 || time == 0) && !busy)
         };
+        stream.trace.phase(3, trace_phase); // TEMP-TRACE
         if verified || spent {
+            stream.trace.note_end(if verified { "verified" } else { "spent" }, String::new()); // TEMP-TRACE
             Self::end_stream(core, stream).await;
             return Ok(StreamTickV1::Ended);
         }
@@ -506,13 +540,20 @@ impl PhysicalControlServiceV1 {
         let mut deadline = timer.now_us();
         loop {
             timer.sleep_until(deadline).await;
-            match Self::stream_tick(core, &stream).await {
+            stream.trace.tick(); // TEMP-TRACE
+            let trace_tick = std::time::Instant::now(); // TEMP-TRACE
+            let trace_result = Self::stream_tick(core, &stream).await; // TEMP-TRACE
+            stream.trace.max_tick_us.fetch_max(trace_tick.elapsed().as_micros() as u64, Ordering::Relaxed); // TEMP-TRACE
+            crate::physical::temp_trace::SUPERVISOR_TICKS.fetch_add(1, Ordering::Relaxed); // TEMP-TRACE
+            crate::physical::temp_trace::SUPERVISOR_TICK_US.fetch_add(trace_tick.elapsed().as_micros() as u64, Ordering::Relaxed); // TEMP-TRACE
+            match trace_result { // TEMP-TRACE: restore `match Self::stream_tick(core, &stream).await {`
                 Ok(StreamTickV1::Continue(period)) => {
                     let period = u64::try_from(period.as_micros()).unwrap_or(u64::MAX);
                     deadline = next_tick_deadline(deadline, period, timer.now_us());
                 }
                 Ok(StreamTickV1::Ended) => break,
-                Err(_) => {
+                Err(e) => { // TEMP-TRACE: restore `Err(_) => {`
+                    stream.trace.note_end("supervisor_error", e.message().to_owned()); // TEMP-TRACE
                     Self::end_stream(core, &stream).await;
                     break;
                 }
@@ -635,16 +676,25 @@ impl PhysicalControlServiceV1 {
             (Err(_), _) => return refuse("Invalid option name".into()),
             (_, Err(_)) => return refuse("Invalid action duration".into()),
         };
+        let trace_receipt = crate::physical::temp_trace::LAST_TOOL_CALL_US.load(Ordering::Relaxed); // TEMP-TRACE
+        let trace_decide = crate::physical::temp_trace::mono_us(); // TEMP-TRACE
+        let (trace_routes, trace_route_us, trace_audits) = (crate::physical::temp_trace::ROUTE_CHECKS.load(Ordering::Relaxed), crate::physical::temp_trace::ROUTE_CHECK_US.load(Ordering::Relaxed), crate::physical::temp_trace::FULL_AUDITS.load(Ordering::Relaxed)); // TEMP-TRACE
+        let (trace_ticks, trace_tick_us) = (crate::physical::temp_trace::SUPERVISOR_TICKS.load(Ordering::Relaxed), crate::physical::temp_trace::SUPERVISOR_TICK_US.load(Ordering::Relaxed)); // TEMP-TRACE
+        let trace_roots = crate::physical::temp_trace::VALIDATE_ROOTS.load(Ordering::Relaxed); // TEMP-TRACE
         // A fresh trusted sample precedes every challenge.
         if let Err(e) = Self::sample(core, &ts.stream).await {
             return refuse(e.message().to_owned());
         }
+        let trace_sampled = crate::physical::temp_trace::mono_us(); // TEMP-TRACE
+        let trace_admit_wait: u64; // TEMP-TRACE
         let admitted = {
             let mut service = core.lock();
+            trace_admit_wait = crate::physical::temp_trace::mono_us().saturating_sub(trace_sampled); // TEMP-TRACE
             service
                 .construct_session_grant(ts.stream.session.clone())
                 .and_then(|g| service.admit_decision(&g, &ts.caller, &label, duration))
         };
+        let trace_admitted = crate::physical::temp_trace::mono_us(); // TEMP-TRACE
         let action = match admitted {
             Ok(a) => a,
             Err(e) => return refuse(e.message().to_owned()),
@@ -652,8 +702,10 @@ impl PhysicalControlServiceV1 {
         // The write's native reply. A refusal or unknown reply closes the
         // stream inside Core (no retry, budget kept); the caller learns only
         // the disposition.
-        let _ = Self::dispatch_admitted_action(core, &action, ts.stream.lane.as_ref()).await;
-        let disposition = core.lock().store.action_status(action.id())?.1;
+        let trace_dispatched = Self::dispatch_admitted_action(core, &action, ts.stream.lane.as_ref()).await; // TEMP-TRACE: restore `let _ = Self::dispatch_admitted_action(core, &action, ts.stream.lane.as_ref()).await;`
+        let trace_status = core.lock().store.action_status(action.id())?; // TEMP-TRACE
+        crate::physical::temp_trace::push(format!("decide action={} option={option} requested_us={duration_us} {} receipt_mono_us={trace_receipt} decide_start_mono_us={trace_decide} receipt_to_decide_us={} sample_us={} admit_lock_wait_us={trace_admit_wait} grant_admit_us={} admit_ledger_write_us={} admission_tick={} deadline_tick={} receipt_to_admission_us={} route_checks+={} route_check_us+={} full_audits+={} supervisor_ticks+={} supervisor_tick_us+={} root_validations+={} dispatch={:?} durable_status={:?}", crate::physical::temp_trace::short(action.id()), crate::physical::temp_trace::stamp(), trace_decide.saturating_sub(trace_receipt), trace_sampled - trace_decide, trace_admitted.saturating_sub(trace_sampled + trace_admit_wait), crate::physical::temp_trace::LAST_ADMIT_WRITE_US.load(Ordering::Relaxed), lane_deadline(&action).saturating_sub(duration_us), lane_deadline(&action), trace_admitted.saturating_sub(trace_receipt), crate::physical::temp_trace::ROUTE_CHECKS.load(Ordering::Relaxed) - trace_routes, crate::physical::temp_trace::ROUTE_CHECK_US.load(Ordering::Relaxed) - trace_route_us, crate::physical::temp_trace::FULL_AUDITS.load(Ordering::Relaxed) - trace_audits, crate::physical::temp_trace::SUPERVISOR_TICKS.load(Ordering::Relaxed) - trace_ticks, crate::physical::temp_trace::SUPERVISOR_TICK_US.load(Ordering::Relaxed) - trace_tick_us, crate::physical::temp_trace::VALIDATE_ROOTS.load(Ordering::Relaxed) - trace_roots, trace_dispatched.as_ref().map_err(|e| e.message().to_owned()), trace_status)); // TEMP-TRACE
+        let disposition = trace_status.1; // TEMP-TRACE: restore `let disposition = core.lock().store.action_status(action.id())?.1;`
         Ok(DecisionToolReplyV1::Allowed { disposition })
     }
     /// Closes a tool session. A session that never committed only releases
@@ -681,6 +733,7 @@ impl PhysicalControlServiceV1 {
             ts.committed.load(Ordering::Acquire)
         };
         if committed {
+            ts.stream.trace.note_end("tool_disconnect", format!("tool_session={}", crate::physical::temp_trace::short(&ts.id))); // TEMP-TRACE
             Self::end_stream(core, &ts.stream).await;
             return Ok(ToolCloseV1::Ended);
         }
@@ -706,6 +759,8 @@ impl PhysicalControlServiceV1 {
     }
 }
 
+/// TEMP-TRACE: an admitted action's deadline, in ticks.
+pub(super) fn lane_deadline(a: &AdmittedBodyActionV1) -> u64 { a.deadline } // TEMP-TRACE
 #[cfg(test)]
 pub(super) fn test_stream(ts: &ToolSessionV1) -> Arc<StreamRuntimeV1> {
     ts.stream.clone()

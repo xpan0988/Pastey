@@ -83,6 +83,13 @@ impl CurrentRemoteHostSession {
     /// its peer rows once and checks them as resolution would, including the
     /// route retirement the legacy projection refresh would perform.
     pub(crate) fn validate_current_physical_route(&self, state: &AppState) -> AppResult<()> {
+        let trace_started = std::time::Instant::now(); // TEMP-TRACE
+        let result = self.validate_current_physical_route_read_only(state); // TEMP-TRACE
+        crate::physical::temp_trace::ROUTE_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
+        crate::physical::temp_trace::ROUTE_CHECK_US.fetch_add(trace_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
+        result // TEMP-TRACE
+    } // TEMP-TRACE
+    fn validate_current_physical_route_read_only(&self, state: &AppState) -> AppResult<()> { // TEMP-TRACE
         let room = storage::get_room_by_id(&state.paths, &self.binding.bridge_id)?;
         let peers = storage::list_bridge_peer_endpoints(&state.paths, &self.binding.bridge_id)?;
         let current = crate::host_runtime::current_host_session_binding_read_only(
@@ -150,6 +157,7 @@ impl CurrentRemoteHostSession {
             &context.peer_route_ref,
             &context.peer_observation_ref,
         );
+        crate::physical::temp_trace::CAPABILITY_QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
         let event = room_control::peer_capability_event(
             "peer_capability.query",
             serde_json::json!({
@@ -327,6 +335,7 @@ async fn invalidate_unreachable_sessions(state: Arc<AppState>) -> AppResult<()> 
 /// whether a `Connected` endpoint is current enough to attempt normal Bridge
 /// transport.
 async fn probe_exact_peer(room: &StoredRoom, peer: &StoredBridgePeerEndpoint) -> bool {
+    crate::physical::temp_trace::PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
     let (Some(host), Some(port), Some(expected_key)) = (
         peer.endpoint_host.as_deref(),
         peer.endpoint_port,
@@ -707,6 +716,15 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(data_version(&observer), before);
+        { // TEMP-TRACE
+            let n = 200; // TEMP-TRACE
+            let t = std::time::Instant::now(); // TEMP-TRACE
+            for _ in 0..n { session.validate_current_physical_route(&fixture.runtime).unwrap(); } // TEMP-TRACE
+            let read_only = t.elapsed() / n; // TEMP-TRACE
+            let t = std::time::Instant::now(); // TEMP-TRACE
+            for _ in 0..n { let c = crate::host_runtime::current_host_session_binding(&fixture.runtime, ROOM_ID, &route).unwrap(); session.binding().validate_current(&c, storage::now_ts()).unwrap(); storage::list_bridge_peer_endpoints(&fixture.runtime.paths, ROOM_ID).unwrap(); } // TEMP-TRACE
+            eprintln!("TEMP-TRACE route check per call: read_only={read_only:?} previous_resolving_path={:?}", t.elapsed() / n); // TEMP-TRACE
+        } // TEMP-TRACE
         // On an unchanged Bridge the resolving path writes nothing either.
         crate::host_runtime::current_host_session_binding(&fixture.runtime, ROOM_ID, &route)
             .unwrap();

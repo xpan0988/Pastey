@@ -87,10 +87,18 @@ async fn relayed(
     relay: &dyn ToolRelayV1,
     request: PhysicalProductRequestV1,
 ) -> AppResult<ToolOutcomeV1> {
+    let trace_kind = serde_json::to_value(&request).ok().and_then(|v| v.get("kind").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default(); // TEMP-TRACE
+    let trace_started = std::time::Instant::now(); // TEMP-TRACE
+    let trace_probes = crate::physical::temp_trace::PROBES.load(std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
+    let trace_queries = crate::physical::temp_trace::CAPABILITY_QUERIES.load(std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
+    let mut trace_polls = 0u64; // TEMP-TRACE
     let id = relay.send(request).await?;
     let deadline = tokio::time::Instant::now() + REPLY_WAIT;
     loop {
+        trace_polls += 1; // TEMP-TRACE
         if let Some(outcome) = relay.outcome(&id).await? {
+            crate::physical::temp_trace::push(format!("mcp_relay kind={trace_kind} {} reply_ms={} polls={trace_polls} probes+={} capability_queries+={} outcome={} {}", crate::physical::temp_trace::stamp(), trace_started.elapsed().as_millis(), crate::physical::temp_trace::PROBES.load(std::sync::atomic::Ordering::Relaxed) - trace_probes, crate::physical::temp_trace::CAPABILITY_QUERIES.load(std::sync::atomic::Ordering::Relaxed) - trace_queries, serde_json::to_value(&outcome).ok().and_then(|v| v.get("outcome").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default(), crate::physical::temp_trace::room_control())); // TEMP-TRACE
+            crate::physical::temp_trace::flush(); // TEMP-TRACE
             return Ok(outcome);
         }
         if tokio::time::Instant::now() >= deadline {
