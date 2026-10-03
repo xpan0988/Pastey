@@ -1375,6 +1375,7 @@ pub async fn receive_room_control_event_handler(
             )
         }
     };
+    crate::physical::temp_trace::count_event(validated.kind.clone()); // TEMP-TRACE
     if validated.kind.starts_with("bridge_plan.") {
         log_bridge_plan_control_event(&validated, "inbound_validated");
     }
@@ -3013,6 +3014,7 @@ fn encrypted_receipt_response(event_key: &[u8; 32], event_id: &str, received_at:
 }
 
 fn control_error(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+    crate::physical::temp_trace::count_event(format!("rejected:{code}")); // TEMP-TRACE
     (
         status,
         [(header::CONTENT_TYPE, CONTROL_ERROR_CONTENT_TYPE)],
@@ -4288,6 +4290,11 @@ async fn receive_authenticated_physical(
     payload: Value,
 ) -> AppResult<()> {
     use crate::physical::{core::PhysicalControlServiceV1, protocol::*};
+    let trace_kind = payload.pointer("/operation/kind").and_then(Value::as_str).unwrap_or("?").to_owned(); // TEMP-TRACE
+    let trace_start = payload.pointer("/operation/start").and_then(Value::as_str).and_then(|s| crate::physical::values::RequestId::try_from(s.to_owned()).ok()); // TEMP-TRACE
+    let trace_watch = matches!(trace_kind.as_str(), "tool_open" | "status_query" | "tool_call" | "tool_close"); // TEMP-TRACE
+    let trace_window = crate::physical::temp_trace::WindowV1::open(&state.paths.db_path); // TEMP-TRACE
+    if trace_kind == "tool_call" { crate::physical::temp_trace::LAST_TOOL_CALL_US.store(crate::physical::temp_trace::mono_us(), std::sync::atomic::Ordering::Relaxed); } // TEMP-TRACE
     let m: PhysicalMessageV1 = serde_json::from_value(payload)?;
     let peer = if m.operation.is_response() {
         &m.executor
@@ -4319,18 +4326,35 @@ async fn receive_authenticated_physical(
         binding,
         current,
     };
-    let (response, work) = {
+    let trace_wait = std::time::Instant::now(); // TEMP-TRACE
+    let mut trace_hold = std::time::Instant::now(); // TEMP-TRACE
+    let mut trace_waited = std::time::Duration::ZERO; // TEMP-TRACE
+    let mut trace_before: Option<Option<bool>> = None; // TEMP-TRACE
+    let mut trace_after: Option<Option<bool>> = None; // TEMP-TRACE
+    let trace_audits = crate::physical::temp_trace::FULL_AUDITS.load(std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
+    let received = (|| { // TEMP-TRACE: restore `let (response, work) = {` and drop this closure
         let mut core = state.physical_control.lock();
+        trace_waited = trace_wait.elapsed(); // TEMP-TRACE
+        trace_hold = std::time::Instant::now(); // TEMP-TRACE
+        if trace_watch { trace_before = trace_start.as_ref().map(|s| core.temp_trace_root_valid(s)); } // TEMP-TRACE
         let ingress = core.verified_peer_ingress(proof)?;
-        core.receive_physical(ingress, m)?
-    };
+        let trace_received = core.receive_physical(ingress, m); // TEMP-TRACE: restore `core.receive_physical(ingress, m)?`
+        if trace_watch { trace_after = trace_start.as_ref().map(|s| core.temp_trace_root_valid(s)); } // TEMP-TRACE
+        trace_received // TEMP-TRACE
+    })(); // TEMP-TRACE: restore `};`
+    let trace_held = trace_hold.elapsed(); // TEMP-TRACE
+    if trace_watch || trace_waited.as_millis() >= 50 || trace_held.as_millis() >= 50 || received.is_err() { // TEMP-TRACE
+        crate::physical::temp_trace::push(format!("receive_physical kind={trace_kind} {} root_valid_on_arrival={trace_before:?} root_valid_after={trace_after:?} core_lock_wait_us={} core_lock_hold_us={} full_audits_during={} window[{}] {} error={:?}", crate::physical::temp_trace::stamp(), trace_waited.as_micros(), trace_held.as_micros(), crate::physical::temp_trace::FULL_AUDITS.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(trace_audits), trace_window.close(&state.paths.db_path), crate::physical::temp_trace::room_control(), received.as_ref().err().map(|e| e.message().to_owned()))); // TEMP-TRACE
+    } // TEMP-TRACE
+    crate::physical::temp_trace::flush(); // TEMP-TRACE
+    let (response, work) = received?; // TEMP-TRACE
     if let Some(work) = work {
         let state = state.clone();
         let bridge = bridge.to_owned();
         tokio::spawn(async move {
-            match PhysicalControlServiceV1::perform_physical_work(&state.physical_control, work)
-                .await
-            {
+            let trace_performed = PhysicalControlServiceV1::perform_physical_work(&state.physical_control, work).await; // TEMP-TRACE
+            crate::physical::temp_trace::flush(); // TEMP-TRACE
+            match trace_performed { // TEMP-TRACE: restore `match PhysicalControlServiceV1::perform_physical_work(&state.physical_control, work).await {`
                 Ok(done) => {
                     if let Some(reply) = done.reply {
                         send_physical_reply(state.clone(), bridge, reply);
@@ -4370,6 +4394,9 @@ fn send_physical_reply(
     response: crate::physical::protocol::PhysicalMessageV1,
 ) {
     tokio::spawn(async move {
+        let trace_kind = serde_json::to_value(&response.operation).ok().and_then(|v| v.get("kind").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default(); // TEMP-TRACE
+        let trace_db = state.paths.db_path.clone(); // TEMP-TRACE
+        let trace_window = crate::physical::temp_trace::WindowV1::open(&trace_db); // TEMP-TRACE
         let result = async {
             let current = state
                 .resolve_current_remote_host_session(&bridge, &response.requester)
@@ -4395,6 +4422,8 @@ fn send_physical_reply(
             Ok::<_, AppError>(())
         }
         .await;
+        crate::physical::temp_trace::push(format!("send_physical_reply kind={trace_kind} {} ok={} window[{}]", crate::physical::temp_trace::stamp(), result.is_ok(), trace_window.close(&trace_db))); // TEMP-TRACE
+        crate::physical::temp_trace::flush(); // TEMP-TRACE
         if result.is_err() {
             logging::write_error_line(
                 "Physical semantic reply delivery uncertain; status query required",

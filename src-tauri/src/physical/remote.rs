@@ -134,6 +134,8 @@ impl PhysicalControlServiceV1 {
             .cloned()
             .collect::<Vec<_>>();
         for p in replaced {
+            let (o, n) = (&p.binding, &binding); // TEMP-TRACE
+            crate::physical::temp_trace::push(format!("verified_peer_ingress REPLACED {} differs: bridge_id={} local_host_ref={} local_session_ref={} peer_session_ref={} peer_route_ref={} expires_at={} (old={} new={}) binding_ref={} session_pair_ref={} old_authenticated={}", crate::physical::temp_trace::stamp(), o.bridge_id != n.bridge_id, o.local_host_ref != n.local_host_ref, o.local_session_ref != n.local_session_ref, o.peer_session_ref != n.peer_session_ref, o.peer_route_ref != n.peer_route_ref, o.expires_at != n.expires_at, o.expires_at, n.expires_at, o.binding_ref != n.binding_ref, o.session_pair_ref != n.session_pair_ref, p.authenticated.load(Ordering::Acquire))); // TEMP-TRACE
             self.invalidate_physical_peer(&p)?;
         }
         if let Some(old) = self
@@ -174,11 +176,18 @@ impl PhysicalControlServiceV1 {
             })
             .cloned()
             .collect::<Vec<_>>();
+        if !sessions.is_empty() { // TEMP-TRACE
+            crate::physical::temp_trace::push(format!("invalidate_physical_peer closing {} root(s) {} roots={:?}", sessions.len(), crate::physical::temp_trace::stamp(), sessions.iter().map(|s| crate::physical::temp_trace::short(s.root().root_id())).collect::<Vec<_>>())); // TEMP-TRACE
+        } // TEMP-TRACE
         for s in sessions {
             self.close_root(s.root())?;
         }
         Ok(())
     }
+    /// TEMP-TRACE: whether the Root of the stream `start` began is still valid.
+    pub(crate) fn temp_trace_root_valid(&self, start: &RequestId) -> Option<bool> { // TEMP-TRACE
+        self.remote.executions.get(start).map(|s| s.root().valid.load(Ordering::Acquire) && self.roots.contains_key(s.root().root_id())) // TEMP-TRACE
+    } // TEMP-TRACE
     pub(crate) fn invalidate_physical_bridge(&mut self, bridge: &str) -> AppResult<()> {
         let peers = self
             .remote
@@ -424,6 +433,7 @@ impl PhysicalControlServiceV1 {
                                 });
                             }
                         } else if let Some(root) = status.root {
+                            crate::physical::temp_trace::push(format!("remote cancel close_attempt revoked {} root={}", crate::physical::temp_trace::stamp(), crate::physical::temp_trace::short(&root))); // TEMP-TRACE
                             self.store.close_attempt(&root, "revoked")?;
                         }
                     } else if matches!(m.operation, PhysicalOperationV1::Reconcile { .. }) {

@@ -610,6 +610,7 @@ impl PhysicalControlServiceV1 {
         Ok(root)
     }
     pub(super) fn validate_root(&mut self, root: &PhysicalAuthorityRootV1) -> AppResult<()> {
+        crate::physical::temp_trace::VALIDATE_ROOTS.fetch_add(1, Ordering::Relaxed); // TEMP-TRACE
         let result = (|| {
             self.validate_ingress(&root.ingress)?;
             if let Some(peer) = &root.peer {
@@ -726,7 +727,10 @@ impl PhysicalControlServiceV1 {
             "Unqualified basis enforcement",
         )
     }
+    #[track_caller] // TEMP-TRACE
     pub(super) fn close_root(&mut self, root: &PhysicalAuthorityRootV1) -> AppResult<()> {
+        let trace_caller = std::panic::Location::caller(); // TEMP-TRACE
+        crate::physical::temp_trace::push(format!("close_root {} root={} was_valid={} caller={}:{}", crate::physical::temp_trace::stamp(), crate::physical::temp_trace::short(root.root_id()), root.valid.load(Ordering::Acquire), trace_caller.file(), trace_caller.line())); // TEMP-TRACE
         self.control.invalidate_root(root.root_id());
         root.valid.store(false, Ordering::Release);
         self.roots.remove(root.root_id());

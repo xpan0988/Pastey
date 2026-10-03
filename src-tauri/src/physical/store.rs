@@ -610,13 +610,17 @@ impl PhysicalStoreV1 {
             }
             j.trusted = None;
         }
+        let trace_started = std::time::Instant::now(); // TEMP-TRACE
         tx.execute("DELETE FROM temp.physical_audit_scope", [])?;
         audit(tx, AuditScopeV1::Full)?;
+        crate::physical::temp_trace::FULL_AUDITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
+        crate::physical::temp_trace::FULL_AUDIT_US.fetch_add(trace_started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
         self.ledger.journal.lock().trusted = Some(version);
         Ok(())
     }
     /// Validates exactly what this transaction wrote, then commits it.
     pub(super) fn commit(&self, tx: rusqlite::Transaction<'_>) -> AppResult<()> {
+        crate::physical::temp_trace::PHYSICAL_COMMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
         let (rows, deleted) = {
             let mut j = self.ledger.journal.lock();
             (std::mem::take(&mut j.rows), std::mem::take(&mut j.deleted))
@@ -649,6 +653,7 @@ impl PhysicalStoreV1 {
         self.ledger.current()?;
         let stamp = FileStampV1::of(&self.ledger.path)?;
         if stamp != *self.ledger.stamp.lock() {
+            crate::physical::temp_trace::RECONNECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // TEMP-TRACE
             *conn = connect(&self.ledger.path, &self.ledger.journal)?;
             let mut j = self.ledger.journal.lock();
             j.trusted = None;

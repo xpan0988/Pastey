@@ -276,10 +276,12 @@ impl HostRuntime {
         // and retained result material so a fresh session can reconcile it.
         let _ = self.native_agents.lock().revoke_bridge_session(room_id);
         self.physical_compatibility.lock().purge_room(room_id);
+        crate::physical::temp_trace::push(format!("purge_room invalidate_physical_bridge {}", crate::physical::temp_trace::stamp())); // TEMP-TRACE
         let _ = self
             .physical_control
             .lock()
             .invalidate_physical_bridge(room_id);
+        crate::physical::temp_trace::flush(); // TEMP-TRACE
         crate::native_v2_orchestration::interrupt_attempts_for_bridge(
             &self.paths,
             room_id,
