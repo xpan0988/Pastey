@@ -28,11 +28,23 @@ test("selected peers change only when the current route is no longer routeable",
 
 test("native-v2 lifecycle polling is scoped to one opened revision and cleaned up", () => {
   const component = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
-  assert.equal(component.match(/window\.setInterval/g)?.length, 1);
+  // Plan status is polled by exactly one interval, only while a revision is open.
+  const statusPolls = component.match(/window\.setInterval\([^;]*refresh\(/g) ?? [];
+  assert.equal(statusPolls.length, 1);
   assert.match(component, /revisionId \? window\.setInterval\(\(\) => void refresh\(revisionId\), 2_000\) : null/);
   assert.match(component, /if \(interval !== null\) window\.clearInterval\(interval\)/);
+  // Other intervals (such as result-Return reconciliation) are fine, but every
+  // interval the component starts is cleared by its effect cleanup.
+  assert.equal(
+    component.match(/window\.setInterval\(/g)?.length,
+    component.match(/window\.clearInterval\(/g)?.length,
+  );
+  // Status events are accepted only for the opened revision, or adopt one when none is open.
   assert.match(component, /pastey:\/\/native-v2-plan-status/);
-  assert.match(component, /event\.payload\.revisionId === revisionId/);
+  assert.match(
+    component,
+    /revisionIdRef\.current === null \|\| event\.payload\.revisionId === revisionIdRef\.current/,
+  );
 });
 
 test("Send and Agent Task keep their routing semantics separate", () => {
