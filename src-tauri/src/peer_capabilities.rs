@@ -25,7 +25,6 @@ pub(crate) const MANAGED_PROVIDER_CAPABILITY: &str = "pastey.managed.provider";
 pub(crate) const MANAGED_RUNTIME_CAPABILITY: &str = "pastey.managed.runtime";
 pub(crate) const EXECUTION_WORLD_CAPABILITY: &str = "pastey.managed.execution_world";
 pub(crate) const MANAGED_EXECUTION_CAPABILITY: &str = "pastey.managed.execution";
-pub(crate) const NATIVE_AGENT_CODEX_CAPABILITY: &str = crate::native_agent::CODEX_CAPABILITY_ID;
 const NATIVE_AGENT_EFFECT: &str = "native_agent_compatibility";
 const REASON_NATIVE_AGENT_INCOMPATIBLE: &str = "native_agent_incompatible";
 const REASON_NATIVE_AGENT_UNAVAILABLE: &str = "native_agent_unavailable";
@@ -192,17 +191,13 @@ pub(crate) fn local_diagnostic_projection(
         )
     };
 
+    let mut capabilities = vec![provider, runtime, execution_world, managed_execution];
+    capabilities.extend(state.native_agents.lock().native_capability_facts());
     PeerCapabilityProjection {
         schema_version: PEER_CAPABILITY_SCHEMA.into(),
         peer_session_id,
         observed_at,
-        capabilities: vec![
-            provider,
-            runtime,
-            execution_world,
-            managed_execution,
-            state.native_agents.lock().native_capability_fact(),
-        ],
+        capabilities,
     }
 }
 
@@ -283,28 +278,32 @@ fn capability(
     }
 }
 
+/// The capability fact of one native capability: its availability and the
+/// exact Pastey protocols its Host supports for it.
 pub(crate) fn native_agent_capability_fact(
+    capability_id: &str,
     state: crate::native_agent::NativeAgentCapabilityStateV1,
+    supported_protocols: &[&str],
 ) -> HostCapabilityFact {
     match state {
         crate::native_agent::NativeAgentCapabilityStateV1::Available => HostCapabilityFact {
-            capability_id: NATIVE_AGENT_CODEX_CAPABILITY.into(),
+            capability_id: capability_id.into(),
             available: true,
             accepted_input_media_types: Vec::new(),
             effect: NATIVE_AGENT_EFFECT.into(),
-            supported_protocols: crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS
+            supported_protocols: supported_protocols
                 .iter()
                 .map(|value| (*value).into())
                 .collect(),
             unavailable_reason: None,
         },
         crate::native_agent::NativeAgentCapabilityStateV1::Incompatible => capability_with_reason(
-            NATIVE_AGENT_CODEX_CAPABILITY,
+            capability_id,
             NATIVE_AGENT_EFFECT,
             REASON_NATIVE_AGENT_INCOMPATIBLE,
         ),
         crate::native_agent::NativeAgentCapabilityStateV1::Unavailable => capability_with_reason(
-            NATIVE_AGENT_CODEX_CAPABILITY,
+            capability_id,
             NATIVE_AGENT_EFFECT,
             REASON_NATIVE_AGENT_UNAVAILABLE,
         ),
@@ -349,13 +348,17 @@ impl PeerCapabilityProjection {
     }
 
     /// Requires this exact current-session observation to advertise the
-    /// concrete Codex capability and every exact schema an operation uses.
+    /// native capability and every exact schema an operation uses.
     /// The result deliberately grants no execution or Transfer authority.
-    pub(crate) fn require_native_agent_protocols(&self, required: &[&str]) -> AppResult<()> {
+    pub(crate) fn require_native_agent_protocols(
+        &self,
+        capability_id: &str,
+        required: &[&str],
+    ) -> AppResult<()> {
         let fact = self
             .capabilities
             .iter()
-            .find(|fact| fact.capability_id == NATIVE_AGENT_CODEX_CAPABILITY)
+            .find(|fact| fact.capability_id == capability_id)
             .ok_or_else(|| {
                 AppError::InvalidInput("Remote native Agent compatibility is unavailable.".into())
             })?;
@@ -592,16 +595,21 @@ mod tests {
     fn native_agent_compatibility_requires_exact_protocols_without_granting_authority() {
         let mut compatible = local_projection("peer".into(), 10);
         compatible.capabilities.push(native_agent_capability_fact(
+            crate::native_agent::CODEX_CAPABILITY_ID,
             crate::native_agent::NativeAgentCapabilityStateV1::Available,
+            &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS,
         ));
         assert!(compatible
-            .require_native_agent_protocols(&crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS)
+            .require_native_agent_protocols(
+                crate::native_agent::CODEX_CAPABILITY_ID,
+                &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS
+            )
             .is_ok());
         assert!(compatible
-            .require_native_agent_protocols(&[
-                crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA,
-                "other"
-            ])
+            .require_native_agent_protocols(
+                crate::native_agent::CODEX_CAPABILITY_ID,
+                &[crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA, "other"]
+            )
             .is_err());
 
         let mut direct_only = compatible.clone();
@@ -611,18 +619,29 @@ mod tests {
                 .map(|value| (*value).into())
                 .collect();
         assert!(direct_only
-            .require_native_agent_protocols(&crate::native_agent::DIRECT_NATIVE_INVOKE_PROTOCOLS)
+            .require_native_agent_protocols(
+                crate::native_agent::CODEX_CAPABILITY_ID,
+                &crate::native_agent::DIRECT_NATIVE_INVOKE_PROTOCOLS
+            )
             .is_ok());
         assert!(direct_only
-            .require_native_agent_protocols(&crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS)
+            .require_native_agent_protocols(
+                crate::native_agent::CODEX_CAPABILITY_ID,
+                &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS
+            )
             .is_err());
 
         let mut incompatible = local_projection("peer".into(), 10);
         incompatible.capabilities.push(native_agent_capability_fact(
+            crate::native_agent::CODEX_CAPABILITY_ID,
             crate::native_agent::NativeAgentCapabilityStateV1::Incompatible,
+            &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS,
         ));
         assert!(incompatible
-            .require_native_agent_protocols(&crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS)
+            .require_native_agent_protocols(
+                crate::native_agent::CODEX_CAPABILITY_ID,
+                &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS
+            )
             .is_err());
         // The fact remains only an observation: this module exposes no Plan,
         // Transfer, Host-selection, or execution grant API.
@@ -633,7 +652,9 @@ mod tests {
     fn native_agent_compatibility_observation_is_bound_to_the_current_session() {
         let mut projection = local_projection("old-session".into(), 10);
         projection.capabilities.push(native_agent_capability_fact(
+            crate::native_agent::CODEX_CAPABILITY_ID,
             crate::native_agent::NativeAgentCapabilityStateV1::Available,
+            &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS,
         ));
         let mut store = PeerCapabilityStore::default();
         store

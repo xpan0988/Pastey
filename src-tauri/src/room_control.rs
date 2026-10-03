@@ -1552,19 +1552,16 @@ pub async fn receive_room_control_event_handler(
             .unwrap_or(Value::Null);
         match validated.kind.as_str() {
             "native_agent.invoke" => {
-                let request: crate::native_agent::NativeAgentInvokeV1 =
-                    match serde_json::from_value(payload) {
-                        Ok(request) if crate::native_agent::validate_invoke(&request).is_ok() => {
-                            request
-                        }
-                        _ => {
-                            return control_error(
-                                StatusCode::BAD_REQUEST,
-                                "invalid_native_agent",
-                                "Invalid native Agent invocation.",
-                            )
-                        }
-                    };
+                let request = match crate::native_agent::parse_invoke(payload) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        return control_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_native_agent",
+                            "Invalid native Agent invocation.",
+                        )
+                    }
+                };
                 if request.target_host_ref != ctx.state.local_host_ref.as_str() {
                     return control_error(
                         StatusCode::FORBIDDEN,
@@ -1576,7 +1573,7 @@ pub async fn receive_room_control_event_handler(
                     .state
                     .native_agents
                     .lock()
-                    .require_codex_compatibility()
+                    .require_capability(&request.agent_capability)
                     .is_err()
                 {
                     return control_error(
@@ -1589,13 +1586,8 @@ pub async fn receive_room_control_event_handler(
                     .state
                     .native_agents
                     .lock()
-                    .start_bridge_codex_task_with_id_resume(
-                        &room_id,
-                        &request.task_id,
-                        std::path::Path::new(&request.workspace),
-                        &request.task,
-                        request.resume,
-                    ) {
+                    .start_bridge_invocation(&room_id, &request)
+                {
                     Ok(status) => status,
                     Err(_) => {
                         return control_error(
@@ -2728,11 +2720,7 @@ fn validate_control_event(
         }
         let replay_id = match kind.as_str() {
             "native_agent.invoke" => {
-                let request = serde_json::from_value::<crate::native_agent::NativeAgentInvokeV1>(
-                    Value::Object(payload.clone()),
-                )
-                .map_err(AppError::from)?;
-                crate::native_agent::validate_invoke(&request)?;
+                let request = crate::native_agent::parse_invoke(Value::Object(payload.clone()))?;
                 format!("native-agent-invoke:{}", request.task_id)
             }
             "native_agent.status" => {
@@ -3870,6 +3858,81 @@ mod tests {
     }
 
     #[test]
+    fn native_capabilities_share_the_fixed_native_agent_event_family() {
+        // A new native capability adds no event kind: every capability uses
+        // these, and only these, Native Agent events.
+        let native = ALLOWED_EVENT_KINDS
+            .iter()
+            .copied()
+            .filter(|kind| kind.starts_with("native_agent."))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            native,
+            [
+                "native_agent.invoke",
+                "native_agent.status",
+                "native_agent.cancel",
+                "native_agent.workspace_prepare",
+                "native_agent.reconcile",
+                "native_agent.reconciliation",
+                "native_agent.retry_result_return",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_generic_invoke_keeps_the_task_keyed_replay_id_and_transport_field_rules() {
+        let now = OffsetDateTime::now_utc();
+        let invoke = |input: Value| {
+            native_agent_event(
+                "native_agent.invoke",
+                serde_json::to_value(crate::native_agent::NativeAgentInvokeV2 {
+                    schema_version: crate::native_agent::NATIVE_AGENT_INVOKE_V2_SCHEMA.into(),
+                    task_id: "task-generic".into(),
+                    target_host_ref: "host:remote".into(),
+                    agent_capability: "fake.longjob.v1".into(),
+                    input: serde_json::from_value(input).unwrap(),
+                })
+                .unwrap(),
+                &native_agent_test_context(),
+            )
+            .unwrap()
+        };
+        let first = validate_control_event(
+            invoke(serde_json::json!({ "steps": 2, "payload": { "a": 1 } })),
+            "room",
+            "source",
+            "target",
+            now,
+        )
+        .unwrap();
+        let other_input = validate_control_event(
+            invoke(serde_json::json!({ "steps": 3, "payload": { "a": 2 } })),
+            "room",
+            "source",
+            "target",
+            now,
+        )
+        .unwrap();
+        // Replay is keyed by task identity, never by the opaque input.
+        assert_eq!(first.request_id, other_input.request_id);
+        assert_eq!(
+            first.request_id.as_deref(),
+            Some("native-agent-invoke:task-generic")
+        );
+        // The transport's existing forbidden-field rule still applies inside
+        // opaque input; Core does not interpret it otherwise.
+        assert!(validate_control_event(
+            invoke(serde_json::json!({ "steps": 2, "payload": { "command": "x" } })),
+            "room",
+            "source",
+            "target",
+            now,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn materially_different_native_agent_facts_have_distinct_semantic_replay_ids() {
         let now = OffsetDateTime::now_utc();
         let status_event = |code: &str| {
@@ -3888,6 +3951,7 @@ mod tests {
                         state: crate::native_agent::NativeAgentTaskStateV1::Running,
                         result: None,
                         code: Some(code.into()),
+                        output: None,
                     },
                 })
                 .unwrap(),
@@ -3917,6 +3981,7 @@ mod tests {
                     result_digest: Some(digest.into()),
                     apply_completed: false,
                     code: Some(code.into()),
+                    task_output: None,
                 })
                 .unwrap(),
                 &native_agent_test_context(),

@@ -8,15 +8,11 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::Write,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +20,15 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+
+mod capability;
+#[cfg(test)]
+use capability::codex::codex_compatibility_at;
+pub(crate) use capability::OpaqueCapabilityPayloadV1;
+use capability::{
+    codex::CodexNativeAdapterV1, ExclusivityKeyV1, NativeCapabilityAdapterV1,
+    NativeInvocationOutcomeV1,
+};
 
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
@@ -46,9 +51,69 @@ pub(crate) const WORKSPACE_MOVEMENT_PROTOCOLS: [&str; 3] = [
     NATIVE_AGENT_TASK_SCHEMA,
     NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA,
 ];
+/// Invocation of any registered native capability with an opaque input.
+/// Status, cancel and reconcile keep `NATIVE_AGENT_PROTOCOL_SCHEMA`.
+pub(crate) const NATIVE_AGENT_INVOKE_V2_SCHEMA: &str = "pastey-native-agent-invoke-v2";
+pub(crate) const GENERIC_NATIVE_INVOKE_PROTOCOLS: [&str; 2] =
+    [NATIVE_AGENT_PROTOCOL_SCHEMA, NATIVE_AGENT_INVOKE_V2_SCHEMA];
 const MAX_TASK_ID_BYTES: usize = 256;
 const MAX_WORKSPACE_BYTES: usize = 4 * 1024;
 const MAX_MOVEMENT_ID_BYTES: usize = 256;
+
+/// Capability-neutral invocation. Core routes it by `agent_capability` and
+/// never reads `input`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeAgentInvokeV2 {
+    pub(crate) schema_version: String,
+    pub(crate) task_id: String,
+    pub(crate) target_host_ref: String,
+    pub(crate) agent_capability: String,
+    pub(crate) input: OpaqueCapabilityPayloadV1,
+}
+
+/// One received invocation, whichever schema carried it.
+pub(crate) struct NativeInvocationRequestV1 {
+    pub(crate) task_id: String,
+    pub(crate) target_host_ref: String,
+    pub(crate) agent_capability: String,
+    pub(crate) input: OpaqueCapabilityPayloadV1,
+}
+
+/// Parses `native_agent.invoke` in either schema. The v1 schema is Codex's
+/// original invocation; its fields become the Codex adapter's input.
+pub(crate) fn parse_invoke(payload: Value) -> AppResult<NativeInvocationRequestV1> {
+    match payload.get("schemaVersion").and_then(Value::as_str) {
+        Some(NATIVE_AGENT_INVOKE_V2_SCHEMA) => {
+            let request: NativeAgentInvokeV2 = serde_json::from_value(payload).map_err(|_| {
+                AppError::InvalidInput("Native Agent invocation is invalid.".into())
+            })?;
+            validate_invoke_v2(&request)?;
+            Ok(NativeInvocationRequestV1 {
+                task_id: request.task_id,
+                target_host_ref: request.target_host_ref,
+                agent_capability: request.agent_capability,
+                input: request.input,
+            })
+        }
+        _ => {
+            let request: NativeAgentInvokeV1 = serde_json::from_value(payload).map_err(|_| {
+                AppError::InvalidInput("Native Agent invocation is invalid.".into())
+            })?;
+            validate_invoke(&request)?;
+            Ok(NativeInvocationRequestV1 {
+                input: capability::codex::legacy_v1_input(
+                    &request.workspace,
+                    &request.task,
+                    request.resume,
+                ),
+                task_id: request.task_id,
+                target_host_ref: request.target_host_ref,
+                agent_capability: request.agent_capability,
+            })
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -114,6 +179,9 @@ pub(crate) struct NativeAgentReconciliationV1 {
     pub(crate) result_digest: Option<String>,
     pub(crate) apply_completed: bool,
     pub(crate) code: Option<String>,
+    /// The executor's recorded terminal output, opaque to Pastey.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) task_output: Option<OpaqueCapabilityPayloadV1>,
 }
 
 /// Immutable control input sent before an existing encrypted Transfer carries
@@ -203,6 +271,15 @@ fn task_accepts_remote_fact(
     next: &NativeAgentTaskStatusV1,
 ) -> bool {
     use NativeAgentTaskStateV1::*;
+    // A recorded terminal output is the capability's authoritative result;
+    // no later fact may replace it.
+    if current.output.is_some() && next.output != current.output {
+        return false;
+    }
+    // A task never changes capability.
+    if next.agent_id != current.agent_id {
+        return false;
+    }
     match current.state {
         Cancelled => next.state == Cancelled,
         Completed => next.state == Completed,
@@ -350,6 +427,9 @@ struct PersistedNativeAgentEnvelopeV1 {
     #[serde(default)]
     bridge_id: Option<String>,
     movement: Option<WorkspaceMovementRecordV1>,
+    /// Held while the task's outcome is unresolved, also across restart.
+    #[serde(default)]
+    exclusivity_key: Option<ExclusivityKeyV1>,
 }
 
 /// The deliberately small renderer-safe projection used only to reopen
@@ -436,22 +516,26 @@ pub(crate) struct NativeAgentTaskStatusV1 {
     pub(crate) state: NativeAgentTaskStateV1,
     pub(crate) result: Option<String>,
     pub(crate) code: Option<String>,
-}
-
-struct NativeCodexSessionV1 {
-    controller: Arc<CodexAppServerV1>,
-    thread_id: String,
+    /// Terminal output of a capability that reports one, opaque to Pastey.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) output: Option<OpaqueCapabilityPayloadV1>,
 }
 
 /// A small Host-private service, not an Agent registry or a Worker adapter.
-#[derive(Default)]
 pub(crate) struct NativeAgentServiceV1 {
-    codex_sessions: HashMap<PathBuf, NativeCodexSessionV1>,
+    /// Capabilities this Host can run, dispatched by capability id.
+    adapters: Vec<Arc<dyn NativeCapabilityAdapterV1>>,
+    /// Workspace movement drives Codex sessions directly.
+    codex: Arc<CodexNativeAdapterV1>,
     tasks: Arc<Mutex<HashMap<String, NativeAgentTaskStatusV1>>>,
-    active_workspaces: Arc<Mutex<HashMap<PathBuf, String>>>,
+    /// Exclusivity keys held by observed invocations, with their task.
+    active_exclusivity: Arc<Mutex<HashMap<ExclusivityKeyV1, String>>>,
+    /// Tasks whose native observer is still running.
+    observed_tasks: Arc<Mutex<HashSet<String>>>,
     remote_targets: HashMap<String, String>,
     task_workspaces: HashMap<String, PathBuf>,
     task_digests: HashMap<String, String>,
+    task_exclusivity: HashMap<String, ExclusivityKeyV1>,
     task_bridges: HashMap<String, String>,
     revoked_bridges: HashSet<String>,
     workspace_movements: HashMap<String, WorkspaceMovementRecordV1>,
@@ -460,7 +544,37 @@ pub(crate) struct NativeAgentServiceV1 {
     fail_post_start_persist_once: bool,
 }
 
+impl Default for NativeAgentServiceV1 {
+    fn default() -> Self {
+        let codex = Arc::new(CodexNativeAdapterV1::default());
+        Self::with_adapters(codex.clone(), vec![codex])
+    }
+}
+
 impl NativeAgentServiceV1 {
+    fn with_adapters(
+        codex: Arc<CodexNativeAdapterV1>,
+        adapters: Vec<Arc<dyn NativeCapabilityAdapterV1>>,
+    ) -> Self {
+        Self {
+            adapters,
+            codex,
+            tasks: Arc::default(),
+            active_exclusivity: Arc::default(),
+            observed_tasks: Arc::default(),
+            remote_targets: HashMap::new(),
+            task_workspaces: HashMap::new(),
+            task_digests: HashMap::new(),
+            task_exclusivity: HashMap::new(),
+            task_bridges: HashMap::new(),
+            revoked_bridges: HashSet::new(),
+            workspace_movements: HashMap::new(),
+            durable_paths: None,
+            #[cfg(test)]
+            fail_post_start_persist_once: false,
+        }
+    }
+
     pub(crate) fn with_paths(paths: crate::storage::AppPaths) -> AppResult<Self> {
         let mut service = Self {
             durable_paths: Some(paths),
@@ -468,6 +582,38 @@ impl NativeAgentServiceV1 {
         };
         service.restore_durable_envelopes()?;
         Ok(service)
+    }
+
+    /// A Host whose only native capabilities are `adapters` (Codex absent).
+    #[cfg(test)]
+    fn with_paths_and_adapters(
+        paths: crate::storage::AppPaths,
+        adapters: Vec<Arc<dyn NativeCapabilityAdapterV1>>,
+    ) -> AppResult<Self> {
+        let mut service = Self::with_adapters(Arc::new(CodexNativeAdapterV1::default()), adapters);
+        service.durable_paths = Some(paths);
+        service.restore_durable_envelopes()?;
+        Ok(service)
+    }
+
+    /// Tests: the task occupying a canonical Codex workspace, if any.
+    #[cfg(test)]
+    fn workspace_occupant(&self, workspace: &Path) -> Option<String> {
+        self.active_exclusivity
+            .lock()
+            .unwrap()
+            .get(&capability::codex::workspace_exclusivity_key(workspace))
+            .cloned()
+    }
+
+    fn adapter(&self, capability_id: &str) -> AppResult<Arc<dyn NativeCapabilityAdapterV1>> {
+        self.adapters
+            .iter()
+            .find(|adapter| adapter.capability_id() == capability_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::InvalidInput("Native capability is unavailable on this Host.".into())
+            })
     }
 
     /// Loads only Pastey's outer facts. Any task whose native outcome was not
@@ -766,6 +912,10 @@ impl NativeAgentServiceV1 {
                 self.task_digests
                     .insert(persisted.task.task_id.clone(), digest);
             }
+            if let Some(key) = persisted.exclusivity_key.clone() {
+                self.task_exclusivity
+                    .insert(persisted.task.task_id.clone(), key);
+            }
             if let Some(bridge_id) = persisted.bridge_id.clone().or_else(|| {
                 persisted
                     .movement
@@ -835,6 +985,7 @@ impl NativeAgentServiceV1 {
                 .cloned()
                 .or_else(|| movement.as_ref().and_then(|value| value.bridge_id.clone())),
             movement: movement.clone(),
+            exclusivity_key: self.task_exclusivity.get(task_id).cloned(),
         };
         let immutable_correlation = serde_json::to_string(&json!({
             "taskId": task_id,
@@ -866,29 +1017,35 @@ impl NativeAgentServiceV1 {
         }
     }
     pub(crate) fn capabilities(&self) -> Vec<NativeAgentCapabilityV1> {
-        vec![NativeAgentCapabilityV1 {
-            agent_id: CODEX_CAPABILITY_ID.into(),
-            display_name: "Codex".into(),
-            state: codex_compatibility_at(Path::new("codex")),
-        }]
+        self.adapters
+            .iter()
+            .map(|adapter| adapter.describe())
+            .collect()
     }
 
-    pub(crate) fn native_capability_fact(&self) -> crate::peer_capabilities::HostCapabilityFact {
-        crate::peer_capabilities::native_agent_capability_fact(codex_compatibility_at(Path::new(
-            "codex",
-        )))
+    /// One existing capability fact per registered native capability.
+    pub(crate) fn native_capability_facts(
+        &self,
+    ) -> Vec<crate::peer_capabilities::HostCapabilityFact> {
+        self.adapters
+            .iter()
+            .map(|adapter| {
+                crate::peer_capabilities::native_agent_capability_fact(
+                    adapter.capability_id(),
+                    adapter.availability(),
+                    adapter.supported_protocols(),
+                )
+            })
+            .collect()
     }
 
+    pub(crate) fn require_capability(&self, capability_id: &str) -> AppResult<()> {
+        self.adapter(capability_id)?.require_available()
+    }
+
+    /// Workspace movement is offered only by the Codex capability.
     pub(crate) fn require_codex_compatibility(&self) -> AppResult<()> {
-        match codex_compatibility_at(Path::new("codex")) {
-            NativeAgentCapabilityStateV1::Available => Ok(()),
-            NativeAgentCapabilityStateV1::Incompatible => {
-                invalid("Codex native app-server interface is incompatible.")
-            }
-            NativeAgentCapabilityStateV1::Unavailable => {
-                invalid("Codex native capability is unavailable.")
-            }
-        }
+        self.require_capability(CODEX_CAPABILITY_ID)
     }
 
     /// Creates the user-visible Review envelope on the initiating Host.  This
@@ -984,6 +1141,7 @@ impl NativeAgentServiceV1 {
                     state: NativeAgentTaskStateV1::Queued,
                     result: None,
                     code: Some("workspace_movement_review".into()),
+                    output: None,
                 },
             );
         self.remote_targets
@@ -1206,6 +1364,7 @@ impl NativeAgentServiceV1 {
                     state: NativeAgentTaskStateV1::Queued,
                     result: None,
                     code: Some("workspace_transfer_pending".into()),
+                    output: None,
                 },
             );
         self.task_digests
@@ -1429,7 +1588,7 @@ impl NativeAgentServiceV1 {
         {
             return self.task_status(&task_id);
         }
-        if !resume && self.codex_sessions.contains_key(task_workspace) {
+        if !resume && self.codex.has_session(task_workspace) {
             return invalid(
                 "Native Agent workspace already has a session; resumption is required.",
             );
@@ -1458,7 +1617,7 @@ impl NativeAgentServiceV1 {
             .lock()
             .map_err(|_| AppError::InvalidInput("Native Agent task store is unavailable.".into()))?
             .remove(&task_id);
-        let had_session = self.codex_sessions.contains_key(&canonical_workspace);
+        let had_session = self.codex.has_session(&canonical_workspace);
         let started = self.start_codex_task_with_executable_and_id_in_movement(
             executable,
             &task_id,
@@ -1472,9 +1631,7 @@ impl NativeAgentServiceV1 {
                 // No turn was spawned on this error path. Close an app-server
                 // created for this landing before its tree may be cleaned.
                 if !had_session {
-                    if let Some(session) = self.codex_sessions.remove(&canonical_workspace) {
-                        session.controller.shutdown();
-                    }
+                    self.codex.shutdown_session(&canonical_workspace);
                 }
                 self.task_workspaces.remove(&task_id);
                 if let Some(queued) = queued {
@@ -1932,12 +2089,12 @@ impl NativeAgentServiceV1 {
         }
         if let Some(workspace) = workspace.as_ref() {
             let active = self
-                .active_workspaces
+                .active_exclusivity
                 .lock()
                 .map_err(|_| {
                     AppError::InvalidInput("Native Agent session store is unavailable.".into())
                 })?
-                .contains_key(workspace);
+                .contains_key(&capability::codex::workspace_exclusivity_key(workspace));
             if active {
                 return Ok(false);
             }
@@ -1955,9 +2112,7 @@ impl NativeAgentServiceV1 {
         self.persist_envelope(&task_id, None)?;
 
         if let Some(workspace) = workspace.as_ref() {
-            if let Some(session) = self.codex_sessions.remove(workspace) {
-                session.controller.shutdown();
-            }
+            self.codex.shutdown_session(workspace);
             crate::regular_file_set_transfer::cleanup_materialized_tree(workspace);
         }
         let mut complete = workspace.as_ref().is_none_or(|path| !path.exists());
@@ -2035,6 +2190,7 @@ impl NativeAgentServiceV1 {
             code: movement
                 .and_then(|value| value.status.code.clone())
                 .or(task.code),
+            task_output: task.output,
         })
     }
 
@@ -2089,6 +2245,7 @@ impl NativeAgentServiceV1 {
                 } else {
                     fact.code.clone()
                 },
+                output: fact.task_output.clone().or_else(|| task.output.clone()),
                 ..task.clone()
             };
             if task_accepts_remote_fact(task, &next) {
@@ -2775,34 +2932,12 @@ impl NativeAgentServiceV1 {
             }
             return Ok(existing);
         }
-        if !resume && self.codex_sessions.contains_key(&workspace) {
+        if !resume && self.codex.has_session(&workspace) {
             return invalid(
                 "Native Agent workspace already has a session; resumption is required.",
             );
         }
         self.start_codex_task_with_executable_and_id(Path::new("codex"), task_id, &workspace, task)
-    }
-
-    pub(crate) fn start_bridge_codex_task_with_id_resume(
-        &mut self,
-        bridge_id: &str,
-        task_id: &str,
-        workspace: &Path,
-        task: &str,
-        resume: bool,
-    ) -> AppResult<NativeAgentTaskStatusV1> {
-        if self.revoked_bridges.contains(bridge_id) {
-            return invalid("Native Agent Bridge authority was revoked.");
-        }
-        self.task_bridges
-            .insert(task_id.to_owned(), bridge_id.to_owned());
-        match self.start_codex_task_with_id_resume(task_id, workspace, task, resume) {
-            Ok(status) => Ok(status),
-            Err(error) => {
-                self.task_bridges.remove(task_id);
-                Err(error)
-            }
-        }
     }
 
     #[cfg(test)]
@@ -2840,12 +2975,52 @@ impl NativeAgentServiceV1 {
         task: &str,
         movement_id: Option<&str>,
     ) -> AppResult<NativeAgentTaskStatusV1> {
-        let workspace = workspace
-            .canonicalize()
-            .map_err(|_| AppError::InvalidInput("Native Agent workspace is unavailable.".into()))?;
-        if !workspace.is_dir() {
-            return invalid("Native Agent workspace must be a directory.");
+        self.codex.use_executable(executable);
+        let input = capability::codex::codex_input(workspace, task, true)?;
+        self.start_invocation_in_movement(CODEX_CAPABILITY_ID, task_id, &input, movement_id)
+    }
+
+    /// Starts one invocation of a registered native capability on a Bridge.
+    pub(crate) fn start_bridge_invocation(
+        &mut self,
+        bridge_id: &str,
+        request: &NativeInvocationRequestV1,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        if self.revoked_bridges.contains(bridge_id) {
+            return invalid("Native Agent Bridge authority was revoked.");
         }
+        self.task_bridges
+            .insert(request.task_id.clone(), bridge_id.to_owned());
+        match self.start_invocation_in_movement(
+            &request.agent_capability,
+            &request.task_id,
+            &request.input,
+            None,
+        ) {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                self.task_bridges.remove(&request.task_id);
+                Err(error)
+            }
+        }
+    }
+
+    /// The capability-neutral start. The adapter owns what the input means
+    /// and how the invocation runs; Pastey owns task identity, exclusivity,
+    /// the durable envelope and the terminal fact.
+    fn start_invocation_in_movement(
+        &mut self,
+        capability_id: &str,
+        task_id: &str,
+        input: &OpaqueCapabilityPayloadV1,
+        movement_id: Option<&str>,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        if !valid_task_id(task_id) {
+            return invalid("Native Agent task identity is invalid.");
+        }
+        input.validate()?;
+        let adapter = self.adapter(capability_id)?;
+        let prepared = adapter.prepare(input)?;
         if let Some(existing) = self
             .tasks
             .lock()
@@ -2853,86 +3028,83 @@ impl NativeAgentServiceV1 {
             .get(task_id)
             .cloned()
         {
-            if self.task_workspaces.get(task_id) != Some(&workspace)
-                || self.task_digests.get(task_id) != Some(&Self::task_digest(task))
+            if existing.agent_id != capability_id
+                || self.task_workspaces.get(task_id) != prepared.host_workspace.as_ref()
+                || self.task_digests.get(task_id) != Some(&prepared.identity_digest)
             {
-                return invalid("Native Agent task identity was replayed for another workspace.");
+                return invalid("Native Agent task identity was replayed with different input.");
             }
             return Ok(existing);
         }
-        match codex_compatibility_at(executable) {
-            NativeAgentCapabilityStateV1::Available => {}
-            NativeAgentCapabilityStateV1::Incompatible => {
-                return invalid(
-                    "Codex is detected but its native app-server interface is incompatible.",
-                )
-            }
-            NativeAgentCapabilityStateV1::Unavailable => {
-                return invalid("Codex native capability is unavailable.")
-            }
+        adapter.require_available()?;
+        if self.invocation_has_authoritative_owner(
+            prepared.exclusivity.as_ref(),
+            prepared.host_workspace.as_deref(),
+            None,
+            movement_id,
+        )? {
+            return invalid(
+                "Native capability already has an unresolved invocation for this resource.",
+            );
         }
-        if self.workspace_has_authoritative_owner(&workspace, None, movement_id)? {
-            return invalid("Codex already has a running task in this workspace session.");
-        }
-
-        let (controller, thread_id, session_reused) = match self.codex_sessions.get(&workspace) {
-            Some(session) => (session.controller.clone(), session.thread_id.clone(), true),
-            None => {
-                let controller = Arc::new(CodexAppServerV1::launch(executable, &workspace)?);
-                let thread_id = controller.start_thread(&workspace)?;
-                self.codex_sessions.insert(
-                    workspace.clone(),
-                    NativeCodexSessionV1 {
-                        controller: controller.clone(),
-                        thread_id: thread_id.clone(),
-                    },
-                );
-                (controller, thread_id, false)
-            }
-        };
+        let started = adapter.start(task_id, input)?;
         let task_id = task_id.to_owned();
         let status = NativeAgentTaskStatusV1 {
-            schema_version: "pastey-native-agent-task-v1".into(),
+            schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
             task_id: task_id.clone(),
-            agent_id: CODEX_CAPABILITY_ID.into(),
-            workspace_name: workspace
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("workspace")
-                .into(),
-            session_reused,
+            agent_id: capability_id.into(),
+            workspace_name: prepared.label.clone(),
+            session_reused: started.session_reused,
             state: NativeAgentTaskStateV1::Running,
             result: None,
             code: None,
+            output: None,
         };
         self.tasks
             .lock()
             .map_err(|_| AppError::InvalidInput("Native Agent task store is unavailable.".into()))?
             .insert(task_id.clone(), status.clone());
-        self.task_workspaces
-            .insert(task_id.clone(), workspace.clone());
+        if let Some(workspace) = prepared.host_workspace.clone() {
+            self.task_workspaces.insert(task_id.clone(), workspace);
+        }
         self.task_digests
-            .insert(task_id.clone(), Self::task_digest(task));
-        self.persist_envelope(&task_id, Some(&Self::task_digest(task)))?;
-        self.active_workspaces
+            .insert(task_id.clone(), prepared.identity_digest.clone());
+        if let Some(key) = prepared.exclusivity.clone() {
+            self.task_exclusivity.insert(task_id.clone(), key);
+        }
+        self.persist_envelope(&task_id, Some(&prepared.identity_digest))?;
+        if let Some(key) = prepared.exclusivity.clone() {
+            self.active_exclusivity
+                .lock()
+                .map_err(|_| {
+                    AppError::InvalidInput("Native Agent session store is unavailable.".into())
+                })?
+                .insert(key, task_id.clone());
+        }
+        self.observed_tasks
             .lock()
             .map_err(|_| {
                 AppError::InvalidInput("Native Agent session store is unavailable.".into())
             })?
-            .insert(workspace.clone(), task_id.clone());
+            .insert(task_id.clone());
         let tasks = self.tasks.clone();
         let durable_paths = self.durable_paths.clone();
-        let active_workspaces = self.active_workspaces.clone();
-        let completed_workspace = workspace.clone();
-        let prompt = task.to_owned();
+        let active_exclusivity = self.active_exclusivity.clone();
+        let observed_tasks = self.observed_tasks.clone();
+        let held_key = prepared.exclusivity;
+        let mut run = started.run;
         thread::spawn(move || {
-            let outcome = controller.run_turn(&thread_id, &prompt);
+            let NativeInvocationOutcomeV1 {
+                kind: outcome,
+                summary,
+                output,
+            } = run.run();
             let mut persisted_status = None;
             if let Ok(mut tasks) = tasks.lock() {
                 if let Some(status) = tasks.get_mut(&task_id) {
                     // Cancellation wins a concurrent late native completion.
                     // The observer still reaches this point to release its
-                    // Host-private workspace execution occupancy.
+                    // Host-private execution occupancy.
                     if status.state == NativeAgentTaskStateV1::Cancelled {
                         if outcome == NativeTurnOutcomeV1::Cancelled {
                             status.code = Some("native_agent_cancelled".into());
@@ -2941,7 +3113,8 @@ impl NativeAgentServiceV1 {
                         match outcome {
                             NativeTurnOutcomeV1::Completed => {
                                 status.state = NativeAgentTaskStateV1::Completed;
-                                status.result = Some("Codex completed its native task.".into());
+                                status.result = summary;
+                                status.output = output;
                             }
                             NativeTurnOutcomeV1::Failed => {
                                 status.state = NativeAgentTaskStateV1::Failed;
@@ -2971,26 +3144,26 @@ impl NativeAgentServiceV1 {
                 );
             }
             if outcome == NativeTurnOutcomeV1::Unknown {
-                // A turn/start acknowledgement or terminal shape may be
-                // indeterminate while the app-server remains alive. Keep the
-                // workspace occupied until its observation channel is actually
-                // lost; a different task must not overlap possible execution.
-                controller.wait_until_observation_lost();
+                // A different task must not overlap possible execution.
+                run.wait_until_observation_lost();
             }
             // Always release only after the native observer exits, including
             // when cancellation had already revoked visible authority.
-            active_workspaces
+            if let Some(key) = held_key {
+                active_exclusivity
+                    .lock()
+                    .ok()
+                    .map(|mut active| active.remove(&key));
+            }
+            observed_tasks
                 .lock()
                 .ok()
-                .map(|mut active| active.remove(&completed_workspace));
+                .map(|mut observed| observed.remove(&task_id));
         });
         Ok(status)
     }
 
-    /// The one Host-local occupancy check shared by direct Agent runs and
-    /// approved workspace movement. A canonical workspace remains owned while
-    /// any execution, movement, uncertain outcome, or apply recovery can still
-    /// affect it.
+    /// Workspace movement's occupancy check for one canonical workspace.
     fn workspace_has_authoritative_owner(
         &self,
         workspace: &Path,
@@ -3000,37 +3173,63 @@ impl NativeAgentServiceV1 {
         let canonical = workspace
             .canonicalize()
             .map_err(|_| AppError::InvalidInput("Native Agent workspace is unavailable.".into()))?;
-        if self
-            .active_workspaces
-            .lock()
-            .map_err(|_| {
-                AppError::InvalidInput("Native Agent session store is unavailable.".into())
-            })?
-            .keys()
-            .any(|occupied| occupied == &canonical)
-        {
-            return Ok(true);
+        self.invocation_has_authoritative_owner(
+            Some(&capability::codex::workspace_exclusivity_key(&canonical)),
+            Some(&canonical),
+            except_task_id,
+            except_movement_id,
+        )
+    }
+
+    /// The one Host-local occupancy check shared by direct invocations and
+    /// approved workspace movement. A resource remains owned while any
+    /// observed execution, movement, uncertain outcome, or apply recovery can
+    /// still affect it. `key` is the adapter's opaque exclusivity key;
+    /// `workspace` is the canonical workspace of workspace-scoped capabilities.
+    fn invocation_has_authoritative_owner(
+        &self,
+        key: Option<&ExclusivityKeyV1>,
+        workspace: Option<&Path>,
+        except_task_id: Option<&str>,
+        except_movement_id: Option<&str>,
+    ) -> AppResult<bool> {
+        if let Some(key) = key {
+            if self
+                .active_exclusivity
+                .lock()
+                .map_err(|_| {
+                    AppError::InvalidInput("Native Agent session store is unavailable.".into())
+                })?
+                .contains_key(key)
+            {
+                return Ok(true);
+            }
         }
-        if self
-            .workspace_movements
-            .iter()
-            .any(|(movement_id, record)| {
-                if Some(movement_id.as_str()) == except_movement_id
-                    || !movement_holds_source_ownership(&record.status)
-                {
-                    return false;
-                }
-                record
-                    .source
-                    .as_ref()
-                    .is_some_and(|source| source.workspace == canonical)
-                    || record
-                        .task_workspace
+        if let Some(canonical) = workspace {
+            if self
+                .workspace_movements
+                .iter()
+                .any(|(movement_id, record)| {
+                    if Some(movement_id.as_str()) == except_movement_id
+                        || !movement_holds_source_ownership(&record.status)
+                    {
+                        return false;
+                    }
+                    record
+                        .source
                         .as_ref()
-                        .is_some_and(|owned| owned == &canonical)
-            })
-        {
-            return Ok(true);
+                        .is_some_and(|source| source.workspace == canonical)
+                        || record
+                            .task_workspace
+                            .as_ref()
+                            .is_some_and(|owned| owned == canonical)
+                })
+            {
+                return Ok(true);
+            }
+        }
+        if key.is_none() && workspace.is_none() {
+            return Ok(false);
         }
         let tasks = self.tasks.lock().map_err(|_| {
             AppError::InvalidInput("Native Agent task store is unavailable.".into())
@@ -3045,10 +3244,12 @@ impl NativeAgentServiceV1 {
                     Some("native_agent_reconciliation_required")
                         | Some("native_agent_outcome_unknown")
                 )
-                && self
-                    .task_workspaces
-                    .get(task_id)
-                    .is_some_and(|owned| owned == &canonical)
+                && (key.is_some_and(|key| self.task_exclusivity.get(task_id) == Some(key))
+                    || workspace.is_some_and(|canonical| {
+                        self.task_workspaces
+                            .get(task_id)
+                            .is_some_and(|owned| owned == canonical)
+                    }))
         }))
     }
 
@@ -3063,7 +3264,7 @@ impl NativeAgentServiceV1 {
 
     /// Revokes the outer movement authority for the exact task. This says
     /// nothing about whether the Host-private native process has stopped; its
-    /// workspace occupancy remains governed by `active_workspaces`.
+    /// workspace occupancy remains governed by `active_exclusivity`.
     fn cancel_matching_workspace_movement(&mut self, task_id: &str, code: &str) {
         for record in self
             .workspace_movements
@@ -3097,6 +3298,61 @@ impl NativeAgentServiceV1 {
         {
             return invalid("Remote native Agent task is invalid.");
         }
+        self.queue_remote_invocation(
+            task_id,
+            target_host_ref,
+            CODEX_CAPABILITY_ID,
+            workspace.rsplit(['/', '\\']).next().unwrap_or("workspace"),
+            &Self::task_digest(task),
+            Some(PathBuf::from(workspace)),
+        )
+    }
+
+    /// Records one invocation this Host sent to another Host. The executor
+    /// owns what `input` means; the requester keeps only its digest.
+    pub(crate) fn queue_bridge_remote_invocation(
+        &mut self,
+        bridge_id: &str,
+        task_id: &str,
+        target_host_ref: &str,
+        capability_id: &str,
+        input: &OpaqueCapabilityPayloadV1,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        if self.revoked_bridges.contains(bridge_id) {
+            return invalid("Native Agent Bridge authority was revoked.");
+        }
+        if !valid_task_id(task_id) || target_host_ref.trim().is_empty() {
+            return invalid("Remote native Agent task is invalid.");
+        }
+        crate::peer_capabilities::validate_semantic_capability_id(capability_id)?;
+        input.validate()?;
+        self.task_bridges
+            .insert(task_id.to_owned(), bridge_id.to_owned());
+        match self.queue_remote_invocation(
+            task_id,
+            target_host_ref,
+            capability_id,
+            capability_id,
+            &input.digest(),
+            None,
+        ) {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                self.task_bridges.remove(task_id);
+                Err(error)
+            }
+        }
+    }
+
+    fn queue_remote_invocation(
+        &mut self,
+        task_id: &str,
+        target_host_ref: &str,
+        capability_id: &str,
+        label: &str,
+        identity_digest: &str,
+        workspace: Option<PathBuf>,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
         if let Some(existing) = self
             .tasks
             .lock()
@@ -3104,9 +3360,10 @@ impl NativeAgentServiceV1 {
             .get(task_id)
             .cloned()
         {
-            if self.remote_targets.get(task_id).map(String::as_str) != Some(target_host_ref)
-                || self.task_workspaces.get(task_id) != Some(&PathBuf::from(workspace))
-                || self.task_digests.get(task_id) != Some(&Self::task_digest(task))
+            if existing.agent_id != capability_id
+                || self.remote_targets.get(task_id).map(String::as_str) != Some(target_host_ref)
+                || self.task_workspaces.get(task_id) != workspace.as_ref()
+                || self.task_digests.get(task_id).map(String::as_str) != Some(identity_digest)
             {
                 return invalid(
                     "Remote native Agent identity was reused with conflicting correlation.",
@@ -3115,18 +3372,15 @@ impl NativeAgentServiceV1 {
             return Ok(existing);
         }
         let status = NativeAgentTaskStatusV1 {
-            schema_version: "pastey-native-agent-task-v1".into(),
+            schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
             task_id: task_id.into(),
-            agent_id: CODEX_CAPABILITY_ID.into(),
-            workspace_name: workspace
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or("workspace")
-                .into(),
+            agent_id: capability_id.into(),
+            workspace_name: label.into(),
             session_reused: false,
             state: NativeAgentTaskStateV1::Queued,
             result: None,
             code: Some("remote_agent_queued".into()),
+            output: None,
         };
         self.tasks
             .lock()
@@ -3134,11 +3388,12 @@ impl NativeAgentServiceV1 {
             .insert(task_id.into(), status.clone());
         self.remote_targets
             .insert(task_id.into(), target_host_ref.into());
-        self.task_workspaces
-            .insert(task_id.into(), PathBuf::from(workspace));
+        if let Some(workspace) = workspace {
+            self.task_workspaces.insert(task_id.into(), workspace);
+        }
         self.task_digests
-            .insert(task_id.into(), Self::task_digest(task));
-        self.persist_envelope(task_id, Some(&Self::task_digest(task)))?;
+            .insert(task_id.into(), identity_digest.into());
+        self.persist_envelope(task_id, Some(identity_digest))?;
         Ok(status)
     }
 
@@ -3499,10 +3754,8 @@ impl NativeAgentServiceV1 {
             }
         }
         self.persist_envelope(task_id, None)?;
-        if let Some(workspace) = self.task_workspaces.get(task_id) {
-            if let Some(session) = self.codex_sessions.get(workspace) {
-                let _ = session.controller.cancel_owned_turn_or_session();
-            }
+        if let Ok(adapter) = self.adapter(&status.agent_id) {
+            let _ = adapter.cancel(task_id);
         }
         Ok(status)
     }
@@ -3519,14 +3772,12 @@ impl NativeAgentServiceV1 {
             .filter_map(|(task_id, bound)| (bound == bridge_id).then_some(task_id.clone()))
             .collect::<Vec<_>>();
         let actively_observed_tasks = self
-            .active_workspaces
+            .observed_tasks
             .lock()
             .map_err(|_| {
                 AppError::InvalidInput("Native Agent session store is unavailable.".into())
             })?
-            .values()
-            .cloned()
-            .collect::<HashSet<_>>();
+            .clone();
         let mut completed_tasks = HashSet::new();
         {
             let mut tasks = self.tasks.lock().map_err(|_| {
@@ -3698,11 +3949,9 @@ impl NativeAgentServiceV1 {
                 }
             }
         }
-        for task_id in &task_ids {
-            if let Some(workspace) = self.task_workspaces.get(task_id).cloned() {
-                if let Some(session) = self.codex_sessions.remove(&workspace) {
-                    let _ = session.controller.cancel_owned_turn_or_session();
-                }
+        for adapter in &self.adapters {
+            for task_id in &task_ids {
+                adapter.release(task_id);
             }
         }
         let movement_ids = self
@@ -3759,13 +4008,13 @@ impl NativeAgentServiceV1 {
             self.remote_targets.remove(&task_id);
             self.task_workspaces.remove(&task_id);
             self.task_digests.remove(&task_id);
+            self.task_exclusivity.remove(&task_id);
             self.task_bridges.remove(&task_id);
         }
         Ok(())
     }
 
     pub(crate) fn cancel_task(&mut self, task_id: &str) -> AppResult<NativeAgentTaskStatusV1> {
-        let workspace = self.task_workspaces.get(task_id).cloned();
         let (status, native_execution_needs_cancellation) = {
             let mut tasks = self.tasks.lock().map_err(|_| {
                 AppError::InvalidInput("Native Agent task store is unavailable.".into())
@@ -3797,16 +4046,13 @@ impl NativeAgentServiceV1 {
         if !native_execution_needs_cancellation {
             return Ok(status);
         }
-        let workspace = workspace.ok_or_else(|| {
-            AppError::InvalidInput("Native Agent task workspace is unavailable.".into())
-        })?;
-        let termination_path = self
-            .codex_sessions
-            .get(&workspace)
-            .map(|session| session.controller.cancel_owned_turn_or_session())
-            .unwrap_or_else(|| invalid("Native Agent session is unavailable."));
-        let terminate_session = match termination_path {
-            Ok(terminate_session) => terminate_session,
+        // The adapter owns how its native execution stops; Pastey's authority
+        // was revoked above whatever this returns.
+        let native_stop = self
+            .adapter(&status.agent_id)
+            .and_then(|adapter| adapter.cancel(task_id));
+        match native_stop {
+            Ok(()) => Ok(status),
             Err(_) => {
                 let status = {
                     let mut tasks = self.tasks.lock().map_err(|_| {
@@ -3826,27 +4072,24 @@ impl NativeAgentServiceV1 {
                     status.code.as_deref().unwrap_or("native_agent_cancelled"),
                 );
                 self.persist_envelope(task_id, None)?;
-                return Ok(status);
+                Ok(status)
             }
-        };
-        if terminate_session {
-            // The observer retains its Arc long enough to see the terminated
-            // app-server channel and release occupancy, but this service must
-            // never offer that dead controller to a later task.
-            self.codex_sessions.remove(&workspace);
         }
-        Ok(status)
     }
 
     pub(crate) fn shutdown(&mut self) {
-        for session in self.codex_sessions.values() {
-            session.controller.shutdown();
+        for adapter in &self.adapters {
+            adapter.shutdown();
         }
-        self.codex_sessions.clear();
-        self.active_workspaces
+        self.codex.shutdown();
+        self.active_exclusivity
             .lock()
             .ok()
             .map(|mut active| active.clear());
+        self.observed_tasks
+            .lock()
+            .ok()
+            .map(|mut observed| observed.clear());
         self.task_workspaces.clear();
     }
 }
@@ -4952,6 +5195,20 @@ pub(crate) fn validate_invoke(request: &NativeAgentInvokeV1) -> AppResult<()> {
     Ok(())
 }
 
+pub(crate) fn validate_invoke_v2(request: &NativeAgentInvokeV2) -> AppResult<()> {
+    if request.schema_version != NATIVE_AGENT_INVOKE_V2_SCHEMA
+        || !valid_task_id(&request.task_id)
+        || request.target_host_ref.trim().is_empty()
+        || request.target_host_ref.len() > 256
+        || crate::peer_capabilities::validate_semantic_capability_id(&request.agent_capability)
+            .is_err()
+        || request.input.validate().is_err()
+    {
+        return invalid("Native Agent invocation is invalid.");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_status(status: &NativeAgentStatusV1) -> AppResult<()> {
     if status.schema_version != NATIVE_AGENT_PROTOCOL_SCHEMA
         || status.task_id.trim().is_empty()
@@ -4960,7 +5217,13 @@ pub(crate) fn validate_status(status: &NativeAgentStatusV1) -> AppResult<()> {
         || status.executing_host_ref.len() > 256
         || status.status.schema_version != "pastey-native-agent-task-v1"
         || status.status.task_id != status.task_id
-        || status.status.agent_id != CODEX_CAPABILITY_ID
+        || crate::peer_capabilities::validate_semantic_capability_id(&status.status.agent_id)
+            .is_err()
+        || status
+            .status
+            .output
+            .as_ref()
+            .is_some_and(|output| output.validate().is_err())
         || status.status.workspace_name.trim().is_empty()
         || status.status.workspace_name.len() > 256
         || status.status.workspace_name.contains('/')
@@ -5032,6 +5295,10 @@ pub(crate) fn validate_reconciliation(fact: &NativeAgentReconciliationV1) -> App
             value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
         || !valid_lifecycle_code(fact.code.as_deref())
+        || fact
+            .task_output
+            .as_ref()
+            .is_some_and(|output| output.validate().is_err())
     {
         return invalid("Native Agent reconciliation fact is invalid.");
     }
@@ -5118,340 +5385,8 @@ fn valid_task_id(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= MAX_TASK_ID_BYTES
 }
 
-fn turn_start_ack_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        // A controlled test-only RPC bound proves acknowledgement ambiguity
-        // without turning a unit test into a 30-second wait. It is not an
-        // execution-duration limit.
-        Duration::from_millis(50)
-    }
-    #[cfg(not(test))]
-    {
-        NATIVE_AGENT_RPC_TIMEOUT
-    }
-}
-
-fn codex_compatibility_at(executable: &Path) -> NativeAgentCapabilityStateV1 {
-    let detected = Command::new(executable)
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-    if !detected {
-        return NativeAgentCapabilityStateV1::Unavailable;
-    }
-    let app_server_usable = Command::new(executable)
-        .args(["app-server", "--help"])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-    if app_server_usable {
-        NativeAgentCapabilityStateV1::Available
-    } else {
-        // Detection proves only the native product exists. The app-server
-        // compatibility fact is deliberately limited to Pastey's fixed
-        // initialize/thread/start/turn/start/observation/interrupt/shutdown
-        // surface; no provider, model, credential, or native session detail
-        // is queried here.
-        NativeAgentCapabilityStateV1::Incompatible
-    }
-}
-
-struct CodexAppServerV1 {
-    child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
-    messages: Mutex<mpsc::Receiver<AppResult<Value>>>,
-    active_turn: Mutex<Option<(String, String)>>,
-    interrupt_requested: AtomicBool,
-}
-
-impl CodexAppServerV1 {
-    fn launch(executable: &Path, workspace: &Path) -> AppResult<Self> {
-        // Deliberately inherit the user's native Codex environment, including
-        // authentication and any native configuration. Pastey owns none of it.
-        let mut child = Command::new(executable)
-            .args(["app-server", "--stdio"])
-            .current_dir(workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| AppError::InvalidInput("Codex stdin is unavailable.".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| AppError::InvalidInput("Codex stdout is unavailable.".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| AppError::InvalidInput("Codex stderr is unavailable.".into()))?;
-        let (sender, receiver) = mpsc::sync_channel(256);
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) => return,
-                    Ok(_) if line.len() > MAX_LINE_BYTES => {
-                        let _ = sender.send(invalid("Codex app-server line exceeded its bound."));
-                        return;
-                    }
-                    Ok(_) => {
-                        let _ = sender.send(serde_json::from_str(&line).map_err(AppError::from));
-                    }
-                    Err(error) => {
-                        let _ = sender.send(Err(AppError::Io(error)));
-                        return;
-                    }
-                }
-            }
-        });
-        thread::spawn(move || {
-            let _ = BufReader::new(stderr)
-                .take(MAX_STDERR_BYTES as u64)
-                .read_to_end(&mut Vec::new());
-        });
-        let controller = Self {
-            child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
-            messages: Mutex::new(receiver),
-            active_turn: Mutex::new(None),
-            interrupt_requested: AtomicBool::new(false),
-        };
-        controller.send(json!({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "Pastey", "version": env!("CARGO_PKG_VERSION")}, "capabilities": {}}}))?;
-        controller.await_result(1, Instant::now() + NATIVE_AGENT_RPC_TIMEOUT)?;
-        controller.send(json!({"method": "initialized", "params": {}}))?;
-        Ok(controller)
-    }
-
-    fn start_thread(&self, workspace: &Path) -> AppResult<String> {
-        self.send(json!({"id": 2, "method": "thread/start", "params": {"cwd": workspace}}))?;
-        self.await_result(2, Instant::now() + NATIVE_AGENT_RPC_TIMEOUT)?
-            .pointer("/thread/id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| AppError::InvalidInput("Codex did not return a native session.".into()))
-    }
-
-    /// Obtains the exact turn identity with a bounded RPC timeout, then waits
-    /// indefinitely for that turn's native terminal fact. Silence is not a
-    /// lifecycle event; only channel/process loss is unknown.
-    fn run_turn(&self, thread_id: &str, task: &str) -> NativeTurnOutcomeV1 {
-        if self
-            .send(json!({"id": 3, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": task}]}}))
-            .is_err()
-        {
-            return NativeTurnOutcomeV1::Unknown;
-        }
-        let turn = match self.await_result(3, Instant::now() + turn_start_ack_timeout()) {
-            Ok(turn) => turn,
-            // The request may have reached Codex even though Pastey did not
-            // receive its acknowledgement. Never retry or infer failure.
-            Err(_) => return NativeTurnOutcomeV1::Unknown,
-        };
-        let Some(turn_id) = turn
-            .pointer("/turn/id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .map(str::to_owned)
-        else {
-            return NativeTurnOutcomeV1::Unknown;
-        };
-        if self
-            .active_turn
-            .lock()
-            .map(|mut active| *active = Some((thread_id.into(), turn_id.clone())))
-            .is_err()
-        {
-            return NativeTurnOutcomeV1::Unknown;
-        }
-        // Cancellation may have been requested while turn/start was awaiting
-        // its acknowledgement. Once its exact identity is known, issue the
-        // one bounded native interrupt without clearing occupancy.
-        let _ = self.send_active_interrupt_if_requested();
-        let outcome = loop {
-            match self.next_observation() {
-                Ok(message)
-                    if message.get("method").and_then(Value::as_str) == Some("turn/completed") =>
-                {
-                    break codex_completed_turn_outcome(&message, thread_id, &turn_id);
-                }
-                Ok(message) if message.get("error").is_some() => {
-                    break NativeTurnOutcomeV1::Unknown;
-                }
-                Ok(_) => {}
-                // App-server stdout/process observation disappeared before an
-                // exact terminal outcome. This is indeterminate, not failed.
-                Err(_) => break NativeTurnOutcomeV1::Unknown,
-            }
-        };
-        let _ = self.clear_active_turn();
-        outcome
-    }
-
-    fn clear_active_turn(&self) -> AppResult<()> {
-        *self
-            .active_turn
-            .lock()
-            .map_err(|_| AppError::InvalidInput("Codex session state is unavailable.".into()))? =
-            None;
-        self.interrupt_requested.store(false, Ordering::Release);
-        Ok(())
-    }
-
-    /// Records cancellation intent independently from native termination. The
-    /// exact active turn stays retained until the observer exits.
-    fn interrupt(&self) -> AppResult<()> {
-        self.interrupt_requested.store(true, Ordering::Release);
-        self.send_active_interrupt_if_requested()
-    }
-
-    /// Explicit user cancellation may arrive after `turn/start` was accepted
-    /// but before Pastey obtained its exact turn identity. In that one case,
-    /// `turn/interrupt` is not available, so terminate this Host-private
-    /// app-server/session instead. This is never automatic: ordinary unknown
-    /// outcome handling keeps observing and retains workspace occupancy.
-    fn cancel_owned_turn_or_session(&self) -> AppResult<bool> {
-        self.interrupt_requested.store(true, Ordering::Release);
-        let has_exact_turn = self
-            .active_turn
-            .lock()
-            .map_err(|_| AppError::InvalidInput("Codex session state is unavailable.".into()))?
-            .is_some();
-        if has_exact_turn {
-            self.send_active_interrupt_if_requested()?;
-            return Ok(false);
-        }
-        self.shutdown();
-        Ok(true)
-    }
-
-    fn send_active_interrupt_if_requested(&self) -> AppResult<()> {
-        if !self.interrupt_requested.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let active = self
-            .active_turn
-            .lock()
-            .map_err(|_| AppError::InvalidInput("Codex session state is unavailable.".into()))?
-            .clone();
-        if let Some((thread_id, turn_id)) = active {
-            self.send(json!({"id": 4, "method": "turn/interrupt", "params": {"threadId": thread_id, "turnId": turn_id}}))?;
-        }
-        Ok(())
-    }
-    fn shutdown(&self) {
-        let _ = self.interrupt();
-        let _ = self.send(json!({"id": 5, "method": "shutdown", "params": {}}));
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-    fn send(&self, value: Value) -> AppResult<()> {
-        let encoded = serde_json::to_vec(&value)?;
-        if encoded.len() > MAX_LINE_BYTES {
-            return invalid("Codex request exceeds its bound.");
-        }
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| AppError::InvalidInput("Codex stdin is unavailable.".into()))?;
-        stdin.write_all(&encoded)?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
-        Ok(())
-    }
-    fn await_result(&self, id: u64, deadline: Instant) -> AppResult<Value> {
-        loop {
-            let message = self.next_message(deadline)?;
-            if message.get("id").and_then(Value::as_u64) == Some(id) {
-                return message.get("result").cloned().ok_or_else(|| {
-                    AppError::InvalidInput("Codex app-server request failed.".into())
-                });
-            }
-            if message.get("error").is_some() {
-                return invalid("Codex app-server request failed.");
-            }
-        }
-    }
-    fn next_message(&self, deadline: Instant) -> AppResult<Value> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| AppError::InvalidInput("Codex native task timed out.".into()))?;
-        self.messages
-            .lock()
-            .map_err(|_| AppError::InvalidInput("Codex messages are unavailable.".into()))?
-            .recv_timeout(remaining)
-            .map_err(|_| AppError::InvalidInput("Codex native task outcome is unknown.".into()))?
-    }
-
-    fn next_observation(&self) -> AppResult<Value> {
-        self.messages
-            .lock()
-            .map_err(|_| AppError::InvalidInput("Codex messages are unavailable.".into()))?
-            .recv()
-            .map_err(|_| {
-                AppError::InvalidInput("Codex native observation is unavailable.".into())
-            })?
-    }
-
-    fn wait_until_observation_lost(&self) {
-        while self.next_observation().is_ok() {}
-    }
-}
-
-impl Drop for CodexAppServerV1 {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
 fn invalid<T>(message: &str) -> AppResult<T> {
     Err(AppError::InvalidInput(message.into()))
-}
-
-/// The native app-server can emit terminal notifications for other threads on
-/// the same connection.  A Pastey task reaches success only when the terminal
-/// notification names the exact `thread/start` thread and `turn/start` turn,
-/// and Codex reports that turn as completed without an error.  Every other
-/// terminal shape is intentionally non-success so it cannot trigger a result
-/// scan, Return Transfer, apply, or global DONE.
-fn codex_completed_turn_outcome(
-    message: &Value,
-    thread_id: &str,
-    turn_id: &str,
-) -> NativeTurnOutcomeV1 {
-    let Some(params) = message.get("params").and_then(Value::as_object) else {
-        return NativeTurnOutcomeV1::Unknown;
-    };
-    if params.get("threadId").and_then(Value::as_str) != Some(thread_id) {
-        return NativeTurnOutcomeV1::Unknown;
-    }
-    let Some(turn) = params.get("turn").and_then(Value::as_object) else {
-        return NativeTurnOutcomeV1::Unknown;
-    };
-    if turn.get("id").and_then(Value::as_str) != Some(turn_id) {
-        return NativeTurnOutcomeV1::Unknown;
-    }
-    match turn.get("status").and_then(Value::as_str) {
-        Some("completed") if turn.get("error").is_none_or(Value::is_null) => {
-            NativeTurnOutcomeV1::Completed
-        }
-        Some("completed") => NativeTurnOutcomeV1::Unknown,
-        Some("failed") => NativeTurnOutcomeV1::Failed,
-        Some("interrupted") => NativeTurnOutcomeV1::Interrupted,
-        // `cancelled` is not currently emitted by Codex's schema, but treating
-        // it as an explicit non-success protects this boundary across native
-        // protocol versions and lets the task envelope surface cancellation.
-        Some("cancelled") => NativeTurnOutcomeV1::Cancelled,
-        Some("inProgress") => NativeTurnOutcomeV1::Unknown,
-        _ => NativeTurnOutcomeV1::Unknown,
-    }
 }
 
 #[cfg(test)]
@@ -5459,6 +5394,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::Ordering;
     use std::{fs, sync::Arc};
 
     mod pair_harness {
@@ -5630,12 +5566,7 @@ exit 1
 
     fn wait_for_workspace_release(service: &NativeAgentServiceV1, workspace: &Path) {
         for _ in 0..300 {
-            if !service
-                .active_workspaces
-                .lock()
-                .unwrap()
-                .contains_key(workspace)
-            {
+            if service.workspace_occupant(workspace).is_none() {
                 return;
             }
             thread::sleep(Duration::from_millis(10));
@@ -5867,10 +5798,8 @@ exit 1
             Some("native_agent_outcome_unknown")
         );
         assert!(service
-            .active_workspaces
-            .lock()
-            .unwrap()
-            .contains_key(&workspace.canonicalize().unwrap()));
+            .workspace_occupant(&workspace.canonicalize().unwrap())
+            .is_some());
 
         assert_eq!(
             service.cancel_task(&started.task_id).unwrap().state,
@@ -6027,6 +5956,7 @@ exit 1
                     state: NativeAgentTaskStateV1::Running,
                     result: None,
                     code: None,
+                    output: None,
                 },
             );
             service.workspace_movements.insert(
@@ -6109,6 +6039,7 @@ exit 1
             state: NativeAgentTaskStateV1::Completed,
             result: Some("done".into()),
             code: None,
+            output: None,
         };
         let wrong = NativeAgentStatusV1 {
             schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
@@ -6154,6 +6085,7 @@ exit 1
                 result_digest: None,
                 apply_completed: false,
                 code: None,
+                task_output: None,
             })
             .unwrap();
         assert_eq!(
@@ -6219,6 +6151,7 @@ exit 1
             state: NativeAgentTaskStateV1::Completed,
             result: Some("late result".into()),
             code: None,
+            output: None,
         };
         assert_eq!(
             service
@@ -6243,6 +6176,7 @@ exit 1
                 result_digest: Some("c".repeat(64)),
                 apply_completed: false,
                 code: None,
+                task_output: None,
             })
             .unwrap();
         assert_eq!(
@@ -7402,6 +7336,7 @@ exit 1
             state: NativeAgentTaskStateV1::Running,
             result: None,
             code: None,
+            output: None,
         };
         before
             .tasks
@@ -8019,11 +7954,9 @@ exit 1
             .unwrap();
         let canonical_workspace = workspace.canonicalize().unwrap();
         let controller = service
-            .codex_sessions
-            .get(&canonical_workspace)
-            .unwrap()
-            .controller
-            .clone();
+            .codex
+            .session_controller(&canonical_workspace)
+            .unwrap();
         for _ in 0..300 {
             if controller.active_turn.lock().unwrap().is_some() {
                 break;
@@ -8033,12 +7966,7 @@ exit 1
         assert!(controller.active_turn.lock().unwrap().is_some());
         assert!(workspace.join("turn-started").exists());
         assert_eq!(
-            service
-                .active_workspaces
-                .lock()
-                .unwrap()
-                .get(&canonical_workspace)
-                .map(String::as_str),
+            service.workspace_occupant(&canonical_workspace).as_deref(),
             Some(started.task_id.as_str())
         );
 
@@ -8048,7 +7976,7 @@ exit 1
             service.task_status("task-live-turn").unwrap().state,
             NativeAgentTaskStateV1::Running
         );
-        assert!(service.codex_sessions.contains_key(&canonical_workspace));
+        assert!(service.codex.has_session(&canonical_workspace));
         assert!(!controller.interrupt_requested.load(Ordering::Acquire));
         fs::write(workspace.join("release-turn"), b"continue").unwrap();
         assert_eq!(
@@ -8063,7 +7991,7 @@ exit 1
         }
         thread::sleep(Duration::from_millis(50));
         assert!(!workspace.join("turn-interrupt-requested").exists());
-        assert!(service.codex_sessions.contains_key(&canonical_workspace));
+        assert!(service.codex.has_session(&canonical_workspace));
         service.shutdown();
         let _ = fs::remove_dir_all(root);
     }
@@ -8290,7 +8218,7 @@ exit 1
             recovered.task_status(task_id).unwrap().state,
             NativeAgentTaskStateV1::Completed
         );
-        assert!(recovered.codex_sessions.is_empty());
+        assert_eq!(recovered.codex.session_count(), 0);
         let movement = recovered.workspace_movements.get(movement_id).unwrap();
         let snapshot = movement.result_snapshot.as_ref().unwrap();
         let identity = movement.result_identity.as_ref().unwrap();
@@ -9031,6 +8959,7 @@ exit 1
             result_digest: None,
             apply_completed: false,
             code: None,
+            task_output: None,
         };
         assert!(service.record_remote_reconciliation(fact).is_err());
     }
@@ -9233,6 +9162,7 @@ exit 1
                         result_digest: None,
                         apply_completed: false,
                         code: None,
+                        task_output: None,
                     },
                 )
                 .unwrap();
@@ -9309,6 +9239,7 @@ exit 1
                     result_digest: None,
                     apply_completed: false,
                     code: None,
+                    task_output: None,
                 },
             )
             .unwrap();
@@ -9386,7 +9317,7 @@ exit 1
             )
             .unwrap();
         assert_eq!(late.state, NativeAgentTaskStateV1::Cancelled);
-        assert!(service.active_workspaces.lock().unwrap().is_empty());
+        assert!(service.active_exclusivity.lock().unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9453,6 +9384,7 @@ exit 1
                 state,
                 result: None,
                 code: code.map(str::to_owned),
+                output: None,
             },
         };
         service
@@ -9476,6 +9408,7 @@ exit 1
                 result_digest: None,
                 apply_completed: false,
                 code: Some("stale".into()),
+                task_output: None,
             })
             .unwrap();
         assert_eq!(
@@ -9514,6 +9447,7 @@ exit 1
                     state: NativeAgentTaskStateV1::Running,
                     result: None,
                     code: Some("late".into()),
+                    output: None,
                 },
             })
             .unwrap();
@@ -9598,6 +9532,7 @@ exit 1
                     result_digest: None,
                     apply_completed: false,
                     code: Some("workspace_transfer_pending".into()),
+                    task_output: None,
                 },
             )
             .unwrap();
@@ -9878,6 +9813,7 @@ exit 1
                 state: NativeAgentTaskStateV1::Completed,
                 result: Some("late".into()),
                 code: None,
+                output: None,
             },
         };
         assert!(service
@@ -9896,6 +9832,7 @@ exit 1
                     result_digest: None,
                     apply_completed: false,
                     code: None,
+                    task_output: None,
                 },
             )
             .is_err());
@@ -9932,11 +9869,9 @@ exit 1
             .unwrap();
         let canonical_workspace = workspace.canonicalize().unwrap();
         let controller = service
-            .codex_sessions
-            .get(&canonical_workspace)
-            .unwrap()
-            .controller
-            .clone();
+            .codex
+            .session_controller(&canonical_workspace)
+            .unwrap();
         for _ in 0..300 {
             if controller.active_turn.lock().unwrap().is_some() {
                 break;
@@ -9946,7 +9881,7 @@ exit 1
         assert!(controller.active_turn.lock().unwrap().is_some());
         service.purge_bridge_authority("room-burn").unwrap();
         assert!(service.revoked_bridges.contains("room-burn"));
-        assert!(!service.codex_sessions.contains_key(&canonical_workspace));
+        assert!(!service.codex.has_session(&canonical_workspace));
         assert!(controller.interrupt_requested.load(Ordering::Acquire));
         assert!(
             crate::storage::get_native_agent_envelope(&paths, "task-burn-observer")
@@ -10533,6 +10468,7 @@ exit 1
             result_digest: Some("a".repeat(64)),
             apply_completed: false,
             code: Some("result_return_retry_required".into()),
+            task_output: None,
         };
         requester
             .record_bridge_remote_reconciliation("room-terminal-proof", fact.clone())
