@@ -913,3 +913,637 @@ fn pair_completed_agent_capture_failure_preserves_history_and_resolution() {
     );
     h.assert_agent_at_most_once();
 }
+
+// Generic native capability: the same lifecycle runs `fake.longjob.v1` with
+// Codex absent on both Hosts. The requester registers no capability; the
+// executor registers only the fake. Wire messages round-trip through JSON and
+// the same parse, validate, start and record functions the product uses.
+use crate::native_agent::capability::fake_longjob::{FakeLongJobAdapterV1, FAKE_LONGJOB_ID};
+
+const CAP_BRIDGE: &str = "room-capability";
+
+fn opaque(value: Value) -> OpaqueCapabilityPayloadV1 {
+    serde_json::from_value(value).unwrap()
+}
+
+fn roundtrip<T: serde::Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
+    serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap()
+}
+
+struct CapabilityPairV1 {
+    root: PathBuf,
+    requester_paths: crate::storage::AppPaths,
+    executor_paths: crate::storage::AppPaths,
+    requester: NativeAgentServiceV1,
+    executor: NativeAgentServiceV1,
+    fake: Arc<FakeLongJobAdapterV1>,
+    retired_fakes: Vec<Arc<FakeLongJobAdapterV1>>,
+}
+
+impl CapabilityPairV1 {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!("pastey-capability-pair-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let requester_paths = durable_paths(&root.join("requester"));
+        let executor_paths = durable_paths(&root.join("executor"));
+        let fake = Arc::new(FakeLongJobAdapterV1::default());
+        let requester =
+            NativeAgentServiceV1::with_paths_and_adapters(requester_paths.clone(), Vec::new())
+                .unwrap();
+        let executor = NativeAgentServiceV1::with_paths_and_adapters(
+            executor_paths.clone(),
+            vec![fake.clone()],
+        )
+        .unwrap();
+        Self {
+            root,
+            requester_paths,
+            executor_paths,
+            requester,
+            executor,
+            fake,
+            retired_fakes: Vec::new(),
+        }
+    }
+
+    /// The requester records the invocation and builds its wire payload.
+    fn send_invoke(&mut self, task_id: &str, input: Value) -> Value {
+        let input = opaque(input);
+        self.requester
+            .queue_bridge_remote_invocation(
+                CAP_BRIDGE,
+                task_id,
+                PAIR_EXECUTOR,
+                FAKE_LONGJOB_ID,
+                &input,
+            )
+            .unwrap();
+        wire_invoke(task_id, input)
+    }
+
+    /// The executor handles `native_agent.invoke` as Room Control does.
+    fn receive_invoke(&mut self, wire: Value) -> AppResult<NativeAgentTaskStatusV1> {
+        let request = parse_invoke(wire)?;
+        assert_eq!(request.target_host_ref, PAIR_EXECUTOR);
+        self.executor.require_capability(&request.agent_capability)?;
+        self.executor.start_bridge_invocation(CAP_BRIDGE, &request)
+    }
+
+    fn invoke(&mut self, task_id: &str, input: Value) -> NativeAgentTaskStatusV1 {
+        let wire = self.send_invoke(task_id, input);
+        self.receive_invoke(wire).unwrap()
+    }
+
+    fn status_message(&self, task_id: &str) -> NativeAgentStatusV1 {
+        NativeAgentStatusV1 {
+            schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: task_id.into(),
+            executing_host_ref: PAIR_EXECUTOR.into(),
+            status: self.executor.task_status(task_id).unwrap(),
+        }
+    }
+
+    fn deliver(&mut self, message: &NativeAgentStatusV1) -> AppResult<NativeAgentTaskStatusV1> {
+        let wire = roundtrip(message);
+        validate_status(&wire)?;
+        self.requester.record_bridge_remote_status(CAP_BRIDGE, wire)
+    }
+
+    fn deliver_status(&mut self, task_id: &str) -> NativeAgentTaskStatusV1 {
+        let message = self.status_message(task_id);
+        self.deliver(&message).unwrap()
+    }
+
+    fn reconcile(&mut self, task_id: &str) -> AppResult<()> {
+        let fact = self.executor.reconciliation_fact(
+            CAP_BRIDGE,
+            task_id,
+            None,
+            PAIR_EXECUTOR,
+            PAIR_SOURCE,
+        )?;
+        let wire = roundtrip(&fact);
+        validate_reconciliation(&wire)?;
+        self.requester
+            .record_bridge_remote_reconciliation(CAP_BRIDGE, wire)
+    }
+
+    fn observed(&self, task_id: &str) -> bool {
+        self.executor
+            .observed_tasks
+            .lock()
+            .unwrap()
+            .contains(task_id)
+    }
+
+    /// Waits until the executor's observer for the task has exited.
+    fn settle(&self, task_id: &str) -> NativeAgentTaskStatusV1 {
+        for _ in 0..500 {
+            if !self.observed(task_id) {
+                return self.executor.task_status(task_id).unwrap();
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("fake.longjob observer did not exit for {task_id}");
+    }
+
+    fn requester_status(&self, task_id: &str) -> NativeAgentTaskStatusV1 {
+        self.requester.task_status(task_id).unwrap()
+    }
+
+    /// A fresh executor process: new service and a new adapter instance.
+    fn restart_executor(&mut self) {
+        let fresh = Arc::new(FakeLongJobAdapterV1::default());
+        let previous = std::mem::replace(&mut self.fake, fresh.clone());
+        self.retired_fakes.push(previous);
+        self.executor = NativeAgentServiceV1::with_paths_and_adapters(
+            self.executor_paths.clone(),
+            vec![fresh],
+        )
+        .unwrap();
+    }
+
+    fn restart_requester(&mut self) {
+        self.requester =
+            NativeAgentServiceV1::with_paths_and_adapters(self.requester_paths.clone(), Vec::new())
+                .unwrap();
+    }
+
+    fn total_starts(&self) -> usize {
+        self.fake.starts()
+            + self
+                .retired_fakes
+                .iter()
+                .map(|fake| fake.starts())
+                .sum::<usize>()
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        let connection = rusqlite::Connection::open(&self.executor_paths.db_path).unwrap();
+        let mut statement = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        names
+    }
+}
+
+impl Drop for CapabilityPairV1 {
+    fn drop(&mut self) {
+        self.fake.shutdown();
+        for fake in &self.retired_fakes {
+            fake.shutdown();
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn wire_invoke(task_id: &str, input: OpaqueCapabilityPayloadV1) -> Value {
+    serde_json::to_value(NativeAgentInvokeV2 {
+        schema_version: NATIVE_AGENT_INVOKE_V2_SCHEMA.into(),
+        task_id: task_id.into(),
+        target_host_ref: PAIR_EXECUTOR.into(),
+        agent_capability: FAKE_LONGJOB_ID.into(),
+        input,
+    })
+    .unwrap()
+}
+
+fn rich_payload() -> Value {
+    json!({
+        "text": "héllo ✓ \u{0007}",
+        "nested": { "z": [1, 2.5, null, true], "a": { "deep": ["x", { "y": -7 }] } },
+        "big": 9007199254740993u64,
+    })
+}
+
+#[test]
+fn capability_discovery_uses_existing_facts_with_codex_absent() {
+    let h = CapabilityPairV1::new();
+    let described = h.executor.capabilities();
+    assert_eq!(described.len(), 1);
+    assert_eq!(described[0].agent_id, FAKE_LONGJOB_ID);
+    let projection = crate::peer_capabilities::PeerCapabilityProjection {
+        schema_version: crate::peer_capabilities::PEER_CAPABILITY_SCHEMA.into(),
+        peer_session_id: "peer".into(),
+        observed_at: 10,
+        capabilities: h.executor.native_capability_facts(),
+    };
+    crate::peer_capabilities::validate_projection(&projection).unwrap();
+    projection
+        .require_native_agent_protocols(FAKE_LONGJOB_ID, &GENERIC_NATIVE_INVOKE_PROTOCOLS)
+        .unwrap();
+    // Workspace movement remains Codex's; Codex itself is absent here.
+    assert!(projection
+        .require_native_agent_protocols(FAKE_LONGJOB_ID, &WORKSPACE_MOVEMENT_PROTOCOLS)
+        .is_err());
+    assert!(projection
+        .require_native_agent_protocols(CODEX_CAPABILITY_ID, &DIRECT_NATIVE_INVOKE_PROTOCOLS)
+        .is_err());
+    assert!(h.executor.require_capability(CODEX_CAPABILITY_ID).is_err());
+    assert!(h.requester.require_capability(FAKE_LONGJOB_ID).is_err());
+}
+
+#[test]
+fn opaque_payload_crosses_hosts_unchanged_and_completes_once() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-complete";
+    let started = h.invoke(task, json!({ "steps": 3, "payload": rich_payload() }));
+    assert_eq!(started.state, NativeAgentTaskStateV1::Running);
+    assert_eq!(started.agent_id, FAKE_LONGJOB_ID);
+    let done = h.settle(task);
+    assert_eq!(done.state, NativeAgentTaskStateV1::Completed);
+    assert_eq!(done.result, None);
+    assert_eq!(h.fake.received_payload(task), Some(rich_payload()));
+    let recorded = h.deliver_status(task);
+    assert_eq!(recorded.state, NativeAgentTaskStateV1::Completed);
+    assert_eq!(
+        serde_json::to_value(recorded.output.unwrap()).unwrap(),
+        json!({ "payload": rich_payload(), "steps": 3 })
+    );
+    assert_eq!(h.total_starts(), 1);
+}
+
+#[test]
+fn stable_task_identity_is_idempotent_and_rejects_different_input() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-identity";
+    h.fake.hold();
+    let input = json!({ "steps": 2, "payload": { "b": 1, "a": 2 } });
+    let wire = h.send_invoke(task, input.clone());
+    h.receive_invoke(wire.clone()).unwrap();
+    // The same delivery again, and the same input with other key order.
+    assert_eq!(
+        h.receive_invoke(wire).unwrap().state,
+        NativeAgentTaskStateV1::Running
+    );
+    let reordered = json!({ "payload": { "a": 2, "b": 1 }, "steps": 2 });
+    h.receive_invoke(wire_invoke(task, opaque(reordered.clone())))
+        .unwrap();
+    assert_eq!(h.total_starts(), 1);
+    // The same task identity with different input is refused on both Hosts.
+    let different = json!({ "steps": 2, "payload": { "a": 3 } });
+    assert!(h
+        .receive_invoke(wire_invoke(task, opaque(different.clone())))
+        .is_err());
+    assert!(h
+        .requester
+        .queue_bridge_remote_invocation(
+            CAP_BRIDGE,
+            task,
+            PAIR_EXECUTOR,
+            FAKE_LONGJOB_ID,
+            &opaque(different)
+        )
+        .is_err());
+    assert!(h
+        .requester
+        .queue_bridge_remote_invocation(
+            CAP_BRIDGE,
+            task,
+            PAIR_EXECUTOR,
+            FAKE_LONGJOB_ID,
+            &opaque(reordered)
+        )
+        .is_ok());
+    h.fake.release();
+    assert_eq!(h.settle(task).state, NativeAgentTaskStateV1::Completed);
+    // After completion a duplicate delivery returns the recorded fact.
+    let again = h.receive_invoke(wire_invoke(task, opaque(input))).unwrap();
+    assert_eq!(again.state, NativeAgentTaskStateV1::Completed);
+    assert_eq!(h.total_starts(), 1);
+}
+
+#[test]
+fn running_then_failed_is_recorded_without_output() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-fail";
+    h.invoke(
+        task,
+        json!({ "steps": 5, "fail_at": 3, "payload": "will fail" }),
+    );
+    let failed = h.settle(task);
+    assert_eq!(failed.state, NativeAgentTaskStateV1::Failed);
+    assert_eq!(failed.code.as_deref(), Some("native_agent_failed"));
+    assert_eq!(failed.output, None);
+    assert_eq!(h.fake.progress(task), Some(2));
+    let recorded = h.deliver_status(task);
+    assert_eq!(recorded.state, NativeAgentTaskStateV1::Failed);
+    assert_eq!(recorded.output, None);
+}
+
+#[test]
+fn cancel_intent_wins_over_a_late_native_completion() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-cancel-late";
+    h.fake.hold();
+    h.fake.complete_despite_cancel();
+    h.invoke(task, json!({ "steps": 2, "payload": "late" }));
+    assert_eq!(
+        h.deliver_status(task).state,
+        NativeAgentTaskStateV1::Running
+    );
+    // The requester revokes first; then the cancel reaches the executor.
+    let local = h.requester.cancel_remote_task(task, PAIR_EXECUTOR).unwrap();
+    assert_eq!(local.state, NativeAgentTaskStateV1::Cancelled);
+    let requested = h.executor.cancel_task(task).unwrap();
+    assert_eq!(requested.state, NativeAgentTaskStateV1::Cancelled);
+    assert_eq!(
+        requested.code.as_deref(),
+        Some("native_agent_cancel_requested")
+    );
+    assert!(h.fake.cancel_requested(task));
+    h.fake.release();
+    let after = h.settle(task);
+    // The job finished natively, but no completion or output is recorded.
+    assert_eq!(h.fake.progress(task), Some(2));
+    assert_eq!(after.state, NativeAgentTaskStateV1::Cancelled);
+    assert_eq!(after.code.as_deref(), Some("native_agent_cancel_requested"));
+    assert_eq!(after.output, None);
+    assert_eq!(
+        h.deliver_status(task).state,
+        NativeAgentTaskStateV1::Cancelled
+    );
+    h.reconcile(task).unwrap();
+    assert_eq!(
+        h.requester_status(task).state,
+        NativeAgentTaskStateV1::Cancelled
+    );
+    assert_eq!(h.requester_status(task).output, None);
+}
+
+#[test]
+fn honoured_cancel_is_confirmed_apart_from_the_request() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-cancel";
+    h.fake.hold();
+    h.invoke(task, json!({ "steps": 2, "payload": "stop" }));
+    let requested = h.executor.cancel_task(task).unwrap();
+    assert_eq!(
+        requested.code.as_deref(),
+        Some("native_agent_cancel_requested")
+    );
+    let confirmed = h.settle(task);
+    assert_eq!(confirmed.state, NativeAgentTaskStateV1::Cancelled);
+    assert_eq!(confirmed.code.as_deref(), Some("native_agent_cancelled"));
+    assert_eq!(h.fake.progress(task), Some(0));
+}
+
+#[test]
+fn lost_invoke_receipt_is_reconciled_not_failed() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-receipt";
+    let wire = h.send_invoke(task, json!({ "steps": 1, "payload": "receipt" }));
+    // The executor accepted the invocation; the requester's send failed.
+    h.receive_invoke(wire).unwrap();
+    let uncertain = h.requester.fail_remote_delivery(task).unwrap();
+    assert_eq!(uncertain.state, NativeAgentTaskStateV1::Interrupted);
+    assert_eq!(
+        uncertain.code.as_deref(),
+        Some("native_agent_reconciliation_required")
+    );
+    assert_eq!(h.settle(task).state, NativeAgentTaskStateV1::Completed);
+    h.reconcile(task).unwrap();
+    let resolved = h.requester_status(task);
+    assert_eq!(resolved.state, NativeAgentTaskStateV1::Completed);
+    assert_eq!(
+        serde_json::to_value(resolved.output.unwrap()).unwrap(),
+        json!({ "payload": "receipt", "steps": 1 })
+    );
+    assert_eq!(h.total_starts(), 1);
+}
+
+#[test]
+fn restart_mid_invocation_is_interrupted_and_never_reruns() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-restart-running";
+    h.fake.hold();
+    h.invoke(task, json!({ "steps": 2, "payload": "running" }));
+    assert_eq!(
+        h.deliver_status(task).state,
+        NativeAgentTaskStateV1::Running
+    );
+    h.restart_executor();
+    let restored = h.executor.task_status(task).unwrap();
+    assert_eq!(restored.state, NativeAgentTaskStateV1::Interrupted);
+    assert_eq!(
+        restored.code.as_deref(),
+        Some("native_agent_reconciliation_required")
+    );
+    h.reconcile(task).unwrap();
+    assert_eq!(
+        h.requester_status(task).state,
+        NativeAgentTaskStateV1::Interrupted
+    );
+    assert_eq!(h.fake.starts(), 0);
+    assert_eq!(h.total_starts(), 1);
+}
+
+#[test]
+fn completed_result_survives_restart_of_both_hosts_without_rerun() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-restart-done";
+    h.invoke(task, json!({ "steps": 2, "payload": { "keep": [1, 2] } }));
+    assert_eq!(h.settle(task).state, NativeAgentTaskStateV1::Completed);
+    // Neither the status nor anything else reached the requester.
+    h.restart_executor();
+    h.restart_requester();
+    assert_eq!(
+        h.requester_status(task).state,
+        NativeAgentTaskStateV1::Interrupted
+    );
+    let restored = h.executor.task_status(task).unwrap();
+    assert_eq!(restored.state, NativeAgentTaskStateV1::Completed);
+    h.reconcile(task).unwrap();
+    let resolved = h.requester_status(task);
+    assert_eq!(resolved.state, NativeAgentTaskStateV1::Completed);
+    assert_eq!(
+        serde_json::to_value(resolved.output.unwrap()).unwrap(),
+        json!({ "payload": { "keep": [1, 2] }, "steps": 2 })
+    );
+    assert_eq!(h.fake.starts(), 0);
+    assert_eq!(h.total_starts(), 1);
+}
+
+#[test]
+fn duplicate_terminal_facts_never_reapply_or_replace_the_result() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-duplicate";
+    h.invoke(task, json!({ "steps": 1, "payload": "once" }));
+    h.settle(task);
+    let first = h.deliver_status(task);
+    for _ in 0..3 {
+        assert_eq!(h.deliver_status(task), first);
+        h.reconcile(task).unwrap();
+        assert_eq!(h.requester_status(task), first);
+    }
+    // A second terminal fact with another output cannot replace the first.
+    let mut forged = h.status_message(task);
+    forged.status.output = Some(opaque(json!({ "payload": "other", "steps": 9 })));
+    h.deliver(&forged).unwrap();
+    assert_eq!(h.requester_status(task), first);
+    assert_eq!(h.total_starts(), 1);
+}
+
+#[test]
+fn session_loss_keeps_reconciliation_material_and_burn_blocks_late_facts() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-session";
+    h.fake.hold();
+    h.invoke(task, json!({ "steps": 1, "payload": "session" }));
+    h.deliver_status(task);
+    // Route loss: the executor keeps observing its live job; the requester,
+    // which observes nothing locally, must reconcile.
+    h.executor.revoke_bridge_session(CAP_BRIDGE).unwrap();
+    h.requester.revoke_bridge_session(CAP_BRIDGE).unwrap();
+    assert_eq!(
+        h.executor.task_status(task).unwrap().state,
+        NativeAgentTaskStateV1::Running
+    );
+    assert_eq!(
+        h.requester_status(task).code.as_deref(),
+        Some("native_agent_reconciliation_required")
+    );
+    h.fake.release();
+    assert_eq!(h.settle(task).state, NativeAgentTaskStateV1::Completed);
+    h.reconcile(task).unwrap();
+    assert_eq!(
+        h.requester_status(task).state,
+        NativeAgentTaskStateV1::Completed
+    );
+
+    // Burn: authority and material are gone and late facts cannot revive it.
+    let burned = "task-cap-burn";
+    h.fake.hold();
+    h.invoke(burned, json!({ "steps": 1, "payload": "burn" }));
+    let late = h.status_message(burned);
+    h.executor.purge_bridge_authority(CAP_BRIDGE).unwrap();
+    h.requester.purge_bridge_authority(CAP_BRIDGE).unwrap();
+    assert!(h.fake.cancel_requested(burned));
+    assert!(h.executor.task_status(burned).is_err());
+    assert!(h
+        .executor
+        .reconciliation_fact(CAP_BRIDGE, burned, None, PAIR_EXECUTOR, PAIR_SOURCE)
+        .is_err());
+    assert!(h.deliver(&late).is_err());
+    assert!(h.requester.task_status(burned).is_err());
+    assert!(h
+        .receive_invoke(wire_invoke(
+            "task-cap-after-burn",
+            opaque(json!({ "steps": 1, "payload": 1 }))
+        ))
+        .is_err());
+    // The released observer exits without recreating the burned task.
+    h.fake.release();
+    for _ in 0..500 {
+        if !h.observed(burned) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!h.observed(burned));
+    assert!(h.executor.task_status(burned).is_err());
+    assert!(crate::storage::get_native_agent_envelope(&h.executor_paths, burned)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn opaque_exclusivity_key_is_held_while_unresolved_and_across_restart() {
+    let mut h = CapabilityPairV1::new();
+    h.fake.hold();
+    h.invoke("task-lane-a", json!({ "steps": 1, "payload": 1, "lane": "x" }));
+    let busy = h.send_invoke("task-lane-b", json!({ "steps": 1, "payload": 2, "lane": "x" }));
+    assert!(h.receive_invoke(busy).is_err());
+    h.invoke("task-lane-c", json!({ "steps": 1, "payload": 3, "lane": "y" }));
+    h.invoke("task-lane-d", json!({ "steps": 1, "payload": 4 }));
+    assert_eq!(h.total_starts(), 3);
+    h.fake.release();
+    for task in ["task-lane-a", "task-lane-c", "task-lane-d"] {
+        assert_eq!(h.settle(task).state, NativeAgentTaskStateV1::Completed);
+    }
+    h.invoke("task-lane-e", json!({ "steps": 1, "payload": 5, "lane": "x" }));
+    h.settle("task-lane-e");
+
+    // An invocation interrupted by restart keeps its key held.
+    h.fake.hold();
+    h.invoke("task-lane-f", json!({ "steps": 1, "payload": 6, "lane": "w" }));
+    h.restart_executor();
+    let blocked = h.send_invoke("task-lane-g", json!({ "steps": 1, "payload": 7, "lane": "w" }));
+    assert!(h.receive_invoke(blocked).is_err());
+    let free = h.send_invoke("task-lane-h", json!({ "steps": 1, "payload": 8, "lane": "v" }));
+    h.receive_invoke(free).unwrap();
+    assert_eq!(h.settle("task-lane-h").state, NativeAgentTaskStateV1::Completed);
+}
+
+#[test]
+fn an_unknown_outcome_holds_its_key_until_cancelled() {
+    let mut h = CapabilityPairV1::new();
+    h.fake.lose_observation();
+    h.invoke("task-unknown-a", json!({ "steps": 1, "payload": 1, "lane": "z" }));
+    for _ in 0..500 {
+        if h.executor.task_status("task-unknown-a").unwrap().state
+            != NativeAgentTaskStateV1::Running
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let unknown = h.executor.task_status("task-unknown-a").unwrap();
+    assert_eq!(unknown.state, NativeAgentTaskStateV1::Interrupted);
+    assert_eq!(unknown.code.as_deref(), Some("native_agent_outcome_unknown"));
+    // Unknown is never success, and the key stays held while observed...
+    assert!(h.observed("task-unknown-a"));
+    let blocked = h.send_invoke("task-unknown-b", json!({ "steps": 1, "payload": 2, "lane": "z" }));
+    assert!(h.receive_invoke(blocked).is_err());
+    // ...and after observation is lost, until the uncertain task is cancelled.
+    h.fake.drop_observation();
+    h.settle("task-unknown-a");
+    let still = h.send_invoke("task-unknown-c", json!({ "steps": 1, "payload": 3, "lane": "z" }));
+    assert!(h.receive_invoke(still).is_err());
+    let cancelled = h.executor.cancel_task("task-unknown-a").unwrap();
+    assert_eq!(cancelled.state, NativeAgentTaskStateV1::Cancelled);
+    let free = h.send_invoke("task-unknown-d", json!({ "steps": 1, "payload": 4, "lane": "z" }));
+    h.receive_invoke(free).unwrap();
+}
+
+#[test]
+fn a_long_invocation_has_no_pastey_deadline() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-long";
+    h.fake.hold();
+    h.invoke(task, json!({ "steps": 1, "payload": "long" }));
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        h.executor.task_status(task).unwrap().state,
+        NativeAgentTaskStateV1::Running
+    );
+    assert_eq!(
+        h.deliver_status(task).state,
+        NativeAgentTaskStateV1::Running
+    );
+    h.fake.release();
+    assert_eq!(h.settle(task).state, NativeAgentTaskStateV1::Completed);
+}
+
+#[test]
+fn a_capability_adds_no_tables() {
+    let mut h = CapabilityPairV1::new();
+    let before = h.table_names();
+    let native = before
+        .iter()
+        .filter(|name| name.starts_with("native_agent"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(native, ["native_agent_conflicts", "native_agent_envelopes"]);
+    let task = "task-cap-tables";
+    h.invoke(task, json!({ "steps": 1, "payload": "tables", "lane": "t" }));
+    h.settle(task);
+    h.restart_executor();
+    h.reconcile(task).unwrap();
+    assert_eq!(h.table_names(), before);
+}

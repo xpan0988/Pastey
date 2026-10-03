@@ -840,13 +840,14 @@ pub fn start_native_codex_task(
         .map_err(|error| error.message())
 }
 
-/// Observes the concrete native Codex capability through the existing Layer 4
+/// Observes one native capability through the existing Layer 4
 /// current-session resolver. Compatibility is only a bounded Host fact: it
 /// does not select the Host or grant invocation, Transfer, or Review authority.
-async fn require_remote_native_codex_compatibility(
+async fn require_remote_native_capability(
     state: Arc<AppState>,
     room_id: &str,
     target: &crate::host_identity::HostRef,
+    capability_id: &str,
     required_protocols: &[&str],
 ) -> Result<crate::bridge_lifecycle::CurrentRemoteHostSession, String> {
     let session = state
@@ -858,7 +859,7 @@ async fn require_remote_native_codex_compatibility(
         .await
         .map_err(|error| error.message())?;
     projection
-        .require_native_agent_protocols(required_protocols)
+        .require_native_agent_protocols(capability_id, required_protocols)
         .map_err(|error| error.message())?;
     Ok(session)
 }
@@ -1021,10 +1022,11 @@ pub async fn start_remote_native_codex_task(
     let target =
         crate::host_identity::HostRef::parse_peer(target_host_ref.clone(), &state.local_host_ref)
             .map_err(|error| error.message())?;
-    let session = require_remote_native_codex_compatibility(
+    let session = require_remote_native_capability(
         state.inner().clone(),
         &room_id,
         &target,
+        crate::native_agent::CODEX_CAPABILITY_ID,
         &crate::native_agent::DIRECT_NATIVE_INVOKE_PROTOCOLS,
     )
     .await?;
@@ -1047,31 +1049,105 @@ pub async fn start_remote_native_codex_task(
         .lock()
         .queue_bridge_remote_task(&room_id, &task_id, target.as_str(), &workspace, &task)
         .map_err(|error| error.message())?;
-    let context = crate::room_control::room_control_session_context_for_peer(
-        &state,
-        &room_id,
-        &peer_session_id,
-    )
-    .map_err(|error| error.message())?;
-    let event = crate::room_control::native_agent_event(
-        "native_agent.invoke",
-        serde_json::to_value(request).map_err(|error| error.to_string())?,
-        &context,
-    )
-    .map_err(|error| error.message())?;
-    if crate::room_control::send_room_control_event(
+    send_native_invoke(
         state.inner().clone(),
         &room_id,
+        &peer_session_id,
+        &task_id,
+        serde_json::to_value(request).map_err(|error| error.to_string())?,
+        queued,
+    )
+    .await
+}
+
+/// Invokes one native capability that the selected current Bridge Host
+/// advertises with the generic invoke protocol. `input` is the capability's
+/// own; Pastey only routes, records and correlates it.
+#[tauri::command]
+pub async fn start_remote_native_capability_task(
+    room_id: String,
+    peer_session_id: String,
+    target_host_ref: String,
+    agent_capability: String,
+    input: crate::native_agent::OpaqueCapabilityPayloadV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    let target =
+        crate::host_identity::HostRef::parse_peer(target_host_ref.clone(), &state.local_host_ref)
+            .map_err(|error| error.message())?;
+    let session = require_remote_native_capability(
+        state.inner().clone(),
+        &room_id,
+        &target,
+        &agent_capability,
+        &crate::native_agent::GENERIC_NATIVE_INVOKE_PROTOCOLS,
+    )
+    .await?;
+    if session.binding().peer_route_ref != peer_session_id {
+        return Err("The selected Host session changed before native invocation.".into());
+    }
+    let task_id = format!("native-agent:{}", uuid::Uuid::new_v4());
+    let request = crate::native_agent::NativeAgentInvokeV2 {
+        schema_version: crate::native_agent::NATIVE_AGENT_INVOKE_V2_SCHEMA.into(),
+        task_id: task_id.clone(),
+        target_host_ref: target.as_str().into(),
+        agent_capability: agent_capability.clone(),
+        input: input.clone(),
+    };
+    crate::native_agent::validate_invoke_v2(&request).map_err(|error| error.message())?;
+    let queued = state
+        .native_agents
+        .lock()
+        .queue_bridge_remote_invocation(
+            &room_id,
+            &task_id,
+            target.as_str(),
+            &agent_capability,
+            &input,
+        )
+        .map_err(|error| error.message())?;
+    send_native_invoke(
+        state.inner().clone(),
+        &room_id,
+        &peer_session_id,
+        &task_id,
+        serde_json::to_value(request).map_err(|error| error.to_string())?,
+        queued,
+    )
+    .await
+}
+
+/// Sends one recorded invocation over the selected peer's current Room
+/// Control session. A delivery failure leaves the task for reconciliation.
+async fn send_native_invoke(
+    state: Arc<AppState>,
+    room_id: &str,
+    peer_session_id: &str,
+    task_id: &str,
+    payload: Value,
+    queued: crate::native_agent::NativeAgentTaskStatusV1,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    let context = crate::room_control::room_control_session_context_for_peer(
+        &state,
+        room_id,
+        peer_session_id,
+    )
+    .map_err(|error| error.message())?;
+    let event = crate::room_control::native_agent_event("native_agent.invoke", payload, &context)
+        .map_err(|error| error.message())?;
+    if crate::room_control::send_room_control_event(
+        state.clone(),
+        room_id,
         event,
         Some(crate::room_control::selected_peer_route(
-            &room_id,
-            &peer_session_id,
+            room_id,
+            peer_session_id,
         )),
     )
     .await
     .is_err()
     {
-        return interrupted_remote_native_invoke_status(&mut state.native_agents.lock(), &task_id);
+        return interrupted_remote_native_invoke_status(&mut state.native_agents.lock(), task_id);
     }
     Ok(queued)
 }
@@ -1223,10 +1299,11 @@ pub async fn propose_remote_native_codex_workspace_movement(
 ) -> Result<crate::native_agent::NativeAgentWorkspaceMovementV1, String> {
     let target = crate::host_identity::HostRef::parse_peer(target_host_ref, &state.local_host_ref)
         .map_err(|error| error.message())?;
-    require_remote_native_codex_compatibility(
+    require_remote_native_capability(
         state.inner().clone(),
         &room_id,
         &target,
+        crate::native_agent::CODEX_CAPABILITY_ID,
         &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS,
     )
     .await?;
@@ -1306,10 +1383,11 @@ pub async fn approve_remote_native_codex_workspace_movement(
     let target =
         crate::host_identity::HostRef::parse_peer(movement.target_host_ref, &state.local_host_ref)
             .map_err(|error| error.message())?;
-    let session = require_remote_native_codex_compatibility(
+    let session = require_remote_native_capability(
         state.inner().clone(),
         &room_id,
         &target,
+        crate::native_agent::CODEX_CAPABILITY_ID,
         &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS,
     )
     .await?;
