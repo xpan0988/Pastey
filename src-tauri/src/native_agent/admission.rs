@@ -53,6 +53,16 @@ pub(super) fn decide(principal: &NativeInvocationPrincipalV1<'_>) -> NativeAdmis
     }
 }
 
+/// What Core resumes once an invocation is admitted. Private to Core: a
+/// Review looks the same to the renderer whichever path created it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum NativeInvocationContinuationV1 {
+    /// `native_agent.invoke`.
+    Direct,
+    /// An approved workspace movement whose workspace has landed here.
+    ReceivedWorkspace { movement_id: String },
+}
+
 /// A remote invocation held for Review. It is never persisted and never
 /// leaves Core: no adapter sees `input` before Accept, and the renderer never
 /// sees it at all.
@@ -62,6 +72,7 @@ pub(super) struct PendingNativeInvocationV1 {
     pub(super) binding: HostSessionBinding,
     pub(super) expires_at: i64,
     pub(super) input: OpaqueCapabilityPayloadV1,
+    pub(super) continuation: NativeInvocationContinuationV1,
 }
 
 /// The renderer-safe facts of one pending Review. It carries no input,

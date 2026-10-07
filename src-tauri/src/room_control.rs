@@ -732,18 +732,6 @@ fn resolve_inbound_room_control_peer(
     }
 }
 
-/// The durable HostRef that Bridge membership bound to the exact
-/// authenticated current-session sender, if any.
-fn authenticated_peer_host_ref<'a>(
-    peers: &'a [StoredBridgePeerEndpoint],
-    inbound_peer: &RoomControlRouteEndpoint,
-) -> Option<&'a str> {
-    peers
-        .iter()
-        .find(|peer| peer.peer_session_id == inbound_peer.peer_session_id)
-        .and_then(|peer| peer.logical_host_ref.as_deref())
-}
-
 fn routeable_room_control_peer(
     peer: &StoredBridgePeerEndpoint,
 ) -> AppResult<RoomControlRouteEndpoint> {
@@ -1976,15 +1964,21 @@ pub async fn receive_room_control_event_handler(
                         "Native Agent workspace targets another Host.",
                     );
                 }
-                let Some(source_host_ref) = authenticated_peer_host_ref(&peers, &inbound_peer)
-                else {
+                // The exact authenticated peer session is the movement's
+                // principal: its HostRef must be the claimed source, and it is
+                // the session the landed workspace's executor Review binds.
+                let Ok(binding) = crate::host_runtime::current_host_session_binding(
+                    &ctx.state,
+                    &room_id,
+                    &inbound_peer.peer_session_id,
+                ) else {
                     return control_error(
                         StatusCode::FORBIDDEN,
                         "host_mismatch",
                         "Native Agent workspace has no bound source Host.",
                     );
                 };
-                if request.source_host_ref != source_host_ref {
+                if request.source_host_ref != binding.peer_host_ref.as_str() {
                     return control_error(
                         StatusCode::FORBIDDEN,
                         "host_mismatch",
@@ -2009,7 +2003,7 @@ pub async fn receive_room_control_event_handler(
                     .state
                     .native_agents
                     .lock()
-                    .accept_bridge_workspace_prepare(&room_id, source_host_ref, request)
+                    .accept_bridge_workspace_prepare(&binding, request)
                     .is_err()
                 {
                     return control_error(
@@ -3619,9 +3613,15 @@ mod tests {
             resolve_inbound_room_control_peer(&peers, "target-key"),
             "route_mismatch",
         );
+        // The source HostRef is the one Bridge membership bound to the exact
+        // authenticated sender's route, as `current_host_session_binding`
+        // resolves it.
         let source_of = |key: &str| {
             let inbound = resolve_inbound_room_control_peer(&peers, key).unwrap();
-            authenticated_peer_host_ref(&peers, &inbound).map(str::to_owned)
+            peers
+                .iter()
+                .find(|peer| peer.peer_session_id == inbound.peer_session_id)
+                .and_then(|peer| peer.logical_host_ref.clone())
         };
         assert_eq!(source_of("new-target-key").as_deref(), Some("host:source"));
         assert_eq!(source_of("other-key").as_deref(), Some("host:other"));
