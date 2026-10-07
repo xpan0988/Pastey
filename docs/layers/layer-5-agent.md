@@ -87,8 +87,23 @@ input to the renderer (only task, Bridge, peer `HostRef`/session, capability
 name and expiry), ends on session loss, disappears on Burn or peer
 departure, and is forgotten on restart. There is no stored grant, ACL, or
 "always allow". Once started, an invocation keeps the existing lifecycle and
-is not re-admitted on route or session change. Received workspace movement
-keeps its existing preparation authority and is not yet behind this Review.
+is not re-admitted on route or session change.
+
+Received workspace movement goes through the same admission. The requester's
+movement Review authorizes moving the workspace and the remote operation; it
+is never execution authority on the executing Host. Workspace preparation is
+bound to the exact authenticated peer `HostSessionBinding`. When the encrypted
+workspace lands and is durably owned by its movement, the task stays `queued`
+with `native_agent_review_required`, still `transferring_to_agent`, holding the
+landed tree and the requester's source; Codex is neither prepared nor
+started. The same pending Review, projection, and Accept/Deny apply. Accept
+additionally revalidates that the landed workspace and held input still
+belong to exactly that movement and task, then continues the existing
+movement lifecycle and Return unchanged. Deny, expiry, session loss, and
+restart end task and movement `failed` with the admission code and remove the
+landed tree through the existing terminal cleanup, never through
+reconciliation. Burn and peer departure remove them with the Bridge. A
+duplicate preparation or landing creates no second Review.
 
 When a workspace or result actually must move across Hosts, Pastey uses the
 existing managed object/RegularFileSet and encrypted Transfer flow only for

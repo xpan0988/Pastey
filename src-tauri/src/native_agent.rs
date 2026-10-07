@@ -26,7 +26,8 @@ mod admission;
 mod capability;
 pub(crate) use admission::NativeInvocationReviewV1;
 use admission::{
-    NativeAdmissionDecisionV1, NativeInvocationPrincipalV1, PendingNativeInvocationV1,
+    NativeAdmissionDecisionV1, NativeInvocationContinuationV1, NativeInvocationPrincipalV1,
+    PendingNativeInvocationV1,
 };
 #[cfg(test)]
 use capability::codex::codex_compatibility_at;
@@ -574,6 +575,10 @@ pub(crate) struct NativeAgentServiceV1 {
     /// Digest of the exact input Core admitted for a task. Replays compare it
     /// so a replayed remote input never reaches an adapter.
     task_input_digests: HashMap<String, String>,
+    /// The exact authenticated peer session each received workspace movement
+    /// was prepared over: the principal of its executor Review once the
+    /// workspace lands. Process-local, like the Review itself.
+    movement_bindings: HashMap<String, HostSessionBinding>,
     workspace_movements: HashMap<String, WorkspaceMovementRecordV1>,
     durable_paths: Option<crate::storage::AppPaths>,
     #[cfg(test)]
@@ -607,6 +612,7 @@ impl NativeAgentServiceV1 {
             pending_reviews: HashMap::new(),
             unstarted_review_tasks: HashSet::new(),
             task_input_digests: HashMap::new(),
+            movement_bindings: HashMap::new(),
             workspace_movements: HashMap::new(),
             durable_paths: None,
             #[cfg(test)]
@@ -720,6 +726,16 @@ impl NativeAgentServiceV1 {
             let mut persisted: PersistedNativeAgentEnvelopeV1 =
                 serde_json::from_str(&stored.record_json).map_err(AppError::from)?;
             let mut changed = false;
+            if persisted.task.state == NativeAgentTaskStateV1::Queued
+                && persisted.task.code.as_deref() == Some(admission::REVIEW_REQUIRED_CODE)
+            {
+                // A Review is process-local and never survives restart. Its
+                // task never started, so this is a definite non-start, not a
+                // reconciliation; a landed workspace is cleaned below.
+                persisted.task.state = NativeAgentTaskStateV1::Failed;
+                persisted.task.code = Some(admission::ADMISSION_REVOKED_CODE.into());
+                changed = true;
+            }
             let unbound_local_restart = persisted.bridge_id.is_none()
                 && persisted.remote_target.is_none()
                 && persisted.movement.is_none()
@@ -1051,16 +1067,18 @@ impl NativeAgentServiceV1 {
         let Some(paths) = self.durable_paths.as_ref() else {
             return Ok(());
         };
-        if self.unstarted_review_tasks.contains(task_id) {
-            // A Review is process-local; a task it never started stays so.
-            return Ok(());
-        }
         let task = self.task_status(task_id)?;
         let movement = self
             .workspace_movements
             .values()
             .find(|record| record.status.task_id == task_id)
             .cloned();
+        if movement.is_none() && self.unstarted_review_tasks.contains(task_id) {
+            // A direct Review is process-local; a task it never started stays
+            // so. A received workspace's envelope already exists and keeps
+            // owning the landed tree.
+            return Ok(());
+        }
         let persisted = PersistedNativeAgentEnvelopeV1 {
             task: task.clone(),
             task_workspace: self.task_workspaces.get(task_id).cloned(),
@@ -1469,10 +1487,30 @@ impl NativeAgentServiceV1 {
         Ok(())
     }
 
-    /// Accepts preparation authority from the authenticated current-session
-    /// peer whose durable HostRef is `authenticated_source_host_ref`. The
-    /// claimed source must be that exact Host before anything is prepared.
+    /// Accepts preparation authority from the exact authenticated current
+    /// peer session `binding`, whose HostRef must be the claimed source. The
+    /// binding becomes the principal of the executor Review that the landed
+    /// workspace waits for: requester approval authorizes the movement, never
+    /// execution on this Host.
     pub(crate) fn accept_bridge_workspace_prepare(
+        &mut self,
+        binding: &HostSessionBinding,
+        request: NativeAgentWorkspacePrepareV1,
+    ) -> AppResult<()> {
+        let movement_id = request.movement_id.clone();
+        self.accept_bridge_workspace_prepare_from(
+            &binding.bridge_id,
+            binding.peer_host_ref.as_str(),
+            request,
+        )?;
+        self.movement_bindings.insert(movement_id, binding.clone());
+        Ok(())
+    }
+
+    /// Preparation authority from the authenticated peer whose durable
+    /// HostRef is `authenticated_source_host_ref`. The claimed source must be
+    /// that exact Host before anything is prepared.
+    fn accept_bridge_workspace_prepare_from(
         &mut self,
         bridge_id: &str,
         authenticated_source_host_ref: &str,
@@ -1641,8 +1679,9 @@ impl NativeAgentServiceV1 {
             })
     }
 
-    /// Binds the received file-set to the pre-authorized task workspace.  The
-    /// native Agent sees only that ordinary local directory.
+    /// Binds the received file-set to the pre-authorized task workspace and
+    /// submits the task to executor admission. The native Agent will see only
+    /// that ordinary local directory, and only after this Host's Review.
     pub(crate) fn start_received_workspace_task(
         &mut self,
         movement_id: &str,
@@ -1655,13 +1694,19 @@ impl NativeAgentServiceV1 {
         )
     }
 
+    /// The landing of an approved outbound workspace. The requester's
+    /// movement approval authorizes moving the workspace, never execution on
+    /// this Host: once the landed tree is durably owned, the task goes
+    /// through the same admission as a direct remote invocation, as the peer
+    /// session that prepared the movement. It stays Queued, unprepared and
+    /// unstarted, until this Host's user accepts its Review.
     fn start_received_workspace_task_with_executable(
         &mut self,
         executable: &Path,
         movement_id: &str,
         task_workspace: &Path,
     ) -> AppResult<NativeAgentTaskStatusV1> {
-        let (task_id, task, resume) = {
+        let (task_id, task, resume, landed) = {
             let record = self.workspace_movements.get(movement_id).ok_or_else(|| {
                 AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
             })?;
@@ -1674,6 +1719,7 @@ impl NativeAgentServiceV1 {
                 record.status.task_id.clone(),
                 prepared.task.clone(),
                 prepared.resume,
+                record.task_workspace.is_some(),
             )
         };
         // A cancellation may have reached this Host after workspace prepare
@@ -1688,6 +1734,20 @@ impl NativeAgentServiceV1 {
         {
             return self.task_status(&task_id);
         }
+        // One landing per movement: a duplicate never replaces the owned tree
+        // or creates a second Review.
+        if landed {
+            return invalid("Native Agent workspace has already landed for this movement.");
+        }
+        let binding = self
+            .movement_bindings
+            .get(movement_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::InvalidInput(
+                    "Native Agent workspace movement has no authenticated session.".into(),
+                )
+            })?;
         if !resume && self.codex.has_session(task_workspace) {
             return invalid(
                 "Native Agent workspace already has a session; resumption is required.",
@@ -1696,13 +1756,16 @@ impl NativeAgentServiceV1 {
         let canonical_workspace = task_workspace.canonicalize().map_err(|_| {
             AppError::InvalidInput("Native Agent task workspace is unavailable.".into())
         })?;
+        self.codex.use_executable(executable);
+        // Assembled only; no adapter reads it before admission.
+        let input = capability::codex::codex_input(&canonical_workspace, &task, true)?;
         // Commit ownership of the materialized tree while the task is still
         // queued. If this write fails, no native turn has started and landing
         // cleanup may safely remove the tree.
         self.workspace_movements
             .get_mut(movement_id)
             .expect("checked above")
-            .task_workspace = Some(canonical_workspace.clone());
+            .task_workspace = Some(canonical_workspace);
         if let Err(error) = self.persist_envelope(&task_id, None) {
             self.workspace_movements
                 .get_mut(movement_id)
@@ -1710,19 +1773,55 @@ impl NativeAgentServiceV1 {
                 .task_workspace = None;
             return Err(error);
         }
+        let admitted = self.admit_invocation(
+            NativeInvocationPrincipalV1::Remote(&binding),
+            CODEX_CAPABILITY_ID,
+            &task_id,
+            &input,
+            NativeInvocationContinuationV1::ReceivedWorkspace {
+                movement_id: movement_id.into(),
+            },
+            crate::storage::now_ts(),
+        );
+        if admitted.is_err() {
+            // Nothing started; give the tree back to landing cleanup.
+            if let Some(record) = self.workspace_movements.get_mut(movement_id) {
+                record.task_workspace = None;
+            }
+            let _ = self.persist_envelope(&task_id, None);
+        }
+        admitted
+    }
+
+    /// Starts an admitted received-workspace task: the existing movement
+    /// start, unchanged. On failure nothing has started and the task is
+    /// Queued again; the caller decides what happens to the landed tree.
+    fn start_admitted_received_workspace(
+        &mut self,
+        movement_id: &str,
+        task_id: &str,
+        input: &OpaqueCapabilityPayloadV1,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        let canonical_workspace = self
+            .workspace_movements
+            .get(movement_id)
+            .and_then(|record| record.task_workspace.clone())
+            .ok_or_else(|| {
+                AppError::InvalidInput("Native Agent task workspace is unavailable.".into())
+            })?;
         // The queued entry is only the pre-transfer envelope, not proof of a
         // native turn. Replace it exactly once after the tree is durable.
         let queued = self
             .tasks
             .lock()
             .map_err(|_| AppError::InvalidInput("Native Agent task store is unavailable.".into()))?
-            .remove(&task_id);
+            .remove(task_id);
+        let was_unstarted_review = self.unstarted_review_tasks.remove(task_id);
         let had_session = self.codex.has_session(&canonical_workspace);
-        let started = self.start_codex_task_with_executable_and_id_in_movement(
-            executable,
-            &task_id,
-            &canonical_workspace,
-            &task,
+        let started = self.start_invocation_in_movement(
+            CODEX_CAPABILITY_ID,
+            task_id,
+            input,
             Some(movement_id),
         );
         let status = match started {
@@ -1733,20 +1832,19 @@ impl NativeAgentServiceV1 {
                 if !had_session {
                     self.codex.shutdown_session(&canonical_workspace);
                 }
-                self.task_workspaces.remove(&task_id);
+                self.task_workspaces.remove(task_id);
                 if let Some(queued) = queued {
                     self.tasks
                         .lock()
                         .map_err(|_| {
                             AppError::InvalidInput("Native Agent task store is unavailable.".into())
                         })?
-                        .insert(task_id.clone(), queued);
+                        .insert(task_id.to_owned(), queued);
                 }
-                self.workspace_movements
-                    .get_mut(movement_id)
-                    .expect("checked above")
-                    .task_workspace = None;
-                let _ = self.persist_envelope(&task_id, None);
+                if was_unstarted_review {
+                    self.unstarted_review_tasks.insert(task_id.to_owned());
+                }
+                let _ = self.persist_envelope(task_id, None);
                 return Err(error);
             }
         };
@@ -1772,6 +1870,34 @@ impl NativeAgentServiceV1 {
         let persisted = self.persist_envelope(&task_id, None);
         let _ = persisted;
         Ok(status)
+    }
+
+    /// Accept's movement-specific revalidation: the landed workspace and the
+    /// input held for Review still belong to exactly this movement and task.
+    fn revalidate_received_workspace(
+        &self,
+        pending: &PendingNativeInvocationV1,
+        movement_id: &str,
+    ) -> AppResult<()> {
+        let record = self.workspace_movements.get(movement_id).ok_or_else(|| {
+            AppError::InvalidInput("Native Agent workspace movement is unavailable.".into())
+        })?;
+        let prepared = record.prepared_remote.as_ref().ok_or_else(|| {
+            AppError::InvalidInput("Native Agent workspace was not prepared on this Host.".into())
+        })?;
+        let workspace = record.task_workspace.as_ref().ok_or_else(|| {
+            AppError::InvalidInput("Native Agent task workspace is unavailable.".into())
+        })?;
+        if record.status.task_id != pending.task_id
+            || record.bridge_id.as_deref() != Some(pending.binding.bridge_id.as_str())
+            || record.status.state != NativeAgentWorkspaceMovementStateV1::TransferringToAgent
+            || pending.capability_id != CODEX_CAPABILITY_ID
+            || !workspace.is_dir()
+            || capability::codex::codex_input(workspace, &prepared.task, true)? != pending.input
+        {
+            return invalid("Native Agent workspace no longer matches its Review.");
+        }
+        Ok(())
     }
 
     pub(crate) fn movement_status(
@@ -3064,28 +3190,9 @@ impl NativeAgentServiceV1 {
         workspace: &Path,
         task: &str,
     ) -> AppResult<NativeAgentTaskStatusV1> {
-        self.start_codex_task_with_executable_and_id_in_movement(
-            executable, task_id, workspace, task, None,
-        )
-    }
-
-    fn start_codex_task_with_executable_and_id_in_movement(
-        &mut self,
-        executable: &Path,
-        task_id: &str,
-        workspace: &Path,
-        task: &str,
-        movement_id: Option<&str>,
-    ) -> AppResult<NativeAgentTaskStatusV1> {
         self.codex.use_executable(executable);
         let input = capability::codex::codex_input(workspace, task, true)?;
-        match movement_id {
-            None => self.start_local_invocation(CODEX_CAPABILITY_ID, task_id, &input),
-            // Received workspace movement keeps its own existing authority.
-            Some(_) => {
-                self.start_invocation_in_movement(CODEX_CAPABILITY_ID, task_id, &input, movement_id)
-            }
-        }
+        self.start_local_invocation(CODEX_CAPABILITY_ID, task_id, &input)
     }
 
     /// An invocation by this Host's own user, admitted by the same policy as
@@ -3105,6 +3212,7 @@ impl NativeAgentServiceV1 {
             capability_id,
             task_id,
             input,
+            NativeInvocationContinuationV1::Direct,
             crate::storage::now_ts(),
         )
     }
@@ -3137,6 +3245,7 @@ impl NativeAgentServiceV1 {
                 &request.agent_capability,
                 &request.task_id,
                 &request.input,
+                NativeInvocationContinuationV1::Direct,
                 now,
             )
         })
@@ -3169,37 +3278,47 @@ impl NativeAgentServiceV1 {
         Ok(Some(existing))
     }
 
-    /// The one admission point for a new invocation. Core admits; the
-    /// adapter only validates and starts what Core admitted.
+    /// The one admission point for a new invocation, direct or a received
+    /// workspace. Core admits; the adapter only validates and starts what
+    /// Core admitted.
     fn admit_invocation(
         &mut self,
         principal: NativeInvocationPrincipalV1<'_>,
         capability_id: &str,
         task_id: &str,
         input: &OpaqueCapabilityPayloadV1,
+        continuation: NativeInvocationContinuationV1,
         now: i64,
     ) -> AppResult<NativeAgentTaskStatusV1> {
         self.adapter(capability_id)?.require_available()?;
         match (admission::decide(&principal), principal) {
-            (NativeAdmissionDecisionV1::Allow, _) => {
-                self.start_invocation_in_movement(capability_id, task_id, input, None)
-            }
+            (NativeAdmissionDecisionV1::Allow, _) => match continuation {
+                NativeInvocationContinuationV1::Direct => {
+                    self.start_invocation_in_movement(capability_id, task_id, input, None)
+                }
+                NativeInvocationContinuationV1::ReceivedWorkspace { movement_id } => {
+                    self.start_admitted_received_workspace(&movement_id, task_id, input)
+                }
+            },
             (
                 NativeAdmissionDecisionV1::RequireReview,
                 NativeInvocationPrincipalV1::Remote(binding),
-            ) => self.hold_for_review(binding, capability_id, task_id, input, now),
+            ) => self.hold_for_review(binding, capability_id, task_id, input, continuation, now),
             _ => invalid("Native capability invocation was not admitted by this Host."),
         }
     }
 
-    /// Holds a remote invocation for Review as a Queued task. Nothing about
-    /// it is durable, and no adapter is called.
+    /// Holds a remote invocation for Review as a Queued task; no adapter is
+    /// called. A direct invocation's task is new and nothing about it is
+    /// durable. A received workspace's task already exists and keeps its
+    /// envelope, which owns the landed tree; only its code changes.
     fn hold_for_review(
         &mut self,
         binding: &HostSessionBinding,
         capability_id: &str,
         task_id: &str,
         input: &OpaqueCapabilityPayloadV1,
+        continuation: NativeInvocationContinuationV1,
         now: i64,
     ) -> AppResult<NativeAgentTaskStatusV1> {
         self.expire_invocation_reviews(now);
@@ -3216,24 +3335,63 @@ impl NativeAgentServiceV1 {
         {
             return invalid("Too many native capability invocations are awaiting Review.");
         }
-        let status = NativeAgentTaskStatusV1 {
-            schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
-            task_id: task_id.into(),
-            agent_id: capability_id.into(),
-            workspace_name: capability_id.into(),
-            session_reused: false,
-            state: NativeAgentTaskStateV1::Queued,
-            result: None,
-            code: Some(admission::REVIEW_REQUIRED_CODE.into()),
-            output: None,
+        let status = match &continuation {
+            NativeInvocationContinuationV1::Direct => {
+                let status = NativeAgentTaskStatusV1 {
+                    schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
+                    task_id: task_id.into(),
+                    agent_id: capability_id.into(),
+                    workspace_name: capability_id.into(),
+                    session_reused: false,
+                    state: NativeAgentTaskStateV1::Queued,
+                    result: None,
+                    code: Some(admission::REVIEW_REQUIRED_CODE.into()),
+                    output: None,
+                };
+                self.tasks
+                    .lock()
+                    .map_err(|_| {
+                        AppError::InvalidInput("Native Agent task store is unavailable.".into())
+                    })?
+                    .insert(task_id.into(), status.clone());
+                self.unstarted_review_tasks.insert(task_id.into());
+                self.task_input_digests
+                    .insert(task_id.into(), input.digest());
+                status
+            }
+            NativeInvocationContinuationV1::ReceivedWorkspace { .. } => {
+                let previous = {
+                    let mut tasks = self.tasks.lock().map_err(|_| {
+                        AppError::InvalidInput("Native Agent task store is unavailable.".into())
+                    })?;
+                    let task = tasks
+                        .get_mut(task_id)
+                        .filter(|task| task.state == NativeAgentTaskStateV1::Queued)
+                        .ok_or_else(|| {
+                            AppError::InvalidInput(
+                                "Native Agent workspace task is not awaiting its start.".into(),
+                            )
+                        })?;
+                    task.code.replace(admission::REVIEW_REQUIRED_CODE.into())
+                };
+                self.unstarted_review_tasks.insert(task_id.into());
+                if let Err(error) = self.persist_envelope(task_id, None) {
+                    self.unstarted_review_tasks.remove(task_id);
+                    if let Some(task) = self
+                        .tasks
+                        .lock()
+                        .map_err(|_| {
+                            AppError::InvalidInput("Native Agent task store is unavailable.".into())
+                        })?
+                        .get_mut(task_id)
+                    {
+                        task.code = previous;
+                    }
+                    return Err(error);
+                }
+                self.task_status(task_id)?
+            }
         };
-        self.tasks
-            .lock()
-            .map_err(|_| AppError::InvalidInput("Native Agent task store is unavailable.".into()))?
-            .insert(task_id.into(), status.clone());
-        self.unstarted_review_tasks.insert(task_id.into());
-        self.task_input_digests
-            .insert(task_id.into(), input.digest());
         self.pending_reviews.insert(
             task_id.into(),
             PendingNativeInvocationV1 {
@@ -3242,6 +3400,7 @@ impl NativeAgentServiceV1 {
                 binding: binding.clone(),
                 expires_at,
                 input: input.clone(),
+                continuation,
             },
         );
         Ok(status)
@@ -3258,8 +3417,36 @@ impl NativeAgentServiceV1 {
             .collect::<Vec<_>>();
         for task_id in expired {
             self.pending_reviews.remove(&task_id);
-            let _ = self.finish_unstarted_review(&task_id, admission::REVIEW_EXPIRED_CODE);
+            let _ = self.end_review(&task_id, admission::REVIEW_EXPIRED_CODE);
         }
+    }
+
+    /// Ends a Review-held task as a definite non-start. A received workspace
+    /// movement ends with it, and the existing terminal cleanup removes its
+    /// landed tree. Nothing was prepared or started, so nothing needs
+    /// reconciliation.
+    fn end_review(&mut self, task_id: &str, code: &str) -> AppResult<NativeAgentTaskStatusV1> {
+        let status = self.finish_unstarted_review(task_id, code)?;
+        let movement_id = self
+            .workspace_movements
+            .iter()
+            .find(|(_, record)| {
+                record.status.task_id == task_id && record.prepared_remote.is_some()
+            })
+            .map(|(movement_id, _)| movement_id.clone());
+        if let Some(movement_id) = movement_id {
+            if let Some(record) = self.workspace_movements.get_mut(&movement_id) {
+                if record.status.state == NativeAgentWorkspaceMovementStateV1::TransferringToAgent
+                    && status.state == NativeAgentTaskStateV1::Failed
+                {
+                    record.status.state = NativeAgentWorkspaceMovementStateV1::Failed;
+                    record.status.code = status.code.clone();
+                }
+            }
+            self.persist_envelope(task_id, None)?;
+            self.cleanup_terminal_remote_workspace(&movement_id)?;
+        }
+        Ok(status)
     }
 
     /// Records the definite non-start of a Review-held task. A cancellation
@@ -3327,8 +3514,28 @@ impl NativeAgentServiceV1 {
             return invalid("Native capability Review is unavailable.");
         };
         if let Err(error) = self.revalidate_review(&pending, current, now) {
-            self.finish_unstarted_review(task_id, admission::ADMISSION_REVOKED_CODE)?;
+            self.end_review(task_id, admission::ADMISSION_REVOKED_CODE)?;
             return Err(error);
+        }
+        if let NativeInvocationContinuationV1::ReceivedWorkspace { movement_id } =
+            &pending.continuation
+        {
+            if let Err(error) = self.revalidate_received_workspace(&pending, movement_id) {
+                self.end_review(task_id, admission::ADMISSION_REVOKED_CODE)?;
+                return Err(error);
+            }
+            // Then the existing movement lifecycle, unchanged.
+            return match self.start_admitted_received_workspace(
+                movement_id,
+                task_id,
+                &pending.input,
+            ) {
+                Ok(status) => Ok(status),
+                Err(error) => {
+                    let _ = self.end_review(task_id, admission::START_REJECTED_CODE);
+                    Err(error)
+                }
+            };
         }
         // The placeholder gives way to the started task.
         self.tasks
@@ -3410,7 +3617,7 @@ impl NativeAgentServiceV1 {
         if self.pending_reviews.remove(task_id).is_none() {
             return invalid("Native capability Review is unavailable.");
         }
-        self.finish_unstarted_review(task_id, admission::ADMISSION_DENIED_CODE)
+        self.end_review(task_id, admission::ADMISSION_DENIED_CODE)
     }
 
     /// Ends every Review held for `bridge_id` as a non-start.
@@ -3423,12 +3630,13 @@ impl NativeAgentServiceV1 {
             .collect::<Vec<_>>();
         for task_id in ended {
             self.pending_reviews.remove(&task_id);
-            let _ = self.finish_unstarted_review(&task_id, code);
+            let _ = self.end_review(&task_id, code);
         }
+        self.movement_bindings
+            .retain(|_, binding| binding.bridge_id != bridge_id);
     }
 
-    /// The capability-neutral start of an invocation that is already admitted
-    /// (or is received workspace movement, which keeps its own authority).
+    /// The capability-neutral start of an invocation that is already admitted.
     /// The adapter owns what the input means and how the invocation runs;
     /// Pastey owns task identity, exclusivity, the durable envelope and the
     /// terminal fact.
@@ -4353,6 +4561,8 @@ impl NativeAgentServiceV1 {
         self.revoked_bridges.insert(bridge_id.to_owned());
         self.pending_reviews
             .retain(|_, pending| pending.binding.bridge_id != bridge_id);
+        self.movement_bindings
+            .retain(|_, binding| binding.bridge_id != bridge_id);
         let task_ids = self
             .task_bridges
             .iter()
@@ -5381,7 +5591,10 @@ pub(crate) async fn monitor_received_workspace_task(
     let mut last: Option<NativeAgentTaskStatusV1> = None;
     loop {
         let task = {
-            let service = runtime.native_agents.lock();
+            let mut service = runtime.native_agents.lock();
+            // A landed workspace's Review ends by Accept, Deny or its bounded
+            // expiry, which this existing loop also evaluates.
+            service.expire_invocation_reviews(crate::storage::now_ts());
             let movement = match service.movement_status(&movement_id) {
                 Ok(value) => value,
                 Err(_) => return,
@@ -6017,6 +6230,49 @@ exit 1
         })
     }
 
+    /// The executor's exact current session with a movement's source peer.
+    fn test_movement_binding(bridge_id: &str) -> HostSessionBinding {
+        HostSessionBinding::new(
+            bridge_id,
+            crate::host_identity::HostRef::from_device_id("test-executor").unwrap(),
+            crate::host_identity::HostRef::from_device_id("test-source").unwrap(),
+            "executor-session",
+            "source-session",
+            "source-route",
+            crate::storage::now_ts() + 3_600,
+        )
+        .unwrap()
+    }
+
+    /// Lands an approved outbound workspace over its prepare session and
+    /// accepts the executor Review it then waits for, as this Host's user
+    /// would.
+    fn land_and_accept(
+        service: &mut NativeAgentServiceV1,
+        executable: &Path,
+        movement_id: &str,
+        task_workspace: &Path,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        let bridge_id = service
+            .workspace_movements
+            .get(movement_id)
+            .and_then(|record| record.bridge_id.clone())
+            .expect("a Bridge-prepared movement");
+        let binding = test_movement_binding(&bridge_id);
+        service
+            .movement_bindings
+            .insert(movement_id.into(), binding.clone());
+        let held = service.start_received_workspace_task_with_executable(
+            executable,
+            movement_id,
+            task_workspace,
+        )?;
+        if service.invocation_review_route(&held.task_id).is_none() {
+            return Ok(held);
+        }
+        service.accept_invocation_review(&held.task_id, Some(&binding), crate::storage::now_ts())
+    }
+
     fn wait_for_terminal(service: &NativeAgentServiceV1, task_id: &str) -> NativeAgentTaskStatusV1 {
         for _ in 0..300 {
             let status = service.task_status(task_id).unwrap();
@@ -6525,27 +6781,26 @@ exit 1
         ));
         let mut service = NativeAgentServiceV1::default();
         service
-            .accept_workspace_prepare(NativeAgentWorkspacePrepareV1 {
-                schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
-                movement_id: "movement-cancel-host".into(),
-                task_id: "task-cancel-host".into(),
-                source_host_ref: "host:source".into(),
-                target_host_ref: "host:target".into(),
-                agent_capability: CODEX_CAPABILITY_ID.into(),
-                task: "work".into(),
-                resume: true,
-                source_object: movement_object(),
-                source_digest: "b".repeat(64),
-                source_bytes: 13,
-            })
-            .unwrap();
-        let started = service
-            .start_received_workspace_task_with_executable(
-                &agent,
-                "movement-cancel-host",
-                &workspace,
+            .accept_bridge_workspace_prepare_from(
+                "room-cancel-host",
+                "host:source",
+                NativeAgentWorkspacePrepareV1 {
+                    schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+                    movement_id: "movement-cancel-host".into(),
+                    task_id: "task-cancel-host".into(),
+                    source_host_ref: "host:source".into(),
+                    target_host_ref: "host:target".into(),
+                    agent_capability: CODEX_CAPABILITY_ID.into(),
+                    task: "work".into(),
+                    resume: true,
+                    source_object: movement_object(),
+                    source_digest: "b".repeat(64),
+                    source_bytes: 13,
+                },
             )
             .unwrap();
+        let started =
+            land_and_accept(&mut service, &agent, "movement-cancel-host", &workspace).unwrap();
         thread::sleep(Duration::from_millis(100));
         assert_eq!(
             service.cancel_task(&started.task_id).unwrap().state,
@@ -7331,15 +7586,13 @@ exit 1
         crate::regular_file_set_transfer::cleanup_package(&package);
         let mut executor = NativeAgentServiceV1::with_paths(executor_paths).unwrap();
         executor
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-conflict",
                 &prepare.source_host_ref.clone(),
                 prepare,
             )
             .unwrap();
-        executor
-            .start_received_workspace_task_with_executable(&agent, "movement-conflict", &received)
-            .unwrap();
+        land_and_accept(&mut executor, &agent, "movement-conflict", &received).unwrap();
         assert_eq!(
             wait_for_terminal(&executor, "task-conflict").state,
             NativeAgentTaskStateV1::Completed
@@ -7679,7 +7932,7 @@ exit 1
     ) -> NativeAgentServiceV1 {
         let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
         service
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 bridge_id,
                 "host:source",
                 NativeAgentWorkspacePrepareV1 {
@@ -8133,7 +8386,9 @@ exit 1
             source_bytes: source_identity.byte_count,
         };
         let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
-        service.accept_workspace_prepare(request.clone()).unwrap();
+        service
+            .accept_bridge_workspace_prepare_from("room-landing", "host:source", request.clone())
+            .unwrap();
         let before = crate::storage::get_native_agent_envelope(&paths, "task-landing")
             .unwrap()
             .unwrap()
@@ -8152,9 +8407,7 @@ exit 1
             source_identity.byte_count,
         )
         .unwrap();
-        service
-            .start_received_workspace_task_with_executable(&agent, "movement-landing", &landed)
-            .unwrap();
+        land_and_accept(&mut service, &agent, "movement-landing", &landed).unwrap();
         let after = crate::storage::get_native_agent_envelope(&paths, "task-landing")
             .unwrap()
             .unwrap()
@@ -8511,7 +8764,7 @@ exit 1
         runtime
             .native_agents
             .lock()
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-session-loss",
                 &request.source_host_ref.clone(),
                 request,
@@ -8675,7 +8928,7 @@ exit 1
         .unwrap();
         let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
         service
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-completed-session-loss",
                 "host:source",
                 NativeAgentWorkspacePrepareV1 {
@@ -8784,7 +9037,7 @@ exit 1
         let prompt = "complete remotely";
         let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
         service
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 bridge_id,
                 "host:source",
                 NativeAgentWorkspacePrepareV1 {
@@ -8802,9 +9055,7 @@ exit 1
                 },
             )
             .unwrap();
-        let started = service
-            .start_received_workspace_task_with_executable(&agent, movement_id, &task_workspace)
-            .unwrap();
+        let started = land_and_accept(&mut service, &agent, movement_id, &task_workspace).unwrap();
         assert_eq!(started.state, NativeAgentTaskStateV1::Running);
         assert_eq!(
             wait_for_terminal(&service, task_id).state,
@@ -9068,7 +9319,7 @@ exit 1
             };
 
         service
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-artifacts",
                 "host:source",
                 prepare("movement-return-cleanup", "task-return-cleanup"),
@@ -9103,7 +9354,7 @@ exit 1
         assert!(!returned_snapshot.exists());
 
         service
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-artifacts",
                 "host:source",
                 prepare("movement-restart-cleanup", "task-restart-cleanup"),
@@ -9162,7 +9413,7 @@ exit 1
         ] {
             let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
             service
-                .accept_bridge_workspace_prepare(
+                .accept_bridge_workspace_prepare_from(
                     "room-artifacts",
                     "host:source",
                     prepare(movement_id, task_id),
@@ -9461,7 +9712,7 @@ exit 1
         let paths = durable_paths(&root);
         let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
         service
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-retry",
                 "host:source",
                 NativeAgentWorkspacePrepareV1 {
@@ -9541,7 +9792,7 @@ exit 1
         runtime
             .native_agents
             .lock()
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-no-route",
                 "host:source",
                 NativeAgentWorkspacePrepareV1 {
@@ -9955,7 +10206,7 @@ exit 1
 
         // An authenticated peer claiming another source Host prepares nothing.
         assert!(service
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-a",
                 "host:source",
                 prepare_from("movement-forged", "task-forged", "host:other"),
@@ -9971,7 +10222,7 @@ exit 1
 
         let request = prepare_from("movement-bound", "task-bound", "host:source");
         service
-            .accept_bridge_workspace_prepare("room-a", "host:source", request.clone())
+            .accept_bridge_workspace_prepare_from("room-a", "host:source", request.clone())
             .unwrap();
         assert_eq!(
             service.task_owner("task-bound").unwrap(),
@@ -9980,10 +10231,10 @@ exit 1
         // Another Bridge cannot adopt it, even from the same source Host, and
         // a new movement cannot reuse its task identity.
         assert!(service
-            .accept_bridge_workspace_prepare("room-b", "host:source", request.clone())
+            .accept_bridge_workspace_prepare_from("room-b", "host:source", request.clone())
             .is_err());
         assert!(service
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-a",
                 "host:source",
                 prepare_from("movement-reused", "task-bound", "host:source"),
@@ -9992,7 +10243,7 @@ exit 1
         assert!(service.movement_status("movement-reused").is_err());
         // The owning Bridge's exact replay stays idempotent.
         service
-            .accept_bridge_workspace_prepare("room-a", "host:source", request)
+            .accept_bridge_workspace_prepare_from("room-a", "host:source", request)
             .unwrap();
         assert_eq!(
             service.task_owner("task-bound").unwrap(),
@@ -10074,7 +10325,7 @@ exit 1
         let paths = durable_paths(&root);
         let mut service = NativeAgentServiceV1::with_paths(paths).unwrap();
         service
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room",
                 "host:source",
                 NativeAgentWorkspacePrepareV1 {
@@ -10138,7 +10389,7 @@ exit 1
         let paths = durable_paths(&root);
         let mut before = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
         before
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-recovery",
                 "host:source",
                 NativeAgentWorkspacePrepareV1 {
@@ -10423,7 +10674,7 @@ exit 1
         crate::regular_file_set_transfer::cleanup_package(&package);
         let mut executor = NativeAgentServiceV1::with_paths(executor_paths).unwrap();
         executor
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-finish",
                 &prepare.source_host_ref.clone(),
                 prepare,
@@ -10431,9 +10682,7 @@ exit 1
             .unwrap();
         // Receiver /finish has completed landing and started the one Agent
         // turn before this sender-local UI write fails.
-        executor
-            .start_received_workspace_task_with_executable(&agent, "movement-finish", &received)
-            .unwrap();
+        land_and_accept(&mut executor, &agent, "movement-finish", &received).unwrap();
         let receipt_ambiguous = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let write = crate::transfer::record_successful_finish_before_sender_bookkeeping(
             Some(&receipt_ambiguous),
@@ -10781,19 +11030,13 @@ exit 1
         fs::write(task_workspace.join("baseline.txt"), b"baseline").unwrap();
         let mut executor = NativeAgentServiceV1::with_paths(executor_paths.clone()).unwrap();
         executor
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-exact",
                 &prepare.source_host_ref.clone(),
                 prepare,
             )
             .unwrap();
-        executor
-            .start_received_workspace_task_with_executable(
-                &agent,
-                "movement-exact",
-                &task_workspace,
-            )
-            .unwrap();
+        land_and_accept(&mut executor, &agent, "movement-exact", &task_workspace).unwrap();
         assert_eq!(
             wait_for_terminal(&executor, "task-exact").state,
             NativeAgentTaskStateV1::Completed
@@ -10986,19 +11229,19 @@ exit 1
         fs::write(task_workspace.join("baseline.txt"), b"baseline").unwrap();
         let mut executor = NativeAgentServiceV1::with_paths(executor_paths).unwrap();
         executor
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-unrepresentable",
                 &prepare.source_host_ref.clone(),
                 prepare,
             )
             .unwrap();
-        executor
-            .start_received_workspace_task_with_executable(
-                &agent,
-                "movement-unrepresentable",
-                &task_workspace,
-            )
-            .unwrap();
+        land_and_accept(
+            &mut executor,
+            &agent,
+            "movement-unrepresentable",
+            &task_workspace,
+        )
+        .unwrap();
         assert_eq!(
             wait_for_terminal(&executor, "task-unrepresentable").state,
             NativeAgentTaskStateV1::Completed
@@ -11142,7 +11385,7 @@ exit 1
         fs::write(workspace.join("baseline.txt"), b"baseline").unwrap();
         let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
         service
-            .accept_bridge_workspace_prepare(
+            .accept_bridge_workspace_prepare_from(
                 "room-persist",
                 "host:source",
                 NativeAgentWorkspacePrepareV1 {
@@ -11161,9 +11404,7 @@ exit 1
             )
             .unwrap();
         service.fail_post_start_persist_once = true;
-        service
-            .start_received_workspace_task_with_executable(&agent, "movement-persist", &workspace)
-            .unwrap();
+        land_and_accept(&mut service, &agent, "movement-persist", &workspace).unwrap();
         let stored = crate::storage::get_native_agent_envelope(&paths, "task-persist")
             .unwrap()
             .unwrap();

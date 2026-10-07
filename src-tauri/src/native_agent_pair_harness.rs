@@ -3,8 +3,13 @@
 const PAIR_BRIDGE: &str = "room-pair";
 const PAIR_MOVEMENT: &str = "movement-pair";
 const PAIR_TASK: &str = "task-pair";
-const PAIR_SOURCE: &str = "host:source";
+/// The requester's durable HostRef, as Bridge membership binds it.
+const PAIR_SOURCE: &str =
+    "host:v1:5050505050505050505050505050505050505050505050505050505050505050";
 const PAIR_EXECUTOR: &str = "host:executor";
+/// Fixture Bridge sessions expire long after any test: an exact binding must
+/// compare equal however often a test resolves it.
+const SESSION_EXPIRES_AT: i64 = 4_102_444_800;
 
 struct NativeAgentPairHarnessV1 {
     root: PathBuf,
@@ -19,6 +24,8 @@ struct NativeAgentPairHarnessV1 {
         NativeAgentWorkspaceTransferV1,
         PathBuf,
     )>,
+    /// The last outbound delivery, to replay it.
+    delivered: Option<(NativeAgentWorkspacePrepareV1, NativeAgentWorkspaceTransferV1)>,
     task_workspace: Option<PathBuf>,
     snapshot: Option<PathBuf>,
     result_identity: Option<crate::safe_file_identity::RegularFileSetIdentity>,
@@ -39,6 +46,7 @@ impl NativeAgentPairHarnessV1 {
             format!(
                 r##"#!/bin/sh
 if [ "$2" = "--help" ]; then exit 0; fi
+if [ "$1" = "app-server" ] && [ "$2" = "--stdio" ]; then echo launch >> '{}/app-server-launches'; fi
 while IFS= read -r line; do
   case "$line" in
     *'"id":1'*) echo '{{"id":1,"result":{{}}}}' ;;
@@ -60,7 +68,7 @@ while IFS= read -r line; do
   esac
 done
 "##,
-                root.display(), root.display(), root.display(), root.display(), root.display(), root.display(), root.display()
+                root.display(), root.display(), root.display(), root.display(), root.display(), root.display(), root.display(), root.display()
             ),
         )
         .unwrap();
@@ -84,6 +92,7 @@ done
             requester,
             executor,
             outbound: None,
+            delivered: None,
             task_workspace: None,
             snapshot: None,
             result_identity: None,
@@ -118,10 +127,41 @@ done
         self.outbound = Some(outbound);
     }
 
+    /// The executor's exact current session with the requester.
+    fn pair_binding() -> crate::host_identity::HostSessionBinding {
+        crate::host_identity::HostSessionBinding::new(
+            PAIR_BRIDGE,
+            crate::host_identity::HostRef::from_device_id("pair-executor").unwrap(),
+            crate::host_identity::HostRef::parse(PAIR_SOURCE).unwrap(),
+            "executor-session",
+            "requester-session",
+            "requester-route",
+            SESSION_EXPIRES_AT,
+        )
+        .unwrap()
+    }
+
+    /// Delivery, landing, and the executor user's Accept of the Review the
+    /// landed workspace waits for.
     fn deliver_outbound(&mut self) {
-        let (prepare, metadata, package) = self.outbound.take().unwrap();
+        let held = self.land_outbound();
+        assert_eq!(held.state, NativeAgentTaskStateV1::Queued);
         self.executor
-            .accept_bridge_workspace_prepare(PAIR_BRIDGE, PAIR_SOURCE, prepare)
+            .accept_invocation_review(
+                PAIR_TASK,
+                Some(&Self::pair_binding()),
+                crate::storage::now_ts(),
+            )
+            .unwrap();
+    }
+
+    /// Room Control's `workspace_prepare`, the encrypted Transfer and its
+    /// landing: the workspace is on the executor and its task awaits Review.
+    fn land_outbound(&mut self) -> NativeAgentTaskStatusV1 {
+        let (prepare, metadata, package) = self.outbound.take().unwrap();
+        self.delivered = Some((prepare.clone(), metadata.clone()));
+        self.executor
+            .accept_bridge_workspace_prepare(&Self::pair_binding(), prepare)
             .unwrap();
         self.executor
             .validate_workspace_transfer(&metadata, PAIR_EXECUTOR)
@@ -134,10 +174,12 @@ done
         )
         .unwrap();
         crate::regular_file_set_transfer::cleanup_package(&package);
-        self.executor
+        let held = self
+            .executor
             .start_received_workspace_task_with_executable(&self.agent, PAIR_MOVEMENT, &tree)
             .unwrap();
         self.task_workspace = Some(tree);
+        held
     }
 
     fn complete_agent(&mut self) {
@@ -1180,7 +1222,7 @@ impl Drop for CapabilityPairV1 {
 
 /// The executor's exact current session with the requester on `bridge_id`.
 fn session_binding(bridge_id: &str) -> crate::host_identity::HostSessionBinding {
-    session_binding_with(bridge_id, "requester-session", crate::storage::now_ts() + 3_600)
+    session_binding_with(bridge_id, "requester-session", SESSION_EXPIRES_AT)
 }
 
 fn session_binding_with(
@@ -2212,4 +2254,481 @@ fn a_restart_forgets_pending_reviews_and_starts_nothing() {
     assert_eq!(h.total_prepares(), 0);
     assert_eq!(h.total_starts(), 0);
     assert_eq!(h.table_names(), tables);
+}
+
+// Received workspace execution goes through the same executor admission as a
+// direct remote invocation. The requester's movement approval authorizes the
+// movement; only the executor's Accept lets Codex start on the executor.
+
+impl NativeAgentPairHarnessV1 {
+    fn landed_tree(&self) -> PathBuf {
+        self.task_workspace.clone().unwrap()
+    }
+
+    /// No Codex app-server was launched and no turn was started.
+    fn assert_codex_untouched(&self) {
+        assert_eq!(self.turn_count("app-server-launches"), 0, "{}", self.state_dump());
+        assert_eq!(self.turn_count("turn-starts"), 0, "{}", self.state_dump());
+        assert!(!self.executor.codex.has_task(PAIR_TASK));
+    }
+
+    fn executor_movement(&self) -> NativeAgentWorkspaceMovementV1 {
+        self.executor.movement_status(PAIR_MOVEMENT).unwrap()
+    }
+
+    fn deliver_executor_status(&mut self) -> NativeAgentTaskStatusV1 {
+        let status = NativeAgentStatusV1 {
+            schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: PAIR_TASK.into(),
+            executing_host_ref: PAIR_EXECUTOR.into(),
+            status: self.executor.task_status(PAIR_TASK).unwrap(),
+        };
+        let wire = roundtrip(&status);
+        validate_status(&wire).unwrap();
+        self.requester
+            .record_bridge_remote_status(PAIR_BRIDGE, wire)
+            .unwrap()
+    }
+
+    /// The executor ended its Review without starting anything: the task
+    /// and movement are a definite, durable non-start with `code`, the
+    /// landed tree is gone, and the requester's source is released.
+    fn assert_definite_non_start(&mut self, code: &str) {
+        let task = self.executor.task_status(PAIR_TASK).unwrap();
+        assert_eq!(task.state, NativeAgentTaskStateV1::Failed, "{}", self.state_dump());
+        assert_eq!(task.code.as_deref(), Some(code));
+        let movement = self.executor_movement();
+        assert_eq!(movement.state, NativeAgentWorkspaceMovementStateV1::Failed);
+        assert_eq!(movement.code.as_deref(), Some(code));
+        assert!(!self.landed_tree().exists(), "{}", self.state_dump());
+        assert!(self
+            .executor
+            .workspace_movements
+            .get(PAIR_MOVEMENT)
+            .unwrap()
+            .task_workspace
+            .is_none());
+        assert!(self.executor.invocation_reviews(crate::storage::now_ts()).is_empty());
+        let durable: PersistedNativeAgentEnvelopeV1 = serde_json::from_str(
+            &crate::storage::get_native_agent_envelope(&self.executor_paths, PAIR_TASK)
+                .unwrap()
+                .unwrap()
+                .record_json,
+        )
+        .unwrap();
+        assert_eq!(durable.task.code.as_deref(), Some(code));
+        let seen = self.deliver_executor_status();
+        assert_eq!(seen.state, NativeAgentTaskStateV1::Failed);
+        assert_eq!(seen.code.as_deref(), Some(code));
+        assert!(!movement_holds_source_ownership(
+            &self.requester.movement_status(PAIR_MOVEMENT).unwrap()
+        ));
+        self.assert_codex_untouched();
+    }
+}
+
+#[test]
+fn a_landed_workspace_waits_for_executor_review_without_starting_codex() {
+    let mut h = NativeAgentPairHarnessV1::new();
+    h.propose();
+    h.approve_workspace();
+    let held = h.land_outbound();
+    assert_eq!(held.state, NativeAgentTaskStateV1::Queued);
+    assert_eq!(held.code.as_deref(), Some("native_agent_review_required"));
+    h.assert_codex_untouched();
+    // The landed tree is owned by its movement while the Review is pending.
+    let tree = h.landed_tree();
+    assert!(tree.is_dir());
+    assert_eq!(
+        h.executor_movement().state,
+        NativeAgentWorkspaceMovementStateV1::TransferringToAgent
+    );
+    assert!(h
+        .executor
+        .workspace_has_authoritative_owner(&tree, None, None)
+        .unwrap());
+    assert!(h
+        .executor
+        .start_codex_task_with_executable(&h.agent, &tree, "another task")
+        .is_err());
+    // The requester sees an unstarted task and keeps its source owned; a
+    // reconciliation reports the pending Review, never an execution.
+    let seen = h.deliver_executor_status();
+    assert_eq!(seen.state, NativeAgentTaskStateV1::Queued);
+    assert_eq!(seen.code.as_deref(), Some("native_agent_review_required"));
+    h.assert_source_owned();
+    let fact = h.reconcile();
+    assert_eq!(fact.task_state, NativeAgentTaskStateV1::Queued);
+    assert_eq!(fact.result_digest, None);
+    assert_ne!(
+        h.requester.task_status(PAIR_TASK).unwrap().state,
+        NativeAgentTaskStateV1::Completed
+    );
+    assert_eq!(h.executor.invocation_reviews(crate::storage::now_ts()).len(), 1);
+    h.assert_codex_untouched();
+}
+
+#[test]
+fn accepting_a_workspace_review_starts_codex_once_and_returns_normally() {
+    let mut h = NativeAgentPairHarnessV1::new();
+    h.propose();
+    h.approve_workspace();
+    h.land_outbound();
+    h.assert_codex_untouched();
+    let started = h
+        .executor
+        .accept_invocation_review(
+            PAIR_TASK,
+            Some(&NativeAgentPairHarnessV1::pair_binding()),
+            crate::storage::now_ts(),
+        )
+        .unwrap();
+    assert_eq!(started.state, NativeAgentTaskStateV1::Running);
+    // Accept is consumed once; a second one starts nothing.
+    assert!(h
+        .executor
+        .accept_invocation_review(
+            PAIR_TASK,
+            Some(&NativeAgentPairHarnessV1::pair_binding()),
+            crate::storage::now_ts(),
+        )
+        .is_err());
+    h.complete_agent();
+    h.reconcile();
+    assert_eq!(
+        h.deliver_return().state,
+        NativeAgentWorkspaceMovementStateV1::Completed,
+        "{}",
+        h.state_dump()
+    );
+    assert_eq!(
+        fs::read(h.source.join("result.txt")).unwrap(),
+        b"agent-result\n"
+    );
+    h.assert_completed_history();
+    assert_eq!(h.turn_count("app-server-launches"), 1);
+    assert_eq!(h.turn_count("turn-starts"), 1);
+    assert_eq!(h.turn_count("turn-completions"), 1);
+}
+
+#[test]
+fn denying_a_workspace_review_is_a_clean_definite_non_start() {
+    let mut h = NativeAgentPairHarnessV1::new();
+    h.propose();
+    h.approve_workspace();
+    h.land_outbound();
+    let denied = h
+        .executor
+        .deny_invocation_review(PAIR_TASK, crate::storage::now_ts())
+        .unwrap();
+    assert_eq!(denied.state, NativeAgentTaskStateV1::Failed);
+    h.assert_definite_non_start("native_agent_admission_denied");
+    // A late or replayed landing cannot revive execution authority.
+    let (prepare, metadata) = h.delivered.clone().unwrap();
+    assert!(h
+        .executor
+        .validate_workspace_transfer(&metadata, PAIR_EXECUTOR)
+        .is_err());
+    assert!(h
+        .executor
+        .accept_bridge_workspace_prepare(&NativeAgentPairHarnessV1::pair_binding(), prepare)
+        .is_ok());
+    assert!(h.executor.invocation_reviews(crate::storage::now_ts()).is_empty());
+    assert!(h
+        .executor
+        .accept_invocation_review(
+            PAIR_TASK,
+            Some(&NativeAgentPairHarnessV1::pair_binding()),
+            crate::storage::now_ts(),
+        )
+        .is_err());
+    // A restart keeps the denial; it is never turned into reconciliation.
+    h.restart_executor();
+    let restored = h.executor.task_status(PAIR_TASK).unwrap();
+    assert_eq!(restored.state, NativeAgentTaskStateV1::Failed);
+    assert_eq!(
+        restored.code.as_deref(),
+        Some("native_agent_admission_denied")
+    );
+    // The requester's source is free for a new reviewed movement.
+    h.requester
+        .propose_bridge_workspace_movement(
+            PAIR_BRIDGE,
+            "movement-after-deny",
+            "task-after-deny",
+            &h.source,
+            PAIR_EXECUTOR,
+            movement_object(),
+            "try again",
+            true,
+        )
+        .unwrap();
+    assert!(h
+        .requester
+        .approve_workspace_movement(
+            "movement-after-deny",
+            PAIR_BRIDGE,
+            PAIR_SOURCE,
+            &h.requester_paths.temp_dir,
+        )
+        .is_ok());
+    h.assert_codex_untouched();
+}
+
+#[test]
+fn an_expired_workspace_review_is_a_clean_definite_non_start() {
+    let mut h = NativeAgentPairHarnessV1::new();
+    h.propose();
+    h.approve_workspace();
+    h.land_outbound();
+    let [review] = h
+        .executor
+        .invocation_reviews(crate::storage::now_ts())
+        .try_into()
+        .unwrap();
+    assert!(h
+        .executor
+        .accept_invocation_review(
+            PAIR_TASK,
+            Some(&NativeAgentPairHarnessV1::pair_binding()),
+            review.expires_at,
+        )
+        .is_err());
+    h.assert_definite_non_start("native_agent_review_expired");
+}
+
+#[test]
+fn a_replaced_or_lost_session_fails_the_workspace_review_closed() {
+    // Accept under another session of the same peer.
+    let mut h = NativeAgentPairHarnessV1::new();
+    h.propose();
+    h.approve_workspace();
+    h.land_outbound();
+    let original = NativeAgentPairHarnessV1::pair_binding();
+    let replaced = crate::host_identity::HostSessionBinding::new(
+        PAIR_BRIDGE,
+        original.local_host_ref.clone(),
+        original.peer_host_ref.clone(),
+        &original.local_session_ref,
+        "requester-session-reconnected",
+        &original.peer_route_ref,
+        original.expires_at,
+    )
+    .unwrap();
+    assert!(h
+        .executor
+        .accept_invocation_review(PAIR_TASK, Some(&replaced), crate::storage::now_ts())
+        .is_err());
+    h.assert_definite_non_start("native_agent_admission_revoked");
+
+    // The session ends while the Review is pending.
+    let mut h = NativeAgentPairHarnessV1::new();
+    h.propose();
+    h.approve_workspace();
+    h.land_outbound();
+    h.executor.revoke_bridge_session(PAIR_BRIDGE).unwrap();
+    h.assert_definite_non_start("native_agent_admission_revoked");
+}
+
+#[test]
+fn burn_before_accept_removes_the_workspace_review_for_good() {
+    let mut h = NativeAgentPairHarnessV1::new();
+    h.propose();
+    h.approve_workspace();
+    h.land_outbound();
+    let tree = h.landed_tree();
+    h.executor.purge_bridge_authority(PAIR_BRIDGE).unwrap();
+    assert!(h.executor.invocation_reviews(crate::storage::now_ts()).is_empty());
+    assert!(h.executor.task_status(PAIR_TASK).is_err());
+    assert!(h.executor.movement_status(PAIR_MOVEMENT).is_err());
+    assert!(!tree.exists());
+    assert!(
+        crate::storage::get_native_agent_envelope(&h.executor_paths, PAIR_TASK)
+            .unwrap()
+            .is_none()
+    );
+    assert!(h
+        .executor
+        .accept_invocation_review(
+            PAIR_TASK,
+            Some(&NativeAgentPairHarnessV1::pair_binding()),
+            crate::storage::now_ts(),
+        )
+        .is_err());
+    // Replayed preparation and landing cannot revive the burned authority.
+    let (prepare, metadata) = h.delivered.clone().unwrap();
+    assert!(h
+        .executor
+        .accept_bridge_workspace_prepare(&NativeAgentPairHarnessV1::pair_binding(), prepare)
+        .is_err());
+    assert!(h
+        .executor
+        .validate_workspace_transfer(&metadata, PAIR_EXECUTOR)
+        .is_err());
+    h.assert_codex_untouched();
+}
+
+#[test]
+fn duplicate_preparation_and_landing_keep_one_review_and_one_start() {
+    let mut h = NativeAgentPairHarnessV1::new();
+    h.propose();
+    h.approve_workspace();
+    h.land_outbound();
+    let tree = h.landed_tree();
+    let (prepare, metadata) = h.delivered.clone().unwrap();
+    assert!(h
+        .executor
+        .accept_bridge_workspace_prepare(&NativeAgentPairHarnessV1::pair_binding(), prepare)
+        .is_ok());
+    // A duplicate landing passes Transfer validation but never replaces the
+    // owned tree or creates a second Review.
+    h.executor
+        .validate_workspace_transfer(&metadata, PAIR_EXECUTOR)
+        .unwrap();
+    let duplicate = h.root.join("duplicate-landing");
+    fs::create_dir(&duplicate).unwrap();
+    assert!(h
+        .executor
+        .start_received_workspace_task_with_executable(&h.agent, PAIR_MOVEMENT, &duplicate)
+        .is_err());
+    assert_eq!(
+        h.executor
+            .workspace_movements
+            .get(PAIR_MOVEMENT)
+            .unwrap()
+            .task_workspace
+            .as_deref(),
+        Some(tree.canonicalize().unwrap().as_path())
+    );
+    assert_eq!(h.executor.invocation_reviews(crate::storage::now_ts()).len(), 1);
+    // A direct invocation cannot reuse the movement's task or its Review.
+    let direct = NativeInvocationRequestV1 {
+        task_id: PAIR_TASK.into(),
+        target_host_ref: PAIR_EXECUTOR.into(),
+        agent_capability: CODEX_CAPABILITY_ID.into(),
+        input: capability::codex::codex_input(&tree, "edit the workspace", true).unwrap(),
+    };
+    assert!(h
+        .executor
+        .receive_bridge_invocation(
+            &NativeAgentPairHarnessV1::pair_binding(),
+            &direct,
+            crate::storage::now_ts(),
+        )
+        .is_err());
+    assert_eq!(h.executor.invocation_reviews(crate::storage::now_ts()).len(), 1);
+    h.assert_codex_untouched();
+    h.executor
+        .accept_invocation_review(
+            PAIR_TASK,
+            Some(&NativeAgentPairHarnessV1::pair_binding()),
+            crate::storage::now_ts(),
+        )
+        .unwrap();
+    h.complete_agent();
+    assert_eq!(h.turn_count("turn-starts"), 1);
+}
+
+#[test]
+fn executor_admission_never_replaces_requester_movement_approval() {
+    let mut h = NativeAgentPairHarnessV1::new();
+    h.propose();
+    // Nothing reaches the executor before the requester approves, and the
+    // executor has nothing it could accept in its place.
+    assert!(h.outbound.is_none());
+    assert!(h.executor.invocation_reviews(crate::storage::now_ts()).is_empty());
+    assert!(h
+        .executor
+        .accept_invocation_review(
+            PAIR_TASK,
+            Some(&NativeAgentPairHarnessV1::pair_binding()),
+            crate::storage::now_ts(),
+        )
+        .is_err());
+    let before = h.requester.movement_status(PAIR_MOVEMENT).unwrap();
+    assert!(!movement_holds_source_ownership(&before));
+    // Requester approval alone moves the workspace but does not run Codex.
+    h.approve_workspace();
+    h.land_outbound();
+    h.assert_codex_untouched();
+    h.executor
+        .accept_invocation_review(
+            PAIR_TASK,
+            Some(&NativeAgentPairHarnessV1::pair_binding()),
+            crate::storage::now_ts(),
+        )
+        .unwrap();
+    h.complete_agent();
+    assert_eq!(h.turn_count("turn-starts"), 1);
+}
+
+#[test]
+fn a_workspace_review_projects_like_a_direct_one() {
+    let mut h = NativeAgentPairHarnessV1::new();
+    h.propose();
+    h.approve_workspace();
+    h.land_outbound();
+    let tree = h.landed_tree();
+    let reviews = h.executor.invocation_reviews(crate::storage::now_ts());
+    let projected = serde_json::to_value(&reviews).unwrap();
+    let [review] = projected.as_array().unwrap().as_slice() else {
+        panic!("one Review");
+    };
+    let mut keys = review
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "bridgeId",
+            "capabilityDisplayName",
+            "expiresAt",
+            "peerHostRef",
+            "requestingPeerSessionId",
+            "taskId",
+        ]
+    );
+    assert_eq!(review["capabilityDisplayName"], "Codex");
+    assert_eq!(review["peerHostRef"], PAIR_SOURCE);
+    let text = projected.to_string();
+    for private in [
+        tree.to_string_lossy().as_ref(),
+        h.root.to_string_lossy().as_ref(),
+        "edit the workspace",
+        PAIR_MOVEMENT,
+        "movement",
+        "workspace",
+        "resume",
+    ] {
+        assert!(!text.contains(private), "{private} leaked into {text}");
+    }
+}
+
+#[test]
+fn a_restart_ends_a_pending_workspace_review_without_reconciliation() {
+    let mut h = NativeAgentPairHarnessV1::new();
+    h.propose();
+    h.approve_workspace();
+    h.land_outbound();
+    h.restart_executor();
+    assert!(h
+        .executor
+        .accept_invocation_review(
+            PAIR_TASK,
+            Some(&NativeAgentPairHarnessV1::pair_binding()),
+            crate::storage::now_ts(),
+        )
+        .is_err());
+    h.assert_definite_non_start("native_agent_admission_revoked");
+    // The requester's reconciliation sees the definite non-start.
+    let fact = h.reconcile();
+    assert_eq!(fact.task_state, NativeAgentTaskStateV1::Failed);
+    assert_eq!(
+        h.requester.task_status(PAIR_TASK).unwrap().state,
+        NativeAgentTaskStateV1::Failed
+    );
 }

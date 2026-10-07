@@ -9,6 +9,7 @@ The current development changes belong in `Unreleased`. Each release archives th
 ### Changed
 
 - A remote native capability invocation now requires this Host's Review before anything runs. Authentication and capability availability no longer suffice: the invocation waits, unprepared and unstarted, until the Host user accepts it under the exact session it arrived on; Deny, expiry, session loss and Burn end it without starting. Local invocations are admitted immediately by the same policy. Reviews are process-local and show no invocation input.
+- An approved workspace movement no longer runs Codex on the executing Host by itself. After the workspace lands, the executor shows the same Agent request as a direct invocation; only its Accept starts Codex, and Deny, expiry, session loss, Burn or restart end the movement as a definite non-start and remove the landed workspace. The requester's own movement Review is unchanged and still required.
 
 ### Fixed
 
