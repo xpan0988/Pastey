@@ -59,6 +59,15 @@ and bounded lifecycle/status are correlated end-to-end. Replay is rejected
 before invocation and cancellation wins over a late status. This direct remote
 case creates no ManagedObject, Scratch, Worker, GST scan, or Transfer.
 
+Every task has one immutable owner: Local, or the Bridge it was created on,
+recorded durably as the envelope's Bridge correlation. No invocation, replay,
+workspace preparation, approval, or failed request from another principal can
+adopt, move, or erase it, so Burn selects exactly the tasks its Bridge owns.
+A Bridge can cancel only its own tasks, never a Local task or another Bridge's.
+Workspace preparation is accepted only when its source Host is the exact
+authenticated current-session peer `HostRef`. Ownership is integrity, not
+admission: it does not decide whether a peer may invoke a capability.
+
 When a workspace or result actually must move across Hosts, Pastey uses the
 existing managed object/RegularFileSet and encrypted Transfer flow only for
 that movement. The normal product presents one Review in device terms—send the

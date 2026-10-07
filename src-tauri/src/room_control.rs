@@ -732,6 +732,18 @@ fn resolve_inbound_room_control_peer(
     }
 }
 
+/// The durable HostRef that Bridge membership bound to the exact
+/// authenticated current-session sender, if any.
+fn authenticated_peer_host_ref<'a>(
+    peers: &'a [StoredBridgePeerEndpoint],
+    inbound_peer: &RoomControlRouteEndpoint,
+) -> Option<&'a str> {
+    peers
+        .iter()
+        .find(|peer| peer.peer_session_id == inbound_peer.peer_session_id)
+        .and_then(|peer| peer.logical_host_ref.as_deref())
+}
+
 fn routeable_room_control_peer(
     peer: &StoredBridgePeerEndpoint,
 ) -> AppResult<RoomControlRouteEndpoint> {
@@ -1712,7 +1724,7 @@ pub async fn receive_room_control_event_handler(
                     .state
                     .native_agents
                     .lock()
-                    .cancel_task(&cancel.task_id)
+                    .cancel_bridge_task(&room_id, &cancel.task_id)
                     .is_err()
                 {
                     return control_error(
@@ -1937,6 +1949,21 @@ pub async fn receive_room_control_event_handler(
                         "Native Agent workspace targets another Host.",
                     );
                 }
+                let Some(source_host_ref) = authenticated_peer_host_ref(&peers, &inbound_peer)
+                else {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native Agent workspace has no bound source Host.",
+                    );
+                };
+                if request.source_host_ref != source_host_ref {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native Agent workspace source is not the authenticated peer Host.",
+                    );
+                }
                 if ctx
                     .state
                     .native_agents
@@ -1955,7 +1982,7 @@ pub async fn receive_room_control_event_handler(
                     .state
                     .native_agents
                     .lock()
-                    .accept_bridge_workspace_prepare(&room_id, request)
+                    .accept_bridge_workspace_prepare(&room_id, source_host_ref, request)
                     .is_err()
                 {
                     return control_error(
@@ -3543,6 +3570,36 @@ mod tests {
                 .peer_session_id,
             "legacy-room-peer:room:reconnect:1"
         );
+    }
+
+    #[test]
+    fn workspace_source_host_is_the_authenticated_current_session_peer() {
+        let mut old = route_peer("legacy-room-peer:room");
+        old.liveness = BridgePeerLiveness::Stale;
+        old.logical_host_ref = Some("host:source".into());
+        let mut current = route_peer("legacy-room-peer:room:reconnect:1");
+        current.transport_public_key = Some("new-target-key".into());
+        current.logical_host_ref = Some("host:source".into());
+        let mut other = route_peer("legacy-room-peer:room:other");
+        other.transport_public_key = Some("other-key".into());
+        other.logical_host_ref = Some("host:other".into());
+        let mut unbound = route_peer("legacy-room-peer:room:unbound");
+        unbound.transport_public_key = Some("unbound-key".into());
+        let peers = vec![old, current, other, unbound];
+
+        // A replaced route's key no longer authenticates any source Host.
+        assert_control_route_error(
+            resolve_inbound_room_control_peer(&peers, "target-key"),
+            "route_mismatch",
+        );
+        let source_of = |key: &str| {
+            let inbound = resolve_inbound_room_control_peer(&peers, key).unwrap();
+            authenticated_peer_host_ref(&peers, &inbound).map(str::to_owned)
+        };
+        assert_eq!(source_of("new-target-key").as_deref(), Some("host:source"));
+        assert_eq!(source_of("other-key").as_deref(), Some("host:other"));
+        // A peer without a bound HostRef has no source identity to claim.
+        assert_eq!(source_of("unbound-key"), None);
     }
 
     #[test]
