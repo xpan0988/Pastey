@@ -1005,6 +1005,52 @@ pub fn cancel_native_agent_task(
         .map_err(|error| error.message())
 }
 
+/// Remote native capability invocations waiting for this Host's Review.
+/// Only renderer-safe facts: never the invocation's input.
+#[tauri::command]
+pub fn list_native_invocation_reviews(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::native_agent::NativeInvocationReviewV1>, String> {
+    Ok(state
+        .native_agents
+        .lock()
+        .invocation_reviews(storage::now_ts()))
+}
+
+/// Accepts one pending Review. The requesting peer's exact session is
+/// re-resolved now; the invocation starts only if it is still the session
+/// the Review was created on.
+#[tauri::command]
+pub fn accept_native_invocation_review(
+    task_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    let route = state.native_agents.lock().invocation_review_route(&task_id);
+    // Resolved outside the native service lock; an absent session is
+    // passed on so the Review still ends, closed.
+    let current = route.and_then(|(bridge_id, peer_route_ref)| {
+        crate::host_runtime::current_host_session_binding(&state, &bridge_id, &peer_route_ref).ok()
+    });
+    state
+        .native_agents
+        .lock()
+        .accept_invocation_review(&task_id, current.as_ref(), storage::now_ts())
+        .map_err(|error| error.message())
+}
+
+/// Denies one pending Review: the invocation never starts.
+#[tauri::command]
+pub fn deny_native_invocation_review(
+    task_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    state
+        .native_agents
+        .lock()
+        .deny_invocation_review(&task_id, storage::now_ts())
+        .map_err(|error| error.message())
+}
+
 /// Dispatches a native Codex task to one exact current Bridge Host. The
 /// workspace path is encrypted control input for that Host only; no managed
 /// resource, Scratch, Worker, or Transfer is introduced when it already exists

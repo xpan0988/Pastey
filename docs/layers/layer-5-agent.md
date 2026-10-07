@@ -68,6 +68,28 @@ Workspace preparation is accepted only when its source Host is the exact
 authenticated current-session peer `HostRef`. Ownership is integrity, not
 admission: it does not decide whether a peer may invoke a capability.
 
+Admission is that decision, made by Core on the executing Host before any
+capability adapter sees the input. Bridge/session authentication and
+capability availability are necessary but never sufficient. The fixed policy
+admits a Local invocation at once and holds every remote `native_agent.invoke`
+for Host Review: after the exact authenticated peer `HostSessionBinding`, the
+target Host, ownership/replay and availability checks pass, the task is
+`queued` with `native_agent_review_required` and neither `prepare` nor `start`
+has run. Accept is one-shot; it starts the invocation only if the exact
+binding is still current, the Bridge was not Burned, the Review has not
+expired (two minutes, bounded by the Bridge expiry), ownership is unchanged
+and the capability is still available. Deny, expiry and lost authority end
+the task `failed` with `native_agent_admission_denied`,
+`native_agent_review_expired` or `native_agent_admission_revoked`; a
+capability that refuses an accepted input ends `native_agent_start_rejected`.
+A pending Review is process-local: it is never persisted, never exposes its
+input to the renderer (only task, Bridge, peer `HostRef`/session, capability
+name and expiry), ends on session loss, disappears on Burn or peer
+departure, and is forgotten on restart. There is no stored grant, ACL, or
+"always allow". Once started, an invocation keeps the existing lifecycle and
+is not re-admitted on route or session change. Received workspace movement
+keeps its existing preparation authority and is not yet behind this Review.
+
 When a workspace or result actually must move across Hosts, Pastey uses the
 existing managed object/RegularFileSet and encrypted Transfer flow only for
 that movement. The normal product presents one Review in device terms—send the

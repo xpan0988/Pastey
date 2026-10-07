@@ -54,6 +54,7 @@ struct JobV1 {
 #[derive(Default)]
 struct FakeStateV1 {
     jobs: HashMap<String, JobV1>,
+    prepares: usize,
     starts: usize,
     hold: bool,
     complete_despite_cancel: bool,
@@ -98,6 +99,11 @@ impl FakeLongJobAdapterV1 {
         self.with(|state| state.observation_lost = true);
     }
 
+    /// How many inputs the capability was asked to prepare.
+    pub(in crate::native_agent) fn prepares(&self) -> usize {
+        self.with(|state| state.prepares)
+    }
+
     /// How many invocations the capability itself accepted.
     pub(in crate::native_agent) fn starts(&self) -> usize {
         self.with(|state| state.starts)
@@ -139,6 +145,7 @@ impl NativeCapabilityAdapterV1 for FakeLongJobAdapterV1 {
     }
 
     fn prepare(&self, input: &OpaqueCapabilityPayloadV1) -> AppResult<PreparedInvocationV1> {
+        self.with(|state| state.prepares += 1);
         let parsed = parse(input)?;
         Ok(PreparedInvocationV1 {
             identity_digest: input.digest(),

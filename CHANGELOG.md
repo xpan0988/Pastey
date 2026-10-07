@@ -6,6 +6,10 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ## Unreleased
 
+### Changed
+
+- A remote native capability invocation now requires this Host's Review before anything runs. Authentication and capability availability no longer suffice: the invocation waits, unprepared and unstarted, until the Host user accepts it under the exact session it arrived on; Deny, expiry, session loss and Burn end it without starting. Local invocations are admitted immediately by the same policy. Reviews are process-local and show no invocation input.
+
 ### Fixed
 
 - Bound every Native Agent task to one immutable owner, Local or its Bridge. Another Bridge can no longer adopt, re-home, or detach a task through a duplicate or conflicting invocation, workspace preparation, or approval, and Burn again selects exactly the tasks its Bridge owns, including after restart.

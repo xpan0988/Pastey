@@ -227,6 +227,21 @@ test("Developer Mode stays inside the selected Bridge and receiver observation i
   assert.match(workspace, /Accept/);
 });
 
+test("native capability Review offers only Accept or Deny and never shows invocation input", () => {
+  const workspace = readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8");
+  const tauri = readFileSync("src/lib/tauri.ts", "utf8");
+  assert.match(workspace, /listNativeInvocationReviews\(\)/);
+  assert.match(workspace, /acceptNativeInvocationReview\(pendingReview\.taskId\)/);
+  assert.match(workspace, /denyNativeInvocationReview\(pendingReview\.taskId\)/);
+  assert.match(workspace, /Agent request/);
+  const review = tauri.match(/export interface NativeInvocationReview \{([^}]*)\}/)?.[1] ?? "";
+  assert.deepEqual(
+    [...review.matchAll(/^\s*(\w+):/gm)].map((field) => field[1]).sort(),
+    ["bridgeId", "capabilityDisplayName", "expiresAt", "peerHostRef", "requestingPeerSessionId", "taskId"],
+  );
+  assert.doesNotMatch(review, /input|path|command|args|provider/i);
+});
+
 test("Bridge send selection never falls back from a stale session to another peer", () => {
   const bridge = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
   assert.match(bridge, /peers\.find\(\(peer\) => peer\.peerSessionId === selectedPeerId\) \?\? null/);

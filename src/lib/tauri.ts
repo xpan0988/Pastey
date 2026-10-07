@@ -235,6 +235,28 @@ export function cancelNativeAgentTask(taskId: string): Promise<NativeAgentTaskSt
   return invoke("cancel_native_agent_task", { taskId });
 }
 
+/** A remote invocation waiting for this Host's Review. Never its input. */
+export interface NativeInvocationReview {
+  taskId: string;
+  bridgeId: string;
+  peerHostRef: string;
+  requestingPeerSessionId: string;
+  capabilityDisplayName: string;
+  expiresAt: number;
+}
+
+export function listNativeInvocationReviews(): Promise<NativeInvocationReview[]> {
+  return invoke("list_native_invocation_reviews");
+}
+
+export function acceptNativeInvocationReview(taskId: string): Promise<NativeAgentTaskStatus> {
+  return invoke("accept_native_invocation_review", { taskId });
+}
+
+export function denyNativeInvocationReview(taskId: string): Promise<NativeAgentTaskStatus> {
+  return invoke("deny_native_invocation_review", { taskId });
+}
+
 export function startRemoteNativeCodexTask(
   roomId: string, peerSessionId: string, targetHostRef: string, workspace: string, task: string, resume: boolean,
 ): Promise<NativeAgentTaskStatus> {
