@@ -121,7 +121,7 @@ done
     fn deliver_outbound(&mut self) {
         let (prepare, metadata, package) = self.outbound.take().unwrap();
         self.executor
-            .accept_bridge_workspace_prepare(PAIR_BRIDGE, prepare)
+            .accept_bridge_workspace_prepare(PAIR_BRIDGE, PAIR_SOURCE, prepare)
             .unwrap();
         self.executor
             .validate_workspace_transfer(&metadata, PAIR_EXECUTOR)
@@ -921,6 +921,7 @@ fn pair_completed_agent_capture_failure_preserves_history_and_resolution() {
 use crate::native_agent::capability::fake_longjob::{FakeLongJobAdapterV1, FAKE_LONGJOB_ID};
 
 const CAP_BRIDGE: &str = "room-capability";
+const OTHER_BRIDGE: &str = "room-capability-other";
 
 fn opaque(value: Value) -> OpaqueCapabilityPayloadV1 {
     serde_json::from_value(value).unwrap()
@@ -983,10 +984,39 @@ impl CapabilityPairV1 {
 
     /// The executor handles `native_agent.invoke` as Room Control does.
     fn receive_invoke(&mut self, wire: Value) -> AppResult<NativeAgentTaskStatusV1> {
+        self.receive_invoke_over(CAP_BRIDGE, wire)
+    }
+
+    /// The same handling for an invoke authenticated on `bridge_id`.
+    fn receive_invoke_over(
+        &mut self,
+        bridge_id: &str,
+        wire: Value,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
         let request = parse_invoke(wire)?;
         assert_eq!(request.target_host_ref, PAIR_EXECUTOR);
         self.executor.require_capability(&request.agent_capability)?;
-        self.executor.start_bridge_invocation(CAP_BRIDGE, &request)
+        self.executor.start_bridge_invocation(bridge_id, &request)
+    }
+
+    fn owner(&self, task_id: &str) -> Option<TaskOwnerV1> {
+        self.executor.task_owner(task_id).unwrap()
+    }
+
+    /// The executor's durable envelope for the task, verbatim.
+    fn durable_record(&self, task_id: &str) -> Option<String> {
+        crate::storage::get_native_agent_envelope(&self.executor_paths, task_id)
+            .unwrap()
+            .map(|stored| stored.record_json)
+    }
+
+    /// The owner the durable envelope records: its `bridge_id`, or `None`
+    /// for Local.
+    fn durable_owner(&self, task_id: &str) -> Option<String> {
+        let record = self.durable_record(task_id).expect("durable envelope");
+        serde_json::from_str::<PersistedNativeAgentEnvelopeV1>(&record)
+            .unwrap()
+            .bridge_id
     }
 
     fn invoke(&mut self, task_id: &str, input: Value) -> NativeAgentTaskStatusV1 {
@@ -1250,7 +1280,7 @@ fn cancel_intent_wins_over_a_late_native_completion() {
     // The requester revokes first; then the cancel reaches the executor.
     let local = h.requester.cancel_remote_task(task, PAIR_EXECUTOR).unwrap();
     assert_eq!(local.state, NativeAgentTaskStateV1::Cancelled);
-    let requested = h.executor.cancel_task(task).unwrap();
+    let requested = h.executor.cancel_bridge_task(CAP_BRIDGE, task).unwrap();
     assert_eq!(requested.state, NativeAgentTaskStateV1::Cancelled);
     assert_eq!(
         requested.code.as_deref(),
@@ -1282,7 +1312,7 @@ fn honoured_cancel_is_confirmed_apart_from_the_request() {
     let task = "task-cap-cancel";
     h.fake.hold();
     h.invoke(task, json!({ "steps": 2, "payload": "stop" }));
-    let requested = h.executor.cancel_task(task).unwrap();
+    let requested = h.executor.cancel_bridge_task(CAP_BRIDGE, task).unwrap();
     assert_eq!(
         requested.code.as_deref(),
         Some("native_agent_cancel_requested")
@@ -1505,7 +1535,7 @@ fn an_unknown_outcome_holds_its_key_until_cancelled() {
     h.settle("task-unknown-a");
     let still = h.send_invoke("task-unknown-c", json!({ "steps": 1, "payload": 3, "lane": "z" }));
     assert!(h.receive_invoke(still).is_err());
-    let cancelled = h.executor.cancel_task("task-unknown-a").unwrap();
+    let cancelled = h.executor.cancel_bridge_task(CAP_BRIDGE, "task-unknown-a").unwrap();
     assert_eq!(cancelled.state, NativeAgentTaskStateV1::Cancelled);
     let free = h.send_invoke("task-unknown-d", json!({ "steps": 1, "payload": 4, "lane": "z" }));
     h.receive_invoke(free).unwrap();
@@ -1546,4 +1576,174 @@ fn a_capability_adds_no_tables() {
     h.restart_executor();
     h.reconcile(task).unwrap();
     assert_eq!(h.table_names(), before);
+}
+
+fn bridge_owner(bridge_id: &str) -> Option<TaskOwnerV1> {
+    Some(TaskOwnerV1::Bridge(bridge_id.into()))
+}
+
+#[test]
+fn another_bridge_cannot_adopt_a_task_with_identical_input() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-adopt";
+    h.fake.hold();
+    let wire = h.send_invoke(task, json!({ "steps": 1, "payload": "owned" }));
+    h.receive_invoke(wire.clone()).unwrap();
+    assert!(h.receive_invoke_over(OTHER_BRIDGE, wire).is_err());
+    assert_eq!(h.owner(task), bridge_owner(CAP_BRIDGE));
+    assert_eq!(h.durable_owner(task).as_deref(), Some(CAP_BRIDGE));
+    assert_eq!(h.total_starts(), 1);
+    // Burn of the other Bridge does not reach the task; Burn of its owner does.
+    h.executor.purge_bridge_authority(OTHER_BRIDGE).unwrap();
+    assert_eq!(
+        h.executor.task_status(task).unwrap().state,
+        NativeAgentTaskStateV1::Running
+    );
+    assert!(!h.fake.cancel_requested(task));
+    h.executor.purge_bridge_authority(CAP_BRIDGE).unwrap();
+    assert!(h.fake.cancel_requested(task));
+    assert!(h.executor.task_status(task).is_err());
+    assert_eq!(h.durable_record(task), None);
+    h.fake.release();
+}
+
+#[test]
+fn a_conflicting_replay_never_disturbs_the_owner() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-conflict-owner";
+    h.fake.hold();
+    h.invoke(task, json!({ "steps": 1, "payload": "original" }));
+    let durable = h.durable_record(task);
+    let different = wire_invoke(task, opaque(json!({ "steps": 1, "payload": "other" })));
+    // From another Bridge, and from the owner itself.
+    assert!(h
+        .receive_invoke_over(OTHER_BRIDGE, different.clone())
+        .is_err());
+    assert!(h.receive_invoke(different).is_err());
+    assert_eq!(h.owner(task), bridge_owner(CAP_BRIDGE));
+    assert_eq!(h.durable_record(task), durable);
+    assert_eq!(h.durable_owner(task).as_deref(), Some(CAP_BRIDGE));
+    assert_eq!(h.total_starts(), 1);
+    h.executor.purge_bridge_authority(CAP_BRIDGE).unwrap();
+    assert!(h.fake.cancel_requested(task));
+    h.fake.release();
+}
+
+#[test]
+fn a_bridge_cannot_adopt_or_cancel_a_local_task() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-local";
+    let input = json!({ "steps": 1, "payload": "local" });
+    h.fake.hold();
+    h.executor
+        .start_invocation_in_movement(FAKE_LONGJOB_ID, task, &opaque(input.clone()), None)
+        .unwrap();
+    assert!(h.receive_invoke(wire_invoke(task, opaque(input))).is_err());
+    assert!(h.executor.cancel_bridge_task(CAP_BRIDGE, task).is_err());
+    assert_eq!(h.owner(task), Some(TaskOwnerV1::Local));
+    assert_eq!(h.durable_owner(task), None);
+    assert_eq!(
+        h.executor.task_status(task).unwrap().state,
+        NativeAgentTaskStateV1::Running
+    );
+    assert!(!h.fake.cancel_requested(task));
+    assert_eq!(h.total_starts(), 1);
+    // Burn of a Bridge never selects a Local task; local cancel still works.
+    h.executor.purge_bridge_authority(CAP_BRIDGE).unwrap();
+    assert!(!h.fake.cancel_requested(task));
+    let cancelled = h.executor.cancel_task(task).unwrap();
+    assert_eq!(cancelled.state, NativeAgentTaskStateV1::Cancelled);
+    assert!(h.fake.cancel_requested(task));
+    h.fake.release();
+}
+
+#[test]
+fn the_owning_bridge_replays_idempotently_without_a_second_start() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-same-owner";
+    h.fake.hold();
+    let wire = h.send_invoke(task, json!({ "steps": 1, "payload": "twice" }));
+    let first = h.receive_invoke(wire.clone()).unwrap();
+    let second = h.receive_invoke(wire).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(h.total_starts(), 1);
+    assert_eq!(h.owner(task), bridge_owner(CAP_BRIDGE));
+    assert_eq!(h.durable_owner(task).as_deref(), Some(CAP_BRIDGE));
+    h.fake.release();
+    assert_eq!(h.settle(task).state, NativeAgentTaskStateV1::Completed);
+}
+
+#[test]
+fn only_the_owning_bridge_can_cancel_a_task() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-cancel-owner";
+    h.fake.hold();
+    h.invoke(task, json!({ "steps": 1, "payload": "cancel" }));
+    assert!(h.executor.cancel_bridge_task(OTHER_BRIDGE, task).is_err());
+    assert_eq!(
+        h.executor.task_status(task).unwrap().state,
+        NativeAgentTaskStateV1::Running
+    );
+    assert!(!h.fake.cancel_requested(task));
+    // An unknown task gets the same answer as another Bridge's task.
+    assert!(h
+        .executor
+        .cancel_bridge_task(CAP_BRIDGE, "task-cap-unknown")
+        .is_err());
+    let cancelled = h.executor.cancel_bridge_task(CAP_BRIDGE, task).unwrap();
+    assert_eq!(cancelled.state, NativeAgentTaskStateV1::Cancelled);
+    assert!(h.fake.cancel_requested(task));
+    assert_eq!(h.owner(task), bridge_owner(CAP_BRIDGE));
+    h.fake.release();
+    assert_eq!(h.settle(task).state, NativeAgentTaskStateV1::Cancelled);
+}
+
+#[test]
+fn restart_restores_local_and_bridge_ownership_from_the_envelope() {
+    let mut h = CapabilityPairV1::new();
+    let bridge_task = "task-cap-restart-bridge";
+    let local_task = "task-cap-restart-local";
+    let local_input = json!({ "steps": 1, "payload": "local" });
+    h.invoke(bridge_task, json!({ "steps": 1, "payload": "bridge" }));
+    h.settle(bridge_task);
+    h.executor
+        .start_invocation_in_movement(
+            FAKE_LONGJOB_ID,
+            local_task,
+            &opaque(local_input.clone()),
+            None,
+        )
+        .unwrap();
+    h.settle(local_task);
+    h.restart_executor();
+    // Ownership is inferred from the envelope's `bridge_id`; none is Local.
+    assert_eq!(h.durable_owner(bridge_task).as_deref(), Some(CAP_BRIDGE));
+    assert_eq!(h.owner(bridge_task), bridge_owner(CAP_BRIDGE));
+    assert_eq!(h.durable_owner(local_task), None);
+    assert_eq!(h.owner(local_task), Some(TaskOwnerV1::Local));
+    // The restored owners still refuse adoption and foreign cancellation.
+    assert!(h
+        .receive_invoke_over(
+            OTHER_BRIDGE,
+            wire_invoke(bridge_task, opaque(json!({ "steps": 1, "payload": "bridge" })))
+        )
+        .is_err());
+    assert!(h
+        .receive_invoke(wire_invoke(local_task, opaque(local_input)))
+        .is_err());
+    assert!(h
+        .executor
+        .cancel_bridge_task(OTHER_BRIDGE, bridge_task)
+        .is_err());
+    assert!(h.executor.cancel_bridge_task(CAP_BRIDGE, local_task).is_err());
+    assert_eq!(h.total_starts(), 2);
+    // Burn selects exactly the restored Bridge task.
+    h.executor.purge_bridge_authority(CAP_BRIDGE).unwrap();
+    assert!(h.executor.task_status(bridge_task).is_err());
+    assert_eq!(h.durable_record(bridge_task), None);
+    assert_eq!(
+        h.executor.task_status(local_task).unwrap().state,
+        NativeAgentTaskStateV1::Completed
+    );
+    assert_eq!(h.owner(local_task), Some(TaskOwnerV1::Local));
 }

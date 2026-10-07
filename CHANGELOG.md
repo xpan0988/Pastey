@@ -6,6 +6,12 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ## Unreleased
 
+### Fixed
+
+- Bound every Native Agent task to one immutable owner, Local or its Bridge. Another Bridge can no longer adopt, re-home, or detach a task through a duplicate or conflicting invocation, workspace preparation, or approval, and Burn again selects exactly the tasks its Bridge owns, including after restart.
+- Executor-side `native_agent.cancel` now requires the authenticated Bridge to own the task; a Bridge cannot cancel a Local task or another Bridge's task.
+- `native_agent.workspace_prepare` is accepted only when its source Host is the authenticated current-session peer `HostRef`.
+
 ## 2.0.0-beta.2 — Pastey 2.0 Beta 2 — 2026-09-25
 
 ### Fixed / Changed

@@ -419,6 +419,17 @@ struct WorkspaceApplyTransactionV1 {
     phase: WorkspaceApplyPhaseV1,
 }
 
+/// The authority a task belongs to. Once a task exists its owner never
+/// changes: no invocation, replay, preparation, cancellation or failure from
+/// another principal may adopt, move or erase it. Only Burn removes a
+/// Bridge-owned task, together with its owner. The owner is durable as the
+/// envelope's `bridge_id` (or its movement's), and its absence means Local.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TaskOwnerV1 {
+    Local,
+    Bridge(String),
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct PersistedNativeAgentEnvelopeV1 {
     task: NativeAgentTaskStatusV1,
@@ -544,6 +555,8 @@ pub(crate) struct NativeAgentServiceV1 {
     task_workspaces: HashMap<String, PathBuf>,
     task_digests: HashMap<String, String>,
     task_exclusivity: HashMap<String, ExclusivityKeyV1>,
+    /// The Bridge that owns each Bridge-derived task. A task in `tasks`
+    /// without an entry here is Local. See `TaskOwnerV1`.
     task_bridges: HashMap<String, String>,
     revoked_bridges: HashSet<String>,
     workspace_movements: HashMap<String, WorkspaceMovementRecordV1>,
@@ -622,6 +635,59 @@ impl NativeAgentServiceV1 {
             .ok_or_else(|| {
                 AppError::InvalidInput("Native capability is unavailable on this Host.".into())
             })
+    }
+
+    /// The owner of an existing task, or `None` when no such task exists.
+    fn task_owner(&self, task_id: &str) -> AppResult<Option<TaskOwnerV1>> {
+        if !self
+            .tasks
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Native Agent task store is unavailable.".into()))?
+            .contains_key(task_id)
+        {
+            return Ok(None);
+        }
+        Ok(Some(match self.task_bridges.get(task_id) {
+            Some(bridge_id) => TaskOwnerV1::Bridge(bridge_id.clone()),
+            None => TaskOwnerV1::Local,
+        }))
+    }
+
+    /// Runs `create` for a task owned by `bridge_id`. An existing task with
+    /// another owner is refused before anything is touched; an existing task
+    /// of this Bridge reaches `create`'s own replay checks with its ownership
+    /// untouched. A new task's owner is recorded first so its durable
+    /// envelope carries it, and is released only if no task was created.
+    fn with_bridge_task_owner<T>(
+        &mut self,
+        bridge_id: &str,
+        task_id: &str,
+        create: impl FnOnce(&mut Self) -> AppResult<T>,
+    ) -> AppResult<T> {
+        if self.revoked_bridges.contains(bridge_id) {
+            return invalid("Native Agent Bridge authority was revoked.");
+        }
+        match self.task_owner(task_id)? {
+            Some(TaskOwnerV1::Bridge(owner)) if owner == bridge_id => create(self),
+            Some(_) => invalid("Native Agent task belongs to another authority."),
+            None => {
+                self.task_bridges
+                    .insert(task_id.to_owned(), bridge_id.to_owned());
+                let result = create(self);
+                if result.is_err() && self.task_owner(task_id)?.is_none() {
+                    self.task_bridges.remove(task_id);
+                }
+                result
+            }
+        }
+    }
+
+    /// Local starts never join a task that a Bridge owns.
+    fn require_local_task_owner(&self, task_id: &str) -> AppResult<()> {
+        if self.task_bridges.contains_key(task_id) {
+            return invalid("Native Agent task belongs to another authority.");
+        }
+        Ok(())
     }
 
     /// Loads only Pastey's outer facts. Any task whose native outcome was not
@@ -1096,6 +1162,9 @@ impl NativeAgentServiceV1 {
             }
             return invalid("Native Agent movement identity was replayed for another workspace.");
         }
+        if self.task_owner(task_id)?.is_some() {
+            return invalid("Native Agent movement task identity is already in use.");
+        }
         let source_workspace_name = source_workspace
             .file_name()
             .and_then(|name| name.to_str())
@@ -1171,31 +1240,24 @@ impl NativeAgentServiceV1 {
         task: &str,
         resume: bool,
     ) -> AppResult<NativeAgentWorkspaceMovementV1> {
-        if self.revoked_bridges.contains(bridge_id) {
-            return invalid("Native Agent Bridge authority was revoked.");
-        }
-        let status = self.propose_workspace_movement(
-            movement_id,
-            task_id,
-            source_workspace,
-            target_host_ref,
-            source_object,
-            task,
-            resume,
-        )?;
-        self.task_bridges
-            .insert(task_id.to_owned(), bridge_id.to_owned());
-        if let Some(record) = self.workspace_movements.get_mut(movement_id) {
-            record.bridge_id = Some(bridge_id.to_owned());
-        }
-        if let Err(error) = self.persist_envelope(task_id, None) {
-            self.task_bridges.remove(task_id);
-            if let Some(record) = self.workspace_movements.get_mut(movement_id) {
-                record.bridge_id = None;
+        self.with_bridge_task_owner(bridge_id, task_id, |service| {
+            let status = service.propose_workspace_movement(
+                movement_id,
+                task_id,
+                source_workspace,
+                target_host_ref,
+                source_object,
+                task,
+                resume,
+            )?;
+            if let Some(record) = service.workspace_movements.get_mut(movement_id) {
+                record.bridge_id = Some(bridge_id.to_owned());
             }
-            return Err(error);
-        }
-        Ok(status)
+            // The proposal's envelope already carries this owner, so a failed
+            // write here leaves memory and disk agreeing on it.
+            service.persist_envelope(task_id, None)?;
+            Ok(status)
+        })
     }
 
     /// Revalidates the approved source and frames it with the established
@@ -1221,10 +1283,11 @@ impl NativeAgentServiceV1 {
         if source_workspace.status.state != NativeAgentWorkspaceMovementStateV1::AwaitingApproval {
             return invalid("Native Agent workspace movement is not awaiting Review approval.");
         }
-        if source_workspace
-            .bridge_id
-            .as_deref()
-            .is_some_and(|bound| bound != bridge_id)
+        // Approval sends the movement over its owning Bridge; it never adopts
+        // an unbound or another Bridge's movement.
+        if source_workspace.bridge_id.as_deref() != Some(bridge_id)
+            || self.task_owner(&source_workspace.status.task_id)?
+                != Some(TaskOwnerV1::Bridge(bridge_id.to_owned()))
         {
             return invalid("Native Agent movement crossed its Bridge authority.");
         }
@@ -1325,6 +1388,9 @@ impl NativeAgentServiceV1 {
             }
             return invalid("Native Agent workspace movement replay does not match its task.");
         }
+        if self.task_owner(&request.task_id)?.is_some() {
+            return invalid("Native Agent workspace movement task identity is already in use.");
+        }
         let status = NativeAgentWorkspaceMovementV1 {
             schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
             movement_id: request.movement_id.clone(),
@@ -1381,23 +1447,27 @@ impl NativeAgentServiceV1 {
         Ok(())
     }
 
+    /// Accepts preparation authority from the authenticated current-session
+    /// peer whose durable HostRef is `authenticated_source_host_ref`. The
+    /// claimed source must be that exact Host before anything is prepared.
     pub(crate) fn accept_bridge_workspace_prepare(
         &mut self,
         bridge_id: &str,
+        authenticated_source_host_ref: &str,
         request: NativeAgentWorkspacePrepareV1,
     ) -> AppResult<()> {
-        if self.revoked_bridges.contains(bridge_id) {
-            return invalid("Native Agent Bridge authority was revoked.");
+        if request.source_host_ref != authenticated_source_host_ref {
+            return invalid("Native Agent workspace source is not the authenticated peer Host.");
         }
         let task_id = request.task_id.clone();
         let movement_id = request.movement_id.clone();
-        self.accept_workspace_prepare(request)?;
-        self.task_bridges
-            .insert(task_id.clone(), bridge_id.to_owned());
-        if let Some(record) = self.workspace_movements.get_mut(&movement_id) {
-            record.bridge_id = Some(bridge_id.to_owned());
-        }
-        self.persist_envelope(&task_id, None)
+        self.with_bridge_task_owner(bridge_id, &task_id, |service| {
+            service.accept_workspace_prepare(request)?;
+            if let Some(record) = service.workspace_movements.get_mut(&movement_id) {
+                record.bridge_id = Some(bridge_id.to_owned());
+            }
+            service.persist_envelope(&task_id, None)
+        })
     }
 
     pub(crate) fn validate_workspace_transfer(
@@ -2897,6 +2967,7 @@ impl NativeAgentServiceV1 {
             .get(task_id)
             .cloned()
         {
+            self.require_local_task_owner(task_id)?;
             if self.task_workspaces.get(task_id) != Some(&workspace)
                 || self.task_digests.get(task_id) != Some(&Self::task_digest(task))
             {
@@ -2933,6 +3004,7 @@ impl NativeAgentServiceV1 {
             .get(task_id)
             .cloned()
         {
+            self.require_local_task_owner(task_id)?;
             if self.task_workspaces.get(task_id) != Some(&workspace)
                 || self.task_digests.get(task_id) != Some(&Self::task_digest(task))
             {
@@ -2994,23 +3066,14 @@ impl NativeAgentServiceV1 {
         bridge_id: &str,
         request: &NativeInvocationRequestV1,
     ) -> AppResult<NativeAgentTaskStatusV1> {
-        if self.revoked_bridges.contains(bridge_id) {
-            return invalid("Native Agent Bridge authority was revoked.");
-        }
-        self.task_bridges
-            .insert(request.task_id.clone(), bridge_id.to_owned());
-        match self.start_invocation_in_movement(
-            &request.agent_capability,
-            &request.task_id,
-            &request.input,
-            None,
-        ) {
-            Ok(status) => Ok(status),
-            Err(error) => {
-                self.task_bridges.remove(&request.task_id);
-                Err(error)
-            }
-        }
+        self.with_bridge_task_owner(bridge_id, &request.task_id, |service| {
+            service.start_invocation_in_movement(
+                &request.agent_capability,
+                &request.task_id,
+                &request.input,
+                None,
+            )
+        })
     }
 
     /// The capability-neutral start. The adapter owns what the input means
@@ -3326,30 +3389,21 @@ impl NativeAgentServiceV1 {
         capability_id: &str,
         input: &OpaqueCapabilityPayloadV1,
     ) -> AppResult<NativeAgentTaskStatusV1> {
-        if self.revoked_bridges.contains(bridge_id) {
-            return invalid("Native Agent Bridge authority was revoked.");
-        }
         if !valid_task_id(task_id) || target_host_ref.trim().is_empty() {
             return invalid("Remote native Agent task is invalid.");
         }
         crate::peer_capabilities::validate_semantic_capability_id(capability_id)?;
         input.validate()?;
-        self.task_bridges
-            .insert(task_id.to_owned(), bridge_id.to_owned());
-        match self.queue_remote_invocation(
-            task_id,
-            target_host_ref,
-            capability_id,
-            capability_id,
-            &input.digest(),
-            None,
-        ) {
-            Ok(status) => Ok(status),
-            Err(error) => {
-                self.task_bridges.remove(task_id);
-                Err(error)
-            }
-        }
+        self.with_bridge_task_owner(bridge_id, task_id, |service| {
+            service.queue_remote_invocation(
+                task_id,
+                target_host_ref,
+                capability_id,
+                capability_id,
+                &input.digest(),
+                None,
+            )
+        })
     }
 
     fn queue_remote_invocation(
@@ -3413,18 +3467,9 @@ impl NativeAgentServiceV1 {
         workspace: &str,
         task: &str,
     ) -> AppResult<NativeAgentTaskStatusV1> {
-        if self.revoked_bridges.contains(bridge_id) {
-            return invalid("Native Agent Bridge authority was revoked.");
-        }
-        self.task_bridges
-            .insert(task_id.to_owned(), bridge_id.to_owned());
-        match self.queue_remote_task(task_id, target_host_ref, workspace, task) {
-            Ok(status) => Ok(status),
-            Err(error) => {
-                self.task_bridges.remove(task_id);
-                Err(error)
-            }
-        }
+        self.with_bridge_task_owner(bridge_id, task_id, |service| {
+            service.queue_remote_task(task_id, target_host_ref, workspace, task)
+        })
     }
 
     pub(crate) fn record_remote_status(
@@ -4020,6 +4065,22 @@ impl NativeAgentServiceV1 {
             self.task_bridges.remove(&task_id);
         }
         Ok(())
+    }
+
+    /// Cancellation received over a Bridge. Only the Bridge that owns the
+    /// task may cancel it. Another Bridge's task and a Local task are refused
+    /// untouched, with the same answer as an unknown task.
+    pub(crate) fn cancel_bridge_task(
+        &mut self,
+        bridge_id: &str,
+        task_id: &str,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        if self.revoked_bridges.contains(bridge_id)
+            || self.task_owner(task_id)? != Some(TaskOwnerV1::Bridge(bridge_id.to_owned()))
+        {
+            return invalid("Native Agent task is unavailable.");
+        }
+        self.cancel_task(task_id)
     }
 
     pub(crate) fn cancel_task(&mut self, task_id: &str) -> AppResult<NativeAgentTaskStatusV1> {
@@ -6457,7 +6518,8 @@ exit 1
         fs::write(source.join("before.txt"), b"approved baseline").unwrap();
         let mut source_host = NativeAgentServiceV1::default();
         let review = source_host
-            .propose_workspace_movement(
+            .propose_bridge_workspace_movement(
+                "room-1",
                 "movement-1",
                 "task-1",
                 &source,
@@ -6503,7 +6565,8 @@ exit 1
         fs::write(source.join("before.txt"), b"approved baseline").unwrap();
         let mut service = NativeAgentServiceV1::default();
         service
-            .propose_workspace_movement(
+            .propose_bridge_workspace_movement(
+                "room-1",
                 "movement-2",
                 "task-2",
                 &source,
@@ -6876,7 +6939,11 @@ exit 1
         crate::regular_file_set_transfer::cleanup_package(&package);
         let mut executor = NativeAgentServiceV1::with_paths(executor_paths).unwrap();
         executor
-            .accept_bridge_workspace_prepare("room-conflict", prepare)
+            .accept_bridge_workspace_prepare(
+                "room-conflict",
+                &prepare.source_host_ref.clone(),
+                prepare,
+            )
             .unwrap();
         executor
             .start_received_workspace_task_with_executable(&agent, "movement-conflict", &received)
@@ -7222,6 +7289,7 @@ exit 1
         service
             .accept_bridge_workspace_prepare(
                 bridge_id,
+                "host:source",
                 NativeAgentWorkspacePrepareV1 {
                     schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
                     movement_id: movement_id.into(),
@@ -7408,7 +7476,8 @@ exit 1
             ("movement-owner-b", "task-owner-b"),
         ] {
             service
-                .propose_workspace_movement(
+                .propose_bridge_workspace_movement(
+                    "room",
                     movement,
                     task,
                     &source,
@@ -8050,7 +8119,11 @@ exit 1
         runtime
             .native_agents
             .lock()
-            .accept_bridge_workspace_prepare("room-session-loss", request)
+            .accept_bridge_workspace_prepare(
+                "room-session-loss",
+                &request.source_host_ref.clone(),
+                request,
+            )
             .unwrap();
         {
             let mut native_agents = runtime.native_agents.lock();
@@ -8214,6 +8287,7 @@ exit 1
         service
             .accept_bridge_workspace_prepare(
                 "room-completed-session-loss",
+                "host:source",
                 NativeAgentWorkspacePrepareV1 {
                     schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
                     movement_id: "movement-completed-session-loss".into(),
@@ -8322,6 +8396,7 @@ exit 1
         service
             .accept_bridge_workspace_prepare(
                 bridge_id,
+                "host:source",
                 NativeAgentWorkspacePrepareV1 {
                     schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
                     movement_id: movement_id.into(),
@@ -8605,6 +8680,7 @@ exit 1
         service
             .accept_bridge_workspace_prepare(
                 "room-artifacts",
+                "host:source",
                 prepare("movement-return-cleanup", "task-return-cleanup"),
             )
             .unwrap();
@@ -8639,6 +8715,7 @@ exit 1
         service
             .accept_bridge_workspace_prepare(
                 "room-artifacts",
+                "host:source",
                 prepare("movement-restart-cleanup", "task-restart-cleanup"),
             )
             .unwrap();
@@ -8695,7 +8772,11 @@ exit 1
         ] {
             let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
             service
-                .accept_bridge_workspace_prepare("room-artifacts", prepare(movement_id, task_id))
+                .accept_bridge_workspace_prepare(
+                    "room-artifacts",
+                    "host:source",
+                    prepare(movement_id, task_id),
+                )
                 .unwrap();
             let (task_workspace, snapshot) =
                 attach_private_artifacts(&mut service, movement_id, task_id, unique);
@@ -8992,6 +9073,7 @@ exit 1
         service
             .accept_bridge_workspace_prepare(
                 "room-retry",
+                "host:source",
                 NativeAgentWorkspacePrepareV1 {
                     schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
                     movement_id: "movement-retry".into(),
@@ -9071,6 +9153,7 @@ exit 1
             .lock()
             .accept_bridge_workspace_prepare(
                 "room-no-route",
+                "host:source",
                 NativeAgentWorkspacePrepareV1 {
                     schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
                     movement_id: "movement-no-route".into(),
@@ -9452,6 +9535,148 @@ exit 1
         let _ = fs::remove_dir_all(root);
     }
 
+    fn prepare_from(
+        movement_id: &str,
+        task_id: &str,
+        source_host_ref: &str,
+    ) -> NativeAgentWorkspacePrepareV1 {
+        NativeAgentWorkspacePrepareV1 {
+            schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
+            movement_id: movement_id.into(),
+            task_id: task_id.into(),
+            source_host_ref: source_host_ref.into(),
+            target_host_ref: "host:local".into(),
+            agent_capability: CODEX_CAPABILITY_ID.into(),
+            task: "edit".into(),
+            resume: true,
+            source_object: movement_object(),
+            source_digest: "a".repeat(64),
+            source_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn workspace_prepare_is_bound_to_the_authenticated_source_host() {
+        let root =
+            std::env::temp_dir().join(format!("pastey-native-prepare-source-{}", Uuid::new_v4()));
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        let owned_by = |bridge_id: &str| Some(TaskOwnerV1::Bridge(bridge_id.into()));
+
+        // An authenticated peer claiming another source Host prepares nothing.
+        assert!(service
+            .accept_bridge_workspace_prepare(
+                "room-a",
+                "host:source",
+                prepare_from("movement-forged", "task-forged", "host:other"),
+            )
+            .is_err());
+        assert!(service.movement_status("movement-forged").is_err());
+        assert_eq!(service.task_owner("task-forged").unwrap(), None);
+        assert!(
+            crate::storage::get_native_agent_envelope(&paths, "task-forged")
+                .unwrap()
+                .is_none()
+        );
+
+        let request = prepare_from("movement-bound", "task-bound", "host:source");
+        service
+            .accept_bridge_workspace_prepare("room-a", "host:source", request.clone())
+            .unwrap();
+        assert_eq!(
+            service.task_owner("task-bound").unwrap(),
+            owned_by("room-a")
+        );
+        // Another Bridge cannot adopt it, even from the same source Host, and
+        // a new movement cannot reuse its task identity.
+        assert!(service
+            .accept_bridge_workspace_prepare("room-b", "host:source", request.clone())
+            .is_err());
+        assert!(service
+            .accept_bridge_workspace_prepare(
+                "room-a",
+                "host:source",
+                prepare_from("movement-reused", "task-bound", "host:source"),
+            )
+            .is_err());
+        assert!(service.movement_status("movement-reused").is_err());
+        // The owning Bridge's exact replay stays idempotent.
+        service
+            .accept_bridge_workspace_prepare("room-a", "host:source", request)
+            .unwrap();
+        assert_eq!(
+            service.task_owner("task-bound").unwrap(),
+            owned_by("room-a")
+        );
+        assert!(service.cancel_bridge_task("room-b", "task-bound").is_err());
+
+        drop(service);
+        let restarted = NativeAgentServiceV1::with_paths(paths).unwrap();
+        assert_eq!(
+            restarted.task_owner("task-bound").unwrap(),
+            owned_by("room-a")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approval_never_moves_a_movement_into_another_authority() {
+        let (root, source, _) = fixture();
+        fs::write(source.join("before.txt"), b"baseline").unwrap();
+        let mut service = NativeAgentServiceV1::default();
+        let propose = |service: &mut NativeAgentServiceV1,
+                       bridge_id: Option<&str>,
+                       movement_id: &str,
+                       task_id: &str| match bridge_id {
+            Some(bridge_id) => service.propose_bridge_workspace_movement(
+                bridge_id,
+                movement_id,
+                task_id,
+                &source,
+                "host:remote",
+                movement_object(),
+                "edit",
+                true,
+            ),
+            None => service.propose_workspace_movement(
+                movement_id,
+                task_id,
+                &source,
+                "host:remote",
+                movement_object(),
+                "edit",
+                true,
+            ),
+        };
+
+        // An unbound proposal is Local: no Bridge can approve or adopt it.
+        propose(&mut service, None, "movement-local", "task-local").unwrap();
+        assert!(service
+            .approve_workspace_movement("movement-local", "room-a", "host:source", &root)
+            .is_err());
+        assert!(propose(&mut service, Some("room-a"), "movement-other", "task-local").is_err());
+        assert_eq!(
+            service.task_owner("task-local").unwrap(),
+            Some(TaskOwnerV1::Local)
+        );
+
+        // A Bridge's proposal is approved only over that Bridge.
+        propose(&mut service, Some("room-a"), "movement-a", "task-a").unwrap();
+        assert!(propose(&mut service, Some("room-b"), "movement-b", "task-a").is_err());
+        assert!(service
+            .approve_workspace_movement("movement-a", "room-b", "host:source", &root)
+            .is_err());
+        assert_eq!(
+            service.task_owner("task-a").unwrap(),
+            Some(TaskOwnerV1::Bridge("room-a".into()))
+        );
+        let (_, _, package) = service
+            .approve_workspace_movement("movement-a", "room-a", "host:source", &root)
+            .unwrap();
+        crate::regular_file_set_transfer::cleanup_package(&package);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn prepared_workspace_cancel_is_idempotent_and_blocks_late_landing() {
         let root =
@@ -9461,6 +9686,7 @@ exit 1
         service
             .accept_bridge_workspace_prepare(
                 "room",
+                "host:source",
                 NativeAgentWorkspacePrepareV1 {
                     schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
                     movement_id: "movement-prepared".into(),
@@ -9477,8 +9703,9 @@ exit 1
             )
             .unwrap();
 
-        let first = service.cancel_task("task-prepared").unwrap();
-        let duplicate = service.cancel_task("task-prepared").unwrap();
+        // The requester revokes prepared authority over its own Bridge.
+        let first = service.cancel_bridge_task("room", "task-prepared").unwrap();
+        let duplicate = service.cancel_bridge_task("room", "task-prepared").unwrap();
         assert_eq!(first, duplicate);
         assert_eq!(first.state, NativeAgentTaskStateV1::Cancelled);
         assert_eq!(
@@ -9523,6 +9750,7 @@ exit 1
         before
             .accept_bridge_workspace_prepare(
                 "room-recovery",
+                "host:source",
                 NativeAgentWorkspacePrepareV1 {
                     schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
                     movement_id: "movement-target".into(),
@@ -9805,7 +10033,11 @@ exit 1
         crate::regular_file_set_transfer::cleanup_package(&package);
         let mut executor = NativeAgentServiceV1::with_paths(executor_paths).unwrap();
         executor
-            .accept_bridge_workspace_prepare("room-finish", prepare)
+            .accept_bridge_workspace_prepare(
+                "room-finish",
+                &prepare.source_host_ref.clone(),
+                prepare,
+            )
             .unwrap();
         // Receiver /finish has completed landing and started the one Agent
         // turn before this sender-local UI write fails.
@@ -10161,7 +10393,11 @@ exit 1
         fs::write(task_workspace.join("baseline.txt"), b"baseline").unwrap();
         let mut executor = NativeAgentServiceV1::with_paths(executor_paths.clone()).unwrap();
         executor
-            .accept_bridge_workspace_prepare("room-exact", prepare)
+            .accept_bridge_workspace_prepare(
+                "room-exact",
+                &prepare.source_host_ref.clone(),
+                prepare,
+            )
             .unwrap();
         executor
             .start_received_workspace_task_with_executable(
@@ -10362,7 +10598,11 @@ exit 1
         fs::write(task_workspace.join("baseline.txt"), b"baseline").unwrap();
         let mut executor = NativeAgentServiceV1::with_paths(executor_paths).unwrap();
         executor
-            .accept_bridge_workspace_prepare("room-unrepresentable", prepare)
+            .accept_bridge_workspace_prepare(
+                "room-unrepresentable",
+                &prepare.source_host_ref.clone(),
+                prepare,
+            )
             .unwrap();
         executor
             .start_received_workspace_task_with_executable(
@@ -10443,7 +10683,8 @@ exit 1
             .unwrap()
             .is_some());
         assert!(requester
-            .propose_workspace_movement(
+            .propose_bridge_workspace_movement(
+                "room-unrepresentable",
                 "movement-next",
                 "task-next",
                 &source,
@@ -10515,6 +10756,7 @@ exit 1
         service
             .accept_bridge_workspace_prepare(
                 "room-persist",
+                "host:source",
                 NativeAgentWorkspacePrepareV1 {
                     schema_version: NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA.into(),
                     movement_id: "movement-persist".into(),
