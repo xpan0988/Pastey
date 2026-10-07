@@ -20,8 +20,14 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::host_identity::HostSessionBinding;
 
+mod admission;
 mod capability;
+pub(crate) use admission::NativeInvocationReviewV1;
+use admission::{
+    NativeAdmissionDecisionV1, NativeInvocationPrincipalV1, PendingNativeInvocationV1,
+};
 #[cfg(test)]
 use capability::codex::codex_compatibility_at;
 pub(crate) use capability::OpaqueCapabilityPayloadV1;
@@ -559,6 +565,15 @@ pub(crate) struct NativeAgentServiceV1 {
     /// without an entry here is Local. See `TaskOwnerV1`.
     task_bridges: HashMap<String, String>,
     revoked_bridges: HashSet<String>,
+    /// Remote invocations held for Host Review, by task. Process-local and
+    /// one-shot; see `admission`.
+    pending_reviews: HashMap<String, PendingNativeInvocationV1>,
+    /// Tasks a Review created that never started. No adapter has seen them
+    /// and they have no durable envelope, so a restart forgets them.
+    unstarted_review_tasks: HashSet<String>,
+    /// Digest of the exact input Core admitted for a task. Replays compare it
+    /// so a replayed remote input never reaches an adapter.
+    task_input_digests: HashMap<String, String>,
     workspace_movements: HashMap<String, WorkspaceMovementRecordV1>,
     durable_paths: Option<crate::storage::AppPaths>,
     #[cfg(test)]
@@ -589,6 +604,9 @@ impl NativeAgentServiceV1 {
             task_exclusivity: HashMap::new(),
             task_bridges: HashMap::new(),
             revoked_bridges: HashSet::new(),
+            pending_reviews: HashMap::new(),
+            unstarted_review_tasks: HashSet::new(),
+            task_input_digests: HashMap::new(),
             workspace_movements: HashMap::new(),
             durable_paths: None,
             #[cfg(test)]
@@ -1033,6 +1051,10 @@ impl NativeAgentServiceV1 {
         let Some(paths) = self.durable_paths.as_ref() else {
             return Ok(());
         };
+        if self.unstarted_review_tasks.contains(task_id) {
+            // A Review is process-local; a task it never started stays so.
+            return Ok(());
+        }
         let task = self.task_status(task_id)?;
         let movement = self
             .workspace_movements
@@ -3057,28 +3079,359 @@ impl NativeAgentServiceV1 {
     ) -> AppResult<NativeAgentTaskStatusV1> {
         self.codex.use_executable(executable);
         let input = capability::codex::codex_input(workspace, task, true)?;
-        self.start_invocation_in_movement(CODEX_CAPABILITY_ID, task_id, &input, movement_id)
+        match movement_id {
+            None => self.start_local_invocation(CODEX_CAPABILITY_ID, task_id, &input),
+            // Received workspace movement keeps its own existing authority.
+            Some(_) => {
+                self.start_invocation_in_movement(CODEX_CAPABILITY_ID, task_id, &input, movement_id)
+            }
+        }
     }
 
-    /// Starts one invocation of a registered native capability on a Bridge.
-    pub(crate) fn start_bridge_invocation(
+    /// An invocation by this Host's own user, admitted by the same policy as
+    /// a remote one. A replay keeps the existing task identity rules.
+    fn start_local_invocation(
         &mut self,
-        bridge_id: &str,
-        request: &NativeInvocationRequestV1,
+        capability_id: &str,
+        task_id: &str,
+        input: &OpaqueCapabilityPayloadV1,
     ) -> AppResult<NativeAgentTaskStatusV1> {
-        self.with_bridge_task_owner(bridge_id, &request.task_id, |service| {
-            service.start_invocation_in_movement(
+        self.require_local_task_owner(task_id)?;
+        if self.task_owner(task_id)?.is_some() {
+            return self.start_invocation_in_movement(capability_id, task_id, input, None);
+        }
+        self.admit_invocation(
+            NativeInvocationPrincipalV1::Local,
+            capability_id,
+            task_id,
+            input,
+            crate::storage::now_ts(),
+        )
+    }
+
+    /// Receives `native_agent.invoke` from the exact authenticated current
+    /// peer session `binding`; the caller has already checked that this Host
+    /// is the target. Then, in order: immutable task ownership and replay,
+    /// capability availability, admission. A remote invocation waits for
+    /// Review, and no adapter sees its input before Accept.
+    pub(crate) fn receive_bridge_invocation(
+        &mut self,
+        binding: &HostSessionBinding,
+        request: &NativeInvocationRequestV1,
+        now: i64,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        if !valid_task_id(&request.task_id) {
+            return invalid("Native Agent task identity is invalid.");
+        }
+        request.input.validate()?;
+        self.with_bridge_task_owner(&binding.bridge_id, &request.task_id, |service| {
+            if let Some(existing) = service.replayed_invocation(
+                &request.task_id,
+                &request.agent_capability,
+                &request.input,
+            )? {
+                return Ok(existing);
+            }
+            service.admit_invocation(
+                NativeInvocationPrincipalV1::Remote(binding),
                 &request.agent_capability,
                 &request.task_id,
                 &request.input,
-                None,
+                now,
             )
         })
     }
 
-    /// The capability-neutral start. The adapter owns what the input means
-    /// and how the invocation runs; Pastey owns task identity, exclusivity,
-    /// the durable envelope and the terminal fact.
+    /// A replay of an existing task answers with that task. Identity is the
+    /// exact input Core admitted, so a replayed input never reaches an
+    /// adapter. A task whose admitted input is no longer known (restored
+    /// after restart) refuses every replay; none could start it again.
+    fn replayed_invocation(
+        &self,
+        task_id: &str,
+        capability_id: &str,
+        input: &OpaqueCapabilityPayloadV1,
+    ) -> AppResult<Option<NativeAgentTaskStatusV1>> {
+        let Some(existing) = self
+            .tasks
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Native Agent task store is unavailable.".into()))?
+            .get(task_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if existing.agent_id != capability_id
+            || self.task_input_digests.get(task_id) != Some(&input.digest())
+        {
+            return invalid("Native Agent task identity was replayed with different input.");
+        }
+        Ok(Some(existing))
+    }
+
+    /// The one admission point for a new invocation. Core admits; the
+    /// adapter only validates and starts what Core admitted.
+    fn admit_invocation(
+        &mut self,
+        principal: NativeInvocationPrincipalV1<'_>,
+        capability_id: &str,
+        task_id: &str,
+        input: &OpaqueCapabilityPayloadV1,
+        now: i64,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.adapter(capability_id)?.require_available()?;
+        match (admission::decide(&principal), principal) {
+            (NativeAdmissionDecisionV1::Allow, _) => {
+                self.start_invocation_in_movement(capability_id, task_id, input, None)
+            }
+            (
+                NativeAdmissionDecisionV1::RequireReview,
+                NativeInvocationPrincipalV1::Remote(binding),
+            ) => self.hold_for_review(binding, capability_id, task_id, input, now),
+            _ => invalid("Native capability invocation was not admitted by this Host."),
+        }
+    }
+
+    /// Holds a remote invocation for Review as a Queued task. Nothing about
+    /// it is durable, and no adapter is called.
+    fn hold_for_review(
+        &mut self,
+        binding: &HostSessionBinding,
+        capability_id: &str,
+        task_id: &str,
+        input: &OpaqueCapabilityPayloadV1,
+        now: i64,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.expire_invocation_reviews(now);
+        let expires_at = (now + admission::INVOCATION_REVIEW_TTL_SECONDS).min(binding.expires_at);
+        if expires_at <= now {
+            return invalid("Native Agent Bridge session has expired.");
+        }
+        if self
+            .pending_reviews
+            .values()
+            .filter(|pending| pending.binding.bridge_id == binding.bridge_id)
+            .count()
+            >= admission::MAX_PENDING_REVIEWS_PER_BRIDGE
+        {
+            return invalid("Too many native capability invocations are awaiting Review.");
+        }
+        let status = NativeAgentTaskStatusV1 {
+            schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
+            task_id: task_id.into(),
+            agent_id: capability_id.into(),
+            workspace_name: capability_id.into(),
+            session_reused: false,
+            state: NativeAgentTaskStateV1::Queued,
+            result: None,
+            code: Some(admission::REVIEW_REQUIRED_CODE.into()),
+            output: None,
+        };
+        self.tasks
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Native Agent task store is unavailable.".into()))?
+            .insert(task_id.into(), status.clone());
+        self.unstarted_review_tasks.insert(task_id.into());
+        self.task_input_digests
+            .insert(task_id.into(), input.digest());
+        self.pending_reviews.insert(
+            task_id.into(),
+            PendingNativeInvocationV1 {
+                task_id: task_id.into(),
+                capability_id: capability_id.into(),
+                binding: binding.clone(),
+                expires_at,
+                input: input.clone(),
+            },
+        );
+        Ok(status)
+    }
+
+    /// Ends every Review whose time has passed. Evaluated whenever Reviews
+    /// are read or decided, and by the invocation's existing status loop.
+    pub(crate) fn expire_invocation_reviews(&mut self, now: i64) {
+        let expired = self
+            .pending_reviews
+            .values()
+            .filter(|pending| pending.expires_at <= now)
+            .map(|pending| pending.task_id.clone())
+            .collect::<Vec<_>>();
+        for task_id in expired {
+            self.pending_reviews.remove(&task_id);
+            let _ = self.finish_unstarted_review(&task_id, admission::REVIEW_EXPIRED_CODE);
+        }
+    }
+
+    /// Records the definite non-start of a Review-held task. A cancellation
+    /// that already ended it stands.
+    fn finish_unstarted_review(
+        &mut self,
+        task_id: &str,
+        code: &str,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            AppError::InvalidInput("Native Agent task store is unavailable.".into())
+        })?;
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or_else(|| AppError::InvalidInput("Native Agent task is unavailable.".into()))?;
+        if task.state == NativeAgentTaskStateV1::Queued {
+            task.state = NativeAgentTaskStateV1::Failed;
+            task.code = Some(code.into());
+        }
+        Ok(task.clone())
+    }
+
+    /// Renderer-safe projection of every pending Review.
+    pub(crate) fn invocation_reviews(&mut self, now: i64) -> Vec<NativeInvocationReviewV1> {
+        self.expire_invocation_reviews(now);
+        let mut reviews = self
+            .pending_reviews
+            .values()
+            .map(|pending| {
+                let display_name = self
+                    .adapter(&pending.capability_id)
+                    .map(|adapter| adapter.display_name().to_owned())
+                    .unwrap_or_else(|_| pending.capability_id.clone());
+                pending.review(&display_name)
+            })
+            .collect::<Vec<_>>();
+        reviews.sort_by(|a, b| (a.expires_at, &a.task_id).cmp(&(b.expires_at, &b.task_id)));
+        reviews
+    }
+
+    /// The Bridge and peer route whose current session an Accept of this
+    /// Review must re-resolve.
+    pub(crate) fn invocation_review_route(&self, task_id: &str) -> Option<(String, String)> {
+        self.pending_reviews.get(task_id).map(|pending| {
+            (
+                pending.binding.bridge_id.clone(),
+                pending.binding.peer_route_ref.clone(),
+            )
+        })
+    }
+
+    /// Host Accept of one pending Review. The Review is consumed whatever
+    /// happens. `current` is the freshly resolved binding of the Review's
+    /// own peer route, if there still is one. Only when the exact binding,
+    /// the Bridge, the TTL, ownership and the capability all still hold does
+    /// the adapter first see the input, to prepare and then start.
+    pub(crate) fn accept_invocation_review(
+        &mut self,
+        task_id: &str,
+        current: Option<&HostSessionBinding>,
+        now: i64,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.expire_invocation_reviews(now);
+        let Some(pending) = self.pending_reviews.remove(task_id) else {
+            return invalid("Native capability Review is unavailable.");
+        };
+        if let Err(error) = self.revalidate_review(&pending, current, now) {
+            self.finish_unstarted_review(task_id, admission::ADMISSION_REVOKED_CODE)?;
+            return Err(error);
+        }
+        // The placeholder gives way to the started task.
+        self.tasks
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Native Agent task store is unavailable.".into()))?
+            .remove(task_id);
+        self.unstarted_review_tasks.remove(task_id);
+        match self.start_invocation_in_movement(
+            &pending.capability_id,
+            task_id,
+            &pending.input,
+            None,
+        ) {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                let mut tasks = self.tasks.lock().map_err(|_| {
+                    AppError::InvalidInput("Native Agent task store is unavailable.".into())
+                })?;
+                if !tasks.contains_key(task_id) {
+                    // Nothing started: a definite, still non-durable non-start.
+                    tasks.insert(
+                        task_id.into(),
+                        NativeAgentTaskStatusV1 {
+                            schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
+                            task_id: task_id.into(),
+                            agent_id: pending.capability_id.clone(),
+                            workspace_name: pending.capability_id.clone(),
+                            session_reused: false,
+                            state: NativeAgentTaskStateV1::Failed,
+                            result: None,
+                            code: Some(admission::START_REJECTED_CODE.into()),
+                            output: None,
+                        },
+                    );
+                    self.unstarted_review_tasks.insert(task_id.into());
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn revalidate_review(
+        &self,
+        pending: &PendingNativeInvocationV1,
+        current: Option<&HostSessionBinding>,
+        now: i64,
+    ) -> AppResult<()> {
+        if pending.expires_at <= now {
+            return invalid("Native capability Review has expired.");
+        }
+        let current = current.ok_or_else(|| {
+            AppError::InvalidInput("Native capability Review session is unavailable.".into())
+        })?;
+        pending.binding.validate_current(current, now)?;
+        if self.revoked_bridges.contains(&pending.binding.bridge_id) {
+            return invalid("Native Agent Bridge authority was revoked.");
+        }
+        if self.task_owner(&pending.task_id)?
+            != Some(TaskOwnerV1::Bridge(pending.binding.bridge_id.clone()))
+        {
+            return invalid("Native Agent task belongs to another authority.");
+        }
+        let task = self.task_status(&pending.task_id)?;
+        if task.state != NativeAgentTaskStateV1::Queued
+            || task.code.as_deref() != Some(admission::REVIEW_REQUIRED_CODE)
+        {
+            return invalid("Native capability Review is no longer pending.");
+        }
+        self.adapter(&pending.capability_id)?.require_available()
+    }
+
+    /// Host Deny of one pending Review: a definite non-start.
+    pub(crate) fn deny_invocation_review(
+        &mut self,
+        task_id: &str,
+        now: i64,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.expire_invocation_reviews(now);
+        if self.pending_reviews.remove(task_id).is_none() {
+            return invalid("Native capability Review is unavailable.");
+        }
+        self.finish_unstarted_review(task_id, admission::ADMISSION_DENIED_CODE)
+    }
+
+    /// Ends every Review held for `bridge_id` as a non-start.
+    fn end_bridge_reviews(&mut self, bridge_id: &str, code: &str) {
+        let ended = self
+            .pending_reviews
+            .values()
+            .filter(|pending| pending.binding.bridge_id == bridge_id)
+            .map(|pending| pending.task_id.clone())
+            .collect::<Vec<_>>();
+        for task_id in ended {
+            self.pending_reviews.remove(&task_id);
+            let _ = self.finish_unstarted_review(&task_id, code);
+        }
+    }
+
+    /// The capability-neutral start of an invocation that is already admitted
+    /// (or is received workspace movement, which keeps its own authority).
+    /// The adapter owns what the input means and how the invocation runs;
+    /// Pastey owns task identity, exclusivity, the durable envelope and the
+    /// terminal fact.
     fn start_invocation_in_movement(
         &mut self,
         capability_id: &str,
@@ -3120,6 +3473,8 @@ impl NativeAgentServiceV1 {
         }
         let started = adapter.start(task_id, input)?;
         let task_id = task_id.to_owned();
+        self.task_input_digests
+            .insert(task_id.clone(), input.digest());
         let status = NativeAgentTaskStatusV1 {
             schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
             task_id: task_id.clone(),
@@ -3761,6 +4116,7 @@ impl NativeAgentServiceV1 {
         {
             return invalid("Native Agent task crossed its Bridge authority.");
         }
+        self.pending_reviews.remove(task_id);
         let status = {
             let mut tasks = self.tasks.lock().map_err(|_| {
                 AppError::InvalidInput("Native Agent task store is unavailable.".into())
@@ -3807,6 +4163,9 @@ impl NativeAgentServiceV1 {
             }
         }
         self.persist_envelope(task_id, None)?;
+        if self.unstarted_review_tasks.contains(task_id) {
+            return Ok(status);
+        }
         if let Ok(adapter) = self.adapter(&status.agent_id) {
             let _ = adapter.cancel(task_id);
         }
@@ -3819,10 +4178,16 @@ impl NativeAgentServiceV1 {
     /// available for authenticated fresh-session reconciliation. Burn uses
     /// `purge_bridge_authority` below.
     pub(crate) fn revoke_bridge_session(&mut self, bridge_id: &str) -> AppResult<()> {
+        // A Review is bound to the exact session that just ended; nothing it
+        // held has started, so there is nothing to reconcile.
+        self.end_bridge_reviews(bridge_id, admission::ADMISSION_REVOKED_CODE);
         let task_ids = self
             .task_bridges
             .iter()
-            .filter_map(|(task_id, bound)| (bound == bridge_id).then_some(task_id.clone()))
+            .filter_map(|(task_id, bound)| {
+                (bound == bridge_id && !self.unstarted_review_tasks.contains(task_id))
+                    .then_some(task_id.clone())
+            })
             .collect::<Vec<_>>();
         let actively_observed_tasks = self
             .observed_tasks
@@ -3986,6 +4351,8 @@ impl NativeAgentServiceV1 {
     /// remote fact cannot recreate a deleted envelope.
     pub(crate) fn purge_bridge_authority(&mut self, bridge_id: &str) -> AppResult<()> {
         self.revoked_bridges.insert(bridge_id.to_owned());
+        self.pending_reviews
+            .retain(|_, pending| pending.binding.bridge_id != bridge_id);
         let task_ids = self
             .task_bridges
             .iter()
@@ -4004,7 +4371,10 @@ impl NativeAgentServiceV1 {
         }
         for adapter in &self.adapters {
             for task_id in &task_ids {
-                adapter.release(task_id);
+                // An adapter never saw a task that a Review did not start.
+                if !self.unstarted_review_tasks.contains(task_id) {
+                    adapter.release(task_id);
+                }
             }
         }
         let movement_ids = self
@@ -4062,6 +4432,8 @@ impl NativeAgentServiceV1 {
             self.task_workspaces.remove(&task_id);
             self.task_digests.remove(&task_id);
             self.task_exclusivity.remove(&task_id);
+            self.task_input_digests.remove(&task_id);
+            self.unstarted_review_tasks.remove(&task_id);
             self.task_bridges.remove(&task_id);
         }
         Ok(())
@@ -4084,6 +4456,8 @@ impl NativeAgentServiceV1 {
     }
 
     pub(crate) fn cancel_task(&mut self, task_id: &str) -> AppResult<NativeAgentTaskStatusV1> {
+        // Cancelling a task held for Review ends the Review; it never started.
+        self.pending_reviews.remove(task_id);
         let (status, native_execution_needs_cancellation) = {
             let mut tasks = self.tasks.lock().map_err(|_| {
                 AppError::InvalidInput("Native Agent task store is unavailable.".into())
@@ -4154,6 +4528,7 @@ impl NativeAgentServiceV1 {
         for adapter in &self.adapters {
             adapter.shutdown();
         }
+        self.pending_reviews.clear();
         self.active_exclusivity
             .lock()
             .ok()
@@ -5623,6 +5998,23 @@ exit 1
             NativeAgentCapabilityStateV1::Unavailable
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A Bridge-owned Codex invocation whose Review was already accepted, for
+    /// tests of what happens after a remote invocation started.
+    fn start_accepted_bridge_codex_task(
+        service: &mut NativeAgentServiceV1,
+        bridge_id: &str,
+        executable: &Path,
+        task_id: &str,
+        workspace: &Path,
+        task: &str,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        service.codex.use_executable(executable);
+        let input = capability::codex::codex_input(workspace, task, true)?;
+        service.with_bridge_task_owner(bridge_id, task_id, |service| {
+            service.start_invocation_in_movement(CODEX_CAPABILITY_ID, task_id, &input, None)
+        })
     }
 
     fn wait_for_terminal(service: &NativeAgentServiceV1, task_id: &str) -> NativeAgentTaskStatusV1 {
@@ -8208,17 +8600,15 @@ exit 1
         let (root, workspace, agent) = blocked_turn_fixture();
         let paths = durable_paths(&root);
         let mut service = NativeAgentServiceV1::with_paths(paths).unwrap();
-        service
-            .task_bridges
-            .insert("task-live-turn".into(), "room-live-turn".into());
-        let started = service
-            .start_codex_task_with_executable_and_id(
-                &agent,
-                "task-live-turn",
-                &workspace,
-                "finish this turn after the route is lost",
-            )
-            .unwrap();
+        let started = start_accepted_bridge_codex_task(
+            &mut service,
+            "room-live-turn",
+            &agent,
+            "task-live-turn",
+            &workspace,
+            "finish this turn after the route is lost",
+        )
+        .unwrap();
         let canonical_workspace = workspace.canonicalize().unwrap();
         let controller = service
             .codex
@@ -10282,17 +10672,15 @@ exit 1
         ));
         let paths = durable_paths(&root);
         let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
-        service
-            .task_bridges
-            .insert("task-burn-observer".into(), "room-burn".into());
-        service
-            .start_codex_task_with_executable_and_id(
-                &agent,
-                "task-burn-observer",
-                &workspace,
-                "wait",
-            )
-            .unwrap();
+        start_accepted_bridge_codex_task(
+            &mut service,
+            "room-burn",
+            &agent,
+            "task-burn-observer",
+            &workspace,
+            "wait",
+        )
+        .unwrap();
         let canonical_workspace = workspace.canonicalize().unwrap();
         let controller = service
             .codex

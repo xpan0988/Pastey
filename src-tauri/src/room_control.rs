@@ -1575,6 +1575,22 @@ pub async fn receive_room_control_event_handler(
                         )
                     }
                 };
+                // The invoking principal is the exact authenticated current
+                // peer session, resolved before anything else is considered.
+                let binding = match crate::host_runtime::current_host_session_binding(
+                    &ctx.state,
+                    &room_id,
+                    &inbound_peer.peer_session_id,
+                ) {
+                    Ok(binding) => binding,
+                    Err(_) => {
+                        return control_error(
+                            StatusCode::FORBIDDEN,
+                            "host_mismatch",
+                            "Native Agent invocation has no bound peer Host.",
+                        )
+                    }
+                };
                 if request.target_host_ref != ctx.state.local_host_ref.as_str() {
                     return control_error(
                         StatusCode::FORBIDDEN,
@@ -1595,12 +1611,13 @@ pub async fn receive_room_control_event_handler(
                         "Native Agent interface is incompatible on this Host.",
                     );
                 }
-                let _started = match ctx
-                    .state
-                    .native_agents
-                    .lock()
-                    .start_bridge_invocation(&room_id, &request)
-                {
+                // Ownership, replay, availability, then admission: a new
+                // remote invocation is held for Host Review, unstarted.
+                let _admitted = match ctx.state.native_agents.lock().receive_bridge_invocation(
+                    &binding,
+                    &request,
+                    storage::now_ts(),
+                ) {
                     Ok(status) => status,
                     Err(_) => {
                         return control_error(
@@ -1633,7 +1650,13 @@ pub async fn receive_room_control_event_handler(
                 ctx.state.spawn(async move {
                     let mut last = None;
                     loop {
-                        let status = response_state.native_agents.lock().task_status(&task_id);
+                        let status = {
+                            let mut agents = response_state.native_agents.lock();
+                            // A Review ends by Accept, Deny or its bounded
+                            // expiry, which this loop also evaluates.
+                            agents.expire_invocation_reviews(storage::now_ts());
+                            agents.task_status(&task_id)
+                        };
                         let Ok(status) = status else {
                             return;
                         };
@@ -1664,7 +1687,11 @@ pub async fn receive_room_control_event_handler(
                             }
                             last = Some(status.clone());
                         }
-                        if status.state != crate::native_agent::NativeAgentTaskStateV1::Running {
+                        if !matches!(
+                            status.state,
+                            crate::native_agent::NativeAgentTaskStateV1::Queued
+                                | crate::native_agent::NativeAgentTaskStateV1::Running
+                        ) {
                             return;
                         }
                         tokio::time::sleep(Duration::from_millis(250)).await;

@@ -6,6 +6,10 @@
 //! and owns all of its HOW: what its input means, how it runs, how it stops,
 //! and what its terminal output contains. Core sees only an opaque payload,
 //! an identity digest and an opaque exclusivity key.
+//!
+//! Adapters hold no authority. Core decides who may invoke a capability
+//! (`native_agent::admission`) before an adapter sees the input; nothing
+//! here knows about peers, sessions, Bridges or Review.
 
 use std::path::PathBuf;
 
@@ -68,7 +72,7 @@ impl ExclusivityKeyV1 {
     }
 }
 
-/// What Core needs to know about an invocation before admitting it.
+/// What Core needs to know about an admitted invocation before starting it.
 pub(crate) struct PreparedInvocationV1 {
     /// Two invocations with the same task identity must have the same digest.
     pub(crate) identity_digest: String,
@@ -133,8 +137,9 @@ pub(crate) trait NativeCapabilityAdapterV1: Send + Sync {
     }
 
     /// Validates the opaque input and reports identity and exclusivity.
+    /// Called only for input Core has already admitted.
     fn prepare(&self, input: &OpaqueCapabilityPayloadV1) -> AppResult<PreparedInvocationV1>;
-    /// Admits and starts one invocation. Called once per task identity.
+    /// Starts one invocation Core has admitted. Called once per task identity.
     fn start(
         &self,
         task_id: &str,

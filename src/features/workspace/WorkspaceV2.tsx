@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAgentTaskLifecycle } from "./AgentTaskLifecycle";
 import { BridgeWorkspace } from "./BridgeWorkspace";
-import { acceptDeveloperTerminal, denyDeveloperTerminal, enterDeveloperMode, getDeveloperTerminalWorkspace } from "../../lib/tauri";
+import { acceptDeveloperTerminal, acceptNativeInvocationReview, denyDeveloperTerminal, denyNativeInvocationReview, enterDeveloperMode, getDeveloperTerminalWorkspace, listNativeInvocationReviews, type NativeInvocationReview } from "../../lib/tauri";
 import type { DeveloperModeUiSession, DeveloperTerminalWorkspace } from "../../lib/types";
 import {
   AboutSettings,
@@ -33,6 +33,8 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
   const [developerWorkspaces, setDeveloperWorkspaces] = useState<Record<string, DeveloperTerminalWorkspace>>({});
   const [developerSessions, setDeveloperSessions] = useState<Record<string, DeveloperModeUiSession>>({});
   const [admissionBusy, setAdmissionBusy] = useState<string | null>(null);
+  const [invocationReviews, setInvocationReviews] = useState<NativeInvocationReview[]>([]);
+  const [reviewBusy, setReviewBusy] = useState<string | null>(null);
   const developerSessionsRef = useRef(developerSessions);
   const task = useAgentTaskLifecycle();
   const activeRoom = props.room;
@@ -82,6 +84,23 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
     const timer = window.setInterval(() => void refresh(), 2_000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [refreshDeveloperWorkspaces]);
+
+  const refreshInvocationReviews = useCallback(async () => {
+    try { setInvocationReviews(await listNativeInvocationReviews()); } catch { setInvocationReviews([]); }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+    const refresh = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try { await refreshInvocationReviews(); } finally { inFlight = false; }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 2_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [refreshInvocationReviews]);
 
   const taskSummary = useMemo(() => task.status && task.presentation ? {
     eyebrow: task.status.state === "draft" ? "Action required" : "Task",
@@ -167,12 +186,32 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
     }
   }
 
+  const pendingReview = invocationReviews[0] ?? null;
+  const reviewRoom = pendingReview ? props.rooms.find((room) => room.id === pendingReview.bridgeId) ?? null : null;
+  const reviewPeer = reviewRoom && pendingReview ? roomMembers(reviewRoom).find((peer) => peer.peerSessionId === pendingReview.requestingPeerSessionId) ?? null : null;
+
+  async function decideInvocationReview(accept: boolean) {
+    if (!pendingReview || reviewBusy) return;
+    setReviewBusy(pendingReview.taskId);
+    setMessage(null);
+    try {
+      if (accept) await acceptNativeInvocationReview(pendingReview.taskId);
+      else await denyNativeInvocationReview(pendingReview.taskId);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Pastey could not complete Agent admission.");
+    } finally {
+      await refreshInvocationReviews();
+      setReviewBusy(null);
+    }
+  }
+
   return (
     <div className="v2-app-shell">
       <BridgeNavigation route={route} rooms={props.rooms} activeRoom={activeRoom} inboxCount={inboxCount} onNavigate={navigate} onOpenBridge={openBridge} />
       <main className="v2-main">
         {message ? <p className="v2-global-message">{message}</p> : null}
         {pendingAdmission && admissionRoom ? <section className="v2-admission-banner" role="alert"><div><strong>Developer Mode request</strong><p>{requestingPeer?.displayName ?? "A connected Host"} requests terminal access to this Host in Bridge {bridgeCode(admissionRoom)}.</p></div><div><button type="button" className="v2-button" disabled={admissionBusy !== null} onClick={() => void decideTerminalAdmission(false)}>Deny</button><button type="button" className="v2-button primary" disabled={admissionBusy !== null} onClick={() => void decideTerminalAdmission(true)}>{admissionBusy ? "Responding…" : "Accept"}</button></div></section> : null}
+        {pendingReview && reviewRoom ? <section className="v2-admission-banner" role="alert"><div><strong>Agent request</strong><p>{reviewPeer?.displayName ?? "A connected Host"} requests to run {pendingReview.capabilityDisplayName} on this Host in Bridge {bridgeCode(reviewRoom)}.</p></div><div><button type="button" className="v2-button" disabled={reviewBusy !== null} onClick={() => void decideInvocationReview(false)}>Deny</button><button type="button" className="v2-button primary" disabled={reviewBusy !== null} onClick={() => void decideInvocationReview(true)}>{reviewBusy ? "Responding…" : "Accept"}</button></div></section> : null}
         {route === "bridge" ? <BridgeWorkspace room={activeRoom} items={props.roomItems} queueItems={props.queueItems} task={task} developerMode={bridgeMode === "developer"} developerSession={activeRoom ? developerSessions[activeRoom.id] ?? null : null} developerWorkspace={activeRoom ? developerWorkspaces[activeRoom.id] ?? { pendingRequests: [], sessions: [] } : { pendingRequests: [], sessions: [] }} onDeveloperSession={(session) => setDeveloperSessions((current) => ({ ...current, [session.roomId]: session }))} onRefreshDeveloper={refreshDeveloperWorkspaces} onNewBridge={() => navigate("new-bridge")} onRefresh={props.onRefreshBridge} onDeveloper={() => setBridgeMode((current) => current === "normal" ? "developer" : "normal")} onBurn={props.onBurnBridge} onEnqueue={props.onEnqueueTransferInputs} /> : null}
         {route === "activity" ? <ActivityScreen items={props.activityItems} transfers={props.transfers} queueItems={props.queueItems} onRevealInFolder={props.onRevealInFolder} /> : null}
         {route === "devices" ? <DevicesScreen room={activeRoom} /> : null}
