@@ -2,7 +2,7 @@
 
 Pastey is cross-device infrastructure for general-capability Agents. A Host is a device and execution locality; a capability is an ability that Host exposes; and an Agent is an intelligence or execution participant that makes or proposes task decisions over capabilities and resources. A general-capability Agent is not architecturally confined to one Host, tool, provider, model, capability family, or local execution environment. Hosts expose capabilities and resources, Agents reason over them, and Pastey makes authorized decisions executable across devices.
 
-This is the product and architecture direction, not a claim of AGI or universal Agent integration. The current 2.0 implementation has a native Codex path and a distinct Generic Managed Worker path over a LAN-oriented current-session Bridge. Source code, validators, and tests are authoritative. The repository is at `2.0.0-beta.2`; its beta status does not establish physical Mac ↔ Windows Native Agent acceptance.
+This is the product and architecture direction, not a claim of AGI or universal Agent integration. The current 2.0 implementation has a capability-neutral native capability path, with Codex as its only shipped adapter, and a distinct Generic Managed Worker path over a LAN-oriented current-session Bridge. Source code, validators, and tests are authoritative. The repository is at `2.0.0-beta.2`; its beta status does not establish physical Mac ↔ Windows Native Agent acceptance.
 
 ## Agent execution across Hosts
 
@@ -22,9 +22,9 @@ Dependencies point downward. Layer 5 decides semantic eligibility before Layer 3
 
 ## Native Host capabilities
 
-Pastey 2.0 treats its currently implemented native Codex Agent capability as a
-Host capability—not as a Pastey Worker harness. The
-boundary is deliberately small:
+Pastey 2.0 treats native Agents as Host capabilities—not as a Pastey Worker
+harness. Codex is the currently implemented one. The boundary is deliberately
+small:
 
 ```text
 Agent owns HOW.
@@ -46,17 +46,39 @@ Agent + workspace so related tasks preserve the Agent's native context while an
 unrelated workspace is never silently reused. Native session identifiers and
 internal conversation mechanics are not Plan semantics.
 
+Inside Pastey the native lifecycle is capability-neutral. A capability plugs in
+as an adapter registered under its capability ID; the adapter owns its input,
+start, stop, and terminal output, while Core owns task identity, ownership,
+admission, status, cancellation, reconciliation, restart recovery, Bridge
+authority, and the durable envelope. Invocation input and output are opaque,
+bounded capability-owned payloads: Core carries, persists, compares, and
+digests them but never interprets them, and adapters receive no peer, session,
+Bridge, or Review context.
+
+Three different facts are kept apart. Bridge membership and the authenticated
+current session prove who is talking. Capability availability proves this Host
+can run the capability. Neither proves that a peer may make this Host run it:
+that is executor-side admission, which Core decides before any adapter sees the
+input. A local invocation is admitted at once; every remote invocation,
+including a workspace that arrived through an approved movement, waits for a
+one-shot, process-local Accept/Deny Review on the executing Host. Every task
+also has one immutable owner—Local or the Bridge it was created on—so no other
+principal can adopt, cancel, or detach it, and Burn selects exactly its
+Bridge's tasks.
+
 For an existing workspace already on the selected connected Host, the direct
 remote Codex path is an authenticated Room Control invocation with exact Host,
-workspace, task correlation, bounded status propagation, replay rejection, and
-cancellation. It reuses the Host's native session service and creates no
+workspace, task correlation, executor Review, bounded status propagation,
+replay rejection, and cancellation. It reuses the Host's native session service and creates no
 ManagedObject, Scratch, Worker, GST scan, or Transfer.
 
 Managed resources and Transfer are introduced only when a workspace or result
 must cross a Host boundary. For a local workspace selected with a remote native
-Agent, Pastey creates one product Review that says it will send the workspace,
-let the Agent work, and return the result. One approval covers that outbound
-Transfer, native task, return Transfer, and unchanged-source apply. The source
+Agent, Pastey creates one requester-side product Review that says it will send
+the workspace, let the Agent work, and return the result. One approval covers
+that outbound Transfer, the requested native task, return Transfer, and
+unchanged-source apply. The executing Host still Accepts or Denies the landed
+workspace before its Agent starts. The source
 is captured as an exact `RegularFileSet` baseline at approval; package framing,
 encrypted transport, and landing reuse the ordinary managed-object Transfer
 seams. The Agent sees only the Host-private task workspace on its Host.
@@ -217,9 +239,9 @@ The Host-owned network broker exists as an independent Phase 5 authority domain,
 
 ## Current product boundary
 
-The primary product path is Native mature Agents. Pastey implements Host-native Codex capability discovery and invocation, Host-private persistent native sessions, local original-workspace operation, authenticated direct remote invocation when that workspace already exists on the target Host, and explicit one-review workspace movement when it does not. The movement path uses encrypted outbound and return Transfer, captures and revalidates the source baseline, preserves a returned result for durable conflict recovery instead of overwriting a changed source, and treats cancellation, stale or replaced sessions, malformed messages, and ambiguous outcomes as non-completion.
+The primary product path is Native mature Agents. Pastey implements Host-native Codex capability discovery and invocation, Host-private persistent native sessions, local original-workspace operation, authenticated direct remote invocation when that workspace already exists on the target Host, and explicit reviewed workspace movement when it does not. Both remote paths start only after the executing Host's own Accept. The movement path uses encrypted outbound and return Transfer, captures and revalidates the source baseline, preserves a returned result for durable conflict recovery instead of overwriting a changed source, and treats cancellation, stale or replaced sessions, malformed messages, and ambiguous outcomes as non-completion.
 
-The associated product presentation exposes native-Agent capability state, task lifecycle, remote invocation, movement review, one approval, bounded movement status, and Bridge-scoped reopening of unresolved durable work with Reconcile, Stop, conflict, and result-Return repair actions. Receipt-ambiguous outbound movement retains source ownership and never triggers automatic workspace resend or Agent rerun. Phase 1 is complete. Phase 2 source-level reliability and deterministic two-Host state validation are complete; physical Mac ↔ Windows validation remains pending.
+The associated product presentation exposes native-Agent capability state, task lifecycle, remote invocation, requester movement review and approval, the executing Host's Agent-request Accept/Deny banner, bounded movement status, and Bridge-scoped reopening of unresolved durable work with Reconcile, Stop, conflict, and result-Return repair actions. Receipt-ambiguous outbound movement retains source ownership and never triggers automatic workspace resend or Agent rerun. Phase 1 is complete. Phase 2 source-level reliability and deterministic two-Host state validation are complete; physical Mac ↔ Windows validation remains pending.
 
 The Generic Managed Worker / Transform / Execute path remains implemented and distinct. It includes the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, the bounded Worker Harness and model-visible Worker Context Contract, provider configuration, exact managed runtime binding, managed Host coordination, native-v2 orchestration, Natural-v2 lowering, and capability observation/confirmation. V1 remains isolated and unchanged: it executes Search/Transfer and rejects Transform/Execute. The Generic Managed path retains its own evidence limits: Bridge Device Check is a bounded Managed E2E self-check, and Windows Managed Execute acceptance does not establish an external-provider or physical multi-Host PASS.
 

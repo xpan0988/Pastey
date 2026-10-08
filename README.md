@@ -16,11 +16,13 @@ Pastey observes available Hosts and bounded capability facts. A task can select 
 
 ## Current implementation
 
-Pastey 2.0 has a LAN-oriented, current-session Bridge; factual Host and capability observations; a native Codex Host capability; and a separate Generic Managed Worker path. Native Codex work can run in the selected Host's original workspace or, after one Review and approval, use encrypted outbound workspace movement, native execution, exact result Return, and requester-side apply. The managed path has immutable Plans, Review and approval, Host admission, Search / Transform / Transfer / Execute steps, explicit cross-Host movement, and Core-owned result acceptance. These four steps are the **current managed semantic model**, not universal verbs for every Host capability.
+Pastey 2.0 has a LAN-oriented, current-session Bridge; factual Host and capability observations; a native Codex Host capability; and a separate Generic Managed Worker path. Native Codex work can run in the selected Host's original workspace or, after the requester's Review and approval, use encrypted outbound workspace movement, native execution, exact result Return, and requester-side apply. A remote invocation or moved workspace starts only after the executing Host's own Accept. The managed path has immutable Plans, Review and approval, Host admission, Search / Transform / Transfer / Execute steps, explicit cross-Host movement, and Core-owned result acceptance. These four steps are the **current managed semantic model**, not universal verbs for every Host capability.
 
 ## Native capabilities
 
 Mature capabilities remain native to the Host that owns them. Codex owns HOW: its provider and model interaction, authentication, context, reasoning, native tools, sandbox, workspace behavior, and session semantics. Pastey validates the selected Host and supplies cross-device movement when needed, task authority, bounded lifecycle observation, consequence handling, cancellation, and recovery. Native Codex is not a Generic Managed Worker and does not enter the managed object model for ordinary Host-local work.
+
+Codex plugs into a capability-neutral native lifecycle through an adapter; its invocation input and output are opaque to Pastey. Bridge membership proves who is talking and capability availability proves the Host can run the capability, but neither lets a peer run it: the executing Host must Accept each remote request in a one-shot Review, and every task stays owned by the Host-local user or the Bridge that created it.
 
 ## Managed execution
 

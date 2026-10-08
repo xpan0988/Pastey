@@ -6,6 +6,11 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ## Unreleased
 
+### Added
+
+- Native capability invocation is now capability-neutral. Core dispatches each invocation by capability ID to a registered adapter that owns its input, start, stop, and terminal output; Core keeps task identity, ownership, admission, status, cancellation, reconciliation, restart recovery, Bridge authority, and the durable envelope. Codex is the only shipped adapter. A capability-neutral `pastey-native-agent-invoke-v2` invocation and its `start_remote_native_capability_task` command exist without a renderer entry point yet.
+- Native capability input and terminal output are opaque, capability-owned payloads bounded to 16 KiB. Core carries, persists, compares, and digests them without interpreting them, and Room Control's field-name safety check skips exactly those payload subtrees while still checking every other field.
+
 ### Changed
 
 - A remote native capability invocation now requires this Host's Review before anything runs. Authentication and capability availability no longer suffice: the invocation waits, unprepared and unstarted, until the Host user accepts it under the exact session it arrived on; Deny, expiry, session loss and Burn end it without starting. Local invocations are admitted immediately by the same policy. Reviews are process-local and show no invocation input.
@@ -16,6 +21,10 @@ The current development changes belong in `Unreleased`. Each release archives th
 - Bound every Native Agent task to one immutable owner, Local or its Bridge. Another Bridge can no longer adopt, re-home, or detach a task through a duplicate or conflicting invocation, workspace preparation, or approval, and Burn again selects exactly the tasks its Bridge owns, including after restart.
 - Executor-side `native_agent.cancel` now requires the authenticated Bridge to own the task; a Bridge cannot cancel a Local task or another Bridge's task.
 - `native_agent.workspace_prepare` is accepted only when its source Host is the authenticated current-session peer `HostRef`.
+
+### Documentation
+
+- Synchronized the README, architecture, Layer 4, Layer 5, reference, and development documentation with the capability-neutral adapter model, the opaque payload boundary, immutable task ownership and Bridge-bound authority, and two-sided Review: the requester's movement approval plus the executing Host's own Accept. The reference now lists the invoke-v2 schema and payload, `native_agent.retry_result_return`, the Review commands, admission codes and bounds, and the admission/adapter sources.
 
 ## 2.0.0-beta.2 — Pastey 2.0 Beta 2 — 2026-09-25
 
