@@ -48,9 +48,9 @@ pub(crate) const NATIVE_AGENT_TASK_SCHEMA: &str = "pastey-native-agent-task-v1";
 pub(crate) const CODEX_CAPABILITY_ID: &str = "agent.coding.codex";
 pub(crate) const NATIVE_AGENT_WORKSPACE_MOVEMENT_SCHEMA: &str =
     "pastey-native-agent-workspace-movement-v1";
-/// The intentionally small, exact control surface Pastey 2.0 understands for
-/// its one concrete native capability. This is a Host capability fact, never
-/// execution, Transfer, or session authority.
+/// The exact control surface of the Codex capability's direct (v1) invocation.
+/// This is a Host capability fact, never execution, Transfer, or session
+/// authority.
 pub(crate) const DIRECT_NATIVE_INVOKE_PROTOCOLS: [&str; 2] =
     [NATIVE_AGENT_PROTOCOL_SCHEMA, NATIVE_AGENT_TASK_SCHEMA];
 pub(crate) const WORKSPACE_MOVEMENT_PROTOCOLS: [&str; 3] = [
@@ -546,7 +546,9 @@ pub(crate) struct NativeAgentTaskStatusV1 {
     pub(crate) output: Option<OpaqueCapabilityPayloadV1>,
 }
 
-/// A small Host-private service, not an Agent registry or a Worker adapter.
+/// A small Host-private service: the native capability lifecycle over a
+/// fixed set of registered adapters. It is not a discoverable Agent
+/// marketplace, an authority source, or a Worker adapter.
 pub(crate) struct NativeAgentServiceV1 {
     /// Capabilities this Host can run, dispatched by capability id.
     adapters: Vec<Arc<dyn NativeCapabilityAdapterV1>>,
@@ -1162,9 +1164,10 @@ impl NativeAgentServiceV1 {
         self.require_capability(CODEX_CAPABILITY_ID)
     }
 
-    /// Creates the user-visible Review envelope on the initiating Host.  This
-    /// only captures an exact safe baseline; no package, transfer, or Agent
-    /// invocation exists until the one approval below.
+    /// Creates the user-visible movement Review on the initiating Host. This
+    /// only captures an exact safe baseline; no package or transfer exists
+    /// until the requester approval below. That approval authorizes the
+    /// movement, never execution: the receiving Host's executor Review does.
     pub(crate) fn propose_workspace_movement(
         &mut self,
         movement_id: &str,
@@ -1218,7 +1221,7 @@ impl NativeAgentServiceV1 {
             source_workspace_name: source_workspace_name.clone(),
             target_host_ref: target_host_ref.into(),
             review_summary: format!(
-                "Pastey will send \"{source_workspace_name}\" to the selected device, let Codex work on it, then return the result here."
+                "Pastey will send \"{source_workspace_name}\" to the selected device and ask it to run Codex. Codex runs only if that device accepts; the result then returns here."
             ),
             state: NativeAgentWorkspaceMovementStateV1::AwaitingApproval,
             code: None,

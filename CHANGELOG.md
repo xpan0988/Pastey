@@ -13,18 +13,26 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Changed
 
-- A remote native capability invocation now requires this Host's Review before anything runs. Authentication and capability availability no longer suffice: the invocation waits, unprepared and unstarted, until the Host user accepts it under the exact session it arrived on; Deny, expiry, session loss and Burn end it without starting. Local invocations are admitted immediately by the same policy. Reviews are process-local and show no invocation input.
-- An approved workspace movement no longer runs Codex on the executing Host by itself. After the workspace lands, the executor shows the same Agent request as a direct invocation; only its Accept starts Codex, and Deny, expiry, session loss, Burn or restart end the movement as a definite non-start and remove the landed workspace. The requester's own movement Review is unchanged and still required.
+- A remote native capability invocation now requires the executing Host's executor Review before anything runs. Authentication and capability availability no longer suffice: the invocation waits, unprepared and unstarted, until the Host user accepts it under the exact session it arrived on; Deny, expiry, session loss and Burn end it without starting. Local invocations are admitted immediately by the same policy. Executor Reviews are process-local and show no invocation input.
+- An approved workspace movement no longer runs Codex on the executing Host by itself. After the workspace lands, the executor shows the same Agent request as a direct invocation; only its Accept starts Codex, and Deny, expiry, session loss, Burn or restart end the movement as a definite non-start and remove the landed workspace. Requester movement approval is unchanged and still required; it authorizes the movement, not execution.
+- The requester's workspace-movement Review no longer says Codex will run: it says the receiving device runs Codex only if it accepts, and its button reads "Approve and send".
 
 ### Fixed
 
 - Bound every Native Agent task to one immutable owner, Local or its Bridge. Another Bridge can no longer adopt, re-home, or detach a task through a duplicate or conflicting invocation, workspace preparation, or approval, and Burn again selects exactly the tasks its Bridge owns, including after restart.
 - Executor-side `native_agent.cancel` now requires the authenticated Bridge to own the task; a Bridge cannot cancel a Local task or another Bridge's task.
 - `native_agent.workspace_prepare` is accepted only when its source Host is the authenticated current-session peer `HostRef`.
+- Cancelling or releasing a Codex task now acts only on that task's own app-server, never on a later session that replaced it at the same workspace.
+- Native Agent shutdown no longer shuts down the Codex adapter twice.
+- An unchanged Bridge no longer rewrites its legacy peer row on every Room Control event.
 
 ### Documentation
 
-- Synchronized the README, architecture, Layer 4, Layer 5, reference, and development documentation with the capability-neutral adapter model, the opaque payload boundary, immutable task ownership and Bridge-bound authority, and two-sided Review: the requester's movement approval plus the executing Host's own Accept. The reference now lists the invoke-v2 schema and payload, `native_agent.retry_result_return`, the Review commands, admission codes and bounds, and the admission/adapter sources.
+- Synchronized the README, architecture, Layer 4, Layer 5, reference, and development documentation with the capability-neutral adapter model, the opaque payload boundary, immutable task ownership and Bridge-bound authority, and two-sided Review: the requester's movement approval plus the executing Host's own Accept. The reference now lists the invoke-v2 schema and payload, `native_agent.retry_result_return`, the Review commands, admission codes and bounds, and the admission/adapter sources. The architecture now states its authority invariants explicitly, Layer 1 and Layer 2 cover landed workspaces and native capability facts, and the docs distinguish native executor admission from managed Host admission.
+
+### Removed
+
+- Removed the static product website (`site/`) from the repository.
 
 ## 2.0.0-beta.2 — Pastey 2.0 Beta 2 — 2026-09-25
 

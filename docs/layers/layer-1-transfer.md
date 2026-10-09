@@ -14,7 +14,7 @@ For a file-like transfer, the sender creates an encrypted payload, divides it in
 
 The sender may update a supported active binary-v1 window at runtime. Window policy is Layer 3 policy; Layer 1 provides the update primitive and does not create its own scheduler.
 
-Layer 1 reports that an encrypted transfer safely landed. It does not read a Bridge Plan, decide which managed primitive follows, infer Transform, or create Layer 5 execution authority.
+Layer 1 reports that an encrypted transfer safely landed. It does not read a Bridge Plan, decide which managed primitive follows, infer Transform, or create Layer 5 execution authority. A landed native workspace likewise only waits for the executing Host's executor Review.
 
 ## Routing and handoff boundaries
 

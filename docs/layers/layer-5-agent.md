@@ -10,11 +10,13 @@ A Host is a device and execution locality represented by Pastey. A capability is
 
 ## Native mature Agents
 
-A mature Agent is a Host capability, not a Pastey-managed Worker. The Agent
-owns HOW; Pastey owns WHERE, authority, cross-Host movement, consequences,
-completion, cancellation, and recovery. The Agent's native provider/auth,
-model selection, workspace behavior, tools, sandbox, reasoning, subagents,
-and persistent conversation remain Host-private and opaque to Pastey.
+A mature Agent or other mature runtime is a Host capability, not a
+Pastey-managed Worker. The native capability owns HOW; Pastey owns WHERE,
+authority, executor admission, task ownership, cross-Host movement,
+consequences, completion, cancellation, and recovery. The capability's native
+provider/auth, model selection, input interpretation, workspace behavior,
+tools, sandbox, reasoning, subagents, safety, and persistent conversation
+remain Host-private and opaque to Pastey.
 
 The default local path is intentionally direct:
 
@@ -71,7 +73,7 @@ turn is non-DONE.
 
 ### Native completion and consequence recovery
 
-Pastey persists only its outer task and movement facts: immutable correlation, Host-private Bridge binding, execution status, exact result snapshot/digest, and requester apply state. Agent execution, result capture, encrypted Return, conflict retention, result Apply, and movement completion are separate facts. A completed Agent task stays `Completed` if capture, Return, retention, Apply, or explicit recovery abandonment later fails. Recovery, Return retry, cancellation, and Burn never authorize a second Agent turn. Restart does not recreate a native process, session, or turn. Unproved Bridge-bound execution becomes interrupted/reconciliation-required; an unbound local task that cannot be reconciled becomes terminal `failed` with `native_agent_interrupted_on_restart` and its unreachable envelope is removed.
+Pastey persists only its outer task and movement facts: immutable correlation, Host-private Bridge binding, execution status, exact result snapshot/digest, and requester apply state. Agent execution, result capture, encrypted Return, conflict retention, result Apply, and movement completion are separate facts. A completed Agent task stays `Completed` if capture, Return, retention, Apply, or explicit recovery abandonment later fails. Recovery, Return retry, cancellation, and Burn never authorize a second Agent turn. Restart does not recreate a native process, session, or turn. Unproved Bridge-bound execution becomes interrupted/reconciliation-required, while a task still awaiting executor Review never started and becomes a definite non-start; an unbound local task that cannot be reconciled becomes terminal `failed` with `native_agent_interrupted_on_restart` and its unreachable envelope is removed.
 
 A durably completed received task can seal its exact result from its retained app-owned workspace if capture was interrupted, then retry only Return. Failed or unsafe capture is a consequence failure. After session loss, fresh authenticated reconciliation can prove a completed task and a validated durable snapshot digest. The requester retains that expected digest separately; it creates `result_identity` only from content actually received locally. The executor resends only its matching snapshot, never reruns the Agent. Lost final outbound Transfer acknowledgement, including a sender bookkeeping failure after receiver `/finish`, remains reconciliation-required and source-owning. Proven failure before Transfer finalization can become an ordinary interruption with best-effort cancellation of queued preparation.
 
@@ -98,52 +100,62 @@ Workspace preparation is accepted only when its source Host is the exact
 authenticated current-session peer `HostRef`. Ownership is integrity, not
 admission: it does not decide whether a peer may invoke a capability.
 
-Admission is that decision, made by Core on the executing Host before any
-capability adapter sees the input. Bridge/session authentication and
-capability availability are necessary but never sufficient. The fixed policy
-admits a Local invocation at once and holds every remote `native_agent.invoke`
-for Host Review: after the exact authenticated peer `HostSessionBinding`, the
+Native executor admission is that decision, made by Core on the executing
+Host before any capability adapter sees the input. It is separate from the
+managed Plan path's attempt-bound Host admission. Bridge/session
+authentication and capability availability are necessary but never
+sufficient. The fixed policy admits a Local invocation at once and holds every
+remote `native_agent.invoke` for executor Review: after the exact authenticated peer `HostSessionBinding`, the
 target Host, ownership/replay and availability checks pass, the task is
 `queued` with `native_agent_review_required` and neither `prepare` nor `start`
 has run. Accept is one-shot; it starts the invocation only if the exact
-binding is still current, the Bridge was not Burned, the Review has not
-expired (two minutes, bounded by the Bridge expiry), ownership is unchanged
+binding is still current, the Bridge was not Burned, the executor Review has
+not expired (two minutes, bounded by the Bridge expiry), ownership is unchanged
 and the capability is still available. Deny, expiry and lost authority end
 the task `failed` with `native_agent_admission_denied`,
 `native_agent_review_expired` or `native_agent_admission_revoked`; a
 capability that refuses an accepted input ends `native_agent_start_rejected`.
-A pending Review is process-local: it is never persisted, never exposes its
+A pending executor Review is process-local: it is never persisted, never exposes its
 input to the renderer (only task, Bridge, peer `HostRef`/session, capability
 name and expiry), ends on session loss, disappears on Burn or peer
 departure, and is forgotten on restart. There is no stored grant, ACL, or
 "always allow". Once started, an invocation keeps the existing lifecycle and
 is not re-admitted on route or session change.
 
-Received workspace movement goes through the same admission. The requester's
-movement Review authorizes moving the workspace and the remote operation; it
-is never execution authority on the executing Host. Workspace preparation is
+Received workspace movement goes through the same admission. Requester
+movement approval authorizes moving the workspace and the remote operation;
+it is never execution authority on the executing Host. Workspace preparation is
 bound to the exact authenticated peer `HostSessionBinding`. When the encrypted
 workspace lands and is durably owned by its movement, the task stays `queued`
 with `native_agent_review_required`, still `transferring_to_agent`, holding the
 landed tree and the requester's source; Codex is neither prepared nor
-started. The same pending Review, projection, and Accept/Deny apply. Accept
+started. The same pending executor Review, projection, and Accept/Deny apply. Accept
 additionally revalidates that the landed workspace and held input still
 belong to exactly that movement and task, then continues the existing
 movement lifecycle and Return unchanged. Deny, expiry, session loss, and
 restart end task and movement `failed` with the admission code and remove the
 landed tree through the existing terminal cleanup, never through
 reconciliation. Burn and peer departure remove them with the Bridge. A
-duplicate preparation or landing creates no second Review.
+duplicate preparation or landing creates no second executor Review.
 
 When a workspace or result actually must move across Hosts, Pastey uses the
 existing managed object/RegularFileSet and encrypted Transfer flow only for
 that movement. Review is two-sided. On the requesting Host, the product
 presents one movement Review in device terms—send the workspace to the Agent
-Host, let Codex work, then return it—and one approval covers sending, the
-requested remote operation, Return, and unchanged-source apply. On the
-executing Host, the landed workspace still waits for that Host's own Accept
-(above) before Codex starts; the requester's approval is never execution
-authority there. The outbound receipt materializes as a
+Host, ask that Host to run Codex, then return the result—and requester
+movement approval covers sending, the requested remote operation, Return, and
+unchanged-source apply. On the executing Host, the landed workspace still
+waits for that Host's own executor Review (above) before Codex starts; the
+requester's approval is never execution authority there. The full order is:
+
+```text
+movement proposal → requester approval
+  → workspace_prepare → encrypted Transfer → materialization
+  → executor Review → Accept → adapter prepare/start
+  → result → Return → source apply or conflict retention
+```
+
+The outbound receipt materializes as a
 Host-private Pastey task workspace; Codex operates on that normal workspace
 without seeing GST, receipts, source Host identity, or other movement internals.
 
@@ -153,7 +165,7 @@ before a bounded staged replacement. An unchanged source applies automatically
 without another confirmation. A changed source retains the returned result and
 enters `conflict_recovery_required` with a durable Host-private recovery copy;
 it does not overwrite, merge, guess, or report movement completion. The Agent
-task remains `Completed` if native execution completed. Before Review, a
+task remains `Completed` if native execution completed. Before the requester's movement Review, a
 cross-Host workspace must be representable faithfully: Pastey rejects
 symlink/reparse and special entries, empty directories, executable modes,
 invalid portable selectors, case-folding collisions, and bounded-manifest
@@ -210,7 +222,7 @@ Core validation tracks the one current location and revision of every logical ob
 
 The canonical B→C rule is therefore structural: a Transform result N+1 at B cannot be consumed at C until the authored B→C Transfer completes and C has the exact receipt.
 
-## Review, approval, readiness, and admission
+## Managed Plan Review, approval, readiness, and Host admission
 
 The deterministic native-v2 Composer accepts only explicit HostRefs, roots, and authored steps. It sorts participants, validates the dependency/object flow, and seals one immutable revision/hash. Natural-v2 may feed this Composer only after Core resolves its bounded aliases; neither path approves or starts the result.
 
@@ -368,7 +380,7 @@ Distributed delivery failure remains unable to prove remote native-process termi
 | Host-native Codex capability discovery/invocation and Host-private native sessions | Generic capability acquisition/install behavior; Agent integration does not authorize installation |
 | Capability-neutral native lifecycle with adapter dispatch by capability ID, opaque bounded input/output, and generic invoke-v2 (exercised by a test-only adapter) | Product UI for invoke-v2 or for any non-Codex native capability |
 | Native Agent local original-workspace execution and direct remote invocation for a workspace already on the selected Host | Automatic or invisible topology mutation; remote movement remains visible and consented |
-| Executor-side Host admission: immutable Local/Bridge task ownership, Bridge-bound cancel, and a one-shot, process-local Accept/Deny Review for every remote invocation and received workspace | Configurable admission policy, stored grants, per-peer allowlists, or "always allow" |
+| Native executor admission: immutable Local/Bridge task ownership, Bridge-bound cancel, and a one-shot, process-local Accept/Deny executor Review for every remote invocation and received workspace | Configurable admission policy, stored grants, per-peer allowlists, or "always allow" |
 | Required remote workspace movement detection, requester movement Review/approval plus executor Accept, encrypted outbound/return movement, restart recovery, source revalidation, and durable conflict recovery | Physical Mac ↔ Windows movement and failure-matrix evidence |
 | Bridge-native NodeList/capability projection, bounded fixed Host probes, and generic semantic-ID capability-acquisition confirmation | Confirmation performs no installation or execution |
 | Deterministic native-v2 Draft/Review/approval/readiness/status/cancel backend and 2.0 lifecycle UI for an opened revision | Renderer-safe Draft discovery/origination, PM context, reviewed topology, and result projection |

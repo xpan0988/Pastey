@@ -22,14 +22,20 @@ Dependencies point downward. Layer 5 decides semantic eligibility before Layer 3
 
 ## Native Host capabilities
 
-Pastey 2.0 treats native Agents as Host capabilities—not as a Pastey Worker
-harness. Codex is the currently implemented one. The boundary is deliberately
-small:
+A mature runtime—Codex today, another Agent, a vendor runtime, or a device
+runtime—is a Host capability, not a Pastey Worker harness and not a special
+control architecture. Codex is the current production adapter. The boundary is
+deliberately small:
 
 ```text
-Agent owns HOW.
-Pastey owns WHERE, authority, cross-Host movement, effects and consequences,
-completion, cancellation, and recovery.
+The native capability owns HOW: its provider or runtime, native session,
+interpretation of its own input, tools, reasoning, execution,
+capability-specific safety, and native outcome.
+
+Pastey owns WHERE and authority: discovery, Host and session identity,
+routing, executor admission, task ownership, lifecycle observation,
+cancellation, Burn, reconciliation, cross-Host movement, and durable outer
+facts.
 ```
 
 Pastey can detect/observe a native Agent, qualify only enough to use its native
@@ -58,27 +64,47 @@ Bridge, or Review context.
 Three different facts are kept apart. Bridge membership and the authenticated
 current session prove who is talking. Capability availability proves this Host
 can run the capability. Neither proves that a peer may make this Host run it:
-that is executor-side admission, which Core decides before any adapter sees the
-input. A local invocation is admitted at once; every remote invocation,
+that is native executor admission, which Core decides before any adapter sees
+the input. It is separate from the managed Plan path's attempt-bound Host
+admission. A local invocation is admitted at once; every remote invocation,
 including a workspace that arrived through an approved movement, waits for a
-one-shot, process-local Accept/Deny Review on the executing Host. Every task
+one-shot, process-local Accept/Deny executor Review on the executing Host. Every task
 also has one immutable owner—Local or the Bridge it was created on—so no other
 principal can adopt, cancel, or detach it, and Burn selects exactly its
 Bridge's tasks.
 
 For an existing workspace already on the selected connected Host, the direct
-remote Codex path is an authenticated Room Control invocation with exact Host,
-workspace, task correlation, executor Review, bounded status propagation,
-replay rejection, and cancellation. It reuses the Host's native session service and creates no
-ManagedObject, Scratch, Worker, GST scan, or Transfer.
+remote path is an authenticated Room Control invocation with exact Host,
+capability, opaque input (for Codex, its workspace and task), task
+correlation, executor Review, bounded status propagation, replay rejection,
+and cancellation. It reuses the Host's native session service and creates no
+ManagedObject, Scratch, Worker, GST scan, or Transfer:
+
+```text
+authenticated current Bridge session
+  → capability observation (a fact, not permission)
+  → native_agent.invoke over Room Control
+  → executor Review on the executing Host
+  → Accept → adapter prepare/start
+```
 
 Managed resources and Transfer are introduced only when a workspace or result
 must cross a Host boundary. For a local workspace selected with a remote native
-Agent, Pastey creates one requester-side product Review that says it will send
-the workspace, let the Agent work, and return the result. One approval covers
-that outbound Transfer, the requested native task, return Transfer, and
-unchanged-source apply. The executing Host still Accepts or Denies the landed
-workspace before its Agent starts. The source
+Agent, Pastey creates one requester movement Review that says it will send the
+workspace, ask the Agent Host to run the task, and return the result.
+Requester movement approval covers that outbound Transfer, the request for the
+remote task, the return Transfer, and unchanged-source apply; it is never
+execution authority. The executing Host's executor Review still Accepts or
+Denies the landed workspace before its capability starts:
+
+```text
+movement proposal → requester approval
+  → workspace_prepare → encrypted Transfer → materialization
+  → executor Review → Accept → adapter prepare/start
+  → result → Return → source apply or conflict retention
+```
+
+The source
 is captured as an exact `RegularFileSet` baseline at approval; package framing,
 encrypted transport, and landing reuse the ordinary managed-object Transfer
 seams. The Agent sees only the Host-private task workspace on its Host.
@@ -89,7 +115,7 @@ Pastey retains the exact returned workspace under Host-private conflict storage
 and enters consequence recovery without overwriting the source. The native
 task remains `Completed` if its execution completed; movement completion and
 result apply remain separate facts. Cross-Host movement is rejected before
-Review when the selected workspace cannot be represented
+requester movement approval when the selected workspace cannot be represented
 faithfully (including symlink/reparse or special entries, empty directories,
 executable modes, invalid portable selectors, or bounded-manifest violations).
 Failed, cancelled, interrupted, lost, malformed, mismatched, or otherwise
@@ -100,6 +126,29 @@ Codex terminal success is intentionally narrow: the exact native
 `turn/completed` notification must name the requested thread and turn, carry
 `status: completed`, and have no error. `failed`, `interrupted`, cancellation,
 and any malformed or mismatched terminal notification stay non-DONE.
+
+## Architecture invariants
+
+- Bridge membership and an authenticated current session are communication
+  authority, never execution authority.
+- A capability observation, including availability and protocol
+  compatibility, is never invocation permission.
+- Remote native capability execution requires native executor admission: a
+  local invocation is admitted at once; a remote one waits for the executing
+  Host's executor Review.
+- An adapter prepares or starts an invocation only after Core has admitted it.
+- Requester movement approval and executor execution approval are distinct;
+  neither substitutes for the other.
+- Every native task has one immutable owner, Local or the Bridge it was
+  created on. Remote cancellation is bound to that owner, and Burn revokes
+  exactly the authority its Bridge owns.
+- Core does not interpret native capability input or output.
+- The native capability owns HOW. A robot, VLA, or vendor device runtime is
+  treated the same way: Pastey owns discovery, authority, routing, and
+  lifecycle, while the native or vendor runtime owns control loops, motion,
+  device safety, and HOW.
+- An unknown outcome is never promoted to success, and restart never reruns
+  native work.
 
 ## Host and capability observations
 
@@ -138,7 +187,7 @@ Host     = exact local binding
 Core     = authority
 ```
 
-Capability is not authority. Probe availability is not executable binding. Acquisition confirmation is neither installation nor execution authority.
+Capability is not authority. Probe availability is not executable binding. Acquisition confirmation is neither installation nor execution authority. This chain is managed Host admission; native capabilities use the separate native executor admission described above.
 
 Execution locality does not change this chain. Core resolves each authored participant's `HostRef` once. Work for the current Host uses direct coordinator dispatch with a fresh local-runtime reference; work for another Host uses its current Bridge/session binding and Room Control. Both paths satisfy the same Layer 5 Review, readiness, attempt-bound admission, prepared/commit, result, continuation, and cancellation contract.
 
@@ -239,7 +288,7 @@ The Host-owned network broker exists as an independent Phase 5 authority domain,
 
 ## Current product boundary
 
-The primary product path is Native mature Agents. Pastey implements Host-native Codex capability discovery and invocation, Host-private persistent native sessions, local original-workspace operation, authenticated direct remote invocation when that workspace already exists on the target Host, and explicit reviewed workspace movement when it does not. Both remote paths start only after the executing Host's own Accept. The movement path uses encrypted outbound and return Transfer, captures and revalidates the source baseline, preserves a returned result for durable conflict recovery instead of overwriting a changed source, and treats cancellation, stale or replaced sessions, malformed messages, and ambiguous outcomes as non-completion.
+The primary product path is Native mature Agents. Pastey implements a capability-neutral native lifecycle with Codex as its production adapter: capability discovery and invocation, Host-private persistent native sessions, local original-workspace operation, authenticated direct remote invocation when that workspace already exists on the target Host, and explicit reviewed workspace movement when it does not. Both remote paths start only after the executing Host's own Accept. The movement path uses encrypted outbound and return Transfer, captures and revalidates the source baseline, preserves a returned result for durable conflict recovery instead of overwriting a changed source, and treats cancellation, stale or replaced sessions, malformed messages, and ambiguous outcomes as non-completion.
 
 The associated product presentation exposes native-Agent capability state, task lifecycle, remote invocation, requester movement review and approval, the executing Host's Agent-request Accept/Deny banner, bounded movement status, and Bridge-scoped reopening of unresolved durable work with Reconcile, Stop, conflict, and result-Return repair actions. Receipt-ambiguous outbound movement retains source ownership and never triggers automatic workspace resend or Agent rerun. Phase 1 is complete. Phase 2 source-level reliability and deterministic two-Host state validation are complete; physical Mac ↔ Windows validation remains pending.
 

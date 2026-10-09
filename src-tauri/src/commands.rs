@@ -1332,8 +1332,9 @@ pub async fn stop_bridge_native_agent_task(
     Ok(local)
 }
 
-/// Builds the one-review cross-device envelope when the selected workspace is
-/// local to this Host and Codex is selected on another current Bridge Host.
+/// Builds the requester movement Review when the selected workspace is local
+/// to this Host and Codex is selected on another current Bridge Host. Codex
+/// runs there only after that Host's own executor Review.
 /// This is deliberately not used for ordinary remote-existing-workspace tasks.
 #[tauri::command]
 pub async fn propose_remote_native_codex_workspace_movement(
