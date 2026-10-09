@@ -9,5 +9,10 @@
       "Bash(git push --force *)",
       "Bash(git push -f *)"
     ]
+  },
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
   }
 }
