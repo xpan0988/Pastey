@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::{NativeAgentCapabilityStateV1, NativeAgentCapabilityV1, NativeTurnOutcomeV1};
 use crate::error::{AppError, AppResult};
@@ -26,6 +26,9 @@ pub(super) mod fake_longjob;
 /// Bound for one invocation input or terminal output. It keeps either well
 /// inside one Room Control event.
 pub(crate) const MAX_CAPABILITY_PAYLOAD_BYTES: usize = 16 * 1024;
+/// The one output shape renderers display: user-facing text an adapter
+/// reports, never interpreted as markup, a command, a path or a link.
+pub(crate) const NATIVE_TEXT_OUTPUT_SCHEMA: &str = "pastey-native-text-output-v1";
 
 /// Capability-owned invocation input or terminal output. Core can carry,
 /// persist, compare and digest it, but only adapters (this module and its
@@ -55,8 +58,47 @@ impl OpaqueCapabilityPayloadV1 {
         Self(value)
     }
 
+    /// User-facing text in the shared text output shape, cut at a character
+    /// boundary so the whole payload stays within its bound. Blank text is
+    /// no output.
+    fn text_output(text: &str) -> Option<Self> {
+        if text.trim().is_empty() {
+            return None;
+        }
+        let envelope = |text: &str, truncated: bool| {
+            json!({
+                "schemaVersion": NATIVE_TEXT_OUTPUT_SCHEMA,
+                "text": text,
+                "truncated": truncated,
+            })
+        };
+        let overhead = serde_json::to_vec(&envelope("", true)).ok()?.len();
+        let budget = MAX_CAPABILITY_PAYLOAD_BYTES.checked_sub(overhead)?;
+        let mut used = 0;
+        let mut end = text.len();
+        for (index, character) in text.char_indices() {
+            used += json_escaped_len(character);
+            if used > budget {
+                end = index;
+                break;
+            }
+        }
+        let output = Self(envelope(&text[..end], end < text.len()));
+        output.validate().ok()?;
+        Some(output)
+    }
+
     fn value(&self) -> &Value {
         &self.0
+    }
+}
+
+/// Bytes serde_json writes for one character inside a JSON string.
+fn json_escaped_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+        '\u{00}'..='\u{1f}' => 6,
+        _ => character.len_utf8(),
     }
 }
 
@@ -97,11 +139,20 @@ pub(crate) struct NativeInvocationOutcomeV1 {
     pub(crate) output: Option<OpaqueCapabilityPayloadV1>,
 }
 
+/// Non-terminal facts an adapter publishes while its invocation runs. Core
+/// records them only while the task is still running; none of them is an
+/// outcome, and none can outlive or override cancellation.
+pub(crate) trait NativeInvocationProgressV1: Send + Sync {
+    /// The native capability is blocked until its own client answers a
+    /// request (for example an approval) that Pastey does not answer.
+    fn awaiting_native_decision(&self, waiting: bool);
+}
+
 /// One started invocation, observed on a Core-owned thread.
 pub(crate) trait NativeInvocationRunV1: Send {
     /// Blocks until the capability reports a terminal outcome or Pastey can
     /// no longer observe it (`Unknown`). There is no Pastey deadline.
-    fn run(&mut self) -> NativeInvocationOutcomeV1;
+    fn run(&mut self, progress: &dyn NativeInvocationProgressV1) -> NativeInvocationOutcomeV1;
     /// After `Unknown`, blocks while the invocation might still be running,
     /// so its exclusivity key stays held.
     fn wait_until_observation_lost(&self);

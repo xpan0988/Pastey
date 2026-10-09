@@ -12,6 +12,7 @@ import {
   getNativeAgentWorkspaceMovementStatus,
   getNativeV2PlanStatus,
   listNativeAgentCapabilities,
+  listRemoteNativeAgentCapabilities,
   proposeRemoteNativeCodexWorkspaceMovement,
   revealNativeAgentConflictResult,
   reconcileRemoteNativeAgentTask,
@@ -97,6 +98,99 @@ export function nativeAgentTaskNeedsObservation(status: NativeAgentTaskStatus | 
   return !!status && (["queued", "running"].includes(status.state)
     || (status.state === "interrupted"
       && ["native_agent_reconciliation_required", "native_agent_outcome_unknown"].includes(status.code ?? "")));
+}
+
+export const NATIVE_TEXT_OUTPUT_SCHEMA = "pastey-native-text-output-v1";
+export const AWAITING_NATIVE_DECISION_CODE = "native_agent_awaiting_native_decision";
+
+/** What the task card shows as the Agent's response, apart from its
+ * lifecycle state. Only a completed task has one. The text is untrusted,
+ * possibly remote data: it is rendered as escaped text and nothing else. */
+export type NativeAgentResponseView =
+  | { kind: "text"; text: string; truncated: boolean }
+  | { kind: "undisplayable" }
+  | { kind: "none" };
+
+export function nativeAgentResponse(status: NativeAgentTaskStatus | null): NativeAgentResponseView | null {
+  if (status?.state !== "completed") return null;
+  const output = status.output;
+  if (output === undefined || output === null) return { kind: "none" };
+  if (typeof output === "object" && !Array.isArray(output)) {
+    const { schemaVersion, text, truncated } = output as Record<string, unknown>;
+    if (schemaVersion === NATIVE_TEXT_OUTPUT_SCHEMA && typeof text === "string" && typeof truncated === "boolean") {
+      return { kind: "text", text, truncated };
+    }
+  }
+  return { kind: "undisplayable" };
+}
+
+/** The task runs, but the native Agent is blocked on a decision only its
+ * own client can make (an approval or a question). Pastey does not answer
+ * it; the user can stop the task. */
+export function nativeAgentAwaitingNativeDecision(status: NativeAgentTaskStatus | null): boolean {
+  return status?.state === "running" && status.code === AWAITING_NATIVE_DECISION_CODE;
+}
+
+export function nativeAgentLifecycleLabel(status: NativeAgentTaskStatus): string {
+  if (nativeAgentAwaitingNativeDecision(status)) return "running · waiting for a native approval";
+  if (status.state === "failed" && status.code === "native_agent_start_failed") return "failed · did not start";
+  return status.state.replace(/_/g, " ");
+}
+
+export function nativeAgentDisplayName(agentId: string | null | undefined): string {
+  return agentId === "agent.coding.codex" ? "Codex" : agentId || "Agent";
+}
+
+/** A selected Host's advertised capability as the card presents it. */
+export type NativeAgentTargetAvailability =
+  | { state: "checking" }
+  | { state: "available" | "incompatible" | "unavailable" }
+  | { state: "unknown"; message: string };
+
+export function nativeAgentTargetAvailability(
+  agentId: string,
+  observation: RemoteNativeCapabilityObservation | null,
+): NativeAgentTargetAvailability {
+  if (!observation || observation.state === "checking") return { state: "checking" };
+  if (observation.state === "error") return { state: "unknown", message: observation.message };
+  const capability = observation.capabilities.find((candidate) => candidate.agentId === agentId);
+  return { state: capability?.state ?? "unavailable" };
+}
+
+export type RemoteNativeCapabilityObservation =
+  | { roomId: string; hostRef: string; state: "checking" }
+  | { roomId: string; hostRef: string; state: "observed"; capabilities: NativeAgentCapability[] }
+  | { roomId: string; hostRef: string; state: "error"; message: string };
+
+/** The selected remote Host's own advertised native capabilities, observed
+ * over the existing capability query whenever the selection changes or the
+ * user refreshes. Never this device's local capability state. */
+export function useRemoteNativeCapabilities(roomId: string, hostRef: string | null) {
+  const [observation, setObservation] = useState<RemoteNativeCapabilityObservation | null>(null);
+  const generation = useRef(0);
+  const refresh = useCallback(async () => {
+    if (!roomId || !hostRef) {
+      setObservation(null);
+      return;
+    }
+    const current = ++generation.current;
+    setObservation({ roomId, hostRef, state: "checking" });
+    try {
+      const capabilities = await listRemoteNativeAgentCapabilities(roomId, hostRef);
+      if (current === generation.current) setObservation({ roomId, hostRef, state: "observed", capabilities });
+    } catch (error) {
+      if (current === generation.current) {
+        setObservation({ roomId, hostRef, state: "error", message: error instanceof Error ? error.message : String(error) });
+      }
+    }
+  }, [hostRef, roomId]);
+  useEffect(() => {
+    if (!hasTauriRuntime()) return;
+    void refresh();
+    return () => { generation.current += 1; };
+  }, [refresh]);
+  const current = observation && observation.roomId === roomId && observation.hostRef === hostRef ? observation : null;
+  return { observation: current, refresh };
 }
 
 const RETURN_RETRY_POLL_INTERVAL_MS = 1_000;
@@ -272,6 +366,8 @@ export function useNativeAgentTask(roomId: string) {
   } | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** The remote Host the shown task runs on, or null for this device. */
+  const [taskHostRef, setTaskHostRef] = useState<string | null>(null);
   const recoveryCorrelation = movement
     ? { taskId: movement.taskId, movementId: movement.movementId, targetHostRef: movement.targetHostRef }
     : recoveryProjection
@@ -295,16 +391,21 @@ export function useNativeAgentTask(roomId: string) {
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not inspect native Agents."); }
   }, []);
 
-  const loadRecoveryProjection = useCallback(async (isCurrent: () => boolean = () => true) => {
+  const loadRecoveryProjection = useCallback(async (
+    isCurrent: () => boolean = () => true,
+    keepShownWhenDrained = false,
+  ) => {
     const projection = await getNativeAgentRecoveryProjection(roomId);
     if (!isCurrent()) return null;
     setRecoveryProjection(projection);
     if (projection) {
       setStatus(projection.task);
       setMovement(projection.movement ?? null);
-    } else {
+      setTaskHostRef(projection.targetHostRef ?? null);
+    } else if (!keepShownWhenDrained) {
       setStatus(null);
       setMovement(null);
+      setTaskHostRef(null);
     }
     return projection;
   }, [roomId]);
@@ -324,9 +425,10 @@ export function useNativeAgentTask(roomId: string) {
       || nativeAgentRecoveryRequiresAction(status, movement)) return;
     // The card remains single-item. Once its durable fact becomes terminal,
     // immediately ask for the next unresolved Bridge-bound item until the
-    // backend reports that recovery is drained.
+    // backend reports that recovery is drained. A drained card keeps showing
+    // the finished task, so its response stays readable.
     setRecoveryProjection(null);
-    void loadRecoveryProjection().catch((error) => {
+    void loadRecoveryProjection(undefined, true).catch((error) => {
       setMessage(error instanceof Error ? error.message : "Pastey could not load the next unresolved native Agent task.");
     });
   }, [loadRecoveryProjection, movement, recoveryCorrelation?.taskId, status]);
@@ -394,7 +496,7 @@ export function useNativeAgentTask(roomId: string) {
   const start = useCallback(async () => {
     if (!workspace.trim() || !taskText.trim() || busy) return;
     setBusy(true); setMessage(null);
-    try { setStatus(await startNativeCodexTask(workspace.trim(), taskText.trim())); }
+    try { setStatus(await startNativeCodexTask(workspace.trim(), taskText.trim())); setTaskHostRef(null); }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start Codex."); }
     finally { setBusy(false); }
   }, [busy, taskText, workspace]);
@@ -404,6 +506,7 @@ export function useNativeAgentTask(roomId: string) {
     setBusy(true); setMessage(null);
     try {
       const started = await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, workspace.trim(), taskText.trim(), true);
+      setTaskHostRef(hostRef);
       try {
         const projection = await loadRecoveryProjection();
         if (!projection) setStatus(started);
@@ -522,7 +625,7 @@ export function useNativeAgentTask(roomId: string) {
 
   const retryingResultReturn = returnRetryObservation?.roomId === roomId
     && returnRetryObservation.movement.movementId === movement?.movementId;
-  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, retryingResultReturn, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
+  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, taskHostRef, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, retryingResultReturn, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
 }
 
 export function StatusBadge({ tone, children }: { tone: LifecycleTone; children: React.ReactNode }) {

@@ -8,7 +8,8 @@ import type { TransferQueueInput, TransferQueueItem } from "../../lib/transferSc
 import type { RoomInfo, RoomItem } from "../../lib/types";
 import type { DeveloperModeUiSession, DeveloperTerminalWorkspace } from "../../lib/types";
 import type { AgentTaskController } from "./AgentTaskLifecycle";
-import { nativeAgentConsequenceAbandonmentRequired, nativeAgentMovementBlocksNewRun, nativeAgentRemoteReconciliationRequired, StatusBadge, useNativeAgentTask } from "./AgentTaskLifecycle";
+import { nativeAgentAwaitingNativeDecision, nativeAgentConsequenceAbandonmentRequired, nativeAgentDisplayName, nativeAgentLifecycleLabel, nativeAgentMovementBlocksNewRun, nativeAgentRemoteReconciliationRequired, nativeAgentResponse, nativeAgentTargetAvailability, StatusBadge, useNativeAgentTask, useRemoteNativeCapabilities, type NativeAgentTargetAvailability } from "./AgentTaskLifecycle";
+import type { NativeAgentCapability, NativeAgentTaskStatus } from "../../lib/tauri";
 import { DeveloperModeScreen } from "./DeveloperModeScreen";
 import { bridgeCode, bridgeDeviceCount, fileName, formatBytes, formatClock, roomPeers } from "./workspaceViewModel";
 
@@ -237,7 +238,14 @@ function NativeAgentTaskCard({ roomId, peers }: { roomId: string; peers: ReturnT
   const [target, setTarget] = useState("local");
   const [workspaceIsLocal, setWorkspaceIsLocal] = useState(false);
   const remote = peers.find((peer) => peer.peerSessionId === target) ?? null;
+  const remoteCapabilities = useRemoteNativeCapabilities(roomId, remote?.hostRef ?? null);
+  const availability: NativeAgentTargetAvailability = remote
+    ? nativeAgentTargetAvailability("agent.coding.codex", remoteCapabilities.observation)
+    : localAvailability(codex);
   const running = agent.status?.state === "running" || agent.status?.state === "queued";
+  const taskHostName = agent.taskHostRef
+    ? peers.find((peer) => peer.hostRef === agent.taskHostRef)?.displayName ?? "the selected device"
+    : null;
   const movementBlocksNewRun = nativeAgentMovementBlocksNewRun(agent.movement);
   const remoteReconciliationRequired = nativeAgentRemoteReconciliationRequired(agent.status, agent.movement);
   const consequenceAbandonmentRequired = nativeAgentConsequenceAbandonmentRequired(agent.movement);
@@ -246,16 +254,55 @@ function NativeAgentTaskCard({ roomId, peers }: { roomId: string; peers: ReturnT
   return <div className="v2-task-open">
     <strong>Run with Codex</strong>
     <label className="v2-target-select"><select value={target} onChange={(event) => setTarget(event.target.value)} disabled={running}><option value="local">This device</option>{peers.filter((peer) => peer.hostRef).map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></label>
-    <small>{remote ? (workspaceIsLocal ? "Pastey will review sending this workspace to the selected device and returning its result." : "Pastey will verify the selected Host’s native Codex compatibility before direct invocation. No files will move.") : codex?.state === "available" ? "Codex is ready to use its native session." : codex?.state === "incompatible" ? "Codex is detected, but its required native interface is incompatible." : "Codex is unavailable on this device."}</small>
+    <small>{availabilityCopy(availability, remote?.displayName ?? null, workspaceIsLocal)}</small>
+    {remote && availability.state !== "checking" && availability.state !== "available" ? <button type="button" className="v2-button" disabled={running} onClick={() => void remoteCapabilities.refresh()}>Check again</button> : null}
     {remote ? <label><input type="checkbox" checked={workspaceIsLocal} onChange={(event) => setWorkspaceIsLocal(event.target.checked)} disabled={running || movementBlocksNewRun} /> This workspace is on this device</label> : null}
     <input value={agent.workspace} onChange={(event) => agent.setWorkspace(event.target.value)} placeholder="Original workspace path…" aria-label="Codex workspace" disabled={running} />
     <textarea value={agent.taskText} onChange={(event) => agent.setTaskText(event.target.value)} placeholder="What should Codex do?" aria-label="Codex task" disabled={running} />
-    {agent.status ? <small>{agent.status.state.replace(/_/g, " ")}{typeof agent.status.sessionReused === "boolean" ? ` · ${agent.status.sessionReused ? "resumed native session" : "new native session"}` : ""}{agent.status.result ? ` · ${agent.status.result}` : ""}</small> : null}
+    {agent.status ? <small>{nativeAgentLifecycleLabel(agent.status)}{taskHostName ? ` · on ${taskHostName}` : ""}{typeof agent.status.sessionReused === "boolean" ? ` · ${agent.status.sessionReused ? "resumed native session" : "new native session"}` : ""}{agent.status.result ? ` · ${agent.status.result}` : ""}</small> : null}
+    {nativeAgentAwaitingNativeDecision(agent.status) ? <small className="v2-error">{nativeAgentDisplayName(agent.status?.agentId)} on {taskHostName ?? "this device"} is waiting for a native approval. Pastey does not answer native approvals in this version, so the task cannot continue from here; stop it to interrupt the turn. To run without approval prompts, change the approval policy in that device’s own Codex configuration.</small> : null}
+    {agent.status ? <NativeAgentResponse status={agent.status} hostName={taskHostName} /> : null}
     {remoteReconciliationRequired && !agent.movement ? <small className="v2-error">The remote task outcome is indeterminate. Pastey will not treat it as complete until it is reconciled or explicitly stopped.</small> : null}
     {agent.movement ? <section className="v2-task-open"><strong>{agent.movement.state === "awaiting_approval" ? "Review workspace movement" : agent.movement.state.replace(/_/g, " ")}</strong><small>{agent.movement.reviewSummary}</small>{agent.movement.state === "awaiting_approval" ? <ul><li>Send “{agent.movement.sourceWorkspaceName}” to {remote?.displayName ?? "the selected device"}.</li><li>Ask that device to run Codex. It runs only if that device accepts.</li><li>Return and apply the result here if the source is unchanged.</li></ul> : null}{remoteReconciliationRequired ? <small className="v2-error">The remote task outcome is indeterminate. Pastey will not reuse this workspace until the task is reconciled or explicitly stopped.</small> : null}{consequenceAbandonmentRequired ? <small className="v2-error">{agent.movement.code === "native_agent_result_snapshot_recovery_failed" ? "Codex completed, but Pastey could not safely capture its result for return. Abandon this movement to release the original workspace; Codex will not run again." : "Pastey could not retain the returned result. Retry its exact Return or abandon this movement; the Agent’s recorded task outcome will remain unchanged."}</small> : null}{resultReturnRetryRequired ? <small className="v2-error">The exact Agent result is durable. Pastey can retry its Return without running Codex again.</small> : null}{agent.movement.state === "conflict_recovery_required" ? <><small className="v2-error">Your original workspace changed while Codex was working. Pastey preserved the result and did not overwrite your changes.</small><footer><button type="button" className="v2-button" disabled={agent.busy} onClick={() => void agent.revealConflictResult()}>Reveal result</button><button type="button" className="v2-button" disabled={agent.busy} onClick={() => void agent.discardConflictResult()}>Discard result</button></footer></> : null}</section> : null}
     {agent.message ? <small className="v2-error">{agent.message}</small> : null}
-    <footer>{agent.movement?.state === "awaiting_approval" && remote ? <button type="button" className="v2-button primary" disabled={agent.busy} onClick={() => void agent.approveRemoteMovement(roomId, remote.peerSessionId)}>Approve and send</button> : remoteReconciliationRequired && !agent.recoveryTaskId ? <button type="button" className="v2-button" disabled={agent.busy} onClick={() => void agent.refreshRecoveryProjection()}>Load recovery details</button> : remoteReconciliationRequired ? <>{agent.recoveryTargetHostRef ? <button type="button" className="v2-button primary" disabled={agent.busy} onClick={() => void agent.reconcileRemote()}>Reconcile</button> : null}<button type="button" className="v2-button" disabled={agent.busy || !agent.recoveryTaskId} onClick={() => void agent.stopRecovery()}>Stop</button></> : consequenceAbandonmentRequired ? <>{resultReturnRetryRequired ? <button type="button" className="v2-button primary" disabled={agent.busy || agent.retryingResultReturn} onClick={() => void agent.retryResultReturn()}>{agent.retryingResultReturn ? "Retrying result Return…" : "Retry result Return"}</button> : null}<button type="button" className="v2-button" disabled={agent.busy} onClick={() => void agent.stopRecovery()}>Abandon recovery</button></> : resultReturnRetryRequired ? <button type="button" className="v2-button primary" disabled={agent.busy || agent.retryingResultReturn} onClick={() => void agent.retryResultReturn()}>{agent.retryingResultReturn ? "Retrying result Return…" : "Retry result Return"}</button> : agent.canCancel ? <button type="button" className="v2-button" disabled={agent.busy} onClick={() => void (remote ? agent.cancelRemote(roomId, remote.peerSessionId, remote.hostRef!) : agent.cancel())}>Stop Codex</button> : <button type="button" className="v2-button primary" disabled={agent.busy || movementBlocksNewRun || (!remote && codex?.state !== "available") || (remote && !remote.hostRef) || !agent.workspace.trim() || !agent.taskText.trim()} onClick={() => void (remote ? (workspaceIsLocal ? agent.proposeRemoteMovement(roomId, remote.hostRef!) : agent.startRemote(roomId, remote.peerSessionId, remote.hostRef!)) : agent.start())}>{agent.busy ? "Starting…" : workspaceIsLocal && remote ? "Review movement" : "Run with Codex"}</button>}</footer>
+    <footer>{agent.movement?.state === "awaiting_approval" && remote ? <button type="button" className="v2-button primary" disabled={agent.busy} onClick={() => void agent.approveRemoteMovement(roomId, remote.peerSessionId)}>Approve and send</button> : remoteReconciliationRequired && !agent.recoveryTaskId ? <button type="button" className="v2-button" disabled={agent.busy} onClick={() => void agent.refreshRecoveryProjection()}>Load recovery details</button> : remoteReconciliationRequired ? <>{agent.recoveryTargetHostRef ? <button type="button" className="v2-button primary" disabled={agent.busy} onClick={() => void agent.reconcileRemote()}>Reconcile</button> : null}<button type="button" className="v2-button" disabled={agent.busy || !agent.recoveryTaskId} onClick={() => void agent.stopRecovery()}>Stop</button></> : consequenceAbandonmentRequired ? <>{resultReturnRetryRequired ? <button type="button" className="v2-button primary" disabled={agent.busy || agent.retryingResultReturn} onClick={() => void agent.retryResultReturn()}>{agent.retryingResultReturn ? "Retrying result Return…" : "Retry result Return"}</button> : null}<button type="button" className="v2-button" disabled={agent.busy} onClick={() => void agent.stopRecovery()}>Abandon recovery</button></> : resultReturnRetryRequired ? <button type="button" className="v2-button primary" disabled={agent.busy || agent.retryingResultReturn} onClick={() => void agent.retryResultReturn()}>{agent.retryingResultReturn ? "Retrying result Return…" : "Retry result Return"}</button> : agent.canCancel ? <button type="button" className="v2-button" disabled={agent.busy} onClick={() => void (remote ? agent.cancelRemote(roomId, remote.peerSessionId, remote.hostRef!) : agent.cancel())}>Stop Codex</button> : <button type="button" className="v2-button primary" disabled={agent.busy || movementBlocksNewRun || availability.state !== "available" || (remote && !remote.hostRef) || !agent.workspace.trim() || !agent.taskText.trim()} onClick={() => void (remote ? (workspaceIsLocal ? agent.proposeRemoteMovement(roomId, remote.hostRef!) : agent.startRemote(roomId, remote.peerSessionId, remote.hostRef!)) : agent.start())}>{agent.busy ? "Starting…" : workspaceIsLocal && remote ? "Review movement" : "Run with Codex"}</button>}</footer>
   </div>;
+}
+
+function localAvailability(codex: NativeAgentCapability | undefined): NativeAgentTargetAvailability {
+  return { state: codex?.state ?? "unavailable" };
+}
+
+function availabilityCopy(availability: NativeAgentTargetAvailability, remoteName: string | null, workspaceIsLocal: boolean): string {
+  const where = remoteName ?? "this device";
+  switch (availability.state) {
+    case "checking": return `Checking Codex on ${where}…`;
+    case "unknown": return `Pastey could not check Codex on ${where}: ${availability.message}`;
+    case "incompatible": return `Codex is detected on ${where}, but its required native interface is incompatible.`;
+    case "unavailable": return `Codex is unavailable on ${where}.`;
+    case "available":
+      if (!remoteName) return "Codex is ready to use its native session.";
+      return workspaceIsLocal
+        ? `Codex is available on ${where}. Pastey will review sending this workspace there and returning its result.`
+        : `Codex is available on ${where}. It runs in an existing workspace there after ${where} accepts; no files move.`;
+  }
+}
+
+/** The Agent's returned response, kept apart from lifecycle state. Native
+ * output is untrusted and possibly remote: it is shown only as escaped
+ * plain text (never markup, a command, a path or a link). */
+function NativeAgentResponse({ status, hostName }: { status: NativeAgentTaskStatus; hostName: string | null }) {
+  const response = nativeAgentResponse(status);
+  if (!response) return null;
+  const agentName = nativeAgentDisplayName(status.agentId);
+  return <section className="v2-agent-response" aria-label={`${agentName} response`}>
+    <strong>{agentName} response{hostName ? ` · from ${hostName}` : ""}</strong>
+    {response.kind === "text"
+      ? <><pre className="v2-agent-response-text">{response.text}</pre>{response.truncated ? <small>Pastey shortened this response to fit its size limit.</small> : null}</>
+      : response.kind === "undisplayable"
+        ? <small>The task completed with output Pastey cannot display as text.</small>
+        : <small>The task completed, but no response text is available.</small>}
+  </section>;
 }
 
 export function MessageCard({ item }: { item: RoomItem }) {

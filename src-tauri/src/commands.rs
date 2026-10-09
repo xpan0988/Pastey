@@ -821,7 +821,33 @@ pub async fn start_native_v2_plan_attempt(
 pub fn list_native_agent_capabilities(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<crate::native_agent::NativeAgentCapabilityV1>, String> {
-    Ok(state.native_agents.lock().capabilities())
+    // Observed after the service lock is released: a cold observation may
+    // launch bounded probe processes.
+    let registry = state.native_agents.lock().capability_registry();
+    Ok(registry.capabilities())
+}
+
+/// The native capabilities one exact current Bridge Host advertises, from a
+/// fresh observation over the existing capability query. Like the local
+/// list, it is a fact for presentation only: it selects no Host and grants
+/// no invocation, Transfer or Review authority.
+#[tauri::command]
+pub async fn list_remote_native_agent_capabilities(
+    room_id: String,
+    target_host_ref: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::native_agent::NativeAgentCapabilityV1>, String> {
+    let target = crate::host_identity::HostRef::parse_peer(target_host_ref, &state.local_host_ref)
+        .map_err(|error| error.message())?;
+    let session = state
+        .resolve_current_remote_host_session(&room_id, &target)
+        .await
+        .map_err(|error| error.message())?;
+    let projection = session
+        .request_capability_projection(state.inner().clone())
+        .await
+        .map_err(|error| error.message())?;
+    Ok(crate::native_agent::remote_native_capabilities(&projection))
 }
 
 /// Starts one task in the Host-private native Codex session for this exact

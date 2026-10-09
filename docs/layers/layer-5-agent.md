@@ -50,6 +50,10 @@ compares, and digests but never interprets. Room Control's field-name safety
 check skips exactly that subtree of `native_agent.invoke` (invoke-v2),
 `native_agent.status`, and `native_agent.reconciliation`; every other field
 is still checked. The renderer treats terminal output only as untrusted data.
+An adapter that reports user-facing text uses the shared
+`pastey-native-text-output-v1` shape (`text`, `truncated`), cut at a character
+boundary to fit the bound; the task card renders it as escaped plain text,
+separately from the lifecycle state, for any capability and any Host.
 
 Codex is the only adapter registered in the shipped product. A test-only
 `fake.longjob.v1` adapter proves the same lifecycle (identity, exclusivity,
@@ -70,6 +74,36 @@ an ephemeral session. Completion is accepted only from the exact requested
 thread and turn with native `status: completed` and no error. A failed,
 interrupted, cancelled, disconnected, malformed, or otherwise ambiguous native
 turn is non-DONE.
+
+The task's output is Codex's final user-facing reply: the completed
+`agentMessage` items (`item/completed`) of the exact thread and turn, preferring
+the last one Codex marks `final_answer`, otherwise the last one not marked
+`commentary`. Streaming deltas, reasoning, plans, tool calls and command output
+are never captured. App-server lines are read with a 1 MiB bound; a longer or
+malformed line is skipped without ending observation, and a completion whose
+reply could not be read, was empty, or was missing says so in its summary
+instead of producing output. Output never changes whether the turn succeeded,
+and a cancelled task never records it.
+
+Codex may block a turn on a request only its own client answers: command,
+file-change and permission approvals, user-input questions and MCP
+elicitations. Pastey never answers them. The running task carries
+`native_agent_awaiting_native_decision` (also on the requesting Host) until
+Codex reports the request resolved; the workspace stays occupied and Stop
+interrupts the turn, which clears the request natively. Other client requests
+Pastey never advertised receive the protocol's method-not-found error.
+Forwarding approval decisions between Hosts is not implemented.
+
+A new session opens on the task's observer thread, so no process launch,
+`initialize` or `thread/start` wait holds the native service lock; a stop
+before the turn starts closes the opening session without sending the turn,
+and a session that cannot open is a definite non-start
+(`native_agent_start_failed`). Availability is a cached read-only observation
+(two bounded probes, 30-second reuse per executable) and is observed afresh
+before each new session. On Windows, `codex` resolves through absolute PATH
+directories, preferring `codex.exe` over the npm `codex.cmd` shim within each;
+the app-server is started in a non-verbatim working directory and shut down by
+closing its stdin, which also ends it behind the shim.
 
 ### Native completion and consequence recovery
 

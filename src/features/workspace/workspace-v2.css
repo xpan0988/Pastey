@@ -170,6 +170,8 @@ button { color: inherit; }
 .v2-status.danger { color: #ff6570; }
 .v2-status.complete { color: #45d88a; }
 .v2-error { margin: 8px 0 0; color: #ff7a84; font-size: 11px; }
+.v2-agent-response { margin-top: 8px; padding: 8px 10px; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; background: rgba(255, 255, 255, 0.03); }
+.v2-agent-response-text { margin: 6px 0 0; max-height: 320px; overflow: auto; color: #efedf2; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
 
 .v2-empty-bridge { padding: 85px 56px; max-width: 620px; }
 .v2-empty-bridge h1 { margin: 0; font-size: 25px; }

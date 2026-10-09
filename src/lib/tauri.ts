@@ -185,6 +185,10 @@ export interface NativeAgentTaskStatus {
   state: NativeAgentTaskState;
   result?: string | null;
   code?: string | null;
+  /** Capability-owned terminal output, possibly from another Host.
+   * Untrusted data: displayed only as escaped text, never interpreted as
+   * markup, a command, a path, or a link. */
+  output?: unknown;
 }
 
 export type NativeAgentWorkspaceMovementState =
@@ -221,6 +225,12 @@ export interface NativeAgentRecoveryProjection {
 
 export function listNativeAgentCapabilities(): Promise<NativeAgentCapability[]> {
   return invoke("list_native_agent_capabilities");
+}
+
+/** A fresh observation of what one exact current Bridge Host advertises.
+ * Presentation only: it neither selects the Host nor grants invocation. */
+export function listRemoteNativeAgentCapabilities(roomId: string, targetHostRef: string): Promise<NativeAgentCapability[]> {
+  return invoke("list_remote_native_agent_capabilities", { roomId, targetHostRef });
 }
 
 export function startNativeCodexTask(workspace: string, task: string): Promise<NativeAgentTaskStatus> {

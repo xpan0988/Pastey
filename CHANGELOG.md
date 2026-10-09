@@ -10,6 +10,9 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 - Native capability invocation is now capability-neutral. Core dispatches each invocation by capability ID to a registered adapter that owns its input, start, stop, and terminal output; Core keeps task identity, ownership, admission, status, cancellation, reconciliation, restart recovery, Bridge authority, and the durable envelope. Codex is the only shipped adapter. A capability-neutral `pastey-native-agent-invoke-v2` invocation and its `start_remote_native_capability_task` command exist without a renderer entry point yet.
 - Native capability input and terminal output are opaque, capability-owned payloads bounded to 16 KiB. Core carries, persists, compares, and digests them without interpreting them, and Room Control's field-name safety check skips exactly those payload subtrees while still checking every other field.
+- A completed Codex task now returns Codex's actual final reply, captured from the exact turn's completed agent messages and bounded to the output limit, instead of only a completion summary. It reaches the requesting device through the existing status and reconciliation path, and the task card shows it as escaped plain text, separate from the task state, including when it came from another Host.
+- A Codex turn blocked on a native approval or question is shown as running and waiting for a native approval, on both Hosts, instead of plain running. Pastey never answers it; Stop interrupts the turn.
+- Selecting a remote device in the Codex task card now shows that device's own advertised Codex availability, with Check again, instead of this device's.
 
 ### Changed
 
@@ -19,6 +22,10 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Fixed
 
+- Starting a Codex task no longer holds the native service lock while Codex launches and opens its session, so status, cancellation, and remote status updates stay responsive; Codex availability is cached briefly and rechecked before each new session.
+- A long or malformed Codex app-server line no longer ends task observation or releases the workspace early.
+- On Windows, an npm-installed Codex (`codex.cmd`) is now found and started, and its app-server stops when Pastey closes the session.
+- A remote Codex task's card no longer disappears as soon as the task completes.
 - Bound every Native Agent task to one immutable owner, Local or its Bridge. Another Bridge can no longer adopt, re-home, or detach a task through a duplicate or conflicting invocation, workspace preparation, or approval, and Burn again selects exactly the tasks its Bridge owns, including after restart.
 - Executor-side `native_agent.cancel` now requires the authenticated Bridge to own the task; a Bridge cannot cancel a Local task or another Bridge's task.
 - `native_agent.workspace_prepare` is accepted only when its source Host is the authenticated current-session peer `HostRef`.

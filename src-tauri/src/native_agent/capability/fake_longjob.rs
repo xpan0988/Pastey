@@ -13,8 +13,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeInvocationOutcomeV1, NativeInvocationRunV1,
-    OpaqueCapabilityPayloadV1, PreparedInvocationV1, StartedInvocationV1,
+    ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeInvocationOutcomeV1,
+    NativeInvocationProgressV1, NativeInvocationRunV1, OpaqueCapabilityPayloadV1,
+    PreparedInvocationV1, StartedInvocationV1,
 };
 use crate::error::{AppError, AppResult};
 use crate::native_agent::{
@@ -226,7 +227,7 @@ struct LongJobRunV1 {
 }
 
 impl NativeInvocationRunV1 for LongJobRunV1 {
-    fn run(&mut self) -> NativeInvocationOutcomeV1 {
+    fn run(&mut self, _progress: &dyn NativeInvocationProgressV1) -> NativeInvocationOutcomeV1 {
         let (lock, wake) = &*self.state;
         let mut state = lock.lock().unwrap();
         for step in 1..=self.steps {

@@ -34,7 +34,7 @@ use capability::codex::codex_compatibility_at;
 pub(crate) use capability::OpaqueCapabilityPayloadV1;
 use capability::{
     codex::CodexNativeAdapterV1, ExclusivityKeyV1, NativeCapabilityAdapterV1,
-    NativeInvocationOutcomeV1,
+    NativeInvocationOutcomeV1, NativeInvocationProgressV1,
 };
 
 const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -63,6 +63,11 @@ pub(crate) const WORKSPACE_MOVEMENT_PROTOCOLS: [&str; 3] = [
 pub(crate) const NATIVE_AGENT_INVOKE_V2_SCHEMA: &str = "pastey-native-agent-invoke-v2";
 pub(crate) const GENERIC_NATIVE_INVOKE_PROTOCOLS: [&str; 2] =
     [NATIVE_AGENT_PROTOCOL_SCHEMA, NATIVE_AGENT_INVOKE_V2_SCHEMA];
+/// A running task whose native capability waits for its own client to
+/// answer a request (an approval, a question) that Pastey does not answer.
+pub(crate) const AWAITING_NATIVE_DECISION_CODE: &str = "native_agent_awaiting_native_decision";
+/// The adapter proved its invocation never started any native work.
+const START_FAILED_CODE: &str = "native_agent_start_failed";
 const MAX_TASK_ID_BYTES: usize = 256;
 const MAX_WORKSPACE_BYTES: usize = 4 * 1024;
 const MAX_MOVEMENT_ID_BYTES: usize = 256;
@@ -506,6 +511,62 @@ enum NativeTurnOutcomeV1 {
     Interrupted,
     Cancelled,
     Unknown,
+    /// Nothing native ran: the capability could not even begin the
+    /// invocation. A definite non-start, never an indeterminate outcome.
+    NotStarted,
+}
+
+/// Core's receiver for one observed invocation's non-terminal facts.
+struct ObservedTaskProgressV1 {
+    tasks: Arc<Mutex<HashMap<String, NativeAgentTaskStatusV1>>>,
+    task_id: String,
+}
+
+impl NativeInvocationProgressV1 for ObservedTaskProgressV1 {
+    fn awaiting_native_decision(&self, waiting: bool) {
+        let Ok(mut tasks) = self.tasks.lock() else {
+            return;
+        };
+        let Some(status) = tasks.get_mut(&self.task_id) else {
+            return;
+        };
+        // Only a running task carries it: cancellation and every terminal
+        // fact already recorded win over a late progress report.
+        if status.state != NativeAgentTaskStateV1::Running {
+            return;
+        }
+        if waiting {
+            status.code = Some(AWAITING_NATIVE_DECISION_CODE.into());
+        } else if status.code.as_deref() == Some(AWAITING_NATIVE_DECISION_CODE) {
+            status.code = None;
+        }
+    }
+}
+
+/// The registered adapters, detached from the service lock so observing
+/// availability (which may launch bounded probe processes) never holds it.
+pub(crate) struct NativeCapabilityRegistryV1(Vec<Arc<dyn NativeCapabilityAdapterV1>>);
+
+impl NativeCapabilityRegistryV1 {
+    pub(crate) fn capabilities(&self) -> Vec<NativeAgentCapabilityV1> {
+        self.0.iter().map(|adapter| adapter.describe()).collect()
+    }
+
+    /// One existing capability fact per registered native capability.
+    pub(crate) fn native_capability_facts(
+        &self,
+    ) -> Vec<crate::peer_capabilities::HostCapabilityFact> {
+        self.0
+            .iter()
+            .map(|adapter| {
+                crate::peer_capabilities::native_agent_capability_fact(
+                    adapter.capability_id(),
+                    adapter.availability(),
+                    adapter.supported_protocols(),
+                )
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -628,6 +689,15 @@ impl NativeAgentServiceV1 {
             ..Self::default()
         };
         service.restore_durable_envelopes()?;
+        #[cfg(not(test))]
+        {
+            // Observe availability once in the background so the first
+            // capability query or invocation does not pay for the probe.
+            let registry = service.capability_registry();
+            thread::spawn(move || {
+                let _ = registry.capabilities();
+            });
+        }
         Ok(service)
     }
 
@@ -1132,27 +1202,23 @@ impl NativeAgentServiceV1 {
                 crate::storage::update_native_agent_observed_task_if_present(paths, task_id, &task);
         }
     }
+    /// The registered adapters, for observation after the caller has
+    /// released the service lock.
+    pub(crate) fn capability_registry(&self) -> NativeCapabilityRegistryV1 {
+        NativeCapabilityRegistryV1(self.adapters.clone())
+    }
+
+    #[cfg(test)]
     pub(crate) fn capabilities(&self) -> Vec<NativeAgentCapabilityV1> {
-        self.adapters
-            .iter()
-            .map(|adapter| adapter.describe())
-            .collect()
+        self.capability_registry().capabilities()
     }
 
     /// One existing capability fact per registered native capability.
+    #[cfg(test)]
     pub(crate) fn native_capability_facts(
         &self,
     ) -> Vec<crate::peer_capabilities::HostCapabilityFact> {
-        self.adapters
-            .iter()
-            .map(|adapter| {
-                crate::peer_capabilities::native_agent_capability_fact(
-                    adapter.capability_id(),
-                    adapter.availability(),
-                    adapter.supported_protocols(),
-                )
-            })
-            .collect()
+        self.capability_registry().native_capability_facts()
     }
 
     pub(crate) fn require_capability(&self, capability_id: &str) -> AppResult<()> {
@@ -3730,12 +3796,16 @@ impl NativeAgentServiceV1 {
         let observed_tasks = self.observed_tasks.clone();
         let held_key = prepared.exclusivity;
         let mut run = started.run;
+        let progress = ObservedTaskProgressV1 {
+            tasks: tasks.clone(),
+            task_id: task_id.clone(),
+        };
         thread::spawn(move || {
             let NativeInvocationOutcomeV1 {
                 kind: outcome,
                 summary,
                 output,
-            } = run.run();
+            } = run.run(&progress);
             let mut persisted_status = None;
             if let Ok(mut tasks) = tasks.lock() {
                 if let Some(status) = tasks.get_mut(&task_id) {
@@ -3750,6 +3820,7 @@ impl NativeAgentServiceV1 {
                         match outcome {
                             NativeTurnOutcomeV1::Completed => {
                                 status.state = NativeAgentTaskStateV1::Completed;
+                                status.code = None;
                                 status.result = summary;
                                 status.output = output;
                             }
@@ -3768,6 +3839,11 @@ impl NativeAgentServiceV1 {
                             NativeTurnOutcomeV1::Unknown => {
                                 status.state = NativeAgentTaskStateV1::Interrupted;
                                 status.code = Some("native_agent_outcome_unknown".into());
+                            }
+                            NativeTurnOutcomeV1::NotStarted => {
+                                status.state = NativeAgentTaskStateV1::Failed;
+                                status.code = Some(START_FAILED_CODE.into());
+                                status.result = summary;
                             }
                         }
                     }
@@ -5841,6 +5917,30 @@ pub(crate) async fn retry_workspace_result_return(
     }
 }
 
+/// A remote Host's native capabilities as one fresh observation reports
+/// them, judged by the protocols this Host would invoke each one with.
+pub(crate) fn remote_native_capabilities(
+    projection: &crate::peer_capabilities::PeerCapabilityProjection,
+) -> Vec<NativeAgentCapabilityV1> {
+    projection
+        .native_agent_capability_ids()
+        .into_iter()
+        .map(|capability_id| {
+            let (display_name, required): (&str, &[&str]) = if capability_id == CODEX_CAPABILITY_ID
+            {
+                ("Codex", &DIRECT_NATIVE_INVOKE_PROTOCOLS)
+            } else {
+                (capability_id, &GENERIC_NATIVE_INVOKE_PROTOCOLS)
+            };
+            NativeAgentCapabilityV1 {
+                agent_id: capability_id.into(),
+                display_name: display_name.into(),
+                state: projection.native_agent_state(capability_id, required),
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn validate_invoke(request: &NativeAgentInvokeV1) -> AppResult<()> {
     if request.schema_version != NATIVE_AGENT_PROTOCOL_SCHEMA
         || request.task_id.trim().is_empty()
@@ -6193,6 +6293,698 @@ exit 1
             fs::set_permissions(&executable, permissions).unwrap();
         }
         executable
+    }
+
+    /// A scripted app-server. `cases` are the shell `case` arms for the
+    /// request lines Pastey writes; every invocation is logged outside the
+    /// workspace so probes and launches can be counted.
+    fn scripted_codex(cases: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("pastey-native-script-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let workspace = root.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let agent = root.join("codex-scripted-fixture");
+        let script = r#"#!/bin/sh
+printf '%s\n' "$*" >> '{ROOT}/invocations'
+if [ "$1" = "--version" ]; then exit 0; fi
+if [ "$2" = "--help" ]; then exit 0; fi
+while IFS= read -r line; do
+  case "$line" in
+{CASES}
+  esac
+done
+"#
+        .replace("{ROOT}", root.to_str().unwrap())
+        .replace("{CASES}", cases)
+        .replace("{ACK}", SCRIPTED_ACK)
+        .replace("{COMPLETED}", SCRIPTED_COMPLETED);
+        fs::write(&agent, script).unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&agent).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&agent, permissions).unwrap();
+        }
+        (root, workspace, agent)
+    }
+
+    const SCRIPTED_OPEN: &str = r#"    *'"id":1,'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"id":2,'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"}}}' ;;
+"#;
+    const SCRIPTED_ACK: &str = r#"printf '%s\n' '{"id":3,"result":{"turn":{"id":"native-turn"}}}'"#;
+    const SCRIPTED_COMPLETED: &str = r#"printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"completed","error":null}}}'"#;
+
+    fn text_output(status: &NativeAgentTaskStatusV1) -> Option<(String, bool)> {
+        let output = serde_json::to_value(status.output.as_ref()?).unwrap();
+        assert_eq!(output["schemaVersion"], "pastey-native-text-output-v1");
+        Some((
+            output["text"].as_str().unwrap().to_owned(),
+            output["truncated"].as_bool().unwrap(),
+        ))
+    }
+
+    fn wait_for_code(service: &NativeAgentServiceV1, task_id: &str, code: Option<&str>) {
+        for _ in 0..500 {
+            if service.task_status(task_id).unwrap().code.as_deref() == code {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "task code never became {code:?}: {:?}",
+            service.task_status(task_id).unwrap()
+        )
+    }
+
+    fn wait_for_file(path: &Path) {
+        for _ in 0..500 {
+            if path.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("{} was never written", path.display())
+    }
+
+    fn invocation_count(root: &Path, invocation: &str) -> usize {
+        fs::read_to_string(root.join("invocations"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == invocation)
+            .count()
+    }
+
+    fn final_answer_fixture() -> (PathBuf, PathBuf, PathBuf) {
+        scripted_codex(&format!(
+            r#"{SCRIPTED_OPEN}    *'"id":3,'*)
+      {{ACK}}
+      printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"threadId":"native-thread","turnId":"native-turn","itemId":"m1","delta":"DELTA-ONLY"}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"native-thread","turnId":"native-turn","item":{{"type":"reasoning","id":"r1","summary":["REASONING-SECRET"],"content":["REASONING-SECRET"]}}}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"native-thread","turnId":"native-turn","item":{{"type":"commandExecution","id":"c1","command":"env","aggregatedOutput":"TOOL-LOG-SECRET"}}}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"native-thread","turnId":"native-turn","item":{{"type":"agentMessage","id":"m0","text":"COMMENTARY-ONLY","phase":"commentary"}}}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"other-thread","turnId":"native-turn","item":{{"type":"agentMessage","id":"x1","text":"OTHER-THREAD","phase":"final_answer"}}}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"native-thread","turnId":"other-turn","item":{{"type":"agentMessage","id":"x2","text":"OTHER-TURN","phase":"final_answer"}}}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"native-thread","turnId":"native-turn","item":{{"type":"agentMessage","id":"m1","text":"Answer <b>bold</b> & \"quoted\" ✓\nsecond line","phase":"final_answer"}}}}}}'
+      {{COMPLETED}}
+      ;;
+"#
+        ))
+    }
+
+    #[test]
+    fn codex_returns_only_the_exact_turns_final_user_facing_answer() {
+        let (root, workspace, agent) = final_answer_fixture();
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "answer me")
+            .unwrap();
+        let terminal = wait_for_terminal(&service, &started.task_id);
+        assert_eq!(terminal.state, NativeAgentTaskStateV1::Completed);
+        assert_eq!(terminal.code, None);
+        assert_eq!(
+            text_output(&terminal),
+            Some((
+                "Answer <b>bold</b> & \"quoted\" ✓\nsecond line".into(),
+                false
+            ))
+        );
+        assert_eq!(
+            terminal.result.as_deref(),
+            Some("Codex completed its native task.")
+        );
+        // Nothing but the exact final answer crosses: no other thread or
+        // turn, no delta, reasoning, tool output, commentary or session id.
+        let projected = serde_json::to_string(&terminal).unwrap();
+        for leaked in [
+            "OTHER-THREAD",
+            "OTHER-TURN",
+            "DELTA-ONLY",
+            "REASONING-SECRET",
+            "TOOL-LOG-SECRET",
+            "COMMENTARY-ONLY",
+            "native-thread",
+            "native-turn",
+        ] {
+            assert!(!projected.contains(leaked), "{leaked} leaked: {projected}");
+        }
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_malformed_and_oversized_responses_never_fabricate_output() {
+        // No agent message at all.
+        let (root, workspace, agent) = fixture();
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "silent")
+            .unwrap();
+        let terminal = wait_for_terminal(&service, &started.task_id);
+        assert_eq!(terminal.state, NativeAgentTaskStateV1::Completed);
+        assert_eq!(terminal.output, None);
+        assert_eq!(
+            terminal.result.as_deref(),
+            Some("Codex completed its native task without a final response.")
+        );
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+
+        // Unreadable lines are skipped without losing observation, and are
+        // reported instead of an answer.
+        let (root, workspace, agent) = scripted_codex(&format!(
+            r#"{SCRIPTED_OPEN}    *'"id":3,'*)
+      {{ACK}}
+      printf '%s\n' 'this is not json'
+      head -c 1100000 /dev/zero | tr '\000' 'x'; printf '\n'
+      {{COMPLETED}}
+      ;;
+"#
+        ));
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "unreadable")
+            .unwrap();
+        let terminal = wait_for_terminal(&service, &started.task_id);
+        assert_eq!(terminal.state, NativeAgentTaskStateV1::Completed);
+        assert_eq!(terminal.output, None);
+        assert_eq!(
+            terminal.result.as_deref(),
+            Some("Codex completed its native task, but Pastey could not read its final response.")
+        );
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+
+        // An answer larger than the output bound is cut, marked, and valid.
+        let (root, workspace, agent) = scripted_codex(&format!(
+            r#"{SCRIPTED_OPEN}    *'"id":3,'*)
+      {{ACK}}
+      printf '%s' '{{"method":"item/completed","params":{{"threadId":"native-thread","turnId":"native-turn","item":{{"type":"agentMessage","id":"m","phase":"final_answer","text":"'
+      head -c 40000 /dev/zero | tr '\000' 'a'
+      printf '%s\n' '"}}}}}}'
+      {{COMPLETED}}
+      ;;
+"#
+        ));
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "long answer")
+            .unwrap();
+        let terminal = wait_for_terminal(&service, &started.task_id);
+        assert_eq!(terminal.state, NativeAgentTaskStateV1::Completed);
+        let output = terminal.output.as_ref().unwrap();
+        output.validate().unwrap();
+        let (text, truncated) = text_output(&terminal).unwrap();
+        assert!(truncated);
+        assert!(text.len() > 15_000 && text.bytes().all(|byte| byte == b'a'));
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancellation_wins_a_racing_native_answer_and_completion() {
+        let (root, workspace, agent) = scripted_codex(&format!(
+            r#"{SCRIPTED_OPEN}    *'"id":3,'*)
+      {{ACK}}
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"native-thread","turnId":"native-turn","item":{{"type":"agentMessage","id":"m","text":"LATE-ANSWER","phase":"final_answer"}}}}}}'
+      touch "$PWD/answer-sent"
+      ( while [ ! -f "$PWD/release-turn" ]; do sleep 0.01; done; {{COMPLETED}} ) &
+      ;;
+    *'turn/interrupt'*) touch "$PWD/interrupt-requested" ;;
+"#
+        ));
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "race")
+            .unwrap();
+        wait_for_file(&workspace.join("answer-sent"));
+        let canonical = workspace.canonicalize().unwrap();
+        let controller = service.codex.wait_for_session_controller(&canonical);
+        for _ in 0..300 {
+            if controller.active_turn.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            service.cancel_task(&started.task_id).unwrap().state,
+            NativeAgentTaskStateV1::Cancelled
+        );
+        wait_for_file(&workspace.join("interrupt-requested"));
+        // Codex finishes anyway: its answer and completion arrive late.
+        fs::write(workspace.join("release-turn"), b"").unwrap();
+        wait_for_workspace_release(&service, &workspace);
+        let after = service.task_status(&started.task_id).unwrap();
+        assert_eq!(after.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(after.output, None);
+        assert_eq!(after.result, None);
+        drop(controller);
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_approval_wait_is_surfaced_unanswered_until_cancel_interrupts_it() {
+        let (root, workspace, agent) = scripted_codex(&format!(
+            r#"{SCRIPTED_OPEN}    *'"id":3,'*)
+      {{ACK}}
+      printf '%s\n' '{{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{{"threadId":"native-thread","turnId":"native-turn","itemId":"cmd-1","command":"touch ../outside"}}}}'
+      printf '%s\n' '{{"id":"tool-1","method":"item/tool/call","params":{{"threadId":"native-thread","turnId":"native-turn","callId":"call-1","tool":"x","arguments":{{}}}}}}'
+      ;;
+    *'"id":"approval-1"'*) printf '%s\n' "$line" > "$PWD/approval-answered" ;;
+    *'"id":"tool-1"'*) printf '%s\n' "$line" > "$PWD/tool-call-refused" ;;
+    *'turn/interrupt'*)
+      printf '%s\n' '{{"method":"serverRequest/resolved","params":{{"threadId":"native-thread","requestId":"approval-1"}}}}'
+      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"native-thread","turn":{{"id":"native-turn","items":[],"status":"interrupted","error":null}}}}}}'
+      ;;
+"#
+        ));
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "needs approval")
+            .unwrap();
+        wait_for_code(
+            &service,
+            &started.task_id,
+            Some(AWAITING_NATIVE_DECISION_CODE),
+        );
+        // A client capability Pastey never offered is refused by protocol.
+        wait_for_file(&workspace.join("tool-call-refused"));
+        let refusal = fs::read_to_string(workspace.join("tool-call-refused")).unwrap();
+        assert!(refusal.contains("-32601"), "{refusal}");
+        // Still running, still occupying its workspace, and never answered.
+        thread::sleep(Duration::from_millis(200));
+        let waiting = service.task_status(&started.task_id).unwrap();
+        assert_eq!(waiting.state, NativeAgentTaskStateV1::Running);
+        assert_eq!(waiting.output, None);
+        assert!(service
+            .workspace_occupant(&workspace.canonicalize().unwrap())
+            .is_some());
+        assert!(!workspace.join("approval-answered").exists());
+
+        let cancelled = service.cancel_task(&started.task_id).unwrap();
+        assert_eq!(cancelled.state, NativeAgentTaskStateV1::Cancelled);
+        wait_for_workspace_release(&service, &workspace);
+        let after = service.task_status(&started.task_id).unwrap();
+        assert_eq!(after.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(after.code.as_deref(), Some("native_agent_cancel_requested"));
+        assert!(!workspace.join("approval-answered").exists());
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn natively_resolved_approval_returns_to_running_and_completes_truthfully() {
+        let (root, workspace, agent) = scripted_codex(&format!(
+            r#"{SCRIPTED_OPEN}    *'"id":3,'*)
+      {{ACK}}
+      printf '%s\n' '{{"id":7,"method":"item/fileChange/requestApproval","params":{{"threadId":"native-thread","turnId":"native-turn","itemId":"patch-1"}}}}'
+      (
+        while [ ! -f "$PWD/resolve-approval" ]; do sleep 0.01; done
+        printf '%s\n' '{{"method":"serverRequest/resolved","params":{{"threadId":"native-thread","requestId":7}}}}'
+        while [ ! -f "$PWD/finish-turn" ]; do sleep 0.01; done
+        printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"native-thread","turnId":"native-turn","item":{{"type":"agentMessage","id":"m","text":"Done after approval."}}}}}}'
+        {{COMPLETED}}
+      ) &
+      ;;
+    *'"id":7'*) printf '%s\n' "$line" > "$PWD/approval-answered" ;;
+"#
+        ));
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "patch")
+            .unwrap();
+        wait_for_code(
+            &service,
+            &started.task_id,
+            Some(AWAITING_NATIVE_DECISION_CODE),
+        );
+        fs::write(workspace.join("resolve-approval"), b"").unwrap();
+        wait_for_code(&service, &started.task_id, None);
+        assert_eq!(
+            service.task_status(&started.task_id).unwrap().state,
+            NativeAgentTaskStateV1::Running
+        );
+        fs::write(workspace.join("finish-turn"), b"").unwrap();
+        let terminal = wait_for_terminal(&service, &started.task_id);
+        assert_eq!(terminal.state, NativeAgentTaskStateV1::Completed);
+        assert_eq!(terminal.code, None);
+        assert_eq!(
+            text_output(&terminal),
+            Some(("Done after approval.".into(), false))
+        );
+        assert!(!workspace.join("approval-answered").exists());
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn slow_session_opening_never_holds_start_status_or_cancel() {
+        let (root, workspace, agent) = scripted_codex(
+            r#"    *'"id":1,'*)
+      while [ ! -f "$PWD/release-initialize" ]; do sleep 0.01; done
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"id":2,'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"}}}' ;;
+    *'"id":3,'*) touch "$PWD/turn-start-received"; {ACK} ;;
+"#,
+        );
+        let service = Arc::new(parking_lot::Mutex::new(NativeAgentServiceV1::default()));
+        // `start` must return while initialize is still unanswered; if it
+        // waited for the app-server it would never return here.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        {
+            let service = service.clone();
+            let agent = agent.clone();
+            let workspace = workspace.clone();
+            thread::spawn(move || {
+                let started = service.lock().start_codex_task_with_executable(
+                    &agent,
+                    &workspace,
+                    "slow open",
+                );
+                let _ = sender.send(started);
+            });
+        }
+        let started = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("start waited for the native app-server")
+            .unwrap();
+        assert_eq!(started.state, NativeAgentTaskStateV1::Running);
+        assert!(!started.session_reused);
+        // The service lock stays free for status and cancellation.
+        let status_at = std::time::Instant::now();
+        let status = service.lock().task_status(&started.task_id).unwrap();
+        assert_eq!(status.state, NativeAgentTaskStateV1::Running);
+        let cancelled = service.lock().cancel_task(&started.task_id).unwrap();
+        assert!(status_at.elapsed() < Duration::from_secs(2));
+        assert_eq!(cancelled.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(
+            cancelled.code.as_deref(),
+            Some("native_agent_cancel_requested")
+        );
+        // Occupancy holds until the opening session is closed, and the turn
+        // is never sent.
+        assert!(service
+            .lock()
+            .workspace_occupant(&workspace.canonicalize().unwrap())
+            .is_some());
+        fs::write(workspace.join("release-initialize"), b"").unwrap();
+        for _ in 0..500 {
+            if service
+                .lock()
+                .workspace_occupant(&workspace.canonicalize().unwrap())
+                .is_none()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let service = service.lock();
+        assert!(service
+            .workspace_occupant(&workspace.canonicalize().unwrap())
+            .is_none());
+        let after = service.task_status(&started.task_id).unwrap();
+        assert_eq!(after.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(after.code.as_deref(), Some("native_agent_cancelled"));
+        thread::sleep(Duration::from_millis(100));
+        assert!(!workspace.join("turn-start-received").exists());
+        assert_eq!(service.codex.session_count(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn availability_is_cached_per_executable_and_rechecked_fresh_at_execution() {
+        let (root, workspace, agent) = scripted_codex(&format!(
+            r#"{SCRIPTED_OPEN}    *'"id":3,'*) {{ACK}}; {{COMPLETED}} ;;
+"#
+        ));
+        let mut service = NativeAgentServiceV1::default();
+        service.codex.use_executable(&agent);
+        for _ in 0..5 {
+            assert_eq!(
+                service.codex.availability(),
+                NativeAgentCapabilityStateV1::Available
+            );
+            assert_eq!(
+                service.capabilities()[0].state,
+                NativeAgentCapabilityStateV1::Available
+            );
+        }
+        assert_eq!(invocation_count(&root, "--version"), 1);
+        assert_eq!(invocation_count(&root, "app-server --help"), 1);
+        // Admission reuses the observation; opening a new session observes
+        // it afresh exactly once.
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "count probes")
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal(&service, &started.task_id).state,
+            NativeAgentTaskStateV1::Completed
+        );
+        assert_eq!(invocation_count(&root, "--version"), 2);
+        assert_eq!(invocation_count(&root, "app-server --stdio"), 1);
+        // A reused session needs no new probe or launch.
+        let second = service
+            .start_codex_task_with_executable(&agent, &workspace, "again")
+            .unwrap();
+        assert!(second.session_reused);
+        wait_for_terminal(&service, &second.task_id);
+        assert_eq!(invocation_count(&root, "--version"), 2);
+        assert_eq!(invocation_count(&root, "app-server --stdio"), 1);
+        // Another executable is a different fact.
+        service.codex.use_executable(&root.join("codex-absent"));
+        assert_eq!(
+            service.codex.availability(),
+            NativeAgentCapabilityStateV1::Unavailable
+        );
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_session_that_cannot_open_is_a_definite_non_start() {
+        let (root, workspace, agent) = scripted_codex(
+            r#"    *'"id":1,'*) printf '%s\n' '{"id":1,"error":{"code":-1,"message":"not signed in"}}' ;;
+    *'"id":3,'*) touch "$PWD/turn-start-received" ;;
+"#,
+        );
+        let mut service = NativeAgentServiceV1::default();
+        let started = service
+            .start_codex_task_with_executable(&agent, &workspace, "never runs")
+            .unwrap();
+        let terminal = wait_for_terminal(&service, &started.task_id);
+        assert_eq!(terminal.state, NativeAgentTaskStateV1::Failed);
+        assert_eq!(terminal.code.as_deref(), Some("native_agent_start_failed"));
+        assert_eq!(
+            terminal.result.as_deref(),
+            Some("Codex could not start its native app-server.")
+        );
+        assert_eq!(terminal.output, None);
+        wait_for_workspace_release(&service, &workspace);
+        assert!(!workspace.join("turn-start-received").exists());
+        assert_eq!(service.codex.session_count(), 0);
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_status_and_reconciliation_carry_the_exact_response_to_the_requester() {
+        let (root, workspace, agent) = final_answer_fixture();
+        let bridge = "room-remote-output";
+        let executor_host = "executor-host";
+        let mut executor = NativeAgentServiceV1::default();
+        let mut requester = NativeAgentServiceV1::default();
+        let task_id = "native-agent:remote-output";
+        requester
+            .queue_bridge_remote_task(
+                bridge,
+                task_id,
+                executor_host,
+                r"C:\Users\someone\project",
+                "answer me",
+            )
+            .unwrap();
+        start_accepted_bridge_codex_task(
+            &mut executor,
+            bridge,
+            &agent,
+            task_id,
+            &workspace,
+            "answer me",
+        )
+        .unwrap();
+        let wire = |status: NativeAgentTaskStatusV1| {
+            let message = NativeAgentStatusV1 {
+                schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                task_id: task_id.into(),
+                executing_host_ref: executor_host.into(),
+                status,
+            };
+            let wire: NativeAgentStatusV1 =
+                serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
+            validate_status(&wire).unwrap();
+            wire
+        };
+        // A native approval wait reaches the requester while still running.
+        let mut waiting = executor.task_status(task_id).unwrap();
+        waiting.state = NativeAgentTaskStateV1::Running;
+        waiting.code = Some(AWAITING_NATIVE_DECISION_CODE.into());
+        let recorded = requester
+            .record_bridge_remote_status(bridge, wire(waiting))
+            .unwrap();
+        assert_eq!(recorded.state, NativeAgentTaskStateV1::Running);
+        assert_eq!(
+            recorded.code.as_deref(),
+            Some(AWAITING_NATIVE_DECISION_CODE)
+        );
+
+        let terminal = wait_for_terminal(&executor, task_id);
+        assert_eq!(terminal.state, NativeAgentTaskStateV1::Completed);
+        let recorded = requester
+            .record_bridge_remote_status(bridge, wire(terminal.clone()))
+            .unwrap();
+        assert_eq!(recorded.state, NativeAgentTaskStateV1::Completed);
+        assert_eq!(recorded.output, terminal.output);
+        assert_eq!(
+            text_output(&recorded).unwrap().0,
+            "Answer <b>bold</b> & \"quoted\" ✓\nsecond line"
+        );
+        // A stale running fact never reopens it or drops its response.
+        let mut stale = terminal.clone();
+        stale.state = NativeAgentTaskStateV1::Running;
+        stale.output = None;
+        let kept = requester
+            .record_bridge_remote_status(bridge, wire(stale))
+            .unwrap();
+        assert_eq!(kept.state, NativeAgentTaskStateV1::Completed);
+        assert_eq!(kept.output, terminal.output);
+        // Reconciliation carries the same opaque response.
+        let fact = executor
+            .reconciliation_fact(bridge, task_id, None, executor_host, "requester-host")
+            .unwrap();
+        assert_eq!(fact.task_output, terminal.output);
+
+        // A requester that cancelled never adopts a late completion's output.
+        let cancelled_task = "native-agent:remote-cancelled";
+        requester
+            .queue_bridge_remote_task(
+                bridge,
+                cancelled_task,
+                executor_host,
+                r"C:\Users\someone\project",
+                "answer me",
+            )
+            .unwrap();
+        requester
+            .cancel_remote_task(cancelled_task, executor_host)
+            .unwrap();
+        let mut late = terminal.clone();
+        late.task_id = cancelled_task.into();
+        let message = NativeAgentStatusV1 {
+            schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: cancelled_task.into(),
+            executing_host_ref: executor_host.into(),
+            status: late,
+        };
+        let after = requester
+            .record_bridge_remote_status(bridge, message)
+            .unwrap();
+        assert_eq!(after.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(after.output, None);
+        let mut late_fact = fact.clone();
+        late_fact.task_id = cancelled_task.into();
+        requester
+            .record_bridge_remote_reconciliation(bridge, late_fact)
+            .unwrap();
+        let after = requester.task_status(cancelled_task).unwrap();
+        assert_eq!(after.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(after.output, None);
+        executor.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_capability_state_is_the_selected_hosts_advertised_fact() {
+        let projection = |capabilities| crate::peer_capabilities::PeerCapabilityProjection {
+            schema_version: crate::peer_capabilities::PEER_CAPABILITY_SCHEMA.into(),
+            peer_session_id: "peer".into(),
+            observed_at: 1,
+            capabilities,
+        };
+        let state_of = |facts| {
+            remote_native_capabilities(&projection(facts))
+                .into_iter()
+                .map(|capability| {
+                    (
+                        capability.agent_id,
+                        capability.display_name,
+                        capability.state,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let fact = crate::peer_capabilities::native_agent_capability_fact;
+        assert_eq!(
+            state_of(vec![fact(
+                CODEX_CAPABILITY_ID,
+                NativeAgentCapabilityStateV1::Available,
+                &WORKSPACE_MOVEMENT_PROTOCOLS
+            )]),
+            vec![(
+                CODEX_CAPABILITY_ID.to_owned(),
+                "Codex".to_owned(),
+                NativeAgentCapabilityStateV1::Available
+            )]
+        );
+        // Advertised without the protocols this Host invokes it with.
+        assert_eq!(
+            state_of(vec![fact(
+                CODEX_CAPABILITY_ID,
+                NativeAgentCapabilityStateV1::Available,
+                &[NATIVE_AGENT_PROTOCOL_SCHEMA]
+            )])[0]
+                .2,
+            NativeAgentCapabilityStateV1::Incompatible
+        );
+        for state in [
+            NativeAgentCapabilityStateV1::Incompatible,
+            NativeAgentCapabilityStateV1::Unavailable,
+        ] {
+            assert_eq!(
+                state_of(vec![fact(
+                    CODEX_CAPABILITY_ID,
+                    state.clone(),
+                    &WORKSPACE_MOVEMENT_PROTOCOLS
+                )])[0]
+                    .2,
+                state
+            );
+        }
+        // Other native capabilities keep their own ids and generic protocols;
+        // non-native facts are not native capabilities at all.
+        let mut facts = vec![fact(
+            "fake.longjob.v1",
+            NativeAgentCapabilityStateV1::Available,
+            &GENERIC_NATIVE_INVOKE_PROTOCOLS,
+        )];
+        facts.push(crate::peer_capabilities::HostCapabilityFact {
+            capability_id: "pastey.managed.runtime".into(),
+            available: true,
+            accepted_input_media_types: Vec::new(),
+            effect: "readiness_observation".into(),
+            supported_protocols: Vec::new(),
+            unavailable_reason: None,
+        });
+        assert_eq!(
+            state_of(facts),
+            vec![(
+                "fake.longjob.v1".to_owned(),
+                "fake.longjob.v1".to_owned(),
+                NativeAgentCapabilityStateV1::Available
+            )]
+        );
+        // No observed native capability means nothing to offer.
+        assert!(state_of(Vec::new()).is_empty());
     }
 
     #[test]
@@ -8868,8 +9660,7 @@ exit 1
         let canonical_workspace = workspace.canonicalize().unwrap();
         let controller = service
             .codex
-            .session_controller(&canonical_workspace)
-            .unwrap();
+            .wait_for_session_controller(&canonical_workspace);
         for _ in 0..300 {
             if controller.active_turn.lock().unwrap().is_some() {
                 break;
@@ -10936,8 +11727,7 @@ exit 1
         let canonical_workspace = workspace.canonicalize().unwrap();
         let controller = service
             .codex
-            .session_controller(&canonical_workspace)
-            .unwrap();
+            .wait_for_session_controller(&canonical_workspace);
         for _ in 0..300 {
             if controller.active_turn.lock().unwrap().is_some() {
                 break;

@@ -15,6 +15,11 @@ import {
   nativeAgentRemoteReconciliationRequired,
   nativeAgentConsequenceAbandonmentRequired,
   nativeAgentTaskNeedsObservation,
+  nativeAgentAwaitingNativeDecision,
+  nativeAgentDisplayName,
+  nativeAgentLifecycleLabel,
+  nativeAgentResponse,
+  nativeAgentTargetAvailability,
 } from "../src/features/workspace/AgentTaskLifecycle";
 import type { FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../src/lib/types";
 
@@ -414,4 +419,101 @@ test("Native Agent recovery drains only after the current item no longer require
     state: "returning_result",
     code: "result_return_retry_required",
   }), true);
+});
+
+test("Native Agent responses are shown apart from lifecycle and only as escaped text", () => {
+  const completed = {
+    schemaVersion: "pastey-native-agent-task-v1" as const,
+    taskId: "task-response",
+    agentId: "agent.coding.codex",
+    workspaceName: "project",
+    state: "completed" as const,
+    result: "Codex completed its native task.",
+    code: null,
+  };
+  const hostile = "<img src=x onerror=alert(1)> [link](https://example.invalid) $(rm -rf ~) C:\\Windows";
+  const output = { schemaVersion: "pastey-native-text-output-v1", text: hostile, truncated: false };
+  assert.deepEqual(nativeAgentResponse({ ...completed, output }), { kind: "text", text: hostile, truncated: false });
+  assert.deepEqual(nativeAgentResponse({ ...completed, output: { ...output, truncated: true } }), { kind: "text", text: hostile, truncated: true });
+  // Completion without a displayable response stays a completion.
+  assert.deepEqual(nativeAgentResponse({ ...completed, output: undefined }), { kind: "none" });
+  assert.deepEqual(nativeAgentResponse({ ...completed, output: null }), { kind: "none" });
+  for (const malformed of [
+    "plain string",
+    ["text"],
+    { schemaVersion: "other", text: "x", truncated: false },
+    { schemaVersion: "pastey-native-text-output-v1", text: 7, truncated: false },
+    { schemaVersion: "pastey-native-text-output-v1", text: "x" },
+    { payload: { text: "fake.longjob" }, steps: 3 },
+  ]) {
+    assert.deepEqual(nativeAgentResponse({ ...completed, output: malformed }), { kind: "undisplayable" });
+  }
+  // Only a completed task has a response; no other state shows output.
+  for (const state of ["queued", "running", "failed", "cancelled", "interrupted"] as const) {
+    assert.equal(nativeAgentResponse({ ...completed, state, output }), null);
+  }
+  assert.equal(nativeAgentResponse(null), null);
+  assert.equal(nativeAgentDisplayName("agent.coding.codex"), "Codex");
+  assert.equal(nativeAgentDisplayName("fake.longjob.v1"), "fake.longjob.v1");
+
+  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  assert.doesNotMatch(card, /dangerouslySetInnerHTML|innerHTML/);
+  assert.match(card, /<pre className="v2-agent-response-text">\{response\.text\}<\/pre>/);
+  const responseCard = card.slice(card.indexOf("function NativeAgentResponse"), card.indexOf("export function MessageCard"));
+  assert.doesNotMatch(responseCard, /<a\b|href=|onClick|open\(|invoke\(/);
+  assert.match(bindings, /output\?: unknown;/);
+});
+
+test("Native approval waits stay running and are explained, not hidden", () => {
+  const running = {
+    schemaVersion: "pastey-native-agent-task-v1" as const,
+    taskId: "task-approval",
+    agentId: "agent.coding.codex",
+    workspaceName: "project",
+    state: "running" as const,
+    code: "native_agent_awaiting_native_decision",
+  };
+  assert.equal(nativeAgentAwaitingNativeDecision(running), true);
+  assert.equal(nativeAgentTaskNeedsObservation(running), true);
+  assert.equal(nativeAgentLifecycleLabel(running), "running · waiting for a native approval");
+  assert.equal(nativeAgentAwaitingNativeDecision({ ...running, code: null }), false);
+  // A cancelled task is never shown as waiting, whatever its last code was.
+  assert.equal(nativeAgentAwaitingNativeDecision({ ...running, state: "cancelled" }), false);
+  assert.equal(nativeAgentLifecycleLabel({ ...running, state: "failed", code: "native_agent_start_failed" }), "failed · did not start");
+  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  assert.match(card, /Pastey does not answer native approvals in this version/);
+  assert.match(card, /agent\.canCancel \? <button[\s\S]*?>Stop Codex<\/button>/);
+});
+
+test("A selected remote Host shows its own advertised Codex availability", () => {
+  const observed = (state: "available" | "incompatible" | "unavailable") => ({
+    roomId: "room",
+    hostRef: "host:windows",
+    state: "observed" as const,
+    capabilities: [{ agentId: "agent.coding.codex", displayName: "Codex", state }],
+  });
+  assert.deepEqual(nativeAgentTargetAvailability("agent.coding.codex", null), { state: "checking" });
+  assert.deepEqual(nativeAgentTargetAvailability("agent.coding.codex", { roomId: "room", hostRef: "host:windows", state: "checking" }), { state: "checking" });
+  for (const state of ["available", "incompatible", "unavailable"] as const) {
+    assert.deepEqual(nativeAgentTargetAvailability("agent.coding.codex", observed(state)), { state });
+  }
+  assert.deepEqual(
+    nativeAgentTargetAvailability("agent.coding.codex", { roomId: "room", hostRef: "host:windows", state: "observed", capabilities: [] }),
+    { state: "unavailable" },
+  );
+  assert.deepEqual(
+    nativeAgentTargetAvailability("agent.coding.codex", { roomId: "room", hostRef: "host:windows", state: "error", message: "no response" }),
+    { state: "unknown", message: "no response" },
+  );
+  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  // The remote target never falls back to this device's local Codex state.
+  assert.match(card, /const availability: NativeAgentTargetAvailability = remote\s*\? nativeAgentTargetAvailability\("agent\.coding\.codex", remoteCapabilities\.observation\)\s*: localAvailability\(codex\);/);
+  assert.match(card, /availability\.state !== "available"/);
+  assert.match(lifecycle, /listRemoteNativeAgentCapabilities\(roomId, hostRef\)/);
+  assert.match(bindings, /invoke\("list_remote_native_agent_capabilities", \{ roomId, targetHostRef \}\)/);
+  // A finished task stays visible (with its response) when recovery drains.
+  assert.match(lifecycle, /loadRecoveryProjection\(undefined, true\)/);
 });

@@ -192,7 +192,8 @@ pub(crate) fn local_diagnostic_projection(
     };
 
     let mut capabilities = vec![provider, runtime, execution_world, managed_execution];
-    capabilities.extend(state.native_agents.lock().native_capability_facts());
+    let native_agents = state.native_agents.lock().capability_registry();
+    capabilities.extend(native_agents.native_capability_facts());
     PeerCapabilityProjection {
         schema_version: PEER_CAPABILITY_SCHEMA.into(),
         peer_session_id,
@@ -344,6 +345,45 @@ impl PeerCapabilityProjection {
             Some(REASON_UNKNOWN | REASON_PLAN_BINDING_REQUIRED) => DiagnosticState::Unknown,
             Some(_) => DiagnosticState::Unavailable,
             None => DiagnosticState::Unknown,
+        }
+    }
+
+    /// Native capabilities this observation reports, by id.
+    pub(crate) fn native_agent_capability_ids(&self) -> Vec<&str> {
+        self.capabilities
+            .iter()
+            .filter(|fact| fact.effect == NATIVE_AGENT_EFFECT)
+            .map(|fact| fact.capability_id.as_str())
+            .collect()
+    }
+
+    /// The observed state of one native capability for an operation using
+    /// `required` protocols: available only when every one is advertised.
+    pub(crate) fn native_agent_state(
+        &self,
+        capability_id: &str,
+        required: &[&str],
+    ) -> crate::native_agent::NativeAgentCapabilityStateV1 {
+        use crate::native_agent::NativeAgentCapabilityStateV1::*;
+        if self
+            .require_native_agent_protocols(capability_id, required)
+            .is_ok()
+        {
+            return Available;
+        }
+        match self
+            .capabilities
+            .iter()
+            .find(|fact| fact.capability_id == capability_id)
+        {
+            // Advertised, but not with every protocol this Host speaks.
+            Some(fact) if fact.available => Incompatible,
+            Some(fact)
+                if fact.unavailable_reason.as_deref() == Some(REASON_NATIVE_AGENT_INCOMPATIBLE) =>
+            {
+                Incompatible
+            }
+            _ => Unavailable,
         }
     }
 
