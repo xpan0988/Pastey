@@ -1,3 +1,4 @@
+import { bridgeConnectionErrorMessage } from "../../lib/bridgeAddress";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAgentTaskLifecycle } from "./AgentTaskLifecycle";
 import { BridgeWorkspace } from "./BridgeWorkspace";
@@ -126,13 +127,13 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
     }
   }
 
-  async function joinBridge(code: string) {
+  async function joinBridge(code: string, address?: string) {
     setMessage(null);
     try {
-      await props.onJoinBridge(code.replace(/\D/g, ""));
+      await props.onJoinBridge(code.replace(/\D/g, ""), address);
       setRoute("bridge");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not join this Bridge.");
+      setMessage(bridgeConnectionErrorMessage(error, Boolean(address)));
       throw error;
     }
   }

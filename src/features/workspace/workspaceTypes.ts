@@ -24,7 +24,8 @@ export interface WorkspaceV2Props {
   queueItems: TransferQueueItem[];
   focusRequest?: { target: "home" | "settings"; token: number };
   onCreateBridge: () => Promise<void>;
-  onJoinBridge: (code: string) => Promise<void>;
+  /** `address` reaches a device on another network (overlay IP or name). */
+  onJoinBridge: (code: string, address?: string) => Promise<void>;
   onListNearbyDevices: () => Promise<NearbyDevice[]>;
   onJoinNearbyDevice: (deviceId: string) => Promise<void>;
   nearbyDiscoveryAvailable: boolean;

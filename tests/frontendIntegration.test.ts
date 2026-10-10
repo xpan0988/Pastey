@@ -25,6 +25,7 @@ import {
 } from "../src/features/workspace/AgentTaskLifecycle";
 import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent, RoomInfo, RoomItem } from "../src/lib/types";
 import { availableRevisionId, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
+import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
 
 function room(peerConnected: boolean): RoomInfo {
   return {
@@ -629,4 +630,41 @@ test("Find file and shared folders keep paths and authority on the searched devi
   assert.match(settings, /Other Bridges cannot/);
   const folderType = bindings.slice(bindings.indexOf("export interface AuthorizedSearchFolder"), bindings.indexOf("export function listAuthorizedSearchFolders"));
   assert.doesNotMatch(folderType, /path/i);
+});
+
+test("An overlay address is checked like Rust checks it and is only a place to look", () => {
+  for (const accepted of ["100.101.102.103", "192.168.1.20", "10.0.0.7", "172.20.4.9", "home-pc", "Windows-PC.tail1234.TS.net", " home-pc "]) {
+    assert.equal(peerAddressProblem(accepted), null, accepted);
+  }
+  for (const refused of ["", "8.8.8.8", "203.0.113.5", "127.0.0.1", "0.0.0.0", "255.255.255.255", "1.2.3", "300.1.1.1", "https://home-pc", "home-pc:48392", "home-pc/rooms", "user@home-pc", "home pc", "-bad.example", "bad..example", "fd7a:115c:a1e0::1"]) {
+    assert.notEqual(peerAddressProblem(refused), null, refused);
+  }
+  assert.match(peerAddressProblem("8.8.8.8") ?? "", /must not be exposed directly to the internet/);
+});
+
+test("Join and reconnect failures say what the user can do", () => {
+  const lan = bridgeConnectionErrorMessage(new Error("timed out while waiting for room discovery"), false);
+  assert.match(lan, /enter its overlay address/);
+  assert.match(lan, /expired or been burned/);
+  const remote = bridgeConnectionErrorMessage(new Error("The other device did not answer. Check that it is running Pastey"), true);
+  assert.match(remote, /same overlay network/);
+  assert.match(bridgeConnectionErrorMessage(new Error("Discovered Bridge identity does not match the preserved Bridge."), true), /different or ended Bridge/);
+  assert.match(bridgeConnectionErrorMessage(new Error("Use an address on a private or overlay network (for example Tailscale or WireGuard). Pastey must not be exposed directly to the internet."), true), /must not be exposed/);
+  assert.match(bridgeConnectionErrorMessage(new Error("Room control delivery failed."), true), /firewall/);
+  const room = (liveness: string[]) => ({ id: "r", created_at: 0, expires_at: 0, status: "active", local_role: "creator", auto_burn_after_expiry: false, peer_connected: false, peers: liveness.map((value) => ({ liveness: value })) }) as unknown as RoomInfo;
+  assert.equal(bridgeReachability(room(["connected", "reconnecting"])), "connected");
+  assert.equal(bridgeReachability(room(["reconnecting"])), "reconnecting");
+  assert.equal(bridgeReachability(room(["disconnected", "left"])), "disconnected");
+  assert.equal(bridgeReachability(room([])), "none");
+
+  const app = readFileSync("src/App.tsx", "utf8");
+  const screens = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
+  const panel = readFileSync("src/features/workspace/BridgeNetworkPanel.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  // LAN join is unchanged; the address is used only when given.
+  assert.match(app, /address \? await joinRoomAt\(code, address\) : await joinRoom\(code\)/);
+  assert.match(screens, /onJoin\(code, remote \? address\.trim\(\) : undefined\)/);
+  assert.match(panel, /setBridgePeerAddress\(room\.id/);
+  assert.match(panel, /gives the other device no permissions/);
+  assert.match(bindings, /invoke\("join_room_at", \{ code, address \}\)/);
 });

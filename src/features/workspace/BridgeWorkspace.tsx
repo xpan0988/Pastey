@@ -12,6 +12,7 @@ import { nativeAgentAwaitingNativeDecision, nativeAgentConsequenceAbandonmentReq
 import type { NativeAgentCapability, NativeAgentTaskStatus } from "../../lib/tauri";
 import { DeveloperModeScreen } from "./DeveloperModeScreen";
 import { RemoteFileFinder } from "./RemoteFileFinder";
+import { BridgeNetworkPanel } from "./BridgeNetworkPanel";
 import { bridgeCode, bridgeDeviceCount, fileName, formatBytes, formatClock, roomPeers } from "./workspaceViewModel";
 
 interface BridgeWorkspaceProps {
@@ -108,6 +109,7 @@ export function BridgeWorkspace({ room, items, queueItems, task, developerMode, 
       <header className="v2-workspace-header">
         <div><h1>Bridge {bridgeCode(room)}</h1><p>{bridgeDeviceCount(room)} devices · {developerMode ? "Developer Mode workspace" : "current-session workspace"}</p></div>
         <div className="v2-bridge-session-actions">
+          <BridgeNetworkPanel room={room} />
           {developerMode ? <button type="button" className="v2-button" onClick={onDeveloper}>Bridge workspace</button> : null}
           {task.status && ["checking_readiness", "preparing", "running"].includes(task.status.state)
             ? <button type="button" className="v2-button" disabled={task.busy !== null} onClick={() => void task.cancel()}>{task.busy === "cancel" ? "Cancelling…" : "Stop task"}</button>

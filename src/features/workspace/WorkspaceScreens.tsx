@@ -1,3 +1,4 @@
+import { peerAddressProblem } from "../../lib/bridgeAddress";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getBridgeNodeListProjection, runBridgeDeviceSelfCheck } from "../../lib/tauri";
 import type { TransferQueueItem } from "../../lib/transferScheduler";
@@ -172,12 +173,15 @@ export function NewBridgeScreen({
   nearbyDiscoveryAvailable,
 }: {
   onCreate: () => Promise<void>;
-  onJoin: (code: string) => Promise<void>;
+  onJoin: (code: string, address?: string) => Promise<void>;
   onListNearby: () => Promise<NearbyDevice[]>;
   onJoinNearby: (deviceId: string) => Promise<void>;
   nearbyDiscoveryAvailable: boolean;
 }) {
   const [code, setCode] = useState("");
+  const [remote, setRemote] = useState(false);
+  const [address, setAddress] = useState("");
+  const addressProblem = remote ? peerAddressProblem(address) : null;
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const busyRef = useRef(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -238,7 +242,7 @@ export function NewBridgeScreen({
           {nearbyDevices.length === 0 ? <div className="v2-nearby-empty"><p>{nearbyMessage}</p><button type="button" className="v2-button" disabled={busyAction !== null} onClick={() => void run("refresh", async () => { await loadNearby(); })}>{busyAction === "refresh" ? "Refreshing…" : "Refresh"}</button></div> : null}
         </div>
         <h2>Join manually</h2>
-        <section className="v2-join-card"><strong>Enter an 8-digit Bridge code</strong><small>Session permission ends when the Bridge is burned or the current session is replaced.</small><div><input value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="4829 1736" aria-label="Bridge code" /><button type="button" className="v2-button primary" disabled={code.length !== 8 || busyAction !== null} onClick={() => void run("join", () => onJoin(code))}>{busyAction === "join" ? "Joining…" : "Join"}</button></div></section>
+        <section className="v2-join-card"><strong>Enter an 8-digit Bridge code</strong><small>Session permission ends when the Bridge is burned or the current session is replaced.</small><div><input value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="4829 1736" aria-label="Bridge code" /><button type="button" className="v2-button primary" disabled={code.length !== 8 || busyAction !== null || (remote && addressProblem !== null)} onClick={() => void run("join", () => onJoin(code, remote ? address.trim() : undefined))}>{busyAction === "join" ? "Joining…" : "Join"}</button></div><label><input type="checkbox" checked={remote} onChange={(event) => setRemote(event.target.checked)} /> The other device is on another network</label>{remote ? <><input value={address} onChange={(event) => setAddress(event.target.value)} placeholder="home-pc.tail1234.ts.net or 100.x.y.z" aria-label="Other device's overlay address" /><small>Its address on a private network you both use, such as Tailscale or WireGuard. The address only says where to look; the code still decides whether you join, and it gives the other device no permissions.{address.trim() && addressProblem ? ` ${addressProblem}` : ""}</small></> : null}</section>
         <h2>Create with code</h2>
         <section className="v2-join-card"><strong>Create an empty Bridge</strong><small>A new Bridge and 8-digit code are created only after this explicit action.</small><div><button type="button" className="v2-button primary" disabled={busyAction !== null} onClick={() => void run("create", onCreate)}>{busyAction === "create" ? "Creating…" : "Create Bridge"}</button></div></section>
         {message ? <p className="v2-error">{message}</p> : null}

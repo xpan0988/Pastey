@@ -308,3 +308,6 @@ button { color: inherit; }
 .v2-finder-results { margin: 8px 0 0; padding: 0; list-style: none; }
 .v2-finder-results li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 0; border-top: 1px solid rgba(255, 255, 255, 0.06); }
 .v2-finder-results li span { min-width: 0; overflow-wrap: anywhere; }
+.v2-bridge-network { position: relative; }
+.v2-bridge-network > .v2-task-open { position: absolute; right: 0; z-index: 5; width: 320px; margin-top: 6px; padding: 10px; border-radius: 8px; background: #1c1b20; border: 1px solid rgba(255, 255, 255, 0.08); }
+.v2-join-card label { display: block; margin-top: 8px; font-size: 11px; color: #c9c7cf; }

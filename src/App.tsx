@@ -14,6 +14,7 @@ import {
   getFileTransferMetadata,
   getRoom,
   joinRoom,
+  joinRoomAt,
   listNearbyDevices,
   listRoomItems,
   listRooms,
@@ -1401,8 +1402,8 @@ function App() {
     await openRoom(room);
   }
 
-  async function handleJoinBridge(code: string) {
-    const room = await joinRoom(code);
+  async function handleJoinBridge(code: string, address?: string) {
+    const room = address ? await joinRoomAt(code, address) : await joinRoom(code);
     await openRoom(room);
   }
 
