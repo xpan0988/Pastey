@@ -178,7 +178,8 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             folder_id TEXT PRIMARY KEY,
             canonical_path TEXT NOT NULL UNIQUE,
             display_name TEXT NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            bridge_id TEXT
         );
 
         -- One Pastey-managed native conversation per owner, capability and
@@ -209,6 +210,7 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
     )?;
     ensure_room_schema(&conn)?;
     ensure_bridge_peer_schema(&conn)?;
+    ensure_authorized_search_folder_schema(&conn)?;
     bridge_plan::init_schema(&conn)?;
     migrate_room_statuses(&conn)?;
     backfill_legacy_bridge_peers(&conn)?;
@@ -354,15 +356,22 @@ pub(crate) struct StoredAuthorizedSearchFolder {
     pub(crate) canonical_path: String,
     pub(crate) display_name: String,
     pub(crate) created_at: i64,
+    /// The one Bridge whose peers may search it. `None` only for a folder
+    /// shared before Bridge scoping; it is never searched.
+    pub(crate) bridge_id: Option<String>,
 }
 
 pub(crate) fn list_authorized_search_folders(
     paths: &AppPaths,
 ) -> AppResult<Vec<StoredAuthorizedSearchFolder>> {
     let conn = connection(paths)?;
+    // A burned Bridge's folders stop at its durable cutoff.
     let mut statement = conn.prepare(
-        "SELECT folder_id, canonical_path, display_name, created_at
-         FROM authorized_search_folders ORDER BY created_at, folder_id",
+        "SELECT folder_id, canonical_path, display_name, created_at, bridge_id
+         FROM authorized_search_folders
+         WHERE bridge_id IS NULL
+            OR NOT EXISTS (SELECT 1 FROM burned_bridges WHERE room_id = bridge_id)
+         ORDER BY created_at, folder_id",
     )?;
     let folders = statement
         .query_map([], |row| {
@@ -371,6 +380,7 @@ pub(crate) fn list_authorized_search_folders(
                 canonical_path: row.get(1)?,
                 display_name: row.get(2)?,
                 created_at: row.get(3)?,
+                bridge_id: row.get(4)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -396,7 +406,24 @@ pub(crate) fn add_authorized_search_folder(
     )?;
     if duplicate != 0 {
         return Err(AppError::InvalidInput(
-            "This folder is already shared for Bridge search.".into(),
+            "This folder is already shared. Stop sharing it first to share it with another Bridge."
+                .into(),
+        ));
+    }
+    let Some(bridge_id) = folder.bridge_id.as_deref() else {
+        return Err(AppError::InvalidInput(
+            "Choose the Bridge this folder is shared with.".into(),
+        ));
+    };
+    let bridge_is_current: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rooms WHERE id = ?1 AND status != 'burned')
+            AND NOT EXISTS(SELECT 1 FROM burned_bridges WHERE room_id = ?1)",
+        [bridge_id],
+        |row| row.get(0),
+    )?;
+    if bridge_is_current == 0 {
+        return Err(AppError::InvalidInput(
+            "That Bridge is no longer available.".into(),
         ));
     }
     if existing >= MAX_AUTHORIZED_SEARCH_FOLDERS {
@@ -405,16 +432,29 @@ pub(crate) fn add_authorized_search_folder(
         ));
     }
     transaction.execute(
-        "INSERT INTO authorized_search_folders (folder_id, canonical_path, display_name, created_at)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO authorized_search_folders (folder_id, canonical_path, display_name, created_at, bridge_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             &folder.folder_id,
             &folder.canonical_path,
             &folder.display_name,
-            folder.created_at
+            folder.created_at,
+            bridge_id
         ],
     )?;
     transaction.commit()?;
+    Ok(())
+}
+
+/// Burn: the Bridge's shared folders end with it.
+pub(crate) fn delete_bridge_authorized_search_folders(
+    paths: &AppPaths,
+    bridge_id: &str,
+) -> AppResult<()> {
+    connection(paths)?.execute(
+        "DELETE FROM authorized_search_folders WHERE bridge_id = ?1",
+        [bridge_id],
+    )?;
     Ok(())
 }
 
@@ -1775,6 +1815,7 @@ pub fn finalize_burned_room(
     // deletion failure leaves the burned tombstone in place for retry.
     bridge_plan::delete_bridge_records(paths, room_id)?;
     crate::native_agent::purge_durable_bridge_state(paths, room_id)?;
+    delete_bridge_authorized_search_folders(paths, room_id)?;
     let conn = connection(paths)?;
     delete_room_files(paths, room_id, effective_inbox_dir)?;
     conn.execute("DELETE FROM room_items WHERE room_id = ?1", [room_id])?;
@@ -2557,6 +2598,22 @@ fn ensure_bridge_peer_schema(conn: &Connection) -> AppResult<()> {
     if !columns.iter().any(|column| column == "logical_host_ref") {
         conn.execute(
             "ALTER TABLE bridge_peers ADD COLUMN logical_host_ref TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Folders shared before they were bound to one Bridge keep no Bridge: they
+/// are shown as needing to be shared again and are never searched.
+fn ensure_authorized_search_folder_schema(conn: &Connection) -> AppResult<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(authorized_search_folders)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "bridge_id") {
+        conn.execute(
+            "ALTER TABLE authorized_search_folders ADD COLUMN bridge_id TEXT",
             [],
         )?;
     }

@@ -735,9 +735,10 @@ pub fn list_authorized_search_folders(
 #[tauri::command]
 pub fn authorize_search_folder(
     path: String,
+    room_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<file_candidates::AuthorizedSearchFolderV1, String> {
-    file_candidates::authorize_search_folder(&state.paths, std::path::Path::new(&path))
+    file_candidates::authorize_search_folder(&state.paths, std::path::Path::new(&path), &room_id)
         .map_err(|error| error.message())
 }
 

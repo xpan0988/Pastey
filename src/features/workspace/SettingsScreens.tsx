@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import {
   authorizeSearchFolder,
   listAuthorizedSearchFolders,
+  listRooms,
   revokeAuthorizedSearchFolder,
   checkManagedWorkerProviderHealth,
   createManagedWorkerProvider,
@@ -16,7 +17,8 @@ import {
   updateManagedWorkerProvider,
 } from "../../lib/tauri";
 import type { AuthorizedSearchFolder, ManagedRuntimeOption, ManagedWorkerProviderSettings, ManagedWorkerProviderSettingsSnapshot } from "../../lib/tauri";
-import type { AppConfig } from "../../lib/types";
+import type { AppConfig, RoomInfo } from "../../lib/types";
+import { bridgeCode } from "./workspaceViewModel";
 import type { NavigateWorkspace, WorkspaceRoute } from "./workspaceTypes";
 
 interface SettingsProps {
@@ -96,17 +98,25 @@ export function SettingsOverview({ config, onNavigate, onConfigChange }: Setting
  * and nothing it or an Agent sends can add a folder here. */
 function SharedSearchFolders() {
   const [folders, setFolders] = useState<AuthorizedSearchFolder[] | null>(null);
+  const [bridges, setBridges] = useState<RoomInfo[]>([]);
+  const [bridgeId, setBridgeId] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     void listAuthorizedSearchFolders().then(setFolders).catch(() => setFolders([]));
+    void listRooms().then((rooms) => setBridges(rooms.filter((room) => room.status === "active"))).catch(() => setBridges([]));
   }, []);
+  const bridgeName = (id: string | null) => {
+    const bridge = bridges.find((room) => room.id === id);
+    return bridge ? `Bridge ${bridgeCode(bridge)}` : id ? "an ended Bridge" : null;
+  };
   async function add() {
+    if (!bridgeId) { setError("Choose the Bridge whose devices may search the folder."); return; }
     setPending(true); setError(null);
     try {
       const chosen = await open({ directory: true, multiple: false });
       if (typeof chosen !== "string") return;
-      await authorizeSearchFolder(chosen);
+      await authorizeSearchFolder(chosen, bridgeId);
       setFolders(await listAuthorizedSearchFolders());
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError));
@@ -119,9 +129,10 @@ function SharedSearchFolders() {
     finally { setPending(false); }
   }
   return <SettingsGroup title="Shared search folders">
-    <p className="v2-settings-note">Connected Bridge devices can find files in these folders by name and ask for one; you choose which folders. Nothing in them is changed or deleted.</p>
-    {folders === null ? <SettingsRow title="Shared folders" value="Checking…" /> : folders.length === 0 ? <SettingsRow title="No shared folders" description="Downloads, Desktop and Documents remain searchable as before." value="None" /> : folders.map((folder) => <div className="v2-settings-row" key={folder.folderId}><span><strong>{folder.displayName}</strong>{folder.unavailable ? <small>Moved or replaced; not searched.</small> : null}</span><button type="button" className="v2-button" disabled={pending} onClick={() => void remove(folder.folderId)}>Stop sharing</button></div>)}
-    <button type="button" className="v2-button" disabled={pending} onClick={() => void add()}>Share a folder…</button>
+    <p className="v2-settings-note">Devices on the chosen Bridge can find files in a shared folder by name and ask for one. Other Bridges cannot. Nothing in the folder is changed or deleted, and burning the Bridge ends the share.</p>
+    {folders === null ? <SettingsRow title="Shared folders" value="Checking…" /> : folders.length === 0 ? <SettingsRow title="No shared folders" description="Downloads, Desktop and Documents remain searchable as before." value="None" /> : folders.map((folder) => <div className="v2-settings-row" key={folder.folderId}><span><strong>{folder.displayName}</strong><small>{folder.bridgeId ? `Shared with ${bridgeName(folder.bridgeId)}` : "Shared before Bridge scoping. Not searched; stop sharing and share it with one Bridge."}{folder.bridgeId && folder.unavailable ? " · moved or replaced; not searched" : ""}</small></span><button type="button" className="v2-button" disabled={pending} onClick={() => void remove(folder.folderId)}>Stop sharing</button></div>)}
+    <label className="v2-target-select"><select value={bridgeId} onChange={(event) => setBridgeId(event.target.value)} disabled={pending || bridges.length === 0} aria-label="Bridge to share with"><option value="">{bridges.length ? "Share with which Bridge?" : "No active Bridge"}</option>{bridges.map((bridge) => <option key={bridge.id} value={bridge.id}>Bridge {bridgeCode(bridge)}{bridge.peer_device_name ? ` · ${bridge.peer_device_name}` : ""}</option>)}</select></label>
+    <button type="button" className="v2-button" disabled={pending || !bridgeId} onClick={() => void add()}>Share a folder…</button>
     {error ? <p className="v2-error" role="alert">{error}</p> : null}
   </SettingsGroup>;
 }

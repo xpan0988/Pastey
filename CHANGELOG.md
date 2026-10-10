@@ -25,6 +25,8 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Fixed
 
+- A shared search folder is now shared with one chosen Bridge only, instead of with every Bridge on the device. Folders shared before this change are not searched until shared again, and burning the Bridge ends the share.
+- Find file now returns the 20 most recently modified matches, newest first, instead of the first 20 found, so a just-rendered video deep in a folder is no longer missed.
 - A Bridge search result is no longer sent if the file was replaced with another file of the same size and modification time after it was found.
 - Cancelling a remote Codex task that was in flight when the executing device restarted now releases its workspace instead of leaving it blocked.
 - Starting a Codex task no longer holds the native service lock while Codex launches and opens its session, so status, cancellation, and remote status updates stay responsive; Codex availability is cached briefly and rechecked before each new session.

@@ -7751,6 +7751,116 @@ done
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Stop after an executor restart revokes Pastey's authority; it is not
+    /// evidence that native work stopped, and it must say so.
+    #[test]
+    fn stop_after_restart_revokes_authority_without_inventing_a_native_outcome() {
+        let (root, workspace, agent) = conversation_codex();
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        fs::write(root.join("hold-turn"), b"").unwrap();
+        start_peer_codex_task(
+            &mut service,
+            &agent,
+            "room-s",
+            "host:mac",
+            "task-stop",
+            &workspace,
+            "inflight",
+            true,
+        )
+        .unwrap();
+        for _ in 0..500 {
+            if native_log(&root)
+                .iter()
+                .any(|line| line.starts_with("turn"))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // While the observer is live, Stop never frees the workspace.
+        let live = service.cancel_bridge_task("room-s", "task-stop").unwrap();
+        assert_eq!(live.state, NativeAgentTaskStateV1::Cancelled);
+        assert!(service
+            .workspace_occupant(&workspace.canonicalize().unwrap())
+            .is_some());
+        service.shutdown();
+        drop(service);
+        let _ = fs::remove_file(root.join("hold-turn"));
+
+        // A second task is in flight when Pastey stops abruptly.
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        fs::write(root.join("hold-turn"), b"").unwrap();
+        start_peer_codex_task(
+            &mut service,
+            &agent,
+            "room-s",
+            "host:mac",
+            "task-restored",
+            &workspace,
+            "second",
+            true,
+        )
+        .unwrap();
+        for _ in 0..500 {
+            if native_log(&root)
+                .iter()
+                .any(|line| line.ends_with("second"))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        service.shutdown();
+        drop(service);
+        let _ = fs::remove_file(root.join("hold-turn"));
+        let mut restarted = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        let restored = restarted.task_status("task-restored").unwrap();
+        assert_eq!(
+            restored.code.as_deref(),
+            Some("native_agent_reconciliation_required")
+        );
+        let stopped = restarted
+            .cancel_bridge_task("room-s", "task-restored")
+            .unwrap();
+        // Pastey's authority is revoked; no native completion, failure or
+        // interruption is claimed, and the stop itself is reported uncertain.
+        assert_eq!(stopped.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(
+            stopped.code.as_deref(),
+            Some("native_agent_cancel_delivery_uncertain")
+        );
+        assert_eq!(stopped.output, None);
+        // The fact survives restart and is what reconciliation reports.
+        let again = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        assert_eq!(again.task_status("task-restored").unwrap(), stopped);
+        let fact = again
+            .reconciliation_fact("room-s", "task-restored", None, "executor", "host:mac")
+            .unwrap();
+        assert_eq!(fact.task_state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(
+            fact.code.as_deref(),
+            Some("native_agent_cancel_delivery_uncertain")
+        );
+        // Nothing was retried: each prompt reached Codex exactly once.
+        let log = native_log(&root);
+        assert_eq!(
+            log.iter().filter(|line| line.ends_with(" second")).count(),
+            1,
+            "{log:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|line| line.ends_with(" inflight"))
+                .count(),
+            1,
+            "{log:?}"
+        );
+        restarted.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn concurrent_follow_ups_are_exclusive_and_each_runs_once() {
         let (root, workspace, agent) = conversation_codex();

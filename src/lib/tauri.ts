@@ -235,6 +235,9 @@ export function listNativeAgentCapabilities(): Promise<NativeAgentCapability[]> 
 export interface AuthorizedSearchFolder {
   folderId: string;
   displayName: string;
+  /** The one Bridge whose devices may search it; null for a folder shared
+   * before Bridge scoping, which is not searched until shared again. */
+  bridgeId: string | null;
   /** Moved, deleted, or replaced since it was shared; search skips it. */
   unavailable: boolean;
 }
@@ -244,9 +247,9 @@ export function listAuthorizedSearchFolders(): Promise<AuthorizedSearchFolder[]>
 }
 
 /** Only this device's own user, choosing a folder with the system picker,
- * can share it. */
-export function authorizeSearchFolder(path: string): Promise<AuthorizedSearchFolder> {
-  return invoke("authorize_search_folder", { path });
+ * can share it, and only with one Bridge. */
+export function authorizeSearchFolder(path: string, roomId: string): Promise<AuthorizedSearchFolder> {
+  return invoke("authorize_search_folder", { path, roomId });
 }
 
 export function revokeAuthorizedSearchFolder(folderId: string): Promise<AuthorizedSearchFolder[]> {

@@ -21,6 +21,10 @@ const MAX_FILENAME_HINT_LENGTH: usize = 128;
 const MAX_CANDIDATES: usize = 20;
 const MAX_SEARCH_MS: u64 = 10_000;
 const MAX_DEPTH: u8 = 8;
+/// Directory entries one Search may visit across all its scopes. Matches
+/// are ranked newest first among what was visited, so the cap bounds the
+/// scan without letting the first-found files crowd out recent ones.
+const MAX_VISITED_ENTRIES: usize = 20_000;
 const CANDIDATE_PAYLOAD_STORE_TTL_SECONDS: i64 = 10 * 60;
 const MAX_FOLDER_DISPLAY_NAME_LENGTH: usize = 128;
 
@@ -34,17 +38,25 @@ pub(crate) const AUTHORIZED_FOLDERS_SCOPE: &str = "authorized_folders";
 pub(crate) struct AuthorizedSearchFolderV1 {
     pub(crate) folder_id: String,
     pub(crate) display_name: String,
+    /// The one Bridge whose peers may search it; `None` for a folder shared
+    /// before Bridge scoping, which is never searched until shared again.
+    pub(crate) bridge_id: Option<String>,
     /// The folder no longer resolves to what was authorized (moved,
     /// deleted, or replaced through a link); Search skips it.
     pub(crate) unavailable: bool,
 }
 
-/// The authorized folders that still resolve to exactly the canonical path
-/// the user authorized. A folder moved, deleted or replaced through a link
-/// anywhere on its path is skipped, never followed.
-fn current_authorized_search_roots(paths: &AppPaths) -> AppResult<Vec<(String, PathBuf)>> {
+/// The folders shared with exactly `bridge_id` that still resolve to the
+/// canonical path the user authorized. A folder moved, deleted or replaced
+/// through a link anywhere on its path is skipped, never followed. Another
+/// Bridge's folders, and folders shared before Bridge scoping, never count.
+fn current_authorized_search_roots(
+    paths: &AppPaths,
+    bridge_id: &str,
+) -> AppResult<Vec<(String, PathBuf)>> {
     Ok(crate::storage::list_authorized_search_folders(paths)?
         .into_iter()
+        .filter(|folder| folder.bridge_id.as_deref() == Some(bridge_id))
         .filter_map(|folder| {
             let stored = PathBuf::from(&folder.canonical_path);
             let current = stored.canonicalize().ok()?;
@@ -56,16 +68,19 @@ fn current_authorized_search_roots(paths: &AppPaths) -> AppResult<Vec<(String, P
 pub(crate) fn list_authorized_search_folders(
     paths: &AppPaths,
 ) -> AppResult<Vec<AuthorizedSearchFolderV1>> {
-    let current = current_authorized_search_roots(paths)?
-        .into_iter()
-        .map(|(_, root)| root)
-        .collect::<Vec<_>>();
     Ok(crate::storage::list_authorized_search_folders(paths)?
         .into_iter()
-        .map(|folder| AuthorizedSearchFolderV1 {
-            unavailable: !current.contains(&PathBuf::from(&folder.canonical_path)),
-            folder_id: folder.folder_id,
-            display_name: folder.display_name,
+        .map(|folder| {
+            let stored = PathBuf::from(&folder.canonical_path);
+            let resolves = stored
+                .canonicalize()
+                .is_ok_and(|current| current == stored && current.is_dir());
+            AuthorizedSearchFolderV1 {
+                unavailable: !resolves || folder.bridge_id.is_none(),
+                folder_id: folder.folder_id,
+                display_name: folder.display_name,
+                bridge_id: folder.bridge_id,
+            }
         })
         .collect())
 }
@@ -78,6 +93,7 @@ pub(crate) fn list_authorized_search_folders(
 pub(crate) fn authorize_search_folder(
     paths: &AppPaths,
     chosen: &Path,
+    bridge_id: &str,
 ) -> AppResult<AuthorizedSearchFolderV1> {
     let metadata = fs::symlink_metadata(chosen)
         .map_err(|_| AppError::InvalidInput("The chosen folder is unavailable.".into()))?;
@@ -157,11 +173,13 @@ pub(crate) fn authorize_search_folder(
         canonical_path,
         display_name,
         created_at: crate::storage::now_ts(),
+        bridge_id: Some(bridge_id.to_owned()),
     };
     crate::storage::add_authorized_search_folder(paths, &folder)?;
     Ok(AuthorizedSearchFolderV1 {
         folder_id: folder.folder_id,
         display_name: folder.display_name,
+        bridge_id: folder.bridge_id,
         unavailable: false,
     })
 }
@@ -266,6 +284,7 @@ struct DiscoveredFileCandidate {
     scope_root: PathBuf,
     scope_label: String,
     fingerprint: safe_file_identity::SourceFingerprint,
+    modified: std::time::SystemTime,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -361,10 +380,18 @@ fn execute_bridge_plan_search_internal_with_roots(
     }
 
     let mut discovered = Vec::new();
+    let mut visited = 0_usize;
     let timeout_ms = MAX_SEARCH_MS;
     for scope in scopes {
-        search_scope(&request, &scope, started, &mut discovered, &mut omitted)?;
-        if discovered.len() >= MAX_CANDIDATES {
+        search_scope(
+            &request,
+            &scope,
+            started,
+            &mut discovered,
+            &mut visited,
+            &mut omitted,
+        )?;
+        if visited >= MAX_VISITED_ENTRIES {
             omitted.too_many_matches = true;
             break;
         }
@@ -381,7 +408,9 @@ fn execute_bridge_plan_search_internal_with_roots(
         }
     }
 
-    let truncated = discovered.len() > MAX_CANDIDATES;
+    let truncated = omitted.too_many_matches;
+    // Newest first: the file just produced is the one most likely wanted.
+    discovered.sort_by(|a, b| b.modified.cmp(&a.modified));
     discovered.truncate(MAX_CANDIDATES);
     result_with_discovered(
         &request,
@@ -399,6 +428,7 @@ fn search_scope(
     scope: &SearchScope,
     started: Instant,
     candidates: &mut Vec<DiscoveredFileCandidate>,
+    visited: &mut usize,
     omitted: &mut FileCandidateOmitted,
 ) -> AppResult<()> {
     let root = match scope.root.canonicalize() {
@@ -421,10 +451,11 @@ fn search_scope(
             Err(_) => continue,
         };
         for entry in entries.flatten() {
-            if candidates.len() >= MAX_CANDIDATES {
+            if *visited >= MAX_VISITED_ENTRIES {
                 omitted.too_many_matches = true;
                 return Ok(());
             }
+            *visited += 1;
             if elapsed_ms(started) > MAX_SEARCH_MS {
                 return Ok(());
             }
@@ -509,13 +540,30 @@ fn search_scope(
                 confidence: confidence_for_match(match_reason).to_string(),
                 match_reason: match_reason.to_string(),
             };
-            candidates.push(DiscoveredFileCandidate {
+            let discovered = DiscoveredFileCandidate {
                 public,
                 local_path: canonical,
                 scope_root: root.clone(),
                 scope_label: scope.label.clone(),
                 fingerprint,
-            });
+                modified: metadata
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            };
+            // Keep only the newest matches; an older one gives way.
+            if candidates.len() < MAX_CANDIDATES {
+                candidates.push(discovered);
+            } else {
+                omitted.too_many_matches = true;
+                if let Some((oldest, _)) = candidates
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, candidate)| candidate.modified)
+                    .filter(|(_, candidate)| candidate.modified < discovered.modified)
+                {
+                    candidates[oldest] = discovered;
+                }
+            }
         }
     }
     Ok(())
@@ -606,7 +654,7 @@ fn resolve_authorized_scopes(
     request: &BridgePlanSearchRequest,
     omitted: &mut FileCandidateOmitted,
 ) -> Vec<SearchScope> {
-    let roots = current_authorized_search_roots(paths).unwrap_or_default();
+    let roots = current_authorized_search_roots(paths, &request.room_ref).unwrap_or_default();
     if roots.is_empty() {
         omitted.scopes_skipped.push(AUTHORIZED_FOLDERS_SCOPE.into());
         log_search_scope(
@@ -1155,7 +1203,7 @@ pub(crate) fn resolve_bridge_plan_selected_file(
     }
     // A folder's authorization ends for its found files too.
     if entry.scope_label == AUTHORIZED_FOLDERS_SCOPE
-        && !current_authorized_search_roots(paths)?
+        && !current_authorized_search_roots(paths, &entry.room_ref)?
             .iter()
             .any(|(_, root)| root == &entry.scope_root)
     {
@@ -1428,13 +1476,28 @@ mod tests {
         fs::write(folder.join("notes.txt"), b"not a video").unwrap();
         // Project files beside the authorized folder are never reachable.
         fs::write(outside.join("REPZ").join("secret_build.mp4"), b"outside").unwrap();
-        let authorized = authorize_search_folder(&paths, &folder).unwrap();
+        create_test_bridge(&paths, "bridge");
+        create_test_bridge(&paths, "other-bridge");
+        let authorized = authorize_search_folder(&paths, &folder, "bridge").unwrap();
         AuthorizedFixture {
             paths,
             outside,
             folder,
             folder_id: authorized.folder_id,
         }
+    }
+
+    fn create_test_bridge(paths: &AppPaths, bridge_id: &str) {
+        crate::storage::create_room(
+            paths,
+            &[7u8; 32],
+            "12345678",
+            15,
+            crate::models::LocalRole::Creator,
+            Some(bridge_id.into()),
+            None,
+        )
+        .unwrap();
     }
 
     fn video_request(attempt_id: &str, hint: &str) -> BridgePlanSearchRequest {
@@ -1549,7 +1612,8 @@ mod tests {
     #[test]
     fn folders_too_broad_hidden_linked_or_duplicate_are_refused() {
         let fixture = authorized_fixture();
-        let refused = |path: &Path| authorize_search_folder(&fixture.paths, path).is_err();
+        let refused =
+            |path: &Path| authorize_search_folder(&fixture.paths, path, "bridge").is_err();
         assert!(refused(Path::new("/")));
         if let Some(home) = dirs::home_dir() {
             assert!(refused(&home));
@@ -1576,7 +1640,7 @@ mod tests {
         for index in 0..15 {
             let folder = fixture.outside.join(format!("extra-{index}"));
             fs::create_dir_all(&folder).unwrap();
-            authorize_search_folder(&fixture.paths, &folder).unwrap();
+            authorize_search_folder(&fixture.paths, &folder, "bridge").unwrap();
         }
         let one_more = fixture.outside.join("one-more");
         fs::create_dir_all(&one_more).unwrap();
@@ -1720,5 +1784,120 @@ mod tests {
         let error = resolve(&fixture, &mut store, "x1", &candidate).unwrap_err();
         assert!(error.message().contains("expired"), "{}", error.message());
         assert!(resolve(&fixture, &mut store, "x1", &candidate).is_err());
+    }
+
+    #[test]
+    fn a_shared_folder_is_searchable_only_from_its_own_bridge() {
+        let fixture = authorized_fixture();
+        let mut store = BridgePlanCandidateStore::default();
+        // The same requester and receiver over another Bridge see nothing:
+        // a valid session alone never widens folder authority.
+        let other = execute_bridge_plan_search_and_store(
+            BridgePlanSearchRequest {
+                room_ref: "other-bridge".into(),
+                ..video_request("b1", "validation")
+            },
+            &fixture.paths,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(other.status, "failed");
+        assert_eq!(other.error_code.as_deref(), Some("no_searchable_scopes"));
+        // A Bridge that does not exist, or that was burned, cannot be given one.
+        let elsewhere = fixture.outside.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        assert!(authorize_search_folder(&fixture.paths, &elsewhere, "no-such-bridge").is_err());
+        let found = search(&fixture, "b2", "lighting", &mut store);
+        let candidate = found.candidates[0].candidate_id.clone();
+        crate::storage::cut_off_bridge_authority(&fixture.paths, "bridge").unwrap();
+        // The durable cutoff ends the share at once, also for found files.
+        assert!(list_authorized_search_folders(&fixture.paths)
+            .unwrap()
+            .is_empty());
+        assert!(resolve(&fixture, &mut store, "b2", &candidate).is_err());
+        assert_eq!(
+            search(&fixture, "b3", "lighting", &mut store).status,
+            "failed"
+        );
+        assert!(authorize_search_folder(&fixture.paths, &elsewhere, "bridge").is_err());
+        // A new Bridge with the same peers starts with nothing shared.
+        create_test_bridge(&fixture.paths, "new-bridge");
+        let fresh = execute_bridge_plan_search_and_store(
+            BridgePlanSearchRequest {
+                room_ref: "new-bridge".into(),
+                ..video_request("b4", "lighting")
+            },
+            &fixture.paths,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(fresh.status, "failed");
+    }
+
+    #[test]
+    fn a_folder_shared_before_bridge_scoping_is_never_searched() {
+        let fixture = authorized_fixture();
+        let connection = rusqlite::Connection::open(&fixture.paths.db_path).unwrap();
+        connection
+            .execute("UPDATE authorized_search_folders SET bridge_id = NULL", [])
+            .unwrap();
+        let listed = list_authorized_search_folders(&fixture.paths).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].unavailable);
+        assert_eq!(listed[0].bridge_id, None);
+        let mut store = BridgePlanCandidateStore::default();
+        assert_eq!(
+            search(&fixture, "n1", "lighting", &mut store).status,
+            "failed"
+        );
+        // The schema migration is idempotent on an existing database.
+        crate::storage::init_database(&fixture.paths).unwrap();
+        // Stopping and sharing again binds it to one Bridge.
+        revoke_authorized_search_folder(&fixture.paths, &fixture.folder_id).unwrap();
+        authorize_search_folder(&fixture.paths, &fixture.folder, "bridge").unwrap();
+        assert_eq!(
+            search(&fixture, "n2", "lighting", &mut store)
+                .candidates
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_newest_matches_are_returned_first_even_when_found_last() {
+        let fixture = authorized_fixture();
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(100_000);
+        // Older clips near the top; the newest renders deepest, where a
+        // first-found cut-off at 20 results would never reach them.
+        for index in 0..30_u64 {
+            let directory = (0..(index / 10))
+                .fold(fixture.folder.join("renders"), |path, level| {
+                    path.join(format!("level{level}"))
+                });
+            fs::create_dir_all(&directory).unwrap();
+            let file = directory.join(format!("take_{index:02}.mp4"));
+            fs::write(&file, b"clip").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(base + std::time::Duration::from_secs(index * 60))
+                .unwrap();
+        }
+        let mut store = BridgePlanCandidateStore::default();
+        let result = search(&fixture, "newest", "take_", &mut store);
+        assert_eq!(result.status, "completed");
+        let names = result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.display_name.clone())
+            .collect::<Vec<_>>();
+        let expected = (10..30_u64)
+            .rev()
+            .map(|index| format!("take_{index:02}.mp4"))
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected);
+        // Only the returned candidates are bound for selection.
+        assert_eq!(store.entries.len(), 20);
     }
 }

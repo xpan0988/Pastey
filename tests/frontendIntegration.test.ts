@@ -623,7 +623,10 @@ test("Find file and shared folders keep paths and authority on the searched devi
   assert.match(card, /<option value="find">Find file<\/option>/);
   // A folder is shared only from this device's own folder picker.
   assert.match(settings, /open\(\{ directory: true, multiple: false \}\)/);
-  assert.match(bindings, /invoke\("authorize_search_folder", \{ path \}\)/);
+  assert.match(bindings, /invoke\("authorize_search_folder", \{ path, roomId \}\)/);
+  // A folder is shared with exactly one Bridge chosen by this device's user.
+  assert.match(settings, /authorizeSearchFolder\(chosen, bridgeId\)/);
+  assert.match(settings, /Other Bridges cannot/);
   const folderType = bindings.slice(bindings.indexOf("export interface AuthorizedSearchFolder"), bindings.indexOf("export function listAuthorizedSearchFolders"));
   assert.doesNotMatch(folderType, /path/i);
 });
